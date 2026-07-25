@@ -15,14 +15,15 @@ cd "$ROOT"
 
 GW="${WEFT_GATEWAY:-http://127.0.0.1:18080}"
 GATE_SECS="${GATE_SECS:-1200}"
-MACHINE="${MACHINE:-eks/r6g.8xlarge-spot-bench}"
+MACHINE="${MACHINE:-eks/r6g.4xlarge-bench}"
 SIZE="${SIZE:-xlarge}"   # use xlarge until gateway image knows "bench"; then SIZE=bench
 WORKER_MIN="${WORKER_MIN:-0}"
 WORKER_MAX="${WORKER_MAX:-0}"
 PATCH_FAT="${PATCH_FAT:-1}"   # patch driver to fat CPU/mem after create (live bypass)
-# Defaults fit r6g.8xlarge (~32 vCPU / 256 GiB). Override for larger nodes when quota allows.
-FAT_CPU="${FAT_CPU:-28}"
-FAT_MEM="${FAT_MEM:-200Gi}"
+# Defaults fit On-Demand r6g.4xlarge (~16 vCPU / 128 GiB) under a 32 vCPU Standard
+# quota. For r6g.8xlarge use FAT_CPU=28 FAT_MEM=200Gi (needs Spot or quota headroom).
+FAT_CPU="${FAT_CPU:-14}"
+FAT_MEM="${FAT_MEM:-110Gi}"
 
 ADMIN_PW="${WEFT_ADMIN_PASSWORD:-$(kubectl -n weft-system get secret weft-gateway-jwt -o jsonpath='{.data.admin-password}' | base64 -d)}"
 TOKEN="$(curl -sS -X POST "$GW/api/auth/login" -H 'content-type: application/json' \
