@@ -68,6 +68,8 @@ if [[ "$PATCH_FAT" == "1" ]]; then
   ]"
   # Drop workers if any — SQL path is driver Connect only.
   kubectl -n "$NS" scale sts -l weft.io/role=worker --replicas=0 2>/dev/null || true
+  # Nudge the ReplicaSet out of FailedCreate backoff after the quota raise.
+  kubectl -n "$NS" annotate deploy "$DRV" "kubectl.kubernetes.io/restartedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
   kubectl -n "$NS" rollout status deploy/"$DRV" --timeout=600s
   # Confirm scheduled on a fat node
   NODE="$(kubectl -n "$NS" get pod -l weft.io/role=driver -o jsonpath='{.items[0].spec.nodeName}')"
