@@ -331,6 +331,31 @@ def run_one(gw: str, token: str, sql: str, cluster_id: str | None) -> tuple[floa
     return (ms / 1000.0 if ms else wall), None
 
 
+
+def wait_driver_ready(cluster_id: str, timeout_s: int = 180) -> None:
+    """Block until the cluster driver pod is Ready (post-OOM restart)."""
+    if not cluster_id:
+        return
+    ns = f"weft-cl-{cluster_id}"
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            out = subprocess.check_output(
+                [
+                    "kubectl", "-n", ns, "get", "pods", "-l", "weft.io/role=driver",
+                    "-o", "jsonpath={.items[0].status.conditions[?(@.type==\"Ready\")].status}",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if out == "True":
+                return
+        except subprocess.CalledProcessError:
+            pass
+        time.sleep(5)
+    print(f"[run] warning: driver in {ns} not Ready within {timeout_s}s", flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gateway", default=os.environ.get("WEFT_GATEWAY", ""))
@@ -399,7 +424,8 @@ def main() -> int:
             if err and transient(err) and transient_left > 0:
                 transient_left -= 1
                 print(f"{name:<5} RETRY try{attempt+1}: {err}", flush=True)
-                time.sleep(20)
+                wait_driver_ready(cluster_id)
+                time.sleep(5)
                 # Do not consume a successful-try slot on transport blips.
                 continue
             if err:
