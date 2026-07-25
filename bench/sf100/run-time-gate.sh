@@ -55,8 +55,12 @@ NS="weft-cl-${CLUSTER_ID}"
 DRV="$(kubectl -n "$NS" get deploy -o jsonpath='{.items[0].metadata.name}')"
 
 if [[ "$PATCH_FAT" == "1" ]]; then
-  echo "[gate] patching driver ${NS}/${DRV} → ${FAT_CPU} CPU / ${FAT_MEM}"
+  echo "[gate] raising ResourceQuota + patching driver ${NS}/${DRV} → ${FAT_CPU} CPU / ${FAT_MEM}"
+  # Namespace quota is sized to worker_size at create time; raise it before the fat pod.
+  kubectl -n "$NS" patch resourcequota weft-cluster-quota --type=merge -p="{\"spec\":{\"hard\":{\"requests.cpu\":\"${FAT_CPU}\",\"requests.memory\":\"${FAT_MEM}\",\"pods\":\"2\"}}}"
+  # Recreate (not RollingUpdate): single-node pools cannot surge an 8→14 CPU pod.
   kubectl -n "$NS" patch deploy "$DRV" --type=json -p="[
+    {\"op\":\"replace\",\"path\":\"/spec/strategy\",\"value\":{\"type\":\"Recreate\"}},
     {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/resources/requests/cpu\",\"value\":\"${FAT_CPU}\"},
     {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/resources/limits/cpu\",\"value\":\"${FAT_CPU}\"},
     {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/resources/requests/memory\",\"value\":\"${FAT_MEM}\"},
