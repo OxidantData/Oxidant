@@ -15,15 +15,15 @@ cd "$ROOT"
 
 GW="${WEFT_GATEWAY:-http://127.0.0.1:18080}"
 GATE_SECS="${GATE_SECS:-1200}"
-MACHINE="${MACHINE:-eks/r6g.4xlarge-bench}"
+MACHINE="${MACHINE:-eks/r6g.8xlarge-spot-bench}"
 SIZE="${SIZE:-xlarge}"   # use xlarge until gateway image knows "bench"; then SIZE=bench
 WORKER_MIN="${WORKER_MIN:-0}"
 WORKER_MAX="${WORKER_MAX:-0}"
 PATCH_FAT="${PATCH_FAT:-1}"   # patch driver to fat CPU/mem after create (live bypass)
 # Defaults fit On-Demand r6g.4xlarge (~16 vCPU / 128 GiB) under a 32 vCPU Standard
 # quota. For r6g.8xlarge use FAT_CPU=28 FAT_MEM=200Gi (needs Spot or quota headroom).
-FAT_CPU="${FAT_CPU:-14}"
-FAT_MEM="${FAT_MEM:-116Gi}"
+FAT_CPU="${FAT_CPU:-28}"
+FAT_MEM="${FAT_MEM:-200Gi}"
 
 ADMIN_PW="${WEFT_ADMIN_PASSWORD:-$(kubectl -n weft-system get secret weft-gateway-jwt -o jsonpath='{.data.admin-password}' | base64 -d)}"
 TOKEN="$(curl -sS -X POST "$GW/api/auth/login" -H 'content-type: application/json' \
@@ -58,6 +58,8 @@ if [[ "$PATCH_FAT" == "1" ]]; then
   echo "[gate] raising ResourceQuota + patching driver ${NS}/${DRV} → ${FAT_CPU} CPU / ${FAT_MEM}"
   # Namespace quota is sized to worker_size at create time; raise it before the fat pod.
   kubectl -n "$NS" patch resourcequota weft-cluster-quota --type=merge -p="{\"spec\":{\"hard\":{\"requests.cpu\":\"${FAT_CPU}\",\"requests.memory\":\"${FAT_MEM}\",\"pods\":\"2\"}}}"
+  # Ensure xlarge-pool toleration (live gateway may omit it when pool label is absent).
+  kubectl -n "$NS" patch deploy "$DRV" --type=strategic -p='{"spec":{"template":{"spec":{"tolerations":[{"key":"weft.io/pool","operator":"Equal","value":"xlarge","effect":"NoSchedule"}]}}}}'
   # Recreate (not RollingUpdate): single-node pools cannot surge an 8→14 CPU pod.
   kubectl -n "$NS" patch deploy "$DRV" --type=json -p="[
     {\"op\":\"replace\",\"path\":\"/spec/strategy\",\"value\":{\"type\":\"Recreate\"}},
