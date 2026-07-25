@@ -381,18 +381,34 @@ def main() -> int:
 
     per_query: list[float | None] = []
     failed: list[int] = []
+
+    def transient(err: str | None) -> bool:
+        if not err:
+            return False
+        e = err.lower()
+        return any(s in e for s in ("transport", "unavailable", "connection reset", "broken pipe", "oom"))
+
     for qi, (name, raw) in enumerate(queries, start=1):
         sql = qualify_sql(raw.strip().rstrip(";").strip(), glue_db, tables)
         times: list[float] = []
         err = None
-        for attempt in range(3):
+        attempt = 0
+        transient_left = 6
+        while attempt < 3:
             wall, err = run_one(gw, token, sql, cluster_id)
+            if err and transient(err) and transient_left > 0:
+                transient_left -= 1
+                print(f"{name:<5} RETRY try{attempt+1}: {err}", flush=True)
+                time.sleep(20)
+                # Do not consume a successful-try slot on transport blips.
+                continue
             if err:
                 print(f"{name:<5} FAIL try{attempt+1}: {err}", flush=True)
                 times.clear()
                 break
             times.append(wall)
             print(f"{name:<5} try{attempt+1} {wall:.4f}s", flush=True)
+            attempt += 1
         if len(times) < 3:
             per_query.append(None)
             failed.append(qi)

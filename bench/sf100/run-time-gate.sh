@@ -23,7 +23,7 @@ PATCH_FAT="${PATCH_FAT:-1}"   # patch driver to fat CPU/mem after create (live b
 # Defaults fit On-Demand r6g.4xlarge (~16 vCPU / 128 GiB) under a 32 vCPU Standard
 # quota. For r6g.8xlarge use FAT_CPU=28 FAT_MEM=200Gi (needs Spot or quota headroom).
 FAT_CPU="${FAT_CPU:-14}"
-FAT_MEM="${FAT_MEM:-110Gi}"
+FAT_MEM="${FAT_MEM:-116Gi}"
 
 ADMIN_PW="${WEFT_ADMIN_PASSWORD:-$(kubectl -n weft-system get secret weft-gateway-jwt -o jsonpath='{.data.admin-password}' | base64 -d)}"
 TOKEN="$(curl -sS -X POST "$GW/api/auth/login" -H 'content-type: application/json' \
