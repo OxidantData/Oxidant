@@ -1,0 +1,21 @@
+{
+  "dataset": "TPC-DS SF100 via Glue (`glue.tpcds_sf100.*`) on S3",
+  "machine": "eks/t4g.xlarge",
+  "runDate": null,
+  "queryCount": 99,
+  "commonCount": 0,
+  "method": "Weft on EKS via gateway POST /api/sql; Glue catalog; 3 tries/query; hot = min(try2, try3); no_limit",
+  "engines": [
+    {
+      "key": "weft",
+      "name": "Weft",
+      "highlight": true,
+      "total": null,
+      "totalAll": null,
+      "source": "pending",
+      "perQuery": [],
+      "failures": null,
+      "failedQueries": []
+    }
+  ]
+}

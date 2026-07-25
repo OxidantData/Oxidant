@@ -1,4 +1,6 @@
-import raw from "../data/benchmarks.json";
+import clickbenchRaw from "../data/benchmarks.json";
+import tpchRaw from "../data/tpch.json";
+import tpcdsRaw from "../data/tpcds.json";
 
 export interface Engine {
   key: string;
@@ -28,7 +30,9 @@ export interface Benchmarks {
   engines: Engine[];
 }
 
-export const benchmarks = raw as Benchmarks;
+export const benchmarks = clickbenchRaw as Benchmarks;
+export const tpchBenchmarks = tpchRaw as Benchmarks;
+export const tpcdsBenchmarks = tpcdsRaw as Benchmarks;
 
 /** One distinct, solid color per engine — shared by every chart so bars/legends stay consistent.
  *  Weft keeps the brand orange; the others get clearly distinguishable hues (not faint grey). */
@@ -37,6 +41,7 @@ export const ENGINE_COLORS: Record<string, string> = {
   sail: "#2563eb", // blue
   spark: "#64748b", // slate
   gluten: "#16a34a", // green
+  duckdb: "#eab308", // gold
 };
 
 export function engineColor(key: string): string {
@@ -50,9 +55,9 @@ export function isMeasured(e: Engine): boolean {
 export const measuredEngines = benchmarks.engines.filter(isMeasured);
 
 /** Weft's speedup vs another engine as a multiple (e.g. 1.24 = 24% faster), or null. */
-export function speedupVs(otherKey: string): number | null {
-  const weft = benchmarks.engines.find((e) => e.key === "weft");
-  const other = benchmarks.engines.find((e) => e.key === otherKey);
+export function speedupVs(otherKey: string, suite: Benchmarks = benchmarks): number | null {
+  const weft = suite.engines.find((e) => e.key === "weft");
+  const other = suite.engines.find((e) => e.key === otherKey);
   if (!weft?.total || !other?.total) return null;
   return other.total / weft.total;
 }

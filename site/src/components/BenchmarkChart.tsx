@@ -1,6 +1,4 @@
-import { benchmarks, engineColor, type Engine } from "../lib/benchmarks";
-
-const weftTotal = benchmarks.engines.find((e) => e.key === "weft")?.total ?? null;
+import { engineColor, type Engine } from "../lib/benchmarks";
 
 /**
  * Total-runtime horizontal bar chart (lower = faster). Measured engines draw a solid bar scaled
@@ -14,6 +12,7 @@ export default function BenchmarkChart({
   engines: Engine[];
   title?: string;
 }) {
+  const weftTotal = engines.find((e) => e.key === "weft")?.total ?? null;
   const measured = engines.filter((e) => e.total != null) as (Engine & { total: number })[];
   const max = measured.length ? Math.max(...measured.map((e) => e.total)) : 1;
   // Fastest first; pending (null) last — matches the ShuttlePass order.

@@ -2,6 +2,9 @@
 //! (DataFusion) registers and runs the queries with ClickBench-style hot timing, and — when a
 //! `duckdb` CLI is found — every result is cross-checked against DuckDB over the same data (an
 //! independent oracle). Runs the full official **TPC-H Q1–Q22** (from `bench/tpch/queries/`).
+//!
+//! For published SF100 timings use [`run_bench`]: Parquet from DuckDB's pre-built
+//! `tpch-sf100.db`, JSON output for the site, optional DuckDB baseline (no row-level oracle).
 
 use std::path::Path;
 use std::process::Command;
@@ -12,6 +15,7 @@ use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::prelude::CsvReadOptions;
 use weft_loom::Engine;
 
+use crate::suite::{self, Query};
 use crate::tpch_data;
 
 /// The 22 official TPC-H queries, loaded from `bench/tpch/queries/q{N}.sql` at compile time. The
@@ -50,6 +54,91 @@ pub(crate) fn queries() -> Vec<(&'static str, &'static str)> {
         q!("21"),
         q!("22"),
     ]
+}
+
+pub struct BenchOpts<'a> {
+    pub sf: f64,
+    pub data: &'a Path,
+    pub duckdb_db: Option<&'a Path>,
+    pub out_json: &'a Path,
+    pub machine: &'a str,
+    pub run_date: &'a str,
+    pub with_duckdb: bool,
+}
+
+/// Published-benchmark path: Parquet tables + JSON results (+ optional DuckDB baseline).
+pub async fn run_bench(opts: BenchOpts<'_>) {
+    eprintln!(
+        "[tpch-bench] SF{} data={} → {}",
+        opts.sf,
+        opts.data.display(),
+        opts.out_json.display()
+    );
+
+    let engine = Engine::new();
+    for t in tpch_data::TABLES {
+        let path = opts.data.join(format!("{t}.parquet"));
+        if path.exists() {
+            engine
+                .register_parquet(t, path.to_str().unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("register {t}: {e}"));
+            continue;
+        }
+        let alt = opts.data.join(t);
+        if alt.is_dir() {
+            engine
+                .register_parquet(t, alt.to_str().unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("register {t}: {e}"));
+            continue;
+        }
+        panic!(
+            "missing TPC-H table `{t}` under {} — run bench/tpch/prepare.sh first",
+            opts.data.display()
+        );
+    }
+
+    let qs: Vec<Query<'_>> = queries()
+        .iter()
+        .map(|(n, s)| Query { name: n, sql: s })
+        .collect();
+
+    eprintln!("[tpch-bench] running Weft ({} queries × 3 tries) …", qs.len());
+    let weft = suite::run_weft(&engine, &qs).await;
+
+    let mut engines = vec![weft];
+    if opts.with_duckdb {
+        if let Some(duck) = suite::duckdb_path() {
+            let duck_data = opts.duckdb_db.unwrap_or(opts.data);
+            eprintln!(
+                "[tpch-bench] running DuckDB baseline on {} …",
+                duck_data.display()
+            );
+            engines.push(suite::run_duckdb(&duck, duck_data, &qs));
+        } else {
+            eprintln!("[tpch-bench] DuckDB not on PATH — skipping baseline");
+        }
+    }
+
+    let dataset = format!("TPC-H SF{} (DuckDB dbgen / blobs.duckdb.org)", opts.sf);
+    suite::write_site_json(
+        opts.out_json,
+        &dataset,
+        opts.machine,
+        opts.run_date,
+        "engine-direct Parquet, 3 tries/query, hot = min(try2, try3)",
+        qs.len(),
+        &engines,
+    )
+    .expect("write tpch results json");
+
+    let failed = engines[0].failures;
+    let hot = engines[0].total().unwrap_or(0.0);
+    eprintln!(
+        "\n=== TPC-H sf{}: weft hot total {hot:.4}s, {failed} failure(s) ===",
+        opts.sf
+    );
 }
 
 /// Generate data, register tables, run the queries (hot timing), and cross-check vs DuckDB.
