@@ -50,3 +50,19 @@ weft-ui-server   = { path = "crates/weft-ui-server" }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# Optimize third-party deps (datafusion, arrow) even in debug builds. The bench
+# gates in CI (`cargo run -p weft-bench -- tpcds ...`) run whole query suites
+# through these crates; unoptimized they dominate the job. Workspace crates stay
+# at opt-level 0 so compile time is unaffected, and deps are cached after run 1.
+[profile.dev.package."*"]
+opt-level = 2
+
+# CI image builds: skipping LTO and letting rustc use 16 codegen units removes
+# the serialized whole-program link that dominates `release`. Use for branch and
+# `main` images; tagged releases must still build with the tuned `release`
+# profile above.
+[profile.release-ci]
+inherits = "release"
+lto = false
+codegen-units = 16
