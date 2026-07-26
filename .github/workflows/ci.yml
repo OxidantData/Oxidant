@@ -174,9 +174,14 @@ jobs:
       # cannot reuse those artifacts — pointed at the shared cache it re-compiled datafusion from
       # scratch and went from 2 min to 20 min, making it the critical path. Its own small,
       # exactly-matching cache is worth the extra entry.
+      # -v2 because `[profile.dev.package."*"] opt-level = 2` invalidates every dependency
+      # artifact without changing anything rust-cache hashes. On the old key the job restored a
+      # full hit of opt-level 0 artifacts, rebuilt datafusion anyway, and could not save over an
+      # existing key -- so it paid the cold build on every run. Bump this whenever a profile
+      # change makes previously cached artifacts unusable.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: spark-parity
+          key: spark-parity-v2
           cache-on-failure: "true"
       - name: Build weft-parity
         run: cargo build -p weft-spark-compat --bin weft-parity
