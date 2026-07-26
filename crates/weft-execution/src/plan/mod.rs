@@ -6,6 +6,7 @@
 //! [`codec`](crate::shuffle::codec) finding showed is the correct one). See
 //! [`stage_planner::plan_distributed`].
 
+pub mod join_chain;
 pub mod shape_extensions;
 pub mod stage_planner;
 

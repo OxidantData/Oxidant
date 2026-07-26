@@ -330,23 +330,175 @@ async fn two_sharded_tables_auto_shuffle_join() {
     );
 }
 
-#[tokio::test]
-async fn three_sharded_tables_is_rejected() {
-    let single = Engine::new();
-    single
-        .register_batches("t", vec![batch(0, 60, 12)])
-        .unwrap();
-    single.register_batches("dim", vec![dim(12)]).unwrap();
-    single
-        .register_batches("dim2", vec![dim(12)])
-        .unwrap();
-    let err = plan_distributed(
-        &single,
-        "SELECT d.d_name AS name, COUNT(*) AS c          FROM t JOIN dim d ON t.k = d.d_key JOIN dim2 d2 ON t.k = d2.d_key          GROUP BY d.d_name",
-        &[],
+fn dim2(groups: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("d2_key", DataType::Int64, false),
+        Field::new("d2_name", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..groups)),
+            Arc::new(Int64Array::from_iter_values((0..groups).map(|i| i * 10))),
+        ],
     )
-    .await;
-    assert!(err.is_err(), "three sharded tables must be rejected");
+    .unwrap()
+}
+
+fn dim2_shard(groups: i64, start: i64, end: i64) -> RecordBatch {
+    let full = dim2(groups);
+    let schema = full.schema();
+    let k = full.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let n = full.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let mut ks = Vec::new();
+    let mut ns = Vec::new();
+    for i in 0..full.num_rows() {
+        let kv = k.value(i);
+        if kv >= start && kv < end {
+            ks.push(kv);
+            ns.push(n.value(i));
+        }
+    }
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ks)),
+            Arc::new(Int64Array::from(ns)),
+        ],
+    )
+    .unwrap()
+}
+
+fn dim_shard(groups: i64, start: i64, end: i64) -> RecordBatch {
+    let full = dim(groups);
+    let schema = full.schema();
+    let k = full.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let n = full.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let mut ks = Vec::new();
+    let mut ns = Vec::new();
+    for i in 0..full.num_rows() {
+        let kv = k.value(i);
+        if kv >= start && kv < end {
+            ks.push(kv);
+            ns.push(n.value(i));
+        }
+    }
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ks)),
+            Arc::new(Int64Array::from(ns)),
+        ],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn multi_dim_broadcast_star_matches_single_node() {
+    // One sharded fact + two replicated dims (ANSI multi-join star) folds into the partial.
+    const G: i64 = 12;
+    let sql = "SELECT d.d_name AS name, SUM(t.v) AS sv, COUNT(*) AS c                FROM t JOIN dim d ON t.k = d.d_key JOIN dim2 d2 ON t.k = d2.d2_key                GROUP BY d.d_name";
+
+    let single = Engine::new();
+    single.register_batches("t", vec![batch(0, 200, G)]).unwrap();
+    single.register_batches("dim", vec![dim(G)]).unwrap();
+    single.register_batches("dim2", vec![dim2(G)]).unwrap();
+    let expected = single.sql(sql).await.unwrap();
+
+    let (p0, p1) = (50701u16, 50702u16);
+    let e0 = Arc::new(Engine::new());
+    e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
+    e0.register_batches("dim", vec![dim(G)]).unwrap();
+    e0.register_batches("dim2", vec![dim2(G)]).unwrap();
+    let e1 = Arc::new(Engine::new());
+    e1.register_batches("t", vec![batch(100, 200, G)]).unwrap();
+    e1.register_batches("dim", vec![dim(G)]).unwrap();
+    e1.register_batches("dim2", vec![dim2(G)]).unwrap();
+    tokio::spawn(async move {
+        let _ = serve_worker(p0, e0).await;
+    });
+    tokio::spawn(async move {
+        let _ = serve_worker(p1, e1).await;
+    });
+    let cluster = Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ]);
+
+    let dq = plan_distributed(&single, sql, &["dim", "dim2"])
+        .await
+        .expect("multi-dim broadcast should plan");
+    assert_eq!(dq.stages.len(), 2, "broadcast star is two stages");
+    let mut gathered = None;
+    for _ in 0..150 {
+        if let Ok(b) = run_stages(&cluster, &dq.stages).await {
+            gathered = Some(b);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let actual = gathered.expect("distributed multi-dim broadcast never succeeded");
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "multi-dim broadcast must equal single-node"
+    );
+}
+
+#[tokio::test]
+async fn three_sharded_tables_left_deep_shuffle_chain() {
+    // Three sharded tables → left-deep pairwise shuffle joins + agg must match single-node.
+    const G: i64 = 12;
+    let sql = "SELECT d.d_name AS name, COUNT(*) AS c, SUM(t.v) AS sv                FROM t JOIN dim d ON t.k = d.d_key JOIN dim2 d2 ON t.k = d2.d2_key                GROUP BY d.d_name";
+
+    let single = Engine::new();
+    single.register_batches("t", vec![batch(0, 200, G)]).unwrap();
+    single.register_batches("dim", vec![dim(G)]).unwrap();
+    single.register_batches("dim2", vec![dim2(G)]).unwrap();
+    let expected = single.sql(sql).await.unwrap();
+
+    let (p0, p1) = (50711u16, 50712u16);
+    let e0 = Arc::new(Engine::new());
+    e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
+    e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)]).unwrap();
+    e0.register_batches("dim2", vec![dim2_shard(G, 0, G / 2)]).unwrap();
+    let e1 = Arc::new(Engine::new());
+    e1.register_batches("t", vec![batch(100, 200, G)]).unwrap();
+    e1.register_batches("dim", vec![dim_shard(G, G / 2, G)]).unwrap();
+    e1.register_batches("dim2", vec![dim2_shard(G, G / 2, G)]).unwrap();
+    tokio::spawn(async move {
+        let _ = serve_worker(p0, e0).await;
+    });
+    tokio::spawn(async move {
+        let _ = serve_worker(p1, e1).await;
+    });
+    let cluster = Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ]);
+
+    let dq = plan_distributed(&single, sql, &[])
+        .await
+        .expect("three-table shuffle chain should plan");
+    assert!(
+        dq.stages.len() >= 5,
+        "left-deep chain needs intermediate stages, got {}",
+        dq.stages.len()
+    );
+    let mut gathered = None;
+    for _ in 0..150 {
+        if let Ok(b) = run_stages(&cluster, &dq.stages).await {
+            gathered = Some(b);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let actual = gathered.expect("distributed join chain never succeeded");
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "left-deep shuffle chain must equal single-node"
+    );
 }
 
 #[tokio::test]

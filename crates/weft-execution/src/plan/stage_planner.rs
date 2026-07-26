@@ -23,8 +23,10 @@
 //! A join is auto-derived when every base table but one is **replicated** (passed in `replicated` —
 //! present in full on every worker): the join then runs locally per worker over the single sharded
 //! table's shard, so it folds straight into the partial stage's FROM tail with no extra shuffle.
-//! This covers star schemas (a sharded fact + replicated dimensions). Joins between two *sharded*
-//! tables are auto-derived as a **shuffle join** when there is a single equijoin key.
+//! This covers star schemas (a sharded fact + replicated dimensions, including multi-dim
+//! join chains folded into the partial). Joins between two or more *sharded* tables lower to a
+//! **left-deep shuffle-join chain** (pairwise equijoin stages, then partial/final aggregate)
+//! when each join is a single equijoin key.
 //!
 //! Also supported: ungrouped/global aggregates, `HAVING` over the aggregated result,
 //! scalar / IN / EXISTS subqueries **over replicated tables only**, and `UNION ALL` of
@@ -60,8 +62,9 @@ pub struct DistributedQuery {
 ///
 /// `replicated` names base tables that are present in **full** on every worker (small dimension
 /// tables). A join is auto-derived as a **broadcast join** — it runs locally per worker — as long as
-/// every table but one is replicated (so exactly one table is sharded). Joins between two *sharded*
-/// tables are auto-derived as a shuffle join when there is a single equijoin between them.
+/// every table but one is replicated (so exactly one table is sharded). Joins between two or more
+/// *sharded* tables are auto-derived as a left-deep shuffle-join chain when each join is a single
+/// equijoin.
 pub async fn plan_distributed(
     engine: &Engine,
     sql: &str,
@@ -160,9 +163,9 @@ pub(crate) fn aggregation_stages_for(
         return global_aggregation_stages(p, &sharded);
     }
 
-    // Two sharded tables → shuffle join + aggregate.
-    if sharded.len() == 2 {
-        return shuffle_join_aggregation_stages(p, &sharded);
+    // Two or more sharded tables → left-deep shuffle-join chain + aggregate.
+    if sharded.len() >= 2 {
+        return crate::plan::join_chain::plan_shuffle_join_chain(p, &sharded, replicated);
     }
 
     // Broadcast-join safety: exactly one base table may be sharded; others must be replicated.
@@ -179,10 +182,10 @@ pub(crate) fn aggregation_stages_for(
         .plan_to_sql(&agg.input)
         .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse input: {e}")))?
         .to_string();
-    let tail = input_sql
-        .strip_prefix("SELECT * ")
-        .ok_or_else(|| Error::Unsupported("auto-distribute: non-trivial aggregate input".into()))?;
-    let tail = sanitize_generated_sql(tail);
+    // Unparser emits `SELECT * FROM …` for a single scan, but multi-join inputs can be
+    // `SELECT *, * FROM …` (one star per join input). Extract the FROM/WHERE/JOIN tail either way.
+    let tail = extract_from_tail(&input_sql)?;
+    let tail = sanitize_generated_sql(&tail);
 
     // Broadcast is only correct if the sharded table is *scanned* exactly once (the driving fact).
     // A second scan — a self-join or a correlated EXISTS/IN subquery over it — would see only the
@@ -265,10 +268,8 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
         .plan_to_sql(&p.agg.input)
         .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse input: {e}")))?
         .to_string();
-    let tail = input_sql
-        .strip_prefix("SELECT * ")
-        .ok_or_else(|| Error::Unsupported("auto-distribute: non-trivial aggregate input".into()))?;
-    let tail = sanitize_generated_sql(tail);
+    let tail = extract_from_tail(&input_sql)?;
+    let tail = sanitize_generated_sql(&tail);
 
     let aggs = p
         .agg
@@ -351,7 +352,7 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
 }
 
 /// Shuffle-join two sharded tables, then run the grouped aggregation.
-fn shuffle_join_aggregation_stages(
+pub(crate) fn shuffle_join_two_tables(
     p: &Peeled<'_>,
     sharded: &[&str],
 ) -> Result<DistributedQuery> {
@@ -472,11 +473,11 @@ fn shuffle_join_aggregation_stages(
 }
 
 /// A leaf table scan, optionally filtered, with an optional SQL alias.
-struct SimpleScan<'a> {
-    table: &'a str,
-    alias: Option<&'a str>,
-    filter_sql: Option<String>,
-    schema: datafusion::common::DFSchemaRef,
+pub(crate) struct SimpleScan<'a> {
+    pub(crate) table: &'a str,
+    pub(crate) alias: Option<&'a str>,
+    pub(crate) filter_sql: Option<String>,
+    pub(crate) schema: datafusion::common::DFSchemaRef,
 }
 
 fn find_inner_equijoin(lp: &LogicalPlan) -> Result<&datafusion::logical_expr::Join> {
@@ -504,7 +505,7 @@ fn find_inner_equijoin(lp: &LogicalPlan) -> Result<&datafusion::logical_expr::Jo
     }
 }
 
-fn simple_table_scan(lp: &LogicalPlan) -> Result<SimpleScan<'_>> {
+pub(crate) fn simple_table_scan(lp: &LogicalPlan) -> Result<SimpleScan<'_>> {
     match lp {
         LogicalPlan::TableScan(s) => Ok(SimpleScan {
             table: s.table_name.table(),
@@ -536,7 +537,7 @@ fn simple_table_scan(lp: &LogicalPlan) -> Result<SimpleScan<'_>> {
 }
 
 
-fn equijoin_from_filter(filter: Option<&Expr>) -> Result<(Expr, Expr)> {
+pub(crate) fn equijoin_from_filter(filter: Option<&Expr>) -> Result<(Expr, Expr)> {
     let Some(Expr::BinaryExpr(b)) = filter else {
         return Err(Error::Unsupported(
             "auto-distribute: shuffle join needs an equijoin key (on or filter)".into(),
@@ -551,7 +552,7 @@ fn equijoin_from_filter(filter: Option<&Expr>) -> Result<(Expr, Expr)> {
     Ok((*b.left.clone(), *b.right.clone()))
 }
 
-fn column_name(e: &Expr) -> Result<String> {
+pub(crate) fn column_name(e: &Expr) -> Result<String> {
     match e {
         Expr::Column(c) => Ok(c.name.clone()),
         other => Err(Error::Unsupported(format!(
@@ -582,7 +583,7 @@ fn column_index_in_scan(scan: &SimpleScan<'_>, name: &str) -> Result<u32> {
 /// `None` when the query has neither. Sort exprs reference output columns; `result` carries those
 /// under their unqualified output names, so column refs are unqualified (e.g. `lineitem.l_returnflag`
 /// → `l_returnflag`, matching `wrap_output`'s aliasing) before unparsing.
-fn build_finalize(p: &Peeled) -> Result<Option<String>> {
+pub(crate) fn build_finalize(p: &Peeled) -> Result<Option<String>> {
     if p.sort.is_none() && p.limit.is_none() {
         return Ok(None);
     }
@@ -615,17 +616,17 @@ fn build_finalize(p: &Peeled) -> Result<Option<String>> {
 }
 
 /// One aggregate in the SELECT list, classified for partial/final decomposition.
-struct AggSpec {
+pub(crate) struct AggSpec {
     /// Lowercased function name (`sum`/`count`/`min`/`max`/`avg`).
-    func: String,
+    pub(crate) func: String,
     /// SQL of the (single) argument, e.g. `t.v` (or `1` for `count(*)`).
-    arg_sql: String,
+    pub(crate) arg_sql: String,
     /// Whether the aggregate is `DISTINCT`.
-    distinct: bool,
+    pub(crate) distinct: bool,
 }
 
 impl AggSpec {
-    fn classify(e: &Expr) -> Result<AggSpec> {
+    pub(crate) fn classify(e: &Expr) -> Result<AggSpec> {
         let Expr::AggregateFunction(af) = e else {
             return Err(Error::Unsupported(format!(
                 "auto-distribute: non-aggregate in aggregate list: {e}"
@@ -646,7 +647,7 @@ impl AggSpec {
 }
 
 /// Re-combinable path (no DISTINCT): partial aggregates per worker, final recombines.
-fn recombine_stage_sql(
+pub(crate) fn recombine_stage_sql(
     p: &Peeled,
     group_sql: &[String],
     aggs: &[AggSpec],
@@ -716,7 +717,7 @@ fn recombine_stage_sql(
 
 /// DISTINCT path: shuffle the raw grouping + argument columns by group key, run the original
 /// aggregate in the final stage (exact, since each group is co-located on one worker).
-fn distinct_stage_sql(
+pub(crate) fn distinct_stage_sql(
     _up: &Unparser,
     p: &Peeled,
     group_sql: &[String],
@@ -832,7 +833,7 @@ fn remap_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
 }
 
 /// Unparse an expr to SQL text.
-fn expr_sql(up: &Unparser, e: &Expr) -> Result<String> {
+pub(crate) fn expr_sql(up: &Unparser, e: &Expr) -> Result<String> {
     up.expr_to_sql(e)
         .map(|ast| sanitize_generated_sql(&ast.to_string()))
         .map_err(|err| Error::Unsupported(format!("auto-distribute: unparse expr: {err}")))
@@ -843,7 +844,39 @@ fn expr_sql(up: &Unparser, e: &Expr) -> Result<String> {
 /// Two common failure modes when generated stage SQL is sent to workers:
 /// - `alias."col"` — dot access with a double-quoted column name;
 /// - `"table".col` — dot access on a double-quoted table name (e.g. reserved `part`).
-fn sanitize_generated_sql(sql: &str) -> String {
+
+/// Extract the `FROM …` tail from an unparsed aggregate input.
+///
+/// DataFusion's unparser yields `SELECT * FROM …` for a plain scan, but a join of N inputs can
+/// become `SELECT *, *, … FROM …`. We only need the FROM/JOIN/WHERE suffix to splice a new SELECT.
+fn extract_from_tail(input_sql: &str) -> Result<String> {
+    if let Some(rest) = input_sql.strip_prefix("SELECT * ") {
+        // Only accept when the remainder starts with FROM (not `*, * FROM`).
+        if rest.starts_with("FROM ") || rest.starts_with("from ") {
+            return Ok(rest.to_string());
+        }
+    }
+    let bytes = input_sql.as_bytes();
+    let upper = input_sql.to_ascii_uppercase();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i + 6 <= upper.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && upper[i..].starts_with(" FROM ") => {
+                return Ok(input_sql[i + 1..].to_string()); // "FROM …"
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Err(Error::Unsupported(
+        "auto-distribute: non-trivial aggregate input (no FROM tail)".into(),
+    ))
+}
+
+pub(crate) fn sanitize_generated_sql(sql: &str) -> String {
     fix_quoted_column_after_dot(&fix_quoted_table_dot_access(sql))
 }
 
@@ -966,7 +999,7 @@ fn count_table_scans(lp: &LogicalPlan, name: &str) -> usize {
 }
 
 /// Collect the base (scanned) table names referenced anywhere in `lp`.
-fn base_tables(lp: &LogicalPlan) -> Vec<String> {
+pub(crate) fn base_tables(lp: &LogicalPlan) -> Vec<String> {
     let mut out = Vec::new();
     collect_tables(lp, &mut out);
     out

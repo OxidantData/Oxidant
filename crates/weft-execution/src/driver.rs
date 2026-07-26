@@ -10,10 +10,9 @@
 //! Multiple upstreams on the output stage express a **shuffle join**: both sides hash-partition on
 //! the join key so matching keys co-locate on one worker, which then joins them locally.
 //!
-//! v1 limits: producer stages must be leaves (an intermediate stage that both consumes *and*
-//! produces — needed for chains of joins like TPC-H Q5 — is a follow-up); static worker list.
-//! Shuffle buckets spill to `WEFT_SPILL_DIR` when over `WEFT_SHUFFLE_SPILL_BYTES` (see
-//! [`crate::shuffle::spill`]); streaming `do_exchange` is still a stub.
+//! Intermediate stages that both consume *and* produce are supported (left-deep join chains).
+//! v1 limits: static worker list. Shuffle buckets spill to `WEFT_SPILL_DIR` when over
+//! `WEFT_SHUFFLE_SPILL_BYTES` (see [`crate::shuffle::spill`]); streaming `do_exchange` is still a stub.
 
 use std::collections::HashSet;
 

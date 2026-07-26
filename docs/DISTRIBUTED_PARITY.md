@@ -52,12 +52,15 @@ Fallback: unsupported plan shapes → Engine::sql on driver
 ### P1 — TPC-DS / Photon-class plan coverage
 
 7. [x] Shuffle joins between **two sharded** tables (auto-derive single equijoin + agg).
-8. [ ] Multi-stage DAGs (join chains, TPC-H Q5 / TPC-DS shape).
+8. [x] Multi-stage DAGs (join chains, TPC-H Q5 / TPC-DS shape).
+   Left-deep pairwise shuffle-join chains for 2+ sharded tables; multi-dim broadcast
+   star (1 sharded fact + N replicated dims) folds into the partial. CrossJoin+filter
+   Q5 with dims replicated uses the broadcast path.
 9. [~] Windows, subqueries, `HAVING`, ungrouped aggregates, set ops.
     Supported: `HAVING`, ungrouped/global aggs, scalar/IN/EXISTS subqueries **over replicated
     tables only** (sharded-table subqueries rejected), `UNION ALL` of distributable aggs.
     Still Unsupported (explicit messages → local fallback): window functions, `UNION` (distinct),
-    correlated/self subqueries over sharded tables, join chains (item 8).
+    correlated/self subqueries over sharded tables.
 10. [~] Shuffle spill + `do_exchange` streaming.
     Ticket/cache path spills stage buckets to disk when over budget (`WEFT_SHUFFLE_SPILL_BYTES`,
     default 256 MiB; files under `WEFT_SPILL_DIR` or temp). Streaming `do_exchange` still stubbed.
