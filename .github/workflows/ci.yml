@@ -8,9 +8,12 @@ name: CI
 #   - ClickBench on real 14.78 GB data -> bench.yml, self-hosted c6a.4xlarge (see deploy/ci-runner/)
 #   - llvm-cov line coverage (informational) -> coverage-nightly.yml
 #
-# BUILD TIME: every compiling job shares ONE cargo cache via `shared-key: workspace` below.
+# BUILD TIME: every compiling job restores ONE cargo cache via `shared-key: workspace` below.
 # Keyed per job (the rust-cache default) the workspace got compiled from scratch four times
 # over, and the four caches evicted each other against the 10 GB per-repo Actions cache cap.
+# `build-test` is the only writer; the rest set `save-if: false`. A shared key with several
+# writers does not work -- GitHub lets exactly one job reserve a key, so they race and the
+# job that happens to finish first defines what everyone restores next run.
 on:
   push:
     branches: [main]
@@ -63,6 +66,11 @@ jobs:
           rustup show
           rustup component add clippy
           rustc --version && cargo --version
+      # Sole writer of the shared cache. Every job below restores this same key with
+      # `save-if: false`: they all use one key, and GitHub only lets one job reserve it, so
+      # without a designated writer they race and the first to finish wins. That was the
+      # smallest job, which meant the rest restored a cache missing most of their artifacts.
+      # This job compiles the broadest set, so its cache is the useful one to keep.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace
@@ -94,6 +102,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace
+          save-if: "false" # build-test writes this cache
       - name: Build weft-bench once (every gate below reuses this binary)
         run: cargo build -p weft-bench
       - name: TPC-H coverage (Q1/Q3/Q5/Q6/Q10)
@@ -132,6 +141,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace
+          save-if: "false" # build-test writes this cache
       - name: ClickBench coverage (43 queries, engine-direct)
         run: cargo run -p weft-bench -- clickbench --rows 20000
       - name: ClickBench coverage (43 queries, live Spark Connect over gRPC)
@@ -156,7 +166,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace
-          cache-on-failure: "true"
+          save-if: "false" # build-test writes this cache
       - name: Build weft-parity
         run: cargo build -p weft-spark-compat --bin weft-parity
       - name: Ratchet against parity/baseline.json
