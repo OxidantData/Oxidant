@@ -1,18 +1,18 @@
 {
   "dataset": "TPC-H SF100 via Glue (`glue.tpch_sf100.*`) on S3",
-  "machine": "eks/r6g.8xlarge-spot-bench",
+  "machine": "eks/r7g.8xlarge-spot single-node (driver-only)",
   "runDate": "2026-07-25",
   "queryCount": 22,
   "commonCount": 22,
-  "method": "Weft on EKS via gateway POST /api/sql; Glue catalog; 3 tries/query; hot = min(try2, try3); no_limit",
+  "method": "SINGLE-NODE: gateway POST /api/sql \u2192 Spark Connect on one driver pod (DataFusion/weft-loom). Workers not on this path. Glue/S3 scanned locally. 3 tries/query; hot = min(try2, try3). Not comparable to multi-executor EMR/Photon/Lakesail until distributed Connect lands \u2014 see docs/DISTRIBUTED_PARITY.md.",
   "engines": [
     {
       "key": "weft",
-      "name": "Weft",
+      "name": "Weft (single-node)",
       "highlight": true,
       "total": 501.155,
       "totalAll": 501.155,
-      "source": "measured (eks/r6g.8xlarge-spot-bench 2026-07-25)",
+      "source": "measured single-node (eks/r7g.8xlarge-spot 2026-07-25)",
       "perQuery": [
         20.836,
         7.456,

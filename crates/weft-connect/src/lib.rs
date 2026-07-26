@@ -31,6 +31,8 @@ use weft_common::{Error, Result};
 use weft_loom::arrow::ipc::reader::StreamReader;
 use weft_loom::arrow::ipc::writer::StreamWriter;
 use weft_loom::arrow::record_batch::RecordBatch;
+use weft_execution::driver::{run_stages, Cluster};
+use weft_execution::plan::plan_distributed;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
 use weft_streaming::StreamingQueryManager;
@@ -116,6 +118,11 @@ impl WeftService {
     /// `Config` set. Honors `spark.sql.defaultCatalog`.
     /// Build a service with external catalogs declared up front (flat `spark.sql.catalog.*`
     /// entries). The catalogs are bridged into the engine before any client connects.
+    /// Borrow the underlying query engine (used by `weft worker` to serve Flight with the same catalogs).
+    pub fn engine(&self) -> Arc<Engine> {
+        Arc::clone(&self.engine)
+    }
+
     pub fn with_catalogs(catalogs: std::collections::HashMap<String, String>) -> Self {
         let service = Self::new();
         if !catalogs.is_empty() {
@@ -360,6 +367,45 @@ impl WeftService {
         self.base_relation_batches(rel).await
     }
 
+
+    /// Run SQL locally, or — when `WEFT_WORKERS` is set — attempt auto-distributed execution
+    /// (`plan_distributed` + Flight shuffle) and fall back to local on unsupported shapes.
+    ///
+    /// **Important:** without file-list sharding, each worker still sees the full Glue/Parquet
+    /// table (N× S3 read). Distributed Connect is opt-in via `WEFT_WORKERS` and is not yet
+    /// comparable to EMR/Photon for TPC-DS; see `docs/DISTRIBUTED_PARITY.md`.
+    async fn execute_sql(
+        &self,
+        query: &str,
+    ) -> std::result::Result<Vec<RecordBatch>, Status> {
+        if let Some(workers) = workers_from_env() {
+            let replicated = replicated_tables_from_env();
+            let replicated_refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
+            match plan_distributed(&self.engine, query, &replicated_refs).await {
+                Ok(dq) => {
+                    let cluster = Cluster::new(workers);
+                    let gathered = run_stages(&cluster, &dq.stages)
+                        .await
+                        .map_err(err_to_status)?;
+                    return match dq.finalize_sql {
+                        None => Ok(gathered),
+                        Some(fsql) => {
+                            self.engine
+                                .register_batches("result", gathered)
+                                .map_err(err_to_status)?;
+                            self.engine.sql(&fsql).await.map_err(err_to_status)
+                        }
+                    };
+                }
+                Err(weft_common::Error::Unsupported(_)) => {
+                    // Shape not yet auto-distributable (most of TPC-DS) — local fallback.
+                }
+                Err(e) => return Err(err_to_status(e)),
+            }
+        }
+        self.engine.sql(query).await.map_err(err_to_status)
+    }
+
     /// Evaluate a `Sql` or `LocalRelation` to record batches, always carrying the schema (an empty
     /// result yields one zero-row batch so the client still receives a typed, non-null table).
     async fn base_relation_batches(
@@ -368,7 +414,7 @@ impl WeftService {
     ) -> std::result::Result<Vec<RecordBatch>, Status> {
         match rel.rel_type.as_ref() {
             Some(sc::relation::RelType::Sql(sql)) => {
-                let mut batches = self.engine.sql(&sql.query).await.map_err(err_to_status)?;
+                let mut batches = self.execute_sql(&sql.query).await?;
                 // A 0-row result must still carry its schema so the client gets a typed (empty)
                 // table. Re-derive the schema only for queries — `engine.schema` plans via
                 // `ctx.sql`, which would re-execute a DDL statement (a query has no side effect).
@@ -1063,6 +1109,41 @@ fn err_to_status(e: Error) -> Status {
 }
 
 /// Start the Spark Connect server and serve until the process is killed.
+
+fn workers_from_env() -> Option<Vec<String>> {
+    let raw = std::env::var("WEFT_WORKERS").ok()?;
+    let workers: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|w| {
+            if w.starts_with("http://") || w.starts_with("https://") {
+                w.to_string()
+            } else {
+                format!("http://{w}")
+            }
+        })
+        .collect();
+    if workers.is_empty() {
+        None
+    } else {
+        Some(workers)
+    }
+}
+
+fn replicated_tables_from_env() -> Vec<String> {
+    std::env::var("WEFT_REPLICATED_TABLES")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.port)
         .parse()

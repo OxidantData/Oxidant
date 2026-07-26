@@ -10,6 +10,16 @@
 #   GATE_SECS=1200 CLUSTER_ID=abc ./bench/sf100/run-time-gate.sh
 set -euo pipefail
 
+# STOP: SF100 via POST /api/sql was verified DRIVER-ONLY (see docs/DISTRIBUTED_PARITY.md).
+# Do not publish multi-executor comparisons until Connect+workers+scan sharding land.
+# Set ALLOW_SINGLE_NODE_GATE=1 to force a single-node measurement anyway.
+if [[ "${ALLOW_SINGLE_NODE_GATE:-0}" != "1" ]]; then
+  echo "[gate] refused: TPC path is not distributed yet (docs/DISTRIBUTED_PARITY.md)." >&2
+  echo "[gate] set ALLOW_SINGLE_NODE_GATE=1 to override for single-node profiling only." >&2
+  exit 3
+fi
+
+
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 

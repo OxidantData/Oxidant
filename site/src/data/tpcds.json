@@ -4,7 +4,7 @@
   "runDate": null,
   "queryCount": 99,
   "commonCount": 0,
-  "method": "Weft on EKS via gateway POST /api/sql; Glue catalog; 3 tries/query; hot = min(try2, try3); no_limit",
+  "method": "PENDING distributed execution. Prior SF100 attempt was driver-only (see docs/DISTRIBUTED_PARITY.md). Do not publish until multi-worker Connect path lands.",
   "engines": [
     {
       "key": "weft",
@@ -12,7 +12,7 @@
       "highlight": true,
       "total": null,
       "totalAll": null,
-      "source": "pending",
+      "source": "pending (distributed path required)",
       "perQuery": [],
       "failures": null,
       "failedQueries": []
