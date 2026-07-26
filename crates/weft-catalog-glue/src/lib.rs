@@ -48,19 +48,21 @@ impl GlueCatalog {
     }
 
     /// Build from a flat options map (`region`, `warehouse`) — the shape used by both the gateway
-    /// connection request and the `spark.sql.catalog.<name>.*` startup config. `region` defaults to
-    /// `us-west-2`; `warehouse` (e.g. `s3://bucket/prefix`, the Spark/Iceberg connection-option
-    /// convention) is optional — CTAS against this catalog needs it (or an explicit `LOCATION`).
+    /// connection request and the `spark.sql.catalog.<name>.*` startup config. `region` resolves
+    /// as option → `AWS_REGION` → `AWS_DEFAULT_REGION` → `us-west-2`; `warehouse` (e.g.
+    /// `s3://bucket/prefix`, the Spark/Iceberg connection-option convention) is optional — CTAS
+    /// against this catalog needs it (or an explicit `LOCATION`).
     ///
     /// SECURITY: the AWS CLI path is **never** taken from `options` (which can be attacker-supplied
     /// via `POST /api/connections`). It is sourced only from the operator-controlled `WEFT_AWS_BIN`
     /// env var, defaulting to `aws` on `$PATH`. Honoring a request-supplied `aws_bin` here was an
     /// arbitrary-executable RCE (`Command::new(options["aws_bin"])`) on the gateway host.
     pub fn from_config(name: &str, options: &HashMap<String, String>) -> Self {
-        let region = options
-            .get("region")
-            .cloned()
-            .unwrap_or_else(|| "us-west-2".to_string());
+        let region = resolve_region(
+            options,
+            std::env::var("AWS_REGION").ok().as_deref(),
+            std::env::var("AWS_DEFAULT_REGION").ok().as_deref(),
+        );
         let aws_bin = std::env::var("WEFT_AWS_BIN").ok();
         let warehouse = options.get("warehouse").cloned();
         Self::new(name, region, aws_bin, warehouse)
@@ -141,66 +143,7 @@ impl CatalogProvider for GlueCatalog {
             .await?;
         let v: serde_json::Value =
             serde_json::from_str(&out).map_err(|e| Error::Io(format!("parse get-table: {e}")))?;
-        let t = &v["Table"];
-        let location = t["StorageDescriptor"]["Location"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| Error::Plan(format!("glue table `{db}.{table}` has no location")))?;
-        // Format from the `classification` table parameter (Glue/Athena convention), default parquet.
-        let classification = t["Parameters"]["classification"]
-            .as_str()
-            .unwrap_or("parquet");
-        let format = TableFormat::from_provider(classification).unwrap_or(TableFormat::Parquet);
-
-        // The Glue-declared schema is the *authoritative* table schema: data columns
-        // (`StorageDescriptor.Columns`) followed by partition columns (`PartitionKeys`). When it is
-        // present and fully mappable we attach it so the engine reads files *against* it — files
-        // whose physical types differ (a common case across monthly Parquet dumps) are cast to the
-        // declared types by DataFusion's scan-time expression adapter, rather than failing schema
-        // inference's strict "merge" check. If the columns are absent/empty, or *any* column has a
-        // type we can't faithfully map, we leave `schema = None` and fall back to Parquet inference
-        // (preserving today's behavior — never guessing a type that could silently corrupt a read).
-        let data_cols = t["StorageDescriptor"]["Columns"].as_array();
-        let part_cols = t["PartitionKeys"].as_array();
-        let schema = columns_to_schema(glue_column_pairs(data_cols, part_cols));
-        // Partition-column NAMES (Hive layout: values live in the object path, e.g.
-        // `.../year=2015/month=01/`, not inside the data files). The engine must know these so it
-        // reads them from the path instead of expecting them in the Parquet — otherwise a
-        // partitioned table (typical of the monthly taxi dumps) scans as NULLs or fails. The types
-        // come along in `schema` (Glue appends partition columns to the declared schema).
-        let partition_columns: Vec<String> = part_cols
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|c| c["Name"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let comment = t["Description"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let properties: HashMap<String, String> = t["Parameters"]
-            .as_object()
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let md = TableMetadata::new(
-            format!("{}.{db}.{table}", self.name),
-            location.to_string(),
-            format,
-        )
-        .with_comment(comment)
-        .with_properties(properties)
-        .with_partition_columns(partition_columns);
-        Ok(match schema {
-            Some(s) => md.with_schema(Arc::new(s)),
-            None => md,
-        })
+        parse_glue_table(&self.name, db, table, &v)
     }
 
     async fn create_table(
@@ -262,6 +205,118 @@ impl GlueCatalog {
         })?;
         Ok(format!("{}/{db}/{table}/", warehouse.trim_end_matches('/')))
     }
+}
+
+/// Resolve the AWS region for a Glue catalog: catalog option → `AWS_REGION` →
+/// `AWS_DEFAULT_REGION` → `us-west-2`. Env values are injected so unit tests can cover the
+/// full precedence chain without mutating process environment.
+fn resolve_region(
+    options: &HashMap<String, String>,
+    aws_region: Option<&str>,
+    aws_default_region: Option<&str>,
+) -> String {
+    if let Some(r) = options.get("region").filter(|s| !s.is_empty()) {
+        return r.clone();
+    }
+    if let Some(r) = aws_region.filter(|s| !s.is_empty()) {
+        return r.to_string();
+    }
+    if let Some(r) = aws_default_region.filter(|s| !s.is_empty()) {
+        return r.to_string();
+    }
+    "us-west-2".to_string()
+}
+
+/// Infer the readable file format from a Glue table's `Parameters` map.
+///
+/// Order of signals (most authoritative first): Iceberg `table_type`, Spark
+/// `spark.sql.sources.provider` / `provider`, then the Glue/Athena `classification`
+/// parameter. Falls back to Parquet when no signal is conclusive.
+fn detect_format(parameters: &serde_json::Value) -> TableFormat {
+    let param = |key: &str| parameters.get(key).and_then(|v| v.as_str());
+    if param("table_type").is_some_and(|v| v.eq_ignore_ascii_case("ICEBERG")) {
+        return TableFormat::Iceberg;
+    }
+    for key in ["spark.sql.sources.provider", "provider"] {
+        if let Some(f) = param(key).and_then(TableFormat::from_provider) {
+            return f;
+        }
+    }
+    param("classification")
+        .and_then(TableFormat::from_provider)
+        .unwrap_or(TableFormat::Parquet)
+}
+
+/// Parse a Glue `get-table` JSON response into [`TableMetadata`] (no I/O). Surfaces
+/// `Parameters.metadata_location` into `properties` so the Iceberg reader can use the
+/// authoritative current-metadata pointer written by Athena/Spark/Glue.
+fn parse_glue_table(
+    catalog_name: &str,
+    db: &str,
+    table: &str,
+    v: &serde_json::Value,
+) -> Result<TableMetadata> {
+    let t = &v["Table"];
+    let location = t["StorageDescriptor"]["Location"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::Plan(format!("glue table `{db}.{table}` has no location")))?;
+    let format = detect_format(&t["Parameters"]);
+
+    // The Glue-declared schema is the *authoritative* table schema: data columns
+    // (`StorageDescriptor.Columns`) followed by partition columns (`PartitionKeys`). When it is
+    // present and fully mappable we attach it so the engine reads files *against* it — files
+    // whose physical types differ (a common case across monthly Parquet dumps) are cast to the
+    // declared types by DataFusion's scan-time expression adapter, rather than failing schema
+    // inference's strict "merge" check. If the columns are absent/empty, or *any* column has a
+    // type we can't faithfully map, we leave `schema = None` and fall back to Parquet inference
+    // (preserving today's behavior — never guessing a type that could silently corrupt a read).
+    let data_cols = t["StorageDescriptor"]["Columns"].as_array();
+    let part_cols = t["PartitionKeys"].as_array();
+    let schema = columns_to_schema(glue_column_pairs(data_cols, part_cols));
+    // Partition-column NAMES (Hive layout: values live in the object path, e.g.
+    // `.../year=2015/month=01/`, not inside the data files). The engine must know these so it
+    // reads them from the path instead of expecting them in the Parquet — otherwise a
+    // partitioned table (typical of the monthly taxi dumps) scans as NULLs or fails. The types
+    // come along in `schema` (Glue appends partition columns to the declared schema).
+    let partition_columns: Vec<String> = part_cols
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c["Name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let comment = t["Description"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut properties: HashMap<String, String> = t["Parameters"]
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Explicitly surface the Iceberg current-metadata pointer (Athena/Spark/Glue convention)
+    // under the stable `metadata_location` key even if a future filter trims other params.
+    if let Some(loc) = t["Parameters"]["metadata_location"].as_str() {
+        properties.insert("metadata_location".to_string(), loc.to_string());
+    }
+
+    let md = TableMetadata::new(
+        format!("{catalog_name}.{db}.{table}"),
+        location.to_string(),
+        format,
+    )
+    .with_comment(comment)
+    .with_properties(properties)
+    .with_partition_columns(partition_columns);
+    Ok(match schema {
+        Some(s) => md.with_schema(Arc::new(s)),
+        None => md,
+    })
 }
 
 /// Build the Glue `create-table --table-input` JSON body for a new table at `location` with
@@ -534,6 +589,92 @@ mod tests {
             cat.resolve_create_location("db", "t", Some("s3://explicit/t".to_string()))
                 .unwrap(),
             "s3://explicit/t/"
+        );
+    }
+
+    // Format detection / region resolution — pure helpers over JSON fixtures (no AWS CLI).
+
+    fn glue_table_fixture(parameters: serde_json::Value) -> serde_json::Value {
+        json!({
+            "Table": {
+                "Name": "t",
+                "StorageDescriptor": {
+                    "Location": "s3://bucket/db/t/",
+                    "Columns": [{"Name": "id", "Type": "bigint"}],
+                },
+                "PartitionKeys": [],
+                "Parameters": parameters,
+            }
+        })
+    }
+
+    #[test]
+    fn iceberg_table_type_detects_iceberg_and_surfaces_metadata_location() {
+        let v = glue_table_fixture(json!({
+            "table_type": "ICEBERG",
+            "metadata_location": "s3://bucket/db/t/metadata/00010-abc.metadata.json",
+            "classification": "parquet",
+        }));
+        let md = parse_glue_table("glue", "db", "t", &v).expect("parsed");
+        assert_eq!(md.format, TableFormat::Iceberg);
+        assert_eq!(
+            md.properties.get("metadata_location").map(String::as_str),
+            Some("s3://bucket/db/t/metadata/00010-abc.metadata.json")
+        );
+    }
+
+    #[test]
+    fn spark_provider_delta_detects_as_delta() {
+        let v = glue_table_fixture(json!({
+            "spark.sql.sources.provider": "delta",
+            "classification": "parquet",
+        }));
+        let md = parse_glue_table("glue", "db", "t", &v).expect("parsed");
+        assert_eq!(md.format, TableFormat::Delta);
+    }
+
+    #[test]
+    fn classification_delta_detects_as_delta() {
+        let v = glue_table_fixture(json!({ "classification": "delta" }));
+        let md = parse_glue_table("glue", "db", "t", &v).expect("parsed");
+        assert_eq!(md.format, TableFormat::Delta);
+    }
+
+    #[test]
+    fn plain_parquet_table_unchanged() {
+        let v = glue_table_fixture(json!({ "classification": "parquet" }));
+        let md = parse_glue_table("glue", "db", "t", &v).expect("parsed");
+        assert_eq!(md.format, TableFormat::Parquet);
+        assert_eq!(md.location, "s3://bucket/db/t/");
+        assert!(!md.properties.contains_key("metadata_location"));
+    }
+
+    #[test]
+    fn region_precedence_option_env_default() {
+        let mut opts = HashMap::new();
+        opts.insert("region".to_string(), "eu-west-1".to_string());
+        // Option wins over both env vars.
+        assert_eq!(
+            resolve_region(&opts, Some("us-east-1"), Some("ap-south-1")),
+            "eu-west-1"
+        );
+        // AWS_REGION wins over AWS_DEFAULT_REGION when option absent.
+        assert_eq!(
+            resolve_region(&HashMap::new(), Some("us-east-1"), Some("ap-south-1")),
+            "us-east-1"
+        );
+        // AWS_DEFAULT_REGION when AWS_REGION absent.
+        assert_eq!(
+            resolve_region(&HashMap::new(), None, Some("ap-south-1")),
+            "ap-south-1"
+        );
+        // Hardcoded fallback when nothing is set.
+        assert_eq!(resolve_region(&HashMap::new(), None, None), "us-west-2");
+        // Empty strings are ignored (treated as unset).
+        opts.insert("region".to_string(), "".to_string());
+        assert_eq!(
+            resolve_region(&opts, Some(""), Some("ap-south-1")),
+            "ap-south-1"
         );
     }
 }
