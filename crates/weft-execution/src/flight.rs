@@ -5,10 +5,11 @@
 //!
 //! - a legacy raw-SQL string — run it and stream the result (the single-stage MVP);
 //! - a [`StageTicket`] — run a stage. A *leaf* stage (no upstreams) runs its SQL on local
-//!   data, hash-partitions the output into per-downstream buckets, caches them, and returns an
-//!   empty stream; a *consumer* stage (with upstreams) pulls its bucket from every upstream,
-//!   registers it as `shuffle_input`, runs its SQL, and streams the result back;
-//! - a [`ShuffleReadTicket`] — stream one cached bucket of a prior stage's output.
+//!   data, hash-partitions the output into per-downstream buckets, caches them (spilling to
+//!   disk when over the shuffle memory budget), and returns an empty stream; a *consumer*
+//!   stage (with upstreams) pulls its bucket from every upstream, registers it as
+//!   `shuffle_input`, runs its SQL, and streams the result back;
+//! - a [`ShuffleReadTicket`] — stream one cached (or spilled) bucket of a prior stage's output.
 //!
 //! This is the two-stage `partial-agg → hash shuffle → final-agg` shape; the driver in
 //! [`crate::driver`] orchestrates it.
@@ -28,33 +29,37 @@ use arrow_flight::{
 use futures::{StreamExt, TryStreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use weft_common::{Error, Result};
-use weft_loom::arrow::datatypes::{Schema, SchemaRef};
+use weft_loom::arrow::datatypes::Schema;
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 
 use crate::shuffle::protocol::{self, ShuffleReadTicket, StageTicket};
+use crate::shuffle::spill::{CachedStage, SpillConfig};
 use crate::shuffle::{hash_partition, SHUFFLE_INPUT_TABLE};
 
-/// One stage's cached output: the output schema (so an *empty* bucket can still be served as a
-/// schema-carrying batch — a downstream consumer must always be able to register the input table)
-/// plus the per-downstream buckets.
-type CachedStage = (SchemaRef, Vec<Vec<RecordBatch>>);
-
 /// Per-stage cached output, partitioned into buckets (one per downstream worker).
+/// Replacing or dropping an entry cleans any spill files via [`CachedStage`]'s `Drop`.
 type StageCache = Arc<Mutex<HashMap<u32, CachedStage>>>;
 
 /// A Flight worker that runs stages on its local engine and serves shuffle buckets.
 pub struct Worker {
     engine: Arc<Engine>,
     stage_outputs: StageCache,
+    spill: SpillConfig,
 }
 
 impl Worker {
-    /// Wrap an engine as a worker.
+    /// Wrap an engine as a worker (spill policy from env — see [`SpillConfig::from_env`]).
     pub fn new(engine: Arc<Engine>) -> Self {
+        Self::with_spill(engine, SpillConfig::from_env())
+    }
+
+    /// Wrap an engine with an explicit spill policy (tests force a tiny threshold).
+    pub fn with_spill(engine: Arc<Engine>, spill: SpillConfig) -> Self {
         Self {
             engine,
             stage_outputs: Arc::new(Mutex::new(HashMap::new())),
+            spill,
         }
     }
 }
@@ -112,7 +117,7 @@ impl Worker {
 
         if t.produce {
             // Producer: capture the output schema up front so an empty bucket can still be served
-            // typed, then run, hash-partition, and cache for downstreams.
+            // typed, then run, hash-partition, and cache (spilling when over budget) for downstreams.
             let schema = self
                 .engine
                 .schema(&t.stage_sql)
@@ -126,10 +131,13 @@ impl Worker {
             let key_cols: Vec<usize> = t.hash_key_cols.iter().map(|&c| c as usize).collect();
             let buckets = hash_partition(&batches, &key_cols, t.num_partitions as usize)
                 .map_err(|e| Status::internal(e.to_string()))?;
+            let cached = CachedStage::from_buckets(schema, buckets, t.stage_id, &self.spill)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            // Replacing an existing entry drops it → spill files for the old stage are removed.
             self.stage_outputs
                 .lock()
                 .expect("stage cache poisoned")
-                .insert(t.stage_id, (schema, buckets));
+                .insert(t.stage_id, cached);
             Ok(Vec::new())
         } else {
             // Output stage: run and return the result.
@@ -143,14 +151,18 @@ impl Worker {
     /// Serve one cached shuffle bucket. An empty bucket is served as a single schema-carrying
     /// empty batch (never a truly empty stream) so the consumer can always register the input
     /// table — important for shuffle joins where some key buckets legitimately have no rows.
-    fn read_shuffle(&self, r: ShuffleReadTicket) -> Vec<RecordBatch> {
+    fn read_shuffle(&self, r: ShuffleReadTicket) -> std::result::Result<Vec<RecordBatch>, Status> {
         let guard = self.stage_outputs.lock().expect("stage cache poisoned");
-        let Some((schema, buckets)) = guard.get(&r.stage_id) else {
-            return Vec::new();
+        let Some(cached) = guard.get(&r.stage_id) else {
+            return Ok(Vec::new());
         };
-        match buckets.get(r.target_partition as usize) {
-            Some(b) if !b.is_empty() => b.clone(),
-            _ => vec![RecordBatch::new_empty(schema.clone())],
+        let batches = cached
+            .read_partition(r.target_partition)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if batches.is_empty() {
+            Ok(vec![RecordBatch::new_empty(cached.schema.clone())])
+        } else {
+            Ok(batches)
         }
     }
 }
@@ -180,7 +192,7 @@ impl FlightService for Worker {
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?,
             protocol::Ticket::Stage(t) => self.run_stage(t).await?,
-            protocol::Ticket::ShuffleRead(r) => self.read_shuffle(r),
+            protocol::Ticket::ShuffleRead(r) => self.read_shuffle(r)?,
         };
         Ok(Response::new(batches_to_stream(batches)))
     }
@@ -233,8 +245,9 @@ impl FlightService for Worker {
     ) -> std::result::Result<Response<Self::ListActionsStream>, Status> {
         unimpl("list_actions")
     }
-    /// The streaming shuffle exchange — left as a documented stub. The MVP uses the simpler
-    /// pull-based `do_get(ShuffleReadTicket)` path instead of a `do_exchange` handshake.
+    /// The streaming shuffle exchange — left as a documented stub. The ticket/cache path
+    /// (including disk spill) is what production queries use today; a push-based `do_exchange`
+    /// handshake remains future work.
     async fn do_exchange(
         &self,
         _r: Request<Streaming<FlightData>>,
@@ -243,13 +256,22 @@ impl FlightService for Worker {
     }
 }
 
-/// Serve a worker on `0.0.0.0:port` until the process exits.
+/// Serve a worker on `0.0.0.0:port` until the process exits (spill policy from env).
 pub async fn serve_worker(port: u16, engine: Arc<Engine>) -> Result<()> {
+    serve_worker_with_spill(port, engine, SpillConfig::from_env()).await
+}
+
+/// Serve a worker with an explicit spill policy.
+pub async fn serve_worker_with_spill(
+    port: u16,
+    engine: Arc<Engine>,
+    spill: SpillConfig,
+) -> Result<()> {
     let addr = format!("0.0.0.0:{port}")
         .parse()
         .map_err(|e| Error::Io(format!("bad worker addr: {e}")))?;
     tonic::transport::Server::builder()
-        .add_service(FlightServiceServer::new(Worker::new(engine)))
+        .add_service(FlightServiceServer::new(Worker::with_spill(engine, spill)))
         .serve(addr)
         .await
         .map_err(|e| Error::Io(format!("worker serve: {e}")))?;

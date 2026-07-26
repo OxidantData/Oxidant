@@ -55,7 +55,9 @@ Fallback: unsupported plan shapes → Engine::sql on driver
 8. [ ] Multi-stage DAGs (join chains, TPC-H Q5 / TPC-DS shape).
 9. [~] Windows, subqueries, `HAVING`, ungrouped aggregates, set ops.
    (`HAVING` + ungrouped/global aggregates supported; windows/subqueries/set ops not.)
-10. [ ] Shuffle spill + `do_exchange` streaming (MVP has no spill).
+10. [~] Shuffle spill + `do_exchange` streaming.
+    Ticket/cache path spills stage buckets to disk when over budget (`WEFT_SHUFFLE_SPILL_BYTES`,
+    default 256 MiB; files under `WEFT_SPILL_DIR` or temp). Streaming `do_exchange` still stubbed.
 
 ### P1 — Cluster semantics
 
@@ -76,7 +78,7 @@ Fallback: unsupported plan shapes → Engine::sql on driver
 | Capability | EMR Spark | Photon | Lakesail | Weft `/api/sql` (this branch) |
 |------------|-----------|--------|----------|-------------------------------|
 | Multi-executor scan | yes | yes | yes | **yes** (file-list shard + workers) |
-| Shuffle across nodes | yes | yes | yes | **yes** (Flight; no spill yet) |
+| Shuffle across nodes | yes | yes | yes | **yes** (Flight; spill on ticket/cache path) |
 | Complex TPC-DS plans distributed | yes | yes | yes | **partial** (fallback local) |
 | Catalog + object storage on all executors | yes | yes | yes | **yes** |
 
