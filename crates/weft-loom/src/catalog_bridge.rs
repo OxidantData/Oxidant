@@ -335,8 +335,7 @@ async fn metadata_to_provider(
             let opts = ListingOptions::new(Arc::new(ParquetFormat::default()))
                 .with_file_extension(".parquet");
             let (opts, file_schema) = apply_partition_columns(opts, md);
-            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".parquet")
-                .await
+            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".parquet").await
         }
         TableFormat::Csv => {
             let loc = crate::shard::ensure_collection_url(&md.location);
@@ -345,8 +344,7 @@ async fn metadata_to_provider(
             let opts =
                 ListingOptions::new(Arc::new(CsvFormat::default())).with_file_extension(".csv");
             let (opts, file_schema) = apply_partition_columns(opts, md);
-            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".csv")
-                .await
+            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".csv").await
         }
         TableFormat::Json => {
             let loc = crate::shard::ensure_collection_url(&md.location);
@@ -355,8 +353,7 @@ async fn metadata_to_provider(
             let opts =
                 ListingOptions::new(Arc::new(JsonFormat::default())).with_file_extension(".json");
             let (opts, file_schema) = apply_partition_columns(opts, md);
-            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".json")
-                .await
+            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".json").await
         }
         // Lakehouse formats resolve to their active Parquet files (version-safe), then the
         // Parquet reader. v1 reads from the local filesystem — remote object stores for Delta /
@@ -391,8 +388,8 @@ async fn sharded_listing_table(
             Some(s) => s,
             None => {
                 return Err(DataFusionError::Plan(format!(
-                    "sharded table `{table_name}` has no files on this worker and no declared schema"
-                )))
+                "sharded table `{table_name}` has no files on this worker and no declared schema"
+            )))
             }
         };
         return crate::shard::empty_table(schema).map_err(weft_to_df);

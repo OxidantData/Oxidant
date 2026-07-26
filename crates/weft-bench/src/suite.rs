@@ -33,11 +33,9 @@ impl EngineResult {
         }
         let mut sum = 0.0;
         let mut any = false;
-        for t in &self.per_query {
-            if let Some(v) = t {
-                sum += v;
-                any = true;
-            }
+        for v in self.per_query.iter().flatten() {
+            sum += v;
+            any = true;
         }
         any.then_some(sum)
     }
@@ -108,9 +106,7 @@ pub fn run_duckdb(duckdb: &str, data: &Path, queries: &[Query<'_>]) -> EngineRes
         for _ in 0..3 {
             let script = format!("{setup}\n.timer on\n{sql};");
             let t = Instant::now();
-            let out = Command::new(duckdb)
-                .args(["-c", &script])
-                .output();
+            let out = Command::new(duckdb).args(["-c", &script]).output();
             match out {
                 Ok(o) if o.status.success() => times.push(t.elapsed().as_secs_f64()),
                 Ok(o) => {

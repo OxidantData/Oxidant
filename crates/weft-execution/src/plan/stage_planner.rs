@@ -245,7 +245,6 @@ pub(crate) fn aggregation_stages_for(
     })
 }
 
-
 /// Ungrouped aggregation: partials per worker, gather to partition 0, recombine.
 fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<DistributedQuery> {
     if sharded.len() != 1 {
@@ -369,7 +368,7 @@ pub(crate) fn shuffle_join_two_tables(
     let right_scan = simple_table_scan(join.right.as_ref())?;
     let left_name = left_scan.table;
     let right_name = right_scan.table;
-    if !(sharded.iter().any(|t| *t == left_name) && sharded.iter().any(|t| *t == right_name)) {
+    if !(sharded.contains(&left_name) && sharded.contains(&right_name)) {
         return Err(Error::Unsupported(
             "auto-distribute: shuffle join sides must be the two sharded tables".into(),
         ));
@@ -511,7 +510,6 @@ pub(crate) fn simple_table_scan(lp: &LogicalPlan) -> Result<SimpleScan<'_>> {
         ))),
     }
 }
-
 
 pub(crate) fn equijoin_from_filter(filter: Option<&Expr>) -> Result<(Expr, Expr)> {
     let Some(Expr::BinaryExpr(b)) = filter else {
@@ -815,12 +813,6 @@ pub(crate) fn expr_sql(up: &Unparser, e: &Expr) -> Result<String> {
         .map_err(|err| Error::Unsupported(format!("auto-distribute: unparse expr: {err}")))
 }
 
-/// Fix SQL fragments from DataFusion's Unparser that the Databricks-dialect re-parser rejects.
-///
-/// Two common failure modes when generated stage SQL is sent to workers:
-/// - `alias."col"` — dot access with a double-quoted column name;
-/// - `"table".col` — dot access on a double-quoted table name (e.g. reserved `part`).
-
 /// Extract the `FROM …` tail from an unparsed aggregate input.
 ///
 /// DataFusion's unparser yields `SELECT * FROM …` for a plain scan, but a join of N inputs can
@@ -852,6 +844,11 @@ pub(crate) fn extract_from_tail(input_sql: &str) -> Result<String> {
     ))
 }
 
+/// Fix SQL fragments from DataFusion's Unparser that the Databricks-dialect re-parser rejects.
+///
+/// Two common failure modes when generated stage SQL is sent to workers:
+/// - `alias."col"` — dot access with a double-quoted column name;
+/// - `"table".col` — dot access on a double-quoted table name (e.g. reserved `part`).
 pub(crate) fn sanitize_generated_sql(sql: &str) -> String {
     fix_interval_pg_style(&fix_quoted_column_after_dot(&fix_quoted_table_dot_access(
         sql,

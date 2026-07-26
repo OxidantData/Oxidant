@@ -135,7 +135,7 @@ fn window_stages_for(p: &WindowPeeled<'_>, replicated: &[&str]) -> Result<Distri
     let up = Unparser::default();
     let part_names: Vec<String> = partition_by
         .iter()
-        .map(|e| column_name(e))
+        .map(column_name)
         .collect::<Result<_>>()?;
 
     let input_sql = up
@@ -152,10 +152,7 @@ fn window_stages_for(p: &WindowPeeled<'_>, replicated: &[&str]) -> Result<Distri
             select_cols.push(name.clone());
         }
     }
-    let partial_sql = sanitize_generated_sql(&format!(
-        "SELECT {} {tail}",
-        select_cols.join(", ")
-    ));
+    let partial_sql = sanitize_generated_sql(&format!("SELECT {} {tail}", select_cols.join(", ")));
     let hash_key_cols: Vec<u32> = (0..part_names.len() as u32).collect();
 
     let mut remap: HashMap<String, String> = HashMap::new();
@@ -218,10 +215,7 @@ fn build_window_inner(
         let sql = expr_sql(up, e)?;
         parts.push(format!("{sql} AS w{i}"));
     }
-    Ok(format!(
-        "SELECT {} FROM shuffle_input",
-        parts.join(", ")
-    ))
+    Ok(format!("SELECT {} FROM shuffle_input", parts.join(", ")))
 }
 
 fn wrap_window_output(
@@ -316,8 +310,7 @@ pub(crate) fn reject_explicit_unsupported(lp: &LogicalPlan) -> Result<()> {
             }
             LogicalPlan::Distinct(_) => {
                 return Err(Error::Unsupported(
-                    "auto-distribute: DISTINCT (or UNION distinct) is not supported"
-                        .into(),
+                    "auto-distribute: DISTINCT (or UNION distinct) is not supported".into(),
                 ));
             }
             _ => return Ok(()),
@@ -336,7 +329,7 @@ pub(crate) fn ensure_subquery_tables_replicated(
     let mut tables = Vec::new();
     collect_subquery_tables(lp, &mut tables);
     for t in &tables {
-        if sharded.iter().any(|s| *s == t.as_str()) {
+        if sharded.contains(&t.as_str()) {
             continue;
         }
         if !replicated.contains(&t.as_str()) {
@@ -398,7 +391,9 @@ fn plan_union_all(
         // Last stage of the arm is its output; keep it as an intermediate gather (empty hash →
         // partition 0) feeding the union stage.
         let arm_out = stages.last().map(|s| s.stage_id).ok_or_else(|| {
-            Error::Unsupported(format!("auto-distribute: UNION ALL arm {arm_i} produced no stages"))
+            Error::Unsupported(format!(
+                "auto-distribute: UNION ALL arm {arm_i} produced no stages"
+            ))
         })?;
         arm_output_ids.push(arm_out);
     }
@@ -413,12 +408,7 @@ fn plan_union_all(
     };
 
     let union_id = next_id;
-    stages.push(StageDef::new(
-        union_id,
-        union_sql,
-        arm_output_ids,
-        vec![],
-    ));
+    stages.push(StageDef::new(union_id, union_sql, arm_output_ids, vec![]));
 
     let finalize_sql = build_outer_finalize(sort, limit)?;
     Ok(DistributedQuery {

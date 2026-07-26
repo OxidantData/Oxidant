@@ -7,11 +7,11 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::catalog::Session;
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::empty::EmptyTable;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::context::SessionState;
-use datafusion::catalog::Session;
 use futures::TryStreamExt;
 use object_store::ObjectMeta;
 use weft_common::{Error, Result};
@@ -95,7 +95,14 @@ pub async fn apply_file_shard(
     file_extension: &str,
     table_name: Option<&str>,
 ) -> Result<Vec<ListingTableUrl>> {
-    apply_file_shard_with(state, urls, file_extension, table_name, ShardAssignment::from_env()).await
+    apply_file_shard_with(
+        state,
+        urls,
+        file_extension,
+        table_name,
+        ShardAssignment::from_env(),
+    )
+    .await
 }
 
 /// Same as [`apply_file_shard`] with an explicit assignment (tests / custom membership).
@@ -118,9 +125,10 @@ pub async fn apply_file_shard_with(
     let mut all_files: Vec<(ListingTableUrl, ObjectMeta)> = Vec::new();
     for url in &urls {
         let store_url = url.object_store();
-        let store = state.runtime_env().object_store(&store_url).map_err(|e| {
-            Error::Io(format!("object store for {}: {e}", store_url.as_str()))
-        })?;
+        let store = state
+            .runtime_env()
+            .object_store(&store_url)
+            .map_err(|e| Error::Io(format!("object store for {}: {e}", store_url.as_str())))?;
         let stream = url
             .list_all_files(state as &dyn Session, store.as_ref(), file_extension)
             .await
@@ -185,10 +193,7 @@ mod tests {
 
     #[test]
     fn assignment_owns_round_robin() {
-        let a = ShardAssignment {
-            index: 1,
-            count: 3,
-        };
+        let a = ShardAssignment { index: 1, count: 3 };
         assert!(!a.owns(0));
         assert!(a.owns(1));
         assert!(!a.owns(2));

@@ -13,9 +13,9 @@ use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
 
 use super::stage_planner::{
-    base_tables, build_finalize, column_name, distinct_stage_sql, equijoin_from_filter,
-    expr_sql, recombine_stage_sql, simple_table_scan, sanitize_generated_sql,
-    shuffle_join_two_tables, AggSpec, DistributedQuery, Peeled, SimpleScan,
+    base_tables, build_finalize, column_name, distinct_stage_sql, equijoin_from_filter, expr_sql,
+    recombine_stage_sql, sanitize_generated_sql, shuffle_join_two_tables, simple_table_scan,
+    AggSpec, DistributedQuery, Peeled, SimpleScan,
 };
 use crate::driver::StageDef;
 
@@ -353,8 +353,9 @@ fn build_chain(
             proj.push(format!("r.{c} AS {c}"));
             new_flats.push(c.clone());
         }
-        let (hash_alias, hash_col) = next_sharded_left_key(steps, i + 1, sharded, &alias_by_relation)
-            .unwrap_or((left_key_alias.clone(), left_key_name.clone()));
+        let (hash_alias, hash_col) =
+            next_sharded_left_key(steps, i + 1, sharded, &alias_by_relation)
+                .unwrap_or((left_key_alias.clone(), left_key_name.clone()));
         let hash_idx = flat_key_index(&new_flats, &hash_alias, &hash_col)?;
         let join_id = next_id;
         next_id += 1;

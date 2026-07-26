@@ -277,8 +277,16 @@ async fn two_sharded_tables_auto_shuffle_join() {
     fn dim_shard(groups: i64, start: i64, end: i64) -> RecordBatch {
         let full = dim(groups);
         let schema = full.schema();
-        let k = full.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let n = full.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let k = full
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let n = full
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let mut ks = Vec::new();
         let mut ns = Vec::new();
         for i in 0..full.num_rows() {
@@ -301,10 +309,12 @@ async fn two_sharded_tables_auto_shuffle_join() {
     let (p0, p1) = (50631u16, 50632u16);
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
-    e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)]).unwrap();
+    e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)])
+        .unwrap();
     let e1 = Arc::new(Engine::new());
     e1.register_batches("t", vec![batch(100, 200, G)]).unwrap();
-    e1.register_batches("dim", vec![dim_shard(G, G / 2, G)]).unwrap();
+    e1.register_batches("dim", vec![dim_shard(G, G / 2, G)])
+        .unwrap();
     tokio::spawn(async move {
         let _ = serve_worker(p0, e0).await;
     });
@@ -358,8 +368,16 @@ fn dim2(groups: i64) -> RecordBatch {
 fn dim2_shard(groups: i64, start: i64, end: i64) -> RecordBatch {
     let full = dim2(groups);
     let schema = full.schema();
-    let k = full.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let n = full.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let k = full
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let n = full
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     let mut ks = Vec::new();
     let mut ns = Vec::new();
     for i in 0..full.num_rows() {
@@ -382,8 +400,16 @@ fn dim2_shard(groups: i64, start: i64, end: i64) -> RecordBatch {
 fn dim_shard(groups: i64, start: i64, end: i64) -> RecordBatch {
     let full = dim(groups);
     let schema = full.schema();
-    let k = full.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let n = full.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let k = full
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let n = full
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     let mut ks = Vec::new();
     let mut ns = Vec::new();
     for i in 0..full.num_rows() {
@@ -410,7 +436,9 @@ async fn multi_dim_broadcast_star_matches_single_node() {
     let sql = "SELECT d.d_name AS name, SUM(t.v) AS sv, COUNT(*) AS c                FROM t JOIN dim d ON t.k = d.d_key JOIN dim2 d2 ON t.k = d2.d2_key                GROUP BY d.d_name";
 
     let single = Engine::new();
-    single.register_batches("t", vec![batch(0, 200, G)]).unwrap();
+    single
+        .register_batches("t", vec![batch(0, 200, G)])
+        .unwrap();
     single.register_batches("dim", vec![dim(G)]).unwrap();
     single.register_batches("dim2", vec![dim2(G)]).unwrap();
     let expected = single.sql(sql).await.unwrap();
@@ -462,7 +490,9 @@ async fn three_sharded_tables_left_deep_shuffle_chain() {
     let sql = "SELECT d.d_name AS name, COUNT(*) AS c, SUM(t.v) AS sv                FROM t JOIN dim d ON t.k = d.d_key JOIN dim2 d2 ON t.k = d2.d2_key                GROUP BY d.d_name";
 
     let single = Engine::new();
-    single.register_batches("t", vec![batch(0, 200, G)]).unwrap();
+    single
+        .register_batches("t", vec![batch(0, 200, G)])
+        .unwrap();
     single.register_batches("dim", vec![dim(G)]).unwrap();
     single.register_batches("dim2", vec![dim2(G)]).unwrap();
     let expected = single.sql(sql).await.unwrap();
@@ -470,12 +500,16 @@ async fn three_sharded_tables_left_deep_shuffle_chain() {
     let (p0, p1) = (50711u16, 50712u16);
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
-    e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)]).unwrap();
-    e0.register_batches("dim2", vec![dim2_shard(G, 0, G / 2)]).unwrap();
+    e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)])
+        .unwrap();
+    e0.register_batches("dim2", vec![dim2_shard(G, 0, G / 2)])
+        .unwrap();
     let e1 = Arc::new(Engine::new());
     e1.register_batches("t", vec![batch(100, 200, G)]).unwrap();
-    e1.register_batches("dim", vec![dim_shard(G, G / 2, G)]).unwrap();
-    e1.register_batches("dim2", vec![dim2_shard(G, G / 2, G)]).unwrap();
+    e1.register_batches("dim", vec![dim_shard(G, G / 2, G)])
+        .unwrap();
+    e1.register_batches("dim2", vec![dim2_shard(G, G / 2, G)])
+        .unwrap();
     tokio::spawn(async move {
         let _ = serve_worker(p0, e0).await;
     });
@@ -561,9 +595,7 @@ async fn two_workers_with_dim(base: u16) -> (Cluster, Engine) {
         format!("http://127.0.0.1:{p1}"),
     ]);
     let planner = Engine::new();
-    planner
-        .register_batches("t", vec![batch(0, N, G)])
-        .unwrap();
+    planner.register_batches("t", vec![batch(0, N, G)]).unwrap();
     planner.register_batches("dim", vec![dim(G)]).unwrap();
     (cluster, planner)
 }
@@ -756,12 +788,7 @@ async fn window_without_partition_by_is_rejected() {
     single
         .register_batches("t", vec![batch(0, 60, 12)])
         .unwrap();
-    let err = plan_distributed(
-        &single,
-        "SELECT SUM(v) OVER () AS sv FROM t",
-        &[],
-    )
-    .await;
+    let err = plan_distributed(&single, "SELECT SUM(v) OVER () AS sv FROM t", &[]).await;
     let msg = format!("{}", err.expect_err("global window must be rejected"));
     assert!(
         msg.contains("PARTITION BY") || msg.contains("window"),

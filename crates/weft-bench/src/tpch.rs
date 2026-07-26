@@ -105,7 +105,10 @@ pub async fn run_bench(opts: BenchOpts<'_>) {
         .map(|(n, s)| Query { name: n, sql: s })
         .collect();
 
-    eprintln!("[tpch-bench] running Weft ({} queries × 3 tries) …", qs.len());
+    eprintln!(
+        "[tpch-bench] running Weft ({} queries × 3 tries) …",
+        qs.len()
+    );
     let weft = suite::run_weft(&engine, &qs).await;
 
     let mut engines = vec![weft];

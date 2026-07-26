@@ -10,9 +10,12 @@
 //!   --hash-keys 0
 //! ```
 
+use std::sync::Arc;
+
 use weft_connect::{serve, ServerConfig};
 use weft_execution::driver::{run_distributed, Cluster, DistributedPlan};
 use weft_execution::flight::serve_worker;
+use weft_loom::Engine;
 
 #[tokio::main]
 async fn main() {
@@ -205,7 +208,10 @@ async fn run_worker(args: &[String]) -> weft_common::Result<()> {
     // Same catalog bootstrap as `weft spark server` so Glue/Hive tables resolve on workers.
     let catalogs = catalog_conf(args);
     if !catalogs.is_empty() {
-        eprintln!("Worker declared {} catalog config entrie(s)", catalogs.len());
+        eprintln!(
+            "Worker declared {} catalog config entrie(s)",
+            catalogs.len()
+        );
     }
     let service = weft_connect::WeftService::with_catalogs(catalogs);
     let engine = service.engine();

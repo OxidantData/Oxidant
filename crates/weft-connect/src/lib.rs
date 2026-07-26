@@ -1566,8 +1566,6 @@ fn err_to_status(e: Error) -> Status {
     }
 }
 
-/// Start the Spark Connect server and serve until the process is killed.
-
 fn replicated_tables_from_env() -> Vec<String> {
     std::env::var("WEFT_REPLICATED_TABLES")
         .ok()
@@ -1581,6 +1579,7 @@ fn replicated_tables_from_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Start the Spark Connect server and serve until the process is killed.
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let port = config.port;
     let ui_port = config.ui_port;

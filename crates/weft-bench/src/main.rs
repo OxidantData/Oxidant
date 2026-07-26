@@ -735,7 +735,7 @@ async fn main() {
         .position(|a| a == "--date")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .unwrap_or_else(|| chrono_today());
+        .unwrap_or_else(chrono_today);
     let out_json = args
         .iter()
         .position(|a| a == "--json")
@@ -760,9 +760,8 @@ async fn main() {
                 .unwrap_or_else(|| format!("{}/weft-tpch-sf{sf}", std::env::temp_dir().display()));
             match cmd {
                 "tpch-bench" => {
-                    let out = out_json.unwrap_or_else(|| {
-                        format!("bench/tpch/results/tpch-sf{sf}.json")
-                    });
+                    let out =
+                        out_json.unwrap_or_else(|| format!("bench/tpch/results/tpch-sf{sf}.json"));
                     tpch::run_bench(tpch::BenchOpts {
                         sf,
                         data: Path::new(&dir),
