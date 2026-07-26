@@ -286,11 +286,23 @@ def ensure_glue_connection(gw: str, token: str) -> None:
     )
 
 
-def create_cluster(gw: str, token: str, name: str, worker_size: str) -> str:
+def create_cluster(
+    gw: str,
+    token: str,
+    name: str,
+    worker_size: str,
+    *,
+    distributed: bool = False,
+    worker_count: int = 2,
+) -> str:
+    if distributed:
+        worker_min = worker_max = max(worker_count, 2)
+    else:
+        worker_min = worker_max = 0
     body = {
         "name": name,
-        "worker_min": 1,
-        "worker_max": 1,
+        "worker_min": worker_min,
+        "worker_max": worker_max,
         "worker_size": worker_size,
     }
     c = http_json("POST", f"{gw}/api/clusters", token, body)
@@ -364,6 +376,17 @@ def main() -> int:
     ap.add_argument("--glue-db", default="")
     ap.add_argument("--cluster-id", default="")
     ap.add_argument("--create-cluster", action="store_true")
+    ap.add_argument(
+        "--distributed",
+        action="store_true",
+        help="Provision worker_min=worker_max=N (default 2). Without this flag, workers=0 (driver-only).",
+    )
+    ap.add_argument(
+        "--worker-count",
+        type=int,
+        default=int(os.environ.get("WEFT_WORKER_COUNT", "2")),
+        help="Worker replicas when --distributed (min 2).",
+    )
     ap.add_argument("--worker-size", default="xlarge")
     ap.add_argument("--cluster-name", default="")
     ap.add_argument("--json", required=True, help="Output site JSON path")
@@ -395,7 +418,14 @@ def main() -> int:
     cluster_id = args.cluster_id or None
     if args.create_cluster:
         name = args.cluster_name or f"bench-{args.suite}-sf{int(args.sf)}"
-        cluster_id = create_cluster(gw, token, name, args.worker_size)
+        cluster_id = create_cluster(
+            gw,
+            token,
+            name,
+            args.worker_size,
+            distributed=args.distributed,
+            worker_count=args.worker_count,
+        )
         wait_cluster(gw, token, cluster_id)
 
     print(
@@ -455,6 +485,11 @@ def main() -> int:
         "method": (
             "Weft on EKS via gateway POST /api/sql; Glue catalog; "
             "3 tries/query; hot = min(try2, try3); no_limit"
+            + (
+                f"; distributed ({args.worker_count} workers)"
+                if args.distributed
+                else "; driver-only (workers=0)"
+            )
         ),
         "engines": [
             {

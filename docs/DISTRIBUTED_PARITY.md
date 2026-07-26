@@ -92,7 +92,17 @@ Fallback: unsupported plan shapes → Engine::sql on driver
 
 1. Ship `weft` images with Connect distributed path + loom file sharding.
 2. Ship `weft-platform` orchestrator with worker Service, Flight NetworkPolicy,
-   `WEFT_WORKERS` / `WEFT_WORKER_SERVICE` / `WEFT_WORKER_COUNT` / `WEFT_REPLICATED_TABLES`.
+   `WEFT_WORKERS` / `WEFT_WORKER_SERVICE` / `WEFT_WORKER_COUNT` / `WEFT_REPLICATED_TABLES` /
+   `WEFT_POD_NAME`. See platform `docs/DISTRIBUTED_DEPLOY.md` for build/push/verify steps.
 3. Create cluster with `worker_min=worker_max=N` (N>1), confirm driver env and worker
    shard logs (`applied file-list shard`).
-4. Re-measure TPC-H/DS SF100; only then update site numbers as distributed.
+4. Re-measure TPC-H/DS SF100 with **`DISTRIBUTED_SF100=1`** (harness default is refuse):
+   ```sh
+   DISTRIBUTED_SF100=1 WORKER_MIN=2 WORKER_MAX=2 ./bench/sf100/run-time-gate.sh
+   # or ad-hoc:
+   python3 bench/sf100/run-via-gateway.py --create-cluster --distributed --worker-count 2 ...
+   ```
+5. Only then update site numbers as distributed.
+
+**Do not** run SF100 without an explicit mode — `run-time-gate.sh` exits unless
+`DISTRIBUTED_SF100=1` or `ALLOW_SINGLE_NODE_GATE=1` (driver-only, not comparable).

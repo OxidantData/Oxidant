@@ -10,26 +10,37 @@
 #   GATE_SECS=1200 CLUSTER_ID=abc ./bench/sf100/run-time-gate.sh
 set -euo pipefail
 
-# STOP: SF100 via POST /api/sql was verified DRIVER-ONLY (see docs/DISTRIBUTED_PARITY.md).
-# Do not publish multi-executor comparisons until Connect+workers+scan sharding land.
-# Set ALLOW_SINGLE_NODE_GATE=1 to force a single-node measurement anyway.
-if [[ "${ALLOW_SINGLE_NODE_GATE:-0}" != "1" ]]; then
-  echo "[gate] refused: TPC path is not distributed yet (docs/DISTRIBUTED_PARITY.md)." >&2
-  echo "[gate] set ALLOW_SINGLE_NODE_GATE=1 to override for single-node profiling only." >&2
+# SF100 is expensive. Pick an explicit mode (default: refuse):
+#   DISTRIBUTED_SF100=1  — multi-worker cluster (worker_min=worker_max=N, no worker scale-down)
+#   ALLOW_SINGLE_NODE_GATE=1 — legacy driver-only profiling (scales workers to 0 after create)
+# See docs/DISTRIBUTED_PARITY.md and weft-platform docs/DISTRIBUTED_DEPLOY.md.
+DISTRIBUTED_SF100="${DISTRIBUTED_SF100:-0}"
+ALLOW_SINGLE_NODE_GATE="${ALLOW_SINGLE_NODE_GATE:-0}"
+if [[ "$DISTRIBUTED_SF100" != "1" && "$ALLOW_SINGLE_NODE_GATE" != "1" ]]; then
+  echo "[gate] refused: SF100 harness requires an explicit mode." >&2
+  echo "[gate]   DISTRIBUTED_SF100=1           multi-worker re-measure (engine+platform branches)" >&2
+  echo "[gate]   ALLOW_SINGLE_NODE_GATE=1        driver-only profiling (not comparable)" >&2
   exit 3
 fi
-
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 GW="${WEFT_GATEWAY:-http://127.0.0.1:18080}"
 GATE_SECS="${GATE_SECS:-1200}"
-MACHINE="${MACHINE:-eks/r6g.8xlarge-spot-bench}"
-SIZE="${SIZE:-xlarge}"   # use xlarge until gateway image knows "bench"; then SIZE=bench
-WORKER_MIN="${WORKER_MIN:-0}"
-WORKER_MAX="${WORKER_MAX:-0}"
-PATCH_FAT="${PATCH_FAT:-1}"   # patch driver to fat CPU/mem after create (live bypass)
+if [[ "$DISTRIBUTED_SF100" == "1" ]]; then
+  MACHINE="${MACHINE:-eks/distributed-sf100}"
+  SIZE="${SIZE:-xlarge}"
+  WORKER_MIN="${WORKER_MIN:-2}"
+  WORKER_MAX="${WORKER_MAX:-2}"
+  PATCH_FAT="${PATCH_FAT:-0}"
+else
+  MACHINE="${MACHINE:-eks/r6g.8xlarge-spot-bench}"
+  SIZE="${SIZE:-xlarge}"   # use xlarge until gateway image knows "bench"; then SIZE=bench
+  WORKER_MIN="${WORKER_MIN:-0}"
+  WORKER_MAX="${WORKER_MAX:-0}"
+  PATCH_FAT="${PATCH_FAT:-1}"   # patch driver to fat CPU/mem after create (live bypass)
+fi
 # Defaults fit On-Demand r6g.4xlarge (~16 vCPU / 128 GiB) under a 32 vCPU Standard
 # quota. For r6g.8xlarge use FAT_CPU=28 FAT_MEM=200Gi (needs Spot or quota headroom).
 FAT_CPU="${FAT_CPU:-28}"
@@ -43,7 +54,7 @@ TOKEN="$(curl -sS -X POST "$GW/api/auth/login" -H 'content-type: application/jso
 auth=(-H "authorization: Bearer $TOKEN" -H 'content-type: application/json')
 
 if [[ -z "${CLUSTER_ID:-}" ]]; then
-  echo "[gate] creating cluster size=${SIZE} workers=${WORKER_MIN}-${WORKER_MAX}"
+  echo "[gate] creating cluster size=${SIZE} workers=${WORKER_MIN}-${WORKER_MAX} distributed=${DISTRIBUTED_SF100}"
   CLUSTER_ID="$(curl -sS -X POST "$GW/api/clusters" "${auth[@]}" \
     -d "{\"name\":\"sf100-time-gate\",\"worker_size\":\"${SIZE}\",\"worker_min\":${WORKER_MIN},\"worker_max\":${WORKER_MAX}}" \
     | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')"
@@ -78,8 +89,10 @@ if [[ "$PATCH_FAT" == "1" ]]; then
     {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/resources/requests/memory\",\"value\":\"${FAT_MEM}\"},
     {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/resources/limits/memory\",\"value\":\"${FAT_MEM}\"}
   ]"
-  # Drop workers if any — SQL path is driver Connect only.
-  kubectl -n "$NS" scale sts -l weft.io/role=worker --replicas=0 2>/dev/null || true
+  # Single-node mode only: drop workers so the fat driver runs alone.
+  if [[ "$DISTRIBUTED_SF100" != "1" ]]; then
+    kubectl -n "$NS" scale sts -l weft.io/role=worker --replicas=0 2>/dev/null || true
+  fi
   # Nudge the ReplicaSet out of FailedCreate backoff after the quota raise.
   kubectl -n "$NS" annotate deploy "$DRV" "kubectl.kubernetes.io/restartedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
   kubectl -n "$NS" rollout status deploy/"$DRV" --timeout=600s
