@@ -4,12 +4,27 @@ name: CI
 # Mirrors the gates from .gitlab-ci.yml that fit a hosted runner (4 vCPU / 16 GB):
 # rustfmt, clippy, workspace tests, the ClickBench/TPC-H/correctness coverage gates, and the
 # Spark-SQL parity ratchet (the `parity` job — fails any PR that drops Spark golden-SQL parity
-# below the committed parity/baseline.json floor). One heavier gate lives elsewhere:
+# below the committed parity/baseline.json floor). Two heavier gates live elsewhere:
 #   - ClickBench on real 14.78 GB data -> bench.yml, self-hosted c6a.4xlarge (see deploy/ci-runner/)
+#   - llvm-cov line coverage (informational) -> coverage-nightly.yml
+#
+# BUILD TIME: every compiling job shares ONE cargo cache via `shared-key: workspace` below.
+# Keyed per job (the rust-cache default) the workspace got compiled from scratch four times
+# over, and the four caches evicted each other against the 10 GB per-repo Actions cache cap.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "site/**"
+      - "**/*.md"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "site/**"
+      - "**/*.md"
+      - "LICENSE"
   workflow_dispatch:
 
 permissions:
@@ -39,7 +54,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   build-test:
-    name: clippy + test + tpch + tpcds
+    name: clippy + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +64,9 @@ jobs:
           rustup component add clippy
           rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+      - uses: taiki-e/install-action@nextest
       - name: Build weft CLI (integration tests in weft-cli spawn the binary)
         run: cargo build -p weft-cli
       - name: local-cluster CLI parse smoke
@@ -56,7 +74,28 @@ jobs:
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test (workspace)
-        run: cargo test --workspace
+        run: cargo nextest run --workspace
+
+  # The TPC-H / TPC-DS / distributed gates used to run at the tail of build-test, which made the
+  # critical path the SUM of compiling the workspace and replaying every query suite. They only
+  # need the `weft-bench` binary, so they run here in parallel against the same shared cache.
+  # Note these execute in the dev profile — `[profile.dev.package."*"] opt-level = 2` in the root
+  # Cargo.toml is what keeps that tractable, since it optimizes datafusion/arrow while leaving
+  # workspace crates cheap to compile.
+  query-gates:
+    name: TPC-H + TPC-DS + distributed gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+      - name: Build weft-bench once (every gate below reuses this binary)
+        run: cargo build -p weft-bench
       - name: TPC-H coverage (Q1/Q3/Q5/Q6/Q10)
         run: cargo run -p weft-bench -- tpch
       - name: TPC-H distributed (3 workers, sf0.05)
@@ -87,6 +126,8 @@ jobs:
           rustup show
           rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
       - name: ClickBench coverage (43 queries, engine-direct)
         run: cargo run -p weft-bench -- clickbench --rows 20000
       - name: ClickBench coverage (43 queries, live Spark Connect over gRPC)
@@ -98,8 +139,6 @@ jobs:
   # fails the PR if strict OR semantic parity drops below the committed parity/baseline.json floor
   # (or the corpus size changes). This is the gate that protects the Spark-compatibility work — a PR
   # can only hold or improve parity. To LAND a gain, re-baseline (see PARITY_SWARM_PLAYBOOK.md §6).
-  # Runs as its own job (separate cache) because the weft-parity binary depends only on weft-loom
-  # (+ datafusion), not the gateway — so it builds fast and stays green independent of platform code.
   parity:
     name: Spark SQL parity ratchet
     runs-on: ubuntu-latest
@@ -112,7 +151,7 @@ jobs:
           rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
         with:
-          key: spark-parity # keep this cache separate from build-test's
+          shared-key: workspace
           cache-on-failure: "true"
       - name: Build weft-parity
         run: cargo build -p weft-spark-compat --bin weft-parity
@@ -143,31 +182,4 @@ jobs:
             parity/parity.html
             parity/scoreboard.json
           retention-days: 30
-          if-no-files-found: ignore
-
-  # Informational line-coverage report (non-blocking). Uploads an HTML artifact for trending.
-  line-coverage:
-    name: line coverage (informational)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
-        run: |
-          rustup show
-          rustup component add llvm-tools-preview
-          rustc --version && cargo --version
-      - uses: Swatinem/rust-cache@v2
-      - name: Build weft CLI (integration tests spawn the binary under llvm-cov target dir)
-        run: cargo build -p weft-cli --target-dir target/llvm-cov-target
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
-      - name: Generate HTML coverage report
-        run: cargo llvm-cov --workspace --html
-      - name: Upload coverage HTML
-        uses: actions/upload-artifact@v4
-        with:
-          name: llvm-cov-html
-          path: target/llvm-cov/html
-          retention-days: 14
           if-no-files-found: ignore

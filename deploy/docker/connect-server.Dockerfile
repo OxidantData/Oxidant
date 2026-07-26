@@ -18,13 +18,19 @@
 #   docker build -f deploy/docker/connect-server.Dockerfile -t weft/connect-server:<tag> .
 ###############################################################################
 
-# ---- chef: pin the toolchain + install cargo-chef once ----------------------
+# Cargo profile to compile with. `release-ci` (see the root Cargo.toml) drops LTO
+# and raises codegen-units, which removes the serialized whole-program link that
+# dominates a full build. Tagged releases override this back to `release`.
+ARG CARGO_PROFILE=release-ci
+
+# ---- chef: pin the toolchain + cargo-chef -----------------------------------
 # rust:1.90 matches rust-toolchain.toml. The full (non-slim) image already has the
 # C toolchain that ring + zstd-sys compile against; the workspace needs no protoc
 # (weft-proto compiles the vendored Spark protos with pure-Rust `protox`).
-FROM rust:1.90-bookworm AS chef
+# cargo-chef comes from its own published image rather than `cargo install`, which
+# compiles it from source on every cold cache.
+FROM lukemathwalker/cargo-chef:0.1.73-rust-1.90-bookworm AS chef
 WORKDIR /build
-RUN cargo install cargo-chef --locked --version ^0.1
 
 # ---- planner: capture the dependency graph (cache key is just the manifests) --
 FROM chef AS planner
@@ -33,12 +39,17 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ---- builder: cook deps (cached across source edits), then build `weft` -------
 FROM chef AS builder
+ARG CARGO_PROFILE
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+# Scoped to the one crate we actually ship: an unscoped cook builds dependencies
+# for all 24 workspace members. Must use the same profile as the build below, or
+# the cooked artifacts land in a different target dir and get recompiled.
+RUN cargo chef cook --profile "$CARGO_PROFILE" --locked --recipe-path recipe.json -p weft-cli --bin weft
 COPY . .
 # The `weft` binary lives in the `weft-cli` crate ([[bin]] name = "weft").
-RUN cargo build --release --locked -p weft-cli --bin weft \
- && strip target/release/weft
+RUN cargo build --profile "$CARGO_PROFILE" --locked -p weft-cli --bin weft \
+ && strip "target/$CARGO_PROFILE/weft" \
+ && install -D "target/$CARGO_PROFILE/weft" /out/weft
 # Pre-create the spill mount-point owned by the runtime uid so the image also works
 # under `docker run --read-only` with tmpfs/volume mounts (K8s emptyDir handles this
 # in-cluster via fsGroup). /tmp already exists in the distroless base.
@@ -89,7 +100,7 @@ ENV TMPDIR=/tmp \
     WEFT_AWS_BIN=/usr/local/aws-cli/v2/current/bin/aws \
     RUST_BACKTRACE=1
 
-COPY --from=builder /build/target/release/weft /usr/local/bin/weft
+COPY --from=builder /out/weft /usr/local/bin/weft
 COPY --from=awscli /usr/local/aws-cli /usr/local/aws-cli
 COPY --from=builder --chown=65532:65532 /rootfs/var/lib/weft/spill /var/lib/weft/spill
 

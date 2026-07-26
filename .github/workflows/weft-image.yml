@@ -17,6 +17,9 @@ name: weft-image
 # SCOPE — engine only. The proprietary control-plane GATEWAY image is built in the
 # PRIVATE GitLab repo and is deliberately NOT built or published here.
 #
+# BUILD CACHE lives in Docker Hub as `vamzi/weft:buildcache-{amd64,arm64}` — see the
+# comment on cache-to below for why this is not the GitHub Actions cache.
+#
 # Repo secrets required (Settings -> Secrets and variables -> Actions):
 #   DOCKERHUB_USERNAME   Docker Hub account that can push to vamzi/weft (vamzi)
 #   DOCKERHUB_TOKEN      Docker Hub access token with Read/Write
@@ -81,6 +84,18 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Tagged releases get the fully tuned `release` profile (thin LTO, one codegen
+      # unit). Everything else builds with `release-ci`, which trades a small amount of
+      # runtime performance for dropping the serialized whole-program link.
+      - name: Select cargo profile
+        id: profile
+        run: |
+          if [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ]; then
+            echo "cargo_profile=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "cargo_profile=release-ci" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build & push by digest (${{ matrix.arch }})
         id: build
         uses: docker/build-push-action@v6
@@ -89,9 +104,19 @@ jobs:
           file: deploy/docker/connect-server.Dockerfile
           platforms: ${{ matrix.platform }}
           provenance: false
+          build-args: |
+            CARGO_PROFILE=${{ steps.profile.outputs.cargo_profile }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # Registry cache, NOT type=gha. The Actions cache is capped at 10 GB per
+          # repository with LRU eviction; a `mode=max` export of this build (cargo-chef
+          # cook layer + full cargo registry, times two architectures) blows past that,
+          # so the two arch scopes evicted each other and most runs started cold. A
+          # Docker Hub cache tag has no such cap. `type=gha` stays as a secondary read
+          # source so a run that happens to still have a warm Actions cache can use it.
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+            type=gha,scope=${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
 
       - name: Export digest
         run: |
