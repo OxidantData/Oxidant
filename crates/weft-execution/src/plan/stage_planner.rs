@@ -24,12 +24,11 @@
 //! present in full on every worker): the join then runs locally per worker over the single sharded
 //! table's shard, so it folds straight into the partial stage's FROM tail with no extra shuffle.
 //! This covers star schemas (a sharded fact + replicated dimensions). Joins between two *sharded*
-//! tables need an explicit shuffle-join plan (see `tests/distributed_join.rs`); auto-deriving those
-//! is a follow-up.
+//! tables are auto-derived as a **shuffle join** when there is a single equijoin key.
 //!
-//! Anything else (ungrouped/global aggregates, two+ sharded tables, `HAVING`, window functions, set
-//! operations, nested subqueries) returns [`Error::Unsupported`] so the caller falls back to
-//! single-node execution.
+//! Also supported: ungrouped/global aggregates, and `HAVING` over the aggregated result.
+//! Anything else (window functions, set operations, nested subqueries, 3+ sharded tables)
+//! returns [`Error::Unsupported`] so the caller falls back to single-node execution.
 
 use std::collections::HashMap;
 
@@ -57,8 +56,7 @@ pub struct DistributedQuery {
 /// `replicated` names base tables that are present in **full** on every worker (small dimension
 /// tables). A join is auto-derived as a **broadcast join** — it runs locally per worker — as long as
 /// every table but one is replicated (so exactly one table is sharded). Joins between two *sharded*
-/// tables need an explicit shuffle-join plan (see `tests/distributed_join.rs`); auto-deriving those
-/// is a follow-up.
+/// tables are auto-derived as a shuffle join when there is a single equijoin between them.
 pub async fn plan_distributed(
     engine: &Engine,
     sql: &str,
@@ -78,6 +76,8 @@ struct Peeled<'a> {
     sort: Option<&'a [datafusion::logical_expr::SortExpr]>,
     /// `LIMIT` fetch count, if any.
     limit: Option<usize>,
+    /// `HAVING` predicate over the aggregate output, if any.
+    having: Option<&'a Expr>,
     /// The aggregate node itself.
     agg: &'a Aggregate,
 }
@@ -88,6 +88,7 @@ fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
     let mut limit = None;
     let mut sort = None;
     let mut projection = None;
+    let mut having = None;
     let mut node = lp;
     loop {
         match node {
@@ -106,11 +107,17 @@ fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
                 projection = Some(p.expr.as_slice());
                 node = &p.input;
             }
+            LogicalPlan::Filter(f) => {
+                // Filter directly above Aggregate is HAVING.
+                having = Some(f.predicate.as_ref());
+                node = &f.input;
+            }
             LogicalPlan::Aggregate(agg) => {
                 return Ok(Peeled {
                     projection,
                     sort,
                     limit,
+                    having,
                     agg,
                 })
             }
@@ -124,26 +131,28 @@ fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
     }
 }
 
-/// Build the two-stage partial→final plan for a grouped aggregation.
+/// Build the distributed plan for a (possibly global) aggregation.
 fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuery> {
     let agg = p.agg;
-    if agg.group_expr.is_empty() {
-        return Err(Error::Unsupported(
-            "auto-distribute: ungrouped/global aggregation not yet supported".into(),
-        ));
-    }
-    // Broadcast-join safety: the partial stage runs the join locally per worker, so exactly one base
-    // table may be sharded; every other must be replicated in full on every worker. (Zero sharded
-    // tables would duplicate the fully-replicated result across workers; two+ need a shuffle join.)
     let tables = base_tables(&agg.input);
     let sharded: Vec<&String> = tables
         .iter()
         .filter(|t| !replicated.contains(&t.as_str()))
         .collect();
+
+    if agg.group_expr.is_empty() {
+        return global_aggregation_stages(p, &sharded);
+    }
+
+    // Two sharded tables → shuffle join + aggregate.
+    if sharded.len() == 2 {
+        return shuffle_join_aggregation_stages(p, &sharded);
+    }
+
+    // Broadcast-join safety: exactly one base table may be sharded; others must be replicated.
     if sharded.len() != 1 {
         return Err(Error::Unsupported(format!(
-            "auto-distribute: need exactly one sharded base table (others replicated), \
-             found {} sharded among {tables:?}",
+            "auto-distribute: need exactly one sharded base table (others replicated),              found {} sharded among {tables:?}",
             sharded.len()
         )));
     }
@@ -218,6 +227,340 @@ fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuer
         ],
         finalize_sql: build_finalize(p)?,
     })
+}
+
+
+/// Ungrouped aggregation: partials per worker, gather to partition 0, recombine.
+fn global_aggregation_stages(p: &Peeled, sharded: &[&String]) -> Result<DistributedQuery> {
+    if sharded.len() != 1 {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: global aggregation needs exactly one sharded table, found {}",
+            sharded.len()
+        )));
+    }
+    let sharded_name = sharded[0].as_str();
+    if count_table_scans(&p.agg.input, sharded_name) > 1 {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: sharded table `{sharded_name}` scanned multiple times"
+        )));
+    }
+    let input_sql = Unparser::default()
+        .plan_to_sql(&p.agg.input)
+        .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse input: {e}")))?
+        .to_string();
+    let tail = input_sql
+        .strip_prefix("SELECT * ")
+        .ok_or_else(|| Error::Unsupported("auto-distribute: non-trivial aggregate input".into()))?;
+    let tail = sanitize_generated_sql(tail);
+
+    let aggs = p
+        .agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()?;
+    if aggs.iter().any(|a| a.distinct) {
+        return Err(Error::Unsupported(
+            "auto-distribute: global COUNT(DISTINCT) not yet supported".into(),
+        ));
+    }
+
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for (i, a) in p.agg.aggr_expr.iter().enumerate() {
+        remap.insert(a.schema_name().to_string(), format!("r{i}"));
+    }
+
+    let mut psel = Vec::new();
+    let mut combine = Vec::new();
+    for (i, a) in aggs.iter().enumerate() {
+        match a.func.as_str() {
+            "sum" => {
+                psel.push(format!("sum({}) AS a{i}", a.arg_sql));
+                combine.push(format!("sum(a{i}) AS r{i}"));
+            }
+            "count" => {
+                psel.push(format!("count({}) AS a{i}", a.arg_sql));
+                combine.push(format!("sum(a{i}) AS r{i}"));
+            }
+            "min" => {
+                psel.push(format!("min({}) AS a{i}", a.arg_sql));
+                combine.push(format!("min(a{i}) AS r{i}"));
+            }
+            "max" => {
+                psel.push(format!("max({}) AS a{i}", a.arg_sql));
+                combine.push(format!("max(a{i}) AS r{i}"));
+            }
+            "avg" => {
+                psel.push(format!(
+                    "sum({}) AS a{i}s, count({}) AS a{i}c",
+                    a.arg_sql, a.arg_sql
+                ));
+                combine.push(format!(
+                    "(CAST(sum(a{i}s) AS DOUBLE) / NULLIF(sum(a{i}c), 0)) AS r{i}"
+                ));
+            }
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "auto-distribute: aggregate `{other}` not supported"
+                )))
+            }
+        }
+    }
+
+    let partial_sql = sanitize_generated_sql(&format!("SELECT {} {tail}", psel.join(", ")));
+    // HAVING COUNT(*) > 0 drops the all-null row workers with an empty shuffle bucket would emit.
+    let inner = format!(
+        "SELECT {} FROM shuffle_input HAVING COUNT(*) > 0",
+        combine.join(", ")
+    );
+    let final_sql = wrap_output(p, &inner, &remap)?;
+    Ok(DistributedQuery {
+        stages: vec![
+            StageDef {
+                stage_id: 0,
+                sql: partial_sql,
+                upstream_stage_ids: vec![],
+                hash_key_cols: vec![],
+            },
+            StageDef {
+                stage_id: 1,
+                sql: final_sql,
+                upstream_stage_ids: vec![0],
+                hash_key_cols: vec![],
+            },
+        ],
+        finalize_sql: build_finalize(p)?,
+    })
+}
+
+/// Shuffle-join two sharded tables, then run the grouped aggregation.
+fn shuffle_join_aggregation_stages(
+    p: &Peeled,
+    sharded: &[&String],
+) -> Result<DistributedQuery> {
+    let join = find_inner_equijoin(&p.agg.input)?;
+    let (left_key_expr, right_key_expr) = match join.on.as_slice() {
+        [(l, r)] => (l.clone(), r.clone()),
+        [] => equijoin_from_filter(join.filter.as_ref())?,
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: shuffle join supports a single equijoin key, found {}",
+                join.on.len()
+            )))
+        }
+    };
+    if join.on.len() > 1 {
+        return Err(Error::Unsupported(
+            "auto-distribute: multi-key shuffle joins not yet supported".into(),
+        ));
+    }
+    // Non-equi residual filter (beyond the single equijoin) is not yet supported.
+    if join.filter.is_some() && !join.on.is_empty() {
+        return Err(Error::Unsupported(
+            "auto-distribute: shuffle join with non-equi filter not yet supported".into(),
+        ));
+    }
+
+    let left_scan = simple_table_scan(join.left.as_ref())?;
+    let right_scan = simple_table_scan(join.right.as_ref())?;
+    let left_name = left_scan.table;
+    let right_name = right_scan.table;
+    if !(sharded.iter().any(|t| t.as_str() == left_name)
+        && sharded.iter().any(|t| t.as_str() == right_name))
+    {
+        return Err(Error::Unsupported(
+            "auto-distribute: shuffle join sides must be the two sharded tables".into(),
+        ));
+    }
+
+    let left_key_name = column_name(&left_key_expr)?;
+    let right_key_name = column_name(&right_key_expr)?;
+    let left_key_idx = column_index_in_scan(&left_scan, &left_key_name)?;
+    let right_key_idx = column_index_in_scan(&right_scan, &right_key_name)?;
+
+    let left_alias = left_scan.alias.unwrap_or(left_name);
+    let right_alias = right_scan.alias.unwrap_or(right_name);
+
+    let left_sql = match &left_scan.filter_sql {
+        Some(f) => format!("SELECT * FROM {left_name} WHERE {f}"),
+        None => format!("SELECT * FROM {left_name}"),
+    };
+    let right_sql = match &right_scan.filter_sql {
+        Some(f) => format!("SELECT * FROM {right_name} WHERE {f}"),
+        None => format!("SELECT * FROM {right_name}"),
+    };
+
+    let up = Unparser::default();
+    let group_sql: Vec<String> = p
+        .agg
+        .group_expr
+        .iter()
+        .map(|g| expr_sql(&up, g))
+        .collect::<Result<_>>()?;
+    let aggs = p
+        .agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for (j, g) in p.agg.group_expr.iter().enumerate() {
+        remap.insert(g.schema_name().to_string(), format!("g{j}"));
+    }
+    for (i, a) in p.agg.aggr_expr.iter().enumerate() {
+        remap.insert(a.schema_name().to_string(), format!("r{i}"));
+    }
+
+    let on_sql = format!("{left_alias}.{left_key_name} = {right_alias}.{right_key_name}");
+    let join_tail = format!(
+        "FROM shuffle_input_0 AS {left_alias} JOIN shuffle_input_1 AS {right_alias} ON {on_sql}"
+    );
+
+    let (partial_sql, final_sql) = if aggs.iter().any(|a| a.distinct) {
+        distinct_stage_sql(&up, p, &group_sql, &aggs, &join_tail, &remap)?
+    } else {
+        recombine_stage_sql(p, &group_sql, &aggs, &join_tail, &remap)?
+    };
+
+    // Stage 3 has a single upstream, so Flight registers it as `shuffle_input` (not `_2`).
+    let hash_group: Vec<u32> = (0..group_sql.len() as u32).collect();
+    Ok(DistributedQuery {
+        stages: vec![
+            StageDef {
+                stage_id: 0,
+                sql: sanitize_generated_sql(&left_sql),
+                upstream_stage_ids: vec![],
+                hash_key_cols: vec![left_key_idx],
+            },
+            StageDef {
+                stage_id: 1,
+                sql: sanitize_generated_sql(&right_sql),
+                upstream_stage_ids: vec![],
+                hash_key_cols: vec![right_key_idx],
+            },
+            StageDef {
+                stage_id: 2,
+                sql: partial_sql,
+                upstream_stage_ids: vec![0, 1],
+                hash_key_cols: hash_group,
+            },
+            StageDef {
+                stage_id: 3,
+                sql: final_sql,
+                upstream_stage_ids: vec![2],
+                hash_key_cols: vec![],
+            },
+        ],
+        finalize_sql: build_finalize(p)?,
+    })
+}
+
+/// A leaf table scan, optionally filtered, with an optional SQL alias.
+struct SimpleScan<'a> {
+    table: &'a str,
+    alias: Option<&'a str>,
+    filter_sql: Option<String>,
+    schema: datafusion::common::DFSchemaRef,
+}
+
+fn find_inner_equijoin(lp: &LogicalPlan) -> Result<&datafusion::logical_expr::Join> {
+    let mut node = lp;
+    loop {
+        match node {
+            LogicalPlan::Projection(p) => node = p.input.as_ref(),
+            LogicalPlan::Filter(f) => node = f.input.as_ref(),
+            LogicalPlan::Join(j) => {
+                use datafusion::logical_expr::JoinType;
+                if j.join_type != JoinType::Inner {
+                    return Err(Error::Unsupported(
+                        "auto-distribute: only INNER shuffle joins are supported".into(),
+                    ));
+                }
+                return Ok(j);
+            }
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "auto-distribute: expected a join under aggregate, found `{}`",
+                    other.display().to_string().lines().next().unwrap_or("")
+                )))
+            }
+        }
+    }
+}
+
+fn simple_table_scan(lp: &LogicalPlan) -> Result<SimpleScan<'_>> {
+    match lp {
+        LogicalPlan::TableScan(s) => Ok(SimpleScan {
+            table: s.table_name.table(),
+            alias: None,
+            filter_sql: None,
+            schema: s.projected_schema.clone(),
+        }),
+        LogicalPlan::SubqueryAlias(sa) => {
+            let mut inner = simple_table_scan(sa.input.as_ref())?;
+            inner.alias = Some(sa.alias.table());
+            Ok(inner)
+        }
+        LogicalPlan::Filter(f) => {
+            let mut inner = simple_table_scan(f.input.as_ref())?;
+            let up = Unparser::default();
+            let pred = expr_sql(&up, f.predicate.as_ref())?;
+            inner.filter_sql = Some(match inner.filter_sql {
+                Some(prev) => format!("({prev}) AND ({pred})"),
+                None => pred,
+            });
+            Ok(inner)
+        }
+        LogicalPlan::Projection(p) => simple_table_scan(p.input.as_ref()),
+        other => Err(Error::Unsupported(format!(
+            "auto-distribute: shuffle join side must be a table scan, found `{}`",
+            other.display().to_string().lines().next().unwrap_or("")
+        ))),
+    }
+}
+
+
+fn equijoin_from_filter(filter: Option<&Expr>) -> Result<(Expr, Expr)> {
+    let Some(Expr::BinaryExpr(b)) = filter else {
+        return Err(Error::Unsupported(
+            "auto-distribute: shuffle join needs an equijoin key (on or filter)".into(),
+        ));
+    };
+    use datafusion::logical_expr::Operator;
+    if b.op != Operator::Eq {
+        return Err(Error::Unsupported(
+            "auto-distribute: shuffle join filter must be a single equality".into(),
+        ));
+    }
+    Ok((*b.left.clone(), *b.right.clone()))
+}
+
+fn column_name(e: &Expr) -> Result<String> {
+    match e {
+        Expr::Column(c) => Ok(c.name.clone()),
+        other => Err(Error::Unsupported(format!(
+            "auto-distribute: join key must be a column, found {other}"
+        ))),
+    }
+}
+
+fn column_index_in_scan(scan: &SimpleScan<'_>, name: &str) -> Result<u32> {
+    for (i, f) in scan.schema.fields().iter().enumerate() {
+        if f.name() == name {
+            return Ok(i as u32);
+        }
+    }
+    let needle = name.to_ascii_lowercase();
+    for (i, f) in scan.schema.fields().iter().enumerate() {
+        if f.name().to_ascii_lowercase() == needle {
+            return Ok(i as u32);
+        }
+    }
+    Err(Error::Unsupported(format!(
+        "auto-distribute: join key `{name}` not found in table `{}`",
+        scan.table
+    )))
 }
 
 /// Build the global finalize query (`ORDER BY` / `LIMIT` over the gathered `result` table), or
@@ -414,7 +757,12 @@ fn wrap_output(p: &Peeled, inner: &str, remap: &HashMap<String, String>) -> Resu
             .join(", "),
         None => "*".to_string(),
     };
-    Ok(format!("SELECT {select} FROM ({inner}) AS combined"))
+    let mut sql = format!("SELECT {select} FROM ({inner}) AS combined");
+    if let Some(pred) = p.having {
+        let having_sql = expr_sql(&up, &remap_columns(pred, remap))?;
+        sql = format!("SELECT * FROM ({sql}) AS having_in WHERE {having_sql}");
+    }
+    Ok(sql)
 }
 
 /// The output column name an expr produces: the alias if present, the unqualified column name for

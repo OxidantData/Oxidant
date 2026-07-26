@@ -32,6 +32,7 @@ use weft_loom::arrow::ipc::reader::StreamReader;
 use weft_loom::arrow::ipc::writer::StreamWriter;
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_execution::driver::{run_stages, Cluster};
+use weft_execution::membership::DnsMembership;
 use weft_execution::plan::plan_distributed;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
@@ -378,12 +379,11 @@ impl WeftService {
         &self,
         query: &str,
     ) -> std::result::Result<Vec<RecordBatch>, Status> {
-        if let Some(workers) = workers_from_env() {
+        if let Some(cluster) = resolve_worker_cluster().await.map_err(err_to_status)? {
             let replicated = replicated_tables_from_env();
             let replicated_refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
             match plan_distributed(&self.engine, query, &replicated_refs).await {
                 Ok(dq) => {
-                    let cluster = Cluster::new(workers);
                     let gathered = run_stages(&cluster, &dq.stages)
                         .await
                         .map_err(err_to_status)?;
@@ -1109,6 +1109,20 @@ fn err_to_status(e: Error) -> Status {
 }
 
 /// Start the Spark Connect server and serve until the process is killed.
+
+/// Prefer live DNS membership (`WEFT_WORKER_SERVICE`); fall back to static `WEFT_WORKERS`.
+async fn resolve_worker_cluster() -> Result<Option<Cluster>> {
+    if let Some(dns) = DnsMembership::from_env() {
+        let endpoints = dns.resolve().await?;
+        if endpoints.is_empty() {
+            return Err(Error::Io(
+                "WEFT_WORKER_SERVICE resolved to zero worker endpoints".into(),
+            ));
+        }
+        return Ok(Some(Cluster::new(endpoints)));
+    }
+    Ok(workers_from_env().map(Cluster::new))
+}
 
 fn workers_from_env() -> Option<Vec<String>> {
     let raw = std::env::var("WEFT_WORKERS").ok()?;

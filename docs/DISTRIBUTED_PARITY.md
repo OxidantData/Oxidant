@@ -1,91 +1,90 @@
 # Distributed execution gaps vs EMR / Photon / Lakesail
 
-**Status (2026-07-25):** TPC-H/TPC-DS SF100 runs via `POST /api/sql` are **driver-only**.
-Workers are not on the query path. Fat single-node Spot runs were stopped; infra torn down.
+**Status (2026-07-25):** Connect SQL can fan out to workers when `WEFT_WORKERS` or
+`WEFT_WORKER_SERVICE` is set. File-list sharding + replicated dims make multi-worker
+scans disjoint. Full TPC-DS plan coverage is still incomplete — unsupported shapes
+fall back to local driver execution.
 
-## What we verified live
+## What we verified live (pre-fix)
 
 | Check | Result |
 |-------|--------|
 | Cluster pods during SF100 | **1 driver**, `worker_min=worker_max=0` |
 | Harness comment | `SQL path is driver Connect only` — scales workers to 0 |
 | Gateway routing | `cluster_client` → Spark Connect `Sql` on driver Service |
-| Connect execution | `weft-connect` → `Engine::sql` (local DataFusion/`weft-loom`) |
+| Connect execution (then) | `weft-connect` → `Engine::sql` (local DataFusion/`weft-loom`) |
 | `weft-execution` | Used by CLI `weft driver` / tests only — **not** by Connect |
 | CPU/memory | One pod requesting 28 CPU / 200Gi on one node; no cross-node shuffle |
 
 Intra-pod DataFusion threading can use many cores on that one box. That is **not**
 distributed execution and is not comparable to EMR / Databricks Photon / Lakesail.
 
-## Architecture today
+## Architecture (after this workstream)
 
 ```
 Gateway POST /api/sql
     → sc://driver:50051  (Spark Connect)
-        → Engine::sql on driver only
-            → Glue catalog + S3 Parquet scanned on driver
+        → plan_distributed + run_stages  (when workers configured)
+            → Arrow Flight shuffle to worker pods :50561
+            → each worker scans its file-list shard (Glue/Parquet)
 
-Workers (if scaled): weft worker :50561 (Arrow Flight)
-    → never dialed by Connect
+Fallback: unsupported plan shapes → Engine::sql on driver
 ```
-
-## What exists but is unused on the product path
-
-- `weft-execution`: 2-stage `partial-agg → hash shuffle → final-agg`, shuffle join tests
-- `plan_distributed`: auto-split **simple grouped aggregations** (+ broadcast star joins)
-- CLI: `weft driver --workers …` / `weft worker --port …`
-- `ClusterMembership` trait; **`K8sMembership` not implemented**
 
 ## Gap checklist (priority order)
 
 ### P0 — Make Connect use workers at all
 
-1. **Wire Connect SQL → `plan_distributed` + `run_stages`** when workers are configured;
+1. [x] **Wire Connect SQL → `plan_distributed` + `run_stages`** when workers are configured;
    fall back to local `Engine::sql` on `Unsupported`.
-2. **Inject worker endpoints into the driver** (`WEFT_WORKERS` or DNS membership).
-3. **K8s wiring**: headless Service for worker StatefulSet; NetworkPolicy allowing
+2. [x] **Inject worker endpoints into the driver** (`WEFT_WORKERS` + `WEFT_WORKER_SERVICE` DNS).
+3. [x] **K8s wiring**: headless Service for worker StatefulSet; NetworkPolicy allowing
    driver↔worker Arrow Flight (`50561`) inside the cluster namespace.
-4. **Same catalog on workers**: workers must load `WEFT_CATALOG_CONF` / Glue like the driver
-   (today `weft worker` starts an empty engine unless `--data` is passed).
+4. [x] **Same catalog on workers**: workers load `WEFT_CATALOG_CONF` / Glue like the driver.
 
 ### P0 — Parallel scans (otherwise N workers each read the full table)
 
-5. **File-list sharding** for Glue/Parquet: partition the active file list by
+5. [x] **File-list sharding** for Glue/Parquet: partition the active file list by
    `worker_index / worker_count` so each worker scans a disjoint shard.
-6. **Replicated vs sharded table policy**: small dims replicated; facts sharded
-   (matches `plan_distributed`'s broadcast-join model).
+6. [x] **Replicated vs sharded table policy**: small dims replicated via
+   `WEFT_REPLICATED_TABLES` (platform default covers TPC-H/DS dims).
 
 ### P1 — TPC-DS / Photon-class plan coverage
 
-7. Shuffle joins between **two sharded** tables (auto-derive, not hand-built tests only).
-8. Multi-stage DAGs (join chains, TPC-H Q5 / TPC-DS shape).
-9. Windows, subqueries, `HAVING`, ungrouped aggregates, set ops.
-10. Shuffle spill + `do_exchange` streaming (MVP has no spill).
+7. [x] Shuffle joins between **two sharded** tables (auto-derive single equijoin + agg).
+8. [ ] Multi-stage DAGs (join chains, TPC-H Q5 / TPC-DS shape).
+9. [~] Windows, subqueries, `HAVING`, ungrouped aggregates, set ops.
+   (`HAVING` + ungrouped/global aggregates supported; windows/subqueries/set ops not.)
+10. [ ] Shuffle spill + `do_exchange` streaming (MVP has no spill).
 
 ### P1 — Cluster semantics
 
-11. `K8sMembership` (EndpointSlice / DNS-SRV) instead of static `WEFT_WORKERS`.
-12. Autoscaling that tracks query parallelism (not idle Flight pods).
-13. Fault retry / speculative tasks.
+11. [x] `DnsMembership` / `WEFT_WORKER_SERVICE` (headless Service A records) instead of
+    static `WEFT_WORKERS` only. (`WEFT_WORKERS` remains as fallback.)
+12. [ ] Autoscaling that tracks query parallelism (not idle Flight pods).
+13. [ ] Fault retry / speculative tasks.
 
 ### P2 — Benchmark honesty
 
-14. Site / harness must label runs **single-node** until P0 items land and a
-    multi-worker SF run is re-measured.
-15. Time-gate methodology only after distributed path is the default for `/api/sql`.
+14. [x] Site / harness must label runs **single-node** until a multi-worker SF run is
+    re-measured on the distributed path.
+15. [ ] Time-gate methodology only after distributed path is the default for `/api/sql`
+    and SF100 is re-run with workers > 0.
 
 ## Comparable engines (what “done” looks like)
 
-| Capability | EMR Spark | Photon | Lakesail | Weft today (`/api/sql`) |
-|------------|-----------|--------|----------|-------------------------|
-| Multi-executor scan | yes | yes | yes | **no** (driver local) |
-| Shuffle across nodes | yes | yes | yes | CLI MVP only |
-| Complex TPC-DS plans distributed | yes | yes | yes | **no** |
-| Catalog + object storage on all executors | yes | yes | yes | driver only |
+| Capability | EMR Spark | Photon | Lakesail | Weft `/api/sql` (this branch) |
+|------------|-----------|--------|----------|-------------------------------|
+| Multi-executor scan | yes | yes | yes | **yes** (file-list shard + workers) |
+| Shuffle across nodes | yes | yes | yes | **yes** (Flight; no spill yet) |
+| Complex TPC-DS plans distributed | yes | yes | yes | **partial** (fallback local) |
+| Catalog + object storage on all executors | yes | yes | yes | **yes** |
 
-## Immediate next commits
+## Deploy checklist before SF100 re-run
 
-1. Platform: worker Service + Flight NetworkPolicy + `WEFT_WORKERS` on driver.
-2. Engine: Connect tries distributed when `WEFT_WORKERS` is set; else local.
-3. Workers: bootstrap same catalogs as driver.
-4. Scan sharding for Glue/Parquet file lists (blocks real speedups).
+1. Ship `weft` images with Connect distributed path + loom file sharding.
+2. Ship `weft-platform` orchestrator with worker Service, Flight NetworkPolicy,
+   `WEFT_WORKERS` / `WEFT_WORKER_SERVICE` / `WEFT_WORKER_COUNT` / `WEFT_REPLICATED_TABLES`.
+3. Create cluster with `worker_min=worker_max=N` (N>1), confirm driver env and worker
+   shard logs (`applied file-list shard`).
+4. Re-measure TPC-H/DS SF100; only then update site numbers as distributed.

@@ -22,6 +22,8 @@ datafusion = "54"
 # 0.13 line DataFusion pulls so the `ObjectStore` trait/types unify; `aws` adds the S3 client + the
 # EC2 instance-role (IMDS) credential provider — no static keys.
 object_store = { version = "0.13", features = ["aws"] }
+# File-list sharding streams object-store listings.
+futures = "0.3"
 # Data-parallel aggregation of independent key-hash partitions (the native GROUP BY carve-out).
 rayon = "1"
 # Spark `split(str, regex)` and other regex-based string UDFs (Spark splits on a regex, unlike

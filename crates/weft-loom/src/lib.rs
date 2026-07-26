@@ -22,6 +22,7 @@ use datafusion::prelude::SessionContext;
 use weft_common::{Error, Result};
 
 pub mod catalog_bridge;
+pub mod shard;
 
 /// Case-insensitive file→table column matching for catalog-declared schemas (Glue/Hive parity).
 mod schema_adapt;

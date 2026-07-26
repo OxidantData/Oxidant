@@ -252,19 +252,117 @@ async fn auto_derived_broadcast_join() {
 }
 
 #[tokio::test]
-async fn two_sharded_tables_is_rejected() {
-    // Two sharded tables in a join can't be a broadcast join — must be rejected (caller falls back
-    // to single-node / a hand-authored shuffle-join plan).
+async fn two_sharded_tables_auto_shuffle_join() {
+    // Two sharded tables → auto-derived shuffle join + aggregation must match single-node.
+    const G: i64 = 12;
+    let sql = "SELECT d.d_name AS name, COUNT(*) AS c, SUM(t.v) AS sv                FROM t JOIN dim d ON t.k = d.d_key GROUP BY d.d_name";
+
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 200, G)])
+        .unwrap();
+    single.register_batches("dim", vec![dim(G)]).unwrap();
+    let expected = single.sql(sql).await.unwrap();
+
+    fn dim_shard(groups: i64, start: i64, end: i64) -> RecordBatch {
+        let full = dim(groups);
+        let schema = full.schema();
+        let k = full.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let n = full.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut ks = Vec::new();
+        let mut ns = Vec::new();
+        for i in 0..full.num_rows() {
+            let kv = k.value(i);
+            if kv >= start && kv < end {
+                ks.push(kv);
+                ns.push(n.value(i));
+            }
+        }
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ks)),
+                Arc::new(Int64Array::from(ns)),
+            ],
+        )
+        .unwrap()
+    }
+
+    let (p0, p1) = (50631u16, 50632u16);
+    let e0 = Arc::new(Engine::new());
+    e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
+    e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)]).unwrap();
+    let e1 = Arc::new(Engine::new());
+    e1.register_batches("t", vec![batch(100, 200, G)]).unwrap();
+    e1.register_batches("dim", vec![dim_shard(G, G / 2, G)]).unwrap();
+    tokio::spawn(async move {
+        let _ = serve_worker(p0, e0).await;
+    });
+    tokio::spawn(async move {
+        let _ = serve_worker(p1, e1).await;
+    });
+    let cluster = Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ]);
+
+    let dq = plan_distributed(&single, sql, &[])
+        .await
+        .expect("plan_distributed should auto-derive the shuffle join");
+    assert!(
+        dq.stages.len() >= 3,
+        "shuffle join should produce multi-stage DAG, got {}",
+        dq.stages.len()
+    );
+    let mut gathered = None;
+    for _ in 0..150 {
+        if let Ok(b) = run_stages(&cluster, &dq.stages).await {
+            gathered = Some(b);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let actual = gathered.expect("distributed shuffle join never succeeded");
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "auto-derived shuffle join must equal single-node"
+    );
+}
+
+#[tokio::test]
+async fn three_sharded_tables_is_rejected() {
     let single = Engine::new();
     single
         .register_batches("t", vec![batch(0, 60, 12)])
         .unwrap();
     single.register_batches("dim", vec![dim(12)]).unwrap();
+    single
+        .register_batches("dim2", vec![dim(12)])
+        .unwrap();
     let err = plan_distributed(
         &single,
-        "SELECT d.d_name AS name, COUNT(*) AS c FROM t JOIN dim d ON t.k = d.d_key GROUP BY d.d_name",
-        &[], // nothing replicated -> both t and dim are sharded
+        "SELECT d.d_name AS name, COUNT(*) AS c          FROM t JOIN dim d ON t.k = d.d_key JOIN dim2 d2 ON t.k = d2.d_key          GROUP BY d.d_name",
+        &[],
     )
     .await;
-    assert!(err.is_err(), "two sharded tables must be rejected");
+    assert!(err.is_err(), "three sharded tables must be rejected");
+}
+
+#[tokio::test]
+async fn global_aggregation_auto_distributes() {
+    let sql = "SELECT SUM(v) AS sv, COUNT(*) AS c FROM t";
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 300, 12)])
+        .unwrap();
+    let expected = single.sql(sql).await.unwrap();
+
+    let c2 = two_workers(50641).await;
+    let actual = run_auto(&c2, &single, sql).await;
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "global aggregation must equal single-node"
+    );
 }

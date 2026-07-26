@@ -34,6 +34,11 @@ pub fn hash_partition(
     if batches.is_empty() {
         return Ok(out);
     }
+    // Empty key list = global gather: every row lands on partition 0 (ungrouped aggregates).
+    if key_cols.is_empty() {
+        out[0].extend(batches.iter().cloned());
+        return Ok(out);
+    }
 
     // One converter for the key columns; the row bytes are an order/value-faithful encoding.
     let key_fields: Vec<SortField> = key_cols
