@@ -13,7 +13,8 @@ name: CI
 # over, and the four caches evicted each other against the 10 GB per-repo Actions cache cap.
 # `build-test` is the only writer; the rest set `save-if: false`. A shared key with several
 # writers does not work -- GitHub lets exactly one job reserve a key, so they race and the
-# job that happens to finish first defines what everyone restores next run.
+# job that happens to finish first defines what everyone restores next run. `parity` is the
+# one job left out of the sharing; see the note above its cache step.
 on:
   push:
     branches: [main]
@@ -163,10 +164,15 @@ jobs:
         run: |
           rustup show
           rustc --version && cargo --version
+      # Deliberately NOT on the shared workspace cache. weft-parity depends only on weft-loom
+      # (+ datafusion), so it resolves a narrower feature set than the whole-workspace build and
+      # cannot reuse those artifacts — pointed at the shared cache it re-compiled datafusion from
+      # scratch and went from 2 min to 20 min, making it the critical path. Its own small,
+      # exactly-matching cache is worth the extra entry.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace
-          save-if: "false" # build-test writes this cache
+          key: spark-parity
+          cache-on-failure: "true"
       - name: Build weft-parity
         run: cargo build -p weft-spark-compat --bin weft-parity
       - name: Ratchet against parity/baseline.json
