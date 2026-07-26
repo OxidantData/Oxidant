@@ -20,6 +20,7 @@ datafusion-proto = "54"  # serialize physical-plan fragments shipped in the Flig
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 futures = "0.3"
 serde_json = "1"
+tracing = "0.1"
 
 [features]
 default = []

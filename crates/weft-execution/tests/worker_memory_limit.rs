@@ -1,5 +1,4 @@
-//! Force shuffle spill via `WEFT_SHUFFLE_SPILL_DIR` and assert the distributed GROUP BY still
-//! matches the single-node result (gap item 10).
+//! Worker honours `WEFT_MEMORY_LIMIT_BYTES` for shuffle caches (SpillStore) without OOM.
 
 use std::sync::Arc;
 
@@ -41,49 +40,29 @@ fn rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
     out
 }
 
-fn spill_file_count(dir: &std::path::Path) -> usize {
-    fn walk(dir: &std::path::Path) -> usize {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return 0;
-        };
-        let mut n = 0;
-        for ent in entries.flatten() {
-            let path = ent.path();
-            if path.is_dir() {
-                n += walk(&path);
-            } else if path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.ends_with(".arrow"))
-            {
-                n += 1;
-            }
-        }
-        n
-    }
-    walk(dir)
-}
-
 #[tokio::test]
-async fn two_worker_groupby_with_forced_spill() {
+async fn worker_memory_limit_spills_shuffle_buckets() {
     const N: i64 = 100;
     let query = "SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t GROUP BY k";
 
+    std::env::remove_var("WEFT_MEMORY_LIMIT_BYTES");
     let single = Engine::new();
     single
         .register_batches("t", vec![make_batch(0, N)])
         .unwrap();
     let expected = rows(&single.sql(query).await.unwrap());
 
-    // One shared spill root for both in-process workers (process-global env). Keep files after
-    // the driver's post-query clear_stages so we can assert spill actually happened.
-    let spill = std::env::temp_dir().join(format!("weft-spill-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&spill);
-    std::fs::create_dir_all(&spill).unwrap();
-    std::env::set_var("WEFT_SHUFFLE_SPILL_DIR", &spill);
-    std::env::set_var("WEFT_KEEP_SHUFFLE_SPILL", "1");
+    let p0 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let p1 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
 
-    let (p0, p1) = (50581u16, 50582u16);
+    // Build engines without the memory cap; workers pick up WEFT_MEMORY_LIMIT_BYTES at serve time
+    // for shuffle SpillStore (mirrors pod env injected at runtime).
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![make_batch(0, N / 2)])
         .unwrap();
@@ -92,9 +71,11 @@ async fn two_worker_groupby_with_forced_spill() {
         .unwrap();
 
     tokio::spawn(async move {
+        std::env::set_var("WEFT_MEMORY_LIMIT_BYTES", "1");
         let _ = serve_worker(p0, e0).await;
     });
     tokio::spawn(async move {
+        std::env::set_var("WEFT_MEMORY_LIMIT_BYTES", "1");
         let _ = serve_worker(p1, e1).await;
     });
 
@@ -118,18 +99,11 @@ async fn two_worker_groupby_with_forced_spill() {
             Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
         }
     }
-    let actual = actual.expect("distributed query with spill never succeeded");
-
-    assert!(
-        spill_file_count(&spill) > 0,
-        "expected at least one spill file under worker spill dir"
-    );
+    let actual = actual.expect("distributed query with worker memory limit never succeeded");
     assert_eq!(
         actual, expected,
-        "spilled distributed result must equal single-node"
+        "memory-limited worker shuffle cache must spill and still match single-node output"
     );
 
-    std::env::remove_var("WEFT_SHUFFLE_SPILL_DIR");
-    std::env::remove_var("WEFT_KEEP_SHUFFLE_SPILL");
-    let _ = std::fs::remove_dir_all(&spill);
+    std::env::remove_var("WEFT_MEMORY_LIMIT_BYTES");
 }

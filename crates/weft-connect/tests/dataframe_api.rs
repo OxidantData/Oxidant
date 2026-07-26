@@ -19,6 +19,7 @@ async fn boot(port: u16) -> SparkConnectServiceClient<Channel> {
     tokio::spawn(async move {
         let _ = serve(ServerConfig {
             port,
+            ui_port: None,
             ..Default::default()
         })
         .await;

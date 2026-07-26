@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 weft-common = { workspace = true }
+weft-execution = { workspace = true }
 weft-orchestrator = { path = "../weft-orchestrator", features = ["k8s"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }

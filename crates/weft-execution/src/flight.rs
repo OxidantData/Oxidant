@@ -66,21 +66,42 @@ pub struct Worker {
 impl Worker {
     /// Wrap an engine as a worker.
     pub fn new(engine: Arc<Engine>) -> Self {
+        let spill = SpillStore::from_env();
+        if let Some(bytes) = std::env::var("WEFT_MEMORY_LIMIT_BYTES")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            eprintln!(
+                "Weft worker memory budget: WEFT_MEMORY_LIMIT_BYTES={bytes} (DataFusion spill pool + shuffle threshold)"
+            );
+        }
         Self {
             engine,
             stage_outputs: Arc::new(Mutex::new(HashMap::new())),
-            spill: SpillStore::from_env(),
+            spill,
             task_slots: worker_task_slots(),
             active_tasks: Arc::new(Mutex::new(0)),
             last_task_status: Arc::new(Mutex::new(None)),
         }
     }
 
+    /// Whether shuffle spilling is active on this worker.
+    pub fn spill_enabled(&self) -> bool {
+        self.spill.is_some()
+    }
+
     fn clear_stages(&self) {
+        // Tests may set `WEFT_KEEP_SHUFFLE_SPILL=1` to inspect spill files after the query;
+        // production always clears on-disk buckets with the in-memory stage cache.
+        let keep_spill = std::env::var("WEFT_KEEP_SHUFFLE_SPILL")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         if let Some(spill) = &self.spill {
-            let guard = self.stage_outputs.lock().expect("stage cache poisoned");
-            for stage_id in guard.keys() {
-                spill.clear_stage(*stage_id);
+            if !keep_spill {
+                let guard = self.stage_outputs.lock().expect("stage cache poisoned");
+                for stage_id in guard.keys() {
+                    spill.clear_stage(*stage_id);
+                }
             }
         }
         self.stage_outputs
@@ -266,13 +287,13 @@ impl Worker {
         batches
     }
 
-    /// Append one pushed shuffle partition to the stage cache so future pull-based
+    /// Append one pushed shuffle batch to the stage cache so future pull-based
     /// `ShuffleReadTicket`s observe the same data.
-    fn cache_pushed_partition(
+    fn cache_append_batch(
         &self,
         header: ShuffleExchangeHeader,
         schema: SchemaRef,
-        batches: Vec<RecordBatch>,
+        batch: RecordBatch,
     ) -> Result<()> {
         let mut guard = self.stage_outputs.lock().expect("stage cache poisoned");
         match guard.get_mut(&header.stage_id) {
@@ -283,11 +304,11 @@ impl Worker {
                         header.stage_id, header.partition_id
                     )));
                 }
-                cache.append_partition(
+                cache.append_batch(
                     existing_schema.clone(),
                     header.stage_id,
                     header.partition_id,
-                    batches,
+                    batch,
                     self.spill.as_ref(),
                 )
             }
@@ -296,7 +317,7 @@ impl Worker {
                     schema.clone(),
                     header.stage_id,
                     header.partition_id,
-                    batches,
+                    vec![batch],
                     self.spill.as_ref(),
                 )?;
                 guard.insert(header.stage_id, (schema, cache));
@@ -332,6 +353,7 @@ impl FlightService for Worker {
                 .map_err(|e| Status::internal(e.to_string()))?,
             protocol::Ticket::Stage(t) => {
                 let _slot = self.try_acquire_task_slot()?;
+                crate::fault_inject::maybe_fault_exit(&t);
                 self.run_stage(t).await?
             }
             protocol::Ticket::ShuffleRead(r) => self.read_shuffle(r),
@@ -413,8 +435,9 @@ impl FlightService for Worker {
         unimpl("list_actions")
     }
     /// Streaming shuffle exchange. The first frame is a metadata-only exchange header
-    /// (`stage_id` + `partition_id`), followed by normal Arrow IPC FlightData frames. The received
-    /// batches are appended into the same stage cache used by pull-based `ShuffleReadTicket`.
+    /// (`stage_id` + `partition_id`), followed by normal Arrow IPC FlightData frames. Each
+    /// received batch is appended into the stage cache as it arrives (gRPC flow control provides
+    /// backpressure); spill policy matches pull-based [`ShuffleReadTicket`] caching.
     async fn do_exchange(
         &self,
         request: Request<Streaming<FlightData>>,
@@ -436,18 +459,37 @@ impl FlightService for Worker {
         let mut rb = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
             stream.map_err(|s| FlightError::Tonic(Box::new(s))),
         );
-        let mut batches = Vec::new();
+        let mut schema: Option<SchemaRef> = None;
+        let mut saw_batch = false;
         while let Some(batch) = rb.next().await {
-            batches.push(batch.map_err(|e| Status::internal(format!("flight decode: {e}")))?);
+            let batch = batch.map_err(|e| Status::internal(format!("flight decode: {e}")))?;
+            saw_batch = true;
+            let batch_schema = batch.schema();
+            if let Some(existing) = &schema {
+                if existing.as_ref() != batch_schema.as_ref() {
+                    return Err(Status::invalid_argument(format!(
+                        "do_exchange schema mismatch for stage {} partition {}",
+                        header.stage_id, header.partition_id
+                    )));
+                }
+            } else {
+                schema = Some(batch_schema);
+            }
+            self.cache_append_batch(header, schema.clone().unwrap(), batch)
+                .map_err(|e| Status::internal(e.to_string()))?;
         }
-        let schema = batches
-            .first()
-            .map(|b| b.schema())
-            .or_else(|| rb.schema().cloned())
-            .ok_or_else(|| Status::invalid_argument("do_exchange missing Arrow schema"))?;
-
-        self.cache_pushed_partition(header, schema, batches)
+        if !saw_batch {
+            let schema = rb
+                .schema()
+                .cloned()
+                .ok_or_else(|| Status::invalid_argument("do_exchange missing Arrow schema"))?;
+            self.cache_append_batch(
+                header,
+                schema.clone(),
+                RecordBatch::new_empty(schema.clone()),
+            )
             .map_err(|e| Status::internal(e.to_string()))?;
+        }
 
         let ack = FlightData {
             flight_descriptor: None,
@@ -789,8 +831,16 @@ fn is_pull_retryable(err: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weft_loom::arrow::array::Int32Array;
+    use weft_loom::arrow::array::{Int32Array, Int64Array};
     use weft_loom::arrow::datatypes::{DataType, Field};
+
+    #[test]
+    fn worker_enables_shuffle_spill_from_memory_limit_env() {
+        std::env::set_var("WEFT_MEMORY_LIMIT_BYTES", "4096");
+        let worker = Worker::new(Arc::new(Engine::new()));
+        assert!(worker.spill_enabled());
+        std::env::remove_var("WEFT_MEMORY_LIMIT_BYTES");
+    }
 
     #[test]
     fn heartbeat_payload_parses_slots() {
@@ -1014,5 +1064,113 @@ mod tests {
             .unwrap();
         assert_eq!(values.value(0), 10);
         assert_eq!(values.value(2), 30);
+    }
+
+    fn int64_batch(schema: &SchemaRef, start: i64, len: i64) -> RecordBatch {
+        let values: Vec<i64> = (start..start + len).collect();
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))]).unwrap()
+    }
+
+    async fn push_batches_stream(
+        endpoint: String,
+        stage_id: u32,
+        partition_id: u32,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> std::result::Result<(), weft_common::Error> {
+        let header = exchange_header_frame(stage_id, partition_id);
+        let mut frames = vec![header];
+        let input = futures::stream::iter(batches.into_iter().map(Ok::<_, FlightError>));
+        let mut encoded = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(input);
+        while let Some(frame) = encoded.next().await {
+            frames.push(
+                frame.map_err(|e| weft_common::Error::Execution(format!("flight encode: {e}")))?,
+            );
+        }
+
+        let mut client = connect_flight(endpoint).await?;
+        let mut stream = client
+            .do_exchange(futures::stream::iter(frames))
+            .await
+            .map_err(|e| weft_common::Error::Execution(format!("do_exchange: {}", e.message())))?
+            .into_inner();
+        while let Some(item) = stream.next().await {
+            item.map_err(|e| weft_common::Error::Execution(format!("do_exchange stream: {e}")))?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn do_exchange_streams_large_partition_under_memory_budget() {
+        let spill_dir =
+            std::env::temp_dir().join(format!("weft-xchg-spill-{}", std::process::id()));
+        std::env::remove_var("WEFT_SHUFFLE_SPILL_DIR");
+        let _ = std::fs::remove_dir_all(&spill_dir);
+
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let engine = Arc::new(Engine::new());
+        tokio::spawn(async move {
+            // Small shuffle cache budget forces spill while batches stream in.
+            std::env::set_var("WEFT_SHUFFLE_SPILL_BYTES", "8192");
+            let _ = serve_worker(port, engine).await;
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+
+        // ~100 rows per batch × 80 batches — far above 8 KiB if buffered entirely in memory.
+        let batches: Vec<RecordBatch> = (0..80)
+            .map(|i| int64_batch(&schema, i * 100, 100))
+            .collect();
+        let expected_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+        let mut pushed = false;
+        for _ in 0..50 {
+            match push_batches_stream(endpoint.clone(), 501, 0, schema.clone(), batches.clone())
+                .await
+            {
+                Ok(()) => {
+                    pushed = true;
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+        assert!(pushed, "worker did not accept streaming do_exchange push");
+
+        let pulled = pull_bucket(endpoint, 501, 0).await.unwrap();
+        assert_eq!(
+            pulled.iter().map(|b| b.num_rows()).sum::<usize>(),
+            expected_rows
+        );
+
+        // SpillStore creates a temp dir when only WEFT_SHUFFLE_SPILL_BYTES is set; verify spill
+        // files exist under the default weft-shuffle-spill prefix.
+        let parent = std::env::temp_dir().join("weft-shuffle-spill");
+        let spilled = std::fs::read_dir(&parent)
+            .map(|entries| {
+                entries.flatten().any(|ent| {
+                    std::fs::read_dir(ent.path())
+                        .map(|sub| {
+                            sub.flatten().any(|f| {
+                                f.file_name()
+                                    .to_string_lossy()
+                                    .starts_with("stage_501_part_0")
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        assert!(
+            spilled,
+            "expected spilled shuffle file for stage 501 partition 0"
+        );
+
+        std::env::remove_var("WEFT_SHUFFLE_SPILL_BYTES");
     }
 }

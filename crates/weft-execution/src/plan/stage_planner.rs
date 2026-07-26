@@ -45,7 +45,8 @@ use weft_common::{Error, Result};
 use weft_loom::Engine;
 
 use super::shape_extensions::{
-    ensure_subquery_tables_replicated, reject_explicit_unsupported, try_union_all, try_window,
+    ensure_subquery_tables_replicated, reject_explicit_unsupported, try_non_aggregate,
+    try_union_all, try_window,
 };
 use crate::driver::StageDef;
 
@@ -68,21 +69,42 @@ pub struct DistributedQuery {
 /// every table but one is replicated (so exactly one table is sharded). Joins between two or more
 /// *sharded* tables are auto-derived as a left-deep shuffle-join chain when each join is a single
 /// equijoin.
+/// Derive a distributed plan from an already-built logical plan.
+pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result<DistributedQuery> {
+    if let Some(dq) = try_union_all(lp, replicated)? {
+        return Ok(dq);
+    }
+    if let Some(dq) = try_window(lp, replicated)? {
+        return Ok(dq);
+    }
+    if let Some(dq) = try_non_aggregate(lp, replicated)? {
+        return Ok(dq);
+    }
+    reject_explicit_unsupported(lp)?;
+    let peeled = peel(lp)?;
+    aggregation_stages_for(&peeled, replicated)
+}
+
+/// SQL convenience wrapper around [`plan_distributed_logical`].
+///
+/// When the shape-based planner cannot lower the query, falls back to a single
+/// [`ExchangeMode::Forward`] stage via [`super::physical_splitter::plan_forward`] (Sail-like
+/// coverage: any locally-plannable SQL still gets a distributed job graph on one worker that
+/// has a full view of the tables). Planner coverage / ratchets must call
+/// [`plan_distributed_logical`] directly so Forward does not inflate the supported count.
 pub async fn plan_distributed(
     engine: &Engine,
     sql: &str,
     replicated: &[&str],
 ) -> Result<DistributedQuery> {
     let lp = engine.logical_plan(sql).await?;
-    if let Some(dq) = try_union_all(&lp, replicated)? {
-        return Ok(dq);
+    match plan_distributed_logical(&lp, replicated) {
+        Ok(dq) => Ok(dq),
+        Err(Error::Unsupported(_)) => {
+            crate::plan::physical_splitter::plan_forward(engine, sql).await
+        }
+        Err(e) => Err(e),
     }
-    if let Some(dq) = try_window(&lp, replicated)? {
-        return Ok(dq);
-    }
-    reject_explicit_unsupported(&lp)?;
-    let peeled = peel(&lp)?;
-    aggregation_stages_for(&peeled, replicated)
 }
 
 /// The top of the plan above the aggregate: the output projection (if any) plus the trailing
@@ -126,10 +148,14 @@ pub(crate) fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
                 node = &p.input;
             }
             LogicalPlan::Filter(f) => {
-                // Filter directly above Aggregate is HAVING.
-                having = Some(f.predicate.as_ref());
-                node = &f.input;
+                if matches!(f.input.as_ref(), LogicalPlan::Aggregate(_)) {
+                    having = Some(f.predicate.as_ref());
+                    node = &f.input;
+                } else {
+                    node = f.input.as_ref();
+                }
             }
+            LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
             LogicalPlan::Aggregate(agg) => {
                 return Ok(Peeled {
                     projection,

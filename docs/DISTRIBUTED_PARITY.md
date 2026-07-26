@@ -1,5 +1,9 @@
 # Distributed execution gaps vs EMR / Photon / Lakesail
 
+Gap analysis. For the closing checklist — every remaining item with an acceptance test,
+such that finishing all of them earns the "Weft distributes the load" claim — see
+[DISTRIBUTED_DONE.md](DISTRIBUTED_DONE.md).
+
 **Status (2026-07-25):** Connect SQL can fan out to workers when `WEFT_WORKERS` or
 `WEFT_WORKER_SERVICE` is set. File-list sharding + replicated dims make multi-worker
 scans disjoint. Full TPC-DS plan coverage is still incomplete — unsupported shapes
@@ -58,22 +62,32 @@ Fallback: unsupported plan shapes → Engine::sql on driver
    Q5 with dims replicated uses the broadcast path.
 9. [x] Windows, subqueries, `HAVING`, ungrouped aggregates, set ops.
     Supported: `HAVING`, ungrouped/global aggs, scalar/IN/EXISTS subqueries **over replicated
-    tables only** (sharded-table subqueries rejected), `UNION ALL` of distributable aggs, and
-    narrow aggregate windows (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG` with `PARTITION BY` over one sharded
-    table — shuffle by partition key, compute locally).
+    tables only** (sharded-table subqueries rejected), `UNION ALL` of distributable aggs, narrow
+    aggregate windows (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG` with `PARTITION BY` over one sharded table),
+    and **non-aggregate scan/gather** (`try_non_aggregate`: one sharded table scatter + global
+    `ORDER BY`/`LIMIT`; all-replicated scans use Forward).
     Still Unsupported (explicit messages → local fallback): global windows (no `PARTITION BY`),
     ranking / `ORDER BY` windows (`ROW_NUMBER`, …), `UNION` (distinct), correlated/self subqueries
-    over sharded tables.
-10. [~] Shuffle spill + `do_exchange` streaming.
+    over sharded tables, and **CTE + cross-join shells** where grouped CTEs must be merged across
+    shards before the outer select (TPC-DS Q1/Q4/Q11 pattern — ~27 queries in the 2026-07-25 histogram).
+10. [x] Shuffle spill + `do_exchange` streaming.
     Ticket/cache path spills stage buckets to disk when over budget (`WEFT_SHUFFLE_SPILL_BYTES`,
-    default 256 MiB; files under `WEFT_SPILL_DIR` or temp). Streaming `do_exchange` still stubbed.
+    default 256 MiB; files under `WEFT_SPILL_DIR` or temp). Streaming `do_exchange` appends
+    incrementally with the same spill budget (`do_exchange_streams_large_partition_under_memory_budget`).
 
 ### P1 — Cluster semantics
 
 11. [x] `DnsMembership` / `WEFT_WORKER_SERVICE` (headless Service A records) instead of
     static `WEFT_WORKERS` only. (`WEFT_WORKERS` remains as fallback.)
-12. [ ] Autoscaling that tracks query parallelism (not idle Flight pods).
-13. [ ] Fault retry / speculative tasks.
+12. [x] Autoscaling that tracks query parallelism (not idle Flight pods).
+    See `weft-orchestrator` / `weft-execution` `autoscale` modules and gateway wiring.
+13. [x] Fault retry / speculative tasks — implemented in
+    [`scheduler.rs`](../crates/weft-execution/src/scheduler.rs); proven by
+    `cargo test -p weft-cli --test cli_fault_tolerance` (worker kill via
+    `WEFT_FAULT_EXIT_*`, restart, retry / lineage recompute). **Speculation default stays off**
+    (`WEFT_SPECULATIVE` unset → false): fault recovery is covered by retries + alternate worker +
+    upstream recompute without duplicating stage work; the 5 s straggler timeout would add latency
+    on fast queries and we have no measured SF/TPC straggler win yet on this path.
 
 ### P2 — Benchmark honesty
 

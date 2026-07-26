@@ -31,13 +31,13 @@ pub trait ClusterBackend: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WorkerBounds {
-    desired: u32,
-    min: u32,
-    max: u32,
+pub(crate) struct WorkerBounds {
+    pub(crate) desired: u32,
+    pub(crate) min: u32,
+    pub(crate) max: u32,
 }
 
-fn worker_bounds(spec: &ClusterSpec) -> WorkerBounds {
+pub(crate) fn worker_bounds(spec: &ClusterSpec) -> WorkerBounds {
     let min = spec.min_workers.max(1);
     let max = spec.max_workers.max(min);
     let desired = spec.worker_count.max(min).min(max);
@@ -170,6 +170,17 @@ impl K8sBackend {
 
     fn worker_deployment_yaml(spec: &ClusterSpec) -> String {
         let bounds = worker_bounds(spec);
+        let memory_env = spec
+            .worker_memory_limit_bytes
+            .map(|bytes| {
+                format!(
+                    r#"        env:
+        - name: WEFT_MEMORY_LIMIT_BYTES
+          value: "{bytes}"
+"#
+                )
+            })
+            .unwrap_or_default();
         format!(
             r#"apiVersion: apps/v1
 kind: Deployment
@@ -178,6 +189,7 @@ metadata:
   namespace: {ns}
   annotations:
     weft.dev/idle-policy: "gateway deletes the cluster namespace after idle timeout"
+    weft.dev/scale-policy: "parallelism-driven via gateway scale API and weft_pending_stage_tasks external metric"
 spec:
   replicas: {replicas}
   selector:
@@ -192,7 +204,7 @@ spec:
       - name: worker
         image: {image}
         args: ["worker", "--port", "{port}"]
-        ports:
+{memory_env}        ports:
         - containerPort: {port}
 ---
 apiVersion: v1
@@ -213,6 +225,8 @@ kind: HorizontalPodAutoscaler
 metadata:
   name: weft-worker
   namespace: {ns}
+  annotations:
+    weft.dev/scale-policy: "query parallelism (weft_pending_stage_tasks), not idle CPU"
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -221,19 +235,25 @@ spec:
   minReplicas: {min}
   maxReplicas: {max}
   metrics:
-  - type: Resource
-    resource:
-      name: cpu
+  - type: External
+    external:
+      metric:
+        name: weft_pending_stage_tasks
+        selector:
+          matchLabels:
+            cluster_id: {cluster_id}
       target:
-        type: Utilization
-        averageUtilization: 70
+        type: AverageValue
+        averageValue: "1"
 "#,
             ns = spec.namespace,
             replicas = bounds.desired,
             image = spec.worker_image,
             port = spec.worker_port,
+            memory_env = memory_env,
             min = bounds.min,
             max = bounds.max,
+            cluster_id = spec.cluster_id,
         )
     }
 }
@@ -309,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn hpa_manifest_contains_replicas() {
+    fn hpa_manifest_uses_parallelism_external_metric() {
         let spec = ClusterSpec::local_demo("abc", 2);
         let yaml = K8sBackend::worker_deployment_yaml(&spec);
         assert!(yaml.contains("HorizontalPodAutoscaler"));
@@ -318,6 +338,18 @@ mod tests {
         assert!(yaml.contains("minReplicas: 2"));
         assert!(yaml.contains("maxReplicas: 8"));
         assert!(yaml.contains("weft.dev/idle-policy"));
+        assert!(yaml.contains("weft_pending_stage_tasks"));
+        assert!(yaml.contains("cluster_id: abc"));
+        assert!(!yaml.contains("averageUtilization"));
+    }
+
+    #[test]
+    fn worker_manifest_includes_memory_limit_env() {
+        let mut spec = ClusterSpec::local_demo("abc", 2);
+        spec.worker_memory_limit_bytes = Some(26_000_000_000);
+        let yaml = K8sBackend::worker_deployment_yaml(&spec);
+        assert!(yaml.contains("WEFT_MEMORY_LIMIT_BYTES"));
+        assert!(yaml.contains("26000000000"));
     }
 
     #[test]

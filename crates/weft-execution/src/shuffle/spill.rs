@@ -1,8 +1,8 @@
 //! Spill hash-shuffle buckets to local disk when in-memory caching would OOM.
 //!
-//! Activated when `WEFT_SHUFFLE_SPILL_DIR` is set, or when `WEFT_MEMORY_LIMIT_BYTES` is set and
-//! cached shuffle data reaches that threshold. Buckets are written as Arrow IPC stream files keyed
-//! by `(stage_id, partition_id)`.
+//! Activated when `WEFT_SHUFFLE_SPILL_DIR` is set, or when `WEFT_SHUFFLE_SPILL_BYTES` /
+//! `WEFT_MEMORY_LIMIT_BYTES` is set and cached shuffle data reaches that threshold. Buckets are
+//! written as Arrow IPC stream files keyed by `(stage_id, partition_id)`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,11 +28,13 @@ impl SpillStore {
     /// Open a spill directory when shuffle spilling is configured.
     ///
     /// `WEFT_SHUFFLE_SPILL_DIR` forces every cached shuffle bucket to disk. When only
-    /// `WEFT_MEMORY_LIMIT_BYTES` is set, a per-worker temporary directory is created and buckets
-    /// spill once their estimated Arrow memory footprint reaches that limit.
+    /// `WEFT_SHUFFLE_SPILL_BYTES` or `WEFT_MEMORY_LIMIT_BYTES` is set, a per-worker temporary
+    /// directory is created and buckets spill once their estimated Arrow memory footprint reaches
+    /// that limit (`WEFT_SHUFFLE_SPILL_BYTES` takes precedence).
     pub fn from_env() -> Option<Self> {
         let configured_root = non_empty_env("WEFT_SHUFFLE_SPILL_DIR").map(PathBuf::from);
-        let memory_limit_bytes = non_empty_env("WEFT_MEMORY_LIMIT_BYTES")
+        let memory_limit_bytes = non_empty_env("WEFT_SHUFFLE_SPILL_BYTES")
+            .or_else(|| non_empty_env("WEFT_MEMORY_LIMIT_BYTES"))
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0);
 
@@ -41,7 +43,13 @@ impl SpillStore {
         }
 
         let force_spill = configured_root.is_some();
-        let root = configured_root.unwrap_or_else(default_spill_root);
+        // Always nest under a unique per-Worker subdirectory so concurrent in-process
+        // workers (tests) — or multiple SpillStore::from_env calls — never clobber the
+        // same `stage_*_part_*.arrow` paths.
+        let root = match configured_root {
+            Some(base) => unique_spill_subdir(base),
+            None => default_spill_root(),
+        };
         let store = Self {
             root,
             force_spill,
@@ -58,10 +66,26 @@ impl SpillStore {
 
     /// Whether a bucket set should be spilled now.
     pub fn should_spill(&self, buckets: &[Vec<RecordBatch>]) -> bool {
-        self.force_spill
-            || self
-                .memory_limit_bytes
-                .is_some_and(|limit| estimated_bucket_bytes(buckets) >= limit)
+        self.force_spill || self.should_spill_bytes(estimated_bucket_bytes(buckets))
+    }
+
+    /// Whether an estimated in-memory footprint should spill now.
+    pub fn should_spill_bytes(&self, bytes: usize) -> bool {
+        self.force_spill || self.memory_limit_bytes.is_some_and(|limit| bytes >= limit)
+    }
+
+    /// Append one batch to a spilled partition (read–extend–write).
+    pub fn append_batch_to_bucket(
+        &self,
+        stage_id: u32,
+        partition: u32,
+        schema: SchemaRef,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let mut merged = self.read_bucket(stage_id, partition).unwrap_or_default();
+        merged.push(batch.clone());
+        self.write_bucket(stage_id, partition, schema, &merged)?;
+        Ok(())
     }
 
     /// Write `batches` for one bucket; returns the file path.
@@ -163,6 +187,39 @@ impl BucketCache {
         Self::maybe_spill(schema, buckets, stage_id, spill)
     }
 
+    /// Append one batch to a partition, spilling when the configured threshold is reached.
+    pub fn append_batch(
+        &mut self,
+        schema: SchemaRef,
+        stage_id: u32,
+        partition: u32,
+        batch: RecordBatch,
+        spill: Option<&SpillStore>,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(buckets) => {
+                let idx = partition as usize;
+                if buckets.len() <= idx {
+                    buckets.resize_with(idx + 1, Vec::new);
+                }
+                buckets[idx].push(batch);
+
+                if let Some(store) = spill {
+                    if store.should_spill(buckets) {
+                        let owned = std::mem::take(buckets);
+                        *self = Self::spill_buckets(schema, owned, stage_id, store)?;
+                    }
+                }
+                Ok(())
+            }
+            Self::Spilled {
+                schema: spilled_schema,
+                spill,
+                stage_id,
+            } => spill.append_batch_to_bucket(*stage_id, partition, spilled_schema.clone(), &batch),
+        }
+    }
+
     /// Append batches to one partition, converting an in-memory cache to spilled if the configured
     /// memory threshold is reached.
     pub fn append_partition(
@@ -257,11 +314,13 @@ fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
-fn default_spill_root() -> PathBuf {
+fn unique_spill_subdir(base: PathBuf) -> PathBuf {
     let seq = SPILL_STORE_SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir()
-        .join("weft-shuffle-spill")
-        .join(format!("{}-{seq}", std::process::id()))
+    base.join(format!("{}-{seq}", std::process::id()))
+}
+
+fn default_spill_root() -> PathBuf {
+    unique_spill_subdir(std::env::temp_dir().join("weft-shuffle-spill"))
 }
 
 fn estimated_bucket_bytes(buckets: &[Vec<RecordBatch>]) -> usize {
@@ -291,6 +350,28 @@ mod tests {
     fn batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
+    }
+
+    #[test]
+    fn append_batch_spills_when_threshold_reached() {
+        let root = default_spill_root();
+        let store = SpillStore {
+            root: root.clone(),
+            force_spill: false,
+            memory_limit_bytes: Some(1),
+        };
+        std::fs::create_dir_all(&root).unwrap();
+
+        let b = batch();
+        let schema = b.schema();
+        let mut cache = BucketCache::from_memory(vec![Vec::new()]);
+        cache
+            .append_batch(schema.clone(), 12, 0, b, Some(&store))
+            .expect("append");
+        assert!(matches!(cache, BucketCache::Spilled { .. }));
+        assert!(!store.read_bucket(12, 0).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

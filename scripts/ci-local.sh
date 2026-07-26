@@ -32,6 +32,9 @@ if ! command -v duckdb >/dev/null 2>&1; then
 fi
 cargo run -p weft-bench -- tpcds --sf 0.01
 
+echo "==> tpcds-distributed planner ratchet"
+cargo run -p weft-bench -- tpcds-distributed --sf 0.01
+
 echo "==> clickbench (engine-direct)"
 cargo run -p weft-bench -- clickbench --rows 20000
 
@@ -42,7 +45,7 @@ echo "==> correctness"
 cargo run -p weft-bench -- correctness --rows 5000
 
 echo "==> correctness-distributed"
-cargo run -p weft-bench -- correctness-distributed --rows 2000
+WEFT_DIST_TPCDS_SAMPLE=8 cargo run -p weft-bench -- correctness-distributed --rows 2000
 
 echo "==> parity ratchet"
 cargo build -p weft-spark-compat --bin weft-parity

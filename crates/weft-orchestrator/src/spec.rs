@@ -13,6 +13,9 @@ pub struct ClusterSpec {
     pub max_workers: u32,
     pub worker_image: String,
     pub connect_image: String,
+    /// DataFusion spill pool + shuffle memory threshold for each worker pod.
+    #[serde(default)]
+    pub worker_memory_limit_bytes: Option<u64>,
 }
 
 impl ClusterSpec {
@@ -26,6 +29,7 @@ impl ClusterSpec {
             max_workers: workers.saturating_mul(4).max(workers),
             worker_image: "weft/worker:latest".into(),
             connect_image: "weft/connect-server:latest".into(),
+            worker_memory_limit_bytes: None,
         }
     }
 

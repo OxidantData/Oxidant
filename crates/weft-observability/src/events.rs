@@ -70,6 +70,11 @@ pub enum ExecutionEvent {
         old_partitions: u32,
         new_partitions: u32,
     },
+    /// Distributed planner rejected the query; Connect fell back to local execution.
+    DistributedFallback {
+        operation_id: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

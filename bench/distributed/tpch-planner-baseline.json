@@ -1,0 +1,29 @@
+{
+  "notes": "TPC-H distributed planner ratchet (lineitem sharded, sf=0.01). Informational twin; not a blocking CI gate.",
+  "suite": "tpch",
+  "query_count": 22,
+  "supported": 11,
+  "supported_queries": [
+    "Q1",
+    "Q3",
+    "Q5",
+    "Q6",
+    "Q7",
+    "Q8",
+    "Q9",
+    "Q10",
+    "Q12",
+    "Q14",
+    "Q19"
+  ],
+  "reason_histogram": {
+    "need exactly one sharded base table (others replicated), found 0 sharded among [\"customer\", \"…": 1,
+    "need exactly one sharded base table (others replicated), found 0 sharded among [\"customer\"]": 1,
+    "need exactly one sharded base table (others replicated), found 0 sharded among [\"partsupp\", \"…": 2,
+    "sharded table `lineitem` scanned 2× (self-join / subquery)": 1,
+    "sharded table `lineitem` scanned 3× (self-join / subquery)": 1,
+    "sharded table `lineitem` scanned multiple times": 1,
+    "subquery over `lineitem` is only safe when that table is replicated": 1,
+    "unsupported top-level plan node `Cross Join:`": 3
+  }
+}

@@ -34,6 +34,9 @@ if [[ "$DISTRIBUTED_SF100" == "1" ]]; then
   WORKER_MIN="${WORKER_MIN:-2}"
   WORKER_MAX="${WORKER_MAX:-2}"
   PATCH_FAT="${PATCH_FAT:-0}"
+  # Honest distributed numbers: unsupported plan shapes must fail, not silently
+  # fall back to a single-node driver run (DISTRIBUTED_DONE D-0.2 / D-4.3).
+  export WEFT_DISTRIBUTED_STRICT="${WEFT_DISTRIBUTED_STRICT:-1}"
 else
   MACHINE="${MACHINE:-eks/r6g.8xlarge-spot-bench}"
   SIZE="${SIZE:-xlarge}"   # use xlarge until gateway image knows "bench"; then SIZE=bench
@@ -74,6 +77,11 @@ done
 
 NS="weft-cl-${CLUSTER_ID}"
 DRV="$(kubectl -n "$NS" get deploy -o jsonpath='{.items[0].metadata.name}')"
+
+if [[ "$DISTRIBUTED_SF100" == "1" ]]; then
+  echo "[gate] setting WEFT_DISTRIBUTED_STRICT=1 on driver ${NS}/${DRV}"
+  kubectl -n "$NS" set env deploy/"$DRV" WEFT_DISTRIBUTED_STRICT=1
+fi
 
 if [[ "$PATCH_FAT" == "1" ]]; then
   echo "[gate] raising ResourceQuota + patching driver ${NS}/${DRV} → ${FAT_CPU} CPU / ${FAT_MEM}"
