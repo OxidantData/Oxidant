@@ -177,6 +177,30 @@ mod tests {
     }
 
     #[test]
+    fn fresh_cached_boundary_at_refresh_margin_is_not_fresh() {
+        let p = AssumeRoleCredentialProvider::new(
+            "arn:aws:iam::123456789012:role/weft-poolctl/analytics".to_string(),
+            None,
+            "us-west-2".to_string(),
+        );
+        let cred = Arc::new(AwsCredential {
+            key_id: "AKIA...".to_string(),
+            secret_key: "secret".to_string(),
+            token: None,
+        });
+        // Predicate is `now + REFRESH_MARGIN < expiry`. Equality at the margin must refresh.
+        *p.cached.write().unwrap() = Some((cred.clone(), SystemTime::now() + REFRESH_MARGIN));
+        assert!(p.fresh_cached().is_none());
+
+        // Just beyond the margin must still be treated as fresh.
+        *p.cached.write().unwrap() = Some((
+            cred,
+            SystemTime::now() + REFRESH_MARGIN + Duration::from_secs(30),
+        ));
+        assert!(p.fresh_cached().is_some());
+    }
+
+    #[test]
     fn default_session_name_is_stable() {
         let p = AssumeRoleCredentialProvider::new(
             "arn:aws:iam::123456789012:role/weft-poolctl/analytics".to_string(),

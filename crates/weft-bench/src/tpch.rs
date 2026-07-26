@@ -354,3 +354,34 @@ fn round_cell(s: &str) -> String {
         Err(_) => s.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_csv_line_honors_quotes_and_escapes() {
+        assert_eq!(parse_csv_line(r#"a,"b,c",d"#), vec!["a", "b,c", "d"]);
+        assert_eq!(
+            parse_csv_line(r#""say ""hi""",x"#),
+            vec![r#"say "hi""#, "x"]
+        );
+        assert_eq!(parse_csv_line("1,2,3"), vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn round_cell_normalizes_numerics_to_scientific() {
+        assert_eq!(round_cell("380456.0"), format!("{:.3e}", 380456.0));
+        assert_eq!(round_cell("380456"), format!("{:.3e}", 380456.0));
+        assert_eq!(round_cell(" 12.5 "), format!("{:.3e}", 12.5));
+        // Non-numeric cells pass through (e.g. nation names).
+        assert_eq!(round_cell("ALGERIA"), "ALGERIA");
+    }
+
+    #[test]
+    fn normalize_text_is_order_independent_after_rounding() {
+        let a = normalize_text("2,380456.0\n1,10\n");
+        let b = normalize_text("1,1.0e1\n2,380456\n");
+        assert_eq!(a, b);
+    }
+}

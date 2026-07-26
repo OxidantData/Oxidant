@@ -451,3 +451,36 @@ fn finish_with_aggregate(
         finalize_sql: build_finalize(p)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flat_col_uses_double_underscore_separator() {
+        assert_eq!(flat_col("lineitem", "l_orderkey"), "lineitem__l_orderkey");
+        assert_eq!(flat_col("o", "orderkey"), "o__orderkey");
+    }
+
+    #[test]
+    fn flat_key_index_finds_projected_join_key() {
+        let flats = vec![
+            "orders__o_orderkey".into(),
+            "orders__o_custkey".into(),
+            "lineitem__l_orderkey".into(),
+        ];
+        assert_eq!(flat_key_index(&flats, "lineitem", "l_orderkey").unwrap(), 2);
+        assert_eq!(flat_key_index(&flats, "orders", "o_orderkey").unwrap(), 0);
+    }
+
+    #[test]
+    fn flat_key_index_errors_when_join_key_missing() {
+        let flats = vec!["orders__o_orderkey".into()];
+        let err = flat_key_index(&flats, "lineitem", "l_orderkey").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lineitem__l_orderkey") && msg.contains("missing"),
+            "got: {msg}"
+        );
+    }
+}

@@ -852,4 +852,15 @@ mod tests {
         assert!(sql[0].physical_plan.contains("[distributed fallback]"));
         assert!(sql[0].physical_plan.contains("global window unsupported"));
     }
+
+    #[test]
+    fn truncate_keeps_short_strings_and_ellipsizes_long_ones() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 5), "hello");
+        // max chars including the ellipsis character — take max-1 then append …
+        assert_eq!(truncate("hello world", 6), "hello…");
+        assert_eq!(truncate("abc", 1), "…");
+        // Multi-byte chars count as one character each (max includes the ellipsis).
+        assert_eq!(truncate("日本語テスト", 4), "日本語…");
+    }
 }

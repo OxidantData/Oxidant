@@ -242,3 +242,55 @@ pub fn emit_worker_task(
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{AppStateStore, OperationState};
+    use std::sync::Arc;
+
+    #[test]
+    fn tracker_success_path_records_job_stage_and_task() {
+        let store: SharedStore = Arc::new(AppStateStore::new());
+        let mut tracker = QueryTracker::begin(store.clone(), "op-success", "SELECT 1");
+        tracker.begin_local_stage("local", 1);
+        tracker.task_started(0, 1, "local");
+        tracker.task_finished(0, 1, "local", 5, 1, 0, 0);
+        tracker.finish_success(1);
+
+        assert_eq!(
+            store.operation_state("op-success"),
+            Some(OperationState::Succeeded)
+        );
+        let jobs = store.list_jobs(None);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "SUCCEEDED");
+        assert_eq!(jobs[0].job_id, tracker.job_id());
+
+        let stages = store.list_stages(None, false);
+        assert!(!stages.is_empty());
+        assert_eq!(stages[0].status, "COMPLETE");
+    }
+
+    #[test]
+    fn tracker_error_path_marks_job_and_stage_failed() {
+        let store: SharedStore = Arc::new(AppStateStore::new());
+        let mut tracker = QueryTracker::begin(store.clone(), "op-fail", "SELECT boom");
+        tracker.begin_stage(2, "hash-agg", 2);
+        tracker.finish_error("boom: divide by zero");
+
+        assert_eq!(
+            store.operation_state("op-fail"),
+            Some(OperationState::Failed)
+        );
+        let jobs = store.list_jobs(None);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "FAILED");
+        assert_eq!(jobs[0].num_failed_stages, 1);
+
+        let stages = store.list_stages(Some("FAILED"), false);
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].stage_id, 2);
+        assert_eq!(stages[0].name, "hash-agg");
+    }
+}

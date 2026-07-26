@@ -1663,6 +1663,32 @@ pub async fn serve_instance(service: WeftService, port: u16) -> Result<()> {
 }
 
 #[cfg(test)]
+mod scan_query_tests {
+    use super::is_scan_query;
+
+    #[test]
+    fn is_scan_query_accepts_row_returning_statements() {
+        assert!(is_scan_query("SELECT 1"));
+        assert!(is_scan_query("  with cte AS (SELECT 1) SELECT * FROM cte"));
+        assert!(is_scan_query("VALUES (1), (2)"));
+        assert!(is_scan_query("TABLE t"));
+    }
+
+    #[test]
+    fn is_scan_query_rejects_catalog_and_ddl() {
+        // These go through engine.sql interceptors and must not take the metrics path.
+        assert!(!is_scan_query("SHOW TABLES"));
+        assert!(!is_scan_query("DESCRIBE t"));
+        assert!(!is_scan_query("EXPLAIN SELECT 1"));
+        assert!(!is_scan_query("CREATE TABLE t AS SELECT 1"));
+        assert!(!is_scan_query("INSERT INTO t VALUES (1)"));
+        assert!(!is_scan_query(""));
+        // Leading '(' is treated as a delimiter, so parenthesized SELECT is not a scan query.
+        assert!(!is_scan_query("(SELECT 1)"));
+    }
+}
+
+#[cfg(test)]
 mod view_materialize_tests {
     use super::*;
     use weft_loom::arrow::array::{Array, Int64Array, StringViewArray};

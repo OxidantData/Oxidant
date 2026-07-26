@@ -1380,4 +1380,73 @@ mod tests {
             "error should name the already-registered role"
         );
     }
+
+    #[test]
+    fn local_path_accepts_file_uri_forms_and_bare_paths() {
+        // RFC `file:///abs` and Hive Metastore's single-slash `file:/abs`.
+        assert_eq!(
+            local_path("file:///tmp/delta/table").unwrap(),
+            "/tmp/delta/table"
+        );
+        assert_eq!(
+            local_path("file:/tmp/delta/table").unwrap(),
+            "/tmp/delta/table"
+        );
+        assert_eq!(local_path("/tmp/delta/table").unwrap(), "/tmp/delta/table");
+    }
+
+    #[test]
+    fn local_path_rejects_non_file_schemes() {
+        let err = local_path("s3://bucket/path").expect_err("s3 must not look local");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("s3://") || msg.contains("`s3://`"),
+            "error should name the scheme: {msg}"
+        );
+        assert!(local_path("hdfs://nn/path").is_err());
+    }
+
+    #[test]
+    fn split_partition_schema_preserves_partition_order_and_drops_file_fields() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Int32, true),
+            Field::new("year", DataType::Int32, false),
+        ]));
+        let (file_schema, part_cols) =
+            split_partition_schema(&schema, &["year".into(), "region".into()]);
+
+        assert_eq!(
+            file_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "amount"]
+        );
+        // Partition columns must follow the *declared partition order*, not schema field order.
+        assert_eq!(
+            part_cols
+                .iter()
+                .map(|(n, dt)| (n.as_str(), dt.clone()))
+                .collect::<Vec<_>>(),
+            vec![("year", DataType::Int32), ("region", DataType::Utf8),]
+        );
+    }
+
+    #[test]
+    fn split_partition_schema_skips_partition_names_missing_from_schema() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let (file_schema, part_cols) =
+            split_partition_schema(&schema, &["region".into(), "missing".into()]);
+
+        assert_eq!(file_schema.fields().len(), 1);
+        assert_eq!(file_schema.field(0).name(), "id");
+        assert_eq!(part_cols.len(), 1);
+        assert_eq!(part_cols[0].0, "region");
+    }
 }

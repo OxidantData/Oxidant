@@ -45,6 +45,15 @@ pub fn maybe_fault_exit(ticket: &StageTicket) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serialize env-mutating tests — `WEFT_FAULT_EXIT_STAGE` is process-global.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     fn ticket(produce: bool) -> StageTicket {
         StageTicket {
@@ -62,11 +71,26 @@ mod tests {
 
     #[test]
     fn stage_filter_matches_producer_and_consumer() {
+        let _guard = env_lock();
         std::env::set_var("WEFT_FAULT_EXIT_STAGE", "producer");
         assert!(stage_matches_filter(&ticket(true)));
         assert!(!stage_matches_filter(&ticket(false)));
         std::env::set_var("WEFT_FAULT_EXIT_STAGE", "consumer");
         assert!(!stage_matches_filter(&ticket(true)));
+        assert!(stage_matches_filter(&ticket(false)));
+        std::env::remove_var("WEFT_FAULT_EXIT_STAGE");
+    }
+
+    #[test]
+    fn unknown_or_missing_stage_filter_matches_all_tickets() {
+        let _guard = env_lock();
+        std::env::remove_var("WEFT_FAULT_EXIT_STAGE");
+        assert!(stage_matches_filter(&ticket(true)));
+        assert!(stage_matches_filter(&ticket(false)));
+
+        // Unrecognized filter values intentionally match everything (fail-open for tests).
+        std::env::set_var("WEFT_FAULT_EXIT_STAGE", "any");
+        assert!(stage_matches_filter(&ticket(true)));
         assert!(stage_matches_filter(&ticket(false)));
         std::env::remove_var("WEFT_FAULT_EXIT_STAGE");
     }

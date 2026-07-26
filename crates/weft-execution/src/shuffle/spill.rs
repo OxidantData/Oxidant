@@ -352,6 +352,20 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
     }
 
+    fn batch_with(values: Vec<i64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
+    }
+
+    fn store_at(root: PathBuf, force_spill: bool, memory_limit_bytes: Option<usize>) -> SpillStore {
+        std::fs::create_dir_all(&root).unwrap();
+        SpillStore {
+            root,
+            force_spill,
+            memory_limit_bytes,
+        }
+    }
+
     #[test]
     fn append_batch_spills_when_threshold_reached() {
         let root = default_spill_root();
@@ -377,12 +391,7 @@ mod tests {
     #[test]
     fn memory_limit_policy_spills_when_threshold_reached() {
         let root = default_spill_root();
-        let store = SpillStore {
-            root: root.clone(),
-            force_spill: false,
-            memory_limit_bytes: Some(1),
-        };
-        std::fs::create_dir_all(&root).unwrap();
+        let store = store_at(root.clone(), false, Some(1));
 
         let b = batch();
         let schema = b.schema();
@@ -390,6 +399,137 @@ mod tests {
             BucketCache::maybe_spill(schema, vec![vec![b]], 11, Some(&store)).expect("spill");
         assert!(matches!(cache, BucketCache::Spilled { .. }));
         assert!(!store.read_bucket(11, 0).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn below_memory_limit_stays_in_memory() {
+        let root = default_spill_root();
+        // Large limit: a tiny Int64 batch must not trigger spill.
+        let store = store_at(root.clone(), false, Some(usize::MAX));
+
+        let b = batch();
+        let schema = b.schema();
+        let cache =
+            BucketCache::maybe_spill(schema, vec![vec![b]], 1, Some(&store)).expect("cache");
+        assert!(matches!(cache, BucketCache::Memory(_)));
+        assert!(!store.path(1, 0).exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn force_spill_writes_even_without_memory_limit() {
+        let root = default_spill_root();
+        let store = store_at(root.clone(), true, None);
+
+        let b = batch();
+        let schema = b.schema();
+        let cache = BucketCache::from_partition(schema, 7, 0, vec![b.clone()], Some(&store))
+            .expect("force spill");
+        assert!(matches!(cache, BucketCache::Spilled { .. }));
+
+        let got = cache.read_partition(0);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].num_rows(), b.num_rows());
+        assert_eq!(
+            got[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn append_partition_crosses_threshold_and_spills() {
+        let root = default_spill_root();
+        // Threshold just above one batch so the first insert stays Memory, second append spills.
+        let one = batch();
+        let one_bytes = estimated_bucket_bytes(&[vec![one.clone()]]);
+        let store = store_at(root.clone(), false, Some(one_bytes + 1));
+
+        let schema = one.schema();
+        let mut cache =
+            BucketCache::maybe_spill(schema.clone(), vec![vec![one]], 3, Some(&store)).unwrap();
+        assert!(matches!(cache, BucketCache::Memory(_)));
+
+        cache
+            .append_partition(schema, 3, 0, vec![batch_with(vec![4, 5])], Some(&store))
+            .unwrap();
+        assert!(matches!(cache, BucketCache::Spilled { .. }));
+
+        let rows: Vec<i64> = cache
+            .read_partition(0)
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(rows, vec![1, 2, 3, 4, 5]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn append_onto_spilled_partition_merges_on_disk() {
+        let root = default_spill_root();
+        let store = store_at(root.clone(), true, None);
+        let first = batch_with(vec![10, 20]);
+        let schema = first.schema();
+        let mut cache =
+            BucketCache::from_partition(schema.clone(), 9, 1, vec![first], Some(&store)).unwrap();
+        assert!(matches!(cache, BucketCache::Spilled { .. }));
+
+        cache
+            .append_partition(schema, 9, 1, vec![batch_with(vec![30])], Some(&store))
+            .unwrap();
+
+        let rows: Vec<i64> = cache
+            .read_partition(1)
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(rows, vec![10, 20, 30]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clear_stage_removes_spill_files_and_empty_read_is_empty() {
+        let root = default_spill_root();
+        let store = store_at(root.clone(), true, None);
+        let b = batch();
+        store.write_bucket(42, 0, b.schema(), &[b]).expect("write");
+        assert!(!store.read_bucket(42, 0).unwrap().is_empty());
+
+        store.clear_stage(42);
+        assert!(store.read_bucket(42, 0).unwrap().is_empty());
+        // Missing partition with no prior write also returns empty (not an error).
+        assert!(store.read_bucket(42, 99).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }

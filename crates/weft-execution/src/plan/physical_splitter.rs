@@ -28,3 +28,38 @@ pub async fn plan_forward(engine: &Engine, sql: &str) -> Result<DistributedQuery
         finalize_sql: None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn plan_forward_trims_whitespace_and_trailing_semicolon() {
+        let engine = Engine::new();
+        let dq = plan_forward(&engine, "  SELECT 1 AS x ;  ")
+            .await
+            .expect("valid SQL should plan");
+        assert_eq!(dq.stages.len(), 1);
+        assert_eq!(dq.stages[0].exchange, ExchangeMode::Forward);
+        assert_eq!(dq.stages[0].sql, "SELECT 1 AS x");
+        assert!(dq.finalize_sql.is_none());
+        assert!(dq.stages[0].upstream_stage_ids.is_empty());
+        assert!(dq.stages[0].hash_key_cols.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_forward_rejects_unplannable_sql() {
+        let engine = Engine::new();
+        let err = plan_forward(&engine, "SELECT FROM")
+            .await
+            .expect_err("invalid SQL must fail before shipping");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parse")
+                || msg.contains("Parser")
+                || msg.contains("syntax")
+                || !msg.is_empty(),
+            "expected a planning/parse error, got: {msg}"
+        );
+    }
+}

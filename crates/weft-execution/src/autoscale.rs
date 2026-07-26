@@ -137,6 +137,15 @@ pub fn autoscale_target() -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serialize env-mutating tests — `WEFT_AUTOSCALE` / gateway vars are process-global.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     fn cluster(workers: usize, partitions: u32) -> Cluster {
         let mut c = Cluster::new(
@@ -184,5 +193,49 @@ mod tests {
             stage_num_tasks(&stage, std::slice::from_ref(&stage), &cluster(4, 4)),
             1
         );
+    }
+
+    #[test]
+    fn autoscale_enabled_accepts_one_and_true() {
+        let _guard = env_lock();
+        std::env::remove_var("WEFT_AUTOSCALE");
+        assert!(!autoscale_enabled());
+        std::env::set_var("WEFT_AUTOSCALE", "1");
+        assert!(autoscale_enabled());
+        std::env::set_var("WEFT_AUTOSCALE", "TRUE");
+        assert!(autoscale_enabled());
+        std::env::set_var("WEFT_AUTOSCALE", "yes");
+        assert!(!autoscale_enabled());
+        std::env::remove_var("WEFT_AUTOSCALE");
+    }
+
+    #[test]
+    fn autoscale_target_requires_both_url_and_cluster_id() {
+        let _guard = env_lock();
+        std::env::remove_var("WEFT_GATEWAY_URL");
+        std::env::remove_var("WEFT_CLUSTER_ID");
+        assert!(autoscale_target().is_none());
+
+        std::env::set_var("WEFT_GATEWAY_URL", "http://gateway:8080/");
+        assert!(autoscale_target().is_none());
+
+        std::env::set_var("WEFT_CLUSTER_ID", "demo");
+        let (url, id) = autoscale_target().expect("both set");
+        assert_eq!(url, "http://gateway:8080");
+        assert_eq!(id, "demo");
+
+        std::env::remove_var("WEFT_GATEWAY_URL");
+        std::env::remove_var("WEFT_CLUSTER_ID");
+    }
+
+    #[test]
+    fn output_stage_task_count_uses_partition_count() {
+        let stages = vec![
+            StageDef::new(0, "SELECT 1", vec![], vec![0]),
+            StageDef::new(1, "SELECT 2", vec![0], vec![]),
+        ];
+        let c = cluster(3, 16);
+        assert_eq!(stage_num_tasks(&stages[0], &stages, &c), 3);
+        assert_eq!(stage_num_tasks(&stages[1], &stages, &c), 16);
     }
 }

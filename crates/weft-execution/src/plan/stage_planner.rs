@@ -1161,4 +1161,66 @@ mod sanitize_tests {
         assert!(got.contains("`part`.p_partkey"));
         assert!(!got.contains(r#""volume""#));
     }
+
+    #[test]
+    fn sanitize_rewrites_pg_style_interval_literals() {
+        // Unparser form that broke TPC-H Q6 distributed stage SQL under Databricks dialect.
+        assert_eq!(
+            sanitize_generated_sql(
+                "SELECT * FROM t WHERE d < (CAST('1994-01-01' AS DATE) + INTERVAL '12 MONS')"
+            ),
+            "SELECT * FROM t WHERE d < (CAST('1994-01-01' AS DATE) + INTERVAL '12' MONTH)"
+        );
+        assert_eq!(
+            sanitize_generated_sql("x + INTERVAL '90 DAYS'"),
+            "x + INTERVAL '90' DAY"
+        );
+        // Already-legal form is left alone.
+        assert_eq!(
+            sanitize_generated_sql("x + INTERVAL '1' YEAR"),
+            "x + INTERVAL '1' YEAR"
+        );
+        // Content inside string literals is not rewritten.
+        assert_eq!(
+            sanitize_generated_sql("SELECT 'INTERVAL ''12 MONS''' AS s"),
+            "SELECT 'INTERVAL ''12 MONS''' AS s"
+        );
+    }
+
+    #[test]
+    fn sanitize_rewrites_signed_and_abbreviated_interval_units() {
+        assert_eq!(
+            sanitize_generated_sql("x - INTERVAL '-90 DAYS'"),
+            "x - INTERVAL '-90' DAY"
+        );
+        assert_eq!(
+            sanitize_generated_sql("x + Interval '2 YR'"),
+            "x + Interval '2' YEAR"
+        );
+        assert_eq!(
+            sanitize_generated_sql("x + INTERVAL '3 MON'"),
+            "x + INTERVAL '3' MONTH"
+        );
+        assert_eq!(
+            sanitize_generated_sql("x + INTERVAL '4 HRS'"),
+            "x + INTERVAL '4' HOUR"
+        );
+        assert_eq!(
+            sanitize_generated_sql("x + INTERVAL '5 MINS'"),
+            "x + INTERVAL '5' MINUTE"
+        );
+        assert_eq!(
+            sanitize_generated_sql("x + INTERVAL '6 SECS'"),
+            "x + INTERVAL '6' SECOND"
+        );
+    }
+
+    #[test]
+    fn sanitize_leaves_multi_unit_pg_interval_bodies_alone() {
+        // Multi-unit combined forms are not safely rewritable — leave the Unparser output as-is.
+        assert_eq!(
+            sanitize_generated_sql("x + INTERVAL '1 YEAR 2 MONS'"),
+            "x + INTERVAL '1 YEAR 2 MONS'"
+        );
+    }
 }
