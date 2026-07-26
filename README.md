@@ -10,8 +10,10 @@ protocol, so unmodified PySpark and Spark SQL clients connect with a one-line UR
 ## Status
 
 Pre-alpha scaffold. The workspace compiles but does not yet execute queries. See
-[`docs/architecture.md`](docs/architecture.md) for the full plan and
-[`docs/ISSUES.md`](docs/ISSUES.md) for the first three issues.
+[`docs/architecture.md`](docs/architecture.md) for the full plan,
+[`docs/TODOS.md`](docs/TODOS.md) / [`docs/CODEMAP.md`](docs/CODEMAP.md) for open work and
+ownership maps, [`docs/AGENT_INDEXING.md`](docs/AGENT_INDEXING.md) for CodeGraph/GitNexus,
+and [`docs/ISSUES.md`](docs/ISSUES.md) for issue history.
 
 ## Architecture (one screen)
 
