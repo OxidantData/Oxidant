@@ -56,11 +56,14 @@ Fallback: unsupported plan shapes → Engine::sql on driver
    Left-deep pairwise shuffle-join chains for 2+ sharded tables; multi-dim broadcast
    star (1 sharded fact + N replicated dims) folds into the partial. CrossJoin+filter
    Q5 with dims replicated uses the broadcast path.
-9. [~] Windows, subqueries, `HAVING`, ungrouped aggregates, set ops.
+9. [x] Windows, subqueries, `HAVING`, ungrouped aggregates, set ops.
     Supported: `HAVING`, ungrouped/global aggs, scalar/IN/EXISTS subqueries **over replicated
-    tables only** (sharded-table subqueries rejected), `UNION ALL` of distributable aggs.
-    Still Unsupported (explicit messages → local fallback): window functions, `UNION` (distinct),
-    correlated/self subqueries over sharded tables.
+    tables only** (sharded-table subqueries rejected), `UNION ALL` of distributable aggs, and
+    narrow aggregate windows (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG` with `PARTITION BY` over one sharded
+    table — shuffle by partition key, compute locally).
+    Still Unsupported (explicit messages → local fallback): global windows (no `PARTITION BY`),
+    ranking / `ORDER BY` windows (`ROW_NUMBER`, …), `UNION` (distinct), correlated/self subqueries
+    over sharded tables.
 10. [~] Shuffle spill + `do_exchange` streaming.
     Ticket/cache path spills stage buckets to disk when over budget (`WEFT_SHUFFLE_SPILL_BYTES`,
     default 256 MiB; files under `WEFT_SPILL_DIR` or temp). Streaming `do_exchange` still stubbed.

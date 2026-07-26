@@ -711,20 +711,49 @@ async fn union_distinct_is_rejected() {
 }
 
 #[tokio::test]
-async fn window_functions_are_rejected() {
+async fn partition_by_sum_window_auto_distributes() {
+    assert_matches(
+        50695,
+        "SELECT k, SUM(v) OVER (PARTITION BY k) AS sv FROM t",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn window_without_partition_by_is_rejected() {
     let single = Engine::new();
     single
         .register_batches("t", vec![batch(0, 60, 12)])
         .unwrap();
     let err = plan_distributed(
         &single,
-        "SELECT k, SUM(v) OVER (PARTITION BY k) AS sv FROM t",
+        "SELECT SUM(v) OVER () AS sv FROM t",
         &[],
     )
     .await;
-    let msg = format!("{}", err.expect_err("windows must be rejected"));
+    let msg = format!("{}", err.expect_err("global window must be rejected"));
     assert!(
-        msg.contains("window"),
-        "expected explicit window Unsupported, got: {msg}"
+        msg.contains("PARTITION BY") || msg.contains("window"),
+        "expected PARTITION BY / window rejection, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn row_number_window_is_rejected() {
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 60, 12)])
+        .unwrap();
+    let err = plan_distributed(
+        &single,
+        "SELECT k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn FROM t",
+        &[],
+    )
+    .await;
+    let msg = format!("{}", err.expect_err("ROW_NUMBER must be rejected"));
+    assert!(
+        msg.contains("window") || msg.contains("ORDER BY") || msg.contains("ROW_NUMBER"),
+        "expected ranking window rejection, got: {msg}"
     );
 }

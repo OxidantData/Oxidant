@@ -6,15 +6,286 @@
 //! - **Subquery safety**: IN / EXISTS / scalar subqueries are only legal over **replicated**
 //!   tables (broadcast-correct); sharded-table subqueries stay rejected by scan counting.
 //! - **UNION ALL** of two (or more) distributable aggregations.
-//! - Explicit **Unsupported** messages for window functions and `UNION` (distinct).
+//! - **Narrow windows**: aggregate `OVER (PARTITION BY …)` over one sharded table (shuffle by
+//!   partition key, then compute locally). Ranking / global windows stay Unsupported.
+//! - Explicit **Unsupported** messages for unsupported window shapes and `UNION` (distinct).
 
-use datafusion::logical_expr::{Expr, LogicalPlan, Union};
+use std::collections::HashMap;
+
+use datafusion::logical_expr::expr::{WindowFunction, WindowFunctionDefinition};
+use datafusion::logical_expr::{Expr, LogicalPlan, Union, Window};
+use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
 
-use super::stage_planner::{aggregation_stages_for, peel, DistributedQuery};
+use super::stage_planner::{
+    aggregation_stages_for, base_tables, column_name, count_table_scans, expr_sql,
+    extract_from_tail, peel, sanitize_generated_sql, DistributedQuery,
+};
 use crate::driver::StageDef;
 
-/// If `lp` is a `UNION ALL` of distributable aggregations (optionally under `ORDER BY` / `LIMIT`),
+/// If `lp` is a distributable aggregate window over one sharded table, lower it; otherwise
+/// `Ok(None)` so the caller falls through (unsupported window shapes return `Err`).
+pub(crate) fn try_window(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<Option<DistributedQuery>> {
+    let Some(p) = peel_window(lp) else {
+        return Ok(None);
+    };
+    Ok(Some(window_stages_for(&p, replicated)?))
+}
+
+/// The top of the plan above a `Window` node: optional projection plus trailing sort/limit.
+pub(crate) struct WindowPeeled<'a> {
+    pub(crate) projection: Option<&'a [Expr]>,
+    pub(crate) sort: Option<&'a [datafusion::logical_expr::SortExpr]>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) window: &'a Window,
+}
+
+fn peel_window(lp: &LogicalPlan) -> Option<WindowPeeled<'_>> {
+    let mut limit = None;
+    let mut sort = None;
+    let mut projection = None;
+    let mut node = lp;
+    loop {
+        match node {
+            LogicalPlan::Limit(l) => {
+                if let Some(Expr::Literal(scalar, _)) = l.fetch.as_deref() {
+                    limit = scalar_as_usize(scalar);
+                }
+                node = l.input.as_ref();
+            }
+            LogicalPlan::Sort(s) => {
+                sort = Some(s.expr.as_slice());
+                node = s.input.as_ref();
+            }
+            LogicalPlan::Projection(p) => {
+                projection = Some(p.expr.as_slice());
+                node = &p.input;
+            }
+            LogicalPlan::Window(w) => {
+                return Some(WindowPeeled {
+                    projection,
+                    sort,
+                    limit,
+                    window: w,
+                });
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn window_stages_for(p: &WindowPeeled<'_>, replicated: &[&str]) -> Result<DistributedQuery> {
+    let w = p.window;
+    if w.window_expr.is_empty() {
+        return Err(Error::Unsupported(
+            "auto-distribute: window plan has no window expressions".into(),
+        ));
+    }
+
+    let tables = base_tables(&w.input);
+    let sharded: Vec<&str> = tables
+        .iter()
+        .filter(|t| !replicated.contains(&t.as_str()))
+        .map(|t| t.as_str())
+        .collect();
+    ensure_subquery_tables_replicated(&w.input, &sharded, replicated)?;
+    if sharded.len() != 1 {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: window over {} sharded tables (need exactly one)",
+            sharded.len()
+        )));
+    }
+    let sharded_name = sharded[0];
+    if count_table_scans(&w.input, sharded_name) > 1 {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: sharded table `{sharded_name}` scanned multiple times under window"
+        )));
+    }
+
+    let mut partition_by: Option<Vec<Expr>> = None;
+    for e in &w.window_expr {
+        let Expr::WindowFunction(wf) = e else {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: non-window expression in window list: {e}"
+            )));
+        };
+        validate_window_func(wf)?;
+        match &partition_by {
+            None => partition_by = Some(wf.params.partition_by.clone()),
+            Some(prev) if prev == &wf.params.partition_by => {}
+            Some(_) => {
+                return Err(Error::Unsupported(
+                    "auto-distribute: mixed PARTITION BY clauses across window functions".into(),
+                ))
+            }
+        }
+    }
+    let partition_by = partition_by.unwrap_or_default();
+    if partition_by.is_empty() {
+        return Err(Error::Unsupported(
+            "auto-distribute: window without PARTITION BY cannot be distributed \
+             (no partition shuffle key) — falling back to local execution"
+                .into(),
+        ));
+    }
+
+    let up = Unparser::default();
+    let part_names: Vec<String> = partition_by
+        .iter()
+        .map(|e| column_name(e))
+        .collect::<Result<_>>()?;
+
+    let input_sql = up
+        .plan_to_sql(&w.input)
+        .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse window input: {e}")))?
+        .to_string();
+    let tail = extract_from_tail(&input_sql)?;
+    let tail = sanitize_generated_sql(&tail);
+
+    let mut select_cols = part_names.clone();
+    for field in w.input.schema().fields() {
+        let name = field.name();
+        if !part_names.iter().any(|p| p == name) {
+            select_cols.push(name.clone());
+        }
+    }
+    let partial_sql = sanitize_generated_sql(&format!(
+        "SELECT {} {tail}",
+        select_cols.join(", ")
+    ));
+    let hash_key_cols: Vec<u32> = (0..part_names.len() as u32).collect();
+
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for (i, e) in w.window_expr.iter().enumerate() {
+        remap.insert(e.schema_name().to_string(), format!("w{i}"));
+    }
+    let inner = build_window_inner(&up, w, &remap)?;
+    let final_sql = wrap_window_output(p, &inner, &remap)?;
+
+    Ok(DistributedQuery {
+        stages: vec![
+            StageDef {
+                stage_id: 0,
+                sql: partial_sql,
+                upstream_stage_ids: vec![],
+                hash_key_cols,
+            },
+            StageDef {
+                stage_id: 1,
+                sql: final_sql,
+                upstream_stage_ids: vec![0],
+                hash_key_cols: vec![],
+            },
+        ],
+        finalize_sql: build_outer_finalize(p.sort, p.limit)?,
+    })
+}
+
+fn validate_window_func(wf: &WindowFunction) -> Result<()> {
+    let name = match &wf.fun {
+        WindowFunctionDefinition::AggregateUDF(f) => f.name().to_ascii_lowercase(),
+        WindowFunctionDefinition::WindowUDF(f) => f.name().to_ascii_lowercase(),
+    };
+    if !matches!(name.as_str(), "sum" | "count" | "min" | "max" | "avg") {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: window function `{name}` is not supported for distribution \
+             (only SUM/COUNT/MIN/MAX/AVG aggregate windows)"
+        )));
+    }
+    if wf.params.distinct {
+        return Err(Error::Unsupported(
+            "auto-distribute: DISTINCT window aggregates are not supported".into(),
+        ));
+    }
+    if wf.params.filter.is_some() {
+        return Err(Error::Unsupported(
+            "auto-distribute: FILTER on window functions is not supported".into(),
+        ));
+    }
+    if !wf.params.order_by.is_empty() {
+        return Err(Error::Unsupported(
+            "auto-distribute: window ORDER BY / ranking frames are not supported \
+             (only partition-wide aggregate windows)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn build_window_inner(
+    up: &Unparser,
+    w: &Window,
+    _remap: &HashMap<String, String>,
+) -> Result<String> {
+    let mut parts = Vec::new();
+    for field in w.input.schema().fields() {
+        parts.push(field.name().clone());
+    }
+    for (i, e) in w.window_expr.iter().enumerate() {
+        let sql = expr_sql(up, e)?;
+        parts.push(format!("{sql} AS w{i}"));
+    }
+    Ok(format!(
+        "SELECT {} FROM shuffle_input",
+        parts.join(", ")
+    ))
+}
+
+fn wrap_window_output(
+    p: &WindowPeeled<'_>,
+    inner: &str,
+    remap: &HashMap<String, String>,
+) -> Result<String> {
+    let up = Unparser::default();
+    let from_sql = format!("({inner}) AS combined");
+    let select = match p.projection {
+        Some(exprs) => exprs
+            .iter()
+            .map(|e| {
+                let name = output_name(e);
+                let sql = expr_sql(&up, &remap_window_columns(strip_alias(e), remap))?;
+                Ok(format!("{sql} AS \"{name}\""))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(", "),
+        None => "*".to_string(),
+    };
+    Ok(format!("SELECT {select} FROM {from_sql}"))
+}
+
+fn remap_window_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    e.clone()
+        .transform(|node| {
+            if let Expr::Column(c) = &node {
+                if let Some(safe) = remap.get(&c.flat_name()) {
+                    return Ok(Transformed::yes(datafusion::prelude::col(safe)));
+                }
+            }
+            Ok(Transformed::no(node))
+        })
+        .map(|t| t.data)
+        .unwrap_or(e.clone())
+}
+
+fn output_name(e: &Expr) -> String {
+    match e {
+        Expr::Alias(a) => a.name.clone(),
+        Expr::Column(c) => c.name.clone(),
+        other => other.schema_name().to_string(),
+    }
+}
+
+fn strip_alias(e: &Expr) -> &Expr {
+    match e {
+        Expr::Alias(a) => &a.expr,
+        other => other,
+    }
+}
+
 /// lower it; otherwise `Ok(None)` so the caller falls through to the aggregation path.
 pub(crate) fn try_union_all(
     lp: &LogicalPlan,
@@ -49,7 +320,7 @@ pub(crate) fn reject_explicit_unsupported(lp: &LogicalPlan) -> Result<()> {
             LogicalPlan::Window(_) => {
                 return Err(Error::Unsupported(
                     "auto-distribute: window functions are not supported \
-                     (no partitioned-window shuffle yet) — falling back to local execution"
+                     (no PARTITION BY shuffle path matched) — falling back to local execution"
                         .into(),
                 ));
             }
@@ -271,5 +542,77 @@ fn collect_all_tables(lp: &LogicalPlan, out: &mut Vec<String>) {
     }
     for c in lp.inputs() {
         collect_all_tables(c, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use weft_loom::arrow::array::{Int64Array, RecordBatch};
+    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+    use weft_loom::Engine;
+
+    use super::*;
+
+    fn tiny_table() -> RecordBatch {
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![0, 1, 0])),
+                std::sync::Arc::new(Int64Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn plan(sql: &str) -> Result<DistributedQuery> {
+        let engine = Engine::new();
+        engine.register_batches("t", vec![tiny_table()]).unwrap();
+        let lp = engine.logical_plan(sql).await?;
+        try_window(&lp, &[])
+            .and_then(|o| o.ok_or_else(|| Error::Unsupported("not a window plan".into())))
+    }
+
+    #[tokio::test]
+    async fn partition_by_window_plans_two_stages() {
+        let dq = plan("SELECT k, SUM(v) OVER (PARTITION BY k) AS sv FROM t")
+            .await
+            .expect("partitioned window should plan");
+        assert_eq!(dq.stages.len(), 2);
+        assert_eq!(dq.stages[0].hash_key_cols, vec![0]);
+        assert!(dq.stages[0].sql.contains("FROM t"));
+        assert!(dq.stages[1].sql.contains("OVER"));
+    }
+
+    #[tokio::test]
+    async fn global_window_is_rejected() {
+        let engine = Engine::new();
+        engine.register_batches("t", vec![tiny_table()]).unwrap();
+        let lp = engine
+            .logical_plan("SELECT SUM(v) OVER () AS sv FROM t")
+            .await
+            .unwrap();
+        let err = try_window(&lp, &[]).expect_err("no PARTITION BY");
+        let msg = format!("{err}");
+        assert!(msg.contains("PARTITION BY"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn union_distinct_rejected_before_peel() {
+        let engine = Engine::new();
+        engine.register_batches("t", vec![tiny_table()]).unwrap();
+        let lp = engine
+            .logical_plan(
+                "SELECT k, SUM(v) AS sv FROM t GROUP BY k \
+                 UNION SELECT k, SUM(v) AS sv FROM t WHERE v > 1 GROUP BY k",
+            )
+            .await
+            .unwrap();
+        let err = try_union_all(&lp, &[]).expect_err("UNION distinct");
+        let msg = format!("{err}");
+        assert!(msg.contains("UNION"), "got: {msg}");
     }
 }

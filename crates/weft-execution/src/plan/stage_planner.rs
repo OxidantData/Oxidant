@@ -29,10 +29,13 @@
 //! when each join is a single equijoin key.
 //!
 //! Also supported: ungrouped/global aggregates, `HAVING` over the aggregated result,
-//! scalar / IN / EXISTS subqueries **over replicated tables only**, and `UNION ALL` of
-//! distributable aggregations. Window functions and `UNION` (distinct) return an explicit
-//! [`Error::Unsupported`] so the caller falls back to single-node execution. Correlated
-//! subqueries over sharded tables are rejected (not broadcast-safe).
+//! scalar / IN / EXISTS subqueries **over replicated tables only**, `UNION ALL` of
+//! distributable aggregations, and **narrow window** support: re-combinable aggregate
+//! windows (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`) with a non-empty `PARTITION BY` over one
+//! sharded table (hash-shuffle by the partition key, then compute the window locally).
+//! Ranking windows, global windows (no `PARTITION BY`), and `UNION` (distinct) return an
+//! explicit [`Error::Unsupported`] so the caller falls back to single-node execution.
+//! Correlated subqueries over sharded tables are rejected (not broadcast-safe).
 
 use std::collections::HashMap;
 
@@ -42,7 +45,7 @@ use weft_common::{Error, Result};
 use weft_loom::Engine;
 
 use super::shape_extensions::{
-    ensure_subquery_tables_replicated, reject_explicit_unsupported, try_union_all,
+    ensure_subquery_tables_replicated, reject_explicit_unsupported, try_union_all, try_window,
 };
 use crate::driver::StageDef;
 
@@ -72,6 +75,9 @@ pub async fn plan_distributed(
 ) -> Result<DistributedQuery> {
     let lp = engine.logical_plan(sql).await?;
     if let Some(dq) = try_union_all(&lp, replicated)? {
+        return Ok(dq);
+    }
+    if let Some(dq) = try_window(&lp, replicated)? {
         return Ok(dq);
     }
     reject_explicit_unsupported(&lp)?;
@@ -849,7 +855,7 @@ pub(crate) fn expr_sql(up: &Unparser, e: &Expr) -> Result<String> {
 ///
 /// DataFusion's unparser yields `SELECT * FROM …` for a plain scan, but a join of N inputs can
 /// become `SELECT *, *, … FROM …`. We only need the FROM/JOIN/WHERE suffix to splice a new SELECT.
-fn extract_from_tail(input_sql: &str) -> Result<String> {
+pub(crate) fn extract_from_tail(input_sql: &str) -> Result<String> {
     if let Some(rest) = input_sql.strip_prefix("SELECT * ") {
         // Only accept when the remainder starts with FROM (not `*, * FROM`).
         if rest.starts_with("FROM ") || rest.starts_with("from ") {
@@ -972,7 +978,7 @@ fn scalar_as_usize(s: &datafusion::scalar::ScalarValue) -> Option<usize> {
 
 /// Count scans of table `name` anywhere in `lp` — across plan inputs **and** subquery plans nested
 /// in expressions (EXISTS / IN / scalar subqueries), so a correlated subquery over the table counts.
-fn count_table_scans(lp: &LogicalPlan, name: &str) -> usize {
+pub(crate) fn count_table_scans(lp: &LogicalPlan, name: &str) -> usize {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     let mut n = match lp {
         LogicalPlan::TableScan(s) if s.table_name.table() == name => 1,
