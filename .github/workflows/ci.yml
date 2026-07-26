@@ -75,15 +75,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace
-      - uses: taiki-e/install-action@nextest
       - name: Build weft CLI (integration tests in weft-cli spawn the binary)
         run: cargo build -p weft-cli
       - name: local-cluster CLI parse smoke
         run: cargo test -p weft-cli local_cluster_mode_parses --bin weft
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Not nextest. It runs every test in its own process and schedules the whole workspace in
+      # parallel, which the distributed tests cannot take: they each spawn several workers and
+      # bind ports, so on a 4 vCPU runner they oversubscribe and start timing out. Measured here
+      # it took the suite to 2207 s and flaked two_worker_groupby_with_forced_spill and
+      # two_sharded_tables_auto_shuffle_join; cargo test runs the binaries serially and stays
+      # well under that.
       - name: test (workspace)
-        run: cargo nextest run --workspace
+        run: cargo test --workspace
 
   # The TPC-H / TPC-DS / distributed gates used to run at the tail of build-test, which made the
   # critical path the SUM of compiling the workspace and replaying every query suite. They only
