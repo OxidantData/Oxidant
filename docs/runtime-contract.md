@@ -53,8 +53,21 @@ clusters should continue to run one connect-server pod plus an autoscaled worker
 
 - Deploy **one driver pod** + **N worker pods** from the OSS images above.
 - Expose a headless Service for workers (`clusterIP: None`) so `WEFT_WORKER_SERVICE` DNS resolves pod IPs.
-- HPA on worker Deployment (CPU-based or custom metrics); the engine picks up scaled workers on the **next** distributed query via DNS refresh.
+- HPA on worker Deployment using external metric `weft_pending_stage_tasks` (requires a metrics adapter), **or** proactive scale via the gateway `POST /clusters/{id}/scale` API when the driver sets `WEFT_AUTOSCALE=1`.
 - IRSA / S3 credentials for data paths (engine uses AWS CLI in the connect-server image for Glue catalog).
+
+## Autoscaling (parallelism-driven)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `WEFT_AUTOSCALE` | Optional | When `1`/`true`, compute a scale recommendation from shuffle partition count and peak stage task demand before each distributed query. |
+| `WEFT_GATEWAY_URL` | With autoscale | Control-plane gateway base URL (e.g. `http://weft-gateway:8080`). |
+| `WEFT_CLUSTER_ID` | With autoscale | Cluster id passed to `POST /clusters/{id}/scale`. |
+| `WEFT_WORKER_MIN` | Optional | Lower bound for recommended worker count (default = current worker count). |
+| `WEFT_WORKER_MAX` | Optional | Upper bound for recommended worker count (default = `min × 4`). |
+| `WEFT_WORKER_MEMORY_LIMIT_BYTES` | Optional | Per-worker spill pool wired into provisioned worker manifests (gateway). |
+
+Recommendation formula: `ceil(max(shuffle_partitions, peak_stage_tasks) / WEFT_WORKER_TASK_SLOTS)`, clamped to `[min, max]`, scale-up only.
 
 ## Health checks
 

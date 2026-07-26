@@ -70,8 +70,12 @@ jobs:
           duckdb --version
       - name: TPC-DS coverage (Q1–Q99, sf0.01, pass-set ratchet)
         run: cargo run -p weft-bench -- tpcds --sf 0.01
+      - name: TPC-DS distributed planner ratchet (46/99 floor, sf0.01)
+        run: cargo run -p weft-bench -- tpcds-distributed --sf 0.01
       - name: Distributed correctness gate
         run: cargo run -p weft-bench -- correctness-distributed --rows 2000
+        env:
+          WEFT_DIST_TPCDS_SAMPLE: "8"
 
   # ClickBench / correctness coverage on small synthetic data. Required gate: all 43 queries must
   # pass. Fixed by switching queries.sql identifiers from ANSI double-quotes to backtick-quotes so

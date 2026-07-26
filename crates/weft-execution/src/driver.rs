@@ -24,6 +24,9 @@ use weft_loom::arrow::record_batch::RecordBatch;
 use weft_observability::{now_ms, ExecutionEvent, SharedStore, StageStatus, TaskStatus};
 
 use crate::aqe::{aqe_enabled, coalesced_partitions};
+use crate::autoscale::{
+    autoscale_enabled, parallelism_demand, recommend_worker_count, task_slots_per_worker,
+};
 use crate::flight::{clear_worker_stages, pull_bucket_with_retry};
 use crate::lineage::StageLineage;
 use crate::membership::{ClusterMembership, StaticMembership};
@@ -227,6 +230,26 @@ pub async fn run_stages_obs(
             )))
         }
     };
+
+    if autoscale_enabled() {
+        let demand = parallelism_demand(&cluster, stages);
+        let rec = recommend_worker_count(
+            cluster.worker_count() as u32,
+            cluster.worker_count() as u32,
+            cluster.worker_count().saturating_mul(4) as u32,
+            &demand,
+            task_slots_per_worker(),
+        );
+        tracing::info!(
+            target: "weft.autoscale",
+            current = rec.current_workers,
+            recommended = rec.recommended_workers,
+            peak = rec.peak_task_demand,
+            should_scale = rec.should_scale,
+            reason = %rec.reason,
+            "parallelism scale recommendation (set WEFT_GATEWAY_URL+WEFT_CLUSTER_ID to apply)"
+        );
+    }
 
     // Producer / intermediate stages: one invocation per worker endpoint (each runs local SQL
     // and hash-partitions into `num_partitions` buckets). Rendezvous hashing applies to the

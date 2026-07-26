@@ -348,7 +348,7 @@ fn duckdb_result(duckdb: &str, dir: &Path, sql: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn normalize_batches(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+pub(crate) fn normalize_batches(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     let opts = FormatOptions::default().with_null("NULL");
     let mut rows = Vec::new();
     for b in batches {

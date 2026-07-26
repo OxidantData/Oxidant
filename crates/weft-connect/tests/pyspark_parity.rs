@@ -17,6 +17,8 @@ async fn boot(port: u16) -> SparkConnectServiceClient<Channel> {
     tokio::spawn(async move {
         let _ = serve(ServerConfig {
             port,
+            // Parallel integration tests collide on Spark's default UI port 4040.
+            ui_port: None,
             ..Default::default()
         })
         .await;

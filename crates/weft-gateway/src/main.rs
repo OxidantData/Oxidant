@@ -6,7 +6,9 @@ use axum::extract::{Path, State};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use weft_execution::autoscale::ParallelismDemand;
 use weft_orchestrator::{
+    autoscale::{recommend_for_cluster, scale_if_needed},
     backend::{ClusterBackend, ClusterInfo, K8sBackend, StaticBackend},
     spec::ClusterSpec,
 };
@@ -34,6 +36,24 @@ struct ProvisionResponse {
     worker_endpoints: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ScaleRequest {
+    recommended_workers: u32,
+    peak_task_demand: u32,
+    shuffle_partitions: u32,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ScaleResponse {
+    scaled: bool,
+    recommended_workers: u32,
+    current_workers: u32,
+    reason: String,
+    worker_endpoints: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() {
     let port: u16 = std::env::var("WEFT_GATEWAY_PORT")
@@ -52,6 +72,7 @@ async fn main() {
         .route("/clusters", post(provision))
         .route("/clusters/{id}", delete(delete_cluster))
         .route("/clusters/{id}/workers", get(list_workers))
+        .route("/clusters/{id}/scale", post(scale_cluster))
         .with_state(AppState { backend });
 
     let addr = format!("0.0.0.0:{port}");
@@ -70,6 +91,9 @@ async fn provision(
         std::env::var("WEFT_WORKER_IMAGE").unwrap_or_else(|_| "weft/worker:latest".into());
     let connect_image =
         std::env::var("WEFT_CLUSTER_IMAGE").unwrap_or_else(|_| "weft/connect-server:latest".into());
+    let worker_memory_limit_bytes = std::env::var("WEFT_WORKER_MEMORY_LIMIT_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok());
     let spec = ClusterSpec {
         cluster_id: req.cluster_id.clone(),
         namespace: format!("weft-cl-{}", req.cluster_id),
@@ -79,6 +103,7 @@ async fn provision(
         max_workers: req.worker_count.saturating_mul(4).max(req.worker_count),
         worker_image,
         connect_image,
+        worker_memory_limit_bytes,
     };
     let info = state
         .backend
@@ -107,4 +132,82 @@ async fn list_workers(State(state): State<AppState>, Path(id): Path<String>) -> 
     let spec = ClusterSpec::local_demo(&id, 2);
     let eps = state.backend.worker_endpoints(&spec).unwrap_or_default();
     Json(eps)
+}
+
+fn cluster_spec_for_id(id: &str) -> ClusterSpec {
+    let worker_count = std::env::var("WEFT_WORKER_COUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let mut spec = ClusterSpec::local_demo(id, worker_count);
+    if let Some(min) = std::env::var("WEFT_WORKER_MIN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        spec.min_workers = min;
+    }
+    if let Some(max) = std::env::var("WEFT_WORKER_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        spec.max_workers = max;
+    }
+    if let Some(bytes) = std::env::var("WEFT_WORKER_MEMORY_LIMIT_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        spec.worker_memory_limit_bytes = Some(bytes);
+    }
+    spec.cluster_id = id.to_string();
+    spec.namespace = format!("weft-cl-{id}");
+    spec
+}
+
+async fn scale_cluster(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ScaleRequest>,
+) -> Json<ScaleResponse> {
+    let spec = cluster_spec_for_id(&id);
+    let demand = ParallelismDemand {
+        shuffle_partitions: req.shuffle_partitions.max(1),
+        peak_stage_tasks: req.peak_task_demand.max(1),
+        stages: vec![],
+    };
+    let mut rec = recommend_for_cluster(
+        &spec,
+        &demand,
+        weft_execution::autoscale::task_slots_per_worker(),
+    );
+    if req.recommended_workers > rec.recommended_workers {
+        rec.recommended_workers = req.recommended_workers.min(spec.max_workers);
+        rec.should_scale = rec.recommended_workers > rec.current_workers;
+    }
+    if !req.reason.is_empty() {
+        rec.reason = req.reason;
+    }
+
+    match scale_if_needed(state.backend.as_ref(), &spec, &rec) {
+        Ok(Some(info)) => Json(ScaleResponse {
+            scaled: true,
+            recommended_workers: rec.recommended_workers,
+            current_workers: info.worker_endpoints.len() as u32,
+            reason: rec.reason,
+            worker_endpoints: info.worker_endpoints,
+        }),
+        Ok(None) => Json(ScaleResponse {
+            scaled: false,
+            recommended_workers: rec.recommended_workers,
+            current_workers: rec.current_workers,
+            reason: rec.reason,
+            worker_endpoints: state.backend.worker_endpoints(&spec).unwrap_or_default(),
+        }),
+        Err(e) => Json(ScaleResponse {
+            scaled: false,
+            recommended_workers: rec.recommended_workers,
+            current_workers: rec.current_workers,
+            reason: format!("scale failed: {e}"),
+            worker_endpoints: vec![],
+        }),
+    }
 }

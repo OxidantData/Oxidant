@@ -617,11 +617,48 @@ impl WeftService {
             _ => {
                 let plan = translate::to_plan(self.engine.ctx(), rel).await?;
                 let schema = Arc::new(plan.schema().as_arrow().clone());
+                let workers = self.workers_from_config();
+                let replicated = replicated_tables_from_env();
+                let replicated_refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
+                let udf_json = self.engine.export_udfs_json();
                 let tracker = operation_id
                     .map(|op| QueryTracker::begin(self.observability.clone(), op, "DataFrame"));
                 if let Some(ref t) = tracker {
                     if let Ok(text) = self.engine.explain(&plan, true).await {
                         t.set_plan(text, None);
+                    }
+                }
+                match distributed::try_run_distributed_plan(
+                    &self.engine,
+                    &workers,
+                    &plan,
+                    "DataFrame",
+                    &replicated_refs,
+                    Some(&udf_json),
+                    tracker.as_ref(),
+                )
+                .await
+                {
+                    Ok(Some(dist)) => {
+                        let mut batches = dist
+                            .into_iter()
+                            .map(signed_columns)
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        if batches.is_empty() {
+                            batches.push(RecordBatch::new_empty(signed_schema(&schema)));
+                        }
+                        if let Some(t) = tracker {
+                            let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+                            t.finish_success(rows);
+                        }
+                        return Ok((batches, None));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        if let Some(t) = tracker {
+                            t.finish_error(e.to_string());
+                        }
+                        return Err(err_to_status(e));
                     }
                 }
                 let local_tracker = tracker.map(|t| {

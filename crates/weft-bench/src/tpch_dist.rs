@@ -20,8 +20,67 @@ use weft_execution::plan::plan_distributed;
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 
+use crate::distributed_coverage::{
+    check_ratchet, plan_coverage_single_shard, print_report, write_report,
+};
 use crate::tpch::{normalize_batches, queries};
 use crate::tpch_data;
+
+/// Planner-only coverage: `plan_distributed` over Q1–Q22 with `lineitem` sharded.
+pub async fn run_planner_coverage(sf: f64, dir: &Path, skip_ratchet: bool) {
+    eprintln!(
+        "[tpch-dist] planner coverage sf{sf} data={} …",
+        dir.display()
+    );
+    if let Err(e) = tpch_data::generate(sf, dir) {
+        eprintln!("[tpch-dist] data generation failed: {e}");
+        std::process::exit(1);
+    }
+
+    let engine = Engine::new();
+    register_csv(&engine, dir).await;
+
+    let qs = queries();
+    let all = tpch_data::TABLES.to_vec();
+    let only = std::env::var("WEFT_TPCH_ONLY").ok();
+    let report = if let Some(ref only) = only {
+        let filtered: Vec<_> = qs
+            .into_iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(only))
+            .collect();
+        plan_coverage_single_shard("tpch", &engine, &filtered, &all, "lineitem").await
+    } else {
+        plan_coverage_single_shard("tpch", &engine, &qs, &all, "lineitem").await
+    };
+
+    for q in &report.per_query {
+        if q.supported {
+            eprintln!("{:<4} PLAN ok", q.name);
+        } else {
+            eprintln!(
+                "{:<4} PLAN skip {}",
+                q.name,
+                q.reason.as_deref().unwrap_or("?")
+            );
+        }
+    }
+
+    print_report(&report);
+    write_report(
+        Path::new("bench/distributed/tpch-planner-latest.json"),
+        &report,
+    );
+
+    if !skip_ratchet
+        && only.is_none()
+        && !check_ratchet(
+            &report,
+            Path::new("bench/distributed/tpch-planner-baseline.json"),
+        )
+    {
+        std::process::exit(1);
+    }
+}
 
 /// Generate data, build worker clusters, and run all 22 queries through the distributed engine.
 pub async fn run(sf: f64, dir: &Path, num_workers: usize) {
@@ -227,7 +286,7 @@ async fn register_csv(engine: &Engine, dir: &Path) {
 
 /// Split `batches` row-wise into `n` shards (each batch sliced into n contiguous ranges), so every
 /// worker gets a portion of lineitem even when the table is a single batch.
-fn shard(batches: &[RecordBatch], n: usize) -> Vec<Vec<RecordBatch>> {
+pub(crate) fn shard(batches: &[RecordBatch], n: usize) -> Vec<Vec<RecordBatch>> {
     let mut out: Vec<Vec<RecordBatch>> = (0..n).map(|_| Vec::new()).collect();
     for b in batches {
         let rows = b.num_rows();

@@ -1,8 +1,11 @@
 //! File-list sharding for distributed Glue/Parquet scans.
 //!
 //! When `WEFT_SHARD_INDEX` (or `WEFT_POD_NAME`) and `WEFT_WORKER_COUNT` are set,
-//! each worker opens only `files[i] where i % N == shard`. Replicated tables
-//! (dimension tables) skip sharding via `WEFT_REPLICATED_TABLES`.
+//! each worker opens only its share of listed files. Assignment is **size-weighted**
+//! (greedy LPT: largest files first, each to the worker with the least bytes so far;
+//! ties broken by lowest worker index). Files are ordered deterministically by
+//! `(size desc, path asc)` before assignment. Replicated tables (dimension tables)
+//! skip sharding via `WEFT_REPLICATED_TABLES`.
 
 use std::sync::Arc;
 
@@ -47,10 +50,49 @@ impl ShardAssignment {
         }
         Some(Self { index, count })
     }
+}
 
-    pub fn owns(&self, file_index: usize) -> bool {
-        file_index % self.count == self.index
+/// Greedy LPT shard assignment: largest file first (path tie-break), each file goes to
+/// the worker with the least total bytes assigned so far (lowest index on tie).
+///
+/// Returns one worker index per input file, in the same order as `files`.
+/// Documented balance bound: `max(worker_bytes) - min(worker_bytes) <= largest_file_size`.
+fn assign_files_by_size(
+    files: &[(ListingTableUrl, ObjectMeta)],
+    worker_count: usize,
+) -> Vec<usize> {
+    if files.is_empty() {
+        return Vec::new();
     }
+    debug_assert!(worker_count > 0);
+
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by(|&a, &b| {
+        files[b].1.size.cmp(&files[a].1.size).then_with(|| {
+            files[a]
+                .1
+                .location
+                .as_ref()
+                .cmp(files[b].1.location.as_ref())
+        })
+    });
+
+    let mut worker_bytes = vec![0u64; worker_count];
+    let mut assignments = vec![0usize; files.len()];
+
+    for file_idx in order {
+        let size = files[file_idx].1.size;
+        let worker = worker_bytes
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, &bytes)| (bytes, *i))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        assignments[file_idx] = worker;
+        worker_bytes[worker] = worker_bytes[worker].saturating_add(size);
+    }
+
+    assignments
 }
 
 /// Tables that every worker should scan fully (broadcast / dimension tables).
@@ -149,10 +191,12 @@ pub async fn apply_file_shard_with(
 
     all_files.sort_by(|a, b| a.1.location.as_ref().cmp(b.1.location.as_ref()));
 
+    let file_shards = assign_files_by_size(&all_files, assignment.count);
+
     let shard_urls: Vec<ListingTableUrl> = all_files
         .into_iter()
         .enumerate()
-        .filter(|(i, _)| assignment.owns(*i))
+        .filter(|(i, _)| file_shards[*i] == assignment.index)
         .map(|(_, (u, _))| u)
         .collect();
 
@@ -190,14 +234,76 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::parquet::arrow::ArrowWriter;
     use datafusion::prelude::SessionContext;
+    use object_store::path::Path;
+    use object_store::ObjectMeta;
+
+    fn meta(path: &str, size: u64) -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from(path),
+            last_modified: chrono::Utc::now(),
+            size,
+            e_tag: None,
+            version: None,
+        }
+    }
+
+    fn dummy_url(path: &str) -> ListingTableUrl {
+        ListingTableUrl::parse(format!("file:///tmp/{path}")).unwrap()
+    }
+
+    fn worker_byte_totals(
+        files: &[(ListingTableUrl, ObjectMeta)],
+        assignments: &[usize],
+        worker_count: usize,
+    ) -> Vec<u64> {
+        let mut totals = vec![0u64; worker_count];
+        for (file, &worker) in files.iter().zip(assignments) {
+            totals[worker] = totals[worker].saturating_add(file.1.size);
+        }
+        totals
+    }
 
     #[test]
-    fn assignment_owns_round_robin() {
-        let a = ShardAssignment { index: 1, count: 3 };
-        assert!(!a.owns(0));
-        assert!(a.owns(1));
-        assert!(!a.owns(2));
-        assert!(a.owns(4));
+    fn size_weighted_assignment_is_deterministic() {
+        let files = vec![
+            (dummy_url("a"), meta("a", 100)),
+            (dummy_url("b"), meta("b", 50)),
+            (dummy_url("c"), meta("c", 50)),
+        ];
+        let a = assign_files_by_size(&files, 2);
+        let b = assign_files_by_size(&files, 2);
+        assert_eq!(a, b);
+        assert_eq!(a, vec![0, 1, 1]);
+    }
+
+    #[test]
+    fn size_weighted_assignment_balances_skewed_files() {
+        // One huge file + many tiny — round-robin would put the giant on one worker alone.
+        let mut files: Vec<(ListingTableUrl, ObjectMeta)> = (0..11)
+            .map(|i| {
+                let size = if i == 0 { 10_000 } else { 1 };
+                (
+                    dummy_url(&format!("part-{i}")),
+                    meta(&format!("part-{i}"), size),
+                )
+            })
+            .collect();
+        files.sort_by(|a, b| a.1.location.as_ref().cmp(b.1.location.as_ref()));
+
+        let assignments = assign_files_by_size(&files, 3);
+        let totals = worker_byte_totals(&files, &assignments, 3);
+        let largest = files.iter().map(|(_, m)| m.size).max().unwrap();
+        let spread = totals.iter().max().unwrap() - totals.iter().min().unwrap();
+        assert!(
+            spread <= largest,
+            "max-min byte spread {spread} should be <= largest file {largest}; totals={totals:?}"
+        );
+
+        // Every file assigned exactly once.
+        assert_eq!(assignments.len(), files.len());
+        for worker in 0..3 {
+            assert!(assignments.contains(&worker));
+        }
     }
 
     #[test]
@@ -227,6 +333,10 @@ mod tests {
     }
 
     fn write_parts(n: usize) -> std::path::PathBuf {
+        write_parts_with_rows(n, 1)
+    }
+
+    fn write_parts_with_rows(n: usize, rows_per_file: usize) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "weft-shard-{}-{}",
             std::process::id(),
@@ -238,11 +348,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         for i in 0..n {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int64Array::from(vec![i as i64]))],
-            )
-            .unwrap();
+            let values: Vec<i64> = (0..rows_per_file)
+                .map(|j| (i * rows_per_file + j) as i64)
+                .collect();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])
+                    .unwrap();
             let f = std::fs::File::create(dir.join(format!("part-{i}.parquet"))).unwrap();
             let mut w = ArrowWriter::try_new(f, schema.clone(), None).unwrap();
             w.write(&batch).unwrap();
@@ -314,6 +425,75 @@ mod tests {
         )])))
         .unwrap();
         assert_eq!(empty.schema().fields().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn skewed_file_list_shard_balances_by_size() {
+        // One large part + several tiny parts on disk — integration check via object-store sizes.
+        let dir = write_parts_with_rows(6, 1);
+        {
+            let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+            let values: Vec<i64> = (0..50_000).collect();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])
+                    .unwrap();
+            let f = std::fs::File::create(dir.join("part-huge.parquet")).unwrap();
+            let mut w = ArrowWriter::try_new(f, schema, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+
+        let location = ensure_collection_url(&format!("file://{}", dir.to_string_lossy()));
+        let url = ListingTableUrl::parse(&location).unwrap();
+        let ctx = SessionContext::new();
+        let worker_count = 3;
+
+        let mut per_worker: Vec<Vec<ListingTableUrl>> = Vec::new();
+        for index in 0..worker_count {
+            per_worker.push(
+                apply_file_shard_with(
+                    &ctx.state(),
+                    vec![url.clone()],
+                    ".parquet",
+                    Some("orders"),
+                    Some(ShardAssignment {
+                        index,
+                        count: worker_count,
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        let mut totals = vec![0u64; worker_count];
+        let mut all_paths: Vec<String> = Vec::new();
+        for (worker, urls) in per_worker.iter().enumerate() {
+            for u in urls {
+                let path = u.as_str().strip_prefix("file://").unwrap_or(u.as_str());
+                let size = std::fs::metadata(path).unwrap().len();
+                totals[worker] += size;
+                all_paths.push(path.to_string());
+            }
+        }
+
+        all_paths.sort();
+        all_paths.dedup();
+        assert_eq!(all_paths.len(), 7, "shards must partition all files");
+
+        let largest = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.metadata().unwrap().len())
+            .max()
+            .unwrap();
+        let spread = totals.iter().max().unwrap() - totals.iter().min().unwrap();
+        assert!(
+            spread <= largest,
+            "max-min byte spread {spread} should be <= largest file {largest}; totals={totals:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

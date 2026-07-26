@@ -435,6 +435,21 @@ impl AppStateStore {
                     });
             }
             ExecutionEvent::AqeCoalesced { .. } => {}
+            ExecutionEvent::DistributedFallback {
+                operation_id,
+                reason,
+            } => {
+                for sql in inner
+                    .sql_executions
+                    .values_mut()
+                    .filter(|s| s.operation_id == *operation_id)
+                {
+                    if !reason.is_empty() {
+                        sql.physical_plan =
+                            format!("[distributed fallback] {reason}\n{}", sql.physical_plan);
+                    }
+                }
+            }
         }
     }
 
@@ -807,5 +822,34 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].status, "SUCCEEDED");
         assert_eq!(store.operation_state(&op), Some(OperationState::Succeeded));
+    }
+
+    #[test]
+    fn distributed_fallback_event_serializes_and_updates_sql() {
+        let store = AppStateStore::new();
+        let op = "op-fb".to_string();
+        let sql_id = store.alloc_sql_id();
+        store.emit(ExecutionEvent::SqlPlanCaptured {
+            operation_id: op.clone(),
+            execution_id: sql_id,
+            description: "SELECT 1".into(),
+            physical_plan: "local plan".into(),
+            logical_plan: None,
+            job_ids: vec![],
+        });
+        store.emit(ExecutionEvent::DistributedFallback {
+            operation_id: op.clone(),
+            reason: "global window unsupported".into(),
+        });
+        let json = serde_json::to_string(&ExecutionEvent::DistributedFallback {
+            operation_id: op.clone(),
+            reason: "global window unsupported".into(),
+        })
+        .expect("serialize");
+        assert!(json.contains("distributed_fallback"));
+        let sql = store.list_sql();
+        assert_eq!(sql.len(), 1);
+        assert!(sql[0].physical_plan.contains("[distributed fallback]"));
+        assert!(sql[0].physical_plan.contains("global window unsupported"));
     }
 }

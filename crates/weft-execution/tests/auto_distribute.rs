@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use weft_execution::driver::{run_stages, Cluster};
 use weft_execution::flight::serve_worker;
-use weft_execution::plan::plan_distributed;
+use weft_execution::plan::{plan_distributed, plan_distributed_logical};
 use weft_loom::arrow::array::{Int64Array, RecordBatch};
 use weft_loom::arrow::datatypes::{DataType, Field, Schema};
 use weft_loom::arrow::util::pretty::pretty_format_batches;
@@ -682,12 +682,12 @@ async fn subquery_over_unreplicated_table_is_rejected() {
         .register_batches("t", vec![batch(0, 60, 12)])
         .unwrap();
     single.register_batches("dim", vec![dim(12)]).unwrap();
-    let err = plan_distributed(
-        &single,
-        "SELECT k, SUM(v) AS sv FROM t WHERE k IN (SELECT d_key FROM dim) GROUP BY k",
-        &[], // dim not replicated
-    )
-    .await;
+    let lp = single
+        .logical_plan("SELECT k, SUM(v) AS sv FROM t WHERE k IN (SELECT d_key FROM dim) GROUP BY k")
+        .await
+        .unwrap();
+    // Shape-only: runtime `plan_distributed` may Forward-fallback; assert the splitter rejects.
+    let err = plan_distributed_logical(&lp, &[] /* dim not replicated */);
     let msg = format!("{}", err.expect_err("must reject unreplicated subquery"));
     assert!(
         msg.contains("replicated") || msg.contains("subquery"),
@@ -721,12 +721,13 @@ async fn subquery_over_sharded_table_is_rejected() {
     single
         .register_batches("t", vec![batch(0, 60, 12)])
         .unwrap();
-    let err = plan_distributed(
-        &single,
-        "SELECT k, SUM(v) AS sv FROM t WHERE k IN (SELECT k FROM t WHERE v > 10) GROUP BY k",
-        &[],
-    )
-    .await;
+    let lp = single
+        .logical_plan(
+            "SELECT k, SUM(v) AS sv FROM t WHERE k IN (SELECT k FROM t WHERE v > 10) GROUP BY k",
+        )
+        .await
+        .unwrap();
+    let err = plan_distributed_logical(&lp, &[]);
     let msg = format!("{}", err.expect_err("must reject sharded self-subquery"));
     assert!(
         msg.contains("scanned") || msg.contains("broadcast-safe") || msg.contains("subquery"),
@@ -760,14 +761,15 @@ async fn union_distinct_is_rejected() {
     single
         .register_batches("t", vec![batch(0, 60, 12)])
         .unwrap();
-    let err = plan_distributed(
-        &single,
-        "SELECT k, SUM(v) AS sv FROM t GROUP BY k \
-         UNION \
-         SELECT k, SUM(v) AS sv FROM t WHERE v > 10 GROUP BY k",
-        &[],
-    )
-    .await;
+    let lp = single
+        .logical_plan(
+            "SELECT k, SUM(v) AS sv FROM t GROUP BY k \
+             UNION \
+             SELECT k, SUM(v) AS sv FROM t WHERE v > 10 GROUP BY k",
+        )
+        .await
+        .unwrap();
+    let err = plan_distributed_logical(&lp, &[]);
     let msg = format!("{}", err.expect_err("UNION distinct must be rejected"));
     assert!(
         msg.contains("UNION") || msg.contains("distinct"),
@@ -807,7 +809,11 @@ async fn window_without_partition_by_is_rejected() {
     single
         .register_batches("t", vec![batch(0, 60, 12)])
         .unwrap();
-    let err = plan_distributed(&single, "SELECT SUM(v) OVER () AS sv FROM t", &[]).await;
+    let lp = single
+        .logical_plan("SELECT SUM(v) OVER () AS sv FROM t")
+        .await
+        .unwrap();
+    let err = plan_distributed_logical(&lp, &[]);
     let msg = format!("{}", err.expect_err("global window must be rejected"));
     assert!(
         msg.contains("PARTITION BY") || msg.contains("window"),
@@ -821,12 +827,11 @@ async fn row_number_window_is_rejected() {
     single
         .register_batches("t", vec![batch(0, 60, 12)])
         .unwrap();
-    let err = plan_distributed(
-        &single,
-        "SELECT k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn FROM t",
-        &[],
-    )
-    .await;
+    let lp = single
+        .logical_plan("SELECT k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn FROM t")
+        .await
+        .unwrap();
+    let err = plan_distributed_logical(&lp, &[]);
     let msg = format!("{}", err.expect_err("ROW_NUMBER must be rejected"));
     assert!(
         msg.contains("window") || msg.contains("ORDER BY") || msg.contains("ROW_NUMBER"),

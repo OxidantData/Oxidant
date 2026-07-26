@@ -4,11 +4,13 @@
 //! mode splits the plan into stages at shuffle boundaries: a driver/worker control plane and
 //! an Arrow Flight data plane for shuffle + result return. The MVP shape is two-stage
 //! `partial-agg → hash shuffle → final-agg` ([`driver::run_distributed`]). Large stage
-//! buckets spill to `WEFT_SPILL_DIR` when over `WEFT_SHUFFLE_SPILL_BYTES` (see
-//! [`shuffle::spill`]); streaming `do_exchange` remains a stub.
+//! buckets spill to disk when over `WEFT_SHUFFLE_SPILL_BYTES` / `WEFT_MEMORY_LIMIT_BYTES` (see
+//! [`shuffle::spill`]); `do_exchange` consumes shuffle pushes incrementally with backpressure.
 
 pub mod aqe;
+pub mod autoscale;
 pub mod driver;
+pub mod fault_inject;
 pub mod flight;
 pub mod lineage;
 pub mod membership;

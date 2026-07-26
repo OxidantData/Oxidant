@@ -32,9 +32,11 @@ use weft_loom::arrow::ipc::reader::StreamReader;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
 
+mod distributed_coverage;
 mod suite;
 mod tpcds;
 mod tpcds_data;
+mod tpcds_dist;
 mod tpch;
 mod tpch_data;
 mod tpch_dist;
@@ -641,7 +643,7 @@ async fn run_correctness(rows: usize) {
     }
 }
 
-/// Distributed correctness: auto-splittable GROUP BY matches single-node engine results.
+/// Distributed correctness: synthetic GROUP BY + optional TPC-DS supported-subset sample.
 async fn run_correctness_distributed(_rows: usize) {
     use weft_execution::driver::{run_stages, Cluster};
     use weft_execution::flight::serve_worker;
@@ -697,7 +699,21 @@ async fn run_correctness_distributed(_rows: usize) {
         std::process::exit(1);
     }
     eprintln!("ok  {sql}");
-    eprintln!("\n=== correctness-distributed: 1/1 OK ===");
+    eprintln!("\n=== correctness-distributed: synthetic 1/1 OK ===");
+
+    // Optional TPC-DS supported-subset sample (CI path).
+    let tpcds_sample: usize = std::env::var("WEFT_DIST_TPCDS_SAMPLE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    if tpcds_sample > 0 {
+        let sf: f64 = flag(&std::env::args().collect::<Vec<_>>(), "--sf").unwrap_or(0.01);
+        let dir = std::env::temp_dir().join(format!("weft-tpcds-dist-corr-sf{sf}"));
+        eprintln!(
+            "\n[correctness-distributed] TPC-DS supported sample (n={tpcds_sample}) sf{sf} …"
+        );
+        tpcds_dist::run_correctness_sample(sf, &dir, 2, tpcds_sample).await;
+    }
 }
 
 /// Parse the value following `name` in `args` as `T` (e.g. `--sf 0.1`, `--workers 4`).
@@ -758,6 +774,7 @@ async fn main() {
             let dir = data
                 .clone()
                 .unwrap_or_else(|| format!("{}/weft-tpch-sf{sf}", std::env::temp_dir().display()));
+            let planner_only = args.iter().any(|a| a == "--planner-only");
             match cmd {
                 "tpch-bench" => {
                     let out =
@@ -775,9 +792,55 @@ async fn main() {
                 }
                 "tpch" => tpch::run(sf, Path::new(&dir)).await,
                 _ => {
-                    let workers: usize = flag(&args, "--workers").unwrap_or(2);
-                    tpch_dist::run(sf, Path::new(&dir), workers).await;
+                    if planner_only {
+                        let skip_ratchet = args.iter().any(|a| a == "--no-ratchet");
+                        tpch_dist::run_planner_coverage(sf, Path::new(&dir), skip_ratchet).await;
+                    } else {
+                        let workers: usize = flag(&args, "--workers").unwrap_or(2);
+                        tpch_dist::run(sf, Path::new(&dir), workers).await;
+                    }
                 }
+            }
+        }
+        Some("tpcds-distributed") => {
+            let sf: f64 = flag(&args, "--sf").unwrap_or(0.01);
+            let dir = data
+                .clone()
+                .unwrap_or_else(|| format!("{}/weft-tpcds-sf{sf}", std::env::temp_dir().display()));
+            let execute = args.iter().any(|a| a == "--execute");
+            if execute {
+                let workers: usize = flag(&args, "--workers").unwrap_or(2);
+                let sample: usize = flag(&args, "--sample").unwrap_or(0);
+                tpcds_dist::run_execute(tpcds_dist::ExecuteOpts {
+                    sf,
+                    data: Path::new(&dir),
+                    workers,
+                    sample,
+                    query_filter: None,
+                })
+                .await;
+            } else {
+                let skip_ratchet = args.iter().any(|a| a == "--no-ratchet");
+                let default_baseline = tpcds_dist::default_baseline_path();
+                let baseline = args
+                    .iter()
+                    .position(|a| a == "--baseline")
+                    .and_then(|i| args.get(i + 1))
+                    .map(Path::new)
+                    .unwrap_or(default_baseline.as_path());
+                let out = args
+                    .iter()
+                    .position(|a| a == "--json")
+                    .and_then(|i| args.get(i + 1))
+                    .map(Path::new);
+                tpcds_dist::run_coverage(tpcds_dist::CoverageOpts {
+                    sf,
+                    data: Path::new(&dir),
+                    baseline,
+                    out_json: out,
+                    skip_ratchet,
+                })
+                .await;
             }
         }
         Some("tpcds") => {
@@ -789,7 +852,8 @@ async fn main() {
         Some(other) => {
             eprintln!(
                 "unknown subcommand: {other}; try `clickbench`, `clickbench-grpc`, `correctness`, \
-                 `correctness-distributed`, `tpch`, `tpch-bench`, `tpch-distributed`, or `tpcds`"
+                 `correctness-distributed`, `tpch`, `tpch-bench`, `tpch-distributed`, \
+                 `tpcds`, or `tpcds-distributed`"
             );
             std::process::exit(2);
         }

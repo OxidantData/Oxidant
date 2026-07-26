@@ -5306,6 +5306,7 @@ name = "weft-bench"
 version = "0.0.0"
 dependencies = [
  "datafusion",
+ "serde",
  "serde_json",
  "tokio",
  "tonic 0.12.3",
@@ -5386,6 +5387,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.12.3",
+ "tracing",
  "uuid",
  "weft-analyzer",
  "weft-catalog",
@@ -5430,6 +5432,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tonic 0.14.6",
+ "tracing",
  "weft-common",
  "weft-loom",
  "weft-observability",
@@ -5445,6 +5448,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "weft-common",
+ "weft-execution",
  "weft-orchestrator",
 ]
 

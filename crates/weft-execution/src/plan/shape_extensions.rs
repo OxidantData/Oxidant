@@ -21,7 +21,7 @@ use super::stage_planner::{
     aggregation_stages_for, base_tables, column_name, count_table_scans, expr_sql,
     extract_from_tail, peel, sanitize_generated_sql, unqualify, DistributedQuery,
 };
-use crate::driver::StageDef;
+use crate::driver::{ExchangeMode, StageDef};
 
 /// If `lp` is a distributable aggregate window over one sharded table, lower it; otherwise
 /// `Ok(None)` so the caller falls through (unsupported window shapes return `Err`).
@@ -33,6 +33,116 @@ pub(crate) fn try_window(
         return Ok(None);
     };
     Ok(Some(window_stages_for(&p, replicated)?))
+}
+
+/// Non-aggregate queries: parallel scan on workers (one sharded table) plus gather, with global
+/// `ORDER BY` / `LIMIT` in `finalize_sql`. All-replicated scans use a single Forward stage.
+pub(crate) fn try_non_aggregate(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<Option<DistributedQuery>> {
+    if plan_contains_aggregate(lp) {
+        return Ok(None);
+    }
+    if plan_contains_window(lp) || plan_contains_distinct(lp) {
+        return Ok(None);
+    }
+
+    let (body, sort, limit) = peel_scan_tail(lp);
+    let tables = base_tables(body);
+    let sharded: Vec<&str> = tables
+        .iter()
+        .filter(|t| !replicated.contains(&t.as_str()))
+        .map(|t| t.as_str())
+        .collect();
+    ensure_subquery_tables_replicated(body, &sharded, replicated)?;
+
+    if sharded.len() > 1 {
+        return Ok(None);
+    }
+
+    if sharded.len() == 1 {
+        let sharded_name = sharded[0];
+        if count_table_scans(body, sharded_name) > 1 {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: sharded table `{sharded_name}` scanned multiple times under scan query"
+            )));
+        }
+    }
+
+    let up = Unparser::default();
+    let worker_sql = up
+        .plan_to_sql(body)
+        .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse scan query: {e}")))?
+        .to_string();
+    let worker_sql = sanitize_generated_sql(&worker_sql);
+    let finalize_sql = build_outer_finalize(sort, limit)?;
+
+    let stage = if sharded.is_empty() {
+        StageDef {
+            stage_id: 0,
+            sql: worker_sql,
+            upstream_stage_ids: vec![],
+            hash_key_cols: vec![],
+            exchange: ExchangeMode::Forward,
+            plan_fragment: None,
+        }
+    } else {
+        StageDef::new(0, worker_sql, vec![], vec![])
+    };
+
+    Ok(Some(DistributedQuery {
+        stages: vec![stage],
+        finalize_sql,
+    }))
+}
+
+fn peel_scan_tail(
+    lp: &LogicalPlan,
+) -> (
+    &LogicalPlan,
+    Option<&[datafusion::logical_expr::SortExpr]>,
+    Option<usize>,
+) {
+    let mut limit = None;
+    let mut sort = None;
+    let mut node = lp;
+    loop {
+        match node {
+            LogicalPlan::Limit(l) => {
+                if let Some(Expr::Literal(scalar, _)) = l.fetch.as_deref() {
+                    limit = scalar_as_usize(scalar);
+                }
+                node = l.input.as_ref();
+            }
+            LogicalPlan::Sort(s) => {
+                sort = Some(s.expr.as_slice());
+                node = s.input.as_ref();
+            }
+            _ => return (node, sort, limit),
+        }
+    }
+}
+
+fn plan_contains_aggregate(lp: &LogicalPlan) -> bool {
+    match lp {
+        LogicalPlan::Aggregate(_) => true,
+        _ => lp.inputs().iter().any(|n| plan_contains_aggregate(n)),
+    }
+}
+
+fn plan_contains_window(lp: &LogicalPlan) -> bool {
+    match lp {
+        LogicalPlan::Window(_) => true,
+        _ => lp.inputs().iter().any(|n| plan_contains_window(n)),
+    }
+}
+
+fn plan_contains_distinct(lp: &LogicalPlan) -> bool {
+    match lp {
+        LogicalPlan::Distinct(_) => true,
+        _ => lp.inputs().iter().any(|n| plan_contains_distinct(n)),
+    }
 }
 
 /// The top of the plan above a `Window` node: optional projection plus trailing sort/limit.
@@ -64,6 +174,8 @@ fn peel_window(lp: &LogicalPlan) -> Option<WindowPeeled<'_>> {
                 projection = Some(p.expr.as_slice());
                 node = &p.input;
             }
+            LogicalPlan::Filter(f) => node = f.input.as_ref(),
+            LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
             LogicalPlan::Window(w) => {
                 return Some(WindowPeeled {
                     projection,
@@ -294,6 +406,7 @@ pub(crate) fn reject_explicit_unsupported(lp: &LogicalPlan) -> Result<()> {
             LogicalPlan::Sort(s) => node = s.input.as_ref(),
             LogicalPlan::Projection(p) => node = p.input.as_ref(),
             LogicalPlan::Filter(f) => node = f.input.as_ref(),
+            LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
             LogicalPlan::Window(_) => {
                 return Err(Error::Unsupported(
                     "auto-distribute: window functions are not supported \
@@ -432,7 +545,7 @@ fn build_outer_finalize(
                     "NULLS LAST"
                 };
                 let expr = up
-                    .expr_to_sql(&s.expr)
+                    .expr_to_sql(&unqualify(&s.expr))
                     .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse sort: {e}")))?
                     .to_string();
                 Ok(format!("{expr} {dir} {nulls}"))
@@ -589,5 +702,49 @@ mod tests {
         let err = try_union_all(&lp, &[]).expect_err("UNION distinct");
         let msg = format!("{err}");
         assert!(msg.contains("UNION"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn non_aggregate_scan_plans_single_scatter_stage() {
+        let engine = Engine::new();
+        engine.register_batches("t", vec![tiny_table()]).unwrap();
+        let lp = engine
+            .logical_plan("SELECT k, v FROM t WHERE v > 15 ORDER BY k LIMIT 2")
+            .await
+            .unwrap();
+        let dq = try_non_aggregate(&lp, &[]).expect("ok").expect("scan plan");
+        assert_eq!(dq.stages.len(), 1);
+        assert_eq!(dq.stages[0].exchange, ExchangeMode::Hash);
+        assert!(dq.stages[0].sql.contains("FROM t"));
+        assert!(dq
+            .finalize_sql
+            .as_ref()
+            .is_some_and(|s| s.contains("LIMIT 2")));
+    }
+
+    #[tokio::test]
+    async fn non_aggregate_replicated_only_uses_forward() {
+        let engine = Engine::new();
+        engine.register_batches("dim", vec![tiny_table()]).unwrap();
+        let lp = engine
+            .logical_plan("SELECT k FROM dim WHERE v > 15 LIMIT 1")
+            .await
+            .unwrap();
+        let dq = try_non_aggregate(&lp, &["dim"])
+            .expect("ok")
+            .expect("forward scan");
+        assert_eq!(dq.stages.len(), 1);
+        assert_eq!(dq.stages[0].exchange, ExchangeMode::Forward);
+    }
+
+    #[tokio::test]
+    async fn non_aggregate_skips_when_aggregate_present() {
+        let engine = Engine::new();
+        engine.register_batches("t", vec![tiny_table()]).unwrap();
+        let lp = engine
+            .logical_plan("SELECT k, SUM(v) FROM t GROUP BY k")
+            .await
+            .unwrap();
+        assert!(try_non_aggregate(&lp, &[]).expect("ok").is_none());
     }
 }

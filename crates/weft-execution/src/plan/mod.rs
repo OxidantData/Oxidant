@@ -10,4 +10,4 @@ pub mod physical_splitter;
 pub mod shape_extensions;
 pub mod stage_planner;
 
-pub use stage_planner::{plan_distributed, DistributedQuery};
+pub use stage_planner::{plan_distributed, plan_distributed_logical, DistributedQuery};
