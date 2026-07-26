@@ -34,6 +34,7 @@ use weft_proto::spark::connect as sc;
 
 mod suite;
 mod tpcds;
+mod tpcds_data;
 mod tpch;
 mod tpch_data;
 mod tpch_dist;
@@ -537,8 +538,6 @@ async fn exec_sql_grpc_batches(
     Ok(out)
 }
 
-/// Correctness mode: for every ClickBench query, assert the gRPC/Arrow-IPC result equals the
-/// engine-direct result (lossless transport), plus ground-truth anchors from the generator.
 async fn run_correctness(rows: usize) {
     let rows = rows.min(10_000);
     eprintln!("[correctness] synthetic `hits`: {rows} rows; engine-direct vs live gRPC …\n");
@@ -642,6 +641,65 @@ async fn run_correctness(rows: usize) {
     }
 }
 
+/// Distributed correctness: auto-splittable GROUP BY matches single-node engine results.
+async fn run_correctness_distributed(_rows: usize) {
+    use weft_execution::driver::{run_stages, Cluster};
+    use weft_execution::flight::serve_worker;
+    use weft_execution::plan::plan_distributed;
+    use weft_loom::arrow::array::Int64Array;
+    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+
+    eprintln!("[correctness-distributed] synthetic `t`, 2 workers …\n");
+    let make_batch = |start: i64, end: i64| -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let ks: Vec<i64> = (start..end).map(|i| i % 5).collect();
+        let vs: Vec<i64> = (start..end).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ks)),
+                Arc::new(Int64Array::from(vs)),
+            ],
+        )
+        .unwrap()
+    };
+
+    const N: i64 = 200;
+    let engine = Engine::new();
+    engine
+        .register_batches("t", vec![make_batch(0, N)])
+        .expect("register");
+
+    let mut endpoints = Vec::new();
+    for (i, (start, end)) in [(0, N / 2), (N / 2, N)].iter().enumerate() {
+        let port = 50680 + i as u16;
+        let e = Arc::new(Engine::new());
+        e.register_batches("t", vec![make_batch(*start, *end)])
+            .unwrap();
+        let ee = e.clone();
+        tokio::spawn(async move {
+            let _ = serve_worker(port, ee).await;
+        });
+        endpoints.push(format!("http://127.0.0.1:{port}"));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let cluster = Cluster::new(endpoints);
+
+    let sql = "SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t GROUP BY k ORDER BY k";
+    let single = normalize(&engine.sql(sql).await.expect("single"));
+    let dq = plan_distributed(&engine, sql, &[]).await.expect("plan");
+    let dist = normalize(&run_stages(&cluster, &dq.stages).await.expect("dist"));
+    if single != dist {
+        eprintln!("FAIL: {} vs {} rows", single.len(), dist.len());
+        std::process::exit(1);
+    }
+    eprintln!("ok  {sql}");
+    eprintln!("\n=== correctness-distributed: 1/1 OK ===");
+}
+
 /// Parse the value following `name` in `args` as `T` (e.g. `--sf 0.1`, `--workers 4`).
 fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
     args.iter()
@@ -694,6 +752,7 @@ async fn main() {
         Some("clickbench") | None => run_clickbench(rows).await,
         Some("clickbench-grpc") => run_clickbench_grpc(rows, data).await,
         Some("correctness") => run_correctness(rows).await,
+        Some("correctness-distributed") => run_correctness_distributed(rows).await,
         Some(cmd @ ("tpch" | "tpch-distributed" | "tpch-bench")) => {
             let sf: f64 = flag(&args, "--sf").unwrap_or(0.05);
             let dir = data
@@ -724,24 +783,14 @@ async fn main() {
         }
         Some("tpcds") => {
             let sf: f64 = flag(&args, "--sf").unwrap_or(0.01);
-            let dir = data.unwrap_or_else(|| {
-                format!("{}/weft-tpcds-sf{sf}", std::env::temp_dir().display())
-            });
-            let out = out_json.unwrap_or_else(|| format!("bench/tpcds/results/tpcds-sf{sf}.json"));
-            tpcds::run(tpcds::RunOpts {
-                sf,
-                data: Path::new(&dir),
-                duckdb_db,
-                out_json: Path::new(&out),
-                machine: &machine,
-                run_date: &run_date,
-                with_duckdb,
-            })
-            .await;
+            let dir = data
+                .unwrap_or_else(|| format!("{}/weft-tpcds-sf{sf}", std::env::temp_dir().display()));
+            tpcds::run(sf, Path::new(&dir)).await;
         }
         Some(other) => {
             eprintln!(
-                "unknown subcommand: {other}; try `clickbench`, `tpch`, `tpch-bench`, or `tpcds`"
+                "unknown subcommand: {other}; try `clickbench`, `clickbench-grpc`, `correctness`, \
+                 `correctness-distributed`, `tpch`, `tpch-bench`, `tpch-distributed`, or `tpcds`"
             );
             std::process::exit(2);
         }

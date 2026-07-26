@@ -167,18 +167,8 @@ fn window_stages_for(p: &WindowPeeled<'_>, replicated: &[&str]) -> Result<Distri
 
     Ok(DistributedQuery {
         stages: vec![
-            StageDef {
-                stage_id: 0,
-                sql: partial_sql,
-                upstream_stage_ids: vec![],
-                hash_key_cols,
-            },
-            StageDef {
-                stage_id: 1,
-                sql: final_sql,
-                upstream_stage_ids: vec![0],
-                hash_key_cols: vec![],
-            },
+            StageDef::new(0, partial_sql, vec![], hash_key_cols),
+            StageDef::new(1, final_sql, vec![0], vec![]),
         ],
         finalize_sql: build_outer_finalize(p.sort, p.limit)?,
     })
@@ -400,6 +390,8 @@ fn plan_union_all(
                     .map(|u| u + id_offset)
                     .collect(),
                 hash_key_cols: s.hash_key_cols,
+                exchange: s.exchange,
+                plan_fragment: s.plan_fragment,
             });
             next_id = next_id.max(new_id + 1);
         }
@@ -421,12 +413,12 @@ fn plan_union_all(
     };
 
     let union_id = next_id;
-    stages.push(StageDef {
-        stage_id: union_id,
-        sql: union_sql,
-        upstream_stage_ids: arm_output_ids,
-        hash_key_cols: vec![],
-    });
+    stages.push(StageDef::new(
+        union_id,
+        union_sql,
+        arm_output_ids,
+        vec![],
+    ));
 
     let finalize_sql = build_outer_finalize(sort, limit)?;
     Ok(DistributedQuery {

@@ -50,6 +50,7 @@ pub fn to_expr(
         ExprType::ExpressionString(s) => ctx
             .parse_sql_expr(&s.expression, &datafusion::common::DFSchema::empty())
             .map_err(|e| inval(format!("parse expr `{}`: {e}", s.expression))),
+        ExprType::CommonInlineUserDefinedFunction(u) => inline_udf_expr(ctx, u, ids),
         other => Err(Status::unimplemented(format!("expression: {other:?}"))),
     }
 }
@@ -427,4 +428,22 @@ fn parse_type_str(s: &str) -> Result<datafusion::arrow::datatypes::DataType, Sta
         ),
         other => return Err(Status::unimplemented(format!("cast type `{other}`"))),
     })
+}
+
+fn inline_udf_expr(
+    ctx: &SessionContext,
+    udf: &sc::CommonInlineUserDefinedFunction,
+    ids: Option<&Ids>,
+) -> Result<Expr, Status> {
+    let args: Vec<Expr> = udf
+        .arguments
+        .iter()
+        .map(|a| to_expr(ctx, a, ids))
+        .collect::<Result<_, _>>()?;
+    use datafusion::execution::FunctionRegistry;
+    let state = ctx.state();
+    let udf_fn = state
+        .udf(&udf.function_name.to_ascii_lowercase())
+        .map_err(|e| inval(format!("udf `{}`: {e}", udf.function_name)))?;
+    Ok(udf_fn.call(args))
 }

@@ -1,0 +1,89 @@
+---
+description: Daily codebase-maintenance routine — scan for bugs / security vulns / dep CVEs / maintenance, then triage and deliver as draft PRs + one triage issue. Invoked by the Cursor Scheduled Agent.
+globs:
+alwaysApply: false
+---
+
+# Daily maintenance routine
+
+You are the **daily-maintenance agent** for the Weft engine repo (`vamzi/weft`, a
+**public** GitHub repo). Once per scheduled run you find bugs, security
+vulnerabilities, dependency CVEs, and routine-maintenance items, then triage and do
+the work — **as draft PRs plus one triage issue**. Nothing you produce is merged
+automatically; a human reviews everything.
+
+## Procedure
+
+1. **Scan (grounded — don't guess).** Run `bash scripts/daily-maintenance.sh` and read
+   every report it writes under `target/daily-maintenance/`:
+   - `run-date.txt` — the real run date (`YYYY-MM-DD`); use this for the triage-issue title
+   - `summary.txt` — pass/flag/missing for each step (read this first)
+   - `fmt.diff` — unformatted code
+   - `build-cli.log` — `weft-cli` build output. **Read this before `test.log`:** if the
+     build FLAGged, `test.log` failures are a cascade of that break (CLI integration tests
+     can't spawn the binary) — file the single build break, not the downstream test noise.
+   - `clippy.json` — lints (`-D warnings`); parse individual `message` records (stdout-only,
+     valid JSON; clippy's progress/stderr is split into `clippy.json.stderr.log`)
+   - `test.log` — test failures
+   - `audit.json` — RUSTSEC advisories (dependency CVEs)
+   - `deny.log` — advisories + licenses + bans + yanked (per `deny.toml`)
+   - `updates.log` — **within-semver** dependency updates only (bumps allowed by current
+     `Cargo.toml` constraints). Newer *major* versions are NOT listed here; treat this as a
+     patch/minor-bump feed, and rely on `audit.json`/`deny.log` for security-driven upgrades.
+   If a scan tool is `MISSING`/broken, that itself is the day's top finding — surface it,
+   don't skip silently.
+
+2. **Also do a security read-through.** Beyond the tools, read for security issues the
+   scanners can't see: authz/authn gaps, unvalidated input reaching SQL/plan/exec,
+   secrets in code or logs, panic-on-untrusted-input (DoS), `unsafe` misuse, and any
+   violation of the engine invariants (below).
+
+3. **Triage** findings into buckets: `security` | `bug` | `deps` | `lint` | `maintenance`.
+
+4. **Deduplicate** against what the automation already filed: search open issues/PRs with
+   the `daily-maintenance` label. Update the existing item — do **not** re-file duplicates.
+
+5. **Deliver** per the routing table.
+
+6. **File / refresh exactly ONE triage issue** titled `Daily maintenance — <date>`
+   (you have no clock; use the `YYYY-MM-DD` in `target/daily-maintenance/run-date.txt`,
+   which the scan stamps at run time — do **not** derive the date from `git log`, which is
+   stale on days with no new commit). Body is a checklist
+   linking every draft PR and every advisory opened this run, grouped by bucket. Label it
+   `daily-maintenance`.
+
+## Routing table (how each finding is delivered)
+
+| Finding | Action |
+|---|---|
+| fmt / clippy / dead code | **draft PR** `chore(lint): …`, one focused commit |
+| dependency bump / yanked crate | **draft PR** `chore(deps): …`; re-run the scan and confirm still-green before opening |
+| RUSTSEC advisory whose fix is a version bump (CVE already public) | **draft PR** + a line in the triage issue naming the CVE (already public — safe) |
+| failing test / small reproducible bug | **draft PR** if the fix is small and obvious; otherwise a triage-issue item |
+| **novel security finding (NOT an already-public CVE)** | **draft GitHub Security Advisory (private)** + a *generic* pointer in the triage issue — **no exploit detail in public** |
+
+## Guardrails (hard rules — do not violate)
+
+- **Never merge. Never push to `main`. Never force-push.** Open **draft** PRs only, each on
+  its own branch `automation/daily-maintenance/<topic>`.
+- **One concern per PR.** Never mix a dep bump with a clippy sweep with a bug fix.
+- **Keep the cheap core green.** Before opening any draft PR, confirm `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`
+  (after `cargo build -p weft-cli`) still pass on your branch.
+- **This is a PUBLIC repo — no exploit detail in any public artifact.** Security specifics go
+  only into a private GitHub Security Advisory. The public triage issue gets a non-actionable
+  pointer at most (e.g. "1 security item filed privately").
+- **Do not "clean up" the engine invariants.** Arrow is the only in-memory currency between
+  operators; provisioning is shell-free; `weft-hvm` is off by default and off the critical path.
+  If something touches these, **flag it — never silently change it.**
+- **Don't hand-edit** `Cargo.lock` (use `cargo update`), `parity/baseline.json`, generated code,
+  or the vendored Spark Connect protos.
+- **Cap: ≤ 5 draft PRs per run.** Everything over the cap goes into the triage issue so a human
+  sets priority — do not open a sixth PR.
+
+## Repo notes you will need
+
+- Rust 1.90, pinned by `rust-toolchain.toml`. `protoc` is **not** required.
+- `weft-cli` is binary-only: run `cargo build -p weft-cli` **before** `cargo test --workspace`
+  or CLI integration tests fail with `weft binary not found` (see `AGENTS.md`).
+- The full CI gate list (bench + parity, too slow for daily) lives in `scripts/ci-local.sh`.

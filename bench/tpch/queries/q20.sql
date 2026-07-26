@@ -26,8 +26,8 @@ WHERE
                     WHERE
                         l_partkey = ps_partkey
                         AND l_suppkey = ps_suppkey
-                        AND l_shipdate >= CAST('1994-01-01' AS date)
-                        AND l_shipdate < CAST('1995-01-01' AS date)))
+                        AND l_shipdate >= date '1994-01-01'
+                        AND l_shipdate < date '1994-01-01' + interval '1' year))
             AND s_nationkey = n_nationkey
             AND n_name = 'CANADA'
         ORDER BY

@@ -26,8 +26,8 @@ FROM (
                 AND n2.n_name = 'GERMANY')
             OR (n1.n_name = 'GERMANY'
                 AND n2.n_name = 'FRANCE'))
-        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)
-        AND CAST('1996-12-31' AS date)) AS shipping
+        AND l_shipdate BETWEEN date '1995-01-01'
+        AND date '1996-12-31') AS shipping
 GROUP BY
     supp_nation,
     cust_nation,

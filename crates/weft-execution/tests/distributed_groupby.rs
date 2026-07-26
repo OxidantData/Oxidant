@@ -54,8 +54,15 @@ async fn two_worker_groupby_matches_single_node() {
         .unwrap();
     let expected = rows(&single.sql(query).await.unwrap());
 
-    // Two workers, each holding half the data under table `t`.
-    let (p0, p1) = (50571u16, 50572u16);
+    // Ephemeral ports avoid collisions with weft-connect tests under workspace CI.
+    let p0 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let p1 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![make_batch(0, N / 2)])
         .unwrap();

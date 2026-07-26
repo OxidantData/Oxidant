@@ -20,7 +20,8 @@ use crate::tpch_data;
 
 /// The 22 official TPC-H queries, loaded from `bench/tpch/queries/q{N}.sql` at compile time. The
 /// trailing `;` is stripped before execution (DataFusion runs a single statement). Standard SQL —
-/// `CAST('…' AS date)`, `INTERVAL`, EXISTS/correlated subqueries, CTEs.
+/// `date '…'` literals, `INTERVAL` day/month/year arithmetic (incl. ANSI `day (3)` precision on
+/// Q1), EXISTS/correlated subqueries, CTEs.
 pub(crate) fn queries() -> Vec<(&'static str, &'static str)> {
     macro_rules! q {
         ($n:literal) => {

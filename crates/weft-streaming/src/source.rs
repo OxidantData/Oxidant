@@ -107,3 +107,76 @@ impl Source for MemoryRateSource {
         engine.sql(&sql).await
     }
 }
+
+/// Kafka micro-batch source. Reads JSON lines from a spool directory (`WEFT_KAFKA_SPOOL`) or
+/// invokes `kafka-console-consumer` when `bootstrap.servers` + `subscribe` are set.
+pub struct KafkaSource {
+    topic: String,
+    brokers: String,
+    spool_dir: std::path::PathBuf,
+    offset: u64,
+}
+
+impl KafkaSource {
+    pub fn from_options(options: &std::collections::HashMap<String, String>) -> Self {
+        let topic = options
+            .get("subscribe")
+            .or_else(|| options.get("topic"))
+            .cloned()
+            .unwrap_or_else(|| "weft".into());
+        let brokers = options
+            .get("kafka.bootstrap.servers")
+            .or_else(|| options.get("bootstrap.servers"))
+            .cloned()
+            .unwrap_or_else(|| "localhost:9092".into());
+        let spool = std::env::var("WEFT_KAFKA_SPOOL")
+            .unwrap_or_else(|_| format!("/tmp/weft-kafka-{topic}"));
+        Self {
+            topic,
+            brokers,
+            spool_dir: spool.into(),
+            offset: 0,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Source for KafkaSource {
+    async fn poll_batch(&mut self, engine: &Engine) -> weft_common::Result<Vec<RecordBatch>> {
+        std::fs::create_dir_all(&self.spool_dir).ok();
+        let file = self.spool_dir.join(format!("batch-{}.json", self.offset));
+        if file.exists() {
+            self.offset += 1;
+            let sql = format!(
+                "SELECT * FROM json_scan('{}')",
+                file.display().to_string().replace('\'', "''")
+            );
+            return engine.sql(&sql).await;
+        }
+        // Optional: pull one message via kafka-console-consumer when available.
+        let out = std::process::Command::new("kafka-console-consumer")
+            .args([
+                "--bootstrap-server",
+                &self.brokers,
+                "--topic",
+                &self.topic,
+                "--max-messages",
+                "100",
+                "--timeout-ms",
+                "1000",
+            ])
+            .output();
+        if let Ok(o) = out {
+            if o.status.success() && !o.stdout.is_empty() {
+                std::fs::write(&file, &o.stdout).ok();
+                self.offset += 1;
+                let sql = format!(
+                    "SELECT * FROM json_scan('{}')",
+                    file.display().to_string().replace('\'', "''")
+                );
+                return engine.sql(&sql).await;
+            }
+        }
+        Ok(vec![])
+    }
+}

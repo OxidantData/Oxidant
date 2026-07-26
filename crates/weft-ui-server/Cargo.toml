@@ -1,0 +1,27 @@
+[package]
+name = "weft-ui-server"
+description = "Spark-compatible REST API and embedded monitoring UI for Weft."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+weft-common = { workspace = true }
+weft-observability = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tracing = "0.1"
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+http-body-util = "0.1"
+tower = "0.5"

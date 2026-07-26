@@ -4,8 +4,8 @@ SELECT
 FROM
     orders
 WHERE
-    o_orderdate >= CAST('1993-07-01' AS date)
-    AND o_orderdate < CAST('1993-10-01' AS date)
+    o_orderdate >= date '1993-07-01'
+    AND o_orderdate < date '1993-07-01' + interval '3' month
     AND EXISTS (
         SELECT
             *

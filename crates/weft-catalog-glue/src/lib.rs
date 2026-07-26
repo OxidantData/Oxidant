@@ -14,7 +14,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use weft_catalog::hive_types::columns_to_schema;
+use weft_catalog::arrow::datatypes::SchemaRef;
+use weft_catalog::hive_types::{
+    columns_to_schema, format_serde, schema_to_columns, validate_identifier,
+};
 use weft_catalog::{CatalogProvider, Error, Result, TableFormat, TableMetadata};
 
 /// A Glue catalog connection, addressed by its registered `name` and AWS `region`.
@@ -22,6 +25,10 @@ pub struct GlueCatalog {
     name: String,
     region: String,
     aws_bin: String,
+    /// `s3://bucket/prefix` root new tables are written under (`{warehouse}/{db}/{table}/`) when a
+    /// `CREATE TABLE ... AS SELECT` doesn't specify an explicit `LOCATION`. `None` means CTAS
+    /// against this catalog must supply an explicit location (see `create_table`).
+    warehouse: Option<String>,
 }
 
 impl GlueCatalog {
@@ -30,16 +37,20 @@ impl GlueCatalog {
         name: impl Into<String>,
         region: impl Into<String>,
         aws_bin: Option<String>,
+        warehouse: Option<String>,
     ) -> Self {
         Self {
             name: name.into(),
             region: region.into(),
             aws_bin: aws_bin.unwrap_or_else(|| "aws".to_string()),
+            warehouse,
         }
     }
 
-    /// Build from a flat options map (`region` only) — the shape used by both the gateway connection
-    /// request and the `spark.sql.catalog.<name>.*` startup config. `region` defaults to `us-west-2`.
+    /// Build from a flat options map (`region`, `warehouse`) — the shape used by both the gateway
+    /// connection request and the `spark.sql.catalog.<name>.*` startup config. `region` defaults to
+    /// `us-west-2`; `warehouse` (e.g. `s3://bucket/prefix`, the Spark/Iceberg connection-option
+    /// convention) is optional — CTAS against this catalog needs it (or an explicit `LOCATION`).
     ///
     /// SECURITY: the AWS CLI path is **never** taken from `options` (which can be attacker-supplied
     /// via `POST /api/connections`). It is sourced only from the operator-controlled `WEFT_AWS_BIN`
@@ -51,7 +62,8 @@ impl GlueCatalog {
             .cloned()
             .unwrap_or_else(|| "us-west-2".to_string());
         let aws_bin = std::env::var("WEFT_AWS_BIN").ok();
-        Self::new(name, region, aws_bin)
+        let warehouse = options.get("warehouse").cloned();
+        Self::new(name, region, aws_bin, warehouse)
     }
 
     /// Run `aws glue <args> --region <region> --output json` and return stdout.
@@ -64,13 +76,28 @@ impl GlueCatalog {
             .await
             .map_err(|e| Error::Io(format!("exec aws glue: {e}")))?;
         if !out.status.success() {
-            return Err(Error::Io(format!(
-                "aws glue {}: {}",
-                args.first().copied().unwrap_or(""),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
+            let action = args.first().copied().unwrap_or("");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(classify_glue_failure(action, stderr.trim()));
         }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+}
+
+/// Classify a failed `aws glue <action>` invocation's stderr.
+///
+/// The AWS CLI reports a missing database/table as `EntityNotFoundException` — an expected
+/// "doesn't exist" signal (e.g. probed by CTAS to decide whether to create vs. fail), not a
+/// genuine failure. That case maps to [`Error::Plan`], which `weft-loom`'s catalog bridge (and
+/// `CatalogProvider::table_exists`'s default impl) already treats as "not found" rather than a
+/// hard error. Every other failure (auth, network, throttling, missing binary output, ...) keeps
+/// mapping to [`Error::Io`] so it still surfaces as a real error instead of being silently
+/// swallowed as "table missing".
+fn classify_glue_failure(action: &str, stderr: &str) -> Error {
+    if stderr.contains("EntityNotFoundException") {
+        Error::Plan(format!("aws glue {action}: {stderr}"))
+    } else {
+        Error::Io(format!("aws glue {action}: {stderr}"))
     }
 }
 
@@ -136,16 +163,150 @@ impl CatalogProvider for GlueCatalog {
         let data_cols = t["StorageDescriptor"]["Columns"].as_array();
         let part_cols = t["PartitionKeys"].as_array();
         let schema = columns_to_schema(glue_column_pairs(data_cols, part_cols));
+        // Partition-column NAMES (Hive layout: values live in the object path, e.g.
+        // `.../year=2015/month=01/`, not inside the data files). The engine must know these so it
+        // reads them from the path instead of expecting them in the Parquet — otherwise a
+        // partitioned table (typical of the monthly taxi dumps) scans as NULLs or fails. The types
+        // come along in `schema` (Glue appends partition columns to the declared schema).
+        let partition_columns: Vec<String> = part_cols
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| c["Name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let comment = t["Description"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let properties: HashMap<String, String> = t["Parameters"]
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let md = TableMetadata::new(
             format!("{}.{db}.{table}", self.name),
             location.to_string(),
             format,
-        );
+        )
+        .with_comment(comment)
+        .with_properties(properties)
+        .with_partition_columns(partition_columns);
         Ok(match schema {
             Some(s) => md.with_schema(Arc::new(s)),
             None => md,
         })
+    }
+
+    async fn create_table(
+        &self,
+        namespace: &[String],
+        table: &str,
+        schema: SchemaRef,
+        format: TableFormat,
+        location: Option<String>,
+        partition_columns: &[String],
+    ) -> Result<TableMetadata> {
+        let db = single_db(namespace)?;
+        let location = self.resolve_create_location(db, table, location)?;
+        let table_input = build_table_input(table, &location, &schema, format, partition_columns)?;
+        let table_input_json = serde_json::to_string(&table_input)
+            .map_err(|e| Error::Io(format!("serialize Glue TableInput: {e}")))?;
+
+        self.glue(&[
+            "create-table",
+            "--database-name",
+            db,
+            "--table-input",
+            &table_input_json,
+        ])
+        .await?;
+
+        let md = TableMetadata::new(format!("{}.{db}.{table}", self.name), location, format)
+            .with_schema(schema)
+            .with_partition_columns(partition_columns.to_vec());
+        Ok(md)
+    }
+}
+
+impl GlueCatalog {
+    /// Resolve the storage location for a table being created: the explicit `location` if given
+    /// (normalized to end in `/`, required for `ListingTable`/`is_collection()` on read-back),
+    /// else `{warehouse}/{db}/{table}/`, else an error naming what's missing.
+    ///
+    /// `db`/`table` are validated as plain identifiers first (`validate_identifier`) — they come
+    /// straight from the SQL statement's table reference, and were previously interpolated
+    /// unsanitized into the warehouse-derived path, letting a name like `../../etc/evil` escape
+    /// the intended directory (a real path-traversal bug for `file://` warehouses).
+    fn resolve_create_location(
+        &self,
+        db: &str,
+        table: &str,
+        location: Option<String>,
+    ) -> Result<String> {
+        if let Some(l) = location {
+            return Ok(if l.ends_with('/') { l } else { format!("{l}/") });
+        }
+        validate_identifier("database", db)?;
+        validate_identifier("table", table)?;
+        let warehouse = self.warehouse.as_deref().ok_or_else(|| {
+            Error::Plan(format!(
+                "catalog `{}` has no `warehouse` configured and no explicit LOCATION given",
+                self.name
+            ))
+        })?;
+        Ok(format!("{}/{db}/{table}/", warehouse.trim_end_matches('/')))
+    }
+}
+
+/// Build the Glue `create-table --table-input` JSON body for a new table at `location` with
+/// `schema`/`format`/`partition_columns`. A pure function (no I/O) so it's independently
+/// unit-testable without shelling out to the `aws` CLI.
+fn build_table_input(
+    table: &str,
+    location: &str,
+    schema: &weft_catalog::arrow::datatypes::Schema,
+    format: TableFormat,
+    partition_columns: &[String],
+) -> Result<serde_json::Value> {
+    let serde = format_serde(format)?;
+    let (data_cols, part_cols) = schema_to_columns(schema, partition_columns)?;
+    let to_json = |cols: &[(String, String)]| {
+        cols.iter()
+            .map(|(name, ty)| serde_json::json!({"Name": name, "Type": ty}))
+            .collect::<Vec<_>>()
+    };
+    Ok(serde_json::json!({
+        "Name": table,
+        "StorageDescriptor": {
+            "Location": location,
+            "Columns": to_json(&data_cols),
+            "InputFormat": serde.input_format,
+            "OutputFormat": serde.output_format,
+            "SerdeInfo": {
+                "SerializationLibrary": serde.serde_lib,
+                "Parameters": serde.serde_params.iter().copied().collect::<HashMap<_, _>>(),
+            },
+        },
+        "PartitionKeys": to_json(&part_cols),
+        "Parameters": { "classification": classification_for(format) },
+    }))
+}
+
+/// The Glue/Athena `classification` table parameter for a physical format (the same convention
+/// `load_table` reads back via `Parameters.classification`).
+fn classification_for(format: TableFormat) -> &'static str {
+    match format {
+        TableFormat::Parquet => "parquet",
+        TableFormat::Csv => "csv",
+        TableFormat::Json => "json",
+        TableFormat::Delta => "delta",
+        TableFormat::Iceberg => "iceberg",
     }
 }
 
@@ -246,6 +407,133 @@ mod tests {
         assert_eq!(
             columns_to_schema(glue_column_pairs(data.as_array(), None)),
             None
+        );
+    }
+
+    // `classify_glue_failure` is what lets a CTAS's "does the target table already exist?" probe
+    // (`get-table`) tell "doesn't exist yet, go ahead and create it" (EntityNotFoundException)
+    // apart from a genuine failure that must still surface as an error.
+
+    #[test]
+    fn entity_not_found_classifies_as_not_found() {
+        let stderr = "An error occurred (EntityNotFoundException) when calling the GetTable \
+                       operation: Entity Not Found";
+        match classify_glue_failure("get-table", stderr) {
+            Error::Plan(msg) => assert!(msg.contains("EntityNotFoundException")),
+            other => panic!("expected Error::Plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn access_denied_classifies_as_io_error() {
+        let stderr = "An error occurred (AccessDeniedException) when calling the GetTable \
+                       operation: User is not authorized";
+        match classify_glue_failure("get-table", stderr) {
+            Error::Io(msg) => assert!(msg.contains("AccessDeniedException")),
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generic_failure_classifies_as_io_error() {
+        let stderr = "Could not connect to the endpoint URL";
+        match classify_glue_failure("get-table", stderr) {
+            Error::Io(msg) => assert!(msg.contains("Could not connect")),
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
+    }
+
+    // `build_table_input` / `resolve_create_location` back `GlueCatalog::create_table` (CTAS write
+    // support) — tested as pure functions so no `aws` CLI invocation is needed.
+
+    fn sample_schema() -> weft_catalog::arrow::datatypes::Schema {
+        use weft_catalog::arrow::datatypes::{DataType, Field};
+        weft_catalog::arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("dt", DataType::Utf8, true),
+        ])
+    }
+
+    #[test]
+    fn build_table_input_shapes_parquet_table_correctly() {
+        let schema = sample_schema();
+        let v = build_table_input(
+            "orders",
+            "s3://bucket/db/orders/",
+            &schema,
+            TableFormat::Parquet,
+            &["dt".to_string()],
+        )
+        .expect("built");
+        assert_eq!(v["Name"], "orders");
+        assert_eq!(v["StorageDescriptor"]["Location"], "s3://bucket/db/orders/");
+        assert_eq!(
+            v["StorageDescriptor"]["Columns"],
+            json!([{"Name": "id", "Type": "bigint"}, {"Name": "name", "Type": "string"}])
+        );
+        assert_eq!(
+            v["PartitionKeys"],
+            json!([{"Name": "dt", "Type": "string"}])
+        );
+        assert_eq!(
+            v["StorageDescriptor"]["SerdeInfo"]["SerializationLibrary"],
+            "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+        );
+        assert_eq!(v["Parameters"]["classification"], "parquet");
+    }
+
+    #[test]
+    fn build_table_input_rejects_lakehouse_write_formats() {
+        let schema = sample_schema();
+        for format in [TableFormat::Delta, TableFormat::Iceberg] {
+            let err = build_table_input("t", "s3://bucket/t/", &schema, format, &[]).unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_create_location_prefers_explicit_location() {
+        let cat = GlueCatalog::new("glue", "us-west-2", None, Some("s3://wh".to_string()));
+        assert_eq!(
+            cat.resolve_create_location("db", "t", Some("s3://explicit/t/".to_string()))
+                .unwrap(),
+            "s3://explicit/t/"
+        );
+    }
+
+    #[test]
+    fn resolve_create_location_falls_back_to_warehouse() {
+        let cat = GlueCatalog::new("glue", "us-west-2", None, Some("s3://wh/".to_string()));
+        assert_eq!(
+            cat.resolve_create_location("db", "t", None).unwrap(),
+            "s3://wh/db/t/"
+        );
+    }
+
+    #[test]
+    fn resolve_create_location_errors_without_warehouse_or_location() {
+        let cat = GlueCatalog::new("glue", "us-west-2", None, None);
+        let err = cat.resolve_create_location("db", "t", None).unwrap_err();
+        assert!(matches!(err, Error::Plan(_)));
+    }
+
+    #[test]
+    fn resolve_create_location_rejects_path_traversal() {
+        let cat = GlueCatalog::new("glue", "us-west-2", None, Some("s3://wh".to_string()));
+        for (db, table) in [("db", "../../etc/evil"), ("../escape", "t"), ("db", "a/b")] {
+            let err = cat.resolve_create_location(db, table, None).unwrap_err();
+            assert!(matches!(err, Error::Plan(_)), "{db}.{table}");
+        }
+    }
+
+    #[test]
+    fn resolve_create_location_normalizes_missing_trailing_slash() {
+        let cat = GlueCatalog::new("glue", "us-west-2", None, None);
+        assert_eq!(
+            cat.resolve_create_location("db", "t", Some("s3://explicit/t".to_string()))
+                .unwrap(),
+            "s3://explicit/t/"
         );
     }
 }

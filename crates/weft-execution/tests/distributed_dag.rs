@@ -94,8 +94,15 @@ async fn multi_shuffle_dag_with_intermediate_stage() {
         .await
         .unwrap();
 
-    // Two workers, each holding half of both tables.
-    let (p0, p1) = (50631u16, 50632u16);
+    // Ephemeral ports for workspace-parallel CI.
+    let p0 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let p1 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
     let e0 = Arc::new(Engine::new());
     e0.register_batches("orders", vec![orders(0, NORD / 2, CUSTS)])
         .unwrap();
@@ -125,12 +132,14 @@ async fn multi_shuffle_dag_with_intermediate_stage() {
             sql: "SELECT o_orderkey, o_custkey, o_region FROM orders".into(),
             upstream_stage_ids: vec![],
             hash_key_cols: vec![1],
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 1,
             sql: "SELECT c_custkey, c_val FROM customer".into(),
             upstream_stage_ids: vec![],
             hash_key_cols: vec![0],
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 2,
@@ -139,6 +148,7 @@ async fn multi_shuffle_dag_with_intermediate_stage() {
                 .into(),
             upstream_stage_ids: vec![0, 1],
             hash_key_cols: vec![0], // re-shuffle the join output by region
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 3,
@@ -146,6 +156,7 @@ async fn multi_shuffle_dag_with_intermediate_stage() {
                 .into(),
             upstream_stage_ids: vec![2],
             hash_key_cols: vec![],
+            ..StageDef::default()
         },
     ];
 
@@ -176,7 +187,14 @@ async fn replicated_small_table_join() {
         .unwrap();
 
     // customer is REPLICATED: the full table on every worker. orders is sharded.
-    let (p0, p1) = (50633u16, 50634u16);
+    let p0 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let p1 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
     let e0 = Arc::new(Engine::new());
     e0.register_batches("orders", vec![orders(0, NORD / 2, CUSTS)])
         .unwrap();
@@ -208,12 +226,14 @@ async fn replicated_small_table_join() {
                 .into(),
             upstream_stage_ids: vec![],
             hash_key_cols: vec![0],
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 1,
             sql: "SELECT k, SUM(s) AS s, SUM(n) AS n FROM shuffle_input GROUP BY k".into(),
             upstream_stage_ids: vec![0],
             hash_key_cols: vec![],
+            ..StageDef::default()
         },
     ];
 

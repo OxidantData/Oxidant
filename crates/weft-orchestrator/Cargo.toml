@@ -1,0 +1,19 @@
+[package]
+name = "weft-orchestrator"
+description = "Cluster provisioning backend: static and Kubernetes worker pool management."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+weft-common = { workspace = true }
+weft-execution = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = []
+k8s = ["weft-execution/k8s"]

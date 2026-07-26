@@ -22,7 +22,7 @@ datafusion = "54"
 # 0.13 line DataFusion pulls so the `ObjectStore` trait/types unify; `aws` adds the S3 client + the
 # EC2 instance-role (IMDS) credential provider — no static keys.
 object_store = { version = "0.13", features = ["aws"] }
-# File-list sharding streams object-store listings.
+# `StreamExt::next` to drain streams; file-list sharding also streams object-store listings.
 futures = "0.3"
 # Data-parallel aggregation of independent key-hash partitions (the native GROUP BY carve-out).
 rayon = "1"
@@ -36,6 +36,19 @@ serde_json = "1"
 # Spark `from_json` parses date/timestamp leaves with Spark format patterns; chrono is already in the
 # tree via arrow (same 0.4 line), so the lock resolves to the existing version — no new dep tree.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# `register_table`'s CTAS write path builds its own fresh runtime on a dedicated OS thread (the
+# DataFusion trait method is sync, but Glue/Hive/object-store writes are async) — needs `rt` in
+# [dependencies], not just as a test-only dev-dependency. `sync` adds `tokio::sync::Mutex`, used by
+# assume_role_credentials.rs to serialize concurrent STS AssumeRole calls (held across an await —
+# a std::sync::Mutex must never be held across one).
+tokio = { version = "1", features = ["rt", "sync"] }
+# `sts:AssumeRole` for the Hadoop-AWS `fs.s3a.assumed.role.arn` config equivalent (see
+# assume_role_credentials.rs) — hand-rolling signed STS calls isn't worth the correctness risk
+# for this one call type, so this pulls in the official SDK rather than extending object_store's
+# own (crate-private) request-signing code. Pinned (not "1") to versions whose MSRV matches this
+# workspace's toolchain — newer releases require a rustc this repo doesn't pin to yet.
+aws-config = "=1.8.13"
+aws-sdk-sts = "=1.97.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

@@ -1,0 +1,76 @@
+{{- if .Values.connect.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weft-connect
+  labels:
+    app: weft-connect
+spec:
+  replicas: {{ .Values.connect.replicas }}
+  selector:
+    matchLabels:
+      app: weft-connect
+  template:
+    metadata:
+      labels:
+        app: weft-connect
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: connect
+          image: {{ .Values.connect.image }}
+          imagePullPolicy: {{ .Values.connect.imagePullPolicy }}
+          args: ["spark", "server", "--port", "{{ .Values.connect.port }}"]
+          ports:
+            - name: spark-connect
+              containerPort: {{ .Values.connect.port }}
+          env:
+            - name: WEFT_WORKER_SERVICE
+              value: {{ printf "weft-worker.%s.svc.cluster.local" .Release.Namespace | quote }}
+            - name: WEFT_WORKER_PORT
+              value: {{ .Values.worker.port | quote }}
+            - name: WEFT_AWS_BIN
+              value: {{ .Values.connect.awsBin | quote }}
+            {{- if .Values.connect.memoryLimitBytes }}
+            - name: WEFT_MEMORY_LIMIT_BYTES
+              value: {{ .Values.connect.memoryLimitBytes | quote }}
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: spill
+              mountPath: /var/lib/weft/spill
+          resources:
+            {{- toYaml .Values.connect.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: spill
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-connect
+  labels:
+    app: weft-connect
+spec:
+  type: {{ .Values.connect.serviceType }}
+  selector:
+    app: weft-connect
+  ports:
+    - name: spark-connect
+      port: {{ .Values.connect.port }}
+      targetPort: {{ .Values.connect.port }}
+{{- end }}

@@ -3,8 +3,8 @@ SELECT
 FROM
     lineitem
 WHERE
-    l_shipdate >= CAST('1994-01-01' AS date)
-    AND l_shipdate < CAST('1995-01-01' AS date)
+    l_shipdate >= date '1994-01-01'
+    AND l_shipdate < date '1994-01-01' + interval '1' year
     AND l_discount BETWEEN 0.05
     AND 0.07
     AND l_quantity < 24;

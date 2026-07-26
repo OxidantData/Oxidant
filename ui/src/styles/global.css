@@ -1,0 +1,36 @@
+:root {
+  --weft-bg: #0b0b0c;
+  --weft-surface: #141416;
+  --weft-border: #26262b;
+  --weft-text: #f4f4f5;
+  --weft-text-muted: #9ca3af;
+  --weft-accent: #ff6a00;
+  --weft-success: #16a34a;
+  --weft-danger: #dc2626;
+  --weft-warning: #d97706;
+  --weft-font-ui: Inter, ui-sans-serif, system-ui, sans-serif;
+  --weft-font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  font-family: var(--weft-font-ui);
+  background: var(--weft-bg);
+  color: var(--weft-text);
+  min-height: 100vh;
+}
+
+@layer components {
+  .weft-card {
+    @apply rounded-lg border border-border bg-surface p-4;
+  }
+  .weft-btn {
+    @apply rounded-md bg-accent px-4 py-2 text-sm font-medium text-white hover:opacity-90;
+  }
+  .status-SUCCEEDED, .status-COMPLETE, .status-SUCCESS { @apply text-success; }
+  .status-FAILED { @apply text-danger; }
+  .status-RUNNING, .status-ACTIVE { @apply text-warning; }
+}

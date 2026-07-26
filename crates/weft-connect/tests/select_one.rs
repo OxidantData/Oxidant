@@ -11,7 +11,7 @@ use weft_proto::spark::connect as sc;
 
 #[tokio::test]
 async fn select_one_over_grpc_returns_1() {
-    let port = 50571;
+    let port = 50971;
 
     // Start the server in the background.
     tokio::spawn(async move {

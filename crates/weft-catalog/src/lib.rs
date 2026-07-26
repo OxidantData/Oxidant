@@ -82,6 +82,12 @@ pub struct TableMetadata {
     pub storage_options: HashMap<String, String>,
     /// Partition column names (informational for v1; Parquet hive-partitioning is inferred).
     pub partition_columns: Vec<String>,
+    /// Table-level comment/description, when the catalog has one (e.g. Hive's table-level
+    /// comment field, Glue's `Description`). `None` when the source doesn't have one set.
+    pub comment: Option<String>,
+    /// Table properties / parameters (e.g. Hive's `parameters` map, Glue's `Parameters` map).
+    /// Empty when the source doesn't surface these.
+    pub properties: HashMap<String, String>,
 }
 
 impl TableMetadata {
@@ -94,6 +100,8 @@ impl TableMetadata {
             schema: None,
             storage_options: HashMap::new(),
             partition_columns: Vec::new(),
+            comment: None,
+            properties: HashMap::new(),
         }
     }
 
@@ -112,6 +120,18 @@ impl TableMetadata {
     /// Builder: attach partition columns.
     pub fn with_partition_columns(mut self, cols: Vec<String>) -> Self {
         self.partition_columns = cols;
+        self
+    }
+
+    /// Builder: attach a table-level comment/description.
+    pub fn with_comment(mut self, comment: Option<String>) -> Self {
+        self.comment = comment;
+        self
+    }
+
+    /// Builder: attach table properties/parameters.
+    pub fn with_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.properties = properties;
         self
     }
 }
@@ -159,6 +179,38 @@ pub trait CatalogProvider: Send + Sync {
             .await?
             .iter()
             .any(|ns| ns.last() == Some(last)))
+    }
+
+    /// Create a new table in `namespace` backed by `schema`/`format`, physically stored at
+    /// `location` (or a catalog-chosen default location when `None`), with `partition_columns`
+    /// appended after the data columns. Called by the DataFusion bridge's `register_table` when a
+    /// `CREATE TABLE ... AS SELECT` targets this catalog — the caller writes the actual data files
+    /// separately and only needs the returned [`TableMetadata`] (in particular its `location`) to
+    /// know where.
+    ///
+    /// Default: `Unsupported`, so a read-only provider (or any future third-party one) keeps
+    /// compiling without implementing writes.
+    async fn create_table(
+        &self,
+        namespace: &[String],
+        table: &str,
+        schema: SchemaRef,
+        format: TableFormat,
+        location: Option<String>,
+        partition_columns: &[String],
+    ) -> Result<TableMetadata> {
+        let _ = (
+            namespace,
+            table,
+            schema,
+            format,
+            location,
+            partition_columns,
+        );
+        Err(Error::Unsupported(format!(
+            "catalog `{}` does not support creating tables",
+            self.name()
+        )))
     }
 }
 

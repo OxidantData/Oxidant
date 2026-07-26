@@ -16,6 +16,10 @@ pub struct CheckpointState {
     pub run_id: String,
     pub batch_id: u64,
     pub source_offsets: Vec<String>,
+    /// Last batch id successfully committed to the sink (exactly-once semantics).
+    pub committed_batch_id: u64,
+    /// Event-time watermark in microseconds (for late-data dropping).
+    pub watermark_micros: i64,
 }
 
 /// Filesystem-backed checkpoint store.
@@ -59,6 +63,8 @@ impl CheckpointStore {
             run_id: id.run_id.clone(),
             batch_id: 0,
             source_offsets: vec![],
+            committed_batch_id: 0,
+            watermark_micros: 0,
         };
         self.save(&state)
     }

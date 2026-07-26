@@ -82,22 +82,31 @@ spill pool on the 32 GB box). **This confirms the original honest expectation: c
 margin; the durable separation is the Phase 2 HVM2 GPU path, not CPU config.** A real c6a run, if
 done, would only need to confirm the `batch_size` candidate before any default change.
 
-### 1.5b — Distributed shuffle — DONE (local MVP, $0)
-Implemented in `crates/weft-execution`: 2-stage `partial-agg → hash shuffle → final-agg`.
+### 1.5b — Distributed shuffle / Sail parity routing — DONE (local MVP, $0)
+Implemented in `crates/weft-execution`: multi-stage `partial-agg → hash shuffle → final-agg`,
+with a Forward fallback path for shapes that are not worth/able to split yet.
 - `shuffle::protocol` — prost `StageTicket`/`ShuffleReadTicket` envelope (tag-byte prefixed so the
   legacy raw-SQL `do_get` ticket still works).
 - `shuffle::partition` — FNV hash partitioning of stage output into per-worker buckets.
 - `flight.rs` — `Worker` caches stage output; consumer stages pull their bucket from every upstream
-  via `do_get(ShuffleReadTicket)`, register `shuffle_input`, and finalize.
+  via `do_get(ShuffleReadTicket)`, register `shuffle_input`, and finalize. `do_exchange` streams
+  stage output through the same Flight path.
 - `shuffle::codec` — `datafusion-proto` physical-fragment ser/de (round-trips a GROUP BY over a
   Parquet leaf; `stage_sql` is the primary path and permanent fallback).
-- `driver::run_distributed` + `weft worker` / `weft driver` CLI subcommands; `run(Mode::Distributed)`
-  seam in `lib.rs`.
+- `driver::run_distributed` + `weft worker` / `weft driver` CLI subcommands; task-slot scheduling
+  and per-task retry/fallback are in the driver path.
+- `weft spark server --mode local-cluster --workers N` starts in-process Flight workers for local
+  Spark Connect smoke tests.
+- `weft-connect::distributed` prefers the distributed path whenever workers are configured; if the
+  shape splitter returns `Unsupported`, `plan_distributed` emits a single Forward stage that
+  `run_stages_obs` executes on one worker.
 - Test `two_worker_groupby_matches_single_node` asserts row-for-row equality with single-node.
 
-**Remaining 1.5b follow-ups (deferred):** auto-decompose SQL aggregates (AVG/COUNT(DISTINCT) via
-sum+count or sketches), >2-stage plans, shuffle spill, dynamic worker discovery, `do_exchange`
-streaming, and routing `weft spark server --cluster` GROUP BY through `run_distributed`.
+**Completed in 1.5b:** auto-decompose SQL aggregates (AVG/COUNT(DISTINCT)), multi-stage DAG plans,
+broadcast joins, global ORDER BY/LIMIT, shuffle spill (`WEFT_SHUFFLE_SPILL_DIR`), dynamic worker
+discovery (`K8sMembership` behind `k8s` feature), Spark Connect → distributed routing, Forward
+fallback, local-cluster mode, task slots, and `do_exchange` streaming — see `stage_planner.rs` +
+`auto_distribute.rs`.
 
 ### Phase 1 exit loose ends
 - Compute **median per-query speedup vs Spark** (need a Spark baseline run or use Sail's published

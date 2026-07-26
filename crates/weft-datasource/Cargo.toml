@@ -11,6 +11,12 @@ rust-version.workspace = true
 weft-common = { workspace = true }
 serde_json = "1"
 apache-avro = "0.17"
+arrow = "55"
+parquet = "55"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
 # TODO(deps): parquet, arrow, object_store,
 #             delta_kernel = "0.x" (deletion vectors + column mapping),
 #             iceberg = "0.9" (position + equality deletes).

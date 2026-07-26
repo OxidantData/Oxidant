@@ -7,10 +7,13 @@
 //! buckets spill to `WEFT_SPILL_DIR` when over `WEFT_SHUFFLE_SPILL_BYTES` (see
 //! [`shuffle::spill`]); streaming `do_exchange` remains a stub.
 
+pub mod aqe;
 pub mod driver;
 pub mod flight;
+pub mod lineage;
 pub mod membership;
 pub mod plan;
+pub mod scheduler;
 pub mod shuffle;
 
 use std::sync::Arc;

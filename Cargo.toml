@@ -29,6 +29,7 @@ weft-analyzer   = { path = "crates/weft-analyzer" }
 weft-catalog    = { path = "crates/weft-catalog" }
 weft-catalog-hive = { path = "crates/weft-catalog-hive" }
 weft-catalog-glue = { path = "crates/weft-catalog-glue" }
+weft-catalog-rest = { path = "crates/weft-catalog-rest" }
 weft-optimizer  = { path = "crates/weft-optimizer" }
 weft-physical   = { path = "crates/weft-physical" }
 weft-datasource = { path = "crates/weft-datasource" }
@@ -40,6 +41,10 @@ weft-connect    = { path = "crates/weft-connect" }
 # Spark parity harness (golden SQL tests + scoreboard).
 weft-spark-compat = { path = "crates/weft-spark-compat" }
 weft-streaming   = { path = "crates/weft-streaming" }
+weft-orchestrator = { path = "crates/weft-orchestrator" }
+weft-gateway     = { path = "crates/weft-gateway" }
+weft-observability = { path = "crates/weft-observability" }
+weft-ui-server   = { path = "crates/weft-ui-server" }
 
 [profile.release]
 opt-level = 3

@@ -16,6 +16,8 @@ weft-common = { workspace = true }
 weft-connect = { workspace = true }
 weft-loom = { workspace = true }
 weft-execution = { workspace = true }
+weft-ui-server = { workspace = true }
+weft-observability = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # TODO(deps): clap = { version = "4", features = ["derive"] } for real subcommand parsing.
 

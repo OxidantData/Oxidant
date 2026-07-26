@@ -1,5 +1,8 @@
 # Cluster provisioning → Kubernetes (secure redesign)
 
+> **Note:** `weft-orchestrator`, `weft-gateway`, and `deploy/helm/weft/` ship in this repo
+> (worker HPA + gateway Deployment). Enable with `WEFT_ORCHESTRATOR=k8s` on the gateway.
+
 This documents the migration of per-user compute "clusters" off the EC2
 shell-`user_data` path and onto hardened Kubernetes pods, the security findings it
 closes, how to enable it, and the one remaining gate before cluster-routed SQL is

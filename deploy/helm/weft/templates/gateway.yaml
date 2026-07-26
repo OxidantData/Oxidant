@@ -1,0 +1,43 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weft-gateway
+  labels:
+    app: weft-gateway
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: weft-gateway
+  template:
+    metadata:
+      labels:
+        app: weft-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: {{ .Values.gateway.image }}
+          ports:
+            - containerPort: {{ .Values.gateway.port }}
+          env:
+            - name: WEFT_GATEWAY_PORT
+              value: "{{ .Values.gateway.port }}"
+            - name: WEFT_ORCHESTRATOR
+              value: {{ .Values.gateway.env.WEFT_ORCHESTRATOR | quote }}
+            - name: WEFT_WORKER_IMAGE
+              value: {{ .Values.gateway.env.WEFT_WORKER_IMAGE | quote }}
+            - name: WEFT_CLUSTER_IMAGE
+              value: {{ .Values.gateway.env.WEFT_CLUSTER_IMAGE | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-gateway
+spec:
+  selector:
+    app: weft-gateway
+  ports:
+    - port: {{ .Values.gateway.port }}
+      targetPort: {{ .Values.gateway.port }}
+{{- end }}

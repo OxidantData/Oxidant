@@ -11,6 +11,7 @@ rust-version.workspace = true
 weft-common = { workspace = true }
 weft-physical = { workspace = true }
 weft-loom = { workspace = true }
+weft-observability = { workspace = true }
 arrow-flight = "58"
 tonic = "0.14"  # must match arrow-flight 58's tonic (its FlightService trait is over 0.14 types)
 prost = "0.14" # shuffle control envelope; pinned to arrow-flight 58's prost major
@@ -18,6 +19,11 @@ datafusion = "54"        # SessionState/RuntimeEnv for deserializing physical-pl
 datafusion-proto = "54"  # serialize physical-plan fragments shipped in the Flight ticket
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 futures = "0.3"
+serde_json = "1"
+
+[features]
+default = []
+k8s = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

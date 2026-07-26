@@ -1,17 +1,12 @@
-//! Disk spill for cached shuffle partition buckets.
+//! Spill hash-shuffle buckets to local disk when in-memory caching would OOM.
 //!
-//! When a producer stage's in-memory bucket cache would exceed
-//! [`SpillConfig::threshold_bytes`], each non-empty bucket is written as an Arrow IPC
-//! stream under [`SpillConfig::spill_dir`] and the in-memory batches are dropped. Consumers
-//! (`pull_bucket` / `ShuffleReadTicket`) transparently reload spilled buckets.
-//!
-//! Env knobs (see `docs/DISTRIBUTED_PARITY.md` item 10):
-//! - `WEFT_SHUFFLE_SPILL_BYTES` — soft in-memory budget for one stage's buckets (default 256 MiB)
-//! - `WEFT_SPILL_DIR` — root directory for spill files (fallback: process temp dir)
+//! Activated when `WEFT_SHUFFLE_SPILL_DIR` is set, or when `WEFT_MEMORY_LIMIT_BYTES` is set and
+//! cached shuffle data reaches that threshold. Buckets are written as Arrow IPC stream files keyed
+//! by `(stage_id, partition_id)`.
 
-use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use weft_common::{Error, Result};
 use weft_loom::arrow::datatypes::SchemaRef;
@@ -19,237 +14,302 @@ use weft_loom::arrow::ipc::reader::StreamReader;
 use weft_loom::arrow::ipc::writer::StreamWriter;
 use weft_loom::arrow::record_batch::RecordBatch;
 
-/// Default soft budget for keeping one stage's shuffle buckets in memory (256 MiB).
-pub const DEFAULT_SHUFFLE_SPILL_BYTES: u64 = 256 * 1024 * 1024;
+static SPILL_STORE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Process-wide counter of buckets spilled to disk (tests assert spill actually happened).
-static SPILL_BUCKET_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Spill policy for the Flight worker's stage-output cache.
+/// On-disk spill store for one worker process.
 #[derive(Debug, Clone)]
-pub struct SpillConfig {
-    /// Soft max bytes of RecordBatch payload kept in memory for one cached stage. At or above
-    /// this size, buckets are written to disk.
-    pub threshold_bytes: u64,
-    /// Root directory; stage spill files live under `{spill_dir}/shuffle/{pid}-{stage_id}/`.
-    pub spill_dir: PathBuf,
+pub struct SpillStore {
+    root: PathBuf,
+    force_spill: bool,
+    memory_limit_bytes: Option<usize>,
 }
 
-impl SpillConfig {
-    /// Read `WEFT_SHUFFLE_SPILL_BYTES` / `WEFT_SPILL_DIR` (with defaults).
-    pub fn from_env() -> Self {
-        let threshold_bytes = std::env::var("WEFT_SHUFFLE_SPILL_BYTES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_SHUFFLE_SPILL_BYTES);
-        let spill_dir = std::env::var("WEFT_SPILL_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir());
-        Self {
-            threshold_bytes,
-            spill_dir,
+impl SpillStore {
+    /// Open a spill directory when shuffle spilling is configured.
+    ///
+    /// `WEFT_SHUFFLE_SPILL_DIR` forces every cached shuffle bucket to disk. When only
+    /// `WEFT_MEMORY_LIMIT_BYTES` is set, a per-worker temporary directory is created and buckets
+    /// spill once their estimated Arrow memory footprint reaches that limit.
+    pub fn from_env() -> Option<Self> {
+        let configured_root = non_empty_env("WEFT_SHUFFLE_SPILL_DIR").map(PathBuf::from);
+        let memory_limit_bytes = non_empty_env("WEFT_MEMORY_LIMIT_BYTES")
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0);
+
+        if configured_root.is_none() && memory_limit_bytes.is_none() {
+            return None;
         }
+
+        let force_spill = configured_root.is_some();
+        let root = configured_root.unwrap_or_else(default_spill_root);
+        let store = Self {
+            root,
+            force_spill,
+            memory_limit_bytes,
+        };
+        std::fs::create_dir_all(&store.root).ok()?;
+        Some(store)
     }
 
-    /// Explicit config (integration tests force a tiny threshold).
-    pub fn new(threshold_bytes: u64, spill_dir: PathBuf) -> Self {
-        Self {
-            threshold_bytes,
-            spill_dir,
+    fn path(&self, stage_id: u32, partition: u32) -> PathBuf {
+        self.root
+            .join(format!("stage_{stage_id}_part_{partition}.arrow"))
+    }
+
+    /// Whether a bucket set should be spilled now.
+    pub fn should_spill(&self, buckets: &[Vec<RecordBatch>]) -> bool {
+        self.force_spill
+            || self
+                .memory_limit_bytes
+                .is_some_and(|limit| estimated_bucket_bytes(buckets) >= limit)
+    }
+
+    /// Write `batches` for one bucket; returns the file path.
+    pub fn write_bucket(
+        &self,
+        stage_id: u32,
+        partition: u32,
+        schema: SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<PathBuf> {
+        let path = self.path(stage_id, partition);
+        let file = std::fs::File::create(&path)
+            .map_err(|e| Error::Io(format!("spill create {}: {e}", path.display())))?;
+        let mut writer = StreamWriter::try_new(file, &schema)
+            .map_err(|e| Error::Io(format!("spill writer: {e}")))?;
+        for b in batches {
+            writer
+                .write(b)
+                .map_err(|e| Error::Io(format!("spill write: {e}")))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| Error::Io(format!("spill finish: {e}")))?;
+        Ok(path)
+    }
+
+    /// Read a spilled bucket back into memory.
+    pub fn read_bucket(&self, stage_id: u32, partition: u32) -> Result<Vec<RecordBatch>> {
+        let path = self.path(stage_id, partition);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        read_ipc_file(&path)
+    }
+
+    /// Remove all spill files for a stage.
+    pub fn clear_stage(&self, stage_id: u32) {
+        if let Ok(entries) = std::fs::read_dir(&self.root) {
+            let prefix = format!("stage_{stage_id}_");
+            for ent in entries.flatten() {
+                if ent.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(ent.path());
+                }
+            }
         }
     }
 }
 
-/// One partition bucket: resident in memory or spilled to an IPC file.
+fn read_ipc_file(path: &Path) -> Result<Vec<RecordBatch>> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::Io(format!("spill open {}: {e}", path.display())))?;
+    let reader =
+        StreamReader::try_new(file, None).map_err(|e| Error::Io(format!("spill read: {e}")))?;
+    reader
+        .map(|b| b.map_err(|e| Error::Io(format!("spill batch: {e}"))))
+        .collect()
+}
+
+/// In-memory bucket set, optionally spilled to disk.
 #[derive(Debug)]
-pub enum Bucket {
-    /// Batches still held in the process.
-    Memory(Vec<RecordBatch>),
-    /// Arrow IPC stream on disk (schema + zero or more batches).
-    Spilled(PathBuf),
+pub enum BucketCache {
+    Memory(Vec<Vec<RecordBatch>>),
+    Spilled {
+        schema: SchemaRef,
+        spill: Arc<SpillStore>,
+        stage_id: u32,
+    },
 }
 
-/// Cached output of one producer stage: schema (for empty-bucket padding) + per-partition buckets.
-#[derive(Debug)]
-pub struct CachedStage {
-    /// Output schema so an empty / missing bucket can still be served typed.
-    pub schema: SchemaRef,
-    /// One entry per downstream partition.
-    pub buckets: Vec<Bucket>,
-    /// Directory holding this stage's spill files; removed on [`Drop`].
-    spill_root: Option<PathBuf>,
-}
-
-impl Drop for CachedStage {
-    fn drop(&mut self) {
-        if let Some(root) = self.spill_root.take() {
-            let _ = fs::remove_dir_all(&root);
-        }
+impl BucketCache {
+    pub fn from_memory(buckets: Vec<Vec<RecordBatch>>) -> Self {
+        Self::Memory(buckets)
     }
-}
 
-impl CachedStage {
-    /// Build a cache entry from hash-partitioned buckets, spilling when over threshold.
-    pub fn from_buckets(
+    pub fn maybe_spill(
         schema: SchemaRef,
         buckets: Vec<Vec<RecordBatch>>,
         stage_id: u32,
-        cfg: &SpillConfig,
+        spill: Option<&SpillStore>,
     ) -> Result<Self> {
-        let total = buckets
-            .iter()
-            .flat_map(|b| b.iter())
-            .map(batch_memory_bytes)
-            .sum::<usize>() as u64;
-
-        if total < cfg.threshold_bytes {
-            return Ok(Self {
-                schema,
-                buckets: buckets.into_iter().map(Bucket::Memory).collect(),
-                spill_root: None,
-            });
-        }
-
-        let spill_root = cfg
-            .spill_dir
-            .join("shuffle")
-            .join(format!("{}-{}", std::process::id(), stage_id));
-        fs::create_dir_all(&spill_root).map_err(|e| {
-            Error::Io(format!(
-                "create shuffle spill dir {}: {e}",
-                spill_root.display()
-            ))
-        })?;
-
-        let mut out = Vec::with_capacity(buckets.len());
-        for (i, batches) in buckets.into_iter().enumerate() {
-            if batches.is_empty() {
-                // Empty buckets are cheap; keep them in memory (schema padding on read).
-                out.push(Bucket::Memory(batches));
-                continue;
+        if let Some(store) = spill {
+            if store.should_spill(&buckets) {
+                return Self::spill_buckets(schema, buckets, stage_id, store);
             }
-            let path = spill_root.join(format!("part-{i}.arrow"));
-            write_ipc(&path, &schema, &batches)?;
-            SPILL_BUCKET_COUNT.fetch_add(1, Ordering::Relaxed);
-            out.push(Bucket::Spilled(path));
         }
+        Ok(Self::Memory(buckets))
+    }
 
-        Ok(Self {
+    /// Cache a single pushed partition, spilling immediately if policy requires it.
+    pub fn from_partition(
+        schema: SchemaRef,
+        stage_id: u32,
+        partition: u32,
+        batches: Vec<RecordBatch>,
+        spill: Option<&SpillStore>,
+    ) -> Result<Self> {
+        let mut buckets = vec![Vec::new(); partition as usize + 1];
+        buckets[partition as usize] = batches;
+        Self::maybe_spill(schema, buckets, stage_id, spill)
+    }
+
+    /// Append batches to one partition, converting an in-memory cache to spilled if the configured
+    /// memory threshold is reached.
+    pub fn append_partition(
+        &mut self,
+        schema: SchemaRef,
+        stage_id: u32,
+        partition: u32,
+        batches: Vec<RecordBatch>,
+        spill: Option<&SpillStore>,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(buckets) => {
+                let idx = partition as usize;
+                if buckets.len() <= idx {
+                    buckets.resize_with(idx + 1, Vec::new);
+                }
+                buckets[idx].extend(batches);
+
+                if let Some(store) = spill {
+                    if store.should_spill(buckets) {
+                        let owned = std::mem::take(buckets);
+                        *self = Self::spill_buckets(schema, owned, stage_id, store)?;
+                    }
+                }
+                Ok(())
+            }
+            Self::Spilled {
+                schema: spilled_schema,
+                spill,
+                stage_id,
+            } => {
+                let mut merged = spill.read_bucket(*stage_id, partition).unwrap_or_default();
+                merged.extend(batches);
+                spill.write_bucket(*stage_id, partition, spilled_schema.clone(), &merged)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn spill_buckets(
+        schema: SchemaRef,
+        buckets: Vec<Vec<RecordBatch>>,
+        stage_id: u32,
+        store: &SpillStore,
+    ) -> Result<Self> {
+        for (i, bucket) in buckets.iter().enumerate() {
+            store.write_bucket(stage_id, i as u32, schema.clone(), bucket)?;
+        }
+        Ok(Self::Spilled {
             schema,
-            buckets: out,
-            spill_root: Some(spill_root),
+            spill: Arc::new(store.clone()),
+            stage_id,
         })
     }
 
-    /// Load one partition for a shuffle read (clones memory buckets / reads spill files).
-    pub fn read_partition(&self, partition: u32) -> Result<Vec<RecordBatch>> {
-        match self.buckets.get(partition as usize) {
-            Some(Bucket::Memory(batches)) if !batches.is_empty() => Ok(batches.clone()),
-            Some(Bucket::Spilled(path)) => load_ipc(path),
-            // Missing or empty: caller pads with a schema-carrying empty batch.
-            _ => Ok(Vec::new()),
+    pub fn read_partition(&self, partition: usize) -> Vec<RecordBatch> {
+        match self {
+            Self::Memory(buckets) => buckets.get(partition).cloned().unwrap_or_default(),
+            Self::Spilled {
+                schema,
+                spill,
+                stage_id,
+            } => spill
+                .read_bucket(*stage_id, partition as u32)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|b| b.num_rows() > 0)
+                .collect::<Vec<_>>()
+                .pipe(|data| {
+                    if data.is_empty() {
+                        vec![RecordBatch::new_empty(schema.clone())]
+                    } else {
+                        data
+                    }
+                }),
+        }
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        match self {
+            Self::Memory(buckets) => buckets
+                .iter()
+                .find_map(|b| b.first())
+                .map(|b| b.schema())
+                .unwrap_or_else(|| Arc::new(weft_loom::arrow::datatypes::Schema::empty())),
+            Self::Spilled { schema, .. } => schema.clone(),
         }
     }
 }
 
-/// Approximate heap footprint of a batch's arrays (used for the spill threshold).
-pub fn batch_memory_bytes(batch: &RecordBatch) -> usize {
-    batch.get_array_memory_size()
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
-/// Number of buckets written to disk since process start (test helper).
-pub fn spilled_bucket_count() -> u64 {
-    SPILL_BUCKET_COUNT.load(Ordering::Relaxed)
+fn default_spill_root() -> PathBuf {
+    let seq = SPILL_STORE_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join("weft-shuffle-spill")
+        .join(format!("{}-{seq}", std::process::id()))
 }
 
-/// Reset the spill counter (test helper).
-pub fn reset_spilled_bucket_count() {
-    SPILL_BUCKET_COUNT.store(0, Ordering::Relaxed);
+fn estimated_bucket_bytes(buckets: &[Vec<RecordBatch>]) -> usize {
+    buckets
+        .iter()
+        .flatten()
+        .map(RecordBatch::get_array_memory_size)
+        .sum()
 }
 
-fn write_ipc(path: &Path, schema: &SchemaRef, batches: &[RecordBatch]) -> Result<()> {
-    let file = File::create(path)
-        .map_err(|e| Error::Io(format!("create spill {}: {e}", path.display())))?;
-    let mut writer = StreamWriter::try_new(file, schema.as_ref())
-        .map_err(|e| Error::Execution(format!("spill ipc writer: {e}")))?;
-    for batch in batches {
-        writer
-            .write(batch)
-            .map_err(|e| Error::Execution(format!("spill ipc write: {e}")))?;
+trait Pipe: Sized {
+    fn pipe<F, R>(self, f: F) -> R
+    where
+        F: FnOnce(Self) -> R,
+    {
+        f(self)
     }
-    writer
-        .finish()
-        .map_err(|e| Error::Execution(format!("spill ipc finish: {e}")))?;
-    Ok(())
 }
-
-fn load_ipc(path: &Path) -> Result<Vec<RecordBatch>> {
-    let file = File::open(path)
-        .map_err(|e| Error::Io(format!("open spill {}: {e}", path.display())))?;
-    let reader = StreamReader::try_new(file, None)
-        .map_err(|e| Error::Execution(format!("spill ipc reader: {e}")))?;
-    let mut out = Vec::new();
-    for batch in reader {
-        out.push(batch.map_err(|e| Error::Execution(format!("spill ipc batch: {e}")))?);
-    }
-    Ok(out)
-}
+impl<T> Pipe for T {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use weft_loom::arrow::array::Int64Array;
     use weft_loom::arrow::datatypes::{DataType, Field, Schema};
 
-    fn sample() -> (SchemaRef, Vec<RecordBatch>) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(Int64Array::from(vec![10, 20, 30])),
-            ],
-        )
-        .unwrap();
-        (schema, vec![batch])
+    fn batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
     }
 
     #[test]
-    fn below_threshold_stays_in_memory() {
-        let (schema, batches) = sample();
-        let dir = std::env::temp_dir().join(format!("weft-spill-mem-{}", std::process::id()));
-        let cfg = SpillConfig::new(u64::MAX, dir);
-        let cached = CachedStage::from_buckets(schema, vec![batches], 0, &cfg).unwrap();
-        assert!(matches!(cached.buckets[0], Bucket::Memory(_)));
-        assert!(cached.spill_root.is_none());
-        let got = cached.read_partition(0).unwrap();
-        assert_eq!(got[0].num_rows(), 3);
-    }
+    fn memory_limit_policy_spills_when_threshold_reached() {
+        let root = default_spill_root();
+        let store = SpillStore {
+            root: root.clone(),
+            force_spill: false,
+            memory_limit_bytes: Some(1),
+        };
+        std::fs::create_dir_all(&root).unwrap();
 
-    #[test]
-    fn over_threshold_spills_and_round_trips() {
-        let (schema, batches) = sample();
-        let dir = std::env::temp_dir().join(format!("weft-spill-disk-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let cfg = SpillConfig::new(1, dir.clone()); // force spill
-        let before = spilled_bucket_count();
-        let cached = CachedStage::from_buckets(schema.clone(), vec![batches, vec![]], 7, &cfg)
-            .unwrap();
-        assert!(matches!(cached.buckets[0], Bucket::Spilled(_)));
-        assert!(matches!(cached.buckets[1], Bucket::Memory(_)));
-        assert!(spilled_bucket_count() > before);
-        let got = cached.read_partition(0).unwrap();
-        assert_eq!(got[0].num_rows(), 3);
-        let empty = cached.read_partition(1).unwrap();
-        assert!(empty.is_empty());
-        let root = cached.spill_root.clone().expect("spill root");
-        assert!(root.exists());
-        drop(cached);
-        assert!(!root.exists(), "Drop must remove spill files");
-        let _ = fs::remove_dir_all(&dir);
+        let b = batch();
+        let schema = b.schema();
+        let cache =
+            BucketCache::maybe_spill(schema, vec![vec![b]], 11, Some(&store)).expect("spill");
+        assert!(matches!(cache, BucketCache::Spilled { .. }));
+        assert!(!store.read_bucket(11, 0).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

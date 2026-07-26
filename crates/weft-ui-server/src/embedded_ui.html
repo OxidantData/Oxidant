@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Weft UI</title>
+  <style>
+    :root {
+      --bg: #0b0b0c; --surface: #141416; --border: #26262b;
+      --text: #f4f4f5; --muted: #9ca3af; --accent: #ff6a00;
+      --success: #16a34a; --danger: #dc2626; --warning: #d97706;
+      --mono: "JetBrains Mono", ui-monospace, monospace;
+      --sans: Inter, system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: var(--sans); background: var(--bg); color: var(--text); min-height: 100vh; }
+    header { border-bottom: 1px solid var(--border); padding: 12px 20px; display: flex; align-items: center; gap: 16px; }
+    header h1 { font-size: 18px; font-weight: 600; }
+    header .meta { color: var(--muted); font-size: 13px; }
+    nav { display: flex; gap: 4px; padding: 8px 20px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+    nav button { background: transparent; border: none; color: var(--muted); padding: 8px 14px; cursor: pointer; border-radius: 6px; font-size: 14px; }
+    nav button.active { background: var(--surface); color: var(--accent); }
+    nav button:hover { color: var(--text); }
+    main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    tr:hover td { background: rgba(255,255,255,0.02); }
+    .status-SUCCEEDED, .status-COMPLETE, .status-SUCCESS { color: var(--success); }
+    .status-FAILED { color: var(--danger); }
+    .status-RUNNING, .status-ACTIVE { color: var(--warning); }
+    pre.plan { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; background: #0b0b0c; padding: 12px; border-radius: 6px; max-height: 400px; overflow: auto; }
+    .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 900px) { .compare-grid { grid-template-columns: 1fr; } }
+    .delta-faster { color: var(--success); }
+    .delta-slower { color: var(--danger); }
+    input[type=text] { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%; max-width: 480px; font-size: 13px; }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .btn { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    .btn:hover { opacity: 0.9; }
+    .hidden { display: none; }
+    .bar { height: 8px; background: var(--accent); border-radius: 4px; }
+    .bar-wrap { background: var(--border); border-radius: 4px; height: 8px; flex: 1; }
+    .flex { display: flex; align-items: center; gap: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Weft</h1>
+    <span class="meta" id="app-meta">Loading…</span>
+  </header>
+  <nav id="tabs">
+    <button data-tab="jobs" class="active">Jobs</button>
+    <button data-tab="stages">Stages</button>
+    <button data-tab="sql">SQL</button>
+    <button data-tab="executors">Executors</button>
+    <button data-tab="environment">Environment</button>
+    <button data-tab="compare">Compare</button>
+  </nav>
+  <main>
+    <section id="panel-jobs" class="panel"></section>
+    <section id="panel-stages" class="panel hidden"></section>
+    <section id="panel-sql" class="panel hidden"></section>
+    <section id="panel-executors" class="panel hidden"></section>
+    <section id="panel-environment" class="panel hidden"></section>
+    <section id="panel-compare" class="panel hidden"></section>
+  </main>
+  <script>
+    const APP_ID = 'weft-local';
+    const api = (path) => fetch('/api/v1/applications/' + APP_ID + path).then(r => r.json());
+    const fmt = (n) => n == null ? '—' : (typeof n === 'number' ? n.toLocaleString() : n);
+    const fmtMs = (ms) => ms == null ? '—' : (ms < 1000 ? ms + ' ms' : (ms/1000).toFixed(2) + ' s');
+    const dur = (start, end) => {
+      if (!start || !end) return '—';
+      const s = new Date(start).getTime(), e = new Date(end).getTime();
+      return fmtMs(e - s);
+    };
+    const statusClass = (s) => 'status-' + (s || '').split(' ')[0];
+
+    let state = { jobs: [], stages: [], sql: [], executors: [], env: {} };
+
+    document.getElementById('tabs').addEventListener('click', (e) => {
+      if (e.target.tagName !== 'BUTTON') return;
+      document.querySelectorAll('#tabs button').forEach(b => b.classList.remove('active'));
+      e.target.classList.add('active');
+      document.querySelectorAll('.panel').forEach(p => p.classList.add('hidden'));
+      document.getElementById('panel-' + e.target.dataset.tab).classList.remove('hidden');
+      if (e.target.dataset.tab === 'compare') renderCompare();
+    });
+
+    async function refresh() {
+      try {
+        const [app, jobs, stages, sql, executors, env] = await Promise.all([
+          fetch('/api/v1/applications').then(r => r.json()),
+          api('/jobs'),
+          api('/stages?details=true'),
+          api('/sql'),
+          api('/executors'),
+          api('/environment'),
+        ]);
+        const a = app[0] || {};
+        document.getElementById('app-meta').textContent =
+          (a.name || 'Weft') + ' · ' + (a.attempts?.[0]?.sparkUser || 'weft') + ' · jobs: ' + jobs.length;
+        state = { jobs, stages, sql, executors, env };
+        renderJobs(); renderStages(); renderSql(); renderExecutors(); renderEnvironment();
+      } catch (e) { console.error(e); }
+    }
+
+    function renderJobs() {
+      const el = document.getElementById('panel-jobs');
+      if (!state.jobs.length) { el.innerHTML = '<div class="card">No jobs yet. Run a query via PySpark.</div>'; return; }
+      el.innerHTML = '<div class="card"><table><thead><tr><th>Job ID</th><th>Description</th><th>Submitted</th><th>Duration</th><th>Stages</th><th>Status</th></tr></thead><tbody>' +
+        state.jobs.map(j => `<tr>
+          <td>${j.jobId}</td>
+          <td title="${(j.description||'').replace(/"/g,'&quot;')}">${j.name || j.description || '—'}</td>
+          <td>${j.submissionTime || '—'}</td>
+          <td>${dur(j.submissionTime, j.completionTime)}</td>
+          <td>${(j.stageIds||[]).join(', ') || '—'}</td>
+          <td class="${statusClass(j.status)}">${j.status}</td>
+        </tr>`).join('') + '</tbody></table></div>';
+    }
+
+    function renderStages() {
+      const el = document.getElementById('panel-stages');
+      if (!state.stages.length) { el.innerHTML = '<div class="card">No stages yet.</div>'; return; }
+      const maxDur = Math.max(...state.stages.map(s => s.executorRunTime || 0), 1);
+      el.innerHTML = '<div class="card"><table><thead><tr><th>Stage</th><th>Description</th><th>Duration</th><th>Tasks</th><th>Shuffle Read</th><th>Shuffle Write</th><th>Status</th></tr></thead><tbody>' +
+        state.stages.map(s => `<tr>
+          <td>${s.stageId}</td>
+          <td>${s.name || s.description || '—'}</td>
+          <td><div class="flex">${fmtMs(s.executorRunTime)}<div class="bar-wrap"><div class="bar" style="width:${((s.executorRunTime||0)/maxDur*100).toFixed(0)}%"></div></div></div></td>
+          <td>${s.numCompleteTasks}/${s.numTasks}</td>
+          <td>${fmt(s.shuffleReadBytes)}</td>
+          <td>${fmt(s.shuffleWriteBytes)}</td>
+          <td class="${statusClass(s.status)}">${s.status}</td>
+        </tr>`).join('') + '</tbody></table></div>';
+    }
+
+    function renderSql() {
+      const el = document.getElementById('panel-sql');
+      if (!state.sql.length) { el.innerHTML = '<div class="card">No SQL executions yet.</div>'; return; }
+      el.innerHTML = state.sql.map(s => `<div class="card">
+        <div style="margin-bottom:8px"><strong>${s.description}</strong> · <span class="${statusClass(s.status)}">${s.status}</span> · ${fmtMs(s.duration)}</div>
+        <pre class="plan">${(s.physicalPlan||'').replace(/</g,'&lt;')}</pre>
+      </div>`).join('');
+    }
+
+    function renderExecutors() {
+      const el = document.getElementById('panel-executors');
+      if (!state.executors.length) { el.innerHTML = '<div class="card">No executors registered. Configure workers for distributed mode.</div>'; return; }
+      el.innerHTML = '<div class="card"><table><thead><tr><th>ID</th><th>Host</th><th>Active</th><th>Completed</th><th>Shuffle Read</th><th>Shuffle Write</th></tr></thead><tbody>' +
+        state.executors.map(e => `<tr>
+          <td>${e.id}</td><td>${e.hostPort}</td><td>${e.activeTasks}</td><td>${e.completedTasks}</td>
+          <td>${fmt(e.totalShuffleRead)}</td><td>${fmt(e.totalShuffleWrite)}</td>
+        </tr>`).join('') + '</tbody></table></div>';
+    }
+
+    function renderEnvironment() {
+      const el = document.getElementById('panel-environment');
+      const props = state.env.sparkProperties || {};
+      const keys = Object.keys(props).sort();
+      el.innerHTML = '<div class="card"><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>' +
+        keys.map(k => `<tr><td>${k}</td><td style="font-family:var(--mono);font-size:12px">${props[k]}</td></tr>`).join('') +
+        '</tbody></table></div>';
+    }
+
+    async function renderCompare() {
+      const el = document.getElementById('panel-compare');
+      const sparkUrl = localStorage.getItem('weft.sparkUrl') || 'http://localhost:4040';
+      el.innerHTML = `<div class="card">
+        <label>Spark UI / History Server base URL</label>
+        <input type="text" id="spark-url" value="${sparkUrl}" />
+        <button class="btn" style="margin-top:12px" id="compare-btn">Compare</button>
+      </div><div id="compare-result"></div>`;
+      document.getElementById('compare-btn').onclick = runCompare;
+    }
+
+    async function runCompare() {
+      const sparkBase = document.getElementById('spark-url').value.replace(/\/$/, '');
+      localStorage.setItem('weft.sparkUrl', sparkBase);
+      const result = document.getElementById('compare-result');
+      result.innerHTML = '<div class="card">Loading…</div>';
+      try {
+        const weftJobs = state.jobs;
+        const weftStages = state.stages;
+        const sparkApps = await fetch('/api/v1/spark-proxy?url=' + encodeURIComponent(sparkBase + '/api/v1/applications')).then(r => r.json());
+        const sparkAppId = sparkApps[0]?.id;
+        let sparkJobs = [], sparkStages = [];
+        if (sparkAppId) {
+          sparkJobs = await fetch('/api/v1/spark-proxy?url=' + encodeURIComponent(sparkBase + '/api/v1/applications/' + sparkAppId + '/jobs')).then(r => r.json());
+          sparkStages = await fetch('/api/v1/spark-proxy?url=' + encodeURIComponent(sparkBase + '/api/v1/applications/' + sparkAppId + '/stages')).then(r => r.json());
+        }
+        const weftDur = weftJobs.reduce((a,j) => a + (j.submissionTime && j.completionTime ? new Date(j.completionTime)-new Date(j.submissionTime) : 0), 0);
+        const sparkDur = sparkJobs.reduce((a,j) => a + (j.submissionTime && j.completionTime ? new Date(j.completionTime)-new Date(j.submissionTime) : 0), 0);
+        const delta = weftDur && sparkDur ? ((sparkDur - weftDur) / sparkDur * 100).toFixed(1) : null;
+        result.innerHTML = `<div class="card compare-grid">
+          <div><h3 style="margin-bottom:12px">Weft</h3>
+            <p>Jobs: ${weftJobs.length} · Stages: ${weftStages.length}</p>
+            <p>Total duration: ${fmtMs(weftDur)}</p>
+            <p>Shuffle read: ${fmt(weftStages.reduce((a,s)=>a+(s.shuffleReadBytes||0),0))}</p>
+          </div>
+          <div><h3 style="margin-bottom:12px">Spark</h3>
+            <p>Jobs: ${sparkJobs.length} · Stages: ${sparkStages.length}</p>
+            <p>Total duration: ${fmtMs(sparkDur)}</p>
+            <p>Shuffle read: ${fmt(sparkStages.reduce((a,s)=>a+(s.shuffleReadBytes||0),0))}</p>
+          </div>
+        </div>
+        ${delta != null ? `<div class="card"><p class="${weftDur < sparkDur ? 'delta-faster' : 'delta-slower'}">Weft is ${Math.abs(delta)}% ${weftDur < sparkDur ? 'faster' : 'slower'} than Spark (job wall-clock sum)</p></div>` : ''}
+        <div class="card compare-grid">
+          <div><h4>Weft stages</h4><pre class="plan">${weftStages.map(s=>`Stage ${s.stageId}: ${s.name} (${fmtMs(s.executorRunTime)})`).join('\n')||'—'}</pre></div>
+          <div><h4>Spark stages</h4><pre class="plan">${sparkStages.map(s=>`Stage ${s.stageId}: ${s.name||s.details} (${fmtMs(s.executorRunTime)})`).join('\n')||'—'}</pre></div>
+        </div>`;
+      } catch (e) {
+        result.innerHTML = `<div class="card" style="color:var(--danger)">Compare failed: ${e.message}. Is Spark UI running at ${sparkBase}?</div>`;
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+    try {
+      const es = new EventSource('/api/v1/events/stream');
+      es.onmessage = () => refresh();
+    } catch (_) {}
+  </script>
+</body>
+</html>

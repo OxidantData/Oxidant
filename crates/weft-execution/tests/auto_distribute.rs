@@ -50,10 +50,19 @@ struct Cluster2 {
     cluster: Cluster,
 }
 
-async fn two_workers(base: u16) -> Cluster2 {
+fn ephemeral_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+async fn two_workers(_base: u16) -> Cluster2 {
     const N: i64 = 300;
     const G: i64 = 12;
-    let (p0, p1) = (base, base + 1);
+    // Ephemeral ports avoid cross-crate collisions under `cargo test --workspace`
+    // (fixed ports previously hung for minutes on TCP connect when another suite stole them).
+    let (p0, p1) = (ephemeral_port(), ephemeral_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, N / 2, G)]).unwrap();
     let e1 = Arc::new(Engine::new());
@@ -213,7 +222,8 @@ async fn auto_derived_broadcast_join() {
     let expected = single.sql(sql).await.unwrap();
 
     // Two workers: `t` sharded, `dim` replicated in full on each.
-    let (p0, p1) = (50621u16, 50622u16);
+    let p0 = ephemeral_port();
+    let p1 = ephemeral_port();
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 150, G)]).unwrap();
     e0.register_batches("dim", vec![dim(G)]).unwrap();
@@ -648,6 +658,26 @@ async fn subquery_over_unreplicated_table_is_rejected() {
         msg.contains("replicated") || msg.contains("subquery"),
         "expected subquery/replicated rejection, got: {msg}"
     );
+}
+
+#[tokio::test]
+async fn two_sharded_tables_shuffle_join_plans() {
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 60, 12)])
+        .unwrap();
+    single.register_batches("dim", vec![dim(12)]).unwrap();
+    let plan = plan_distributed(
+        &single,
+        "SELECT d.d_key AS name, COUNT(*) AS c FROM t JOIN dim d ON t.k = d.d_key GROUP BY d.d_key",
+        &[],
+    )
+    .await;
+    assert!(
+        plan.is_ok(),
+        "two-sharded shuffle join should auto-derive: {plan:?}"
+    );
+    assert_eq!(plan.unwrap().stages.len(), 3);
 }
 
 #[tokio::test]

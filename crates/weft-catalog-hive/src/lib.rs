@@ -14,10 +14,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use weft_catalog::hive_types::columns_to_schema;
+use weft_catalog::arrow::datatypes::SchemaRef;
+use weft_catalog::hive_types::{
+    columns_to_schema, format_serde, schema_to_columns, validate_identifier,
+};
 use weft_catalog::{CatalogProvider, Error, Result, TableFormat, TableMetadata};
 
-use thrift::{HiveTable, MetastoreClient};
+use thrift::{HiveTable, MetastoreClient, NewHiveTable};
 
 /// The default Hive Metastore Thrift port.
 const DEFAULT_PORT: u16 = 9083;
@@ -27,24 +30,39 @@ pub struct HiveCatalog {
     name: String,
     host: String,
     port: u16,
+    /// Root new tables are written under (`{warehouse}/{db}/{table}/`) when a `CREATE TABLE ... AS
+    /// SELECT` doesn't specify an explicit `LOCATION`. `None` means CTAS against this catalog must
+    /// supply an explicit location (see `create_table`). Same convention as `GlueCatalog`.
+    warehouse: Option<String>,
 }
 
 impl HiveCatalog {
-    /// Build from a `thrift://host:port` URI (port defaults to 9083).
+    /// Build from a `thrift://host:port` URI (port defaults to 9083). No `warehouse` — CTAS
+    /// against a catalog built this way needs an explicit `LOCATION`; use [`Self::from_config`] to
+    /// set one via the `warehouse` option.
     pub fn from_uri(name: &str, uri: &str) -> Result<Self> {
         let (host, port) = parse_thrift_uri(uri)?;
         Ok(Self {
             name: name.to_string(),
             host,
             port,
+            warehouse: None,
         })
     }
 
     /// Build from `spark.sql.catalog.<name>.*` options (the `spark.sql.catalog.<name>.` prefix
-    /// already stripped, so keys are `type`, `uri`, …). Requires a `uri` (or `host`[+`port`]).
+    /// already stripped, so keys are `type`, `uri`, `warehouse`, …). Requires a `uri` (or
+    /// `host`[+`port`]).
     pub fn from_config(name: &str, options: &HashMap<String, String>) -> Result<Self> {
+        let warehouse = options.get("warehouse").cloned();
         if let Some(uri) = options.get("uri").or_else(|| options.get("thrift.uri")) {
-            return Self::from_uri(name, uri);
+            let (host, port) = parse_thrift_uri(uri)?;
+            return Ok(Self {
+                name: name.to_string(),
+                host,
+                port,
+                warehouse,
+            });
         }
         if let Some(host) = options.get("host") {
             let port = options
@@ -55,6 +73,7 @@ impl HiveCatalog {
                 name: name.to_string(),
                 host: host.clone(),
                 port,
+                warehouse,
             });
         }
         Err(Error::Plan(format!(
@@ -64,6 +83,34 @@ impl HiveCatalog {
 
     async fn connect(&self) -> Result<MetastoreClient> {
         MetastoreClient::connect(&self.host, self.port).await
+    }
+
+    /// Resolve the storage location for a table being created: the explicit `location` if given
+    /// (normalized to end in `/`, required for `ListingTable`/`is_collection()` on read-back),
+    /// else `{warehouse}/{db}/{table}/`, else an error naming what's missing.
+    ///
+    /// `db`/`table` are validated as plain identifiers first (`validate_identifier`) — they come
+    /// straight from the SQL statement's table reference, and were previously interpolated
+    /// unsanitized into the warehouse-derived path, letting a name like `../../etc/evil` escape
+    /// the intended directory (a real path-traversal bug for `file://` warehouses).
+    fn resolve_create_location(
+        &self,
+        db: &str,
+        table: &str,
+        location: Option<String>,
+    ) -> Result<String> {
+        if let Some(l) = location {
+            return Ok(if l.ends_with('/') { l } else { format!("{l}/") });
+        }
+        validate_identifier("database", db)?;
+        validate_identifier("table", table)?;
+        let warehouse = self.warehouse.as_deref().ok_or_else(|| {
+            Error::Plan(format!(
+                "catalog `{}` has no `warehouse` configured and no explicit LOCATION given",
+                self.name
+            ))
+        })?;
+        Ok(format!("{}/{db}/{table}/", warehouse.trim_end_matches('/')))
     }
 }
 
@@ -104,12 +151,52 @@ impl CatalogProvider for HiveCatalog {
         let schema_cols = t.columns.iter().chain(t.partition_typed.iter()).cloned();
         let schema = columns_to_schema(schema_cols);
 
+        let properties: HashMap<String, String> = t.parameters.iter().cloned().collect();
         let md = TableMetadata::new(format!("{}.{db}.{table}", self.name), location, format)
-            .with_partition_columns(t.partition_columns.clone());
+            .with_partition_columns(t.partition_columns.clone())
+            .with_comment(t.comment().map(str::to_string))
+            .with_properties(properties);
         Ok(match schema {
             Some(s) => md.with_schema(Arc::new(s)),
             None => md,
         })
+    }
+
+    async fn create_table(
+        &self,
+        namespace: &[String],
+        table: &str,
+        schema: SchemaRef,
+        format: TableFormat,
+        location: Option<String>,
+        partition_columns: &[String],
+    ) -> Result<TableMetadata> {
+        let db = single_database(namespace)?;
+        let location = self.resolve_create_location(db, table, location)?;
+        let serde = format_serde(format)?;
+        let (columns, part_cols) = schema_to_columns(&schema, partition_columns)?;
+
+        let new_table = NewHiveTable {
+            db_name: db.to_string(),
+            table_name: table.to_string(),
+            location: location.clone(),
+            input_format: serde.input_format,
+            output_format: serde.output_format,
+            serde_lib: serde.serde_lib,
+            serde_params: serde
+                .serde_params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            columns,
+            partition_columns: part_cols,
+        };
+        self.connect().await?.create_table(&new_table).await?;
+
+        let md = TableMetadata::new(format!("{}.{db}.{table}", self.name), location, format)
+            .with_schema(schema)
+            .with_partition_columns(partition_columns.to_vec());
+        Ok(md)
     }
 }
 
@@ -247,5 +334,42 @@ mod tests {
         opts.insert("uri".to_string(), "thrift://h:9083".to_string());
         let c = HiveCatalog::from_config("prod", &opts).unwrap();
         assert_eq!(c.name(), "prod");
+    }
+
+    fn catalog_with_warehouse(warehouse: Option<&str>) -> HiveCatalog {
+        let mut opts = HashMap::new();
+        opts.insert("uri".to_string(), "thrift://h:9083".to_string());
+        if let Some(w) = warehouse {
+            opts.insert("warehouse".to_string(), w.to_string());
+        }
+        HiveCatalog::from_config("hive", &opts).unwrap()
+    }
+
+    #[test]
+    fn resolve_create_location_rejects_path_traversal() {
+        let cat = catalog_with_warehouse(Some("s3://wh"));
+        for (db, table) in [("db", "../../etc/evil"), ("../escape", "t"), ("db", "a/b")] {
+            let err = cat.resolve_create_location(db, table, None).unwrap_err();
+            assert!(matches!(err, Error::Plan(_)), "{db}.{table}");
+        }
+    }
+
+    #[test]
+    fn resolve_create_location_normalizes_missing_trailing_slash() {
+        let cat = catalog_with_warehouse(None);
+        assert_eq!(
+            cat.resolve_create_location("db", "t", Some("s3://explicit/t".to_string()))
+                .unwrap(),
+            "s3://explicit/t/"
+        );
+    }
+
+    #[test]
+    fn resolve_create_location_falls_back_to_warehouse() {
+        let cat = catalog_with_warehouse(Some("s3://wh/"));
+        assert_eq!(
+            cat.resolve_create_location("db", "t", None).unwrap(),
+            "s3://wh/db/t/"
+        );
     }
 }

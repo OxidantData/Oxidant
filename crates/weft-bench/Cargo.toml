@@ -1,6 +1,6 @@
 [package]
 name = "weft-bench"
-description = "Engine-direct + live-server benchmark harness: runs ClickBench (and TPC-H) queries through weft-loom / weft-connect on synthetic data, ClickBench-style."
+description = "Engine-direct + live-server benchmark harness: ClickBench, TPC-H, and TPC-DS through weft-loom / weft-connect."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

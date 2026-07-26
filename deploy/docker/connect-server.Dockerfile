@@ -116,6 +116,7 @@ CMD ["spark", "server", "--port", "50051"]
 #     -p 50051:50051 weft/connect-server:<tag>
 #
 # Credentials: NONE are baked in. In-cluster, catalog/storage auth is per-cluster
-# least-privilege IRSA (the pod's ServiceAccount role), so the AWS CLI is not
-# bundled — the engine uses the AWS SDK / IRSA web-identity token directly.
+# least-privilege IRSA (the pod's ServiceAccount role). The AWS CLI *binary* is
+# bundled (see awscli stage + WEFT_AWS_BIN) so Glue catalog resolution can shell
+# out to `aws glue …`; identity still comes from IRSA / the environment.
 ###############################################################################

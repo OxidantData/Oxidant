@@ -8,6 +8,42 @@
 
 use prost::Message;
 
+/// Number of bytes in the fixed-width [`ShuffleExchangeHeader`] encoding.
+pub const SHUFFLE_EXCHANGE_HEADER_LEN: usize = 8;
+
+/// The first `do_exchange` frame carries this header in `FlightData.app_metadata`, followed by
+/// normal Arrow IPC `FlightData` schema/batch frames for that stage partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShuffleExchangeHeader {
+    /// The stage whose output partition is being pushed to this worker.
+    pub stage_id: u32,
+    /// The target shuffle partition on this worker.
+    pub partition_id: u32,
+}
+
+impl ShuffleExchangeHeader {
+    /// Encode as `stage_id` little-endian followed by `partition_id` little-endian.
+    pub fn encode(self) -> [u8; SHUFFLE_EXCHANGE_HEADER_LEN] {
+        let mut out = [0u8; SHUFFLE_EXCHANGE_HEADER_LEN];
+        out[..4].copy_from_slice(&self.stage_id.to_le_bytes());
+        out[4..].copy_from_slice(&self.partition_id.to_le_bytes());
+        out
+    }
+
+    /// Decode a fixed-width exchange header.
+    pub fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
+        if bytes.len() != SHUFFLE_EXCHANGE_HEADER_LEN {
+            return Err("bad shuffle exchange header length");
+        }
+        let stage_id = u32::from_le_bytes(bytes[..4].try_into().expect("slice length checked"));
+        let partition_id = u32::from_le_bytes(bytes[4..].try_into().expect("slice length checked"));
+        Ok(Self {
+            stage_id,
+            partition_id,
+        })
+    }
+}
+
 /// A unit of distributed work: run a stage on one worker and stream its result back.
 ///
 /// For the MVP the stage is expressed as SQL ([`stage_sql`]); once a stage has upstreams it
@@ -159,5 +195,15 @@ mod tests {
             Ticket::Sql(sql) => assert_eq!(sql, "SELECT 21 + 21 AS answer"),
             _ => panic!("expected Sql"),
         }
+    }
+
+    #[test]
+    fn shuffle_exchange_header_round_trips() {
+        let h = ShuffleExchangeHeader {
+            stage_id: 42,
+            partition_id: 7,
+        };
+        assert_eq!(ShuffleExchangeHeader::decode(&h.encode()).unwrap(), h);
+        assert!(ShuffleExchangeHeader::decode(&h.encode()[..7]).is_err());
     }
 }

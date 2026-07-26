@@ -27,6 +27,73 @@ pub fn scan(_uri: &str, _req: &ScanRequest) -> Result<()> {
     Ok(())
 }
 
+/// Write Arrow record batches to a Parquet file (create or overwrite).
+pub fn write_parquet(path: &str, batches: &[arrow::record_batch::RecordBatch]) -> Result<()> {
+    use arrow::datatypes::Schema;
+    use parquet::arrow::ArrowWriter;
+    use std::fs::File;
+    use std::sync::Arc;
+
+    if batches.is_empty() {
+        let schema = Arc::new(Schema::empty());
+        let file = File::create(path).map_err(|e| Error::Io(format!("create {path}: {e}")))?;
+        let writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| Error::Io(format!("parquet writer: {e}")))?;
+        writer
+            .close()
+            .map_err(|e| Error::Io(format!("parquet close: {e}")))?;
+        return Ok(());
+    }
+    let file = File::create(path).map_err(|e| Error::Io(format!("create {path}: {e}")))?;
+    let mut writer = ArrowWriter::try_new(file, batches[0].schema(), None)
+        .map_err(|e| Error::Io(format!("parquet writer: {e}")))?;
+    for batch in batches {
+        writer
+            .write(batch)
+            .map_err(|e| Error::Io(format!("parquet write: {e}")))?;
+    }
+    writer
+        .close()
+        .map_err(|e| Error::Io(format!("parquet close: {e}")))?;
+    Ok(())
+}
+
+/// Append a new Parquet data file to a Delta table by writing a JSON add action to `_delta_log`.
+pub fn delta_append(
+    table_path: &str,
+    relative_path: &str,
+    batches: &[arrow::record_batch::RecordBatch],
+) -> Result<()> {
+    use std::path::Path;
+
+    let base = Path::new(table_path);
+    let data_path = base.join(relative_path);
+    if let Some(parent) = data_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Io(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    write_parquet(data_path.to_str().unwrap(), batches)?;
+
+    let log_dir = base.join("_delta_log");
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|e| Error::Io(format!("mkdir {}: {e}", log_dir.display())))?;
+    let version = std::fs::read_dir(&log_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    let commit = log_dir.join(format!("{version:020}.json"));
+    let action = serde_json::json!({
+        "add": {
+            "path": relative_path.replace('\\', "/"),
+            "size": std::fs::metadata(base.join(relative_path)).map(|m| m.len()).unwrap_or(0),
+            "modificationTime": chrono::Utc::now().timestamp_millis(),
+            "dataChange": true
+        }
+    });
+    std::fs::write(&commit, format!("{action}\n"))
+        .map_err(|e| Error::Io(format!("write {}: {e}", commit.display())))?;
+    Ok(())
+}
+
 /// Resolve a Delta Lake table to its active data-file paths by replaying the JSON transaction
 /// log (`_delta_log/*.json`): `add` actions introduce files, `remove` actions retire them.
 ///
@@ -86,6 +153,214 @@ pub fn delta_active_files(table_path: &str) -> Result<Vec<std::path::PathBuf>> {
         }
     }
     Ok(order.into_iter().map(|p| base.join(p)).collect())
+}
+
+/// Hive-style partition pruning: keep only paths whose `key=value` segments match `filter`.
+///
+/// `filter` is a simple SQL fragment like `year = 2024 AND month = 3` or `region='us'`.
+pub fn prune_partition_paths(
+    files: &[std::path::PathBuf],
+    filter: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    let Some(filter) = filter else {
+        return files.to_vec();
+    };
+    let predicates = parse_partition_predicates(filter);
+    if predicates.is_empty() {
+        return files.to_vec();
+    }
+    files
+        .iter()
+        .filter(|p| path_matches_predicates(p, &predicates))
+        .cloned()
+        .collect()
+}
+
+/// Apply partition pruning from a [`ScanRequest`] before scanning lakehouse files.
+pub fn active_files_for_scan(
+    table_path: &str,
+    format: &str,
+    req: &ScanRequest,
+) -> Result<Vec<std::path::PathBuf>> {
+    let files = match format.to_ascii_lowercase().as_str() {
+        "delta" => delta_active_files(table_path)?,
+        "iceberg" => iceberg_active_files(table_path)?,
+        other => {
+            return Err(Error::Unsupported(format!(
+                "active_files_for_scan: unsupported format `{other}`"
+            )))
+        }
+    };
+    Ok(prune_partition_paths(&files, req.filter.as_deref()))
+}
+
+fn parse_partition_predicates(filter: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for part in filter.split("AND").flat_map(|s| s.split("and")) {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            let key = k.trim().trim_matches('`').trim_matches('"');
+            let val = v
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"')
+                .trim_matches('`');
+            if !key.is_empty() {
+                out.push((key.to_string(), val.to_string()));
+            }
+        }
+    }
+    out
+}
+
+fn path_matches_predicates(path: &std::path::Path, preds: &[(String, String)]) -> bool {
+    let s = path.to_string_lossy();
+    preds.iter().all(|(k, v)| {
+        if s.contains(&format!("{k}={v}")) || s.contains(&format!("{k}={v}/")) {
+            return true;
+        }
+        // Hive paths often zero-pad numeric partition values (month=01 vs month=1).
+        if let (Ok(want), Some(Ok(have))) = (
+            v.parse::<i64>(),
+            extract_partition_value(&s, k).map(|h| h.parse::<i64>()),
+        ) {
+            return want == have;
+        }
+        false
+    })
+}
+
+fn extract_partition_value(path: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    let start = path.find(&needle)? + needle.len();
+    let rest = &path[start..];
+    let end = rest.find('/').unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Read Delta deletion-vector metadata paths from the transaction log (v1: skip DV files on read).
+pub fn delta_deletion_vector_paths(table_path: &str) -> Result<Vec<std::path::PathBuf>> {
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    let base = Path::new(table_path);
+    let log_dir = base.join("_delta_log");
+    let mut commits: Vec<std::path::PathBuf> = std::fs::read_dir(&log_dir)
+        .map_err(|e| Error::Io(format!("reading {}: {e}", log_dir.display())))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+        .collect();
+    commits.sort();
+    let mut dvs = HashSet::new();
+    for commit in &commits {
+        let content = std::fs::read_to_string(commit)
+            .map_err(|e| Error::Io(format!("reading {}: {e}", commit.display())))?;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(line)
+                .map_err(|e| Error::Io(format!("delta log json: {e}")))?;
+            if let Some(dv) = v
+                .get("add")
+                .and_then(|a| a.get("deletionVector"))
+                .and_then(|dv| dv.get("storageType"))
+                .and_then(|t| t.as_str())
+            {
+                if dv == "u" || dv == "i" {
+                    if let Some(path) = v
+                        .get("add")
+                        .and_then(|a| a.get("path"))
+                        .and_then(|p| p.as_str())
+                    {
+                        dvs.insert(base.join(path));
+                    }
+                }
+            }
+        }
+    }
+    Ok(dvs.into_iter().collect())
+}
+
+/// Append Parquet data files to an Iceberg table by writing a new manifest + snapshot metadata.
+pub fn iceberg_append(
+    table_path: &str,
+    relative_path: &str,
+    batches: &[arrow::record_batch::RecordBatch],
+) -> Result<()> {
+    use std::path::Path;
+
+    let base = Path::new(table_path);
+    let data_path = base.join(relative_path);
+    if let Some(parent) = data_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Io(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    write_parquet(data_path.to_str().unwrap(), batches)?;
+    let meta_dir = base.join("metadata");
+    std::fs::create_dir_all(&meta_dir)
+        .map_err(|e| Error::Io(format!("mkdir {}: {e}", meta_dir.display())))?;
+
+    let version = std::fs::read_dir(&meta_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        })
+        .unwrap_or(0) as i64
+        + 1;
+    let manifest = base.join(format!("metadata/snap-{version}.avro"));
+    let data_file = data_path.to_string_lossy();
+    write_avro_manifest(&manifest, &data_file)?;
+    let metadata = serde_json::json!({
+        "format-version": 2,
+        "table-uuid": uuid_simple(),
+        "location": base.to_string_lossy(),
+        "current-snapshot-id": version,
+        "snapshots": [{
+            "snapshot-id": version,
+            "manifest-list": manifest.to_string_lossy(),
+        }]
+    });
+    std::fs::write(
+        meta_dir.join(format!("v{version}.metadata.json")),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .map_err(|e| Error::Io(format!("write metadata: {e}")))?;
+    std::fs::write(meta_dir.join("version-hint.text"), version.to_string())
+        .map_err(|e| Error::Io(format!("write version hint: {e}")))?;
+    Ok(())
+}
+
+fn uuid_simple() -> String {
+    format!("weft-{}", std::process::id())
+}
+
+fn write_avro_manifest(path: &std::path::Path, data_file: &str) -> Result<()> {
+    use apache_avro::{types::Value, Schema, Writer};
+    let schema = Schema::parse_str(
+        r#"{"type":"record","name":"manifest_entry","fields":[
+            {"name":"status","type":"int"},
+            {"name":"data_file","type":{"type":"record","name":"data_file","fields":[
+                {"name":"content","type":"int"},
+                {"name":"file_path","type":"string"}]}}]}"#,
+    )
+    .map_err(|e| Error::Io(format!("avro schema: {e}")))?;
+    let mut w = Writer::new(&schema, Vec::new());
+    w.append(Value::Record(vec![
+        ("status".into(), Value::Int(1)),
+        (
+            "data_file".into(),
+            Value::Record(vec![
+                ("content".into(), Value::Int(0)),
+                ("file_path".into(), Value::String(data_file.into())),
+            ]),
+        ),
+    ]))
+    .map_err(|e| Error::Io(format!("avro append: {e}")))?;
+    std::fs::write(path, w.into_inner().unwrap())
+        .map_err(|e| Error::Io(format!("write {}: {e}", path.display())))
 }
 
 // ---- Iceberg -------------------------------------------------------------------------------
@@ -277,5 +552,35 @@ mod tests {
         let files = iceberg_active_files(dir.to_str().unwrap()).unwrap();
         assert_eq!(files, vec![data]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_partition_paths_filters_hive_layout() {
+        let files = vec![
+            std::path::PathBuf::from("/data/year=2024/month=01/part.parquet"),
+            std::path::PathBuf::from("/data/year=2024/month=02/part.parquet"),
+            std::path::PathBuf::from("/data/year=2023/month=12/part.parquet"),
+        ];
+        let pruned = prune_partition_paths(&files, Some("year = 2024 AND month = 1"));
+        assert_eq!(pruned.len(), 1);
+        assert!(pruned[0].to_string_lossy().contains("month=01"));
+    }
+
+    #[test]
+    fn write_parquet_roundtrip() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("out.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))])
+                .unwrap();
+        write_parquet(path.to_str().unwrap(), &[batch]).unwrap();
+        assert!(path.exists());
     }
 }

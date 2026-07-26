@@ -238,18 +238,8 @@ pub(crate) fn aggregation_stages_for(
     let hash_key_cols: Vec<u32> = (0..group_sql.len() as u32).collect();
     Ok(DistributedQuery {
         stages: vec![
-            StageDef {
-                stage_id: 0,
-                sql: partial_sql,
-                upstream_stage_ids: vec![],
-                hash_key_cols,
-            },
-            StageDef {
-                stage_id: 1,
-                sql: final_sql,
-                upstream_stage_ids: vec![0],
-                hash_key_cols: vec![],
-            },
+            StageDef::new(0, partial_sql, vec![], hash_key_cols),
+            StageDef::new(1, final_sql, vec![0], vec![]),
         ],
         finalize_sql: build_finalize(p)?,
     })
@@ -340,18 +330,8 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
     let final_sql = wrap_output(p, &inner, &remap)?;
     Ok(DistributedQuery {
         stages: vec![
-            StageDef {
-                stage_id: 0,
-                sql: partial_sql,
-                upstream_stage_ids: vec![],
-                hash_key_cols: vec![],
-            },
-            StageDef {
-                stage_id: 1,
-                sql: final_sql,
-                upstream_stage_ids: vec![0],
-                hash_key_cols: vec![],
-            },
+            StageDef::new(0, partial_sql, vec![], vec![]),
+            StageDef::new(1, final_sql, vec![0], vec![]),
         ],
         finalize_sql: build_finalize(p)?,
     })
@@ -449,30 +429,20 @@ pub(crate) fn shuffle_join_two_tables(
     let hash_group: Vec<u32> = (0..group_sql.len() as u32).collect();
     Ok(DistributedQuery {
         stages: vec![
-            StageDef {
-                stage_id: 0,
-                sql: sanitize_generated_sql(&left_sql),
-                upstream_stage_ids: vec![],
-                hash_key_cols: vec![left_key_idx],
-            },
-            StageDef {
-                stage_id: 1,
-                sql: sanitize_generated_sql(&right_sql),
-                upstream_stage_ids: vec![],
-                hash_key_cols: vec![right_key_idx],
-            },
-            StageDef {
-                stage_id: 2,
-                sql: partial_sql,
-                upstream_stage_ids: vec![0, 1],
-                hash_key_cols: hash_group,
-            },
-            StageDef {
-                stage_id: 3,
-                sql: final_sql,
-                upstream_stage_ids: vec![2],
-                hash_key_cols: vec![],
-            },
+            StageDef::new(
+                0,
+                sanitize_generated_sql(&left_sql),
+                vec![],
+                vec![left_key_idx],
+            ),
+            StageDef::new(
+                1,
+                sanitize_generated_sql(&right_sql),
+                vec![],
+                vec![right_key_idx],
+            ),
+            StageDef::new(2, partial_sql, vec![0, 1], hash_group),
+            StageDef::new(3, final_sql, vec![2], vec![]),
         ],
         finalize_sql: build_finalize(p)?,
     })
@@ -883,7 +853,128 @@ pub(crate) fn extract_from_tail(input_sql: &str) -> Result<String> {
 }
 
 pub(crate) fn sanitize_generated_sql(sql: &str) -> String {
-    fix_quoted_column_after_dot(&fix_quoted_table_dot_access(sql))
+    fix_interval_pg_style(&fix_quoted_column_after_dot(&fix_quoted_table_dot_access(
+        sql,
+    )))
+}
+
+/// DataFusion's Unparser emits Postgres-style combined interval literals
+/// (`INTERVAL '12 MONS'`, `INTERVAL '90 DAYS'`). Workers re-parse under the Databricks dialect,
+/// which requires a unit *after* the quoted value (`INTERVAL '12' MONTH`). Rewrite the combined
+/// form so stage SQL round-trips. Case-insensitive on the keyword and unit abbreviation.
+fn fix_interval_pg_style(sql: &str) -> String {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        // Skip quoted strings so we never rewrite interval-looking content inside literals.
+        if b[i] == b'\'' || b[i] == b'"' {
+            let quote = b[i];
+            let start = i;
+            i += 1;
+            while i < n {
+                if b[i] == quote {
+                    if i + 1 < n && b[i + 1] == quote {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        if interval_kw_at(b, i) {
+            let after_kw = i + 8;
+            let mut j = after_kw;
+            while j < n && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < n && b[j] == b'\'' {
+                let lit_open = j;
+                j += 1;
+                let lit_body = j;
+                while j < n && b[j] != b'\'' {
+                    j += 1;
+                }
+                if j < n {
+                    let body = &sql[lit_body..j];
+                    if let Some((num, unit)) = split_pg_interval_body(body) {
+                        out.push_str(&sql[i..lit_open]);
+                        out.push('\'');
+                        out.push_str(num);
+                        out.push('\'');
+                        out.push(' ');
+                        out.push_str(unit);
+                        i = j + 1; // past closing quote
+                        continue;
+                    }
+                }
+            }
+        }
+
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn interval_kw_at(b: &[u8], i: usize) -> bool {
+    const KW: &[u8] = b"interval";
+    if i + KW.len() > b.len() {
+        return false;
+    }
+    if i > 0 {
+        let prev = b[i - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            return false;
+        }
+    }
+    if !b[i..i + KW.len()].eq_ignore_ascii_case(KW) {
+        return false;
+    }
+    let after = i + KW.len();
+    if after < b.len() {
+        let next = b[after];
+        if next.is_ascii_alphanumeric() || next == b'_' {
+            return false;
+        }
+    }
+    true
+}
+
+/// Split `"12 MONS"` / `"-90 DAYS"` into (`"-90"`, `"DAY"`). Returns `None` when the body is already
+/// a bare numeric literal (no unit inside the quotes).
+fn split_pg_interval_body(body: &str) -> Option<(&str, &'static str)> {
+    let body = body.trim();
+    let mut parts = body.split_whitespace();
+    let num = parts.next()?;
+    let unit_raw = parts.next()?;
+    if parts.next().is_some() {
+        return None; // multi-unit combined forms — leave alone
+    }
+    // Number may be signed / decimal; require it to look numeric.
+    if !num
+        .bytes()
+        .enumerate()
+        .all(|(i, c)| c.is_ascii_digit() || ((c == b'+' || c == b'-') && i == 0) || c == b'.')
+    {
+        return None;
+    }
+    let unit = match unit_raw.to_ascii_uppercase().as_str() {
+        "YEAR" | "YEARS" | "YR" | "YRS" => "YEAR",
+        "MONTH" | "MONTHS" | "MON" | "MONS" => "MONTH",
+        "DAY" | "DAYS" | "D" => "DAY",
+        "HOUR" | "HOURS" | "HR" | "HRS" => "HOUR",
+        "MINUTE" | "MINUTES" | "MIN" | "MINS" => "MINUTE",
+        "SECOND" | "SECONDS" | "SEC" | "SECS" => "SECOND",
+        _ => return None,
+    };
+    Some((num, unit))
 }
 
 /// `"table".col` → `` `table`.col `` so dot access parses under the Databricks dialect.

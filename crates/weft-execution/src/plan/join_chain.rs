@@ -279,12 +279,7 @@ fn build_chain(
                 let key_idx = flat_key_index(&flats, &left_key_alias, &left_key_name)?;
                 let id = next_id;
                 next_id += 1;
-                stages.push(StageDef {
-                    stage_id: id,
-                    sql,
-                    upstream_stage_ids: vec![],
-                    hash_key_cols: vec![key_idx],
-                });
+                stages.push(StageDef::new(id, sql, vec![], vec![key_idx]));
                 left_flats = flats;
                 id
             }
@@ -298,12 +293,12 @@ fn build_chain(
         let right_key_idx = flat_key_index(&right_flats, &right_alias, &right_key_name)?;
         let right_id = next_id;
         next_id += 1;
-        stages.push(StageDef {
-            stage_id: right_id,
-            sql: right_sql,
-            upstream_stage_ids: vec![],
-            hash_key_cols: vec![right_key_idx],
-        });
+        stages.push(StageDef::new(
+            right_id,
+            right_sql,
+            vec![],
+            vec![right_key_idx],
+        ));
 
         let on_sql = format!(
             "l.{} = r.{}",
@@ -363,12 +358,12 @@ fn build_chain(
         let hash_idx = flat_key_index(&new_flats, &hash_alias, &hash_col)?;
         let join_id = next_id;
         next_id += 1;
-        stages.push(StageDef {
-            stage_id: join_id,
-            sql: sanitize_generated_sql(&format!("SELECT {} {join_from}", proj.join(", "))),
-            upstream_stage_ids: vec![left_stage_id, right_id],
-            hash_key_cols: vec![hash_idx],
-        });
+        stages.push(StageDef::new(
+            join_id,
+            sanitize_generated_sql(&format!("SELECT {} {join_from}", proj.join(", "))),
+            vec![left_stage_id, right_id],
+            vec![hash_idx],
+        ));
         left_side = LeftSide::Stage { id: join_id };
         left_flats = new_flats;
     }
@@ -443,18 +438,13 @@ fn finish_with_aggregate(
     let hash_group: Vec<u32> = (0..group_sql.len() as u32).collect();
     let join_id = *next_id;
     *next_id += 1;
-    stages.push(StageDef {
-        stage_id: join_id,
-        sql: partial_sql,
-        upstream_stage_ids: vec![left_stage_id, right_id],
-        hash_key_cols: hash_group,
-    });
-    stages.push(StageDef {
-        stage_id: *next_id,
-        sql: final_sql,
-        upstream_stage_ids: vec![join_id],
-        hash_key_cols: vec![],
-    });
+    stages.push(StageDef::new(
+        join_id,
+        partial_sql,
+        vec![left_stage_id, right_id],
+        hash_group,
+    ));
+    stages.push(StageDef::new(*next_id, final_sql, vec![join_id], vec![]));
     Ok(DistributedQuery {
         stages: std::mem::take(stages),
         finalize_sql: build_finalize(p)?,

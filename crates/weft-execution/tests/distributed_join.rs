@@ -84,7 +84,14 @@ async fn two_worker_shuffle_join_matches_single_node() {
     let expected = rows(&single.sql(SINGLE_SQL).await.unwrap());
 
     // Two workers; each holds half of orders AND half of customer under the base table names.
-    let (p0, p1) = (50581u16, 50582u16);
+    let p0 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let p1 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
     let e0 = Arc::new(Engine::new());
     e0.register_batches("orders", vec![orders(0, ORDERS / 2, CUSTS)])
         .unwrap();
@@ -117,12 +124,14 @@ async fn two_worker_shuffle_join_matches_single_node() {
             sql: "SELECT o_orderkey, o_custkey FROM orders".into(),
             upstream_stage_ids: vec![],
             hash_key_cols: vec![1],
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 1,
             sql: "SELECT c_custkey, c_val FROM customer".into(),
             upstream_stage_ids: vec![],
             hash_key_cols: vec![0],
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 2,
@@ -132,6 +141,7 @@ async fn two_worker_shuffle_join_matches_single_node() {
                 .into(),
             upstream_stage_ids: vec![0, 1],
             hash_key_cols: vec![],
+            ..StageDef::default()
         },
     ];
 

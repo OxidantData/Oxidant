@@ -13,7 +13,7 @@ pub mod spill;
 
 pub use partition::hash_partition;
 pub use protocol::{decode_ticket, ShuffleReadTicket, StageTicket, Ticket};
-pub use spill::{SpillConfig, DEFAULT_SHUFFLE_SPILL_BYTES};
+pub use spill::SpillStore;
 
 /// The table name a stage's shuffle input is registered under before its SQL runs.
 pub const SHUFFLE_INPUT_TABLE: &str = "shuffle_input";

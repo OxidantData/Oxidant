@@ -1,0 +1,39 @@
+# Minimal data-plane chart: one Spark Connect driver + N Flight workers.
+# Full control-plane (gateway/SSO/Terraform) is out of scope — see docs/distributed-k8s.md.
+
+replicaCount: 1
+
+connect:
+  enabled: true
+  image: weft/connect-server:latest
+  imagePullPolicy: IfNotPresent
+  replicas: 1
+  port: 50051
+  serviceType: ClusterIP
+  # Bundled in connect-server.Dockerfile (awscli stage).
+  awsBin: /usr/local/aws-cli/v2/current/bin/aws
+  memoryLimitBytes: ""
+  resources: {}
+
+worker:
+  image: weft/worker:latest
+  imagePullPolicy: IfNotPresent
+  port: 50561
+  replicas: 2
+  memoryLimitBytes: ""
+  resources: {}
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+
+# Optional control-plane stub. Disabled by default — gateway.Dockerfile is not in-tree yet.
+gateway:
+  enabled: false
+  image: weft/gateway:latest
+  port: 8080
+  env:
+    WEFT_ORCHESTRATOR: k8s
+    WEFT_WORKER_IMAGE: weft/worker:latest
+    WEFT_CLUSTER_IMAGE: weft/connect-server:latest

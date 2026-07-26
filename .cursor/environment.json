@@ -1,0 +1,5 @@
+{
+  "$comment": "Cursor background-agent environment for the daily-maintenance routine (see .cursor/rules/daily-maintenance.mdc). Rust 1.90 auto-installs from rust-toolchain.toml; protoc is NOT required (weft-proto/build.rs uses pure-Rust protox). We install the two scan tools once at env-build time.",
+  "install": "rustup show; (command -v cargo-audit >/dev/null || cargo install cargo-audit --locked); (command -v cargo-deny >/dev/null || cargo install cargo-deny --locked)",
+  "terminals": []
+}

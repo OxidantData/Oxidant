@@ -40,17 +40,46 @@ impl WeftService {
             }
             _ => Trigger::ProcessingTime(std::time::Duration::from_secs(1)),
         };
+        let sink_path = match &start.sink_destination {
+            Some(sc::write_stream_operation_start::SinkDestination::Path(p)) if !p.is_empty() => {
+                Some(p.clone())
+            }
+            Some(sc::write_stream_operation_start::SinkDestination::TableName(t))
+                if !t.is_empty() =>
+            {
+                Some(t.clone())
+            }
+            _ => None,
+        };
+        let config =
+            weft_streaming::StreamQueryConfig::from_spark(&start.format, &start.options, sink_path);
         let id = self
             .streaming
-            .start(name.clone(), checkpoint, trigger)
+            .start_with_config(name.clone(), checkpoint, trigger.clone(), config)
             .await;
-        // Kick off first batch in background for processing-time triggers.
+        // Kick off batches: once/availableNow run to completion; processing-time loops.
         let mgr = self.streaming.clone();
         let eng = self.engine.clone();
         let qid = id.id.clone();
-        tokio::spawn(async move {
-            let _ = mgr.process_all_available(&qid, &eng).await;
-        });
+        match trigger {
+            Trigger::ProcessingTime(interval) => {
+                tokio::spawn(async move {
+                    loop {
+                        let _ = mgr.run_batch(&qid, &eng).await;
+                        let active = mgr.status(&qid).await.map(|s| s.is_active).unwrap_or(false);
+                        if !active {
+                            break;
+                        }
+                        tokio::time::sleep(interval).await;
+                    }
+                });
+            }
+            _ => {
+                tokio::spawn(async move {
+                    let _ = mgr.process_all_available(&qid, &eng).await;
+                });
+            }
+        }
         Ok(sc::WriteStreamOperationStartResult {
             query_id: Some(sc::StreamingQueryInstanceId {
                 id: id.id,

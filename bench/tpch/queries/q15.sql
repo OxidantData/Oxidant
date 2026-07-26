@@ -5,8 +5,8 @@ WITH revenue AS (
     FROM
         lineitem
     WHERE
-        l_shipdate >= CAST('1996-01-01' AS date)
-      AND l_shipdate < CAST('1996-04-01' AS date)
+        l_shipdate >= date '1996-01-01'
+      AND l_shipdate < date '1996-01-01' + interval '3' month
     GROUP BY
         supplier_no
 )

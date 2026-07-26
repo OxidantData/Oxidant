@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! weft spark server --port 50051         # Spark Connect server; point PySpark at sc://host:50051
+//! weft spark server --mode local-cluster --workers 2
 //! weft worker --port 50561 [--data hits.parquet --table t]   # a distributed Flight worker
 //! weft driver --workers h:p,h:p \         # orchestrate a 2-stage distributed aggregation
 //!   --partial-sql "SELECT k, COUNT(*) c, SUM(v) s FROM t GROUP BY k" \
@@ -22,6 +23,7 @@ async fn main() {
     let result = match cmd {
         Some("worker") => run_worker(&args).await,
         Some("driver") => run_driver(&args).await,
+        Some("history-server") => run_history_server(&args).await,
         // `weft spark server ...` (and the bare `server` alias) keep the Spark Connect path.
         _ if args.iter().any(|a| a == "server") => run_server(&args).await,
         _ => {
@@ -38,7 +40,10 @@ async fn main() {
 fn usage() {
     eprintln!("weft {}", env!("CARGO_PKG_VERSION"));
     eprintln!("usage:");
-    eprintln!("  weft spark server --port <PORT>");
+    eprintln!(
+        "  weft spark server --port <PORT> [--ui-port <PORT>] [--no-ui] [--mode local|local-cluster] [--workers <N>]"
+    );
+    eprintln!("  weft history-server --dir <LOG_DIR> [--port <PORT>]");
     eprintln!("  weft worker --port <PORT> [--data <parquet> --table <name>]");
     eprintln!(
         "  weft driver --workers <h:p,h:p> --partial-sql <SQL> --final-sql <SQL> --hash-keys <c,c>"
@@ -46,15 +51,122 @@ fn usage() {
 }
 
 async fn run_server(args: &[String]) -> weft_common::Result<()> {
+    let mode = server_mode(args)?;
     let port = flag(args, "--port")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50051);
+    let ui_port = if args.iter().any(|a| a == "--no-ui") {
+        None
+    } else {
+        Some(
+            flag(args, "--ui-port")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4040),
+        )
+    };
     let catalogs = catalog_conf(args);
     if !catalogs.is_empty() {
         eprintln!("Declared {} catalog config entrie(s)", catalogs.len());
     }
+    let workers = match mode {
+        ServerMode::Local => Vec::new(),
+        ServerMode::LocalCluster { workers } => start_local_cluster_workers(workers).await?,
+    };
+    if !workers.is_empty() {
+        let csv = workers.join(",");
+        // Mirror the generated endpoints into the process environment for helper paths that still
+        // consult WEFT_WORKERS, while passing the explicit list below as the authoritative config.
+        std::env::set_var("WEFT_WORKERS", &csv);
+        eprintln!("Weft local-cluster workers: {csv}");
+    }
     eprintln!("Weft Spark Connect server listening on sc://0.0.0.0:{port}");
-    serve(ServerConfig { port, catalogs }).await
+    if let Some(ui) = ui_port {
+        eprintln!("Weft UI at http://0.0.0.0:{ui}");
+    }
+    let mut config = ServerConfig {
+        port,
+        ui_port,
+        catalogs,
+        ..Default::default()
+    };
+    if !workers.is_empty() {
+        config.workers = workers;
+    }
+    serve(config).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerMode {
+    Local,
+    LocalCluster { workers: usize },
+}
+
+fn server_mode(args: &[String]) -> weft_common::Result<ServerMode> {
+    let mode = flag(args, "--mode").unwrap_or_else(|| "local".to_string());
+    match mode.as_str() {
+        "local" | "single-node" => Ok(ServerMode::Local),
+        "local-cluster" => {
+            let workers = flag(args, "--workers")
+                .or_else(|| std::env::var("WEFT_DEFAULT_PARALLELISM").ok())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(2);
+            if workers == 0 {
+                return Err(weft_common::Error::Io(
+                    "local-cluster requires at least one worker".into(),
+                ));
+            }
+            Ok(ServerMode::LocalCluster { workers })
+        }
+        other => Err(weft_common::Error::Io(format!(
+            "unknown spark server mode `{other}` (expected local or local-cluster)"
+        ))),
+    }
+}
+
+async fn start_local_cluster_workers(count: usize) -> weft_common::Result<Vec<String>> {
+    let mut endpoints = Vec::with_capacity(count);
+    for idx in 0..count {
+        let port = pick_ephemeral_port()?;
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let engine = Arc::new(Engine::new());
+        tokio::spawn(async move {
+            if let Err(e) = serve_worker(port, engine).await {
+                eprintln!("weft local-cluster worker {idx} exited: {e}");
+            }
+        });
+        eprintln!("Weft local-cluster worker {idx} listening on Flight {endpoint}");
+        endpoints.push(endpoint);
+    }
+    Ok(endpoints)
+}
+
+fn pick_ephemeral_port() -> weft_common::Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| weft_common::Error::Io(format!("bind ephemeral worker port: {e}")))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| weft_common::Error::Io(format!("read ephemeral worker port: {e}")))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+async fn run_history_server(args: &[String]) -> weft_common::Result<()> {
+    use std::sync::Arc;
+    use weft_observability::AppStateStore;
+    use weft_ui_server::{serve as serve_ui, UiServerConfig};
+
+    let port: u16 = flag(args, "--port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(18080);
+    let dir = flag(args, "--dir")
+        .or_else(|| std::env::var("WEFT_EVENT_LOG_DIR").ok())
+        .ok_or_else(|| {
+            weft_common::Error::Io("history-server requires --dir or WEFT_EVENT_LOG_DIR".into())
+        })?;
+    let store = Arc::new(AppStateStore::load_event_log(std::path::Path::new(&dir)));
+    eprintln!("Weft history server on http://0.0.0.0:{port} (log: {dir})");
+    serve_ui(UiServerConfig { port, store }).await
 }
 
 /// Collect startup catalog config from repeated `--catalog-conf key=value` flags and the
@@ -154,6 +266,48 @@ async fn run_driver(args: &[String]) -> weft_common::Result<()> {
 
 /// Read the value following `--name` in `args`.
 fn flag(args: &[String], name: &str) -> Option<String> {
+    let eq = format!("{name}=");
+    if let Some(value) = args.iter().find_map(|a| a.strip_prefix(&eq)) {
+        return Some(value.to_string());
+    }
     let i = args.iter().position(|a| a == name)?;
     args.get(i + 1).cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn local_cluster_mode_parses_workers() {
+        let parsed = server_mode(&args(&[
+            "weft",
+            "spark",
+            "server",
+            "--mode",
+            "local-cluster",
+            "--workers",
+            "3",
+        ]))
+        .unwrap();
+        assert_eq!(parsed, ServerMode::LocalCluster { workers: 3 });
+    }
+
+    #[test]
+    fn local_cluster_mode_rejects_zero_workers() {
+        let parsed = server_mode(&args(&[
+            "weft",
+            "spark",
+            "server",
+            "--mode",
+            "local-cluster",
+            "--workers",
+            "0",
+        ]));
+        assert!(parsed.is_err());
+    }
 }

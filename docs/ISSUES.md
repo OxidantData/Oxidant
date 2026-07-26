@@ -51,15 +51,13 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
     CPU config. Caveat: synthetic/local signal, not the c6a absolutes — a real run would only need
     to confirm the `batch_size` candidate.
 - **1.5a — DONE:** single-stage driver/worker over Arrow Flight (`weft-execution::flight`).
-- **1.5b — DONE (local MVP):** multi-stage distributed shuffle. `partial-agg → hash shuffle by key
-  → final-agg` over Arrow Flight: a prost `StageTicket`/`ShuffleReadTicket` control envelope, FNV
-  hash partitioning of stage output into per-worker buckets (`shuffle::partition`), pull-based
-  shuffle via `do_get(ShuffleReadTicket)`, and `datafusion-proto` physical-fragment ser/de
-  (`shuffle::codec`, round-trips a GROUP BY over a Parquet leaf). `driver::run_distributed`
-  orchestrates the two stages; `weft worker` / `weft driver` CLI subcommands drive it. The headline
-  test `two_worker_groupby_matches_single_node` asserts the distributed result equals single-node
-  row-for-row. v1 limits: re-combinable aggregates only (COUNT/SUM/MIN/MAX; no AVG/COUNT(DISTINCT)
-  auto-decomposition), 2-stage only, static worker list, no shuffle spill, `do_exchange` stubbed.
+- **1.5b — DONE (local MVP):** distributed shuffle plus Sail-style Forward coverage. The planner
+  now handles AVG/COUNT(DISTINCT), multi-stage DAGs, broadcast joins, global ORDER BY/LIMIT, and
+  falls back to a single Forward stage for locally plannable shapes it cannot split. The runtime has
+  Flight shuffle, shuffle spill, `do_exchange`, task slots/retries, K8s membership, Spark Connect
+  distributed routing, and `weft spark server --mode local-cluster`. TPC-H distributed and
+  correctness-distributed are CI gates; Forward correctness assumes the selected worker has a full
+  table view (shared storage or full replication).
 - Reusable benchmarking instance: `scratchpad/c6a.sh {up|run|stop|start|down}` (stopped between
   runs; data + build cache persist on EBS).
 

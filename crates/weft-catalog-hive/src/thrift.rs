@@ -45,7 +45,9 @@ pub struct HiveTable {
     /// `tableType` (e.g. `EXTERNAL_TABLE`, `MANAGED_TABLE`, `VIRTUAL_VIEW`).
     pub table_type: Option<String>,
     /// `parameters` — table properties; `table_type=ICEBERG` / `spark.sql.sources.provider=delta`
-    /// here are the most reliable format signals.
+    /// here are the most reliable format signals. Hive Metastore has no dedicated table-level
+    /// comment field on the `Table` struct itself — `COMMENT '...'` on `CREATE TABLE` is stored
+    /// as the `comment` key in this same map, hence [`HiveTable::comment`] below.
     pub parameters: Vec<(String, String)>,
     /// `sd.cols` — the data columns as `(name, hive_type_string)`, in declaration order. The
     /// catalog-declared schema the engine coerces files to.
@@ -64,6 +66,12 @@ impl HiveTable {
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The table-level comment, i.e. the `parameters["comment"]` entry Hive Metastore stores
+    /// `CREATE TABLE ... COMMENT '...'` under (there is no separate Thrift field for it).
+    pub fn comment(&self) -> Option<&str> {
+        self.param("comment")
     }
 }
 
@@ -113,6 +121,35 @@ impl MetastoreClient {
         write_stop(&mut args);
         self.call("get_table", &args).await?;
         self.read_table_result(db_name, table).await
+    }
+
+    /// `create_table(tbl)` — declare a new external table. Returns `Ok(())` on Hive Metastore's
+    /// `void` success reply; a declared exception (`AlreadyExistsException`, `InvalidObjectException`,
+    /// `MetaException`, `NoSuchObjectException` — all delivered as a struct field in the result, not
+    /// a Thrift-protocol-level exception) surfaces as `Error::Io` with its message.
+    pub async fn create_table(&mut self, tbl: &NewHiveTable) -> Result<()> {
+        let mut args = Vec::new();
+        write_field(&mut args, T_STRUCT, 1); // the single `Table tbl` arg
+        write_new_table(&mut args, tbl);
+        write_stop(&mut args);
+        self.call("create_table", &args).await?;
+        self.read_void_result("create_table").await
+    }
+
+    /// Read a `void`-result reply: success is an empty struct (just `T_STOP`); any field present is
+    /// one of the RPC's declared exceptions.
+    async fn read_void_result(&mut self, method: &str) -> Result<()> {
+        loop {
+            let (ftype, _fid) = self.read_field_header().await?;
+            if ftype == T_STOP {
+                return Ok(());
+            }
+            if ftype == T_STRUCT {
+                let msg = self.read_struct_message().await?;
+                return Err(Error::Io(format!("Hive Metastore {method} failed: {msg}")));
+            }
+            self.skip(ftype).await?;
+        }
     }
 
     /// Frame and send a method call, then read + validate the reply envelope.
@@ -479,6 +516,88 @@ fn write_field(buf: &mut Vec<u8>, ftype: u8, id: i16) {
 fn write_stop(buf: &mut Vec<u8>) {
     buf.push(T_STOP);
 }
+/// Write a `list<T>` header (element type + count); caller writes each element after.
+fn write_list_header(buf: &mut Vec<u8>, elem_type: u8, count: usize) {
+    buf.push(elem_type);
+    write_i32(buf, count as i32);
+}
+/// Write one `FieldSchema` struct: `name` (field 1) + `type` (field 2), no `comment` (field 3,
+/// optional — Hive doesn't require it).
+fn write_field_schema(buf: &mut Vec<u8>, name: &str, ty: &str) {
+    write_field(buf, T_STRING, 1);
+    write_string(buf, name);
+    write_field(buf, T_STRING, 2);
+    write_string(buf, ty);
+    write_stop(buf);
+}
+/// Write a `map<string,string>` value (key/value type bytes, count, then each pair).
+fn write_string_map(buf: &mut Vec<u8>, pairs: &[(String, String)]) {
+    buf.push(T_STRING);
+    buf.push(T_STRING);
+    write_i32(buf, pairs.len() as i32);
+    for (k, v) in pairs {
+        write_string(buf, k);
+        write_string(buf, v);
+    }
+}
+
+/// Everything needed to declare a new Hive table via `create_table` — built by
+/// `weft-catalog-hive`'s `HiveCatalog::create_table` from the CTAS result's schema (via
+/// `weft_catalog::hive_types::schema_to_columns`/`format_serde`).
+pub struct NewHiveTable {
+    pub db_name: String,
+    pub table_name: String,
+    pub location: String,
+    pub input_format: &'static str,
+    pub output_format: &'static str,
+    pub serde_lib: &'static str,
+    pub serde_params: Vec<(String, String)>,
+    /// Data columns as `(name, hive_type_string)`, in declaration order.
+    pub columns: Vec<(String, String)>,
+    /// Partition columns as `(name, hive_type_string)`, in declaration order.
+    pub partition_columns: Vec<(String, String)>,
+}
+
+/// Write the Thrift `Table` struct (Hive Metastore's `create_table` single arg, field id 1):
+/// `tableName` (1), `dbName` (2), `sd` (7, a `StorageDescriptor`), `partitionKeys` (8),
+/// `parameters` (9, empty), `tableType` (12, `EXTERNAL_TABLE` — Weft never owns/deletes the data).
+fn write_new_table(buf: &mut Vec<u8>, tbl: &NewHiveTable) {
+    write_field(buf, T_STRING, 1); // tableName
+    write_string(buf, &tbl.table_name);
+    write_field(buf, T_STRING, 2); // dbName
+    write_string(buf, &tbl.db_name);
+
+    write_field(buf, T_STRUCT, 7); // sd: StorageDescriptor
+    write_field(buf, T_LIST, 1); // cols
+    write_list_header(buf, T_STRUCT, tbl.columns.len());
+    for (name, ty) in &tbl.columns {
+        write_field_schema(buf, name, ty);
+    }
+    write_field(buf, T_STRING, 2); // location
+    write_string(buf, &tbl.location);
+    write_field(buf, T_STRING, 3); // inputFormat
+    write_string(buf, tbl.input_format);
+    write_field(buf, T_STRING, 4); // outputFormat
+    write_string(buf, tbl.output_format);
+    write_field(buf, T_STRUCT, 7); // serdeInfo: SerDeInfo
+    write_field(buf, T_STRING, 2); // serializationLib
+    write_string(buf, tbl.serde_lib);
+    write_field(buf, T_MAP, 3); // parameters
+    write_string_map(buf, &tbl.serde_params);
+    write_stop(buf); // end SerDeInfo
+    write_stop(buf); // end StorageDescriptor
+
+    write_field(buf, T_LIST, 8); // partitionKeys
+    write_list_header(buf, T_STRUCT, tbl.partition_columns.len());
+    for (name, ty) in &tbl.partition_columns {
+        write_field_schema(buf, name, ty);
+    }
+    write_field(buf, T_MAP, 9); // parameters (table-level, empty)
+    write_string_map(buf, &[]);
+    write_field(buf, T_STRING, 12); // tableType
+    write_string(buf, "EXTERNAL_TABLE");
+    write_stop(buf); // end Table
+}
 
 #[cfg(test)]
 mod tests {
@@ -681,5 +800,123 @@ mod tests {
             .unwrap();
         let t = client.get_table("db", "ice").await.unwrap();
         assert_eq!(t.param("table_type"), Some("ICEBERG"));
+    }
+
+    // `write_new_table`/`create_table` back `HiveCatalog::create_table` (CTAS write support).
+
+    fn sample_new_table() -> NewHiveTable {
+        NewHiveTable {
+            db_name: "db".to_string(),
+            table_name: "orders".to_string(),
+            location: "s3://bucket/db/orders/".to_string(),
+            input_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+            output_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+            serde_lib: "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+            serde_params: vec![],
+            columns: vec![
+                ("id".to_string(), "bigint".to_string()),
+                ("name".to_string(), "string".to_string()),
+            ],
+            partition_columns: vec![("dt".to_string(), "string".to_string())],
+        }
+    }
+
+    #[test]
+    fn write_new_table_encodes_expected_fields() {
+        let tbl = sample_new_table();
+        let mut buf = Vec::new();
+        write_new_table(&mut buf, &tbl);
+        // Thrift strings are length-prefixed raw UTF-8 bytes, so each value's bytes appear
+        // contiguously in the buffer — a substring check is a reliable, low-effort way to confirm
+        // every field made it into the wire encoding without hand-rolling a full struct decoder.
+        let s = String::from_utf8_lossy(&buf);
+        for expect in [
+            "orders",
+            "db",
+            "s3://bucket/db/orders/",
+            "id",
+            "bigint",
+            "name",
+            "string",
+            "dt",
+            "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+            "EXTERNAL_TABLE",
+        ] {
+            assert!(
+                s.contains(expect),
+                "expected `{expect}` in encoded Table struct"
+            );
+        }
+    }
+
+    /// Encode a Thrift `void`-success reply envelope (empty result struct).
+    fn encode_void_reply(seq: i32) -> Vec<u8> {
+        let mut msg = Vec::new();
+        write_i32(&mut msg, (VERSION_1 | 2u32) as i32); // REPLY
+        write_string(&mut msg, "create_table");
+        write_i32(&mut msg, seq);
+        write_stop(&mut msg); // empty result struct = void success
+        msg
+    }
+
+    /// Encode a Thrift reply carrying a declared exception (e.g. `AlreadyExistsException`) in the
+    /// result struct's field 1, with a `message` (field 1 of the exception struct).
+    fn encode_exception_reply(seq: i32, message: &str) -> Vec<u8> {
+        let mut exc = Vec::new();
+        write_field(&mut exc, T_STRING, 1);
+        write_string(&mut exc, message);
+        write_stop(&mut exc);
+
+        let mut result = Vec::new();
+        write_field(&mut result, T_STRUCT, 1); // o1: AlreadyExistsException
+        result.extend_from_slice(&exc);
+        write_stop(&mut result);
+
+        let mut msg = Vec::new();
+        write_i32(&mut msg, (VERSION_1 | 2u32) as i32); // REPLY
+        write_string(&mut msg, "create_table");
+        write_i32(&mut msg, seq);
+        msg.extend_from_slice(&result);
+        msg
+    }
+
+    #[tokio::test]
+    async fn create_table_succeeds_on_void_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reply = encode_void_reply(1);
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 4096];
+            let _ = sock.read(&mut scratch).await;
+            sock.write_all(&reply).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let mut client = MetastoreClient::connect(&addr.ip().to_string(), addr.port())
+            .await
+            .unwrap();
+        client.create_table(&sample_new_table()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_table_surfaces_declared_exception() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reply = encode_exception_reply(1, "Table orders already exists");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 4096];
+            let _ = sock.read(&mut scratch).await;
+            sock.write_all(&reply).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let mut client = MetastoreClient::connect(&addr.ip().to_string(), addr.port())
+            .await
+            .unwrap();
+        let err = client.create_table(&sample_new_table()).await.unwrap_err();
+        match err {
+            Error::Io(msg) => assert!(msg.contains("already exists")),
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
     }
 }

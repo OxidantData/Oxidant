@@ -1,9 +1,11 @@
 # Deploying Weft as a self-hosted data platform on AWS
 
-> **Status: outline / contract.** The Terraform, Helm chart, and container images referenced here
-> land per the platform plan (`~/.claude/plans/lets-plan-to-create-gentle-wand.md`). This document
-> is the user-facing deploy guide; the verification target is that a **fresh AWS account can follow
-> it end-to-end with no out-of-band steps**.
+> **Status: outline / contract for the full platform** (SSO, gateway operator, Terraform).
+> For a **runnable** distributed data-plane today (Kind or BYO EKS: connect-server + workers,
+> AWS CLI in the image), use [`distributed-k8s.md`](distributed-k8s.md) instead.
+>
+> The Terraform modules and complete Helm control-plane referenced below are **not all in-tree
+> yet**. This document remains the long-term user-facing deploy guide.
 
 Weft deploys entirely into **your own AWS account** (self-hosted, single-account). You get a
 Databricks-like workspace: SSO login, EKS-backed compute clusters you spin up and down, a local or

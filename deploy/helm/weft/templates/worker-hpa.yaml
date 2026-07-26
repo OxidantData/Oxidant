@@ -1,0 +1,91 @@
+{{- if .Values.worker.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: weft-worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: weft-worker
+  minReplicas: {{ .Values.worker.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.worker.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.worker.autoscaling.targetCPUUtilizationPercentage }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weft-worker
+  labels:
+    app: weft-worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app: weft-worker
+  template:
+    metadata:
+      labels:
+        app: weft-worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: worker
+          image: {{ .Values.worker.image }}
+          imagePullPolicy: {{ .Values.worker.imagePullPolicy }}
+          args: ["worker", "--port", "{{ .Values.worker.port }}"]
+          ports:
+            - name: flight
+              containerPort: {{ .Values.worker.port }}
+          env:
+            {{- if .Values.worker.memoryLimitBytes }}
+            - name: WEFT_MEMORY_LIMIT_BYTES
+              value: {{ .Values.worker.memoryLimitBytes | quote }}
+            {{- end }}
+            - name: WEFT_AWS_BIN
+              value: {{ .Values.connect.awsBin | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: spill
+              mountPath: /var/lib/weft/spill
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: spill
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-worker
+  labels:
+    app: weft-worker
+spec:
+  clusterIP: None
+  selector:
+    app: weft-worker
+  ports:
+    - name: flight
+      port: {{ .Values.worker.port }}
+      targetPort: {{ .Values.worker.port }}

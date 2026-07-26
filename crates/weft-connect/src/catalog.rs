@@ -79,9 +79,13 @@ pub fn build_provider(
             let cat = weft_catalog_glue::GlueCatalog::from_config(name, options);
             Ok(Arc::new(cat))
         }
-        // Future: "rest" (Iceberg REST / Unity).
+        "rest" | "unity" | "iceberg" => {
+            let cat = weft_catalog_rest::RestCatalog::from_config(name, options)
+                .map_err(err_to_status)?;
+            Ok(Arc::new(cat))
+        }
         other => Err(Status::unimplemented(format!(
-            "catalog type `{other}` is not supported yet (have: hive, glue)"
+            "catalog type `{other}` is not supported yet (have: hive, glue, rest/unity/iceberg)"
         ))),
     }
 }

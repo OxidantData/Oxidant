@@ -24,12 +24,27 @@
 //! tail, `IDENTIFIER(...)` names, or an unrecognized format — returns `None`, leaving the statement
 //! byte-identical for the normal path (it keeps failing exactly as today — never a regression).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// A lowered, ready-to-execute external-table DDL plus the managed directory to create first.
 pub(crate) struct Lowered {
     pub ddl: String,
     pub table_dir: PathBuf,
+    /// The parsed (possibly qualified, possibly backticked) table name, verbatim — lets the caller
+    /// check whether its first segment names a registered external catalog before committing to
+    /// this local-warehouse lowering (see `Engine::sql`'s use of this via
+    /// `name_targets_external_catalog`), and is also used to key `Engine::created_tables`.
+    pub name: String,
+    /// The lowercased `USING <fmt>` provider (`parquet`/`orc`/`csv`/`json`).
+    pub format: String,
+    /// Table-level `COMMENT '…'`, if present (retained rather than dropped so later `SHOW CREATE
+    /// TABLE`/`SHOW TBLPROPERTIES`/`DESCRIBE EXTENDED` work can answer it).
+    pub comment: Option<String>,
+    /// Table-level `TBLPROPERTIES(…)` key/value pairs, if present. Best-effort parsed: a malformed
+    /// entry is simply skipped rather than failing the whole lowering (matches the pre-existing
+    /// behavior of accepting any balanced-parens tail here).
+    pub properties: HashMap<String, String>,
 }
 
 const FORMATS: &[&str] = &["parquet", "orc", "csv", "json"];
@@ -58,20 +73,24 @@ pub(crate) fn lower_create_table_using(sql: &str, warehouse: &Path) -> Option<Lo
         return None;
     }
 
-    // Tail: accept only end-of-statement after dropping table-level `COMMENT '…'` /
-    // `TBLPROPERTIES(…)` (metadata, data-faithful). Bail on `AS` (CTAS), `PARTITIONED BY`,
-    // `OPTIONS` (storage-affecting), `LOCATION`, `CLUSTERED`, or anything else — never a lossy
-    // rewrite.
+    // Tail: accept only end-of-statement after retaining table-level `COMMENT '…'` /
+    // `TBLPROPERTIES(…)` (metadata, data-faithful — no longer dropped, see `Lowered::comment`/
+    // `Lowered::properties`). Bail on `AS` (CTAS), `PARTITIONED BY`, `OPTIONS` (storage-affecting),
+    // `LOCATION`, `CLUSTERED`, or anything else — never a lossy rewrite.
+    let mut comment: Option<String> = None;
+    let mut properties: HashMap<String, String> = HashMap::new();
     loop {
         if t.at_end() {
             break;
         }
         if t.kw("comment").is_some() {
-            t.string_literal()?;
+            let lit = t.string_literal()?;
+            comment = Some(unquote_string_literal(lit));
             continue;
         }
         if t.kw("tblproperties").is_some() {
-            t.balanced_parens()?;
+            let span = t.balanced_parens()?;
+            properties = parse_properties(span);
             continue;
         }
         // Unknown / storage-affecting tail — do not risk a lossy rewrite.
@@ -87,7 +106,14 @@ pub(crate) fn lower_create_table_using(sql: &str, warehouse: &Path) -> Option<Lo
         "CREATE EXTERNAL TABLE {ine}{name} {cols} STORED AS {} LOCATION '{location}'",
         fmt_l.to_uppercase()
     );
-    Some(Lowered { ddl, table_dir })
+    Some(Lowered {
+        ddl,
+        table_dir,
+        name,
+        format: fmt_l,
+        comment,
+        properties,
+    })
 }
 
 /// A CTAS lowering: materialize `select_sql` into `table_dir`, then run `ddl`.
@@ -96,6 +122,15 @@ pub(crate) struct LoweredCtas {
     pub fmt: String,
     pub ddl: String,
     pub table_dir: PathBuf,
+    /// The parsed (possibly qualified, possibly backticked) table name, verbatim — see
+    /// `Lowered::name`; also used to key `Engine::created_tables`.
+    pub name: String,
+    /// Table-level `COMMENT '…'`. Always `None` today — this CTAS lowering doesn't yet parse a
+    /// `COMMENT`/`TBLPROPERTIES` tail between `USING <fmt>` and `AS` (unsupported shape, same as
+    /// before this change: such a statement fails to lower and falls through to the normal path).
+    pub comment: Option<String>,
+    /// Table-level `TBLPROPERTIES(…)`. Always empty today, for the same reason as `comment` above.
+    pub properties: HashMap<String, String>,
 }
 
 /// Return lowering for `CREATE TABLE [IF NOT EXISTS] name USING fmt AS SELECT …`.
@@ -142,6 +177,9 @@ pub(crate) fn lower_create_table_ctas(sql: &str, warehouse: &Path) -> Option<Low
         fmt: fmt_l,
         ddl,
         table_dir,
+        name,
+        comment: None,
+        properties: HashMap::new(),
     })
 }
 
@@ -150,6 +188,68 @@ pub(crate) fn lower_create_table_ctas(sql: &str, warehouse: &Path) -> Option<Low
 /// (DataFusion's INSERT `count` row is dropped — `spark.sql("INSERT …")` is an empty DataFrame).
 pub(crate) fn is_insert(sql: &str) -> bool {
     Tok::new(sql).peek_kw("insert")
+}
+
+/// Decode a single- or double-quoted string-literal span (as returned by [`Tok::string_literal`],
+/// quotes included) into its value. Single-quoted literals go through the same
+/// `unescapeSQLString`-faithful decode as the rest of weft's Spark literal handling (`''` collapsed
+/// to `'`, `\n`/`\t`/`\uXXXX`/octal escapes, etc. — see [`crate::spark_unescape_sql_string`]);
+/// double-quoted literals only ever double their own quote char (`""` → `"`), per Spark's own
+/// `unescapeSQLString`, which only rewrites single-quoted literals.
+fn unquote_string_literal(lit: &str) -> String {
+    if lit.len() < 2 {
+        return String::new();
+    }
+    let content = &lit[1..lit.len() - 1];
+    if lit.as_bytes()[0] == b'\'' {
+        crate::spark_unescape_sql_string(content)
+    } else {
+        content.replace("\"\"", "\"")
+    }
+}
+
+/// Best-effort parse of a `TBLPROPERTIES(…)` balanced-parens span (as returned by
+/// [`Tok::balanced_parens`], outer parens included) into its `'key'='value'` pairs. Any entry that
+/// doesn't match the expected shape simply stops parsing further entries — this never fails the
+/// lowering itself (see `Lowered::properties`'s doc comment).
+fn parse_properties(span: &str) -> HashMap<String, String> {
+    let inner = span
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(span);
+    let mut map = HashMap::new();
+    let mut t = Tok::new(inner);
+    loop {
+        t.skip_ws_comments();
+        // Spark's `TBLPROPERTIES`/`OPTIONS` key grammar accepts either a quoted string literal
+        // (`'password'`) or a bare/backtick-quoted identifier (`password`) — `SHOW
+        // TBLPROPERTIES(...password = 'password')` in the vendored corpus uses the latter, so an
+        // identifier-only key must not silently truncate the whole property list.
+        let key = if let Some(key_lit) = t.string_literal() {
+            unquote_string_literal(key_lit)
+        } else if let Some(id) = t.ident() {
+            id
+        } else {
+            break;
+        };
+        t.skip_ws_comments();
+        if t.peek_ch() != Some(b'=') {
+            break;
+        }
+        t.i += 1;
+        t.skip_ws_comments();
+        let Some(val_lit) = t.string_literal() else {
+            break;
+        };
+        map.insert(key, unquote_string_literal(val_lit));
+        t.skip_ws_comments();
+        if t.peek_ch() == Some(b',') {
+            t.i += 1;
+            continue;
+        }
+        break;
+    }
+    map
 }
 
 /// Map a (possibly qualified / backticked) table name to a filesystem-safe directory component.
@@ -436,18 +536,24 @@ mod tests {
     }
 
     #[test]
-    fn drops_trailing_comment_and_tblproperties() {
+    fn retains_trailing_comment_and_tblproperties() {
         let w = Path::new("/tmp/wh");
         let l = lower_create_table_using(
             "create table t(a int) using csv COMMENT 'hi' TBLPROPERTIES('k'='v');",
             w,
         )
         .expect("should lower");
+        // The rewritten DDL still doesn't embed COMMENT/TBLPROPERTIES text (DataFusion's
+        // `CREATE EXTERNAL TABLE` doesn't understand either) — but the values are no longer
+        // discarded, they're carried on `Lowered` for the caller to persist.
         assert!(l
             .ddl
             .starts_with("CREATE EXTERNAL TABLE t (a int) STORED AS CSV"));
         assert!(!l.ddl.contains("COMMENT"));
         assert!(!l.ddl.contains("TBLPROPERTIES"));
+        assert_eq!(l.name, "t");
+        assert_eq!(l.comment.as_deref(), Some("hi"));
+        assert_eq!(l.properties.get("k").map(String::as_str), Some("v"));
     }
 
     #[test]

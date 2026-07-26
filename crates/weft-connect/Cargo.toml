@@ -15,12 +15,15 @@ weft-sql = { workspace = true }
 weft-analyzer = { workspace = true }
 weft-optimizer = { workspace = true }
 weft-physical = { workspace = true }
-weft-execution = { workspace = true }
+weft-execution = { workspace = true, features = ["k8s"] }
 weft-catalog = { workspace = true }
 weft-catalog-hive = { workspace = true }
 weft-catalog-glue = { workspace = true }
+weft-catalog-rest = { workspace = true }
 weft-loom = { workspace = true }
 weft-streaming = { workspace = true }
+weft-observability = { workspace = true }
+weft-ui-server = { workspace = true }
 datafusion = "54"  # lower Spark Connect relations/expressions to DataFusion logical plans
 serde_json = "1"
 tonic = "0.12"
@@ -28,6 +31,8 @@ prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
+# Phase 3: HTTP client to forward artifacts and UDF registrations to the co-located pyworker sidecar.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

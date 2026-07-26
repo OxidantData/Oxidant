@@ -39,7 +39,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   build-test:
-    name: clippy + test + tpch
+    name: clippy + test + tpch + tpcds
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,14 +51,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build weft CLI (integration tests in weft-cli spawn the binary)
         run: cargo build -p weft-cli
+      - name: local-cluster CLI parse smoke
+        run: cargo test -p weft-cli local_cluster_mode_parses --bin weft
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test (workspace)
         run: cargo test --workspace
       - name: TPC-H coverage (Q1/Q3/Q5/Q6/Q10)
         run: cargo run -p weft-bench -- tpch
-      - name: TPC-H distributed (2 workers, sf0.01)
-        run: cargo run -p weft-bench -- tpch-distributed --sf 0.01 --workers 2
+      - name: TPC-H distributed (3 workers, sf0.05)
+        run: cargo run -p weft-bench -- tpch-distributed --sf 0.05 --workers 3
+        env:
+          WEFT_TPCH_DIST_REQUIRE_ALL: "1"
+      - name: Install DuckDB CLI (TPC-DS dsdgen + oracle)
+        run: |
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.3.2/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
+          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
+          duckdb --version
+      - name: TPC-DS coverage (Q1–Q99, sf0.01, pass-set ratchet)
+        run: cargo run -p weft-bench -- tpcds --sf 0.01
+      - name: Distributed correctness gate
+        run: cargo run -p weft-bench -- correctness-distributed --rows 2000
 
   # ClickBench / correctness coverage on small synthetic data. Required gate: all 43 queries must
   # pass. Fixed by switching queries.sql identifiers from ANSI double-quotes to backtick-quotes so

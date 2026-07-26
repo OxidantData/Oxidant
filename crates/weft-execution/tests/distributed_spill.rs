@@ -1,11 +1,10 @@
-//! Force shuffle spill with a 1-byte threshold and assert the distributed GROUP BY still
+//! Force shuffle spill via `WEFT_SHUFFLE_SPILL_DIR` and assert the distributed GROUP BY still
 //! matches the single-node result (gap item 10).
 
 use std::sync::Arc;
 
 use weft_execution::driver::{run_distributed, Cluster, DistributedPlan};
-use weft_execution::flight::serve_worker_with_spill;
-use weft_execution::shuffle::spill::{self, SpillConfig};
+use weft_execution::flight::serve_worker;
 use weft_loom::arrow::array::Int64Array;
 use weft_loom::arrow::datatypes::{DataType, Field, Schema};
 use weft_loom::arrow::record_batch::RecordBatch;
@@ -42,6 +41,12 @@ fn rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
     out
 }
 
+fn spill_file_count(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0)
+}
+
 #[tokio::test]
 async fn two_worker_groupby_with_forced_spill() {
     const N: i64 = 100;
@@ -53,16 +58,12 @@ async fn two_worker_groupby_with_forced_spill() {
         .unwrap();
     let expected = rows(&single.sql(query).await.unwrap());
 
-    // Dedicated spill roots so we can assert files were written, then cleaned on replace/drop.
     let spill0 = std::env::temp_dir().join(format!("weft-spill-test-0-{}", std::process::id()));
     let spill1 = std::env::temp_dir().join(format!("weft-spill-test-1-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&spill0);
     let _ = std::fs::remove_dir_all(&spill1);
     std::fs::create_dir_all(&spill0).unwrap();
     std::fs::create_dir_all(&spill1).unwrap();
-
-    spill::reset_spilled_bucket_count();
-    let before = spill::spilled_bucket_count();
 
     let (p0, p1) = (50581u16, 50582u16);
     let e0 = Arc::new(Engine::new());
@@ -72,13 +73,15 @@ async fn two_worker_groupby_with_forced_spill() {
     e1.register_batches("t", vec![make_batch(N / 2, N)])
         .unwrap();
 
-    let cfg0 = SpillConfig::new(1, spill0.clone()); // 1 byte → always spill non-empty buckets
-    let cfg1 = SpillConfig::new(1, spill1.clone());
+    let spill0_spawn = spill0.clone();
+    let spill1_spawn = spill1.clone();
     tokio::spawn(async move {
-        let _ = serve_worker_with_spill(p0, e0, cfg0).await;
+        std::env::set_var("WEFT_SHUFFLE_SPILL_DIR", spill0_spawn);
+        let _ = serve_worker(p0, e0).await;
     });
     tokio::spawn(async move {
-        let _ = serve_worker_with_spill(p1, e1, cfg1).await;
+        std::env::set_var("WEFT_SHUFFLE_SPILL_DIR", spill1_spawn);
+        let _ = serve_worker(p1, e1).await;
     });
 
     let cluster = Cluster::new(vec![
@@ -104,8 +107,8 @@ async fn two_worker_groupby_with_forced_spill() {
     let actual = actual.expect("distributed query with spill never succeeded");
 
     assert!(
-        spill::spilled_bucket_count() > before,
-        "expected at least one bucket to spill to disk"
+        spill_file_count(&spill0) > 0 || spill_file_count(&spill1) > 0,
+        "expected at least one spill file under worker spill dirs"
     );
     assert_eq!(
         actual, expected,
