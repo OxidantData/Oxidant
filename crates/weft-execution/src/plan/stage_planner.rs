@@ -777,7 +777,7 @@ fn strip_alias(e: &Expr) -> &Expr {
 /// Drop the table qualifier from every column reference (e.g. `lineitem.l_returnflag` →
 /// `l_returnflag`), so a sort over the gathered `result` table resolves against its unqualified
 /// output column names.
-fn unqualify(e: &Expr) -> Expr {
+pub(crate) fn unqualify(e: &Expr) -> Expr {
     use datafusion::common::tree_node::{Transformed, TreeNode};
     e.clone()
         .transform(|node| {

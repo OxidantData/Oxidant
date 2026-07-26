@@ -19,7 +19,7 @@ use weft_common::{Error, Result};
 
 use super::stage_planner::{
     aggregation_stages_for, base_tables, column_name, count_table_scans, expr_sql,
-    extract_from_tail, peel, sanitize_generated_sql, DistributedQuery,
+    extract_from_tail, peel, sanitize_generated_sql, unqualify, DistributedQuery,
 };
 use crate::driver::StageDef;
 
@@ -212,7 +212,8 @@ fn build_window_inner(
         parts.push(field.name().clone());
     }
     for (i, e) in w.window_expr.iter().enumerate() {
-        let sql = expr_sql(up, e)?;
+        // shuffle_input has no table qualifier — strip relation prefixes from the OVER clause.
+        let sql = expr_sql(up, &unqualify(e))?;
         parts.push(format!("{sql} AS w{i}"));
     }
     Ok(format!("SELECT {} FROM shuffle_input", parts.join(", ")))
@@ -223,36 +224,28 @@ fn wrap_window_output(
     inner: &str,
     remap: &HashMap<String, String>,
 ) -> Result<String> {
-    let up = Unparser::default();
     let from_sql = format!("({inner}) AS combined");
     let select = match p.projection {
         Some(exprs) => exprs
             .iter()
             .map(|e| {
                 let name = output_name(e);
-                let sql = expr_sql(&up, &remap_window_columns(strip_alias(e), remap))?;
-                Ok(format!("{sql} AS \"{name}\""))
+                // Prefer remapped window alias (w0, …); otherwise the bare output column name.
+                // Never emit relation-qualified refs — `combined` has no `t.` prefix.
+                let stripped = strip_alias(e);
+                let key = stripped.schema_name().to_string();
+                let src = remap
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| column_name(stripped).ok())
+                    .unwrap_or_else(|| name.clone());
+                Ok::<_, Error>(format!("{src} AS \"{name}\""))
             })
             .collect::<Result<Vec<_>>>()?
             .join(", "),
         None => "*".to_string(),
     };
     Ok(format!("SELECT {select} FROM {from_sql}"))
-}
-
-fn remap_window_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
-    use datafusion::common::tree_node::{Transformed, TreeNode};
-    e.clone()
-        .transform(|node| {
-            if let Expr::Column(c) = &node {
-                if let Some(safe) = remap.get(&c.flat_name()) {
-                    return Ok(Transformed::yes(datafusion::prelude::col(safe)));
-                }
-            }
-            Ok(Transformed::no(node))
-        })
-        .map(|t| t.data)
-        .unwrap_or(e.clone())
 }
 
 fn output_name(e: &Expr) -> String {

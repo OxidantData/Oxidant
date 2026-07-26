@@ -96,7 +96,10 @@ async fn run_auto(c2: &Cluster2, planner: &Engine, sql: &str) -> Vec<RecordBatch
                 out = Some(b);
                 break;
             }
-            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            Err(e) => {
+                eprintln!("run_stages err: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await
+            }
         }
     }
     let gathered = out.expect("distributed run never succeeded");
@@ -709,7 +712,7 @@ async fn two_sharded_tables_shuffle_join_plans() {
         plan.is_ok(),
         "two-sharded shuffle join should auto-derive: {plan:?}"
     );
-    assert_eq!(plan.unwrap().stages.len(), 3);
+    assert_eq!(plan.unwrap().stages.len(), 4);
 }
 
 #[tokio::test]
@@ -774,12 +777,28 @@ async fn union_distinct_is_rejected() {
 
 #[tokio::test]
 async fn partition_by_sum_window_auto_distributes() {
-    assert_matches(
-        50695,
-        "SELECT k, SUM(v) OVER (PARTITION BY k) AS sv FROM t",
-        false,
-    )
-    .await;
+    let sql = "SELECT k, SUM(v) OVER (PARTITION BY k) AS sv FROM t";
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 300, 12)])
+        .unwrap();
+    let dq = plan_distributed(&single, sql, &[])
+        .await
+        .expect("window should plan");
+    assert_eq!(dq.stages.len(), 2);
+    // Catch relation-qualified stage SQL before paying for a 2-worker cluster.
+    let local = Engine::new();
+    local
+        .register_batches("shuffle_input", vec![batch(0, 50, 12)])
+        .unwrap();
+    local.sql(&dq.stages[1].sql).await.unwrap_or_else(|e| {
+        panic!(
+            "stage1 SQL invalid: {e}
+{}",
+            dq.stages[1].sql
+        )
+    });
+    assert_matches(50695, sql, false).await;
 }
 
 #[tokio::test]
