@@ -22,6 +22,7 @@ use datafusion::prelude::SessionContext;
 use weft_common::{Error, Result};
 
 pub mod catalog_bridge;
+pub mod shard;
 
 /// `sts:AssumeRole` credential provider for S3 access (Hadoop-AWS `fs.s3a.assumed.role.arn`
 /// equivalent) — see [`assume_role_credentials::AssumeRoleCredentialProvider`].

@@ -32,6 +32,7 @@ use weft_loom::arrow::ipc::reader::StreamReader;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
 
+mod suite;
 mod tpcds;
 mod tpcds_data;
 mod tpch;
@@ -723,21 +724,60 @@ async fn main() {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
+    let machine = args
+        .iter()
+        .position(|a| a == "--machine")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "local".into());
+    let run_date = args
+        .iter()
+        .position(|a| a == "--date")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(chrono_today);
+    let out_json = args
+        .iter()
+        .position(|a| a == "--json")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let duckdb_db = args
+        .iter()
+        .position(|a| a == "--duckdb-db")
+        .and_then(|i| args.get(i + 1))
+        .map(Path::new);
+    let with_duckdb = !args.iter().any(|a| a == "--no-duckdb");
+
     match args.get(1).map(String::as_str) {
         Some("clickbench") | None => run_clickbench(rows).await,
         Some("clickbench-grpc") => run_clickbench_grpc(rows, data).await,
         Some("correctness") => run_correctness(rows).await,
         Some("correctness-distributed") => run_correctness_distributed(rows).await,
-        Some(cmd @ ("tpch" | "tpch-distributed")) => {
+        Some(cmd @ ("tpch" | "tpch-distributed" | "tpch-bench")) => {
             let sf: f64 = flag(&args, "--sf").unwrap_or(0.05);
             let dir = data
                 .clone()
                 .unwrap_or_else(|| format!("{}/weft-tpch-sf{sf}", std::env::temp_dir().display()));
-            if cmd == "tpch" {
-                tpch::run(sf, Path::new(&dir)).await;
-            } else {
-                let workers: usize = flag(&args, "--workers").unwrap_or(2);
-                tpch_dist::run(sf, Path::new(&dir), workers).await;
+            match cmd {
+                "tpch-bench" => {
+                    let out =
+                        out_json.unwrap_or_else(|| format!("bench/tpch/results/tpch-sf{sf}.json"));
+                    tpch::run_bench(tpch::BenchOpts {
+                        sf,
+                        data: Path::new(&dir),
+                        duckdb_db,
+                        out_json: Path::new(&out),
+                        machine: &machine,
+                        run_date: &run_date,
+                        with_duckdb,
+                    })
+                    .await;
+                }
+                "tpch" => tpch::run(sf, Path::new(&dir)).await,
+                _ => {
+                    let workers: usize = flag(&args, "--workers").unwrap_or(2);
+                    tpch_dist::run(sf, Path::new(&dir), workers).await;
+                }
             }
         }
         Some("tpcds") => {
@@ -748,9 +788,32 @@ async fn main() {
         }
         Some(other) => {
             eprintln!(
-                "unknown subcommand: {other}; try `clickbench`, `clickbench-grpc`, `tpch`, or `tpcds`"
+                "unknown subcommand: {other}; try `clickbench`, `clickbench-grpc`, `correctness`, \
+                 `correctness-distributed`, `tpch`, `tpch-bench`, `tpch-distributed`, or `tpcds`"
             );
             std::process::exit(2);
         }
     }
+}
+
+fn chrono_today() -> String {
+    // Avoid a chrono dependency: UTC date from the process clock.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    // Civil date from Unix day count (Howard Hinnant algorithm).
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }

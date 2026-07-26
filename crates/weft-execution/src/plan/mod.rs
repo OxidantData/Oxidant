@@ -5,7 +5,9 @@
 //! ([`stage_planner`]). Fallback: single-stage [`ExchangeMode::Forward`](crate::driver::ExchangeMode)
 //! via [`physical_splitter`] so any locally-plannable SQL still gets a distributed job graph.
 
+pub mod join_chain;
 pub mod physical_splitter;
+pub mod shape_extensions;
 pub mod stage_planner;
 
 pub use stage_planner::{plan_distributed, DistributedQuery};

@@ -140,7 +140,7 @@ impl SchemaProvider for WeftSchemaProvider {
             // A storage / connection / unsupported failure is a real error — surface it.
             Err(e) => return Err(weft_to_df(e)),
         };
-        let provider = metadata_to_provider(&self.ctx.state(), &metadata).await?;
+        let provider = metadata_to_provider(&self.ctx.state(), &metadata, name).await?;
         self.tables
             .lock()
             .expect("tables poisoned")
@@ -287,7 +287,7 @@ async fn register_table_async(
     )
     .await?;
 
-    metadata_to_provider(&state, &metadata).await
+    metadata_to_provider(&state, &metadata, &name).await
 }
 
 /// Extract `(schema, batches)` from a `TableProvider` that's always a `MemTable` on this path
@@ -320,6 +320,7 @@ async fn extract_mem_table_data(
 async fn metadata_to_provider(
     state: &SessionState,
     md: &TableMetadata,
+    table_name: &str,
 ) -> DfResult<Arc<dyn TableProvider>> {
     use datafusion::datasource::file_format::csv::CsvFormat;
     use datafusion::datasource::file_format::json::JsonFormat;
@@ -328,34 +329,31 @@ async fn metadata_to_provider(
 
     match md.format {
         TableFormat::Parquet => {
-            let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
+            let loc = crate::shard::ensure_collection_url(&md.location);
+            let url = ListingTableUrl::parse(&loc).map_err(loc_err(md))?;
             ensure_remote_store(state, &url, Some(&md.storage_options))?;
             let opts = ListingOptions::new(Arc::new(ParquetFormat::default()))
                 .with_file_extension(".parquet");
             let (opts, file_schema) = apply_partition_columns(opts, md);
-            crate::build_listing_table(state, vec![url], opts, file_schema)
-                .await
-                .map_err(weft_to_df)
+            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".parquet").await
         }
         TableFormat::Csv => {
-            let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
+            let loc = crate::shard::ensure_collection_url(&md.location);
+            let url = ListingTableUrl::parse(&loc).map_err(loc_err(md))?;
             ensure_remote_store(state, &url, Some(&md.storage_options))?;
             let opts =
                 ListingOptions::new(Arc::new(CsvFormat::default())).with_file_extension(".csv");
             let (opts, file_schema) = apply_partition_columns(opts, md);
-            crate::build_listing_table(state, vec![url], opts, file_schema)
-                .await
-                .map_err(weft_to_df)
+            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".csv").await
         }
         TableFormat::Json => {
-            let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
+            let loc = crate::shard::ensure_collection_url(&md.location);
+            let url = ListingTableUrl::parse(&loc).map_err(loc_err(md))?;
             ensure_remote_store(state, &url, Some(&md.storage_options))?;
             let opts =
                 ListingOptions::new(Arc::new(JsonFormat::default())).with_file_extension(".json");
             let (opts, file_schema) = apply_partition_columns(opts, md);
-            crate::build_listing_table(state, vec![url], opts, file_schema)
-                .await
-                .map_err(weft_to_df)
+            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".json").await
         }
         // Lakehouse formats resolve to their active Parquet files (version-safe), then the
         // Parquet reader. v1 reads from the local filesystem — remote object stores for Delta /
@@ -363,14 +361,42 @@ async fn metadata_to_provider(
         TableFormat::Delta => {
             let path = local_path(&md.location)?;
             let files = weft_datasource::delta_active_files(&path).map_err(weft_to_df)?;
-            parquet_files_provider(state, &md.location, files, md.schema.clone()).await
+            parquet_files_provider(state, &md.location, files, md.schema.clone(), table_name).await
         }
         TableFormat::Iceberg => {
             let path = local_path(&md.location)?;
             let files = weft_datasource::iceberg_active_files(&path).map_err(weft_to_df)?;
-            parquet_files_provider(state, &md.location, files, md.schema.clone()).await
+            parquet_files_provider(state, &md.location, files, md.schema.clone(), table_name).await
         }
     }
+}
+
+/// List+shard files then build a [`ListingTable`], or an empty MemTable when this shard is vacant.
+async fn sharded_listing_table(
+    state: &SessionState,
+    urls: Vec<datafusion::datasource::listing::ListingTableUrl>,
+    opts: datafusion::datasource::listing::ListingOptions,
+    schema: Option<datafusion::arrow::datatypes::SchemaRef>,
+    table_name: &str,
+    file_extension: &str,
+) -> DfResult<Arc<dyn TableProvider>> {
+    let sharded = crate::shard::apply_file_shard(state, urls, file_extension, Some(table_name))
+        .await
+        .map_err(weft_to_df)?;
+    if sharded.is_empty() {
+        let schema = match schema {
+            Some(s) => s,
+            None => {
+                return Err(DataFusionError::Plan(format!(
+                "sharded table `{table_name}` has no files on this worker and no declared schema"
+            )))
+            }
+        };
+        return crate::shard::empty_table(schema).map_err(weft_to_df);
+    }
+    crate::build_listing_table(state, sharded, opts, schema)
+        .await
+        .map_err(weft_to_df)
 }
 
 /// Configure Hive-style partition columns on a listing table. Glue (and other Hive metastores)
@@ -635,6 +661,7 @@ async fn parquet_files_provider(
     location: &str,
     files: Vec<std::path::PathBuf>,
     schema: Option<datafusion::arrow::datatypes::SchemaRef>,
+    table_name: &str,
 ) -> DfResult<Arc<dyn TableProvider>> {
     use datafusion::datasource::file_format::parquet::ParquetFormat;
     use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
@@ -652,9 +679,7 @@ async fn parquet_files_provider(
         })
         .collect::<DfResult<Vec<_>>>()?;
     let opts = ListingOptions::new(Arc::new(ParquetFormat::default()));
-    crate::build_listing_table(state, urls, opts, schema)
-        .await
-        .map_err(weft_to_df)
+    sharded_listing_table(state, urls, opts, schema, table_name, ".parquet").await
 }
 
 /// Convert a storage URI to a local filesystem path, or error for a scheme v1 can't read locally.

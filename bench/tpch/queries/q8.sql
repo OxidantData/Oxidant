@@ -1,7 +1,7 @@
 SELECT
     o_year,
     sum(
-        CASE WHEN nation = 'BRAZIL' THEN
+        CASE WHEN nation_name = 'BRAZIL' THEN
             volume
         ELSE
             0
@@ -10,7 +10,7 @@ FROM (
     SELECT
         extract(year FROM o_orderdate) AS o_year,
         l_extendedprice * (1 - l_discount) AS volume,
-        n2.n_name AS nation
+        n2.n_name AS nation_name
     FROM
         part,
         supplier,
@@ -36,4 +36,3 @@ GROUP BY
     o_year
 ORDER BY
     o_year;
-

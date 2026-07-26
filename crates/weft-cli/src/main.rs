@@ -205,14 +205,23 @@ async fn run_worker(args: &[String]) -> weft_common::Result<()> {
     let port: u16 = flag(args, "--port")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| weft_common::Error::Io("worker requires --port".into()))?;
-    let engine = Engine::new();
+    // Same catalog bootstrap as `weft spark server` so Glue/Hive tables resolve on workers.
+    let catalogs = catalog_conf(args);
+    if !catalogs.is_empty() {
+        eprintln!(
+            "Worker declared {} catalog config entrie(s)",
+            catalogs.len()
+        );
+    }
+    let service = weft_connect::WeftService::with_catalogs(catalogs);
+    let engine = service.engine();
     // Optionally register a Parquet table so a driver query has data to read.
     if let (Some(data), Some(table)) = (flag(args, "--data"), flag(args, "--table")) {
         engine.register_parquet(&table, &data).await?;
         eprintln!("registered `{table}` from {data}");
     }
     eprintln!("Weft worker listening on Flight 0.0.0.0:{port}");
-    serve_worker(port, Arc::new(engine)).await
+    serve_worker(port, engine).await
 }
 
 async fn run_driver(args: &[String]) -> weft_common::Result<()> {

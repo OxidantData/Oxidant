@@ -3,9 +3,9 @@
 //! Local mode runs the physical plan across a thread pool (morsel-driven). Distributed
 //! mode splits the plan into stages at shuffle boundaries: a driver/worker control plane and
 //! an Arrow Flight data plane for shuffle + result return. The MVP shape is two-stage
-//! `partial-agg → hash shuffle → final-agg` ([`driver::run_distributed`]). Out-of-core,
-//! partitioned shuffle with spill is a deliberate divergence lane — Sail's cluster mode is new
-//! (Feb 2026) and its ClickBench is single-process-per-query.
+//! `partial-agg → hash shuffle → final-agg` ([`driver::run_distributed`]). Large stage
+//! buckets spill to `WEFT_SPILL_DIR` when over `WEFT_SHUFFLE_SPILL_BYTES` (see
+//! [`shuffle::spill`]); streaming `do_exchange` remains a stub.
 
 pub mod aqe;
 pub mod driver;

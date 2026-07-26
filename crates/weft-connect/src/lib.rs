@@ -162,6 +162,11 @@ impl WeftService {
     /// registered into both the engine (so `cat.ns.tbl` resolves) and the registry (so the
     /// `spark.catalog.*` RPC sees it). Catalogs with incomplete config are retried on the next
     /// `Config` set. Honors `spark.sql.defaultCatalog`.
+    /// Borrow the underlying query engine (used by `weft worker` to serve Flight with the same catalogs).
+    pub fn engine(&self) -> Arc<Engine> {
+        Arc::clone(&self.engine)
+    }
+
     /// Build a service with external catalogs declared up front (flat `spark.sql.catalog.*`
     /// entries). The catalogs are bridged into the engine before any client connects.
     pub fn with_catalogs(catalogs: std::collections::HashMap<String, String>) -> Self {
@@ -200,11 +205,6 @@ impl WeftService {
         let mut svc = Self::new();
         svc.engine = engine;
         svc
-    }
-
-    /// Access the session engine (register tables for distributed planning in tests).
-    pub fn engine(&self) -> &Arc<Engine> {
-        &self.engine
     }
 
     fn sync_catalogs(&self) {
@@ -485,6 +485,10 @@ impl WeftService {
     /// Evaluate a `Sql` or `LocalRelation` to record batches, with observability hooks. The second
     /// tuple element is the executed-plan stats (rows / bytes scanned / duration) — `Some` only for
     /// a metrics-capturing scan query, `None` otherwise (so we never emit fabricated zero metrics).
+    ///
+    /// When workers or `WEFT_WORKER_SERVICE` is configured, auto-splittable queries route through
+    /// [`distributed::try_run_distributed`] (file sharding via `WEFT_WORKER_COUNT` / `WEFT_SHARD_INDEX`
+    /// on workers; replicated dims via `WEFT_REPLICATED_TABLES`). Unsupported shapes fall back locally.
     async fn base_relation_batches(
         &self,
         rel: &sc::Relation,
@@ -493,6 +497,8 @@ impl WeftService {
         match rel.rel_type.as_ref() {
             Some(sc::relation::RelType::Sql(sql)) => {
                 let workers = self.workers_from_config();
+                let replicated = replicated_tables_from_env();
+                let replicated_refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
                 let udf_json = self.engine.export_udfs_json();
                 let description = truncate_sql(&sql.query);
                 let tracker = operation_id.map(|op| {
@@ -509,7 +515,7 @@ impl WeftService {
                     &self.engine,
                     &workers,
                     &sql.query,
-                    &[],
+                    &replicated_refs,
                     Some(&udf_json),
                     tracker.as_ref(),
                 )
@@ -1558,6 +1564,19 @@ fn err_to_status(e: Error) -> Status {
         Error::Unsupported(_) => Status::unimplemented(msg),
         Error::Execution(_) | Error::Io(_) => Status::internal(msg),
     }
+}
+
+fn replicated_tables_from_env() -> Vec<String> {
+    std::env::var("WEFT_REPLICATED_TABLES")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Start the Spark Connect server and serve until the process is killed.

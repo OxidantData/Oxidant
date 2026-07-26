@@ -5,9 +5,16 @@
 //! hash-partitions its output, and caches the buckets. The output stage runs on every partition
 //! owner, pulling upstream buckets and returning results.
 //!
+//! The MVP shape — two stages, `partial-agg → hash shuffle → final-agg` — is the
+//! [`DistributedPlan`] convenience built on top of this (see [`DistributedPlan::into_stages`]).
+//! Multiple upstreams on the output stage express a **shuffle join**: both sides hash-partition on
+//! the join key so matching keys co-locate on one worker, which then joins them locally.
+//!
+//! Intermediate stages that both consume *and* produce are supported (left-deep join chains).
 //! Shuffle partition count defaults to worker count but can be overridden via
 //! `WEFT_SHUFFLE_PARTITIONS` (like `spark.sql.shuffle.partitions`) or, when that is unset,
-//! `WEFT_DEFAULT_PARALLELISM`.
+//! `WEFT_DEFAULT_PARALLELISM`. Shuffle buckets spill when over the configured memory budget
+//! (see [`crate::shuffle::spill`]); push-based `do_exchange` complements pull-based shuffle reads.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

@@ -22,6 +22,8 @@ datafusion = "54"
 # 0.13 line DataFusion pulls so the `ObjectStore` trait/types unify; `aws` adds the S3 client + the
 # EC2 instance-role (IMDS) credential provider — no static keys.
 object_store = { version = "0.13", features = ["aws"] }
+# `StreamExt::next` to drain streams; file-list sharding also streams object-store listings.
+futures = "0.3"
 # Data-parallel aggregation of independent key-hash partitions (the native GROUP BY carve-out).
 rayon = "1"
 # Spark `split(str, regex)` and other regex-based string UDFs (Spark splits on a regex, unlike
@@ -40,10 +42,6 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # assume_role_credentials.rs to serialize concurrent STS AssumeRole calls (held across an await —
 # a std::sync::Mutex must never be held across one).
 tokio = { version = "1", features = ["rt", "sync"] }
-# `StreamExt::next` to drain a DataFusion `SendableRecordBatchStream` batch-by-batch in the CTAS
-# write path (stream the SELECT straight to storage instead of collecting it into driver memory).
-# Same 0.3 line the rest of the tree already pulls (weft-execution), so the lock is unchanged.
-futures = "0.3"
 # `sts:AssumeRole` for the Hadoop-AWS `fs.s3a.assumed.role.arn` config equivalent (see
 # assume_role_credentials.rs) — hand-rolling signed STS calls isn't worth the correctness risk
 # for this one call type, so this pulls in the official SDK rather than extending object_store's
