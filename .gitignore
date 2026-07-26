@@ -36,3 +36,7 @@ node_modules/
 
 # Session-scoped AWS runner: keypair PEM, state, sweep scripts (never commit secrets)
 scratchpad/
+
+# Local agent code-intelligence indexes (regenerate with scripts/index-agents.sh)
+.codegraph/
+.gitnexus/

@@ -1,5 +1,20 @@
 # AGENTS.md
 
+## Start here (maps)
+
+| Doc | Use when |
+|-----|----------|
+| [docs/TODOS.md](docs/TODOS.md) | Picking work / open gates |
+| [docs/CODEMAP.md](docs/CODEMAP.md) | Crate / bench / site ownership |
+| [docs/architecture.md](docs/architecture.md) | Engine design (Loom / HVM / Connect) |
+| [docs/AGENT_INDEXING.md](docs/AGENT_INDEXING.md) | CodeGraph + GitNexus install / re-index |
+| [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) | Phase resume narrative |
+
+If `.codegraph/` / `.gitnexus/` exist (run `./scripts/index-agents.sh` locally), prefer
+CodeGraph `codegraph_explore` and GitNexus `query` / `impact` / `detect_changes`. For
+platform↔engine cross-repo work, use GitNexus group `weft` (see AGENT_INDEXING). If
+indexes are missing, use the docs above — do not block. Never commit index directories.
+
 ## Cursor Cloud specific instructions
 
 Weft is a Rust workspace implementing a drop-in Apache Spark replacement that speaks the
