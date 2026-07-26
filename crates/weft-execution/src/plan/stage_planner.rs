@@ -26,9 +26,11 @@
 //! This covers star schemas (a sharded fact + replicated dimensions). Joins between two *sharded*
 //! tables are auto-derived as a **shuffle join** when there is a single equijoin key.
 //!
-//! Also supported: ungrouped/global aggregates, and `HAVING` over the aggregated result.
-//! Anything else (window functions, set operations, nested subqueries, 3+ sharded tables)
-//! returns [`Error::Unsupported`] so the caller falls back to single-node execution.
+//! Also supported: ungrouped/global aggregates, `HAVING` over the aggregated result,
+//! scalar / IN / EXISTS subqueries **over replicated tables only**, and `UNION ALL` of
+//! distributable aggregations. Window functions and `UNION` (distinct) return an explicit
+//! [`Error::Unsupported`] so the caller falls back to single-node execution. Correlated
+//! subqueries over sharded tables are rejected (not broadcast-safe).
 
 use std::collections::HashMap;
 
@@ -37,6 +39,9 @@ use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
 use weft_loom::Engine;
 
+use super::shape_extensions::{
+    ensure_subquery_tables_replicated, reject_explicit_unsupported, try_union_all,
+};
 use crate::driver::StageDef;
 
 /// A query lowered to a distributed [`StageDef`] DAG.
@@ -63,28 +68,32 @@ pub async fn plan_distributed(
     replicated: &[&str],
 ) -> Result<DistributedQuery> {
     let lp = engine.logical_plan(sql).await?;
+    if let Some(dq) = try_union_all(&lp, replicated)? {
+        return Ok(dq);
+    }
+    reject_explicit_unsupported(&lp)?;
     let peeled = peel(&lp)?;
-    aggregation_stages(&peeled, replicated)
+    aggregation_stages_for(&peeled, replicated)
 }
 
 /// The top of the plan above the aggregate: the output projection (if any) plus the trailing
 /// `ORDER BY` / `LIMIT`, which the final stage must reproduce.
-struct Peeled<'a> {
+pub(crate) struct Peeled<'a> {
     /// Output projection exprs (the SELECT list), if the plan has a `Projection` over the aggregate.
-    projection: Option<&'a [Expr]>,
+    pub(crate) projection: Option<&'a [Expr]>,
     /// `ORDER BY` exprs to apply on the final output, if any.
-    sort: Option<&'a [datafusion::logical_expr::SortExpr]>,
+    pub(crate) sort: Option<&'a [datafusion::logical_expr::SortExpr]>,
     /// `LIMIT` fetch count, if any.
-    limit: Option<usize>,
+    pub(crate) limit: Option<usize>,
     /// `HAVING` predicate over the aggregate output, if any.
-    having: Option<&'a Expr>,
+    pub(crate) having: Option<&'a Expr>,
     /// The aggregate node itself.
-    agg: &'a Aggregate,
+    pub(crate) agg: &'a Aggregate,
 }
 
 /// Strip an optional `Limit` / `Sort` / `Projection` off the top and require an `Aggregate` under
 /// them. Rejects anything else (the caller falls back to single-node).
-fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
+pub(crate) fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
     let mut limit = None;
     let mut sort = None;
     let mut projection = None;
@@ -132,13 +141,20 @@ fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
 }
 
 /// Build the distributed plan for a (possibly global) aggregation.
-fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuery> {
+pub(crate) fn aggregation_stages_for(
+    p: &Peeled<'_>,
+    replicated: &[&str],
+) -> Result<DistributedQuery> {
     let agg = p.agg;
     let tables = base_tables(&agg.input);
-    let sharded: Vec<&String> = tables
+    let sharded: Vec<&str> = tables
         .iter()
         .filter(|t| !replicated.contains(&t.as_str()))
+        .map(|t| t.as_str())
         .collect();
+
+    // Subqueries (IN / EXISTS / scalar) only over replicated dims — never over unreplicated tables.
+    ensure_subquery_tables_replicated(&agg.input, &sharded, replicated)?;
 
     if agg.group_expr.is_empty() {
         return global_aggregation_stages(p, &sharded);
@@ -152,7 +168,8 @@ fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuer
     // Broadcast-join safety: exactly one base table may be sharded; others must be replicated.
     if sharded.len() != 1 {
         return Err(Error::Unsupported(format!(
-            "auto-distribute: need exactly one sharded base table (others replicated),              found {} sharded among {tables:?}",
+            "auto-distribute: need exactly one sharded base table (others replicated), \
+             found {} sharded among {tables:?}",
             sharded.len()
         )));
     }
@@ -171,7 +188,7 @@ fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuer
     // A second scan — a self-join or a correlated EXISTS/IN subquery over it — would see only the
     // local shard per worker and silently lose cross-shard rows, so reject it. (`base_tables` counts
     // the plan-input scan only; subquery scans live in expressions, so descend into those too.)
-    let sharded_name = sharded[0].as_str();
+    let sharded_name = sharded[0];
     let scans = count_table_scans(&agg.input, sharded_name);
     if scans > 1 {
         return Err(Error::Unsupported(format!(
@@ -231,14 +248,14 @@ fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuer
 
 
 /// Ungrouped aggregation: partials per worker, gather to partition 0, recombine.
-fn global_aggregation_stages(p: &Peeled, sharded: &[&String]) -> Result<DistributedQuery> {
+fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<DistributedQuery> {
     if sharded.len() != 1 {
         return Err(Error::Unsupported(format!(
             "auto-distribute: global aggregation needs exactly one sharded table, found {}",
             sharded.len()
         )));
     }
-    let sharded_name = sharded[0].as_str();
+    let sharded_name = sharded[0];
     if count_table_scans(&p.agg.input, sharded_name) > 1 {
         return Err(Error::Unsupported(format!(
             "auto-distribute: sharded table `{sharded_name}` scanned multiple times"
@@ -335,8 +352,8 @@ fn global_aggregation_stages(p: &Peeled, sharded: &[&String]) -> Result<Distribu
 
 /// Shuffle-join two sharded tables, then run the grouped aggregation.
 fn shuffle_join_aggregation_stages(
-    p: &Peeled,
-    sharded: &[&String],
+    p: &Peeled<'_>,
+    sharded: &[&str],
 ) -> Result<DistributedQuery> {
     let join = find_inner_equijoin(&p.agg.input)?;
     let (left_key_expr, right_key_expr) = match join.on.as_slice() {
@@ -365,9 +382,7 @@ fn shuffle_join_aggregation_stages(
     let right_scan = simple_table_scan(join.right.as_ref())?;
     let left_name = left_scan.table;
     let right_name = right_scan.table;
-    if !(sharded.iter().any(|t| t.as_str() == left_name)
-        && sharded.iter().any(|t| t.as_str() == right_name))
-    {
+    if !(sharded.iter().any(|t| *t == left_name) && sharded.iter().any(|t| *t == right_name)) {
         return Err(Error::Unsupported(
             "auto-distribute: shuffle join sides must be the two sharded tables".into(),
         ));
@@ -743,8 +758,16 @@ fn distinct_stage_sql(
 /// item explicitly aliased back to its original output name (so a bare `t.k` stays column `k`, and
 /// downstream `ORDER BY` over those names resolves). `ORDER BY` / `LIMIT` are *not* applied here —
 /// they're global and run in [`build_finalize`].
-fn wrap_output(p: &Peeled, inner: &str, remap: &HashMap<String, String>) -> Result<String> {
+fn wrap_output(p: &Peeled<'_>, inner: &str, remap: &HashMap<String, String>) -> Result<String> {
     let up = Unparser::default();
+    // Apply HAVING against remapped `g{j}`/`r{i}` columns *before* the output projection aliases
+    // them back to original names (otherwise `WHERE r0 > …` fails against `having_in.sv`).
+    let from_sql = if let Some(pred) = p.having {
+        let having_sql = expr_sql(&up, &remap_columns(pred, remap))?;
+        format!("(SELECT * FROM ({inner}) AS combined WHERE {having_sql}) AS having_in")
+    } else {
+        format!("({inner}) AS combined")
+    };
     let select = match p.projection {
         Some(exprs) => exprs
             .iter()
@@ -757,17 +780,9 @@ fn wrap_output(p: &Peeled, inner: &str, remap: &HashMap<String, String>) -> Resu
             .join(", "),
         None => "*".to_string(),
     };
-    let mut sql = format!("SELECT {select} FROM ({inner}) AS combined");
-    if let Some(pred) = p.having {
-        let having_sql = expr_sql(&up, &remap_columns(pred, remap))?;
-        sql = format!("SELECT * FROM ({sql}) AS having_in WHERE {having_sql}");
-    }
-    Ok(sql)
+    Ok(format!("SELECT {select} FROM {from_sql}"))
 }
 
-/// The output column name an expr produces: the alias if present, the unqualified column name for
-/// a bare column reference (so `t.k` stays `k`, matching non-distributed output), else its schema
-/// name.
 fn output_name(e: &Expr) -> String {
     match e {
         Expr::Alias(a) => a.name.clone(),

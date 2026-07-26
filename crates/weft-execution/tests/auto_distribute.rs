@@ -366,3 +366,213 @@ async fn global_aggregation_auto_distributes() {
         "global aggregation must equal single-node"
     );
 }
+
+#[tokio::test]
+async fn having_auto_distributes() {
+    assert_matches(
+        50651,
+        "SELECT k, SUM(v) AS sv FROM t GROUP BY k HAVING SUM(v) > 1000",
+        false,
+    )
+    .await;
+}
+
+/// Helper: two workers with sharded `t` + full replicated `dim`.
+async fn two_workers_with_dim(base: u16) -> (Cluster, Engine) {
+    const N: i64 = 300;
+    const G: i64 = 12;
+    let (p0, p1) = (base, base + 1);
+    let e0 = Arc::new(Engine::new());
+    e0.register_batches("t", vec![batch(0, N / 2, G)]).unwrap();
+    e0.register_batches("dim", vec![dim(G)]).unwrap();
+    let e1 = Arc::new(Engine::new());
+    e1.register_batches("t", vec![batch(N / 2, N, G)]).unwrap();
+    e1.register_batches("dim", vec![dim(G)]).unwrap();
+    tokio::spawn(async move {
+        let _ = serve_worker(p0, e0).await;
+    });
+    tokio::spawn(async move {
+        let _ = serve_worker(p1, e1).await;
+    });
+    let cluster = Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ]);
+    let planner = Engine::new();
+    planner
+        .register_batches("t", vec![batch(0, N, G)])
+        .unwrap();
+    planner.register_batches("dim", vec![dim(G)]).unwrap();
+    (cluster, planner)
+}
+
+async fn run_auto_replicated(
+    cluster: &Cluster,
+    planner: &Engine,
+    sql: &str,
+    replicated: &[&str],
+) -> Vec<RecordBatch> {
+    let dq = plan_distributed(planner, sql, replicated)
+        .await
+        .expect("plan_distributed");
+    let mut out = None;
+    for _ in 0..150 {
+        match run_stages(cluster, &dq.stages).await {
+            Ok(b) => {
+                out = Some(b);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    let gathered = out.expect("distributed run never succeeded");
+    match &dq.finalize_sql {
+        None => gathered,
+        Some(fsql) => {
+            let fin = Engine::new();
+            fin.register_batches("result", gathered).unwrap();
+            fin.sql(fsql).await.expect("finalize")
+        }
+    }
+}
+
+#[tokio::test]
+async fn in_subquery_over_replicated_dim() {
+    let sql = "SELECT k, SUM(v) AS sv FROM t WHERE k IN (SELECT d_key FROM dim WHERE d_name >= 0) GROUP BY k";
+    let (cluster, planner) = two_workers_with_dim(50661).await;
+    let expected = planner.sql(sql).await.unwrap();
+    let actual = run_auto_replicated(&cluster, &planner, sql, &["dim"]).await;
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "IN subquery over replicated dim must equal single-node"
+    );
+}
+
+#[tokio::test]
+async fn exists_subquery_over_replicated_dim() {
+    let sql = "SELECT k, SUM(v) AS sv FROM t \
+               WHERE EXISTS (SELECT 1 FROM dim d WHERE d.d_key = t.k AND d.d_name >= 0) \
+               GROUP BY k";
+    let (cluster, planner) = two_workers_with_dim(50671).await;
+    let expected = planner.sql(sql).await.unwrap();
+    let actual = run_auto_replicated(&cluster, &planner, sql, &["dim"]).await;
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "EXISTS over replicated dim must equal single-node"
+    );
+}
+
+#[tokio::test]
+async fn scalar_subquery_over_replicated_dim() {
+    let sql = "SELECT k, SUM(v) AS sv FROM t \
+               WHERE v > (SELECT AVG(d_name) FROM dim) GROUP BY k";
+    let (cluster, planner) = two_workers_with_dim(50681).await;
+    let expected = planner.sql(sql).await.unwrap();
+    let actual = run_auto_replicated(&cluster, &planner, sql, &["dim"]).await;
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "scalar subquery over replicated dim must equal single-node"
+    );
+}
+
+#[tokio::test]
+async fn subquery_over_unreplicated_table_is_rejected() {
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 60, 12)])
+        .unwrap();
+    single.register_batches("dim", vec![dim(12)]).unwrap();
+    let err = plan_distributed(
+        &single,
+        "SELECT k, SUM(v) AS sv FROM t WHERE k IN (SELECT d_key FROM dim) GROUP BY k",
+        &[], // dim not replicated
+    )
+    .await;
+    let msg = format!("{}", err.expect_err("must reject unreplicated subquery"));
+    assert!(
+        msg.contains("replicated") || msg.contains("subquery"),
+        "expected subquery/replicated rejection, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn subquery_over_sharded_table_is_rejected() {
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 60, 12)])
+        .unwrap();
+    let err = plan_distributed(
+        &single,
+        "SELECT k, SUM(v) AS sv FROM t WHERE k IN (SELECT k FROM t WHERE v > 10) GROUP BY k",
+        &[],
+    )
+    .await;
+    let msg = format!("{}", err.expect_err("must reject sharded self-subquery"));
+    assert!(
+        msg.contains("scanned") || msg.contains("broadcast-safe") || msg.contains("subquery"),
+        "expected sharded-subquery rejection, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn union_all_of_two_aggs() {
+    let sql = "SELECT k, SUM(v) AS sv FROM t GROUP BY k \
+               UNION ALL \
+               SELECT k, SUM(v) AS sv FROM t WHERE v > 50 GROUP BY k";
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 300, 12)])
+        .unwrap();
+    let expected = single.sql(sql).await.unwrap();
+
+    let c2 = two_workers(50691).await;
+    let actual = run_auto(&c2, &single, sql).await;
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "UNION ALL of two aggs must equal single-node"
+    );
+}
+
+#[tokio::test]
+async fn union_distinct_is_rejected() {
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 60, 12)])
+        .unwrap();
+    let err = plan_distributed(
+        &single,
+        "SELECT k, SUM(v) AS sv FROM t GROUP BY k \
+         UNION \
+         SELECT k, SUM(v) AS sv FROM t WHERE v > 10 GROUP BY k",
+        &[],
+    )
+    .await;
+    let msg = format!("{}", err.expect_err("UNION distinct must be rejected"));
+    assert!(
+        msg.contains("UNION") || msg.contains("distinct"),
+        "expected UNION distinct message, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn window_functions_are_rejected() {
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 60, 12)])
+        .unwrap();
+    let err = plan_distributed(
+        &single,
+        "SELECT k, SUM(v) OVER (PARTITION BY k) AS sv FROM t",
+        &[],
+    )
+    .await;
+    let msg = format!("{}", err.expect_err("windows must be rejected"));
+    assert!(
+        msg.contains("window"),
+        "expected explicit window Unsupported, got: {msg}"
+    );
+}
