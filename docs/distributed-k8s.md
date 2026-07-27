@@ -219,6 +219,14 @@ Overlay [`deploy/helm/weft/values-sf100.yaml`](../deploy/helm/weft/values-sf100.
 - `connect.distributedStrict: true` → `WEFT_DISTRIBUTED_STRICT=1` on the driver
 - Connect CPU request **3000m** (not 3500m) so a c6g.xlarge can still schedule CNI /
   kube-proxy / node agents beside the pod
+- Connect memory request **5Gi** (not 7Gi). Requests are matched against node
+  **allocatable**, not capacity: EKS kube-reserved on an 8 GiB node is ~2.05 GiB, so a
+  c6g.xlarge offers only ~5.85 GiB and a 7Gi request leaves the driver Pending with
+  "Insufficient memory". Check `kubectl describe node` before raising it.
+- Connect carries a `podAntiAffinity` against `app=weft-worker`. The instance-type
+  nodeSelector is a placeholder, so arch is otherwise the only constraint and the
+  scheduler could park the driver on a worker node, silently taking CPU and memory
+  away from the worker being benchmarked.
 - IRSA / instance-type labels left as **obvious placeholders** — fill before install
 
 ```sh

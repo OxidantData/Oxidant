@@ -11,6 +11,11 @@
 #   memoryLimitBytes     → DataFusion bounded spill pool (joins/sorts/aggs)
 #   shuffleSpillBytes    → SpillStore shuffle-bucket cache threshold (separate Vec)
 #   memoryLimitBytes + shuffleSpillBytes + headroom <= container memory limit
+#   container memory limit <= node ALLOCATABLE (not capacity)
+# EKS kube-reserved is significant: ~2.05 GiB on an 8 GiB node (allocatable ~5.85 GiB)
+# and ~5.7 GiB on a 64 GiB node (allocatable ~58.2 GiB). Sizing against capacity
+# instead of allocatable leaves the pod Pending, which looks like a cluster problem
+# rather than a values bug. Verify with `kubectl describe node | grep -A5 Allocatable`.
 # Headroom covers Arrow decode buffers, object-store/S3 client, the AWS CLI
 # subprocess Glue shells out to, and allocator fragmentation. Overlapping the
 # two budgets at ~limit each will OOMKill the pod before either threshold trips.
@@ -26,17 +31,21 @@ connect:
   enabled: true
   distributedStrict: true
   forceShuffleSpill: false
-  # 7Gi limit: ~3 Gi DF + ~1.5 Gi shuffle + ~2.5 Gi headroom.
-  memoryLimitBytes: "3221225472"   # 3 Gi — DataFusion pool
-  shuffleSpillBytes: "1610612736"  # 1.5 Gi — shuffle cache threshold
+  # 5Gi limit: ~2 Gi DF + ~1 Gi shuffle + ~2 Gi headroom.
+  memoryLimitBytes: "2147483648"   # 2 Gi — DataFusion pool
+  shuffleSpillBytes: "1073741824"  # 1 Gi — shuffle cache threshold
   resources:
     requests:
       # c6g.xlarge ≈ 3920m allocatable; leave ~900m for CNI / kube-proxy / agents.
       cpu: "3000m"
-      memory: 7Gi
+      # Memory must fit ALLOCATABLE, not capacity. EKS kube-reserved on an 8 GiB node
+      # is ~2.05 GiB, so allocatable is only ~5.85 GiB — a 7Gi request leaves the pod
+      # Pending forever with "Insufficient memory". Do not raise this without
+      # recomputing against the node's real `kubectl describe node` allocatable.
+      memory: 5Gi
     limits:
       cpu: "4"
-      memory: 7Gi
+      memory: 5Gi
   nodeSelector:
     kubernetes.io/arch: arm64
     # REPLACE: node group / capacity type labels for the c6g.xlarge pool

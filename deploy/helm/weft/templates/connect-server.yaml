@@ -27,10 +27,20 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.connect.affinity }}
       affinity:
+        # Keep the driver off the worker nodes. The SF100 topology claims a dedicated
+        # driver instance; without this the scheduler is free to co-locate connect with
+        # a worker (the instance-type nodeSelector is a commented-out placeholder, so
+        # arch is the only other constraint) and the worker loses CPU and memory to it.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: weft-worker
+              topologyKey: kubernetes.io/hostname
+        {{- with .Values.connect.affinity }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       {{- with .Values.connect.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
