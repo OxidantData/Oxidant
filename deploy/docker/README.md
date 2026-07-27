@@ -92,8 +92,10 @@ volumes:
 - { name: spill, emptyDir: {} }
 ```
 
-The image sets `TMPDIR=/tmp`, `HOME=/tmp`, and `WEFT_SPILL_DIR=/var/lib/weft/spill`.
-Set `WEFT_MEMORY_LIMIT_BYTES` from the pod memory limit so large aggregations spill.
+The image sets `TMPDIR=/tmp` and `HOME=/tmp`. Shuffle spill is controlled by
+`WEFT_SHUFFLE_SPILL_DIR` (Helm points it at `/var/lib/weft/spill`). The historical
+`WEFT_SPILL_DIR` env var is **unused** by the engine — do not set it. Set
+`WEFT_MEMORY_LIMIT_BYTES` from the pod memory limit so large aggregations spill.
 
 Standalone:
 

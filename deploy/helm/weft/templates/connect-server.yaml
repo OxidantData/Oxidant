@@ -15,11 +15,26 @@ spec:
       labels:
         app: weft-connect
     spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
+      {{- with .Values.connect.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.connect.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.connect.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: connect
           image: {{ .Values.connect.image }}
@@ -35,6 +50,12 @@ spec:
               value: {{ .Values.worker.port | quote }}
             - name: WEFT_AWS_BIN
               value: {{ .Values.connect.awsBin | quote }}
+            - name: WEFT_SHUFFLE_SPILL_DIR
+              value: /var/lib/weft/spill
+            {{- if .Values.connect.distributedStrict }}
+            - name: WEFT_DISTRIBUTED_STRICT
+              value: "1"
+            {{- end }}
             {{- if .Values.connect.memoryLimitBytes }}
             - name: WEFT_MEMORY_LIMIT_BYTES
               value: {{ .Values.connect.memoryLimitBytes | quote }}

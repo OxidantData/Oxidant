@@ -1,7 +1,22 @@
 # Minimal data-plane chart: one Spark Connect driver + N Flight workers.
 # Full control-plane (gateway/SSO/Terraform) is out of scope — see docs/distributed-k8s.md.
+#
+# SHARDING CONTRACT (workers):
+#   WEFT_WORKER_COUNT  = StatefulSet replica count (must be fixed; never HPA-scaled)
+#   WEFT_POD_NAME      = metadata.name (StatefulSet ordinal: weft-worker-0, …)
+#   ShardAssignment::from_env parses the trailing ordinal from WEFT_POD_NAME.
+# Autoscaling is incompatible with that contract — see worker.autoscaling below.
 
 replicaCount: 1
+
+# Shared IRSA / RBAC surface for connect + workers (S3 + Glue).
+serviceAccount:
+  create: true
+  name: weft
+  annotations: {}
+  # Example IRSA (fill in real ARNs in an overlay — do not invent account IDs here):
+  # annotations:
+  #   eks.amazonaws.com/role-arn: "arn:aws:iam::AWS_ACCOUNT_ID:role/WEFT_IRSA_ROLE_NAME"
 
 connect:
   enabled: true
@@ -14,16 +29,36 @@ connect:
   awsBin: /usr/local/aws-cli/v2/current/bin/aws
   memoryLimitBytes: ""
   resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # When true, fail queries that cannot be planned distributed (server-side).
+  distributedStrict: false
 
 worker:
   image: weft/worker:latest
   imagePullPolicy: IfNotPresent
   port: 50561
+  # Fixed replica count — also emitted as WEFT_WORKER_COUNT on every worker pod.
   replicas: 2
   memoryLimitBytes: ""
   resources: {}
-  autoscaling:
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Spill PVC (volumeClaimTemplates). Defaults stay small; SF100 overlay bumps size.
+  # Engine reads WEFT_SHUFFLE_SPILL_DIR (not the legacy unused WEFT_SPILL_DIR).
+  persistence:
     enabled: true
+    storageClass: ""
+    size: 8Gi
+    accessModes:
+      - ReadWriteOnce
+  # HPA + fixed WEFT_WORKER_COUNT are incoherent: scaling changes the shard modulus
+  # while pods still advertise the render-time count → silent data loss or duplication.
+  # Chart FAILS to render when this is true. Keep false; pin replicas instead.
+  autoscaling:
+    enabled: false
     minReplicas: 2
     maxReplicas: 8
     targetCPUUtilizationPercentage: 70

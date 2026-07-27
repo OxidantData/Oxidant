@@ -34,5 +34,6 @@ EXPOSE 50561
 
 # Inherits from the connect-server base:
 #   USER 65532:65532, /usr/local/bin/weft ENTRYPOINT, TMPDIR/HOME=/tmp,
-#   WEFT_SPILL_DIR=/var/lib/weft/spill, and the read-only-rootfs posture.
+#   and the read-only-rootfs posture. Helm sets WEFT_SHUFFLE_SPILL_DIR on the
+#   spill volume (WEFT_SPILL_DIR is unused legacy).
 CMD ["worker", "--port", "50561"]

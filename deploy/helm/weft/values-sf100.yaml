@@ -1,0 +1,61 @@
+# Operator topology for TPC-DS / TPC-H SF100 on EKS (arm64 / Graviton).
+#
+# Target hardware (provision outside this chart — placeholders below):
+#   driver / connect: 1x c6g.xlarge  (4 vCPU / 8 GiB)  + ~100 GiB EBS
+#   workers:          2x m8g.4xlarge (16 vCPU / 64 GiB) + 500 GiB gp3 each
+#   replicas pinned at 2 (min=max=2); autoscaling MUST stay false.
+#
+# Fill IRSA / storage class with real cluster values before install.
+
+serviceAccount:
+  create: true
+  name: weft
+  annotations:
+    # REPLACE: real account + role used for S3 + Glue IRSA
+    eks.amazonaws.com/role-arn: "arn:aws:iam::AWS_ACCOUNT_ID:role/WEFT_IRSA_ROLE_NAME"
+
+connect:
+  enabled: true
+  distributedStrict: true
+  # ~75% of c6g.xlarge memory — leave headroom for the OS / kubelet.
+  memoryLimitBytes: "6442450944" # 6 GiB
+  resources:
+    requests:
+      cpu: "3500m"
+      memory: 7Gi
+    limits:
+      cpu: "4"
+      memory: 7Gi
+  nodeSelector:
+    kubernetes.io/arch: arm64
+    # REPLACE: node group / capacity type labels for the c6g.xlarge pool
+    # node.kubernetes.io/instance-type: c6g.xlarge
+  tolerations: []
+  affinity: {}
+
+worker:
+  replicas: 2
+  autoscaling:
+    enabled: false
+  # Match container memory limit so aggregations spill instead of OOM.
+  memoryLimitBytes: "51539607552" # 48 GiB
+  resources:
+    requests:
+      cpu: "14"
+      memory: 56Gi
+    limits:
+      cpu: "16"
+      memory: 56Gi
+  nodeSelector:
+    kubernetes.io/arch: arm64
+    # REPLACE: node group / capacity type labels for the m8g.4xlarge pool
+    # node.kubernetes.io/instance-type: m8g.4xlarge
+  tolerations: []
+  affinity: {}
+  persistence:
+    enabled: true
+    # REPLACE: cluster gp3 StorageClass name (often "gp3")
+    storageClass: "gp3"
+    size: 500Gi
+    accessModes:
+      - ReadWriteOnce
