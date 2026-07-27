@@ -796,35 +796,40 @@ async fn assert_join_stages_reparse(dq: &weft_execution::plan::DistributedQuery,
     }
 }
 
-/// LEFT JOIN + agg over two sharded tables must match single-node (null-extended unmatched keys).
-/// FULL / ANTI equality share this fixture shape in the loop below; NULL-key co-location is covered
-/// by `null_join_keys_are_hashed_not_dropped`.
+/// LEFT / FULL / ANTI shuffle joins: one cluster, equality vs single-node.
+/// Uses pid-seeded ports (not ephemeral bind/drop) — TOCTOU otherwise connects to leftover
+/// listeners and silently drops a shuffle partition (odd keys missing).
+/// NULL-key co-location is covered by `null_join_keys_are_hashed_not_dropped`.
 #[tokio::test]
 async fn two_sharded_tables_left_outer_shuffle_join() {
     let _guard = OUTER_JOIN_TEST_LOCK.lock().await;
     const G: i64 = 12;
-    let sql = "SELECT t.k AS k, COUNT(*) AS c, SUM(COALESCE(d.d_name, 0)) AS sv \
-               FROM t LEFT JOIN dim d ON t.k = d.d_key GROUP BY t.k";
+    let dim_all = vec![
+        dim_shard(G, 0, G / 2),
+        dim_shard(G + G / 4, G, G + G / 4), // right-only keys for FULL
+    ];
 
     let single = Engine::new();
     single
         .register_batches("t", vec![batch(0, 200, G)])
         .unwrap();
-    // Dim covers only half the keys so LEFT JOIN produces null-extended rows.
-    single
-        .register_batches("dim", vec![dim_shard(G, 0, G / 2)])
-        .unwrap();
-    let expected = single.sql(sql).await.unwrap();
+    single.register_batches("dim", dim_all).unwrap();
 
-    let (p0, p1) = (ephemeral_port(), ephemeral_port());
+    let (p0, p1) = (unique_worker_port(), unique_worker_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
     e0.register_batches("dim", vec![dim_shard(G, 0, G / 4)])
         .unwrap();
     let e1 = Arc::new(Engine::new());
     e1.register_batches("t", vec![batch(100, 200, G)]).unwrap();
-    e1.register_batches("dim", vec![dim_shard(G, G / 4, G / 2)])
-        .unwrap();
+    e1.register_batches(
+        "dim",
+        vec![
+            dim_shard(G, G / 4, G / 2),
+            dim_shard(G + G / 4, G, G + G / 4),
+        ],
+    )
+    .unwrap();
     tokio::spawn(async move {
         let _ = serve_worker(p0, e0).await;
     });
@@ -850,29 +855,51 @@ async fn two_sharded_tables_left_outer_shuffle_join() {
         format!("http://127.0.0.1:{p1}"),
     ]);
 
-    let dq = plan_distributed_logical(&single.logical_plan(sql).await.unwrap(), &[])
-        .expect("LEFT JOIN shuffle should plan");
-    assert!(
-        dq.stages.iter().any(|s| s.sql.contains("LEFT JOIN")),
-        "expected LEFT JOIN in stage SQL, stages={:?}",
-        dq.stages.iter().map(|s| &s.sql).collect::<Vec<_>>()
-    );
-    // assert_join_stages_reparse skipped for bisect
-    let mut last = Vec::new();
-    for _ in 0..150 {
-        if let Ok(b) = run_stages(&cluster, &dq.stages).await {
-            last = sorted_lines(&b);
-            if last == sorted_lines(&expected) {
-                return;
+    for (sql, stage_kw) in [
+        (
+            "SELECT t.k AS k, COUNT(*) AS c, SUM(COALESCE(d.d_name, 0)) AS sv \
+             FROM t LEFT JOIN dim d ON t.k = d.d_key GROUP BY t.k",
+            "LEFT JOIN",
+        ),
+        (
+            "SELECT t.k AS k, COUNT(*) AS c, SUM(COALESCE(d.d_name, 0)) AS sv \
+             FROM t FULL OUTER JOIN dim d ON t.k = d.d_key GROUP BY t.k",
+            "FULL OUTER JOIN",
+        ),
+        (
+            "SELECT t.k AS k, COUNT(*) AS c, SUM(t.v) AS sv \
+             FROM t LEFT ANTI JOIN dim d ON t.k = d.d_key GROUP BY t.k",
+            "LEFT ANTI JOIN",
+        ),
+    ] {
+        let expected = single.sql(sql).await.unwrap();
+        let dq = plan_distributed_logical(&single.logical_plan(sql).await.unwrap(), &[])
+            .unwrap_or_else(|e| panic!("{stage_kw} should plan: {e}"));
+        assert!(
+            dq.stages.iter().any(|s| s.sql.contains(stage_kw)),
+            "expected {stage_kw} in stage SQL, got: {:?}",
+            dq.stages.iter().map(|s| &s.sql).collect::<Vec<_>>()
+        );
+        assert_join_stages_reparse(&dq, stage_kw).await;
+
+        let mut last = Vec::new();
+        let mut ok = false;
+        for _ in 0..150 {
+            if let Ok(b) = run_stages(&cluster, &dq.stages).await {
+                last = sorted_lines(&b);
+                if last == sorted_lines(&expected) {
+                    ok = true;
+                    break;
+                }
             }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            ok,
+            "{stage_kw} shuffle must equal single-node\n got: {last:?}\n exp: {:?}",
+            sorted_lines(&expected)
+        );
     }
-    assert_eq!(
-        last,
-        sorted_lines(&expected),
-        "LEFT JOIN shuffle must equal single-node"
-    );
 }
 
 #[tokio::test]
