@@ -97,12 +97,17 @@ Chart mitigation: `connect.shufflePartitions` (default `worker.replicas`) always
 `WEFT_SHUFFLE_PARTITIONS` on the driver, so the modulus is constant regardless of what
 DNS reports. Keep it pinned for any publishable run.
 
-**Follow-up (engine — do not land on this branch):** the driver should (a) freeze
-`num_partitions` for the lifetime of a query rather than recomputing it per stage,
-(b) hard-fail on a mid-query membership change instead of silently re-shaping, and
-(c) under `WEFT_DISTRIBUTED_STRICT=1`, hard-fail when the discovered worker count
-differs from `WEFT_WORKER_COUNT`. Tracked on `vamzi/distributed-membership-stability`;
-the chart pin is a mitigation, not a fix.
+**Engine fix (landed on `vamzi/distributed-membership-stability`):** the driver now
+freezes the planned worker set and `num_partitions` for the lifetime of a query,
+hard-fails when live membership differs at any stage barrier, and cross-checks its
+visible fan-out against `WEFT_WORKER_COUNT`. That last check only fires if the driver
+process actually has the variable, which is why `WEFT_WORKER_COUNT` is set on the
+**connect** pod too — deliberately without `WEFT_POD_NAME`/`WEFT_SHARD_INDEX`, since
+`ShardAssignment::from_env` needs an index as well as a count and returns `None`
+without one, so the driver never shards its own reads.
+
+The reproduction is worth knowing: a 2-worker `GROUP BY` over 200 keys returned `Ok`
+with 50 rows when membership shrank mid-query.
 
 ## Build images
 

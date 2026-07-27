@@ -60,6 +60,15 @@ spec:
               value: {{ .Values.worker.port | quote }}
             - name: WEFT_AWS_BIN
               value: {{ .Values.connect.awsBin | quote }}
+            # The driver cross-checks its visible worker fan-out against this and hard-fails
+            # on mismatch, so a not-Ready worker aborts the query instead of returning the
+            # surviving shards as if they were the whole table.
+            #
+            # Safe to set here WITHOUT WEFT_POD_NAME / WEFT_SHARD_INDEX: ShardAssignment::from_env
+            # needs a shard *index* as well as a count and returns None without one, so the
+            # driver never starts sharding its own reads. Do not add a pod-name env here.
+            - name: WEFT_WORKER_COUNT
+              value: {{ .Values.worker.replicas | quote }}
             # Pin the shuffle modulus. Unset, shuffle_partitions() falls back to the LIVE
             # worker count, and refresh_cluster_workers() recomputes it between stages of a
             # single query. A worker that briefly leaves the headless Service (restart, OOM

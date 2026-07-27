@@ -53,6 +53,11 @@ connect:
   # Shuffle bucket count (WEFT_SHUFFLE_PARTITIONS on the driver). Empty → worker.replicas.
   # Must stay pinned: an unpinned modulus is recomputed from live DNS membership between
   # stages, which silently drops rows when a worker blips. See connect-server.yaml.
+  #
+  # Do NOT raise this above worker.replicas yet. AQE coalescing (WEFT_AQE, on by default)
+  # only engages when partitions exceed workers, and it lowers num_partitions after the
+  # producer stage while the consumer then reads only the reduced range — the buckets
+  # above it are never pulled. Keeping partitions == replicas keeps that path dormant.
   shufflePartitions: ""
 
 worker:
