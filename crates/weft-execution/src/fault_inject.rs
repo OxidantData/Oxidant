@@ -66,6 +66,7 @@ mod tests {
             hash_key_cols: vec![0],
             upstream_stage_ids: if produce { vec![] } else { vec![0] },
             produce,
+            lakehouse_snapshot_pins: String::new(),
         }
     }
 

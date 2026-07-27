@@ -51,4 +51,8 @@ aws-config = "=1.8.13"
 aws-sdk-sts = "=1.97.0"
 
 [dev-dependencies]
+delta_kernel = { version = "=0.25.0", features = ["arrow-58"] }
+delta_kernel_default_engine = "=0.25.0"
+iceberg = { version = "=0.8.0", default-features = false, features = ["storage-fs"] }
+tempfile = "3.27.0"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

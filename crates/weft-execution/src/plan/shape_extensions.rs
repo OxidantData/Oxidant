@@ -86,6 +86,7 @@ pub(crate) fn try_non_aggregate(
             hash_key_cols: vec![],
             exchange: ExchangeMode::Forward,
             plan_fragment: None,
+            lakehouse_snapshot_pins: String::new(),
         }
     } else {
         StageDef::new(0, worker_sql, vec![], vec![])
@@ -491,6 +492,7 @@ fn plan_union_all(
                 hash_key_cols: s.hash_key_cols,
                 exchange: s.exchange,
                 plan_fragment: s.plan_fragment,
+                lakehouse_snapshot_pins: s.lakehouse_snapshot_pins,
             });
             next_id = next_id.max(new_id + 1);
         }

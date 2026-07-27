@@ -117,6 +117,8 @@ pub struct StageDef {
     pub hash_key_cols: Vec<u32>,
     pub exchange: ExchangeMode,
     pub plan_fragment: Option<Vec<u8>>,
+    /// Driver-captured table-name→Delta/Iceberg identity map, serialized as JSON.
+    pub lakehouse_snapshot_pins: String,
 }
 
 impl Default for StageDef {
@@ -128,6 +130,7 @@ impl Default for StageDef {
             hash_key_cols: Vec::new(),
             exchange: ExchangeMode::Hash,
             plan_fragment: None,
+            lakehouse_snapshot_pins: String::new(),
         }
     }
 }
@@ -692,6 +695,7 @@ fn stage_ticket(
         hash_key_cols: stage.hash_key_cols.clone(),
         upstream_stage_ids: stage.upstream_stage_ids.clone(),
         produce,
+        lakehouse_snapshot_pins: stage.lakehouse_snapshot_pins.clone(),
     }
 }
 

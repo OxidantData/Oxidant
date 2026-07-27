@@ -61,6 +61,14 @@ fn assign_files_by_size(
     files: &[(ListingTableUrl, ObjectMeta)],
     worker_count: usize,
 ) -> Vec<usize> {
+    let known_sizes = files
+        .iter()
+        .map(|(url, meta)| (url.clone(), meta.size))
+        .collect::<Vec<_>>();
+    assign_known_files_by_size(&known_sizes, worker_count)
+}
+
+fn assign_known_files_by_size(files: &[(ListingTableUrl, u64)], worker_count: usize) -> Vec<usize> {
     if files.is_empty() {
         return Vec::new();
     }
@@ -68,20 +76,17 @@ fn assign_files_by_size(
 
     let mut order: Vec<usize> = (0..files.len()).collect();
     order.sort_by(|&a, &b| {
-        files[b].1.size.cmp(&files[a].1.size).then_with(|| {
-            files[a]
-                .1
-                .location
-                .as_ref()
-                .cmp(files[b].1.location.as_ref())
-        })
+        files[b]
+            .1
+            .cmp(&files[a].1)
+            .then_with(|| files[a].0.as_str().cmp(files[b].0.as_str()))
     });
 
     let mut worker_bytes = vec![0u64; worker_count];
     let mut assignments = vec![0usize; files.len()];
 
     for file_idx in order {
-        let size = files[file_idx].1.size;
+        let size = files[file_idx].1;
         let worker = worker_bytes
             .iter()
             .enumerate()
@@ -145,6 +150,122 @@ pub async fn apply_file_shard(
         ShardAssignment::from_env(),
     )
     .await
+}
+
+/// Shard an already-resolved file list using metadata-provided sizes.
+///
+/// Unlike [`apply_file_shard`], this never lists or heads object-store files. Delta and Iceberg
+/// resolvers already carry authoritative sizes in their transaction/manifest metadata, so using
+/// those values avoids one remote metadata request per file on every worker.
+pub fn apply_known_file_shard(
+    files: Vec<(ListingTableUrl, u64)>,
+    table_name: Option<&str>,
+) -> Vec<(ListingTableUrl, u64)> {
+    apply_known_file_shard_with(files, table_name, ShardAssignment::from_env())
+}
+
+/// Same as [`apply_known_file_shard`] with an explicit assignment for tests.
+pub fn apply_known_file_shard_with(
+    files: Vec<(ListingTableUrl, u64)>,
+    table_name: Option<&str>,
+    assignment: Option<ShardAssignment>,
+) -> Vec<(ListingTableUrl, u64)> {
+    let Some(assignment) = assignment else {
+        return files;
+    };
+    if table_name.is_some_and(is_replicated_table) {
+        return files;
+    }
+
+    let file_shards = assign_known_files_by_size(&files, assignment.count);
+    files
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| file_shards[*index] == assignment.index)
+        .map(|(_, file)| file)
+        .collect()
+}
+
+/// List files once, exclude Spark/Hive metadata paths, and return this worker's size-weighted
+/// shard together with the already-fetched object metadata.
+pub async fn list_visible_file_shard(
+    state: &SessionState,
+    urls: Vec<ListingTableUrl>,
+    file_extension: &str,
+    table_name: Option<&str>,
+) -> Result<Vec<(ListingTableUrl, ObjectMeta)>> {
+    list_visible_file_shard_with(
+        state,
+        urls,
+        file_extension,
+        table_name,
+        ShardAssignment::from_env(),
+    )
+    .await
+}
+
+/// Same as [`list_visible_file_shard`] with an explicit assignment for tests.
+pub async fn list_visible_file_shard_with(
+    state: &SessionState,
+    urls: Vec<ListingTableUrl>,
+    file_extension: &str,
+    table_name: Option<&str>,
+    assignment: Option<ShardAssignment>,
+) -> Result<Vec<(ListingTableUrl, ObjectMeta)>> {
+    let mut files = Vec::new();
+    for url in &urls {
+        let store_url = url.object_store();
+        let store = state
+            .runtime_env()
+            .object_store(&store_url)
+            .map_err(|e| Error::Io(format!("object store for {}: {e}", store_url.as_str())))?;
+        let stream = url
+            .list_all_files(state as &dyn Session, store.as_ref(), file_extension)
+            .await
+            .map_err(|e| Error::Io(format!("list files for {}: {e}", url.as_str())))?;
+        let metas: Vec<ObjectMeta> = stream
+            .try_collect()
+            .await
+            .map_err(|e| Error::Io(format!("list files stream: {e}")))?;
+        for meta in metas {
+            if visible_data_path(url, &meta) {
+                files.push((object_meta_to_url(url, &meta)?, meta));
+            }
+        }
+    }
+    files.sort_by(|a, b| a.1.location.as_ref().cmp(b.1.location.as_ref()));
+
+    let Some(assignment) = assignment else {
+        return Ok(files);
+    };
+    if table_name.is_some_and(is_replicated_table) {
+        return Ok(files);
+    }
+    let assignments = assign_files_by_size(&files, assignment.count);
+    Ok(files
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| assignments[*index] == assignment.index)
+        .map(|(_, file)| file)
+        .collect())
+}
+
+fn visible_data_path(base: &ListingTableUrl, meta: &ObjectMeta) -> bool {
+    let location = meta.location.as_ref();
+    let relative = if base.is_collection() {
+        let prefix = base.prefix().as_ref().trim_end_matches('/');
+        location
+            .strip_prefix(prefix)
+            .unwrap_or(location)
+            .trim_start_matches('/')
+    } else {
+        location.rsplit('/').next().unwrap_or(location)
+    };
+    !relative.split('/').any(|segment| {
+        segment.starts_with('_')
+            || segment.starts_with('.')
+            || segment.eq_ignore_ascii_case("metadata")
+    })
 }
 
 /// Same as [`apply_file_shard`] with an explicit assignment (tests / custom membership).
@@ -307,6 +428,28 @@ mod tests {
     }
 
     #[test]
+    fn known_size_sharding_uses_metadata_without_object_store_calls() {
+        let files = vec![
+            (dummy_url("large.parquet"), 100),
+            (dummy_url("medium.parquet"), 60),
+            (dummy_url("small.parquet"), 40),
+        ];
+        let worker_zero = apply_known_file_shard_with(
+            files.clone(),
+            Some("orders"),
+            Some(ShardAssignment { index: 0, count: 2 }),
+        );
+        let worker_one = apply_known_file_shard_with(
+            files,
+            Some("orders"),
+            Some(ShardAssignment { index: 1, count: 2 }),
+        );
+
+        assert_eq!(worker_zero.iter().map(|(_, size)| size).sum::<u64>(), 100);
+        assert_eq!(worker_one.iter().map(|(_, size)| size).sum::<u64>(), 100);
+    }
+
+    #[test]
     fn replicated_parses_csv() {
         std::env::remove_var("WEFT_REPLICATED_TABLES");
         assert!(!is_replicated_table("orders"));
@@ -397,6 +540,37 @@ mod tests {
         all.sort();
         all.dedup();
         assert_eq!(all.len(), 4, "shards must be disjoint");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn parquet_listing_excludes_delta_checkpoints_and_hidden_metadata() {
+        let dir = write_parts(1);
+        let delta_log = dir.join("_delta_log");
+        let iceberg_metadata = dir.join("metadata");
+        std::fs::create_dir_all(&delta_log).unwrap();
+        std::fs::create_dir_all(&iceberg_metadata).unwrap();
+        std::fs::copy(
+            dir.join("part-0.parquet"),
+            delta_log.join("00000000000000000010.checkpoint.parquet"),
+        )
+        .unwrap();
+        std::fs::copy(
+            dir.join("part-0.parquet"),
+            iceberg_metadata.join("metadata-table.parquet"),
+        )
+        .unwrap();
+        let location = ensure_collection_url(&format!("file://{}", dir.to_string_lossy()));
+        let url = ListingTableUrl::parse(&location).unwrap();
+        let ctx = SessionContext::new();
+
+        let files =
+            list_visible_file_shard_with(&ctx.state(), vec![url], ".parquet", Some("orders"), None)
+                .await
+                .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].0.as_str().ends_with("/part-0.parquet"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

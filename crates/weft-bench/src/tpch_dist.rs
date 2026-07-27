@@ -201,6 +201,7 @@ pub async fn run(sf: f64, dir: &Path, num_workers: usize) {
                 hash_key_cols: s.hash_key_cols.clone(),
                 exchange: s.exchange,
                 plan_fragment: s.plan_fragment.clone(),
+                lakehouse_snapshot_pins: s.lakehouse_snapshot_pins.clone(),
             })
             .collect();
 

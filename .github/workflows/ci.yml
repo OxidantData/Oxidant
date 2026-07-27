@@ -62,6 +62,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Start MinIO service container
+        run: |
+          docker run -d --name weft-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin123 \
+            quay.io/minio/minio:latest server /data
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:9000/minio/health/live && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:9000/minio/health/live
+          docker run --rm --network host \
+            -e MC_HOST_local=http://minioadmin:minioadmin123@127.0.0.1:9000 \
+            minio/mc mb --ignore-existing local/weft-test
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
           rustup show
@@ -89,6 +104,9 @@ jobs:
       # well under that.
       - name: test (workspace)
         run: cargo test --workspace
+        env:
+          WEFT_MINIO_TEST: "1"
+          WEFT_MINIO_ENDPOINT: "http://127.0.0.1:9000"
 
   # The TPC-H / TPC-DS / distributed gates used to run at the tail of build-test, which made the
   # critical path the SUM of compiling the workspace and replaying every query suite. They only
