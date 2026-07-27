@@ -624,9 +624,39 @@ mod tests {
     }
 
     #[test]
+    fn iceberg_table_type_wins_over_conflicting_delta_provider() {
+        // Authoritative Iceberg `table_type` must beat Spark provider / classification noise —
+        // otherwise workers open the wrong reader and can silently mis-apply deletes.
+        let v = glue_table_fixture(json!({
+            "table_type": "ICEBERG",
+            "spark.sql.sources.provider": "delta",
+            "provider": "delta",
+            "classification": "parquet",
+            "metadata_location": "s3://bucket/db/t/metadata/snap.metadata.json",
+        }));
+        let md = parse_glue_table("glue", "db", "t", &v).expect("parsed");
+        assert_eq!(md.format, TableFormat::Iceberg);
+        assert_eq!(
+            md.properties.get("metadata_location").map(String::as_str),
+            Some("s3://bucket/db/t/metadata/snap.metadata.json")
+        );
+    }
+
+    #[test]
     fn spark_provider_delta_detects_as_delta() {
         let v = glue_table_fixture(json!({
             "spark.sql.sources.provider": "delta",
+            "classification": "parquet",
+        }));
+        let md = parse_glue_table("glue", "db", "t", &v).expect("parsed");
+        assert_eq!(md.format, TableFormat::Delta);
+    }
+
+    #[test]
+    fn bare_provider_delta_detects_as_delta() {
+        // Some Glue writers set only `provider`, not `spark.sql.sources.provider`.
+        let v = glue_table_fixture(json!({
+            "provider": "delta",
             "classification": "parquet",
         }));
         let md = parse_glue_table("glue", "db", "t", &v).expect("parsed");
