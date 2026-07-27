@@ -29,12 +29,15 @@
 //! when each join is a single equijoin key.
 //!
 //! Also supported: ungrouped/global aggregates, `HAVING` over the aggregated result,
-//! scalar / IN / EXISTS subqueries **over replicated tables only**, `UNION ALL` of
-//! distributable aggregations, and **narrow window** support: re-combinable aggregate
+//! scalar / IN / EXISTS subqueries **over replicated tables only**, distributable set operations,
+//! and **narrow window** support: re-combinable aggregate
 //! windows (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`) with a non-empty `PARTITION BY` over one
 //! sharded table (hash-shuffle by the partition key, then compute the window locally).
-//! Ranking windows, global windows (no `PARTITION BY`), and `UNION` (distinct) return an
-//! explicit [`Error::Unsupported`] so the caller falls back to single-node execution.
+//! CTE-heavy outer cross joins are lowered recursively by [`super::dag_splitter`]: each sharded
+//! aggregate branch becomes its own sub-DAG, and a gathered outer stage combines the branch
+//! outputs with any replicated-only inputs.
+//! Ranking windows and global windows (no `PARTITION BY`) return an explicit
+//! [`Error::Unsupported`] so the caller falls back to single-node execution.
 //! Correlated subqueries over sharded tables are rejected (not broadcast-safe).
 
 use std::collections::HashMap;
@@ -81,8 +84,13 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
         return Ok(dq);
     }
     reject_explicit_unsupported(lp)?;
-    let peeled = peel(lp)?;
-    aggregation_stages_for(&peeled, replicated)
+    match peel(lp) {
+        Ok(peeled) => aggregation_stages_for(&peeled, replicated),
+        Err(linear_error) => match super::dag_splitter::try_branch_dag(lp, replicated)? {
+            Some(dq) => Ok(dq),
+            None => Err(linear_error),
+        },
+    }
 }
 
 /// SQL convenience wrapper around [`plan_distributed_logical`].
