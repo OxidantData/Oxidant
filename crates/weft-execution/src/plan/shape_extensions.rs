@@ -198,6 +198,21 @@ fn window_stages_for(p: &WindowPeeled<'_>, replicated: &[&str]) -> Result<Distri
         ));
     }
 
+    // This path treats `w.input` as a scan whose schema columns pass through the shuffle
+    // untouched. When the input is itself an `Aggregate` (TPC-DS Q12/Q20/Q53/Q63/Q89/Q98'
+    // `sum(sum(x)) OVER (PARTITION BY …)`), that is wrong twice over: the partial stage computes
+    // a *per-shard* aggregate that the final stage never recombines, and the final stage re-emits
+    // the aggregate expression as if it were a plain shuffle_input column (`No field named
+    // store_sales.ss_sales_price`). Composing partial-agg → combine → window is a separate piece
+    // of work; until then decline so the query runs single-node.
+    if plan_contains_aggregate(&w.input) {
+        return Err(Error::Unsupported(
+            "auto-distribute: window over an aggregation is not supported \
+             (needs partial-aggregate → combine → window composition)"
+                .into(),
+        ));
+    }
+
     let tables = base_tables(&w.input);
     let sharded: Vec<&str> = tables
         .iter()

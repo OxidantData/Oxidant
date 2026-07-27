@@ -42,7 +42,7 @@
 
 use std::collections::HashMap;
 
-use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan};
+use datafusion::logical_expr::{Aggregate, Expr, JoinType, LogicalPlan};
 use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
 use weft_loom::Engine;
@@ -84,13 +84,30 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
         return Ok(dq);
     }
     reject_explicit_unsupported(lp)?;
-    match peel(lp) {
+    let dq = match peel(lp) {
         Ok(peeled) => aggregation_stages_for(&peeled, replicated),
         Err(linear_error) => match super::dag_splitter::try_branch_dag(lp, replicated)? {
             Some(dq) => Ok(dq),
             None => Err(linear_error),
         },
+    }?;
+    validate_stage_sql(&dq)?;
+    Ok(dq)
+}
+
+/// Last-line check on the SQL every stage will hand to a worker.
+///
+/// Individual shape handlers each splice Unparser output into their own stage SQL, so a
+/// generated-SQL defect has to be caught in each of them or in one place after the fact. This is
+/// that one place — it runs on whatever the chosen path produced.
+fn validate_stage_sql(dq: &DistributedQuery) -> Result<()> {
+    for s in &dq.stages {
+        reject_out_of_scope_join_alias_refs(&s.sql)?;
     }
+    if let Some(f) = &dq.finalize_sql {
+        reject_out_of_scope_join_alias_refs(f)?;
+    }
+    Ok(())
 }
 
 /// SQL convenience wrapper around [`plan_distributed_logical`].
@@ -210,6 +227,7 @@ pub(crate) fn aggregation_stages_for(
     replicated: &[&str],
 ) -> Result<DistributedQuery> {
     let agg = p.agg;
+    reject_grouping_sets(&agg.group_expr)?;
     let tables = base_tables(&agg.input);
     let sharded: Vec<&str> = tables
         .iter()
@@ -237,6 +255,8 @@ pub(crate) fn aggregation_stages_for(
             sharded.len()
         )));
     }
+    let sharded_name = sharded[0];
+    reject_unsafe_broadcast_shapes(&agg.input, sharded_name)?;
     // The aggregate's input must unparse to a plain `SELECT * FROM …` so we can splice our own
     // SELECT list onto its FROM/WHERE tail without losing column qualifiers.
     let input_sql = Unparser::default()
@@ -252,7 +272,6 @@ pub(crate) fn aggregation_stages_for(
     // A second scan — a self-join or a correlated EXISTS/IN subquery over it — would see only the
     // local shard per worker and silently lose cross-shard rows, so reject it. (`base_tables` counts
     // the plan-input scan only; subquery scans live in expressions, so descend into those too.)
-    let sharded_name = sharded[0];
     let scans = count_table_scans(&agg.input, sharded_name);
     if scans > 1 {
         return Err(Error::Unsupported(format!(
@@ -307,6 +326,7 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
             "auto-distribute: sharded table `{sharded_name}` scanned multiple times"
         )));
     }
+    reject_unsafe_broadcast_shapes(&p.agg.input, sharded_name)?;
     let input_sql = Unparser::default()
         .plan_to_sql(&p.agg.input)
         .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse input: {e}")))?
@@ -976,6 +996,173 @@ pub(crate) fn extract_from_tail(input_sql: &str) -> Result<String> {
     ))
 }
 
+/// Reject plan shapes where broadcasting the replicated tables to every worker duplicates output
+/// rows instead of partitioning them.
+///
+/// The single-sharded-table broadcast model is correct when every output row is produced by
+/// matching against the (partitioned) sharded table, which a plain inner-join chain guarantees.
+/// Two shapes break that invariant, and both go wrong silently — the query returns a number that
+/// is a multiple of the right one:
+///
+/// - a `UNION ALL` arm with no path to the sharded table. TPC-DS Q33/Q56/Q60/Q66/Q71/Q76 union one
+///   pre-aggregated arm per channel (`store_sales` / `catalog_sales` / `web_sales`). With
+///   `store_sales` sharded, the other two arms scan replicated tables only, so every worker
+///   computes those arms in full and the final `SUM` multiplies them by the worker count — Q66 at
+///   two workers returns exactly 2× the correct total for the affected columns.
+/// - an outer join whose preserved side does not reach the sharded table. TPC-DS Q97 `FULL OUTER
+///   JOIN`s two independently-aggregated fact tables; the side without the sharded table is
+///   replicated, so its unmatched rows (and under `FULL`, all of its rows) survive once per worker
+///   rather than once overall.
+///
+/// A subtree that never scans the sharded table is uniformly replicated and harmless on its own —
+/// it only becomes a duplication bug where a parent combines it additively with sharded data, and
+/// that parent is the node this catches. So skip such subtrees rather than flagging them, and stop
+/// at a nested `Aggregate`: below one, the replicated subtree's result is identical and complete on
+/// every worker, which is what lets TPC-DS Q54's `UNION ALL` of two non-sharded facts feed a
+/// `DISTINCT` customer filter safely.
+fn reject_unsafe_broadcast_shapes(lp: &LogicalPlan, sharded_name: &str) -> Result<()> {
+    if count_table_scans(lp, sharded_name) == 0 {
+        return Ok(());
+    }
+    match lp {
+        LogicalPlan::Aggregate(_) => Ok(()),
+        LogicalPlan::Union(u) => {
+            for arm in &u.inputs {
+                if count_table_scans(arm, sharded_name) == 0 {
+                    return Err(Error::Unsupported(format!(
+                        "auto-distribute: UNION ALL arm does not scan sharded table \
+                         `{sharded_name}` — broadcasting it would repeat that arm's rows on \
+                         every worker"
+                    )));
+                }
+                reject_unsafe_broadcast_shapes(arm, sharded_name)?;
+            }
+            Ok(())
+        }
+        LogicalPlan::Join(j) => {
+            match j.join_type {
+                JoinType::Full => {
+                    return Err(Error::Unsupported(
+                        "auto-distribute: FULL OUTER JOIN is not broadcast-safe with a single \
+                         sharded table"
+                            .into(),
+                    ));
+                }
+                JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark
+                    if count_table_scans(&j.left, sharded_name) == 0 =>
+                {
+                    return Err(Error::Unsupported(format!(
+                        "auto-distribute: LEFT join's preserved side does not scan sharded table \
+                         `{sharded_name}` — its unmatched rows would repeat on every worker"
+                    )));
+                }
+                JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
+                    if count_table_scans(&j.right, sharded_name) == 0 =>
+                {
+                    return Err(Error::Unsupported(format!(
+                        "auto-distribute: RIGHT join's preserved side does not scan sharded table \
+                         `{sharded_name}` — its unmatched rows would repeat on every worker"
+                    )));
+                }
+                _ => {}
+            }
+            reject_unsafe_broadcast_shapes(&j.left, sharded_name)?;
+            reject_unsafe_broadcast_shapes(&j.right, sharded_name)
+        }
+        other => {
+            for c in other.inputs() {
+                reject_unsafe_broadcast_shapes(c, sharded_name)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Reject stage SQL that references the Unparser's `left` / `right` join-side alias from outside
+/// the lexical scope that defined it.
+///
+/// DataFusion's Unparser names a decorrelated subquery's join sides `"left"` / `"right"`. When
+/// that side is *also* wrapped in another alias one level out — TPC-DS Q8/Q38/Q87's chained
+/// `EXISTS`, which unparses to `(SELECT … FROM (…) AS "left" WHERE EXISTS (…)) AS hot_cust WHERE
+/// EXISTS (… `left`.c_last_name …)` — the trailing reference sits in a sibling scope where
+/// `left` was never bound, and the row it means is only reachable through the outer alias the
+/// Unparser failed to substitute. The SQL parses fine; it fails at name resolution on the worker
+/// (`No field named left.c_last_name`). Renaming the alias uniformly would not help, since the
+/// reference is dangling rather than merely awkwardly quoted, so reject and fall back.
+///
+/// Scope is tracked as a stack of paren depths: `AS "left"` binds `left` in the frame that is open
+/// where the alias appears, and stays visible to every nested subquery (which is what makes the
+/// legitimate correlation work) until that frame's paren closes.
+pub(crate) fn reject_out_of_scope_join_alias_refs(sql: &str) -> Result<()> {
+    const DEFS: [(&str, &str); 4] = [
+        ("\"left\"", "left"),
+        ("\"right\"", "right"),
+        ("`left`", "left"),
+        ("`right`", "right"),
+    ];
+    const USES: [(&str, &str); 4] = [
+        ("\"left\".", "left"),
+        ("\"right\".", "right"),
+        ("`left`.", "left"),
+        ("`right`.", "right"),
+    ];
+    let bytes = sql.as_bytes();
+    let mut stack: Vec<Vec<&str>> = vec![Vec::new()];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                stack.push(Vec::new());
+                i += 1;
+            }
+            b')' => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            _ => {
+                if let Some((pat, name)) = USES.iter().find(|(pat, _)| sql[i..].starts_with(*pat)) {
+                    if !stack.iter().any(|frame| frame.contains(name)) {
+                        return Err(Error::Unsupported(format!(
+                            "auto-distribute: generated SQL references join-side alias `{name}` \
+                             outside the scope that defines it (Unparser aliasing)"
+                        )));
+                    }
+                    i += pat.len();
+                    continue;
+                }
+                if let Some((pat, name)) = DEFS.iter().find(|(pat, _)| sql[i..].starts_with(*pat)) {
+                    stack.last_mut().expect("stack never empty").push(name);
+                    i += pat.len();
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject `ROLLUP` / `CUBE` / `GROUPING SETS`.
+///
+/// The partial/final split treats `group_expr` positionally: each entry becomes one `g{j}` column
+/// that the final stage re-groups on. A grouping set is a *single* `group_expr` entry that expands
+/// to several grouping levels, so `g0` would stand for the whole `ROLLUP(...)` construct — the
+/// remap can't name `channel`/`id` individually, and the emitted stage SQL passes `ROLLUP (...)`
+/// through to workers, which re-parse it under the Databricks dialect as a call to a function
+/// named `rollup` (TPC-DS Q5/Q18/Q22/Q77/Q80). Decline and let the query run single-node.
+fn reject_grouping_sets(group_expr: &[Expr]) -> Result<()> {
+    for g in group_expr {
+        if matches!(g, Expr::GroupingSet(_)) {
+            return Err(Error::Unsupported(
+                "auto-distribute: ROLLUP / CUBE / GROUPING SETS are not supported".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Fix SQL fragments from DataFusion's Unparser that the Databricks-dialect re-parser rejects.
 ///
 /// Two common failure modes when generated stage SQL is sent to workers:
@@ -1237,6 +1424,46 @@ fn collect_tables(lp: &LogicalPlan, out: &mut Vec<String>) {
     }
     for c in lp.inputs() {
         collect_tables(c, out);
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::reject_out_of_scope_join_alias_refs;
+
+    #[test]
+    fn plain_sql_without_join_side_aliases_is_accepted() {
+        assert!(reject_out_of_scope_join_alias_refs(
+            "SELECT a, sum(b) FROM t WHERE c > 1 GROUP BY a"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn correlated_reference_into_a_nested_subquery_is_accepted() {
+        // `left` is bound one level out and used inside the EXISTS — the legitimate shape.
+        let sql = r#"SELECT count(1) FROM (SELECT * FROM t) AS "left" WHERE EXISTS (SELECT 1 FROM u WHERE (`left`.k = u.k))"#;
+        assert!(reject_out_of_scope_join_alias_refs(sql).is_ok());
+    }
+
+    #[test]
+    fn reference_after_the_defining_scope_closed_is_rejected() {
+        // TPC-DS Q38/Q87 shape: `left` is bound inside the parens that `AS hot_cust` closes, so
+        // the second EXISTS refers to a name that no longer exists.
+        let sql = r#"SELECT count(1) FROM (SELECT * FROM (SELECT * FROM t) AS "left" WHERE EXISTS (SELECT 1 FROM u WHERE (`left`.k = u.k))) AS hot_cust WHERE EXISTS (SELECT 1 FROM v WHERE (`left`.k = v.k))"#;
+        let err = reject_out_of_scope_join_alias_refs(sql).expect_err("dangling `left`");
+        assert!(err.to_string().contains("outside the scope"), "{err}");
+    }
+
+    #[test]
+    fn reference_with_no_definition_at_all_is_rejected() {
+        assert!(reject_out_of_scope_join_alias_refs(r#"SELECT "left".a FROM t"#).is_err());
+    }
+
+    #[test]
+    fn a_sibling_scopes_definition_does_not_leak() {
+        let sql = r#"SELECT * FROM (SELECT 1 FROM x AS "left" WHERE `left`.a = 1), (SELECT `left`.b FROM y)"#;
+        assert!(reject_out_of_scope_join_alias_refs(sql).is_err());
     }
 }
 
