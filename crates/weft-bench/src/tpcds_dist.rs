@@ -535,26 +535,23 @@ mod tests {
         }
     }
 
-    /// Write a throwaway baseline; the name is derived from its contents so parallel tests
-    /// never share a path.
-    fn baseline_file(queries: &[&str]) -> PathBuf {
+    /// Write a throwaway baseline under a caller-supplied name, so tests running in parallel
+    /// never write and read the same path.
+    fn baseline_file(label: &str, queries: &[&str]) -> PathBuf {
         let base = ExecuteBaseline {
             notes: String::new(),
             suite: "tpcds".into(),
             verified: queries.len(),
             verified_queries: queries.iter().map(|s| s.to_string()).collect(),
         };
-        let path = std::env::temp_dir().join(format!(
-            "weft-tpcds-execute-baseline-{}.json",
-            queries.join("-")
-        ));
+        let path = std::env::temp_dir().join(format!("weft-tpcds-execute-baseline-{label}.json"));
         std::fs::write(&path, serde_json::to_string(&base).unwrap()).unwrap();
         path
     }
 
     #[test]
     fn clean_sweep_holding_the_baseline_passes() {
-        let f = baseline_file(&["Q3", "Q6"]);
+        let f = baseline_file("held", &["Q3", "Q6"]);
         assert!(check_execute_ratchet(
             &report(&["Q3", "Q6"], &[], &[]),
             Some(&f)
@@ -564,7 +561,7 @@ mod tests {
     #[test]
     fn a_mismatch_fails_even_when_the_baseline_set_is_intact() {
         // The whole point of the gate: a wrong answer is never ratcheted or tolerated.
-        let f = baseline_file(&["Q3"]);
+        let f = baseline_file("mismatch", &["Q3"]);
         assert!(!check_execute_ratchet(
             &report(&["Q3"], &["Q66"], &[]),
             Some(&f)
@@ -586,13 +583,13 @@ mod tests {
 
     #[test]
     fn losing_a_baseline_query_fails() {
-        let f = baseline_file(&["Q3", "Q6"]);
+        let f = baseline_file("lost", &["Q3", "Q6"]);
         assert!(!check_execute_ratchet(&report(&["Q3"], &[], &[]), Some(&f)));
     }
 
     #[test]
     fn gaining_a_query_passes_and_asks_for_a_re_baseline() {
-        let f = baseline_file(&["Q3"]);
+        let f = baseline_file("gained", &["Q3"]);
         assert!(check_execute_ratchet(
             &report(&["Q3", "Q6"], &[], &[]),
             Some(&f)
