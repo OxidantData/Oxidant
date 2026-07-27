@@ -186,6 +186,7 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
     };
 
     let (mut ok, mut mismatch, mut error) = (0usize, 0usize, 0usize);
+    let debug = std::env::var("WEFT_TPCDS_DEBUG").is_ok();
 
     for (i, (name, sql, fact)) in to_run.iter().take(run_count).enumerate() {
         let replicated: Vec<&str> = all
@@ -215,6 +216,22 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
                 .unwrap_or_else(|| panic!("no cluster for sharded fact {fact}"))
         };
         let mode = if forward { "forward" } else { "shuffle" };
+
+        if std::env::var("WEFT_TPCDS_DEBUG").as_deref() == Ok("plan") {
+            let lp = single.logical_plan(sql).await.unwrap();
+            eprintln!("  {name} logical plan:\n{}", lp.display_indent_schema());
+        }
+        if debug {
+            for s in &dq.stages {
+                eprintln!(
+                    "  {name} [{mode}] stage{} keys{:?} exch={:?}: {}",
+                    s.stage_id, s.hash_key_cols, s.exchange, s.sql
+                );
+            }
+            if let Some(f) = &dq.finalize_sql {
+                eprintln!("  {name} finalize: {f}");
+            }
+        }
 
         let base = (i as u32 + 1) * 1000;
         let stages: Vec<StageDef> = dq
@@ -262,6 +279,17 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
         } else {
             mismatch += 1;
             eprintln!("{name:<4} distributed MISMATCH [{mode}]");
+            if debug {
+                let exp = normalize_batches(&expected);
+                let got = normalize_batches(&result);
+                eprintln!(
+                    "  expected {} rows / got {} rows\n  first expected: {:?}\n  first got:      {:?}",
+                    exp.len(),
+                    got.len(),
+                    exp.first(),
+                    got.first()
+                );
+            }
         }
     }
 
