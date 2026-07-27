@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use serde_json::Value;
@@ -364,6 +365,75 @@ pub(crate) fn normalize_batches(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     rows
 }
 
+/// Ordered row-for-row equality for the distributed execute gate.
+///
+/// Float32/Float64 columns compare with [`FLOAT_REL_EPS`] relative tolerance (partial-aggregate
+/// recombination is not bit-identical to single-node). Decimals, integers, dates, and strings
+/// stay byte-exact via Arrow's default formatter. Row order is significant — unlike
+/// [`rows_equal`], which is a multiset comparator for the single-node DuckDB oracle.
+pub(crate) fn batches_equal_ordered(a: &[RecordBatch], b: &[RecordBatch]) -> bool {
+    let schema_a = match a.first() {
+        Some(batch) => batch.schema(),
+        None => return b.iter().all(|batch| batch.num_rows() == 0),
+    };
+    let schema_b = match b.first() {
+        Some(batch) => batch.schema(),
+        None => return a.iter().all(|batch| batch.num_rows() == 0),
+    };
+    if schema_a.fields().len() != schema_b.fields().len() {
+        return false;
+    }
+
+    let float_cols: Vec<bool> = schema_a
+        .fields()
+        .iter()
+        .zip(schema_b.fields())
+        .map(|(fa, fb)| {
+            // Only treat a column as float-tolerant when *both* sides are Float32/Float64.
+            // A Decimal↔Float mismatch must stay an exact string compare (and fail).
+            is_float_type(fa.data_type()) && is_float_type(fb.data_type())
+        })
+        .collect();
+
+    let rows_a = normalize_batches(a);
+    let rows_b = normalize_batches(b);
+    if rows_a.len() != rows_b.len() {
+        return false;
+    }
+    rows_a.iter().zip(rows_b.iter()).all(|(ra, rb)| {
+        if ra.len() != rb.len() || ra.len() != float_cols.len() {
+            return false;
+        }
+        ra.iter()
+            .zip(rb.iter())
+            .zip(float_cols.iter())
+            .all(|((ca, cb), &is_float)| {
+                if is_float {
+                    float_cells_close(ca, cb)
+                } else {
+                    ca == cb
+                }
+            })
+    })
+}
+
+fn is_float_type(dt: &DataType) -> bool {
+    matches!(dt, DataType::Float32 | DataType::Float64)
+}
+
+fn float_cells_close(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if a == "NULL" || b == "NULL" {
+        return false;
+    }
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => floats_close(x, y),
+        _ => false,
+    }
+}
+
 fn normalize_text(text: &str) -> Vec<Vec<String>> {
     text.lines()
         .filter(|l| !l.is_empty())
@@ -514,6 +584,69 @@ mod tests {
         let a = vec![vec!["1.0".into()]];
         let b = vec![vec!["1.01".into()]]; // 1% > 0.1%
         assert!(!rows_equal(&a, &b));
+    }
+
+    #[test]
+    fn ordered_float_tolerance_matches_near_values() {
+        use datafusion::arrow::array::Float64Array;
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ratio", DataType::Float64, false),
+        ]));
+        let mk = |id: i64, ratio: f64| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(datafusion::arrow::array::Int64Array::from(vec![id])),
+                    Arc::new(Float64Array::from(vec![ratio])),
+                ],
+            )
+            .unwrap()
+        };
+        let a = vec![mk(1, 2.934e-3)];
+        let b = vec![mk(1, 2.935e-3)];
+        assert!(batches_equal_ordered(&a, &b));
+    }
+
+    #[test]
+    fn ordered_decimal_stays_exact() {
+        use datafusion::arrow::array::{ArrayRef, Decimal128Array};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amt",
+            DataType::Decimal128(15, 2),
+            false,
+        )]));
+        let mk = |v: i128| {
+            let arr: ArrayRef = Arc::new(
+                Decimal128Array::from(vec![v])
+                    .with_precision_and_scale(15, 2)
+                    .unwrap(),
+            );
+            RecordBatch::try_new(schema.clone(), vec![arr]).unwrap()
+        };
+        // 1.00 vs 1.01 as decimal — must NOT match under float eps.
+        assert!(!batches_equal_ordered(&[mk(100)], &[mk(101)]));
+        assert!(batches_equal_ordered(&[mk(100)], &[mk(100)]));
+    }
+
+    #[test]
+    fn ordered_row_order_matters() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mk = |ids: Vec<i64>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids))]).unwrap()
+        };
+        assert!(!batches_equal_ordered(&[mk(vec![1, 2])], &[mk(vec![2, 1])]));
+        assert!(batches_equal_ordered(&[mk(vec![1, 2])], &[mk(vec![1, 2])]));
     }
 
     #[test]

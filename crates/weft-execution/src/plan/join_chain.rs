@@ -84,6 +84,7 @@ struct ChainStep<'a> {
     right: SimpleScan<'a>,
     left_key: Expr,
     right_key: Expr,
+    residual_filter: Option<Expr>,
     join_type: JoinType,
 }
 
@@ -194,7 +195,7 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
             LogicalPlan::Filter(f) => walk(f.input.as_ref()),
             LogicalPlan::Join(j) => {
                 supported_shuffle_join_type(j.join_type)?;
-                let (left_key, right_key) = single_equijoin_key(j)?;
+                let (left_key, right_key, residual_filter) = single_equijoin_key(j)?;
                 let right = simple_table_scan(j.right.as_ref())?;
                 match simple_table_scan(j.left.as_ref()) {
                     Ok(leftmost) => Ok((
@@ -203,6 +204,7 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
                             right,
                             left_key,
                             right_key,
+                            residual_filter,
                             join_type: j.join_type,
                         }],
                     )),
@@ -212,6 +214,7 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
                             right,
                             left_key,
                             right_key,
+                            residual_filter,
                             join_type: j.join_type,
                         });
                         Ok((leftmost, steps))
@@ -227,22 +230,24 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
     walk(lp)
 }
 
-fn single_equijoin_key(join: &datafusion::logical_expr::Join) -> Result<(Expr, Expr)> {
-    match join.on.as_slice() {
-        [(l, r)] => {
-            if join.filter.is_some() {
-                return Err(Error::Unsupported(
-                    "auto-distribute: shuffle join with non-equi filter not yet supported".into(),
-                ));
-            }
-            Ok((l.clone(), r.clone()))
-        }
+fn single_equijoin_key(
+    join: &datafusion::logical_expr::Join,
+) -> Result<(Expr, Expr, Option<Expr>)> {
+    let key = match join.on.as_slice() {
+        [(l, r)] => Ok((l.clone(), r.clone(), join.filter.clone())),
         [] => equijoin_from_filter(join.filter.as_ref()),
         _ => Err(Error::Unsupported(format!(
             "auto-distribute: shuffle join supports a single equijoin key, found {}",
             join.on.len()
         ))),
+    }?;
+    if key.2.is_some() && join.join_type != JoinType::Inner {
+        return Err(Error::Unsupported(
+            "auto-distribute: residual filters on outer/semi/anti shuffle joins are not supported"
+                .into(),
+        ));
     }
+    Ok(key)
 }
 
 fn flat_col(alias: &str, col: &str) -> String {
@@ -316,6 +321,41 @@ fn flatten_expr(e: &Expr, alias_by_relation: &HashMap<String, String>) -> Expr {
                             alias, &c.name,
                         ))));
                     }
+                }
+            }
+            Ok(Transformed::no(node))
+        })
+        .map(|t| t.data)
+        .unwrap_or(e.clone())
+}
+
+/// Rewrite a logical join residual for the physical names used by a pairwise chain stage.
+///
+/// Columns already carried by the left intermediate and columns from the current shuffled right
+/// input are flattened; pending replicated inputs remain ordinary qualified table columns.
+fn flatten_join_residual(
+    e: &Expr,
+    alias_by_relation: &HashMap<String, String>,
+    right_alias: &str,
+    replicated_aliases: &[String],
+) -> Expr {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    e.clone()
+        .transform(|node| {
+            if let Expr::Column(c) = &node {
+                if let Some(rel) = &c.relation {
+                    let relation = rel.table();
+                    let alias = alias_by_relation
+                        .get(relation)
+                        .map(String::as_str)
+                        .unwrap_or(relation);
+                    let rewritten = if replicated_aliases.iter().any(|raw| raw == alias) {
+                        datafusion::common::Column::new(Some(alias), c.name.clone())
+                    } else {
+                        let stage_alias = if alias == right_alias { "r" } else { "l" };
+                        datafusion::common::Column::new(Some(stage_alias), flat_col(alias, &c.name))
+                    };
+                    return Ok(Transformed::yes(Expr::Column(rewritten)));
                 }
             }
             Ok(Transformed::no(node))
@@ -427,6 +467,10 @@ fn build_chain(
         let join_kw = sql_join_keyword(step.join_type)?;
         let mut join_from =
             format!("FROM shuffle_input_0 AS l {join_kw} shuffle_input_1 AS r ON {on_sql}");
+        let replicated_aliases: Vec<String> = pending_bcast
+            .iter()
+            .map(|&bi| scan_alias(&steps[bi].right).to_string())
+            .collect();
         for &bi in &pending_bcast {
             let b = &steps[bi];
             let b_alias = scan_alias(&b.right);
@@ -448,6 +492,27 @@ fn build_chain(
             }
             alias_by_relation.insert(b.right.table.to_string(), b_alias.to_string());
             alias_by_relation.insert(b_alias.to_string(), b_alias.to_string());
+        }
+
+        let up = Unparser::default();
+        let residual_sql = pending_bcast
+            .iter()
+            .filter_map(|&bi| steps[bi].residual_filter.as_ref())
+            .chain(step.residual_filter.iter())
+            .map(|residual| {
+                expr_sql(
+                    &up,
+                    &flatten_join_residual(
+                        residual,
+                        &alias_by_relation,
+                        &right_alias,
+                        &replicated_aliases,
+                    ),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !residual_sql.is_empty() {
+            join_from.push_str(&format!(" WHERE {}", residual_sql.join(" AND ")));
         }
         pending_bcast.clear();
 

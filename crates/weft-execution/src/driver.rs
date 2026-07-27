@@ -288,14 +288,33 @@ pub async fn run_stages_obs(
     // Producer / intermediate stages: one invocation per worker endpoint (each runs local SQL
     // and hash-partitions into `num_partitions` buckets). Rendezvous hashing applies to the
     // output stage only.
+    //
+    // A `Forward` producer (a replicated-only UNION/aggregation arm — see
+    // `stage_planner::reject_unsafe_broadcast_shapes`/`try_split_broadcast_union`) is run on
+    // exactly the first worker instead of every worker: every worker holds the *same* full copy
+    // of a replicated-only arm's data, so running it on all of them and hash-partitioning each
+    // worker's identical output would land every worker's copy in the same target bucket(s),
+    // multiplying that arm's contribution by the worker count once a downstream combine stage
+    // sums the buckets back together. Downstream consumers still list every worker as an
+    // upstream endpoint for this stage id (`stage_ticket`'s shared `upstream_endpoints`), but
+    // workers that never produced it simply have no cache entry and `read_shuffle` serves them
+    // an empty bucket rather than erroring — so a single real producer is sufficient.
     for stage in stages.iter().filter(|s| s.stage_id != output.stage_id) {
         ensure_stable_membership(&cluster, &planned_workers)?;
         let np = cluster.num_partitions;
         let mut futs = Vec::new();
-        for (i, endpoint) in cluster.workers.iter().enumerate() {
+        let producers: Vec<(usize, String)> = if stage.exchange == ExchangeMode::Forward {
+            let first = cluster.workers.first().cloned().ok_or_else(|| {
+                Error::Execution("forward producer stage requires at least one worker".into())
+            })?;
+            vec![(0, first)]
+        } else {
+            cluster.workers.iter().cloned().enumerate().collect()
+        };
+        for (i, endpoint) in producers {
             let ticket = stage_ticket(stage, i as u32, np, &cluster, true);
             let membership = cluster.membership.clone();
-            let ep = endpoint.clone();
+            let ep = endpoint;
             let host = ep
                 .trim_start_matches("http://")
                 .trim_start_matches("https://")

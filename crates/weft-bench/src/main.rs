@@ -676,24 +676,61 @@ async fn run_correctness_distributed(_rows: usize) {
         .expect("register");
 
     let mut endpoints = Vec::new();
-    for (i, (start, end)) in [(0, N / 2), (N / 2, N)].iter().enumerate() {
-        let port = 50680 + i as u16;
+    let mut ports = Vec::new();
+    for (start, end) in [(0, N / 2), (N / 2, N)] {
+        // Ephemeral bind avoids fixed-port collisions with earlier CI steps (tpch/tpcds
+        // leave TIME_WAIT on 506xx) and with parallel local runs.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
         let e = Arc::new(Engine::new());
-        e.register_batches("t", vec![make_batch(*start, *end)])
+        e.register_batches("t", vec![make_batch(start, end)])
             .unwrap();
         let ee = e.clone();
         tokio::spawn(async move {
             let _ = serve_worker(port, ee).await;
         });
+        ports.push(port);
         endpoints.push(format!("http://127.0.0.1:{port}"));
     }
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    for port in &ports {
+        let mut ok = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", *port))
+                .await
+                .is_ok()
+            {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ok, "correctness worker did not bind on port {port}");
+    }
     let cluster = Cluster::new(endpoints);
 
     let sql = "SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t GROUP BY k ORDER BY k";
     let single = normalize(&engine.sql(sql).await.expect("single"));
     let dq = plan_distributed(&engine, sql, &[]).await.expect("plan");
-    let dist = normalize(&run_stages(&cluster, &dq.stages).await.expect("dist"));
+    // Retry transient connect races (worker accepted TCP but Flight not ready yet).
+    let mut dist_batches = None;
+    let mut last_err = None;
+    for _ in 0..30 {
+        match run_stages(&cluster, &dq.stages).await {
+            Ok(b) => {
+                dist_batches = Some(b);
+                break;
+            }
+            Err(e) if e.to_string().contains("connect") => {
+                last_err = Some(e.to_string());
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("dist: {e}"),
+        }
+    }
+    let dist = normalize(
+        &dist_batches.unwrap_or_else(|| panic!("dist connect retries exhausted: {last_err:?}")),
+    );
     if single != dist {
         eprintln!("FAIL: {} vs {} rows", single.len(), dist.len());
         std::process::exit(1);

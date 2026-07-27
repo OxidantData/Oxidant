@@ -252,6 +252,16 @@ impl Worker {
                     .map_err(|e| Status::internal(e.to_string()))?;
                 input.extend(part);
             }
+            // A `Forward`-mode upstream (a replicated-only UNION/aggregation arm — see
+            // `stage_planner::try_split_broadcast_union`) runs on exactly one worker; every other
+            // worker listed in `upstream_endpoints` has no cache entry for that stage, so its
+            // `do_get` round-trips a placeholder batch with an unknown (zero-field) schema rather
+            // than the stage's real schema (see `Worker::read_shuffle` / `do_get_batches_once`).
+            // Once at least one batch carries the real schema, drop those schema-less
+            // placeholders so `register_batches` doesn't see mismatched Arrow schemas.
+            if input.len() > 1 && input.iter().any(|b| !b.schema().fields().is_empty()) {
+                input.retain(|b| !b.schema().fields().is_empty());
+            }
             let name = if single {
                 SHUFFLE_INPUT_TABLE.to_string()
             } else {

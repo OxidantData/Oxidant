@@ -742,7 +742,7 @@ async fn scalar_subquery_over_replicated_dim() {
 }
 
 #[tokio::test]
-async fn subquery_over_unreplicated_table_is_rejected() {
+async fn subquery_over_unreplicated_table_materializes_dim() {
     let single = Engine::new();
     single
         .register_batches("t", vec![batch(0, 60, 12)])
@@ -752,12 +752,19 @@ async fn subquery_over_unreplicated_table_is_rejected() {
         .logical_plan("SELECT k, SUM(v) AS sv FROM t WHERE k IN (SELECT d_key FROM dim) GROUP BY k")
         .await
         .unwrap();
-    // Shape-only: runtime `plan_distributed` may Forward-fallback; assert the splitter rejects.
-    let err = plan_distributed_logical(&lp, &[] /* dim not replicated */);
-    let msg = format!("{}", err.expect_err("must reject unreplicated subquery"));
+    // Dim is not in the replicated set, so the planner gathers it into a stage and rewrites the
+    // IN-subquery against `shuffle_input_N` rather than declining.
+    let dq = plan_distributed_logical(&lp, &[] /* dim not replicated */)
+        .expect("unreplicated dim subquery should materialize");
     assert!(
-        msg.contains("replicated") || msg.contains("subquery"),
-        "expected subquery/replicated rejection, got: {msg}"
+        dq.stages
+            .iter()
+            .any(|s| s.sql.contains("__weft_subquery_gate") || s.sql.contains("FROM dim")),
+        "expected a dim gather / subquery-gate stage, got: {dq:?}"
+    );
+    assert!(
+        dq.stages.iter().any(|s| s.sql.contains("shuffle_input_")),
+        "final stage must read the materialized dim via shuffle_input: {dq:?}"
     );
 }
 
@@ -779,6 +786,37 @@ async fn two_sharded_tables_shuffle_join_plans() {
         "two-sharded shuffle join should auto-derive: {plan:?}"
     );
     assert_eq!(plan.unwrap().stages.len(), 4);
+}
+
+#[tokio::test]
+async fn shuffle_join_conjunction_keeps_residual_in_stage_sql() {
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 60, 12)])
+        .unwrap();
+    single.register_batches("dim", vec![dim(12)]).unwrap();
+    let lp = single
+        .logical_plan(
+            "SELECT d.d_key, COUNT(*) \
+             FROM t JOIN dim d ON t.k = d.d_key AND t.v > d.d_name \
+             GROUP BY d.d_key",
+        )
+        .await
+        .unwrap();
+
+    let dq = plan_distributed_logical(&lp, &[])
+        .expect("equality plus residual predicate should plan as a shuffle join");
+    let join_stage = dq
+        .stages
+        .iter()
+        .find(|stage| stage.upstream_stage_ids.len() == 2)
+        .expect("shuffle plan should contain a two-input join stage");
+
+    assert!(
+        join_stage.sql.contains(" WHERE "),
+        "residual predicate must remain as a post-join filter: {}",
+        join_stage.sql
+    );
 }
 
 /// Flattened leaf schemas matching `leaf_stage_sql` output (`alias__col`).
@@ -976,7 +1014,7 @@ async fn full_then_inner_chain_coalesces_carried_join_key() {
 }
 
 #[tokio::test]
-async fn subquery_over_sharded_table_is_rejected() {
+async fn subquery_over_sharded_table_gathers_fact() {
     let single = Engine::new();
     single
         .register_batches("t", vec![batch(0, 60, 12)])
@@ -987,11 +1025,20 @@ async fn subquery_over_sharded_table_is_rejected() {
         )
         .await
         .unwrap();
-    let err = plan_distributed_logical(&lp, &[]);
-    let msg = format!("{}", err.expect_err("must reject sharded self-subquery"));
+    // Self-subquery over the sharded fact needs a gather-to-partition-0 rewrite so every
+    // worker sees the full `t` when evaluating the IN list.
+    let dq = plan_distributed_logical(&lp, &[]).expect("sharded self-subquery should gather");
     assert!(
-        msg.contains("scanned") || msg.contains("broadcast-safe") || msg.contains("subquery"),
-        "expected sharded-subquery rejection, got: {msg}"
+        dq.stages
+            .iter()
+            .any(|s| s.sql.contains("__weft_materialize_gate") || s.sql.contains("gathered_fact")),
+        "expected gather/materialize stages, got: {dq:?}"
+    );
+    assert!(
+        dq.stages
+            .iter()
+            .any(|s| s.sql.contains("shuffle_input_") && s.sql.contains("IN (")),
+        "final stage must evaluate the IN-subquery against gathered shuffle input: {dq:?}"
     );
 }
 
@@ -1100,7 +1147,7 @@ async fn window_without_partition_by_is_rejected() {
 }
 
 #[tokio::test]
-async fn row_number_window_is_rejected() {
+async fn row_number_window_gathers_then_ranks() {
     let single = Engine::new();
     single
         .register_batches("t", vec![batch(0, 60, 12)])
@@ -1109,10 +1156,13 @@ async fn row_number_window_is_rejected() {
         .logical_plan("SELECT k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn FROM t")
         .await
         .unwrap();
-    let err = plan_distributed_logical(&lp, &[]);
-    let msg = format!("{}", err.expect_err("ROW_NUMBER must be rejected"));
+    // Ranking windows need global order within each partition, so the planner gathers the
+    // sharded fact and applies ROW_NUMBER on the combined input.
+    let dq = plan_distributed_logical(&lp, &[]).expect("ROW_NUMBER should gather then rank");
     assert!(
-        msg.contains("window") || msg.contains("ORDER BY") || msg.contains("ROW_NUMBER"),
-        "expected ranking window rejection, got: {msg}"
+        dq.stages.iter().any(|s| {
+            s.sql.to_lowercase().contains("row_number()") && s.sql.contains("shuffle_input_")
+        }),
+        "ranking stage must run ROW_NUMBER over gathered shuffle input: {dq:?}"
     );
 }
