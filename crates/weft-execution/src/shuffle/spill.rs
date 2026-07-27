@@ -59,6 +59,25 @@ impl SpillStore {
         Some(store)
     }
 
+    /// Spill when the in-memory bucket footprint reaches `memory_limit_bytes` (threshold policy,
+    /// not force-all). Writes under `root` (created if missing). Prefer this in tests over
+    /// process-global `WEFT_*` env so concurrent suites cannot poison each other.
+    pub fn with_memory_limit(root: impl Into<PathBuf>, memory_limit_bytes: usize) -> Result<Self> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)
+            .map_err(|e| Error::Io(format!("spill create {}: {e}", root.display())))?;
+        Ok(Self {
+            root,
+            force_spill: false,
+            memory_limit_bytes: Some(memory_limit_bytes.max(1)),
+        })
+    }
+
+    /// Directory where this store writes `stage_*_part_*.arrow` files.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn path(&self, stage_id: u32, partition: u32) -> PathBuf {
         self.root
             .join(format!("stage_{stage_id}_part_{partition}.arrow"))
@@ -321,6 +340,11 @@ fn unique_spill_subdir(base: PathBuf) -> PathBuf {
 
 fn default_spill_root() -> PathBuf {
     unique_spill_subdir(std::env::temp_dir().join("weft-shuffle-spill"))
+}
+
+/// Estimated Arrow footprint of record batches (same metric [`SpillStore`] thresholds use).
+pub fn estimated_batch_bytes(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::get_array_memory_size).sum()
 }
 
 fn estimated_bucket_bytes(buckets: &[Vec<RecordBatch>]) -> usize {

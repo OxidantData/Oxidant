@@ -597,10 +597,14 @@ async fn having_auto_distributes() {
 }
 
 /// Helper: two workers with sharded `t` + full replicated `dim`.
-async fn two_workers_with_dim(base: u16) -> (Cluster, Engine) {
+///
+/// Ephemeral ports, for the same reason [`two_workers`] uses them: a fixed port that another suite
+/// on the runner already holds leaves the workers unbound, and every stage then burns the TCP
+/// connect timeout instead of failing.
+async fn two_workers_with_dim() -> (Cluster, Engine) {
     const N: i64 = 300;
     const G: i64 = 12;
-    let (p0, p1) = (base, base + 1);
+    let (p0, p1) = (ephemeral_port(), ephemeral_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, N / 2, G)]).unwrap();
     e0.register_batches("dim", vec![dim(G)]).unwrap();
@@ -613,6 +617,20 @@ async fn two_workers_with_dim(base: u16) -> (Cluster, Engine) {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
+    for (label, port) in [("w0", p0), ("w1", p1)] {
+        let mut bound = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                bound = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(bound, "{label} did not bind on port {port}");
+    }
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
@@ -632,17 +650,26 @@ async fn run_auto_replicated(
     let dq = plan_distributed(planner, sql, replicated)
         .await
         .expect("plan_distributed");
+    // The workers are already bound by the time we get here, so this only rides out the brief
+    // window before they accept. Keep the last error: swallowing it turned one CI failure into
+    // thirty minutes of retries reporting nothing but "never succeeded".
     let mut out = None;
-    for _ in 0..150 {
+    let mut last_err = None;
+    for _ in 0..20 {
         match run_stages(cluster, &dq.stages).await {
             Ok(b) => {
                 out = Some(b);
                 break;
             }
-            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
     }
-    let gathered = out.expect("distributed run never succeeded");
+    let gathered = out.unwrap_or_else(|| {
+        panic!("distributed run never succeeded; last error: {last_err:?}");
+    });
     match &dq.finalize_sql {
         None => gathered,
         Some(fsql) => {
@@ -656,7 +683,7 @@ async fn run_auto_replicated(
 #[tokio::test]
 async fn in_subquery_over_replicated_dim() {
     let sql = "SELECT k, SUM(v) AS sv FROM t WHERE k IN (SELECT d_key FROM dim WHERE d_name >= 0) GROUP BY k";
-    let (cluster, planner) = two_workers_with_dim(50661).await;
+    let (cluster, planner) = two_workers_with_dim().await;
     let expected = planner.sql(sql).await.unwrap();
     let actual = run_auto_replicated(&cluster, &planner, sql, &["dim"]).await;
     assert_eq!(
@@ -671,7 +698,7 @@ async fn exists_subquery_over_replicated_dim() {
     let sql = "SELECT k, SUM(v) AS sv FROM t \
                WHERE EXISTS (SELECT 1 FROM dim d WHERE d.d_key = t.k AND d.d_name >= 0) \
                GROUP BY k";
-    let (cluster, planner) = two_workers_with_dim(50671).await;
+    let (cluster, planner) = two_workers_with_dim().await;
     let expected = planner.sql(sql).await.unwrap();
     let actual = run_auto_replicated(&cluster, &planner, sql, &["dim"]).await;
     assert_eq!(
@@ -685,7 +712,7 @@ async fn exists_subquery_over_replicated_dim() {
 async fn scalar_subquery_over_replicated_dim() {
     let sql = "SELECT k, SUM(v) AS sv FROM t \
                WHERE v > (SELECT AVG(d_name) FROM dim) GROUP BY k";
-    let (cluster, planner) = two_workers_with_dim(50681).await;
+    let (cluster, planner) = two_workers_with_dim().await;
     let expected = planner.sql(sql).await.unwrap();
     let actual = run_auto_replicated(&cluster, &planner, sql, &["dim"]).await;
     assert_eq!(
