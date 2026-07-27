@@ -58,6 +58,8 @@ pub struct Worker {
     engine: Arc<Engine>,
     stage_outputs: StageCache,
     spill: Option<SpillStore>,
+    /// When true, `clear_stages` leaves on-disk spill files (tests asserting spill happened).
+    keep_spill: bool,
     task_slots: usize,
     active_tasks: Arc<Mutex<usize>>,
     last_task_status: Arc<Mutex<Option<Vec<u8>>>>,
@@ -80,10 +82,31 @@ impl Worker {
             engine,
             stage_outputs: Arc::new(Mutex::new(HashMap::new())),
             spill,
+            keep_spill: false,
             task_slots: worker_task_slots(),
             active_tasks: Arc::new(Mutex::new(0)),
             last_task_status: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Wrap an engine with an explicit spill store (tests / custom budgets).
+    pub fn with_spill(engine: Arc<Engine>, spill: SpillStore) -> Self {
+        Self {
+            engine,
+            stage_outputs: Arc::new(Mutex::new(HashMap::new())),
+            spill: Some(spill),
+            keep_spill: false,
+            task_slots: worker_task_slots(),
+            active_tasks: Arc::new(Mutex::new(0)),
+            last_task_status: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Like [`with_spill`], but leave spill files on disk after stage eviction (mixture assertions).
+    pub fn with_spill_keep(engine: Arc<Engine>, spill: SpillStore) -> Self {
+        let mut w = Self::with_spill(engine, spill);
+        w.keep_spill = true;
+        w
     }
 
     /// Whether shuffle spilling is active on this worker.
@@ -92,11 +115,12 @@ impl Worker {
     }
 
     fn clear_stages(&self) {
-        // Tests may set `WEFT_KEEP_SHUFFLE_SPILL=1` to inspect spill files after the query;
-        // production always clears on-disk buckets with the in-memory stage cache.
-        let keep_spill = std::env::var("WEFT_KEEP_SHUFFLE_SPILL")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        // Tests may set `WEFT_KEEP_SHUFFLE_SPILL=1` or construct via [`with_spill_keep`] to inspect
+        // spill files after the query; production always clears on-disk buckets with the cache.
+        let keep_spill = self.keep_spill
+            || std::env::var("WEFT_KEEP_SHUFFLE_SPILL")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         if let Some(spill) = &self.spill {
             if !keep_spill {
                 let guard = self.stage_outputs.lock().expect("stage cache poisoned");
@@ -504,11 +528,30 @@ impl FlightService for Worker {
 
 /// Serve a worker on `0.0.0.0:port` until the process exits.
 pub async fn serve_worker(port: u16, engine: Arc<Engine>) -> Result<()> {
+    serve_flight_worker(port, Worker::new(engine)).await
+}
+
+/// Serve a worker constructed with an explicit spill store (threshold / mixture tests).
+pub async fn serve_worker_with_spill(
+    port: u16,
+    engine: Arc<Engine>,
+    spill: SpillStore,
+    keep_spill: bool,
+) -> Result<()> {
+    let worker = if keep_spill {
+        Worker::with_spill_keep(engine, spill)
+    } else {
+        Worker::with_spill(engine, spill)
+    };
+    serve_flight_worker(port, worker).await
+}
+
+async fn serve_flight_worker(port: u16, worker: Worker) -> Result<()> {
     let addr = format!("0.0.0.0:{port}")
         .parse()
         .map_err(|e| Error::Io(format!("bad worker addr: {e}")))?;
     tonic::transport::Server::builder()
-        .add_service(FlightServiceServer::new(Worker::new(engine)))
+        .add_service(FlightServiceServer::new(worker))
         .serve(addr)
         .await
         .map_err(|e| Error::Io(format!("worker serve: {e}")))?;
@@ -837,7 +880,9 @@ mod tests {
 
     #[test]
     fn worker_enables_shuffle_spill_from_memory_limit_env() {
-        std::env::set_var("WEFT_MEMORY_LIMIT_BYTES", "4096");
+        // Use a budget large enough that a racing Engine::new() in another test is not
+        // starved (4 KiB previously poisoned parallel DF pools). Spill policy still enables.
+        std::env::set_var("WEFT_MEMORY_LIMIT_BYTES", "67108864");
         let worker = Worker::new(Arc::new(Engine::new()));
         assert!(worker.spill_enabled());
         std::env::remove_var("WEFT_MEMORY_LIMIT_BYTES");
@@ -939,6 +984,51 @@ mod tests {
         // The cached bucket 0 should now be pullable and contain the row.
         let pulled = pull_bucket(endpoint, 0, 0).await.unwrap();
         assert_eq!(pulled.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    }
+
+    #[tokio::test]
+    async fn shuffle_pull_is_non_destructive() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let engine = Arc::new(Engine::new());
+        tokio::spawn(async move {
+            let _ = serve_worker(port, engine).await;
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let ticket = StageTicket {
+            stage_id: 42,
+            partition_id: 0,
+            num_partitions: 1,
+            upstream_endpoints: vec![],
+            stage_sql: "SELECT 7 AS k, 9 AS v".into(),
+            plan_fragment: vec![],
+            hash_key_cols: vec![0],
+            upstream_stage_ids: vec![],
+            produce: true,
+        };
+        for _ in 0..50 {
+            if run_stage_on_worker(endpoint.clone(), ticket.clone())
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let first = pull_bucket(endpoint.clone(), 42, 0).await.unwrap();
+        let second = pull_bucket(endpoint, 42, 0).await.unwrap();
+        assert_eq!(
+            first.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1,
+            "first AQE-style sample pull"
+        );
+        assert_eq!(
+            second.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1,
+            "second pull must still see the bucket (sampling is non-destructive)"
+        );
     }
 
     #[tokio::test]

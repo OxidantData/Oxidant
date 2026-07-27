@@ -48,6 +48,14 @@ pub fn shuffle_partitions(worker_count: usize) -> u32 {
         .unwrap_or(worker_count.max(1) as u32)
 }
 
+/// Expected worker fan-out from `WEFT_WORKER_COUNT` (same env workers use for file sharding).
+pub fn expected_worker_count_from_env() -> Option<usize> {
+    std::env::var("WEFT_WORKER_COUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+}
+
 /// A cluster snapshot for one query: workers + stable partition→owner mapping.
 #[derive(Clone)]
 pub struct Cluster {
@@ -55,6 +63,9 @@ pub struct Cluster {
     pub workers: Vec<String>,
     /// Hash-shuffle partition count (may exceed worker count).
     pub num_partitions: u32,
+    /// When set (or derived from `WEFT_WORKER_COUNT`), the driver hard-fails if the
+    /// visible worker fan-out differs — workers shard files by that modulus.
+    pub expected_worker_count: Option<usize>,
     pub(crate) membership: Arc<dyn ClusterMembership>,
 }
 
@@ -66,6 +77,7 @@ impl Cluster {
         Self {
             workers,
             num_partitions,
+            expected_worker_count: expected_worker_count_from_env(),
             membership,
         }
     }
@@ -77,6 +89,7 @@ impl Cluster {
         Self {
             workers,
             num_partitions,
+            expected_worker_count: expected_worker_count_from_env(),
             membership,
         }
     }
@@ -96,6 +109,21 @@ impl Cluster {
         self.membership
             .owner_of(partition, self.num_partitions)
             .ok_or_else(|| Error::Execution(format!("no owner for partition {partition}")))
+    }
+
+    /// Fail if the visible fan-out disagrees with the workers' file-shard modulus.
+    pub fn check_shard_modulus(&self) -> Result<()> {
+        let Some(expected) = self.expected_worker_count else {
+            return Ok(());
+        };
+        let observed = self.worker_count();
+        if observed != expected {
+            return Err(Error::Execution(format!(
+                "driver worker fan-out ({observed}) does not match WEFT_WORKER_COUNT ({expected}); \
+                 workers shard files as i-of-{expected}, so continuing would silently drop data"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -214,7 +242,10 @@ pub async fn run_stages_obs(
     let lineage = Arc::new(StageLineage::new());
     let stage_map: HashMap<u32, StageDef> =
         stages.iter().map(|s| (s.stage_id, s.clone())).collect();
-    let mut cluster = cluster.clone();
+    let cluster = cluster.clone();
+    // Freeze the planning snapshot for this query: never reshape partitions from membership.
+    let planned_workers = cluster.workers.clone();
+    cluster.check_shard_modulus()?;
     let consumed: HashSet<u32> = stages
         .iter()
         .flat_map(|s| s.upstream_stage_ids.iter().copied())
@@ -258,7 +289,7 @@ pub async fn run_stages_obs(
     // and hash-partitions into `num_partitions` buckets). Rendezvous hashing applies to the
     // output stage only.
     for stage in stages.iter().filter(|s| s.stage_id != output.stage_id) {
-        refresh_cluster_workers(&mut cluster);
+        ensure_stable_membership(&cluster, &planned_workers)?;
         let np = cluster.num_partitions;
         let mut futs = Vec::new();
         for (i, endpoint) in cluster.workers.iter().enumerate() {
@@ -341,26 +372,38 @@ pub async fn run_stages_obs(
             });
         }
         // AQE: sample bucket row counts after producer stage when enabled.
+        // Observability only — never shrink `num_partitions` here. Producers already wrote
+        // `np` buckets; dropping the consumer range to `new_p < np` orphans buckets
+        // `new_p..np-1` (silent row loss). Correct coalesced reads would need the consumer
+        // to pull `p, p+new_p, …` up to the original modulus; until that exists, keep the
+        // planned partition count frozen for the query lifetime.
         if aqe_enabled() {
             let mut counts = vec![0usize; np as usize];
             for p in 0..np {
                 if let Ok(ep) = cluster.owner_endpoint(p) {
+                    // `pull_bucket` clones from the stage cache — sampling is non-destructive.
                     if let Ok(batches) = pull_bucket_with_retry(ep, stage.stage_id, p).await {
                         counts[p as usize] = batches.iter().map(|b| b.num_rows()).sum();
                     }
                 }
             }
             if let Ok(new_p) = coalesced_partitions(cluster.worker_count(), np, &counts) {
-                if new_p < cluster.num_partitions {
+                if new_p < np {
                     if let (Some(ref s), Some(ref op)) = (&store, &operation_id) {
                         s.emit(ExecutionEvent::AqeCoalesced {
                             operation_id: op.clone(),
                             stage_id: stage.stage_id as i32,
-                            old_partitions: cluster.num_partitions,
+                            old_partitions: np,
                             new_partitions: new_p,
                         });
                     }
-                    cluster.num_partitions = new_p;
+                    tracing::info!(
+                        target: "weft.aqe",
+                        stage_id = stage.stage_id,
+                        old_partitions = np,
+                        suggested_partitions = new_p,
+                        "AQE would coalesce shuffle partitions; keeping planned count to avoid orphaning buckets"
+                    );
                 }
             }
         }
@@ -372,7 +415,7 @@ pub async fn run_stages_obs(
     // - else: per-partition rendezvous shuffle read
     let scatter_output = output.upstream_stage_ids.is_empty() && output.hash_key_cols.is_empty();
     let mut out = Vec::new();
-    refresh_cluster_workers(&mut cluster);
+    ensure_stable_membership(&cluster, &planned_workers)?;
     let w = cluster.num_partitions;
     if output.exchange == ExchangeMode::Forward {
         let endpoint =
@@ -646,13 +689,39 @@ fn emit_task_finished(
     }
 }
 
-/// Refresh worker list from live membership (autoscaling between stage barriers).
-fn refresh_cluster_workers(cluster: &mut Cluster) {
-    let fresh = cluster.membership.endpoints();
-    if !fresh.is_empty() && fresh != cluster.workers {
-        cluster.workers = fresh;
-        cluster.num_partitions = shuffle_partitions(cluster.workers.len());
+/// Compare endpoint lists as sets (DNS may reorder; partition ownership uses the snapshot order).
+fn same_endpoint_set(a: &[String], b: &[String]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
+    let mut aa = a.to_vec();
+    let mut bb = b.to_vec();
+    aa.sort();
+    bb.sort();
+    aa == bb
+}
+
+/// At each stage barrier, require the live membership to match the query planning snapshot.
+///
+/// Previously `refresh_cluster_workers` mutated `workers` + `num_partitions` mid-query, which
+/// silently dropped shuffle buckets when the modulus shrank. Transient per-task retries
+/// ([`crate::scheduler::run_stage_with_retry`]) still consult live membership for alternate
+/// endpoints; only the planned fan-out is frozen here. `num_partitions` is never recomputed from
+/// membership (AQE may still coalesce partitions deliberately when enabled).
+fn ensure_stable_membership(cluster: &Cluster, planned_workers: &[String]) -> Result<()> {
+    let fresh = cluster.membership.endpoints();
+    if fresh.is_empty() {
+        return Err(Error::Execution(
+            "cluster membership became empty mid-query; refusing to continue".into(),
+        ));
+    }
+    if !same_endpoint_set(&fresh, planned_workers) {
+        return Err(Error::Execution(format!(
+            "cluster membership changed mid-query: expected {planned_workers:?}, observed {fresh:?}; \
+             refusing to continue to avoid silent shuffle row loss"
+        )));
+    }
+    Ok(())
 }
 
 fn unify_schema(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
@@ -733,5 +802,48 @@ mod tests {
         let cluster = Cluster::new(vec!["a:1".into()]);
         let ticket = stage_ticket(&stage, 0, 1, &cluster, true);
         assert_eq!(ticket.plan_fragment, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn same_endpoint_set_ignores_order() {
+        assert!(same_endpoint_set(
+            &["a".into(), "b".into()],
+            &["b".into(), "a".into()]
+        ));
+        assert!(!same_endpoint_set(&["a".into()], &["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn check_shard_modulus_rejects_mismatch() {
+        let mut cluster = Cluster::new(vec!["http://127.0.0.1:1".into()]);
+        cluster.expected_worker_count = Some(2);
+        let err = cluster.check_shard_modulus().unwrap_err().to_string();
+        assert!(err.contains("WEFT_WORKER_COUNT"));
+        assert!(err.contains("fan-out"));
+    }
+
+    #[test]
+    fn check_shard_modulus_allows_match_and_unset() {
+        let mut cluster = Cluster::new(vec![
+            "http://127.0.0.1:1".into(),
+            "http://127.0.0.1:2".into(),
+        ]);
+        assert!(cluster.check_shard_modulus().is_ok());
+        cluster.expected_worker_count = Some(2);
+        assert!(cluster.check_shard_modulus().is_ok());
+    }
+
+    #[test]
+    fn ensure_stable_membership_rejects_shrink() {
+        let cluster = Cluster::new(vec!["a:1".into(), "b:1".into()]);
+        // Swap in a membership that reports a different set.
+        let mut cluster = cluster;
+        cluster.membership = Arc::new(StaticMembership::new(vec!["a:1".into()]));
+        let err = ensure_stable_membership(&cluster, &["a:1".into(), "b:1".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("membership changed mid-query"));
+        assert!(err.contains("expected"));
+        assert!(err.contains("observed"));
     }
 }
