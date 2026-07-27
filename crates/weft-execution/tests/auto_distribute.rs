@@ -77,6 +77,25 @@ fn ephemeral_port() -> u16 {
     port
 }
 
+/// Block until each worker accepts TCP. `serve_worker` swallows bind errors, so without this a
+/// stolen port turns into a retry loop that only ever reports "never succeeded".
+async fn await_worker_bind(workers: &[(&str, u16)]) {
+    for &(label, port) in workers {
+        let mut ok = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ok, "{label} did not bind on port {port}");
+    }
+}
+
 async fn two_workers(_base: u16) -> Cluster2 {
     const N: i64 = 300;
     const G: i64 = 12;
@@ -329,7 +348,7 @@ async fn two_sharded_tables_auto_shuffle_join() {
         .unwrap()
     }
 
-    let (p0, p1) = (50631u16, 50632u16);
+    let (p0, p1) = (ephemeral_port(), ephemeral_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
     e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)])
@@ -344,6 +363,7 @@ async fn two_sharded_tables_auto_shuffle_join() {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
@@ -358,14 +378,23 @@ async fn two_sharded_tables_auto_shuffle_join() {
         dq.stages.len()
     );
     let mut gathered = None;
+    let mut last_err = None;
     for _ in 0..150 {
-        if let Ok(b) = run_stages(&cluster, &dq.stages).await {
-            gathered = Some(b);
-            break;
+        match run_stages(&cluster, &dq.stages).await {
+            Ok(b) => {
+                gathered = Some(b);
+                break;
+            }
+            Err(e) => last_err = Some(e.to_string()),
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let actual = gathered.expect("distributed shuffle join never succeeded");
+    let actual = gathered.unwrap_or_else(|| {
+        panic!(
+            "distributed shuffle join never succeeded; last error: {}",
+            last_err.as_deref().unwrap_or("<none>")
+        )
+    });
     assert_eq!(
         sorted_lines(&actual),
         sorted_lines(&expected),
@@ -617,20 +646,7 @@ async fn two_workers_with_dim() -> (Cluster, Engine) {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
-    for (label, port) in [("w0", p0), ("w1", p1)] {
-        let mut bound = false;
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                bound = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(bound, "{label} did not bind on port {port}");
-    }
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
@@ -863,20 +879,7 @@ async fn two_sharded_tables_left_outer_shuffle_join() {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
-    for (label, port) in [("w0", p0), ("w1", p1)] {
-        let mut ok = false;
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                ok = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(ok, "{label} did not bind on port {port}");
-    }
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
