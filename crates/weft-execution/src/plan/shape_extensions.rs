@@ -5,15 +5,16 @@
 //!
 //! - **Subquery safety**: IN / EXISTS / scalar subqueries are only legal over **replicated**
 //!   tables (broadcast-correct); sharded-table subqueries stay rejected by scan counting.
-//! - **UNION ALL** of two (or more) distributable aggregations.
+//! - **UNION ALL** / **UNION** (distinct) / **INTERSECT** / **EXCEPT** of distributable arms
+//!   (branch stages + hash-shuffle co-location, then local set / dedup).
 //! - **Narrow windows**: aggregate `OVER (PARTITION BY …)` over one sharded table (shuffle by
 //!   partition key, then compute locally). Ranking / global windows stay Unsupported.
-//! - Explicit **Unsupported** messages for unsupported window shapes and `UNION` (distinct).
+//! - Explicit **Unsupported** messages for unsupported window / distinct shapes.
 
 use std::collections::HashMap;
 
 use datafusion::logical_expr::expr::{WindowFunction, WindowFunctionDefinition};
-use datafusion::logical_expr::{Expr, LogicalPlan, Union, Window};
+use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Union, Window};
 use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
 
@@ -375,26 +376,121 @@ fn strip_alias(e: &Expr) -> &Expr {
     }
 }
 
-/// lower it; otherwise `Ok(None)` so the caller falls through to the aggregation path.
+/// Set ops / distinct: `UNION ALL`, `UNION` (distinct), `INTERSECT` / `EXCEPT` (as semi/anti),
+/// and a top-level `DISTINCT` over a distributable aggregation. Otherwise `Ok(None)`.
 pub(crate) fn try_union_all(
     lp: &LogicalPlan,
     replicated: &[&str],
 ) -> Result<Option<DistributedQuery>> {
     let (inner, sort, limit) = peek_sort_limit(lp);
-    match inner {
-        LogicalPlan::Distinct(d) => {
-            if matches!(d.input().as_ref(), LogicalPlan::Union(_)) {
-                return Err(Error::Unsupported(
-                    "auto-distribute: UNION (distinct) is not supported — use UNION ALL, \
-                     or fall back to local execution"
-                        .into(),
-                ));
-            }
-            Ok(None)
+    // Strip projections / aliases so `SELECT … FROM (… UNION …) alias` still matches.
+    let mut inner = inner;
+    loop {
+        match inner {
+            LogicalPlan::Projection(p) => inner = p.input.as_ref(),
+            LogicalPlan::SubqueryAlias(s) => inner = s.input.as_ref(),
+            LogicalPlan::Filter(f) => inner = f.input.as_ref(),
+            _ => break,
         }
-        LogicalPlan::Union(u) => Ok(Some(plan_union_all(u, replicated, sort, limit)?)),
+    }
+    match inner {
+        LogicalPlan::Distinct(d) => match d.input().as_ref() {
+            LogicalPlan::Union(u) => Ok(Some(plan_union(
+                u,
+                replicated,
+                sort,
+                limit,
+                SetCombine::UnionDistinct,
+            )?)),
+            other => {
+                // `SELECT DISTINCT …` over a distributable aggregation: plan the agg, then
+                // hash-shuffle the full row and dedup locally.
+                if let Ok(peeled) = peel(other) {
+                    if peeled.sort.is_some() || peeled.limit.is_some() {
+                        return Err(Error::Unsupported(
+                            "auto-distribute: DISTINCT over ORDER BY/LIMIT is not supported".into(),
+                        ));
+                    }
+                    let n_cols = other.schema().fields().len() as u32;
+                    if n_cols == 0 {
+                        return Err(Error::Unsupported(
+                            "auto-distribute: DISTINCT over empty schema".into(),
+                        ));
+                    }
+                    let mut dq = aggregation_stages_for(&peeled, replicated)?;
+                    append_full_row_dedup(&mut dq, n_cols, sort, limit)?;
+                    return Ok(Some(dq));
+                }
+                // Non-aggregate DISTINCT (e.g. `SELECT DISTINCT col FROM t WHERE …`): reuse the
+                // scan/forward path, then hash-shuffle full rows and dedup.
+                if let Some(mut dq) = try_non_aggregate(other, replicated)? {
+                    let n_cols = other.schema().fields().len() as u32;
+                    if n_cols == 0 {
+                        return Err(Error::Unsupported(
+                            "auto-distribute: DISTINCT over empty schema".into(),
+                        ));
+                    }
+                    // try_non_aggregate may already have set finalize for sort/limit on `other`;
+                    // outer sort/limit (peeled above Distinct) wins when present.
+                    if sort.is_some() || limit.is_some() {
+                        dq.finalize_sql = build_outer_finalize(sort, limit)?;
+                    }
+                    append_full_row_dedup(&mut dq, n_cols, None, None)?;
+                    return Ok(Some(dq));
+                }
+                Ok(None)
+            }
+        },
+        LogicalPlan::Union(u) => Ok(Some(plan_union(
+            u,
+            replicated,
+            sort,
+            limit,
+            SetCombine::UnionAll,
+        )?)),
+        LogicalPlan::Join(j)
+            if matches!(
+                j.join_type,
+                JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
+            ) =>
+        {
+            // DataFusion lowers INTERSECT/EXCEPT to semi/anti joins. Plan both arms, hash the
+            // full row for co-location, then run INTERSECT/EXCEPT locally.
+            Ok(Some(plan_semi_anti_set_op(j, replicated, sort, limit)?))
+        }
         _ => Ok(None),
     }
+}
+
+#[derive(Clone, Copy)]
+enum SetCombine {
+    UnionAll,
+    UnionDistinct,
+}
+
+/// Hash-partition the last stage on every output column, then `SELECT DISTINCT *`.
+fn append_full_row_dedup(
+    dq: &mut DistributedQuery,
+    n_cols: u32,
+    sort: Option<&[datafusion::logical_expr::SortExpr]>,
+    limit: Option<usize>,
+) -> Result<()> {
+    let last = dq.stages.last_mut().ok_or_else(|| {
+        Error::Unsupported("auto-distribute: DISTINCT has no stages to dedup".into())
+    })?;
+    last.hash_key_cols = (0..n_cols).collect();
+    let dedup_id = last.stage_id.saturating_add(1);
+    let upstream = last.stage_id;
+    dq.stages.push(StageDef::new(
+        dedup_id,
+        "SELECT DISTINCT * FROM shuffle_input".to_string(),
+        vec![upstream],
+        vec![],
+    ));
+    if dq.finalize_sql.is_none() {
+        dq.finalize_sql = build_outer_finalize(sort, limit)?;
+    }
+    Ok(())
 }
 
 /// Reject window / distinct shapes with an explicit message before the generic peel error.
@@ -447,33 +543,38 @@ pub(crate) fn ensure_subquery_tables_replicated(
     Ok(())
 }
 
-fn plan_union_all(
+fn plan_union(
     u: &Union,
     replicated: &[&str],
     sort: Option<&[datafusion::logical_expr::SortExpr]>,
     limit: Option<usize>,
+    combine: SetCombine,
 ) -> Result<DistributedQuery> {
     if u.inputs.len() < 2 {
         return Err(Error::Unsupported(
-            "auto-distribute: UNION ALL needs at least two arms".into(),
+            "auto-distribute: UNION needs at least two arms".into(),
         ));
     }
 
     let mut stages: Vec<StageDef> = Vec::new();
     let mut arm_output_ids: Vec<u32> = Vec::new();
     let mut next_id: u32 = 0;
+    let label = match combine {
+        SetCombine::UnionAll => "UNION ALL",
+        SetCombine::UnionDistinct => "UNION",
+    };
 
     for (arm_i, arm) in u.inputs.iter().enumerate() {
         let peeled = peel(arm).map_err(|e| {
             Error::Unsupported(format!(
-                "auto-distribute: UNION ALL arm {arm_i} is not a distributable aggregation: {e}"
+                "auto-distribute: {label} arm {arm_i} is not a distributable aggregation: {e}"
             ))
         })?;
         // Per-arm ORDER BY / LIMIT under UNION is unexpected (optimizer lifts them); reject rather
         // than silently drop.
         if peeled.sort.is_some() || peeled.limit.is_some() {
             return Err(Error::Unsupported(format!(
-                "auto-distribute: UNION ALL arm {arm_i} has ORDER BY/LIMIT; apply them outside the UNION"
+                "auto-distribute: {label} arm {arm_i} has ORDER BY/LIMIT; apply them outside the UNION"
             )));
         }
         let arm_dq = aggregation_stages_for(&peeled, replicated)?;
@@ -486,7 +587,7 @@ fn plan_union_all(
                 upstream_stage_ids: s
                     .upstream_stage_ids
                     .into_iter()
-                    .map(|u| u + id_offset)
+                    .map(|uid| uid + id_offset)
                     .collect(),
                 hash_key_cols: s.hash_key_cols,
                 exchange: s.exchange,
@@ -494,11 +595,9 @@ fn plan_union_all(
             });
             next_id = next_id.max(new_id + 1);
         }
-        // Last stage of the arm is its output; keep it as an intermediate gather (empty hash →
-        // partition 0) feeding the union stage.
         let arm_out = stages.last().map(|s| s.stage_id).ok_or_else(|| {
             Error::Unsupported(format!(
-                "auto-distribute: UNION ALL arm {arm_i} produced no stages"
+                "auto-distribute: {label} arm {arm_i} produced no stages"
             ))
         })?;
         arm_output_ids.push(arm_out);
@@ -513,13 +612,139 @@ fn plan_union_all(
         parts.join(" UNION ALL ")
     };
 
+    let n_cols = u.schema.fields().len() as u32;
     let union_id = next_id;
-    stages.push(StageDef::new(union_id, union_sql, arm_output_ids, vec![]));
+    match combine {
+        SetCombine::UnionAll => {
+            // Gather (empty hash) — UNION ALL needs no co-location.
+            stages.push(StageDef::new(union_id, union_sql, arm_output_ids, vec![]));
+            Ok(DistributedQuery {
+                stages,
+                finalize_sql: build_outer_finalize(sort, limit)?,
+            })
+        }
+        SetCombine::UnionDistinct => {
+            // Hash-shuffle the concatenated rows on the full output row, then dedup locally.
+            if n_cols == 0 {
+                return Err(Error::Unsupported(
+                    "auto-distribute: UNION distinct over empty schema".into(),
+                ));
+            }
+            stages.push(StageDef::new(
+                union_id,
+                union_sql,
+                arm_output_ids,
+                (0..n_cols).collect(),
+            ));
+            let dedup_id = union_id + 1;
+            stages.push(StageDef::new(
+                dedup_id,
+                "SELECT DISTINCT * FROM shuffle_input".to_string(),
+                vec![union_id],
+                vec![],
+            ));
+            Ok(DistributedQuery {
+                stages,
+                finalize_sql: build_outer_finalize(sort, limit)?,
+            })
+        }
+    }
+}
 
-    let finalize_sql = build_outer_finalize(sort, limit)?;
+/// Plan INTERSECT / EXCEPT when DataFusion has lowered them to a semi/anti join of two arms.
+///
+/// Both sides are planned as independent stage DAGs (same offset trick as UNION). Their outputs
+/// are hash-shuffled on the full row so equal rows co-locate; the final stage runs
+/// `INTERSECT` / `EXCEPT` (or `… ALL`) locally.
+fn plan_semi_anti_set_op(
+    join: &datafusion::logical_expr::Join,
+    replicated: &[&str],
+    sort: Option<&[datafusion::logical_expr::SortExpr]>,
+    limit: Option<usize>,
+) -> Result<DistributedQuery> {
+    let (op_sql, is_all) = match join.join_type {
+        JoinType::LeftSemi | JoinType::RightSemi => {
+            // DISTINCT INTERSECT inserts Distinct on the left before the semi join.
+            let is_all = !matches!(join.left.as_ref(), LogicalPlan::Distinct(_));
+            ("INTERSECT", is_all)
+        }
+        JoinType::LeftAnti | JoinType::RightAnti => {
+            let is_all = !matches!(join.left.as_ref(), LogicalPlan::Distinct(_));
+            ("EXCEPT", is_all)
+        }
+        other => {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: set-op path got unexpected join type {other:?}"
+            )));
+        }
+    };
+    let quant = if is_all { " ALL" } else { "" };
+    let label = format!("{op_sql}{quant}");
+
+    // Strip Distinct wrapper on the left (INTERSECT/EXCEPT DISTINCT).
+    let left_lp = match join.left.as_ref() {
+        LogicalPlan::Distinct(d) => d.input().as_ref(),
+        other => other,
+    };
+    let right_lp = join.right.as_ref();
+
+    let mut stages: Vec<StageDef> = Vec::new();
+    let mut next_id: u32 = 0;
+    let mut arm_outs = Vec::with_capacity(2);
+    for (arm_i, arm) in [left_lp, right_lp].into_iter().enumerate() {
+        let peeled = peel(arm).map_err(|e| {
+            Error::Unsupported(format!(
+                "auto-distribute: {label} arm {arm_i} is not a distributable aggregation: {e}"
+            ))
+        })?;
+        if peeled.sort.is_some() || peeled.limit.is_some() {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: {label} arm {arm_i} has ORDER BY/LIMIT; apply them outside the set op"
+            )));
+        }
+        let arm_dq = aggregation_stages_for(&peeled, replicated)?;
+        let id_offset = next_id;
+        for s in arm_dq.stages {
+            let new_id = s.stage_id + id_offset;
+            stages.push(StageDef {
+                stage_id: new_id,
+                sql: s.sql,
+                upstream_stage_ids: s
+                    .upstream_stage_ids
+                    .into_iter()
+                    .map(|uid| uid + id_offset)
+                    .collect(),
+                hash_key_cols: s.hash_key_cols,
+                exchange: s.exchange,
+                plan_fragment: s.plan_fragment,
+            });
+            next_id = next_id.max(new_id + 1);
+        }
+        let arm_out = stages.last().map(|s| s.stage_id).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "auto-distribute: {label} arm {arm_i} produced no stages"
+            ))
+        })?;
+        // Re-hash arm output on the full row so equal rows from both arms co-locate.
+        let n_cols = arm.schema().fields().len() as u32;
+        if n_cols == 0 {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: {label} arm {arm_i} has empty schema"
+            )));
+        }
+        if let Some(s) = stages.last_mut() {
+            s.hash_key_cols = (0..n_cols).collect();
+        }
+        arm_outs.push(arm_out);
+    }
+
+    let set_sql =
+        format!("SELECT * FROM shuffle_input_0 {op_sql}{quant} SELECT * FROM shuffle_input_1");
+    let set_id = next_id;
+    stages.push(StageDef::new(set_id, set_sql, arm_outs, vec![]));
     Ok(DistributedQuery {
         stages,
-        finalize_sql,
+        finalize_sql: build_outer_finalize(sort, limit)?,
     })
 }
 
@@ -689,7 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn union_distinct_rejected_before_peel() {
+    async fn union_distinct_plans_dedup_stage() {
         let engine = Engine::new();
         engine.register_batches("t", vec![tiny_table()]).unwrap();
         let lp = engine
@@ -699,9 +924,43 @@ mod tests {
             )
             .await
             .unwrap();
-        let err = try_union_all(&lp, &[]).expect_err("UNION distinct");
-        let msg = format!("{err}");
-        assert!(msg.contains("UNION"), "got: {msg}");
+        let dq = try_union_all(&lp, &[])
+            .expect("ok")
+            .expect("UNION distinct should plan");
+        let last = dq.stages.last().expect("stages");
+        assert!(
+            last.sql.to_uppercase().contains("DISTINCT"),
+            "expected dedup stage, got: {}",
+            last.sql
+        );
+        let union_stage = &dq.stages[dq.stages.len() - 2];
+        assert!(
+            !union_stage.hash_key_cols.is_empty(),
+            "union distinct must hash-shuffle full rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn intersect_of_two_aggs_plans() {
+        let engine = Engine::new();
+        engine.register_batches("t", vec![tiny_table()]).unwrap();
+        let lp = engine
+            .logical_plan(
+                "SELECT k FROM t GROUP BY k \
+                 INTERSECT \
+                 SELECT k FROM t WHERE v > 1 GROUP BY k",
+            )
+            .await
+            .unwrap();
+        let dq = try_union_all(&lp, &[])
+            .expect("ok")
+            .expect("INTERSECT should plan");
+        let last = dq.stages.last().expect("stages");
+        assert!(
+            last.sql.to_uppercase().contains("INTERSECT"),
+            "got: {}",
+            last.sql
+        );
     }
 
     #[tokio::test]

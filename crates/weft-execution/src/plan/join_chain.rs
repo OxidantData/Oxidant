@@ -1,14 +1,24 @@
 //! Left-deep shuffle-join chains for two or more sharded tables.
 //!
 //! A single equijoin between exactly two sharded leaf scans reuses the proven two-table path in
-//! [`super::stage_planner`]. Longer chains emit pairwise shuffle stages (intermediate
-//! consume+produce) with flattened column names (`alias__col`), then partial/final aggregate.
+//! [`super::stage_planner`] (**inner only**). Longer chains — and any LEFT / RIGHT / FULL / SEMI /
+//! ANTI equijoin — emit pairwise shuffle stages (intermediate consume+produce) with flattened
+//! column names (`alias__col`), then partial/final aggregate.
+//!
+//! ## Outer / semi / anti correctness
+//!
+//! Both sides of a sharded–sharded equijoin are hash-partitioned on the join key so every key's
+//! rows co-locate on one worker. That is sufficient for:
+//! - **LEFT / RIGHT / FULL OUTER**: null-extension is local to the worker that owns the key;
+//!   unmatched rows never need another worker's partition.
+//! - **SEMI / ANTI**: matching is presence-only and likewise key-local.
+//!
 //! Replicated dimensions that appear in the chain fold into the next shuffle-join stage as
-//! local broadcast joins.
+//! local broadcast joins (always `JOIN`, since the dim is complete on every worker).
 
 use std::collections::HashMap;
 
-use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::logical_expr::{Expr, JoinType, LogicalPlan};
 use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
 
@@ -32,8 +42,10 @@ pub(crate) fn plan_shuffle_join_chain(
         ));
     }
 
-    // Fast path: exactly one join, both sides sharded leaf scans, no other base tables.
+    // Fast path: exactly one *inner* join, both sides sharded leaf scans, no other base tables.
+    // Outer / semi / anti use the general chain builder (same shuffle co-location, different JOIN).
     if steps.len() == 1
+        && steps[0].join_type == JoinType::Inner
         && sharded.len() == 2
         && base_tables(&p.agg.input).len() == 2
         && sharded.contains(&leftmost.table)
@@ -63,6 +75,47 @@ struct ChainStep<'a> {
     right: SimpleScan<'a>,
     left_key: Expr,
     right_key: Expr,
+    join_type: JoinType,
+}
+
+fn supported_shuffle_join_type(jt: JoinType) -> Result<()> {
+    match jt {
+        JoinType::Inner
+        | JoinType::Left
+        | JoinType::Right
+        | JoinType::Full
+        | JoinType::LeftSemi
+        | JoinType::LeftAnti
+        | JoinType::RightSemi
+        | JoinType::RightAnti => Ok(()),
+        other => Err(Error::Unsupported(format!(
+            "auto-distribute: shuffle join type `{other}` is not supported"
+        ))),
+    }
+}
+
+fn sql_join_keyword(jt: JoinType) -> Result<&'static str> {
+    match jt {
+        JoinType::Inner => Ok("JOIN"),
+        JoinType::Left => Ok("LEFT JOIN"),
+        JoinType::Right => Ok("RIGHT JOIN"),
+        JoinType::Full => Ok("FULL OUTER JOIN"),
+        JoinType::LeftSemi => Ok("LEFT SEMI JOIN"),
+        JoinType::LeftAnti => Ok("LEFT ANTI JOIN"),
+        JoinType::RightSemi => Ok("RIGHT SEMI JOIN"),
+        JoinType::RightAnti => Ok("RIGHT ANTI JOIN"),
+        other => Err(Error::Unsupported(format!(
+            "auto-distribute: cannot emit SQL for join type `{other}`"
+        ))),
+    }
+}
+
+/// SEMI / ANTI / mark joins project only one side.
+fn projects_right_side(jt: JoinType) -> bool {
+    matches!(
+        jt,
+        JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+    )
 }
 
 fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<ChainStep<'_>>)> {
@@ -71,12 +124,7 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
             LogicalPlan::Projection(p) => walk(p.input.as_ref()),
             LogicalPlan::Filter(f) => walk(f.input.as_ref()),
             LogicalPlan::Join(j) => {
-                use datafusion::logical_expr::JoinType;
-                if j.join_type != JoinType::Inner {
-                    return Err(Error::Unsupported(
-                        "auto-distribute: only INNER joins in shuffle chains".into(),
-                    ));
-                }
+                supported_shuffle_join_type(j.join_type)?;
                 let (left_key, right_key) = single_equijoin_key(j)?;
                 let right = simple_table_scan(j.right.as_ref())?;
                 match simple_table_scan(j.left.as_ref()) {
@@ -86,6 +134,7 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
                             right,
                             left_key,
                             right_key,
+                            join_type: j.join_type,
                         }],
                     )),
                     Err(_) => {
@@ -94,13 +143,14 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
                             right,
                             left_key,
                             right_key,
+                            join_type: j.join_type,
                         });
                         Ok((leftmost, steps))
                     }
                 }
             }
             other => Err(Error::Unsupported(format!(
-                "auto-distribute: expected left-deep inner join chain, found `{}`",
+                "auto-distribute: expected left-deep equijoin chain, found `{}`",
                 other.display().to_string().lines().next().unwrap_or("")
             ))),
         }
@@ -305,8 +355,9 @@ fn build_chain(
             flat_col(&left_key_alias, &left_key_name),
             flat_col(&right_alias, &right_key_name)
         );
+        let join_kw = sql_join_keyword(step.join_type)?;
         let mut join_from =
-            format!("FROM shuffle_input_0 AS l JOIN shuffle_input_1 AS r ON {on_sql}");
+            format!("FROM shuffle_input_0 AS l {join_kw} shuffle_input_1 AS r ON {on_sql}");
         for &bi in &pending_bcast {
             let b = &steps[bi];
             let b_alias = scan_alias(&b.right);
@@ -317,6 +368,7 @@ fn build_chain(
                 .cloned()
                 .unwrap_or(b_left_rel);
             let b_right_col = column_name(&b.right_key)?;
+            // Replicated dims are complete on every worker — always an inner JOIN fold.
             join_from.push_str(&format!(
                 " JOIN {} AS {b_alias} ON l.{} = {b_alias}.{b_right_col}",
                 b.right.table,
@@ -349,9 +401,19 @@ fn build_chain(
             proj.push(format!("l.{c} AS {c}"));
             new_flats.push(c.clone());
         }
-        for c in &right_flats {
-            proj.push(format!("r.{c} AS {c}"));
-            new_flats.push(c.clone());
+        if projects_right_side(step.join_type) {
+            for c in &right_flats {
+                proj.push(format!("r.{c} AS {c}"));
+                new_flats.push(c.clone());
+            }
+        } else if matches!(step.join_type, JoinType::RightSemi | JoinType::RightAnti) {
+            // Right semi/anti keep the right schema only.
+            proj.clear();
+            new_flats.clear();
+            for c in &right_flats {
+                proj.push(format!("r.{c} AS {c}"));
+                new_flats.push(c.clone());
+            }
         }
         let (hash_alias, hash_col) =
             next_sharded_left_key(steps, i + 1, sharded, &alias_by_relation)
@@ -455,6 +517,18 @@ fn finish_with_aggregate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_join_keyword_covers_outer_and_semi() {
+        assert_eq!(sql_join_keyword(JoinType::Left).unwrap(), "LEFT JOIN");
+        assert_eq!(sql_join_keyword(JoinType::Full).unwrap(), "FULL OUTER JOIN");
+        assert_eq!(
+            sql_join_keyword(JoinType::LeftAnti).unwrap(),
+            "LEFT ANTI JOIN"
+        );
+        assert!(projects_right_side(JoinType::Left));
+        assert!(!projects_right_side(JoinType::LeftSemi));
+    }
 
     #[test]
     fn flat_col_uses_double_underscore_separator() {

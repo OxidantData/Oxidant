@@ -716,6 +716,66 @@ async fn two_sharded_tables_shuffle_join_plans() {
 }
 
 #[tokio::test]
+async fn two_sharded_tables_left_outer_shuffle_join() {
+    // LEFT JOIN + agg over two sharded tables must match single-node (null-extended unmatched keys).
+    const G: i64 = 12;
+    let sql = "SELECT t.k AS k, COUNT(*) AS c, SUM(COALESCE(d.d_name, 0)) AS sv \
+               FROM t LEFT JOIN dim d ON t.k = d.d_key GROUP BY t.k";
+
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 200, G)])
+        .unwrap();
+    // Dim covers only half the keys so LEFT JOIN produces null-extended rows.
+    single
+        .register_batches("dim", vec![dim_shard(G, 0, G / 2)])
+        .unwrap();
+    let expected = single.sql(sql).await.unwrap();
+
+    let (p0, p1) = (50633u16, 50634u16);
+    let e0 = Arc::new(Engine::new());
+    e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
+    e0.register_batches("dim", vec![dim_shard(G, 0, G / 4)])
+        .unwrap();
+    let e1 = Arc::new(Engine::new());
+    e1.register_batches("t", vec![batch(100, 200, G)]).unwrap();
+    e1.register_batches("dim", vec![dim_shard(G, G / 4, G / 2)])
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = serve_worker(p0, e0).await;
+    });
+    tokio::spawn(async move {
+        let _ = serve_worker(p1, e1).await;
+    });
+    let cluster = Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ]);
+
+    let dq = plan_distributed_logical(&single.logical_plan(sql).await.unwrap(), &[])
+        .expect("LEFT JOIN shuffle should plan");
+    assert!(
+        dq.stages.iter().any(|s| s.sql.contains("LEFT JOIN")),
+        "expected LEFT JOIN in stage SQL, stages={:?}",
+        dq.stages.iter().map(|s| &s.sql).collect::<Vec<_>>()
+    );
+    let mut gathered = None;
+    for _ in 0..150 {
+        if let Ok(b) = run_stages(&cluster, &dq.stages).await {
+            gathered = Some(b);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let actual = gathered.expect("distributed LEFT JOIN never succeeded");
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "LEFT JOIN shuffle must equal single-node"
+    );
+}
+
+#[tokio::test]
 async fn subquery_over_sharded_table_is_rejected() {
     let single = Engine::new();
     single
@@ -756,24 +816,42 @@ async fn union_all_of_two_aggs() {
 }
 
 #[tokio::test]
-async fn union_distinct_is_rejected() {
+async fn union_distinct_of_two_aggs() {
+    let sql = "SELECT k, SUM(v) AS sv FROM t GROUP BY k \
+               UNION \
+               SELECT k, SUM(v) AS sv FROM t WHERE v > 50 GROUP BY k";
     let single = Engine::new();
     single
-        .register_batches("t", vec![batch(0, 60, 12)])
+        .register_batches("t", vec![batch(0, 300, 12)])
         .unwrap();
-    let lp = single
-        .logical_plan(
-            "SELECT k, SUM(v) AS sv FROM t GROUP BY k \
-             UNION \
-             SELECT k, SUM(v) AS sv FROM t WHERE v > 10 GROUP BY k",
-        )
-        .await
+    let expected = single.sql(sql).await.unwrap();
+
+    let c2 = two_workers(50692).await;
+    let actual = run_auto(&c2, &single, sql).await;
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "UNION distinct of two aggs must equal single-node"
+    );
+}
+
+#[tokio::test]
+async fn except_of_two_aggs() {
+    let sql = "SELECT k FROM t GROUP BY k \
+               EXCEPT \
+               SELECT k FROM t WHERE v > 100 GROUP BY k";
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 300, 12)])
         .unwrap();
-    let err = plan_distributed_logical(&lp, &[]);
-    let msg = format!("{}", err.expect_err("UNION distinct must be rejected"));
-    assert!(
-        msg.contains("UNION") || msg.contains("distinct"),
-        "expected UNION distinct message, got: {msg}"
+    let expected = single.sql(sql).await.unwrap();
+
+    let c2 = two_workers(50693).await;
+    let actual = run_auto(&c2, &single, sql).await;
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "EXCEPT of two aggs must equal single-node"
     );
 }
 
