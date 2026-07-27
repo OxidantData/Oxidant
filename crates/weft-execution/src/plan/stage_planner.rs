@@ -29,17 +29,20 @@
 //! when each join is a single equijoin key.
 //!
 //! Also supported: ungrouped/global aggregates, `HAVING` over the aggregated result,
-//! scalar / IN / EXISTS subqueries **over replicated tables only**, `UNION ALL` of
-//! distributable aggregations, and **narrow window** support: re-combinable aggregate
+//! scalar / IN / EXISTS subqueries **over replicated tables only**, distributable set operations,
+//! and **narrow window** support: re-combinable aggregate
 //! windows (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`) with a non-empty `PARTITION BY` over one
 //! sharded table (hash-shuffle by the partition key, then compute the window locally).
-//! Ranking windows, global windows (no `PARTITION BY`), and `UNION` (distinct) return an
-//! explicit [`Error::Unsupported`] so the caller falls back to single-node execution.
+//! CTE-heavy outer cross joins are lowered recursively by [`super::dag_splitter`]: each sharded
+//! aggregate branch becomes its own sub-DAG, and a gathered outer stage combines the branch
+//! outputs with any replicated-only inputs.
+//! Ranking windows and global windows (no `PARTITION BY`) return an explicit
+//! [`Error::Unsupported`] so the caller falls back to single-node execution.
 //! Correlated subqueries over sharded tables are rejected (not broadcast-safe).
 
 use std::collections::HashMap;
 
-use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan};
+use datafusion::logical_expr::{Aggregate, Expr, JoinType, LogicalPlan};
 use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
 use weft_loom::Engine;
@@ -81,8 +84,30 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
         return Ok(dq);
     }
     reject_explicit_unsupported(lp)?;
-    let peeled = peel(lp)?;
-    aggregation_stages_for(&peeled, replicated)
+    let dq = match peel(lp) {
+        Ok(peeled) => aggregation_stages_for(&peeled, replicated),
+        Err(linear_error) => match super::dag_splitter::try_branch_dag(lp, replicated)? {
+            Some(dq) => Ok(dq),
+            None => Err(linear_error),
+        },
+    }?;
+    validate_stage_sql(&dq)?;
+    Ok(dq)
+}
+
+/// Last-line check on the SQL every stage will hand to a worker.
+///
+/// Individual shape handlers each splice Unparser output into their own stage SQL, so a
+/// generated-SQL defect has to be caught in each of them or in one place after the fact. This is
+/// that one place — it runs on whatever the chosen path produced.
+fn validate_stage_sql(dq: &DistributedQuery) -> Result<()> {
+    for s in &dq.stages {
+        reject_out_of_scope_join_alias_refs(&s.sql)?;
+    }
+    if let Some(f) = &dq.finalize_sql {
+        reject_out_of_scope_join_alias_refs(f)?;
+    }
+    Ok(())
 }
 
 /// SQL convenience wrapper around [`plan_distributed_logical`].
@@ -116,19 +141,35 @@ pub(crate) struct Peeled<'a> {
     pub(crate) sort: Option<&'a [datafusion::logical_expr::SortExpr]>,
     /// `LIMIT` fetch count, if any.
     pub(crate) limit: Option<usize>,
-    /// `HAVING` predicate over the aggregate output, if any.
-    pub(crate) having: Option<&'a Expr>,
+    /// Post-aggregate (`HAVING`) predicates, outermost first. Every `Filter` above the `Aggregate`
+    /// lands here — see [`peel`].
+    pub(crate) having: Vec<&'a Expr>,
+    /// `Projection`s found *below* the output projection and above the `Aggregate`, which only
+    /// rename the aggregate's output columns. TPC-DS Q21's `SELECT * FROM (SELECT … sum(…) AS
+    /// inv_before … GROUP BY …) x WHERE …` puts one here: the inner subquery aliases the aggregate
+    /// output before the `HAVING` or the outer projection ever names it. Ordered innermost-first so
+    /// [`build_remap`] can fold them in the order the aliases were introduced.
+    pub(crate) alias_projections: Vec<&'a [Expr]>,
     /// The aggregate node itself.
     pub(crate) agg: &'a Aggregate,
 }
 
 /// Strip an optional `Limit` / `Sort` / `Projection` off the top and require an `Aggregate` under
 /// them. Rejects anything else (the caller falls back to single-node).
+///
+/// Every `Filter` crossed on the way down is a post-aggregate predicate: this loop only descends
+/// through `Limit` / `Sort` / `Projection` / `Filter` / `SubqueryAlias`, so if it reaches the
+/// `Aggregate` at all, nothing it passed could have filtered pre-aggregation rows. They are
+/// therefore all collected as `HAVING` rather than matched positionally — an earlier version
+/// required the `Filter` to sit *directly* on the `Aggregate` and silently discarded the predicate
+/// otherwise, which made TPC-DS Q21 (`Filter` → `SubqueryAlias` → `Projection` → `Aggregate`)
+/// return unfiltered rows.
 pub(crate) fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
     let mut limit = None;
     let mut sort = None;
     let mut projection = None;
-    let mut having = None;
+    let mut having = Vec::new();
+    let mut alias_projections: Vec<&[Expr]> = Vec::new();
     let mut node = lp;
     loop {
         match node {
@@ -144,26 +185,31 @@ pub(crate) fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
                 node = &s.input;
             }
             LogicalPlan::Projection(p) => {
-                projection = Some(p.expr.as_slice());
+                // Scanning outer→inner, the first `Projection` is the query's real output
+                // projection. Anything below it only renames aggregate output on the way to the
+                // `Aggregate`, and is folded into the remap instead of replacing the output list.
+                if projection.is_none() {
+                    projection = Some(p.expr.as_slice());
+                } else {
+                    alias_projections.push(p.expr.as_slice());
+                }
                 node = &p.input;
             }
             LogicalPlan::Filter(f) => {
-                if matches!(f.input.as_ref(), LogicalPlan::Aggregate(_)) {
-                    having = Some(f.predicate.as_ref());
-                    node = &f.input;
-                } else {
-                    node = f.input.as_ref();
-                }
+                having.push(f.predicate.as_ref());
+                node = f.input.as_ref();
             }
             LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
             LogicalPlan::Aggregate(agg) => {
+                alias_projections.reverse();
                 return Ok(Peeled {
                     projection,
                     sort,
                     limit,
                     having,
+                    alias_projections,
                     agg,
-                })
+                });
             }
             other => {
                 return Err(Error::Unsupported(format!(
@@ -181,6 +227,7 @@ pub(crate) fn aggregation_stages_for(
     replicated: &[&str],
 ) -> Result<DistributedQuery> {
     let agg = p.agg;
+    reject_grouping_sets(&agg.group_expr)?;
     let tables = base_tables(&agg.input);
     let sharded: Vec<&str> = tables
         .iter()
@@ -208,6 +255,8 @@ pub(crate) fn aggregation_stages_for(
             sharded.len()
         )));
     }
+    let sharded_name = sharded[0];
+    reject_unsafe_broadcast_shapes(&agg.input, sharded_name)?;
     // The aggregate's input must unparse to a plain `SELECT * FROM …` so we can splice our own
     // SELECT list onto its FROM/WHERE tail without losing column qualifiers.
     let input_sql = Unparser::default()
@@ -223,7 +272,6 @@ pub(crate) fn aggregation_stages_for(
     // A second scan — a self-join or a correlated EXISTS/IN subquery over it — would see only the
     // local shard per worker and silently lose cross-shard rows, so reject it. (`base_tables` counts
     // the plan-input scan only; subquery scans live in expressions, so descend into those too.)
-    let sharded_name = sharded[0];
     let scans = count_table_scans(&agg.input, sharded_name);
     if scans > 1 {
         return Err(Error::Unsupported(format!(
@@ -246,14 +294,7 @@ pub(crate) fn aggregation_stages_for(
         .collect::<Result<Vec<_>>>()?;
     let distinct = aggs.iter().any(|a| a.distinct);
 
-    // remap: original output column name -> safe name (`g{j}` group, `r{i}` aggregate result).
-    let mut remap: HashMap<String, String> = HashMap::new();
-    for (j, g) in agg.group_expr.iter().enumerate() {
-        remap.insert(g.schema_name().to_string(), format!("g{j}"));
-    }
-    for (i, a) in agg.aggr_expr.iter().enumerate() {
-        remap.insert(a.schema_name().to_string(), format!("r{i}"));
-    }
+    let remap = build_remap(p);
 
     let (partial_sql, final_sql) = if distinct {
         distinct_stage_sql(&up, p, &group_sql, &aggs, &tail, &remap)?
@@ -285,6 +326,7 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
             "auto-distribute: sharded table `{sharded_name}` scanned multiple times"
         )));
     }
+    reject_unsafe_broadcast_shapes(&p.agg.input, sharded_name)?;
     let input_sql = Unparser::default()
         .plan_to_sql(&p.agg.input)
         .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse input: {e}")))?
@@ -304,10 +346,7 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
         ));
     }
 
-    let mut remap: HashMap<String, String> = HashMap::new();
-    for (i, a) in p.agg.aggr_expr.iter().enumerate() {
-        remap.insert(a.schema_name().to_string(), format!("r{i}"));
-    }
+    let remap = build_remap(p);
 
     let mut psel = Vec::new();
     let mut combine = Vec::new();
@@ -334,9 +373,10 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
                     "sum({}) AS a{i}s, count({}) AS a{i}c",
                     a.arg_sql, a.arg_sql
                 ));
-                combine.push(format!(
-                    "(CAST(sum(a{i}s) AS DOUBLE) / NULLIF(sum(a{i}c), 0)) AS r{i}"
-                ));
+                // No cast: SUM/COUNT keep DataFusion's own AVG result type (a DECIMAL average
+                // stays DECIMAL at the same scale). Forcing DOUBLE here made TPC-DS Q7/Q26 return
+                // numerically-right values at the wrong scale (`120.65` vs `120.650000`).
+                combine.push(format!("(sum(a{i}s) / NULLIF(sum(a{i}c), 0)) AS r{i}"));
             }
             other => {
                 return Err(Error::Unsupported(format!(
@@ -431,13 +471,7 @@ pub(crate) fn shuffle_join_two_tables(
         .map(AggSpec::classify)
         .collect::<Result<Vec<_>>>()?;
 
-    let mut remap: HashMap<String, String> = HashMap::new();
-    for (j, g) in p.agg.group_expr.iter().enumerate() {
-        remap.insert(g.schema_name().to_string(), format!("g{j}"));
-    }
-    for (i, a) in p.agg.aggr_expr.iter().enumerate() {
-        remap.insert(a.schema_name().to_string(), format!("r{i}"));
-    }
+    let remap = build_remap(p);
 
     let on_sql = format!("{left_alias}.{left_key_name} = {right_alias}.{right_key_name}");
     let join_tail = format!(
@@ -627,6 +661,11 @@ pub(crate) struct AggSpec {
 
 impl AggSpec {
     pub(crate) fn classify(e: &Expr) -> Result<AggSpec> {
+        // An aggregate written `sum(x) AS total` arrives wrapped in an alias.
+        let e = match e {
+            Expr::Alias(a) => a.expr.as_ref(),
+            other => other,
+        };
         let Expr::AggregateFunction(af) = e else {
             return Err(Error::Unsupported(format!(
                 "auto-distribute: non-aggregate in aggregate list: {e}"
@@ -686,9 +725,10 @@ pub(crate) fn recombine_stage_sql(
                     "sum({}) AS a{i}s, count({}) AS a{i}c",
                     a.arg_sql, a.arg_sql
                 ));
-                combine.push(format!(
-                    "(CAST(sum(a{i}s) AS DOUBLE) / NULLIF(sum(a{i}c), 0)) AS r{i}"
-                ));
+                // No cast: SUM/COUNT keep DataFusion's own AVG result type (a DECIMAL average
+                // stays DECIMAL at the same scale). Forcing DOUBLE here made TPC-DS Q7/Q26 return
+                // numerically-right values at the wrong scale (`120.65` vs `120.650000`).
+                combine.push(format!("(sum(a{i}s) / NULLIF(sum(a{i}c), 0)) AS r{i}"));
             }
             other => {
                 return Err(Error::Unsupported(format!(
@@ -754,6 +794,57 @@ pub(crate) fn distinct_stage_sql(
     Ok((partial_sql, final_sql))
 }
 
+/// Map the aggregate's output column names to the safe stage names (`g{j}` group, `r{i}` result).
+///
+/// Keyed three ways, because callers reach these columns under different names: the expression's
+/// `schema_name` (how the plan refers to it), an explicit `AS` alias on the group/aggregate expr,
+/// and the `Aggregate`'s own schema field names.
+pub(crate) fn build_agg_remap(agg: &Aggregate) -> HashMap<String, String> {
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for (j, g) in agg.group_expr.iter().enumerate() {
+        remap.insert(g.schema_name().to_string(), format!("g{j}"));
+        if let Expr::Alias(a) = g {
+            remap.insert(a.name.clone(), format!("g{j}"));
+        }
+    }
+    for (i, a) in agg.aggr_expr.iter().enumerate() {
+        remap.insert(a.schema_name().to_string(), format!("r{i}"));
+        if let Expr::Alias(al) = a {
+            remap.insert(al.name.clone(), format!("r{i}"));
+        }
+    }
+    let n_group = agg.group_expr.len();
+    for (j, field) in agg.schema.fields().iter().take(n_group).enumerate() {
+        remap.insert(field.name().clone(), format!("g{j}"));
+    }
+    for (i, field) in agg.schema.fields().iter().skip(n_group).enumerate() {
+        remap.insert(field.name().clone(), format!("r{i}"));
+    }
+    remap
+}
+
+/// [`build_agg_remap`] extended with [`Peeled::alias_projections`], so a `HAVING` written against
+/// an intervening subquery's aliases (TPC-DS Q21's `inv_before`) still resolves to `r{i}` / `g{j}`.
+pub(crate) fn build_remap(p: &Peeled<'_>) -> HashMap<String, String> {
+    let mut remap = build_agg_remap(p.agg);
+    for proj in &p.alias_projections {
+        for e in proj.iter() {
+            let Expr::Alias(a) = e else { continue };
+            let mapped = match a.expr.as_ref() {
+                Expr::Column(c) => remap
+                    .get(&c.flat_name())
+                    .or_else(|| remap.get(&c.name))
+                    .cloned(),
+                other => remap.get(&other.schema_name().to_string()).cloned(),
+            };
+            if let Some(mapped) = mapped {
+                remap.insert(a.name.clone(), mapped);
+            }
+        }
+    }
+    remap
+}
+
 /// Wrap the combined inner query so the final stage's output matches the original query's columns:
 /// re-apply the output projection with aggregate/group columns remapped to `r{i}`/`g{j}`, each
 /// item explicitly aliased back to its original output name (so a bare `t.k` stays column `k`, and
@@ -763,11 +854,17 @@ fn wrap_output(p: &Peeled<'_>, inner: &str, remap: &HashMap<String, String>) -> 
     let up = Unparser::default();
     // Apply HAVING against remapped `g{j}`/`r{i}` columns *before* the output projection aliases
     // them back to original names (otherwise `WHERE r0 > …` fails against `having_in.sv`).
-    let from_sql = if let Some(pred) = p.having {
-        let having_sql = expr_sql(&up, &remap_columns(pred, remap))?;
-        format!("(SELECT * FROM ({inner}) AS combined WHERE {having_sql}) AS having_in")
-    } else {
+    let from_sql = if p.having.is_empty() {
         format!("({inner}) AS combined")
+    } else {
+        let mut preds = Vec::with_capacity(p.having.len());
+        for pred in &p.having {
+            let mapped = remap_columns(&unqualify(pred), remap);
+            ensure_all_columns_remapped(&mapped)?;
+            preds.push(format!("({})", expr_sql(&up, &mapped)?));
+        }
+        let having_sql = preds.join(" AND ");
+        format!("(SELECT * FROM ({inner}) AS combined WHERE {having_sql}) AS having_in")
     };
     let select = match p.projection {
         Some(exprs) => exprs
@@ -822,7 +919,7 @@ fn remap_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
     e.clone()
         .transform(|node| {
             if let Expr::Column(c) = &node {
-                if let Some(safe) = remap.get(&c.flat_name()) {
+                if let Some(safe) = remap.get(&c.flat_name()).or_else(|| remap.get(&c.name)) {
                     return Ok(Transformed::yes(datafusion::prelude::col(safe)));
                 }
             }
@@ -830,6 +927,35 @@ fn remap_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
         })
         .map(|t| t.data)
         .unwrap_or(e.clone())
+}
+
+/// Require every column in an already-remapped predicate to name a `g{j}` / `r{i}` stage column.
+///
+/// Anything left un-remapped refers to a name that only existed in the original plan, so the
+/// predicate would either fail on the worker or — worse, if the name happens to collide — filter
+/// on the wrong column. Decline the query instead.
+fn ensure_all_columns_remapped(e: &Expr) -> Result<()> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut bad: Option<String> = None;
+    let _ = e.apply(|node| {
+        if let Expr::Column(c) = node {
+            let safe = c.relation.is_none()
+                && matches!(c.name.as_bytes(), [b'g' | b'r', rest @ ..]
+                    if !rest.is_empty() && rest.iter().all(u8::is_ascii_digit));
+            if !safe {
+                bad = Some(c.flat_name());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    match bad {
+        Some(name) => Err(Error::Unsupported(format!(
+            "auto-distribute: HAVING references `{name}`, which does not map to an aggregate or \
+             group output column"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Unparse an expr to SQL text.
@@ -868,6 +994,173 @@ pub(crate) fn extract_from_tail(input_sql: &str) -> Result<String> {
     Err(Error::Unsupported(
         "auto-distribute: non-trivial aggregate input (no FROM tail)".into(),
     ))
+}
+
+/// Reject plan shapes where broadcasting the replicated tables to every worker duplicates output
+/// rows instead of partitioning them.
+///
+/// The single-sharded-table broadcast model is correct when every output row is produced by
+/// matching against the (partitioned) sharded table, which a plain inner-join chain guarantees.
+/// Two shapes break that invariant, and both go wrong silently — the query returns a number that
+/// is a multiple of the right one:
+///
+/// - a `UNION ALL` arm with no path to the sharded table. TPC-DS Q33/Q56/Q60/Q66/Q71/Q76 union one
+///   pre-aggregated arm per channel (`store_sales` / `catalog_sales` / `web_sales`). With
+///   `store_sales` sharded, the other two arms scan replicated tables only, so every worker
+///   computes those arms in full and the final `SUM` multiplies them by the worker count — Q66 at
+///   two workers returns exactly 2× the correct total for the affected columns.
+/// - an outer join whose preserved side does not reach the sharded table. TPC-DS Q97 `FULL OUTER
+///   JOIN`s two independently-aggregated fact tables; the side without the sharded table is
+///   replicated, so its unmatched rows (and under `FULL`, all of its rows) survive once per worker
+///   rather than once overall.
+///
+/// A subtree that never scans the sharded table is uniformly replicated and harmless on its own —
+/// it only becomes a duplication bug where a parent combines it additively with sharded data, and
+/// that parent is the node this catches. So skip such subtrees rather than flagging them, and stop
+/// at a nested `Aggregate`: below one, the replicated subtree's result is identical and complete on
+/// every worker, which is what lets TPC-DS Q54's `UNION ALL` of two non-sharded facts feed a
+/// `DISTINCT` customer filter safely.
+fn reject_unsafe_broadcast_shapes(lp: &LogicalPlan, sharded_name: &str) -> Result<()> {
+    if count_table_scans(lp, sharded_name) == 0 {
+        return Ok(());
+    }
+    match lp {
+        LogicalPlan::Aggregate(_) => Ok(()),
+        LogicalPlan::Union(u) => {
+            for arm in &u.inputs {
+                if count_table_scans(arm, sharded_name) == 0 {
+                    return Err(Error::Unsupported(format!(
+                        "auto-distribute: UNION ALL arm does not scan sharded table \
+                         `{sharded_name}` — broadcasting it would repeat that arm's rows on \
+                         every worker"
+                    )));
+                }
+                reject_unsafe_broadcast_shapes(arm, sharded_name)?;
+            }
+            Ok(())
+        }
+        LogicalPlan::Join(j) => {
+            match j.join_type {
+                JoinType::Full => {
+                    return Err(Error::Unsupported(
+                        "auto-distribute: FULL OUTER JOIN is not broadcast-safe with a single \
+                         sharded table"
+                            .into(),
+                    ));
+                }
+                JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark
+                    if count_table_scans(&j.left, sharded_name) == 0 =>
+                {
+                    return Err(Error::Unsupported(format!(
+                        "auto-distribute: LEFT join's preserved side does not scan sharded table \
+                         `{sharded_name}` — its unmatched rows would repeat on every worker"
+                    )));
+                }
+                JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
+                    if count_table_scans(&j.right, sharded_name) == 0 =>
+                {
+                    return Err(Error::Unsupported(format!(
+                        "auto-distribute: RIGHT join's preserved side does not scan sharded table \
+                         `{sharded_name}` — its unmatched rows would repeat on every worker"
+                    )));
+                }
+                _ => {}
+            }
+            reject_unsafe_broadcast_shapes(&j.left, sharded_name)?;
+            reject_unsafe_broadcast_shapes(&j.right, sharded_name)
+        }
+        other => {
+            for c in other.inputs() {
+                reject_unsafe_broadcast_shapes(c, sharded_name)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Reject stage SQL that references the Unparser's `left` / `right` join-side alias from outside
+/// the lexical scope that defined it.
+///
+/// DataFusion's Unparser names a decorrelated subquery's join sides `"left"` / `"right"`. When
+/// that side is *also* wrapped in another alias one level out — TPC-DS Q8/Q38/Q87's chained
+/// `EXISTS`, which unparses to `(SELECT … FROM (…) AS "left" WHERE EXISTS (…)) AS hot_cust WHERE
+/// EXISTS (… `left`.c_last_name …)` — the trailing reference sits in a sibling scope where
+/// `left` was never bound, and the row it means is only reachable through the outer alias the
+/// Unparser failed to substitute. The SQL parses fine; it fails at name resolution on the worker
+/// (`No field named left.c_last_name`). Renaming the alias uniformly would not help, since the
+/// reference is dangling rather than merely awkwardly quoted, so reject and fall back.
+///
+/// Scope is tracked as a stack of paren depths: `AS "left"` binds `left` in the frame that is open
+/// where the alias appears, and stays visible to every nested subquery (which is what makes the
+/// legitimate correlation work) until that frame's paren closes.
+pub(crate) fn reject_out_of_scope_join_alias_refs(sql: &str) -> Result<()> {
+    const DEFS: [(&str, &str); 4] = [
+        ("\"left\"", "left"),
+        ("\"right\"", "right"),
+        ("`left`", "left"),
+        ("`right`", "right"),
+    ];
+    const USES: [(&str, &str); 4] = [
+        ("\"left\".", "left"),
+        ("\"right\".", "right"),
+        ("`left`.", "left"),
+        ("`right`.", "right"),
+    ];
+    let bytes = sql.as_bytes();
+    let mut stack: Vec<Vec<&str>> = vec![Vec::new()];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                stack.push(Vec::new());
+                i += 1;
+            }
+            b')' => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            _ => {
+                if let Some((pat, name)) = USES.iter().find(|(pat, _)| sql[i..].starts_with(*pat)) {
+                    if !stack.iter().any(|frame| frame.contains(name)) {
+                        return Err(Error::Unsupported(format!(
+                            "auto-distribute: generated SQL references join-side alias `{name}` \
+                             outside the scope that defines it (Unparser aliasing)"
+                        )));
+                    }
+                    i += pat.len();
+                    continue;
+                }
+                if let Some((pat, name)) = DEFS.iter().find(|(pat, _)| sql[i..].starts_with(*pat)) {
+                    stack.last_mut().expect("stack never empty").push(name);
+                    i += pat.len();
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject `ROLLUP` / `CUBE` / `GROUPING SETS`.
+///
+/// The partial/final split treats `group_expr` positionally: each entry becomes one `g{j}` column
+/// that the final stage re-groups on. A grouping set is a *single* `group_expr` entry that expands
+/// to several grouping levels, so `g0` would stand for the whole `ROLLUP(...)` construct — the
+/// remap can't name `channel`/`id` individually, and the emitted stage SQL passes `ROLLUP (...)`
+/// through to workers, which re-parse it under the Databricks dialect as a call to a function
+/// named `rollup` (TPC-DS Q5/Q18/Q22/Q77/Q80). Decline and let the query run single-node.
+fn reject_grouping_sets(group_expr: &[Expr]) -> Result<()> {
+    for g in group_expr {
+        if matches!(g, Expr::GroupingSet(_)) {
+            return Err(Error::Unsupported(
+                "auto-distribute: ROLLUP / CUBE / GROUPING SETS are not supported".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Fix SQL fragments from DataFusion's Unparser that the Databricks-dialect re-parser rejects.
@@ -1131,6 +1424,46 @@ fn collect_tables(lp: &LogicalPlan, out: &mut Vec<String>) {
     }
     for c in lp.inputs() {
         collect_tables(c, out);
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::reject_out_of_scope_join_alias_refs;
+
+    #[test]
+    fn plain_sql_without_join_side_aliases_is_accepted() {
+        assert!(reject_out_of_scope_join_alias_refs(
+            "SELECT a, sum(b) FROM t WHERE c > 1 GROUP BY a"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn correlated_reference_into_a_nested_subquery_is_accepted() {
+        // `left` is bound one level out and used inside the EXISTS — the legitimate shape.
+        let sql = r#"SELECT count(1) FROM (SELECT * FROM t) AS "left" WHERE EXISTS (SELECT 1 FROM u WHERE (`left`.k = u.k))"#;
+        assert!(reject_out_of_scope_join_alias_refs(sql).is_ok());
+    }
+
+    #[test]
+    fn reference_after_the_defining_scope_closed_is_rejected() {
+        // TPC-DS Q38/Q87 shape: `left` is bound inside the parens that `AS hot_cust` closes, so
+        // the second EXISTS refers to a name that no longer exists.
+        let sql = r#"SELECT count(1) FROM (SELECT * FROM (SELECT * FROM t) AS "left" WHERE EXISTS (SELECT 1 FROM u WHERE (`left`.k = u.k))) AS hot_cust WHERE EXISTS (SELECT 1 FROM v WHERE (`left`.k = v.k))"#;
+        let err = reject_out_of_scope_join_alias_refs(sql).expect_err("dangling `left`");
+        assert!(err.to_string().contains("outside the scope"), "{err}");
+    }
+
+    #[test]
+    fn reference_with_no_definition_at_all_is_rejected() {
+        assert!(reject_out_of_scope_join_alias_refs(r#"SELECT "left".a FROM t"#).is_err());
+    }
+
+    #[test]
+    fn a_sibling_scopes_definition_does_not_leak() {
+        let sql = r#"SELECT * FROM (SELECT 1 FROM x AS "left" WHERE `left`.a = 1), (SELECT `left`.b FROM y)"#;
+        assert!(reject_out_of_scope_join_alias_refs(sql).is_err());
     }
 }
 

@@ -811,12 +811,21 @@ async fn main() {
             if execute {
                 let workers: usize = flag(&args, "--workers").unwrap_or(2);
                 let sample: usize = flag(&args, "--sample").unwrap_or(0);
+                let default_baseline = tpcds_dist::default_execute_baseline_path();
+                let baseline = args
+                    .iter()
+                    .position(|a| a == "--baseline")
+                    .and_then(|i| args.get(i + 1))
+                    .map(Path::new)
+                    .unwrap_or(default_baseline.as_path());
+                let skip_ratchet = args.iter().any(|a| a == "--no-ratchet");
                 tpcds_dist::run_execute(tpcds_dist::ExecuteOpts {
                     sf,
                     data: Path::new(&dir),
                     workers,
                     sample,
                     query_filter: None,
+                    baseline: (!skip_ratchet).then_some(baseline),
                 })
                 .await;
             } else {

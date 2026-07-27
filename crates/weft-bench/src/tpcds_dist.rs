@@ -4,6 +4,7 @@
 //! `bench/distributed/tpcds-planner-baseline.json`. Execute mode compares distributed vs
 //! single-node for the supported subset at small SF.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,6 +53,30 @@ pub struct ExecuteOpts<'a> {
     pub sample: usize,
     /// When set, only run these query names (must also be planner-supported).
     pub query_filter: Option<&'a [&'a str]>,
+    /// Ratchet the execute-verified set against this baseline. Only meaningful for a full sweep;
+    /// skipped when the run is sampled or filtered, since a subset cannot prove the set held.
+    pub baseline: Option<&'a Path>,
+}
+
+/// The execute-verified set: queries whose distributed result matched single-node exactly.
+///
+/// This is the number that says something about the engine. The planner ratchet counts queries a
+/// distributed plan could be *built* for, which is a strictly weaker claim — before this gate
+/// existed, 24 of 67 "supported" queries were returning a wrong answer or failing on the worker.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ExecuteBaseline {
+    #[serde(default)]
+    pub notes: String,
+    pub suite: String,
+    pub verified: usize,
+    pub verified_queries: Vec<String>,
+}
+
+/// Outcome of one full execute sweep.
+pub struct ExecuteReport {
+    pub verified: Vec<String>,
+    pub mismatched: Vec<String>,
+    pub errored: Vec<String>,
 }
 
 /// Register all 24 TPC-DS Parquet tables on `engine`.
@@ -185,7 +210,12 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
         opts.sample.min(to_run.len())
     };
 
-    let (mut ok, mut mismatch, mut error) = (0usize, 0usize, 0usize);
+    let mut report = ExecuteReport {
+        verified: Vec::new(),
+        mismatched: Vec::new(),
+        errored: Vec::new(),
+    };
+    let debug = std::env::var("WEFT_TPCDS_DEBUG").is_ok();
 
     for (i, (name, sql, fact)) in to_run.iter().take(run_count).enumerate() {
         let replicated: Vec<&str> = all
@@ -196,7 +226,7 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
         let dq = match plan_distributed(&single, sql, &replicated).await {
             Ok(d) => d,
             Err(e) => {
-                error += 1;
+                report.errored.push(name.to_string());
                 eprintln!("{name:<4} replan ERROR: {e}");
                 continue;
             }
@@ -216,6 +246,22 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
         };
         let mode = if forward { "forward" } else { "shuffle" };
 
+        if std::env::var("WEFT_TPCDS_DEBUG").as_deref() == Ok("plan") {
+            let lp = single.logical_plan(sql).await.unwrap();
+            eprintln!("  {name} logical plan:\n{}", lp.display_indent_schema());
+        }
+        if debug {
+            for s in &dq.stages {
+                eprintln!(
+                    "  {name} [{mode}] stage{} keys{:?} exch={:?}: {}",
+                    s.stage_id, s.hash_key_cols, s.exchange, s.sql
+                );
+            }
+            if let Some(f) = &dq.finalize_sql {
+                eprintln!("  {name} finalize: {f}");
+            }
+        }
+
         let base = (i as u32 + 1) * 1000;
         let stages: Vec<StageDef> = dq
             .stages
@@ -233,7 +279,7 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
         let gathered = match run_stages_with_retry(cluster, &stages).await {
             Ok(b) => b,
             Err(e) => {
-                error += 1;
+                report.errored.push(name.to_string());
                 eprintln!("{name:<4} distributed ERROR: {e}");
                 continue;
             }
@@ -257,22 +303,119 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
 
         let expected = single.sql(sql).await.unwrap();
         if normalize_batches(&result) == normalize_batches(&expected) {
-            ok += 1;
+            report.verified.push(name.to_string());
             eprintln!("{name:<4} distributed ok [{mode}] ({})", dq.stages.len());
         } else {
-            mismatch += 1;
+            report.mismatched.push(name.to_string());
             eprintln!("{name:<4} distributed MISMATCH [{mode}]");
+            if debug {
+                let exp = normalize_batches(&expected);
+                let got = normalize_batches(&result);
+                eprintln!(
+                    "  expected {} rows / got {} rows\n  first expected: {:?}\n  first got:      {:?}",
+                    exp.len(),
+                    got.len(),
+                    exp.first(),
+                    got.first()
+                );
+            }
         }
     }
 
     eprintln!(
-        "\n=== TPC-DS distributed execute sf{}: {ok} ok, {mismatch} mismatch, {error} error \
+        "\n=== TPC-DS distributed execute sf{}: {} execute-verified, {} mismatch, {} error \
          (ran {run_count}) ===",
-        opts.sf
+        opts.sf,
+        report.verified.len(),
+        report.mismatched.len(),
+        report.errored.len()
     );
-    if mismatch > 0 || error > 0 {
+    eprintln!(
+        "verified_json={}",
+        serde_json::to_string(&report.verified).unwrap_or_default()
+    );
+
+    // A sampled or filtered run only ever sees a subset, so it can confirm the queries it ran but
+    // cannot prove the baseline set still holds. Ratchet the full sweep only.
+    let full_sweep = opts.sample == 0 && opts.query_filter.is_none() && only.is_none();
+    let baseline = opts.baseline.filter(|_| full_sweep);
+    if !check_execute_ratchet(&report, baseline) {
         std::process::exit(1);
     }
+}
+
+/// Enforce the execute gate: no mismatches, no errors, and no query dropping out of the
+/// execute-verified baseline.
+///
+/// Mismatches are never tolerated and are not ratcheted to a count — a wrong answer is a wrong
+/// answer regardless of how many of them there are.
+fn check_execute_ratchet(report: &ExecuteReport, baseline: Option<&Path>) -> bool {
+    let mut ok = true;
+    if !report.mismatched.is_empty() {
+        eprintln!(
+            "[tpcds-execute] WRONG ANSWERS: {} — a distributed plan must never return a result \
+             that differs from single-node; make the planner decline the shape instead",
+            report.mismatched.join(", ")
+        );
+        ok = false;
+    }
+    if !report.errored.is_empty() {
+        eprintln!(
+            "[tpcds-execute] EXECUTION ERRORS: {} — the planner accepted a shape it cannot run",
+            report.errored.join(", ")
+        );
+        ok = false;
+    }
+
+    let Some(path) = baseline else {
+        return ok;
+    };
+    let base: ExecuteBaseline = serde_json::from_str(
+        &std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read execute baseline {}: {e}", path.display())),
+    )
+    .unwrap_or_else(|e| panic!("parse execute baseline {}: {e}", path.display()));
+
+    let lost: Vec<&String> = base
+        .verified_queries
+        .iter()
+        .filter(|q| !report.verified.contains(q))
+        .collect();
+    if lost.is_empty() {
+        let gained: Vec<&String> = report
+            .verified
+            .iter()
+            .filter(|q| !base.verified_queries.contains(q))
+            .collect();
+        if gained.is_empty() {
+            eprintln!(
+                "[tpcds-execute] ratchet OK: {} execute-verified held (baseline {})",
+                report.verified.len(),
+                base.verified
+            );
+        } else {
+            eprintln!(
+                "[tpcds-execute] ratchet gain: +{} execute-verified — re-baseline {}: {}",
+                gained.len(),
+                path.display(),
+                gained
+                    .iter()
+                    .map(|q| q.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    } else {
+        eprintln!(
+            "[tpcds-execute] RATCHET REGRESSION: no longer execute-verified: {}",
+            lost.iter()
+                .map(|q| q.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        ok = false;
+    }
+    ok
 }
 
 struct ClusterSet {
@@ -359,6 +502,7 @@ pub async fn run_correctness_sample(sf: f64, data: &Path, workers: usize, sample
         workers,
         sample,
         query_filter: Some(CORRECTNESS_CI_QUERIES),
+        baseline: None,
     })
     .await;
 }
@@ -367,9 +511,114 @@ pub fn default_baseline_path() -> PathBuf {
     PathBuf::from("bench/distributed/tpcds-planner-baseline.json")
 }
 
+pub fn default_execute_baseline_path() -> PathBuf {
+    PathBuf::from("bench/distributed/tpcds-execute-baseline.json")
+}
+
 /// Load embedded baseline for tests / dry runs before the file exists on disk.
 #[allow(dead_code)]
 pub fn embedded_baseline_supported() -> usize {
     let v: serde_json::Value = serde_json::from_str(BASELINE_JSON).expect("embedded baseline");
     v.get("supported").and_then(|s| s.as_u64()).unwrap_or(0) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(verified: &[&str], mismatched: &[&str], errored: &[&str]) -> ExecuteReport {
+        let own = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect();
+        ExecuteReport {
+            verified: own(verified),
+            mismatched: own(mismatched),
+            errored: own(errored),
+        }
+    }
+
+    /// Write a throwaway baseline under a caller-supplied name, so tests running in parallel
+    /// never write and read the same path.
+    fn baseline_file(label: &str, queries: &[&str]) -> PathBuf {
+        let base = ExecuteBaseline {
+            notes: String::new(),
+            suite: "tpcds".into(),
+            verified: queries.len(),
+            verified_queries: queries.iter().map(|s| s.to_string()).collect(),
+        };
+        let path = std::env::temp_dir().join(format!("weft-tpcds-execute-baseline-{label}.json"));
+        std::fs::write(&path, serde_json::to_string(&base).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn clean_sweep_holding_the_baseline_passes() {
+        let f = baseline_file("held", &["Q3", "Q6"]);
+        assert!(check_execute_ratchet(
+            &report(&["Q3", "Q6"], &[], &[]),
+            Some(&f)
+        ));
+    }
+
+    #[test]
+    fn a_mismatch_fails_even_when_the_baseline_set_is_intact() {
+        // The whole point of the gate: a wrong answer is never ratcheted or tolerated.
+        let f = baseline_file("mismatch", &["Q3"]);
+        assert!(!check_execute_ratchet(
+            &report(&["Q3"], &["Q66"], &[]),
+            Some(&f)
+        ));
+    }
+
+    #[test]
+    fn a_mismatch_fails_with_no_baseline_at_all() {
+        assert!(!check_execute_ratchet(
+            &report(&["Q3"], &["Q66"], &[]),
+            None
+        ));
+    }
+
+    #[test]
+    fn an_execution_error_fails() {
+        assert!(!check_execute_ratchet(&report(&["Q3"], &[], &["Q5"]), None));
+    }
+
+    #[test]
+    fn losing_a_baseline_query_fails() {
+        let f = baseline_file("lost", &["Q3", "Q6"]);
+        assert!(!check_execute_ratchet(&report(&["Q3"], &[], &[]), Some(&f)));
+    }
+
+    #[test]
+    fn gaining_a_query_passes_and_asks_for_a_re_baseline() {
+        let f = baseline_file("gained", &["Q3"]);
+        assert!(check_execute_ratchet(
+            &report(&["Q3", "Q6"], &[], &[]),
+            Some(&f)
+        ));
+    }
+
+    #[test]
+    fn committed_execute_baseline_is_a_subset_of_the_planner_baseline() {
+        // A query can only be execute-verified if the planner can distribute it, so the execute
+        // set drifting outside the planner set means one of the two files is stale.
+        let exec: ExecuteBaseline = serde_json::from_str(
+            &std::fs::read_to_string("../../bench/distributed/tpcds-execute-baseline.json")
+                .expect("execute baseline"),
+        )
+        .expect("parse execute baseline");
+        let planner: serde_json::Value =
+            serde_json::from_str(BASELINE_JSON).expect("planner baseline");
+        let supported: Vec<String> = planner["supported_queries"]
+            .as_array()
+            .expect("supported_queries")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(exec.verified, exec.verified_queries.len());
+        let outside: Vec<&String> = exec
+            .verified_queries
+            .iter()
+            .filter(|q| !supported.contains(q))
+            .collect();
+        assert!(outside.is_empty(), "not planner-supported: {outside:?}");
+    }
 }

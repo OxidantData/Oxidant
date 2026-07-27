@@ -35,6 +35,9 @@ cargo run -p weft-bench -- tpcds --sf 0.01
 echo "==> tpcds-distributed planner ratchet"
 cargo run -p weft-bench -- tpcds-distributed --sf 0.01
 
+echo "==> tpcds-distributed execute correctness ratchet"
+cargo run -p weft-bench -- tpcds-distributed --execute --sf 0.01 --workers 2
+
 echo "==> clickbench (engine-direct)"
 cargo run -p weft-bench -- clickbench --rows 20000
 
