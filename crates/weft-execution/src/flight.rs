@@ -836,7 +836,9 @@ mod tests {
 
     #[test]
     fn worker_enables_shuffle_spill_from_memory_limit_env() {
-        std::env::set_var("WEFT_MEMORY_LIMIT_BYTES", "4096");
+        // Use a budget large enough that a racing Engine::new() in another test is not
+        // starved (4 KiB previously poisoned parallel DF pools). Spill policy still enables.
+        std::env::set_var("WEFT_MEMORY_LIMIT_BYTES", "67108864");
         let worker = Worker::new(Arc::new(Engine::new()));
         assert!(worker.spill_enabled());
         std::env::remove_var("WEFT_MEMORY_LIMIT_BYTES");
@@ -937,6 +939,51 @@ mod tests {
         // The cached bucket 0 should now be pullable and contain the row.
         let pulled = pull_bucket(endpoint, 0, 0).await.unwrap();
         assert_eq!(pulled.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    }
+
+    #[tokio::test]
+    async fn shuffle_pull_is_non_destructive() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let engine = Arc::new(Engine::new());
+        tokio::spawn(async move {
+            let _ = serve_worker(port, engine).await;
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let ticket = StageTicket {
+            stage_id: 42,
+            partition_id: 0,
+            num_partitions: 1,
+            upstream_endpoints: vec![],
+            stage_sql: "SELECT 7 AS k, 9 AS v".into(),
+            plan_fragment: vec![],
+            hash_key_cols: vec![0],
+            upstream_stage_ids: vec![],
+            produce: true,
+        };
+        for _ in 0..50 {
+            if run_stage_on_worker(endpoint.clone(), ticket.clone())
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let first = pull_bucket(endpoint.clone(), 42, 0).await.unwrap();
+        let second = pull_bucket(endpoint, 42, 0).await.unwrap();
+        assert_eq!(
+            first.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1,
+            "first AQE-style sample pull"
+        );
+        assert_eq!(
+            second.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1,
+            "second pull must still see the bucket (sampling is non-destructive)"
+        );
     }
 
     #[tokio::test]

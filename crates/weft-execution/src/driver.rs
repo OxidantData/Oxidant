@@ -239,7 +239,7 @@ pub async fn run_stages_obs(
     let lineage = Arc::new(StageLineage::new());
     let stage_map: HashMap<u32, StageDef> =
         stages.iter().map(|s| (s.stage_id, s.clone())).collect();
-    let mut cluster = cluster.clone();
+    let cluster = cluster.clone();
     // Freeze the planning snapshot for this query: never reshape partitions from membership.
     let planned_workers = cluster.workers.clone();
     cluster.check_shard_modulus()?;
@@ -369,26 +369,38 @@ pub async fn run_stages_obs(
             });
         }
         // AQE: sample bucket row counts after producer stage when enabled.
+        // Observability only — never shrink `num_partitions` here. Producers already wrote
+        // `np` buckets; dropping the consumer range to `new_p < np` orphans buckets
+        // `new_p..np-1` (silent row loss). Correct coalesced reads would need the consumer
+        // to pull `p, p+new_p, …` up to the original modulus; until that exists, keep the
+        // planned partition count frozen for the query lifetime.
         if aqe_enabled() {
             let mut counts = vec![0usize; np as usize];
             for p in 0..np {
                 if let Ok(ep) = cluster.owner_endpoint(p) {
+                    // `pull_bucket` clones from the stage cache — sampling is non-destructive.
                     if let Ok(batches) = pull_bucket_with_retry(ep, stage.stage_id, p).await {
                         counts[p as usize] = batches.iter().map(|b| b.num_rows()).sum();
                     }
                 }
             }
             if let Ok(new_p) = coalesced_partitions(cluster.worker_count(), np, &counts) {
-                if new_p < cluster.num_partitions {
+                if new_p < np {
                     if let (Some(ref s), Some(ref op)) = (&store, &operation_id) {
                         s.emit(ExecutionEvent::AqeCoalesced {
                             operation_id: op.clone(),
                             stage_id: stage.stage_id as i32,
-                            old_partitions: cluster.num_partitions,
+                            old_partitions: np,
                             new_partitions: new_p,
                         });
                     }
-                    cluster.num_partitions = new_p;
+                    tracing::info!(
+                        target: "weft.aqe",
+                        stage_id = stage.stage_id,
+                        old_partitions = np,
+                        suggested_partitions = new_p,
+                        "AQE would coalesce shuffle partitions; keeping planned count to avoid orphaning buckets"
+                    );
                 }
             }
         }

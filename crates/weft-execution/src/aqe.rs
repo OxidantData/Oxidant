@@ -1,9 +1,18 @@
-//! Adaptive query execution: runtime partition coalescing when shuffle output is small/skewed.
+//! Adaptive query execution: runtime partition coalescing suggestions when shuffle output is
+//! small/skewed.
+//!
+//! [`coalesced_partitions`] is consulted after producer stages for observability
+//! (`AqeCoalesced` / tracing). The driver must **not** shrink the consumer partition range
+//! mid-query until the shuffle read path can merge `p, p+w, …` buckets — otherwise rows in
+//! orphaned buckets are silently dropped.
 
 use weft_common::Result;
 
-/// After a producer stage, optionally reduce shuffle partitions for downstream stages when
-/// every bucket is below `WEFT_AQE_COALESCE_MAX_ROWS` (default 4096) per worker.
+/// After a producer stage, suggest a reduced shuffle partition count when every bucket is
+/// below `WEFT_AQE_COALESCE_MAX_ROWS` (default 4096) per sampled worker.
+///
+/// Callers must treat the return value as a **suggestion** for metrics / future planning —
+/// applying it as the consumer's `0..new_p` range orphans producer buckets `new_p..current`.
 pub fn coalesced_partitions(
     num_workers: usize,
     current_partitions: u32,

@@ -236,3 +236,81 @@ async fn static_two_worker_cluster_still_succeeds() {
     }
     assert!(ok, "fixed-membership 2-worker cluster must keep working");
 }
+
+/// Producers write 4 shuffle buckets on a 2-worker cluster. AQE defaults on and
+/// `coalesced_partitions` would suggest shrinking to 2 — previously the driver mutated
+/// `num_partitions` mid-query and the consumer orphaned buckets 2..3 (silent row loss).
+#[tokio::test]
+async fn aqe_coalesce_suggestion_must_not_orphan_shuffle_buckets() {
+    // Prove the suggestion path would fire for this shape (partitions > workers, small buckets).
+    let would_coalesce =
+        weft_execution::aqe::coalesced_partitions(2, 4, &[10, 10, 10, 10]).expect("coalesce");
+    assert_eq!(
+        would_coalesce, 2,
+        "test setup must engage AQE coalescing (suggested 2 of 4)"
+    );
+    assert!(
+        weft_execution::aqe::aqe_enabled(),
+        "AQE defaults on; coalescing suggestion path must run during the query"
+    );
+
+    const N: i64 = 200;
+    let query = "SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t GROUP BY k";
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![make_batch(0, N)])
+        .unwrap();
+    let expected = rows(&single.sql(query).await.unwrap());
+
+    let p0 = bind_port().await;
+    let p1 = bind_port().await;
+    let e0 = Arc::new(Engine::new());
+    e0.register_batches("t", vec![make_batch(0, N / 2)])
+        .unwrap();
+    let e1 = Arc::new(Engine::new());
+    e1.register_batches("t", vec![make_batch(N / 2, N)])
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = serve_worker(p0, e0).await;
+    });
+    tokio::spawn(async move {
+        let _ = serve_worker(p1, e1).await;
+    });
+
+    // Raise planned modulus above worker count without process-global env (avoids test races).
+    let mut cluster = Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ]);
+    cluster.num_partitions = 4;
+
+    let plan = DistributedPlan {
+        partial_sql: "SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t GROUP BY k".into(),
+        final_sql: "SELECT k, SUM(c) AS c, SUM(s) AS s FROM shuffle_input GROUP BY k".into(),
+        hash_key_cols: vec![0],
+    };
+
+    let mut actual = None;
+    let mut last_err = None;
+    for _ in 0..50 {
+        match run_distributed(&cluster, &plan).await {
+            Ok(b) => {
+                actual = Some(rows(&b));
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    let actual = actual
+        .unwrap_or_else(|| panic!("distributed query never succeeded; last_err={last_err:?}"));
+    assert_eq!(
+        actual,
+        expected,
+        "AQE coalesce suggestion must not orphan shuffle buckets (got count sum={}, expected {N})",
+        actual.iter().map(|(_, c, _)| c).sum::<i64>()
+    );
+}
