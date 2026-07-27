@@ -6,22 +6,29 @@ Publish TPC-H / TPC-DS **SF100** against Weft:
    `s3://weft-artifacts-<account>/{tpch,tpcds}-sf100/<table>/` as Parquet.
 2. Register Glue databases `tpch_sf100` / `tpcds_sf100` (empty Columns — Weft
    infers Parquet schema).
-3. Run queries either:
+3. *(Optional lakehouse)* Lay Iceberg + Delta **metadata** over the same Parquet
+   objects and register sibling Glue databases (see [Lakehouse formats](#lakehouse-formats-iceberg--delta)).
+4. Run queries either:
    - **Direct Spark Connect** (preferred for this Helm data-plane chart):
      `bench/sf100/run-spark-connect.py` → `sc://host:50051`
    - **Gateway HTTP** (private control-plane, not in this chart):
      `bench/sf100/run-via-gateway.py` → `POST /api/sql`
-4. Compare Parquet / Iceberg / Delta result checksums once lakehouse formats land.
+5. Compare Parquet / Iceberg / Delta result checksums.
+6. Write `site/src/data/{tpch,tpcds}.json` for the Performance page.
 
-**Today the dump/register path is Parquet-only.** Iceberg and Delta Glue tables are
-landing on a separate branch — do not claim those formats work from this harness yet.
+**Status:** dataset generation for all three formats works (step 3). *Reading* Iceberg
+and Delta from S3 is landing on `vamzi/lakehouse-s3-formats`; until that merges, only
+the Parquet Glue databases are queryable end to end - do not publish Iceberg/Delta
+numbers from this harness yet.
 
 ## Paths
 
 | Artifact | Location |
 |----------|----------|
 | Parquet | `s3://weft-artifacts-810738286322/tpch-sf100/`, `…/tpcds-sf100/` |
-| Glue | `tpch_sf100.*`, `tpcds_sf100.*` |
+| Glue (Parquet) | `tpch_sf100.*`, `tpcds_sf100.*` |
+| Glue (Iceberg) | `tpch_sf100_iceberg.*`, `tpcds_sf100_iceberg.*` |
+| Glue (Delta) | `tpch_sf100_delta.*`, `tpcds_sf100_delta.*` |
 | Query SQL | `SELECT … FROM glue.tpch_sf100.lineitem` |
 | IRSA | annotate the chart `serviceAccount` (see `values-sf100.yaml` placeholders) |
 
@@ -121,6 +128,81 @@ Each JSONL record includes `wall_s` / `hot_s`, `row_count`, and a SHA-256 `check
 of the collected rows for cross-format comparison.
 
 SF≥100 refuses to start without `WEFT_DISTRIBUTED_STRICT=1` or `--strict`.
+
+## Lakehouse formats (Iceberg + Delta)
+
+**One Parquet copy, three catalog entries.** Iceberg and Delta are metadata over the
+same objects `dump-to-s3.sh` already wrote — so format timing comparisons are not
+confounded by different row-group layouts. Weft cannot write Iceberg/Delta (Glue
+`build_table_input` rejects those write targets); generation is intentionally
+out-of-band via PyIceberg / delta-rs.
+
+| Step | Command |
+|------|---------|
+| 0. Parquet dump | `./bench/sf100/dump-to-s3.sh` (or EC2 launcher) |
+| 1. Iceberg + Delta metadata | see below |
+| 2. Verify | `COUNT(*)` via gateway against each Glue DB |
+| 3. Tear down | `./bench/sf100/teardown-lakehouse.sh` |
+
+```sh
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r bench/sf100/requirements.txt
+
+# Always dry-run first (no AWS writes)
+python3 bench/sf100/build-lakehouse.py \
+  --suite tpcds --sf 100 \
+  --source-prefix s3://weft-artifacts-$ACCOUNT/tpcds-sf100 \
+  --formats iceberg,delta \
+  --dry-run
+
+# Operator run (creates metadata + Glue DBs)
+python3 bench/sf100/build-lakehouse.py \
+  --suite tpcds --sf 100 \
+  --source-prefix s3://weft-artifacts-$ACCOUNT/tpcds-sf100 \
+  --iceberg-warehouse s3://weft-artifacts-$ACCOUNT/tpcds-sf100-iceberg \
+  --formats iceberg,delta
+```
+
+**Glue parameters (paired with Weft `detect_format` on `vamzi/lakehouse-s3-formats`):**
+
+| Format | Glue DB | Parameters set |
+|--------|---------|----------------|
+| Parquet | `{suite}_sf{SF}` | `classification=parquet` |
+| Iceberg | `{suite}_sf{SF}_iceberg` | `table_type=ICEBERG`, `metadata_location=…` (wins detector) |
+| Delta | `{suite}_sf{SF}_delta` | `classification=delta`, `provider=delta`, `spark.sql.sources.provider=delta` |
+
+Harness tip: point `--glue-db` at one of the three DB names above.
+
+**Cost (order of magnitude, us-west-2):** SF100 Parquet for TPC-DS is on the order of
+**~100–300 GiB** (exact size after dump — check `aws s3 ls --summarize`). Storing one
+copy at ~$0.023/GB-month is roughly **$3–$7/month**; Iceberg metadata + Delta `_delta_log`
+add little. Idle datasets still bill — tear down when done:
+
+```sh
+SUITE=tpcds SF=100 ./bench/sf100/teardown-lakehouse.sh          # Glue only
+SUITE=tpcds SF=100 DELETE_DATA=1 ./bench/sf100/teardown-lakehouse.sh  # + purge metadata
+```
+
+**Local rehearsal (no AWS):**
+
+```sh
+./bench/sf100/rehearse-local.sh   # skips cleanly if Python deps missing
+```
+
+**Shared prefix hazard (Parquet ↔ Delta):** `convert_to_deltalake` writes `_delta_log/`
+*inside* the Parquet table directory by design (one data copy). Commit-0 only has JSON
+actions, which a `.parquet` extension filter ignores. Delta **checkpoints** are
+`_delta_log/*.checkpoint.parquet` — those *do* match a naive Parquet lister
+(`ListingOptions.with_file_extension(".parquet")`) and will fail or corrupt a Parquet
+benchmark scan once anything optimizes/writes the Delta table. The local rehearsal plants
+a dummy checkpoint and checks both: naive listing is contaminated; listing that excludes
+`_delta_log/` is not. Engine fix (separate worker): skip `_delta_log` in Parquet listings.
+Alternative if we ever need physical isolation: Delta allows absolute paths in `add.path`,
+so `_delta_log` can live in a sibling prefix referencing the same data files — not
+implemented here.
+
+Verified library APIs (pinned in `requirements.txt`): `pyiceberg==0.11.1`
+`Table.add_files`, `deltalake==1.6.2` `convert_to_deltalake(..., mode='ignore')`.
 
 ## Run via gateway / EKS
 
