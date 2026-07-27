@@ -124,19 +124,35 @@ pub(crate) struct Peeled<'a> {
     pub(crate) sort: Option<&'a [datafusion::logical_expr::SortExpr]>,
     /// `LIMIT` fetch count, if any.
     pub(crate) limit: Option<usize>,
-    /// `HAVING` predicate over the aggregate output, if any.
-    pub(crate) having: Option<&'a Expr>,
+    /// Post-aggregate (`HAVING`) predicates, outermost first. Every `Filter` above the `Aggregate`
+    /// lands here — see [`peel`].
+    pub(crate) having: Vec<&'a Expr>,
+    /// `Projection`s found *below* the output projection and above the `Aggregate`, which only
+    /// rename the aggregate's output columns. TPC-DS Q21's `SELECT * FROM (SELECT … sum(…) AS
+    /// inv_before … GROUP BY …) x WHERE …` puts one here: the inner subquery aliases the aggregate
+    /// output before the `HAVING` or the outer projection ever names it. Ordered innermost-first so
+    /// [`build_remap`] can fold them in the order the aliases were introduced.
+    pub(crate) alias_projections: Vec<&'a [Expr]>,
     /// The aggregate node itself.
     pub(crate) agg: &'a Aggregate,
 }
 
 /// Strip an optional `Limit` / `Sort` / `Projection` off the top and require an `Aggregate` under
 /// them. Rejects anything else (the caller falls back to single-node).
+///
+/// Every `Filter` crossed on the way down is a post-aggregate predicate: this loop only descends
+/// through `Limit` / `Sort` / `Projection` / `Filter` / `SubqueryAlias`, so if it reaches the
+/// `Aggregate` at all, nothing it passed could have filtered pre-aggregation rows. They are
+/// therefore all collected as `HAVING` rather than matched positionally — an earlier version
+/// required the `Filter` to sit *directly* on the `Aggregate` and silently discarded the predicate
+/// otherwise, which made TPC-DS Q21 (`Filter` → `SubqueryAlias` → `Projection` → `Aggregate`)
+/// return unfiltered rows.
 pub(crate) fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
     let mut limit = None;
     let mut sort = None;
     let mut projection = None;
-    let mut having = None;
+    let mut having = Vec::new();
+    let mut alias_projections: Vec<&[Expr]> = Vec::new();
     let mut node = lp;
     loop {
         match node {
@@ -152,26 +168,31 @@ pub(crate) fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
                 node = &s.input;
             }
             LogicalPlan::Projection(p) => {
-                projection = Some(p.expr.as_slice());
+                // Scanning outer→inner, the first `Projection` is the query's real output
+                // projection. Anything below it only renames aggregate output on the way to the
+                // `Aggregate`, and is folded into the remap instead of replacing the output list.
+                if projection.is_none() {
+                    projection = Some(p.expr.as_slice());
+                } else {
+                    alias_projections.push(p.expr.as_slice());
+                }
                 node = &p.input;
             }
             LogicalPlan::Filter(f) => {
-                if matches!(f.input.as_ref(), LogicalPlan::Aggregate(_)) {
-                    having = Some(f.predicate.as_ref());
-                    node = &f.input;
-                } else {
-                    node = f.input.as_ref();
-                }
+                having.push(f.predicate.as_ref());
+                node = f.input.as_ref();
             }
             LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
             LogicalPlan::Aggregate(agg) => {
+                alias_projections.reverse();
                 return Ok(Peeled {
                     projection,
                     sort,
                     limit,
                     having,
+                    alias_projections,
                     agg,
-                })
+                });
             }
             other => {
                 return Err(Error::Unsupported(format!(
@@ -254,14 +275,7 @@ pub(crate) fn aggregation_stages_for(
         .collect::<Result<Vec<_>>>()?;
     let distinct = aggs.iter().any(|a| a.distinct);
 
-    // remap: original output column name -> safe name (`g{j}` group, `r{i}` aggregate result).
-    let mut remap: HashMap<String, String> = HashMap::new();
-    for (j, g) in agg.group_expr.iter().enumerate() {
-        remap.insert(g.schema_name().to_string(), format!("g{j}"));
-    }
-    for (i, a) in agg.aggr_expr.iter().enumerate() {
-        remap.insert(a.schema_name().to_string(), format!("r{i}"));
-    }
+    let remap = build_remap(p);
 
     let (partial_sql, final_sql) = if distinct {
         distinct_stage_sql(&up, p, &group_sql, &aggs, &tail, &remap)?
@@ -312,10 +326,7 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
         ));
     }
 
-    let mut remap: HashMap<String, String> = HashMap::new();
-    for (i, a) in p.agg.aggr_expr.iter().enumerate() {
-        remap.insert(a.schema_name().to_string(), format!("r{i}"));
-    }
+    let remap = build_remap(p);
 
     let mut psel = Vec::new();
     let mut combine = Vec::new();
@@ -440,13 +451,7 @@ pub(crate) fn shuffle_join_two_tables(
         .map(AggSpec::classify)
         .collect::<Result<Vec<_>>>()?;
 
-    let mut remap: HashMap<String, String> = HashMap::new();
-    for (j, g) in p.agg.group_expr.iter().enumerate() {
-        remap.insert(g.schema_name().to_string(), format!("g{j}"));
-    }
-    for (i, a) in p.agg.aggr_expr.iter().enumerate() {
-        remap.insert(a.schema_name().to_string(), format!("r{i}"));
-    }
+    let remap = build_remap(p);
 
     let on_sql = format!("{left_alias}.{left_key_name} = {right_alias}.{right_key_name}");
     let join_tail = format!(
@@ -636,6 +641,11 @@ pub(crate) struct AggSpec {
 
 impl AggSpec {
     pub(crate) fn classify(e: &Expr) -> Result<AggSpec> {
+        // An aggregate written `sum(x) AS total` arrives wrapped in an alias.
+        let e = match e {
+            Expr::Alias(a) => a.expr.as_ref(),
+            other => other,
+        };
         let Expr::AggregateFunction(af) = e else {
             return Err(Error::Unsupported(format!(
                 "auto-distribute: non-aggregate in aggregate list: {e}"
@@ -764,6 +774,57 @@ pub(crate) fn distinct_stage_sql(
     Ok((partial_sql, final_sql))
 }
 
+/// Map the aggregate's output column names to the safe stage names (`g{j}` group, `r{i}` result).
+///
+/// Keyed three ways, because callers reach these columns under different names: the expression's
+/// `schema_name` (how the plan refers to it), an explicit `AS` alias on the group/aggregate expr,
+/// and the `Aggregate`'s own schema field names.
+pub(crate) fn build_agg_remap(agg: &Aggregate) -> HashMap<String, String> {
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for (j, g) in agg.group_expr.iter().enumerate() {
+        remap.insert(g.schema_name().to_string(), format!("g{j}"));
+        if let Expr::Alias(a) = g {
+            remap.insert(a.name.clone(), format!("g{j}"));
+        }
+    }
+    for (i, a) in agg.aggr_expr.iter().enumerate() {
+        remap.insert(a.schema_name().to_string(), format!("r{i}"));
+        if let Expr::Alias(al) = a {
+            remap.insert(al.name.clone(), format!("r{i}"));
+        }
+    }
+    let n_group = agg.group_expr.len();
+    for (j, field) in agg.schema.fields().iter().take(n_group).enumerate() {
+        remap.insert(field.name().clone(), format!("g{j}"));
+    }
+    for (i, field) in agg.schema.fields().iter().skip(n_group).enumerate() {
+        remap.insert(field.name().clone(), format!("r{i}"));
+    }
+    remap
+}
+
+/// [`build_agg_remap`] extended with [`Peeled::alias_projections`], so a `HAVING` written against
+/// an intervening subquery's aliases (TPC-DS Q21's `inv_before`) still resolves to `r{i}` / `g{j}`.
+pub(crate) fn build_remap(p: &Peeled<'_>) -> HashMap<String, String> {
+    let mut remap = build_agg_remap(p.agg);
+    for proj in &p.alias_projections {
+        for e in proj.iter() {
+            let Expr::Alias(a) = e else { continue };
+            let mapped = match a.expr.as_ref() {
+                Expr::Column(c) => remap
+                    .get(&c.flat_name())
+                    .or_else(|| remap.get(&c.name))
+                    .cloned(),
+                other => remap.get(&other.schema_name().to_string()).cloned(),
+            };
+            if let Some(mapped) = mapped {
+                remap.insert(a.name.clone(), mapped);
+            }
+        }
+    }
+    remap
+}
+
 /// Wrap the combined inner query so the final stage's output matches the original query's columns:
 /// re-apply the output projection with aggregate/group columns remapped to `r{i}`/`g{j}`, each
 /// item explicitly aliased back to its original output name (so a bare `t.k` stays column `k`, and
@@ -773,11 +834,17 @@ fn wrap_output(p: &Peeled<'_>, inner: &str, remap: &HashMap<String, String>) -> 
     let up = Unparser::default();
     // Apply HAVING against remapped `g{j}`/`r{i}` columns *before* the output projection aliases
     // them back to original names (otherwise `WHERE r0 > …` fails against `having_in.sv`).
-    let from_sql = if let Some(pred) = p.having {
-        let having_sql = expr_sql(&up, &remap_columns(pred, remap))?;
-        format!("(SELECT * FROM ({inner}) AS combined WHERE {having_sql}) AS having_in")
-    } else {
+    let from_sql = if p.having.is_empty() {
         format!("({inner}) AS combined")
+    } else {
+        let mut preds = Vec::with_capacity(p.having.len());
+        for pred in &p.having {
+            let mapped = remap_columns(&unqualify(pred), remap);
+            ensure_all_columns_remapped(&mapped)?;
+            preds.push(format!("({})", expr_sql(&up, &mapped)?));
+        }
+        let having_sql = preds.join(" AND ");
+        format!("(SELECT * FROM ({inner}) AS combined WHERE {having_sql}) AS having_in")
     };
     let select = match p.projection {
         Some(exprs) => exprs
@@ -832,7 +899,7 @@ fn remap_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
     e.clone()
         .transform(|node| {
             if let Expr::Column(c) = &node {
-                if let Some(safe) = remap.get(&c.flat_name()) {
+                if let Some(safe) = remap.get(&c.flat_name()).or_else(|| remap.get(&c.name)) {
                     return Ok(Transformed::yes(datafusion::prelude::col(safe)));
                 }
             }
@@ -840,6 +907,35 @@ fn remap_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
         })
         .map(|t| t.data)
         .unwrap_or(e.clone())
+}
+
+/// Require every column in an already-remapped predicate to name a `g{j}` / `r{i}` stage column.
+///
+/// Anything left un-remapped refers to a name that only existed in the original plan, so the
+/// predicate would either fail on the worker or — worse, if the name happens to collide — filter
+/// on the wrong column. Decline the query instead.
+fn ensure_all_columns_remapped(e: &Expr) -> Result<()> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut bad: Option<String> = None;
+    let _ = e.apply(|node| {
+        if let Expr::Column(c) = node {
+            let safe = c.relation.is_none()
+                && matches!(c.name.as_bytes(), [b'g' | b'r', rest @ ..]
+                    if !rest.is_empty() && rest.iter().all(u8::is_ascii_digit));
+            if !safe {
+                bad = Some(c.flat_name());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    match bad {
+        Some(name) => Err(Error::Unsupported(format!(
+            "auto-distribute: HAVING references `{name}`, which does not map to an aggregate or \
+             group output column"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Unparse an expr to SQL text.

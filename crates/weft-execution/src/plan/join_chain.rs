@@ -30,9 +30,9 @@ use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
 
 use super::stage_planner::{
-    base_tables, build_finalize, column_name, distinct_stage_sql, equijoin_from_filter, expr_sql,
-    recombine_stage_sql, sanitize_generated_sql, shuffle_join_two_tables, simple_table_scan,
-    AggSpec, DistributedQuery, Peeled, SimpleScan,
+    base_tables, build_finalize, build_remap, column_name, distinct_stage_sql,
+    equijoin_from_filter, expr_sql, recombine_stage_sql, sanitize_generated_sql,
+    shuffle_join_two_tables, simple_table_scan, AggSpec, DistributedQuery, Peeled, SimpleScan,
 };
 use crate::driver::StageDef;
 
@@ -158,7 +158,7 @@ fn ensure_semi_anti_aggs_ok(p: &Peeled<'_>, steps: &[ChainStep<'_>]) -> Result<(
             collect_column_relations(e, &mut refs);
         }
     }
-    if let Some(h) = p.having {
+    for h in &p.having {
         collect_column_relations(h, &mut refs);
     }
     for r in &refs {
@@ -562,13 +562,7 @@ fn finish_with_aggregate(
         })
         .collect::<Result<_>>()?;
 
-    let mut remap: HashMap<String, String> = HashMap::new();
-    for (j, g) in p.agg.group_expr.iter().enumerate() {
-        remap.insert(g.schema_name().to_string(), format!("g{j}"));
-    }
-    for (i, a) in p.agg.aggr_expr.iter().enumerate() {
-        remap.insert(a.schema_name().to_string(), format!("r{i}"));
-    }
+    let remap = build_remap(p);
 
     let (partial_sql, final_sql) = if aggs.iter().any(|a| a.distinct) {
         distinct_stage_sql(&up, p, &group_sql, &aggs, join_from, &remap)?
