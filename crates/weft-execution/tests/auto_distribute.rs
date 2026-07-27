@@ -278,6 +278,7 @@ async fn auto_derived_broadcast_join() {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
@@ -495,7 +496,7 @@ async fn multi_dim_broadcast_star_matches_single_node() {
     single.register_batches("dim2", vec![dim2(G)]).unwrap();
     let expected = single.sql(sql).await.unwrap();
 
-    let (p0, p1) = (50701u16, 50702u16);
+    let (p0, p1) = (ephemeral_port(), ephemeral_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
     e0.register_batches("dim", vec![dim(G)]).unwrap();
@@ -510,6 +511,7 @@ async fn multi_dim_broadcast_star_matches_single_node() {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
@@ -549,7 +551,7 @@ async fn three_sharded_tables_left_deep_shuffle_chain() {
     single.register_batches("dim2", vec![dim2(G)]).unwrap();
     let expected = single.sql(sql).await.unwrap();
 
-    let (p0, p1) = (50711u16, 50712u16);
+    let (p0, p1) = (ephemeral_port(), ephemeral_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
     e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)])
@@ -568,6 +570,7 @@ async fn three_sharded_tables_left_deep_shuffle_chain() {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
