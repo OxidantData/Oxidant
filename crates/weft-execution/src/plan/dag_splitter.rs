@@ -800,4 +800,25 @@ mod tests {
         assert!(msg.contains("preserved side"), "{msg}");
         assert!(msg.contains("duplicate rows once per worker"), "{msg}");
     }
+
+    #[tokio::test]
+    async fn remaining_sharded_scan_in_outer_plan_is_rejected() {
+        // After materializing branches, any leftover scan of a sharded fact (including inside an
+        // EXISTS/scalar subquery) would read only partition 0 and silently drop rows.
+        let lp = logical_plan("SELECT k FROM t WHERE EXISTS (SELECT 1 FROM t t2 WHERE t2.k = t.k)")
+            .await;
+        let err = reject_remaining_sharded_scans(&lp, &[]).expect_err("sharded t still present");
+        let msg = err.to_string();
+        assert!(msg.contains("unmaterialized sharded table"), "{msg}");
+        assert!(
+            msg.contains("\"t\"") || msg.contains("`t`") || msg.contains("t"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remaining_scan_of_only_replicated_tables_is_allowed() {
+        let lp = logical_plan("SELECT dk FROM d").await;
+        reject_remaining_sharded_scans(&lp, &["d"]).expect("replicated dim may remain in outer");
+    }
 }

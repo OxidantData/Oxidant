@@ -2387,3 +2387,113 @@ mod grouping_set_tests {
         assert_eq!(empty.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
     }
 }
+
+/// Regression locks for PR #52 planner fixes: Q21-shaped HAVING above an aliasing projection,
+/// fail-loud unmapped HAVING columns, and AVG recombine without a forced DOUBLE cast.
+#[cfg(test)]
+mod peel_remap_tests {
+    use std::sync::Arc;
+
+    use datafusion::prelude::col;
+    use weft_loom::arrow::array::{Int64Array, RecordBatch};
+    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+    use weft_loom::Engine;
+
+    use super::{build_remap, ensure_all_columns_remapped, peel, plan_distributed_logical};
+
+    fn tiny_table() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![0i64, 1, 0])),
+                Arc::new(Int64Array::from(vec![10i64, 20, 30])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ensure_all_columns_remapped_accepts_stage_names_only() {
+        ensure_all_columns_remapped(&col("r0")).expect("r0 is a remapped aggregate output");
+        ensure_all_columns_remapped(&col("g0")).expect("g0 is a remapped group key");
+        let err = ensure_all_columns_remapped(&col("inv_before"))
+            .expect_err("original alias must not slip through");
+        assert!(err.to_string().contains("HAVING references"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn q21_shaped_having_above_alias_projection_remaps() {
+        // Filter → SubqueryAlias → Projection → Aggregate. An earlier peel required the Filter to
+        // sit directly on Aggregate and silently dropped the predicate (unfiltered Q21 rows).
+        let engine = Engine::new();
+        engine.register_batches("t", vec![tiny_table()]).unwrap();
+        let lp = engine
+            .logical_plan(
+                "SELECT * FROM (\
+                     SELECT k, SUM(v) AS inv_before FROM t GROUP BY k\
+                 ) x WHERE inv_before > 10",
+            )
+            .await
+            .unwrap();
+
+        let peeled = peel(&lp).expect("Q21-shaped plan must peel");
+        assert!(
+            !peeled.having.is_empty(),
+            "intervening Filter must be collected as HAVING"
+        );
+        assert!(
+            !peeled.alias_projections.is_empty(),
+            "inner SUM alias projection must be retained for remap"
+        );
+        let remap = build_remap(&peeled);
+        assert_eq!(
+            remap.get("inv_before").map(String::as_str),
+            Some("r0"),
+            "alias inv_before must map to aggregate slot r0; got {remap:?}"
+        );
+
+        let dq = plan_distributed_logical(&lp, &[]).expect("must distribute");
+        let final_sql = &dq.stages.last().expect("stages").sql;
+        // Predicate must use remapped `r0`; the output projection may still alias it back
+        // to `"inv_before"` for schema fidelity.
+        assert!(
+            final_sql.contains("WHERE") && final_sql.contains("(r0 > 10)"),
+            "final stage must filter on remapped r0; got: {final_sql}"
+        );
+        assert!(
+            !final_sql.contains("inv_before >"),
+            "HAVING must not filter on the pre-remap alias name; got: {final_sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn avg_recombine_does_not_force_double_cast() {
+        // Forcing CAST(... AS DOUBLE) made TPC-DS Q7/Q26 return the right number at the wrong scale.
+        let engine = Engine::new();
+        engine.register_batches("t", vec![tiny_table()]).unwrap();
+        let lp = engine
+            .logical_plan("SELECT k, AVG(v) AS av FROM t GROUP BY k")
+            .await
+            .unwrap();
+        let dq = plan_distributed_logical(&lp, &[]).expect("avg must distribute");
+        let sql = dq
+            .stages
+            .iter()
+            .map(|s| s.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            sql.contains("(sum(a0s) / NULLIF(sum(a0c), 0))"),
+            "expected SUM/COUNT recombine; got:\n{sql}"
+        );
+        let upper = sql.to_uppercase();
+        assert!(
+            !upper.contains("AS DOUBLE") && !upper.contains("AS FLOAT64"),
+            "AVG recombine must not force DOUBLE; got:\n{sql}"
+        );
+    }
+}

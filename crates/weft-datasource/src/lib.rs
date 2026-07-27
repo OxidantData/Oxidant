@@ -1417,4 +1417,46 @@ mod tests {
         write_parquet(path.to_str().unwrap(), &[batch]).unwrap();
         assert!(path.exists());
     }
+
+    #[tokio::test]
+    async fn active_files_rejects_incompatible_snapshot_pin() {
+        // Pin identity is format-tagged so a driver/worker mismatch fails loud before any I/O
+        // that could resolve a different file set and silently drop or invent rows.
+        let store = local_store();
+        let req = ScanRequest::default();
+
+        let err = active_files_for_scan(
+            store.clone(),
+            "file:///unused",
+            "delta",
+            None,
+            Some(&SnapshotIdentity::Iceberg {
+                snapshot_id: 1,
+                sequence_number: 0,
+                metadata_location: "file:///unused/metadata.json".into(),
+            }),
+            &req,
+        )
+        .await
+        .expect_err("Iceberg pin must not open a Delta scan");
+        assert!(
+            err.to_string().contains("incompatible snapshot identity"),
+            "got: {err}"
+        );
+
+        let err = active_files_for_scan(
+            store,
+            "file:///unused",
+            "iceberg",
+            None,
+            Some(&SnapshotIdentity::Delta { version: 7 }),
+            &req,
+        )
+        .await
+        .expect_err("Delta pin must not open an Iceberg scan");
+        assert!(
+            err.to_string().contains("incompatible snapshot identity"),
+            "got: {err}"
+        );
+    }
 }
