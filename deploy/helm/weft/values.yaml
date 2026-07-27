@@ -27,11 +27,18 @@ connect:
   serviceType: ClusterIP
   # Bundled in connect-server.Dockerfile (awscli stage).
   awsBin: /usr/local/aws-cli/v2/current/bin/aws
-  # DataFusion / shuffle memory pool hint (bytes). Prefer shuffleSpillBytes for
-  # the shuffle threshold (it takes precedence in SpillStore::from_env).
+  # TWO SEPARATE memory pools (see values-sf100.yaml invariant):
+  #   memoryLimitBytes  → DataFusion spill pool (joins/sorts/aggs)
+  #   shuffleSpillBytes → SpillStore shuffle-bucket cache threshold
+  # Invariant when set: memoryLimitBytes + shuffleSpillBytes + headroom
+  #   <= container memory limit.
+  # Both empty (default): SpillStore::from_env returns None and the in-memory
+  # shuffle cache is UNBOUNDED — fine for Kind smoke, NOT safe for large queries
+  # out of the box. Set both explicitly for any real workload (see SF100 overlay).
   memoryLimitBytes: ""
   # Threshold for hash-shuffle spill (bytes). Spill files land under
   # $TMPDIR/weft-shuffle-spill/… — chart sets TMPDIR to the spill volume.
+  # Takes precedence over memoryLimitBytes inside SpillStore::from_env.
   shuffleSpillBytes: ""
   # DEBUG ONLY: set WEFT_SHUFFLE_SPILL_DIR and force EVERY shuffle bucket to disk.
   # Invalidates benchmark timings. Default off.
@@ -50,6 +57,8 @@ worker:
   port: 50561
   # Fixed replica count — also emitted as WEFT_WORKER_COUNT on every worker pod.
   replicas: 2
+  # Same two-pool model as connect (above). Both empty by default → unbounded
+  # shuffle cache (SpillStore::from_env is None). Not safe for SF-scale queries.
   memoryLimitBytes: ""
   # Threshold for hash-shuffle spill (bytes). Prefer this over memoryLimitBytes for
   # shuffle. Chart sets TMPDIR=/var/lib/weft/spill so default_spill_root() lands on

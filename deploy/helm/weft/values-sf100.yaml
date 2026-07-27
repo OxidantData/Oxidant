@@ -6,6 +6,14 @@
 #   replicas pinned at 2 (min=max=2); autoscaling MUST stay false.
 #
 # Fill IRSA / storage class with real cluster values before install.
+#
+# MEMORY INVARIANT (two separate pools — do NOT set them equal to the limit):
+#   memoryLimitBytes     → DataFusion bounded spill pool (joins/sorts/aggs)
+#   shuffleSpillBytes    → SpillStore shuffle-bucket cache threshold (separate Vec)
+#   memoryLimitBytes + shuffleSpillBytes + headroom <= container memory limit
+# Headroom covers Arrow decode buffers, object-store/S3 client, the AWS CLI
+# subprocess Glue shells out to, and allocator fragmentation. Overlapping the
+# two budgets at ~limit each will OOMKill the pod before either threshold trips.
 
 serviceAccount:
   create: true
@@ -18,9 +26,9 @@ connect:
   enabled: true
   distributedStrict: true
   forceShuffleSpill: false
-  # ~75% of c6g.xlarge memory — leave headroom for the OS / kubelet.
-  memoryLimitBytes: "6442450944" # 6 GiB
-  shuffleSpillBytes: "6442450944" # threshold spill (not force-spill)
+  # 7Gi limit: ~3 Gi DF + ~1.5 Gi shuffle + ~2.5 Gi headroom.
+  memoryLimitBytes: "3221225472"   # 3 Gi — DataFusion pool
+  shuffleSpillBytes: "1610612736"  # 1.5 Gi — shuffle cache threshold
   resources:
     requests:
       # c6g.xlarge ≈ 3920m allocatable; leave ~900m for CNI / kube-proxy / agents.
@@ -39,9 +47,9 @@ worker:
   autoscaling:
     enabled: false
   forceShuffleSpill: false
-  # Match container memory limit so aggregations spill under pressure (threshold).
-  memoryLimitBytes: "51539607552" # 48 GiB
-  shuffleSpillBytes: "51539607552" # WEFT_SHUFFLE_SPILL_BYTES (takes precedence)
+  # 56Gi limit: ~26 Gi DF + ~14 Gi shuffle + ~16 Gi headroom.
+  memoryLimitBytes: "27917287424"  # 26 Gi — DataFusion pool
+  shuffleSpillBytes: "15032385536" # 14 Gi — shuffle cache threshold
   resources:
     requests:
       cpu: "14"
