@@ -60,8 +60,24 @@ jobs:
   build-test:
     name: clippy + test
     runs-on: ubuntu-latest
+    # Fail fast rather than burning an hour on a wedged runner. The suite compiles the workspace
+    # twice over (see the disk-reclaim step) and then runs the distributed tests serially, so the
+    # honest ceiling is well above the ~10 min this takes on `main`.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      # `iceberg` 0.8 is the newest release compatible with the pinned Rust 1.90, and it pulls
+      # `parquet`/`arrow` 57 alongside the workspace's 58. `cargo test --workspace` therefore builds
+      # two full Arrow stacks plus a test binary per crate, which overruns the ~14 GB a standard
+      # runner leaves free and kills the job with no log to show for it. Reclaiming the preinstalled
+      # SDKs buys ~25 GB. This can go away once the toolchain moves to 1.92+ and `iceberg` 0.9 can
+      # share the workspace's Arrow.
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          df -h /
       - name: Start MinIO service container
         run: |
           docker run -d --name weft-minio \
