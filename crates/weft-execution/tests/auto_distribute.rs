@@ -781,6 +781,37 @@ async fn two_sharded_tables_shuffle_join_plans() {
     assert_eq!(plan.unwrap().stages.len(), 4);
 }
 
+#[tokio::test]
+async fn shuffle_join_conjunction_keeps_residual_in_stage_sql() {
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 60, 12)])
+        .unwrap();
+    single.register_batches("dim", vec![dim(12)]).unwrap();
+    let lp = single
+        .logical_plan(
+            "SELECT d.d_key, COUNT(*) \
+             FROM t JOIN dim d ON t.k = d.d_key AND t.v > d.d_name \
+             GROUP BY d.d_key",
+        )
+        .await
+        .unwrap();
+
+    let dq = plan_distributed_logical(&lp, &[])
+        .expect("equality plus residual predicate should plan as a shuffle join");
+    let join_stage = dq
+        .stages
+        .iter()
+        .find(|stage| stage.upstream_stage_ids.len() == 2)
+        .expect("shuffle plan should contain a two-input join stage");
+
+    assert!(
+        join_stage.sql.contains(" WHERE "),
+        "residual predicate must remain as a post-join filter: {}",
+        join_stage.sql
+    );
+}
+
 /// Flattened leaf schemas matching `leaf_stage_sql` output (`alias__col`).
 fn flat_shuffle_inputs(nullable_keys: bool) -> (RecordBatch, RecordBatch) {
     let left = {

@@ -17,7 +17,7 @@ use weft_loom::Engine;
 use crate::distributed_coverage::{
     check_ratchet, plan_coverage, print_report, try_plan_with_facts, write_report,
 };
-use crate::tpcds::{normalize_batches, queries};
+use crate::tpcds::{batches_equal_ordered, normalize_batches, queries};
 use crate::tpcds_data;
 use crate::tpch_dist::shard;
 
@@ -166,17 +166,34 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
     let all = tpcds_data::TABLES.to_vec();
     let facts = FACT_TABLES.to_vec();
 
+    // Apply WEFT_TPCDS_ONLY / query_filter *before* the plan pass and cluster build so a
+    // single-query iteration doesn't pay for 99 plans + 16 in-process engines.
+    let only = std::env::var("WEFT_TPCDS_ONLY").ok();
+    let qs_filtered: Vec<(&str, &str)> = qs
+        .iter()
+        .copied()
+        .filter(|(name, _)| {
+            if let Some(ref o) = only {
+                if !name.eq_ignore_ascii_case(o) {
+                    return false;
+                }
+            }
+            if let Some(filter) = opts.query_filter {
+                if !filter.iter().any(|q| q.eq_ignore_ascii_case(name)) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
     // Plan pass: collect supported queries + sharded fact.
     let mut supported: Vec<(String, String, String)> = Vec::new(); // name, sql, fact
-    for (name, raw) in &qs {
+    for (name, raw) in &qs_filtered {
         let sql = raw.trim().trim_end_matches(';').trim();
         if let Ok((_dq, fact)) = try_plan_with_facts(&single, sql, &all, &facts).await {
             supported.push((name.to_string(), sql.to_string(), fact));
         }
-    }
-
-    if let Some(filter) = opts.query_filter {
-        supported.retain(|(n, _, _)| filter.iter().any(|q| q.eq_ignore_ascii_case(n)));
     }
 
     let sample = if opts.sample == 0 {
@@ -185,29 +202,40 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
         opts.sample.min(supported.len())
     };
     eprintln!(
-        "[tpcds-dist] {}/{} distributable; executing sample of {sample}\n",
+        "[tpcds-dist] {}/{} distributable (of {} considered); executing sample of {sample}\n",
         supported.len(),
-        qs.len()
+        qs.len(),
+        qs_filtered.len()
     );
 
-    // Load full table data once.
+    let to_run: Vec<&(String, String, String)> = supported.iter().take(sample).collect();
+    let run_count = to_run.len();
+
+    // Load full table data once (only needed if we have something to execute).
     let mut full: Vec<(&str, Vec<weft_loom::arrow::record_batch::RecordBatch>)> = Vec::new();
-    for t in tpcds_data::TABLES {
-        let b = single.sql(&format!("SELECT * FROM {t}")).await.unwrap();
-        full.push((t, b));
+    if run_count > 0 {
+        for t in tpcds_data::TABLES {
+            let b = single.sql(&format!("SELECT * FROM {t}")).await.unwrap();
+            full.push((t, b));
+        }
     }
 
-    let clusters = build_clusters(&full, opts.workers).await;
-
-    let only = std::env::var("WEFT_TPCDS_ONLY").ok();
-    let mut to_run: Vec<&(String, String, String)> = supported.iter().collect();
-    if let Some(ref o) = only {
-        to_run.retain(|(n, _, _)| n.eq_ignore_ascii_case(o));
-    }
-    let run_count = if opts.sample == 0 {
-        to_run.len()
+    // Build only the fact clusters this run will touch, plus the unreplicated `full`
+    // cluster (Forward plans and cheap to add — 2 workers vs 14 for all facts).
+    let needed_facts: Vec<&str> = {
+        let mut seen = std::collections::BTreeSet::new();
+        for (_, _, fact) in &to_run {
+            seen.insert(fact.as_str());
+        }
+        seen.into_iter().collect()
+    };
+    let clusters = if run_count == 0 {
+        ClusterSet {
+            by_fact: HashMap::new(),
+            full: Cluster::new(Vec::new()),
+        }
     } else {
-        opts.sample.min(to_run.len())
+        build_clusters(&full, opts.workers, &needed_facts, true).await
     };
 
     let mut report = ExecuteReport {
@@ -217,7 +245,7 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
     };
     let debug = std::env::var("WEFT_TPCDS_DEBUG").is_ok();
 
-    for (i, (name, sql, fact)) in to_run.iter().take(run_count).enumerate() {
+    for (i, (name, sql, fact)) in to_run.iter().enumerate() {
         let replicated: Vec<&str> = all
             .iter()
             .copied()
@@ -232,10 +260,25 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
             }
         };
 
+        // A plan is "whole-query forward" only if its *output* stage (the one nothing else
+        // consumes — see `run_stages_obs`) runs with `Forward` exchange, i.e. the entire query
+        // executes on a single worker against a fully-replicated dataset (no fact table needs
+        // sharding). A plan that mixes a `Forward` producer (a replicated-only UNION arm — see
+        // `stage_planner::try_split_broadcast_union`) with an ordinary hash-shuffled combine
+        // output still needs `fact` genuinely sharded across workers, so it must use the
+        // `by_fact` cluster like any other shuffle plan — using the fully-replicated `full`
+        // cluster here would run the sharded arm's aggregation on the *whole* table on every
+        // worker and multiply its contribution by the worker count.
+        let consumed: std::collections::HashSet<u32> = dq
+            .stages
+            .iter()
+            .flat_map(|s| s.upstream_stage_ids.iter().copied())
+            .collect();
         let forward = dq
             .stages
             .iter()
-            .any(|s| s.exchange == ExchangeMode::Forward);
+            .filter(|s| !consumed.contains(&s.stage_id))
+            .all(|s| s.exchange == ExchangeMode::Forward);
         let cluster = if forward {
             &clusters.full
         } else {
@@ -303,7 +346,7 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
         };
 
         let expected = single.sql(sql).await.unwrap();
-        if normalize_batches(&result) == normalize_batches(&expected) {
+        if batches_equal_ordered(&result, &expected) {
             report.verified.push(name.to_string());
             eprintln!("{name:<4} distributed ok [{mode}] ({})", dq.stages.len());
         } else {
@@ -319,6 +362,12 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
                     exp.first(),
                     got.first()
                 );
+                if std::env::var("WEFT_TPCDS_DEBUG_FULL").is_ok() {
+                    for (i, (e, g)) in exp.iter().zip(got.iter()).enumerate() {
+                        let mark = if e == g { "==" } else { "!=" };
+                        eprintln!("    [{i}] {mark} exp={e:?}\n           got={g:?}");
+                    }
+                }
             }
         }
     }
@@ -427,9 +476,14 @@ struct ClusterSet {
 async fn build_clusters(
     full: &[(&str, Vec<weft_loom::arrow::record_batch::RecordBatch>)],
     num_workers: usize,
+    needed_facts: &[&str],
+    need_full: bool,
 ) -> ClusterSet {
     let mut by_fact = HashMap::new();
     for (fi, fact) in FACT_TABLES.iter().enumerate() {
+        if !needed_facts.contains(fact) {
+            continue;
+        }
         let fact_batches = full.iter().find(|(t, _)| *t == *fact).unwrap().1.clone();
         let shards = shard(&fact_batches, num_workers);
         let base_port = 50800u16 + (fi as u16) * 10;
@@ -454,23 +508,28 @@ async fn build_clusters(
         by_fact.insert(fact.to_string(), Cluster::new(endpoints));
     }
 
-    let mut full_endpoints = Vec::new();
-    for i in 0..num_workers {
-        let e = Arc::new(Engine::new());
-        for (t, batches) in full {
-            e.register_batches(t, batches.clone()).unwrap();
+    let full_cluster = if need_full {
+        let mut full_endpoints = Vec::new();
+        for i in 0..num_workers {
+            let e = Arc::new(Engine::new());
+            for (t, batches) in full {
+                e.register_batches(t, batches.clone()).unwrap();
+            }
+            let port = 50900 + i as u16;
+            let ee = e.clone();
+            tokio::spawn(async move {
+                let _ = serve_worker(port, ee).await;
+            });
+            full_endpoints.push(format!("http://127.0.0.1:{port}"));
         }
-        let port = 50900 + i as u16;
-        let ee = e.clone();
-        tokio::spawn(async move {
-            let _ = serve_worker(port, ee).await;
-        });
-        full_endpoints.push(format!("http://127.0.0.1:{port}"));
-    }
+        Cluster::new(full_endpoints)
+    } else {
+        Cluster::new(Vec::new())
+    };
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     ClusterSet {
         by_fact,
-        full: Cluster::new(full_endpoints),
+        full: full_cluster,
     }
 }
 
