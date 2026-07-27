@@ -1007,6 +1007,7 @@ mod tests {
             hash_key_cols: vec![0],
             upstream_stage_ids: vec![],
             produce: true,
+            lakehouse_snapshot_pins: String::new(),
         };
         for _ in 0..50 {
             if run_stage_on_worker(endpoint.clone(), ticket.clone())
