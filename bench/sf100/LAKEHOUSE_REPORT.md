@@ -43,8 +43,16 @@ Same S3 Parquet prefix for Parquet + Delta; Iceberg warehouse is `{source}-icebe
 
 No AWS commands were executed in this worker session.
 
-## What’s left for the operator
+## Follow-up: `_delta_log` checkpoint contamination
 
-1. Dry-run then run `build-lakehouse.py` against the real SF100 Parquet prefix.
-2. Point the EKS harness `--glue-db` at `_iceberg` / `_delta` sibling DBs.
-3. Tear down with `teardown-lakehouse.sh` when idle to stop S3/Glue sprawl.
+**Finding (rehearsal):** After planting
+`_delta_log/00000000000000000010.checkpoint.parquet` with a foreign schema, a naive
+`.parquet` extension listing **is contaminated** — `pyarrow` fails with
+`ArrowInvalid: Schema at index 1 was different` (checkpoint schema vs table schema).
+Excluding `_delta_log/` restores the original row count (**MITIGATION OK**).
+
+Fresh `convert_to_deltalake` (commit 0, JSON only) does **not** contaminate yet.
+The hazard appears once a checkpoint exists.
+
+Documented in `README.md`. Engine-side exclude of `_delta_log` is owned by the
+`catalog_bridge` worker; this rehearsal is the proof.
