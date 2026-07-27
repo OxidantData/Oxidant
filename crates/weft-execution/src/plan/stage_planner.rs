@@ -342,9 +342,10 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
                     "sum({}) AS a{i}s, count({}) AS a{i}c",
                     a.arg_sql, a.arg_sql
                 ));
-                combine.push(format!(
-                    "(CAST(sum(a{i}s) AS DOUBLE) / NULLIF(sum(a{i}c), 0)) AS r{i}"
-                ));
+                // No cast: SUM/COUNT keep DataFusion's own AVG result type (a DECIMAL average
+                // stays DECIMAL at the same scale). Forcing DOUBLE here made TPC-DS Q7/Q26 return
+                // numerically-right values at the wrong scale (`120.65` vs `120.650000`).
+                combine.push(format!("(sum(a{i}s) / NULLIF(sum(a{i}c), 0)) AS r{i}"));
             }
             other => {
                 return Err(Error::Unsupported(format!(
@@ -694,9 +695,10 @@ pub(crate) fn recombine_stage_sql(
                     "sum({}) AS a{i}s, count({}) AS a{i}c",
                     a.arg_sql, a.arg_sql
                 ));
-                combine.push(format!(
-                    "(CAST(sum(a{i}s) AS DOUBLE) / NULLIF(sum(a{i}c), 0)) AS r{i}"
-                ));
+                // No cast: SUM/COUNT keep DataFusion's own AVG result type (a DECIMAL average
+                // stays DECIMAL at the same scale). Forcing DOUBLE here made TPC-DS Q7/Q26 return
+                // numerically-right values at the wrong scale (`120.65` vs `120.650000`).
+                combine.push(format!("(sum(a{i}s) / NULLIF(sum(a{i}c), 0)) AS r{i}"));
             }
             other => {
                 return Err(Error::Unsupported(format!(
