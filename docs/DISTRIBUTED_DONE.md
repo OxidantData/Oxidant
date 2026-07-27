@@ -55,14 +55,18 @@ Turn "many shapes fall back" into an exact number before any cloud spend.
   `plan_distributed` over all 99 queries and reports supported vs fallback, grouped by
   reject reason. Same for the TPC-H set.
   *Accept:* one command prints `N/99 distributable` plus a reason histogram.
-  *(2026-07-25: **52/99** after non-aggregate + window gains; baseline in
-  `bench/distributed/tpcds-planner-baseline.json`.)*
-- [ ] **D-1.2 Correctness of the supported subset.** Execute every distributable query on
+  *(2026-07-26: **46/99**; baseline in `bench/distributed/tpcds-planner-baseline.json`. This
+  counts queries a plan can be **built** for and says nothing about the answer — D-1.2 is the
+  number to quote.)*
+- [x] **D-1.2 Correctness of the supported subset.** Execute every distributable query on
   in-process workers and assert row-for-row equality with single-node, extending the
   pattern of `two_worker_groupby_matches_single_node`.
   *Accept:* zero mismatches across the supported subset at small SF.
-  *(Partial: CI runs a curated execute sample; full 52-query execute still blocked on
-  stage-SQL / unparser issues.)*
+  *(2026-07-26: **46/46 execute-verified**, zero mismatches, zero errors, at sf0.01 on two
+  workers — `tpcds-distributed --execute`, ratcheted against
+  `bench/distributed/tpcds-execute-baseline.json`. Getting here meant dropping the planner count
+  from 67 to 46: a full execute sweep showed 24 of those 67 returning a wrong answer or failing
+  on the worker, and the planner now declines those shapes so they fall back to single-node.)*
 - [x] **D-1.3 CI ratchet.** Commit the coverage JSON as a baseline and fail CI when the
   supported count drops, next to the existing Spark-parity ratchet.
   *Accept:* a deliberate regression turns CI red.
@@ -152,7 +156,8 @@ Only after Phases 0–2; Phase 3 items that are not yet done must be stated as c
 
 | Gate | Command |
 |------|---------|
-| Coverage ratchet | `cargo run -p weft-bench -- tpcds-distributed` (D-1.1/1.3) |
+| Planner coverage ratchet | `cargo run -p weft-bench -- tpcds-distributed` (D-1.1/1.3) |
+| Execute correctness ratchet | `cargo run -p weft-bench -- tpcds-distributed --execute --sf 0.01 --workers 2` (D-1.2) |
 | Distributed correctness | `cargo run -p weft-bench -- correctness-distributed` |
 | TPC-H distributed | `cargo run -p weft-bench -- tpch-distributed --sf 0.01 --workers 2` |
 | Fault tolerance | worker-kill test from D-3.1 in `cargo test --workspace` |

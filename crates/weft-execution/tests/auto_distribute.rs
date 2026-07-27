@@ -2,6 +2,7 @@
 //! distributed result (gathered + optional global finalize) must equal single-node, for a range of
 //! grouped-aggregation shapes (SUM/COUNT/MIN/MAX/AVG, COUNT(DISTINCT), ORDER BY/LIMIT).
 
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
 use weft_execution::driver::{run_stages, Cluster};
@@ -11,6 +12,25 @@ use weft_loom::arrow::array::{Int64Array, RecordBatch};
 use weft_loom::arrow::datatypes::{DataType, Field, Schema};
 use weft_loom::arrow::util::pretty::pretty_format_batches;
 use weft_loom::Engine;
+
+/// Serialize multi-worker outer-join tests and give each worker a fresh port. The bind/drop
+/// `ephemeral_port()` helper races under parallel tests and can also reuse TIME_WAIT ports
+/// across sequential tests, causing silent connects to the wrong worker.
+static OUTER_JOIN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static OUTER_JOIN_PORT: AtomicU16 = AtomicU16::new(0);
+
+fn unique_worker_port() -> u16 {
+    // Seed once from pid so leftover listeners from prior cargo-test processes on 46000+ do not
+    // steal traffic (bind failure is ignored by `let _ = serve_worker(...)`).
+    let prev = OUTER_JOIN_PORT.fetch_add(1, Ordering::Relaxed);
+    if prev == 0 {
+        let seed = 41000 + (std::process::id() as u16 % 20000);
+        OUTER_JOIN_PORT.store(seed.wrapping_add(1), Ordering::Relaxed);
+        seed
+    } else {
+        prev
+    }
+}
 
 /// rows(k, v, w) where k = i % `groups`, v = i, w = i % 7 — for grouping/aggregation.
 fn batch(start: i64, end: i64, groups: i64) -> RecordBatch {
@@ -55,6 +75,25 @@ fn ephemeral_port() -> u16 {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port
+}
+
+/// Block until each worker accepts TCP. `serve_worker` swallows bind errors, so without this a
+/// stolen port turns into a retry loop that only ever reports "never succeeded".
+async fn await_worker_bind(workers: &[(&str, u16)]) {
+    for &(label, port) in workers {
+        let mut ok = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ok, "{label} did not bind on port {port}");
+    }
 }
 
 async fn two_workers(_base: u16) -> Cluster2 {
@@ -239,6 +278,7 @@ async fn auto_derived_broadcast_join() {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
@@ -309,7 +349,7 @@ async fn two_sharded_tables_auto_shuffle_join() {
         .unwrap()
     }
 
-    let (p0, p1) = (50631u16, 50632u16);
+    let (p0, p1) = (ephemeral_port(), ephemeral_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
     e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)])
@@ -324,6 +364,7 @@ async fn two_sharded_tables_auto_shuffle_join() {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
@@ -338,14 +379,23 @@ async fn two_sharded_tables_auto_shuffle_join() {
         dq.stages.len()
     );
     let mut gathered = None;
+    let mut last_err = None;
     for _ in 0..150 {
-        if let Ok(b) = run_stages(&cluster, &dq.stages).await {
-            gathered = Some(b);
-            break;
+        match run_stages(&cluster, &dq.stages).await {
+            Ok(b) => {
+                gathered = Some(b);
+                break;
+            }
+            Err(e) => last_err = Some(e.to_string()),
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let actual = gathered.expect("distributed shuffle join never succeeded");
+    let actual = gathered.unwrap_or_else(|| {
+        panic!(
+            "distributed shuffle join never succeeded; last error: {}",
+            last_err.as_deref().unwrap_or("<none>")
+        )
+    });
     assert_eq!(
         sorted_lines(&actual),
         sorted_lines(&expected),
@@ -446,7 +496,7 @@ async fn multi_dim_broadcast_star_matches_single_node() {
     single.register_batches("dim2", vec![dim2(G)]).unwrap();
     let expected = single.sql(sql).await.unwrap();
 
-    let (p0, p1) = (50701u16, 50702u16);
+    let (p0, p1) = (ephemeral_port(), ephemeral_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
     e0.register_batches("dim", vec![dim(G)]).unwrap();
@@ -461,6 +511,7 @@ async fn multi_dim_broadcast_star_matches_single_node() {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
@@ -500,7 +551,7 @@ async fn three_sharded_tables_left_deep_shuffle_chain() {
     single.register_batches("dim2", vec![dim2(G)]).unwrap();
     let expected = single.sql(sql).await.unwrap();
 
-    let (p0, p1) = (50711u16, 50712u16);
+    let (p0, p1) = (ephemeral_port(), ephemeral_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
     e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)])
@@ -519,6 +570,7 @@ async fn three_sharded_tables_left_deep_shuffle_chain() {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
@@ -597,20 +649,7 @@ async fn two_workers_with_dim() -> (Cluster, Engine) {
     tokio::spawn(async move {
         let _ = serve_worker(p1, e1).await;
     });
-    for (label, port) in [("w0", p0), ("w1", p1)] {
-        let mut bound = false;
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                bound = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(bound, "{label} did not bind on port {port}");
-    }
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
     let cluster = Cluster::new(vec![
         format!("http://127.0.0.1:{p0}"),
         format!("http://127.0.0.1:{p1}"),
@@ -742,6 +781,200 @@ async fn two_sharded_tables_shuffle_join_plans() {
     assert_eq!(plan.unwrap().stages.len(), 4);
 }
 
+/// Flattened leaf schemas matching `leaf_stage_sql` output (`alias__col`).
+fn flat_shuffle_inputs(nullable_keys: bool) -> (RecordBatch, RecordBatch) {
+    let left = {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("t__k", DataType::Int64, nullable_keys),
+            Field::new("t__v", DataType::Int64, false),
+            Field::new("t__w", DataType::Int64, false),
+        ]));
+        let k = if nullable_keys {
+            Int64Array::from(vec![Some(0i64), None])
+        } else {
+            Int64Array::from(vec![0i64, 1])
+        };
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(k),
+                Arc::new(Int64Array::from(vec![10i64, 12])),
+                Arc::new(Int64Array::from(vec![0i64, 1])),
+            ],
+        )
+        .unwrap()
+    };
+    let right = {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d__d_key", DataType::Int64, nullable_keys),
+            Field::new("d__d_name", DataType::Int64, false),
+        ]));
+        let k = if nullable_keys {
+            Int64Array::from(vec![Some(1i64), None])
+        } else {
+            Int64Array::from(vec![0i64, 1])
+        };
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(k), Arc::new(Int64Array::from(vec![100i64, 200]))],
+        )
+        .unwrap()
+    };
+    (left, right)
+}
+
+async fn assert_join_stages_reparse(dq: &weft_execution::plan::DistributedQuery, label: &str) {
+    let (left, right) = flat_shuffle_inputs(true);
+    let probe = Engine::new();
+    probe
+        .register_batches("shuffle_input_0", vec![left])
+        .unwrap();
+    probe
+        .register_batches("shuffle_input_1", vec![right])
+        .unwrap();
+    for s in &dq.stages {
+        if s.upstream_stage_ids.len() == 2 {
+            probe
+                .sql(&s.sql)
+                .await
+                .unwrap_or_else(|e| panic!("{label} stage SQL re-parse failed: {e}\n{}", s.sql));
+        }
+    }
+}
+
+/// LEFT / FULL / ANTI shuffle joins: one cluster, equality vs single-node.
+/// Uses pid-seeded ports (not ephemeral bind/drop) — TOCTOU otherwise connects to leftover
+/// listeners and silently drops a shuffle partition (odd keys missing).
+/// NULL-key co-location is covered by `null_join_keys_are_hashed_not_dropped`.
+#[tokio::test]
+async fn two_sharded_tables_left_outer_shuffle_join() {
+    let _guard = OUTER_JOIN_TEST_LOCK.lock().await;
+    const G: i64 = 12;
+    let dim_all = vec![
+        dim_shard(G, 0, G / 2),
+        dim_shard(G + G / 4, G, G + G / 4), // right-only keys for FULL
+    ];
+
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 200, G)])
+        .unwrap();
+    single.register_batches("dim", dim_all).unwrap();
+
+    let (p0, p1) = (unique_worker_port(), unique_worker_port());
+    let e0 = Arc::new(Engine::new());
+    e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
+    e0.register_batches("dim", vec![dim_shard(G, 0, G / 4)])
+        .unwrap();
+    let e1 = Arc::new(Engine::new());
+    e1.register_batches("t", vec![batch(100, 200, G)]).unwrap();
+    e1.register_batches(
+        "dim",
+        vec![
+            dim_shard(G, G / 4, G / 2),
+            dim_shard(G + G / 4, G, G + G / 4),
+        ],
+    )
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = serve_worker(p0, e0).await;
+    });
+    tokio::spawn(async move {
+        let _ = serve_worker(p1, e1).await;
+    });
+    await_worker_bind(&[("w0", p0), ("w1", p1)]).await;
+    let cluster = Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ]);
+
+    for (sql, stage_kw) in [
+        (
+            "SELECT t.k AS k, COUNT(*) AS c, SUM(COALESCE(d.d_name, 0)) AS sv \
+             FROM t LEFT JOIN dim d ON t.k = d.d_key GROUP BY t.k",
+            "LEFT JOIN",
+        ),
+        (
+            "SELECT t.k AS k, COUNT(*) AS c, SUM(COALESCE(d.d_name, 0)) AS sv \
+             FROM t FULL OUTER JOIN dim d ON t.k = d.d_key GROUP BY t.k",
+            "FULL OUTER JOIN",
+        ),
+        (
+            "SELECT t.k AS k, COUNT(*) AS c, SUM(t.v) AS sv \
+             FROM t LEFT ANTI JOIN dim d ON t.k = d.d_key GROUP BY t.k",
+            "LEFT ANTI JOIN",
+        ),
+    ] {
+        let expected = single.sql(sql).await.unwrap();
+        let dq = plan_distributed_logical(&single.logical_plan(sql).await.unwrap(), &[])
+            .unwrap_or_else(|e| panic!("{stage_kw} should plan: {e}"));
+        assert!(
+            dq.stages.iter().any(|s| s.sql.contains(stage_kw)),
+            "expected {stage_kw} in stage SQL, got: {:?}",
+            dq.stages.iter().map(|s| &s.sql).collect::<Vec<_>>()
+        );
+        assert_join_stages_reparse(&dq, stage_kw).await;
+
+        let mut last = Vec::new();
+        let mut ok = false;
+        for _ in 0..150 {
+            if let Ok(b) = run_stages(&cluster, &dq.stages).await {
+                last = sorted_lines(&b);
+                if last == sorted_lines(&expected) {
+                    ok = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            ok,
+            "{stage_kw} shuffle must equal single-node\n got: {last:?}\n exp: {:?}",
+            sorted_lines(&expected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_then_inner_chain_coalesces_carried_join_key() {
+    // Blocker 1: after FULL, intermediate projection must COALESCE the carried key so the next
+    // shuffle still colocates unmatched-right rows.
+    let single = Engine::new();
+    single.register_batches("t", vec![batch(0, 40, 8)]).unwrap();
+    single.register_batches("dim", vec![dim(8)]).unwrap();
+    single.register_batches("dim2", vec![dim2(8)]).unwrap();
+    let sql = "SELECT t.k AS k, COUNT(*) AS c \
+               FROM t FULL OUTER JOIN dim d ON t.k = d.d_key \
+               JOIN dim2 d2 ON t.k = d2.d2_key \
+               GROUP BY t.k";
+    let dq = plan_distributed_logical(&single.logical_plan(sql).await.unwrap(), &[])
+        .expect("FULL then JOIN chain should plan");
+    let intermediate = dq
+        .stages
+        .iter()
+        .find(|s| {
+            s.upstream_stage_ids.len() == 2
+                && s.hash_key_cols.len() == 1
+                && !s.sql.contains("GROUP BY")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected intermediate join stage, stages={:?}",
+                dq.stages.iter().map(|s| &s.sql).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        intermediate.sql.to_uppercase().contains("COALESCE"),
+        "FULL intermediate must COALESCE carried key, got:\n{}",
+        intermediate.sql
+    );
+    assert!(
+        intermediate.sql.contains("FULL OUTER JOIN"),
+        "expected FULL OUTER JOIN in intermediate, got:\n{}",
+        intermediate.sql
+    );
+}
+
 #[tokio::test]
 async fn subquery_over_sharded_table_is_rejected() {
     let single = Engine::new();
@@ -783,24 +1016,42 @@ async fn union_all_of_two_aggs() {
 }
 
 #[tokio::test]
-async fn union_distinct_is_rejected() {
+async fn union_distinct_of_two_aggs() {
+    let sql = "SELECT k, SUM(v) AS sv FROM t GROUP BY k \
+               UNION \
+               SELECT k, SUM(v) AS sv FROM t WHERE v > 50 GROUP BY k";
     let single = Engine::new();
     single
-        .register_batches("t", vec![batch(0, 60, 12)])
+        .register_batches("t", vec![batch(0, 300, 12)])
         .unwrap();
-    let lp = single
-        .logical_plan(
-            "SELECT k, SUM(v) AS sv FROM t GROUP BY k \
-             UNION \
-             SELECT k, SUM(v) AS sv FROM t WHERE v > 10 GROUP BY k",
-        )
-        .await
+    let expected = single.sql(sql).await.unwrap();
+
+    let c2 = two_workers(50692).await;
+    let actual = run_auto(&c2, &single, sql).await;
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "UNION distinct of two aggs must equal single-node"
+    );
+}
+
+#[tokio::test]
+async fn except_of_two_aggs() {
+    let sql = "SELECT k FROM t GROUP BY k \
+               EXCEPT \
+               SELECT k FROM t WHERE v > 100 GROUP BY k";
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![batch(0, 300, 12)])
         .unwrap();
-    let err = plan_distributed_logical(&lp, &[]);
-    let msg = format!("{}", err.expect_err("UNION distinct must be rejected"));
-    assert!(
-        msg.contains("UNION") || msg.contains("distinct"),
-        "expected UNION distinct message, got: {msg}"
+    let expected = single.sql(sql).await.unwrap();
+
+    let c2 = two_workers(50693).await;
+    let actual = run_auto(&c2, &single, sql).await;
+    assert_eq!(
+        sorted_lines(&actual),
+        sorted_lines(&expected),
+        "EXCEPT of two aggs must equal single-node"
     );
 }
 
