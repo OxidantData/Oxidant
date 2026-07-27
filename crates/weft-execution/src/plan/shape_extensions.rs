@@ -734,6 +734,7 @@ fn plan_semi_anti_set_op(
                 hash_key_cols: s.hash_key_cols,
                 exchange: s.exchange,
                 plan_fragment: s.plan_fragment,
+                lakehouse_snapshot_pins: s.lakehouse_snapshot_pins,
             });
             next_id = next_id.max(new_id + 1);
         }
