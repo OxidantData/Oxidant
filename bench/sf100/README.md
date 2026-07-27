@@ -104,6 +104,18 @@ SUITE=tpcds SF=100 DELETE_DATA=1 ./bench/sf100/teardown-lakehouse.sh  # + purge 
 ./bench/sf100/rehearse-local.sh   # skips cleanly if Python deps missing
 ```
 
+**Shared prefix hazard (Parquet ↔ Delta):** `convert_to_deltalake` writes `_delta_log/`
+*inside* the Parquet table directory by design (one data copy). Commit-0 only has JSON
+actions, which a `.parquet` extension filter ignores. Delta **checkpoints** are
+`_delta_log/*.checkpoint.parquet` — those *do* match a naive Parquet lister
+(`ListingOptions.with_file_extension(".parquet")`) and will fail or corrupt a Parquet
+benchmark scan once anything optimizes/writes the Delta table. The local rehearsal plants
+a dummy checkpoint and checks both: naive listing is contaminated; listing that excludes
+`_delta_log/` is not. Engine fix (separate worker): skip `_delta_log` in Parquet listings.
+Alternative if we ever need physical isolation: Delta allows absolute paths in `add.path`,
+so `_delta_log` can live in a sibling prefix referencing the same data files — not
+implemented here.
+
 Verified library APIs (pinned in `requirements.txt`): `pyiceberg==0.11.1`
 `Table.add_files`, `deltalake==1.6.2` `convert_to_deltalake(..., mode='ignore')`.
 

@@ -165,8 +165,13 @@ def to_fs_path(uri: str) -> Path:
     return Path(uri)
 
 
-def list_parquet_files(table_uri: str) -> list[str]:
-    """Return full URIs/paths of *.parquet under table_uri (non-recursive + one level)."""
+def list_parquet_files(table_uri: str, *, include_delta_log: bool = False) -> list[str]:
+    """Return full URIs/paths of *.parquet under table_uri.
+
+    By default skips ``_delta_log/`` and Iceberg ``metadata/`` (data files only).
+    Pass ``include_delta_log=True`` to mimic a naive engine listing that only filters
+    on the ``.parquet`` extension (Weft ``ListingOptions.with_file_extension``).
+    """
     if is_s3(table_uri):
         import s3fs  # noqa: WPS433 — optional until S3 path used
 
@@ -175,19 +180,26 @@ def list_parquet_files(table_uri: str) -> list[str]:
         bare = table_uri[len("s3://") :].rstrip("/")
         paths = []
         for p in fs.find(bare):
-            if p.endswith(".parquet") and "/_delta_log/" not in p and "/metadata/" not in p:
-                paths.append(f"s3://{p}")
+            if not p.endswith(".parquet"):
+                continue
+            if "/metadata/" in p:
+                continue
+            if not include_delta_log and "/_delta_log/" in p:
+                continue
+            paths.append(f"s3://{p}")
         return sorted(paths)
 
     root = to_fs_path(table_uri)
     if not root.exists():
         return []
-    files = []
     if root.is_file() and root.suffix == ".parquet":
         return [str(root.resolve())]
+    files = []
     for p in sorted(root.rglob("*.parquet")):
         s = str(p.resolve())
-        if "/_delta_log/" in s or "/metadata/" in s:
+        if "/metadata/" in s:
+            continue
+        if not include_delta_log and "/_delta_log/" in s:
             continue
         files.append(s)
     return files
@@ -526,9 +538,57 @@ def parquet_row_count(files: Sequence[str]) -> int:
     return total
 
 
+def plant_dummy_delta_checkpoint(table_uri: str) -> str:
+    """Write a foreign-schema Parquet under ``_delta_log/`` (simulates a Delta checkpoint)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    if is_s3(table_uri):
+        raise NotImplementedError("checkpoint planting is local-only (rehearsal)")
+    root = to_fs_path(table_uri)
+    log_dir = root / "_delta_log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    # Real Delta checkpoints look like 00000000000000000010.checkpoint.parquet
+    path = log_dir / "00000000000000000010.checkpoint.parquet"
+    # Schema deliberately unrelated to the table (Delta action-log shape, simplified).
+    pq.write_table(
+        pa.table(
+            {
+                "txn": pa.array([1, 2], type=pa.int64()),
+                "add": pa.array(["x", "y"], type=pa.string()),
+            }
+        ),
+        path,
+    )
+    return str(path.resolve())
+
+
+def try_plain_parquet_row_count(
+    table_uri: str, *, include_delta_log: bool
+) -> tuple[int | None, str]:
+    """Read directory as plain Parquet (no Delta/Iceberg reader).
+
+    Returns ``(row_count, note)``. ``row_count`` is None when the scan fails
+    (typical when a checkpoint Parquet has a conflicting schema).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    files = list_parquet_files(table_uri, include_delta_log=include_delta_log)
+    if not files:
+        return 0, "no parquet files"
+    try:
+        # Mimic ListingTable: every path the .parquet extension filter allows.
+        tables = [pq.read_table(f) for f in files]
+        combined = pa.concat_tables(tables)
+        return combined.num_rows, f"read {len(files)} file(s)"
+    except Exception as e:  # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+
+
 def verify_local_reads(table_uri: str, iceberg_table, delta_uri: str) -> None:
-    """Assert Iceberg + Delta row counts match Parquet (local rehearsal)."""
-    files = list_parquet_files(table_uri)
+    """Assert Iceberg + Delta + plain-Parquet isolation after in-place ``_delta_log``."""
+    files = list_parquet_files(table_uri, include_delta_log=False)
     expected = parquet_row_count(files)
     ice_rows = iceberg_table.scan().to_arrow().num_rows
     from deltalake import DeltaTable
@@ -540,6 +600,50 @@ def verify_local_reads(table_uri: str, iceberg_table, delta_uri: str) -> None:
             f"row count mismatch parquet={expected} iceberg={ice_rows} delta={delta_rows}"
         )
     print(f"[verify] rows match: {expected}")
+
+    # 1) Plain Parquet read of the shared prefix after convert (commit-0 has no checkpoint yet).
+    plain_rows, plain_note = try_plain_parquet_row_count(table_uri, include_delta_log=True)
+    if plain_rows != expected:
+        raise AssertionError(
+            "plain Parquet read after Delta convert contaminated: "
+            f"got={plain_rows} expected={expected} ({plain_note})"
+        )
+    print(f"[verify] plain Parquet after Delta convert: {plain_rows} rows ({plain_note})")
+
+    # 2) Plant a dummy Delta checkpoint.parquet and re-read with the same extension filter
+    #    the engine uses today (ListingOptions.with_file_extension(".parquet")).
+    ckpt = plant_dummy_delta_checkpoint(table_uri)
+    print(f"[verify] planted dummy checkpoint: {ckpt}")
+    naive_files = list_parquet_files(table_uri, include_delta_log=True)
+    if not any(f.endswith("checkpoint.parquet") for f in naive_files):
+        raise AssertionError("dummy checkpoint not visible to .parquet extension listing")
+    contam_rows, contam_note = try_plain_parquet_row_count(table_uri, include_delta_log=True)
+    if contam_rows == expected:
+        # Unexpected: schemas happened to concat cleanly and row count matched by luck.
+        print(
+            f"[verify] CONTAMINATION NOT OBSERVED: naive .parquet listing still "
+            f"{contam_rows} rows with checkpoint present ({contam_note}). "
+            "Hazard may still exist for schema-incompatible checkpoints; "
+            "engine should still exclude _delta_log."
+        )
+    elif contam_rows is None:
+        print(f"[verify] CONTAMINATION MANIFEST (scan error): {contam_note}")
+    else:
+        print(
+            f"[verify] CONTAMINATION MANIFEST (wrong row count): "
+            f"got={contam_rows} expected={expected} ({contam_note})"
+        )
+
+    # Mitigation check: excluding _delta_log (the engine fix) restores the original rows.
+    safe_rows, safe_note = try_plain_parquet_row_count(table_uri, include_delta_log=False)
+    if safe_rows != expected:
+        raise AssertionError(
+            f"data-only Parquet listing (exclude _delta_log) still wrong: "
+            f"got={safe_rows} expected={expected} ({safe_note})"
+        )
+    print(
+        f"[verify] MITIGATION OK: exclude _delta_log → {safe_rows} rows ({safe_note})"
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
