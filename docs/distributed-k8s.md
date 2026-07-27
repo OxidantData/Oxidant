@@ -73,11 +73,36 @@ Config-side mitigations on this chart / harness:
 1. Readiness probes so DNS omits unbound pods.
 2. `bench/sf100/run-spark-connect.py` preflight: refuse unless Ready `weft-worker` pods
    equal `--worker-count` / `WEFT_WORKER_COUNT` (default 2 for SF≥100).
+3. `WEFT_SHUFFLE_PARTITIONS` is pinned on the driver (see below).
 
-**Follow-up (engine — do not land on this branch):** under `WEFT_DISTRIBUTED_STRICT=1`,
-the driver in `crates/weft-execution` should hard-fail when the discovered worker count
-differs from `WEFT_WORKER_COUNT`. Phase B is rewriting that crate on another branch;
-track the guard there to avoid merge conflicts.
+### Shuffle modulus drift (a second, distinct hazard)
+
+The preflight above only checks membership at the **start** of a run. There is a
+separate failure that needs no pod to be missing at launch:
+
+`shuffle_partitions()` falls back to the live worker count when neither
+`WEFT_SHUFFLE_PARTITIONS` nor `WEFT_DEFAULT_PARALLELISM` is set, and
+`refresh_cluster_workers()` recomputes `num_partitions` *between stages of a single
+query*. Producers hash rows into `fnv1a(row) % np` buckets; a consumer pulls bucket
+`partition_id` from every worker. So if `np` is 2 while producers run and 1 by the
+time the consumer runs, every row in bucket 1 is never pulled by anyone — the query
+returns fewer rows, faster, and reports success. Rendezvous ownership
+(`owner_of(partition, num_partitions)`) is a function of the member set too, so a
+blip can also route a bucket to a worker that never received it.
+
+A mid-run OOM kill or a failed liveness probe is enough to trigger this, and the
+memory budgets in `values-sf100.yaml` are deliberately tight.
+
+Chart mitigation: `connect.shufflePartitions` (default `worker.replicas`) always emits
+`WEFT_SHUFFLE_PARTITIONS` on the driver, so the modulus is constant regardless of what
+DNS reports. Keep it pinned for any publishable run.
+
+**Follow-up (engine — do not land on this branch):** the driver should (a) freeze
+`num_partitions` for the lifetime of a query rather than recomputing it per stage,
+(b) hard-fail on a mid-query membership change instead of silently re-shaping, and
+(c) under `WEFT_DISTRIBUTED_STRICT=1`, hard-fail when the discovered worker count
+differs from `WEFT_WORKER_COUNT`. Tracked on `vamzi/distributed-membership-stability`;
+the chart pin is a mitigation, not a fix.
 
 ## Build images
 

@@ -50,6 +50,10 @@ connect:
   affinity: {}
   # When true, fail queries that cannot be planned distributed (server-side).
   distributedStrict: false
+  # Shuffle bucket count (WEFT_SHUFFLE_PARTITIONS on the driver). Empty → worker.replicas.
+  # Must stay pinned: an unpinned modulus is recomputed from live DNS membership between
+  # stages, which silently drops rows when a worker blips. See connect-server.yaml.
+  shufflePartitions: ""
 
 worker:
   image: weft/worker:latest

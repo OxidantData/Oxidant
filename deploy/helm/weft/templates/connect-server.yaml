@@ -50,6 +50,15 @@ spec:
               value: {{ .Values.worker.port | quote }}
             - name: WEFT_AWS_BIN
               value: {{ .Values.connect.awsBin | quote }}
+            # Pin the shuffle modulus. Unset, shuffle_partitions() falls back to the LIVE
+            # worker count, and refresh_cluster_workers() recomputes it between stages of a
+            # single query. A worker that briefly leaves the headless Service (restart, OOM
+            # kill, failed readiness probe) therefore shrinks the modulus mid-flight: rows
+            # that producers hashed into the now-out-of-range buckets are never pulled by
+            # any consumer, so the query returns FEWER ROWS, FASTER, with no error. Pinning
+            # keeps the modulus constant no matter what DNS reports.
+            - name: WEFT_SHUFFLE_PARTITIONS
+              value: {{ (.Values.connect.shufflePartitions | default .Values.worker.replicas) | quote }}
             # Threshold spill under temp_dir()/weft-shuffle-spill — point TMPDIR at the
             # spill volume. Never set WEFT_SHUFFLE_SPILL_DIR unless forceShuffleSpill.
             - name: TMPDIR
