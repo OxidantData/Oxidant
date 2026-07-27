@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -27,11 +29,86 @@ use datafusion::execution::context::SessionState;
 use datafusion::prelude::SessionContext;
 use weft_catalog::{CatalogProvider as WeftCatalog, TableFormat, TableMetadata};
 use weft_common::Error;
+use weft_datasource::SnapshotIdentity;
+
+#[derive(Default)]
+struct LakehouseSnapshotContext {
+    requested: HashMap<String, SnapshotIdentity>,
+    observed: Mutex<HashMap<String, SnapshotIdentity>>,
+}
+
+tokio::task_local! {
+    static LAKEHOUSE_SNAPSHOT_CONTEXT: Arc<LakehouseSnapshotContext>;
+}
+
+pub(crate) async fn capture_lakehouse_snapshots<F, T>(future: F) -> weft_common::Result<(T, String)>
+where
+    F: Future<Output = weft_common::Result<T>>,
+{
+    let context = Arc::new(LakehouseSnapshotContext::default());
+    let value = LAKEHOUSE_SNAPSHOT_CONTEXT
+        .scope(context.clone(), future)
+        .await?;
+    let observed = context
+        .observed
+        .lock()
+        .expect("lakehouse snapshot observations poisoned")
+        .clone();
+    let json = serde_json::to_string(&observed)
+        .map_err(|e| Error::Execution(format!("serialize lakehouse snapshot pins: {e}")))?;
+    Ok((value, json))
+}
+
+pub(crate) async fn with_lakehouse_snapshots<F, T>(
+    pins_json: &str,
+    future: F,
+) -> weft_common::Result<T>
+where
+    F: Future<Output = weft_common::Result<T>>,
+{
+    let requested = if pins_json.trim().is_empty() {
+        HashMap::new()
+    } else {
+        serde_json::from_str(pins_json)
+            .map_err(|e| Error::Plan(format!("invalid lakehouse snapshot pins: {e}")))?
+    };
+    LAKEHOUSE_SNAPSHOT_CONTEXT
+        .scope(
+            Arc::new(LakehouseSnapshotContext {
+                requested,
+                observed: Mutex::new(HashMap::new()),
+            }),
+            future,
+        )
+        .await
+}
+
+fn requested_lakehouse_snapshot(table_name: &str) -> Option<SnapshotIdentity> {
+    LAKEHOUSE_SNAPSHOT_CONTEXT
+        .try_with(|context| context.requested.get(table_name).cloned())
+        .ok()
+        .flatten()
+}
+
+fn record_lakehouse_snapshot(table_name: &str, snapshot: &SnapshotIdentity) {
+    let _ = LAKEHOUSE_SNAPSHOT_CONTEXT.try_with(|context| {
+        context
+            .observed
+            .lock()
+            .expect("lakehouse snapshot observations poisoned")
+            .insert(table_name.to_string(), snapshot.clone());
+    });
+}
+
+fn lakehouse_snapshot_context_is_set() -> bool {
+    LAKEHOUSE_SNAPSHOT_CONTEXT.try_with(|_| ()).is_ok()
+}
 
 /// DataFusion `CatalogProvider` backed by a weft [`WeftCatalog`].
 pub struct WeftCatalogProvider {
     catalog: Arc<dyn WeftCatalog>,
     ctx: Arc<SessionContext>,
+    require_lakehouse_snapshot_pins: Arc<AtomicBool>,
     /// Lazily-created per-namespace schema providers (cheap wrappers; cached so repeated
     /// references to the same namespace share a table cache).
     schemas: Mutex<HashMap<String, Arc<dyn SchemaProvider>>>,
@@ -39,10 +116,15 @@ pub struct WeftCatalogProvider {
 
 impl WeftCatalogProvider {
     /// Wrap a weft catalog. `ctx` supplies the session state used to infer schemas / read files.
-    pub fn new(catalog: Arc<dyn WeftCatalog>, ctx: Arc<SessionContext>) -> Self {
+    pub fn new(
+        catalog: Arc<dyn WeftCatalog>,
+        ctx: Arc<SessionContext>,
+        require_lakehouse_snapshot_pins: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             catalog,
             ctx,
+            require_lakehouse_snapshot_pins,
             schemas: Mutex::new(HashMap::new()),
         }
     }
@@ -78,6 +160,7 @@ impl CatalogProvider for WeftCatalogProvider {
                 self.catalog.clone(),
                 vec![name.to_string()],
                 self.ctx.clone(),
+                self.require_lakehouse_snapshot_pins.clone(),
             ))
         });
         Some(provider.clone())
@@ -89,8 +172,15 @@ struct WeftSchemaProvider {
     catalog: Arc<dyn WeftCatalog>,
     namespace: Vec<String>,
     ctx: Arc<SessionContext>,
+    require_lakehouse_snapshot_pins: Arc<AtomicBool>,
     /// Resolved tables, cached so a table referenced repeatedly in a query is loaded once.
-    tables: Mutex<HashMap<String, Arc<dyn TableProvider>>>,
+    tables: Mutex<HashMap<String, CachedTable>>,
+}
+
+struct CachedTable {
+    provider: Arc<dyn TableProvider>,
+    snapshot_key: Option<String>,
+    snapshot: Option<SnapshotIdentity>,
 }
 
 impl WeftSchemaProvider {
@@ -98,11 +188,13 @@ impl WeftSchemaProvider {
         catalog: Arc<dyn WeftCatalog>,
         namespace: Vec<String>,
         ctx: Arc<SessionContext>,
+        require_lakehouse_snapshot_pins: Arc<AtomicBool>,
     ) -> Self {
         Self {
             catalog,
             namespace,
             ctx,
+            require_lakehouse_snapshot_pins,
             tables: Mutex::new(HashMap::new()),
         }
     }
@@ -130,8 +222,41 @@ impl SchemaProvider for WeftSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
-        if let Some(t) = self.tables.lock().expect("tables poisoned").get(name) {
-            return Ok(Some(t.clone()));
+        {
+            let tables = self.tables.lock().expect("tables poisoned");
+            if let Some(cached) = tables.get(name) {
+                if let (Some(snapshot_key), Some(snapshot)) =
+                    (&cached.snapshot_key, &cached.snapshot)
+                {
+                    if self.require_lakehouse_snapshot_pins.load(Ordering::Relaxed)
+                        && !lakehouse_snapshot_context_is_set()
+                    {
+                        return Err(DataFusionError::Plan(format!(
+                            "distributed lakehouse table `{snapshot_key}` was resolved outside \
+                             its pinned snapshot scope"
+                        )));
+                    }
+                    match requested_lakehouse_snapshot(snapshot_key) {
+                        Some(requested) if requested != *snapshot => {}
+                        Some(_) => {
+                            record_lakehouse_snapshot(snapshot_key, snapshot);
+                            return Ok(Some(cached.provider.clone()));
+                        }
+                        None if self.require_lakehouse_snapshot_pins.load(Ordering::Relaxed) => {
+                            return Err(DataFusionError::Plan(format!(
+                                "distributed stage omitted the snapshot pin for lakehouse table \
+                                 `{snapshot_key}`"
+                            )));
+                        }
+                        None => {
+                            record_lakehouse_snapshot(snapshot_key, snapshot);
+                            return Ok(Some(cached.provider.clone()));
+                        }
+                    }
+                } else {
+                    return Ok(Some(cached.provider.clone()));
+                }
+            }
         }
         let metadata = match self.catalog.load_table(&self.namespace, name).await {
             Ok(md) => md,
@@ -140,12 +265,22 @@ impl SchemaProvider for WeftSchemaProvider {
             // A storage / connection / unsupported failure is a real error — surface it.
             Err(e) => return Err(weft_to_df(e)),
         };
-        let provider = metadata_to_provider(&self.ctx.state(), &metadata, name).await?;
-        self.tables
-            .lock()
-            .expect("tables poisoned")
-            .insert(name.to_string(), provider.clone());
-        Ok(Some(provider))
+        let resolved = metadata_to_provider(
+            &self.ctx.state(),
+            &metadata,
+            name,
+            self.require_lakehouse_snapshot_pins.load(Ordering::Relaxed),
+        )
+        .await?;
+        self.tables.lock().expect("tables poisoned").insert(
+            name.to_string(),
+            CachedTable {
+                provider: resolved.provider.clone(),
+                snapshot_key: resolved.snapshot_key,
+                snapshot: resolved.snapshot,
+            },
+        );
+        Ok(Some(resolved.provider))
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -182,10 +317,14 @@ impl SchemaProvider for WeftSchemaProvider {
             ))
         })??;
 
-        self.tables
-            .lock()
-            .expect("tables poisoned")
-            .insert(name, provider.clone());
+        self.tables.lock().expect("tables poisoned").insert(
+            name,
+            CachedTable {
+                provider: provider.clone(),
+                snapshot_key: None,
+                snapshot: None,
+            },
+        );
         Ok(Some(provider))
     }
 }
@@ -287,7 +426,9 @@ async fn register_table_async(
     )
     .await?;
 
-    metadata_to_provider(&state, &metadata, &name).await
+    Ok(metadata_to_provider(&state, &metadata, &name, false)
+        .await?
+        .provider)
 }
 
 /// Extract `(schema, batches)` from a `TableProvider` that's always a `MemTable` on this path
@@ -317,25 +458,28 @@ async fn extract_mem_table_data(
 }
 
 /// Turn resolved table metadata into a readable DataFusion `TableProvider`.
-async fn metadata_to_provider(
+pub(crate) struct ProviderResolution {
+    pub(crate) provider: Arc<dyn TableProvider>,
+    snapshot_key: Option<String>,
+    snapshot: Option<SnapshotIdentity>,
+}
+
+pub(crate) async fn metadata_to_provider(
     state: &SessionState,
     md: &TableMetadata,
     table_name: &str,
-) -> DfResult<Arc<dyn TableProvider>> {
+    require_lakehouse_snapshot_pin: bool,
+) -> DfResult<ProviderResolution> {
     use datafusion::datasource::file_format::csv::CsvFormat;
     use datafusion::datasource::file_format::json::JsonFormat;
-    use datafusion::datasource::file_format::parquet::ParquetFormat;
     use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 
-    match md.format {
+    let provider = match md.format {
         TableFormat::Parquet => {
             let loc = crate::shard::ensure_collection_url(&md.location);
             let url = ListingTableUrl::parse(&loc).map_err(loc_err(md))?;
             ensure_remote_store(state, &url, Some(&md.storage_options))?;
-            let opts = ListingOptions::new(Arc::new(ParquetFormat::default()))
-                .with_file_extension(".parquet");
-            let (opts, file_schema) = apply_partition_columns(opts, md);
-            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".parquet").await
+            parquet_metadata_provider(state, md, table_name, vec![url]).await?
         }
         TableFormat::Csv => {
             let loc = crate::shard::ensure_collection_url(&md.location);
@@ -344,7 +488,7 @@ async fn metadata_to_provider(
             let opts =
                 ListingOptions::new(Arc::new(CsvFormat::default())).with_file_extension(".csv");
             let (opts, file_schema) = apply_partition_columns(opts, md);
-            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".csv").await
+            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".csv").await?
         }
         TableFormat::Json => {
             let loc = crate::shard::ensure_collection_url(&md.location);
@@ -353,22 +497,33 @@ async fn metadata_to_provider(
             let opts =
                 ListingOptions::new(Arc::new(JsonFormat::default())).with_file_extension(".json");
             let (opts, file_schema) = apply_partition_columns(opts, md);
-            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".json").await
+            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".json").await?
         }
-        // Lakehouse formats resolve to their active Parquet files (version-safe), then the
-        // Parquet reader. v1 reads from the local filesystem — remote object stores for Delta /
-        // Iceberg follow once the resolver registers an `object_store` for the location's scheme.
+        // Lakehouse formats are handled below because they also return a pinned snapshot identity.
         TableFormat::Delta => {
-            let path = local_path(&md.location)?;
-            let files = weft_datasource::delta_active_files(&path).map_err(weft_to_df)?;
-            parquet_files_provider(state, &md.location, files, md.schema.clone(), table_name).await
+            return resolve_lakehouse_provider(
+                state,
+                md,
+                table_name,
+                require_lakehouse_snapshot_pin,
+            )
+            .await;
         }
         TableFormat::Iceberg => {
-            let path = local_path(&md.location)?;
-            let files = weft_datasource::iceberg_active_files(&path).map_err(weft_to_df)?;
-            parquet_files_provider(state, &md.location, files, md.schema.clone(), table_name).await
+            return resolve_lakehouse_provider(
+                state,
+                md,
+                table_name,
+                require_lakehouse_snapshot_pin,
+            )
+            .await;
         }
-    }
+    };
+    Ok(ProviderResolution {
+        provider,
+        snapshot_key: None,
+        snapshot: None,
+    })
 }
 
 /// List+shard files then build a [`ListingTable`], or an empty MemTable when this shard is vacant.
@@ -529,6 +684,23 @@ fn ensure_remote_store(
     let mut builder = object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(&bucket)
         .with_region(region.clone());
+    if let Some(options) = storage_options {
+        for (key, value) in options {
+            let normalized = match key.as_str() {
+                "s3.access-key-id" | "fs.s3a.access.key" => "access_key_id",
+                "s3.secret-access-key" | "fs.s3a.secret.key" => "secret_access_key",
+                "s3.session-token" | "fs.s3a.session.token" => "session_token",
+                "s3.endpoint" | "fs.s3a.endpoint" => "endpoint",
+                "s3.region" | "fs.s3a.endpoint.region" => "region",
+                "s3.allow-http" => "allow_http",
+                "s3.virtual-hosted-style-request" => "virtual_hosted_style_request",
+                other => other.strip_prefix("s3.").unwrap_or(other),
+            };
+            if let Ok(config_key) = normalized.parse::<object_store::aws::AmazonS3ConfigKey>() {
+                builder = builder.with_config(config_key, value);
+            }
+        }
+    }
     if let Some(role_arn) = &requested_role {
         let session_name = storage_options
             .and_then(|opts| {
@@ -655,51 +827,609 @@ fn encode_batches(
     Ok(buf)
 }
 
-/// Build a Parquet listing table over an explicit set of files (the Delta/Iceberg seam).
-async fn parquet_files_provider(
+async fn parquet_metadata_provider(
     state: &SessionState,
-    location: &str,
-    files: Vec<std::path::PathBuf>,
-    schema: Option<datafusion::arrow::datatypes::SchemaRef>,
+    md: &TableMetadata,
     table_name: &str,
+    roots: Vec<datafusion::datasource::listing::ListingTableUrl>,
 ) -> DfResult<Arc<dyn TableProvider>> {
-    use datafusion::datasource::file_format::parquet::ParquetFormat;
-    use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
-
-    if files.is_empty() {
-        return Err(DataFusionError::Plan(format!(
-            "table `{location}` has no active data files"
-        )));
+    let listed = crate::shard::list_visible_file_shard(state, roots, ".parquet", Some(table_name))
+        .await
+        .map_err(weft_to_df)?;
+    if listed.is_empty() {
+        return match &md.schema {
+            Some(schema) => crate::shard::empty_table(schema.clone()).map_err(weft_to_df),
+            None => Err(DataFusionError::Plan(format!(
+                "Parquet table `{}` has no visible data files and no declared schema",
+                md.location
+            ))),
+        };
     }
-    let urls = files
+
+    let table_schema = match &md.schema {
+        Some(schema) => schema.clone(),
+        None => infer_listed_parquet_schema(state, &listed).await?,
+    };
+    let (file_schema, partition_columns) =
+        split_partition_schema(&table_schema, &md.partition_columns);
+    let partition_fields = md
+        .partition_columns
         .iter()
-        .map(|p| {
-            ListingTableUrl::parse(p.to_string_lossy())
-                .map_err(|e| DataFusionError::Plan(format!("bad file path {}: {e}", p.display())))
-        })
-        .collect::<DfResult<Vec<_>>>()?;
-    let opts = ListingOptions::new(Arc::new(ParquetFormat::default()));
-    sharded_listing_table(state, urls, opts, schema, table_name, ".parquet").await
+        .filter_map(|name| table_schema.field_with_name(name).ok().cloned())
+        .map(Arc::new)
+        .collect::<Vec<_>>();
+    let empty_partition_values = std::collections::BTreeMap::new();
+    let mut groups: Vec<(
+        datafusion::execution::object_store::ObjectStoreUrl,
+        Vec<datafusion::datasource::listing::PartitionedFile>,
+    )> = Vec::new();
+    for (url, meta) in listed {
+        let mut file = datafusion::datasource::listing::PartitionedFile::new_from_meta(meta);
+        file.partition_values = partition_values(
+            url.as_str(),
+            &empty_partition_values,
+            &md.partition_columns,
+            &partition_columns,
+        )?;
+        let store_url = url.object_store();
+        match groups
+            .iter_mut()
+            .find(|(existing, _)| existing == &store_url)
+        {
+            Some((_, files)) => files.push(file),
+            None => groups.push((store_url, vec![file])),
+        }
+    }
+    Ok(Arc::new(LakehouseTableProvider {
+        schema: table_schema,
+        file_schema,
+        partition_fields,
+        groups,
+        case_insensitive_schema_adapter: md.schema.is_some(),
+    }))
 }
 
-/// Convert a storage URI to a local filesystem path, or error for a scheme v1 can't read locally.
-///
-/// Handles both `file:///abs` (RFC form) and Hive's `file:/abs` (single-slash, as the Metastore
-/// returns it), as well as bare paths. Non-`file` schemes (`s3://`, `hdfs://`, …) are not local.
-fn local_path(location: &str) -> DfResult<String> {
-    if let Some(rest) = location.strip_prefix("file://") {
-        return Ok(rest.to_string());
+async fn resolve_lakehouse_provider(
+    state: &SessionState,
+    md: &TableMetadata,
+    table_name: &str,
+    require_snapshot_pin: bool,
+) -> DfResult<ProviderResolution> {
+    use datafusion::datasource::listing::ListingTableUrl;
+
+    let root = ListingTableUrl::parse(crate::shard::ensure_collection_url(&md.location))
+        .map_err(loc_err(md))?;
+    ensure_remote_store(state, &root, Some(&md.storage_options))?;
+    let store = state.runtime_env().object_store(&root)?;
+    let pinned_snapshot = requested_lakehouse_snapshot(&md.name);
+    if require_snapshot_pin {
+        if !lakehouse_snapshot_context_is_set() {
+            return Err(DataFusionError::Plan(format!(
+                "distributed lakehouse table `{}` was resolved outside its pinned snapshot scope",
+                md.name
+            )));
+        }
+        if pinned_snapshot.is_none() {
+            return Err(DataFusionError::Plan(format!(
+                "distributed stage omitted the snapshot pin for lakehouse table `{}`",
+                md.name
+            )));
+        }
     }
-    if let Some(rest) = location.strip_prefix("file:") {
-        return Ok(rest.to_string());
-    }
-    if location.contains("://") {
-        let scheme = location.split("://").next().unwrap_or("");
+    let metadata_location = md.properties.get("metadata_location").map(String::as_str);
+    let resolved = weft_datasource::active_files_for_scan(
+        store,
+        &md.location,
+        match md.format {
+            TableFormat::Delta => "delta",
+            TableFormat::Iceberg => "iceberg",
+            _ => unreachable!("lakehouse resolver called for non-lakehouse format"),
+        },
+        metadata_location,
+        pinned_snapshot.as_ref(),
+        &weft_datasource::ScanRequest::default(),
+    )
+    .await
+    .map_err(weft_to_df)?;
+    record_lakehouse_snapshot(&md.name, &resolved.snapshot);
+    if let Some(mapping) = resolved
+        .column_mappings
+        .iter()
+        .find(|mapping| mapping.logical_path != mapping.physical_path)
+    {
         return Err(DataFusionError::NotImplemented(format!(
-            "reading Delta/Iceberg from `{scheme}://` is not supported yet (local filesystem only)"
+            "lakehouse column mapping is not yet supported for `{}` (logical `{}` is stored as \
+             `{}`); refusing to return null or misnamed columns",
+            md.name, mapping.logical_path, mapping.physical_path
         )));
     }
-    Ok(location.to_string())
+
+    if resolved.files.is_empty() {
+        return Err(DataFusionError::Plan(format!(
+            "table `{}` has no active data files",
+            md.location
+        )));
+    }
+
+    let table_schema = match &md.schema {
+        Some(schema) => schema.clone(),
+        None => {
+            infer_parquet_schema(state, &resolved.files[0].location, resolved.files[0].size).await?
+        }
+    };
+    let (file_schema, partition_columns) =
+        split_partition_schema(&table_schema, &md.partition_columns);
+    let partition_fields = md
+        .partition_columns
+        .iter()
+        .filter_map(|name| table_schema.field_with_name(name).ok().cloned())
+        .map(Arc::new)
+        .collect::<Vec<_>>();
+
+    let mut files_by_location = resolved
+        .files
+        .into_iter()
+        .map(|file| {
+            let url = ListingTableUrl::parse(&file.location).map_err(|e| {
+                DataFusionError::Plan(format!("bad lakehouse file `{}`: {e}", file.location))
+            })?;
+            Ok((url, file))
+        })
+        .collect::<DfResult<Vec<_>>>()?;
+    let selected = crate::shard::apply_known_file_shard(
+        files_by_location
+            .iter()
+            .map(|(url, file)| (url.clone(), file.size))
+            .collect(),
+        Some(table_name),
+    );
+    let selected_locations = selected
+        .into_iter()
+        .map(|(url, _)| url.as_str().to_string())
+        .collect::<std::collections::HashSet<_>>();
+    files_by_location.retain(|(url, _)| selected_locations.contains(url.as_str()));
+
+    if files_by_location.is_empty() {
+        return Ok(ProviderResolution {
+            provider: crate::shard::empty_table(table_schema).map_err(weft_to_df)?,
+            snapshot_key: Some(md.name.clone()),
+            snapshot: Some(resolved.snapshot),
+        });
+    }
+
+    let mut position_delete_cache = HashMap::new();
+    let mut groups: Vec<(
+        datafusion::execution::object_store::ObjectStoreUrl,
+        Vec<datafusion::datasource::listing::PartitionedFile>,
+    )> = Vec::new();
+    for (url, file) in files_by_location {
+        let mut deleted_rows = Vec::new();
+        for deletion in &file.deletions {
+            match deletion {
+                weft_datasource::RowDeletion::DeltaDeletionVector {
+                    deleted_row_indexes,
+                } => deleted_rows.extend(deleted_row_indexes.iter().copied()),
+                weft_datasource::RowDeletion::IcebergPositionDelete { delete_file } => {
+                    let positions =
+                        if let Some(positions) = position_delete_cache.get(&delete_file.location) {
+                            positions
+                        } else {
+                            let positions =
+                                read_iceberg_position_deletes(state, md, delete_file).await?;
+                            position_delete_cache.insert(delete_file.location.clone(), positions);
+                            position_delete_cache
+                                .get(&delete_file.location)
+                                .expect("position delete cache entry was just inserted")
+                        };
+                    let mut matched_target = false;
+                    for (recorded_path, indexes) in positions {
+                        if iceberg_paths_equal(recorded_path, &file.location) {
+                            matched_target = true;
+                            deleted_rows.extend(indexes.iter().copied());
+                        }
+                    }
+                    if !matched_target
+                        && delete_file.record_count > 0
+                        && delete_file.referenced_data_file.is_some()
+                    {
+                        return Err(DataFusionError::Execution(format!(
+                            "Iceberg position delete `{}` was associated with data file `{}` but \
+                             contained no matching `file_path`; refusing to skip the delete",
+                            delete_file.location, file.location
+                        )));
+                    }
+                }
+                weft_datasource::RowDeletion::IcebergEqualityDelete { delete_file } => {
+                    return Err(DataFusionError::NotImplemented(format!(
+                        "Iceberg equality deletes are not yet supported; refusing to read `{}` \
+                         with equality delete file `{}`",
+                        md.name, delete_file.location
+                    )));
+                }
+            }
+        }
+        deleted_rows.sort_unstable();
+        deleted_rows.dedup();
+
+        let mut partitioned = datafusion::datasource::listing::PartitionedFile::new(
+            url.prefix().to_string(),
+            file.size,
+        );
+        partitioned.partition_values = partition_values(
+            &file.location,
+            &file.partition_values,
+            &md.partition_columns,
+            &partition_columns,
+        )?;
+        if !deleted_rows.is_empty() {
+            let access_plan = deletion_access_plan(state, &url, file.size, &deleted_rows).await?;
+            partitioned = partitioned.with_extension(access_plan);
+        }
+
+        let store_url = url.object_store();
+        match groups
+            .iter_mut()
+            .find(|(existing, _)| existing == &store_url)
+        {
+            Some((_, files)) => files.push(partitioned),
+            None => groups.push((store_url, vec![partitioned])),
+        }
+    }
+
+    let provider = Arc::new(LakehouseTableProvider {
+        schema: table_schema,
+        file_schema,
+        partition_fields,
+        groups,
+        case_insensitive_schema_adapter: md.schema.is_some(),
+    });
+    Ok(ProviderResolution {
+        provider,
+        snapshot_key: Some(md.name.clone()),
+        snapshot: Some(resolved.snapshot),
+    })
+}
+
+#[derive(Debug)]
+struct LakehouseTableProvider {
+    schema: SchemaRef,
+    file_schema: SchemaRef,
+    partition_fields: Vec<datafusion::arrow::datatypes::FieldRef>,
+    groups: Vec<(
+        datafusion::execution::object_store::ObjectStoreUrl,
+        Vec<datafusion::datasource::listing::PartitionedFile>,
+    )>,
+    case_insensitive_schema_adapter: bool,
+}
+
+#[async_trait]
+impl TableProvider for LakehouseTableProvider {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> datafusion::logical_expr::TableType {
+        datafusion::logical_expr::TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[datafusion::logical_expr::Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
+        use datafusion::datasource::source::DataSourceExec;
+        use datafusion::datasource::table_schema::TableSchema;
+
+        let table_schema =
+            TableSchema::new(self.file_schema.clone(), self.partition_fields.clone());
+        let mut plans: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>> =
+            Vec::with_capacity(self.groups.len());
+        for (store_url, files) in &self.groups {
+            let parquet_options = datafusion::common::config::TableParquetOptions {
+                global: state.config_options().execution.parquet.clone(),
+                ..Default::default()
+            };
+            let source = Arc::new(
+                ParquetSource::new(table_schema.clone())
+                    .with_table_parquet_options(parquet_options),
+            );
+            let file_groups = files
+                .iter()
+                .cloned()
+                .map(|file| datafusion::datasource::physical_plan::FileGroup::new(vec![file]))
+                .collect();
+            let expr_adapter = self.case_insensitive_schema_adapter.then(|| {
+                Arc::new(crate::schema_adapt::CaseInsensitiveExprAdapterFactory)
+                    as Arc<dyn datafusion::physical_expr_adapter::PhysicalExprAdapterFactory>
+            });
+            let config = FileScanConfigBuilder::new(store_url.clone(), source)
+                .with_file_groups(file_groups)
+                .with_limit(limit)
+                .with_expr_adapter(expr_adapter)
+                .with_projection_indices(projection.cloned())?
+                .build();
+            plans.push(DataSourceExec::from_data_source(config));
+        }
+        if plans.is_empty() {
+            Err(DataFusionError::Execution(
+                "lakehouse scan has no object-store file groups".into(),
+            ))
+        } else {
+            datafusion::physical_plan::union::UnionExec::try_new(plans)
+        }
+    }
+}
+
+async fn infer_listed_parquet_schema(
+    state: &SessionState,
+    files: &[(
+        datafusion::datasource::listing::ListingTableUrl,
+        object_store::ObjectMeta,
+    )],
+) -> DfResult<SchemaRef> {
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::file_format::FileFormat;
+
+    let store_url = files[0].0.object_store();
+    if files.iter().any(|(url, _)| url.object_store() != store_url) {
+        return Err(DataFusionError::NotImplemented(
+            "schema inference across multiple object stores is not supported; provide a catalog schema"
+                .into(),
+        ));
+    }
+    let store = state.runtime_env().object_store(&store_url)?;
+    let objects = files
+        .iter()
+        .map(|(_, metadata)| metadata.clone())
+        .collect::<Vec<_>>();
+    ParquetFormat::default()
+        .infer_schema(state as &dyn datafusion::catalog::Session, &store, &objects)
+        .await
+}
+
+async fn infer_parquet_schema(
+    state: &SessionState,
+    location: &str,
+    size: u64,
+) -> DfResult<SchemaRef> {
+    use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
+    use datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder;
+
+    let url = datafusion::datasource::listing::ListingTableUrl::parse(location)
+        .map_err(|e| DataFusionError::Plan(format!("bad Parquet file `{location}`: {e}")))?;
+    let store = state.runtime_env().object_store(&url)?;
+    let reader = ParquetObjectReader::new(store, url.prefix().clone()).with_file_size(size);
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(|e| {
+            DataFusionError::Execution(format!("read Parquet schema `{location}`: {e}"))
+        })?;
+    Ok(builder.schema().clone())
+}
+
+async fn deletion_access_plan(
+    state: &SessionState,
+    url: &datafusion::datasource::listing::ListingTableUrl,
+    size: u64,
+    deleted_rows: &[u64],
+) -> DfResult<datafusion::datasource::physical_plan::parquet::ParquetAccessPlan> {
+    use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
+    use datafusion::parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+    use datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+
+    let store = state.runtime_env().object_store(url)?;
+    let mut reader = ParquetObjectReader::new(store, url.prefix().clone()).with_file_size(size);
+    let metadata = reader.get_metadata(None).await.map_err(|e| {
+        DataFusionError::Execution(format!("read Parquet metadata `{}`: {e}", url.as_str()))
+    })?;
+    let mut plan = ParquetAccessPlan::new_all(metadata.num_row_groups());
+    let mut file_offset = 0u64;
+    let mut delete_offset = 0usize;
+    for (row_group_index, row_group) in metadata.row_groups().iter().enumerate() {
+        let row_count = u64::try_from(row_group.num_rows()).map_err(|_| {
+            DataFusionError::Execution(format!("negative Parquet row count in `{}`", url.as_str()))
+        })?;
+        let row_group_end = file_offset + row_count;
+        let start = delete_offset;
+        while delete_offset < deleted_rows.len() && deleted_rows[delete_offset] < row_group_end {
+            delete_offset += 1;
+        }
+        if start != delete_offset {
+            let mut selectors = Vec::new();
+            let mut cursor = 0usize;
+            for deleted in &deleted_rows[start..delete_offset] {
+                if *deleted < file_offset {
+                    return Err(DataFusionError::Execution(format!(
+                        "deletion index {deleted} is out of order for `{}`",
+                        url.as_str()
+                    )));
+                }
+                let local = usize::try_from(*deleted - file_offset).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "deletion index {deleted} does not fit this platform"
+                    ))
+                })?;
+                if local > cursor {
+                    selectors.push(RowSelector::select(local - cursor));
+                }
+                selectors.push(RowSelector::skip(1));
+                cursor = local + 1;
+            }
+            let row_count = usize::try_from(row_count)
+                .map_err(|_| DataFusionError::Execution("Parquet row group is too large".into()))?;
+            if cursor < row_count {
+                selectors.push(RowSelector::select(row_count - cursor));
+            }
+            plan.scan_selection(row_group_index, RowSelection::from(selectors));
+        }
+        file_offset = row_group_end;
+    }
+    if delete_offset != deleted_rows.len() {
+        return Err(DataFusionError::Execution(format!(
+            "deletion index {} exceeds the {} rows in `{}`",
+            deleted_rows[delete_offset],
+            file_offset,
+            url.as_str()
+        )));
+    }
+    Ok(plan)
+}
+
+async fn read_iceberg_position_deletes(
+    state: &SessionState,
+    md: &TableMetadata,
+    delete_file: &weft_datasource::IcebergDeleteFile,
+) -> DfResult<HashMap<String, Vec<u64>>> {
+    use datafusion::arrow::array::Array;
+    use datafusion::common::ScalarValue;
+    use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
+    use datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder;
+    use futures::TryStreamExt;
+
+    if delete_file.file_format != weft_datasource::IcebergFileFormat::Parquet {
+        return Err(DataFusionError::NotImplemented(format!(
+            "Iceberg position delete format {:?} is not supported for `{}`",
+            delete_file.file_format, delete_file.location
+        )));
+    }
+    let url = datafusion::datasource::listing::ListingTableUrl::parse(&delete_file.location)
+        .map_err(|e| {
+            DataFusionError::Plan(format!(
+                "bad Iceberg position delete path `{}`: {e}",
+                delete_file.location
+            ))
+        })?;
+    ensure_remote_store(state, &url, Some(&md.storage_options))?;
+    let store = state.runtime_env().object_store(&url)?;
+    let reader =
+        ParquetObjectReader::new(store, url.prefix().clone()).with_file_size(delete_file.size);
+    let batches = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "read Iceberg position delete metadata `{}`: {e}",
+                delete_file.location
+            ))
+        })?
+        .build()
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "open Iceberg position delete `{}`: {e}",
+                delete_file.location
+            ))
+        })?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "read Iceberg position delete `{}`: {e}",
+                delete_file.location
+            ))
+        })?;
+
+    let mut positions = HashMap::<String, Vec<u64>>::new();
+    for batch in batches {
+        let file_column = batch.schema().index_of("file_path").map_err(|_| {
+            DataFusionError::Execution(format!(
+                "Iceberg position delete `{}` has no `file_path` column",
+                delete_file.location
+            ))
+        })?;
+        let pos_column = batch.schema().index_of("pos").map_err(|_| {
+            DataFusionError::Execution(format!(
+                "Iceberg position delete `{}` has no `pos` column",
+                delete_file.location
+            ))
+        })?;
+        for row in 0..batch.num_rows() {
+            if batch.column(file_column).is_null(row) || batch.column(pos_column).is_null(row) {
+                return Err(DataFusionError::Execution(format!(
+                    "Iceberg position delete `{}` contains a null file path or position",
+                    delete_file.location
+                )));
+            }
+            let file_path = match ScalarValue::try_from_array(batch.column(file_column), row)? {
+                ScalarValue::Utf8(Some(value))
+                | ScalarValue::Utf8View(Some(value))
+                | ScalarValue::LargeUtf8(Some(value)) => value,
+                other => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Iceberg position delete `{}` has non-string `file_path` value {other:?}",
+                        delete_file.location
+                    )));
+                }
+            };
+            let position = match ScalarValue::try_from_array(batch.column(pos_column), row)? {
+                ScalarValue::Int64(Some(value)) if value >= 0 => value as u64,
+                other => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Iceberg position delete `{}` has invalid `pos` value {other:?}",
+                        delete_file.location
+                    )));
+                }
+            };
+            positions.entry(file_path).or_default().push(position);
+        }
+    }
+    for indexes in positions.values_mut() {
+        indexes.sort_unstable();
+        indexes.dedup();
+    }
+    Ok(positions)
+}
+
+fn iceberg_paths_equal(recorded: &str, resolved: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .strip_prefix("s3a://")
+            .map(|rest| format!("s3://{rest}"))
+            .unwrap_or_else(|| value.to_string())
+    };
+    let recorded = normalize(recorded);
+    let resolved = normalize(resolved);
+    recorded == resolved
+        || (!recorded.contains("://")
+            && resolved.ends_with(&format!("/{}", recorded.trim_start_matches('/'))))
+}
+
+fn partition_values(
+    location: &str,
+    values: &std::collections::BTreeMap<String, String>,
+    partition_names: &[String],
+    partition_columns: &[(String, datafusion::arrow::datatypes::DataType)],
+) -> DfResult<Vec<datafusion::common::ScalarValue>> {
+    partition_names
+        .iter()
+        .filter_map(|name| {
+            partition_columns
+                .iter()
+                .find(|(column, _)| column == name)
+                .map(|(_, data_type)| (name, data_type))
+        })
+        .map(|(name, data_type)| {
+            let value = values
+                .get(name)
+                .cloned()
+                .or_else(|| hive_partition_value(location, name));
+            match value {
+                Some(value) if value != "__HIVE_DEFAULT_PARTITION__" => {
+                    datafusion::common::ScalarValue::try_from_string(value, data_type)
+                }
+                _ => datafusion::common::ScalarValue::try_from(data_type),
+            }
+        })
+        .collect()
+}
+
+fn hive_partition_value(location: &str, key: &str) -> Option<String> {
+    let needle = format!("/{key}=");
+    let start = location.find(&needle)? + needle.len();
+    let rest = &location[start..];
+    let end = rest.find('/').unwrap_or(rest.len());
+    Some(rest[..end].to_string())
 }
 
 fn loc_err(md: &TableMetadata) -> impl Fn(DataFusionError) -> DataFusionError + '_ {
@@ -1382,28 +2112,54 @@ mod tests {
     }
 
     #[test]
-    fn local_path_accepts_file_uri_forms_and_bare_paths() {
-        // RFC `file:///abs` and Hive Metastore's single-slash `file:/abs`.
-        assert_eq!(
-            local_path("file:///tmp/delta/table").unwrap(),
-            "/tmp/delta/table"
-        );
-        assert_eq!(
-            local_path("file:/tmp/delta/table").unwrap(),
-            "/tmp/delta/table"
-        );
-        assert_eq!(local_path("/tmp/delta/table").unwrap(), "/tmp/delta/table");
+    fn iceberg_path_matching_normalizes_s3a_and_relative_paths() {
+        assert!(iceberg_paths_equal(
+            "s3a://bucket/table/data/part.parquet",
+            "s3://bucket/table/data/part.parquet"
+        ));
+        assert!(iceberg_paths_equal(
+            "data/part.parquet",
+            "s3://bucket/table/data/part.parquet"
+        ));
+        assert!(!iceberg_paths_equal(
+            "data/other.parquet",
+            "s3://bucket/table/data/part.parquet"
+        ));
     }
 
-    #[test]
-    fn local_path_rejects_non_file_schemes() {
-        let err = local_path("s3://bucket/path").expect_err("s3 must not look local");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("s3://") || msg.contains("`s3://`"),
-            "error should name the scheme: {msg}"
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lost_task_local_pin_fails_instead_of_resolving_latest() {
+        let state = SessionContext::new().state();
+        let metadata = TableMetadata::new(
+            "fake.ns.orders",
+            "file:///does/not/matter",
+            TableFormat::Delta,
         );
-        assert!(local_path("hdfs://nn/path").is_err());
+        let pins = serde_json::json!({
+            "fake.ns.orders": SnapshotIdentity::Delta { version: 7 }
+        })
+        .to_string();
+
+        let result = with_lakehouse_snapshots(&pins, async move {
+            let result = tokio::spawn(async move {
+                metadata_to_provider(&state, &metadata, "orders", true).await
+            })
+            .await
+            .expect("spawned resolver task");
+            Ok(result)
+        })
+        .await
+        .unwrap();
+        let error = match result {
+            Ok(_) => panic!("a spawned distributed resolution must not fall back to latest"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("outside its pinned snapshot scope"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

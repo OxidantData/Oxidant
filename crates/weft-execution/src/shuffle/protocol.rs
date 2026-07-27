@@ -86,6 +86,10 @@ pub struct StageTicket {
     /// e.g. a join whose result is re-shuffled before a final aggregate).
     #[prost(bool, tag = "9")]
     pub produce: bool,
+    /// Optional JSON map of fully-qualified table names to pinned Delta/Iceberg identities.
+    /// Empty keeps old tickets wire-compatible and is valid for stages without lakehouse tables.
+    #[prost(string, tag = "10")]
+    pub lakehouse_snapshot_pins: String,
 }
 
 /// A pull request for one hash bucket of an already-produced stage output.
@@ -167,6 +171,7 @@ mod tests {
             hash_key_cols: vec![0],
             upstream_stage_ids: vec![0],
             produce: false,
+            lakehouse_snapshot_pins: r#"{"prod.db.t":{"format":"delta","version":7}}"#.into(),
         };
         let bytes = t.to_ticket_bytes();
         match decode_ticket(&bytes).unwrap() {

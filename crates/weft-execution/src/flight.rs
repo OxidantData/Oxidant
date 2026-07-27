@@ -68,6 +68,7 @@ pub struct Worker {
 impl Worker {
     /// Wrap an engine as a worker.
     pub fn new(engine: Arc<Engine>) -> Self {
+        engine.require_lakehouse_snapshot_pins();
         let spill = SpillStore::from_env();
         if let Some(bytes) = std::env::var("WEFT_MEMORY_LIMIT_BYTES")
             .ok()
@@ -266,12 +267,12 @@ impl Worker {
             // typed, then run, hash-partition, and cache for downstreams.
             let schema = self
                 .engine
-                .schema(&t.stage_sql)
+                .schema_with_lakehouse_snapshots(&t.stage_sql, &t.lakehouse_snapshot_pins)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
             let batches = self
                 .engine
-                .sql(&t.stage_sql)
+                .sql_with_lakehouse_snapshots(&t.stage_sql, &t.lakehouse_snapshot_pins)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
             let key_cols: Vec<usize> = t.hash_key_cols.iter().map(|&c| c as usize).collect();
@@ -288,7 +289,7 @@ impl Worker {
         } else {
             // Output stage: run and return the result.
             self.engine
-                .sql(&t.stage_sql)
+                .sql_with_lakehouse_snapshots(&t.stage_sql, &t.lakehouse_snapshot_pins)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))
         }
@@ -965,6 +966,7 @@ mod tests {
             hash_key_cols: vec![0],
             upstream_stage_ids: vec![],
             produce: true,
+            lakehouse_snapshot_pins: String::new(),
         };
         let mut out = None;
         for _ in 0..50 {
@@ -1005,6 +1007,7 @@ mod tests {
             hash_key_cols: vec![0],
             upstream_stage_ids: vec![],
             produce: true,
+            lakehouse_snapshot_pins: String::new(),
         };
         for _ in 0..50 {
             if run_stage_on_worker(endpoint.clone(), ticket.clone())
@@ -1052,6 +1055,7 @@ mod tests {
             hash_key_cols: vec![0],
             upstream_stage_ids: vec![],
             produce: true,
+            lakehouse_snapshot_pins: String::new(),
         };
         for _ in 0..50 {
             if run_stage_on_worker(endpoint.clone(), ticket.clone())
@@ -1093,6 +1097,7 @@ mod tests {
             hash_key_cols: vec![],
             upstream_stage_ids: vec![7],
             produce: false,
+            lakehouse_snapshot_pins: String::new(),
         };
         let mut out = None;
         for _ in 0..50 {

@@ -60,8 +60,39 @@ jobs:
   build-test:
     name: clippy + test
     runs-on: ubuntu-latest
+    # Fail fast rather than burning an hour on a wedged runner. The suite compiles the workspace
+    # twice over (see the disk-reclaim step) and then runs the distributed tests serially, so the
+    # honest ceiling is well above the ~10 min this takes on `main`.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      # `iceberg` 0.8 is the newest release compatible with the pinned Rust 1.90, and it pulls
+      # `parquet`/`arrow` 57 alongside the workspace's 58. `cargo test --workspace` therefore builds
+      # two full Arrow stacks plus a test binary per crate, which overruns the ~14 GB a standard
+      # runner leaves free and kills the job with no log to show for it. Reclaiming the preinstalled
+      # SDKs buys ~25 GB. This can go away once the toolchain moves to 1.92+ and `iceberg` 0.9 can
+      # share the workspace's Arrow.
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          df -h /
+      - name: Start MinIO service container
+        run: |
+          docker run -d --name weft-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin123 \
+            quay.io/minio/minio:latest server /data
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:9000/minio/health/live && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:9000/minio/health/live
+          docker run --rm --network host \
+            -e MC_HOST_local=http://minioadmin:minioadmin123@127.0.0.1:9000 \
+            minio/mc mb --ignore-existing local/weft-test
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
           rustup show
@@ -89,6 +120,9 @@ jobs:
       # well under that.
       - name: test (workspace)
         run: cargo test --workspace
+        env:
+          WEFT_MINIO_TEST: "1"
+          WEFT_MINIO_ENDPOINT: "http://127.0.0.1:9000"
 
   # The TPC-H / TPC-DS / distributed gates used to run at the tail of build-test, which made the
   # critical path the SUM of compiling the workspace and replaying every query suite. They only

@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use datafusion::prelude::SessionContext;
@@ -1757,6 +1758,9 @@ pub struct Engine {
     /// separately at CREATE time. Consulted by later SHOW/DESCRIBE work via
     /// [`Engine::created_table_meta`].
     created_tables: Mutex<HashMap<String, CreatedTableMeta>>,
+    /// Set permanently on Flight workers so losing a distributed stage's task-local snapshot
+    /// scope fails rather than silently resolving a newer lakehouse snapshot.
+    require_lakehouse_snapshot_pins: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -1875,6 +1879,7 @@ impl Engine {
                 vec![weft_catalog::DEFAULT_NAMESPACE.to_string()],
             )),
             created_tables: Mutex::new(HashMap::new()),
+            require_lakehouse_snapshot_pins: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2208,6 +2213,38 @@ impl Engine {
         self.create_logical_plan_spark(query.as_ref()).await
     }
 
+    /// Plan one driver query while capturing the exact Delta/Iceberg identities it resolved.
+    pub async fn logical_plan_with_lakehouse_snapshots(
+        &self,
+        query: &str,
+    ) -> Result<(datafusion::logical_expr::LogicalPlan, String)> {
+        catalog_bridge::capture_lakehouse_snapshots(self.logical_plan(query)).await
+    }
+
+    /// Execute worker SQL under snapshot pins serialized by the driver.
+    pub async fn sql_with_lakehouse_snapshots(
+        &self,
+        query: &str,
+        pins_json: &str,
+    ) -> Result<Vec<RecordBatch>> {
+        catalog_bridge::with_lakehouse_snapshots(pins_json, self.sql(query)).await
+    }
+
+    /// Resolve worker output schema under the same snapshot pins as execution.
+    pub async fn schema_with_lakehouse_snapshots(
+        &self,
+        query: &str,
+        pins_json: &str,
+    ) -> Result<arrow::datatypes::SchemaRef> {
+        catalog_bridge::with_lakehouse_snapshots(pins_json, self.schema(query)).await
+    }
+
+    /// Mark this engine as a distributed worker where an unpinned lakehouse read is invalid.
+    pub fn require_lakehouse_snapshot_pins(&self) {
+        self.require_lakehouse_snapshot_pins
+            .store(true, Ordering::Relaxed);
+    }
+
     /// Render a Spark-style `EXPLAIN` string for a logical plan, for Spark Connect
     /// `AnalyzePlan(Explain)` (PySpark `df.explain()`). `extended` mirrors Spark's EXTENDED mode:
     /// it prepends the parsed + optimized logical plans; otherwise only the physical plan is shown
@@ -2353,45 +2390,29 @@ impl Engine {
             .map_err(|e| Error::Execution(format!("register parquet `{name}`: {e}")))
     }
 
-    /// Register a Delta Lake table directory under `name` — resolves active files from the
-    /// `_delta_log` (via [`weft_datasource::delta_active_files`]), then the native reader.
+    /// Register a Delta Lake table directory under `name`.
     pub async fn register_delta(&self, name: &str, table_path: &str) -> Result<()> {
-        let files = weft_datasource::delta_active_files(table_path)?;
-        self.register_parquet_files(name, table_path, files).await
+        self.register_lakehouse(name, table_path, weft_catalog::TableFormat::Delta)
+            .await
     }
 
-    /// Register an Iceberg table directory under `name` — resolves data files from the current
-    /// snapshot's manifests (via [`weft_datasource::iceberg_active_files`]), then the reader.
+    /// Register an Iceberg table directory under `name`.
     pub async fn register_iceberg(&self, name: &str, table_path: &str) -> Result<()> {
-        let files = weft_datasource::iceberg_active_files(table_path)?;
-        self.register_parquet_files(name, table_path, files).await
+        self.register_lakehouse(name, table_path, weft_catalog::TableFormat::Iceberg)
+            .await
     }
 
-    /// Expose a set of Parquet files as a DataFusion listing table — the version-safe seam both
-    /// lakehouse readers share (resolve the format to files, then use DataFusion 54's reader).
-    async fn register_parquet_files(
+    async fn register_lakehouse(
         &self,
         name: &str,
         table_path: &str,
-        files: Vec<std::path::PathBuf>,
+        format: weft_catalog::TableFormat,
     ) -> Result<()> {
-        use datafusion::datasource::file_format::parquet::ParquetFormat;
-        use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
-
-        if files.is_empty() {
-            return Err(Error::Plan(format!(
-                "table `{table_path}` has no active data files"
-            )));
-        }
-        let urls = files
-            .iter()
-            .map(|p| {
-                ListingTableUrl::parse(p.to_string_lossy())
-                    .map_err(|e| Error::Io(format!("bad file path {}: {e}", p.display())))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let opts = ListingOptions::new(Arc::new(ParquetFormat::default()));
-        let table = build_listing_table(&self.ctx.state(), urls, opts, None).await?;
+        let metadata = weft_catalog::TableMetadata::new(name, table_path, format);
+        let table = catalog_bridge::metadata_to_provider(&self.ctx.state(), &metadata, name, false)
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))?
+            .provider;
         self.ctx
             .register_table(name, table)
             .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
@@ -2412,6 +2433,7 @@ impl Engine {
         let bridge = Arc::new(catalog_bridge::WeftCatalogProvider::new(
             provider,
             self.ctx.clone(),
+            self.require_lakehouse_snapshot_pins.clone(),
         ));
         self.ctx.register_catalog(name, bridge);
     }
@@ -5465,14 +5487,44 @@ mod tests {
             w.write(&batch).unwrap();
             w.close().unwrap();
         }
-        let commit = concat!(
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-            "\n",
-            r#"{"metaData":{"id":"t","format":{"provider":"parquet"},"schemaString":"{}","partitionColumns":[]}}"#,
-            "\n",
-            r#"{"add":{"path":"part-0.parquet","partitionValues":{},"size":1,"modificationTime":0,"dataChange":true}}"#,
-            "\n",
-        );
+        let file_size = std::fs::metadata(dir.join("part-0.parquet")).unwrap().len();
+        let schema_string = serde_json::json!({
+            "type": "struct",
+            "fields": [{
+                "name": "x",
+                "type": "long",
+                "nullable": false,
+                "metadata": {}
+            }]
+        })
+        .to_string();
+        let commit = [
+            serde_json::json!({
+                "protocol": {"minReaderVersion": 1, "minWriterVersion": 2}
+            })
+            .to_string(),
+            serde_json::json!({
+                "metaData": {
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": schema_string,
+                    "partitionColumns": [],
+                    "configuration": {}
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "add": {
+                    "path": "part-0.parquet",
+                    "partitionValues": {},
+                    "size": file_size,
+                    "modificationTime": 0,
+                    "dataChange": true
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
         std::fs::write(log.join("00000000000000000000.json"), commit).unwrap();
 
         let engine = Engine::new();

@@ -122,14 +122,18 @@ pub async fn plan_distributed(
     sql: &str,
     replicated: &[&str],
 ) -> Result<DistributedQuery> {
-    let lp = engine.logical_plan(sql).await?;
-    match plan_distributed_logical(&lp, replicated) {
+    let (lp, lakehouse_snapshot_pins) = engine.logical_plan_with_lakehouse_snapshots(sql).await?;
+    let mut query = match plan_distributed_logical(&lp, replicated) {
         Ok(dq) => Ok(dq),
         Err(Error::Unsupported(_)) => {
             crate::plan::physical_splitter::plan_forward(engine, sql).await
         }
         Err(e) => Err(e),
+    }?;
+    for stage in &mut query.stages {
+        stage.lakehouse_snapshot_pins = lakehouse_snapshot_pins.clone();
     }
+    Ok(query)
 }
 
 /// The top of the plan above the aggregate: the output projection (if any) plus the trailing

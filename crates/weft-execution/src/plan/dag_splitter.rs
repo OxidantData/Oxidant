@@ -389,6 +389,7 @@ fn append_branch(
             hash_key_cols: stage.hash_key_cols,
             exchange: stage.exchange,
             plan_fragment: stage.plan_fragment,
+            lakehouse_snapshot_pins: stage.lakehouse_snapshot_pins,
         });
         output_id = Some(new_id);
         *next_id = (*next_id).max(new_id.checked_add(1).ok_or_else(|| {
