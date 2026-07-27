@@ -1,17 +1,24 @@
 //! Left-deep shuffle-join chains for two or more sharded tables.
 //!
 //! A single equijoin between exactly two sharded leaf scans reuses the proven two-table path in
-//! [`super::stage_planner`] (**inner only**). Longer chains — and any LEFT / RIGHT / FULL / SEMI /
-//! ANTI equijoin — emit pairwise shuffle stages (intermediate consume+produce) with flattened
+//! [`super::stage_planner`] (**inner only**). Longer chains — and LEFT / RIGHT / FULL / LEFT SEMI /
+//! LEFT ANTI equijoins — emit pairwise shuffle stages (intermediate consume+produce) with flattened
 //! column names (`alias__col`), then partial/final aggregate.
 //!
 //! ## Outer / semi / anti correctness
 //!
 //! Both sides of a sharded–sharded equijoin are hash-partitioned on the join key so every key's
-//! rows co-locate on one worker. That is sufficient for:
+//! rows co-locate on one worker. Arrow row-format hashing treats NULL as an ordinary key value
+//! (null-key rows are not dropped), so:
 //! - **LEFT / RIGHT / FULL OUTER**: null-extension is local to the worker that owns the key;
-//!   unmatched rows never need another worker's partition.
-//! - **SEMI / ANTI**: matching is presence-only and likewise key-local.
+//!   unmatched rows (including NULL-key rows) never need another worker's partition.
+//! - **LEFT SEMI / LEFT ANTI**: matching is presence-only and likewise key-local.
+//!
+//! After an intermediate **FULL** or **RIGHT** join, unmatched right rows have NULL on the left
+//! key; the intermediate projection therefore emits
+//! `COALESCE(l.<join_key>, r.<join_key>) AS <left_flat>` so the next stage still hashes on the
+//! real key value. `RIGHT SEMI` / `RIGHT ANTI` are rejected — Spark SQL has no such keywords;
+//! use `LEFT SEMI` / `LEFT ANTI` (or swap inputs upstream).
 //!
 //! Replicated dimensions that appear in the chain fold into the next shuffle-join stage as
 //! local broadcast joins (always `JOIN`, since the dim is complete on every worker).
@@ -68,6 +75,8 @@ pub(crate) fn plan_shuffle_join_chain(
         ));
     }
 
+    ensure_semi_anti_aggs_ok(p, &steps)?;
+
     build_chain(p, sharded, replicated, leftmost, &steps)
 }
 
@@ -85,9 +94,14 @@ fn supported_shuffle_join_type(jt: JoinType) -> Result<()> {
         | JoinType::Right
         | JoinType::Full
         | JoinType::LeftSemi
-        | JoinType::LeftAnti
-        | JoinType::RightSemi
-        | JoinType::RightAnti => Ok(()),
+        | JoinType::LeftAnti => Ok(()),
+        // Spark SQL / Databricks dialect has LEFT SEMI / LEFT ANTI only. Emitting RIGHT SEMI
+        // would pass planning and fail later when workers re-parse stage SQL.
+        JoinType::RightSemi | JoinType::RightAnti => Err(Error::Unsupported(
+            "auto-distribute: RIGHT SEMI / RIGHT ANTI shuffle joins are not supported \
+             (Spark SQL has no RIGHT SEMI/ANTI) — rewrite as LEFT SEMI/ANTI with swapped inputs"
+                .into(),
+        )),
         other => Err(Error::Unsupported(format!(
             "auto-distribute: shuffle join type `{other}` is not supported"
         ))),
@@ -102,20 +116,75 @@ fn sql_join_keyword(jt: JoinType) -> Result<&'static str> {
         JoinType::Full => Ok("FULL OUTER JOIN"),
         JoinType::LeftSemi => Ok("LEFT SEMI JOIN"),
         JoinType::LeftAnti => Ok("LEFT ANTI JOIN"),
-        JoinType::RightSemi => Ok("RIGHT SEMI JOIN"),
-        JoinType::RightAnti => Ok("RIGHT ANTI JOIN"),
+        JoinType::RightSemi | JoinType::RightAnti => Err(Error::Unsupported(
+            "auto-distribute: RIGHT SEMI / RIGHT ANTI cannot be emitted as stage SQL \
+             (not valid Spark SQL)"
+                .into(),
+        )),
         other => Err(Error::Unsupported(format!(
             "auto-distribute: cannot emit SQL for join type `{other}`"
         ))),
     }
 }
 
-/// SEMI / ANTI / mark joins project only one side.
+/// SEMI / ANTI joins project only the kept side (left for LeftSemi/LeftAnti).
 fn projects_right_side(jt: JoinType) -> bool {
     matches!(
         jt,
         JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
     )
+}
+
+/// Reject aggregates/projections that need columns from a semi/anti join's dropped side.
+fn ensure_semi_anti_aggs_ok(p: &Peeled<'_>, steps: &[ChainStep<'_>]) -> Result<()> {
+    let mut dropped_relations = Vec::new();
+    for step in steps {
+        if matches!(step.join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+            dropped_relations.push(step.right.table.to_string());
+            if let Some(a) = step.right.alias {
+                dropped_relations.push(a.to_string());
+            }
+        }
+    }
+    if dropped_relations.is_empty() {
+        return Ok(());
+    }
+    let mut refs = Vec::new();
+    for e in p.agg.group_expr.iter().chain(p.agg.aggr_expr.iter()) {
+        collect_column_relations(e, &mut refs);
+    }
+    if let Some(proj) = p.projection {
+        for e in proj {
+            collect_column_relations(e, &mut refs);
+        }
+    }
+    if let Some(h) = p.having {
+        collect_column_relations(h, &mut refs);
+    }
+    for r in &refs {
+        if dropped_relations.iter().any(|d| d == r) {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: aggregate/projection references `{r}` from a SEMI/ANTI \
+                 join's dropped side"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn collect_column_relations(e: &Expr, out: &mut Vec<String>) {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let _ = e.apply(|node| {
+        if let Expr::Column(c) = node {
+            if let Some(rel) = &c.relation {
+                let t = rel.table().to_string();
+                if !out.iter().any(|x| x == &t) {
+                    out.push(t);
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
 }
 
 fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<ChainStep<'_>>)> {
@@ -395,26 +464,34 @@ fn build_chain(
         }
 
         // Intermediate join output; hash by next sharded join's left key when possible.
+        // After FULL/RIGHT, unmatched right rows have NULL on the left join key — carry
+        // COALESCE(l.key, r.key) under the left flat name so the next shuffle still colocates.
+        let coalesce_join_key = matches!(step.join_type, JoinType::Full | JoinType::Right);
+        let left_flat_key = flat_col(&left_key_alias, &left_key_name);
+        let right_flat_key = flat_col(&right_alias, &right_key_name);
         let mut proj = Vec::new();
         let mut new_flats = Vec::new();
         for c in &left_flats {
-            proj.push(format!("l.{c} AS {c}"));
+            if coalesce_join_key && c == &left_flat_key {
+                proj.push(format!("COALESCE(l.{c}, r.{right_flat_key}) AS {c}"));
+            } else {
+                proj.push(format!("l.{c} AS {c}"));
+            }
             new_flats.push(c.clone());
         }
         if projects_right_side(step.join_type) {
             for c in &right_flats {
-                proj.push(format!("r.{c} AS {c}"));
-                new_flats.push(c.clone());
-            }
-        } else if matches!(step.join_type, JoinType::RightSemi | JoinType::RightAnti) {
-            // Right semi/anti keep the right schema only.
-            proj.clear();
-            new_flats.clear();
-            for c in &right_flats {
+                // Skip the right join-key column when we already coalesced it into the left flat
+                // name — otherwise the projection would duplicate the key under two names and
+                // confuse the next stage's hash index.
+                if coalesce_join_key && c == &right_flat_key {
+                    continue;
+                }
                 proj.push(format!("r.{c} AS {c}"));
                 new_flats.push(c.clone());
             }
         }
+        // LeftSemi/LeftAnti: left columns only (right side is not in the join output schema).
         let (hash_alias, hash_col) =
             next_sharded_left_key(steps, i + 1, sharded, &alias_by_relation)
                 .unwrap_or((left_key_alias.clone(), left_key_name.clone()));
@@ -517,17 +594,76 @@ fn finish_with_aggregate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use weft_loom::arrow::array::Int64Array;
+    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+    use weft_loom::arrow::record_batch::RecordBatch;
+
+    use crate::shuffle::partition::hash_partition;
+    use weft_loom::arrow::array::Array;
 
     #[test]
-    fn sql_join_keyword_covers_outer_and_semi() {
+    fn sql_join_keyword_emits_spark_valid_outer_and_semi() {
         assert_eq!(sql_join_keyword(JoinType::Left).unwrap(), "LEFT JOIN");
+        assert_eq!(sql_join_keyword(JoinType::Right).unwrap(), "RIGHT JOIN");
         assert_eq!(sql_join_keyword(JoinType::Full).unwrap(), "FULL OUTER JOIN");
+        assert_eq!(
+            sql_join_keyword(JoinType::LeftSemi).unwrap(),
+            "LEFT SEMI JOIN"
+        );
         assert_eq!(
             sql_join_keyword(JoinType::LeftAnti).unwrap(),
             "LEFT ANTI JOIN"
         );
         assert!(projects_right_side(JoinType::Left));
         assert!(!projects_right_side(JoinType::LeftSemi));
+    }
+
+    #[test]
+    fn right_semi_anti_are_rejected_not_emitted() {
+        let err = supported_shuffle_join_type(JoinType::RightSemi).unwrap_err();
+        assert!(err.to_string().contains("RIGHT SEMI"), "got: {err}");
+        let err = sql_join_keyword(JoinType::RightAnti).unwrap_err();
+        assert!(
+            err.to_string().contains("RIGHT") && err.to_string().contains("ANTI"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn null_join_keys_are_hashed_not_dropped() {
+        // Arrow row-format FNV hashing must keep NULL-key rows (required for LEFT/FULL/ANTI).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(2), None])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+            ],
+        )
+        .unwrap();
+        let parts = hash_partition(&[batch], &[0], 3).unwrap();
+        let got: usize = parts
+            .iter()
+            .flat_map(|p| p.iter())
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(got, 4, "NULL-key rows must survive hash_partition");
+        // Both NULL keys co-locate in the same bucket.
+        let mut null_buckets = 0;
+        for p in &parts {
+            let has_null = p.iter().any(|b| {
+                let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..k.len()).any(|i| k.is_null(i))
+            });
+            if has_null {
+                null_buckets += 1;
+            }
+        }
+        assert_eq!(null_buckets, 1, "all NULL keys must hash to one bucket");
     }
 
     #[test]
