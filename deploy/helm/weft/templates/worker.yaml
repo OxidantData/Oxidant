@@ -40,10 +40,17 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.worker.affinity }}
       affinity:
+        # One worker per node — topology must survive lowered CPU requests.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: weft-worker
+              topologyKey: kubernetes.io/hostname
+        {{- with .Values.worker.affinity }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       {{- with .Values.worker.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
@@ -66,13 +73,38 @@ spec:
                   fieldPath: metadata.name
             - name: WEFT_AWS_BIN
               value: {{ .Values.connect.awsBin | quote }}
-            # Real spill knob (WEFT_SPILL_DIR is unused legacy — do not set it).
-            - name: WEFT_SHUFFLE_SPILL_DIR
+            # Threshold spill lands under temp_dir()/weft-shuffle-spill/… — point TMPDIR
+            # at the spill volume so default_spill_root() uses the PVC, not /tmp emptyDir.
+            # Do NOT set WEFT_SHUFFLE_SPILL_DIR here: that enables force_spill (every bucket
+            # to disk) and invalidates benchmark timings. See worker.forceShuffleSpill.
+            - name: TMPDIR
               value: /var/lib/weft/spill
+            - name: HOME
+              value: /tmp
+            {{- if .Values.worker.shuffleSpillBytes }}
+            - name: WEFT_SHUFFLE_SPILL_BYTES
+              value: {{ .Values.worker.shuffleSpillBytes | quote }}
+            {{- end }}
             {{- if .Values.worker.memoryLimitBytes }}
             - name: WEFT_MEMORY_LIMIT_BYTES
               value: {{ .Values.worker.memoryLimitBytes | quote }}
             {{- end }}
+            {{- if .Values.worker.forceShuffleSpill }}
+            - name: WEFT_SHUFFLE_SPILL_DIR
+              value: /var/lib/weft/spill
+            {{- end }}
+          readinessProbe:
+            tcpSocket:
+              port: flight
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: flight
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -110,6 +142,7 @@ spec:
   {{- end }}
 ---
 # Headless Service — DNS discovery for WEFT_WORKER_SERVICE (do not give this a clusterIP).
+# publishNotReadyAddresses stays false so DNS only returns Ready workers (readinessProbe).
 apiVersion: v1
 kind: Service
 metadata:

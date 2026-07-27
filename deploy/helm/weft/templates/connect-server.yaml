@@ -50,8 +50,16 @@ spec:
               value: {{ .Values.worker.port | quote }}
             - name: WEFT_AWS_BIN
               value: {{ .Values.connect.awsBin | quote }}
-            - name: WEFT_SHUFFLE_SPILL_DIR
+            # Threshold spill under temp_dir()/weft-shuffle-spill — point TMPDIR at the
+            # spill volume. Never set WEFT_SHUFFLE_SPILL_DIR unless forceShuffleSpill.
+            - name: TMPDIR
               value: /var/lib/weft/spill
+            - name: HOME
+              value: /tmp
+            {{- if .Values.connect.shuffleSpillBytes }}
+            - name: WEFT_SHUFFLE_SPILL_BYTES
+              value: {{ .Values.connect.shuffleSpillBytes | quote }}
+            {{- end }}
             {{- if .Values.connect.distributedStrict }}
             - name: WEFT_DISTRIBUTED_STRICT
               value: "1"
@@ -60,6 +68,22 @@ spec:
             - name: WEFT_MEMORY_LIMIT_BYTES
               value: {{ .Values.connect.memoryLimitBytes | quote }}
             {{- end }}
+            {{- if .Values.connect.forceShuffleSpill }}
+            - name: WEFT_SHUFFLE_SPILL_DIR
+              value: /var/lib/weft/spill
+            {{- end }}
+          readinessProbe:
+            tcpSocket:
+              port: spark-connect
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: spark-connect
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

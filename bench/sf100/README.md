@@ -55,12 +55,18 @@ must have:
 |-----|--------|-----|
 | `WEFT_WORKER_COUNT` | `worker.replicas` | Shard modulus; must be fixed |
 | `WEFT_POD_NAME` | `fieldRef: metadata.name` | Trailing ordinal → shard index |
+| `TMPDIR` | `/var/lib/weft/spill` | Threshold spill root on the PVC |
+| `WEFT_SHUFFLE_SPILL_BYTES` | `worker.shuffleSpillBytes` | Spill threshold (not force-spill) |
+| `WEFT_MEMORY_LIMIT_BYTES` | `worker.memoryLimitBytes` | Fallback threshold / DF pool |
 
-`ShardAssignment::from_env` (`crates/weft-loom/src/shard.rs`) returns `None` when these
-are missing, and **every worker then reads the whole table** (silent duplication).
-Autoscaling is **chart-rejected** (`helm template … --set worker.autoscaling.enabled=true`
-fails) because an HPA that changes replica count while `WEFT_WORKER_COUNT` stays at
-render-time is incoherent.
+Do **not** set `WEFT_SHUFFLE_SPILL_DIR` for benchmarks (`forceShuffleSpill` is debug-only
+and forces every shuffle bucket to disk).
+
+`ShardAssignment::from_env` (`crates/weft-loom/src/shard.rs`) returns `None` when the
+sharding env is missing, and **every worker then reads the whole table** (silent
+duplication). Autoscaling is **chart-rejected**. A **not-Ready** worker is a different
+failure: remaining workers still only read their own shard → silent row loss. The chart
+adds Flight readiness probes; the Spark Connect runner preflights Ready pod count.
 
 SF100 topology overlay:
 
@@ -86,6 +92,7 @@ kubectl -n weft port-forward svc/weft-connect 50051:50051
 WEFT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
   --endpoint sc://localhost:50051 \
   --suite tpcds --sf 100 --glue-db tpcds_sf100 \
+  --namespace weft --worker-count 2 \
   --only 1,3,6 \
   --json /tmp/tpcds-sc.jsonl
 
@@ -93,8 +100,13 @@ WEFT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
 WEFT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
   --endpoint sc://localhost:50051 \
   --suite tpcds --sf 100 --glue-db tpcds_sf100 \
+  --namespace weft --worker-count 2 \
   --json results/tpcds-sf100-parquet.jsonl --resume
 ```
+
+Preflight (default for SF≥100): refuses to start unless Ready `app=weft-worker` pods
+equal `--worker-count` (or `$WEFT_WORKER_COUNT`). Override only with
+`--skip-worker-preflight` (unsafe).
 
 Each JSONL record includes `wall_s` / `hot_s`, `row_count`, and a SHA-256 `checksum`
 of the collected rows for cross-format comparison.

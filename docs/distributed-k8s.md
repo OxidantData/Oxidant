@@ -45,8 +45,39 @@ The Helm chart therefore:
   someone turns it on: a fixed `WEFT_WORKER_COUNT` plus an HPA that changes replica
   count is incoherent (scale out → unread shards / data loss; or pods keep reading
   everything). Pin `worker.replicas` instead.
-- Sets `WEFT_SHUFFLE_SPILL_DIR=/var/lib/weft/spill` (the engine’s real spill knob).
-  The historical `WEFT_SPILL_DIR` env var is **unused** by Rust code — do not set it.
+- TCP **readiness** (and liveness) probes on the Flight port so the headless Service
+  DNS only returns workers that have bound the port.
+- Required **podAntiAffinity** on `app=weft-worker` / `kubernetes.io/hostname` so one
+  worker lands per node.
+- **Threshold shuffle spill** (not force-spill):
+  - Spill PVC (or emptyDir) mounted at `/var/lib/weft/spill`
+  - `TMPDIR=/var/lib/weft/spill` so `default_spill_root()` → `$TMPDIR/weft-shuffle-spill/…`
+    lands on that volume (with only `WEFT_SHUFFLE_SPILL_BYTES` /
+    `WEFT_MEMORY_LIMIT_BYTES`, the engine does **not** use `WEFT_SHUFFLE_SPILL_DIR`)
+  - `WEFT_SHUFFLE_SPILL_BYTES` for an explicit threshold (takes precedence over
+    `WEFT_MEMORY_LIMIT_BYTES`)
+  - **`WEFT_SHUFFLE_SPILL_DIR` is debug-only** (`worker.forceShuffleSpill: true`): when
+    set, `SpillStore::from_env` enables `force_spill` and writes **every** shuffle
+    bucket to disk — do not enable for publishable benchmarks
+  - Legacy `WEFT_SPILL_DIR` is **unused** by Rust — do not set it
+
+### Silent shard loss (config mitigations + engine follow-up)
+
+Each worker shards from its **own** env (`WEFT_POD_NAME` ordinal / `WEFT_WORKER_COUNT`).
+The driver discovers live endpoints via DNS and partitions by `workers.len()`. Nothing
+cross-checks the two today: if `weft-worker-1` is not Ready, the driver may dispatch
+only to `weft-worker-0`, which still reads only shard 0 of 2 → ~half the rows, no error.
+
+Config-side mitigations on this chart / harness:
+
+1. Readiness probes so DNS omits unbound pods.
+2. `bench/sf100/run-spark-connect.py` preflight: refuse unless Ready `weft-worker` pods
+   equal `--worker-count` / `WEFT_WORKER_COUNT` (default 2 for SF≥100).
+
+**Follow-up (engine — do not land on this branch):** under `WEFT_DISTRIBUTED_STRICT=1`,
+the driver in `crates/weft-execution` should hard-fail when the discovered worker count
+differs from `WEFT_WORKER_COUNT`. Phase B is rewriting that crate on another branch;
+track the guard there to avoid merge conflicts.
 
 ## Build images
 
@@ -158,8 +189,11 @@ Overlay [`deploy/helm/weft/values-sf100.yaml`](../deploy/helm/weft/values-sf100.
 - Connect sized for **c6g.xlarge** (4 vCPU / 8 GiB), workers for **m8g.4xlarge**
   (16 vCPU / 64 GiB), `kubernetes.io/arch=arm64`
 - `worker.replicas: 2`, autoscaling off, **500Gi gp3** spill PVC per worker
-- `WEFT_MEMORY_LIMIT_BYTES` aligned with container memory limits
+- `WEFT_MEMORY_LIMIT_BYTES` + `WEFT_SHUFFLE_SPILL_BYTES` aligned with container memory
+  (threshold spill); `TMPDIR` on the spill PVC; `forceShuffleSpill: false`
 - `connect.distributedStrict: true` → `WEFT_DISTRIBUTED_STRICT=1` on the driver
+- Connect CPU request **3000m** (not 3500m) so a c6g.xlarge can still schedule CNI /
+  kube-proxy / node agents beside the pod
 - IRSA / instance-type labels left as **obvious placeholders** — fill before install
 
 ```sh
@@ -191,6 +225,7 @@ Then run the direct Spark Connect SF100 harness (see [`bench/sf100/README.md`](.
 WEFT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
   --endpoint sc://localhost:50051 \
   --suite tpcds --sf 100 --glue-db tpcds_sf100 \
+  --namespace weft --worker-count 2 \
   --json results/tpcds-sf100.jsonl --resume
 ```
 
@@ -205,7 +240,8 @@ WEFT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
    to that binary. No static keys in the image.
 
 See also [`runtime-contract.md`](runtime-contract.md) for the full env surface
-(`WEFT_WORKER_SERVICE`, `WEFT_SHUFFLE_SPILL_DIR`, memory limits).
+(`WEFT_WORKER_SERVICE`, `WEFT_SHUFFLE_SPILL_BYTES`, `WEFT_MEMORY_LIMIT_BYTES`,
+`TMPDIR`; `WEFT_SHUFFLE_SPILL_DIR` is force-spill / debug-only).
 
 ## TPC-H on distributed
 
@@ -225,7 +261,9 @@ before workers re-parse stage SQL.
 | Symptom | Likely cause |
 |---------|----------------|
 | Inflated row counts / duplicated aggregates with 2 workers | Missing `WEFT_WORKER_COUNT` / `WEFT_POD_NAME` — confirm StatefulSet env |
+| ~Half the rows, no error | A worker not Ready while others still shard as if N is full — check readiness + runner preflight |
 | Driver plans but workers never receive tasks | `WEFT_WORKER_SERVICE` DNS empty — check headless Service + ready pods |
+| Benchmarks unexpectedly disk-bound | `forceShuffleSpill` / `WEFT_SHUFFLE_SPILL_DIR` enabled — turn it off |
 | `INTERVAL … leading_precision` plan error | Client bypassed `normalize_spark_sql` — use `Engine::sql` / Connect server |
 | `INTERVAL requires a unit after the literal` on workers | Stage SQL not sanitized — ensure current `weft-execution` sanitize path |
 | Glue / S3 auth failures | IRSA / role missing; confirm `aws sts get-caller-identity` inside the pod |

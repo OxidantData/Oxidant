@@ -91,9 +91,9 @@ USER 65532:65532
 # Read-only rootfs survival: the engine stages sort/aggregation spill and Delta/
 # catalog scratch under std::env::temp_dir() (== $TMPDIR). Keep every writable path
 # on an emptyDir mount, and keep HOME off the read-only rootfs.
-#   - Shuffle spill is controlled by WEFT_SHUFFLE_SPILL_DIR (set by Helm to
-#     /var/lib/weft/spill). The old WEFT_SPILL_DIR name is unused by the engine —
-#     do not document or set it.
+#   - Shuffle spill: set WEFT_SHUFFLE_SPILL_BYTES (threshold) and point TMPDIR at a
+#     writable spill volume. WEFT_SHUFFLE_SPILL_DIR is DEBUG-ONLY (force-spill).
+#     The old WEFT_SPILL_DIR name is unused by the engine — do not set it.
 #   - WEFT_MEMORY_LIMIT_BYTES (unset here) bounds the spill pool; set it from the
 #     pod's memory limit to make aggregations spill instead of OOM-killing.
 ENV TMPDIR=/tmp \
@@ -120,7 +120,7 @@ CMD ["spark", "server", "--port", "50051"]
 #                                seccompProfile.type: RuntimeDefault
 #   volumes (emptyDir or PVC):
 #     - name: tmp    mountPath: /tmp                 # $TMPDIR scratch
-#     - name: spill  mountPath: /var/lib/weft/spill  # WEFT_SHUFFLE_SPILL_DIR
+#     - name: spill  mountPath: /var/lib/weft/spill  # TMPDIR for threshold spill
 #
 # Standalone (outside K8s):
 #   docker run --read-only \

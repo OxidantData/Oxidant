@@ -56,6 +56,56 @@ def _strict_requested(flag: bool) -> bool:
     return v == "1" or v.lower() == "true"
 
 
+def _ready_worker_count(namespace: str) -> tuple[int, int]:
+    """Return (ready_count, total_count) for pods labeled app=weft-worker."""
+    import subprocess
+
+    out = subprocess.check_output(
+        [
+            "kubectl",
+            "-n",
+            namespace,
+            "get",
+            "pods",
+            "-l",
+            "app=weft-worker",
+            "-o",
+            "json",
+        ],
+        text=True,
+    )
+    data = json.loads(out)
+    items = data.get("items") or []
+    ready = 0
+    for pod in items:
+        conds = (pod.get("status") or {}).get("conditions") or []
+        if any(c.get("type") == "Ready" and c.get("status") == "True" for c in conds):
+            ready += 1
+    return ready, len(items)
+
+
+def assert_workers_ready(namespace: str, expected: int) -> None:
+    """Refuse to run unless Ready worker pods == expected shard count.
+
+    Each worker shards by its own WEFT_POD_NAME ordinal over WEFT_WORKER_COUNT, while
+    the driver discovers live endpoints via DNS. If a worker is not Ready, DNS omits
+    it and the remaining workers still only read their own shard → silent row loss.
+    """
+    ready, total = _ready_worker_count(namespace)
+    print(
+        f"[preflight] namespace={namespace} workers ready={ready}/{total} "
+        f"expected={expected}",
+        flush=True,
+    )
+    if ready != expected:
+        raise SystemExit(
+            f"preflight failed: {ready} Ready weft-worker pods (total={total}), "
+            f"expected {expected} (== WEFT_WORKER_COUNT). "
+            "A missing worker silently drops its shard. "
+            "Wait for StatefulSet Ready, or pass --skip-worker-preflight (unsafe)."
+        )
+
+
 def _result_checksum(rows: list) -> str:
     """Stable checksum over collected rows (order-preserving within the result)."""
     h = hashlib.sha256()
@@ -161,6 +211,22 @@ def main() -> int:
         help="Timed attempts per query (default 1; use 3 for ClickBench-style hot)",
     )
     ap.add_argument("--machine", default="eks/sf100")
+    ap.add_argument(
+        "--namespace",
+        default=os.environ.get("WEFT_NAMESPACE", "weft"),
+        help="K8s namespace for worker preflight (default weft / $WEFT_NAMESPACE)",
+    )
+    ap.add_argument(
+        "--worker-count",
+        type=int,
+        default=int(os.environ.get("WEFT_WORKER_COUNT", "0") or "0"),
+        help="Expected Ready weft-worker pods (== chart worker.replicas / WEFT_WORKER_COUNT)",
+    )
+    ap.add_argument(
+        "--skip-worker-preflight",
+        action="store_true",
+        help="Skip Ready-worker count check (unsafe: missing workers drop shards silently)",
+    )
     args = ap.parse_args()
 
     strict = _strict_requested(args.strict)
@@ -181,6 +247,15 @@ def main() -> int:
                 "refusing SF>=100 without WEFT_DISTRIBUTED_STRICT=1 or --strict "
                 "(silent single-node fallback is not publishable)"
             )
+
+    expected_workers = args.worker_count
+    if expected_workers <= 0 and not args.skip_worker_preflight:
+        # Default SF100 topology is 2 workers when unset.
+        expected_workers = 2 if args.sf >= 100 else 0
+    if not args.skip_worker_preflight and expected_workers > 0:
+        assert_workers_ready(args.namespace, expected_workers)
+    elif args.skip_worker_preflight:
+        print("[preflight] SKIPPED (--skip-worker-preflight)", flush=True)
 
     glue_db = args.glue_db or f"{args.suite}_sf{int(args.sf)}"
     tables = TPCH_TABLES if args.suite == "tpch" else TPCDS_TABLES

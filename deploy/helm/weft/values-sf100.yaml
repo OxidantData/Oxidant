@@ -17,11 +17,14 @@ serviceAccount:
 connect:
   enabled: true
   distributedStrict: true
+  forceShuffleSpill: false
   # ~75% of c6g.xlarge memory — leave headroom for the OS / kubelet.
   memoryLimitBytes: "6442450944" # 6 GiB
+  shuffleSpillBytes: "6442450944" # threshold spill (not force-spill)
   resources:
     requests:
-      cpu: "3500m"
+      # c6g.xlarge ≈ 3920m allocatable; leave ~900m for CNI / kube-proxy / agents.
+      cpu: "3000m"
       memory: 7Gi
     limits:
       cpu: "4"
@@ -30,15 +33,15 @@ connect:
     kubernetes.io/arch: arm64
     # REPLACE: node group / capacity type labels for the c6g.xlarge pool
     # node.kubernetes.io/instance-type: c6g.xlarge
-  tolerations: []
-  affinity: {}
 
 worker:
   replicas: 2
   autoscaling:
     enabled: false
-  # Match container memory limit so aggregations spill instead of OOM.
+  forceShuffleSpill: false
+  # Match container memory limit so aggregations spill under pressure (threshold).
   memoryLimitBytes: "51539607552" # 48 GiB
+  shuffleSpillBytes: "51539607552" # WEFT_SHUFFLE_SPILL_BYTES (takes precedence)
   resources:
     requests:
       cpu: "14"
@@ -50,8 +53,6 @@ worker:
     kubernetes.io/arch: arm64
     # REPLACE: node group / capacity type labels for the m8g.4xlarge pool
     # node.kubernetes.io/instance-type: m8g.4xlarge
-  tolerations: []
-  affinity: {}
   persistence:
     enabled: true
     # REPLACE: cluster gp3 StorageClass name (often "gp3")

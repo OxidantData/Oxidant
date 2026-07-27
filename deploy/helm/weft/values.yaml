@@ -27,10 +27,19 @@ connect:
   serviceType: ClusterIP
   # Bundled in connect-server.Dockerfile (awscli stage).
   awsBin: /usr/local/aws-cli/v2/current/bin/aws
+  # DataFusion / shuffle memory pool hint (bytes). Prefer shuffleSpillBytes for
+  # the shuffle threshold (it takes precedence in SpillStore::from_env).
   memoryLimitBytes: ""
+  # Threshold for hash-shuffle spill (bytes). Spill files land under
+  # $TMPDIR/weft-shuffle-spill/… — chart sets TMPDIR to the spill volume.
+  shuffleSpillBytes: ""
+  # DEBUG ONLY: set WEFT_SHUFFLE_SPILL_DIR and force EVERY shuffle bucket to disk.
+  # Invalidates benchmark timings. Default off.
+  forceShuffleSpill: false
   resources: {}
   nodeSelector: {}
   tolerations: []
+  # Optional extra affinity (nodeAffinity / podAffinity). Do not set podAntiAffinity here.
   affinity: {}
   # When true, fail queries that cannot be planned distributed (server-side).
   distributedStrict: false
@@ -42,12 +51,22 @@ worker:
   # Fixed replica count — also emitted as WEFT_WORKER_COUNT on every worker pod.
   replicas: 2
   memoryLimitBytes: ""
+  # Threshold for hash-shuffle spill (bytes). Prefer this over memoryLimitBytes for
+  # shuffle. Chart sets TMPDIR=/var/lib/weft/spill so default_spill_root() lands on
+  # the PVC (or emptyDir spill volume), NOT node ephemeral via /tmp.
+  shuffleSpillBytes: ""
+  # DEBUG ONLY: sets WEFT_SHUFFLE_SPILL_DIR → force_spill=true (every bucket to disk).
+  # Never enable for publishable benchmarks. Default off.
+  forceShuffleSpill: false
   resources: {}
   nodeSelector: {}
   tolerations: []
+  # Optional extra affinity (nodeAffinity / podAffinity). Chart always adds
+  # required podAntiAffinity on app=weft-worker / kubernetes.io/hostname.
   affinity: {}
-  # Spill PVC (volumeClaimTemplates). Defaults stay small; SF100 overlay bumps size.
-  # Engine reads WEFT_SHUFFLE_SPILL_DIR (not the legacy unused WEFT_SPILL_DIR).
+  # Spill volume (PVC via volumeClaimTemplates, or emptyDir when disabled).
+  # Mounted at /var/lib/weft/spill; TMPDIR points here so threshold spill uses it.
+  # Do NOT set WEFT_SHUFFLE_SPILL_DIR in production — that forces all-spill.
   persistence:
     enabled: true
     storageClass: ""

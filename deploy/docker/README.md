@@ -92,10 +92,13 @@ volumes:
 - { name: spill, emptyDir: {} }
 ```
 
-The image sets `TMPDIR=/tmp` and `HOME=/tmp`. Shuffle spill is controlled by
-`WEFT_SHUFFLE_SPILL_DIR` (Helm points it at `/var/lib/weft/spill`). The historical
-`WEFT_SPILL_DIR` env var is **unused** by the engine — do not set it. Set
-`WEFT_MEMORY_LIMIT_BYTES` from the pod memory limit so large aggregations spill.
+The image defaults `TMPDIR=/tmp` and `HOME=/tmp`. The Helm chart overrides `TMPDIR` to
+`/var/lib/weft/spill` (PVC or emptyDir) so threshold shuffle spill
+(`WEFT_SHUFFLE_SPILL_BYTES` / `WEFT_MEMORY_LIMIT_BYTES`) lands on that volume via
+`default_spill_root()`. **`WEFT_SHUFFLE_SPILL_DIR` is debug-only** — when set, the engine
+force-spills every shuffle bucket to disk and invalidates benchmark timings. The
+historical `WEFT_SPILL_DIR` env var is **unused**. Set `WEFT_MEMORY_LIMIT_BYTES` /
+`WEFT_SHUFFLE_SPILL_BYTES` from the pod memory limit for threshold spill.
 
 Standalone:
 
