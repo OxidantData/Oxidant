@@ -85,13 +85,29 @@ pub async fn try_plan_with_facts(
     Err(mode_error(&errors))
 }
 
+/// Pick the most informative reject reason across the fact-table candidates.
+///
+/// Every query is replanned once per candidate fact, so a query touching one fact produces six
+/// `found 0 sharded` misses for facts it never references. Taking a plain mode lets that noise
+/// outvote the real blocker reported for the fact the query actually uses, which is what the
+/// operator needs to see. Prefer the mode among the reasons that say something specific.
 fn mode_error(errors: &[String]) -> String {
     if errors.is_empty() {
         return "plan failed".into();
     }
+    let specific: Vec<&str> = errors
+        .iter()
+        .map(String::as_str)
+        .filter(|e| !e.contains("found 0 sharded") && !e.contains("sharded table, found 0"))
+        .collect();
+    let pool: Vec<&str> = if specific.is_empty() {
+        errors.iter().map(String::as_str).collect()
+    } else {
+        specific
+    };
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for e in errors {
-        *counts.entry(e.as_str()).or_default() += 1;
+    for e in &pool {
+        *counts.entry(*e).or_default() += 1;
     }
     counts
         .into_iter()
@@ -311,5 +327,27 @@ mod tests {
     #[test]
     fn mode_error_picks_most_common() {
         assert_eq!(mode_error(&["a".into(), "b".into(), "a".into(),]), "a");
+    }
+
+    #[test]
+    fn mode_error_prefers_specific_reason_over_untouched_fact_noise() {
+        // Five facts the query never scans report `found 0 sharded`; the one real blocker must win.
+        let errors: Vec<String> = vec![
+            "need exactly one sharded base table (others replicated), found 0 sharded among [..]"
+                .into(),
+            "global aggregation needs exactly one sharded table, found 0".into(),
+            "found 0 sharded".into(),
+            "FULL OUTER JOIN is not broadcast-safe with a single sharded table".into(),
+        ];
+        assert_eq!(
+            mode_error(&errors),
+            "FULL OUTER JOIN is not broadcast-safe with a single sharded table"
+        );
+    }
+
+    #[test]
+    fn mode_error_falls_back_when_every_reason_is_noise() {
+        let errors: Vec<String> = vec!["found 0 sharded".into(), "found 0 sharded".into()];
+        assert_eq!(mode_error(&errors), "found 0 sharded");
     }
 }

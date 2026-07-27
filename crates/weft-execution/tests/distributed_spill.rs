@@ -10,6 +10,13 @@ use weft_loom::arrow::datatypes::{DataType, Field, Schema};
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 
+fn ephemeral_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
 fn make_batch(start: i64, end: i64) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
@@ -83,7 +90,7 @@ async fn two_worker_groupby_with_forced_spill() {
     std::env::set_var("WEFT_SHUFFLE_SPILL_DIR", &spill);
     std::env::set_var("WEFT_KEEP_SHUFFLE_SPILL", "1");
 
-    let (p0, p1) = (50581u16, 50582u16);
+    let (p0, p1) = (ephemeral_port(), ephemeral_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![make_batch(0, N / 2)])
         .unwrap();

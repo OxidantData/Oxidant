@@ -126,6 +126,13 @@ jobs:
         run: cargo run -p weft-bench -- tpcds --sf 0.01
       - name: TPC-DS distributed planner ratchet (46/99 floor, sf0.01)
         run: cargo run -p weft-bench -- tpcds-distributed --sf 0.01
+      # The planner ratchet above only proves a distributed plan can be BUILT. This runs every
+      # distributable query on a real two-worker cluster and compares row-for-row against
+      # single-node. It fails on ANY mismatch or execution error, and on any query dropping out of
+      # bench/distributed/tpcds-execute-baseline.json. Full sweep, not a sample: sampling eight
+      # queries is how 24 wrong-or-broken queries were counted as "distributed" for so long.
+      - name: TPC-DS distributed EXECUTE correctness ratchet (46 verified, sf0.01, 2 workers)
+        run: cargo run -p weft-bench -- tpcds-distributed --execute --sf 0.01 --workers 2
       - name: Distributed correctness gate
         run: cargo run -p weft-bench -- correctness-distributed --rows 2000
         env:
