@@ -106,6 +106,52 @@ def assert_workers_ready(namespace: str, expected: int) -> None:
         )
 
 
+class WorkerGate:
+    """Bracket every query with a worker-readiness check.
+
+    The one-shot preflight above only proves the cluster was healthy at t=0. A worker
+    that restarts, is evicted, or fails a liveness probe *during* a sweep drops out of
+    headless DNS, so the driver plans for fewer endpoints while the survivors still
+    shard over the render-time WEFT_WORKER_COUNT. Every query after that point returns
+    a subset of the data, faster, and reports success — a resumable SF100 sweep is one
+    long process, so a single blip can quietly poison the rest of the run.
+
+    Checking before *and* after each query brackets the timed region, so a worker that
+    dies and recovers between queries cannot slip through. Both checks happen outside
+    the measured window.
+    """
+
+    def __init__(self, namespace: str, expected: int, enabled: bool):
+        self.namespace = namespace
+        self.expected = expected
+        self.enabled = enabled and expected > 0
+
+    def observe(self) -> int | None:
+        """Ready worker count, or None when gating is disabled/unavailable."""
+        if not self.enabled:
+            return None
+        try:
+            ready, _ = _ready_worker_count(self.namespace)
+        except Exception as e:  # noqa: BLE001 — kubectl missing/unreachable
+            raise SystemExit(
+                f"worker gate: cannot read pod readiness ({type(e).__name__}: {e}). "
+                "Results would be unverifiable; fix kubectl access or pass "
+                "--skip-worker-preflight (unsafe)."
+            ) from e
+        return ready
+
+    def require(self, query: str, when: str) -> int | None:
+        ready = self.observe()
+        if ready is not None and ready != self.expected:
+            raise SystemExit(
+                f"worker gate failed {when} {query}: {ready} Ready weft-worker pods, "
+                f"expected {self.expected}. Rows from the missing shard are dropped "
+                "silently, so every result from here on is void. Restore the "
+                "StatefulSet and re-run with --resume (completed queries are kept)."
+            )
+        return ready
+
+
 def _result_checksum(rows: list) -> str:
     """Stable checksum over collected rows (order-preserving within the result)."""
     h = hashlib.sha256()
@@ -256,6 +302,9 @@ def main() -> int:
         assert_workers_ready(args.namespace, expected_workers)
     elif args.skip_worker_preflight:
         print("[preflight] SKIPPED (--skip-worker-preflight)", flush=True)
+    gate = WorkerGate(
+        args.namespace, expected_workers, not args.skip_worker_preflight
+    )
 
     glue_db = args.glue_db or f"{args.suite}_sf{int(args.sf)}"
     tables = TPCH_TABLES if args.suite == "tpch" else TPCDS_TABLES
@@ -293,6 +342,7 @@ def main() -> int:
         err: str | None = None
         row_count = None
 
+        workers_ready = gate.require(name, "before")
         for attempt in range(1, max(args.tries, 1) + 1):
             t0 = time.perf_counter()
             try:
@@ -333,6 +383,9 @@ def main() -> int:
             failed.append(name)
             continue
 
+        # A success is only publishable if the cluster was whole for the whole query.
+        gate.require(name, "after")
+
         hot = min(times[1], times[2]) if len(times) >= 3 else times[-1]
         rec = {
             "query": name,
@@ -342,6 +395,7 @@ def main() -> int:
             "tries_s": times,
             "row_count": row_count,
             "checksum": checksum,
+            "workers_ready": workers_ready,
             "suite": args.suite,
             "sf": args.sf,
             "glue_db": glue_db,

@@ -108,6 +108,15 @@ Preflight (default for SF≥100): refuses to start unless Ready `app=weft-worker
 equal `--worker-count` (or `$WEFT_WORKER_COUNT`). Override only with
 `--skip-worker-preflight` (unsafe).
 
+The same check also brackets **every query**, before and after. The one-shot preflight
+only proves the cluster was healthy at t=0; a worker that restarts or fails a probe
+mid-sweep drops out of headless DNS, and the survivors keep sharding over the
+render-time `WEFT_WORKER_COUNT`, so every later query silently returns a subset —
+faster, and marked `ok`. A resumable sweep is one long process, so one blip would
+otherwise poison the rest of the run. On mismatch the runner aborts; fix the
+StatefulSet and re-run with `--resume` (completed queries are kept). Successful
+records carry `workers_ready` so results stay auditable after the fact.
+
 Each JSONL record includes `wall_s` / `hot_s`, `row_count`, and a SHA-256 `checksum`
 of the collected rows for cross-format comparison.
 
