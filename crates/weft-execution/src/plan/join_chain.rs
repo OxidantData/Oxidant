@@ -30,8 +30,8 @@ use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
 
 use super::stage_planner::{
-    base_tables, build_finalize, build_remap, column_name, distinct_stage_sql,
-    equijoin_from_filter, expr_sql, recombine_stage_sql, sanitize_generated_sql,
+    base_tables, build_finalize, build_remap, collect_equijoin_keys, column_name,
+    distinct_stage_sql, expr_sql, recombine_stage_sql, sanitize_generated_sql,
     shuffle_join_two_tables, simple_table_scan, AggSpec, DistributedQuery, Peeled, SimpleScan,
 };
 use crate::driver::StageDef;
@@ -82,8 +82,8 @@ pub(crate) fn plan_shuffle_join_chain(
 
 struct ChainStep<'a> {
     right: SimpleScan<'a>,
-    left_key: Expr,
-    right_key: Expr,
+    /// Equijoin key pairs `(left, right)` — one or more for composite keys (KAN-10).
+    keys: Vec<(Expr, Expr)>,
     residual_filter: Option<Expr>,
     join_type: JoinType,
 }
@@ -193,17 +193,21 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
         match lp {
             LogicalPlan::Projection(p) => walk(p.input.as_ref()),
             LogicalPlan::Filter(f) => walk(f.input.as_ref()),
+            // KAN-11: CTE / subquery aliases wrap otherwise left-deep equijoin trees.
+            LogicalPlan::SubqueryAlias(s) => walk(s.input.as_ref()),
+            LogicalPlan::Sort(s) => walk(s.input.as_ref()),
+            LogicalPlan::Limit(l) => walk(l.input.as_ref()),
+            LogicalPlan::Distinct(d) => walk(d.input().as_ref()),
             LogicalPlan::Join(j) => {
                 supported_shuffle_join_type(j.join_type)?;
-                let (left_key, right_key, residual_filter) = single_equijoin_key(j)?;
+                let (keys, residual_filter) = equijoin_keys(j)?;
                 let right = simple_table_scan(j.right.as_ref())?;
                 match simple_table_scan(j.left.as_ref()) {
                     Ok(leftmost) => Ok((
                         leftmost,
                         vec![ChainStep {
                             right,
-                            left_key,
-                            right_key,
+                            keys,
                             residual_filter,
                             join_type: j.join_type,
                         }],
@@ -212,8 +216,7 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
                         let (leftmost, mut steps) = walk(j.left.as_ref())?;
                         steps.push(ChainStep {
                             right,
-                            left_key,
-                            right_key,
+                            keys,
                             residual_filter,
                             join_type: j.join_type,
                         });
@@ -230,24 +233,18 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
     walk(lp)
 }
 
-fn single_equijoin_key(
+/// Extract one or more equijoin key pairs plus any non-equality residual (KAN-10 / D-2.7 / D-2.9).
+fn equijoin_keys(
     join: &datafusion::logical_expr::Join,
-) -> Result<(Expr, Expr, Option<Expr>)> {
-    let key = match join.on.as_slice() {
-        [(l, r)] => Ok((l.clone(), r.clone(), join.filter.clone())),
-        [] => equijoin_from_filter(join.filter.as_ref()),
-        _ => Err(Error::Unsupported(format!(
-            "auto-distribute: shuffle join supports a single equijoin key, found {}",
-            join.on.len()
-        ))),
-    }?;
-    if key.2.is_some() && join.join_type != JoinType::Inner {
+) -> Result<super::stage_planner::EquijoinKeys> {
+    let (keys, residual) = collect_equijoin_keys(&join.on, join.filter.as_ref())?;
+    if residual.is_some() && join.join_type != JoinType::Inner {
         return Err(Error::Unsupported(
             "auto-distribute: residual filters on outer/semi/anti shuffle joins are not supported"
                 .into(),
         ));
     }
-    Ok(key)
+    Ok((keys, residual))
 }
 
 fn flat_col(alias: &str, col: &str) -> String {
@@ -424,46 +421,61 @@ fn build_chain(
             continue;
         }
 
-        let left_key_name = column_name(&step.left_key)?;
-        let right_key_name = column_name(&step.right_key)?;
-        let left_key_rel = relation_of(&step.left_key)?;
-        let left_key_alias = alias_by_relation
-            .get(&left_key_rel)
-            .cloned()
-            .unwrap_or(left_key_rel);
-
+        // Resolve each composite key's left-side alias (usually one relation).
+        let mut left_key_metas: Vec<(String, String)> = Vec::with_capacity(step.keys.len());
+        let mut right_key_names: Vec<String> = Vec::with_capacity(step.keys.len());
+        for (left_key, right_key) in &step.keys {
+            let left_key_name = column_name(left_key)?;
+            let left_key_rel = relation_of(left_key)?;
+            let left_key_alias = alias_by_relation
+                .get(&left_key_rel)
+                .cloned()
+                .unwrap_or(left_key_rel);
+            left_key_metas.push((left_key_alias, left_key_name));
+            right_key_names.push(column_name(right_key)?);
+        }
         let left_stage_id = match &left_side {
             LeftSide::Leaf => {
                 let (sql, flats) = leaf_stage_sql(&leftmost);
-                let key_idx = flat_key_index(&flats, &left_key_alias, &left_key_name)?;
+                let mut key_idxs = Vec::with_capacity(left_key_metas.len());
+                for (alias, name) in &left_key_metas {
+                    key_idxs.push(flat_key_index(&flats, alias, name)?);
+                }
                 let id = next_id;
                 next_id += 1;
-                stages.push(StageDef::new(id, sql, vec![], vec![key_idx]));
+                stages.push(StageDef::new(id, sql, vec![], key_idxs));
                 left_flats = flats;
                 id
             }
             LeftSide::Stage { id } => {
-                let _ = flat_key_index(&left_flats, &left_key_alias, &left_key_name)?;
+                for (alias, name) in &left_key_metas {
+                    let _ = flat_key_index(&left_flats, alias, name)?;
+                }
                 *id
             }
         };
 
         let (right_sql, right_flats) = leaf_stage_sql(&step.right);
-        let right_key_idx = flat_key_index(&right_flats, &right_alias, &right_key_name)?;
+        let mut right_key_idxs = Vec::with_capacity(right_key_names.len());
+        for name in &right_key_names {
+            right_key_idxs.push(flat_key_index(&right_flats, &right_alias, name)?);
+        }
         let right_id = next_id;
         next_id += 1;
-        stages.push(StageDef::new(
-            right_id,
-            right_sql,
-            vec![],
-            vec![right_key_idx],
-        ));
+        stages.push(StageDef::new(right_id, right_sql, vec![], right_key_idxs));
 
-        let on_sql = format!(
-            "l.{} = r.{}",
-            flat_col(&left_key_alias, &left_key_name),
-            flat_col(&right_alias, &right_key_name)
-        );
+        let on_sql = left_key_metas
+            .iter()
+            .zip(right_key_names.iter())
+            .map(|((l_alias, l_name), r_name)| {
+                format!(
+                    "l.{} = r.{}",
+                    flat_col(l_alias, l_name),
+                    flat_col(&right_alias, r_name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let join_kw = sql_join_keyword(step.join_type)?;
         let mut join_from =
             format!("FROM shuffle_input_0 AS l {join_kw} shuffle_input_1 AS r ON {on_sql}");
@@ -474,18 +486,25 @@ fn build_chain(
         for &bi in &pending_bcast {
             let b = &steps[bi];
             let b_alias = scan_alias(&b.right);
-            let b_left_col = column_name(&b.left_key)?;
-            let b_left_rel = relation_of(&b.left_key)?;
-            let b_left_alias = alias_by_relation
-                .get(&b_left_rel)
-                .cloned()
-                .unwrap_or(b_left_rel);
-            let b_right_col = column_name(&b.right_key)?;
+            let mut on_parts = Vec::with_capacity(b.keys.len());
+            for (b_left, b_right) in &b.keys {
+                let b_left_col = column_name(b_left)?;
+                let b_left_rel = relation_of(b_left)?;
+                let b_left_alias = alias_by_relation
+                    .get(&b_left_rel)
+                    .cloned()
+                    .unwrap_or(b_left_rel);
+                let b_right_col = column_name(b_right)?;
+                on_parts.push(format!(
+                    "l.{} = {b_alias}.{b_right_col}",
+                    flat_col(&b_left_alias, &b_left_col)
+                ));
+            }
             // Replicated dims are complete on every worker — always an inner JOIN fold.
             join_from.push_str(&format!(
-                " JOIN {} AS {b_alias} ON l.{} = {b_alias}.{b_right_col}",
+                " JOIN {} AS {b_alias} ON {}",
                 b.right.table,
-                flat_col(&b_left_alias, &b_left_col)
+                on_parts.join(" AND ")
             ));
             if let Some(pred) = &b.right.filter_sql {
                 join_from.push_str(&format!(" AND ({pred})"));
@@ -528,17 +547,25 @@ fn build_chain(
             );
         }
 
-        // Intermediate join output; hash by next sharded join's left key when possible.
+        // Intermediate join output; hash by next sharded join's left key(s) when possible.
         // After FULL/RIGHT, unmatched right rows have NULL on the left join key — carry
         // COALESCE(l.key, r.key) under the left flat name so the next shuffle still colocates.
         let coalesce_join_key = matches!(step.join_type, JoinType::Full | JoinType::Right);
-        let left_flat_key = flat_col(&left_key_alias, &left_key_name);
-        let right_flat_key = flat_col(&right_alias, &right_key_name);
+        let coalesce_left_flats: Vec<(String, String)> = left_key_metas
+            .iter()
+            .zip(right_key_names.iter())
+            .map(|((l_alias, l_name), r_name)| {
+                (flat_col(l_alias, l_name), flat_col(&right_alias, r_name))
+            })
+            .collect();
         let mut proj = Vec::new();
         let mut new_flats = Vec::new();
         for c in &left_flats {
-            if coalesce_join_key && c == &left_flat_key {
-                proj.push(format!("COALESCE(l.{c}, r.{right_flat_key}) AS {c}"));
+            if let Some((_, right_flat)) = coalesce_join_key
+                .then_some(())
+                .and_then(|_| coalesce_left_flats.iter().find(|(lf, _)| lf == c))
+            {
+                proj.push(format!("COALESCE(l.{c}, r.{right_flat}) AS {c}"));
             } else {
                 proj.push(format!("l.{c} AS {c}"));
             }
@@ -546,10 +573,8 @@ fn build_chain(
         }
         if projects_right_side(step.join_type) {
             for c in &right_flats {
-                // Skip the right join-key column when we already coalesced it into the left flat
-                // name — otherwise the projection would duplicate the key under two names and
-                // confuse the next stage's hash index.
-                if coalesce_join_key && c == &right_flat_key {
+                // Skip right join-key columns when coalesced into the left flat name.
+                if coalesce_join_key && coalesce_left_flats.iter().any(|(_, rf)| rf == c) {
                     continue;
                 }
                 proj.push(format!("r.{c} AS {c}"));
@@ -557,17 +582,19 @@ fn build_chain(
             }
         }
         // LeftSemi/LeftAnti: left columns only (right side is not in the join output schema).
-        let (hash_alias, hash_col) =
-            next_sharded_left_key(steps, i + 1, sharded, &alias_by_relation)
-                .unwrap_or((left_key_alias.clone(), left_key_name.clone()));
-        let hash_idx = flat_key_index(&new_flats, &hash_alias, &hash_col)?;
+        let hash_keys = next_sharded_left_keys(steps, i + 1, sharded, &alias_by_relation)
+            .unwrap_or_else(|| left_key_metas.clone());
+        let mut hash_idxs = Vec::with_capacity(hash_keys.len());
+        for (hash_alias, hash_col) in &hash_keys {
+            hash_idxs.push(flat_key_index(&new_flats, hash_alias, hash_col)?);
+        }
         let join_id = next_id;
         next_id += 1;
         stages.push(StageDef::new(
             join_id,
             sanitize_generated_sql(&format!("SELECT {} {join_from}", proj.join(", "))),
             vec![left_stage_id, right_id],
-            vec![hash_idx],
+            hash_idxs,
         ));
         left_side = LeftSide::Stage { id: join_id };
         left_flats = new_flats;
@@ -578,20 +605,24 @@ fn build_chain(
     ))
 }
 
-fn next_sharded_left_key(
+fn next_sharded_left_keys(
     steps: &[ChainStep<'_>],
     from: usize,
     sharded: &[&str],
     alias_by_relation: &HashMap<String, String>,
-) -> Option<(String, String)> {
+) -> Option<Vec<(String, String)>> {
     for step in steps.iter().skip(from) {
         if !sharded.contains(&step.right.table) {
             continue;
         }
-        let col = column_name(&step.left_key).ok()?;
-        let rel = relation_of(&step.left_key).ok()?;
-        let alias = alias_by_relation.get(&rel).cloned().unwrap_or(rel);
-        return Some((alias, col));
+        let mut out = Vec::with_capacity(step.keys.len());
+        for (left_key, _) in &step.keys {
+            let col = column_name(left_key).ok()?;
+            let rel = relation_of(left_key).ok()?;
+            let alias = alias_by_relation.get(&rel).cloned().unwrap_or(rel);
+            out.push((alias, col));
+        }
+        return Some(out);
     }
     None
 }

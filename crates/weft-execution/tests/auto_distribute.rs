@@ -819,6 +819,103 @@ async fn shuffle_join_conjunction_keeps_residual_in_stage_sql() {
     );
 }
 
+#[tokio::test]
+async fn shuffle_join_multi_key_hashes_composite() {
+    // KAN-10 / D-2.7: composite equijoin keys must plan (hash both columns).
+    let single = Engine::new();
+    // Build a fact with (k, k2) so both join keys are real columns.
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("k2", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let fact = RecordBatch::try_new(
+        fact_schema,
+        vec![
+            Arc::new(Int64Array::from(
+                (0..60).map(|i| i % 12).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                (0..60).map(|i| (i % 12) * 10).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from((0..60).collect::<Vec<_>>())),
+        ],
+    )
+    .unwrap();
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("d_key", DataType::Int64, false),
+        Field::new("d_key2", DataType::Int64, false),
+    ]));
+    let dim_batch = RecordBatch::try_new(
+        dim_schema,
+        vec![
+            Arc::new(Int64Array::from((0..12).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                (0..12).map(|i| i * 10).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    single.register_batches("t", vec![fact]).unwrap();
+    single.register_batches("dim2", vec![dim_batch]).unwrap();
+    let plan = plan_distributed(
+        &single,
+        "SELECT d.d_key, COUNT(*) AS c \
+         FROM t JOIN dim2 d ON t.k = d.d_key AND t.k2 = d.d_key2 \
+         GROUP BY d.d_key",
+        &[],
+    )
+    .await;
+    let dq = plan.expect("multi-key shuffle join should plan");
+    let producers: Vec<_> = dq
+        .stages
+        .iter()
+        .filter(|s| s.upstream_stage_ids.is_empty() && !s.hash_key_cols.is_empty())
+        .collect();
+    assert!(
+        producers.iter().any(|s| s.hash_key_cols.len() >= 2),
+        "leaf producers must hash the composite key: {:?}",
+        producers
+            .iter()
+            .map(|s| &s.hash_key_cols)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        dq.stages
+            .iter()
+            .any(|s| s.sql.contains(" AND ") && s.upstream_stage_ids.len() == 2),
+        "join stage ON must AND both keys: {:?}",
+        dq.stages.iter().map(|s| &s.sql).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn subquery_alias_around_join_chain_is_peeled() {
+    // KAN-11: SubqueryAlias wrapping a left-deep join must not reject the chain.
+    let single = Engine::new();
+    single.register_batches("t", vec![batch(0, 40, 8)]).unwrap();
+    single.register_batches("dim", vec![dim(8)]).unwrap();
+    let plan = plan_distributed(
+        &single,
+        "SELECT name, SUM(c) FROM (\
+            SELECT d.d_key AS name, COUNT(*) AS c \
+            FROM t JOIN dim d ON t.k = d.d_key \
+            GROUP BY d.d_key\
+         ) x GROUP BY name",
+        &[],
+    )
+    .await;
+    // Outer aggregate-over-aggregate may gather or reject stacked aggs; the inner aliased
+    // join itself must not fail solely for SubqueryAlias.
+    if let Err(e) = &plan {
+        let msg = e.to_string();
+        assert!(
+            !msg.contains("SubqueryAlias"),
+            "must not reject solely for SubqueryAlias: {msg}"
+        );
+    }
+}
+
 /// Flattened leaf schemas matching `leaf_stage_sql` output (`alias__col`).
 fn flat_shuffle_inputs(nullable_keys: bool) -> (RecordBatch, RecordBatch) {
     let left = {

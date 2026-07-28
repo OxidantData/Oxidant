@@ -96,18 +96,21 @@ The D-1.1 histogram, not this document, decides the order inside Phase 2.
 - [x] **D-2.4 Global windows** (no `PARTITION BY`) — single-partition gather stage, or an
   explicit permanent reject with a documented rationale.
   *(Explicit permanent reject; test `global_window_is_rejected`.)*
-- [ ] **D-2.5 `UNION` distinct / `INTERSECT` / `EXCEPT`** — branch stages plus a
-  hash-shuffled dedup stage.
-- [ ] **D-2.6 Subqueries over sharded tables.** Decorrelate to a join where DataFusion
-  already can, then reuse the shuffle-join chain; keep rejecting what cannot decorrelate.
-- [ ] **D-2.7 Multi-key equijoins.** `shuffle_join_two_tables` currently rejects
-  `join.on.len() > 1`; hash on the composite key.
-- [ ] **D-2.8 Outer / semi / anti shuffle joins.** `find_inner_equijoin` is inner-only.
-- [ ] **D-2.9 Non-equi residual filters** alongside the equijoin key.
+- [x] **D-2.5 `UNION` distinct / `INTERSECT` / `EXCEPT`** — branch stages plus a
+  hash-shuffled dedup stage. *(Note: Jira KAN-1 reused "D-2.5" for auto-broadcast —
+  that lives under `E-DIST-BCAST` / `WEFT_AUTO_BROADCAST_THRESHOLD_BYTES`.)*
+- [x] **D-2.6 Subqueries over sharded tables.** Decorrelate / gather via
+  `try_materialize_subquery_fact` + `try_materialize_complex_fact` (KAN-12); non-gatherable
+  shapes remain explicit rejects.
+- [x] **D-2.7 Multi-key equijoins.** Composite `ON` keys hash all columns (KAN-10).
+- [x] **D-2.8 Outer / semi / anti shuffle joins.** Left-deep chain supports
+  LEFT/RIGHT/FULL/LEFT SEMI/LEFT ANTI.
+- [x] **D-2.9 Non-equi residual filters** alongside the equijoin key.
 - [ ] **D-2.10 Global `COUNT(DISTINCT)`** — currently an explicit reject in
   `global_aggregation_stages`; shuffle by the distinct argument, then combine.
-- [ ] **D-2.11 Coverage exit.** Whatever remains unsupported after the above is documented
-  in `DISTRIBUTED_PARITY.md` as a deliberate permanent reject with a reason.
+- [~] **D-2.11 Coverage exit.** TPC-DS execute-verified **95/99**. Remaining deliberate
+  declines: **Q5, Q14, Q77, Q80** (ROLLUP + UNION/INTERSECT Unparser round-trip breakage) —
+  documented in `DISTRIBUTED_PARITY.md` (KAN-13).
 
 *Accept for the phase:* the D-1.3 ratchet reaches the agreed threshold and every remaining
 fallback is a listed, intentional one.

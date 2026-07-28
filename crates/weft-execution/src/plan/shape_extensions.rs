@@ -1250,21 +1250,57 @@ fn add_partition_gate(sql: &str) -> Result<String> {
     Ok(statements.remove(0).to_string())
 }
 
-/// Every table scanned inside expression subqueries (EXISTS / IN / scalar) must be **replicated**,
-/// unless it is already the driving sharded fact (that case is rejected separately by scan
-/// counting — a second shard-local scan would silently drop cross-shard rows).
+/// Every table scanned inside expression subqueries (EXISTS / IN / scalar) must be **replicated**.
+///
+/// A subquery over the driving sharded fact is never shard-local-safe (HAVING thresholds like
+/// TPC-H Q11, correlated filters, etc.) — those shapes gather via `try_materialize_complex_fact`
+/// after this reject (see `plan_distributed_logical` materializable_rejection for `subquery over`).
 pub(crate) fn ensure_subquery_tables_replicated(
     lp: &LogicalPlan,
-    sharded: &[&str],
+    _sharded: &[&str],
     replicated: &[&str],
 ) -> Result<()> {
     let mut tables = Vec::new();
     collect_subquery_tables(lp, &mut tables);
     for t in &tables {
-        if sharded.contains(&t.as_str()) {
-            continue;
-        }
         if !replicated.contains(&t.as_str()) {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: subquery over `{t}` is only safe when that table is replicated"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Same rule for post-aggregate `HAVING` predicates (not visible to [`collect_subquery_tables`] on
+/// the aggregate input alone).
+pub(crate) fn ensure_having_subquery_tables_replicated(
+    having: &[&Expr],
+    replicated: &[&str],
+) -> Result<()> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    for pred in having {
+        let mut bad: Option<String> = None;
+        let _ = pred.apply(|expr| {
+            let subquery = match expr {
+                Expr::InSubquery(iq) => Some(iq.subquery.subquery.as_ref()),
+                Expr::ScalarSubquery(sq) => Some(sq.subquery.as_ref()),
+                Expr::Exists(ex) => Some(ex.subquery.subquery.as_ref()),
+                _ => None,
+            };
+            if let Some(lp) = subquery {
+                let mut tables = base_tables(lp);
+                collect_subquery_tables(lp, &mut tables);
+                for t in &tables {
+                    if !replicated.contains(&t.as_str()) {
+                        bad = Some(t.clone());
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        if let Some(t) = bad {
             return Err(Error::Unsupported(format!(
                 "auto-distribute: subquery over `{t}` is only safe when that table is replicated"
             )));

@@ -1,15 +1,13 @@
 //! Distributed TPC-H: run every query through [`plan_distributed`] and compare row-for-row
 //! against single-node.
 //!
-//! Two worker pools:
-//! - **Sharded** — `lineitem` partitioned across workers, dimensions replicated. Used when the
-//!   shape-based splitter emits a multi-stage Hash plan.
-//! - **Full-replicate** — every table present in full on every worker. Used for
-//!   [`ExchangeMode::Forward`](weft_execution::driver::ExchangeMode) single-stage plans (Sail
-//!   shared-storage coverage path) so correlated / nested queries stay correct.
+//! Candidate facts (KAN-9): `lineitem`, `orders`, `partsupp`, `customer` — each query is planned
+//! with the first fact that yields a distributable shape (others replicated). Worker pools shard
+//! that chosen fact; Forward plans use a fully-replicated pool.
 //!
-//! The CI gate requires **0 single-node fallback** and **0 mismatch** (22 distributed-ok).
+//! The CI gate requires **0 single-node fallback** and **0 mismatch** across Q1–Q22.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -21,12 +19,15 @@ use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 
 use crate::distributed_coverage::{
-    check_ratchet, plan_coverage_single_shard, print_report, write_report,
+    check_ratchet, plan_coverage, print_report, try_plan_with_facts, write_report,
 };
 use crate::tpch::{normalize_batches, queries};
 use crate::tpch_data;
 
-/// Planner-only coverage: `plan_distributed` over Q1–Q22 with `lineitem` sharded.
+/// Candidate sharded facts for TPC-H (KAN-9). Order is try-order; first successful plan wins.
+pub const FACT_TABLES: [&str; 4] = ["lineitem", "orders", "partsupp", "customer"];
+
+/// Planner-only coverage: `plan_distributed` over Q1–Q22 with multi-fact candidates.
 pub async fn run_planner_coverage(sf: f64, dir: &Path, skip_ratchet: bool) {
     eprintln!(
         "[tpch-dist] planner coverage sf{sf} data={} …",
@@ -42,20 +43,25 @@ pub async fn run_planner_coverage(sf: f64, dir: &Path, skip_ratchet: bool) {
 
     let qs = queries();
     let all = tpch_data::TABLES.to_vec();
+    let facts = FACT_TABLES.to_vec();
     let only = std::env::var("WEFT_TPCH_ONLY").ok();
     let report = if let Some(ref only) = only {
         let filtered: Vec<_> = qs
             .into_iter()
             .filter(|(n, _)| n.eq_ignore_ascii_case(only))
             .collect();
-        plan_coverage_single_shard("tpch", &engine, &filtered, &all, "lineitem").await
+        plan_coverage("tpch", &engine, &filtered, &all, &facts).await
     } else {
-        plan_coverage_single_shard("tpch", &engine, &qs, &all, "lineitem").await
+        plan_coverage("tpch", &engine, &qs, &all, &facts).await
     };
 
     for q in &report.per_query {
         if q.supported {
-            eprintln!("{:<4} PLAN ok", q.name);
+            eprintln!(
+                "{:<4} PLAN ok (fact={})",
+                q.name,
+                q.sharded_fact.as_deref().unwrap_or("?")
+            );
         } else {
             eprintln!(
                 "{:<4} PLAN skip {}",
@@ -98,93 +104,99 @@ pub async fn run(sf: f64, dir: &Path, num_workers: usize) {
         let b = single.sql(&format!("SELECT * FROM {t}")).await.unwrap();
         full.push((t, b));
     }
-    let lineitem = &full.iter().find(|(t, _)| *t == "lineitem").unwrap().1;
-    let shards = shard(lineitem, num_workers);
 
-    // Sharded pool: lineitem partitioned, dims replicated.
-    let mut shard_endpoints = Vec::new();
-    for (i, shard_batches) in shards.into_iter().enumerate() {
-        let e = Arc::new(Engine::new());
-        for (t, batches) in &full {
-            let data = if *t == "lineitem" {
-                shard_batches.clone()
-            } else {
-                batches.clone()
-            };
-            e.register_batches(t, data).unwrap();
-        }
-        let port = 50670 + i as u16;
-        let ee = e.clone();
-        tokio::spawn(async move {
-            let _ = serve_worker(port, ee).await;
-        });
-        shard_endpoints.push(format!("http://127.0.0.1:{port}"));
-    }
-    let shard_cluster = Cluster::new(shard_endpoints);
-
-    // Full-replicate pool: every table complete on every worker (Forward path).
-    let mut full_endpoints = Vec::new();
-    for i in 0..num_workers {
-        let e = Arc::new(Engine::new());
-        for (t, batches) in &full {
-            e.register_batches(t, batches.clone()).unwrap();
-        }
-        let port = 50770 + i as u16;
-        let ee = e.clone();
-        tokio::spawn(async move {
-            let _ = serve_worker(port, ee).await;
-        });
-        full_endpoints.push(format!("http://127.0.0.1:{port}"));
-    }
-    let full_cluster = Cluster::new(full_endpoints);
-
-    let replicated: Vec<&str> = tpch_data::TABLES
-        .iter()
-        .copied()
-        .filter(|t| *t != "lineitem")
-        .collect();
-    eprintln!(
-        "[tpch-dist] {num_workers} sharded workers + {num_workers} full-replicate workers \
-         ({} dims replicated on shard pool)\n",
-        replicated.len()
-    );
-
+    let all = tpch_data::TABLES.to_vec();
+    let facts = FACT_TABLES.to_vec();
     let only = std::env::var("WEFT_TPCH_ONLY").ok();
     let fail_on_fallback = std::env::var("WEFT_TPCH_DIST_REQUIRE_ALL")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(true);
-    let (mut dist_ok, mut fallback, mut mismatch) = (0usize, 0usize, 0usize);
-    for (qi, (name, raw)) in queries().into_iter().enumerate() {
-        if let Some(o) = &only {
-            if name != o {
+
+    let mut planned: Vec<(String, String, String)> = Vec::new(); // name, sql, fact
+    for (name, raw) in queries() {
+        if let Some(ref o) = only {
+            if name != o.as_str() {
                 continue;
             }
         }
-        let sql = raw.trim().trim_end_matches(';').trim();
+        let sql = raw.trim().trim_end_matches(';').trim().to_string();
+        match try_plan_with_facts(&single, &sql, &all, &facts).await {
+            Ok((_dq, fact)) => planned.push((name.to_string(), sql, fact)),
+            Err(e) => {
+                eprintln!("{name:<4} PLAN ERROR: {e}");
+                if fail_on_fallback {
+                    // Counted below via dist_ok < 22
+                }
+            }
+        }
+    }
+
+    let needed_facts: Vec<&str> = {
+        let mut seen = BTreeSet::new();
+        for (_, _, fact) in &planned {
+            seen.insert(fact.as_str());
+        }
+        seen.into_iter().collect()
+    };
+    let clusters = build_clusters(&full, num_workers, &needed_facts).await;
+    eprintln!(
+        "[tpch-dist] {num_workers} workers × facts {:?} + full-replicate pool\n",
+        needed_facts
+    );
+
+    let (mut dist_ok, mut fallback, mut mismatch) = (0usize, 0usize, 0usize);
+    // Track plan failures for queries that never entered `planned`.
+    let planned_names: BTreeSet<&str> = planned.iter().map(|(n, _, _)| n.as_str()).collect();
+    for (name, _) in queries() {
+        if let Some(ref o) = only {
+            if name != o.as_str() {
+                continue;
+            }
+        }
+        if !planned_names.contains(name) {
+            fallback += 1;
+        }
+    }
+
+    for (qi, (name, sql, fact)) in planned.iter().enumerate() {
+        let replicated: Vec<&str> = all
+            .iter()
+            .copied()
+            .filter(|t| *t != fact.as_str())
+            .collect();
         let dq = match plan_distributed(&single, sql, &replicated).await {
             Ok(dq) => dq,
             Err(e) => {
                 fallback += 1;
-                eprintln!("{name:<4} PLAN ERROR (unexpected): {e}");
+                eprintln!("{name:<4} PLAN ERROR (unexpected replan): {e}");
                 continue;
             }
         };
 
+        let consumed: std::collections::HashSet<u32> = dq
+            .stages
+            .iter()
+            .flat_map(|s| s.upstream_stage_ids.iter().copied())
+            .collect();
         let forward = dq
             .stages
             .iter()
-            .any(|s| s.exchange == ExchangeMode::Forward);
+            .filter(|s| !consumed.contains(&s.stage_id))
+            .all(|s| s.exchange == ExchangeMode::Forward);
         let cluster = if forward {
-            &full_cluster
+            &clusters.full
         } else {
-            &shard_cluster
+            clusters
+                .by_fact
+                .get(fact)
+                .unwrap_or_else(|| panic!("missing cluster for fact {fact}"))
         };
         let mode = if forward { "forward" } else { "shuffle" };
 
         if std::env::var("WEFT_TPCH_DEBUG").is_ok() {
             for s in &dq.stages {
                 eprintln!(
-                    "  {name} [{mode}] stage{} keys{:?} exch={:?}: {}",
+                    "  {name} [{mode} fact={fact}] stage{} keys{:?} exch={:?}: {}",
                     s.stage_id, s.hash_key_cols, s.exchange, s.sql
                 );
             }
@@ -248,27 +260,91 @@ pub async fn run(sf: f64, dir: &Path, num_workers: usize) {
         if normalize_batches(&result) == normalize_batches(&expected) {
             dist_ok += 1;
             eprintln!(
-                "{name:<4} distributed ok [{mode}] ({} stages)",
+                "{name:<4} distributed ok [{mode} fact={fact}] ({} stages)",
                 dq.stages.len()
             );
         } else {
             mismatch += 1;
-            eprintln!("{name:<4} distributed MISMATCH vs single-node [{mode}]");
+            eprintln!("{name:<4} distributed MISMATCH vs single-node [{mode} fact={fact}]");
         }
     }
 
+    let considered = if only.is_some() {
+        planned.len() + fallback
+    } else {
+        22
+    };
     eprintln!(
         "\n=== TPC-H distributed sf{sf}: {dist_ok} distributed-ok, {fallback} plan-error, \
-         {mismatch} mismatch (of 22) ==="
+         {mismatch} mismatch (of {considered}) ==="
     );
-    if mismatch > 0 || (fail_on_fallback && fallback > 0) || dist_ok < 22 {
-        if dist_ok < 22 {
+    if mismatch > 0 || (fail_on_fallback && fallback > 0) || (only.is_none() && dist_ok < 22) {
+        if only.is_none() && dist_ok < 22 {
             eprintln!(
                 "[tpch-dist] required 22 distributed-ok, got {dist_ok} (fallback={fallback}, \
                  mismatch={mismatch})"
             );
         }
         std::process::exit(1);
+    }
+}
+
+struct ClusterSet {
+    by_fact: HashMap<String, Cluster>,
+    full: Cluster,
+}
+
+async fn build_clusters(
+    full: &[(&str, Vec<RecordBatch>)],
+    num_workers: usize,
+    needed_facts: &[&str],
+) -> ClusterSet {
+    let mut by_fact = HashMap::new();
+    for (fi, fact) in FACT_TABLES.iter().enumerate() {
+        if !needed_facts.contains(fact) {
+            continue;
+        }
+        let fact_batches = full.iter().find(|(t, _)| *t == *fact).unwrap().1.clone();
+        let shards = shard(&fact_batches, num_workers);
+        let base_port = 50670u16 + (fi as u16) * 20;
+        let mut endpoints = Vec::new();
+        for (i, shard_batches) in shards.into_iter().enumerate() {
+            let e = Arc::new(Engine::new());
+            for (t, batches) in full {
+                let data = if *t == *fact {
+                    shard_batches.clone()
+                } else {
+                    batches.clone()
+                };
+                e.register_batches(t, data).unwrap();
+            }
+            let port = base_port + i as u16;
+            let ee = e.clone();
+            tokio::spawn(async move {
+                let _ = serve_worker(port, ee).await;
+            });
+            endpoints.push(format!("http://127.0.0.1:{port}"));
+        }
+        by_fact.insert(fact.to_string(), Cluster::new(endpoints));
+    }
+
+    let mut full_endpoints = Vec::new();
+    for i in 0..num_workers {
+        let e = Arc::new(Engine::new());
+        for (t, batches) in full {
+            e.register_batches(t, batches.clone()).unwrap();
+        }
+        let port = 50770 + i as u16;
+        let ee = e.clone();
+        tokio::spawn(async move {
+            let _ = serve_worker(port, ee).await;
+        });
+        full_endpoints.push(format!("http://127.0.0.1:{port}"));
+    }
+
+    ClusterSet {
+        by_fact,
+        full: Cluster::new(full_endpoints),
     }
 }
 
@@ -287,7 +363,7 @@ async fn register_csv(engine: &Engine, dir: &Path) {
 }
 
 /// Split `batches` row-wise into `n` shards (each batch sliced into n contiguous ranges), so every
-/// worker gets a portion of lineitem even when the table is a single batch.
+/// worker gets a portion of the fact even when the table is a single batch.
 pub(crate) fn shard(batches: &[RecordBatch], n: usize) -> Vec<Vec<RecordBatch>> {
     let mut out: Vec<Vec<RecordBatch>> = (0..n).map(|_| Vec::new()).collect();
     for b in batches {

@@ -162,7 +162,8 @@ pub async fn plan_coverage(
     }
 }
 
-/// Single-sharded-table coverage (TPC-H: `lineitem` sharded, all else replicated).
+/// Single-sharded-table coverage (legacy helper; multi-fact TPC-H uses [`plan_coverage`]).
+#[allow(dead_code)]
 pub async fn plan_coverage_single_shard(
     suite: &str,
     engine: &Engine,
