@@ -1,8 +1,11 @@
 # Running distributed Weft on Kubernetes (Kind + EKS)
 
-This is the **minimal runnable** path: one Spark Connect driver pod + N Arrow Flight
+This is the **minimal runnable Kubernetes** path: one Spark Connect driver pod + N Arrow Flight
 worker pods, discovered via a headless Service. It matches the OSS runtime contract in
 [`runtime-contract.md`](runtime-contract.md).
+
+For an **EKS-free** AWS data plane (Packer AMI + CloudFormation Auto Scaling Groups), see
+[`distributed-ec2.md`](distributed-ec2.md).
 
 For the future full platform (SSO, gateway operator, Terraform), see
 [`deployment.md`](deployment.md) — that outline is **not** required here.

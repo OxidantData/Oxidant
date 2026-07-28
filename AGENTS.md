@@ -7,6 +7,8 @@
 | [docs/TODOS.md](docs/TODOS.md) | Picking work / open gates |
 | [docs/CODEMAP.md](docs/CODEMAP.md) | Crate / bench / site ownership |
 | [docs/architecture.md](docs/architecture.md) | Engine design (Loom / HVM / Connect) |
+| [docs/distributed-ec2.md](docs/distributed-ec2.md) | EC2 ASG data plane (Packer + CFN) |
+| [docs/distributed-k8s.md](docs/distributed-k8s.md) | Kind / EKS Helm data plane |
 | [docs/AGENT_INDEXING.md](docs/AGENT_INDEXING.md) | CodeGraph + GitNexus install / re-index |
 | [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) | Phase resume narrative |
 
@@ -62,9 +64,11 @@ The `weft` binary also has `worker` and `driver` subcommands for a Flight-based
 driver/worker cluster (`weft worker --port ...`, `weft driver --workers h:p,... --partial-sql ... --final-sql ...`).
 Not needed for the basic single-server flow.
 
-For **Kubernetes / EKS** (Helm: one connect-server + N workers, AWS CLI baked into the
-image), see [`docs/distributed-k8s.md`](docs/distributed-k8s.md). Local TPC-H distributed
-gate: `cargo run -p weft-bench -- tpch-distributed --sf 0.01 --workers 2`.
+For **EC2 / CloudFormation + ASG** (Packer AMI, fixed worker count, Route53 discovery),
+see [`docs/distributed-ec2.md`](docs/distributed-ec2.md). For **Kubernetes / EKS**
+(Helm: one connect-server + N workers), see [`docs/distributed-k8s.md`](docs/distributed-k8s.md).
+Local TPC-H distributed gate:
+`cargo run -p weft-bench -- tpch-distributed --sf 0.01 --workers 2`.
 
 ### CI gotchas (commit / push / PR)
 

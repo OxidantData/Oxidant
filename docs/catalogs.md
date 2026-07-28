@@ -39,8 +39,15 @@ weft spark server --port 50051 \
 # or: WEFT_CATALOG_CONF="spark.sql.catalog.prod.type=hive;spark.sql.catalog.prod.uri=thrift://hms:9083"
 ```
 
-Supported `type` values today: **`hive`** (Hive Metastore over Thrift). `rest` (Iceberg REST /
-Unity) and `glue` follow the same shape.
+Supported `type` values today: **`hive`** (Hive Metastore over Thrift), **`glue`**
+(AWS Glue Data Catalog via the AWS CLI + instance role / IRSA), and **`rest`** /
+`unity` / `iceberg` (Iceberg REST). Glue options: `region`, optional `warehouse`
+(`s3://bucket/prefix` for CTAS without `LOCATION`). The AWS CLI path is taken only
+from `WEFT_AWS_BIN` (never from catalog options).
+
+EC2 ASG walkthrough (create Glue DB/table, IAM, `CatalogConf`):
+[`distributed-ec2.md`](distributed-ec2.md). K8s/IRSA notes:
+[`distributed-k8s.md`](distributed-k8s.md).
 
 ## Bring your own catalog (Rust)
 

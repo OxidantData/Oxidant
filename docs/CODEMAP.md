@@ -45,6 +45,10 @@ Agent indexes: [AGENT_INDEXING.md](AGENT_INDEXING.md).
 | `site/` | Vite/React marketing + charts (GitHub Pages) |
 | `parity/` | Spark golden baseline ratchet (`baseline.json`) |
 | `docs/` | Architecture, issues, next steps, catalogs, runtime contract |
+| `deploy/docker/` | connect-server / worker container images |
+| `deploy/helm/weft/` | Kind / EKS Helm chart (driver + workers) |
+| `deploy/packer/` | Hardened AL2023 AMI for EC2 driver/workers |
+| `deploy/cloudformation/` | CFN + ASG data plane (no EKS) |
 | `scripts/` | CI local, daily maintenance, `index-agents.sh` |
 
 ## Docs map
@@ -58,4 +62,6 @@ Agent indexes: [AGENT_INDEXING.md](AGENT_INDEXING.md).
 | `NEXT_STEPS.md` | Resume / phase narrative |
 | `ISSUES.md` | Issue-level history |
 | `runtime-contract.md` | Contract for weft-platform consumers |
+| `distributed-ec2.md` | Packer AMI + CFN/ASG data plane |
+| `distributed-k8s.md` | Kind / EKS Helm data plane |
 | `catalogs.md` | External catalog SPI |

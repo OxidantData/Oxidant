@@ -1,8 +1,10 @@
 # Deploying Weft as a self-hosted data platform on AWS
 
 > **Status: outline / contract for the full platform** (SSO, gateway operator, Terraform).
-> For a **runnable** distributed data-plane today (Kind or BYO EKS: connect-server + workers,
-> AWS CLI in the image), use [`distributed-k8s.md`](distributed-k8s.md) instead.
+> For a **runnable** distributed data-plane today:
+>
+> - **EC2 / ASG (no EKS):** [`distributed-ec2.md`](distributed-ec2.md)
+> - **Kind or BYO EKS:** [`distributed-k8s.md`](distributed-k8s.md)
 >
 > The Terraform modules and complete Helm control-plane referenced below are **not all in-tree
 > yet**. This document remains the long-term user-facing deploy guide.
