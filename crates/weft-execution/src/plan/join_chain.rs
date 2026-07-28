@@ -269,8 +269,8 @@ fn leaf_stage_sql(scan: &SimpleScan<'_>) -> (String, Vec<String>) {
         flats.push(flat);
     }
     let from = match &scan.filter_sql {
-        Some(pred) => format!("FROM {} WHERE {pred}", scan.table),
-        None => format!("FROM {}", scan.table),
+        Some(pred) => format!("FROM {} WHERE {pred}", scan.table_sql),
+        None => format!("FROM {}", scan.table_sql),
     };
     (
         sanitize_generated_sql(&format!("SELECT {} {from}", sels.join(", "))),

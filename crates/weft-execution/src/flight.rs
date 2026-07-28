@@ -47,6 +47,16 @@ pub const ACTION_HEARTBEAT: &str = "heartbeat";
 /// Flight `do_action` type: accept/report simple task status payloads.
 pub const ACTION_TASK_STATUS: &str = "task_status";
 
+/// Max gRPC message size for Arrow Flight (KAN-6).
+///
+/// Mirrors `weft-connect`'s Spark Connect limit. tonic defaults to 4 MiB decode, which SF100
+/// shuffle/DoGet frames exceed (TPC-DS Q65 ~58 MiB). Encode is unlimited by default, but we
+/// raise both sides so DoExchange inbound frames are accepted too.
+const MAX_MSG: usize = 256 * 1024 * 1024;
+/// Cap rows per Flight encode input so a single `FlightData` frame stays well under `MAX_MSG`
+/// even when size estimation under-counts wide string/binary batches.
+const FLIGHT_CHUNK_ROWS: usize = 8192;
+
 /// One stage's cached output: schema + partitioned buckets (memory or spilled).
 type CachedStage = (SchemaRef, BucketCache);
 
@@ -213,8 +223,28 @@ fn unimpl<T>(what: &str) -> std::result::Result<Response<T>, Status> {
     )))
 }
 
+/// Slice batches so each encode input is at most [`FLIGHT_CHUNK_ROWS`] rows.
+fn chunk_batches_for_flight(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let rows = batch.num_rows();
+        if rows <= FLIGHT_CHUNK_ROWS {
+            out.push(batch);
+            continue;
+        }
+        let mut offset = 0;
+        while offset < rows {
+            let end = (offset + FLIGHT_CHUNK_ROWS).min(rows);
+            out.push(batch.slice(offset, end - offset));
+            offset = end;
+        }
+    }
+    out
+}
+
 /// Build a Flight `do_get` response stream from a set of record batches.
 fn batches_to_stream(batches: Vec<RecordBatch>) -> FlightStream<FlightData> {
+    let batches = chunk_batches_for_flight(batches);
     let schema = match batches.first() {
         Some(b) => b.schema(),
         None => Arc::new(Schema::empty()),
@@ -561,7 +591,11 @@ async fn serve_flight_worker(port: u16, worker: Worker) -> Result<()> {
         .parse()
         .map_err(|e| Error::Io(format!("bad worker addr: {e}")))?;
     tonic::transport::Server::builder()
-        .add_service(FlightServiceServer::new(worker))
+        .add_service(
+            FlightServiceServer::new(worker)
+                .max_decoding_message_size(MAX_MSG)
+                .max_encoding_message_size(MAX_MSG),
+        )
         .serve(addr)
         .await
         .map_err(|e| Error::Io(format!("worker serve: {e}")))?;
@@ -603,7 +637,9 @@ async fn connect_flight(
         .connect()
         .await
         .map_err(|e| Error::Io(format!("connect worker: {e}")))?;
-    Ok(FlightServiceClient::new(channel))
+    Ok(FlightServiceClient::new(channel)
+        .max_decoding_message_size(MAX_MSG)
+        .max_encoding_message_size(MAX_MSG))
 }
 
 async fn do_get_batches_once(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<RecordBatch>> {
@@ -840,6 +876,7 @@ async fn push_bucket_once(
 ) -> Result<()> {
     let header = exchange_header_frame(stage_id, target_partition);
     let mut frames = vec![header];
+    let batches = chunk_batches_for_flight(batches);
     let input = futures::stream::iter(batches.into_iter().map(Ok::<_, FlightError>));
     let mut encoded = FlightDataEncoderBuilder::new()
         .with_schema(schema)
@@ -1185,6 +1222,7 @@ mod tests {
     ) -> std::result::Result<(), weft_common::Error> {
         let header = exchange_header_frame(stage_id, partition_id);
         let mut frames = vec![header];
+        let batches = chunk_batches_for_flight(batches);
         let input = futures::stream::iter(batches.into_iter().map(Ok::<_, FlightError>));
         let mut encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
@@ -1205,6 +1243,81 @@ mod tests {
             item.map_err(|e| weft_common::Error::Execution(format!("do_exchange stream: {e}")))?;
         }
         Ok(())
+    }
+
+    /// KAN-6: payloads above tonic's default 4 MiB decode limit must round-trip via Flight.
+    #[tokio::test]
+    async fn flight_round_trips_payload_over_default_4mb_limit() {
+        use weft_loom::arrow::array::StringArray;
+
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let engine = Arc::new(Engine::new());
+        tokio::spawn(async move {
+            let _ = serve_worker(port, engine).await;
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+
+        // One ~5.5 MiB string batch — above tonic's 4 MiB default decode limit.
+        let blob = "x".repeat(5 * 1024 * 1024 + 512 * 1024);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![blob.as_str()]))],
+        )
+        .unwrap();
+        let expected_bytes = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .len();
+        assert!(
+            expected_bytes > 4 * 1024 * 1024,
+            "fixture must exceed tonic's default 4 MiB decode limit"
+        );
+
+        let mut pushed = false;
+        for _ in 0..50 {
+            match push_batches_stream(
+                endpoint.clone(),
+                650,
+                0,
+                schema.clone(),
+                vec![batch.clone()],
+            )
+            .await
+            {
+                Ok(()) => {
+                    pushed = true;
+                    break;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        !msg.contains("decoded message length too large"),
+                        "KAN-6: Flight push hit 4 MiB limit: {msg}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        assert!(pushed, "worker did not accept >4 MiB do_exchange push");
+
+        let pulled = pull_bucket(endpoint, 650, 0)
+            .await
+            .expect("pull >4 MiB bucket");
+        assert_eq!(pulled.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        let got = pulled[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(got.len(), expected_bytes);
     }
 
     #[tokio::test]

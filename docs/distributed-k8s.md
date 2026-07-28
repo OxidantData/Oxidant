@@ -221,6 +221,8 @@ Overlay [`deploy/helm/weft/values-sf100.yaml`](../deploy/helm/weft/values-sf100.
 - `worker.replicas: 2`, autoscaling off, **500Gi gp3** spill PVC per worker
 - `WEFT_MEMORY_LIMIT_BYTES` + `WEFT_SHUFFLE_SPILL_BYTES` aligned with container memory
   (threshold spill); `TMPDIR` on the spill PVC; `forceShuffleSpill: false`
+- `WEFT_PREFER_HASH_JOIN=false` on workers, selecting spill-capable sort-merge joins for SF100
+  equijoins because DataFusion 54 hash-join build inputs fail rather than spill under pool pressure
 - `connect.distributedStrict: true` → `WEFT_DISTRIBUTED_STRICT=1` on the driver
 - Connect CPU request **3000m** (not 3500m) so a c6g.xlarge can still schedule CNI /
   kube-proxy / node agents beside the pod
