@@ -668,6 +668,9 @@ fn flatten_and_conjuncts(expr: &Expr, out: &mut Vec<Expr>) {
     }
 }
 
+/// Equijoin key pairs `(left, right)` plus optional non-equality residual filter.
+pub(crate) type EquijoinKeys = (Vec<(Expr, Expr)>, Option<Expr>);
+
 /// Collect equijoin key pairs from `ON` plus every equality conjunct in `filter` (KAN-10).
 ///
 /// DataFusion often parks composite `ON a=b AND c=d` as a single `on` pair plus an equality
@@ -677,7 +680,7 @@ fn flatten_and_conjuncts(expr: &Expr, out: &mut Vec<Expr>) {
 pub(crate) fn collect_equijoin_keys(
     on: &[(Expr, Expr)],
     filter: Option<&Expr>,
-) -> Result<(Vec<(Expr, Expr)>, Option<Expr>)> {
+) -> Result<EquijoinKeys> {
     use datafusion::logical_expr::Operator;
 
     let mut keys: Vec<(Expr, Expr)> = on.to_vec();

@@ -236,7 +236,7 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
 /// Extract one or more equijoin key pairs plus any non-equality residual (KAN-10 / D-2.7 / D-2.9).
 fn equijoin_keys(
     join: &datafusion::logical_expr::Join,
-) -> Result<(Vec<(Expr, Expr)>, Option<Expr>)> {
+) -> Result<super::stage_planner::EquijoinKeys> {
     let (keys, residual) = collect_equijoin_keys(&join.on, join.filter.as_ref())?;
     if residual.is_some() && join.join_type != JoinType::Inner {
         return Err(Error::Unsupported(
