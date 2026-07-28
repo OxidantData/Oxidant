@@ -262,6 +262,7 @@ async fn recompute_upstream_producers(
                 upstream_stage_ids: stage_def.upstream_stage_ids.clone(),
                 produce: true,
                 lakehouse_snapshot_pins: stage_def.lakehouse_snapshot_pins.clone(),
+                replicated_tables: stage_def.replicated_tables.clone(),
             };
             run_stage_inner(membership, target, producer_ticket, lineage, stages).await?;
         }

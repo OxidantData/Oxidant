@@ -500,6 +500,7 @@ fn append_branch(
             exchange: stage.exchange,
             plan_fragment: stage.plan_fragment,
             lakehouse_snapshot_pins: stage.lakehouse_snapshot_pins,
+            replicated_tables: String::new(),
         });
         output_id = Some(new_id);
         *next_id = (*next_id).max(new_id.checked_add(1).ok_or_else(|| {

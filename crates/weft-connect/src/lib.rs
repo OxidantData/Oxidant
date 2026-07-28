@@ -488,7 +488,8 @@ impl WeftService {
     ///
     /// When workers or `WEFT_WORKER_SERVICE` is configured, auto-splittable queries route through
     /// [`distributed::try_run_distributed`] (file sharding via `WEFT_WORKER_COUNT` / `WEFT_SHARD_INDEX`
-    /// on workers; replicated dims via `WEFT_REPLICATED_TABLES`). Unsupported shapes fall back locally.
+    /// on workers; dims auto-replicated from table sizes, with optional `WEFT_REPLICATED_TABLES`
+    /// override). Unsupported shapes fall back locally.
     async fn base_relation_batches(
         &self,
         rel: &sc::Relation,
@@ -497,20 +498,24 @@ impl WeftService {
         match rel.rel_type.as_ref() {
             Some(sc::relation::RelType::Sql(sql)) => {
                 let workers = self.workers_from_config();
-                let replicated = replicated_tables_from_env();
-                let replicated_refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
                 let udf_json = self.engine.export_udfs_json();
                 let description = truncate_sql(&sql.query);
                 let tracker = operation_id.map(|op| {
                     QueryTracker::begin(self.observability.clone(), op, description.clone())
                 });
-                if let Some(ref t) = tracker {
-                    if let Ok(plan) = self.engine.logical_plan(&sql.query).await {
-                        if let Ok(text) = self.engine.explain(&plan, true).await {
-                            t.set_plan(text, None);
-                        }
+                let plan_for_dist = self.engine.logical_plan(&sql.query).await.ok();
+                if let (Some(ref t), Some(ref plan)) = (&tracker, &plan_for_dist) {
+                    if let Ok(text) = self.engine.explain(plan, true).await {
+                        t.set_plan(text, None);
                     }
                 }
+                let replicated = match &plan_for_dist {
+                    Some(plan) => {
+                        weft_execution::plan::resolve_replicated_tables(&self.engine, plan).await
+                    }
+                    None => weft_loom::shard::replicated_tables_override_from_env(),
+                };
+                let replicated_refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
                 match distributed::try_run_distributed(
                     &self.engine,
                     &workers,
@@ -618,7 +623,8 @@ impl WeftService {
                 let plan = translate::to_plan(self.engine.ctx(), rel).await?;
                 let schema = Arc::new(plan.schema().as_arrow().clone());
                 let workers = self.workers_from_config();
-                let replicated = replicated_tables_from_env();
+                let replicated =
+                    weft_execution::plan::resolve_replicated_tables(&self.engine, &plan).await;
                 let replicated_refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
                 let udf_json = self.engine.export_udfs_json();
                 let tracker = operation_id
@@ -1601,19 +1607,6 @@ fn err_to_status(e: Error) -> Status {
         Error::Unsupported(_) => Status::unimplemented(msg),
         Error::Execution(_) | Error::Io(_) => Status::internal(msg),
     }
-}
-
-fn replicated_tables_from_env() -> Vec<String> {
-    std::env::var("WEFT_REPLICATED_TABLES")
-        .ok()
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Start the Spark Connect server and serve until the process is killed.

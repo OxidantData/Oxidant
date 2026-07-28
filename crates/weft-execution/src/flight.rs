@@ -305,16 +305,21 @@ impl Worker {
         if t.produce {
             // Producer: capture the output schema up front so an empty bucket can still be served
             // typed, then run, hash-partition, and cache for downstreams.
-            let schema = self
-                .engine
-                .schema_with_lakehouse_snapshots(&t.stage_sql, &t.lakehouse_snapshot_pins)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let batches = self
-                .engine
-                .sql_with_lakehouse_snapshots(&t.stage_sql, &t.lakehouse_snapshot_pins)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+            let (schema, batches) =
+                weft_loom::shard::with_replicated_tables(&t.replicated_tables, async {
+                    let schema = self
+                        .engine
+                        .schema_with_lakehouse_snapshots(&t.stage_sql, &t.lakehouse_snapshot_pins)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    let batches = self
+                        .engine
+                        .sql_with_lakehouse_snapshots(&t.stage_sql, &t.lakehouse_snapshot_pins)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    Ok::<_, Status>((schema, batches))
+                })
+                .await?;
             let key_cols: Vec<usize> = t.hash_key_cols.iter().map(|&c| c as usize).collect();
             let buckets = hash_partition(&batches, &key_cols, t.num_partitions as usize)
                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -328,10 +333,13 @@ impl Worker {
             Ok(Vec::new())
         } else {
             // Output stage: run and return the result.
-            self.engine
-                .sql_with_lakehouse_snapshots(&t.stage_sql, &t.lakehouse_snapshot_pins)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))
+            weft_loom::shard::with_replicated_tables(
+                &t.replicated_tables,
+                self.engine
+                    .sql_with_lakehouse_snapshots(&t.stage_sql, &t.lakehouse_snapshot_pins),
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
         }
     }
 
@@ -1014,6 +1022,7 @@ mod tests {
             upstream_stage_ids: vec![],
             produce: true,
             lakehouse_snapshot_pins: String::new(),
+            replicated_tables: String::new(),
         };
         let mut out = None;
         for _ in 0..50 {
@@ -1055,6 +1064,7 @@ mod tests {
             upstream_stage_ids: vec![],
             produce: true,
             lakehouse_snapshot_pins: String::new(),
+            replicated_tables: String::new(),
         };
         for _ in 0..50 {
             if run_stage_on_worker(endpoint.clone(), ticket.clone())
@@ -1103,6 +1113,7 @@ mod tests {
             upstream_stage_ids: vec![],
             produce: true,
             lakehouse_snapshot_pins: String::new(),
+            replicated_tables: String::new(),
         };
         for _ in 0..50 {
             if run_stage_on_worker(endpoint.clone(), ticket.clone())
@@ -1145,6 +1156,7 @@ mod tests {
             upstream_stage_ids: vec![7],
             produce: false,
             lakehouse_snapshot_pins: String::new(),
+            replicated_tables: String::new(),
         };
         let mut out = None;
         for _ in 0..50 {

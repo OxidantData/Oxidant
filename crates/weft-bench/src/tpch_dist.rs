@@ -202,6 +202,7 @@ pub async fn run(sf: f64, dir: &Path, num_workers: usize) {
                 exchange: s.exchange,
                 plan_fragment: s.plan_fragment.clone(),
                 lakehouse_snapshot_pins: s.lakehouse_snapshot_pins.clone(),
+                replicated_tables: s.replicated_tables.clone(),
             })
             .collect();
 

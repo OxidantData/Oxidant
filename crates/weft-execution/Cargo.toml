@@ -28,3 +28,4 @@ k8s = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tempfile = "3"

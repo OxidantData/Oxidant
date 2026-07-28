@@ -21,6 +21,8 @@ This document defines the environment contract between the **OSS engine images**
 | `WEFT_DEFAULT_PARALLELISM` | Optional | Default local parallelism. In `spark server --mode local-cluster`, this is the default worker count when `--workers` is omitted (fallback `2`). |
 | `WEFT_TASK_MAX_RETRIES` | Optional | Per-task retry attempts before alternate worker fallback (default `3`). |
 | `WEFT_MEMORY_LIMIT_BYTES` | Recommended | DataFusion spill pool size (e.g. `26000000000` on a 32 GB node). |
+| `WEFT_AUTO_BROADCAST_THRESHOLD_BYTES` | Optional | Cap for size-based dim replication (default `34359738368` = 32 GiB). Per query, every scanned table smaller than the largest **and** ≤ this cap is treated as fully replicated on every worker. `0` disables auto (override only). |
+| `WEFT_REPLICATED_TABLES` | Optional | Comma-separated force-include override for replicate/broadcast dims. Auto-broadcast from file sizes is the primary path; operators should not need a bench-specific dim list. |
 
 ## Worker pod
 
@@ -29,6 +31,8 @@ This document defines the environment contract between the **OSS engine images**
 | `WEFT_WORKER_TASK_SLOTS` | Optional | Advisory task concurrency per worker. The platform should set this to the CPU slots allocated to each worker pod; the current OSS worker treats one Flight request as one task and future schedulers will use this as the per-worker slot count. |
 | `WEFT_SHUFFLE_SPILL_DIR` | Optional | Directory for spilled shuffle buckets when in-memory cache is full. |
 | `WEFT_MEMORY_LIMIT_BYTES` | Recommended | Same spill pool tuning as the driver. |
+| `WEFT_AUTO_BROADCAST_THRESHOLD_BYTES` | Optional | Same auto-broadcast cap as the driver (default 32 GiB). |
+| `WEFT_REPLICATED_TABLES` | Optional | Same force-include override as the driver. Stage tickets also carry the driver's classified list as a task-local overlay so workers match planning without relying on this env. |
 | `WEFT_PREFER_HASH_JOIN` | Optional | Defaults to `true`. Set to `false` for large memory-constrained joins to use spill-capable sort-merge joins; DataFusion 54 hash-join build inputs do not spill when the bounded pool fills. |
 
 ## Local-cluster mode

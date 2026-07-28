@@ -101,8 +101,8 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
         Ok(dq)
     })();
 
-    match primary {
-        Ok(dq) => Ok(dq),
+    let mut dq = match primary {
+        Ok(dq) => dq,
         Err(primary_error) => {
             let reason = primary_error.to_string();
             let materializable_rejection = reason.contains("scanned multiple times")
@@ -130,13 +130,48 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
             match try_materialize_complex_fact(lp, replicated) {
                 Ok(Some(mut dq)) => {
                     validate_stage_sql(&mut dq)?;
-                    Ok(dq)
+                    dq
                 }
-                Ok(None) => Err(primary_error),
-                Err(gather_err) => Err(gather_err),
+                Ok(None) => return Err(primary_error),
+                Err(gather_err) => return Err(gather_err),
             }
         }
+    };
+    stamp_replicated_tables(&mut dq, replicated);
+    Ok(dq)
+}
+
+fn stamp_replicated_tables(dq: &mut DistributedQuery, replicated: &[&str]) {
+    let csv = replicated.join(",");
+    for stage in &mut dq.stages {
+        stage.replicated_tables = csv.clone();
     }
+}
+
+/// Infer replicate/broadcast tables from file sizes + optional `WEFT_REPLICATED_TABLES` override.
+///
+/// See [`weft_loom::shard::classify_replicated_tables`]: the largest known table in the plan stays
+/// sharded; smaller tables under `WEFT_AUTO_BROADCAST_THRESHOLD_BYTES` (default 32 GiB) replicate.
+pub async fn resolve_replicated_tables(engine: &Engine, lp: &LogicalPlan) -> Vec<String> {
+    use std::collections::HashSet;
+    use weft_loom::shard::{
+        auto_broadcast_threshold_bytes, classify_replicated_tables,
+        replicated_tables_override_from_env,
+    };
+
+    let mut seen = HashSet::new();
+    let mut sized: Vec<(String, Option<u64>)> = Vec::new();
+    for name in base_tables(lp) {
+        let key = name.to_ascii_lowercase();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let bytes = engine.estimate_table_bytes(&name).await;
+        sized.push((name, bytes));
+    }
+    let override_names = replicated_tables_override_from_env();
+    let override_refs: Vec<&str> = override_names.iter().map(String::as_str).collect();
+    classify_replicated_tables(&sized, &override_refs, auto_broadcast_threshold_bytes())
 }
 
 /// Last-line check on the SQL every stage will hand to a worker.
@@ -185,6 +220,9 @@ pub async fn plan_distributed(
     }?;
     for stage in &mut query.stages {
         stage.lakehouse_snapshot_pins = lakehouse_snapshot_pins.clone();
+        if stage.replicated_tables.is_empty() {
+            stage.replicated_tables = replicated.join(",");
+        }
     }
     Ok(query)
 }
@@ -2036,7 +2074,7 @@ pub(crate) fn count_table_scans(lp: &LogicalPlan, name: &str) -> usize {
 }
 
 /// Collect the base (scanned) table names referenced anywhere in `lp`.
-pub(crate) fn base_tables(lp: &LogicalPlan) -> Vec<String> {
+pub fn base_tables(lp: &LogicalPlan) -> Vec<String> {
     let mut out = Vec::new();
     collect_tables(lp, &mut out);
     out

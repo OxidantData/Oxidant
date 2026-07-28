@@ -526,6 +526,51 @@ pub(crate) async fn metadata_to_provider(
     })
 }
 
+/// Sum on-disk / object-store bytes for a catalog table (no shard filter). Returns `None` when
+/// the format cannot be sized (or listing fails).
+pub async fn estimate_bytes_for_metadata(state: &SessionState, md: &TableMetadata) -> Option<u64> {
+    use datafusion::datasource::listing::ListingTableUrl;
+
+    match md.format {
+        TableFormat::Parquet | TableFormat::Csv | TableFormat::Json => {
+            let loc = crate::shard::ensure_collection_url(&md.location);
+            let url = ListingTableUrl::parse(&loc).ok()?;
+            ensure_remote_store(state, &url, Some(&md.storage_options)).ok()?;
+            let ext = match md.format {
+                TableFormat::Parquet => ".parquet",
+                TableFormat::Csv => ".csv",
+                TableFormat::Json => ".json",
+                _ => unreachable!(),
+            };
+            crate::shard::sum_listing_bytes(state, vec![url], ext)
+                .await
+                .ok()
+        }
+        TableFormat::Delta | TableFormat::Iceberg => {
+            let root =
+                ListingTableUrl::parse(crate::shard::ensure_collection_url(&md.location)).ok()?;
+            ensure_remote_store(state, &root, Some(&md.storage_options)).ok()?;
+            let store = state.runtime_env().object_store(&root).ok()?;
+            let metadata_location = md.properties.get("metadata_location").map(String::as_str);
+            let resolved = weft_datasource::active_files_for_scan(
+                store,
+                &md.location,
+                match md.format {
+                    TableFormat::Delta => "delta",
+                    TableFormat::Iceberg => "iceberg",
+                    _ => unreachable!(),
+                },
+                metadata_location,
+                None,
+                &weft_datasource::ScanRequest::default(),
+            )
+            .await
+            .ok()?;
+            Some(resolved.files.iter().map(|f| f.size).sum())
+        }
+    }
+}
+
 /// List+shard files then build a [`ListingTable`], or an empty MemTable when this shard is vacant.
 async fn sharded_listing_table(
     state: &SessionState,

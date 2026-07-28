@@ -5,8 +5,11 @@
 //! (greedy LPT: largest files first, each to the worker with the least bytes so far;
 //! ties broken by lowest worker index). Files are ordered deterministically by
 //! `(size desc, path asc)` before assignment. Replicated tables (dimension tables)
-//! skip sharding via `WEFT_REPLICATED_TABLES`.
+//! skip sharding via `WEFT_REPLICATED_TABLES` and/or the driver's auto-broadcast
+//! classification (task-local overlay from the stage ticket).
 
+use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
@@ -18,6 +21,15 @@ use datafusion::execution::context::SessionState;
 use futures::TryStreamExt;
 use object_store::ObjectMeta;
 use weft_common::{Error, Result};
+
+/// Default auto-broadcast byte cap (32 GiB). Tables at/above this stay sharded even when
+/// smaller than the query's largest table.
+pub const DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
+tokio::task_local! {
+    /// Driver-classified replicate set for the current stage (lowercase names).
+    static REPLICATED_TABLES_CONTEXT: Arc<HashSet<String>>;
+}
 
 /// Shard assignment for this process, if configured for a multi-worker cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,23 +112,126 @@ fn assign_known_files_by_size(files: &[(ListingTableUrl, u64)], worker_count: us
     assignments
 }
 
-/// Tables that every worker should scan fully (broadcast / dimension tables).
-pub fn replicated_table_names() -> Vec<String> {
+/// Parse a comma-separated table-name list into lowercase names (empty tokens dropped).
+pub fn parse_replicated_tables_csv(csv: &str) -> Vec<String> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+/// Optional operator force-include list (`WEFT_REPLICATED_TABLES`). Auto-broadcast is the
+/// primary path; this env only adds names on top.
+pub fn replicated_tables_override_from_env() -> Vec<String> {
     std::env::var("WEFT_REPLICATED_TABLES")
         .ok()
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(|t| t.to_ascii_lowercase())
-                .collect()
-        })
+        .map(|s| parse_replicated_tables_csv(&s))
         .unwrap_or_default()
+}
+
+/// Tables that every worker should scan fully (broadcast / dimension tables).
+///
+/// Union of the optional env override and the stage ticket's task-local set (when installed).
+pub fn replicated_table_names() -> Vec<String> {
+    let mut names = replicated_tables_override_from_env();
+    if let Ok(extra) =
+        REPLICATED_TABLES_CONTEXT.try_with(|set| set.iter().cloned().collect::<Vec<_>>())
+    {
+        for name in extra {
+            if !names.iter().any(|n| n == &name) {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 pub fn is_replicated_table(table_name: &str) -> bool {
     let needle = table_name.to_ascii_lowercase();
-    replicated_table_names().iter().any(|t| t == &needle)
+    if replicated_tables_override_from_env()
+        .iter()
+        .any(|t| t == &needle)
+    {
+        return true;
+    }
+    REPLICATED_TABLES_CONTEXT
+        .try_with(|set| set.contains(&needle))
+        .unwrap_or(false)
+}
+
+/// Run `future` with a stage-scoped replicate set (comma-separated names). Empty csv installs
+/// an empty overlay so env override remains the only force-include source.
+pub async fn with_replicated_tables<F, T>(csv: &str, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let set: HashSet<String> = parse_replicated_tables_csv(csv).into_iter().collect();
+    REPLICATED_TABLES_CONTEXT.scope(Arc::new(set), future).await
+}
+
+/// Byte cap for auto-broadcast (`WEFT_AUTO_BROADCAST_THRESHOLD_BYTES`). Default 32 GiB.
+/// `0` disables size-based auto-replication (env override only).
+pub fn auto_broadcast_threshold_bytes() -> u64 {
+    match std::env::var("WEFT_AUTO_BROADCAST_THRESHOLD_BYTES") {
+        Ok(s) => s
+            .trim()
+            .parse()
+            .unwrap_or(DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES),
+        Err(_) => DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES,
+    }
+}
+
+/// Classify which scanned tables should be fully replicated on every worker.
+///
+/// - Always include `override_names` (operator force-include).
+/// - Among tables with known sizes: let `max` be the maximum known size; auto-replicate `t`
+///   when `size(t) < max` and `size(t) <= threshold`.
+/// - Unknown sizes and tables at `max` stay sharded (unless overridden).
+/// - `threshold == 0` disables auto (override only).
+pub fn classify_replicated_tables(
+    sized: &[(String, Option<u64>)],
+    override_names: &[&str],
+    threshold: u64,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        let lower = name.to_ascii_lowercase();
+        if !out.iter().any(|n| n == &lower) {
+            out.push(lower);
+        }
+    };
+    for name in override_names {
+        if !name.trim().is_empty() {
+            push(name.trim());
+        }
+    }
+    if threshold == 0 {
+        return out;
+    }
+    let max = sized.iter().filter_map(|(_, s)| *s).max();
+    let Some(max) = max else {
+        return out;
+    };
+    for (name, size) in sized {
+        let Some(sz) = size else {
+            continue;
+        };
+        if *sz < max && *sz <= threshold {
+            push(name);
+        }
+    }
+    out
+}
+
+/// Sum object sizes under `urls` (no shard filter). Used for auto-broadcast sizing.
+pub async fn sum_listing_bytes(
+    state: &SessionState,
+    urls: Vec<ListingTableUrl>,
+    file_extension: &str,
+) -> Result<u64> {
+    let files = list_visible_file_shard_with(state, urls, file_extension, None, None).await?;
+    Ok(files.iter().map(|(_, meta)| meta.size).sum())
 }
 
 /// Ensure a directory/prefix location ends with `/` so DataFusion treats it as a collection.
@@ -460,6 +575,62 @@ mod tests {
     }
 
     #[test]
+    fn classify_largest_sharded_smaller_under_threshold_replicated() {
+        let sized = vec![
+            ("lineitem".into(), Some(75_000_000_000)),
+            ("orders".into(), Some(17_000_000_000)),
+            ("nation".into(), Some(2_000)),
+        ];
+        let got = classify_replicated_tables(&sized, &[], 32 * 1024 * 1024 * 1024);
+        assert!(got.contains(&"orders".to_string()));
+        assert!(got.contains(&"nation".to_string()));
+        assert!(!got.iter().any(|t| t == "lineitem"));
+    }
+
+    #[test]
+    fn classify_second_large_table_over_threshold_stays_sharded() {
+        let sized = vec![
+            ("fact_a".into(), Some(80_000_000_000)),
+            ("fact_b".into(), Some(50_000_000_000)),
+            ("dim".into(), Some(1_000_000)),
+        ];
+        let got = classify_replicated_tables(&sized, &[], 32 * 1024 * 1024 * 1024);
+        assert!(got.contains(&"dim".to_string()));
+        assert!(!got.iter().any(|t| t == "fact_a"));
+        assert!(!got.iter().any(|t| t == "fact_b"));
+    }
+
+    #[test]
+    fn classify_override_wins_and_threshold_zero_disables_auto() {
+        let sized = vec![("lineitem".into(), Some(100)), ("orders".into(), Some(10))];
+        let with_override = classify_replicated_tables(&sized, &["lineitem"], 32 << 30);
+        assert!(with_override.contains(&"lineitem".to_string()));
+        assert!(with_override.contains(&"orders".to_string()));
+
+        let disabled = classify_replicated_tables(&sized, &["nation"], 0);
+        assert_eq!(disabled, vec!["nation".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn task_local_replicated_skips_known_file_shard_without_env() {
+        std::env::remove_var("WEFT_REPLICATED_TABLES");
+        let files = vec![(dummy_url("a.parquet"), 100), (dummy_url("b.parquet"), 60)];
+        let assignment = Some(ShardAssignment { index: 0, count: 2 });
+        let sharded = apply_known_file_shard_with(files.clone(), Some("dim"), assignment);
+        assert_eq!(sharded.len(), 1, "without overlay, dim is sharded");
+
+        let full = with_replicated_tables("dim", async {
+            apply_known_file_shard_with(files, Some("dim"), assignment)
+        })
+        .await;
+        assert_eq!(
+            full.len(),
+            2,
+            "task-local overlay replicates full file list"
+        );
+    }
+
+    #[test]
     fn collection_url_gets_trailing_slash() {
         assert_eq!(
             ensure_collection_url("s3://bucket/tpch/lineitem"),
@@ -480,9 +651,12 @@ mod tests {
     }
 
     fn write_parts_with_rows(n: usize, rows_per_file: usize) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "weft-shard-{}-{}",
+            "weft-shard-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

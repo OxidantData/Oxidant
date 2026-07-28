@@ -61,6 +61,15 @@ The Helm chart therefore:
     bucket to disk — do not enable for publishable benchmarks
   - Legacy `WEFT_SPILL_DIR` is **unused** by Rust — do not set it
 
+### Auto-broadcast dims (no operator dim list)
+
+SF100 / multi-worker Connect no longer needs `WEFT_REPLICATED_TABLES` for TPC-H/DS
+dimensions. The driver classifies dims from Glue/Parquet (or lakehouse) file sizes —
+tables smaller than the query's largest scan and under
+`WEFT_AUTO_BROADCAST_THRESHOLD_BYTES` (default 32 GiB) are fully replicated on every
+worker — and ships that list on each `StageTicket`. Keep `WEFT_REPLICATED_TABLES` only
+as an optional force-include override.
+
 ### Silent shard loss (config mitigations + engine follow-up)
 
 Each worker shards from its **own** env (`WEFT_POD_NAME` ordinal / `WEFT_WORKER_COUNT`).

@@ -25,6 +25,7 @@ pub async fn plan_forward(engine: &Engine, sql: &str) -> Result<DistributedQuery
             exchange: ExchangeMode::Forward,
             plan_fragment: None,
             lakehouse_snapshot_pins: String::new(),
+            replicated_tables: String::new(),
         }],
         finalize_sql: None,
     })

@@ -90,6 +90,10 @@ pub struct StageTicket {
     /// Empty keeps old tickets wire-compatible and is valid for stages without lakehouse tables.
     #[prost(string, tag = "10")]
     pub lakehouse_snapshot_pins: String,
+    /// Comma-separated replicate/broadcast table names from the driver. Empty keeps older
+    /// tickets wire-compatible; workers install this as a task-local overlay for file sharding.
+    #[prost(string, tag = "11")]
+    pub replicated_tables: String,
 }
 
 /// A pull request for one hash bucket of an already-produced stage output.
@@ -172,6 +176,7 @@ mod tests {
             upstream_stage_ids: vec![0],
             produce: false,
             lakehouse_snapshot_pins: r#"{"prod.db.t":{"format":"delta","version":7}}"#.into(),
+            replicated_tables: String::new(),
         };
         let bytes = t.to_ticket_bytes();
         match decode_ticket(&bytes).unwrap() {

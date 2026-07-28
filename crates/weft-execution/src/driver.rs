@@ -147,6 +147,9 @@ pub struct StageDef {
     pub plan_fragment: Option<Vec<u8>>,
     /// Driver-captured table-name→Delta/Iceberg identity map, serialized as JSON.
     pub lakehouse_snapshot_pins: String,
+    /// Comma-separated tables the driver classified as fully replicated (auto-broadcast /
+    /// `WEFT_REPLICATED_TABLES` override). Empty keeps older tickets wire-compatible.
+    pub replicated_tables: String,
 }
 
 impl Default for StageDef {
@@ -159,6 +162,7 @@ impl Default for StageDef {
             exchange: ExchangeMode::Hash,
             plan_fragment: None,
             lakehouse_snapshot_pins: String::new(),
+            replicated_tables: String::new(),
         }
     }
 }
@@ -784,6 +788,7 @@ fn stage_ticket(
         upstream_stage_ids: stage.upstream_stage_ids.clone(),
         produce,
         lakehouse_snapshot_pins: stage.lakehouse_snapshot_pins.clone(),
+        replicated_tables: stage.replicated_tables.clone(),
     }
 }
 

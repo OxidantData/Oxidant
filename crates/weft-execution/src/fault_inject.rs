@@ -67,6 +67,7 @@ mod tests {
             upstream_stage_ids: if produce { vec![] } else { vec![0] },
             produce,
             lakehouse_snapshot_pins: String::new(),
+            replicated_tables: String::new(),
         }
     }
 

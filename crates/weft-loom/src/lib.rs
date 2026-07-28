@@ -3217,6 +3217,39 @@ impl Engine {
         self.ctx.as_ref()
     }
 
+    /// Estimate total file bytes for a scanned table (Glue/Parquet/Delta/Iceberg listing).
+    /// Returns `None` for MemTables, missing tables, or listing failures — callers treat that as
+    /// "unknown" for auto-broadcast (not auto-replicated unless overridden).
+    pub async fn estimate_table_bytes(&self, table_name: &str) -> Option<u64> {
+        let bare = table_name.rsplit('.').next().unwrap_or(table_name);
+
+        // Session-registered ListingTable (e.g. `register_parquet`).
+        if let Ok(provider) = self.ctx.table_provider(bare).await {
+            if let Some(bytes) =
+                estimate_listing_provider_bytes(&self.ctx.state(), provider.as_ref()).await
+            {
+                return Some(bytes);
+            }
+        }
+
+        // External weft catalogs (Glue / Hive / REST): search namespaces for `bare`.
+        let catalogs: Vec<Arc<dyn weft_catalog::CatalogProvider>> = self
+            .weft_catalogs
+            .lock()
+            .expect("weft_catalogs poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for cat in catalogs {
+            if let Some(bytes) =
+                estimate_bytes_in_catalog(&self.ctx.state(), cat.as_ref(), bare).await
+            {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
     /// Schema (database) names in the built-in in-process catalog — backs `listDatabases` for the
     /// default `spark_catalog` (the catalog holding temp views and ad-hoc registered tables).
     pub fn builtin_namespaces(&self) -> Vec<String> {
@@ -3246,6 +3279,53 @@ impl Engine {
             .default_catalog
             .clone()
     }
+}
+
+async fn estimate_listing_provider_bytes(
+    state: &datafusion::execution::context::SessionState,
+    provider: &dyn datafusion::catalog::TableProvider,
+) -> Option<u64> {
+    use datafusion::datasource::listing::ListingTable;
+    let listing = provider.downcast_ref::<ListingTable>()?;
+    let urls = listing.table_paths().clone();
+    let ext = listing.options().file_extension.as_str();
+    shard::sum_listing_bytes(state, urls, ext).await.ok()
+}
+
+async fn estimate_bytes_in_catalog(
+    state: &datafusion::execution::context::SessionState,
+    catalog: &dyn weft_catalog::CatalogProvider,
+    table: &str,
+) -> Option<u64> {
+    let top = catalog.list_namespaces(&[]).await.ok()?;
+    let mut namespaces = top;
+    // One level of nesting is enough for Hive/Glue (`db`) and covers Unity-style parents.
+    let mut i = 0;
+    while i < namespaces.len() {
+        if let Ok(children) = catalog.list_namespaces(&namespaces[i]).await {
+            for child in children {
+                if !namespaces.iter().any(|n| n == &child) {
+                    namespaces.push(child);
+                }
+            }
+        }
+        i += 1;
+        if i > 64 {
+            break;
+        }
+    }
+    for ns in namespaces {
+        if let Ok(md) = catalog.load_table(&ns, table).await {
+            if let Some(bytes) = catalog_bridge::estimate_bytes_for_metadata(state, &md).await {
+                return Some(bytes);
+            }
+        }
+    }
+    // Also try empty namespace (flat catalogs).
+    if let Ok(md) = catalog.load_table(&[], table).await {
+        return catalog_bridge::estimate_bytes_for_metadata(state, &md).await;
+    }
+    None
 }
 
 /// A parsed catalog-listing/`SHOW` statement (see [`parse_show`]).

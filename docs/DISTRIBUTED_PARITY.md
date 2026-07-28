@@ -50,8 +50,10 @@ Fallback: unsupported plan shapes → Engine::sql on driver
 
 5. [x] **File-list sharding** for Glue/Parquet: partition the active file list by
    `worker_index / worker_count` so each worker scans a disjoint shard.
-6. [x] **Replicated vs sharded table policy**: small dims replicated via
-   `WEFT_REPLICATED_TABLES` (platform default covers TPC-H/DS dims).
+6. [x] **Replicated vs sharded table policy**: small dims auto-replicated from Glue/Parquet
+   (or lakehouse) file sizes — tables smaller than the query's largest scan and under
+   `WEFT_AUTO_BROADCAST_THRESHOLD_BYTES` (default 32 GiB). Optional
+   `WEFT_REPLICATED_TABLES` force-include override only.
 
 ### P1 — TPC-DS / Photon-class plan coverage
 
@@ -109,8 +111,10 @@ Fallback: unsupported plan shapes → Engine::sql on driver
 
 1. Ship `weft` images with Connect distributed path + loom file sharding.
 2. Ship `weft-platform` orchestrator with worker Service, Flight NetworkPolicy,
-   `WEFT_WORKERS` / `WEFT_WORKER_SERVICE` / `WEFT_WORKER_COUNT` / `WEFT_REPLICATED_TABLES` /
-   `WEFT_POD_NAME`. See platform `docs/DISTRIBUTED_DEPLOY.md` for build/push/verify steps.
+   `WEFT_WORKERS` / `WEFT_WORKER_SERVICE` / `WEFT_WORKER_COUNT` /
+   `WEFT_AUTO_BROADCAST_THRESHOLD_BYTES` (optional) / `WEFT_REPLICATED_TABLES`
+   (optional override) / `WEFT_POD_NAME`. See platform `docs/DISTRIBUTED_DEPLOY.md`
+   for build/push/verify steps.
 3. Create cluster with `worker_min=worker_max=N` (N>1), confirm driver env and worker
    shard logs (`applied file-list shard`).
 4. Re-measure TPC-H/DS SF100 with **`DISTRIBUTED_SF100=1`** (harness default is refuse):

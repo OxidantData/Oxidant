@@ -90,6 +90,7 @@ pub(crate) fn try_non_aggregate(
             exchange: ExchangeMode::Forward,
             plan_fragment: None,
             lakehouse_snapshot_pins: String::new(),
+            replicated_tables: String::new(),
         }
     } else {
         StageDef::new(0, worker_sql, vec![], vec![])
@@ -1364,6 +1365,7 @@ fn plan_union(
                 exchange: s.exchange,
                 plan_fragment: s.plan_fragment,
                 lakehouse_snapshot_pins: s.lakehouse_snapshot_pins,
+                replicated_tables: String::new(),
             });
             next_id = next_id.max(new_id + 1);
         }
@@ -1490,6 +1492,7 @@ fn plan_semi_anti_set_op(
                 exchange: s.exchange,
                 plan_fragment: s.plan_fragment,
                 lakehouse_snapshot_pins: s.lakehouse_snapshot_pins,
+                replicated_tables: String::new(),
             });
             next_id = next_id.max(new_id + 1);
         }
