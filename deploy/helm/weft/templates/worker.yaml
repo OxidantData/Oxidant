@@ -89,6 +89,8 @@ spec:
             - name: WEFT_MEMORY_LIMIT_BYTES
               value: {{ .Values.worker.memoryLimitBytes | quote }}
             {{- end }}
+            - name: WEFT_PREFER_HASH_JOIN
+              value: {{ .Values.worker.preferHashJoin | quote }}
             {{- if .Values.worker.forceShuffleSpill }}
             - name: WEFT_SHUFFLE_SPILL_DIR
               value: /var/lib/weft/spill

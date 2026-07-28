@@ -1778,6 +1778,8 @@ impl Engine {
     /// - `WEFT_COALESCE_BATCHES` (bool) — coalesce small batches after filtering.
     /// - `WEFT_REPARTITION_AGGREGATIONS` (bool) — repartition before aggregation for parallelism
     ///   (the lever most likely to move the high-card `GROUP BY` queries Q32–Q34).
+    /// - `WEFT_PREFER_HASH_JOIN` (bool) — when false, use spill-capable sort-merge joins for
+    ///   partitioned equijoins instead of DataFusion's in-memory hash join.
     pub fn new() -> Self {
         use datafusion::prelude::SessionConfig;
 
@@ -1831,6 +1833,9 @@ impl Engine {
             }
             if let Some(b) = env_bool("WEFT_REPARTITION_AGGREGATIONS") {
                 opts.optimizer.repartition_aggregations = b;
+            }
+            if let Some(b) = env_bool("WEFT_PREFER_HASH_JOIN") {
+                opts.optimizer.prefer_hash_join = b;
             }
         }
 

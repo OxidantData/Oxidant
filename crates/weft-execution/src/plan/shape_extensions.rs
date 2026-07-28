@@ -21,7 +21,8 @@ use weft_common::{Error, Result};
 
 use super::stage_planner::{
     aggregation_stages_for, base_tables, build_agg_remap, column_name, count_table_scans, expr_sql,
-    extract_from_tail, peel, sanitize_generated_sql, unqualify, DistributedQuery, Peeled,
+    extract_from_tail, peel, qualified_table_sql, sanitize_generated_sql, unqualify,
+    DistributedQuery, Peeled,
 };
 use crate::driver::{ExchangeMode, StageDef};
 
@@ -940,11 +941,12 @@ pub(crate) fn try_materialize_subquery_fact(
     // otherwise-present zero-input global-aggregate row on every other partition without wrapping
     // (and thereby semantically hiding) the original ORDER BY.
     let final_sql = sanitize_generated_sql(&add_partition_gate(&rewritten_sql)?);
+    let fact_sql = qualified_table_sql(lp, fact);
     Ok(Some(DistributedQuery {
         stages: vec![
             StageDef::new(
                 0,
-                sanitize_generated_sql(&format!("SELECT * FROM {fact}")),
+                sanitize_generated_sql(&format!("SELECT * FROM {fact_sql}")),
                 vec![],
                 vec![],
             ),
@@ -1049,11 +1051,12 @@ pub(crate) fn try_materialize_complex_fact(
         "SELECT gathered_fact.* FROM ({rewritten_sql}) AS gathered_fact \
          WHERE EXISTS (SELECT 1 FROM shuffle_input_1)"
     ));
+    let fact_sql = qualified_table_sql(lp, fact);
     Ok(Some(DistributedQuery {
         stages: vec![
             StageDef::new(
                 0,
-                sanitize_generated_sql(&format!("SELECT * FROM {fact}")),
+                sanitize_generated_sql(&format!("SELECT * FROM {fact_sql}")),
                 vec![],
                 vec![],
             ),

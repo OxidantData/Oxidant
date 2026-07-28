@@ -56,9 +56,14 @@ worker:
   autoscaling:
     enabled: false
   forceShuffleSpill: false
-  # 56Gi limit: ~26 Gi DF + ~14 Gi shuffle + ~16 Gi headroom.
-  memoryLimitBytes: "27917287424"  # 26 Gi — DataFusion pool
-  shuffleSpillBytes: "15032385536" # 14 Gi — shuffle cache threshold
+  # KAN-7: leave more cgroup headroom than DF+shuffle alone. HashJoin / Arrow / S3 / aws-cli
+  # RSS sits outside FairSpillPool; 26+14 left only ~16 Gi of 56 Gi and still OOMKilled on SF100.
+  # 20 Gi DF + 8 Gi shuffle = 28 Gi tracked → ~28 Gi native headroom under a 56 Gi limit.
+  memoryLimitBytes: "21474836480"  # 20 Gi — DataFusion spill pool
+  shuffleSpillBytes: "8589934592"  # 8 Gi — shuffle cache threshold
+  # DataFusion 54 HashJoinInput is not spillable. At SF100, prefer sort-merge joins so bounded-pool
+  # pressure spills sort/join buffers to the gp3 PVC instead of failing Resources exhausted.
+  preferHashJoin: false
   resources:
     requests:
       cpu: "14"

@@ -29,6 +29,7 @@ This document defines the environment contract between the **OSS engine images**
 | `WEFT_WORKER_TASK_SLOTS` | Optional | Advisory task concurrency per worker. The platform should set this to the CPU slots allocated to each worker pod; the current OSS worker treats one Flight request as one task and future schedulers will use this as the per-worker slot count. |
 | `WEFT_SHUFFLE_SPILL_DIR` | Optional | Directory for spilled shuffle buckets when in-memory cache is full. |
 | `WEFT_MEMORY_LIMIT_BYTES` | Recommended | Same spill pool tuning as the driver. |
+| `WEFT_PREFER_HASH_JOIN` | Optional | Defaults to `true`. Set to `false` for large memory-constrained joins to use spill-capable sort-merge joins; DataFusion 54 hash-join build inputs do not spill when the bounded pool fills. |
 
 ## Local-cluster mode
 

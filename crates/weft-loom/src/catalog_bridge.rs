@@ -539,14 +539,11 @@ async fn sharded_listing_table(
         .await
         .map_err(weft_to_df)?;
     if sharded.is_empty() {
-        let schema = match schema {
-            Some(s) => s,
-            None => {
-                return Err(DataFusionError::Plan(format!(
+        let schema = schema.ok_or_else(|| {
+            DataFusionError::Plan(format!(
                 "sharded table `{table_name}` has no files on this worker and no declared schema"
-            )))
-            }
-        };
+            ))
+        })?;
         return crate::shard::empty_table(schema).map_err(weft_to_df);
     }
     crate::build_listing_table(state, sharded, opts, schema)
@@ -833,17 +830,56 @@ async fn parquet_metadata_provider(
     table_name: &str,
     roots: Vec<datafusion::datasource::listing::ListingTableUrl>,
 ) -> DfResult<Arc<dyn TableProvider>> {
-    let listed = crate::shard::list_visible_file_shard(state, roots, ".parquet", Some(table_name))
+    parquet_metadata_provider_with_assignment(
+        state,
+        md,
+        table_name,
+        roots,
+        crate::shard::ShardAssignment::from_env(),
+    )
+    .await
+}
+
+async fn parquet_metadata_provider_with_assignment(
+    state: &SessionState,
+    md: &TableMetadata,
+    table_name: &str,
+    roots: Vec<datafusion::datasource::listing::ListingTableUrl>,
+    assignment: Option<crate::shard::ShardAssignment>,
+) -> DfResult<Arc<dyn TableProvider>> {
+    let listed = crate::shard::list_visible_file_shard_with(
+        state,
+        roots.clone(),
+        ".parquet",
+        Some(table_name),
+        assignment,
+    )
+    .await
+    .map_err(weft_to_df)?;
+    if listed.is_empty() {
+        // This worker's shard may be vacant while peers still hold files (KAN-5). Prefer the
+        // catalog schema; otherwise infer from the unsharded listing so we can return an empty
+        // typed table instead of failing the whole stage.
+        if let Some(schema) = &md.schema {
+            return crate::shard::empty_table(schema.clone()).map_err(weft_to_df);
+        }
+        let unsharded = crate::shard::list_visible_file_shard_with(
+            state,
+            roots,
+            ".parquet",
+            Some(table_name),
+            None,
+        )
         .await
         .map_err(weft_to_df)?;
-    if listed.is_empty() {
-        return match &md.schema {
-            Some(schema) => crate::shard::empty_table(schema.clone()).map_err(weft_to_df),
-            None => Err(DataFusionError::Plan(format!(
+        if unsharded.is_empty() {
+            return Err(DataFusionError::Plan(format!(
                 "Parquet table `{}` has no visible data files and no declared schema",
                 md.location
-            ))),
-        };
+            )));
+        }
+        let schema = infer_listed_parquet_schema(state, &unsharded).await?;
+        return crate::shard::empty_table(schema).map_err(weft_to_df);
     }
 
     let table_schema = match &md.schema {
@@ -1487,7 +1523,14 @@ mod tests {
     }
 
     fn write_parquet_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("weft-cat-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "weft-cat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
@@ -1528,6 +1571,41 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!((c, s), (4, 10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn vacant_parquet_shard_infers_schema_from_peer_files() {
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        let dir = write_parquet_dir();
+        let location =
+            crate::shard::ensure_collection_url(&format!("file://{}", dir.to_string_lossy()));
+        let root = ListingTableUrl::parse(&location).unwrap();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let md = TableMetadata::new("fake.ns.orders", location, TableFormat::Parquet);
+
+        // One file is assigned to worker 0; worker 1 must still register an empty, typed table.
+        let provider = parquet_metadata_provider_with_assignment(
+            &state,
+            &md,
+            "orders",
+            vec![root],
+            Some(crate::shard::ShardAssignment { index: 1, count: 2 }),
+        )
+        .await
+        .expect("vacant shard should infer schema from the unsharded listing");
+
+        assert_eq!(provider.schema().fields().len(), 1);
+        assert_eq!(provider.schema().field(0).name(), "x");
+        assert_eq!(provider.schema().field(0).data_type(), &DataType::Int64);
+        let plan = provider.scan(&state, None, &[], None).await.unwrap();
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

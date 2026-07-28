@@ -43,6 +43,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::common::TableReference;
 use datafusion::logical_expr::{Aggregate, Expr, GroupingSet, JoinType, LogicalPlan, Union};
 use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
@@ -490,12 +491,12 @@ pub(crate) fn shuffle_join_two_tables(
     let right_alias = right_scan.alias.unwrap_or(right_name);
 
     let left_sql = match &left_scan.filter_sql {
-        Some(f) => format!("SELECT * FROM {left_name} WHERE {f}"),
-        None => format!("SELECT * FROM {left_name}"),
+        Some(f) => format!("SELECT * FROM {} WHERE {f}", left_scan.table_sql),
+        None => format!("SELECT * FROM {}", left_scan.table_sql),
     };
     let right_sql = match &right_scan.filter_sql {
-        Some(f) => format!("SELECT * FROM {right_name} WHERE {f}"),
-        None => format!("SELECT * FROM {right_name}"),
+        Some(f) => format!("SELECT * FROM {} WHERE {f}", right_scan.table_sql),
+        None => format!("SELECT * FROM {}", right_scan.table_sql),
     };
 
     let up = Unparser::default();
@@ -553,7 +554,14 @@ pub(crate) fn shuffle_join_two_tables(
 
 /// A leaf table scan, optionally filtered, with an optional SQL alias.
 pub(crate) struct SimpleScan<'a> {
+    /// Bare table name (used for replicate/shard policy matching).
     pub(crate) table: &'a str,
+    /// Catalog-qualified SQL relation text for stage `FROM` clauses (KAN-4).
+    ///
+    /// Workers resolve unqualified names to `spark_catalog.default.*`; Glue SF100 tables live
+    /// under `glue.<db>.<table>`, so leaf stage SQL must preserve the logical plan's
+    /// [`TableReference`] qualification.
+    pub(crate) table_sql: String,
     pub(crate) alias: Option<&'a str>,
     pub(crate) filter_sql: Option<String>,
     pub(crate) schema: datafusion::common::DFSchemaRef,
@@ -588,6 +596,7 @@ pub(crate) fn simple_table_scan(lp: &LogicalPlan) -> Result<SimpleScan<'_>> {
     match lp {
         LogicalPlan::TableScan(s) => Ok(SimpleScan {
             table: s.table_name.table(),
+            table_sql: table_ref_sql(&s.table_name),
             alias: None,
             filter_sql: None,
             schema: s.projected_schema.clone(),
@@ -2042,9 +2051,104 @@ fn collect_tables(lp: &LogicalPlan, out: &mut Vec<String>) {
     }
 }
 
+/// SQL relation text preserving catalog/schema qualification from a logical [`TableReference`].
+pub(crate) fn table_ref_sql(reference: &TableReference) -> String {
+    reference.to_string()
+}
+
+/// Look up the catalog-qualified SQL text for a bare table name in `lp` (and expression
+/// subqueries). Falls back to the bare name when no matching scan exists (local MemTables).
+pub(crate) fn qualified_table_sql(lp: &LogicalPlan, bare: &str) -> String {
+    find_qualified_table_sql(lp, bare).unwrap_or_else(|| bare.to_string())
+}
+
+fn find_qualified_table_sql(lp: &LogicalPlan, bare: &str) -> Option<String> {
+    if let LogicalPlan::TableScan(s) = lp {
+        if s.table_name.table() == bare {
+            return Some(table_ref_sql(&s.table_name));
+        }
+    }
+    for e in lp.expressions() {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        let mut found = None;
+        let _ = e.apply(|node| {
+            let sub = match node {
+                Expr::Exists(ex) => Some(ex.subquery.subquery.as_ref()),
+                Expr::InSubquery(iq) => Some(iq.subquery.subquery.as_ref()),
+                Expr::ScalarSubquery(sq) => Some(sq.subquery.as_ref()),
+                _ => None,
+            };
+            if let Some(plan) = sub {
+                if let Some(sql) = find_qualified_table_sql(plan, bare) {
+                    found = Some(sql);
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        if found.is_some() {
+            return found;
+        }
+    }
+    for c in lp.inputs() {
+        if let Some(sql) = find_qualified_table_sql(c, bare) {
+            return Some(sql);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod guard_tests {
-    use super::{reject_out_of_scope_join_alias_refs, rewrite_out_of_scope_join_alias_refs};
+    use super::{
+        find_qualified_table_sql, qualified_table_sql, reject_out_of_scope_join_alias_refs,
+        rewrite_out_of_scope_join_alias_refs, table_ref_sql,
+    };
+    use datafusion::common::TableReference;
+    use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::prelude::lit;
+    use std::sync::Arc;
+    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn table_ref_sql_preserves_qualification() {
+        assert_eq!(table_ref_sql(&TableReference::bare("lineitem")), "lineitem");
+        assert_eq!(
+            table_ref_sql(&TableReference::partial("tpch_sf100", "lineitem")),
+            "tpch_sf100.lineitem"
+        );
+        assert_eq!(
+            table_ref_sql(&TableReference::full("glue", "tpch_sf100", "lineitem")),
+            "glue.tpch_sf100.lineitem"
+        );
+    }
+
+    #[test]
+    fn qualified_table_sql_reads_full_table_reference_from_scan() {
+        use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let source = Arc::new(LogicalTableSource::new(schema));
+        let lp = LogicalPlanBuilder::scan(
+            TableReference::full("glue", "tpch_sf100", "lineitem"),
+            source,
+            None,
+        )
+        .unwrap()
+        .filter(lit(true))
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(
+            qualified_table_sql(&lp, "lineitem"),
+            "glue.tpch_sf100.lineitem"
+        );
+        assert_eq!(
+            find_qualified_table_sql(&lp, "orders"),
+            None,
+            "missing bare name must not invent a qualification"
+        );
+    }
 
     #[test]
     fn plain_sql_without_join_side_aliases_is_accepted() {

@@ -76,6 +76,9 @@ worker:
   # DEBUG ONLY: sets WEFT_SHUFFLE_SPILL_DIR → force_spill=true (every bucket to disk).
   # Never enable for publishable benchmarks. Default off.
   forceShuffleSpill: false
+  # DataFusion hash joins keep their build side in memory and fail when the bounded pool fills.
+  # Set false on memory-constrained large-data workers to use spill-capable sort-merge joins.
+  preferHashJoin: true
   resources: {}
   nodeSelector: {}
   tolerations: []
