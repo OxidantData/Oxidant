@@ -63,15 +63,14 @@ Fallback: unsupported plan shapes → Engine::sql on driver
    star (1 sharded fact + N replicated dims) folds into the partial. CrossJoin+filter
    Q5 with dims replicated uses the broadcast path.
 9. [x] Windows, subqueries, `HAVING`, ungrouped aggregates, set ops.
-    Supported: `HAVING`, ungrouped/global aggs, scalar/IN/EXISTS subqueries **over replicated
-    tables only** (sharded-table subqueries rejected), `UNION ALL` of distributable aggs, narrow
-    aggregate windows (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG` with `PARTITION BY` over one sharded table),
-    and **non-aggregate scan/gather** (`try_non_aggregate`: one sharded table scatter + global
-    `ORDER BY`/`LIMIT`; all-replicated scans use Forward).
-    Still Unsupported (explicit messages → local fallback): global windows (no `PARTITION BY`),
-    ranking / `ORDER BY` windows (`ROW_NUMBER`, …), `UNION` (distinct), correlated/self subqueries
-    over sharded tables, and **CTE + cross-join shells** where grouped CTEs must be merged across
-    shards before the outer select (TPC-DS Q1/Q4/Q11 pattern — ~27 queries in the 2026-07-25 histogram).
+    Supported: `HAVING`, ungrouped/global aggs, subqueries over sharded facts via gather
+    (`try_materialize_*`), `UNION`/`INTERSECT`/`EXCEPT` arms, multi-key equijoins + residuals,
+    outer/semi/anti shuffle chains, narrow aggregate windows, non-aggregate scan/gather.
+    **Deliberate permanent rejects (KAN-13 / D-2.11 residual):** TPC-DS **Q5, Q14, Q77, Q80** —
+    ROLLUP/CUBE/GROUPING SETS composed with UNION/INTERSECT where DataFusion Unparser stage SQL
+    does not round-trip under the workers' Databricks dialect (correctness-first decline).
+    Also still unsupported: global windows (no `PARTITION BY`), global `COUNT(DISTINCT)` without
+    gather.
 10. [x] Shuffle spill + `do_exchange` streaming.
     Ticket/cache path spills stage buckets to disk when over budget (`WEFT_SHUFFLE_SPILL_BYTES`,
     default 256 MiB; files under `WEFT_SPILL_DIR` or temp). Streaming `do_exchange` appends

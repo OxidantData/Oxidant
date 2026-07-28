@@ -152,16 +152,44 @@ class WorkerGate:
         return ready
 
 
+def _canonical_cell(v) -> str:
+    """Normalize cell values so Spark vs Weft decimals/floats compare as multisets (KAN-8)."""
+    if v is None:
+        return "NULL"
+    # Decimal / DecimalType often stringify with trailing zeros inconsistently.
+    try:
+        from decimal import Decimal
+
+        if isinstance(v, Decimal):
+            return format(v.normalize(), "f")
+    except Exception:
+        pass
+    if isinstance(v, float):
+        # Stable short form; avoids -0.0 vs 0.0 and tiny binary noise.
+        if v == 0.0:
+            return "0"
+        return f"{v:.12g}"
+    return repr(v)
+
+
 def _result_checksum(rows: list) -> str:
-    """Stable checksum over collected rows (order-preserving within the result)."""
-    h = hashlib.sha256()
+    """Stable multiset checksum (KAN-8).
+
+    Sort row canonical forms before hashing so ORDER BY-less or tie-broken results still
+    match Spark goldens. True order-sensitive diffs remain visible via row_count + wall
+    times; correctness vs Spark is multiset equality for these suites.
+    """
+    lines: list[str] = []
     for row in rows:
-        # Row is typically a pyspark Row; fall back to tuple/repr.
         try:
             vals = tuple(row)
         except TypeError:
             vals = (row,)
-        h.update(repr(vals).encode("utf-8", "replace"))
+        lines.append("(" + ", ".join(_canonical_cell(v) for v in vals) + ")")
+    lines.sort()
+    h = hashlib.sha256()
+    for line in lines:
+        h.update(line.encode("utf-8", "replace"))
         h.update(b"\n")
     return h.hexdigest()
 

@@ -50,8 +50,9 @@ use weft_common::{Error, Result};
 use weft_loom::Engine;
 
 use super::shape_extensions::{
-    ensure_subquery_tables_replicated, reject_explicit_unsupported, try_materialize_complex_fact,
-    try_materialize_subquery_fact, try_non_aggregate, try_union_all, try_window,
+    ensure_having_subquery_tables_replicated, ensure_subquery_tables_replicated,
+    reject_explicit_unsupported, try_materialize_complex_fact, try_materialize_subquery_fact,
+    try_non_aggregate, try_union_all, try_window,
 };
 use crate::driver::{ExchangeMode, StageDef};
 
@@ -123,7 +124,11 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
                 || reason.contains("COUNT(DISTINCT)")
                 || reason.contains("UNION ALL arm does not scan sharded table")
                 || reason.contains("branch-aware CrossJoin")
-                || reason.contains("expected left-deep equijoin chain");
+                || reason.contains("expected left-deep equijoin chain")
+                // KAN-12: subquery-only / correlated fact scans that cannot stay shard-local
+                // (TPC-H Q20) — gather the fact via try_materialize_complex_fact.
+                || reason.contains("subquery over")
+                || reason.contains("preserved side does not scan sharded table");
             if !materializable_rejection {
                 return Err(primary_error);
             }
@@ -330,7 +335,9 @@ pub(crate) fn aggregation_stages_for(
         .collect();
 
     // Subqueries (IN / EXISTS / scalar) only over replicated dims — never over unreplicated tables.
+    // Also check HAVING: TPC-H Q11 embeds a partsupp scalar subquery in HAVING that must gather.
     ensure_subquery_tables_replicated(&agg.input, &sharded, replicated)?;
+    ensure_having_subquery_tables_replicated(&p.having, replicated)?;
 
     if agg.group_expr.is_empty() {
         return global_aggregation_stages(p, &sharded);
@@ -494,21 +501,7 @@ pub(crate) fn shuffle_join_two_tables(
     sharded: &[&str],
 ) -> Result<DistributedQuery> {
     let join = find_inner_equijoin(&p.agg.input)?;
-    let (left_key_expr, right_key_expr, residual_filter) = match join.on.as_slice() {
-        [(l, r)] => (l.clone(), r.clone(), join.filter.clone()),
-        [] => equijoin_from_filter(join.filter.as_ref())?,
-        _ => {
-            return Err(Error::Unsupported(format!(
-                "auto-distribute: shuffle join supports a single equijoin key, found {}",
-                join.on.len()
-            )))
-        }
-    };
-    if join.on.len() > 1 {
-        return Err(Error::Unsupported(
-            "auto-distribute: multi-key shuffle joins not yet supported".into(),
-        ));
-    }
+    let (key_pairs, residual_filter) = collect_equijoin_keys(&join.on, join.filter.as_ref())?;
 
     let left_scan = simple_table_scan(join.left.as_ref())?;
     let right_scan = simple_table_scan(join.right.as_ref())?;
@@ -520,13 +513,20 @@ pub(crate) fn shuffle_join_two_tables(
         ));
     }
 
-    let left_key_name = column_name(&left_key_expr)?;
-    let right_key_name = column_name(&right_key_expr)?;
-    let left_key_idx = column_index_in_scan(&left_scan, &left_key_name)?;
-    let right_key_idx = column_index_in_scan(&right_scan, &right_key_name)?;
-
+    let mut left_key_idxs = Vec::with_capacity(key_pairs.len());
+    let mut right_key_idxs = Vec::with_capacity(key_pairs.len());
+    let mut on_parts = Vec::with_capacity(key_pairs.len());
     let left_alias = left_scan.alias.unwrap_or(left_name);
     let right_alias = right_scan.alias.unwrap_or(right_name);
+    for (left_key_expr, right_key_expr) in &key_pairs {
+        let left_key_name = column_name(left_key_expr)?;
+        let right_key_name = column_name(right_key_expr)?;
+        left_key_idxs.push(column_index_in_scan(&left_scan, &left_key_name)?);
+        right_key_idxs.push(column_index_in_scan(&right_scan, &right_key_name)?);
+        on_parts.push(format!(
+            "{left_alias}.{left_key_name} = {right_alias}.{right_key_name}"
+        ));
+    }
 
     let left_sql = match &left_scan.filter_sql {
         Some(f) => format!("SELECT * FROM {} WHERE {f}", left_scan.table_sql),
@@ -553,7 +553,7 @@ pub(crate) fn shuffle_join_two_tables(
 
     let remap = build_remap(p);
 
-    let on_sql = format!("{left_alias}.{left_key_name} = {right_alias}.{right_key_name}");
+    let on_sql = on_parts.join(" AND ");
     let mut join_tail = format!(
         "FROM shuffle_input_0 AS {left_alias} JOIN shuffle_input_1 AS {right_alias} ON {on_sql}"
     );
@@ -571,17 +571,12 @@ pub(crate) fn shuffle_join_two_tables(
     let hash_group: Vec<u32> = (0..group_sql.len() as u32).collect();
     Ok(DistributedQuery {
         stages: vec![
-            StageDef::new(
-                0,
-                sanitize_generated_sql(&left_sql),
-                vec![],
-                vec![left_key_idx],
-            ),
+            StageDef::new(0, sanitize_generated_sql(&left_sql), vec![], left_key_idxs),
             StageDef::new(
                 1,
                 sanitize_generated_sql(&right_sql),
                 vec![],
-                vec![right_key_idx],
+                right_key_idxs,
             ),
             StageDef::new(2, partial_sql, vec![0, 1], hash_group),
             StageDef::new(3, final_sql, vec![2], vec![]),
@@ -662,57 +657,79 @@ pub(crate) fn simple_table_scan(lp: &LogicalPlan) -> Result<SimpleScan<'_>> {
     }
 }
 
-pub(crate) fn equijoin_from_filter(filter: Option<&Expr>) -> Result<(Expr, Expr, Option<Expr>)> {
-    let Some(filter) = filter else {
-        return Err(Error::Unsupported(
-            "auto-distribute: shuffle join needs an equijoin key (on or filter)".into(),
-        ));
-    };
+fn flatten_and_conjuncts(expr: &Expr, out: &mut Vec<Expr>) {
+    use datafusion::logical_expr::Operator;
+    match expr {
+        Expr::BinaryExpr(b) if b.op == Operator::And => {
+            flatten_and_conjuncts(&b.left, out);
+            flatten_and_conjuncts(&b.right, out);
+        }
+        _ => out.push(expr.clone()),
+    }
+}
+
+/// Collect equijoin key pairs from `ON` plus every equality conjunct in `filter` (KAN-10).
+///
+/// DataFusion often parks composite `ON a=b AND c=d` as a single `on` pair plus an equality
+/// residual in `join.filter`. Those residual equalities must become hash keys too — leaving them
+/// as a post-shuffle `WHERE` is correct for INNER only when the first key alone co-locates rows,
+/// but hashing the full composite key is what D-2.7 requires and avoids skew-sensitive bugs.
+pub(crate) fn collect_equijoin_keys(
+    on: &[(Expr, Expr)],
+    filter: Option<&Expr>,
+) -> Result<(Vec<(Expr, Expr)>, Option<Expr>)> {
     use datafusion::logical_expr::Operator;
 
-    fn flatten_and(expr: &Expr, out: &mut Vec<Expr>) {
-        match expr {
-            Expr::BinaryExpr(b) if b.op == Operator::And => {
-                flatten_and(&b.left, out);
-                flatten_and(&b.right, out);
+    let mut keys: Vec<(Expr, Expr)> = on.to_vec();
+    let mut residual_parts: Vec<Expr> = Vec::new();
+
+    if let Some(filter) = filter {
+        let mut conjuncts = Vec::new();
+        flatten_and_conjuncts(filter, &mut conjuncts);
+        for expr in conjuncts {
+            match expr {
+                Expr::BinaryExpr(b) if b.op == Operator::Eq => {
+                    keys.push((*b.left, *b.right));
+                }
+                other => residual_parts.push(other),
             }
-            _ => out.push(expr.clone()),
         }
     }
 
-    let mut conjuncts = Vec::new();
-    flatten_and(filter, &mut conjuncts);
-    let Some(key_idx) = conjuncts
-        .iter()
-        .position(|expr| matches!(expr, Expr::BinaryExpr(b) if b.op == Operator::Eq))
-    else {
+    if keys.is_empty() {
         return Err(Error::Unsupported(
-            "auto-distribute: shuffle join filter must contain an equality".into(),
+            "auto-distribute: shuffle join needs an equijoin key (on or filter)".into(),
         ));
-    };
-
-    let Expr::BinaryExpr(key) = conjuncts.remove(key_idx) else {
-        unreachable!("key index selected only binary equality expressions");
-    };
-    let residual = conjuncts.into_iter().reduce(Expr::and);
-    Ok((*key.left, *key.right, residual))
+    }
+    let residual = residual_parts.into_iter().reduce(Expr::and);
+    Ok((keys, residual))
 }
 
 #[cfg(test)]
 mod equijoin_filter_tests {
-    use super::equijoin_from_filter;
+    use super::collect_equijoin_keys;
     use datafusion::prelude::{col, lit};
 
     #[test]
-    fn extracts_first_equality_and_preserves_non_equality_residual() {
+    fn extracts_equality_keys_and_preserves_non_equality_residual() {
         let filter = col("a").eq(col("b")).and(col("c").gt(lit(1_i64)));
 
-        let (left, right, residual) =
-            equijoin_from_filter(Some(&filter)).expect("equality conjunct should be accepted");
+        let (keys, residual) = collect_equijoin_keys(&[], Some(&filter))
+            .expect("equality conjunct should be accepted");
 
-        assert_eq!(left, col("a"));
-        assert_eq!(right, col("b"));
+        assert_eq!(keys, vec![(col("a"), col("b"))]);
         assert_eq!(residual, Some(col("c").gt(lit(1_i64))));
+    }
+
+    #[test]
+    fn promotes_all_filter_equalities_to_composite_keys() {
+        let filter = col("a")
+            .eq(col("b"))
+            .and(col("c").eq(col("d")))
+            .and(col("e").gt(lit(1_i64)));
+        let (keys, residual) = collect_equijoin_keys(&[], Some(&filter)).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(residual, Some(col("e").gt(lit(1_i64))));
     }
 }
 
@@ -1448,7 +1465,9 @@ fn reject_unsafe_broadcast_shapes(lp: &LogicalPlan, sharded_name: &str) -> Resul
         return Ok(());
     }
     match lp {
-        LogicalPlan::Aggregate(_) => Ok(()),
+        // Nested aggregates (TPC-H Q13: count distribution over a LEFT JOIN group-by) must still
+        // validate joins below — stopping here previously allowed sharding the null-supplying side.
+        LogicalPlan::Aggregate(a) => reject_unsafe_broadcast_shapes(&a.input, sharded_name),
         LogicalPlan::Union(u) => {
             for arm in &u.inputs {
                 if count_table_scans(arm, sharded_name) == 0 {

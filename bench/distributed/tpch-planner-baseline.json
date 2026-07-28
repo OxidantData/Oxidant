@@ -1,29 +1,143 @@
 {
-  "notes": "TPC-H distributed planner ratchet (lineitem sharded, sf=0.01). Informational twin; not a blocking CI gate.",
   "suite": "tpch",
   "query_count": 22,
-  "supported": 11,
+  "supported": 22,
   "supported_queries": [
     "Q1",
+    "Q2",
     "Q3",
+    "Q4",
     "Q5",
     "Q6",
     "Q7",
     "Q8",
     "Q9",
     "Q10",
+    "Q11",
     "Q12",
+    "Q13",
     "Q14",
-    "Q19"
+    "Q15",
+    "Q16",
+    "Q17",
+    "Q18",
+    "Q19",
+    "Q20",
+    "Q21",
+    "Q22"
   ],
-  "reason_histogram": {
-    "need exactly one sharded base table (others replicated), found 0 sharded among [\"customer\", \"…": 1,
-    "need exactly one sharded base table (others replicated), found 0 sharded among [\"customer\"]": 1,
-    "need exactly one sharded base table (others replicated), found 0 sharded among [\"partsupp\", \"…": 2,
-    "sharded table `lineitem` scanned 2× (self-join / subquery)": 1,
-    "sharded table `lineitem` scanned 3× (self-join / subquery)": 1,
-    "sharded table `lineitem` scanned multiple times": 1,
-    "subquery over `lineitem` is only safe when that table is replicated": 1,
-    "unsupported top-level plan node `Cross Join:`": 3
-  }
+  "reason_histogram": {},
+  "per_query": [
+    {
+      "name": "Q1",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q2",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q3",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q4",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q5",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q6",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q7",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q8",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q9",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q10",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q11",
+      "supported": true,
+      "sharded_fact": "partsupp"
+    },
+    {
+      "name": "Q12",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q13",
+      "supported": true,
+      "sharded_fact": "orders"
+    },
+    {
+      "name": "Q14",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q15",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q16",
+      "supported": true,
+      "sharded_fact": "partsupp"
+    },
+    {
+      "name": "Q17",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q18",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q19",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q20",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q21",
+      "supported": true,
+      "sharded_fact": "lineitem"
+    },
+    {
+      "name": "Q22",
+      "supported": true,
+      "sharded_fact": "orders"
+    }
+  ],
+  "notes": "TPC-H distributed planner ratchet (multi-fact: lineitem/orders/partsupp/customer). Informational twin; not a blocking CI gate. Raised to 22/22 with KAN-8..13 planner work."
 }
