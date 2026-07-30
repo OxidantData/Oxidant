@@ -11,6 +11,11 @@ use prost::Message;
 /// Number of bytes in the fixed-width [`ShuffleExchangeHeader`] encoding.
 pub const SHUFFLE_EXCHANGE_HEADER_LEN: usize = 8;
 
+/// Flight `do_action` type: best-effort cancel of a stage currently running on the worker
+/// (body: the decimal stage id). Trips the per-stage cancel flag so the stage task unwinds
+/// and its task slot frees instead of running until the stage timeout (KAN-17).
+pub const ACTION_CANCEL_STAGE: &str = "cancel_stage";
+
 /// The first `do_exchange` frame carries this header in `FlightData.app_metadata`, followed by
 /// normal Arrow IPC `FlightData` schema/batch frames for that stage partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -234,28 +234,33 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
 }
 
 /// Extract one or more equijoin key pairs plus any non-equality residual (KAN-10 / D-2.7 / D-2.9).
+///
+/// A residual on an **outer** join (LEFT / RIGHT / FULL) is part of the join condition, not a
+/// post-join filter — TPC-H Q13's `LEFT JOIN orders ON c_custkey = o_custkey AND o_comment NOT
+/// LIKE …` must keep the `NOT LIKE` in the ON clause or unmatched left rows would be filtered
+/// out instead of null-extended. [`build_chain`] therefore emits it into the ON clause. SEMI /
+/// ANTI joins keep rejecting residuals: their dropped side makes the reference scope ambiguous.
 fn equijoin_keys(
     join: &datafusion::logical_expr::Join,
 ) -> Result<super::stage_planner::EquijoinKeys> {
     let (keys, residual) = collect_equijoin_keys(&join.on, join.filter.as_ref())?;
-    if residual.is_some() && join.join_type != JoinType::Inner {
+    if residual.is_some() && matches!(join.join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
         return Err(Error::Unsupported(
-            "auto-distribute: residual filters on outer/semi/anti shuffle joins are not supported"
-                .into(),
+            "auto-distribute: residual filters on semi/anti shuffle joins are not supported".into(),
         ));
     }
     Ok((keys, residual))
 }
 
-fn flat_col(alias: &str, col: &str) -> String {
+pub(crate) fn flat_col(alias: &str, col: &str) -> String {
     format!("{alias}__{col}")
 }
 
-fn scan_alias<'a>(scan: &SimpleScan<'a>) -> &'a str {
+pub(crate) fn scan_alias<'a>(scan: &SimpleScan<'a>) -> &'a str {
     scan.alias.unwrap_or(scan.table)
 }
 
-fn leaf_stage_sql(scan: &SimpleScan<'_>) -> (String, Vec<String>) {
+pub(crate) fn leaf_stage_sql(scan: &SimpleScan<'_>) -> (String, Vec<String>) {
     let alias = scan_alias(scan);
     let mut flats = Vec::new();
     let mut sels = Vec::new();
@@ -275,7 +280,7 @@ fn leaf_stage_sql(scan: &SimpleScan<'_>) -> (String, Vec<String>) {
     )
 }
 
-fn flat_key_index(flats: &[String], alias: &str, col: &str) -> Result<u32> {
+pub(crate) fn flat_key_index(flats: &[String], alias: &str, col: &str) -> Result<u32> {
     let want = flat_col(alias, col);
     flats
         .iter()
@@ -330,7 +335,9 @@ fn flatten_expr(e: &Expr, alias_by_relation: &HashMap<String, String>) -> Expr {
 ///
 /// Columns already carried by the left intermediate and columns from the current shuffled right
 /// input are flattened; pending replicated inputs remain ordinary qualified table columns.
-fn flatten_join_residual(
+/// Also used by the semi/anti planner's sharded–sharded outer body (TPC-H Q16), which exports
+/// its co-located join output under the same flattened names.
+pub(crate) fn flatten_join_residual(
     e: &Expr,
     alias_by_relation: &HashMap<String, String>,
     right_alias: &str,
@@ -464,7 +471,12 @@ fn build_chain(
         next_id += 1;
         stages.push(StageDef::new(right_id, right_sql, vec![], right_key_idxs));
 
-        let on_sql = left_key_metas
+        let replicated_aliases: Vec<String> = pending_bcast
+            .iter()
+            .map(|&bi| scan_alias(&steps[bi].right).to_string())
+            .collect();
+        let up = Unparser::default();
+        let mut on_sql = left_key_metas
             .iter()
             .zip(right_key_names.iter())
             .map(|((l_alias, l_name), r_name)| {
@@ -476,13 +488,42 @@ fn build_chain(
             })
             .collect::<Vec<_>>()
             .join(" AND ");
+        // Outer join (LEFT/RIGHT/FULL): a non-equality residual is part of the join condition —
+        // fold it into the ON clause so unmatched rows still null-extend (TPC-H Q13's
+        // `… AND o_comment NOT LIKE …`). It must not reference a replicated dim folded *below*,
+        // whose alias is only bound later in the FROM clause.
+        let inner_join = step.join_type == JoinType::Inner;
+        if !inner_join {
+            if let Some(residual) = &step.residual_filter {
+                let flattened = flatten_join_residual(
+                    residual,
+                    &alias_by_relation,
+                    &right_alias,
+                    &replicated_aliases,
+                );
+                if expr_references_relations(&flattened, &replicated_aliases) {
+                    return Err(Error::Unsupported(
+                        "auto-distribute: outer shuffle join residual references a replicated \
+                         dimension folded later in the stage — not supported"
+                            .into(),
+                    ));
+                }
+                on_sql.push_str(&format!(" AND ({})", expr_sql(&up, &flattened)?));
+            }
+            if pending_bcast
+                .iter()
+                .any(|&bi| steps[bi].residual_filter.is_some())
+            {
+                return Err(Error::Unsupported(
+                    "auto-distribute: residual filters on replicated-dimension joins alongside \
+                     an outer shuffle join are not supported"
+                        .into(),
+                ));
+            }
+        }
         let join_kw = sql_join_keyword(step.join_type)?;
         let mut join_from =
             format!("FROM shuffle_input_0 AS l {join_kw} shuffle_input_1 AS r ON {on_sql}");
-        let replicated_aliases: Vec<String> = pending_bcast
-            .iter()
-            .map(|&bi| scan_alias(&steps[bi].right).to_string())
-            .collect();
         for &bi in &pending_bcast {
             let b = &steps[bi];
             let b_alias = scan_alias(&b.right);
@@ -513,23 +554,28 @@ fn build_chain(
             alias_by_relation.insert(b_alias.to_string(), b_alias.to_string());
         }
 
-        let up = Unparser::default();
-        let residual_sql = pending_bcast
-            .iter()
-            .filter_map(|&bi| steps[bi].residual_filter.as_ref())
-            .chain(step.residual_filter.iter())
-            .map(|residual| {
-                expr_sql(
-                    &up,
-                    &flatten_join_residual(
-                        residual,
-                        &alias_by_relation,
-                        &right_alias,
-                        &replicated_aliases,
-                    ),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // INNER joins may push the residual to a post-join WHERE (equivalent there); outer joins
+        // already folded theirs into the ON clause above.
+        let residual_sql = if inner_join {
+            pending_bcast
+                .iter()
+                .filter_map(|&bi| steps[bi].residual_filter.as_ref())
+                .chain(step.residual_filter.iter())
+                .map(|residual| {
+                    expr_sql(
+                        &up,
+                        &flatten_join_residual(
+                            residual,
+                            &alias_by_relation,
+                            &right_alias,
+                            &replicated_aliases,
+                        ),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         if !residual_sql.is_empty() {
             join_from.push_str(&format!(" WHERE {}", residual_sql.join(" AND ")));
         }
@@ -603,6 +649,25 @@ fn build_chain(
     Err(Error::Unsupported(
         "auto-distribute: shuffle join chain did not produce a final aggregate stage".into(),
     ))
+}
+
+/// True when any column in `e` is qualified by one of `relations` (used to keep outer-join
+/// residuals from referencing a replicated dim whose alias is bound later in the FROM clause).
+fn expr_references_relations(e: &Expr, relations: &[String]) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut found = false;
+    let _ = e.apply(|node| {
+        if let Expr::Column(c) = node {
+            if let Some(rel) = &c.relation {
+                if relations.iter().any(|r| r == rel.table()) {
+                    found = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 fn next_sharded_left_keys(
@@ -679,6 +744,197 @@ fn finish_with_aggregate(
         stages: std::mem::take(stages),
         finalize_sql: build_finalize(p)?,
     })
+}
+
+/// KAN-26: normalize `Filter → CROSS JOIN` (a SQL comma-join) into the inner equijoin shape the
+/// broadcast / shuffle-join planners already understand.
+///
+/// `FROM orders, lineitem WHERE o_orderkey = l_orderkey AND <preds>` (TPC-H Q12) reaches the
+/// planner as a `Cross Join` with the whole WHERE parked in a `Filter` above it, and the chain /
+/// two-table paths require their equijoin keys in `on` / `join.filter` — so these queries were
+/// rejected with "shuffle join needs an equijoin key". The rewrite is semantics-preserving:
+/// cross-table conjuncts move into the join filter ([`collect_equijoin_keys`] promotes the
+/// equalities to hash keys, the rest stays residual), and single-table conjuncts push down to a
+/// `Filter` over that side. Applied bottom-up, so a multi-table comma join converges across
+/// repeated calls (each call normalizes the outermost level; pushed-down filters re-expose the
+/// next inner cross join).
+///
+/// Returns `None` when the plan has no `Filter → cross join` with at least one usable
+/// cross-table column equality — the caller then keeps the original error path.
+pub(crate) fn rewrite_comma_join_filters(lp: &LogicalPlan) -> Option<LogicalPlan> {
+    let (plan, changed) = rewrite_comma_join_node(lp);
+    changed.then_some(plan)
+}
+
+fn rewrite_comma_join_node(lp: &LogicalPlan) -> (LogicalPlan, bool) {
+    let mut changed = false;
+    let mut new_inputs = Vec::with_capacity(lp.inputs().len());
+    for input in lp.inputs() {
+        let (rewritten, child_changed) = rewrite_comma_join_node(input);
+        changed |= child_changed;
+        new_inputs.push(rewritten);
+    }
+    let mut node = if changed {
+        match lp.with_new_exprs(lp.expressions(), new_inputs) {
+            Ok(n) => n,
+            Err(_) => return (lp.clone(), false),
+        }
+    } else {
+        lp.clone()
+    };
+    if let LogicalPlan::Filter(f) = &node {
+        if let LogicalPlan::Join(j) = f.input.as_ref() {
+            if j.join_type == JoinType::Inner && j.on.is_empty() {
+                if let Some(rewritten) = convert_filter_cross_join(&f.predicate, j) {
+                    node = rewritten;
+                    changed = true;
+                }
+            }
+        }
+    }
+    (node, changed)
+}
+
+/// The relations (qualifiers) and field names one join side brings into scope, used to classify
+/// which side of the cross join a filter conjunct's columns come from.
+pub(crate) struct JoinSideScope {
+    relations: std::collections::HashSet<String>,
+    fields: std::collections::HashSet<String>,
+}
+
+impl JoinSideScope {
+    pub(crate) fn of(lp: &LogicalPlan) -> Self {
+        let mut relations = std::collections::HashSet::new();
+        let mut fields = std::collections::HashSet::new();
+        for (qualifier, field) in lp.schema().iter() {
+            if let Some(q) = qualifier {
+                relations.insert(q.table().to_string());
+            }
+            fields.insert(field.name().clone());
+        }
+        JoinSideScope { relations, fields }
+    }
+
+    pub(crate) fn contains(&self, c: &datafusion::common::Column) -> bool {
+        match &c.relation {
+            Some(r) => self.relations.contains(r.table()),
+            None => self.fields.contains(&c.name),
+        }
+    }
+}
+
+pub(crate) enum ConjunctSide {
+    Left,
+    Right,
+    Cross,
+    /// A column neither side owns (or an unqualified name both sides own) — do not rewrite.
+    Unknown,
+}
+
+pub(crate) fn conjunct_side(
+    conjunct: &Expr,
+    left: &JoinSideScope,
+    right: &JoinSideScope,
+) -> ConjunctSide {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut saw_left = false;
+    let mut saw_right = false;
+    let mut unknown = false;
+    let _ = conjunct.apply(|node| {
+        if let Expr::Column(c) = node {
+            match (left.contains(c), right.contains(c)) {
+                // Unqualified columns present on both sides are ambiguous — bail.
+                (true, true) if c.relation.is_none() => unknown = true,
+                (true, _) => saw_left = true,
+                (_, true) => saw_right = true,
+                _ => unknown = true,
+            }
+            if unknown {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    match (unknown, saw_left, saw_right) {
+        (true, _, _) => ConjunctSide::Unknown,
+        (_, true, true) => ConjunctSide::Cross,
+        (_, true, false) => ConjunctSide::Left,
+        (_, false, true) => ConjunctSide::Right,
+        // No columns at all (a constant predicate): treat as left-side, it filters rows either way.
+        (_, false, false) => ConjunctSide::Left,
+    }
+}
+
+/// `a.k = b.k` with plain columns on both sides — promotable to a shuffle hash key.
+fn is_column_equality(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::BinaryExpr(b)
+            if b.op == datafusion::logical_expr::Operator::Eq
+                && matches!(b.left.as_ref(), Expr::Column(_))
+                && matches!(b.right.as_ref(), Expr::Column(_))
+    )
+}
+
+fn convert_filter_cross_join(
+    predicate: &Expr,
+    join: &datafusion::logical_expr::Join,
+) -> Option<LogicalPlan> {
+    use datafusion::logical_expr::LogicalPlanBuilder;
+
+    let left_scope = JoinSideScope::of(&join.left);
+    let right_scope = JoinSideScope::of(&join.right);
+
+    let mut conjuncts = Vec::new();
+    super::stage_planner::flatten_and_conjuncts(predicate, &mut conjuncts);
+    let mut left_preds = Vec::new();
+    let mut right_preds = Vec::new();
+    let mut cross_preds = Vec::new();
+    for conjunct in conjuncts {
+        match conjunct_side(&conjunct, &left_scope, &right_scope) {
+            ConjunctSide::Left => left_preds.push(conjunct),
+            ConjunctSide::Right => right_preds.push(conjunct),
+            ConjunctSide::Cross => cross_preds.push(conjunct),
+            ConjunctSide::Unknown => return None,
+        }
+    }
+    // Only rewrite when at least one cross-table equality can become a shuffle key; otherwise
+    // the conversion buys nothing and the original error path is clearer.
+    if !cross_preds.iter().any(is_column_equality) {
+        return None;
+    }
+
+    let push_down = |side: &LogicalPlan, preds: Vec<Expr>| -> Option<LogicalPlan> {
+        if preds.is_empty() {
+            return Some(side.clone());
+        }
+        let combined = preds.into_iter().reduce(Expr::and)?;
+        LogicalPlanBuilder::from(side.clone())
+            .filter(combined)
+            .ok()?
+            .build()
+            .ok()
+    };
+    let new_left = push_down(&join.left, left_preds)?;
+    let new_right = push_down(&join.right, right_preds)?;
+
+    if let Some(existing) = &join.filter {
+        cross_preds.push(existing.clone());
+    }
+    let join_filter = cross_preds.into_iter().reduce(Expr::and)?;
+    LogicalPlanBuilder::from(new_left)
+        .join(
+            new_right,
+            JoinType::Inner,
+            (
+                Vec::<datafusion::common::Column>::new(),
+                Vec::<datafusion::common::Column>::new(),
+            ),
+            Some(join_filter),
+        )
+        .ok()?
+        .build()
+        .ok()
 }
 
 #[cfg(test)]

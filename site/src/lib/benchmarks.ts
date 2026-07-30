@@ -38,6 +38,7 @@ export const tpcdsBenchmarks = tpcdsRaw as Benchmarks;
  *  Weft keeps the brand orange; the others get clearly distinguishable hues (not faint grey). */
 export const ENGINE_COLORS: Record<string, string> = {
   weft: "var(--weft-accent)", // brand orange
+  "weft-dist": "var(--weft-accent)", // brand orange (distributed TPC-H/DS suites)
   sail: "#2563eb", // blue
   spark: "#64748b", // slate
   gluten: "#16a34a", // green

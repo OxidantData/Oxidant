@@ -23,6 +23,8 @@
 #   --key-name NAME
 #   --hosted-zone-name weft.internal
 #   --catalog-conf 'spark.sql.catalog.glue.type=glue;...'
+#   --distributed-strict true|false
+#   --prefer-hash-join true|false
 #   --extra KEY=VALUE            (repeatable raw template params)
 set -euo pipefail
 
@@ -42,7 +44,10 @@ DATA_BUCKETS=""
 GLUE="false"
 MEMORY_LIMIT=""
 SHUFFLE_SPILL=""
+SHUFFLE_PARTITIONS=""
 CATALOG_CONF=""
+DISTRIBUTED_STRICT="false"
+PREFER_HASH_JOIN="true"
 DRIVER_ROOT=40
 WORKER_ROOT=40
 DRIVER_SPILL=100
@@ -72,7 +77,10 @@ while [[ $# -gt 0 ]]; do
     --glue) GLUE="${2:?}"; shift 2 ;;
     --memory-limit-bytes) MEMORY_LIMIT="${2:?}"; shift 2 ;;
     --shuffle-spill-bytes) SHUFFLE_SPILL="${2:?}"; shift 2 ;;
+    --shuffle-partitions) SHUFFLE_PARTITIONS="${2:?}"; shift 2 ;;
     --catalog-conf) CATALOG_CONF="${2:?}"; shift 2 ;;
+    --distributed-strict) DISTRIBUTED_STRICT="${2:?}"; shift 2 ;;
+    --prefer-hash-join) PREFER_HASH_JOIN="${2:?}"; shift 2 ;;
     --driver-root-size) DRIVER_ROOT="${2:?}"; shift 2 ;;
     --worker-root-size) WORKER_ROOT="${2:?}"; shift 2 ;;
     --driver-spill-size) DRIVER_SPILL="${2:?}"; shift 2 ;;
@@ -98,6 +106,14 @@ fi
 if ! command -v aws >/dev/null 2>&1; then
   echo "error: aws CLI not found" >&2
   exit 1
+fi
+
+if [[ "${EXPOSE}" == "true" ]]; then
+  echo "error: --expose-connect true is deprecated and blocked." >&2
+  echo "  Do not put Spark Connect behind an NLB for this data plane / SF100." >&2
+  echo "  Use --expose-connect false (default) and connect to the driver instance IP" >&2
+  echo "  with --client-cidr <your-/32-or-VPC>. See docs/distributed-ec2.md." >&2
+  exit 2
 fi
 
 echo "[deploy] validating template…"
@@ -129,7 +145,10 @@ aws cloudformation deploy \
     HostedZoneName="${HOSTED_ZONE}" \
     MemoryLimitBytes="${MEMORY_LIMIT}" \
     ShuffleSpillBytes="${SHUFFLE_SPILL}" \
+    ShufflePartitions="${SHUFFLE_PARTITIONS}" \
     CatalogConf="${CATALOG_CONF}" \
+    DistributedStrict="${DISTRIBUTED_STRICT}" \
+    PreferHashJoin="${PREFER_HASH_JOIN}" \
     DataBucketArns="${DATA_BUCKETS}" \
     KeyName="${KEY_NAME}" \
     ${EXTRA_PARAMS[@]+"${EXTRA_PARAMS[@]}"}

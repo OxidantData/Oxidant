@@ -57,6 +57,21 @@ pub(crate) fn queries() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// The 22 queries with the `__WEFT_SF__` scale-factor placeholder resolved for `sf`: TPC-H
+/// Q11's HAVING fraction is spec-defined as `0.0001 / SF`, so `q11.sql` carries the token and
+/// every SF runs the correct threshold (KAN-30). All other queries pass through unchanged.
+pub(crate) fn queries_for_sf(sf: f64) -> Vec<(&'static str, String)> {
+    queries()
+        .into_iter()
+        .map(|(n, s)| (n, substitute_sf(s, sf)))
+        .collect()
+}
+
+/// Substitute the `__WEFT_SF__` placeholder (KAN-30).
+fn substitute_sf(sql: &str, sf: f64) -> String {
+    sql.replace("__WEFT_SF__", &format!("{sf}"))
+}
+
 pub struct BenchOpts<'a> {
     pub sf: f64,
     pub data: &'a Path,
@@ -100,9 +115,13 @@ pub async fn run_bench(opts: BenchOpts<'_>) {
         );
     }
 
-    let qs: Vec<Query<'_>> = queries()
+    let owned = queries_for_sf(opts.sf);
+    let qs: Vec<Query<'_>> = owned
         .iter()
-        .map(|(n, s)| Query { name: n, sql: s })
+        .map(|&(n, ref s)| Query {
+            name: n,
+            sql: s.as_str(),
+        })
         .collect();
 
     eprintln!(
@@ -178,7 +197,7 @@ pub async fn run(sf: f64, dir: &Path) {
 
     let mut failed = 0usize;
     let mut hot_total = 0.0f64;
-    for (name, raw) in queries() {
+    for (name, raw) in queries_for_sf(sf) {
         let sql = raw.trim().trim_end_matches(';').trim();
         // Three tries; hot = min of try 2 & 3 (ClickBench contract).
         let mut times = Vec::new();
@@ -383,5 +402,28 @@ mod tests {
         let a = normalize_text("2,380456.0\n1,10\n");
         let b = normalize_text("1,1.0e1\n2,380456\n");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn q11_fraction_scales_with_sf() {
+        // KAN-30: the spec fraction is 0.0001/SF; the substituted SQL must carry exactly that
+        // (and never leak the placeholder token).
+        let q11 = |sf: f64| {
+            queries_for_sf(sf)
+                .into_iter()
+                .find(|(n, _)| *n == "Q11")
+                .map(|(_, s)| s)
+                .expect("Q11")
+        };
+        assert!(q11(1.0).contains("0.0001 / 1"), "{}", q11(1.0));
+        assert!(q11(10.0).contains("0.0001 / 10"), "{}", q11(10.0));
+        assert!(q11(0.01).contains("0.0001 / 0.01"), "{}", q11(0.01));
+        for sf in [1.0, 10.0, 100.0, 0.01] {
+            assert!(!q11(sf).contains("__WEFT_SF__"), "sf={sf}");
+        }
+        // No other query carries the placeholder.
+        for (name, sql) in queries_for_sf(10.0) {
+            assert!(!sql.contains("__WEFT_SF__"), "{name}");
+        }
     }
 }

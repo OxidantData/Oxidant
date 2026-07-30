@@ -21,7 +21,7 @@ use weft_loom::Engine;
 use crate::distributed_coverage::{
     check_ratchet, plan_coverage, print_report, try_plan_with_facts, write_report,
 };
-use crate::tpch::{normalize_batches, queries};
+use crate::tpch::{normalize_batches, queries_for_sf};
 use crate::tpch_data;
 
 /// Candidate sharded facts for TPC-H (KAN-9). Order is try-order; first successful plan wins.
@@ -41,7 +41,8 @@ pub async fn run_planner_coverage(sf: f64, dir: &Path, skip_ratchet: bool) {
     let engine = Engine::new();
     register_csv(&engine, dir).await;
 
-    let qs = queries();
+    let owned = queries_for_sf(sf);
+    let qs: Vec<(&str, &str)> = owned.iter().map(|(n, s)| (*n, s.as_str())).collect();
     let all = tpch_data::TABLES.to_vec();
     let facts = FACT_TABLES.to_vec();
     let only = std::env::var("WEFT_TPCH_ONLY").ok();
@@ -112,10 +113,13 @@ pub async fn run(sf: f64, dir: &Path, num_workers: usize) {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(true);
 
+    let owned = queries_for_sf(sf);
+    let qs: Vec<(&str, &str)> = owned.iter().map(|(n, s)| (*n, s.as_str())).collect();
+
     let mut planned: Vec<(String, String, String)> = Vec::new(); // name, sql, fact
-    for (name, raw) in queries() {
+    for (name, raw) in &qs {
         if let Some(ref o) = only {
-            if name != o.as_str() {
+            if *name != o.as_str() {
                 continue;
             }
         }
@@ -147,9 +151,9 @@ pub async fn run(sf: f64, dir: &Path, num_workers: usize) {
     let (mut dist_ok, mut fallback, mut mismatch) = (0usize, 0usize, 0usize);
     // Track plan failures for queries that never entered `planned`.
     let planned_names: BTreeSet<&str> = planned.iter().map(|(n, _, _)| n.as_str()).collect();
-    for (name, _) in queries() {
+    for (name, _) in &qs {
         if let Some(ref o) = only {
-            if name != o.as_str() {
+            if *name != o.as_str() {
                 continue;
             }
         }

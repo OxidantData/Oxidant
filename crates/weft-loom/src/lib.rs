@@ -51,6 +51,9 @@ mod spark_int_literals;
 mod spark_create_table;
 mod spark_decimal;
 
+/// Memory-pool progress timestamps for the worker no-progress stage watchdog (KAN-47).
+pub mod progress_pool;
+
 /// Re-export of the exact `arrow` DataFusion uses, so every crate in the workspace encodes
 /// Arrow IPC against one version (no cross-crate `arrow` mismatch).
 pub use datafusion::arrow;
@@ -67,6 +70,24 @@ pub const NAME: &str = "loom";
 /// Parse a `usize` tuning knob from the environment (absent / unparseable → `None`).
 fn env_usize(key: &str) -> Option<usize> {
     std::env::var(key).ok().and_then(|s| s.parse().ok())
+}
+
+/// Total size in bytes of every regular file under `dir`, recursively. Best-effort —
+/// unreadable entries count as 0 (spill files churn while the watchdog walks).
+pub fn dir_bytes(dir: &std::path::Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += dir_bytes(&path);
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
 }
 
 /// Parse a boolean tuning knob from the environment. Accepts `1/0`, `true/false`, `on/off`
@@ -1722,6 +1743,193 @@ fn aggregate_plan_metric(plan: &dyn datafusion::physical_plan::ExecutionPlan, na
     total
 }
 
+/// Session join-strategy preference from `WEFT_PREFER_HASH_JOIN` (KAN-53).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinPreference {
+    /// `auto` — the default (also the fallback for unset/empty/unrecognized values): the
+    /// engine chooses per query instead of per deployment. A query's partitioned equijoins
+    /// run as hash joins only when every build side is positively estimated to fit the
+    /// KAN-25 budget ([`Engine::hash_join_build_budget`]); over budget OR with no usable
+    /// build-side statistics the query is re-planned with spill-capable sort-merge joins
+    /// (unknown ⇒ safe: an unaccounted hash build can OOM-kill the worker before the
+    /// runtime pool-exhaustion retry fires — SF10 TPC-H Q16/Q21, TPC-DS Q11; KAN-57).
+    /// Without a bounded pool there is no budget to guard, so plans keep their hash
+    /// joins. The runtime pool-exhaustion retry (and the KAN-53 stall-retry) remains the
+    /// backstop for estimates that undershoot in the other direction.
+    Auto,
+    /// `true`/`1`/`on`/`yes`: force DataFusion's in-memory hash join session-wide (the
+    /// pre-KAN-53 behavior when the variable was set).
+    ForceHash,
+    /// `false`/`0`/`off`/`no`: force spill-capable sort-merge joins for partitioned
+    /// equijoins session-wide.
+    ForceSortMerge,
+}
+
+/// Parse `WEFT_PREFER_HASH_JOIN` as the KAN-53 tri-state (`auto`|`true`|`false`). Before
+/// KAN-53 this was a plain boolean force; `auto` is now the default so the engine picks a
+/// strategy per join from build-side statistics rather than coin-flipping one per
+/// deployment (TPC-DS SF10: Q93 wants hash, Q58 wants sort-merge).
+fn join_preference() -> JoinPreference {
+    let Ok(raw) = std::env::var("WEFT_PREFER_HASH_JOIN") else {
+        return JoinPreference::Auto;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => JoinPreference::ForceHash,
+        "0" | "false" | "off" | "no" => JoinPreference::ForceSortMerge,
+        _ => JoinPreference::Auto,
+    }
+}
+
+tokio::task_local! {
+    /// KAN-53 stall-retry marker: installed by the Flight worker when it re-runs a stage
+    /// task that the KAN-47 no-progress watchdog aborted, so the engine plans the retry
+    /// with the OPPOSITE join strategy (hash ⇄ sort-merge) from the first attempt.
+    /// Task-local — concurrent stage tasks on one worker keep independent selections
+    /// (same idiom as `shard::with_replicated_tables`).
+    static JOIN_STRATEGY_FLIP: ();
+}
+
+/// Whether the current task is a KAN-53 stall-retry attempt (see [`JOIN_STRATEGY_FLIP`]).
+fn join_strategy_flipped() -> bool {
+    JOIN_STRATEGY_FLIP.try_with(|_| ()).is_ok()
+}
+
+/// Run `future` as a KAN-53 stall-retry attempt: [`Engine::collect_join_guarded`] and
+/// [`Engine::sql_stream`] plan it with the join strategy opposite to the first attempt's
+/// physical plan, bypassing the `auto`/forced selection — the flip IS the retry.
+pub async fn with_join_strategy_flipped<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    JOIN_STRATEGY_FLIP.scope((), future).await
+}
+
+/// Default ceiling for a single hash-join build side, as a fraction of the bounded memory
+/// pool (`WEFT_MEMORY_LIMIT_BYTES`); overridable via `WEFT_HASH_JOIN_MAX_BUILD_FRACTION`.
+/// KAN-25: DataFusion 54's `HashJoinExec` registers its build side with the runtime memory
+/// pool (`HashJoinInput`) but is NOT spillable — once the bounded pool fills, the build
+/// fails with `Resources Exhausted` instead of spilling, and its untracked overhead (the
+/// merged build batch, hash-table growth, probe-side buffering) can push worker RSS far
+/// past the pool and wedge the query against the cgroup limit. The guard built on this
+/// budget re-plans such queries with spill-capable sort-merge joins.
+const DEFAULT_HASH_JOIN_MAX_BUILD_FRACTION: f64 = 0.25;
+
+/// Estimated in-memory width of one row of `schema`, in bytes. Fixed-width types use their
+/// exact size; variable-width values use a flat 48 bytes (offset + typical content). Only a
+/// coarse build-side size estimate: an underestimate merely defers a query to the runtime
+/// retry in [`Engine::collect_join_guarded`], an overestimate only picks the (correct,
+/// spill-capable) sort-merge join earlier.
+fn estimated_row_width(schema: &arrow::datatypes::Schema) -> usize {
+    use arrow::datatypes::DataType;
+    schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
+            DataType::Int16 | DataType::UInt16 => 2,
+            DataType::Int32
+            | DataType::UInt32
+            | DataType::Float32
+            | DataType::Date32
+            | DataType::Time32(_) => 4,
+            DataType::Int64
+            | DataType::UInt64
+            | DataType::Float64
+            | DataType::Date64
+            | DataType::Timestamp(..)
+            | DataType::Time64(_)
+            | DataType::Duration(_) => 8,
+            DataType::Decimal128(..) => 16,
+            DataType::Decimal256(..) => 32,
+            DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView => 48,
+            _ => 64,
+        })
+        .sum()
+}
+
+/// Downcast a plan node to a hash join, if it is one. (DataFusion 54's `ExecutionPlan`
+/// supertrait is `Any` directly — there is no `as_any()` adapter.)
+fn as_hash_join(
+    plan: &dyn datafusion::physical_plan::ExecutionPlan,
+) -> Option<&datafusion::physical_plan::joins::HashJoinExec> {
+    (plan as &dyn std::any::Any).downcast_ref()
+}
+
+/// Whether `plan`'s tree contains a hash join at all.
+fn contains_hash_join(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> bool {
+    as_hash_join(plan).is_some()
+        || plan
+            .children()
+            .iter()
+            .any(|c| contains_hash_join(c.as_ref()))
+}
+
+/// Estimated in-memory bytes of a hash join's build (left) side, from the child's plan
+/// statistics. Prefers row count × schema row width (`total_byte_size` under-reports for
+/// compressed scans — e.g. it is the Parquet file size); `None` when the plan carries no
+/// usable statistics (e.g. a Glue/S3 parquet scan without collected statistics, or a
+/// join-output build side). `None` is NOT "fits the budget": with a bounded pool the
+/// caller treats it as a sort-merge reroute (see [`Engine::plan_time_smj_reroute`]) —
+/// an unaccounted hash build (KAN-57) can OOM-kill the worker before the runtime
+/// pool-exhaustion retry ever fires (SF10: TPC-H Q16/Q21, TPC-DS Q11).
+fn hash_join_build_estimated_bytes(
+    hj: &datafusion::physical_plan::joins::HashJoinExec,
+) -> Option<usize> {
+    let build = hj.left();
+    let stats = build.partition_statistics(None).ok()?;
+    if let Some(rows) = stats.num_rows.get_value() {
+        return Some(rows.saturating_mul(estimated_row_width(&build.schema())));
+    }
+    stats
+        .total_byte_size
+        .get_value()
+        .copied()
+        .filter(|b| *b > 0)
+}
+
+/// Whether any hash join in `plan` has a build side estimated above `budget` bytes.
+fn hash_join_build_exceeds(
+    plan: &dyn datafusion::physical_plan::ExecutionPlan,
+    budget: usize,
+) -> bool {
+    if let Some(hj) = as_hash_join(plan) {
+        if hash_join_build_estimated_bytes(hj).is_some_and(|b| b > budget) {
+            return true;
+        }
+    }
+    plan.children()
+        .iter()
+        .any(|c| hash_join_build_exceeds(c.as_ref(), budget))
+}
+
+/// Whether any hash join in `plan` has NO usable build-side estimate
+/// ([`hash_join_build_estimated_bytes`] is `None`). Distinct from
+/// [`hash_join_build_exceeds`]: unknown is not "fits".
+fn hash_join_build_estimate_unknown(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> bool {
+    if let Some(hj) = as_hash_join(plan) {
+        if hash_join_build_estimated_bytes(hj).is_none() {
+            return true;
+        }
+    }
+    plan.children()
+        .iter()
+        .any(|c| hash_join_build_estimate_unknown(c.as_ref()))
+}
+
+/// Whether an execution error is the bounded memory pool denying a reservation.
+/// DataFusion renders `DataFusionError::ResourcesExhausted` as "Resources Exhausted: …";
+/// match textually so wrapped / contextual errors still count.
+fn is_pool_exhausted(err: &datafusion::error::DataFusionError) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("resources exhausted")
+}
+
 /// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
 /// operators behind the same surface in Phase 1.
 pub struct Engine {
@@ -1761,6 +1969,17 @@ pub struct Engine {
     /// Set permanently on Flight workers so losing a distributed stage's task-local snapshot
     /// scope fails rather than silently resolving a newer lakehouse snapshot.
     require_lakehouse_snapshot_pins: Arc<AtomicBool>,
+    /// The bounded spill-pool size in bytes (`WEFT_MEMORY_LIMIT_BYTES`), when configured.
+    /// Drives the KAN-25 hash-join memory guard ([`Engine::collect_join_guarded`]); `None`
+    /// (unbounded pool) disables the guard entirely.
+    memory_pool_bytes: Option<usize>,
+    /// Last-activity timestamp of the engine's memory pool (grow/shrink/try_grow) — a
+    /// worker-wide operator-progress signal for the stage no-progress watchdog (KAN-47).
+    pool_activity: progress_pool::PoolActivity,
+    /// This engine's dedicated DataFusion spill directory (sort/aggregate spill files).
+    /// Kept out of the shared OS temp root so the watchdog can size it cheaply; removed
+    /// on `Drop` like [`Engine::warehouse`].
+    spill_dir: PathBuf,
 }
 
 impl Engine {
@@ -1778,9 +1997,31 @@ impl Engine {
     /// - `WEFT_COALESCE_BATCHES` (bool) — coalesce small batches after filtering.
     /// - `WEFT_REPARTITION_AGGREGATIONS` (bool) — repartition before aggregation for parallelism
     ///   (the lever most likely to move the high-card `GROUP BY` queries Q32–Q34).
-    /// - `WEFT_PREFER_HASH_JOIN` (bool) — when false, use spill-capable sort-merge joins for
-    ///   partitioned equijoins instead of DataFusion's in-memory hash join.
+    /// - `WEFT_PREFER_HASH_JOIN` (`auto`|`true`|`false`, default `auto`, KAN-53) — `true`
+    ///   forces DataFusion's in-memory hash join session-wide, `false` forces spill-capable
+    ///   sort-merge joins for partitioned equijoins; `auto` chooses per query: hash joins
+    ///   only when each build side is positively estimated to fit the KAN-25 budget below,
+    ///   sort-merge when over budget OR when no usable build-side statistics exist
+    ///   (unknown ⇒ safe; without a bounded pool, plans keep their hash joins).
+    /// - `WEFT_HASH_JOIN_MAX_BUILD_FRACTION` (f64 in (0, 1], default 0.25) — with a bounded
+    ///   pool, the per-join build-side budget (as a pool fraction) above which `auto` mode
+    ///   re-plans a query with sort-merge joins (KAN-25/KAN-53; see
+    ///   [`Engine::collect_join_guarded`]).
     pub fn new() -> Self {
+        let memory_limit = std::env::var("WEFT_MEMORY_LIMIT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        Self::new_inner(memory_limit)
+    }
+
+    /// Engine with an explicit bounded spill pool of `bytes`, independent of the process
+    /// environment — identical to [`Engine::new`] with `WEFT_MEMORY_LIMIT_BYTES=<bytes>`.
+    /// Used by tests and by callers that size the pool programmatically.
+    pub fn new_with_memory_limit(bytes: usize) -> Self {
+        Self::new_inner(Some(bytes))
+    }
+
+    fn new_inner(memory_limit: Option<usize>) -> Self {
         use datafusion::prelude::SessionConfig;
 
         let mut config = SessionConfig::new();
@@ -1834,26 +2075,51 @@ impl Engine {
             if let Some(b) = env_bool("WEFT_REPARTITION_AGGREGATIONS") {
                 opts.optimizer.repartition_aggregations = b;
             }
-            if let Some(b) = env_bool("WEFT_PREFER_HASH_JOIN") {
-                opts.optimizer.prefer_hash_join = b;
+            match join_preference() {
+                JoinPreference::ForceHash => opts.optimizer.prefer_hash_join = true,
+                JoinPreference::ForceSortMerge => opts.optimizer.prefer_hash_join = false,
+                // Auto (KAN-53 default): leave the planner default (hash) as the
+                // under-budget fast path; `collect_join_guarded` / `sql_stream` re-plan
+                // per query from build-side statistics.
+                JoinPreference::Auto => {}
             }
         }
 
-        let mut ctx = match std::env::var("WEFT_MEMORY_LIMIT_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            Some(bytes) => {
-                use datafusion::execution::memory_pool::FairSpillPool;
-                use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-                use std::sync::Arc;
-                let env = RuntimeEnvBuilder::new()
-                    .with_memory_pool(Arc::new(FairSpillPool::new(bytes)))
-                    .build_arc()
-                    .expect("runtime env");
-                SessionContext::new_with_config_rt(config, env)
-            }
-            None => SessionContext::new_with_config(config),
+        // A process+atomic-unique id scopes this engine's managed dirs (warehouse + DF spill).
+        let id = WAREHOUSE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A dedicated per-engine DataFusion spill dir (sort/aggregate spill files), nested
+        // under the OS temp root exactly like DataFusion's default `TempOs` placement but
+        // owned by this engine, so the worker watchdog can size it cheaply as a progress
+        // signal (KAN-47) and `Drop` can reclaim it like the warehouse dir.
+        let spill_dir = std::env::temp_dir().join("weft-df-spill").join(format!(
+            "{}-{}",
+            std::process::id(),
+            id
+        ));
+        // DataFusion's disk manager `create_dir`s the configured dir itself (parents must
+        // exist already), so create the full path up front.
+        std::fs::create_dir_all(&spill_dir).expect("create DataFusion spill dir");
+        let (pool_activity, mut ctx) = {
+            use datafusion::execution::memory_pool::{
+                FairSpillPool, MemoryPool, UnboundedMemoryPool,
+            };
+            use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+            use std::sync::Arc;
+            // With `WEFT_MEMORY_LIMIT_BYTES` set: the bounded `FairSpillPool` (aggregations/
+            // sorts spill instead of OOM-killing); unset: the unbounded pool — DataFusion's
+            // own default. Either way the pool is wrapped so operator memory activity is
+            // timestamped for the no-progress watchdog.
+            let inner: Arc<dyn MemoryPool> = match memory_limit {
+                Some(bytes) => Arc::new(FairSpillPool::new(bytes)),
+                None => Arc::new(UnboundedMemoryPool::default()),
+            };
+            let (pool, activity) = progress_pool::ProgressMemoryPool::new(inner);
+            let env = RuntimeEnvBuilder::new()
+                .with_memory_pool(pool)
+                .with_temp_file_path(&spill_dir)
+                .build_arc()
+                .expect("runtime env");
+            (activity, SessionContext::new_with_config_rt(config, env))
         };
         register_spark_function_aliases(&ctx);
         spark_functions::register(&ctx);
@@ -1867,7 +2133,6 @@ impl Engine {
         }
         // A process+atomic-unique managed warehouse dir for `CREATE TABLE … USING <fmt>` tables.
         // Created lazily (per-table `create_dir_all` in `Engine::sql`) and torn down on `Drop`.
-        let id = WAREHOUSE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let warehouse = std::env::temp_dir().join("weft-warehouse").join(format!(
             "{}-{}",
             std::process::id(),
@@ -1885,7 +2150,24 @@ impl Engine {
             )),
             created_tables: Mutex::new(HashMap::new()),
             require_lakehouse_snapshot_pins: Arc::new(AtomicBool::new(false)),
+            memory_pool_bytes: memory_limit,
+            pool_activity,
+            spill_dir,
         }
+    }
+
+    /// Milliseconds since engine construction of the last memory-pool `grow`/`shrink`/
+    /// `try_grow` — a worker-wide operator-activity signal for the stage no-progress
+    /// watchdog (KAN-47). Any live operator work touches the pool; a parked query goes silent.
+    pub fn pool_activity_ms(&self) -> u64 {
+        self.pool_activity.last_activity_ms()
+    }
+
+    /// Total bytes currently on disk in this engine's DataFusion spill directory —
+    /// a second worker-wide progress signal (frozen under the spill-pool deadlock class).
+    /// Best-effort: a missing/unreadable dir counts as 0.
+    pub fn spill_dir_bytes(&self) -> u64 {
+        dir_bytes(&self.spill_dir)
     }
 
     /// Import UDF definitions from JSON (distributed worker sync).
@@ -2019,10 +2301,7 @@ impl Engine {
             return Ok(vec![]);
         }
         let df = self.plan_spark(query).await?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| Error::Execution(e.to_string()))?;
+        let batches = self.collect_join_guarded(df).await?;
         // The view planned/created successfully — update the temp-view registry. A new temporary
         // view is recorded; a persistent view with the same name removes any prior temp entry
         // (DataFusion keeps a single namespace, so the persistent definition now shadows it).
@@ -2226,6 +2505,16 @@ impl Engine {
         catalog_bridge::capture_lakehouse_snapshots(self.logical_plan(query)).await
     }
 
+    /// Run an arbitrary planning future while capturing the exact Delta/Iceberg identities
+    /// it resolves — the generic counterpart of [`Engine::logical_plan_with_lakehouse_snapshots`]
+    /// for callers that build a logical plan without SQL (the Spark Connect DataFrame path).
+    pub async fn capture_lakehouse_snapshots<F, T>(&self, future: F) -> Result<(T, String)>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        catalog_bridge::capture_lakehouse_snapshots(future).await
+    }
+
     /// Execute worker SQL under snapshot pins serialized by the driver.
     pub async fn sql_with_lakehouse_snapshots(
         &self,
@@ -2320,6 +2609,345 @@ impl Engine {
             .map_err(|e| Error::Execution(e.to_string()))
     }
 
+    /// The build-side budget in bytes for the KAN-25 hash-join memory guard: a fraction of
+    /// the bounded pool (`WEFT_HASH_JOIN_MAX_BUILD_FRACTION`, default
+    /// [`DEFAULT_HASH_JOIN_MAX_BUILD_FRACTION`]). `None` when the engine runs unbounded (no
+    /// `WEFT_MEMORY_LIMIT_BYTES`) — the guard is then fully off and behavior is unchanged.
+    fn hash_join_build_budget(&self) -> Option<usize> {
+        let fraction = std::env::var("WEFT_HASH_JOIN_MAX_BUILD_FRACTION")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|f| *f > 0.0 && *f <= 1.0)
+            .unwrap_or(DEFAULT_HASH_JOIN_MAX_BUILD_FRACTION);
+        self.memory_pool_bytes
+            .map(|pool| (pool as f64 * fraction) as usize)
+    }
+
+    /// Whether the KAN-25 sort-merge fallback is explicitly allowed (env
+    /// `WEFT_SORT_MERGE_FALLBACK`, default **false**, KAN-45). DataFusion 54.0's
+    /// sort-merge/external-sort pipeline could deadlock under a bounded `FairSpillPool` at
+    /// scale: a spilling operator stalls waiting for pool memory while its consumer stops
+    /// draining a `RepartitionExec` channel, and the whole query parks with zero CPU/IO
+    /// until the stage timeout kills it (observed live at TPC-DS SF10 on Q11/Q72/Q93;
+    /// upstream: delta-io/delta-rs#4614). The 54.1.0 upgrade fixed that deadlock, so the
+    /// KAN-53 `auto` join selection re-plans with sort-merge by default
+    /// ([`Engine::smj_replan_allowed`]); this knob remains as an opt-in that also allows
+    /// the re-plan when `WEFT_PREFER_HASH_JOIN` forces a strategy.
+    fn smj_fallback_enabled() -> bool {
+        std::env::var("WEFT_SORT_MERGE_FALLBACK")
+            .ok()
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Whether a query may be re-planned with sort-merge joins (KAN-25/KAN-53): explicitly
+    /// via the KAN-45 [`Engine::smj_fallback_enabled`] opt-in, or implicitly under the
+    /// KAN-53 default `auto` join selection — the DataFusion 54.1.0 upgrade fixed the
+    /// bounded-pool sort-merge deadlock the KAN-45 default guarded against. Forced
+    /// `WEFT_PREFER_HASH_JOIN=true|false` without the opt-in keeps the KAN-45 fail-fast
+    /// behavior.
+    fn smj_replan_allowed() -> bool {
+        Self::smj_fallback_enabled() || join_preference() == JoinPreference::Auto
+    }
+
+    /// Whether the plan-time guard reroutes `plan` to a sort-merge re-plan: a bounded-pool
+    /// build-side estimate over the KAN-25 budget ([`Engine::hash_join_build_budget`]) —
+    /// or NO usable estimate at all — with the re-plan allowed
+    /// ([`Engine::smj_replan_allowed`]). Shared by [`Engine::collect_join_guarded`] and
+    /// [`Engine::sql_stream`] so the auto selection is one predicate.
+    ///
+    /// Unknown ⇒ sort-merge, not hash: a hash build whose size the planner cannot see is
+    /// exactly the shape that OOM-killed SF10 workers (TPC-H Q16/Q21, TPC-DS Q11) — the
+    /// build is not fully pool-accounted (KAN-57), so the runtime pool-exhaustion retry
+    /// never fires before the cgroup killer. Hash is chosen only when statistics
+    /// positively say the build fits the budget; the runtime retry remains the backstop
+    /// for estimates that undershoot in the other direction. Without a bounded pool there
+    /// is no budget to fit, so the plan always keeps its hash joins (unchanged).
+    fn plan_time_smj_reroute(&self, plan: &dyn datafusion::physical_plan::ExecutionPlan) -> bool {
+        let Some(budget) = self.hash_join_build_budget() else {
+            return false;
+        };
+        if !Self::smj_replan_allowed() {
+            return false;
+        }
+        hash_join_build_exceeds(plan, budget) || hash_join_build_estimate_unknown(plan)
+    }
+
+    /// The join strategy a KAN-53 stall-retry flip re-plans with (`true` = hash): the
+    /// opposite of what the first attempt actually RAN — its plan-time sort-merge reroute
+    /// ([`Engine::plan_time_smj_reroute`]) when that engaged, else the session plan's own
+    /// joins. (Re-deriving from the fresh session plan alone would misread an over-budget
+    /// `auto` first attempt, whose executed plan was the rerouted sort-merge one.)
+    fn flip_prefer_hash(&self, plan: &dyn datafusion::physical_plan::ExecutionPlan) -> bool {
+        if self.plan_time_smj_reroute(plan) {
+            return true; // the first attempt ran the sort-merge reroute
+        }
+        !contains_hash_join(plan)
+    }
+
+    /// Re-plan `logical` with `prefer_hash_join` set to `prefer_hash` on a query-scoped
+    /// session state that shares this engine's catalogs, function registries and —
+    /// load-bearing — its runtime environment (the same bounded `FairSpillPool`). With
+    /// `prefer_hash=false` the result is a physical plan whose partitioned equijoins are
+    /// spill-capable sort-merge joins (KAN-25). Session-global config is never mutated, so
+    /// concurrent queries on this engine keep their own join selection.
+    ///
+    /// `sort_spill_reservation_bytes` is lowered to 1 MiB for a sort-merge re-plan: with
+    /// DataFusion's 10 MiB default, `partitions × 2` sorters on a tight pool can each be
+    /// denied their minimum reservation ("Not enough memory to continue external sort"),
+    /// which would make the retry fail where the hash join only errored — the fallback must
+    /// be able to spill its way through pools far smaller than the join inputs.
+    async fn physical_plan_with_join_preference(
+        &self,
+        logical: datafusion::logical_expr::LogicalPlan,
+        prefer_hash: bool,
+    ) -> Result<(
+        SessionContext,
+        Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    )> {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        let mut config = self.ctx.state().config().clone();
+        // The query-scoped session SHARES this engine's catalog list; DataFusion's default
+        // `create_default_catalog_and_schema=true` would make `SessionStateBuilder::build()`
+        // register a fresh EMPTY default catalog into that shared list, wiping every table
+        // the engine has registered (latent KAN-25 bug — a worker taking the sort-merge
+        // fallback lost its registered tables for all later queries — exposed by KAN-53's
+        // flipped-retry path, which queries the engine again after a re-plan).
+        config = config.with_create_default_catalog_and_schema(false);
+        {
+            let opts = config.options_mut();
+            opts.optimizer.prefer_hash_join = prefer_hash;
+            if !prefer_hash {
+                opts.execution.sort_spill_reservation_bytes =
+                    opts.execution.sort_spill_reservation_bytes.min(1024 * 1024);
+            }
+        }
+        let state = SessionStateBuilder::new_from_existing(self.ctx.state())
+            .with_config(config)
+            .build();
+        // The returned context is load-bearing: the plan must be COLLECTED under its
+        // `task_ctx` (same shared catalog/runtime/pool, fallback config), or execution
+        // reads the original session's options — e.g. the 10 MiB sort spill reservation
+        // this session deliberately lowers.
+        let ctx = SessionContext::new_with_state(state);
+        let df = ctx
+            .execute_logical_plan(logical)
+            .await
+            .map_err(|e| Error::Plan(e.to_string()))?;
+        let plan = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        Ok((ctx, plan))
+    }
+
+    /// Re-plan `logical` with sort-merge joins — the KAN-25 fallback shape; see
+    /// [`Engine::physical_plan_with_join_preference`].
+    async fn sort_merge_physical_plan(
+        &self,
+        logical: datafusion::logical_expr::LogicalPlan,
+    ) -> Result<(
+        SessionContext,
+        Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    )> {
+        self.physical_plan_with_join_preference(logical, false)
+            .await
+    }
+
+    /// Give the doomed first attempt's surviving partition streams a moment to release
+    /// their pool reservations before the sort-merge retry claims its own. When a hash-join
+    /// build errors out of `collect`, the other partitions' streams are still finishing
+    /// asynchronously and hold most of the pool; they drain within a few hundred ms, and
+    /// retrying against a still-full pool starves the fallback's external sorters
+    /// ("Not enough memory to continue external sort"). Bounded at 10 s — if the pool never
+    /// drains (a concurrent third query holding it, e.g.) the retry proceeds anyway and may
+    /// fail with the actionable error rather than wedging.
+    async fn wait_for_pool_drain(&self) {
+        let Some(pool_bytes) = self.memory_pool_bytes else {
+            return;
+        };
+        let pool = &self.ctx.task_ctx().runtime_env().memory_pool;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pool.reserved() > pool_bytes / 4 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Collect a row-returning DataFrame under the KAN-25/KAN-53 join guard. With no
+    /// bounded pool this is exactly `df.collect()`. With a pool:
+    /// 1. stall-retry (KAN-53) — a watchdog-aborted stage's retry attempt runs the OPPOSITE
+    ///    join strategy from the first attempt's plan ([`with_join_strategy_flipped`]);
+    /// 2. plan time — if any hash join's build side is estimated above
+    ///    [`Engine::hash_join_build_budget`], re-plan and run with sort-merge joins when
+    ///    [`Engine::smj_replan_allowed`] (KAN-53 `auto` default or the KAN-45 opt-in);
+    /// 3. runtime — if execution exhausts the pool under a hash join (statistics can
+    ///    underestimate, e.g. wide strings), retry once with sort-merge joins (same gate);
+    /// 4. if the retry also fails, or the re-plan is not allowed, return an actionable
+    ///    error instead of wedging the worker.
+    ///
+    /// Queries that neither trip the estimate nor exhaust the pool are byte-for-byte on the
+    /// old path, so hash-join-friendly queries keep their current performance.
+    async fn collect_join_guarded(
+        &self,
+        df: datafusion::dataframe::DataFrame,
+    ) -> Result<Vec<RecordBatch>> {
+        let plan = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        // KAN-53 stall-retry: the worker re-runs a watchdog-aborted stage under
+        // `with_join_strategy_flipped`; plan the retry with the strategy opposite to the
+        // first attempt's (hash ⇄ sort-merge), bypassing the selection below — the flip
+        // IS the retry, so it also bypasses `smj_replan_allowed`.
+        if join_strategy_flipped() {
+            let prefer_hash = self.flip_prefer_hash(plan.as_ref());
+            let (flip_ctx, flip_plan) = self
+                .physical_plan_with_join_preference(df.logical_plan().clone(), prefer_hash)
+                .await?;
+            self.wait_for_pool_drain().await;
+            return datafusion::physical_plan::collect(flip_plan, flip_ctx.task_ctx())
+                .await
+                .map_err(|e| Error::Execution(e.to_string()));
+        }
+        if self.plan_time_smj_reroute(plan.as_ref()) {
+            if let Ok((smj_ctx, smj)) = self
+                .sort_merge_physical_plan(df.logical_plan().clone())
+                .await
+            {
+                return datafusion::physical_plan::collect(smj, smj_ctx.task_ctx())
+                    .await
+                    .map_err(|e| Error::Execution(e.to_string()));
+            }
+            // Re-planning failed (a join shape sort-merge cannot take, e.g.): fall through
+            // to the hash plan — the runtime guard below still bounds the blast radius.
+        }
+        // KAN-45: with the sort-merge re-plan not allowed (a forced
+        // `WEFT_PREFER_HASH_JOIN=true|false` without WEFT_SORT_MERGE_FALLBACK) an
+        // over-budget build runs the hash plan anyway; a pool overflow then fails fast
+        // (below) rather than rerouting silently.
+        match datafusion::physical_plan::collect(plan.clone(), self.ctx.task_ctx()).await {
+            Ok(batches) => Ok(batches),
+            Err(e) => {
+                let had_hash_join = contains_hash_join(plan.as_ref());
+                drop(plan);
+                if is_pool_exhausted(&e) && had_hash_join && Self::smj_replan_allowed() {
+                    self.wait_for_pool_drain().await;
+                    let (smj_ctx, smj) = self
+                        .sort_merge_physical_plan(df.logical_plan().clone())
+                        .await?;
+                    return datafusion::physical_plan::collect(smj, smj_ctx.task_ctx())
+                        .await
+                        .map_err(|retry| {
+                            Error::Execution(format!(
+                                "query exhausted the WEFT_MEMORY_LIMIT_BYTES pool under a \
+                                 non-spillable hash join and the sort-merge retry failed: \
+                                 {retry}"
+                            ))
+                        });
+                }
+                if is_pool_exhausted(&e) && had_hash_join {
+                    return Err(Error::Execution(format!(
+                        "query exhausted the WEFT_MEMORY_LIMIT_BYTES pool under a \
+                         non-spillable hash join: {e}. The KAN-25 sort-merge fallback is \
+                         not allowed for this session (a forced WEFT_PREFER_HASH_JOIN \
+                         without WEFT_SORT_MERGE_FALLBACK); use the default \
+                         WEFT_PREFER_HASH_JOIN=auto, set WEFT_SORT_MERGE_FALLBACK=true, or \
+                         raise WEFT_MEMORY_LIMIT_BYTES / WEFT_HASH_JOIN_MAX_BUILD_FRACTION."
+                    )));
+                }
+                Err(Error::Execution(e.to_string()))
+            }
+        }
+    }
+
+    /// Execute a row-returning `query` as a **stream** of record batches (KAN-32) instead of
+    /// collecting it whole. Distributed producer stages use this to pipeline hash
+    /// partitioning and shuffle spill with execution, so a large stage output never sits
+    /// fully materialized in worker memory outside the bounded pool.
+    ///
+    /// Planning is identical to [`Engine::sql`] (same Spark rewrites via `plan_spark`), and
+    /// the KAN-25 plan-time fallback applies when [`Engine::smj_replan_allowed`] (KAN-53
+    /// `auto` default or the KAN-45 opt-in): when a hash join's build side is estimated
+    /// above the pool budget, the stream runs the sort-merge plan instead. A *runtime* pool
+    /// exhaustion surfaces as a stream error — callers should discard any partial output
+    /// and retry through [`Engine::sql`]; a failed stream must never be retried in place,
+    /// or already-emitted rows would be duplicated.
+    ///
+    /// A KAN-53 stall-retry attempt ([`with_join_strategy_flipped`]) runs the OPPOSITE join
+    /// strategy from the first attempt's plan, mirroring [`Engine::collect_join_guarded`].
+    pub async fn sql_stream(
+        &self,
+        query: &str,
+    ) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        let df = self.plan_spark(query).await?;
+        // KAN-53 stall-retry (mirrors `collect_join_guarded`): plan the retried stage with
+        // the join strategy opposite to the first attempt's — the flip bypasses the
+        // auto/forced selection below.
+        if join_strategy_flipped() {
+            let plan = df
+                .create_physical_plan()
+                .await
+                .map_err(|e| Error::Execution(e.to_string()))?;
+            let prefer_hash = self.flip_prefer_hash(plan.as_ref());
+            let (flip_ctx, flip_plan) = self
+                .physical_plan_with_join_preference(df.logical_plan().clone(), prefer_hash)
+                .await?;
+            self.wait_for_pool_drain().await;
+            // Merge the re-planned partitions into one stream (stage output is unordered
+            // by contract — ORDER BY/LIMIT live in the driver finalize).
+            let merged: Arc<dyn datafusion::physical_plan::ExecutionPlan> = Arc::new(
+                datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+                    flip_plan,
+                ),
+            );
+            return merged
+                .execute(0, flip_ctx.task_ctx())
+                .map_err(|e| Error::Execution(e.to_string()));
+        }
+        if self.hash_join_build_budget().is_some() {
+            let plan = df
+                .create_physical_plan()
+                .await
+                .map_err(|e| Error::Execution(e.to_string()))?;
+            if self.plan_time_smj_reroute(plan.as_ref()) {
+                if let Ok((smj_ctx, smj)) = self
+                    .sort_merge_physical_plan(df.logical_plan().clone())
+                    .await
+                {
+                    // Merge the sort-merge plan's partitions into one stream (stage output
+                    // is unordered by contract — ORDER BY/LIMIT live in the driver finalize).
+                    let merged: Arc<dyn datafusion::physical_plan::ExecutionPlan> = Arc::new(
+                        datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+                            smj,
+                        ),
+                    );
+                    return merged
+                        .execute(0, smj_ctx.task_ctx())
+                        .map_err(|e| Error::Execution(e.to_string()));
+                }
+                // Re-planning failed (a join shape sort-merge cannot take, e.g.): fall
+                // through to the hash plan — a runtime pool exhaustion then surfaces as a
+                // stream error and the caller's collect fallback bounds the blast radius.
+            }
+        }
+        df.execute_stream()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))
+    }
+
+    /// Stream worker SQL under snapshot pins serialized by the driver — the streaming
+    /// counterpart of [`Engine::sql_with_lakehouse_snapshots`]. The pins scope covers
+    /// planning, which is where lakehouse tables resolve; the returned stream reads the
+    /// pinned providers captured in the physical plan.
+    pub async fn sql_stream_with_lakehouse_snapshots(
+        &self,
+        query: &str,
+        pins_json: &str,
+    ) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        catalog_bridge::with_lakehouse_snapshots(pins_json, self.sql_stream(query)).await
+    }
+
     /// Run a row-returning `query` and return its result batches **plus** execution statistics —
     /// the substrate for Databricks-style observability (duration, rows, bytes scanned).
     ///
@@ -2377,6 +3005,12 @@ impl Engine {
             .register_table(name, Arc::new(table))
             .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
         Ok(())
+    }
+
+    /// Deregister a table previously registered via [`Self::register_batches`] (e.g. a finished
+    /// stage's `shuffle_input`). A missing name is a no-op.
+    pub fn deregister_table(&self, name: &str) {
+        let _ = self.ctx.deregister_table(name);
     }
 
     /// Snapshot of the session state, for building a `FunctionRegistry`/codec when
@@ -4345,12 +4979,15 @@ impl Default for Engine {
 }
 
 impl Drop for Engine {
-    /// Tear down this engine's managed warehouse directory (the `CREATE TABLE … USING <fmt>`
-    /// format-backed storage). Best-effort: a leftover temp dir is harmless, so failures are
-    /// ignored.
+    /// Tear down this engine's managed directories: the warehouse (the `CREATE TABLE …
+    /// USING <fmt>` format-backed storage) and the DataFusion spill dir. Best-effort: a
+    /// leftover temp dir is harmless, so failures are ignored.
     fn drop(&mut self) {
         if self.warehouse.exists() {
             let _ = std::fs::remove_dir_all(&self.warehouse);
+        }
+        if self.spill_dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.spill_dir);
         }
     }
 }
@@ -5526,8 +6163,8 @@ mod tests {
 
     #[tokio::test]
     async fn register_batches_is_queryable() {
-        use arrow::array::Int64Array;
-        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
@@ -5635,5 +6272,863 @@ mod tests {
             .value(0);
         assert_eq!((c, s), (4, 10));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- KAN-25: hash-join build-side memory guard -----------------------------
+
+    /// Serializes the join-guard tests that mutate `WEFT_SORT_MERGE_FALLBACK` /
+    /// `WEFT_TARGET_PARTITIONS` / `WEFT_BATCH_SIZE` (process-global env).
+    static JOIN_GUARD_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// `(k, v)` Int64 batches, `rows` total split across 4 partitions; keys are `i % key_mod`
+    /// so the big table joins the small one exactly once per row.
+    fn join_guard_kv_batches(rows: i64, key_mod: i64) -> Vec<RecordBatch> {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let per = rows / 4;
+        (0..4)
+            .map(|p| {
+                let start = p * per;
+                let ks: Vec<i64> = (start..start + per).map(|i| i % key_mod).collect();
+                let vs: Vec<i64> = (start..start + per).collect();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(ks)),
+                        Arc::new(Int64Array::from(vs)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// `(k, s)` batches with a `width`-char string column, so the in-memory build side is far
+    /// larger than the row-count × flat-width estimate the plan-time guard computes. Emits
+    /// 1024-row batches (one MemTable partition): external sorters reserve memory per
+    /// incoming batch, and a single giant batch would make one `try_grow` exceed the whole
+    /// pool — an artifact of the test data layout, not of the guard.
+    fn join_guard_wide_batches(rows: i64, key_mod: i64, width: usize) -> Vec<RecordBatch> {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let filler = "x".repeat(width);
+        let per = 1024;
+        (0..rows)
+            .step_by(per as usize)
+            .map(|start| {
+                let end = (start + per).min(rows);
+                let ks: Vec<i64> = (start..end).map(|i| i % key_mod).collect();
+                let ss: Vec<&str> = (start..end).map(|_| filler.as_str()).collect();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(ks)),
+                        Arc::new(StringArray::from(ss)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn join_guard_row_width_counts_fixed_and_variable() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("c", DataType::Int32, false),
+        ]);
+        assert_eq!(estimated_row_width(&schema), 8 + 48 + 4);
+    }
+
+    #[test]
+    fn join_guard_detects_pool_exhaustion_errors() {
+        assert!(is_pool_exhausted(
+            &datafusion::error::DataFusionError::ResourcesExhausted(
+                "Failed to allocate additional 1024 for HashJoinInput[0]".to_string()
+            )
+        ));
+        assert!(!is_pool_exhausted(
+            &datafusion::error::DataFusionError::Execution("boom".to_string())
+        ));
+    }
+
+    #[tokio::test]
+    async fn join_guard_off_without_bounded_pool() {
+        let engine = Engine::new();
+        assert_eq!(engine.memory_pool_bytes, None);
+        assert_eq!(engine.hash_join_build_budget(), None);
+    }
+
+    #[tokio::test]
+    async fn join_guard_estimates_build_side_from_plan_statistics() {
+        let engine = Engine::new();
+        engine
+            .register_batches("left_t", join_guard_kv_batches(100_000, 100_000))
+            .unwrap();
+        engine
+            .register_batches("right_t", join_guard_kv_batches(200_000, 200_000))
+            .unwrap();
+        // DataFusion's JoinSelection builds the smaller side (by `total_byte_size`), so the
+        // build is `left_t`; the scan projects only the join key, i.e. 100k rows × 8 B/row
+        // = 800 KB estimated. Big-build plans are the big⋈big shapes (TPC-H Q18/Q21) where
+        // even the smaller side blows the budget.
+        let plan = engine
+            .physical_plan("SELECT COUNT(*) AS c FROM left_t l JOIN right_t r ON l.k = r.k")
+            .await
+            .unwrap();
+        assert!(contains_hash_join(plan.as_ref()));
+        assert!(hash_join_build_exceeds(plan.as_ref(), 500_000));
+        assert!(!hash_join_build_exceeds(plan.as_ref(), usize::MAX));
+    }
+
+    #[tokio::test]
+    async fn join_guard_replan_produces_sort_merge_join() {
+        let engine = Engine::new();
+        engine
+            .register_batches("big", join_guard_kv_batches(1_000, 100))
+            .unwrap();
+        engine
+            .register_batches("small", join_guard_kv_batches(100, 100))
+            .unwrap();
+        let logical = engine
+            .logical_plan("SELECT COUNT(*) AS c FROM big b JOIN small s ON b.k = s.k")
+            .await
+            .unwrap();
+        let (_ctx, smj) = engine.sort_merge_physical_plan(logical).await.unwrap();
+        let display = datafusion::physical_plan::displayable(smj.as_ref())
+            .indent(false)
+            .to_string();
+        assert!(
+            display.contains("SortMergeJoin"),
+            "expected a sort-merge join plan, got:\n{display}"
+        );
+        assert!(!contains_hash_join(smj.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn join_guard_plan_time_fallback_completes_oversized_build() {
+        // 256 MiB pool → 64 MiB build budget (default fraction 0.25). Big⋈big 1:1 join:
+        // DataFusion builds the smaller side BY BYTES and prunes it to the join key, so the
+        // build is `right_t`'s key column — 9.5M rows × 8 B/row = 76 MB, over budget. The
+        // plan-time guard must downgrade to a sort-merge join and the query must complete
+        // with correct results. (The pool leaves the `partitions × 2` external sorters
+        // honest headroom — the runtime-retry test covers the tighter shape.)
+        // KAN-45: the sort-merge fallback is opt-in since DataFusion's sort-merge pipeline
+        // can deadlock under a bounded pool — enable it explicitly for this test.
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::set_var("WEFT_SORT_MERGE_FALLBACK", "true");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        const LEFT: i64 = 9_000_000;
+        const RIGHT: i64 = 9_500_000;
+        engine
+            .register_batches("left_t", join_guard_kv_batches(LEFT, LEFT))
+            .unwrap();
+        engine
+            .register_batches("right_t", join_guard_kv_batches(RIGHT, RIGHT))
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c, SUM(l.v) AS s FROM left_t l JOIN right_t r ON l.k = r.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        let budget = engine.hash_join_build_budget().unwrap();
+        assert_eq!(budget, 64 * 1024 * 1024);
+        assert!(
+            hash_join_build_exceeds(plan.as_ref(), budget),
+            "the oversized build side must trip the plan-time guard"
+        );
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("oversized-build join must complete under the bounded pool via sort-merge");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let s = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        // Unique keys on both sides → 1:1 match for every left row.
+        assert_eq!(c, LEFT);
+        assert_eq!(s, LEFT * (LEFT - 1) / 2);
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+    }
+
+    /// KAN-45/KAN-53: with `WEFT_PREFER_HASH_JOIN=true` forced (no `auto` selection, no
+    /// `WEFT_SORT_MERGE_FALLBACK`), an over-budget build estimate must NOT reroute to a
+    /// sort-merge plan — the query runs the hash plan (and, if the actual build fits the
+    /// pool, completes). A pool overflow instead fails fast with an actionable error
+    /// (covered by the message shape in `collect_join_guarded`).
+    #[tokio::test]
+    async fn join_guard_forced_hash_runs_overbudget_hash_plan() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        std::env::set_var("WEFT_PREFER_HASH_JOIN", "true");
+        assert!(!Engine::smj_replan_allowed());
+        // Same shape as the plan-time-fallback test but with two partitions: the estimate
+        // (76 MB) trips the 64 MiB budget, while the actual keys-only build (one copy per
+        // output partition, 2 × 76 MB) fits the 256 MiB pool — so the hash plan completes,
+        // proving a forced-hash session never detours onto the sort-merge path.
+        std::env::set_var("WEFT_TARGET_PARTITIONS", "2");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        std::env::remove_var("WEFT_TARGET_PARTITIONS");
+        const LEFT: i64 = 9_000_000;
+        const RIGHT: i64 = 9_500_000;
+        engine
+            .register_batches("left_t", join_guard_kv_batches(LEFT, LEFT))
+            .unwrap();
+        engine
+            .register_batches("right_t", join_guard_kv_batches(RIGHT, RIGHT))
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c, SUM(l.v) AS s FROM left_t l JOIN right_t r ON l.k = r.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        let budget = engine.hash_join_build_budget().unwrap();
+        assert!(hash_join_build_exceeds(plan.as_ref(), budget));
+        assert!(
+            !engine.plan_time_smj_reroute(plan.as_ref()),
+            "a forced-hash session must not reroute an over-budget build to sort-merge"
+        );
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("over-budget estimate must still run (and complete) as a hash join");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, LEFT);
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+    }
+
+    /// KAN-45/KAN-53: when a hash join genuinely exhausts the bounded pool and the
+    /// sort-merge re-plan is not allowed (forced `WEFT_PREFER_HASH_JOIN=true`, no
+    /// `WEFT_SORT_MERGE_FALLBACK`), the error must be fast and actionable — naming the
+    /// knobs that would allow the retry — not a silent reroute or a wedge.
+    #[tokio::test]
+    async fn join_guard_forced_hash_pool_overflow_errors_actionably() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        std::env::set_var("WEFT_PREFER_HASH_JOIN", "true");
+        std::env::set_var("WEFT_TARGET_PARTITIONS", "2");
+        std::env::set_var("WEFT_BATCH_SIZE", "1024");
+        let engine = Engine::new_with_memory_limit(64 * 1024 * 1024);
+        std::env::remove_var("WEFT_TARGET_PARTITIONS");
+        std::env::remove_var("WEFT_BATCH_SIZE");
+        const LEFT: i64 = 170_000;
+        const RIGHT: i64 = 340_000;
+        engine
+            .register_batches("left_wide", join_guard_wide_batches(LEFT, LEFT, 400))
+            .unwrap();
+        engine
+            .register_batches("right_wide", join_guard_wide_batches(RIGHT, RIGHT, 400))
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c, SUM(length(l.s)) AS sl, SUM(length(r.s)) AS sr \
+             FROM left_wide l JOIN right_wide r ON l.k = r.k";
+        let err = engine.sql(query).await.expect_err(
+            "pool-overflowing hash join must fail fast when the SMJ re-plan is not allowed",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("WEFT_SORT_MERGE_FALLBACK"),
+            "error must name the opt-in knob, got: {msg}"
+        );
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+    }
+
+    /// KAN-53: `WEFT_PREFER_HASH_JOIN` is a tri-state — `auto` is the default and the
+    /// fallback for empty/unrecognized values; the legacy boolean spellings still force.
+    #[tokio::test]
+    async fn join_preference_parses_auto_true_false() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        assert_eq!(join_preference(), JoinPreference::Auto);
+        for v in ["auto", "AUTO", " auto ", "", "garbage"] {
+            std::env::set_var("WEFT_PREFER_HASH_JOIN", v);
+            assert_eq!(join_preference(), JoinPreference::Auto, "value {v:?}");
+        }
+        for v in ["true", "1", "TRUE", "on", "yes"] {
+            std::env::set_var("WEFT_PREFER_HASH_JOIN", v);
+            assert_eq!(join_preference(), JoinPreference::ForceHash, "value {v:?}");
+        }
+        for v in ["false", "0", "FALSE", "off", "no"] {
+            std::env::set_var("WEFT_PREFER_HASH_JOIN", v);
+            assert_eq!(
+                join_preference(),
+                JoinPreference::ForceSortMerge,
+                "value {v:?}"
+            );
+        }
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+    }
+
+    /// KAN-53: the env override is honored — `false` forces sort-merge even for a tiny
+    /// build (no bounded pool needed), `true` forces hash, and an explicit `auto` behaves
+    /// like the default.
+    #[tokio::test]
+    async fn prefer_hash_join_env_override_honored() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        let query = "SELECT COUNT(*) AS c FROM a JOIN b ON a.k = b.k";
+        let plan_display = || async {
+            let engine = Engine::new();
+            engine
+                .register_batches("a", join_guard_kv_batches(1_000, 1_000))
+                .unwrap();
+            engine
+                .register_batches("b", join_guard_kv_batches(2_000, 2_000))
+                .unwrap();
+            let plan = engine.physical_plan(query).await.unwrap();
+            let display = datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(false)
+                .to_string();
+            (contains_hash_join(plan.as_ref()), display)
+        };
+
+        std::env::set_var("WEFT_PREFER_HASH_JOIN", "false");
+        let (has_hash, display) = plan_display().await;
+        assert!(
+            !has_hash && display.contains("SortMergeJoin"),
+            "WEFT_PREFER_HASH_JOIN=false must force sort-merge, got:\n{display}"
+        );
+
+        for v in ["true", "auto"] {
+            std::env::set_var("WEFT_PREFER_HASH_JOIN", v);
+            let (has_hash, display) = plan_display().await;
+            assert!(
+                has_hash && !display.contains("SortMergeJoin"),
+                "WEFT_PREFER_HASH_JOIN={v} must plan a hash join for a small build, got:\n{display}"
+            );
+        }
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+    }
+
+    /// KAN-53: with the default `auto` selection, a build side estimated UNDER the KAN-25
+    /// budget keeps the hash fast path — no plan-time reroute, query completes as a hash
+    /// join.
+    #[tokio::test]
+    async fn auto_join_selection_small_build_keeps_hash() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        assert_eq!(join_preference(), JoinPreference::Auto);
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        engine
+            .register_batches("big", join_guard_kv_batches(100_000, 100_000))
+            .unwrap();
+        engine
+            .register_batches("small", join_guard_kv_batches(1_000, 1_000))
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c FROM big b JOIN small s ON b.k = s.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(contains_hash_join(plan.as_ref()));
+        assert!(
+            !engine.plan_time_smj_reroute(plan.as_ref()),
+            "a build side estimated under the budget must keep the hash join"
+        );
+        let batches = engine.sql(query).await.unwrap();
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, 1_000);
+    }
+
+    /// KAN-53: with the default `auto` selection — and crucially WITHOUT the KAN-45
+    /// `WEFT_SORT_MERGE_FALLBACK` opt-in — an over-budget build estimate reroutes the
+    /// query to sort-merge at plan time and the query completes with correct results.
+    /// Same shape as `join_guard_plan_time_fallback_completes_oversized_build`, which
+    /// enables the opt-in explicitly.
+    #[tokio::test]
+    async fn auto_join_selection_large_build_reroutes_sort_merge() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        assert!(
+            !Engine::smj_fallback_enabled(),
+            "auto selection must not rely on the KAN-45 opt-in"
+        );
+        assert!(Engine::smj_replan_allowed());
+        std::env::set_var("WEFT_TARGET_PARTITIONS", "2");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        std::env::remove_var("WEFT_TARGET_PARTITIONS");
+        const LEFT: i64 = 9_000_000;
+        const RIGHT: i64 = 9_500_000;
+        engine
+            .register_batches("left_t", join_guard_kv_batches(LEFT, LEFT))
+            .unwrap();
+        engine
+            .register_batches("right_t", join_guard_kv_batches(RIGHT, RIGHT))
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c, SUM(l.v) AS s FROM left_t l JOIN right_t r ON l.k = r.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        let budget = engine.hash_join_build_budget().unwrap();
+        assert!(
+            hash_join_build_exceeds(plan.as_ref(), budget),
+            "the oversized build side must trip the budget estimate"
+        );
+        assert!(
+            engine.plan_time_smj_reroute(plan.as_ref()),
+            "auto selection must reroute an over-budget build to sort-merge"
+        );
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("auto-rerouted sort-merge join must complete under the bounded pool");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let s = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, LEFT);
+        assert_eq!(s, LEFT * (LEFT - 1) / 2);
+    }
+
+    /// KAN-53: under the default `auto` selection the runtime pool-exhaustion retry also
+    /// engages WITHOUT the KAN-45 opt-in — an under-reporting estimate whose hash build
+    /// overflows the pool at runtime is retried as sort-merge and completes. Mirrors
+    /// `join_guard_runtime_retry_when_estimate_underreports` (which sets
+    /// `WEFT_SORT_MERGE_FALLBACK=true`).
+    #[tokio::test]
+    async fn auto_runtime_retry_when_estimate_underreports() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        std::env::set_var("WEFT_TARGET_PARTITIONS", "2");
+        std::env::set_var("WEFT_BATCH_SIZE", "1024");
+        let engine = Engine::new_with_memory_limit(64 * 1024 * 1024);
+        std::env::remove_var("WEFT_TARGET_PARTITIONS");
+        std::env::remove_var("WEFT_BATCH_SIZE");
+        const LEFT: i64 = 170_000;
+        const RIGHT: i64 = 340_000;
+        engine
+            .register_batches("left_wide", join_guard_wide_batches(LEFT, LEFT, 400))
+            .unwrap();
+        engine
+            .register_batches("right_wide", join_guard_wide_batches(RIGHT, RIGHT, 400))
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c, SUM(length(l.s)) AS sl, SUM(length(r.s)) AS sr \
+             FROM left_wide l JOIN right_wide r ON l.k = r.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(
+            !engine.plan_time_smj_reroute(plan.as_ref()),
+            "the flat-width estimate must NOT trip the plan-time guard (runtime retry path)"
+        );
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("auto selection must retry a pool-exhausted hash join as sort-merge");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let sl = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let sr = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, LEFT);
+        assert_eq!(sl, LEFT * 400);
+        assert_eq!(sr, LEFT * 400);
+    }
+
+    /// KAN-53: a stall-retry attempt (`with_join_strategy_flipped`) re-plans with the
+    /// OPPOSITE join strategy from the first attempt and completes with identical
+    /// results. A hash first-attempt (small build under `auto`) flips to sort-merge.
+    #[tokio::test]
+    async fn stall_retry_flip_inverts_join_strategy() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        engine
+            .register_batches("big", join_guard_kv_batches(100_000, 100_000))
+            .unwrap();
+        engine
+            .register_batches("small", join_guard_kv_batches(1_000, 1_000))
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c FROM big b JOIN small s ON b.k = s.k";
+        // First attempt: auto keeps the hash fast path for the small build...
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(contains_hash_join(plan.as_ref()));
+        // ...so the flip decision is sort-merge.
+        assert!(!engine.flip_prefer_hash(plan.as_ref()));
+        let logical = engine.logical_plan(query).await.unwrap();
+        let (_ctx, flipped) = engine
+            .physical_plan_with_join_preference(logical, engine.flip_prefer_hash(plan.as_ref()))
+            .await
+            .unwrap();
+        let display = datafusion::physical_plan::displayable(flipped.as_ref())
+            .indent(false)
+            .to_string();
+        assert!(
+            display.contains("SortMergeJoin") && !contains_hash_join(flipped.as_ref()),
+            "the flip of a hash first-attempt must be a sort-merge plan, got:\n{display}"
+        );
+        // End to end: the flipped collect path returns the same rows as the plain path.
+        let plain = engine.sql(query).await.unwrap();
+        let retried = with_join_strategy_flipped(engine.sql(query)).await.unwrap();
+        assert_eq!(plain, retried);
+    }
+
+    /// KAN-53: the flip also inverts the other direction — an over-budget `auto` first
+    /// attempt (which ran the plan-time sort-merge reroute) retries as a hash join.
+    #[tokio::test]
+    async fn stall_retry_flip_inverts_sort_merge_first_attempt() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        engine
+            .register_batches("left_t", join_guard_kv_batches(9_000_000, 9_000_000))
+            .unwrap();
+        engine
+            .register_batches("right_t", join_guard_kv_batches(9_500_000, 9_500_000))
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c FROM left_t l JOIN right_t r ON l.k = r.k";
+        // The session plan is hash, but the plan-time guard rerouted the first attempt to
+        // sort-merge — the flip must therefore re-plan with hash, not sort-merge again.
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(engine.plan_time_smj_reroute(plan.as_ref()));
+        assert!(engine.flip_prefer_hash(plan.as_ref()));
+        let logical = engine.logical_plan(query).await.unwrap();
+        let (_ctx, flipped) = engine
+            .physical_plan_with_join_preference(logical, engine.flip_prefer_hash(plan.as_ref()))
+            .await
+            .unwrap();
+        assert!(
+            contains_hash_join(flipped.as_ref()),
+            "the flip of a sort-merge first-attempt must be a hash plan"
+        );
+    }
+
+    /// Test-only scan wrapper that hides child statistics — the Glue/S3 parquet shape
+    /// behind SF10's unknown-estimate join OOMs (TPC-H Q16/Q21, TPC-DS Q11). Delegates
+    /// everything except `partition_statistics`, which keeps the trait default
+    /// (`Statistics::new_unknown`).
+    #[derive(Debug)]
+    struct UnknownStatsExec {
+        inner: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        props: Arc<datafusion::physical_plan::PlanProperties>,
+    }
+
+    impl UnknownStatsExec {
+        fn new(inner: Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> Self {
+            use datafusion::physical_plan::ExecutionPlanProperties;
+            let props = datafusion::physical_plan::PlanProperties::new(
+                inner.properties().eq_properties.clone(),
+                inner.output_partitioning().clone(),
+                inner.pipeline_behavior(),
+                inner.boundedness(),
+            );
+            Self {
+                inner,
+                props: props.into(),
+            }
+        }
+    }
+
+    impl datafusion::physical_plan::DisplayAs for UnknownStatsExec {
+        fn fmt_as(
+            &self,
+            _t: datafusion::physical_plan::DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            write!(f, "UnknownStatsExec")
+        }
+    }
+
+    impl datafusion::physical_plan::ExecutionPlan for UnknownStatsExec {
+        fn name(&self) -> &str {
+            "UnknownStatsExec"
+        }
+        fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+            &self.props
+        }
+        fn children(&self) -> Vec<&Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            Ok(Arc::new(Self::new(children.remove(0))))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<datafusion::execution::TaskContext>,
+        ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream>
+        {
+            self.inner.execute(partition, context)
+        }
+    }
+
+    /// Test-only table provider whose scans carry NO usable statistics (unknown row count
+    /// AND byte size): `TableProvider::statistics` stays at its unknown default and the
+    /// physical scan hides the in-memory batches behind [`UnknownStatsExec`].
+    #[derive(Debug)]
+    struct UnknownStatsTable {
+        inner: datafusion::datasource::MemTable,
+    }
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for UnknownStatsTable {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+        fn table_type(&self) -> datafusion::logical_expr::TableType {
+            datafusion::logical_expr::TableType::Base
+        }
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[datafusion::logical_expr::Expr],
+            limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            let inner = self.inner.scan(state, projection, filters, limit).await?;
+            Ok(Arc::new(UnknownStatsExec::new(inner)))
+        }
+    }
+
+    /// Register `batches` under `name` with statistics hidden (see [`UnknownStatsTable`]).
+    fn register_unknown_stats_table(engine: &Engine, name: &str, batches: Vec<RecordBatch>) {
+        let schema = batches[0].schema();
+        let inner = datafusion::datasource::MemTable::try_new(schema, vec![batches]).unwrap();
+        engine
+            .ctx
+            .register_table(name, Arc::new(UnknownStatsTable { inner }))
+            .unwrap();
+    }
+
+    /// KAN-53 follow-up: with a bounded pool, a hash join whose build side has NO usable
+    /// estimate must reroute to sort-merge — unknown is not "fits" (the SF10 OOM shape:
+    /// the unaccounted build kills the worker before the runtime retry can fire, KAN-57).
+    /// The rerouted query must still complete with correct results (DF 54.1.0 fixed the
+    /// sort-merge deadlock).
+    #[tokio::test]
+    async fn auto_join_selection_unknown_estimate_reroutes_sort_merge() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        assert_eq!(join_preference(), JoinPreference::Auto);
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        register_unknown_stats_table(&engine, "u_big", join_guard_kv_batches(100_000, 100_000));
+        register_unknown_stats_table(&engine, "u_small", join_guard_kv_batches(1_000, 1_000));
+        let query = "SELECT COUNT(*) AS c FROM u_big b JOIN u_small s ON b.k = s.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(contains_hash_join(plan.as_ref()));
+        assert!(
+            hash_join_build_estimate_unknown(plan.as_ref()),
+            "test shape must have an unknown build-side estimate"
+        );
+        assert!(
+            engine.plan_time_smj_reroute(plan.as_ref()),
+            "unknown estimate + bounded pool must reroute to sort-merge"
+        );
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("unknown-estimate join must complete via sort-merge");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, 1_000);
+    }
+
+    /// KAN-53 follow-up: without a bounded pool there is no budget to guard — an
+    /// unknown-estimate hash join keeps the hash plan (behavior unchanged), matching the
+    /// positive-estimate case (`auto_join_selection_small_build_keeps_hash`).
+    #[tokio::test]
+    async fn auto_join_selection_unknown_estimate_unbounded_keeps_hash() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        let engine = Engine::new();
+        register_unknown_stats_table(&engine, "u_big", join_guard_kv_batches(100_000, 100_000));
+        register_unknown_stats_table(&engine, "u_small", join_guard_kv_batches(1_000, 1_000));
+        let query = "SELECT COUNT(*) AS c FROM u_big b JOIN u_small s ON b.k = s.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(contains_hash_join(plan.as_ref()));
+        assert!(hash_join_build_estimate_unknown(plan.as_ref()));
+        assert!(
+            !engine.plan_time_smj_reroute(plan.as_ref()),
+            "unbounded pool must never reroute — no budget to guard"
+        );
+        let batches = engine.sql(query).await.unwrap();
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, 1_000);
+    }
+
+    #[tokio::test]
+    async fn join_guard_runtime_retry_when_estimate_underreports() {
+        // Wide strings on both sides; the aggregates over BOTH string columns keep the
+        // build side (the smaller input, ~70 MB actual) from being pruned to keys — a
+        // keys-only build is the shape DataFusion already handles well. The flat-width
+        // estimate (170k × 56 B ≈ 9.5 MB) stays under the 16 MiB budget, so the plan-time
+        // guard stays out — but the actual build blows the 64 MiB pool at runtime: the
+        // first attempt must fail with `Resources Exhausted` and the guard must retry once
+        // with sort-merge joins, completing instead of wedging. The env knobs keep one
+        // coalesced/repartitioned batch (~0.4 MB) far below a sorter's fair share of the
+        // pool (~10 MiB) — at production pool sizes this headroom exists at any partition
+        // count; the window is tight so parallel tests keep their own defaults.
+        // KAN-45: the sort-merge fallback is opt-in — enable it explicitly for this test.
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::set_var("WEFT_SORT_MERGE_FALLBACK", "true");
+        std::env::set_var("WEFT_TARGET_PARTITIONS", "2");
+        std::env::set_var("WEFT_BATCH_SIZE", "1024");
+        let engine = Engine::new_with_memory_limit(64 * 1024 * 1024);
+        std::env::remove_var("WEFT_TARGET_PARTITIONS");
+        std::env::remove_var("WEFT_BATCH_SIZE");
+        const LEFT: i64 = 170_000;
+        const RIGHT: i64 = 340_000;
+        engine
+            .register_batches("left_wide", join_guard_wide_batches(LEFT, LEFT, 400))
+            .unwrap();
+        engine
+            .register_batches("right_wide", join_guard_wide_batches(RIGHT, RIGHT, 400))
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c, SUM(length(l.s)) AS sl, SUM(length(r.s)) AS sr \
+             FROM left_wide l JOIN right_wide r ON l.k = r.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        let budget = engine.hash_join_build_budget().unwrap();
+        assert!(
+            !hash_join_build_exceeds(plan.as_ref(), budget),
+            "the flat-width estimate must NOT trip the plan-time guard (runtime retry path)"
+        );
+        // Non-vacuity: the string column must sit on the build side...
+        fn build_schema_has(p: &dyn datafusion::physical_plan::ExecutionPlan, col: &str) -> bool {
+            if let Some(hj) = as_hash_join(p) {
+                if hj.left().schema().field_with_name(col).is_ok() {
+                    return true;
+                }
+            }
+            p.children()
+                .iter()
+                .any(|c| build_schema_has(c.as_ref(), col))
+        }
+        assert!(build_schema_has(plan.as_ref(), "s"));
+        // ...and the SAME query against a plain DataFusion session on the same 32 MiB pool
+        // (no weft guard) must fail with `Resources Exhausted`.
+        {
+            use datafusion::execution::memory_pool::FairSpillPool;
+            use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+            let env = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(FairSpillPool::new(64 * 1024 * 1024)))
+                .build_arc()
+                .unwrap();
+            let raw = SessionContext::new_with_config_rt(Default::default(), env);
+            raw.register_table(
+                "left_wide",
+                Arc::new(
+                    datafusion::datasource::MemTable::try_new(
+                        join_guard_wide_batches(LEFT, LEFT, 400)[0].schema(),
+                        vec![join_guard_wide_batches(LEFT, LEFT, 400)],
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+            raw.register_table(
+                "right_wide",
+                Arc::new(
+                    datafusion::datasource::MemTable::try_new(
+                        join_guard_wide_batches(RIGHT, RIGHT, 400)[0].schema(),
+                        vec![join_guard_wide_batches(RIGHT, RIGHT, 400)],
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+            let err = raw
+                .sql(query)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .expect_err("unguarded hash join must exhaust the pool");
+            assert!(
+                err.to_string()
+                    .to_ascii_lowercase()
+                    .contains("resources exhausted"),
+                "expected pool exhaustion, got: {err}"
+            );
+        }
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("pool-exhausted hash join must be retried as sort-merge");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let sl = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let sr = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, LEFT);
+        assert_eq!(sl, LEFT * 400);
+        assert_eq!(sr, LEFT * 400);
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
     }
 }

@@ -13,8 +13,14 @@ set -euo pipefail
 
 ENV_FILE=/etc/weft/weft.env
 SPILL_MOUNT=/var/lib/weft/spill
-SPILL_DEVICE_CANDIDATES=(/dev/nvme1n1 /dev/xvdf /dev/sdf)
+# Legacy name hints only — Nitro often puts the *root* on nvme1n1 and the extra
+# EBS spill volume on nvme0n1 (or the reverse). Never pick a partitioned/root disk;
+# see find_spill_device().
+SPILL_DEVICE_CANDIDATES=(/dev/nvme0n1 /dev/nvme1n1 /dev/xvdf /dev/sdf)
 IMDS_TOKEN_TTL=21600
+# Systemd oneshot PATH can omit /usr/local/bin on some images; pin the AMI aws CLI.
+AWS_BIN="${WEFT_AWS_BIN:-/usr/local/bin/aws}"
+export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
 log() { echo "[weft-bootstrap] $*"; }
 
@@ -33,7 +39,7 @@ tag_value() {
   local key="$1"
   local attempt out
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    out="$(aws ec2 describe-tags \
+    out="$("${AWS_BIN}" ec2 describe-tags \
       --region "${REGION}" \
       --filters "Name=resource-id,Values=${INSTANCE_ID}" "Name=key,Values=${key}" \
       --query 'Tags[0].Value' --output text 2>/dev/null | sed 's/^None$//' || true)"
@@ -46,17 +52,48 @@ tag_value() {
   printf ''
 }
 
-mount_spill_volume() {
-  mkdir -p "${SPILL_MOUNT}"
-  local dev=""
-  for candidate in "${SPILL_DEVICE_CANDIDATES[@]}"; do
-    if [[ -b "${candidate}" ]]; then
-      dev="${candidate}"
-      break
+find_spill_device() {
+  # Pick the largest whole-disk block device that is NOT the root disk and has no
+  # partitions in use. On AL2023 Nitro, root may be nvme0n1 or nvme1n1; the extra
+  # gp3 spill volume is the other unpartitioned NVMe.
+  local root_src root_disk candidate size best="" best_size=0
+  root_src="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+  root_disk=""
+  if [[ -n "${root_src}" ]]; then
+    root_disk="$(lsblk -no PKNAME "${root_src}" 2>/dev/null || true)"
+    if [[ -z "${root_disk}" ]]; then
+      root_disk="$(basename "${root_src}" | sed -E 's/p?[0-9]+$//')"
+    fi
+  fi
+  for candidate in "${SPILL_DEVICE_CANDIDATES[@]}" $(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}'); do
+    [[ -b "${candidate}" ]] || continue
+    local base
+    base="$(basename "${candidate}")"
+    [[ -n "${root_disk}" && "${base}" == "${root_disk}" ]] && continue
+    # Skip disks that already have child partitions (root-style layout).
+    if lsblk -n -o NAME,TYPE "${candidate}" | awk 'NR>1 && $2=="part"{found=1} END{exit !found}'; then
+      continue
+    fi
+    size="$(lsblk -bn -o SIZE "${candidate}" 2>/dev/null | head -1 || echo 0)"
+    if (( size > best_size )); then
+      best="${candidate}"
+      best_size="${size}"
     fi
   done
+  printf '%s' "${best}"
+}
+
+mount_spill_volume() {
+  mkdir -p "${SPILL_MOUNT}"
+  local dev
+  dev="$(find_spill_device)"
   if [[ -z "${dev}" ]]; then
     log "no spill block device found; using root filesystem at ${SPILL_MOUNT}"
+    chown weft:weft "${SPILL_MOUNT}"
+    return 0
+  fi
+  if findmnt -n "${SPILL_MOUNT}" >/dev/null 2>&1 || mountpoint -q "${SPILL_MOUNT}" 2>/dev/null; then
+    log "spill already mounted at ${SPILL_MOUNT}"
     chown weft:weft "${SPILL_MOUNT}"
     return 0
   fi
@@ -64,8 +101,16 @@ mount_spill_volume() {
     log "formatting ${dev} as xfs"
     mkfs.xfs -f "${dev}"
   fi
-  if ! findmnt -n "${SPILL_MOUNT}" >/dev/null 2>&1; then
-    mount -o defaults,nofail "${dev}" "${SPILL_MOUNT}"
+  # Idempotent: first boot / fstab / prior bootstrap may already own the device.
+  if ! mount -o defaults,nofail "${dev}" "${SPILL_MOUNT}" 2>/tmp/weft-mount.err; then
+    if findmnt -n "${SPILL_MOUNT}" >/dev/null 2>&1 || mountpoint -q "${SPILL_MOUNT}" 2>/dev/null; then
+      log "spill became mounted at ${SPILL_MOUNT} during race"
+    elif grep -qiE 'already mounted|busy' /tmp/weft-mount.err 2>/dev/null; then
+      log "spill device ${dev} busy; continuing with ${SPILL_MOUNT}"
+    else
+      log "ERROR: mount ${dev} -> ${SPILL_MOUNT} failed: $(cat /tmp/weft-mount.err 2>/dev/null || true)"
+      return 1
+    fi
   fi
   # Persist across reboot.
   local uuid
@@ -83,7 +128,7 @@ wait_for_workers() {
   local deadline=$((SECONDS + 240))
   local ids=""
   while (( SECONDS < deadline )); do
-    ids="$(aws autoscaling describe-auto-scaling-groups \
+    ids="$("${AWS_BIN}" autoscaling describe-auto-scaling-groups \
       --region "${REGION}" \
       --auto-scaling-group-names "${asg}" \
       --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
@@ -109,7 +154,7 @@ sync_worker_dns() {
   local fqdn="$2"
   local asg="$3"
   local ids ip records json
-  ids="$(aws autoscaling describe-auto-scaling-groups \
+  ids="$("${AWS_BIN}" autoscaling describe-auto-scaling-groups \
     --region "${REGION}" \
     --auto-scaling-group-names "${asg}" \
     --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
@@ -117,7 +162,7 @@ sync_worker_dns() {
   records=""
   while IFS= read -r id; do
     [[ -z "${id}" ]] && continue
-    ip="$(aws ec2 describe-instances \
+    ip="$("${AWS_BIN}" ec2 describe-instances \
       --region "${REGION}" \
       --instance-ids "${id}" \
       --query 'Reservations[0].Instances[0].PrivateIpAddress' \
@@ -133,12 +178,12 @@ sync_worker_dns() {
   if [[ -z "${records}" ]]; then
     # Nothing InService — delete the RRSet if present.
     local existing
-    existing="$(aws route53 list-resource-record-sets \
+    existing="$("${AWS_BIN}" route53 list-resource-record-sets \
       --hosted-zone-id "${zone_id}" \
       --query "ResourceRecordSets[?Name=='${fqdn}.' || Name=='${fqdn}'] | [0]" \
       --output json 2>/dev/null || echo "null")"
     if [[ "${existing}" != "null" && -n "${existing}" ]]; then
-      aws route53 change-resource-record-sets \
+      "${AWS_BIN}" route53 change-resource-record-sets \
         --hosted-zone-id "${zone_id}" \
         --change-batch "{\"Changes\":[{\"Action\":\"DELETE\",\"ResourceRecordSet\":${existing}}]}" \
         || log "Route53 DELETE skipped (already gone)"
@@ -162,7 +207,7 @@ sync_worker_dns() {
 }
 EOF
 )"
-  aws route53 change-resource-record-sets \
+  "${AWS_BIN}" route53 change-resource-record-sets \
     --hosted-zone-id "${zone_id}" \
     --change-batch "${json}"
   log "Route53 UPSERT ${fqdn} with peers: ${records}"
@@ -196,11 +241,17 @@ EOF
     escaped="${CATALOG_CONF//\"/\\\"}"
     echo "WEFT_CATALOG_CONF=\"${escaped}\"" >> "${ENV_FILE}"
   fi
+  if [[ -n "${PREFER_HASH_JOIN}" && "${PREFER_HASH_JOIN}" != "None" ]]; then
+    echo "WEFT_PREFER_HASH_JOIN=${PREFER_HASH_JOIN}" >> "${ENV_FILE}"
+  fi
   if [[ "${role}" == "driver" ]]; then
     cat >> "${ENV_FILE}" <<EOF
 WEFT_WORKER_SERVICE=${WORKER_DNS_NAME}
 WEFT_SHUFFLE_PARTITIONS=${SHUFFLE_PARTITIONS}
 EOF
+    if [[ "${DISTRIBUTED_STRICT}" == "true" || "${DISTRIBUTED_STRICT}" == "1" ]]; then
+      echo "WEFT_DISTRIBUTED_STRICT=1" >> "${ENV_FILE}"
+    fi
   else
     cat >> "${ENV_FILE}" <<EOF
 WEFT_SHARD_INDEX=${SHARD_INDEX}
@@ -213,12 +264,19 @@ EOF
 
 enable_role_unit() {
   local role="$1"
+  # Enable only — do NOT `systemctl start` / `--now` from here.
+  # weft-bootstrap.service declares Before=weft-driver/weft-worker; starting those
+  # units inside this oneshot deadlocks until TimeoutStartSec (300s) and leaves
+  # Connect unhealthy. UserData (or multi-user WantedBy ordering) starts the role
+  # unit after bootstrap exits successfully.
   systemctl daemon-reload
   if [[ "${role}" == "driver" ]]; then
-    systemctl disable --now weft-worker.service 2>/dev/null || true
+    systemctl disable weft-worker.service 2>/dev/null || true
+    systemctl stop weft-worker.service 2>/dev/null || true
     systemctl enable weft-driver.service
   else
-    systemctl disable --now weft-driver.service 2>/dev/null || true
+    systemctl disable weft-driver.service 2>/dev/null || true
+    systemctl stop weft-driver.service 2>/dev/null || true
     systemctl enable weft-worker.service
   fi
 }
@@ -239,10 +297,14 @@ MEMORY_LIMIT_BYTES="$(tag_value weft:memory-limit-bytes)"
 SHUFFLE_SPILL_BYTES="$(tag_value weft:shuffle-spill-bytes)"
 SHUFFLE_PARTITIONS="$(tag_value weft:shuffle-partitions)"
 CATALOG_CONF="$(tag_value weft:catalog-conf)"
+DISTRIBUTED_STRICT="$(tag_value weft:distributed-strict)"
+PREFER_HASH_JOIN="$(tag_value weft:prefer-hash-join)"
 
 ROLE="${ROLE:-worker}"
 WORKER_COUNT="${WORKER_COUNT:-1}"
 SHUFFLE_PARTITIONS="${SHUFFLE_PARTITIONS:-${WORKER_COUNT}}"
+DISTRIBUTED_STRICT="${DISTRIBUTED_STRICT:-false}"
+PREFER_HASH_JOIN="${PREFER_HASH_JOIN:-true}"
 
 if [[ "${1:-}" == "--deregister" ]]; then
   if [[ "${ROLE}" == "worker" && -n "${HOSTED_ZONE_ID}" && -n "${WORKER_DNS_NAME}" && -n "${WORKER_ASG}" ]]; then

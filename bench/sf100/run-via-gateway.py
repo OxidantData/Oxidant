@@ -219,7 +219,7 @@ def main() -> int:
 
     glue_db = args.glue_db or f"{args.suite}_sf{int(args.sf)}"
     tables = TPCH_TABLES if args.suite == "tpch" else TPCDS_TABLES
-    queries = filter_queries(load_queries(args.suite), args.only)
+    queries = filter_queries(load_queries(args.suite, args.sf), args.only)
 
     pw = admin_password()
     token = http_json(

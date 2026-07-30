@@ -7,6 +7,7 @@
 
 pub mod dag_splitter;
 pub mod join_chain;
+pub mod join_order;
 pub mod physical_splitter;
 pub mod shape_extensions;
 pub mod stage_planner;

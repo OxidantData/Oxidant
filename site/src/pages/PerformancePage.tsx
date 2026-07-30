@@ -108,8 +108,8 @@ function SuiteSection({
 
       {!anyMeasured && (
         <div className="mt-6 rounded-weft border border-dashed border-hairline bg-bg-subtle p-4 text-sm text-muted">
-          <strong className="text-body">Pending.</strong> SF100 Parquet lands in S3 under Glue; the
-          gateway harness fills these numbers when the EKS run completes.
+          <strong className="text-body">Pending.</strong> Parquet lands in S3 under Glue; the
+          harness fills these numbers when the distributed run completes.
         </div>
       )}
 
@@ -145,8 +145,8 @@ export default function PerformancePage() {
         <span className="weft-eyebrow">Benchmarks</span>
         <h1 className="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">Performance</h1>
         <p className="mt-4 text-lg text-muted">
-          ClickBench on a dedicated box, plus TPC-H / TPC-DS SF100 through the live Weft engine on
-          EKS — data in S3, catalogued in Glue, queried as{" "}
+          ClickBench on a dedicated box, plus TPC-H / TPC-DS SF10 through the live Weft engine in
+          distributed mode — data in S3, catalogued in Glue, queried as{" "}
           <code className="text-sm text-body">glue.&lt;db&gt;.&lt;table&gt;</code>.
         </p>
       </div>
@@ -248,9 +248,9 @@ export default function PerformancePage() {
       </div>
 
       <SuiteSection
-        eyebrow="TPC-H SF100"
+        eyebrow="TPC-H SF10"
         title="Decision-support on Glue"
-        blurb="Official Q1–Q22 against Parquet in S3, catalogued as glue.tpch_sf100.*, driven through the Weft gateway on EKS."
+        blurb="Official Q1–Q22 against Parquet in S3, catalogued as glue.tpch_sf10.*, executed distributed (1 driver + 2 workers) over Spark Connect in strict mode — every query golden-validated against DuckDB SF10: 20/22 checksum-exact, the other two value-identical modulo Spark-faithful decimal scale."
         suite={tpchBenchmarks}
       />
 
@@ -259,9 +259,9 @@ export default function PerformancePage() {
       </div>
 
       <SuiteSection
-        eyebrow="TPC-DS SF100"
+        eyebrow="TPC-DS SF10"
         title="Retail warehouse workload"
-        blurb="99 queries against glue.tpcds_sf100.* — same dump → Glue → EKS path as TPC-H. Per-query chart omitted (99 bars); totals and failure list tell the story."
+        blurb="99 queries against glue.tpcds_sf10.* — same Glue → distributed path as TPC-H. 60/99 execute end-to-end, each golden-validated against DuckDB SF10; the remaining 39 are clean strict-mode planner refusals for distributed shapes Weft doesn't cover yet — the engine says no rather than risk a wrong answer. Per-query chart omitted (99 bars); totals and failure list tell the story."
         suite={tpcdsBenchmarks}
         showPerQuery={false}
       />
@@ -272,34 +272,37 @@ export default function PerformancePage() {
 
       <section className="mt-2 grid gap-8 lg:grid-cols-2">
         <div className="min-w-0">
-          <h3 className="mb-3 text-lg font-semibold">SF100 data path</h3>
+          <h3 className="mb-3 text-lg font-semibold">SF10 data path</h3>
           <ul className="space-y-2.5 text-sm text-muted">
             <li>
               <strong className="text-body">Object store.</strong>{" "}
-              <code className="text-body">s3://weft-artifacts-…/&#123;tpch,tpcds&#125;-sf100/</code>
+              <code className="text-body">s3://weft-artifacts-…/&#123;tpch,tpcds&#125;-sf10/</code>
             </li>
             <li>
               <strong className="text-body">Catalog.</strong> AWS Glue databases{" "}
-              <code className="text-body">tpch_sf100</code> /{" "}
-              <code className="text-body">tpcds_sf100</code>, attached as the gateway connection{" "}
+              <code className="text-body">tpch_sf10</code> /{" "}
+              <code className="text-body">tpcds_sf10</code>, attached as the Spark catalog{" "}
               <code className="text-body">glue</code>.
             </li>
             <li>
-              <strong className="text-body">Compute.</strong> Weft connect-server on EKS (IRSA reads
-              the artifacts bucket).
+              <strong className="text-body">Compute.</strong> Weft Spark Connect driver + 2 workers
+              on EC2 (AL2023 arm64, the <code className="text-body">weft-sf10</code> ASGs), strict
+              distributed mode.
             </li>
           </ul>
         </div>
         <div className="min-w-0">
-          <h3 className="mb-3 text-lg font-semibold">Reproduce SF100</h3>
+          <h3 className="mb-3 text-lg font-semibold">Reproduce SF10</h3>
           <CodeBlock
             lines={[
-              { text: "./bench/sf100/launch-dump-ec2.sh   # AMD box → S3", comment: true },
-              { text: "SUITE=tpch  SF=100 ./bench/sf100/register-glue.sh" },
-              { text: "SUITE=tpcds SF=100 ./bench/sf100/register-glue.sh" },
-              { text: "python3 bench/sf100/run-via-gateway.py \\" },
-              { text: "  --suite tpch --sf 100 --create-cluster \\" },
-              { text: "  --json site/src/data/tpch.json" },
+              { text: "# driver up at sc://<driver>:50051 (scripts/sf10-start.sh)", comment: true },
+              { text: "python3 bench/sf100/run-spark-connect.py \\" },
+              { text: "  --endpoint sc://<driver>:50051 --suite tpch --sf 10 \\" },
+              { text: "  --glue-db tpch_sf10 --strict --worker-count 2 \\" },
+              { text: "  --skip-worker-preflight --query-timeout 900 \\" },
+              { text: "  --json bench/sf100/results/tpch-sf10.jsonl" },
+              { text: "# then regenerate this page's data", comment: true },
+              { text: "python3 bench/sf100/results/to-site-sf10.py" },
             ]}
           />
           <p className="mt-3 text-xs text-muted">

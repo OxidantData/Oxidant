@@ -1,9 +1,14 @@
 # Operator topology for TPC-DS / TPC-H SF100 on EKS (arm64 / Graviton).
 #
-# Target hardware (provision outside this chart — placeholders below):
-#   driver / connect: 1x c6g.xlarge  (4 vCPU / 8 GiB)  + ~100 GiB EBS
-#   workers:          2x m8g.4xlarge (16 vCPU / 64 GiB) + 500 GiB gp3 each
+# Target hardware (provision outside this chart — placeholders below).
+# CANONICAL — keep in sync with docs/distributed-ec2.md § "SF100 topology"
+# (EC2 CloudFormation uses the same instance shapes for honesty runs):
+#   driver / connect: 1x c6g.xlarge  (4 vCPU / 8 GiB)  + 100 GiB gp3 root
+#   workers:          2x m8g.8xlarge (32 vCPU / 128 GiB) + 500 GiB gp3 spill each
 #   replicas pinned at 2 (min=max=2); autoscaling MUST stay false.
+#   KAN-14 rerun: m8g.4xlarge (64 GiB) is UNDER-PROVISIONED — DataFusion 54 HashJoin is
+#   not spillable, so every multi-fact SF100 TPC-H join OOM'd the 64 GiB worker cgroup.
+#   Use m8g.8xlarge + WEFT_SHUFFLE_PARTITIONS ~= worker vCPU (see distributed-ec2.md).
 #
 # Fill IRSA / storage class with real cluster values before install.
 #
@@ -58,9 +63,14 @@ worker:
   forceShuffleSpill: false
   # KAN-7: leave more cgroup headroom than DF+shuffle alone. HashJoin / Arrow / S3 / aws-cli
   # RSS sits outside FairSpillPool; 26+14 left only ~16 Gi of 56 Gi and still OOMKilled on SF100.
-  # 20 Gi DF + 8 Gi shuffle = 28 Gi tracked → ~28 Gi native headroom under a 56 Gi limit.
-  memoryLimitBytes: "21474836480"  # 20 Gi — DataFusion spill pool
+  # KAN-14: bumped to 40 Gi for m8g.8xlarge (128 GiB) — HashJoin build side is NOT spillable,
+  # so 20 Gi pool on 64 GiB OOM'd every multi-fact SF100 join. 40 Gi DF + 8 Gi shuffle = 48 Gi
+  # tracked → ~80 Gi native headroom under a ~112 Gi cgroup ceiling on 128 GiB.
+  memoryLimitBytes: "42949672960"  # 40 Gi — DataFusion spill pool
   shuffleSpillBytes: "8589934592"  # 8 Gi — shuffle cache threshold
+  # Shuffle fan-out (driver-side): set ~= worker vCPU (e.g. 32 on m8g.8xlarge), NOT the
+  # default worker-count (=2), to spread the hash shuffle and avoid 2-bucket skew. This is
+  # an env on the connect/driver pod: WEFT_SHUFFLE_PARTITIONS=32.
   # DataFusion 54 HashJoinInput is not spillable. At SF100, prefer sort-merge joins so bounded-pool
   # pressure spills sort/join buffers to the gp3 PVC instead of failing Resources exhausted.
   preferHashJoin: false

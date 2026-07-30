@@ -1,6 +1,21 @@
-# SF100 on S3 + Glue + EKS
+# SF100 on S3 + Glue (+ EC2 CF or EKS)
 
 Publish TPC-H / TPC-DS **SF100** against Weft:
+
+### Canonical compute topology
+
+Keep published SF100 numbers on this shape (EKS Helm overlay **or** EC2 ASG — same
+iron). Full EC2 deploy recipe:
+[`docs/distributed-ec2.md` § SF100 topology](../../docs/distributed-ec2.md#sf100-topology-canonical).
+
+| Role | Count | Instance | Disk |
+|------|------:|----------|------|
+| Driver / Connect | 1 | `c6g.xlarge` (4 vCPU / 8 GiB, arm64) | 100 GiB gp3 root |
+| Workers | 2 (min=max=2) | `m8g.8xlarge` (32 vCPU / 128 GiB, arm64) | 500 GiB gp3 spill each |
+
+EKS: [`deploy/helm/weft/values-sf100.yaml`](../../deploy/helm/weft/values-sf100.yaml).
+EC2 remeasure (driver IP only — **no NLB**):
+`STACK=weft-sf100 SUITE=all ./bench/sf100/remeasure-distributed.sh`.
 
 1. Dump DuckDB’s pre-built SF100 databases to
    `s3://weft-artifacts-<account>/{tpch,tpcds}-sf100/<table>/` as Parquet.

@@ -34,6 +34,8 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -236,6 +238,16 @@ def _build_spark(endpoint: str, catalog: str, region: str, warehouse: str | None
     return builder.getOrCreate()
 
 
+# Single-worker executor so `df.collect()` can be bounded by a wall-clock timeout. A
+# wedged/deadlocked query (e.g. a driver-side gather that never returns) would otherwise
+# block the whole suite forever; on timeout we abandon the future and recreate the session.
+_COLLECT_EXEC = ThreadPoolExecutor(max_workers=1)
+
+
+def _collect_with_timeout(df, timeout: float):
+    return _COLLECT_EXEC.submit(df.collect).result(timeout=timeout)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="TPC-H/DS SF100 runner over Spark Connect (sc://host:port)"
@@ -283,6 +295,14 @@ def main() -> int:
         type=int,
         default=1,
         help="Timed attempts per query (default 1; use 3 for ClickBench-style hot)",
+    )
+    ap.add_argument(
+        "--query-timeout",
+        type=float,
+        default=float(os.environ.get("WEFT_QUERY_TIMEOUT", "300")),
+        help="Per-query wall-clock timeout in seconds (default 300 / $WEFT_QUERY_TIMEOUT). "
+        "A wedged/deadlocked query fails fast and the Spark session is recreated instead of "
+        "hanging the whole suite.",
     )
     ap.add_argument("--machine", default="eks/sf100")
     ap.add_argument(
@@ -336,7 +356,7 @@ def main() -> int:
 
     glue_db = args.glue_db or f"{args.suite}_sf{int(args.sf)}"
     tables = TPCH_TABLES if args.suite == "tpch" else TPCDS_TABLES
-    queries = filter_queries(load_queries(args.suite), args.only)
+    queries = filter_queries(load_queries(args.suite, args.sf), args.only)
     out = Path(args.json)
     done = _load_done(out) if args.resume else set()
 
@@ -347,12 +367,15 @@ def main() -> int:
         flush=True,
     )
 
-    spark = _build_spark(
-        args.endpoint,
-        args.catalog,
-        args.region,
-        args.warehouse or None,
-    )
+    def new_session():
+        return _build_spark(
+            args.endpoint,
+            args.catalog,
+            args.region,
+            args.warehouse or None,
+        )
+
+    spark = new_session()
 
     failed: list[str] = []
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -375,7 +398,7 @@ def main() -> int:
             t0 = time.perf_counter()
             try:
                 df = spark.sql(sql)
-                rows = df.collect()
+                rows = _collect_with_timeout(df, args.query_timeout)
                 wall = time.perf_counter() - t0
                 checksum = _result_checksum(rows)
                 row_count = len(rows)
@@ -385,11 +408,31 @@ def main() -> int:
                     f"checksum={checksum[:12]}…",
                     flush=True,
                 )
+            except FutureTimeoutError:
+                wall = time.perf_counter() - t0
+                err = (
+                    f"TimeoutError: query exceeded {args.query_timeout:.0f}s "
+                    f"(possible server-side wedge/deadlock)"
+                )
+                print(f"{name:<5} FAIL try{attempt} ({wall:.4f}s): {err}", flush=True)
+                times.clear()
+                # The wedged query may have poisoned the session (and the abandoned
+                # collect thread is still blocked server-side) — start a fresh session.
+                try:
+                    spark.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                spark = new_session()
+                break
             except Exception as e:  # noqa: BLE001 — surface any Connect/engine failure
                 wall = time.perf_counter() - t0
                 err = f"{type(e).__name__}: {e}"
                 # Strict server turns distributed fallback into an error; treat as hard fail.
                 print(f"{name:<5} FAIL try{attempt} ({wall:.4f}s): {err}", flush=True)
+                if not str(e).strip():
+                    import traceback
+
+                    print(traceback.format_exc(), flush=True)
                 times.clear()
                 break
 

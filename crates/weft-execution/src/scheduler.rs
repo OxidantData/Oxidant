@@ -33,18 +33,27 @@ pub fn speculative_timeout_ms() -> u64 {
 }
 
 /// Whether an execution error is worth retrying on another worker.
+///
+/// KAN-15: a deadline/timeout on a stage `do_get` is NOT retryable — the original attempt
+/// keeps running server-side, so retrying duplicates it (the retry storm that exhausted
+/// worker task slots). Genuine connect/refused/unavailable failures stay retryable: they
+/// mean the stage never started.
 pub fn is_retryable(err: &Error) -> bool {
     let s = err.to_string().to_ascii_lowercase();
-    s.contains("connect worker")
-        || s.contains("do_get:")
-        || s.contains("unavailable")
+    if s.contains("connect worker") {
+        return true;
+    }
+    if s.contains("deadline") || s.contains("timed out") || s.contains("timeout") {
+        return false;
+    }
+    s.contains("unavailable")
         || s.contains("connection")
-        || s.contains("deadline")
         || s.contains("reset")
         || s.contains("broken pipe")
         || s.contains("health check failed")
         || s.contains("shuffle")
         || s.contains("empty bucket")
+        || s.contains("no task slots")
 }
 
 /// Whether the error likely means an upstream producer bucket is missing (recompute candidate).
@@ -305,6 +314,32 @@ mod tests {
             "do_get: Unavailable".into()
         )));
         assert!(!is_retryable(&Error::Plan("bad sql".into())));
+    }
+
+    #[test]
+    fn deadline_exceeded_stage_do_get_is_not_retryable() {
+        // KAN-15: the original attempt is still running server-side; a retry would duplicate it.
+        assert!(!is_retryable(&Error::Execution(
+            "do_get: Timeout expired".into()
+        )));
+        assert!(!is_retryable(&Error::Execution(
+            "do_get: stage timed out after 600000 ms (WEFT_STAGE_TIMEOUT_MS)".into()
+        )));
+        // A worker-side cancellation is likewise terminal, and plain execution errors
+        // no longer ride the blanket `do_get:` match.
+        assert!(!is_retryable(&Error::Execution(
+            "do_get: stage cancelled by driver".into()
+        )));
+        assert!(!is_retryable(&Error::Execution(
+            "do_get: internal error: bad sql".into()
+        )));
+        // Genuine connect-level failures (nothing started server-side) stay retryable.
+        assert!(is_retryable(&Error::Io(
+            "connect worker: deadline has elapsed".into()
+        )));
+        assert!(is_retryable(&Error::Io(
+            "connect worker: connection refused".into()
+        )));
     }
 
     #[test]

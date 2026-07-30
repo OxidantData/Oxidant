@@ -199,12 +199,21 @@ def qualify_sql(sql: str, glue_db: str, tables: list[str], catalog: str = "glue"
     )
 
 
-def load_queries(suite: str) -> list[tuple[str, str]]:
+def substitute_sf(sql: str, sf: float) -> str:
+    """Resolve the `__WEFT_SF__` scale-factor placeholder.
+
+    TPC-H Q11's HAVING fraction is spec-defined as 0.0001/SF; `q11.sql` carries
+    the token so every SF runs the correct threshold (KAN-30).
+    """
+    return sql.replace("__WEFT_SF__", f"{sf:g}")
+
+
+def load_queries(suite: str, sf: float = 1) -> list[tuple[str, str]]:
     qdir = REPO / "bench" / suite / "queries"
     files = sorted(qdir.glob("q*.sql"), key=lambda p: int(p.stem[1:]))
     if not files:
         raise SystemExit(f"no queries in {qdir}")
-    return [(f"Q{p.stem[1:]}", p.read_text()) for p in files]
+    return [(f"Q{p.stem[1:]}", substitute_sf(p.read_text(), sf)) for p in files]
 
 
 def filter_queries(

@@ -174,7 +174,17 @@ struct WeftSchemaProvider {
     ctx: Arc<SessionContext>,
     require_lakehouse_snapshot_pins: Arc<AtomicBool>,
     /// Resolved tables, cached so a table referenced repeatedly in a query is loaded once.
-    tables: Mutex<HashMap<String, CachedTable>>,
+    ///
+    /// Keyed by `(name, replicated)` where `replicated` is the shard/replicate decision the
+    /// provider was built under ([`crate::shard::is_replicated_table`]): a provider *embeds*
+    /// that decision (a replicated table lists all files; a sharded one only this worker's
+    /// shard), and the driver's per-query auto-broadcast classification flips a table's role
+    /// between queries via the stage ticket's task-local overlay. Keying by name alone served
+    /// the stale variant — a table first resolved as replicated was later scanned in full on
+    /// every worker where the plan assumed shards (rows × worker count), or first resolved as
+    /// sharded and later served as only a shard where the plan assumed a full copy (rows
+    /// dropped) — KAN-35. Both variants fit in the cache, so a role flip costs one re-list.
+    tables: Mutex<HashMap<(String, bool), CachedTable>>,
 }
 
 struct CachedTable {
@@ -213,18 +223,24 @@ impl fmt::Debug for WeftSchemaProvider {
 impl SchemaProvider for WeftSchemaProvider {
     fn table_names(&self) -> Vec<String> {
         // Best-effort: already-resolved tables. `spark.catalog.listTables` uses the weft provider.
+        // The cache may hold both shard-context variants of a table; report each name once.
         self.tables
             .lock()
             .expect("tables poisoned")
             .keys()
-            .cloned()
+            .map(|(name, _)| name.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
             .collect()
     }
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        // The shard/replicate decision is baked into a cached provider at resolution time;
+        // resolve (or reuse) the variant matching this query's classification (KAN-35).
+        let replicated = crate::shard::is_replicated_table(name);
         {
             let tables = self.tables.lock().expect("tables poisoned");
-            if let Some(cached) = tables.get(name) {
+            if let Some(cached) = tables.get(&(name.to_string(), replicated)) {
                 if let (Some(snapshot_key), Some(snapshot)) =
                     (&cached.snapshot_key, &cached.snapshot)
                 {
@@ -273,7 +289,7 @@ impl SchemaProvider for WeftSchemaProvider {
         )
         .await?;
         self.tables.lock().expect("tables poisoned").insert(
-            name.to_string(),
+            (name.to_string(), replicated),
             CachedTable {
                 provider: resolved.provider.clone(),
                 snapshot_key: resolved.snapshot_key,
@@ -287,7 +303,8 @@ impl SchemaProvider for WeftSchemaProvider {
         self.tables
             .lock()
             .expect("tables poisoned")
-            .contains_key(name)
+            .keys()
+            .any(|(n, _)| n == name)
     }
 
     fn register_table(
@@ -318,7 +335,7 @@ impl SchemaProvider for WeftSchemaProvider {
         })??;
 
         self.tables.lock().expect("tables poisoned").insert(
-            name,
+            (name.clone(), crate::shard::is_replicated_table(&name)),
             CachedTable {
                 provider: provider.clone(),
                 snapshot_key: None,

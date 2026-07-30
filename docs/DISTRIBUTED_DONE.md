@@ -149,8 +149,9 @@ Only after Phases 0–2; Phase 3 items that are not yet done must be stated as c
 - [~] **D-4.3** `DISTRIBUTED_SF100=1 WORKER_MIN=2 WORKER_MAX=2 ./bench/sf100/run-time-gate.sh`
   with `WEFT_DISTRIBUTED_STRICT=1`, so any fallback fails the run rather than producing a
   driver-only number labelled distributed.
-  *(Gate script now exports `WEFT_DISTRIBUTED_STRICT=1` and patches the driver Deploy when
-  `DISTRIBUTED_SF100=1`. Actual SF100 wall-clock re-measure still needs a live EKS cluster.)*
+  *(Gate script exports `WEFT_DISTRIBUTED_STRICT=1`. Preferred honesty path is EC2 CF
+  with canonical topology — 1× c6g.xlarge + 2× m8g.4xlarge / 500 GiB spill — see
+  `docs/distributed-ec2.md` § SF100 topology and `bench/sf100/remeasure-distributed.sh`.)*
 - [ ] **D-4.4** Update `site/src/data/{tpch,tpcds}.json` and the Performance page, publishing
   the distributed coverage fraction alongside the timings. Until then site numbers stay
   labelled single-node.

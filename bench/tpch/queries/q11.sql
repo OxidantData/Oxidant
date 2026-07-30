@@ -14,7 +14,9 @@ GROUP BY
 HAVING
     sum(ps_supplycost * ps_availqty) > (
         SELECT
-            sum(ps_supplycost * ps_availqty) * 0.0001000000
+            -- TPC-H spec: the fraction is 0.0001/SF; `__WEFT_SF__` is substituted
+            -- with the scale factor by the bench harnesses.
+            sum(ps_supplycost * ps_availqty) * 0.0001 / __WEFT_SF__
         FROM
             partsupp,
             supplier,

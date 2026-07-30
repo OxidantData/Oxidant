@@ -17,3 +17,8 @@ pub use spill::{estimated_batch_bytes, SpillStore};
 
 /// The table name a stage's shuffle input is registered under before its SQL runs.
 pub const SHUFFLE_INPUT_TABLE: &str = "shuffle_input";
+
+/// Producer scope used for stage-cache entries (and their spill files) written by push-based
+/// `do_exchange`, where the producing task's partition id is not known to the receiver
+/// (KAN-32). Pull-produced entries use the producing task's own partition id instead.
+pub const PUSH_SRC: u32 = u32::MAX;

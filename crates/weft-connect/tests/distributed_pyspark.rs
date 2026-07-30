@@ -21,6 +21,9 @@ const W0: u16 = 50871;
 const W1: u16 = 50872;
 const W0_DF: u16 = 50874;
 const W1_DF: u16 = 50875;
+const PORT_Z: u16 = 50876;
+const W0_Z: u16 = 50877;
+const W1_Z: u16 = 50878;
 
 fn make_batch(start: i64, end: i64) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -177,6 +180,59 @@ async fn distributed_groupby_via_dataframe_relation_tree() {
     );
 }
 
+#[tokio::test]
+async fn distributed_zero_row_result_still_streams_typed_empty_batch() {
+    // KAN-42: a distributed query whose result is empty must still stream one typed (empty)
+    // ArrowBatch — PySpark's `collect()` asserts `table is not None`, so a bare
+    // ResultComplete-only stream kills the client (TPC-DS Q17 at SF10).
+    const N: i64 = 100;
+    for (port, start, end) in [(W0_Z, 0, N / 2), (W1_Z, N / 2, N)] {
+        let e = Arc::new(Engine::new());
+        e.register_batches("t", vec![make_batch(start, end)])
+            .unwrap();
+        let ee = e.clone();
+        tokio::spawn(async move {
+            let _ = serve_worker(port, ee).await;
+        });
+    }
+
+    let driver_engine = Arc::new(Engine::new());
+    driver_engine
+        .register_batches("t", vec![make_batch(0, N)])
+        .unwrap();
+
+    let mut service = WeftService::with_engine(driver_engine);
+    service.workers = vec![
+        format!("http://127.0.0.1:{W0_Z}"),
+        format!("http://127.0.0.1:{W1_Z}"),
+    ];
+
+    tokio::spawn(async move {
+        let _ = weft_connect::serve_instance(service, PORT_Z).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut client = connect(&format!("http://127.0.0.1:{PORT_Z}")).await;
+    // Distributable shape (filter + two-stage aggregate + driver-side ORDER BY/LIMIT finalize)
+    // with an empty result set.
+    let (batches, arrow_responses) = exec_sql_full(
+        &mut client,
+        "SELECT k, SUM(v) AS s FROM t WHERE v < 0 GROUP BY k ORDER BY k LIMIT 100",
+    )
+    .await;
+    assert!(
+        arrow_responses > 0,
+        "zero-row distributed result must still stream one typed empty ArrowBatch \
+         (PySpark asserts `table is not None`)"
+    );
+    let got_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(got_rows, 0);
+    let schema = batches[0].schema();
+    assert_eq!(schema.field(0).name(), "k");
+    assert_eq!(schema.field(1).name(), "s");
+}
+
 fn expr(t: sc::expression::ExprType) -> sc::Expression {
     sc::Expression {
         common: None,
@@ -273,6 +329,15 @@ async fn connect(endpoint: &str) -> SparkConnectServiceClient<Channel> {
 }
 
 async fn exec_sql(client: &mut SparkConnectServiceClient<Channel>, sql: &str) -> Vec<RecordBatch> {
+    exec_sql_full(client, sql).await.0
+}
+
+/// Like [`exec_sql`], but also reports how many `ArrowBatch` responses the stream carried —
+/// the client-visible contract a zero-row result must still honor (KAN-42).
+async fn exec_sql_full(
+    client: &mut SparkConnectServiceClient<Channel>,
+    sql: &str,
+) -> (Vec<RecordBatch>, usize) {
     use std::io::Cursor;
     use weft_loom::arrow::ipc::reader::StreamReader;
     use weft_proto::spark::connect as sc;
@@ -292,8 +357,10 @@ async fn exec_sql(client: &mut SparkConnectServiceClient<Channel>, sql: &str) ->
     };
     let mut stream = client.execute_plan(req).await.unwrap().into_inner();
     let mut out = Vec::new();
+    let mut arrow_responses = 0;
     while let Some(msg) = stream.message().await.unwrap() {
         if let Some(sc::execute_plan_response::ResponseType::ArrowBatch(b)) = msg.response_type {
+            arrow_responses += 1;
             if b.data.is_empty() {
                 continue;
             }
@@ -303,5 +370,5 @@ async fn exec_sql(client: &mut SparkConnectServiceClient<Channel>, sql: &str) ->
             }
         }
     }
-    out
+    (out, arrow_responses)
 }

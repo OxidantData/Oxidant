@@ -226,15 +226,20 @@ registry access, and (for Glue/S3) an IRSA role bound to the chart ServiceAccoun
 
 ### SF100 topology
 
-Overlay [`deploy/helm/weft/values-sf100.yaml`](../deploy/helm/weft/values-sf100.yaml):
+Overlay [`deploy/helm/weft/values-sf100.yaml`](../deploy/helm/weft/values-sf100.yaml).
+**Instance shapes match the EC2 CloudFormation SF100 topology** (track both places —
+see [`distributed-ec2.md` § SF100 topology](distributed-ec2.md#sf100-topology-canonical)):
+1× **c6g.xlarge** driver + 2× **m8g.4xlarge** workers (min=max=2), 500 GiB gp3 spill
+per worker, arm64.
 
 - Connect sized for **c6g.xlarge** (4 vCPU / 8 GiB), workers for **m8g.4xlarge**
   (16 vCPU / 64 GiB), `kubernetes.io/arch=arm64`
 - `worker.replicas: 2`, autoscaling off, **500Gi gp3** spill PVC per worker
 - `WEFT_MEMORY_LIMIT_BYTES` + `WEFT_SHUFFLE_SPILL_BYTES` aligned with container memory
   (threshold spill); `TMPDIR` on the spill PVC; `forceShuffleSpill: false`
-- `WEFT_PREFER_HASH_JOIN=false` on workers, selecting spill-capable sort-merge joins for SF100
-  equijoins because DataFusion 54 hash-join build inputs fail rather than spill under pool pressure
+- `WEFT_PREFER_HASH_JOIN=true` on workers (KAN-45): the sort-merge path can deadlock under
+  the bounded FairSpillPool at scale (upstream: delta-io/delta-rs#4614); hash-join build
+  inputs fail fast rather than spill under pool pressure, which beats a 10-minute wedge
 - `connect.distributedStrict: true` → `WEFT_DISTRIBUTED_STRICT=1` on the driver
 - Connect CPU request **3000m** (not 3500m) so a c6g.xlarge can still schedule CNI /
   kube-proxy / node agents beside the pod

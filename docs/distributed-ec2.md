@@ -13,7 +13,7 @@ For the future full platform (SSO, gateway operator, Terraform), see
 ## Architecture
 
 ```
-PySpark / weft-bench  -->  weft driver :50051  (optional NLB)
+PySpark / weft-bench  -->  weft driver :50051  (direct IP — no LB)
                               |
                               |  WEFT_WORKER_SERVICE DNS (multi-A)
                               v
@@ -36,7 +36,26 @@ PySpark / weft-bench  -->  weft driver :50051  (optional NLB)
 | Catalog | Optional `WEFT_CATALOG_CONF` (Glue) on **driver and workers** via the `CatalogConf` stack parameter |
 
 Workers are **not** behind a single L4 VIP for Flight (shuffle state is per-worker).
-Only the Connect client path may use an NLB (`ExposeConnect=true`).
+Connect clients talk to the **single driver IP** (private from VPC/VPN/bastion, or
+public IP + `ClientCidr` for laptop honesty runs).
+
+### Do not put Spark Connect behind an NLB
+
+**Bad approach — do not use for Weft data-plane / SF100 / TPC honesty runs.**
+
+An internet-facing Network Load Balancer on `:50051` (`ExposeConnect=true`) is the
+wrong model for this workload:
+
+| Reality | Why an NLB does not help |
+|---------|--------------------------|
+| One Connect driver | Nothing to load-balance; Databricks / LakeSail / OSS Spark Connect also terminate on the driver (or a control-plane proxy), not an L4 VIP in front of query compute |
+| Workers are stateful Flight peers | Shuffle and shard index are per-instance; never put workers behind a shared VIP |
+| Honesty / bench runs | NLB health checks + target registration add minutes of false “unhealthy” while `weft-driver` is already listening — wasted wall clock, not signal |
+| Failure mode | ASG + TG health can mark the only driver unhealthy and black-hole clients even when `:50051` accepts connections |
+
+Keep `ExposeConnect=false` (the default). Resolve the driver instance IP and use
+`sc://<driver-ip>:50051`. The `ExposeConnect` parameter remains only as a
+deprecated escape hatch and must not be used for published SF100 numbers.
 
 ## End-to-end checklist
 
@@ -72,7 +91,7 @@ This template does **not** create a VPC. You need:
 | VPC | Existing |
 | Subnets | Prefer **private** subnets with NAT (or VPC endpoints) so instances can reach S3, Glue, and package updates |
 | Path to S3/Glue | Gateway/Interface VPC endpoints **or** NAT egress |
-| Client path to `:50051` | Either a host inside `ClientCidr`, or `ExposeConnect=true` (internet-facing NLB) using **public** subnets |
+| Client path to `:50051` | Host inside `ClientCidr` (VPC / VPN / bastion), **or** driver **public** IP with `ClientCidr` set to your `/32` — **not** an NLB (see [Do not put Spark Connect behind an NLB](#do-not-put-spark-connect-behind-an-nlb)) |
 
 ### Why worker count is fixed
 
@@ -223,7 +242,7 @@ Details: [`deploy/packer/README.md`](../deploy/packer/README.md).
 
 ```sh
 export VPC_ID=vpc-0abc
-export SUBNETS=subnet-aaa,subnet-bbb   # private (+ public if ExposeConnect=true)
+export SUBNETS=subnet-aaa,subnet-bbb   # private preferred; public only if laptop hits driver public IP
 
 ./deploy/cloudformation/deploy-stack.sh \
   --ami "${AMI_ID}" \
@@ -247,13 +266,17 @@ export SUBNETS=subnet-aaa,subnet-bbb   # private (+ public if ExposeConnect=true
 
 Template: [`deploy/cloudformation/weft-cluster.yaml`](../deploy/cloudformation/weft-cluster.yaml).
 
+> **SF100 honesty runs** use a fixed Graviton topology — see
+> [SF100 topology (canonical)](#sf100-topology-canonical) below. Do not publish
+> numbers from the smaller `m6i.*` demo sizes in the example above.
+
 What the stack creates:
 
 - IAM instance profiles (SSM + optional S3/Glue; workers also get Route53 change on the private zone)
 - Security groups (Connect `50051` from `ClientCidr`; Flight `50561` driver→workers and worker↔worker)
 - Private hosted zone (`HostedZoneName`, default `weft.internal`)
 - Driver LT + ASG (size 1) and worker LT + ASG (size `WorkerCount`)
-- Optional internet-facing NLB when `ExposeConnect=true`
+- **No NLB** in the supported path (`ExposeConnect=false`)
 
 ### Parameters
 
@@ -273,8 +296,8 @@ What the stack creates:
 | `CatalogConf` | empty | `WEFT_CATALOG_CONF` on driver **and** workers (≤256 chars) |
 | `DataBucketArns` | empty | S3 ARNs on the instance profiles |
 | `EnableGlueAccess` | `false` | Glue `Get*` API permissions on instance profiles |
-| `ExposeConnect` | `false` | Internet-facing NLB on TCP 50051 |
-| `ClientCidr` | `10.0.0.0/8` | Who may hit driver `:50051` |
+| `ExposeConnect` | `false` | **Deprecated / do not use** — creates an internet-facing Connect NLB (bad for this data plane; see above) |
+| `ClientCidr` | `10.0.0.0/8` | Who may hit driver `:50051` (use your laptop `/32` for public-IP honesty runs) |
 | `HostedZoneName` | `weft.internal` | Private zone created in the VPC |
 | `KeyName` | empty | Optional SSH key (SSM preferred) |
 
@@ -390,30 +413,33 @@ No static keys belong in the AMI, user-data, or `CatalogConf`.
 
 ## 5. Run a query
 
-### Discover the Connect endpoint
+### Discover the Connect endpoint (driver IP — never NLB)
 
 ```sh
-aws cloudformation describe-stacks --region "${AWS_REGION}" --stack-name weft-demo \
-  --query 'Stacks[0].Outputs[?OutputKey==`ConnectEndpoint`].OutputValue' --output text
+STACK=weft-demo
+# Prefer public IP for laptop clients (SG must allow ClientCidr); else PrivateIpAddress.
+DRIVER_IP=$(aws ec2 describe-instances --region "${AWS_REGION}" \
+  --filters "Name=tag:Name,Values=${STACK}-driver" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+# fallback if the driver has no public IP:
+if [[ -z "${DRIVER_IP}" || "${DRIVER_IP}" == "None" ]]; then
+  DRIVER_IP=$(aws ec2 describe-instances --region "${AWS_REGION}" \
+    --filters "Name=tag:Name,Values=${STACK}-driver" "Name=instance-state-name,Values=running" \
+    --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+fi
+export CONNECT="sc://${DRIVER_IP}:50051"
+echo "$CONNECT"
 ```
 
-- `ExposeConnect=true` → `sc://<nlb-dns>:50051`
-- otherwise → resolve the driver private IP and use `sc://<private-ip>:50051` from a
-  client that can reach `ClientCidr` (bastion, VPN, or same VPC)
-
-```sh
-# private IP when ExposeConnect=false
-aws ec2 describe-instances --region "${AWS_REGION}" \
-  --filters "Name=tag:Name,Values=weft-demo-driver" "Name=instance-state-name,Values=running" \
-  --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text
-```
+Do **not** use the stack’s legacy `ConnectEndpoint` NLB DNS when `ExposeConnect=true`.
+Leave `ExposeConnect=false` and open `:50051` only to `ClientCidr`.
 
 ### Smoke test
 
 ```python
 from pyspark.sql import SparkSession
 
-ENDPOINT = "sc://10.0.1.20:50051"  # or NLB DNS
+ENDPOINT = "sc://10.0.1.20:50051"  # driver private or public IP
 
 spark = SparkSession.builder.remote(ENDPOINT).getOrCreate()
 spark.sql("SELECT 1 AS hello").show()
@@ -428,15 +454,110 @@ spark.sql("SELECT * FROM glue.weft_demo.orders LIMIT 10").show()
 If you populated SF-scale Glue tables with [`bench/sf100/`](../bench/sf100/):
 
 ```sh
+# Wrapper auto-resolves the driver IP when CONNECT is unset:
+STACK=weft-sf100 SUITE=all ./bench/sf100/remeasure-distributed.sh
+
+# Or explicit:
+CONNECT=sc://<driver-ip>:50051 SUITE=all ./bench/sf100/remeasure-distributed.sh
+
+# Or call the harness directly:
 WEFT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
-  --endpoint sc://<driver-or-nlb>:50051 \
+  --endpoint sc://<driver-ip>:50051 \
   --suite tpch --sf 100 --glue-db tpch_sf100 \
   --region "${AWS_REGION}" \
-  --json results/tpch-sf100-ec2.jsonl --resume
+  --json results/tpch-sf100-ec2.jsonl --resume --skip-worker-preflight
 ```
 
 The harness sets `spark.sql.catalog.glue.type=glue` on the client; keep stack
 `CatalogConf` aligned so workers resolve the same catalog.
+
+---
+
+## SF100 topology (canonical)
+
+**Keep this table in sync with any published SF100 EC2 numbers** (KAN-14). Same
+instance shapes as the EKS overlay
+[`deploy/helm/weft/values-sf100.yaml`](../deploy/helm/weft/values-sf100.yaml) —
+Graviton **arm64** AMI required (`c6g` / `m8g`).
+
+| Role | Count | Instance type | vCPU / RAM | Root EBS | Spill EBS (`/var/lib/weft/spill`) | ASG |
+|------|------:|---------------|------------|----------|-----------------------------------|-----|
+| Driver (Spark Connect `:50051`) | 1 | **`c6g.xlarge`** | 4 / 8 GiB | **100 GiB gp3** | 0 (optional; root is enough for driver) | Min=Max=Desired=**1** |
+| Workers (Flight `:50561`) | 2 | **`m8g.8xlarge`** | 32 / 128 GiB | 40 GiB gp3 (default) | **500 GiB gp3** each | Min=Max=Desired=**2** (pinned; no scale policies) |
+
+| Engine env (SF100) | Value | Where |
+|--------------------|-------|-------|
+| `WEFT_DISTRIBUTED_STRICT` | `1` | driver (`--distributed-strict true`) |
+| `WEFT_PREFER_HASH_JOIN` | `false` | driver + workers (`--prefer-hash-join false`) |
+| `WEFT_MEMORY_LIMIT_BYTES` | `42949672960` (40 Gi) | workers (DataFusion spill pool) |
+| `WEFT_SHUFFLE_SPILL_BYTES` | `8589934592` (8 Gi) | workers (shuffle cache threshold) |
+| `WEFT_SHUFFLE_PARTITIONS` | `32` | driver (≈ worker vCPU; > worker count spreads shuffle + reduces skew) |
+| `WEFT_WORKER_COUNT` / shards | `2` | fixed; matches ASG size |
+| Catalog | Glue Parquet `tpch_sf100` / `tpcds_sf100` | `CatalogConf` on driver **and** workers |
+| Dataset | `s3://weft-artifacts-<account>/{tpch,tpcds}-sf100/` | Parquet only for publishable runs |
+
+Memory invariant (same as Helm SF100): `memoryLimitBytes + shuffleSpillBytes + headroom
+≤ instance RAM`. On `m8g.8xlarge` (128 GiB) that is 40 Gi + 8 Gi tracked ≈ 48 Gi, leaving
+~80 Gi native headroom for Arrow / S3 / Glue CLI — do not raise both pools to the full
+limit. Worker cgroup is `MemoryMax=112G` / `MemoryHigh=96G`.
+
+> **Why `m8g.8xlarge`, not `m8g.4xlarge` (KAN-14 rerun, 2026-07-28):** DataFusion 54's
+> `HashJoin` build side is **not spillable**, so at SF100 the big `lineitem ⋈ orders`
+> build lands mostly *outside* the `FairSpillPool`. On `m8g.4xlarge` (64 GiB, 20 Gi pool)
+> every multi-fact TPC-H join (Q2/Q3/Q4/Q5/Q7/Q8) blew past the 56 Gi worker cgroup and
+> the stage aborted — the driver reported `register `result`: no batches` while the
+> single-table scans (Q1/Q6) still passed. `m8g.8xlarge` (128 GiB, 40 Gi pool) plus
+> `WEFT_SHUFFLE_PARTITIONS=32` (≈ worker vCPU; removes the 2-bucket skew that pinned all
+> shuffle onto one worker) gives the join real headroom. Keep `values-sf100.yaml` in sync.
+
+### Deploy recipe (copy/paste)
+
+Bake an **arm64** Weft AMI first (`./deploy/packer/build-ami.sh` with a
+`linux/aarch64` `weft` binary), then:
+
+```sh
+export AWS_REGION=us-west-2
+export BUCKET=weft-artifacts-$(aws sts get-caller-identity --query Account --output text)
+export AMI_ID=ami-…                 # arm64 Packer output
+export VPC_ID=vpc-…
+export SUBNETS=subnet-…,subnet-…    # public subnets only if the laptop hits the driver public IP
+MY_IP=$(curl -fsS https://checkip.amazonaws.com)/32
+
+./deploy/cloudformation/deploy-stack.sh \
+  --ami "${AMI_ID}" \
+  --vpc "${VPC_ID}" \
+  --subnets "${SUBNETS}" \
+  --stack weft-sf100 \
+  --region "${AWS_REGION}" \
+  --driver-type c6g.xlarge \
+  --worker-type m8g.8xlarge \
+  --workers 2 \
+  --driver-root-size 100 \
+  --worker-root-size 40 \
+  --driver-spill-size 0 \
+  --worker-spill-size 500 \
+  --memory-limit-bytes 42949672960 \
+  --shuffle-spill-bytes 8589934592 \
+  --shuffle-partitions 32 \
+  --distributed-strict true \
+  --prefer-hash-join false \
+  --data-buckets "arn:aws:s3:::${BUCKET},arn:aws:s3:::${BUCKET}/*" \
+  --glue true \
+  --catalog-conf "spark.sql.catalog.glue.type=glue;spark.sql.catalog.glue.region=${AWS_REGION};spark.sql.catalog.glue.warehouse=s3://${BUCKET}/warehouse" \
+  --expose-connect false \
+  --client-cidr "${MY_IP}"
+```
+
+**Never** pass `--expose-connect true` for SF100. Connect to the driver IP:
+
+```sh
+STACK=weft-sf100 SUITE=all ./bench/sf100/remeasure-distributed.sh
+# or SUITE=tpch / SUITE=tpcds
+```
+
+Cross-links: EKS twin in [`distributed-k8s.md` § SF100 topology](distributed-k8s.md#sf100-topology);
+harness notes in [`bench/sf100/README.md`](../bench/sf100/README.md);
+definition of done D-4.* in [`DISTRIBUTED_DONE.md`](DISTRIBUTED_DONE.md).
 
 ---
 
@@ -492,7 +613,7 @@ aws glue delete-database --region "${AWS_REGION}" --name "${GLUE_DB}"
 
 | Symptom | Likely cause |
 |---------|----------------|
-| Inflated / duplicated aggregates | Missing `WEFT_SHARD_INDEX` / `WEFT_WORKER_COUNT` on workers — check `/etc/weft/weft.env` |
+| Inflated / duplicated aggregates | Missing `WEFT_SHARD_INDEX` / `WEFT_WORKER_COUNT` on workers, or the **same** `WEFT_SHARD_INDEX` on every worker (each then reads shard 0's file subset, so single-file tables count 2× and size-balanced multi-file tables ~1× with skew) — check `/etc/weft/weft.env` on *every* worker |
 | Driver fails membership vs count | Route53 A set size ≠ `WorkerCount` — wait for all workers InService; check worker Route53 IAM |
 | Workers never receive tasks | Driver cannot resolve `WEFT_WORKER_SERVICE` — private zone VPC association / SG |
 | `aws glue … EntityNotFound` | Wrong database/table name or region in `CatalogConf` |

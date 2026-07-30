@@ -23,9 +23,20 @@ variable "weft_binary_url" {
   description = "HTTPS URL to a linux weft binary. Leave empty when staging a local binary via build-ami.sh."
 }
 
+variable "architecture" {
+  type        = string
+  default     = "arm64"
+  description = "AMI / binary arch: arm64 (SF100 Graviton c6g/m8g) or x86_64."
+  validation {
+    condition     = contains(["arm64", "x86_64"], var.architecture)
+    error_message = "Architecture must be arm64 or x86_64."
+  }
+}
+
 variable "instance_type" {
-  type    = string
-  default = "t3.large"
+  type        = string
+  default     = ""
+  description = "Builder instance type. Empty → t4g.large (arm64) or t3.large (x86_64)."
 }
 
 variable "subnet_id" {
@@ -40,25 +51,30 @@ variable "associate_public_ip_address" {
 }
 
 locals {
-  timestamp = formatdate("YYYYMMDD-hhmmss", timestamp())
-  ami_name  = "${var.ami_name_prefix}-${local.timestamp}"
+  timestamp     = formatdate("YYYYMMDD-hhmmss", timestamp())
+  ami_name      = "${var.ami_name_prefix}-${var.architecture}-${local.timestamp}"
+  instance_type = var.instance_type != "" ? var.instance_type : (
+    var.architecture == "arm64" ? "t4g.large" : "t3.large"
+  )
+  # AL2023 naming: arm64 images use "al2023-ami-*-arm64", x86 use "*-x86_64".
+  ami_name_glob = "al2023-ami-*-${var.architecture}"
 }
 
 source "amazon-ebs" "weft" {
   region                      = var.region
-  instance_type               = var.instance_type
+  instance_type               = local.instance_type
   ami_name                    = local.ami_name
-  ami_description             = "Hardened Weft driver/worker runtime (AL2023)"
+  ami_description             = "Hardened Weft driver/worker runtime (AL2023 ${var.architecture})"
   ssh_username                = "ec2-user"
   associate_public_ip_address = var.associate_public_ip_address
   subnet_id                   = var.subnet_id == "" ? null : var.subnet_id
 
   source_ami_filter {
     filters = {
-      name                = "al2023-ami-*-x86_64"
+      name                = local.ami_name_glob
       root-device-type    = "ebs"
       virtualization-type = "hvm"
-      architecture        = "x86_64"
+      architecture        = var.architecture
     }
     owners      = ["137112412989"]
     most_recent = true
@@ -71,9 +87,10 @@ source "amazon-ebs" "weft" {
   }
 
   tags = {
-    Name      = local.ami_name
-    Project   = "weft"
-    Component = "runtime"
+    Name         = local.ami_name
+    Project      = "weft"
+    Component    = "runtime"
+    Architecture = var.architecture
   }
 }
 

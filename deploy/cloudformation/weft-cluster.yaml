@@ -23,7 +23,12 @@ Metadata:
           - WorkerSpillVolumeSize
           - WorkerSpillVolumeType
       - Label: { default: Engine tuning }
-        Parameters: [MemoryLimitBytes, ShuffleSpillBytes, CatalogConf]
+        Parameters:
+          - MemoryLimitBytes
+          - ShuffleSpillBytes
+          - CatalogConf
+          - DistributedStrict
+          - PreferHashJoin
       - Label: { default: IAM data access }
         Parameters: [DataBucketArns, EnableGlueAccess]
 
@@ -39,8 +44,8 @@ Parameters:
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Description: >
-      Subnets for driver/worker ASGs (prefer private). When ExposeConnect=true,
-      an internet-facing NLB is created in these subnets (use public subnets then).
+      Subnets for driver/worker ASGs (prefer private). Public subnets only if
+      clients must hit the driver public IP. Do not use ExposeConnect/NLB.
 
   KeyName:
     Type: String
@@ -142,6 +147,31 @@ Parameters:
       Must be ≤256 chars (EC2 tag limit). Leave empty and configure from the PySpark
       client for driver-only smoke tests; distributed scans need this on workers too.
 
+  DistributedStrict:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      When true, set WEFT_DISTRIBUTED_STRICT=1 on the driver (honesty runs / SF100).
+      Local fallback becomes an error instead of silently single-node executing.
+
+  PreferHashJoin:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      WEFT_PREFER_HASH_JOIN on driver and workers. Keep true (KAN-45): the sort-merge
+      path (false) can deadlock under the bounded FairSpillPool at scale — DataFusion 54
+      HashJoinInput does not spill, but a pool overflow fails fast instead of wedging.
+
+  ShufflePartitions:
+    Type: String
+    Default: ''
+    Description: >
+      Optional WEFT_SHUFFLE_PARTITIONS (hash-shuffle fan-out, driver-side). Empty falls
+      back to WorkerCount. For SF100 set ~= worker vCPU (e.g. 32 on m8g.8xlarge) to spread
+      the shuffle and avoid 2-bucket skew pinning all load onto one worker.
+
   DataBucketArns:
     Type: CommaDelimitedList
     Default: ''
@@ -159,15 +189,18 @@ Parameters:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
-    Description: When true, create an internet-facing NLB on TCP 50051.
+    Description: >
+      DEPRECATED — leave false. When true, creates an internet-facing NLB on TCP
+      50051. Do not use for SF100 / honesty runs: one Connect driver needs no LB;
+      NLB health checks add false downtime. Connect to the driver instance IP
+      instead (see docs/distributed-ec2.md § Do not put Spark Connect behind an NLB).
 
   ClientCidr:
     Type: String
     Default: '10.0.0.0/8'
     Description: >
-      CIDR allowed to reach the driver on 50051 when ExposeConnect=false
-      (VPC / peered clients). Ignored for NLB path (NLB is open; lock down via SG
-      source from the NLB ENIs — here we allow ClientCidr on the driver SG either way).
+      CIDR allowed to reach the driver on TCP 50051 (VPC / VPN / laptop /32).
+      Primary client path — prefer this over ExposeConnect.
 
   HostedZoneName:
     Type: String
@@ -182,6 +215,7 @@ Conditions:
   HasCatalogConf: !Not [!Equals [!Ref CatalogConf, '']]
   DriverSpillEnabled: !Not [!Equals [!Ref DriverSpillVolumeSize, 0]]
   WorkerSpillEnabled: !Not [!Equals [!Ref WorkerSpillVolumeSize, 0]]
+  HasShufflePartitions: !Not [!Equals [!Ref ShufflePartitions, '']]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -227,7 +261,7 @@ Resources:
       FromPort: 50561
       ToPort: 50561
       SourceSecurityGroupId: !Ref DriverSecurityGroup
-      Description: Driver → worker Flight
+      Description: Driver to worker Flight
 
   WorkerFlightFromWorkers:
     Type: AWS::EC2::SecurityGroupIngress
@@ -237,7 +271,7 @@ Resources:
       FromPort: 50561
       ToPort: 50561
       SourceSecurityGroupId: !Ref WorkerSecurityGroup
-      Description: Worker ↔ worker Flight shuffle
+      Description: Worker to worker Flight shuffle
 
   # ---------------------------------------------------------------------------
   # Private DNS (multi-A for WEFT_WORKER_SERVICE)
@@ -439,9 +473,13 @@ Resources:
               - Key: weft:shuffle-spill-bytes
                 Value: !Ref ShuffleSpillBytes
               - Key: weft:shuffle-partitions
-                Value: !Sub '${WorkerCount}'
+                Value: !If [HasShufflePartitions, !Ref ShufflePartitions, !Sub '${WorkerCount}']
               - Key: weft:catalog-conf
                 Value: !If [HasCatalogConf, !Ref CatalogConf, 'none']
+              - Key: weft:distributed-strict
+                Value: !Ref DistributedStrict
+              - Key: weft:prefer-hash-join
+                Value: !Ref PreferHashJoin
           - ResourceType: volume
             Tags:
               - Key: Name
@@ -449,11 +487,15 @@ Resources:
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
-            set -euo pipefail
+            set -uo pipefail
+            exec > >(tee -a /var/log/weft-userdata.log) 2>&1
+            echo "[userdata] driver boot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             # Tags are also readable via IMDS InstanceMetadataTags; bootstrap
             # uses DescribeTags as the source of truth. Kick bootstrap early.
             systemctl start weft-bootstrap.service
-            systemctl start weft-driver.service
+            systemctl enable --now weft-driver.service
+            systemctl is-active weft-bootstrap weft-driver || true
+            ss -lntp | grep 50051 || true
 
   WorkerLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
@@ -507,9 +549,13 @@ Resources:
               - Key: weft:shuffle-spill-bytes
                 Value: !Ref ShuffleSpillBytes
               - Key: weft:shuffle-partitions
-                Value: !Sub '${WorkerCount}'
+                Value: !If [HasShufflePartitions, !Ref ShufflePartitions, !Sub '${WorkerCount}']
               - Key: weft:catalog-conf
                 Value: !If [HasCatalogConf, !Ref CatalogConf, 'none']
+              - Key: weft:distributed-strict
+                Value: !Ref DistributedStrict
+              - Key: weft:prefer-hash-join
+                Value: !Ref PreferHashJoin
           - ResourceType: volume
             Tags:
               - Key: Name
@@ -517,9 +563,12 @@ Resources:
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
-            set -euo pipefail
+            set -uo pipefail
+            exec > >(tee -a /var/log/weft-userdata.log) 2>&1
+            echo "[userdata] worker boot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             systemctl start weft-bootstrap.service
-            systemctl start weft-worker.service
+            systemctl enable --now weft-worker.service
+            systemctl is-active weft-bootstrap weft-worker || true
 
   # ---------------------------------------------------------------------------
   # Auto Scaling Groups (fixed size — no scaling policies)
@@ -578,7 +627,8 @@ Resources:
         PauseTime: PT5M
 
   # ---------------------------------------------------------------------------
-  # Optional Connect NLB
+  # DEPRECATED optional Connect NLB — leave ExposeConnect=false; use driver IP.
+  # See docs/distributed-ec2.md § Do not put Spark Connect behind an NLB.
   # ---------------------------------------------------------------------------
   ConnectTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
@@ -647,11 +697,14 @@ Outputs:
     Value: !Ref WorkerAutoScalingGroup
 
   ConnectEndpoint:
-    Description: Spark Connect URL (NLB DNS when exposed; otherwise discover the driver private IP)
+    Description: >
+      Spark Connect URL. Supported path is always the driver instance IP
+      (PublicIpAddress or PrivateIpAddress of ${AWS::StackName}-driver).
+      NLB DNS is deprecated — do not use for SF100.
     Value: !If
       - ExposeConnectEnabled
-      - !Sub 'sc://${ConnectNlb.DNSName}:50051'
-      - !Sub 'sc://<driver-private-ip>:50051 (ExposeConnect=false; look up ${AWS::StackName}-driver)'
+      - !Sub 'DEPRECATED-NLB sc://${ConnectNlb.DNSName}:50051 — use driver IP instead'
+      - !Sub 'sc://<driver-ip>:50051 (resolve ${AWS::StackName}-driver PublicIpAddress or PrivateIpAddress)'
 
   WorkerCount:
     Value: !Ref WorkerCount

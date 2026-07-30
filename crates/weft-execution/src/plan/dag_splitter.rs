@@ -7,6 +7,20 @@
 //! sub-DAGs, replaces them with the worker's `shuffle_input[_i]` tables, and unparses the
 //! remaining outer plan as one gathered output stage.
 //!
+//! Two branch refinements (KAN-41, TPC-DS Q11/Q58/Q78 at SF10):
+//!
+//! - **Replicated-only aggregate branches are materialized, not inlined.** A branch whose
+//!   inputs are all replicated (Q58's `cs_items`/`ws_items`, Q78's `cs`/`ws` arms) used to stay
+//!   inline in the gathered outer stage — which runs once per shuffle partition, so the full
+//!   replicated-fact scan + aggregate was recomputed `WEFT_SHUFFLE_PARTITIONS` times (16× at
+//!   SF10) with only partition 0's copy ever used. Such a branch now becomes a single
+//!   `Forward` stage: computed exactly once on one worker (every worker holds the replicated
+//!   inputs), its exact output gathered to partition 0 like any sharded branch's.
+//! - **Identical branches are planned once.** A CTE self-joined N times (Q11's `year_total` ×4)
+//!   inlines as N structurally identical subtrees; deduplicating by plan fingerprint (volatile
+//!   expressions excluded — they must re-evaluate per reference) leaves one sub-DAG whose
+//!   shuffle output every outer placeholder pulls.
+//!
 //! ## Why any join type at the outer skeleton is safe
 //!
 //! Each materialized branch's final stage always writes with empty `hash_key_cols`, so — per
@@ -49,47 +63,89 @@ pub(crate) fn try_branch_dag(
         return Ok(None);
     }
 
-    let mut branch_nodes = Vec::new();
-    collect_sharded_branches(lp, replicated, &mut branch_nodes);
-    if branch_nodes.is_empty() {
+    let mut branches = Vec::new();
+    collect_sharded_branches(lp, replicated, &mut branches);
+    // At least one genuinely sharded branch must exist; a skeleton whose branches are all
+    // replicated-only belongs to the replicated-table paths, not to this splitter.
+    if !branches.iter().any(|b| b.kind == BranchKind::Sharded) {
         return Ok(None);
     }
 
-    let branch_count = branch_nodes.len();
-    let branch_by_node: HashMap<usize, usize> = branch_nodes
+    let branch_count = branches.len();
+    let branch_by_node: HashMap<usize, usize> = branches
         .iter()
         .enumerate()
-        .map(|(i, node)| (node_id(node), i))
+        .map(|(i, b)| (node_id(b.node), i))
         .collect();
 
-    let mut branch_queries = Vec::with_capacity(branch_count);
-    for (i, branch) in branch_nodes.iter().enumerate() {
-        reject_mixed_union_branch(branch, replicated)?;
-        let dq = plan_branch(branch, replicated).map_err(|e| {
-            Error::Unsupported(format!(
-                "auto-distribute: branch-aware CrossJoin branch {i} is not distributable: {e}"
-            ))
-        })?;
-        // Only the branch's own *output* stage matters here: it is the one whose stage id
-        // becomes the outer skeleton's upstream (via `append_branch`), so it alone must satisfy
-        // the "empty hash key ⇒ everything gathers to partition 0" invariant the rest of this
-        // module relies on (see the module doc). An *intermediate* Forward stage feeding that
-        // output — e.g. a UNION arm scanning only replicated tables, run once via
-        // `try_split_broadcast_union` / `plan_union`'s zero-sharded-arm path and then combined
-        // with the sharded arm(s) inside this same sub-DAG — is exactly the safe "run once,
-        // shuffle its (already-exact) contribution" pattern the driver already implements for
-        // Forward producer stages, so it is not rejected here.
-        if dq
-            .stages
-            .last()
-            .is_some_and(|s| s.exchange == ExchangeMode::Forward)
-        {
-            return Err(Error::Unsupported(format!(
-                "auto-distribute: branch-aware CrossJoin branch {i} outputs via Forward exchange; \
-                 a replicated-only branch must remain in the outer stage"
-            )));
+    // KAN-41 (TPC-DS Q11): one CTE self-joined N times inlines as N structurally identical
+    // branch subtrees. Plan each distinct branch ONCE and point every occurrence's outer
+    // placeholder at the same shuffle output; without this the fact scans + aggregates of the
+    // CTE run N times over the full sub-DAG. Only deterministic branches (no volatile
+    // expressions) may share an evaluation — a `rand()`-bearing branch is re-evaluated per
+    // occurrence single-node, so deduplicating it would change results.
+    let mut rep_of: Vec<usize> = (0..branch_count).collect();
+    let mut fp_to_rep: HashMap<String, usize> = HashMap::new();
+    for (i, b) in branches.iter().enumerate() {
+        if let Some(fp) = branch_fingerprint(b.node) {
+            if let Some(&r) = fp_to_rep.get(&fp) {
+                rep_of[i] = r;
+            } else {
+                fp_to_rep.insert(fp, i);
+            }
         }
-        branch_queries.push(dq);
+    }
+    let mut reps: Vec<usize> = Vec::new();
+    for &r in &rep_of {
+        if !reps.contains(&r) {
+            reps.push(r);
+        }
+    }
+
+    let mut rep_queries: HashMap<usize, DistributedQuery> = HashMap::with_capacity(reps.len());
+    for &r in &reps {
+        let branch = &branches[r];
+        reject_mixed_union_branch(branch.node, replicated)?;
+        let dq = match branch.kind {
+            BranchKind::Sharded => {
+                let dq = plan_branch(branch.node, replicated).map_err(|e| {
+                    Error::Unsupported(format!(
+                        "auto-distribute: branch-aware CrossJoin branch {r} is not distributable: {e}"
+                    ))
+                })?;
+                // Only the branch's own *output* stage matters here: it is the one whose stage id
+                // becomes the outer skeleton's upstream (via `append_branch`), so it alone must satisfy
+                // the "empty hash key ⇒ everything gathers to partition 0" invariant the rest of this
+                // module relies on (see the module doc). An *intermediate* Forward stage feeding that
+                // output — e.g. a UNION arm scanning only replicated tables, run once via
+                // `try_split_broadcast_union` / `plan_union`'s zero-sharded-arm path and then combined
+                // with the sharded arm(s) inside this same sub-DAG — is exactly the safe "run once,
+                // shuffle its (already-exact) contribution" pattern the driver already implements for
+                // Forward producer stages, so it is not rejected here.
+                if dq
+                    .stages
+                    .last()
+                    .is_some_and(|s| s.exchange == ExchangeMode::Forward)
+                {
+                    return Err(Error::Unsupported(format!(
+                        "auto-distribute: branch-aware CrossJoin branch {r} scans a sharded table \
+                         but outputs via Forward exchange; its sharded input must flow through \
+                         hash-shuffled stages, not a single-worker forward"
+                    )));
+                }
+                dq
+            }
+            // KAN-41 (TPC-DS Q58/Q78): an aggregate branch over only *replicated* tables (e.g.
+            // Q58's `cs_items` over catalog_sales) must NOT stay inline in the gathered outer
+            // stage: that stage runs once per shuffle partition, so the full replicated-fact
+            // scan + join + aggregate would be recomputed `WEFT_SHUFFLE_PARTITIONS` times
+            // (16× at SF10) while only partition 0's copy is ever used. Materialize it as one
+            // `Forward` stage instead — computed exactly once (the driver's Forward producers
+            // run on a single worker), its already-exact output gathered to partition 0 like
+            // any other branch output.
+            BranchKind::ReplicatedAggregate => forward_branch_query(branch.node, r)?,
+        };
+        rep_queries.insert(r, dq);
     }
 
     let rewritten = replace_branches(lp, &branch_by_node, branch_count)?.0;
@@ -112,12 +168,17 @@ pub(crate) fn try_branch_dag(
         .to_string();
 
     let mut stages = Vec::new();
-    let mut upstream_stage_ids = Vec::with_capacity(branch_count);
     let mut next_id = 0u32;
-    for (i, dq) in branch_queries.into_iter().enumerate() {
-        let output = append_branch(&mut stages, &mut next_id, dq, i)?;
-        upstream_stage_ids.push(output);
+    let mut rep_output: HashMap<usize, u32> = HashMap::with_capacity(reps.len());
+    for &r in &reps {
+        let dq = rep_queries.remove(&r).expect("representative planned");
+        let output = append_branch(&mut stages, &mut next_id, dq, r)?;
+        rep_output.insert(r, output);
     }
+    // One upstream per *occurrence* (positions map to `shuffle_input_{i}` names on the worker);
+    // deduplicated occurrences repeat their representative's output stage id, which the worker
+    // simply pulls once per position.
+    let upstream_stage_ids: Vec<u32> = (0..branch_count).map(|i| rep_output[&rep_of[i]]).collect();
 
     stages.push(StageDef::new(
         next_id,
@@ -129,6 +190,95 @@ pub(crate) fn try_branch_dag(
         stages,
         finalize_sql: None,
     }))
+}
+
+/// One collected branch of the outer join skeleton.
+#[derive(Debug)]
+struct Branch<'a> {
+    node: &'a LogicalPlan,
+    kind: BranchKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BranchKind {
+    /// Scans at least one sharded table; planned through the shape planners into a sub-DAG.
+    Sharded,
+    /// An aggregate branch over only replicated tables; materialized as a single `Forward`
+    /// stage so its full replicated-fact scan runs once, not once per shuffle partition.
+    ReplicatedAggregate,
+}
+
+/// Materialize a replicated-only aggregate branch as one `Forward` stage: every worker holds
+/// the full replicated inputs, so any single worker computes the exact branch output.
+fn forward_branch_query(branch: &LogicalPlan, branch_i: usize) -> Result<DistributedQuery> {
+    let sql = Unparser::default()
+        .plan_to_sql(branch)
+        .map_err(|e| {
+            Error::Unsupported(format!(
+                "auto-distribute: unparse replicated aggregate branch {branch_i}: {e}"
+            ))
+        })?
+        .to_string();
+    Ok(DistributedQuery {
+        stages: vec![StageDef {
+            stage_id: 0,
+            sql: sanitize_generated_sql(&sql),
+            upstream_stage_ids: vec![],
+            hash_key_cols: vec![],
+            exchange: ExchangeMode::Forward,
+            plan_fragment: None,
+            lakehouse_snapshot_pins: String::new(),
+            replicated_tables: String::new(),
+        }],
+        finalize_sql: None,
+    })
+}
+
+/// Structural fingerprint for branch deduplication: the full plan tree below any top-level
+/// `SubqueryAlias` wrappers (self-join aliases like `t_s_firstyear` / `t_s_secyear` must not
+/// defeat identity). `None` for branches carrying volatile expressions — those may never
+/// share an evaluation (see the dedup note in [`try_branch_dag`]).
+fn branch_fingerprint(branch: &LogicalPlan) -> Option<String> {
+    if plan_contains_volatile(branch) {
+        return None;
+    }
+    let mut inner = branch;
+    while let LogicalPlan::SubqueryAlias(alias) = inner {
+        inner = alias.input.as_ref();
+    }
+    Some(format!("{inner}"))
+}
+
+/// Whether any expression in the plan (including subquery plans) contains a volatile scalar
+/// function (`rand()`, `now()`, …) whose result may differ across evaluations.
+fn plan_contains_volatile(lp: &LogicalPlan) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+
+    let mut volatile = false;
+    let _ = lp.apply(|node| {
+        if volatile {
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        for expr in node.expressions() {
+            let _ = expr.apply(|e| {
+                if let Expr::ScalarFunction(f) = e {
+                    if f.func.signature().volatility
+                        == datafusion::logical_expr::Volatility::Volatile
+                    {
+                        volatile = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+        }
+        Ok(if volatile {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    });
+    volatile
 }
 
 /// A `UNION ALL` arm that scans only replicated tables is not itself unsafe to mix with a sharded
@@ -281,25 +431,40 @@ fn is_branch_gated(lp: &LogicalPlan) -> bool {
     }
 }
 
-/// Collect the maximal sharded subplans below the cross-join skeleton. Unary nodes above or between
+/// Collect the maximal sharded subplans below the cross-join skeleton, plus replicated-only
+/// *aggregate* branches (see [`BranchKind::ReplicatedAggregate`]). Unary nodes above or between
 /// cross joins remain in the skeleton so their expressions retain the original branch qualifiers.
-/// Replicated-only leaves also remain there: evaluating them once beside the gathered sharded
-/// inputs is correct and avoids duplicating a Forward intermediate on every worker.
+/// Replicated-only leaves that are cheap to re-evaluate per partition (plain dimension scans /
+/// filters) also remain there: evaluating them beside the gathered sharded inputs is correct and
+/// avoids a Forward round-trip for data that is already local.
 fn collect_sharded_branches<'a>(
     lp: &'a LogicalPlan,
     replicated: &[&str],
-    out: &mut Vec<&'a LogicalPlan>,
+    out: &mut Vec<Branch<'a>>,
 ) {
     // Stop at an aggregate branch the linear planner already understands. Its input often contains
     // fact/dimension cross joins of its own; descending through those would gather raw fact rows
     // before aggregating and defeat the purpose of this splitter.
     if peel(lp).is_ok() {
-        let tables = base_tables(lp);
+        // Scan counting must include expression subqueries: a branch whose *join inputs* are all
+        // replicated but whose IN/EXISTS/scalar subquery reads a sharded table is NOT safe to
+        // materialize as a single Forward stage — that stage runs on one worker and would read
+        // only that worker's shard of the fact.
+        let mut tables = HashSet::new();
+        collect_tables_with_subqueries(lp, &mut tables);
         if tables
             .iter()
             .any(|table| !replicated.contains(&table.as_str()))
         {
-            out.push(lp);
+            out.push(Branch {
+                node: lp,
+                kind: BranchKind::Sharded,
+            });
+        } else if !tables.is_empty() && !plan_contains_volatile(lp) {
+            out.push(Branch {
+                node: lp,
+                kind: BranchKind::ReplicatedAggregate,
+            });
         }
         return;
     }
@@ -321,7 +486,10 @@ fn collect_sharded_branches<'a>(
         .iter()
         .any(|table| !replicated.contains(&table.as_str()))
     {
-        out.push(lp);
+        out.push(Branch {
+            node: lp,
+            kind: BranchKind::Sharded,
+        });
     }
 }
 
@@ -821,5 +989,98 @@ mod tests {
     async fn remaining_scan_of_only_replicated_tables_is_allowed() {
         let lp = logical_plan("SELECT dk FROM d").await;
         reject_remaining_sharded_scans(&lp, &["d"]).expect("replicated dim may remain in outer");
+    }
+
+    /// KAN-41 (TPC-DS Q11): self-join aliases (`a`/`b`) wrap structurally identical subtrees —
+    /// their fingerprints must match so the branch is planned once.
+    #[tokio::test]
+    async fn fingerprint_ignores_top_level_alias() {
+        let lp = logical_plan(
+            "WITH a AS (SELECT k, SUM(v) AS s FROM t GROUP BY k) \
+             SELECT x.k, x.s, y.s FROM a x JOIN a y ON x.k = y.k",
+        )
+        .await;
+        let mut branches = Vec::new();
+        collect_sharded_branches(&lp, &[], &mut branches);
+        assert_eq!(branches.len(), 2, "two CTE references: {branches:?}");
+        let f0 = branch_fingerprint(branches[0].node);
+        let f1 = branch_fingerprint(branches[1].node);
+        assert!(f0.is_some() && f0 == f1, "aliases must not defeat identity");
+    }
+
+    /// A branch carrying a volatile expression may never share one evaluation across its
+    /// occurrences — single-node re-evaluates it per reference, so deduplication would change
+    /// results. Its fingerprint is `None`, keeping every occurrence its own sub-DAG.
+    #[tokio::test]
+    async fn volatile_branch_has_no_fingerprint() {
+        let lp = logical_plan(
+            "WITH a AS (SELECT k, SUM(v) + random() * 0 AS s FROM t GROUP BY k) \
+             SELECT x.k, x.s, y.s FROM a x JOIN a y ON x.k = y.k",
+        )
+        .await;
+        let mut branches = Vec::new();
+        collect_sharded_branches(&lp, &[], &mut branches);
+        assert_eq!(branches.len(), 2, "two CTE references: {branches:?}");
+        for b in &branches {
+            assert!(
+                branch_fingerprint(b.node).is_none(),
+                "volatile branch must not be deduplicated"
+            );
+        }
+        // ...and the plan keeps one sub-DAG per occurrence (partial+combine each, plus outer).
+        let dq = plan_distributed_logical(&lp, &[]).expect("volatile self-join still plans");
+        assert_eq!(
+            dq.stages.len(),
+            5,
+            "volatile branches are not deduplicated: {dq:?}"
+        );
+    }
+
+    /// KAN-41 (TPC-DS Q58): an aggregate branch over only replicated tables is collected for
+    /// Forward materialization; a plain replicated scan stays inline in the outer stage.
+    #[tokio::test]
+    async fn replicated_aggregate_branch_is_collected_but_plain_scan_is_not() {
+        let lp = logical_plan(
+            "WITH a AS (SELECT k, SUM(v) AS s FROM t GROUP BY k), \
+             b AS (SELECT dk AS k, SUM(1) AS n FROM d GROUP BY dk) \
+             SELECT a.k, a.s, b.n, d.label FROM a JOIN b ON a.k = b.k CROSS JOIN d",
+        )
+        .await;
+        let mut branches = Vec::new();
+        collect_sharded_branches(&lp, &["d"], &mut branches);
+        let kinds: Vec<_> = branches.iter().map(|b| b.kind).collect();
+        assert!(
+            kinds.contains(&BranchKind::Sharded),
+            "sharded aggregate branch: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&BranchKind::ReplicatedAggregate),
+            "replicated aggregate branch: {kinds:?}"
+        );
+        assert_eq!(
+            branches.len(),
+            2,
+            "the plain `d` scan stays in the outer stage: {kinds:?}"
+        );
+    }
+
+    /// A branch whose *join inputs* are replicated but whose IN subquery reads the sharded fact
+    /// must NOT be Forward-materialized: the Forward stage runs on one worker and would read
+    /// only that worker's shard of `t`. It classifies as sharded, so the shape planners either
+    /// distribute it honestly or decline the query to the gather fallback.
+    #[tokio::test]
+    async fn replicated_branch_with_sharded_subquery_is_not_forward_materialized() {
+        let lp = logical_plan(
+            "WITH a AS (SELECT dk AS k, SUM(1) AS n FROM d WHERE dk IN (SELECT k FROM t) GROUP BY dk), \
+             b AS (SELECT k, SUM(v) AS s FROM t GROUP BY k) \
+             SELECT a.k, a.n, b.s FROM a JOIN b ON a.k = b.k",
+        )
+        .await;
+        let mut branches = Vec::new();
+        collect_sharded_branches(&lp, &["d"], &mut branches);
+        assert!(
+            branches.iter().all(|b| b.kind == BranchKind::Sharded),
+            "no branch may be classified replicated-aggregate: {branches:?}"
+        );
     }
 }

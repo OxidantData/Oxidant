@@ -24,11 +24,28 @@ pub async fn try_run_distributed(
     udf_json: Option<&str>,
     tracker: Option<&QueryTracker>,
 ) -> Result<Option<Vec<RecordBatch>>> {
-    let lp = engine.logical_plan(sql).await?;
-    try_run_distributed_plan(engine, workers, &lp, sql, replicated, udf_json, tracker).await
+    // Capture the exact Delta/Iceberg snapshot identities this query resolves so every
+    // worker stage scans the SAME pinned snapshot (KAN-48) — workers reject unpinned
+    // lakehouse scans.
+    let (lp, lakehouse_snapshot_pins) = engine.logical_plan_with_lakehouse_snapshots(sql).await?;
+    try_run_distributed_plan(
+        engine,
+        workers,
+        &lp,
+        sql,
+        replicated,
+        udf_json,
+        tracker,
+        &lakehouse_snapshot_pins,
+    )
+    .await
 }
 
 /// Like [`try_run_distributed`], but accepts an already-built logical plan (DataFrame API path).
+/// `lakehouse_snapshot_pins` is the driver's captured table→snapshot JSON map
+/// ([`Engine::capture_lakehouse_snapshots`]), stamped onto every stage so workers resolve
+/// lakehouse tables at the same pinned snapshot; empty when the plan scans no lakehouse tables.
+#[allow(clippy::too_many_arguments)]
 pub async fn try_run_distributed_plan(
     engine: &Engine,
     workers: &[String],
@@ -37,6 +54,7 @@ pub async fn try_run_distributed_plan(
     replicated: &[&str],
     udf_json: Option<&str>,
     tracker: Option<&QueryTracker>,
+    lakehouse_snapshot_pins: &str,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let membership = resolve_membership(workers);
     let endpoints = membership.endpoints();
@@ -44,7 +62,7 @@ pub async fn try_run_distributed_plan(
         return Ok(None);
     }
 
-    let dq = match plan_distributed_logical(plan, replicated) {
+    let mut dq = match plan_distributed_logical(plan, replicated) {
         Ok(d) => d,
         Err(Error::Unsupported(reason)) => {
             record_distributed_fallback(tracker, &reason);
@@ -55,6 +73,9 @@ pub async fn try_run_distributed_plan(
         }
         Err(e) => return Err(e),
     };
+    for stage in &mut dq.stages {
+        stage.lakehouse_snapshot_pins = lakehouse_snapshot_pins.to_string();
+    }
     let cluster = Cluster::from_membership(membership);
 
     if let Some(json) = udf_json.filter(|s| !s.is_empty() && *s != "[]") {
@@ -342,6 +363,34 @@ mod tests {
         assert!(
             msg.contains("window") || msg.contains("PARTITION BY") || msg.contains("unsupported"),
             "reject reason should be preserved, got: {msg}"
+        );
+    }
+
+    /// KAN-22 floor: a correlated scalar subquery over a second *sharded* table must surface a
+    /// clear, actionable strict-mode rejection naming the shape — never a silent unbounded
+    /// driver-local collect.
+    #[tokio::test]
+    async fn strict_mode_rejects_correlated_subquery_over_sharded_table() {
+        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        std::env::set_var("WEFT_DISTRIBUTED_STRICT", "1");
+        let e = engine_with_t().await;
+        e.register_batches("u", vec![test_batch()]).unwrap();
+        // `t` and `u` both sharded: the subquery over `u` cannot stay shard-local and the
+        // whole-fact gather handles exactly one sharded fact, so this must reject.
+        let sql = "SELECT t.k, t.v FROM t, u WHERE t.k = u.k \
+                   AND t.v = (SELECT max(u.v) FROM u WHERE u.k = t.k)";
+        let workers: Vec<String> = WORKERS.iter().map(|s| (*s).to_string()).collect();
+        let result = try_run_distributed(&e, &workers, sql, &[], None, None).await;
+        std::env::remove_var("WEFT_DISTRIBUTED_STRICT");
+        let err = result.expect_err("strict mode must fail");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+        assert!(
+            msg.contains("subquery over `u` is only safe when that table is replicated"),
+            "reject reason should name the unsupported shape, got: {msg}"
         );
     }
 

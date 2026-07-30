@@ -61,7 +61,15 @@ fn show(batches: &[RecordBatch]) -> String {
 /// Sort batch rows textually for order-insensitive comparison (grouped results have no inherent
 /// order); the per-line sort makes the comparison independent of worker concatenation order.
 fn sorted_lines(batches: &[RecordBatch]) -> Vec<String> {
-    let mut lines: Vec<String> = show(batches).lines().map(|s| s.to_string()).collect();
+    // Zero-row batches carry no row content — since KAN-28 the distributed path returns them
+    // *typed* (a schema-carrying empty batch) where single-node returns an empty vec, so
+    // compare row content only.
+    let batches: Vec<RecordBatch> = batches
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .cloned()
+        .collect();
+    let mut lines: Vec<String> = show(&batches).lines().map(|s| s.to_string()).collect();
     lines.sort();
     lines
 }
@@ -1111,7 +1119,7 @@ async fn full_then_inner_chain_coalesces_carried_join_key() {
 }
 
 #[tokio::test]
-async fn subquery_over_sharded_table_gathers_fact() {
+async fn subquery_over_sharded_table_plans_semi_shuffle() {
     let single = Engine::new();
     single
         .register_batches("t", vec![batch(0, 60, 12)])
@@ -1122,20 +1130,27 @@ async fn subquery_over_sharded_table_gathers_fact() {
         )
         .await
         .unwrap();
-    // Self-subquery over the sharded fact needs a gather-to-partition-0 rewrite so every
-    // worker sees the full `t` when evaluating the IN list.
-    let dq = plan_distributed_logical(&lp, &[]).expect("sharded self-subquery should gather");
+    // KAN-29: an uncorrelated self-IN over the sharded fact no longer gathers the whole fact to
+    // partition 0 — the IN list is a key producer hash-shuffled by `k`, co-located with the
+    // outer scan, and the semi join feeds the ordinary partial/combine aggregation.
+    let dq = plan_distributed_logical(&lp, &[]).expect("sharded self-IN should plan semi shuffle");
+    assert_eq!(
+        dq.stages.len(),
+        4,
+        "key producer -> outer scan -> semi+partial -> combine: {dq:?}"
+    );
+    assert_eq!(dq.stages[0].hash_key_cols, vec![0]);
     assert!(
-        dq.stages
-            .iter()
-            .any(|s| s.sql.contains("__weft_materialize_gate") || s.sql.contains("gathered_fact")),
-        "expected gather/materialize stages, got: {dq:?}"
+        dq.stages[0].sql.contains("SELECT t.k AS k0 FROM t WHERE"),
+        "{}",
+        dq.stages[0].sql
     );
     assert!(
-        dq.stages
-            .iter()
-            .any(|s| s.sql.contains("shuffle_input_") && s.sql.contains("IN (")),
-        "final stage must evaluate the IN-subquery against gathered shuffle input: {dq:?}"
+        dq.stages[2]
+            .sql
+            .contains("o.ok0 IN (SELECT k0 FROM shuffle_input_1)"),
+        "semi stage must evaluate the IN against the co-located key stream: {}",
+        dq.stages[2].sql
     );
 }
 

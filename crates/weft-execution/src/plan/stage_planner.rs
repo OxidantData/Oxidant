@@ -26,7 +26,15 @@
 //! This covers star schemas (a sharded fact + replicated dimensions, including multi-dim
 //! join chains folded into the partial). Joins between two or more *sharded* tables lower to a
 //! **left-deep shuffle-join chain** (pairwise equijoin stages, then partial/final aggregate)
-//! when each join is a single equijoin key.
+//! when each join is a single equijoin key. Two sharded-table compositions layer on top of that:
+//!
+//! - **comma-joins** (`FROM a, b WHERE a.k = b.k`, TPC-H Q12) — which DataFusion leaves as a
+//!   `CROSS JOIN` + `Filter` — are normalized into an inner equijoin by
+//!   [`super::join_chain::rewrite_comma_join_filters`] and planned by the ordinary paths.
+//! - an **aggregate over a pre-aggregated derived table** (TPC-H Q13's count-distribution over a
+//!   LEFT JOIN group-by, TPC-DS Q54's revenue bands over a per-customer `GROUP BY` CTE) is
+//!   composed from the inner distributed aggregation plus one exact outer-aggregate stage
+//!   hash-shuffled by the outer group key ([`aggregate_over_aggregate_stages`]).
 //!
 //! Also supported: ungrouped/global aggregates, `HAVING` over the aggregated result,
 //! scalar / IN / EXISTS subqueries **over replicated tables only**, distributable set operations,
@@ -38,7 +46,12 @@
 //! outputs with any replicated-only inputs.
 //! Ranking windows and global windows (no `PARTITION BY`) return an explicit
 //! [`Error::Unsupported`] so the caller falls back to single-node execution.
-//! Correlated subqueries over sharded tables are rejected (not broadcast-safe).
+//! Correlated scalar subqueries over sharded tables are either decorrelated into a distributed
+//! per-key aggregate + shuffle join (equality-correlated `min`/`max`/`sum`/`count`, TPC-H Q2 —
+//! see [`super::shape_extensions::try_decorrelate_scalar_subquery`]) or rejected (not
+//! broadcast-safe). **Uncorrelated** scalar-aggregate thresholds in HAVING (TPC-H Q11) get a
+//! one-row broadcast — scalar partial/combine stages plus driver-side literal injection into the
+//! outer stages ([`super::shape_extensions::try_uncorrelated_scalar_threshold`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,8 +64,10 @@ use weft_loom::Engine;
 
 use super::shape_extensions::{
     ensure_having_subquery_tables_replicated, ensure_subquery_tables_replicated,
-    reject_explicit_unsupported, try_materialize_complex_fact, try_materialize_subquery_fact,
-    try_non_aggregate, try_union_all, try_window,
+    reject_explicit_unsupported, try_decorrelate_scalar_subquery, try_derived_scalar_equality,
+    try_in_agg_semi_join, try_materialize_complex_fact, try_materialize_subquery_fact,
+    try_nested_in_semi, try_non_aggregate, try_semi_anti_subqueries,
+    try_uncorrelated_scalar_threshold, try_union_all, try_window,
 };
 use crate::driver::{ExchangeMode, StageDef};
 
@@ -77,7 +92,50 @@ pub struct DistributedQuery {
 /// equijoin.
 /// Derive a distributed plan from an already-built logical plan.
 pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result<DistributedQuery> {
+    // Filter-first inner-join reorder (TPC-DS Q72 at SF10): DataFusion executes inner joins in
+    // written order, so a fact⋈fact join placed before the selective dimension filters must
+    // stream (or, under the workers' unknown-stats sort-merge reroute, external-sort) the
+    // exploded intermediate — Q72's stage 0 wrote 36-38 GB of sort spill per worker and never
+    // finished. Pulling filtered leaves ahead is semantics-preserving and shrinks the
+    // intermediate before the expensive join; a no-op (returns `None`) for plans whose order
+    // already matches, so unaffected queries keep their plans byte-for-byte.
+    let reordered = super::join_order::reorder_filtered_dims_first(lp);
+    let lp = reordered.as_ref().unwrap_or(lp);
     let primary: Result<DistributedQuery> = (|| {
+        // Correlated scalar min/max/sum/count subqueries (TPC-H Q2) get a real shuffle-join
+        // plan here instead of the whole-fact gather they'd otherwise fall into below.
+        if let Some(dq) = try_decorrelate_scalar_subquery(lp, replicated)? {
+            return Ok(dq);
+        }
+        // Uncorrelated scalar-aggregate thresholds (TPC-H Q11's global HAVING fraction) get a
+        // one-row broadcast: scalar partial/combine stages, then the driver inlines the single
+        // computed value into the outer stages' SQL before dispatch (literal injection).
+        if let Some(dq) = try_uncorrelated_scalar_threshold(lp, replicated)? {
+            return Ok(dq);
+        }
+        // KAN-37: TPC-H Q18's grouped `IN` aggregate fused with the identical outer aggregate
+        // joins the tiny per-key aggregate stream to the replicated dims instead of shuffling
+        // the full 3-way join output (~60M wide rows at SF10 → 600s stage-timeout blowout).
+        if let Some(dq) = try_in_agg_semi_join(lp, replicated)? {
+            return Ok(dq);
+        }
+        // EXISTS / NOT EXISTS / IN predicates over a sharded fact (TPC-H Q4/Q18/Q21) plan as
+        // co-located semi/anti key shuffles feeding the ordinary two-stage aggregation,
+        // replacing the whole-fact single-partition gather they'd otherwise fall into below.
+        if let Some(dq) = try_semi_anti_subqueries(lp, replicated)? {
+            return Ok(dq);
+        }
+        // A non-aggregate top with one nested IN / correlated-scalar IN predicate (TPC-H Q20)
+        // plans as a co-located semi cascade.
+        if let Some(dq) = try_nested_in_semi(lp, replicated)? {
+            return Ok(dq);
+        }
+        // An uncorrelated scalar over a derived per-key aggregate (TPC-H Q15's
+        // `total_revenue = (SELECT max(total_revenue) FROM revenue)`) plans as a distributed
+        // derived table + the KAN-27 one-row scalar broadcast.
+        if let Some(dq) = try_derived_scalar_equality(lp, replicated)? {
+            return Ok(dq);
+        }
         if let Some(dq) = try_materialize_subquery_fact(lp, replicated)? {
             return Ok(dq);
         }
@@ -105,7 +163,23 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
     let mut dq = match primary {
         Ok(dq) => dq,
         Err(primary_error) => {
+            // KAN-26: a comma-join (`CROSS JOIN` + `WHERE` equijoin — TPC-H Q12) becomes a
+            // shuffleable inner equijoin once the filter conjuncts are pushed into the join.
+            // Retry the whole planner on the normalized plan before the gather / rejection
+            // fallbacks; `rewrite_comma_join_filters` returns `None` (and the retry simply
+            // fails) for anything else, so those paths see the original error unchanged.
             let reason = primary_error.to_string();
+            if reason.contains("shuffle join needs an equijoin key")
+                || reason.contains("Cross Join")
+            {
+                if let Some(rewritten) = crate::plan::join_chain::rewrite_comma_join_filters(lp) {
+                    // The recursive call validates and stamps; on failure the original error
+                    // drives the usual fallbacks below.
+                    if let Ok(dq) = plan_distributed_logical(&rewritten, replicated) {
+                        return Ok(dq);
+                    }
+                }
+            }
             let materializable_rejection = reason.contains("scanned multiple times")
                 || reason.contains("scanned 2×")
                 || reason.contains("scanned 3×")
@@ -315,7 +389,7 @@ pub(crate) fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
                 return Err(Error::Unsupported(format!(
                     "auto-distribute: unsupported top-level plan node `{}`",
                     other.display().to_string().lines().next().unwrap_or("")
-                )))
+                )));
             }
         }
     }
@@ -335,7 +409,8 @@ pub(crate) fn aggregation_stages_for(
         .collect();
 
     // Subqueries (IN / EXISTS / scalar) only over replicated dims — never over unreplicated tables.
-    // Also check HAVING: TPC-H Q11 embeds a partsupp scalar subquery in HAVING that must gather.
+    // Also check HAVING: whatever reaches here with a sharded-table subquery in HAVING was
+    // declined by the one-row-broadcast path (TPC-H Q11) and must gather instead.
     ensure_subquery_tables_replicated(&agg.input, &sharded, replicated)?;
     ensure_having_subquery_tables_replicated(&p.having, replicated)?;
 
@@ -345,7 +420,29 @@ pub(crate) fn aggregation_stages_for(
 
     // Two or more sharded tables → left-deep shuffle-join chain + aggregate.
     if sharded.len() >= 2 {
+        // KAN-26: the aggregate's input may itself be a pre-aggregated derived table (TPC-H
+        // Q13's count-distribution over a LEFT JOIN group-by). The chain builder only accepts
+        // raw scan inputs and would reject with "expected left-deep equijoin chain", so compose
+        // instead: distribute the inner aggregation, then hash-shuffle its output by the outer
+        // group key into an exact single-stage outer aggregate.
+        if peels_to_inner_aggregate(&agg.input) {
+            return aggregate_over_aggregate_stages(p, replicated);
+        }
         return crate::plan::join_chain::plan_shuffle_join_chain(p, &sharded, replicated);
+    }
+
+    // KAN-36/KAN-44: a *single* sharded table needs the same composition whenever the
+    // aggregate's input is itself an aggregation (a pre-aggregated derived table / CTE). The
+    // flat broadcast path below would splice the inner aggregation into the partial stage's
+    // FROM tail and run its GROUP BY per worker: an inner group whose rows span workers emits
+    // one partial row per worker, and the outer aggregate reads those partials as final —
+    // TPC-DS Q54's `my_revenue` CTE emitted two rows for one customer, splitting the outer
+    // revenue-band count. The composition plans the inner aggregation exactly (partial →
+    // shuffle by the inner key → combine) before the outer aggregate ever sees a row. This
+    // subsumes the original KAN-36 divert (TPC-H Q13's null-extended outer join at the
+    // auto-broadcast configuration, whose per-worker repetition the inner recombine absorbs).
+    if sharded.len() == 1 && peels_to_inner_aggregate(&agg.input) {
+        return aggregate_over_aggregate_stages(p, replicated);
     }
 
     // Broadcast-join safety: exactly one base table may be sharded; others must be replicated.
@@ -360,7 +457,14 @@ pub(crate) fn aggregation_stages_for(
     if let Some(dq) = try_split_broadcast_union(p, sharded_name)? {
         return Ok(dq);
     }
-    reject_unsafe_broadcast_shapes(&agg.input, sharded_name)?;
+    if let Some(join) = sharded_null_extended_outer_join(&agg.input, sharded_name) {
+        // KAN-36: the blanket preserved-side rejection does not apply to the relaxed outer-join
+        // shape — but only aggregates blind to the preserved side's per-worker repetition may
+        // use it (see the helper).
+        ensure_null_extended_aggregate_args(agg, join)?;
+    } else {
+        reject_unsafe_broadcast_shapes(&agg.input, sharded_name)?;
+    }
     // The aggregate's input must unparse to a plain `SELECT * FROM …` so we can splice our own
     // SELECT list onto its FROM/WHERE tail without losing column qualifiers.
     let input_sql = Unparser::default()
@@ -423,6 +527,261 @@ pub(crate) fn aggregation_stages_for(
         ],
         finalize_sql: build_finalize(p)?,
     })
+}
+
+/// True when `lp` reaches an `Aggregate` through only column-renaming nodes (`Projection` /
+/// `SubqueryAlias`) — i.e. the query aggregates an already-aggregated derived table (TPC-H Q13).
+/// A `Filter` on the way down would be a pre-aggregation predicate on the derived table, which
+/// [`aggregate_over_aggregate_stages`] cannot re-apply, so it deliberately does not descend
+/// through one.
+fn peels_to_inner_aggregate(lp: &LogicalPlan) -> bool {
+    let mut node = lp;
+    loop {
+        match node {
+            LogicalPlan::Projection(p) => node = p.input.as_ref(),
+            LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
+            LogicalPlan::Aggregate(_) => return true,
+            _ => return false,
+        }
+    }
+}
+
+/// TPC-H Q13 at the auto-broadcast configuration (KAN-36): the single sharded table sits on the
+/// **null-extended** side of a `LEFT` / `RIGHT` outer join whose preserved side scans only
+/// replicated tables (`replicated customer LEFT JOIN sharded orders`). Per-worker broadcast
+/// evaluation then repeats every preserved row on every worker — sound only under an aggregate
+/// whose recombine absorbs that repetition (see [`ensure_null_extended_aggregate_args`]), which
+/// is why the blanket preserved-side rejection in [`reject_unsafe_broadcast_shapes`] is relaxed
+/// for exactly this shape. Returns the join when the shape matches.
+fn sharded_null_extended_outer_join<'a>(
+    lp: &'a LogicalPlan,
+    sharded_name: &str,
+) -> Option<&'a datafusion::logical_expr::Join> {
+    let mut node = lp;
+    loop {
+        match node {
+            LogicalPlan::Projection(p) => node = p.input.as_ref(),
+            LogicalPlan::Filter(f) => node = f.input.as_ref(),
+            LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
+            LogicalPlan::Join(j) => {
+                // Exactly one scan of the sharded table on the null-extended side, none on the
+                // preserved side. Semi/anti joins stay rejected: they emit a replicated preserved
+                // row on every worker with a *local* match, which no recombine absorbs.
+                let matches = match j.join_type {
+                    JoinType::Left => {
+                        count_table_scans(&j.right, sharded_name) == 1
+                            && count_table_scans(&j.left, sharded_name) == 0
+                    }
+                    JoinType::Right => {
+                        count_table_scans(&j.left, sharded_name) == 1
+                            && count_table_scans(&j.right, sharded_name) == 0
+                    }
+                    _ => false,
+                };
+                return matches.then_some(j);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The relaxed outer-join broadcast shape is exact only when no aggregate can observe the
+/// preserved side's per-worker repetition: every aggregate argument must reference at least one
+/// column, and only columns of the null-extended (sharded) side — NULL-extended rows contribute
+/// nothing to `count` / `sum` / `min` / `max` / `avg` partials over those columns, so the
+/// ordinary recombine stays exact. `count(1)` / `count(*)` or any aggregate over a preserved-side
+/// column would count every preserved row once per worker, and DISTINCT aggregates compose with
+/// the raw-row shuffle, not this recombine — all stay rejected.
+fn ensure_null_extended_aggregate_args(
+    agg: &Aggregate,
+    join: &datafusion::logical_expr::Join,
+) -> Result<()> {
+    let extended = match join.join_type {
+        JoinType::Left => &join.right,
+        _ => &join.left,
+    };
+    let scope = crate::plan::join_chain::JoinSideScope::of(extended);
+    for e in &agg.aggr_expr {
+        if AggSpec::classify(e)?.distinct {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: DISTINCT aggregate `{e}` over a sharded null-extended join \
+                 side is not supported"
+            )));
+        }
+        let mut cols = Vec::new();
+        collect_expr_columns(strip_alias(e), &mut cols);
+        if cols.is_empty() || !cols.iter().all(|c| scope.contains(c)) {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: aggregate `{e}` reads columns outside the sharded \
+                 null-extended join side — broadcasting the join would repeat the replicated \
+                 preserved side's rows on every worker"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Aggregation over a pre-aggregated derived table (TPC-H Q13):
+///
+/// ```sql
+/// SELECT c_count, count(*) FROM (
+///     SELECT c_custkey, count(o_orderkey) FROM customer LEFT JOIN orders … GROUP BY c_custkey
+/// ) AS c_orders GROUP BY c_count
+/// ```
+///
+/// Reached either with 2+ sharded base tables (the inner LEFT JOIN planned as a shuffle-join
+/// chain, KAN-26) or with a single sharded table (KAN-36/KAN-44) — originally only TPC-H Q13's
+/// null-extended outer join at the auto-broadcast configuration, now every single-sharded
+/// agg-over-agg input, since the flat broadcast path would otherwise run the inner GROUP BY per
+/// worker and leak un-combined partial groups to the outer aggregate (TPC-DS Q54).
+///
+/// The inner aggregation is planned by the ordinary machinery (which handles the sharded LEFT
+/// JOIN chain). Its terminal combine stage emits exactly one row per inner group, so
+/// re-targeting that stage's hash key at the outer `GROUP BY` column(s) co-locates every row of
+/// an outer group on one worker; the outer aggregate then runs **exactly** in a single stage —
+/// the same co-location argument the DISTINCT path uses — and the query's HAVING / output
+/// projection wrap it via the ordinary [`wrap_output`] remap.
+///
+/// Only outer group keys that are plain inner output columns can serve as hash keys, and the
+/// outer aggregate arguments must reference inner output columns only; anything else returns
+/// [`Error::Unsupported`] so the caller's strict-mode rejection / gather fallback decides.
+fn aggregate_over_aggregate_stages(
+    p: &Peeled<'_>,
+    replicated: &[&str],
+) -> Result<DistributedQuery> {
+    let unsupported = |why: String| {
+        Error::Unsupported(format!("auto-distribute: aggregate over aggregate: {why}"))
+    };
+    let inner = peel(&p.agg.input)?;
+    if inner.sort.is_some() || inner.limit.is_some() {
+        return Err(unsupported(
+            "inner aggregation with ORDER BY / LIMIT is not supported".into(),
+        ));
+    }
+    if !inner.having.is_empty() {
+        return Err(unsupported(
+            "a FILTER between the two aggregations is not supported".into(),
+        ));
+    }
+    if is_grouping_set(&inner.agg.group_expr) || is_grouping_set(&p.agg.group_expr) {
+        return Err(unsupported(
+            "ROLLUP / CUBE / GROUPING SETS on either level are not supported".into(),
+        ));
+    }
+    let mut dq = aggregation_stages_for(&inner, replicated)?;
+
+    // Output column names of the inner terminal stage, in order: the aliased projection names
+    // when the inner query has an output projection, otherwise the raw `g{j}` / `r{i}` names.
+    let inner_out: Vec<String> = match inner.projection {
+        Some(exprs) => exprs.iter().map(output_name).collect(),
+        None => (0..inner.agg.group_expr.len())
+            .map(|j| format!("g{j}"))
+            .chain((0..inner.agg.aggr_expr.len()).map(|i| format!("r{i}")))
+            .collect(),
+    };
+
+    // Outer group keys must be plain inner output columns — only those can be hash keys.
+    let mut hash_key_cols = Vec::with_capacity(p.agg.group_expr.len());
+    let mut group_names = Vec::with_capacity(p.agg.group_expr.len());
+    for g in &p.agg.group_expr {
+        let Expr::Column(c) = g else {
+            return Err(unsupported(format!(
+                "outer group key `{g}` is not a plain inner output column"
+            )));
+        };
+        let idx = inner_out.iter().position(|n| n == &c.name).ok_or_else(|| {
+            unsupported(format!(
+                "outer group key `{}` is not an inner output column",
+                c.flat_name()
+            ))
+        })?;
+        hash_key_cols.push(idx as u32);
+        group_names.push(c.name.clone());
+    }
+
+    // Every column the outer aggregates read must come from the inner aggregation's output.
+    let up = Unparser::default();
+    let mut aggs = Vec::with_capacity(p.agg.aggr_expr.len());
+    for a in &p.agg.aggr_expr {
+        let Expr::AggregateFunction(af) = strip_alias(a) else {
+            return Err(unsupported(format!(
+                "non-aggregate in outer aggregate list: {a}"
+            )));
+        };
+        if af.params.args.len() > 1 {
+            return Err(unsupported(format!(
+                "multi-argument outer aggregate `{a}` is not supported"
+            )));
+        }
+        for arg in &af.params.args {
+            let mut cols = Vec::new();
+            collect_expr_columns(arg, &mut cols);
+            if let Some(bad) = cols.iter().find(|c| !inner_out.contains(&c.name)) {
+                return Err(unsupported(format!(
+                    "outer aggregate argument `{}` is not an inner output column",
+                    bad.flat_name()
+                )));
+            }
+        }
+        aggs.push(af);
+    }
+
+    // Re-target the inner terminal stage at the outer group key so outer groups co-locate.
+    let combine = dq
+        .stages
+        .last_mut()
+        .ok_or_else(|| unsupported("inner aggregation produced no stages".into()))?;
+    combine.hash_key_cols = hash_key_cols;
+    let combine_id = combine.stage_id;
+
+    // Exact single-stage outer aggregate over the co-located rows. With no outer group key the
+    // shuffle gathers to partition 0, so suppress the synthetic zero-input row on the others
+    // (mirrors `global_aggregation_stages`).
+    let mut sel: Vec<String> = group_names
+        .iter()
+        .enumerate()
+        .map(|(j, n)| format!("{n} AS g{j}"))
+        .collect();
+    for (i, af) in aggs.iter().enumerate() {
+        let func = af.func.name().to_ascii_lowercase();
+        let distinct = if af.params.distinct { "DISTINCT " } else { "" };
+        let arg_sql = match af.params.args.first() {
+            Some(arg) => expr_sql(&up, &unqualify(arg))?,
+            None => "1".to_string(), // count(*) carries no arg
+        };
+        sel.push(format!("{func}({distinct}{arg_sql}) AS r{i}"));
+    }
+    let inner_sql = if group_names.is_empty() {
+        format!(
+            "SELECT {} FROM shuffle_input HAVING COUNT(*) > 0",
+            sel.join(", ")
+        )
+    } else {
+        format!(
+            "SELECT {} FROM shuffle_input GROUP BY {}",
+            sel.join(", "),
+            group_names.join(", ")
+        )
+    };
+    let remap = build_remap(p);
+    let outer_sql = wrap_output(p, &inner_sql, &remap)?;
+
+    let next_id = dq.stages.iter().map(|s| s.stage_id).max().unwrap_or(0) + 1;
+    dq.stages
+        .push(StageDef::new(next_id, outer_sql, vec![combine_id], vec![]));
+    dq.finalize_sql = build_finalize(p)?;
+    Ok(dq)
+}
+
+/// Every `Column` referenced anywhere in `e`.
+fn collect_expr_columns(e: &Expr, out: &mut Vec<datafusion::common::Column>) {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let _ = e.apply(|node| {
+        if let Expr::Column(c) = node {
+            out.push(c.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
 }
 
 /// Ungrouped aggregation: partials per worker, gather to partition 0, recombine.
@@ -619,7 +978,7 @@ fn find_inner_equijoin(lp: &LogicalPlan) -> Result<&datafusion::logical_expr::Jo
                 return Err(Error::Unsupported(format!(
                     "auto-distribute: expected a join under aggregate, found `{}`",
                     other.display().to_string().lines().next().unwrap_or("")
-                )))
+                )));
             }
         }
     }
@@ -657,7 +1016,7 @@ pub(crate) fn simple_table_scan(lp: &LogicalPlan) -> Result<SimpleScan<'_>> {
     }
 }
 
-fn flatten_and_conjuncts(expr: &Expr, out: &mut Vec<Expr>) {
+pub(crate) fn flatten_and_conjuncts(expr: &Expr, out: &mut Vec<Expr>) {
     use datafusion::logical_expr::Operator;
     match expr {
         Expr::BinaryExpr(b) if b.op == Operator::And => {
@@ -785,7 +1144,7 @@ pub(crate) fn build_finalize(p: &Peeled) -> Result<Option<String>> {
                 };
                 Ok(format!(
                     "{} {dir} {nulls}",
-                    expr_sql(&up, &unqualify(&s.expr))?
+                    finalize_expr_sql(&up, &unqualify(&s.expr))?
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1045,7 +1404,11 @@ pub(crate) fn build_remap(p: &Peeled<'_>) -> HashMap<String, String> {
 /// item explicitly aliased back to its original output name (so a bare `t.k` stays column `k`, and
 /// downstream `ORDER BY` over those names resolves). `ORDER BY` / `LIMIT` are *not* applied here —
 /// they're global and run in [`build_finalize`].
-fn wrap_output(p: &Peeled<'_>, inner: &str, remap: &HashMap<String, String>) -> Result<String> {
+pub(crate) fn wrap_output(
+    p: &Peeled<'_>,
+    inner: &str,
+    remap: &HashMap<String, String>,
+) -> Result<String> {
     let up = Unparser::default();
     // Apply HAVING against remapped `g{j}`/`r{i}` columns *before* the output projection aliases
     // them back to original names (otherwise `WHERE r0 > …` fails against `having_in.sv`).
@@ -1084,10 +1447,12 @@ fn output_name(e: &Expr) -> String {
     }
 }
 
-/// The expr without its top-level alias (so we can re-alias after remapping).
+/// The expr without its alias layer(s) (so we can re-alias after remapping). Stacked aliases —
+/// TPC-H Q13's `count(Int64(1)) AS count(*) AS custdist` — strip fully: keeping an inner alias
+/// would splice `r0 AS "count(*)" AS "custdist"`, which is not valid SQL.
 fn strip_alias(e: &Expr) -> &Expr {
     match e {
-        Expr::Alias(a) => &a.expr,
+        Expr::Alias(a) => strip_alias(&a.expr),
         other => other,
     }
 }
@@ -1158,6 +1523,36 @@ pub(crate) fn expr_sql(up: &Unparser, e: &Expr) -> Result<String> {
     up.expr_to_sql(e)
         .map(|ast| sanitize_generated_sql(&ast.to_string()))
         .map_err(|err| Error::Unsupported(format!("auto-distribute: unparse expr: {err}")))
+}
+
+/// [`expr_sql`] for expression positions in a **finalize** query (which the engine parses under
+/// the Databricks dialect). The Unparser double-quotes identifiers that collide with reserved
+/// words (`"value"`, TPC-H Q11's `ORDER BY value DESC`), but the Databricks dialect reads double
+/// quotes as *string literals* — so `ORDER BY "value"` silently sorted by a constant and
+/// returned the gather order. The Unparser only double-quotes identifiers (its string literals
+/// are single-quoted), so re-quoting them as backticks — which the dialect treats as identifiers
+/// — is faithful.
+pub(crate) fn finalize_expr_sql(up: &Unparser, e: &Expr) -> Result<String> {
+    let sql = expr_sql(up, e)?;
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            out.push(c);
+            continue;
+        }
+        let mut ident = String::new();
+        for c in chars.by_ref() {
+            if c == '"' {
+                break;
+            }
+            ident.push(c);
+        }
+        out.push('`');
+        out.push_str(&ident);
+        out.push('`');
+    }
+    Ok(out)
 }
 
 /// Extract the `FROM …` tail from an unparsed aggregate input.

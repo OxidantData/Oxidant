@@ -76,7 +76,10 @@ for t in "${TABLES[@]}"; do
     s3_uri="${ICEBERG_WAREHOUSE%/}/${glue_db}/${t}/"
   fi
   if [[ "$FORMAT" != "iceberg" ]]; then
-    if ! aws s3 ls "$s3_uri" --region "$REGION" | grep -q .; then
+    # NOTE: capture the listing instead of `... | grep -q .` — under `set -o pipefail`,
+    # `grep -q` closes the pipe after the first match and multi-line listings (multi-file
+    # tables) make `aws` die with SIGPIPE, falsely reporting the prefix as empty.
+    if [[ -z "$(aws s3 ls "$s3_uri" --region "$REGION")" ]]; then
       echo "[glue] WARN: empty ${s3_uri} — skipping ${t}"
       continue
     fi
