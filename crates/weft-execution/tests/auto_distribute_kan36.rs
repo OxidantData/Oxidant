@@ -7,9 +7,11 @@
 //! - **Q13**: replicated-preserved-side `customer LEFT JOIN orders` feeding KAN-26's
 //!   agg-over-agg count distribution — the inner aggregation's count partials recombine across
 //!   workers, absorbing the preserved side's per-worker repetition.
-//! - **Q22**: the uncorrelated scalar threshold over replicated `customer` computes its partial
-//!   exactly once (`ExchangeMode::Forward`), and the outer `customer` export scan likewise runs
-//!   once, hash-shuffled by `c_custkey` to co-locate with the `orders` anti key stream.
+//! - **Q22**: the outer `customer` export scan runs exactly once (`ExchangeMode::Forward`),
+//!   hash-shuffled by `c_custkey` to co-locate with the `orders` anti key stream. (KAN-55
+//!   simplified the scalar half: the uncorrelated threshold over replicated `customer` is
+//!   partition-independent, so it now evaluates verbatim in the scan's WHERE — no Forward
+//!   scalar partial or driver literal injection.)
 //!
 //! Every distributed plan must equal single-node end-to-end, and none may fall back to the
 //! whole-fact gather (KAN-29 floor).
@@ -308,7 +310,10 @@ async fn q13_distributed_matches_single_node() {
     assert_distributed_matches_single_node(Q13).await;
 }
 
-// --- Q22: run-once scalar partial + run-once replicated outer scan, co-located NOT EXISTS ---
+// --- Q22: replicated scalar conjunct verbatim + run-once replicated outer scan, co-located
+// NOT EXISTS (KAN-55 simplified this from the KAN-36 scalar-broadcast plan: the avg body reads
+// only replicated `customer`, so it is partition-independent and no driver literal injection is
+// needed — 4 stages instead of 6, same provable semantics) ---
 
 #[tokio::test]
 async fn q22_replicated_outer_plans_forward_scalar_and_scan() {
@@ -317,25 +322,12 @@ async fn q22_replicated_outer_plans_forward_scalar_and_scan() {
     let dq = plan_distributed_logical(&lp, &AUTO_BROADCAST_REPLICATED).expect("Q22 should plan");
     assert_eq!(
         dq.stages.len(),
-        6,
-        "scalar partial/combine -> anti producer -> forward outer scan -> anti+partial -> combine: {dq:?}"
+        4,
+        "anti producer -> forward outer scan -> anti+partial -> combine: {dq:?}"
     );
-    let scalar_partial = &dq.stages[0];
-    assert_eq!(
-        scalar_partial.exchange,
-        ExchangeMode::Forward,
-        "the scalar body is fully replicated — its partial must run exactly once: {dq:?}"
-    );
-    assert!(
-        scalar_partial
-            .sql
-            .contains("sum(customer.c_acctbal) AS a0s, count(customer.c_acctbal) AS a0c"),
-        "avg decomposes into sum/count partials: {}",
-        scalar_partial.sql
-    );
-    let producer = &dq.stages[2];
+    let producer = &dq.stages[0];
     assert_eq!(producer.hash_key_cols, vec![0], "hashed by o_custkey");
-    let scan = &dq.stages[3];
+    let scan = &dq.stages[1];
     assert_eq!(
         scan.exchange,
         ExchangeMode::Forward,
@@ -344,12 +336,18 @@ async fn q22_replicated_outer_plans_forward_scalar_and_scan() {
     assert_eq!(scan.hash_key_cols, vec![0], "hashed by c_custkey");
     assert!(
         scan.sql
-            .contains("customer.c_acctbal > '__WEFT_SCALAR_STAGE__'"),
-        "the driver inlines the global avg before dispatch: {}",
+            .contains("customer.c_acctbal > (SELECT avg(customer.c_acctbal) FROM customer"),
+        "the replicated scalar body evaluates verbatim wherever the outer row is read: {}",
         scan.sql
     );
-    let anti = &dq.stages[4];
-    assert_eq!(anti.upstream_stage_ids, vec![3, 2]);
+    assert!(
+        !dq.stages
+            .iter()
+            .any(|s| s.sql.contains("__WEFT_SCALAR_STAGE__")),
+        "no scalar broadcast stage is needed for a replicated scalar body: {dq:?}"
+    );
+    let anti = &dq.stages[2];
+    assert_eq!(anti.upstream_stage_ids, vec![1, 0]);
     assert!(
         anti.sql
             .contains("NOT EXISTS (SELECT 1 FROM shuffle_input_1 AS k WHERE k.k0 = o.ok0)"),

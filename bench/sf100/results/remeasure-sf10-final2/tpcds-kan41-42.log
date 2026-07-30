@@ -1,0 +1,13 @@
+[run] strict mode: connect pod must have WEFT_DISTRIBUTED_STRICT=1 (values-sf100.yaml sets connect.distributedStrict); fallback is a hard failure
+[preflight] SKIPPED (--skip-worker-preflight)
+[run] endpoint=sc://18.236.223.115:50051 suite=tpcds sf=10.0 catalog=glue glue_db=tpcds_sf10 queries=6 resume_skip=0
+Q11   FAIL try1 (600.0764s): TimeoutError: query exceeded 600s (possible server-side wedge/deadlock)
+Q17   try1 36.4797s rows=0 checksum=e3b0c44298fc…
+Q17   HOT  36.4797s
+Q58   try1 27.0861s rows=31 checksum=e25f18eef98f…
+Q58   HOT  27.0861s
+Q72   FAIL try1 (600.0422s): TimeoutError: query exceeded 600s (possible server-side wedge/deadlock)
+Q78   try1 49.4319s rows=100 checksum=0d53ebe7e0a5…
+Q78   HOT  49.4319s
+Q93   FAIL try1 (600.0427s): TimeoutError: query exceeded 600s (possible server-side wedge/deadlock)
+[run] wrote bench/sf100/results/remeasure-sf10-final2/tpcds-kan41-42.jsonl  ok=3 failed=3 skipped=0

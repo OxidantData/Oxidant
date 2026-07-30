@@ -146,6 +146,71 @@ async fn cancel_stages_on_workers(workers: &[String], stage_ids: impl Iterator<I
     let _ = futures::future::join_all(futs).await;
 }
 
+/// KAN-46: RAII backstop for [`run_stages_obs`] cleanup. When the driver future is dropped
+/// mid-query — tonic cancels the Spark Connect `ExecutePlan` handler future as soon as the
+/// client's call goes away (disconnect, client-side timeout) — ordinary cleanup written
+/// after the inner await never runs: worker stage tasks kept burning slots until the stage
+/// timeout, cached shuffle buckets stayed resident (SF10: 17–27 GB of worker RSS pinned by
+/// abandoned queries), and both the cancel-registry entry and the watcher task leaked. On
+/// drop, abort the watcher, unregister the query, and spawn the same best-effort stage
+/// cancel + `clear_stages` sweep the normal exit path runs inline.
+struct QueryAbortGuard {
+    workers: Vec<String>,
+    stage_ids: Vec<u32>,
+    query_id: String,
+    watcher: Option<tokio::task::JoinHandle<()>>,
+    armed: bool,
+}
+
+impl QueryAbortGuard {
+    fn new(
+        cluster: &Cluster,
+        stages: &[StageDef],
+        query_id: &str,
+        watcher: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            workers: cluster.workers.clone(),
+            stage_ids: stages.iter().map(|s| s.stage_id).collect(),
+            query_id: query_id.to_string(),
+            watcher: Some(watcher),
+            armed: true,
+        }
+    }
+
+    /// Normal exit: hand the watcher back so the caller can abort it; the guard stands down
+    /// and the caller runs the cleanup inline (awaited, exactly once).
+    fn disarm(&mut self) -> tokio::task::JoinHandle<()> {
+        self.armed = false;
+        self.watcher.take().expect("abort guard disarmed once")
+    }
+}
+
+impl Drop for QueryAbortGuard {
+    fn drop(&mut self) {
+        if let Some(watcher) = self.watcher.take() {
+            watcher.abort();
+        }
+        if !self.armed {
+            return;
+        }
+        unregister_query_cancel(&self.query_id);
+        let workers = std::mem::take(&mut self.workers);
+        let stage_ids = std::mem::take(&mut self.stage_ids);
+        // Detached and best-effort: the query's result is already abandoned. During runtime
+        // shutdown there may be nothing left to spawn onto; the stage timeout (KAN-17) and
+        // the stage-output TTL (KAN-18) remain the backstops there.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                cancel_stages_on_workers(&workers, stage_ids.iter().copied()).await;
+                for ep in &workers {
+                    let _ = clear_worker_stages(ep.clone()).await;
+                }
+            });
+        }
+    }
+}
+
 /// A cluster snapshot for one query: workers + stable partition→owner mapping.
 #[derive(Clone)]
 pub struct Cluster {
@@ -520,9 +585,13 @@ pub async fn run_stages_obs(
         .unwrap_or_else(new_query_id);
     let cancel = register_query_cancel(&query_id);
     let watcher = spawn_cancel_watcher(&cluster.workers, stages, cancel.clone());
+    // KAN-46: when this future is dropped mid-query (a disconnected Spark Connect client
+    // cancels the handler future), the guard's Drop runs the same cancel + eviction the
+    // normal exit path below runs inline.
+    let mut abort_guard = QueryAbortGuard::new(cluster, stages, &query_id, watcher);
     let result =
         run_stages_obs_inner(cluster, stages, store, operation_id, &query_id, &cancel).await;
-    watcher.abort();
+    abort_guard.disarm().abort();
     unregister_query_cancel(&query_id);
     if result.is_err() {
         // Best-effort: abort any of this plan's stages still running on workers so wedged

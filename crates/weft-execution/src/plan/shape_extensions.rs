@@ -6,6 +6,11 @@
 //! - **Subquery safety**: a fact scanned only inside IN / EXISTS / scalar subqueries can be
 //!   gathered once and evaluated on one gated partition; self-subqueries over the driving
 //!   sharded fact stay rejected by scan counting.
+//! - **KAN-55 distributed subqueries over sharded facts** (TPC-DS Q9/Q10/Q16/Q35/Q69/Q94):
+//!   subquery predicates reading only replicated tables evaluate verbatim per partition;
+//!   a global aggregate above the semi/anti filter re-runs exactly over the gathered filtered
+//!   rows (COUNT(DISTINCT) included); uncorrelated global-aggregate scalar subqueries in the
+//!   projection decompose into per-worker partials + a one-row combine the gated outer reads.
 //! - **Correlated scalar subqueries** (`fact.col = (SELECT min/max/sum/count(…) FROM fact, …
 //!   WHERE outer.key = fact.key …)`, TPC-H Q2) are decorrelated into a per-key distributed
 //!   aggregation hash-joined against the outer scan, instead of gathering the whole fact.
@@ -23,6 +28,7 @@
 //! - Explicit **Unsupported** messages for unsupported window / distinct shapes.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use datafusion::common::Column;
 use datafusion::logical_expr::expr::{BinaryExpr, WindowFunction, WindowFunctionDefinition};
@@ -1465,6 +1471,9 @@ struct ScalarConjunct {
     /// configuration, where `customer` replicates and only the NOT EXISTS fact shards). The
     /// partial must then run **once** ([`ExchangeMode::Forward`]): per-worker partials of the
     /// identical replicated input would multiply the combined value by the worker count.
+    /// (KAN-55: a fully-replicated scalar body now routes to a plain verbatim conjunct via
+    /// `subquery_conjunct_all_replicated` before this classifier runs, so from the current
+    /// caller this flag is set only for sharded bodies — i.e. always `false`.)
     forward_partial: bool,
 }
 
@@ -2131,15 +2140,19 @@ pub(crate) fn try_semi_anti_subqueries(
     let Ok(p) = peel(lp) else {
         return Ok(None);
     };
-    if p.agg.group_expr.is_empty()
-        || p.agg
-            .group_expr
-            .iter()
-            .any(|e| matches!(e, Expr::GroupingSet(_)))
+    if p.agg
+        .group_expr
+        .iter()
+        .any(|e| matches!(e, Expr::GroupingSet(_)))
         || p.having.iter().any(|h| expr_contains_subquery(h))
     {
         return Ok(None);
     }
+    // KAN-55: a global aggregate (empty GROUP BY — TPC-DS Q16/Q94's `count(DISTINCT …), sum(…)`)
+    // is admissible alongside the grouped case: with no group key to hash by, the semi/anti
+    // output gathers to one partition and the aggregate recomputes exactly there (see the stage
+    // assembly at the bottom of this function).
+    let global_agg = p.agg.group_expr.is_empty();
     let up = Unparser::default();
     let aggs = p
         .agg
@@ -2270,6 +2283,17 @@ pub(crate) fn try_semi_anti_subqueries(
     let mut regular: Vec<&Expr> = Vec::new();
     let mut scalar_conj: Option<ScalarConjunct> = None;
     for c in &conjuncts {
+        // KAN-55: a subquery predicate whose every table is replicated is partition-independent
+        // — each partition holds the same full rows for every table it reads, so it evaluates
+        // exactly as it would single-node (IN / NOT EXISTS three-valued logic included). Emit it
+        // verbatim as a regular conjunct wherever the outer row is read instead of forcing its
+        // tables through the key-stream machinery: TPC-DS Q69's `NOT EXISTS` over replicated
+        // `web_sales` / `catalog_sales`, Q10/Q35's `EXISTS(web) OR EXISTS(catalog)` arm, Q16/Q94's
+        // `NOT EXISTS` over the replicated returns table.
+        if expr_contains_subquery(c) && subquery_conjunct_all_replicated(c, replicated) {
+            regular.push(*c);
+            continue;
+        }
         match c {
             Expr::Exists(ex) => sub_preds.push(SubPred::Exists {
                 anti: ex.negated,
@@ -3023,6 +3047,17 @@ pub(crate) fn try_semi_anti_subqueries(
         None
     };
 
+    // A fully-replicated outer (scan_id None) is read on *every* partition; a row is then
+    // emitted exactly once only because some semi key stream gates it onto its key's partition
+    // (on any other partition the `EXISTS` finds no co-located key and kills the row; anti
+    // streams co-located on the same shared key are complete on that one partition). With only
+    // anti producers there is no gate: `NOT EXISTS` over the partition-local key share holds on
+    // every partition but the key's own, so each kept row would be emitted once per partition.
+    // Decline to the gather fallback rather than multiply rows.
+    if scan_id.is_none() && producers.iter().all(|pr| pr.anti) {
+        return Ok(None);
+    }
+
     // Semi/anti conditions against the co-located key streams.
     let total_upstreams = producer_out_ids.len() + usize::from(scan_id.is_some());
     let mut conds: Vec<String> = Vec::new();
@@ -3116,10 +3151,19 @@ pub(crate) fn try_semi_anti_subqueries(
     // argument rows (hash-shuffled by group key, so every group lands wholly on one worker) and
     // the final stage runs the original aggregate over the co-located rows (TPC-H Q16's
     // `count(DISTINCT ps_suppkey)`).
-    let (partial_sql, final_sql) = if stage_aggs.iter().any(|a| a.distinct) {
-        distinct_stage_sql(&up, &p, &group_sql, &stage_aggs, &tail, &remap)?
+    //
+    // KAN-55: a global aggregate has no group key to hash by, so the semi/anti output gathers to
+    // one partition (empty hash key) and the aggregate recomputes exactly over the complete
+    // filtered row set there.
+    let (partial_sql, final_sql, needs_gate) = if global_agg {
+        let (ps, fs) = global_semi_stage_sql(&p, &stage_aggs, &tail, &remap)?;
+        (ps, fs, stage_aggs.iter().any(|a| a.distinct))
+    } else if stage_aggs.iter().any(|a| a.distinct) {
+        let (ps, fs) = distinct_stage_sql(&up, &p, &group_sql, &stage_aggs, &tail, &remap)?;
+        (ps, fs, false)
     } else {
-        recombine_stage_sql(&p, &group_sql, &stage_aggs, &tail, &remap)?
+        let (ps, fs) = recombine_stage_sql(&p, &group_sql, &stage_aggs, &tail, &remap)?;
+        (ps, fs, false)
     };
 
     let mut upstreams: Vec<u32> = Vec::new();
@@ -3128,14 +3172,35 @@ pub(crate) fn try_semi_anti_subqueries(
     }
     upstreams.extend(producer_out_ids);
     let semi_id = next_id;
-    let combine_id = next_id + 1;
     stages.push(StageDef::new(
         semi_id,
         partial_sql,
         upstreams,
         (0..group_sql.len() as u32).collect(),
     ));
-    stages.push(StageDef::new(combine_id, final_sql, vec![semi_id], vec![]));
+    if needs_gate {
+        // DISTINCT global aggregates project raw rows, so an all-empty true result delivers zero
+        // rows even to the gather partition — yet single-node still emits the synthetic
+        // zero-input global row. The one-row gate lands only on partition 0, so the combine's
+        // `COUNT(*) > 0 OR EXISTS (gate)` emits exactly one row cluster-wide either way.
+        let gate_id = next_id + 1;
+        let combine_id = next_id + 2;
+        stages.push(StageDef::new(
+            gate_id,
+            "SELECT 1 AS __weft_semi_gate".to_string(),
+            vec![],
+            vec![],
+        ));
+        stages.push(StageDef::new(
+            combine_id,
+            final_sql,
+            vec![semi_id, gate_id],
+            vec![],
+        ));
+    } else {
+        let combine_id = next_id + 1;
+        stages.push(StageDef::new(combine_id, final_sql, vec![semi_id], vec![]));
+    }
 
     let finalize_sql = build_finalize(&p)?;
     if scalar_conj.is_some() {
@@ -3155,6 +3220,93 @@ pub(crate) fn try_semi_anti_subqueries(
         stages,
         finalize_sql,
     }))
+}
+
+/// True when every expression subquery inside `e` scans only replicated tables (recursively).
+/// Such a predicate is partition-independent: every partition holds the full rows of every table
+/// the predicate reads, so its value on a given outer row cannot depend on which partition that
+/// row was shuffled to — it may be evaluated verbatim wherever the outer row is read.
+fn subquery_conjunct_all_replicated(e: &Expr, replicated: &[&str]) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut ok = true;
+    let _ = e.apply(|expr| {
+        let subquery = match expr {
+            Expr::InSubquery(iq) => Some(iq.subquery.subquery.as_ref()),
+            Expr::ScalarSubquery(sq) => Some(sq.subquery.as_ref()),
+            Expr::Exists(ex) => Some(ex.subquery.subquery.as_ref()),
+            _ => None,
+        };
+        if let Some(lp) = subquery {
+            let mut tables = base_tables(lp);
+            collect_subquery_tables(lp, &mut tables);
+            if tables.iter().any(|t| !replicated.contains(&t.as_str())) {
+                ok = false;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    ok
+}
+
+/// Global-aggregate finish for the semi/anti path (KAN-55, TPC-DS Q16/Q94): no group key exists
+/// to hash by, so the semi/anti-filtered rows (or their recombinable partials) gather to one
+/// partition — empty hash key — and the aggregate recomputes there.
+///
+/// - No DISTINCT: one global partial row per partition (count/sum decompose, avg into
+///   sum/count); every partition emits its partial even over zero input rows, so the combine's
+///   input is non-empty exactly on the gather partition and `HAVING COUNT(*) > 0` drops the
+///   synthetic row everywhere else. An all-empty true result still sums to `(0, NULL, …)`,
+///   matching single-node. The combine reads a single upstream (`shuffle_input`).
+/// - DISTINCT: the exact raw-row path — every filtered row lands on the gather partition, so
+///   re-running the original aggregate there is exact. Raw rows mean an all-empty true result
+///   delivers zero rows; the caller adds a partition-0 gate upstream and the combine reads
+///   `shuffle_input_0` (rows) + `shuffle_input_1` (gate), emitting exactly one row cluster-wide
+///   via `HAVING COUNT(*) > 0 OR EXISTS (gate)`.
+fn global_semi_stage_sql(
+    p: &Peeled<'_>,
+    aggs: &[AggSpec],
+    tail: &str,
+    remap: &HashMap<String, String>,
+) -> Result<(String, String)> {
+    if aggs.iter().any(|a| a.distinct) {
+        let psel = aggs
+            .iter()
+            .enumerate()
+            .map(|(i, a)| format!("{} AS c{i}", a.arg_sql))
+            .collect::<Vec<_>>();
+        let partial_sql = sanitize_generated_sql(&format!("SELECT {} {tail}", psel.join(", ")));
+        let combine = aggs
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let d = if a.distinct { "DISTINCT " } else { "" };
+                format!("{}({d}c{i}) AS r{i}", a.func)
+            })
+            .collect::<Vec<_>>();
+        let inner = format!(
+            "SELECT {} FROM shuffle_input_0 \
+             HAVING (COUNT(*) > 0) OR EXISTS (SELECT 1 FROM shuffle_input_1)",
+            combine.join(", ")
+        );
+        let final_sql = wrap_output(p, &inner, remap)?;
+        return Ok((partial_sql, final_sql));
+    }
+
+    let mut psel = Vec::new();
+    let mut combine = Vec::new();
+    for (i, a) in aggs.iter().enumerate() {
+        let (items, comb) = per_key_agg_parts(&a.func, &a.arg_sql, i)?;
+        psel.extend(items);
+        combine.push(format!("{comb} AS r{i}"));
+    }
+    let partial_sql = sanitize_generated_sql(&format!("SELECT {} {tail}", psel.join(", ")));
+    let inner = format!(
+        "SELECT {} FROM shuffle_input HAVING COUNT(*) > 0",
+        combine.join(", ")
+    );
+    let final_sql = wrap_output(p, &inner, remap)?;
+    Ok((partial_sql, final_sql))
 }
 
 /// Distribute a non-aggregate query whose WHERE carries one nested `IN` semi predicate over a
@@ -3197,11 +3349,14 @@ pub(crate) fn try_semi_anti_subqueries(
 /// Shape restrictions (anything else returns `Ok(None)` → the existing gather / rejection
 /// paths): the top is a plain projection (+ sort/limit) over the filtered outer body; exactly
 /// one top-level `IN` / `NOT IN` conjunct, every other conjunct subquery-free; the outer body
-/// scans exactly one sharded table once (others replicated); the `IN` subquery's body is a
-/// single sharded fact scan whose WHERE carries exactly one nested uncorrelated `IN` (a single
-/// sharded table behind a plain filtered scan) and exactly one equality-correlated scalar
-/// min/max/sum/count compare (correlation keys are plain columns, and the top `IN`'s inner key
-/// is one of them); every other inner predicate is inner-only.
+/// scans at most one sharded table once (others replicated — a fully-replicated outer is
+/// exported once via [`ExchangeMode::Forward`], KAN-55); the `IN` subquery's body is a single
+/// fact scan — sharded, or replicated with a Forward export whose duplicates the threshold
+/// semi's `GROUP BY` would anyway absorb — whose WHERE carries exactly one nested uncorrelated
+/// `IN` (likewise a single fact scan behind a plain filter; a replicated key table is
+/// Forward-exported, the `IN` being duplicate-insensitive) and exactly one equality-correlated
+/// scalar min/max/sum/count compare over a **sharded** fact (correlation keys are plain columns,
+/// and the top `IN`'s inner key is one of them); every other inner predicate is inner-only.
 pub(crate) fn try_nested_in_semi(
     lp: &LogicalPlan,
     replicated: &[&str],
@@ -3256,13 +3411,24 @@ pub(crate) fn try_nested_in_semi(
         return Ok(None);
     };
 
-    // The outer body scans exactly one sharded table once; everything else replicated.
+    // The outer body scans at most one sharded table (exactly once); everything else replicated.
+    // A fully-replicated outer is exported exactly once below (`ExchangeMode::Forward`):
+    // per-worker scans of the identical rows would deliver each outer row to its key's
+    // partition once per worker and multiply the output rows. (KAN-55's per-query sizing
+    // replicates e.g. Q20's `supplier` at SF10, where the subquery's `lineitem` is the largest
+    // table the query reads.)
     let body_sharded: Vec<String> = base_tables(body)
         .into_iter()
         .filter(|t| !replicated.contains(&t.as_str()))
         .collect();
-    if body_sharded.len() != 1 || count_table_scans(body, &body_sharded[0]) != 1 {
+    if body_sharded.len() > 1 {
         return Ok(None);
+    }
+    let forward_outer_scan = body_sharded.is_empty();
+    if let [outer_fact] = body_sharded.as_slice() {
+        if count_table_scans(body, outer_fact) != 1 {
+            return Ok(None);
+        }
     }
     let outer_scope = PlanScope::of(body);
     let top_outer = top.expr.as_ref();
@@ -3306,12 +3472,19 @@ pub(crate) fn try_nested_in_semi(
         .map(String::as_str)
         .filter(|t| !replicated.contains(t))
         .collect();
-    let [mid_fact] = mid_sharded.as_slice() else {
-        return Ok(None);
-    };
-    if mid_tables.len() != 1 || count_table_scans(mid_body, mid_fact) != 1 {
+    if mid_tables.len() != 1 || mid_sharded.len() > 1 {
         return Ok(None);
     }
+    let forward_mid_scan = mid_sharded.is_empty();
+    if let [mid_fact] = mid_sharded.as_slice() {
+        if count_table_scans(mid_body, mid_fact) != 1 {
+            return Ok(None);
+        }
+    }
+    // A replicated middle fact would duplicate its rows once per worker; the threshold semi's
+    // `GROUP BY` (stage 5) absorbs duplicates and every `IN` downstream is duplicate-insensitive
+    // — but the scan is still exported exactly once (Forward) to avoid the pointless shuffle
+    // traffic.
     let mid_scope = PlanScope::of(mid_body);
     {
         let mut cols = Vec::new();
@@ -3437,12 +3610,18 @@ pub(crate) fn try_nested_in_semi(
         .map(String::as_str)
         .filter(|t| !replicated.contains(t))
         .collect();
-    let [nested_fact] = nested_sharded.as_slice() else {
-        return Ok(None);
-    };
-    if nested_tables.len() != 1 || count_table_scans(nested_body, nested_fact) != 1 {
+    if nested_tables.len() != 1 || nested_sharded.len() > 1 {
         return Ok(None);
     }
+    let forward_nested_scan = nested_sharded.is_empty();
+    if let [nested_fact] = nested_sharded.as_slice() {
+        if count_table_scans(nested_body, nested_fact) != 1 {
+            return Ok(None);
+        }
+    }
+    // A replicated nested key table would duplicate the key stream once per worker; the nested
+    // semi is an `IN`, which is duplicate-insensitive — but the keys are still exported exactly
+    // once (Forward) to avoid the pointless shuffle traffic.
     let nested_scope = PlanScope::of(nested_body);
     for pred in nested_preds.iter().chain(std::iter::once(&nested_key)) {
         let mut cols = Vec::new();
@@ -3755,15 +3934,29 @@ pub(crate) fn try_nested_in_semi(
     );
 
     let corr_hash: Vec<u32> = (0..n_corr as u32).collect();
+    // Replicated scans (KAN-55 per-query sizing) export exactly once — see the comments at the
+    // outer / middle / nested checks. Sharded scans keep the plain per-worker hash exchange.
+    let mut nested_keys = StageDef::new(2, nested_keys_sql, vec![], vec![0]);
+    if forward_nested_scan {
+        nested_keys.exchange = ExchangeMode::Forward;
+    }
+    let mut mid_scan = StageDef::new(3, scan_sql, vec![], vec![0]);
+    if forward_mid_scan {
+        mid_scan.exchange = ExchangeMode::Forward;
+    }
+    let mut outer_scan = StageDef::new(6, outer_scan_sql, vec![], vec![0]);
+    if forward_outer_scan {
+        outer_scan.exchange = ExchangeMode::Forward;
+    }
     Ok(Some(DistributedQuery {
         stages: vec![
             StageDef::new(0, partial_sql, vec![], corr_hash.clone()),
             StageDef::new(1, combine_sql, vec![0], corr_hash.clone()),
-            StageDef::new(2, nested_keys_sql, vec![], vec![0]),
-            StageDef::new(3, scan_sql, vec![], vec![0]),
+            nested_keys,
+            mid_scan,
             StageDef::new(4, semi_sql, vec![3, 2], corr_hash),
             StageDef::new(5, threshold_sql, vec![4, 1], vec![0]),
-            StageDef::new(6, outer_scan_sql, vec![], vec![0]),
+            outer_scan,
             StageDef::new(7, final_sql, vec![6, 5], vec![]),
         ],
         finalize_sql: build_outer_finalize(sort, limit)?,
@@ -4678,6 +4871,371 @@ fn where_clause(up: &Unparser, preds: &[&Expr]) -> Result<String> {
     Ok(format!(" WHERE {}", parts.join(" AND ")))
 }
 
+/// KAN-55 (TPC-DS Q9): a projection carrying **uncorrelated global-aggregate scalar
+/// subqueries** over the sharded fact, on top of an all-replicated outer body:
+///
+/// ```sql
+/// SELECT CASE WHEN (SELECT count(*) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) > 74129
+///        THEN (SELECT avg(ss_ext_discount_amt) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20)
+///        ELSE (SELECT avg(ss_net_paid) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) END
+/// FROM reason WHERE r_reason_sk = 1
+/// ```
+///
+/// Equivalence argument. Each scalar is a *global* aggregate, so it decomposes exactly under any
+/// row partition: count → Σ of per-worker counts, sum → Σ of per-worker sums, avg → Σsum/Σcount,
+/// min/max → min/max of partials. Stage pair per scalar: a per-worker partial over the local
+/// shard (run once via [`ExchangeMode::Forward`] when the body is fully replicated — per-worker
+/// partials of identical input would multiply the value) and a one-row combine gathered to
+/// shuffle partition 0. The combined row IS the single-node value of the scalar, so substituting
+/// `(SELECT * FROM shuffle_input_{i})` for each scalar subquery leaves the projection's value
+/// unchanged. The outer body reads only replicated tables plus these scalar rows — identical on
+/// every partition — so a partition-0 gate (`EXISTS` on a gathered one-row stage) makes the
+/// query emit exactly once cluster-wide.
+///
+/// Anything outside this shape (grouped / DISTINCT / correlated scalar bodies, non-scalar
+/// subqueries in the projection, aggregates or subqueries in the outer body, a sharded table in
+/// the outer body) returns `Ok(None)` and keeps the existing gather / rejection behavior.
+pub(crate) fn try_scalar_subquery_projection(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<Option<DistributedQuery>> {
+    let (body, sort, limit) = peek_sort_limit(lp);
+    let mut node = body;
+    while let LogicalPlan::SubqueryAlias(s) = node {
+        node = s.input.as_ref();
+    }
+    let LogicalPlan::Projection(proj) = node else {
+        return Ok(None);
+    };
+
+    // Collect the scalar subqueries in projection (textual) order — the same order the Unparser
+    // re-emits them, so replacement `i` below pairs with scalar `i`. Any other subquery kind, or
+    // a top-level aggregate/window, is not this shape.
+    let mut scalars: Vec<&LogicalPlan> = Vec::new();
+    {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        for e in &proj.expr {
+            let mut bad = false;
+            let _ = e.apply(|expr| {
+                match expr {
+                    Expr::ScalarSubquery(sq) => scalars.push(sq.subquery.as_ref()),
+                    Expr::Exists(_)
+                    | Expr::InSubquery(_)
+                    | Expr::AggregateFunction(_)
+                    | Expr::WindowFunction(_) => {
+                        bad = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    _ => {}
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+            if bad {
+                return Ok(None);
+            }
+        }
+    }
+    if scalars.is_empty() {
+        return Ok(None);
+    }
+
+    // The outer body: replicated tables only, and no subqueries / aggregates / windows of its
+    // own (those belong to other shapes).
+    fn plan_exprs_subquery_free(lp: &LogicalPlan) -> bool {
+        !lp.expressions().iter().any(expr_contains_subquery)
+            && lp.inputs().iter().all(|i| plan_exprs_subquery_free(i))
+    }
+    let input = proj.input.as_ref();
+    if base_tables(input)
+        .iter()
+        .any(|t| !replicated.contains(&t.as_str()))
+        || plan_contains_aggregate(input)
+        || plan_contains_window(input)
+        || !plan_exprs_subquery_free(input)
+    {
+        return Ok(None);
+    }
+
+    let up = Unparser::default();
+    let mut stages: Vec<StageDef> = Vec::new();
+    let mut combine_ids: Vec<u32> = Vec::new();
+    for sub in &scalars {
+        let Some((partial_sql, combine_sql, forward_partial)) =
+            global_scalar_body_stages(&up, sub, replicated)?
+        else {
+            return Ok(None);
+        };
+        let pid = stages.len() as u32;
+        let mut partial = StageDef::new(pid, partial_sql, vec![], vec![]);
+        if forward_partial {
+            // Replicated body: identical on every worker, so compute the partial exactly once.
+            partial.exchange = ExchangeMode::Forward;
+        }
+        stages.push(partial);
+        stages.push(StageDef::new(pid + 1, combine_sql, vec![pid], vec![]));
+        combine_ids.push(pid + 1);
+    }
+
+    // Re-emit the original projection with each scalar subquery swapped for its one-row input,
+    // then gate output to partition 0 (the outer tables are replicated — every partition could
+    // otherwise produce the row).
+    let original_sql = up
+        .plan_to_sql(node)
+        .map_err(|e| {
+            Error::Unsupported(format!(
+                "auto-distribute: unparse scalar-subquery projection: {e}"
+            ))
+        })?
+        .to_string();
+    let Ok((rewritten_sql, replaced)) = rewrite_scalar_subqueries(&original_sql, scalars.len())
+    else {
+        // The textual and logical subquery walks did not correspond 1:1 — not this shape.
+        return Ok(None);
+    };
+    if replaced != scalars.len() {
+        return Ok(None);
+    }
+    let gate_id = stages.len() as u32;
+    stages.push(StageDef::new(
+        gate_id,
+        "SELECT 1 AS __weft_scalar_gate".to_string(),
+        vec![],
+        vec![],
+    ));
+    let mut upstreams = combine_ids;
+    upstreams.push(gate_id);
+    let final_id = stages.len() as u32;
+    let final_sql = sanitize_generated_sql(&format!(
+        "SELECT * FROM ({rewritten_sql}) AS __weft_scalar_src \
+         WHERE EXISTS (SELECT 1 FROM shuffle_input_{})",
+        upstreams.len() - 1
+    ));
+    stages.push(StageDef::new(final_id, final_sql, upstreams, vec![]));
+
+    Ok(Some(DistributedQuery {
+        stages,
+        finalize_sql: build_outer_finalize(sort, limit)?,
+    }))
+}
+
+/// Validate one uncorrelated global-aggregate scalar body and emit its `(partial_sql,
+/// combine_sql, forward_partial)` stage SQL — `Ok(None)` when the body is outside the provable
+/// shape. Mirrors the checks in [`classify_scalar_conjunct`], minus the compare-side handling.
+fn global_scalar_body_stages(
+    up: &Unparser,
+    subquery: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<Option<(String, String, bool)>> {
+    let mut sp = subquery;
+    while let LogicalPlan::SubqueryAlias(a) = sp {
+        sp = a.input.as_ref();
+    }
+    // At most one single-expression projection over the aggregate (`count(Int64(1)) AS
+    // count(*)`), re-applied in the combine with the combined value as `m0` — the same handling
+    // as classify_scalar_conjunct.
+    let mut projection: Option<&[Expr]> = None;
+    while let LogicalPlan::Projection(pj) = sp {
+        if projection.is_some() || pj.expr.len() != 1 {
+            return Ok(None);
+        }
+        projection = Some(pj.expr.as_slice());
+        sp = pj.input.as_ref();
+    }
+    let LogicalPlan::Aggregate(sub_agg) = sp else {
+        return Ok(None);
+    };
+    if !sub_agg.group_expr.is_empty() || sub_agg.aggr_expr.len() != 1 {
+        return Ok(None);
+    }
+    let Ok(spec) = AggSpec::classify(&sub_agg.aggr_expr[0]) else {
+        return Ok(None);
+    };
+    if spec.distinct || !matches!(spec.func.as_str(), "min" | "max" | "sum" | "count" | "avg") {
+        return Ok(None);
+    }
+    let mut inner_preds: Vec<&Expr> = Vec::new();
+    let mut inner_body: &LogicalPlan = sub_agg.input.as_ref();
+    while let LogicalPlan::Filter(f) = inner_body {
+        flatten_conjuncts(&f.predicate, &mut inner_preds);
+        inner_body = f.input.as_ref();
+    }
+    if plan_has_filter_or_subquery_expr(inner_body) || plan_contains_outer_reference(inner_body) {
+        return Ok(None);
+    }
+    let scope = PlanScope::of(inner_body);
+    for conjunct in &inner_preds {
+        // A nested subquery inside a body predicate carries no `Column` nodes, so the scope
+        // check below would pass it vacuously — reject it explicitly instead of evaluating it
+        // per shard.
+        if expr_contains_subquery(conjunct) {
+            return Ok(None);
+        }
+        let mut cols = Vec::new();
+        expr_columns_tagged(conjunct, &mut cols);
+        if !cols
+            .iter()
+            .all(|(c, is_outer)| !is_outer && scope.contains(c))
+        {
+            return Ok(None);
+        }
+    }
+    let mut arg_cols = Vec::new();
+    expr_columns(&sub_agg.aggr_expr[0], &mut arg_cols);
+    if !arg_cols.iter().all(|c| scope.contains(c)) {
+        return Ok(None);
+    }
+
+    // Table safety: at most one sharded table in the body, scanned exactly once; every other
+    // table replicated. A fully-replicated body computes its partial once (Forward).
+    let inner_tables = base_tables(inner_body);
+    let mut inner_sharded: Vec<&str> = inner_tables
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !replicated.contains(t))
+        .collect();
+    inner_sharded.sort_unstable();
+    inner_sharded.dedup();
+    let forward_partial = match inner_sharded.as_slice() {
+        [] => true,
+        [fact] => {
+            if count_table_scans(inner_body, fact) != 1 {
+                return Ok(None);
+            }
+            false
+        }
+        _ => return Ok(None),
+    };
+
+    let inner_sql = up
+        .plan_to_sql(inner_body)
+        .map_err(|e| {
+            Error::Unsupported(format!(
+                "auto-distribute: unparse scalar projection body: {e}"
+            ))
+        })?
+        .to_string();
+    let inner_tail = sanitize_generated_sql(&extract_from_tail(&inner_sql)?);
+    let inner_where = where_clause(up, &inner_preds)?;
+    let (items, comb) = per_key_agg_parts(&spec.func, &spec.arg_sql, 0)?;
+    let partial_sql = sanitize_generated_sql(&format!(
+        "SELECT {} {inner_tail}{inner_where}",
+        items.join(", ")
+    ));
+    // The partial is a global aggregate: one row per worker even over an empty shard, so the
+    // combine's input is non-empty on the gather partition and `HAVING COUNT(…) > 0` suppresses
+    // the synthetic row elsewhere. AVG guards on its count partial (0, not NULL, over empty
+    // input) so its NULL quotient row still reads as a NULL scalar — the same convention as
+    // classify_scalar_conjunct.
+    let guard = if spec.func == "avg" { "a0c" } else { "a0" };
+    // A projection over the scalar aggregate is re-applied with the combined value as `m0`; its
+    // only column reference must be the aggregate.
+    let mut m0_remap: HashMap<String, String> = HashMap::new();
+    m0_remap.insert(
+        sub_agg.aggr_expr[0].schema_name().to_string(),
+        "m0".to_string(),
+    );
+    if let Some(f) = sub_agg.schema.fields().first() {
+        m0_remap.insert(f.name().clone(), "m0".to_string());
+    }
+    let proj_sql = match projection {
+        Some(exprs) => {
+            if expr_contains_subquery(&exprs[0]) {
+                return Ok(None);
+            }
+            let mapped = remap_expr_columns(strip_alias(&exprs[0]), &m0_remap);
+            let mut cols = Vec::new();
+            expr_columns(&mapped, &mut cols);
+            if !cols.iter().all(|c| c.relation.is_none() && c.name == "m0") {
+                return Ok(None);
+            }
+            expr_sql(up, &mapped)?
+        }
+        None => "m0".to_string(),
+    };
+    let combine_sql = format!(
+        "SELECT {proj_sql} AS s0 FROM \
+         (SELECT {comb} AS m0 FROM shuffle_input HAVING COUNT({guard}) > 0) AS combined"
+    );
+    Ok(Some((partial_sql, combine_sql, forward_partial)))
+}
+
+/// Parse generated SQL and replace each scalar `(SELECT …)` expression — in textual order — with
+/// a one-row `(SELECT * FROM shuffle_input_{i})` subquery, returning the rewritten SQL and the
+/// replacement count. Only scalar subquery expression nodes are touched (derived tables in FROM
+/// are a different AST node); the count lets the caller verify the logical and textual subquery
+/// walks corresponded 1:1 before trusting the rewrite.
+fn rewrite_scalar_subqueries(sql: &str, inputs: usize) -> Result<(String, usize)> {
+    use std::ops::ControlFlow;
+
+    use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Statement, VisitMut, VisitorMut};
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
+
+    let mut replacements: Vec<SqlExpr> = Vec::with_capacity(inputs);
+    for i in 0..inputs {
+        let mut stmts = Parser::parse_sql(
+            &GenericDialect {},
+            &format!("SELECT * FROM shuffle_input_{i}"),
+        )
+        .map_err(|e| {
+            Error::Unsupported(format!(
+                "auto-distribute: build scalar replacement subquery: {e}"
+            ))
+        })?;
+        let Some(Statement::Query(q)) = stmts.pop() else {
+            return Err(Error::Unsupported(
+                "auto-distribute: scalar replacement subquery did not parse".into(),
+            ));
+        };
+        replacements.push(SqlExpr::Subquery(q));
+    }
+
+    struct Rewriter {
+        replacements: Vec<SqlExpr>,
+        count: usize,
+    }
+    impl VisitorMut for Rewriter {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &mut SqlExpr) -> ControlFlow<Self::Break> {
+            if matches!(expr, SqlExpr::Subquery(_)) {
+                let i = self.count;
+                self.count += 1;
+                if i < self.replacements.len() {
+                    // Swap the whole node; the replacement contains no subquery of its own, and
+                    // the original subtree is discarded unwalked (a nested subquery inside it
+                    // would surface as a count mismatch at the caller).
+                    *expr = self.replacements[i].clone();
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| {
+        Error::Unsupported(format!(
+            "auto-distribute: parse generated SQL for scalar replacement: {e}"
+        ))
+    })?;
+    if statements.len() != 1 {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: scalar replacement expected one statement, found {}",
+            statements.len()
+        )));
+    }
+    let mut rewriter = Rewriter {
+        replacements,
+        count: 0,
+    };
+    let _ = statements.visit(&mut rewriter);
+    if rewriter.count != inputs {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: scalar replacement saw {} textual subqueries for {inputs} logical",
+            rewriter.count
+        )));
+    }
+    Ok((statements.remove(0).to_string(), rewriter.count))
+}
+
 /// Materialize one fact that is sharded **only inside expression subqueries**, then evaluate the
 /// original query exactly once against the gathered rows.
 ///
@@ -5165,7 +5723,15 @@ fn plan_union(
     limit: Option<usize>,
     combine: SetCombine,
 ) -> Result<DistributedQuery> {
-    if u.inputs.len() < 2 {
+    // A bare `Union` is always bag union (UNION DISTINCT is a `Distinct` over a `Union`), which
+    // is associative — flatten a nested `Union(Union(a, b), c)` tree (TPC-DS Q27's hand-rolled
+    // ROLLUP unions three aggregates over one CTE) so each leaf arm plans independently instead
+    // of failing the arm peel on a nested `Union` node.
+    let mut arms: Vec<Arc<LogicalPlan>> = Vec::new();
+    for input in &u.inputs {
+        super::stage_planner::flatten_union_all(input, &mut arms);
+    }
+    if arms.len() < 2 {
         return Err(Error::Unsupported(
             "auto-distribute: UNION needs at least two arms".into(),
         ));
@@ -5179,7 +5745,7 @@ fn plan_union(
         SetCombine::UnionDistinct => "UNION",
     };
 
-    for (arm_i, arm) in u.inputs.iter().enumerate() {
+    for (arm_i, arm) in arms.iter().enumerate() {
         let peeled = peel(arm).map_err(|e| {
             Error::Unsupported(format!(
                 "auto-distribute: {label} arm {arm_i} is not a distributable aggregation: {e}"
@@ -5440,7 +6006,7 @@ fn scalar_as_usize(s: &datafusion::scalar::ScalarValue) -> Option<usize> {
     }
 }
 
-fn collect_subquery_tables(lp: &LogicalPlan, out: &mut Vec<String>) {
+pub(crate) fn collect_subquery_tables(lp: &LogicalPlan, out: &mut Vec<String>) {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     for e in lp.expressions() {
         let _ = e.apply(|node| {

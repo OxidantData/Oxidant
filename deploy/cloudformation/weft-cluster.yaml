@@ -492,6 +492,11 @@ Resources:
             echo "[userdata] driver boot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             # Tags are also readable via IMDS InstanceMetadataTags; bootstrap
             # uses DescribeTags as the source of truth. Kick bootstrap early.
+            # Ordering contract (KAN-58): bootstrap must COMPLETE (spill mount,
+            # env file, DNS upsert) before the role unit starts — that is why
+            # bootstrap only *enables* weft-driver and UserData starts it here
+            # after `systemctl start weft-bootstrap` returns. On reboots the
+            # unit graph (Requires/After on weft-bootstrap) enforces the same.
             systemctl start weft-bootstrap.service
             systemctl enable --now weft-driver.service
             systemctl is-active weft-bootstrap weft-driver || true
@@ -566,6 +571,11 @@ Resources:
             set -uo pipefail
             exec > >(tee -a /var/log/weft-userdata.log) 2>&1
             echo "[userdata] worker boot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            # Ordering contract (KAN-58): bootstrap must COMPLETE (spill mount,
+            # env file with shard index, Route53 upsert) before the worker
+            # starts — bootstrap only *enables* weft-worker; UserData starts it
+            # here after `systemctl start weft-bootstrap` returns. On reboots
+            # the unit graph (Requires/After on weft-bootstrap) does the same.
             systemctl start weft-bootstrap.service
             systemctl enable --now weft-worker.service
             systemctl is-active weft-bootstrap weft-worker || true

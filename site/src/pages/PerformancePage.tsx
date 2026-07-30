@@ -261,7 +261,7 @@ export default function PerformancePage() {
       <SuiteSection
         eyebrow="TPC-DS SF10"
         title="Retail warehouse workload"
-        blurb="99 queries against glue.tpcds_sf10.* — same Glue → distributed path as TPC-H. 60/99 execute end-to-end, each golden-validated against DuckDB SF10; the remaining 39 are clean strict-mode planner refusals for distributed shapes Weft doesn't cover yet — the engine says no rather than risk a wrong answer. Per-query chart omitted (99 bars); totals and failure list tell the story."
+        blurb="99 queries against glue.tpcds_sf10.* — same Glue → distributed path as TPC-H. 72/99 execute end-to-end, each golden-validated against DuckDB SF10; the remaining 27 are clean strict-mode planner refusals for distributed shapes Weft doesn't cover yet — the engine says no rather than risk a wrong answer. Per-query chart omitted (99 bars); totals and failure list tell the story."
         suite={tpcdsBenchmarks}
         showPerQuery={false}
       />

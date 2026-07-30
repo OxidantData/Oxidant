@@ -565,11 +565,31 @@ definition of done D-4.* in [`DISTRIBUTED_DONE.md`](DISTRIBUTED_DONE.md).
 
 `/usr/local/lib/weft/bootstrap.sh` (oneshot `weft-bootstrap.service`):
 
-1. Mounts the spill volume (if present) at `/var/lib/weft/spill`
+1. Mounts the spill volume (if present) at `/var/lib/weft/spill` — detection is
+   name-agnostic: the largest unmounted, unpartitioned, non-root whole disk
+   wins (plain `lsblk` scan; Nitro NVMe enumeration order is not stable, so no
+   `/dev/nvmeX` name hints). Persists via `/etc/fstab`; safe to re-run.
 2. Reads instance tags (`weft:role`, `weft:worker-count`, `weft:worker-asg`,
    `weft:catalog-conf`, …)
-3. **Workers:** waits for InService peers, assigns `WEFT_SHARD_INDEX`, UPSERTs Route53
-4. Writes `/etc/weft/weft.env` and enables `weft-driver` or `weft-worker`
+3. **Workers:** waits for InService peers, assigns `WEFT_SHARD_INDEX`, UPSERTs the
+   shared Route53 A RRSet from the InService peers **plus its own IP** (self may
+   not be InService yet on a cold start; dead instances are pruned on every boot)
+4. Writes `/etc/weft/weft.env` **atomically** (temp file + rename — a killed
+   bootstrap can never leave a truncated env file) and **enables** (never starts)
+   `weft-driver` or `weft-worker`
+
+Ordering (KAN-58): the role units declare `Requires=`/`After=` on
+`weft-bootstrap.service` and bootstrap declares `Before=` on them — so bootstrap
+must never `systemctl start`/`--now` a role unit from inside its own oneshot
+(that closed the cycle that deadlocked fresh instances until `TimeoutStartSec`).
+First boot: UserData runs `systemctl start weft-bootstrap.service`, waits for it,
+then `systemctl enable --now weft-<role>`. Reboots: the WantedBy/Requires/After
+graph re-runs bootstrap (idempotent) before the role unit. Shutdown / scale-in:
+`ExecStop` runs `bootstrap.sh --deregister`, which removes **only this
+instance's IP** from the RRSet — never a full re-sync (at stop time the ASG may
+still list the instance InService, which would re-add its dying IP and leave it
+stale forever). Workers that die without `ExecStop` are pruned by the next
+worker boot's full re-sync.
 
 | Role | Env written |
 |------|-------------|
@@ -614,12 +634,14 @@ aws glue delete-database --region "${AWS_REGION}" --name "${GLUE_DB}"
 | Symptom | Likely cause |
 |---------|----------------|
 | Inflated / duplicated aggregates | Missing `WEFT_SHARD_INDEX` / `WEFT_WORKER_COUNT` on workers, or the **same** `WEFT_SHARD_INDEX` on every worker (each then reads shard 0's file subset, so single-file tables count 2× and size-balanced multi-file tables ~1× with skew) — check `/etc/weft/weft.env` on *every* worker |
+| Fresh instance: bootstrap "starting" for 5 min, then no `/etc/weft/weft.env` and the role unit never starts | Pre-KAN-58 AMI: bootstrap started the role unit from inside its own oneshot while the role unit `Requires=`/`After=` bootstrap — a circular wait killed at `TimeoutStartSec`. Rebake from current `deploy/packer`; live fix: copy the repo `bootstrap.sh` over `/usr/local/lib/weft/bootstrap.sh`, then `systemctl reset-failed weft-bootstrap && systemctl start weft-bootstrap && systemctl start weft-<role>` |
+| Queries fail on dead worker IPs ("no free task slots") | Stale A records in `workers.<zone>` — instances killed without `ExecStop` (or pre-KAN-58 deregistration, which re-synced the full InService set and could re-add the dying IP). `sudo systemctl restart weft-bootstrap` on any live worker forces a full re-sync that prunes dead IPs; graceful stops now remove only the instance's own IP |
 | Driver fails membership vs count | Route53 A set size ≠ `WorkerCount` — wait for all workers InService; check worker Route53 IAM |
 | Workers never receive tasks | Driver cannot resolve `WEFT_WORKER_SERVICE` — private zone VPC association / SG |
 | `aws glue … EntityNotFound` | Wrong database/table name or region in `CatalogConf` |
 | `AccessDenied` on Glue/S3 | Deployed with `--glue false` or incomplete `DataBucketArns` (need bucket **and** `/*`) |
 | Catalog works locally on driver but distributed scan fails | Workers missing `WEFT_CATALOG_CONF` — set stack `CatalogConf`, replace instances |
-| Spill fills root volume | Spill size `0` or device not detected — `lsblk` / bootstrap logs for `/dev/xvdf` |
+| Spill fills root volume | Spill size `0`, or no eligible device: bootstrap picks the largest **unmounted, unpartitioned, non-root** whole disk (no fixed device names) — `lsblk -f` and the bootstrap log line `no spill block device found` tell you which disks were skipped and why (mounted / has partitions) |
 | OOM on large queries | Empty memory/shuffle thresholds — set `MemoryLimitBytes` + `ShuffleSpillBytes` |
 | `CatalogConf` deploy error / truncated tag | Value must be ≤256 characters |
 
@@ -637,7 +659,7 @@ sudo -u weft /usr/local/bin/aws glue get-databases --region "$AWS_REGION"
 | Path | Role |
 |------|------|
 | [`deploy/packer/weft-runtime.pkr.hcl`](../deploy/packer/weft-runtime.pkr.hcl) | Packer AMI |
-| [`deploy/packer/files/bootstrap.sh`](../deploy/packer/files/bootstrap.sh) | Boot: shard index + DNS + env (+ catalog) |
+| [`deploy/packer/files/bootstrap.sh`](../deploy/packer/files/bootstrap.sh) | Boot: spill mount + shard index + DNS upsert + atomic env (+ catalog); shutdown: self-IP DNS deregistration |
 | [`deploy/packer/files/systemd/`](../deploy/packer/files/systemd/) | `weft-bootstrap` / `weft-driver` / `weft-worker` |
 | [`deploy/packer/build-ami.sh`](../deploy/packer/build-ami.sh) | AMI build wrapper |
 | [`deploy/cloudformation/weft-cluster.yaml`](../deploy/cloudformation/weft-cluster.yaml) | CFN stack |

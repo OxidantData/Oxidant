@@ -2054,16 +2054,13 @@ impl Engine {
             opts.catalog.default_catalog = weft_catalog::DEFAULT_CATALOG.to_string();
             opts.catalog.default_schema = weft_catalog::DEFAULT_NAMESPACE.to_string();
             // Spark's default NULL ordering treats NULL as the smallest value (ASC → NULLS FIRST,
-            // DESC → NULLS LAST), whereas DataFusion defaults to Postgres's `nulls_max` (ASC →
-            // NULLS LAST). Matching Spark makes weft's implicit ORDER BY (including window-function
-            // ORDER BY, where it changes computed running aggregates, not just row order) produce
-            // Spark's committed output.
-            opts.sql_parser.default_null_ordering = "nulls_min".to_string();
-            // Spark's default null ordering is ASC NULLS FIRST / DESC NULLS LAST, expressed by
-            // DataFusion's `nulls_min`. DataFusion's own default (`nulls_max`, Postgres-style ASC
-            // NULLS LAST) silently flips both the outer ORDER BY *and* the within-window ORDER BY,
-            // which changes window-frame contents (e.g. a NULL row's RANGE/ROWS neighbours) and the
-            // final row order. Aligning the default is a faithful match to Spark.
+            // DESC → NULLS LAST — Spark's ORDER BY reference:
+            // https://spark.apache.org/docs/latest/sql-ref-syntax-qry-select-orderby.html), whereas
+            // DataFusion defaults to Postgres's `nulls_max` (ASC → NULLS LAST, DESC → NULLS FIRST).
+            // Matching Spark via `nulls_min` makes weft's implicit ORDER BY (including
+            // window-function ORDER BY, where it changes window-frame contents — e.g. a NULL row's
+            // RANGE/ROWS neighbours — and computed running aggregates, not just row order) produce
+            // Spark's committed output. KAN-52 regression-pins this with the `kan52_*` tests.
             opts.sql_parser.default_null_ordering = "nulls_min".to_string();
             opts.execution.parquet.pushdown_filters = true;
             opts.execution.parquet.reorder_filters = true;
@@ -5002,6 +4999,175 @@ mod tests {
         let batches = engine.sql("SELECT 1 AS x").await.unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         assert_eq!(batches[0].num_columns(), 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // KAN-52 — Spark's default NULL ordering: ASC → NULLS FIRST, DESC → NULLS LAST
+    // (https://spark.apache.org/docs/latest/sql-ref-syntax-qry-select-orderby.html:
+    // "If null_sort_order is not specified, then NULLs sort first if sort order is ASC
+    // and NULLS sort last if sort order is DESC"). weft pins it via
+    // `datafusion.sql_parser.default_null_ordering = "nulls_min"` in `Engine::new_inner`
+    // (DataFusion's own default is Postgres's `nulls_max`, the exact opposite); these
+    // tests fail if that setting or the explicit NULLS FIRST/LAST passthrough regresses.
+    // ---------------------------------------------------------------------
+
+    /// Collect column `col` across `batches` as ordered `Option<i32>`s so a test can assert
+    /// exactly where NULL keys land in a sort.
+    fn int32_column(batches: &[RecordBatch], col: usize) -> Vec<Option<i32>> {
+        use arrow::array::{Array, Int32Array};
+        let mut out = Vec::new();
+        for b in batches {
+            let arr = b
+                .column(col)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("INT column");
+            out.extend((0..arr.len()).map(|i| (!arr.is_null(i)).then(|| arr.value(i))));
+        }
+        out
+    }
+
+    /// Register a one-column nullable `INT` table under `name`, rows in the order given.
+    fn register_int_table(engine: &Engine, name: &str, values: &[Option<i32>]) {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
+            .unwrap();
+        engine.register_batches(name, vec![batch]).unwrap();
+    }
+
+    /// Spark's default: ASC sorts NULL keys FIRST (`nulls_min`), not Postgres's NULLS LAST.
+    #[tokio::test]
+    async fn kan52_default_asc_sorts_nulls_first() {
+        let engine = Engine::new();
+        register_int_table(&engine, "t", &[Some(2), None, Some(1)]);
+        let batches = engine.sql("SELECT x FROM t ORDER BY x").await.unwrap();
+        assert_eq!(int32_column(&batches, 0), vec![None, Some(1), Some(2)]);
+    }
+
+    /// Spark's default: DESC sorts NULL keys LAST.
+    #[tokio::test]
+    async fn kan52_default_desc_sorts_nulls_last() {
+        let engine = Engine::new();
+        register_int_table(&engine, "t", &[Some(2), None, Some(1)]);
+        let batches = engine.sql("SELECT x FROM t ORDER BY x DESC").await.unwrap();
+        assert_eq!(int32_column(&batches, 0), vec![Some(2), Some(1), None]);
+    }
+
+    /// Explicit NULLS LAST overrides the ASC default and must be honored as written.
+    #[tokio::test]
+    async fn kan52_explicit_nulls_last_on_asc_honored() {
+        let engine = Engine::new();
+        register_int_table(&engine, "t", &[Some(2), None, Some(1)]);
+        let batches = engine
+            .sql("SELECT x FROM t ORDER BY x ASC NULLS LAST")
+            .await
+            .unwrap();
+        assert_eq!(int32_column(&batches, 0), vec![Some(1), Some(2), None]);
+    }
+
+    /// Explicit NULLS FIRST overrides any direction default (TPC-DS q11 spells NULLS FIRST
+    /// explicitly — the clause must round-trip untouched).
+    #[tokio::test]
+    async fn kan52_explicit_nulls_first_honored() {
+        let engine = Engine::new();
+        register_int_table(&engine, "t", &[Some(2), None, Some(1)]);
+        for (sql, expected) in [
+            // No direction → ASC with explicit NULLS FIRST.
+            (
+                "SELECT x FROM t ORDER BY x NULLS FIRST",
+                vec![None, Some(1), Some(2)],
+            ),
+            // DESC with explicit NULLS FIRST (opposite of the DESC default).
+            (
+                "SELECT x FROM t ORDER BY x DESC NULLS FIRST",
+                vec![None, Some(2), Some(1)],
+            ),
+        ] {
+            let batches = engine.sql(sql).await.unwrap();
+            assert_eq!(int32_column(&batches, 0), expected, "{sql}");
+        }
+    }
+
+    /// The ORDER BY … LIMIT boundary (the TPC-DS Q12-class shape): the NULL-keyed row must
+    /// fall INSIDE the LIMIT window for default ASC and OUTSIDE it for default DESC — this is
+    /// exactly where a wrong default flips the result set, not just the row order.
+    #[tokio::test]
+    async fn kan52_order_by_limit_boundary_matches_spark() {
+        let engine = Engine::new();
+        register_int_table(&engine, "t", &[Some(3), None, Some(1), Some(2)]);
+        let asc = engine
+            .sql("SELECT x FROM t ORDER BY x LIMIT 2")
+            .await
+            .unwrap();
+        assert_eq!(int32_column(&asc, 0), vec![None, Some(1)]);
+        let desc = engine
+            .sql("SELECT x FROM t ORDER BY x DESC LIMIT 2")
+            .await
+            .unwrap();
+        assert_eq!(int32_column(&desc, 0), vec![Some(3), Some(2)]);
+    }
+
+    /// The same default applies to the within-window ORDER BY (where it changes computed
+    /// values, not just row order): under Spark's `nulls_min` the NULL-keyed row ranks FIRST
+    /// for ASC and LAST for DESC.
+    #[tokio::test]
+    async fn kan52_window_order_by_uses_spark_default() {
+        let engine = Engine::new();
+        register_int_table(&engine, "t", &[Some(2), None, Some(1)]);
+        let asc = engine
+            .sql(
+                "SELECT r FROM \
+                 (SELECT x, CAST(RANK() OVER (ORDER BY x) AS INT) AS r FROM t) \
+                 WHERE x IS NULL",
+            )
+            .await
+            .unwrap();
+        assert_eq!(int32_column(&asc, 0), vec![Some(1)]);
+        let desc = engine
+            .sql(
+                "SELECT r FROM \
+                 (SELECT x, CAST(RANK() OVER (ORDER BY x DESC) AS INT) AS r FROM t) \
+                 WHERE x IS NULL",
+            )
+            .await
+            .unwrap();
+        assert_eq!(int32_column(&desc, 0), vec![Some(3)]);
+    }
+
+    /// Distributed finalize replay: in a distributed run the driver re-parses the finalize
+    /// `ORDER BY` on a *fresh* engine (weft-execution's `build_finalize` emits the null
+    /// ordering resolved at plan time as an explicit `NULLS FIRST`/`NULLS LAST` clause, so
+    /// the finalizer's own default never gets a say). This emulates that hop at the loom
+    /// level: gathered rows replayed through the resolved finalize SQL must reproduce the
+    /// single-node order.
+    #[tokio::test]
+    async fn kan52_finalize_replay_on_fresh_engine_matches_single_node() {
+        let single = Engine::new();
+        register_int_table(&single, "t", &[Some(2), None, Some(1)]);
+        for (query, finalize_sql) in [
+            (
+                "SELECT x FROM t ORDER BY x",
+                "SELECT x FROM result ORDER BY x ASC NULLS FIRST",
+            ),
+            (
+                "SELECT x FROM t ORDER BY x DESC",
+                "SELECT x FROM result ORDER BY x DESC NULLS LAST",
+            ),
+        ] {
+            let expected = single.sql(query).await.unwrap();
+            // The driver's finalize engine sees the gathered stage output as `result`, in
+            // whatever order the workers produced (stages are unordered by contract).
+            let finalizer = Engine::new();
+            register_int_table(&finalizer, "result", &[Some(1), None, Some(2)]);
+            let actual = finalizer.sql(finalize_sql).await.unwrap();
+            assert_eq!(
+                int32_column(&actual, 0),
+                int32_column(&expected, 0),
+                "{query} vs {finalize_sql}"
+            );
+        }
     }
 
     #[tokio::test]

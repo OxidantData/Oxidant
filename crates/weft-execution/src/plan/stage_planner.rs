@@ -63,10 +63,11 @@ use weft_common::{Error, Result};
 use weft_loom::Engine;
 
 use super::shape_extensions::{
-    ensure_having_subquery_tables_replicated, ensure_subquery_tables_replicated,
-    reject_explicit_unsupported, try_decorrelate_scalar_subquery, try_derived_scalar_equality,
-    try_in_agg_semi_join, try_materialize_complex_fact, try_materialize_subquery_fact,
-    try_nested_in_semi, try_non_aggregate, try_semi_anti_subqueries,
+    collect_subquery_tables, ensure_having_subquery_tables_replicated,
+    ensure_subquery_tables_replicated, reject_explicit_unsupported,
+    try_decorrelate_scalar_subquery, try_derived_scalar_equality, try_in_agg_semi_join,
+    try_materialize_complex_fact, try_materialize_subquery_fact, try_nested_in_semi,
+    try_non_aggregate, try_scalar_subquery_projection, try_semi_anti_subqueries,
     try_uncorrelated_scalar_threshold, try_union_all, try_window,
 };
 use crate::driver::{ExchangeMode, StageDef};
@@ -134,6 +135,12 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
         // `total_revenue = (SELECT max(total_revenue) FROM revenue)`) plans as a distributed
         // derived table + the KAN-27 one-row scalar broadcast.
         if let Some(dq) = try_derived_scalar_equality(lp, replicated)? {
+            return Ok(dq);
+        }
+        // KAN-55: uncorrelated global-aggregate scalar subqueries in the projection over an
+        // all-replicated outer (TPC-DS Q9) plan as per-scalar partial/combine pairs plus a
+        // gated single-partition outer evaluation.
+        if let Some(dq) = try_scalar_subquery_projection(lp, replicated)? {
             return Ok(dq);
         }
         if let Some(dq) = try_materialize_subquery_fact(lp, replicated)? {
@@ -231,6 +238,12 @@ fn stamp_replicated_tables(dq: &mut DistributedQuery, replicated: &[&str]) {
 ///
 /// See [`weft_loom::shard::classify_replicated_tables`]: the largest known table in the plan stays
 /// sharded; smaller tables under `WEFT_AUTO_BROADCAST_THRESHOLD_BYTES` (default 32 GiB) replicate.
+///
+/// KAN-55: tables scanned only inside expression subqueries (EXISTS / IN / scalar) are sized too.
+/// They were previously invisible here and defaulted to *sharded*, which made e.g. TPC-DS Q10's
+/// 500 MB `web_sales` shard-by-default at SF10 simply because it appears only inside a subquery —
+/// blocking plans that are provably safe once the table replicates. Sizing them keeps the
+/// per-query rule uniform: the largest table the query reads anywhere stays sharded.
 pub async fn resolve_replicated_tables(engine: &Engine, lp: &LogicalPlan) -> Vec<String> {
     use std::collections::HashSet;
     use weft_loom::shard::{
@@ -240,7 +253,9 @@ pub async fn resolve_replicated_tables(engine: &Engine, lp: &LogicalPlan) -> Vec
 
     let mut seen = HashSet::new();
     let mut sized: Vec<(String, Option<u64>)> = Vec::new();
-    for name in base_tables(lp) {
+    let mut names = base_tables(lp);
+    collect_subquery_tables(lp, &mut names);
+    for name in names {
         let key = name.to_ascii_lowercase();
         if !seen.insert(key.clone()) {
             continue;
@@ -1607,10 +1622,13 @@ pub(crate) fn extract_from_tail(input_sql: &str) -> Result<String> {
 /// `Ok(None)` — falling through to the flat [`reject_unsafe_broadcast_shapes`] guard — when: no
 /// `Union` is found under `agg.input`; every arm (or no arm) scans `sharded_name`, so there is
 /// nothing to place differently; the aggregate has a `DISTINCT` aggregate (not yet composed with
-/// this split); or the `Union` sits under a plan node this function does not know how to rebuild
+/// this split); the `Union` sits under a plan node this function does not know how to rebuild
 /// with a narrowed child (only single-child nodes and `Join` are supported — see
-/// [`split_union_by_sharding`]). `ROLLUP`/`CUBE`/`GROUPING SETS` (TPC-DS Q77/Q80) *are* supported,
-/// mirroring the single-arm path's empty-hash-key gather + `HAVING COUNT(*) > 0` convention.
+/// [`split_union_by_sharding`]); the narrowed sharded side still contains an aggregate and the
+/// SUM-only guard below does not hold (KAN-54); or the outer aggregate uses
+/// `ROLLUP`/`CUBE`/`GROUPING SETS` (TPC-DS Q5/Q77/Q80) — per-arm `Forward` placement composed
+/// with the grouping-set gather returned wrong answers, so those keep the honest single-node
+/// fallback until the composition is proven correct.
 fn try_split_broadcast_union(
     p: &Peeled<'_>,
     sharded_name: &str,
@@ -1650,6 +1668,40 @@ fn try_split_broadcast_union(
             "auto-distribute: sharded table `{sharded_name}` scanned {scans}× \
              (self-join / subquery) — not broadcast-safe"
         )));
+    }
+
+    // KAN-54 (TPC-DS Q33/Q56/Q60): when the narrowed sharded side still contains an aggregate
+    // (a pre-aggregated per-channel arm), the partial stage recomputes that inner GROUP BY per
+    // worker. A key present on w workers then contributes w inner rows where the single-node
+    // plan has one, and each carries a per-worker partial value rather than the key's total.
+    // An outer SUM still composes exactly — partial sums re-add to the key total regardless of
+    // row multiplicity — but COUNT/AVG read the inflated multiplicity and MIN/MAX compare
+    // partials instead of totals, so those must keep refusing. The inner aggregates must
+    // decompose additively for the same reason (SUM/COUNT only, never DISTINCT), must be
+    // leaf-level (an aggregate under an aggregate is KAN-44's composition, not this one's),
+    // and must not use grouping sets (per-worker ROLLUP levels do not re-add so naively).
+    let mut inner_aggs = Vec::new();
+    collect_aggregates(&sharded_input, &mut inner_aggs);
+    if !inner_aggs.is_empty() {
+        let inner_ok = inner_aggs.iter().all(|a| {
+            let mut nested = Vec::new();
+            collect_aggregates(&a.input, &mut nested);
+            nested.is_empty()
+                && !is_grouping_set(&a.group_expr)
+                && a.aggr_expr.iter().all(|e| {
+                    AggSpec::classify(e)
+                        .map(|s| !s.distinct && matches!(s.func.as_str(), "sum" | "count"))
+                        .unwrap_or(false)
+                })
+        });
+        let outer_ok = agg.aggr_expr.iter().all(|e| {
+            AggSpec::classify(e)
+                .map(|s| !s.distinct && s.func == "sum")
+                .unwrap_or(false)
+        });
+        if !inner_ok || !outer_ok {
+            return Ok(None);
+        }
     }
 
     let up = Unparser::default();
@@ -1759,15 +1811,37 @@ fn split_union_by_sharding(
     sharded_name: &str,
 ) -> Result<Option<(LogicalPlan, LogicalPlan)>> {
     if let LogicalPlan::Union(u) = lp {
-        let mut sharded_arms = Vec::new();
-        let mut replicated_arms = Vec::new();
-        for arm in &u.inputs {
-            if count_table_scans(arm, sharded_name) > 0 {
-                sharded_arms.push(Arc::clone(arm));
-            } else {
-                replicated_arms.push(Arc::clone(arm));
+        // Flatten nested unions before bucketing arms (TPC-DS Q33/Q56/Q60/Q76 keep their
+        // three-way set op nested as `Union(Union(ss, cs), ws)`). Without this, the inner
+        // `Union(ss, cs)` buckets as one "sharded" arm and its replicated-only `cs` leaf trips
+        // [`reject_unsafe_broadcast_shapes`] below.
+        let mut arms = Vec::new();
+        for input in &u.inputs {
+            flatten_union_all(input, &mut arms);
+        }
+        let bucket = |arms: &[Arc<LogicalPlan>]| {
+            let mut sharded_arms = Vec::new();
+            let mut replicated_arms = Vec::new();
+            for arm in arms {
+                if count_table_scans(arm, sharded_name) > 0 {
+                    sharded_arms.push(Arc::clone(arm));
+                } else {
+                    replicated_arms.push(Arc::clone(arm));
+                }
+            }
+            (sharded_arms, replicated_arms)
+        };
+        let (sharded_arms, replicated_arms) = bucket(&arms);
+        if !sharded_arms.is_empty() && !replicated_arms.is_empty() {
+            // A flattened rebuild can fail where the original nested union planned fine: the SQL
+            // planner coerces arm types (TPC-DS Q77's `coalesce(returns, 0)` widens a decimal in
+            // two arms but not the third), and `Union::try_new` validates strictly. Fall back to
+            // bucketing only the top-level inputs in that case — the pre-flatten behavior.
+            if let (Ok(s), Ok(r)) = (union_of_arms(sharded_arms), union_of_arms(replicated_arms)) {
+                return Ok(Some((s, r)));
             }
         }
+        let (sharded_arms, replicated_arms) = bucket(&u.inputs);
         if sharded_arms.is_empty() || replicated_arms.is_empty() {
             return Ok(None);
         }
@@ -1823,6 +1897,31 @@ fn split_union_by_sharding(
 fn with_new_child(lp: &LogicalPlan, child: LogicalPlan) -> Result<LogicalPlan> {
     lp.with_new_exprs(lp.expressions(), vec![child])
         .map_err(|e| Error::Unsupported(format!("auto-distribute: rebuild union-split node: {e}")))
+}
+
+/// Flatten a nested `Union` tree into its leaf arms. A bare `LogicalPlan::Union` is always a bag
+/// union (`UNION DISTINCT` is a `Distinct` node above a `Union`; INTERSECT/EXCEPT lower to
+/// semi/anti joins), and bag union is associative, so the leaf arm list is equivalent to the
+/// tree. Shared by [`split_union_by_sharding`] and `shape_extensions::plan_union`.
+pub(crate) fn flatten_union_all(lp: &Arc<LogicalPlan>, arms: &mut Vec<Arc<LogicalPlan>>) {
+    match lp.as_ref() {
+        LogicalPlan::Union(u) => {
+            for input in &u.inputs {
+                flatten_union_all(input, arms);
+            }
+        }
+        _ => arms.push(Arc::clone(lp)),
+    }
+}
+
+/// Every `Aggregate` node in the subtree, at any depth.
+fn collect_aggregates<'a>(lp: &'a LogicalPlan, out: &mut Vec<&'a Aggregate>) {
+    if let LogicalPlan::Aggregate(a) = lp {
+        out.push(a);
+    }
+    for c in lp.inputs() {
+        collect_aggregates(c, out);
+    }
 }
 
 /// Rebuild a `Union` from a (possibly single-element) arm subset, collapsing to the bare plan

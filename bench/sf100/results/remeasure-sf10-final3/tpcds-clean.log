@@ -1,0 +1,315 @@
+[run] strict mode: connect pod must have WEFT_DISTRIBUTED_STRICT=1 (values-sf100.yaml sets connect.distributedStrict); fallback is a hard failure
+[preflight] SKIPPED (--skip-worker-preflight)
+[run] endpoint=sc://18.236.223.115:50051 suite=tpcds sf=10.0 catalog=glue glue_db=tpcds_sf10 queries=97 resume_skip=0
+/private/tmp/weft-smoke-venv/lib/python3.14/site-packages/pyspark/sql/connect/utils.py:41: FutureWarning: PySpark does not yet fully support pandas >= 3.0.0. Some features may not work correctly. It is recommended to use pandas < 3.0.0 for now.
+  require_minimum_pandas_version()
+/private/tmp/weft-smoke-venv/lib/python3.14/site-packages/pyspark/testing/utils.py:127: FutureWarning: PySpark does not yet fully support pandas >= 3.0.0. Some features may not work correctly. It is recommended to use pandas < 3.0.0 for now.
+  require_minimum_pandas_version()
+Q1    FAIL try1 (15.9388s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_returns` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_returns` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q2    try1 16.6235s rows=2513 checksum=103df2fec7a2…
+Q2    HOT  16.6235s
+Q3    try1 17.0456s rows=100 checksum=a4e9709ff0c2…
+Q3    HOT  17.0456s
+Q4    FAIL try1 (18.5710s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q5    FAIL try1 (41.0547s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: UNION ALL arm does not scan sharded table `store_sales` — broadcasting it would repeat that arm's rows on every worker"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: UNION ALL arm does not scan sharded table `store_sales` — broadcasting it would repeat that arm's rows on every worker"
+>
+Q6    try1 23.8971s rows=51 checksum=357e932d3d1b…
+Q6    HOT  23.8971s
+Q7    try1 26.4149s rows=100 checksum=8c97e39a6020…
+Q7    HOT  26.4149s
+Q8    try1 21.2787s rows=9 checksum=7afd86a2f729…
+Q8    HOT  21.2787s
+Q9    FAIL try1 (4.7502s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: subquery over `store_sales` is only safe when that table is replicated"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: subquery over `store_sales` is only safe when that table is replicated"
+>
+Q10   FAIL try1 (11.2844s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: subquery over `store_sales` is only safe when that table is replicated"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: subquery over `store_sales` is only safe when that table is replicated"
+>
+Q12   try1 13.3797s rows=100 checksum=133da748afcd…
+Q12   HOT  13.3797s
+Q13   try1 28.4292s rows=1 checksum=d14a6269ccf8…
+Q13   HOT  28.4292s
+Q14   FAIL try1 (18.6990s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: subquery over `store_sales` is only safe when that table is replicated"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: subquery over `store_sales` is only safe when that table is replicated"
+>
+Q15   try1 17.2921s rows=100 checksum=b4d28d9b9777…
+Q15   HOT  17.2921s
+Q16   FAIL try1 (15.6500s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: subquery over `catalog_sales` is only safe when that table is replicated"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: subquery over `catalog_sales` is only safe when that table is replicated"
+>
+Q17   try1 29.8563s rows=0 checksum=e3b0c44298fc…
+Q17   HOT  29.8563s
+Q18   try1 27.4740s rows=100 checksum=3afb37046515…
+Q18   HOT  27.4740s
+Q19   try1 25.4637s rows=100 checksum=c586851a599e…
+Q19   HOT  25.4637s
+Q20   try1 12.6215s rows=100 checksum=b92809bfe09f…
+Q20   HOT  12.6215s
+Q21   try1 23.9238s rows=100 checksum=d9daec5f7a73…
+Q21   HOT  23.9238s
+Q22   try1 14.5424s rows=100 checksum=170883a5eca8…
+Q22   HOT  14.5424s
+Q23   FAIL try1 (21.9727s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q24   FAIL try1 (22.2184s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q25   try1 28.2726s rows=2 checksum=34bb675d60dd…
+Q25   HOT  28.2726s
+Q26   try1 23.1644s rows=100 checksum=3275b6cd17c5…
+Q26   HOT  23.1644s
+Q27   FAIL try1 (18.0833s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q28   FAIL try1 (3.7421s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q29   try1 28.3783s rows=8 checksum=93830acf6010…
+Q29   HOT  28.3783s
+Q30   FAIL try1 (14.7706s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `web_returns` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `web_returns` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q31   try1 20.3464s rows=307 checksum=2267d57010af…
+Q31   HOT  20.3464s
+Q32   try1 13.3688s rows=1 checksum=4cd94a7b8814…
+Q32   HOT  13.3688s
+Q33   FAIL try1 (22.0825s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q34   try1 21.4559s rows=1560 checksum=8ea031658780…
+Q34   HOT  21.4559s
+Q35   FAIL try1 (11.1967s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: subquery over `store_sales` is only safe when that table is replicated"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: subquery over `store_sales` is only safe when that table is replicated"
+>
+Q36   FAIL try1 (14.6388s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q37   try1 32.6978s rows=2 checksum=bf6bb0a172a3…
+Q37   HOT  32.6978s
+Q38   FAIL try1 (18.3956s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q39   FAIL try1 (14.7433s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `inventory` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `inventory` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q40   try1 21.4389s rows=100 checksum=fd9a674a8149…
+Q40   HOT  21.4389s
+Q41   FAIL try1 (3.6401s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `item` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `item` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q42   try1 14.1656s rows=11 checksum=f4b9061304f6…
+Q42   HOT  14.1656s
+Q43   try1 12.8996s rows=18 checksum=88de50b29c32…
+Q43   HOT  12.8996s
+Q44   FAIL try1 (7.4888s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q45   try1 20.5634s rows=49 checksum=f2475e4e5770…
+Q45   HOT  20.5634s
+Q46   try1 25.9104s rows=100 checksum=bf326bf81a84…
+Q46   HOT  25.9104s
+Q47   FAIL try1 (14.8008s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q48   try1 24.4067s rows=1 checksum=5d8941b53929…
+Q48   HOT  24.4067s
+Q49   FAIL try1 (26.1803s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q50   try1 18.5590s rows=51 checksum=0840a4471ca2…
+Q50   HOT  18.5590s
+Q51   FAIL try1 (10.8107s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q52   try1 14.1643s rows=100 checksum=71faf67bee8c…
+Q52   HOT  14.1643s
+Q53   try1 17.6593s rows=100 checksum=b5117893d749…
+Q53   HOT  17.6593s
+Q54   try1 35.7863s rows=1 checksum=01d8a946b3e1…
+Q54   HOT  35.7863s
+Q55   try1 13.7196s rows=100 checksum=a71e9a584f76…
+Q55   HOT  13.7196s
+Q56   FAIL try1 (22.1824s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q57   FAIL try1 (14.6393s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `catalog_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `catalog_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q58   FAIL try1 (600.0389s): TimeoutError: query exceeded 600s (possible server-side wedge/deadlock)
+Q59   try1 14.7608s rows=100 checksum=3c890a72d48f…
+Q59   HOT  14.7608s
+Q60   FAIL try1 (21.7031s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q61   try1 32.4175s rows=1 checksum=1593d986acba…
+Q61   HOT  32.4175s
+Q62   try1 22.3229s rows=100 checksum=a60f2e751fef…
+Q62   HOT  22.3229s
+Q63   try1 18.2259s rows=100 checksum=2af8d59766e2…
+Q63   HOT  18.2259s
+Q64   try1 60.9390s rows=28 checksum=5953e16ea72f…
+Q64   HOT  60.9390s
+Q65   try1 19.3742s rows=100 checksum=9626f17278e7…
+Q65   HOT  19.3742s
+Q66   try1 30.3660s rows=10 checksum=fc2dc0b98b51…
+Q66   HOT  30.3660s
+Q67   FAIL try1 (14.9043s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q68   try1 25.7412s rows=100 checksum=2d47b8c4daed…
+Q68   HOT  25.7412s
+Q69   FAIL try1 (10.8088s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: subquery over `store_sales` is only safe when that table is replicated"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: subquery over `store_sales` is only safe when that table is replicated"
+>
+Q70   FAIL try1 (11.0988s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q71   try1 29.5917s rows=9655 checksum=84f8f4b98538…
+Q71   HOT  29.5917s
+Q73   try1 21.0307s rows=17 checksum=58dd53e7fc2a…
+Q73   HOT  21.0307s
+Q74   try1 26.5021s rows=100 checksum=19f2a8d63f1b…
+Q74   HOT  26.5021s
+Q75   FAIL try1 (29.6535s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q76   FAIL try1 (18.7873s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q77   FAIL try1 (33.7872s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: UNION ALL arm does not scan sharded table `store_sales` — broadcasting it would repeat that arm's rows on every worker"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: UNION ALL arm does not scan sharded table `store_sales` — broadcasting it would repeat that arm's rows on every worker"
+>
+Q78   try1 43.2191s rows=100 checksum=0d53ebe7e0a5…
+Q78   HOT  43.2191s
+Q79   try1 21.5319s rows=100 checksum=cafbfd4a254f…
+Q79   HOT  21.5319s
+Q80   FAIL try1 (43.5317s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: UNION ALL arm does not scan sharded table `store_sales` — broadcasting it would repeat that arm's rows on every worker"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: UNION ALL arm does not scan sharded table `store_sales` — broadcasting it would repeat that arm's rows on every worker"
+>
+Q81   FAIL try1 (14.6932s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `catalog_returns` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `catalog_returns` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q82   try1 32.9083s rows=6 checksum=a159f1da855b…
+Q82   HOT  32.9083s
+Q83   try1 22.1164s rows=100 checksum=5ec1644a61d9…
+Q83   HOT  22.1164s
+Q84   try1 24.2518s rows=100 checksum=a51b4618231e…
+Q84   HOT  24.2518s
+Q85   try1 31.5476s rows=15 checksum=ffffd9528573…
+Q85   HOT  31.5476s
+Q86   FAIL try1 (11.2113s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `web_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `web_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q87   FAIL try1 (18.7370s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q88   try1 28.7010s rows=1 checksum=09ca62efccf5…
+Q88   HOT  28.7010s
+Q89   try1 17.2173s rows=100 checksum=9606d497ab8d…
+Q89   HOT  17.2173s
+Q90   try1 17.1570s rows=1 checksum=6a528717855b…
+Q90   HOT  17.1570s
+Q91   try1 30.2320s rows=12 checksum=5aac2759118b…
+Q91   HOT  30.2320s
+Q92   try1 12.6924s rows=1 checksum=69afd9862c88…
+Q92   HOT  12.6924s
+Q93   try1 13.9700s rows=100 checksum=1b6bcfecdcc8…
+Q93   HOT  13.9700s
+Q94   FAIL try1 (14.6665s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: subquery over `web_sales` is only safe when that table is replicated"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: subquery over `web_sales` is only safe when that table is replicated"
+>
+Q95   FAIL try1 (14.7422s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: subquery over `web_sales` is only safe when that table is replicated"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: subquery over `web_sales` is only safe when that table is replicated"
+>
+Q96   try1 16.5203s rows=1 checksum=e493b43a0946…
+Q96   HOT  16.5203s
+Q97   FAIL try1 (11.3288s): SparkConnectGrpcException: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.UNIMPLEMENTED
+	details = "unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+	debug_error_string = "UNIMPLEMENTED:unsupported: auto-distribute: refusing whole-fact gather of sharded table `store_sales` in strict mode (WEFT_DISTRIBUTED_STRICT=1): it would centralize the entire fact on one shuffle partition (KAN-29) and no distributed semi/anti or decorrelated shape matched this query"
+>
+Q98   try1 13.5551s rows=15076 checksum=ebfc679215bf…
+Q98   HOT  13.5551s
+Q99   try1 20.3536s rows=100 checksum=25681ee554e0…
+Q99   HOT  20.3536s
+[run] wrote bench/sf100/results/remeasure-sf10-final3/tpcds-clean.jsonl  ok=58 failed=39 skipped=0

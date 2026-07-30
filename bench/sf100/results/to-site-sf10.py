@@ -28,12 +28,12 @@ METHOD = (
 
 SUITES = [
     {
-        "jsonl": os.path.join(HERE, "kan47-validation", "tpch-sf10-final.jsonl"),
+        "jsonl": os.path.join(HERE, "kan49-wave2", "tpch-merged.jsonl"),
         "out": os.path.join(SITE, "tpch.json"),
         "dataset": "TPC-H SF10 via Glue (`glue.tpch_sf10.*`) on S3",
     },
     {
-        "jsonl": os.path.join(HERE, "tpcds-final", "tpcds-sf10.jsonl"),
+        "jsonl": os.path.join(HERE, "kan49-wave2", "tpcds-sf10.jsonl"),
         "out": os.path.join(SITE, "tpcds.json"),
         "dataset": "TPC-DS SF10 via Glue (`glue.tpcds_sf10.*`) on S3",
     },

@@ -308,6 +308,54 @@ impl Drop for ShuffleInputGuard {
     }
 }
 
+/// KAN-31/KAN-46: reap a producer stage task's spill scope when the task exits without
+/// committing its output into the stage cache — execution error, driver cancel, no-progress
+/// watchdog abort, stage timeout, or the do_get future being dropped because the Flight
+/// client (the driver) went away mid-stage. [`BucketCache`] has no `Drop` of its own, and an
+/// uncommitted stage id never reaches the cache, so neither `clear_stages` (KAN-18) nor the
+/// TTL sweep could ever find those files: failed/ENOSPC stages at SF10 left 25–38 GB of
+/// orphaned `stage_*_src*_part_*.segN.arrow` segments per worker, and the following queries
+/// then hit ENOSPC. Disarm only when the task's output is committed — the cache entry then
+/// owns the files and `clear_stages` / the TTL sweep reaps them.
+struct StageSpillReaper {
+    spill: Option<SpillStore>,
+    stage_outputs: StageCache,
+    stage_inserted: Arc<Mutex<HashMap<(u32, u32), std::time::Instant>>>,
+    stage_id: u32,
+    src: u32,
+    armed: bool,
+}
+
+impl StageSpillReaper {
+    /// The task committed its output: the cache entry owns the spill files now.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StageSpillReaper {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The `enforce_total_budget` failure path can leave a half-committed entry behind;
+        // drop it with its files. Locks are taken and released one at a time (never nested)
+        // to stay clear of the stamps→cache order used by `read_shuffle` /
+        // `note_stage_output_insert`.
+        self.stage_outputs
+            .lock()
+            .expect("stage cache poisoned")
+            .remove(&(self.stage_id, self.src));
+        self.stage_inserted
+            .lock()
+            .expect("stage stamps poisoned")
+            .remove(&(self.stage_id, self.src));
+        if let Some(spill) = &self.spill {
+            spill.clear_scoped_stage(self.stage_id, self.src);
+        }
+    }
+}
+
 /// Number of concurrent stage tasks this worker should admit.
 pub fn worker_task_slots() -> usize {
     std::env::var("WEFT_WORKER_TASK_SLOTS")
@@ -1123,6 +1171,19 @@ impl FlightService for Worker {
                 let progress = Arc::new(StageProgress::default());
                 let start = std::time::Instant::now();
                 let retry_ticket = t.clone();
+                // KAN-31/KAN-46: reap this producer task's spill scope when the task exits
+                // without committing — error return, or this future being dropped because
+                // the Flight client went away mid-stage. Armed only for producers: a
+                // consumer task's `(stage_id, partition_id)` scope files belong to that
+                // stage's producer tasks, not to it.
+                let mut spill_reaper = StageSpillReaper {
+                    spill: self.spill.clone(),
+                    stage_outputs: self.stage_outputs.clone(),
+                    stage_inserted: self.stage_inserted.clone(),
+                    stage_id,
+                    src: partition_id,
+                    armed: t.produce,
+                };
                 let run = async {
                     test_stage_delay().await;
                     test_stage_stall_once().await;
@@ -1163,6 +1224,11 @@ impl FlightService for Worker {
                     }
                     result => result,
                 };
+                if result.is_ok() {
+                    // Committed: the cache entry owns its spill files now (reaped by
+                    // `clear_stages` / the TTL sweep), so the reaper stands down.
+                    spill_reaper.disarm();
+                }
                 self.unregister_stage_cancel(stage_id, &cancel);
                 // Per-stage observability summary (KAN-47): one line per stage-task exit.
                 eprintln!(

@@ -19,7 +19,7 @@
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
-use weft_execution::driver::{run_stages, Cluster};
+use weft_execution::driver::{run_stages, Cluster, ExchangeMode};
 use weft_execution::flight::serve_worker;
 use weft_execution::plan::plan_distributed_logical;
 use weft_loom::arrow::array::{ArrayRef, Date32Array, Float64Array, Int64Array, StringArray};
@@ -540,6 +540,99 @@ async fn q20_nested_in_plans_semi_cascade() {
 #[tokio::test]
 async fn q20_distributed_matches_single_node() {
     assert_distributed_matches_single_node(Q20).await;
+}
+
+// --- Q20 at the SF10 auto-broadcast configuration (KAN-55 regression): per-query sizing
+// replicates `supplier`/`partsupp`/`part` (the subquery's `lineitem` is the largest table the
+// query reads), so the cascade must Forward-export the replicated scans instead of declining to
+// the strict-refused whole-fact gather ---
+
+/// `lineitem` stays sharded; every other table is replicated (the SF10 layout for Q20).
+const SF10_REPLICATED: [&str; 7] = [
+    "customer", "orders", "part", "partsupp", "supplier", "nation", "region",
+];
+
+/// Only `lineitem` sharded row-wise; every other table held in full on each worker.
+async fn two_workers_sharded_lineitem_only() -> Cluster {
+    let (p0, p1) = (unique_worker_port(), unique_worker_port());
+    for (i, port) in [p0, p1].into_iter().enumerate() {
+        let e = Arc::new(Engine::new());
+        register(&e, "customer", vec![customer()]);
+        register(&e, "orders", vec![orders()]);
+        register(&e, "lineitem", shard_rows(&lineitem(), i));
+        register(&e, "part", vec![part()]);
+        register(&e, "partsupp", vec![partsupp()]);
+        register(&e, "supplier", vec![supplier()]);
+        register(&e, "nation", vec![nation()]);
+        register(&e, "region", vec![region()]);
+        tokio::spawn(async move {
+            let _ = serve_worker(port, e).await;
+        });
+    }
+    Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ])
+}
+
+#[tokio::test]
+async fn q20_sf10_replicated_dims_plans_semi_cascade() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("WEFT_DISTRIBUTED_STRICT", "1");
+    let planner = tpch_engine().await;
+    let lp = planner.logical_plan(Q20).await.expect("logical plan");
+    let dq = plan_distributed_logical(&lp, &SF10_REPLICATED);
+    std::env::remove_var("WEFT_DISTRIBUTED_STRICT");
+    let dq = dq.expect(
+        "Q20 must plan in strict mode at the SF10 classification \
+         (KAN-55 regressed this to the refused whole-fact gather)",
+    );
+    assert_eq!(dq.stages.len(), 8, "the same 8-stage cascade: {dq:?}");
+    assert!(
+        !dq.stages
+            .iter()
+            .any(|s| s.sql.contains("__weft_materialize_gate")
+                || s.sql.contains("__weft_subquery_gate")),
+        "no whole-fact gather: {dq:?}"
+    );
+    // The sharded scalar fact keeps its per-worker partial; the three now-replicated scans
+    // (nested part keys, middle partsupp, outer supplier⋈nation) export exactly once.
+    assert_eq!(dq.stages[0].exchange, ExchangeMode::Hash);
+    for (idx, what) in [
+        (2, "nested part keys"),
+        (3, "middle partsupp"),
+        (6, "outer supplier"),
+    ] {
+        assert_eq!(
+            dq.stages[idx].exchange,
+            ExchangeMode::Forward,
+            "{what} is replicated at SF10 and must be exported exactly once: {dq:?}"
+        );
+    }
+    assert!(
+        dq.stages[5]
+            .sql
+            .contains("ON t.k0 = ps.k0 AND t.k1 = ps.k1 AND (ps.cmp0 > t.thr)"),
+        "the correlated scalar compare is unchanged: {}",
+        dq.stages[5].sql
+    );
+}
+
+#[tokio::test]
+async fn q20_sf10_replicated_dims_distributed_matches_single_node() {
+    let planner = tpch_engine().await;
+    let expected = planner.sql(Q20).await.expect("single-node");
+    assert!(
+        expected.iter().map(RecordBatch::num_rows).sum::<usize>() > 0,
+        "test data must produce a non-empty result"
+    );
+    let cluster = two_workers_sharded_lineitem_only().await;
+    let actual = run_distributed(&cluster, &planner, Q20, &SF10_REPLICATED).await;
+    assert_eq!(
+        rows_sorted(&actual),
+        rows_sorted(&expected),
+        "distributed must equal single-node"
+    );
 }
 
 // --- Q22: uncorrelated scalar threshold + correlated NOT EXISTS over two sharded tables ---

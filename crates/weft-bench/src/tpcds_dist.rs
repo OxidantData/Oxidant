@@ -211,15 +211,6 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
     let to_run: Vec<&(String, String, String)> = supported.iter().take(sample).collect();
     let run_count = to_run.len();
 
-    // Load full table data once (only needed if we have something to execute).
-    let mut full: Vec<(&str, Vec<weft_loom::arrow::record_batch::RecordBatch>)> = Vec::new();
-    if run_count > 0 {
-        for t in tpcds_data::TABLES {
-            let b = single.sql(&format!("SELECT * FROM {t}")).await.unwrap();
-            full.push((t, b));
-        }
-    }
-
     // Build only the fact clusters this run will touch, plus the unreplicated `full`
     // cluster (Forward plans and cheap to add — 2 workers vs 14 for all facts).
     let needed_facts: Vec<&str> = {
@@ -229,13 +220,26 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
         }
         seen.into_iter().collect()
     };
+
+    // Load the sharded facts once — only needed to write per-worker parquet shards.
+    // Replicated tables are registered on workers straight from the generated
+    // parquet fixtures (real ListingTables with statistics), so their batches are
+    // never materialized here (KAN-51).
+    let mut fact_data: Vec<(&str, Vec<weft_loom::arrow::record_batch::RecordBatch>)> = Vec::new();
+    if run_count > 0 {
+        for fact in &needed_facts {
+            let b = single.sql(&format!("SELECT * FROM {fact}")).await.unwrap();
+            fact_data.push((fact, b));
+        }
+    }
+
     let clusters = if run_count == 0 {
         ClusterSet {
             by_fact: HashMap::new(),
             full: Cluster::new(Vec::new()),
         }
     } else {
-        build_clusters(&full, opts.workers, &needed_facts, true).await
+        build_clusters(opts.data, &fact_data, opts.workers, &needed_facts, true).await
     };
 
     let mut report = ExecuteReport {
@@ -475,7 +479,8 @@ struct ClusterSet {
 }
 
 async fn build_clusters(
-    full: &[(&str, Vec<weft_loom::arrow::record_batch::RecordBatch>)],
+    dir: &Path,
+    fact_data: &[(&str, Vec<weft_loom::arrow::record_batch::RecordBatch>)],
     num_workers: usize,
     needed_facts: &[&str],
     need_full: bool,
@@ -485,20 +490,14 @@ async fn build_clusters(
         if !needed_facts.contains(fact) {
             continue;
         }
-        let fact_batches = full.iter().find(|(t, _)| *t == *fact).unwrap().1.clone();
-        let shards = shard(&fact_batches, num_workers);
+        let fact_batches = &fact_data.iter().find(|(t, _)| *t == *fact).unwrap().1;
+        let shards = shard(fact_batches, num_workers);
+        let shard_paths = write_fact_shards(dir, fact, &shards);
         let base_port = 50800u16 + (fi as u16) * 10;
         let mut endpoints = Vec::new();
-        for (i, shard_batches) in shards.into_iter().enumerate() {
+        for (i, shard_path) in shard_paths.into_iter().enumerate() {
             let e = Arc::new(Engine::new());
-            for (t, batches) in full {
-                let data = if *t == *fact {
-                    shard_batches.clone()
-                } else {
-                    batches.clone()
-                };
-                e.register_batches(t, data).unwrap();
-            }
+            register_worker_tables(&e, dir, Some((fact, shard_path.as_path()))).await;
             let port = base_port + i as u16;
             let ee = e.clone();
             tokio::spawn(async move {
@@ -513,9 +512,7 @@ async fn build_clusters(
         let mut full_endpoints = Vec::new();
         for i in 0..num_workers {
             let e = Arc::new(Engine::new());
-            for (t, batches) in full {
-                e.register_batches(t, batches.clone()).unwrap();
-            }
+            register_worker_tables(&e, dir, None).await;
             let port = 50900 + i as u16;
             let ee = e.clone();
             tokio::spawn(async move {
@@ -532,6 +529,74 @@ async fn build_clusters(
         by_fact,
         full: full_cluster,
     }
+}
+
+/// Register every TPC-DS table on a worker engine as a parquet **ListingTable** —
+/// the same provider shape live workers get when `catalog_bridge` resolves the
+/// Glue table (KAN-51): real file statistics, dynamic-filter pushdown, and
+/// partitioned joins, instead of the old stat-less in-memory `MemTable`s that
+/// made workers plan single-partition `CollectLeft` joins (the false local Q72
+/// timeout during KAN-41). `fact_shard` maps the sharded fact to this worker's
+/// parquet shard; every other (replicated) table resolves to the generated
+/// `<dir>/<table>.parquet` fixture.
+async fn register_worker_tables(engine: &Engine, dir: &Path, fact_shard: Option<(&str, &Path)>) {
+    for t in tpcds_data::TABLES {
+        let path = match fact_shard {
+            Some((fact, shard)) if t == fact => shard.to_path_buf(),
+            _ => dir.join(format!("{t}.parquet")),
+        };
+        engine
+            .register_parquet(t, path.to_str().expect("utf8 path"))
+            .await
+            .unwrap_or_else(|e| panic!("worker register {t}: {e}"));
+    }
+}
+
+/// Write each worker's fact shard as its own parquet file under
+/// `<dir>/dist-shards/<fact>/worker-<i>.parquet` and return the per-worker paths.
+/// A zero-row shard still gets a schema-only file so every worker resolves the
+/// fact — the old `register_batches` path panicked on empty batches.
+fn write_fact_shards(
+    dir: &Path,
+    fact: &str,
+    shards: &[Vec<weft_loom::arrow::record_batch::RecordBatch>],
+) -> Vec<PathBuf> {
+    let shard_dir = dir.join("dist-shards").join(fact);
+    if shard_dir.exists() {
+        std::fs::remove_dir_all(&shard_dir).expect("clear stale fact shards");
+    }
+    std::fs::create_dir_all(&shard_dir).expect("create shard dir");
+    let schema = shards
+        .iter()
+        .find_map(|s| s.first())
+        .map(|b| b.schema())
+        .unwrap_or_else(|| panic!("fact table {fact} produced no batches"));
+    shards
+        .iter()
+        .enumerate()
+        .map(|(i, batches)| {
+            let path = shard_dir.join(format!("worker-{i}.parquet"));
+            write_parquet(&path, schema.clone(), batches);
+            path
+        })
+        .collect()
+}
+
+/// Write record batches as a single parquet file (zero batches → schema-only file).
+fn write_parquet(
+    path: &Path,
+    schema: weft_loom::arrow::datatypes::SchemaRef,
+    batches: &[weft_loom::arrow::record_batch::RecordBatch],
+) {
+    use datafusion::parquet::arrow::ArrowWriter;
+
+    let file =
+        std::fs::File::create(path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    for b in batches {
+        writer.write(b).expect("write shard batch");
+    }
+    writer.close().expect("close shard parquet");
 }
 
 async fn run_stages_with_retry(
@@ -681,5 +746,80 @@ mod tests {
             .filter(|q| !supported.contains(q))
             .collect();
         assert!(outside.is_empty(), "not planner-supported: {outside:?}");
+    }
+
+    fn tiny_batch() -> weft_loom::arrow::record_batch::RecordBatch {
+        use weft_loom::arrow::array::Int64Array;
+        use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+        use weft_loom::arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
+    }
+
+    /// KAN-51: worker tables must be parquet ListingTables (like live workers via
+    /// `catalog_bridge`), not stat-less in-memory `MemTable`s — a scan plans as a
+    /// parquet `DataSourceExec`, never `MemoryExec`.
+    #[tokio::test]
+    async fn worker_tables_are_parquet_listing_tables() {
+        let dir = std::env::temp_dir().join(format!("weft-tpcds-dist-tbl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let batch = tiny_batch();
+        for t in tpcds_data::TABLES {
+            write_parquet(
+                &dir.join(format!("{t}.parquet")),
+                batch.schema(),
+                std::slice::from_ref(&batch),
+            );
+        }
+        let engine = Engine::new();
+        register_worker_tables(&engine, &dir, None).await;
+        let plan = engine
+            .sql("EXPLAIN SELECT COUNT(*) FROM store_sales")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| format!("{b:?}"))
+            .collect::<String>();
+        assert!(
+            plan.contains("DataSourceExec") && plan.contains("file_type=parquet"),
+            "expected a parquet ListingTable scan: {plan}"
+        );
+        assert!(
+            !plan.contains("MemoryExec"),
+            "unexpected MemTable scan: {plan}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fact shards land as per-worker parquet files; zero-row shards still read
+    /// back as a valid, empty table (the old MemTable path panicked on them).
+    #[tokio::test]
+    async fn fact_shards_round_trip_including_empty_shards() {
+        let dir =
+            std::env::temp_dir().join(format!("weft-tpcds-dist-shard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let batch = tiny_batch();
+        let shards = shard(std::slice::from_ref(&batch), 4); // 3 rows over 4 workers → some empty shards
+        assert_eq!(shards.len(), 4);
+        assert!(shards.iter().any(|s| s.is_empty()));
+        let paths = write_fact_shards(&dir, "store_sales", &shards);
+        let mut total = 0i64;
+        for p in &paths {
+            let engine = Engine::new();
+            engine
+                .register_parquet("shard", p.to_str().unwrap())
+                .await
+                .unwrap();
+            let b = engine.sql("SELECT COUNT(*) FROM shard").await.unwrap();
+            let counts = b[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<weft_loom::arrow::array::Int64Array>()
+                .unwrap();
+            total += counts.value(0);
+        }
+        assert_eq!(total, 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

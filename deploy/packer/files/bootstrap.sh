@@ -5,18 +5,16 @@
 #   1. Mount spill EBS (if present) at /var/lib/weft/spill
 #   2. Read instance tags / IMDS for role + cluster config
 #   3. Workers: assign WEFT_SHARD_INDEX from sorted InService ASG peers
-#   4. Workers: upsert (or delete) this instance's A record in the private zone
-#   5. Write /etc/weft/weft.env and enable the matching systemd unit
+#   4. Workers: upsert the shared A RRSet (boot: full set incl. own IP) and
+#      remove ONLY this instance's IP on shutdown (symmetric deregistration)
+#   5. Write /etc/weft/weft.env atomically and enable (never start) the
+#      matching systemd unit — UserData / the unit graph starts it after us
 #
 # No credentials are stored — uses the instance profile only.
 set -euo pipefail
 
 ENV_FILE=/etc/weft/weft.env
 SPILL_MOUNT=/var/lib/weft/spill
-# Legacy name hints only — Nitro often puts the *root* on nvme1n1 and the extra
-# EBS spill volume on nvme0n1 (or the reverse). Never pick a partitioned/root disk;
-# see find_spill_device().
-SPILL_DEVICE_CANDIDATES=(/dev/nvme0n1 /dev/nvme1n1 /dev/xvdf /dev/sdf)
 IMDS_TOKEN_TTL=21600
 # Systemd oneshot PATH can omit /usr/local/bin on some images; pin the AMI aws CLI.
 AWS_BIN="${WEFT_AWS_BIN:-/usr/local/bin/aws}"
@@ -52,34 +50,52 @@ tag_value() {
   printf ''
 }
 
+# Single-shot variant for the shutdown path (--deregister): no 10×2s retry
+# budget when the network may be going away — TimeoutStopSec bounds the whole
+# ExecStop, and a missed deregistration is pruned by the next boot's full sync.
+tag_value_fast() {
+  local key="$1"
+  "${AWS_BIN}" ec2 describe-tags \
+    --region "${REGION}" \
+    --filters "Name=resource-id,Values=${INSTANCE_ID}" "Name=key,Values=${key}" \
+    --query 'Tags[0].Value' --output text \
+    --cli-connect-timeout 5 --cli-read-timeout 10 2>/dev/null | sed 's/^None$//' || true
+}
+
 find_spill_device() {
-  # Pick the largest whole-disk block device that is NOT the root disk and has no
-  # partitions in use. On AL2023 Nitro, root may be nvme0n1 or nvme1n1; the extra
-  # gp3 spill volume is the other unpartitioned NVMe.
-  local root_src root_disk candidate size best="" best_size=0
+  # Pick the largest whole-disk block device that is NOT the root disk and has
+  # nothing mounted on it (neither the disk itself nor any child). No device
+  # name guessing: on Nitro the spill volume may enumerate as nvme0n1, nvme1n1,
+  # nvme2n1… depending on attach/enumeration order, so name hints silently miss
+  # it (KAN-58: a ~100G spill NVMe went unused and spill landed on the root fs).
+  local root_src root_disk="" best="" best_size=0
   root_src="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
-  root_disk=""
   if [[ -n "${root_src}" ]]; then
     root_disk="$(lsblk -no PKNAME "${root_src}" 2>/dev/null || true)"
     if [[ -z "${root_disk}" ]]; then
       root_disk="$(basename "${root_src}" | sed -E 's/p?[0-9]+$//')"
     fi
   fi
-  for candidate in "${SPILL_DEVICE_CANDIDATES[@]}" $(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}'); do
-    [[ -b "${candidate}" ]] || continue
-    local base
-    base="$(basename "${candidate}")"
-    [[ -n "${root_disk}" && "${base}" == "${root_disk}" ]] && continue
-    # Skip disks that already have child partitions (root-style layout).
-    if lsblk -n -o NAME,TYPE "${candidate}" | awk 'NR>1 && $2=="part"{found=1} END{exit !found}'; then
+  local name size dev
+  while read -r name size; do
+    [[ -n "${name}" && -n "${size}" ]] || continue
+    [[ -n "${root_disk}" && "${name}" == "${root_disk}" ]] && continue
+    dev="/dev/${name}"
+    # Skip disks with child partitions (root-style layout): mkfs.xfs refuses a
+    # partition table anyway, and we never want to clobber one.
+    if lsblk -n -o NAME,TYPE "${dev}" 2>/dev/null | awk 'NR>1 && $2=="part"{found=1} END{exit !found}'; then
       continue
     fi
-    size="$(lsblk -bn -o SIZE "${candidate}" 2>/dev/null | head -1 || echo 0)"
+    # Skip anything with a mountpoint on the disk or a descendant (paranoia on
+    # top of the root-disk exclusion; also catches [SWAP]).
+    if [[ -n "$(lsblk -n -o MOUNTPOINT "${dev}" 2>/dev/null | tr -d '[:space:]')" ]]; then
+      continue
+    fi
     if (( size > best_size )); then
-      best="${candidate}"
+      best="${dev}"
       best_size="${size}"
     fi
-  done
+  done < <(lsblk -dbn -o NAME,SIZE,TYPE 2>/dev/null | awk '$3=="disk" && $2>0 {print $1, $2}')
   printf '%s' "${best}"
 }
 
@@ -147,8 +163,12 @@ wait_for_workers() {
 }
 
 # Multi-value answer set: maintain one A RRSet with all worker IPs.
-# Each worker rewrites the full set from the current InService peer list so
-# stale IPs are pruned without needing SET_IDENTIFIER / multivalue routing.
+# Boot path: rewrite the full set from the current InService peer list PLUS
+# this instance's own IP. Self must always be included — on a cold start the
+# ASG may not have flipped us to InService yet, and without self in the set
+# the last worker to boot would upsert a set missing itself until some other
+# worker reboots. Dead instances are pruned here because they are no longer
+# InService. Shutdown path is remove_self_dns() (symmetric, self-only).
 sync_worker_dns() {
   local zone_id="$1"
   local fqdn="$2"
@@ -159,38 +179,25 @@ sync_worker_dns() {
     --auto-scaling-group-names "${asg}" \
     --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
     --output text 2>/dev/null | tr '\t' '\n' | sort)"
-  records=""
+  # Own IP first, then InService peers (dedup via sort -u when rendering).
+  local ips="${PRIVATE_IP}"
   while IFS= read -r id; do
-    [[ -z "${id}" ]] && continue
+    [[ -z "${id}" || "${id}" == "${INSTANCE_ID}" ]] && continue
     ip="$("${AWS_BIN}" ec2 describe-instances \
       --region "${REGION}" \
       --instance-ids "${id}" \
       --query 'Reservations[0].Instances[0].PrivateIpAddress' \
       --output text)"
     if [[ -n "${ip}" && "${ip}" != "None" ]]; then
-      if [[ -n "${records}" ]]; then
-        records+=","
-      fi
-      records+="{\"Value\":\"${ip}\"}"
+      ips+=$'\n'"${ip}"
     fi
   done <<< "${ids}"
 
-  if [[ -z "${records}" ]]; then
-    # Nothing InService — delete the RRSet if present.
-    local existing
-    existing="$("${AWS_BIN}" route53 list-resource-record-sets \
-      --hosted-zone-id "${zone_id}" \
-      --query "ResourceRecordSets[?Name=='${fqdn}.' || Name=='${fqdn}'] | [0]" \
-      --output json 2>/dev/null || echo "null")"
-    if [[ "${existing}" != "null" && -n "${existing}" ]]; then
-      "${AWS_BIN}" route53 change-resource-record-sets \
-        --hosted-zone-id "${zone_id}" \
-        --change-batch "{\"Changes\":[{\"Action\":\"DELETE\",\"ResourceRecordSet\":${existing}}]}" \
-        || log "Route53 DELETE skipped (already gone)"
-    fi
-    log "no InService workers; DNS cleared for ${fqdn}"
-    return 0
-  fi
+  records=""
+  while IFS= read -r ip; do
+    [[ -z "${ip}" ]] && continue
+    records+="${records:+,}{\"Value\":\"${ip}\"}"
+  done < <(printf '%s\n' "${ips}" | sort -u)
 
   json="$(cat <<EOF
 {
@@ -210,15 +217,89 @@ EOF
   "${AWS_BIN}" route53 change-resource-record-sets \
     --hosted-zone-id "${zone_id}" \
     --change-batch "${json}"
-  log "Route53 UPSERT ${fqdn} with peers: ${records}"
+  log "Route53 UPSERT ${fqdn} (self + InService peers): ${records}"
+}
+
+# Shutdown / scale-in deregistration: remove ONLY this instance's IP from the
+# shared RRSet (symmetric with boot, which adds it). Never rewrite the full
+# peer set here — at stop time the ASG may still list us InService, so a full
+# re-sync would re-add our own dying IP and leave it stale forever if no other
+# worker happens to bootstrap afterwards (KAN-58: zombie worker IPs in
+# workers.<zone> → driver queries failed with "no free task slots" on dead
+# instances). Instances that die without running this are pruned by the next
+# worker boot's sync_worker_dns().
+remove_self_dns() {
+  local zone_id="$1"
+  local fqdn="$2"
+  local values ip records="" json existing
+  values="$("${AWS_BIN}" route53 list-resource-record-sets \
+    --hosted-zone-id "${zone_id}" \
+    --query "ResourceRecordSets[?Name=='${fqdn}.' || Name=='${fqdn}'].ResourceRecords[].Value" \
+    --output text --cli-connect-timeout 5 --cli-read-timeout 10 2>/dev/null || true)"
+  if [[ -z "${values//[[:space:]]/}" ]]; then
+    log "no A records for ${fqdn}; nothing to deregister"
+    return 0
+  fi
+  for ip in ${values}; do
+    [[ "${ip}" == "${PRIVATE_IP}" || "${ip}" == "None" ]] && continue
+    records+="${records:+,}{\"Value\":\"${ip}\"}"
+  done
+  if [[ -z "${records}" ]]; then
+    # Ours was the last record — delete the whole RRSet (needs the exact set).
+    existing="$("${AWS_BIN}" route53 list-resource-record-sets \
+      --hosted-zone-id "${zone_id}" \
+      --query "ResourceRecordSets[?Name=='${fqdn}.' || Name=='${fqdn}'] | [0]" \
+      --output json --cli-connect-timeout 5 --cli-read-timeout 10 2>/dev/null || true)"
+    if [[ -n "${existing}" && "${existing}" != "null" && "${existing}" != "None" ]]; then
+      if "${AWS_BIN}" route53 change-resource-record-sets \
+        --hosted-zone-id "${zone_id}" \
+        --change-batch "{\"Changes\":[{\"Action\":\"DELETE\",\"ResourceRecordSet\":${existing}}]}" \
+        --cli-connect-timeout 5 --cli-read-timeout 10; then
+        log "Route53 DELETE ${fqdn} (removed last record ${PRIVATE_IP})"
+      else
+        log "Route53 DELETE ${fqdn} failed (already gone?)"
+      fi
+    fi
+    return 0
+  fi
+  json="$(cat <<EOF
+{
+  "Comment": "weft worker deregister ${INSTANCE_ID}",
+  "Changes": [{
+    "Action": "UPSERT",
+    "ResourceRecordSet": {
+      "Name": "${fqdn}",
+      "Type": "A",
+      "TTL": 10,
+      "ResourceRecords": [${records}]
+    }
+  }]
+}
+EOF
+)"
+  if "${AWS_BIN}" route53 change-resource-record-sets \
+    --hosted-zone-id "${zone_id}" \
+    --change-batch "${json}" \
+    --cli-connect-timeout 5 --cli-read-timeout 10; then
+    log "Route53 removed ${PRIVATE_IP} from ${fqdn}; remaining: ${records}"
+  else
+    log "Route53 deregister of ${PRIVATE_IP} from ${fqdn} FAILED — next worker boot's full sync will prune it"
+  fi
 }
 
 write_env() {
   local role="$1"
   umask 022
   mkdir -p /etc/weft
-  # systemd EnvironmentFile: quote values that contain ';' or spaces.
-  cat > "${ENV_FILE}" <<EOF
+  # Atomic: render into a temp file in the same directory, then rename. A
+  # bootstrap kill (TimeoutStartSec, power loss) mid-write must never leave a
+  # truncated env file behind — systemd's EnvironmentFile= would silently load
+  # partial config (missing WEFT_SHARD_INDEX ⇒ duplicate shards / wrong counts).
+  local tmp
+  tmp="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
+  {
+    # systemd EnvironmentFile: quote values that contain ';' or spaces.
+    cat <<EOF
 # Generated by weft-bootstrap — do not edit by hand.
 WEFT_ROLE=${role}
 WEFT_AWS_BIN=/usr/local/bin/aws
@@ -229,54 +310,60 @@ HOME=/var/lib/weft
 WEFT_WORKER_COUNT=${WORKER_COUNT}
 WEFT_WORKER_PORT=50561
 EOF
-  if [[ -n "${MEMORY_LIMIT_BYTES}" && "${MEMORY_LIMIT_BYTES}" != "None" ]]; then
-    echo "WEFT_MEMORY_LIMIT_BYTES=${MEMORY_LIMIT_BYTES}" >> "${ENV_FILE}"
-  fi
-  if [[ -n "${SHUFFLE_SPILL_BYTES}" && "${SHUFFLE_SPILL_BYTES}" != "None" ]]; then
-    echo "WEFT_SHUFFLE_SPILL_BYTES=${SHUFFLE_SPILL_BYTES}" >> "${ENV_FILE}"
-  fi
-  if [[ -n "${CATALOG_CONF}" && "${CATALOG_CONF}" != "None" && "${CATALOG_CONF}" != "none" ]]; then
-    # Escape embedded double-quotes for systemd EnvironmentFile quoting.
-    local escaped
-    escaped="${CATALOG_CONF//\"/\\\"}"
-    echo "WEFT_CATALOG_CONF=\"${escaped}\"" >> "${ENV_FILE}"
-  fi
-  if [[ -n "${PREFER_HASH_JOIN}" && "${PREFER_HASH_JOIN}" != "None" ]]; then
-    echo "WEFT_PREFER_HASH_JOIN=${PREFER_HASH_JOIN}" >> "${ENV_FILE}"
-  fi
-  if [[ "${role}" == "driver" ]]; then
-    cat >> "${ENV_FILE}" <<EOF
+    if [[ -n "${MEMORY_LIMIT_BYTES}" && "${MEMORY_LIMIT_BYTES}" != "None" ]]; then
+      echo "WEFT_MEMORY_LIMIT_BYTES=${MEMORY_LIMIT_BYTES}"
+    fi
+    if [[ -n "${SHUFFLE_SPILL_BYTES}" && "${SHUFFLE_SPILL_BYTES}" != "None" ]]; then
+      echo "WEFT_SHUFFLE_SPILL_BYTES=${SHUFFLE_SPILL_BYTES}"
+    fi
+    if [[ -n "${CATALOG_CONF}" && "${CATALOG_CONF}" != "None" && "${CATALOG_CONF}" != "none" ]]; then
+      # Escape embedded double-quotes for systemd EnvironmentFile quoting.
+      local escaped
+      escaped="${CATALOG_CONF//\"/\\\"}"
+      echo "WEFT_CATALOG_CONF=\"${escaped}\""
+    fi
+    if [[ -n "${PREFER_HASH_JOIN}" && "${PREFER_HASH_JOIN}" != "None" ]]; then
+      echo "WEFT_PREFER_HASH_JOIN=${PREFER_HASH_JOIN}"
+    fi
+    if [[ "${role}" == "driver" ]]; then
+      cat <<EOF
 WEFT_WORKER_SERVICE=${WORKER_DNS_NAME}
 WEFT_SHUFFLE_PARTITIONS=${SHUFFLE_PARTITIONS}
 EOF
-    if [[ "${DISTRIBUTED_STRICT}" == "true" || "${DISTRIBUTED_STRICT}" == "1" ]]; then
-      echo "WEFT_DISTRIBUTED_STRICT=1" >> "${ENV_FILE}"
-    fi
-  else
-    cat >> "${ENV_FILE}" <<EOF
+      if [[ "${DISTRIBUTED_STRICT}" == "true" || "${DISTRIBUTED_STRICT}" == "1" ]]; then
+        echo "WEFT_DISTRIBUTED_STRICT=1"
+      fi
+    else
+      cat <<EOF
 WEFT_SHARD_INDEX=${SHARD_INDEX}
 EOF
-  fi
-  chown root:weft "${ENV_FILE}"
-  chmod 640 "${ENV_FILE}"
-  log "wrote ${ENV_FILE}"
+    fi
+  } > "${tmp}"
+  chown root:weft "${tmp}"
+  chmod 640 "${tmp}"
+  mv -f "${tmp}" "${ENV_FILE}"
+  log "wrote ${ENV_FILE} (atomic)"
 }
 
 enable_role_unit() {
   local role="$1"
-  # Enable only — do NOT `systemctl start` / `--now` from here.
-  # weft-bootstrap.service declares Before=weft-driver/weft-worker; starting those
-  # units inside this oneshot deadlocks until TimeoutStartSec (300s) and leaves
-  # Connect unhealthy. UserData (or multi-user WantedBy ordering) starts the role
-  # unit after bootstrap exits successfully.
+  # Enable only — NEVER `systemctl start` / `--now` the role unit from inside
+  # this oneshot: weft-driver/weft-worker declare Requires=+After=
+  # weft-bootstrap, so a synchronous start here circular-waits until
+  # TimeoutStartSec kills bootstrap and (via Requires=) the role unit never
+  # starts again (KAN-58 boot deadlock). UserData starts the role unit on
+  # first boot; the WantedBy/Requires/After graph does it on reboots — always
+  # AFTER this unit has completed (env file + DNS + spill are the
+  # preconditions). The opposite-role stop below is --no-block for the same
+  # reason: bootstrap must not wait on any other unit's job.
   systemctl daemon-reload
   if [[ "${role}" == "driver" ]]; then
     systemctl disable weft-worker.service 2>/dev/null || true
-    systemctl stop weft-worker.service 2>/dev/null || true
+    systemctl stop --no-block weft-worker.service 2>/dev/null || true
     systemctl enable weft-driver.service
   else
     systemctl disable weft-driver.service 2>/dev/null || true
-    systemctl stop weft-driver.service 2>/dev/null || true
+    systemctl stop --no-block weft-driver.service 2>/dev/null || true
     systemctl enable weft-worker.service
   fi
 }
@@ -287,6 +374,19 @@ TOKEN="$(imds_token)"
 INSTANCE_ID="$(imds_get meta-data/instance-id)"
 REGION="$(imds_get meta-data/placement/region)"
 PRIVATE_IP="$(imds_get meta-data/local-ipv4)"
+
+# Shutdown / scale-in fast path: fetch ONLY the tags deregistration needs,
+# single-shot (network may be going away; TimeoutStopSec bounds us).
+if [[ "${1:-}" == "--deregister" ]]; then
+  ROLE="$(tag_value_fast weft:role)"
+  HOSTED_ZONE_ID="$(tag_value_fast weft:hosted-zone-id)"
+  WORKER_DNS_NAME="$(tag_value_fast weft:worker-dns-name)"
+  ROLE="${ROLE:-worker}"
+  if [[ "${ROLE}" == "worker" && -n "${HOSTED_ZONE_ID}" && -n "${WORKER_DNS_NAME}" ]]; then
+    remove_self_dns "${HOSTED_ZONE_ID}" "${WORKER_DNS_NAME}" || true
+  fi
+  exit 0
+fi
 
 ROLE="$(tag_value weft:role)"
 WORKER_COUNT="$(tag_value weft:worker-count)"
@@ -305,14 +405,6 @@ WORKER_COUNT="${WORKER_COUNT:-1}"
 SHUFFLE_PARTITIONS="${SHUFFLE_PARTITIONS:-${WORKER_COUNT}}"
 DISTRIBUTED_STRICT="${DISTRIBUTED_STRICT:-false}"
 PREFER_HASH_JOIN="${PREFER_HASH_JOIN:-true}"
-
-if [[ "${1:-}" == "--deregister" ]]; then
-  if [[ "${ROLE}" == "worker" && -n "${HOSTED_ZONE_ID}" && -n "${WORKER_DNS_NAME}" && -n "${WORKER_ASG}" ]]; then
-    # Re-sync DNS without this instance (lifecycle may already mark it Terminating).
-    sync_worker_dns "${HOSTED_ZONE_ID}" "${WORKER_DNS_NAME}" "${WORKER_ASG}" || true
-  fi
-  exit 0
-fi
 
 mount_spill_volume
 

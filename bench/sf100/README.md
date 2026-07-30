@@ -144,6 +144,42 @@ of the collected rows for cross-format comparison.
 
 SF≥100 refuses to start without `WEFT_DISTRIBUTED_STRICT=1` or `--strict`.
 
+## Golden checks (KAN-50)
+
+`results/golden-check-tpch.py` and `results/golden-check-tpcds.py` recompute each
+query's answer with DuckDB (`/tmp/weft-sf10/{tpch,tpcds}-sf10.db`) and compare it
+against a suite JSONL's recorded engine checksums, printing a three-way verdict per
+query — **MATCH / BENIGN / MISMATCH** — with benign queries listed separately in the
+summary:
+
+```sh
+python3 bench/sf100/results/golden-check-tpch.py --jsonl results/kan47-validation/tpch-sf10-final.jsonl
+python3 bench/sf100/results/golden-check-tpcds.py --jsonl results/tpcds-final/tpcds-sf10.jsonl
+```
+
+BENIGN covers the two known-benign diff classes (formerly triaged by hand):
+
+- **numeric-scale** — the engine returns Spark-faithful decimals (e.g. AVG →
+  `DECIMAL(19,6)`) while DuckDB returns f64 with full precision. A golden float and
+  an engine decimal at scale *k* compare equal when the float, rounded half-even on
+  its exact decimal repr at *k*, equals the decimal (the engine's truncating
+  f64→decimal cast is also accepted). A verdict is *verified* only when a concrete
+  per-column (mode, scale) assignment — or that assignment with one cell's mode
+  flipped (±1 ulp of f64 accumulation noise) — reproduces the recorded checksum
+  exactly.
+- **boundary-tie** — `ORDER BY … LIMIT` whose keys do not fully determine the
+  first N (ties at the boundary, or NULLs in ORDER BY columns where Spark's
+  NULLS-FIRST default differs from DuckDB's NULLS-LAST). *Verified* by enumerating
+  every legitimate boundary pick from the golden full result when the ambiguous
+  zone is small; otherwise heuristic.
+
+Anything else, plus ±1-ulp engine aggregate drift that no assignment reproduces
+(see bench/tpcds/README.md's 0.1 % float-tolerance convention), is BENIGN only as a
+labelled heuristic gated on equal row counts — audit those queries. The verdict and
+canonicalization rules live in `results/golden_common.py`
+(`python3 bench/sf100/results/golden_common.py --self-test`); `--strict-benign`
+reclassifies heuristic BENIGN as MISMATCH.
+
 ## Lakehouse formats (Iceberg + Delta)
 
 **One Parquet copy, three catalog entries.** Iceberg and Delta are metadata over the
