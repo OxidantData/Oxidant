@@ -252,7 +252,7 @@ export default function PerformancePage() {
       <SuiteSection
         eyebrow="TPC-H SF10"
         title="Decision-support, head-to-head with Spark"
-        blurb="Official Q1–Q22 over the same SF10 Parquet bytes on S3, on the same 3-node spec (1x c6g.2xlarge + 2x m8g.2xlarge): Weft distributed in strict mode via Spark Connect — every query golden-validated against DuckDB SF10 — vs stock Apache Spark 3.5.6 on EMR 7.13.0/YARN. Spark takes this round: 88.6s vs 623.2s hot (7.0x). At ~10 GB the fixed per-query cost of Weft's distributed planning and Flight dispatch dominates — Spark answers most queries in 1-8s where Weft pays 12-50s. Correctness is table stakes and Weft meets it: 22/22 golden-clean (20 checksum-exact, 2 value-identical modulo Spark-faithful decimal scale)."
+        blurb="Official Q1–Q22 over the same SF10 Parquet bytes on S3, on the same 3-node spec (1x c6g.2xlarge + 2x m8g.2xlarge), re-run fresh the same day with identical temperature (2 runs/query, hot = run 2): Weft distributed in strict mode via Spark Connect vs stock Apache Spark 3.5.6 on EMR 7.13.0/YARN. This round is a photo finish: 99.5s vs 87.3s hot (1.14x), and Weft wins 7 of 22 queries outright (Q15 2.3x faster than Spark). The previous publish was 7.0x Spark — the per-query orchestration tax behind it (uncached catalog sizing, serialized stage dispatch, redundant planning) has been engineered out. Correctness is table stakes and Weft meets it: 22/22 golden-clean against DuckDB SF10."
         suite={tpchBenchmarks}
       />
 
@@ -263,7 +263,7 @@ export default function PerformancePage() {
       <SuiteSection
         eyebrow="TPC-DS SF10"
         title="Retail warehouse, 99 queries each"
-        blurb="Same hardware, same bytes, all 99 queries on both engines. Spark wins the SF10 sprint: 286.8s vs 2438.5s hot (8.5x). Weft runs 99/99 end-to-end under strict mode, each golden-validated against DuckDB SF10 — the engine refuses rather than risk a wrong answer when a shape doesn't fit. The gap is per-query overhead and execution maturity (codegen, adaptive joins), not correctness or coverage. Per-query chart omitted (99 bars); totals tell the story."
+        blurb="Same hardware, same bytes, all 99 queries on both engines, same temperature. Spark still takes the SF10 marathon: 282.8s vs 660.0s hot (2.33x) — down from 8.5x in the previous publish — but Weft wins 28 of the 99 outright and runs 99/99 end-to-end under strict mode, every one golden-validated against DuckDB SF10. The residual gap concentrates in six queries (Q23, Q37, Q9, Q82, Q88, Q28) whose plans amplify ~15 GB of input into tens of GB of shuffled intermediates; closing it is the broadcast-join/adaptive-execution work now queued. Per-query chart omitted (99 bars); totals tell the story."
         suite={tpcdsBenchmarks}
         showPerQuery={false}
       />

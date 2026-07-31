@@ -41,12 +41,16 @@ pub fn coalesced_partitions(
     }
 }
 
+/// AQE sampling is **off by default**: the suggestion it computes is deliberately never
+/// applied (see [`finish_stage_barrier`](crate::driver) — shrinking the consumer range would
+/// orphan producer buckets), so the per-stage `bucket_row_counts` round trips were pure
+/// overhead on every query. Set `WEFT_AQE=1` to re-enable the observability sample.
 pub fn aqe_enabled() -> bool {
     std::env::var("WEFT_AQE")
         .ok()
         .as_deref()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn aqe_coalesce_max_rows() -> usize {
@@ -59,16 +63,44 @@ fn aqe_coalesce_max_rows() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `WEFT_AQE` is process-global; serialize tests that mutate it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn coalesces_small_uniform_buckets() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WEFT_AQE", "1");
         let p = coalesced_partitions(4, 8, &[100, 120, 90, 110, 80, 95, 105, 100]).unwrap();
+        std::env::remove_var("WEFT_AQE");
         assert_eq!(p, 4);
     }
 
     #[test]
     fn keeps_partitions_on_skew() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WEFT_AQE", "1");
         let p = coalesced_partitions(2, 4, &[10, 10, 10, 9000]).unwrap();
+        std::env::remove_var("WEFT_AQE");
         assert_eq!(p, 4);
+    }
+
+    #[test]
+    fn aqe_defaults_off_and_env_opts_in() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WEFT_AQE");
+        assert!(
+            !aqe_enabled(),
+            "AQE sampling must default off — its suggestion is never applied, so the \
+             per-stage bucket-row-count round trips are pure overhead"
+        );
+        // With the default off, the suggestion path is a no-op pass-through.
+        let p = coalesced_partitions(4, 8, &[100, 120, 90, 110, 80, 95, 105, 100]).unwrap();
+        assert_eq!(p, 8, "disabled AQE must not suggest coalescing");
+
+        std::env::set_var("WEFT_AQE", "1");
+        assert!(aqe_enabled());
+        std::env::remove_var("WEFT_AQE");
     }
 }

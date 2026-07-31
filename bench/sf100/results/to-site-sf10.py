@@ -3,10 +3,15 @@
 
 Ground truth is per-query JSONL (one record per query: status, hot_s, runDate):
 
-- weft: run-spark-connect.py against the distributed cluster (kan49-wave3).
-- Spark on EMR: bench/sf100/emr/run-emr-suite.py (emr-compare/), same queries and
-  same S3 bytes on the same instance spec (1x c6g.2xlarge driver/master,
-  2x m8g.2xlarge workers/core).
+- weft: run-spark-connect.py against the distributed cluster (perf-f1f5-sf10/, after the
+  per-query-overhead fixes: cached table sizing, concurrent partition dispatch, pooled
+  Flight channels, single planning pass, AQE sampling off, 10 GiB shuffle budget).
+- Spark on EMR: bench/sf100/emr/run-emr-suite.py, same queries and same S3 bytes on the
+  same instance spec (1x c6g.2xlarge driver/master, 2x m8g.2xlarge workers/core), re-run
+  fresh the same day.
+
+Both engines use identical temperature semantics: 2 runs per query, hot = best of run 2
+(the earlier publish compared weft cold-single-run vs Spark best-of-2 — fixed here).
 
 perQuery is positional (Q1 -> index 0); failed queries stay `null` so the site
 renders them as gaps, never dropped. failedQueries holds the canonical 1-based
@@ -27,9 +32,11 @@ SITE = os.path.join(REPO, "site", "src", "data")
 
 MACHINE = "ec2 1x c6g.2xlarge driver/master + 2x m8g.2xlarge workers/core (arm64, us-west-2)"
 METHOD = (
-    "Same query text, same SF10 Parquet bytes on S3. Weft: DISTRIBUTED strict mode via "
-    "Spark Connect (run-spark-connect.py), golden-validated vs DuckDB SF10. "
-    "Spark: stock EMR 7.13.0 on YARN (run-emr-suite.py), temp views over the same S3 prefix."
+    "Same query text, same SF10 Parquet bytes on S3, same 3-node spec, same day. Weft: "
+    "DISTRIBUTED strict mode via Spark Connect (run-spark-connect.py), every query "
+    "golden-validated vs DuckDB SF10. Spark: stock EMR 7.13.0 on YARN (run-emr-suite.py), "
+    "temp views over the same S3 prefix. Both engines: 2 runs per query, hot = run 2 "
+    "(identical temperature semantics)."
 )
 
 ENGINES = {
@@ -52,16 +59,16 @@ SUITES = [
         "out": os.path.join(SITE, "tpch.json"),
         "dataset": "TPC-H SF10 Parquet on S3 (`s3://weft-artifacts-…/tpch-sf10/`)",
         "jsonl": {
-            "weft": os.path.join(HERE, "kan49-wave3", "tpch-sf10-99stack.jsonl"),
-            "emr": os.path.join(HERE, "emr-compare", "tpch-sf10-emr.jsonl"),
+            "weft": os.path.join(HERE, "perf-f1f5-sf10", "tpch-sf10.jsonl"),
+            "emr": os.path.join(HERE, "perf-f1f5-sf10", "tpch-sf10-emr.jsonl"),
         },
     },
     {
         "out": os.path.join(SITE, "tpcds.json"),
         "dataset": "TPC-DS SF10 Parquet on S3 (`s3://weft-artifacts-…/tpcds-sf10/`)",
         "jsonl": {
-            "weft": os.path.join(HERE, "kan49-wave3", "tpcds-sf10-99.jsonl"),
-            "emr": os.path.join(HERE, "emr-compare", "tpcds-sf10-emr.jsonl"),
+            "weft": os.path.join(HERE, "perf-f1f5-sf10", "tpcds-sf10.jsonl"),
+            "emr": os.path.join(HERE, "perf-f1f5-sf10", "tpcds-sf10-emr.jsonl"),
         },
     },
 ]

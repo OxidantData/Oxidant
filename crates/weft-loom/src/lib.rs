@@ -1980,6 +1980,13 @@ pub struct Engine {
     /// Kept out of the shared OS temp root so the watchdog can size it cheaply; removed
     /// on `Drop` like [`Engine::warehouse`].
     spill_dir: PathBuf,
+    /// Cached `estimate_table_bytes` results, keyed by the lowercased table name as passed
+    /// (catalog-qualified or bare). Auto-broadcast sizing runs per query, and the uncached
+    /// path shells out to the Glue CLI + S3 LISTs for every table — a multi-second fixed tax
+    /// per query (the SF10 per-query floor). Sizes only steer the replicate/shard heuristic
+    /// (never correctness), so a bounded TTL (`WEFT_TABLE_BYTES_CACHE_TTL_MS`, default 1h,
+    /// 0 disables) is safe against data growth.
+    table_bytes_cache: Mutex<HashMap<String, (Option<u64>, std::time::Instant)>>,
 }
 
 impl Engine {
@@ -2150,6 +2157,7 @@ impl Engine {
             memory_pool_bytes: memory_limit,
             pool_activity,
             spill_dir,
+            table_bytes_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2927,6 +2935,18 @@ impl Engine {
                 // through to the hash plan — a runtime pool exhaustion then surfaces as a
                 // stream error and the caller's collect fallback bounds the blast radius.
             }
+            // No reroute: execute the physical plan just built for the guard check instead
+            // of letting `execute_stream` plan a second time (the budget guard runs on
+            // every worker stage task, so this was a full duplicate physical-plan pass per
+            // task). Merge partitions into one stream, mirroring the branches above and
+            // `DataFrame::execute_stream`'s own contract (stage output is unordered —
+            // ORDER BY/LIMIT live in the driver finalize).
+            let merged: Arc<dyn datafusion::physical_plan::ExecutionPlan> = Arc::new(
+                datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(plan),
+            );
+            return merged
+                .execute(0, self.ctx.task_ctx())
+                .map_err(|e| Error::Execution(e.to_string()));
         }
         df.execute_stream()
             .await
@@ -3851,7 +3871,37 @@ impl Engine {
     /// Estimate total file bytes for a scanned table (Glue/Parquet/Delta/Iceberg listing).
     /// Returns `None` for MemTables, missing tables, or listing failures — callers treat that as
     /// "unknown" for auto-broadcast (not auto-replicated unless overridden).
+    ///
+    /// Results are cached per engine for `WEFT_TABLE_BYTES_CACHE_TTL_MS` (default 1 hour;
+    /// `0` disables). The uncached path lists every file (and, for external catalogs, probes
+    /// namespaces via the catalog CLI) on **every query** — seconds per table per query on
+    /// Glue+S3. Only the replicate/shard heuristic consumes these sizes, so bounded staleness
+    /// is safe: a stale size changes performance, never results.
     pub async fn estimate_table_bytes(&self, table_name: &str) -> Option<u64> {
+        let key = table_name.to_ascii_lowercase();
+        let Some(ttl) = table_bytes_cache_ttl() else {
+            return self.estimate_table_bytes_uncached(table_name).await;
+        };
+        let fresh = self
+            .table_bytes_cache
+            .lock()
+            .expect("table_bytes_cache poisoned")
+            .get(&key)
+            .filter(|(_, at)| at.elapsed() < ttl)
+            .map(|(bytes, _)| *bytes);
+        if let Some(bytes) = fresh {
+            return bytes;
+        }
+        let bytes = self.estimate_table_bytes_uncached(table_name).await;
+        self.table_bytes_cache
+            .lock()
+            .expect("table_bytes_cache poisoned")
+            .insert(key, (bytes, std::time::Instant::now()));
+        bytes
+    }
+
+    /// The uncached sizing walk behind [`Engine::estimate_table_bytes`].
+    async fn estimate_table_bytes_uncached(&self, table_name: &str) -> Option<u64> {
         let bare = table_name.rsplit('.').next().unwrap_or(table_name);
 
         // Session-registered ListingTable (e.g. `register_parquet`).
@@ -3921,6 +3971,17 @@ async fn estimate_listing_provider_bytes(
     let urls = listing.table_paths().clone();
     let ext = listing.options().file_extension.as_str();
     shard::sum_listing_bytes(state, urls, ext).await.ok()
+}
+
+/// Freshness window for the per-engine [`Engine::estimate_table_bytes`] cache
+/// (`WEFT_TABLE_BYTES_CACHE_TTL_MS`). Default 1 hour; `0` disables caching (every call
+/// re-lists). Sizes feed only the auto-broadcast heuristic, never correctness.
+fn table_bytes_cache_ttl() -> Option<std::time::Duration> {
+    let ms = std::env::var("WEFT_TABLE_BYTES_CACHE_TTL_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(3_600_000);
+    (ms > 0).then_some(std::time::Duration::from_millis(ms))
 }
 
 async fn estimate_bytes_in_catalog(
@@ -4999,6 +5060,77 @@ mod tests {
         let batches = engine.sql("SELECT 1 AS x").await.unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         assert_eq!(batches[0].num_columns(), 1);
+    }
+
+    /// `WEFT_TABLE_BYTES_CACHE_TTL_MS` is process-global; serialize tests that mutate it.
+    static TABLE_BYTES_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// F1: auto-broadcast sizing runs on every query, and the uncached path re-lists every
+    /// file (on Glue+S3 it also shells out to the aws CLI per probed namespace) — the
+    /// multi-second fixed tax on every query at SF10. The estimate must be cached per
+    /// engine: after the first estimate, deregistering the table must NOT change the
+    /// answer within the TTL (the estimator is not re-invoked), and
+    /// `WEFT_TABLE_BYTES_CACHE_TTL_MS=0` must disable the cache (the now-missing table
+    /// estimates to `None`).
+    #[tokio::test]
+    async fn estimate_table_bytes_caches_listing_within_ttl() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let _guard = TABLE_BYTES_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_TABLE_BYTES_CACHE_TTL_MS");
+
+        let dir = std::env::temp_dir().join(format!(
+            "weft-est-bytes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4]))],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.join("part-0.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema.clone(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let part0_len = std::fs::metadata(dir.join("part-0.parquet")).unwrap().len();
+
+        let engine = Engine::new();
+        // Trailing slash: DataFusion treats the path as a collection (lists at query time).
+        engine
+            .register_parquet("t", &format!("{}/", dir.display()))
+            .await
+            .unwrap();
+        let first = engine
+            .estimate_table_bytes("t")
+            .await
+            .expect("listing must size the table");
+        assert_eq!(first, part0_len);
+
+        // Within the TTL the cached estimate must be served without re-invoking the
+        // estimator — observable because the table no longer exists to re-estimate.
+        engine.deregister_table("t");
+        let cached = engine.estimate_table_bytes("t").await;
+        assert_eq!(
+            cached,
+            Some(first),
+            "TTL cache hit must skip the estimator entirely"
+        );
+
+        // Disable the cache → the estimator runs and finds no such table.
+        std::env::set_var("WEFT_TABLE_BYTES_CACHE_TTL_MS", "0");
+        let uncached = engine.estimate_table_bytes("t").await;
+        std::env::remove_var("WEFT_TABLE_BYTES_CACHE_TTL_MS");
+        assert_eq!(uncached, None, "disabled cache must re-run the estimator");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---------------------------------------------------------------------
@@ -6516,6 +6648,55 @@ mod tests {
             Field::new("c", DataType::Int32, false),
         ]);
         assert_eq!(estimated_row_width(&schema), 8 + 48 + 4);
+    }
+
+    /// F4: with a bounded pool the KAN-25 guard plans every `sql_stream` query physically;
+    /// the no-reroute path must then execute THAT plan (previously `execute_stream` planned
+    /// a second time — a full duplicate physical-plan pass on every worker stage task).
+    /// The reused plan is executed through the same merged single-stream contract as the
+    /// reroute branches, so rows must match the collect path exactly.
+    #[tokio::test]
+    async fn sql_stream_under_budget_guard_matches_collect() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        engine
+            .register_batches("left_t", join_guard_kv_batches(4096, 64))
+            .unwrap();
+        engine
+            .register_batches("right_t", join_guard_kv_batches(4096, 64))
+            .unwrap();
+        // Tiny keys-only build side (≪ 64 MiB budget) → no reroute: exercises the
+        // plan-reuse path on a 4-partition join (merged into one stream).
+        let query = "SELECT COUNT(*) AS c, SUM(l.v) AS s \
+                     FROM left_t l JOIN right_t r ON l.k = r.k";
+        use futures::StreamExt;
+        let mut stream = engine.sql_stream(query).await.unwrap();
+        let mut streamed = Vec::new();
+        while let Some(batch) = stream.next().await {
+            streamed.push(batch.unwrap());
+        }
+        let collected = engine.sql(query).await.unwrap();
+        let sum = |batches: &[RecordBatch], col: usize| -> i64 {
+            use arrow::array::Int64Array;
+            batches
+                .iter()
+                .map(|b| {
+                    b.column(col)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0)
+                })
+                .sum()
+        };
+        // Each of the 4096 left rows matches the 64 right rows sharing its key.
+        assert_eq!(sum(&streamed, 0), 4096 * 64);
+        assert_eq!(sum(&collected, 0), 4096 * 64);
+        let expected_s = 64 * (4095 * 4096 / 2);
+        assert_eq!(sum(&streamed, 1), expected_s);
+        assert_eq!(sum(&collected, 1), expected_s);
     }
 
     #[test]

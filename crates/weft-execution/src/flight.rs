@@ -35,7 +35,7 @@ use weft_loom::Engine;
 
 use crate::shuffle::protocol::{self, ShuffleExchangeHeader, ShuffleReadTicket, StageTicket};
 use crate::shuffle::spill::{enforce_total_budget, BucketCache, SpillStore};
-use crate::shuffle::{hash_partition, PUSH_SRC, SHUFFLE_INPUT_TABLE};
+use crate::shuffle::{hash_partition, PUSH_SRC};
 
 /// Flight `do_action` type: evict all cached stage outputs on this worker.
 pub const ACTION_CLEAR_STAGES: &str = "clear_stages";
@@ -86,6 +86,10 @@ pub struct Worker {
     keep_spill: bool,
     task_slots: usize,
     active_tasks: Arc<Mutex<usize>>,
+    /// Bounded-wait admission for stage tasks (F2): the driver dispatches all of a stage's
+    /// partition tasks concurrently, so tasks beyond `task_slots` must queue here until a
+    /// slot frees instead of bouncing back to the driver as `resource_exhausted`.
+    task_slots_sem: Arc<tokio::sync::Semaphore>,
     last_task_status: Arc<Mutex<Option<Vec<u8>>>>,
     /// Per-stage cancel flags, tripped by the `cancel_stage` action (KAN-17).
     stage_cancels: Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>,
@@ -108,13 +112,15 @@ impl Worker {
                 "Weft worker memory budget: WEFT_MEMORY_LIMIT_BYTES={bytes} (DataFusion spill pool + shuffle threshold)"
             );
         }
+        let slots = worker_task_slots();
         Self {
             engine,
             stage_outputs: Arc::new(Mutex::new(HashMap::new())),
             spill,
             keep_spill: false,
-            task_slots: worker_task_slots(),
+            task_slots: slots,
             active_tasks: Arc::new(Mutex::new(0)),
+            task_slots_sem: Arc::new(tokio::sync::Semaphore::new(slots)),
             last_task_status: Arc::new(Mutex::new(None)),
             stage_cancels: Arc::new(Mutex::new(HashMap::new())),
             stage_inserted: Arc::new(Mutex::new(HashMap::new())),
@@ -124,13 +130,15 @@ impl Worker {
 
     /// Wrap an engine with an explicit spill store (tests / custom budgets).
     pub fn with_spill(engine: Arc<Engine>, spill: SpillStore) -> Self {
+        let slots = worker_task_slots();
         Self {
             engine,
             stage_outputs: Arc::new(Mutex::new(HashMap::new())),
             spill: Some(spill),
             keep_spill: false,
-            task_slots: worker_task_slots(),
+            task_slots: slots,
             active_tasks: Arc::new(Mutex::new(0)),
+            task_slots_sem: Arc::new(tokio::sync::Semaphore::new(slots)),
             last_task_status: Arc::new(Mutex::new(None)),
             stage_cancels: Arc::new(Mutex::new(HashMap::new())),
             stage_inserted: Arc::new(Mutex::new(HashMap::new())),
@@ -206,17 +214,33 @@ impl Worker {
         .to_string()
     }
 
-    fn try_acquire_task_slot(&self) -> std::result::Result<TaskSlotGuard, Status> {
-        let mut active = self.active_tasks.lock().expect("task counter poisoned");
-        if *active >= self.task_slots {
-            return Err(Status::resource_exhausted(format!(
-                "no task slots available ({}/{})",
-                *active, self.task_slots
-            )));
-        }
-        *active += 1;
+    /// Acquire a task slot, waiting for one to free when the worker is momentarily full
+    /// (F2): the driver dispatches all of a stage's partition tasks concurrently, so tasks
+    /// beyond `task_slots` must queue here instead of bouncing back to the driver (whose
+    /// 3-attempt × 100ms retry window would spuriously fail them behind a long wave).
+    /// Bounded by `WEFT_TASK_SLOT_WAIT_MS` (default = the stage timeout): a worker still
+    /// saturated after that is genuinely overloaded and rejects exactly as before.
+    async fn acquire_task_slot(&self) -> std::result::Result<TaskSlotGuard, Status> {
+        let wait = task_slot_wait();
+        let permit =
+            match tokio::time::timeout(wait, self.task_slots_sem.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_closed)) => {
+                    return Err(Status::resource_exhausted("task slot semaphore closed"));
+                }
+                Err(_) => {
+                    return Err(Status::resource_exhausted(format!(
+                        "no task slots available after {}s wait ({}/{})",
+                        wait.as_secs(),
+                        self.active_task_count(),
+                        self.task_slots
+                    )));
+                }
+            };
+        *self.active_tasks.lock().expect("task counter poisoned") += 1;
         Ok(TaskSlotGuard {
             active_tasks: self.active_tasks.clone(),
+            _permit: permit,
         })
     }
 
@@ -283,6 +307,8 @@ impl Worker {
 
 struct TaskSlotGuard {
     active_tasks: Arc<Mutex<usize>>,
+    /// Held for the task's lifetime so the next queued task unblocks on drop.
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Drop for TaskSlotGuard {
@@ -368,6 +394,18 @@ pub fn worker_task_slots() -> usize {
                 .unwrap_or(4)
         })
         .max(1)
+}
+
+/// How long a stage task may queue for a free worker task slot before being rejected
+/// (env: `WEFT_TASK_SLOT_WAIT_MS`, default = the stage timeout, 10 minutes). See
+/// [`Worker::acquire_task_slot`].
+pub fn task_slot_wait() -> std::time::Duration {
+    std::env::var("WEFT_TASK_SLOT_WAIT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&ms: &u64| ms > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(stage_timeout)
 }
 
 /// Server-side per-stage wall-clock limit (env: `WEFT_STAGE_TIMEOUT_MS`, default 10 minutes).
@@ -708,16 +746,33 @@ impl Worker {
     }
 
     /// Run a [`StageTicket`]. First, if it has upstreams, pull this worker's bucket of each upstream
-    /// stage from every worker and register them as `shuffle_input` (one upstream) or
-    /// `shuffle_input_{i}` (the i-th of several — e.g. a shuffle join's two sides). Then run the
-    /// stage SQL. If `produce` is set, hash-partition the result by `hash_key_cols` and cache it for
-    /// downstreams (returning empty); otherwise return the result (the output stage). A stage can
-    /// both consume *and* produce — an intermediate stage of a multi-shuffle DAG.
+    /// stage from every worker and register them under this task's localized `shuffle_input` names
+    /// (one per upstream). Then run the stage SQL. If `produce` is set, hash-partition the result
+    /// by `hash_key_cols` and cache it for downstreams (returning empty); otherwise return the
+    /// result (the output stage). A stage can both consume *and* produce — an intermediate stage
+    /// of a multi-shuffle DAG.
     async fn run_stage(
         &self,
         t: StageTicket,
         progress: &StageProgress,
     ) -> std::result::Result<Vec<RecordBatch>, Status> {
+        // F2: scope this task's shuffle-input tables (and the stage SQL referencing them)
+        // to (stage_id, partition_id) so sibling partition tasks on this worker register
+        // disjoint MemTables and run concurrently — they previously shared the fixed
+        // `shuffle_input*` names, which forced the driver to serialize per-worker tasks.
+        let t = if t.upstream_stage_ids.is_empty() {
+            t
+        } else {
+            StageTicket {
+                stage_sql: crate::shuffle::localize_shuffle_input_sql(
+                    &t.stage_sql,
+                    t.stage_id,
+                    t.partition_id,
+                    t.upstream_stage_ids.len(),
+                ),
+                ..t
+            }
+        };
         // Pull + register each upstream's bucket (no-op for a leaf). The guard deregisters
         // the `shuffle_input*` tables on every exit path (KAN-19).
         let mut shuffle_inputs = ShuffleInputGuard {
@@ -756,9 +811,9 @@ impl Worker {
                     .collect();
             }
             let name = if single {
-                SHUFFLE_INPUT_TABLE.to_string()
+                crate::shuffle::localized_shuffle_input_name(t.stage_id, t.partition_id, None)
             } else {
-                format!("{SHUFFLE_INPUT_TABLE}_{i}")
+                crate::shuffle::localized_shuffle_input_name(t.stage_id, t.partition_id, Some(i))
             };
             self.engine
                 .register_batches(&name, input)
@@ -1162,7 +1217,7 @@ impl FlightService for Worker {
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?,
             protocol::Ticket::Stage(t) => {
-                let _slot = self.try_acquire_task_slot()?;
+                let _slot = self.acquire_task_slot().await?;
                 crate::fault_inject::maybe_fault_exit(&t);
                 let stage_id = t.stage_id;
                 let partition_id = t.partition_id;
@@ -1476,6 +1531,9 @@ async fn do_get_batches(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<R
                 if !crate::scheduler::is_retryable(&e) || attempt + 1 == MAX_TRIES {
                     return Err(e);
                 }
+                // Transport-class failure: the pooled channel may be a dead connection
+                // (worker restart) — drop it so the retry dials fresh.
+                evict_flight_channel(&endpoint);
                 last_err = Some(e);
                 tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)))
                     .await;
@@ -1485,8 +1543,41 @@ async fn do_get_batches(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<R
     Err(last_err.unwrap_or_else(|| Error::Execution("do_get failed".into())))
 }
 
+/// Process-wide Flight channel pool: one eagerly-established HTTP/2 channel per endpoint,
+/// cheaply cloned per RPC (tonic `Channel` clones share the connection). Previously every
+/// `do_get`/`do_action`/`do_exchange` paid a fresh TCP+HTTP/2 handshake — with per-stage
+/// task/fetch fan-out that is dozens of connection establishments per stage per query.
+static FLIGHT_CHANNELS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, tonic::transport::Channel>>,
+> = std::sync::OnceLock::new();
+
+fn flight_channels(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, tonic::transport::Channel>> {
+    FLIGHT_CHANNELS.get_or_init(Default::default)
+}
+
+/// Drop a cached channel after a transport-class error (worker restart, broken h2
+/// connection): tonic does not redial an eagerly-connected `Channel`, so without eviction
+/// every later RPC to that endpoint would keep failing on the dead connection.
+fn evict_flight_channel(endpoint: &str) {
+    if let Some(map) = FLIGHT_CHANNELS.get() {
+        map.lock()
+            .expect("flight channels poisoned")
+            .remove(endpoint);
+    }
+}
+
+fn flight_client(
+    channel: tonic::transport::Channel,
+) -> FlightServiceClient<tonic::transport::Channel> {
+    FlightServiceClient::new(channel)
+        .max_decoding_message_size(MAX_MSG)
+        .max_encoding_message_size(MAX_MSG)
+}
+
 /// Connect to a Flight worker with a short connect timeout so CI port conflicts fail fast
-/// instead of hanging on the default TCP SYN retry window (~minutes).
+/// instead of hanging on the default TCP SYN retry window (~minutes). Channels are pooled
+/// per endpoint (see [`FLIGHT_CHANNELS`]).
 ///
 /// KAN-15: there is deliberately no blanket per-request timeout here — tonic applies it to the
 /// whole `do_get` stream, so any stage slower than the limit failed client-side while the
@@ -1495,15 +1586,25 @@ async fn do_get_batches(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<R
 async fn connect_flight(
     endpoint: String,
 ) -> Result<FlightServiceClient<tonic::transport::Channel>> {
-    let channel = tonic::transport::Endpoint::from_shared(endpoint)
+    if let Some(channel) = flight_channels()
+        .lock()
+        .expect("flight channels poisoned")
+        .get(&endpoint)
+        .cloned()
+    {
+        return Ok(flight_client(channel));
+    }
+    let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
         .map_err(|e| Error::Io(format!("endpoint: {e}")))?
         .connect_timeout(std::time::Duration::from_secs(2))
         .connect()
         .await
         .map_err(|e| Error::Io(format!("connect worker: {e}")))?;
-    Ok(FlightServiceClient::new(channel)
-        .max_decoding_message_size(MAX_MSG)
-        .max_encoding_message_size(MAX_MSG))
+    flight_channels()
+        .lock()
+        .expect("flight channels poisoned")
+        .insert(endpoint, channel.clone());
+    Ok(flight_client(channel))
 }
 
 async fn do_get_batches_once(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<RecordBatch>> {
@@ -1624,7 +1725,7 @@ async fn do_action_collect(
     action_type: &str,
     body: &[u8],
 ) -> Result<Vec<Vec<u8>>> {
-    let mut client = connect_flight(endpoint).await?;
+    let mut client = connect_flight(endpoint.clone()).await?;
     let action = Action {
         r#type: action_type.to_string(),
         body: body.to_vec().into(),
@@ -1632,7 +1733,11 @@ async fn do_action_collect(
     let mut stream = client
         .do_action(action)
         .await
-        .map_err(|e| Error::Execution(format!("do_action: {}", e.message())))?
+        .map_err(|e| {
+            // Transport-class failure: drop the pooled channel so the next action dials fresh.
+            evict_flight_channel(&endpoint);
+            Error::Execution(format!("do_action: {}", e.message()))
+        })?
         .into_inner();
     let mut bodies = Vec::new();
     while let Some(item) = stream.next().await {
@@ -1758,6 +1863,8 @@ pub async fn push_bucket_with_schema(
         {
             Ok(()) => return Ok(()),
             Err(e) if is_pull_retryable(&e) && attempt + 1 < MAX_TRIES => {
+                // Transport-class failure: drop the pooled channel so the retry dials fresh.
+                evict_flight_channel(&endpoint);
                 last = Some(e);
                 tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)))
                     .await;
@@ -2202,6 +2309,57 @@ mod tests {
             .unwrap();
         assert_eq!(values.value(0), 10);
         assert_eq!(values.value(2), 30);
+    }
+
+    /// F3: Flight channels are pooled per endpoint — repeat connects hand back clones of
+    /// the one HTTP/2 connection instead of re-dialing — and a transport-class failure
+    /// evicts the pooled channel so the next RPC dials fresh (tonic never redials an
+    /// eagerly-connected `Channel`, so without eviction a worker restart would wedge
+    /// every later RPC to that endpoint).
+    #[tokio::test]
+    async fn flight_channel_pool_reuses_then_evicts() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let engine = Arc::new(Engine::new());
+        tokio::spawn(async move {
+            let _ = serve_worker(port, engine).await;
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        evict_flight_channel(&endpoint); // clean slate: another test may have used this port
+
+        // Retry the first connect until the spawned server is accepting.
+        let mut connected = false;
+        for _ in 0..50 {
+            if connect_flight(endpoint.clone()).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(connected, "worker did not accept connections");
+
+        // A second connect must be a pool hit — the endpoint stays cached exactly once.
+        connect_flight(endpoint.clone()).await.unwrap();
+        assert!(
+            flight_channels().lock().unwrap().contains_key(&endpoint),
+            "channel must be pooled for reuse"
+        );
+
+        // Eviction drops it; the next connect re-dials and re-pools.
+        evict_flight_channel(&endpoint);
+        assert!(
+            !flight_channels().lock().unwrap().contains_key(&endpoint),
+            "eviction must drop the pooled channel"
+        );
+        connect_flight(endpoint.clone()).await.unwrap();
+        assert!(
+            flight_channels().lock().unwrap().contains_key(&endpoint),
+            "reconnect after eviction must re-dial and re-pool"
+        );
+        // Leave no stale channel behind for this test's now-doomed server.
+        evict_flight_channel(&endpoint);
     }
 
     fn int64_batch(schema: &SchemaRef, start: i64, len: i64) -> RecordBatch {

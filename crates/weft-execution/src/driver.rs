@@ -920,16 +920,14 @@ async fn run_stages_obs_inner(
             out.extend(r?);
         }
     } else {
-        // Group partitions by rendezvous owner so concurrent tasks on the same worker do not
-        // race on the shared `shuffle_input` registration table.
-        let mut by_endpoint: std::collections::BTreeMap<String, Vec<u32>> =
-            std::collections::BTreeMap::new();
+        // One task per output partition, all dispatched concurrently (F2): the worker
+        // scopes its shuffle-input registrations per task (`localize_shuffle_input_sql`),
+        // so same-worker tasks no longer race — the per-endpoint serialization that used
+        // to protect the shared `shuffle_input` table names is gone. Tasks beyond a
+        // worker's slot count queue server-side (`acquire_task_slot`).
+        let mut futs = Vec::new();
         for p in 0..w {
             let endpoint = cluster.owner_endpoint(p)?;
-            by_endpoint.entry(endpoint).or_default().push(p);
-        }
-        let mut ep_futs = Vec::new();
-        for (endpoint, parts) in by_endpoint {
             let membership = cluster.membership.clone();
             let output = output.clone();
             let cluster = cluster.clone();
@@ -939,67 +937,73 @@ async fn run_stages_obs_inner(
             let store_c = store.clone();
             let op_c = operation_id.clone();
             let stage_id = output.stage_id as i32;
-            let task_ids: Vec<(u32, i64)> = parts
-                .iter()
-                .copied()
-                .map(|p| {
-                    let task_id = alloc_task_id(&store, p as i64);
-                    emit_task_started(&store, &operation_id, stage_id, task_id, &host);
-                    (p, task_id)
-                })
-                .collect();
-            ep_futs.push(async move {
-                let mut local = Vec::new();
-                for (p, task_id) in task_ids {
-                    let ticket = stage_ticket(&output, p, w, &cluster, false);
-                    let start = std::time::Instant::now();
-                    match run_stage_with_retry(
-                        &membership,
-                        endpoint.clone(),
-                        ticket,
-                        &lineage,
-                        &stage_map,
-                    )
-                    .await
-                    {
-                        Ok(batches) => {
-                            let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
-                            emit_task_finished(
-                                &store_c,
-                                &op_c,
-                                stage_id,
-                                task_id,
-                                &host,
-                                TaskStatus::Success,
-                                start.elapsed().as_millis() as i64,
-                                rows * 8,
-                                0,
-                                rows,
-                            );
-                            local.extend(batches);
-                        }
-                        Err(e) => {
-                            emit_task_finished(
-                                &store_c,
-                                &op_c,
-                                stage_id,
-                                task_id,
-                                &host,
-                                TaskStatus::Failed,
-                                start.elapsed().as_millis() as i64,
-                                0,
-                                0,
-                                0,
-                            );
-                            return Err(e);
-                        }
+            let task_id = alloc_task_id(&store, p as i64);
+            emit_task_started(&store, &operation_id, stage_id, task_id, &host);
+            futs.push(async move {
+                let ticket = stage_ticket(&output, p, w, &cluster, false);
+                let start = std::time::Instant::now();
+                let result = run_stage_with_retry(
+                    &membership,
+                    endpoint.clone(),
+                    ticket,
+                    &lineage,
+                    &stage_map,
+                )
+                .await;
+                match &result {
+                    Ok(batches) => {
+                        let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+                        emit_task_finished(
+                            &store_c,
+                            &op_c,
+                            stage_id,
+                            task_id,
+                            &host,
+                            TaskStatus::Success,
+                            start.elapsed().as_millis() as i64,
+                            rows * 8,
+                            0,
+                            rows,
+                        );
+                    }
+                    Err(_) => {
+                        emit_task_finished(
+                            &store_c,
+                            &op_c,
+                            stage_id,
+                            task_id,
+                            &host,
+                            TaskStatus::Failed,
+                            start.elapsed().as_millis() as i64,
+                            0,
+                            0,
+                            0,
+                        );
                     }
                 }
-                Ok::<_, Error>(local)
+                // Tag with the partition so the merged output keeps partition order
+                // (completion order is arbitrary under concurrent dispatch).
+                result.map(|batches| (p, batches))
             });
         }
-        for r in futures::future::join_all(ep_futs).await {
-            out.extend(r?);
+        let mut first_err = None;
+        let mut indexed: Vec<(u32, Vec<RecordBatch>)> = Vec::new();
+        for r in futures::future::join_all(futs).await {
+            match r {
+                Ok(v) => indexed.push(v),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        indexed.sort_by_key(|(p, _)| *p);
+        for (_, batches) in indexed {
+            out.extend(batches);
         }
     }
 
@@ -1032,9 +1036,11 @@ fn executor_id(endpoint: &str) -> String {
         .to_string()
 }
 
-/// Run an intermediate (consume + produce) stage: one task per shuffle partition, grouped by
-/// rendezvous owner so concurrent tasks on the same worker do not race on the shared
-/// `shuffle_input` registration table — the same discipline as the output stage (KAN-32).
+/// Run an intermediate (consume + produce) stage: one task per shuffle partition, all
+/// dispatched concurrently (F2). The worker scopes its shuffle-input registrations per
+/// task (`localize_shuffle_input_sql`), so same-worker tasks no longer race on a shared
+/// `shuffle_input` table — the per-endpoint serialization (KAN-32) is gone; tasks beyond
+/// a worker's slot count queue server-side (`acquire_task_slot`).
 async fn run_intermediate_stage(
     cluster: &Cluster,
     stage: &StageDef,
@@ -1044,14 +1050,9 @@ async fn run_intermediate_stage(
     store: &Option<SharedStore>,
     operation_id: &Option<String>,
 ) -> Result<()> {
-    let mut by_endpoint: std::collections::BTreeMap<String, Vec<u32>> =
-        std::collections::BTreeMap::new();
+    let mut futs = Vec::new();
     for p in 0..num_partitions {
         let endpoint = cluster.owner_endpoint(p)?;
-        by_endpoint.entry(endpoint).or_default().push(p);
-    }
-    let mut ep_futs = Vec::new();
-    for (endpoint, parts) in by_endpoint {
         let membership = cluster.membership.clone();
         let stage = stage.clone();
         let cluster = cluster.clone();
@@ -1061,67 +1062,60 @@ async fn run_intermediate_stage(
         let store_c = store.clone();
         let op_c = operation_id.clone();
         let stage_id = stage.stage_id as i32;
-        let task_ids: Vec<(u32, i64)> = parts
-            .iter()
-            .copied()
-            .map(|p| {
-                let task_id = alloc_task_id(store, p as i64);
-                emit_task_started(store, operation_id, stage_id, task_id, &host);
-                (p, task_id)
-            })
-            .collect();
-        ep_futs.push(async move {
-            for (p, task_id) in task_ids {
-                let ticket = stage_ticket(&stage, p, num_partitions, &cluster, true);
-                let start = std::time::Instant::now();
-                match run_stage_with_retry(
-                    &membership,
-                    endpoint.clone(),
-                    ticket,
-                    &lineage,
-                    &stage_map,
-                )
-                .await
-                {
-                    Ok(batches) => {
-                        let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
-                        emit_task_finished(
-                            &store_c,
-                            &op_c,
-                            stage_id,
-                            task_id,
-                            &host,
-                            TaskStatus::Success,
-                            start.elapsed().as_millis() as i64,
-                            rows * 8,
-                            0,
-                            rows,
-                        );
-                    }
-                    Err(e) => {
-                        emit_task_finished(
-                            &store_c,
-                            &op_c,
-                            stage_id,
-                            task_id,
-                            &host,
-                            TaskStatus::Failed,
-                            start.elapsed().as_millis() as i64,
-                            0,
-                            0,
-                            0,
-                        );
-                        return Err(e);
-                    }
+        let task_id = alloc_task_id(store, p as i64);
+        emit_task_started(store, operation_id, stage_id, task_id, &host);
+        futs.push(async move {
+            let ticket = stage_ticket(&stage, p, num_partitions, &cluster, true);
+            let start = std::time::Instant::now();
+            let result =
+                run_stage_with_retry(&membership, endpoint.clone(), ticket, &lineage, &stage_map)
+                    .await;
+            match &result {
+                Ok(batches) => {
+                    let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+                    emit_task_finished(
+                        &store_c,
+                        &op_c,
+                        stage_id,
+                        task_id,
+                        &host,
+                        TaskStatus::Success,
+                        start.elapsed().as_millis() as i64,
+                        rows * 8,
+                        0,
+                        rows,
+                    );
+                }
+                Err(_) => {
+                    emit_task_finished(
+                        &store_c,
+                        &op_c,
+                        stage_id,
+                        task_id,
+                        &host,
+                        TaskStatus::Failed,
+                        start.elapsed().as_millis() as i64,
+                        0,
+                        0,
+                        0,
+                    );
                 }
             }
-            Ok::<_, Error>(())
+            result.map(|_| ())
         });
     }
-    for r in futures::future::join_all(ep_futs).await {
-        r?;
+    let mut first_err = None;
+    for r in futures::future::join_all(futs).await {
+        if let Err(e) = r {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Emit the StageFinished event for a producer stage and (when AQE is enabled) sample its

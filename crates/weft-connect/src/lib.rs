@@ -595,29 +595,47 @@ impl WeftService {
                 let tracker = operation_id.map(|op| {
                     QueryTracker::begin(self.observability.clone(), op, description.clone())
                 });
-                let plan_for_dist = self.engine.logical_plan(&sql.query).await.ok();
-                if let (Some(ref t), Some(ref plan)) = (&tracker, &plan_for_dist) {
+                // Build the logical plan ONCE per query (with the Delta/Iceberg snapshot
+                // pins the workers must scan at — KAN-48): it feeds the observability
+                // explain, the auto-broadcast sizing, and the distributed planner itself.
+                // Previously the query was parsed/analyzed here and then *again* inside
+                // `try_run_distributed` — a full second planning pass per query.
+                let plan_and_pins = self
+                    .engine
+                    .logical_plan_with_lakehouse_snapshots(&sql.query)
+                    .await
+                    .ok();
+                if let (Some(ref t), Some((ref plan, _))) = (&tracker, &plan_and_pins) {
                     if let Ok(text) = self.engine.explain(plan, true).await {
                         t.set_plan(text, None);
                     }
                 }
-                let replicated = match &plan_for_dist {
-                    Some(plan) => {
+                let replicated = match &plan_and_pins {
+                    Some((plan, _)) => {
                         weft_execution::plan::resolve_replicated_tables(&self.engine, plan).await
                     }
                     None => weft_loom::shard::replicated_tables_override_from_env(),
                 };
                 let replicated_refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
-                match distributed::try_run_distributed(
-                    &self.engine,
-                    &workers,
-                    &sql.query,
-                    &replicated_refs,
-                    Some(&udf_json),
-                    tracker.as_ref(),
-                )
-                .await
-                {
+                // A plan that failed to build skips the distributed attempt; the local
+                // path below re-parses and surfaces the same error to the client.
+                let dist_result = match &plan_and_pins {
+                    Some((plan, pins)) => {
+                        distributed::try_run_distributed_plan(
+                            &self.engine,
+                            &workers,
+                            plan,
+                            &sql.query,
+                            &replicated_refs,
+                            Some(&udf_json),
+                            tracker.as_ref(),
+                            pins,
+                        )
+                        .await
+                    }
+                    None => Ok(None),
+                };
+                match dist_result {
                     Ok(Some(dist)) => {
                         // Same unsigned->signed normalization as the DataFrame path below:
                         // ranking windows (`rank`/`row_number`/...) produce UInt64, which

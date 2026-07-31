@@ -322,17 +322,18 @@ pub async fn resolve_replicated_tables(engine: &Engine, lp: &LogicalPlan) -> Vec
     };
 
     let mut seen = HashSet::new();
-    let mut sized: Vec<(String, Option<u64>)> = Vec::new();
     let mut names = base_tables(lp);
     collect_subquery_tables(lp, &mut names);
-    for name in names {
-        let key = name.to_ascii_lowercase();
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-        let bytes = engine.estimate_table_bytes(&name).await;
-        sized.push((name, bytes));
-    }
+    let names: Vec<String> = names
+        .into_iter()
+        .filter(|name| seen.insert(name.to_ascii_lowercase()))
+        .collect();
+    // Size tables concurrently: a cache miss lists files (and, for external catalogs,
+    // probes namespaces via the catalog CLI) — serializing those multiplies the first-query
+    // latency by the table count. The per-engine estimate cache keeps repeats cheap.
+    let estimates =
+        futures::future::join_all(names.iter().map(|name| engine.estimate_table_bytes(name))).await;
+    let sized: Vec<(String, Option<u64>)> = names.into_iter().zip(estimates).collect();
     let override_names = replicated_tables_override_from_env();
     let override_refs: Vec<&str> = override_names.iter().map(String::as_str).collect();
     classify_replicated_tables(&sized, &override_refs, auto_broadcast_threshold_bytes())

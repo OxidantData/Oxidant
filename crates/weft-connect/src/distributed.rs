@@ -16,6 +16,11 @@ use weft_observability::{ExecutionEvent, QueryTracker};
 
 /// If workers or K8s service discovery is configured and `sql` is auto-splittable, run distributed.
 /// Returns `Ok(None)` when the query should fall back to single-node execution.
+///
+/// Test-only convenience wrapper: production callers (the SQL and DataFrame paths in
+/// weft-connect) build the plan once themselves and call [`try_run_distributed_plan`]
+/// directly — re-parsing the SQL here would be a second planning pass per query.
+#[cfg(test)]
 pub async fn try_run_distributed(
     engine: &Engine,
     workers: &[String],
@@ -107,9 +112,9 @@ pub async fn try_run_distributed_plan(
                     submission_time_ms: weft_observability::now_ms(),
                 });
         }
-        if let Ok(text) = engine.explain(plan, true).await {
-            t.set_plan(text, None);
-        }
+        // Note: no physical-plan `explain` here — both callers (the SQL path and the
+        // DataFrame path in weft-connect) already set the tracker's plan text before
+        // calling in, so this was a second full optimize+physical pass per query.
     }
 
     let store = tracker.map(|t| t.store().clone());
