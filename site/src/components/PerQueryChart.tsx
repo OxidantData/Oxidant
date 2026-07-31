@@ -6,7 +6,16 @@ import { engineColor, type Engine } from "../lib/benchmarks";
  * and dependency-free. If no engine is measured yet, shows a placeholder so the section still
  * renders during the `pending` phase.
  */
-export default function PerQueryChart({ engines, queryCount }: { engines: Engine[]; queryCount: number }) {
+export default function PerQueryChart({
+  engines,
+  queryCount,
+  queryBase = 0,
+}: {
+  engines: Engine[];
+  queryCount: number;
+  /** First query number for axis labels (ClickBench is 0-based; TPC-H/DS are 1-based). */
+  queryBase?: number;
+}) {
   const measured = engines.filter((e) => e.perQuery.length > 0);
   const [logScale, setLogScale] = useState(true);
 
@@ -44,7 +53,9 @@ export default function PerQueryChart({ engines, queryCount }: { engines: Engine
   return (
     <div className="weft-card p-5 sm:p-6">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <h3 className="text-sm font-semibold">Per-query hot time (Q0–Q{n - 1})</h3>
+        <h3 className="text-sm font-semibold">
+          Per-query hot time (Q{queryBase}–Q{queryBase + n - 1})
+        </h3>
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-3 text-xs">
             {measured.map((e) => (
@@ -95,7 +106,7 @@ export default function PerQueryChart({ engines, queryCount }: { engines: Engine
                   height={Math.max(0.5, h)}
                   fill={engineColor(e.key)}
                 >
-                  <title>{`${e.name} · Q${qi}: ${v.toFixed(3)}s`}</title>
+                  <title>{`${e.name} · Q${qi + queryBase}: ${v.toFixed(3)}s`}</title>
                 </rect>
               );
             });
@@ -111,7 +122,7 @@ export default function PerQueryChart({ engines, queryCount }: { engines: Engine
                 className="fill-muted"
                 fontSize={10}
               >
-                {qi}
+                {qi + queryBase}
               </text>
             ) : null,
           )}

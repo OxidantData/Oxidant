@@ -12,7 +12,8 @@ export default function BenchmarkChart({
   engines: Engine[];
   title?: string;
 }) {
-  const weftTotal = engines.find((e) => e.key === "weft")?.total ?? null;
+  const weftTotal =
+    (engines.find((e) => e.key === "weft") ?? engines.find((e) => e.highlight))?.total ?? null;
   const measured = engines.filter((e) => e.total != null) as (Engine & { total: number })[];
   const max = measured.length ? Math.max(...measured.map((e) => e.total)) : 1;
   // Fastest first; pending (null) last — matches the ShuttlePass order.

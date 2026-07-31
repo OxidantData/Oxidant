@@ -41,6 +41,7 @@ export const ENGINE_COLORS: Record<string, string> = {
   "weft-dist": "var(--weft-accent)", // brand orange (distributed TPC-H/DS suites)
   sail: "#2563eb", // blue
   spark: "#64748b", // slate
+  "spark-emr": "#64748b", // slate (Spark on EMR, TPC-H/DS head-to-head)
   gluten: "#16a34a", // green
   duckdb: "#eab308", // gold
 };

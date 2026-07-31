@@ -85,12 +85,15 @@ function SuiteSection({
   blurb,
   suite,
   showPerQuery = true,
+  queryBase = 1,
 }: {
   eyebrow: string;
   title: string;
   blurb: string;
   suite: Benchmarks;
   showPerQuery?: boolean;
+  /** First query number for axis labels (TPC-H/DS are 1-based). */
+  queryBase?: number;
 }) {
   const anyMeasured = suite.engines.some((e) => e.total != null);
   return (
@@ -126,7 +129,7 @@ function SuiteSection({
 
       {showPerQuery && anyMeasured && suite.queryCount <= 43 && (
         <div className="mt-8">
-          <PerQueryChart engines={suite.engines} queryCount={suite.queryCount} />
+          <PerQueryChart engines={suite.engines} queryCount={suite.queryCount} queryBase={queryBase} />
         </div>
       )}
 
@@ -145,9 +148,8 @@ export default function PerformancePage() {
         <span className="weft-eyebrow">Benchmarks</span>
         <h1 className="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">Performance</h1>
         <p className="mt-4 text-lg text-muted">
-          ClickBench on a dedicated box, plus TPC-H / TPC-DS SF10 through the live Weft engine in
-          distributed mode — data in S3, catalogued in Glue, queried as{" "}
-          <code className="text-sm text-body">glue.&lt;db&gt;.&lt;table&gt;</code>.
+          ClickBench on a dedicated box, plus TPC-H / TPC-DS SF10 head-to-head: Weft distributed vs
+          stock Apache Spark on EMR — same instance spec, same Parquet bytes in S3, same query text.
         </p>
       </div>
 
@@ -249,8 +251,8 @@ export default function PerformancePage() {
 
       <SuiteSection
         eyebrow="TPC-H SF10"
-        title="Decision-support on Glue"
-        blurb="Official Q1–Q22 against Parquet in S3, catalogued as glue.tpch_sf10.*, executed distributed (1 driver + 2 workers) over Spark Connect in strict mode — every query golden-validated against DuckDB SF10: 20/22 checksum-exact, the other two value-identical modulo Spark-faithful decimal scale."
+        title="Decision-support, head-to-head with Spark"
+        blurb="Official Q1–Q22 over the same SF10 Parquet bytes on S3, on the same 3-node spec (1x c6g.2xlarge + 2x m8g.2xlarge): Weft distributed in strict mode via Spark Connect — every query golden-validated against DuckDB SF10 — vs stock Apache Spark 3.5.6 on EMR 7.13.0/YARN. Spark takes this round: 88.6s vs 623.2s hot (7.0x). At ~10 GB the fixed per-query cost of Weft's distributed planning and Flight dispatch dominates — Spark answers most queries in 1-8s where Weft pays 12-50s. Correctness is table stakes and Weft meets it: 22/22 golden-clean (20 checksum-exact, 2 value-identical modulo Spark-faithful decimal scale)."
         suite={tpchBenchmarks}
       />
 
@@ -260,8 +262,8 @@ export default function PerformancePage() {
 
       <SuiteSection
         eyebrow="TPC-DS SF10"
-        title="Retail warehouse workload"
-        blurb="99 queries against glue.tpcds_sf10.* — same Glue → distributed path as TPC-H. All 99 execute end-to-end under strict mode, each golden-validated against DuckDB SF10; every distributed shape is exact by construction, and the engine refuses rather than risk a wrong answer when a shape doesn't fit. Per-query chart omitted (99 bars); totals tell the story."
+        title="Retail warehouse, 99 queries each"
+        blurb="Same hardware, same bytes, all 99 queries on both engines. Spark wins the SF10 sprint: 286.8s vs 2438.5s hot (8.5x). Weft runs 99/99 end-to-end under strict mode, each golden-validated against DuckDB SF10 — the engine refuses rather than risk a wrong answer when a shape doesn't fit. The gap is per-query overhead and execution maturity (codegen, adaptive joins), not correctness or coverage. Per-query chart omitted (99 bars); totals tell the story."
         suite={tpcdsBenchmarks}
         showPerQuery={false}
       />
@@ -285,9 +287,18 @@ export default function PerformancePage() {
               <code className="text-body">glue</code>.
             </li>
             <li>
-              <strong className="text-body">Compute.</strong> Weft Spark Connect driver + 2 workers
-              on EC2 (AL2023 arm64, the <code className="text-body">weft-sf10</code> ASGs), strict
-              distributed mode.
+              <strong className="text-body">Weft compute.</strong> Weft Spark Connect driver + 2
+              workers on EC2 (AL2023 arm64, the <code className="text-body">weft-sf10</code> ASGs),
+              strict distributed mode.
+            </li>
+            <li>
+              <strong className="text-body">Spark compute.</strong> Stock EMR 7.13.0 (Spark
+              3.5.6-amzn-2) on YARN — 1x c6g.2xlarge master + 2x m8g.2xlarge core, the same instance
+              spec as Weft. Tables registered as temp views over the same S3 prefix (the Glue DBs
+              are schema-less weft registrations, so Spark infers from the parquet footers — same
+              bytes either way). Two Spark-only normalizations, both documented in the runner:
+              interval field precision (TPC-H Q1) and backtick aliases (EMR rejects{" "}
+              <code className="text-body">AS &quot;...&quot;</code> outside ANSI mode).
             </li>
           </ul>
         </div>
@@ -295,12 +306,17 @@ export default function PerformancePage() {
           <h3 className="mb-3 text-lg font-semibold">Reproduce SF10</h3>
           <CodeBlock
             lines={[
-              { text: "# driver up at sc://<driver>:50051 (scripts/sf10-start.sh)", comment: true },
+              { text: "# weft: driver up at sc://<driver>:50051 (scripts/sf10-start.sh)", comment: true },
               { text: "python3 bench/sf100/run-spark-connect.py \\" },
               { text: "  --endpoint sc://<driver>:50051 --suite tpch --sf 10 \\" },
               { text: "  --glue-db tpch_sf10 --strict --worker-count 2 \\" },
               { text: "  --skip-worker-preflight --query-timeout 900 \\" },
               { text: "  --json bench/sf100/results/tpch-sf10.jsonl" },
+              { text: "# spark: on the EMR master (same instance spec)", comment: true },
+              { text: "spark-submit --master yarn --deploy-mode client \\" },
+              { text: "  bench/sf100/emr/run-emr-suite.py --suite tpch \\" },
+              { text: "  --queries-dir bench/tpch/queries --runs 2 \\" },
+              { text: "  --out /tmp/tpch-sf10-emr.jsonl" },
               { text: "# then regenerate this page's data", comment: true },
               { text: "python3 bench/sf100/results/to-site-sf10.py" },
             ]}
