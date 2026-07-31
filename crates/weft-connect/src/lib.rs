@@ -619,7 +619,14 @@ impl WeftService {
                 .await
                 {
                     Ok(Some(dist)) => {
-                        let mut batches = dist;
+                        // Same unsigned->signed normalization as the DataFrame path below:
+                        // ranking windows (`rank`/`row_number`/...) produce UInt64, which
+                        // Spark has no type for — PySpark rejects the Arrow stream outright
+                        // (UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION, SF10 Q36/44/49/67/70/86).
+                        let mut batches = dist
+                            .into_iter()
+                            .map(signed_columns)
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
                         // Same 0-row contract as the local path below: a distributed query
                         // with an empty result comes back with no batches at all (the
                         // driver-side finalize re-runs through `engine.sql`, which returns
@@ -632,7 +639,7 @@ impl WeftService {
                                 .schema(&sql.query)
                                 .await
                                 .map_err(err_to_status)?;
-                            batches.push(RecordBatch::new_empty(schema));
+                            batches.push(RecordBatch::new_empty(signed_schema(&schema)));
                         }
                         if let Some(t) = tracker {
                             let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();

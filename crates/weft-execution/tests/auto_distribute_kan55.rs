@@ -90,19 +90,15 @@ const REPL_WEB: [&str; 11] = [
     "reason",
 ];
 
-static PORT: AtomicU16 = AtomicU16::new(0);
+static PORT: std::sync::OnceLock<AtomicU16> = std::sync::OnceLock::new();
 
 fn unique_worker_port() -> u16 {
-    let prev = PORT.fetch_add(1, Ordering::Relaxed);
-    if prev == 0 {
-        // Keep the base well below u16::MAX for any pid (and clear of the sibling test
-        // binaries' 46000-base range, since cargo runs each binary as its own process).
-        let seed = 30000 + (std::process::id() as u16 % 15000);
-        PORT.store(seed.wrapping_add(1), Ordering::Relaxed);
-        seed
-    } else {
-        prev
-    }
+    // OnceLock-seeded allocator with the base BELOW the Linux ephemeral source range
+    // (32768..=60999): the harness's own outbound connections can never steal a worker's
+    // port (serve_worker swallows EADDRINUSE; the old in-range bases flaked "did not
+    // bind" / "distributed run never succeeded" on loaded CI runners).
+    PORT.get_or_init(|| AtomicU16::new(24000 + (std::process::id() as u16 % 512)))
+        .fetch_add(1, Ordering::Relaxed)
 }
 
 /// `WEFT_DISTRIBUTED_STRICT` is process-global; serialize the tests that set it.
@@ -796,11 +792,13 @@ async fn anti_only_replicated_outer_keeps_the_gather() {
     assert_eq!(rows_sorted(&actual), rows_sorted(&expected));
 }
 
-/// Q95's `IN` bodies scan the sharded fact twice (the `ws_wh` self-join CTE): a distributed
-/// plan needs a shuffle-first distinct-key producer that does not exist yet, so strict mode must
-/// keep refusing (correctness over coverage).
+/// KAN-49 wave-3b: Q95's `IN` bodies scan the sharded fact twice (the `ws_wh` self-join CTE),
+/// which the KAN-55 semi/anti machinery declined. The shuffle-first distinct-key producer now
+/// exists (see `gather_shapes::try_self_join_in_keys` and the end-to-end coverage in
+/// `auto_distribute_kan49c.rs`): the fact hash-shuffles by the order key, the self-join keys
+/// compute per partition, and strict mode must plan.
 #[tokio::test]
-async fn q95_self_join_in_still_refuses_in_strict() {
+async fn q95_self_join_in_plans_in_strict() {
     std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
     let planner = tpcds_engine().await;
     let lp = planner.logical_plan(Q95).await.expect("logical plan");
@@ -808,10 +806,32 @@ async fn q95_self_join_in_still_refuses_in_strict() {
     std::env::set_var("WEFT_DISTRIBUTED_STRICT", "1");
     let planned = plan_distributed_logical(&lp, &REPL_WEB);
     std::env::remove_var("WEFT_DISTRIBUTED_STRICT");
-    let err = planned.expect_err("Q95 must keep refusing in strict mode");
+    let dq = planned.expect("Q95 plans in strict mode (KAN-49 wave-3b)");
+    let producer = dq
+        .stages
+        .iter()
+        .find(|s| s.sql.contains("AS k0") && s.sql.contains("AS ic0"))
+        .expect("the ws_wh key producer: {dq:?}");
+    assert_eq!(producer.hash_key_cols, vec![0], "hashed by ws_order_number");
+    let keys = dq
+        .stages
+        .iter()
+        .find(|s| s.sql.contains("SELECT DISTINCT a.k0"))
+        .expect("the per-partition self-join distinct keys: {dq:?}");
     assert!(
-        err.to_string().contains("web_sales"),
-        "the refusal names the sharded fact: {err}"
+        keys.sql.contains("shuffle_input a JOIN shuffle_input b"),
+        "the self-join evaluates over the co-located rows: {}",
+        keys.sql
+    );
+    assert!(
+        dq.stages
+            .iter()
+            .any(|s| s.sql.contains("count(DISTINCT o.ok0)")),
+        "the per-partition exact distinct count: {dq:?}"
+    );
+    assert!(
+        !dq.stages.iter().any(|s| s.sql == "SELECT * FROM web_sales"),
+        "no whole-fact gather: {dq:?}"
     );
 }
 

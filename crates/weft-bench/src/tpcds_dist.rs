@@ -604,16 +604,22 @@ async fn run_stages_with_retry(
     stages: &[StageDef],
 ) -> Result<Vec<weft_loom::arrow::record_batch::RecordBatch>, String> {
     let mut last_err = None;
-    for _ in 0..30 {
+    // 30s ceiling: on the 4-vCPU CI runner a worker can be unreachable for several seconds
+    // under load (FD pressure, accept-queue backlog) and then recover — the old 30×100ms=3s
+    // window gave up mid-hiccup and failed the whole execute gate (Q30/Q81/Q91/Q80 flakes).
+    // A genuinely dead worker still fails inside 30s, and only connection-layer errors retry;
+    // plan/SQL errors never match the markers.
+    for _ in 0..60 {
         match run_stages(cluster, stages).await {
             Ok(b) => return Ok(b),
             Err(e) => {
-                let transient = e.to_string().contains("connect");
-                last_err = Some(e.to_string());
+                let msg = e.to_string();
+                let transient = msg.contains("connect") || msg.contains("transport");
+                last_err = Some(msg);
                 if !transient {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
     }

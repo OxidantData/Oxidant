@@ -233,6 +233,95 @@ async fn distributed_zero_row_result_still_streams_typed_empty_batch() {
     assert_eq!(schema.field(1).name(), "s");
 }
 
+const PORT_R: u16 = 50879;
+const W0_R: u16 = 50880;
+const W1_R: u16 = 50881;
+
+#[tokio::test]
+async fn distributed_sql_rank_window_result_is_signed_for_pyspark() {
+    // KAN-49 (SF10 Q36/44/49/67/70/86): DataFusion ranking windows produce UInt64, which
+    // Spark has no type for — PySpark aborts the Arrow stream with
+    // UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION. The SQL distributed path must normalize
+    // unsigned columns to signed exactly like the DataFrame path does.
+    const N: i64 = 100;
+    for (port, start, end) in [(W0_R, 0, N / 2), (W1_R, N / 2, N)] {
+        let e = Arc::new(Engine::new());
+        e.register_batches("t", vec![make_batch(start, end)])
+            .unwrap();
+        let ee = e.clone();
+        tokio::spawn(async move {
+            let _ = serve_worker(port, ee).await;
+        });
+    }
+
+    let store = Arc::new(AppStateStore::new());
+    let mut rx = store.subscribe();
+    let mut service = WeftService::with_store(store.clone());
+    service
+        .engine()
+        .register_batches("t", vec![make_batch(0, N)])
+        .unwrap();
+    service.workers = vec![
+        format!("http://127.0.0.1:{W0_R}"),
+        format!("http://127.0.0.1:{W1_R}"),
+    ];
+
+    tokio::spawn(async move {
+        let _ = weft_connect::serve_instance(service, PORT_R).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Window over an aggregate: rank emits UInt64 under DataFusion.
+    let sql = "SELECT k, s, RANK() OVER (ORDER BY s DESC) AS r \
+               FROM (SELECT k, SUM(v) AS s FROM t GROUP BY k) ORDER BY r";
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![make_batch(0, N)])
+        .unwrap();
+    let expected = single.sql(sql).await.unwrap();
+    let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
+
+    let mut client = connect(&format!("http://127.0.0.1:{PORT_R}")).await;
+    let batches = exec_sql(&mut client, sql).await;
+    let got_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(got_rows, expected_rows);
+
+    // The query must actually have gone distributed — a local fallback would be
+    // signed already and make this test vacuous.
+    let mut went_distributed = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::DistributedFallback { .. } => {
+                panic!("query fell back to local execution; test is vacuous")
+            }
+            ExecutionEvent::StageStarted { num_tasks, .. } if num_tasks >= 2 => {
+                went_distributed = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(went_distributed, "expected multi-task worker stages");
+
+    for b in &batches {
+        for f in b.schema().fields() {
+            assert!(
+                !matches!(
+                    f.data_type(),
+                    DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+                ),
+                "unsigned column `{}` ({:?}) reached the client; PySpark rejects it",
+                f.name(),
+                f.data_type()
+            );
+        }
+    }
+    let schema0 = batches[0].schema();
+    let r = &schema0.fields()[2];
+    assert_eq!(r.name(), "r");
+    assert_eq!(r.data_type(), &DataType::Int64, "rank maps to Spark long");
+}
+
 fn expr(t: sc::expression::ExprType) -> sc::Expression {
     sc::Expression {
         common: None,

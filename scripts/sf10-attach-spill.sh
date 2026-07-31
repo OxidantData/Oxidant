@@ -44,11 +44,16 @@ aws ec2 describe-instances --region "$REGION" \
     TARGET="ec2-user@$PRIV"
     EXTRA=(-o "ProxyCommand ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -W %h:%p ec2-user@$DRIVER_IP")
   fi
-  # wait for the device node, then format (if fresh) + mount
-  ssh -n "${SSH_OPTS[@]}" "${EXTRA[@]}" "$TARGET" '
+  # wait for the device node, then format (if fresh) + mount. Pick the unmounted disk
+  # matching SIZE_GIB exactly: NVMe enumeration order is racy after a stop/start, and a
+  # plain "largest unmounted" pick once grabbed a stale 100 GiB leftover instead of the
+  # fresh 200 GiB spill volume. ${EXTRA[@]+...} is the bash-3.2-safe empty-array form
+  # under `set -u` (macOS /bin/bash aborts on "${EXTRA[@]}" when EXTRA is empty).
+  WANT_BYTES=$(( SIZE_GIB * 1024 * 1024 * 1024 ))
+  ssh -n "${SSH_OPTS[@]}" ${EXTRA[@]+"${EXTRA[@]}"} "$TARGET" '
     set -e
     for i in $(seq 1 30); do
-      DEV=$(sudo lsblk -nrbo NAME,SIZE,TYPE,MOUNTPOINT | awk "\$3==\"disk\" && \$4==\"\" {print \$2, \"/dev/\" \$1}" | sort -rn | awk "NR==1 {print \$2}")
+      DEV=$(sudo lsblk -nrbo NAME,SIZE,TYPE,MOUNTPOINT | awk -v want='"$WANT_BYTES"' "\$3==\"disk\" && \$4==\"\" && \$2 >= want*0.99 && \$2 <= want*1.01 {print \"/dev/\" \$1; exit}")
       [ -n "$DEV" ] && break; sleep 2
     done
     [ -n "$DEV" ] || { echo "no unmounted spill device found"; exit 1; }

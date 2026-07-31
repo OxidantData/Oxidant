@@ -32,7 +32,10 @@ use std::sync::Arc;
 
 use datafusion::common::Column;
 use datafusion::logical_expr::expr::{BinaryExpr, WindowFunction, WindowFunctionDefinition};
-use datafusion::logical_expr::{Aggregate, Expr, JoinType, LogicalPlan, Operator, Union, Window};
+use datafusion::logical_expr::{
+    Aggregate, Expr, JoinType, LogicalPlan, Operator, Union, Window, WindowFrame, WindowFrameBound,
+    WindowFrameUnits,
+};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
@@ -43,9 +46,11 @@ use super::join_chain::{
 };
 use super::stage_planner::{
     aggregation_stages_for, base_tables, build_agg_remap, build_finalize, build_remap, column_name,
-    count_table_scans, distinct_stage_sql, expr_sql, extract_from_tail, peel, qualified_table_sql,
-    recombine_stage_sql, sanitize_generated_sql, simple_table_scan, unqualify, wrap_output,
-    AggSpec, DistributedQuery, Peeled,
+    count_table_scans, distinct_stage_sql, expr_sql, extract_from_tail, final_group_by_sql,
+    flatten_distinct_union, flattened_group_exprs, is_grouping_set, partial_and_combine_lists,
+    partial_combine_sql, peel, plan_distributed_logical, qualified_table_sql, recombine_stage_sql,
+    reject_unsafe_broadcast_shapes, resolve_grouping_specs, sanitize_generated_sql,
+    simple_table_scan, unqualify, wrap_output, AggSpec, DistributedQuery, Peeled,
 };
 use crate::driver::{scalar_literal_supported, ExchangeMode, StageDef, SCALAR_TOKEN};
 
@@ -376,24 +381,333 @@ fn window_stages_for(p: &WindowPeeled<'_>, replicated: &[&str]) -> Result<Distri
 ///    whole partition), then the window aggregate is computed locally and the query's
 ///    HAVING-equivalent filter / output projection are re-applied.
 ///
-/// Only a window sitting **directly** on a plain `Aggregate` is handled — `aggregation_stages_for`
-/// itself still enforces broadcast safety and rejects `ROLLUP`/`CUBE`/`GROUPING SETS`, DISTINCT
-/// over 2+ sharded tables needing a join chain, etc., so those surface as their own specific
-/// [`Error::Unsupported`] reasons. A window over a `UNION`/`DISTINCT` of aggregates (TPC-DS Q36)
-/// is out of scope here and rejected explicitly.
+/// **Stacked windows** (KAN-49a, TPC-DS Q47/Q57): several `WindowAggr` nodes may layer over the
+/// same aggregate — e.g. a `rank() OVER (PARTITION BY g ORDER BY …)` feeding an
+/// `avg(…) OVER (PARTITION BY g')`. Step 3 repeats per layer, innermost first: each layer's
+/// input is re-shuffled by *its* `PARTITION BY` columns (ranking included — a `rank()`/`dense_rank()`/
+/// `row_number()` over a co-located partition is exact, the same argument that makes partition-wide
+/// aggregate windows exact), earlier `w{k}` columns pass through, and the outermost layer applies
+/// the query's HAVING-equivalent filter / output projection.
+///
+/// **KAN-49b extensions** (TPC-DS Q36/Q44/Q51/Q67/Q70/Q86):
+///
+/// - The window no longer has to sit *directly* on the `Aggregate`: `SubqueryAlias` /
+///   `Projection` layers between them fold into the remap, and a `Filter` there is a
+///   HAVING-equivalent that applies on the combine stage's output before any window computes.
+/// - **ROLLUP / CUBE / GROUPING SETS** aggregates compose (Q67/Q70/Q86): the ordinary machinery
+///   already gathers finest-level partials to one partition and reconstructs every rollup level
+///   there (`grouping()` outputs included — recomputed against the combine's real
+///   `GROUP BY ROLLUP`); the window then re-shuffles the tiny combined output by its
+///   `PARTITION BY` key. Super-aggregate rows carry NULL grouping columns, and NULL keys
+///   hash-consistently land on one partition, so per-partition window semantics match
+///   single-node exactly.
+/// - **Expression partition keys** (`PARTITION BY grouping(a)+grouping(b), CASE WHEN … THEN a
+///   END` — Q70/Q86) materialize as computed columns on the producer stage so the shuffle can
+///   hash them.
+/// - **Global ranking windows** (no `PARTITION BY` — Q44): the tiny post-aggregate result
+///   gathers to partition 0 (a post-aggregation gather — strict mode only forbids gathering the
+///   raw sharded fact) and the global `rank()` computes there.
+/// - **Framed aggregate windows** (`sum(x) OVER (… ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING
+///   AND CURRENT ROW)` — Q51): any frame is exact on a co-located partition, so the frame is
+///   re-emitted into the window stage's `OVER` clause.
+/// - A HAVING-equivalent carrying an **uncorrelated scalar subquery over the sharded fact**
+///   (Q44) plans the subquery as its own partial/combine pair whose one-row output gathers to
+///   partition 0 and rides the window stage as an extra co-located input (see
+///   [`plan_scalar_having_stream`]).
+/// - An **uncorrelated `IN` subquery over the sharded fact** in the aggregate's input filter
+///   (Q70) plans as a co-located key stream semi-filtering a scan-export stage (see
+///   [`agg_pipeline_with_in_producer`]).
+///
+/// A window over a distributable `UNION` of aggregates (TPC-DS Q36) or over a `FULL OUTER JOIN`
+/// of two windowed aggregates (TPC-DS Q51) routes to its own composition
+/// ([`window_over_distinct_union_stages_for`] / [`window_over_join_stages_for`]).
 fn window_over_aggregate_stages_for(
     p: &WindowPeeled<'_>,
     replicated: &[&str],
 ) -> Result<DistributedQuery> {
-    let w = p.window;
-    let LogicalPlan::Aggregate(agg) = w.input.as_ref() else {
-        return Err(Error::Unsupported(
-            "auto-distribute: window over an aggregation is only supported when the window sits \
-             directly over a GROUP BY (no UNION / DISTINCT underneath it)"
-                .into(),
-        ));
+    // Collect the stack of window layers between the peeled top and the aggregate, outermost
+    // first (`windows[0]` is `p.window`).
+    let mut windows: Vec<&Window> = vec![p.window];
+    let mut node = p.window.input.as_ref();
+    while let LogicalPlan::Window(inner) = node {
+        windows.push(inner);
+        node = inner.input.as_ref();
+    }
+    // KAN-49b: look through `SubqueryAlias` / `Projection` / `Filter` layers between the
+    // innermost window and the aggregate (Q44/Q67). Projections only rename aggregate outputs
+    // on the way up and fold into the remap; a Filter there is a HAVING-equivalent that must
+    // apply before any window computes.
+    let mut between_projections: Vec<&[Expr]> = Vec::new();
+    let mut between_filters: Vec<&Expr> = Vec::new();
+    let agg = loop {
+        match node {
+            LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
+            LogicalPlan::Projection(proj) => {
+                if windows.len() == 1
+                    && between_projections.is_empty()
+                    && between_filters.is_empty()
+                    && matches!(proj.input.as_ref(), LogicalPlan::Join(_))
+                {
+                    // TPC-DS Q51: framed windows over a FULL OUTER JOIN of windowed aggregates.
+                    return window_over_join_stages_for(p, windows[0], proj, replicated);
+                }
+                between_projections.push(proj.expr.as_slice());
+                node = proj.input.as_ref();
+            }
+            LogicalPlan::Filter(f) => {
+                between_filters.push(f.predicate.as_ref());
+                node = f.input.as_ref();
+            }
+            LogicalPlan::Distinct(_)
+                if windows.len() == 1
+                    && between_projections.is_empty()
+                    && between_filters.is_empty() =>
+            {
+                // TPC-DS Q36: a ranking window over a UNION sharing one aggregate CTE.
+                return window_over_distinct_union_stages_for(p, windows[0], node, replicated);
+            }
+            LogicalPlan::Aggregate(agg) => break agg,
+            _ => {
+                return Err(Error::Unsupported(
+                    "auto-distribute: window over an aggregation is only supported when the \
+                     window sits over a GROUP BY (possibly through renames / a HAVING filter), \
+                     a distributable UNION of aggregates, or a join of windowed aggregates"
+                        .into(),
+                ));
+            }
+        }
     };
 
+    // Pre-window HAVING-equivalent conjuncts (Q44). Conjuncts carrying an uncorrelated scalar
+    // subquery over the sharded fact cannot evaluate per-partition (each partition would see
+    // only its shard's scalar); they become co-located one-row streams the window stage reads
+    // as extra inputs. Subquery-free conjuncts ride the combine stage as ordinary HAVING.
+    let mut having_conjuncts: Vec<&Expr> = Vec::new();
+    for f in &between_filters {
+        flatten_conjuncts(f, &mut having_conjuncts);
+    }
+    let scalar_having = having_conjuncts.iter().any(|c| expr_contains_subquery(c));
+
+    // One PARTITION BY per layer (mixed clauses within a layer stay rejected). A *global*
+    // layer (no PARTITION BY) is admitted when every window function in it is a ranking
+    // function — the tiny post-aggregate result gathers to partition 0 and the global rank
+    // computes there (Q44); aggregate windows still require a shuffle key.
+    let mut partition_bys: Vec<Vec<Expr>> = Vec::with_capacity(windows.len());
+    for w in &windows {
+        partition_bys.push(validate_window_layer(w)?);
+    }
+    if scalar_having && (windows.len() > 1 || partition_bys.iter().any(|pb| !pb.is_empty())) {
+        return Err(Error::Unsupported(
+            "auto-distribute: window over an aggregation: a HAVING carrying a scalar subquery \
+             over the sharded fact is only supported under a single global (no PARTITION BY) \
+             ranking window — the scalar stream lands on partition 0 only"
+                .into(),
+        ));
+    }
+
+    let up = Unparser::default();
+    // Plan the scalar subquery stream(s) first: their stage ids slot between the aggregation
+    // pipeline and the window stage (rebased on insertion), and the rewritten HAVING references
+    // them positionally as `shuffle_input_{1+i}` (the window stage's upstream list is
+    // [producer, streams…]).
+    let mut scalar_streams: Vec<Vec<StageDef>> = Vec::new();
+    let mut window_having_sql: Vec<String> = Vec::new();
+    if scalar_having {
+        let remap = build_window_over_agg_remap(agg, &[], &between_projections);
+        for c in &having_conjuncts {
+            let rewritten =
+                rewrite_scalar_having_conjunct(&up, c, &remap, replicated, &mut scalar_streams)?;
+            window_having_sql.push(format!("({rewritten})"));
+        }
+    }
+
+    // The base partial→combine pipeline. Q70's uncorrelated `IN` subquery over the sharded
+    // fact in the aggregate's input filter splits out into a co-located key stream plus a
+    // scan-export / semi composition; everything else reuses the ordinary aggregation planner
+    // verbatim: a no-projection/no-sort/no-limit `Peeled` makes its final stage emit the raw
+    // `g{j}`/`r{i}` row (`SELECT * FROM (…) AS combined`) instead of aliasing back to source
+    // names, which is exactly the input the window stage below needs. This also gets broadcast
+    // safety, ROLLUP handling, and (if ever needed) the shuffle-join-chain / DISTINCT paths
+    // for free, without duplicating any of that logic here.
+    let mut dq = if let Some(split) = split_in_subquery_from_agg_input(agg, replicated)? {
+        agg_pipeline_with_in_producer(agg, &split, replicated)?
+    } else {
+        let synthetic = Peeled {
+            projection: None,
+            sort: None,
+            limit: None,
+            having: if scalar_having {
+                Vec::new()
+            } else {
+                having_conjuncts.clone()
+            },
+            alias_projections: between_projections.clone(),
+            agg,
+        };
+        aggregation_stages_for(&synthetic, replicated)?
+    };
+    // Scalar stream stages go after the base pipeline (they are leaves / tiny combines) and
+    // before the window stage that consumes them; ids rebase onto the pipeline's numbering.
+    // The window layers' first producer is the base pipeline's *terminal* stage, which stops
+    // being `stages.last()` once the streams are appended — capture its id now.
+    let base_terminal_id = dq
+        .stages
+        .last()
+        .ok_or_else(|| {
+            Error::Unsupported("auto-distribute: window-over-aggregate produced no stages".into())
+        })?
+        .stage_id;
+    let mut scalar_combine_ids: Vec<u32> = Vec::new();
+    for stages in scalar_streams {
+        let offset = dq.stages.iter().map(|s| s.stage_id).max().unwrap_or(0) + 1;
+        for mut s in stages {
+            s.stage_id += offset;
+            for u in &mut s.upstream_stage_ids {
+                *u += offset;
+            }
+            dq.stages.push(s);
+        }
+        scalar_combine_ids.push(dq.stages.last().expect("scalar combine appended").stage_id);
+    }
+
+    let n_group = flattened_group_exprs(&agg.group_expr).len();
+    let base_remap = build_window_over_agg_remap(agg, &[], &between_projections);
+    let mut stage_cols: Vec<String> = (0..n_group).map(|j| format!("g{j}")).collect();
+    stage_cols.extend((0..agg.aggr_expr.len()).map(|i| format!("r{i}")));
+
+    // Each layer re-shuffles its input by its own PARTITION BY (the previous stage's hash key is
+    // re-targeted, exactly like the single-window combine retarget below) and computes locally.
+    let mut next_w = 0usize;
+    let mut next_c = 0usize;
+    let mut chained_exprs: Vec<Expr> = Vec::new();
+    let n_layers = windows.len();
+    let mut producer_stage_id = base_terminal_id;
+    for (depth, w) in windows.iter().rev().enumerate() {
+        let partition_by = &partition_bys[n_layers - 1 - depth];
+        let mut layer_remap =
+            build_window_over_agg_remap(agg, &chained_exprs, &between_projections);
+        // Map each partition key to a producer output column. An *expression* key (Q70/Q86's
+        // `grouping(a)+grouping(b)`, `CASE WHEN grouping(b)=0 THEN a END`) materializes as a
+        // computed column appended to the producer stage's SELECT so the shuffle can hash it.
+        let mut hash_key_cols: Vec<u32> = Vec::with_capacity(partition_by.len());
+        let mut computed: Vec<(String, String)> = Vec::new();
+        for e in partition_by.iter() {
+            if let Expr::Column(c) = e {
+                if let Some(idx) = base_remap
+                    .get(&c.flat_name())
+                    .or_else(|| base_remap.get(&c.name))
+                    .and_then(|name| remap_name_to_index(name, n_group))
+                {
+                    hash_key_cols.push(idx);
+                    continue;
+                }
+            }
+            let mapped = remap_expr_columns(e, &layer_remap);
+            ensure_all_window_columns_remapped(&mapped).map_err(|_| {
+                Error::Unsupported(format!(
+                    "auto-distribute: window over an aggregation: PARTITION BY expression `{e}` \
+                     does not map to group, aggregate, or window output columns"
+                ))
+            })?;
+            let name = format!("c{next_c}");
+            next_c += 1;
+            hash_key_cols.push((stage_cols.len() + computed.len()) as u32);
+            layer_remap.insert(e.schema_name().to_string(), name.clone());
+            computed.push((expr_sql(&up, &mapped)?, name));
+        }
+
+        // The producer stage (the aggregate's combine for the innermost layer, the previous
+        // window stage otherwise) currently has an empty hash key because it expected to be the
+        // terminal stage. Re-target it at this layer's partition columns so the window stage
+        // below sees whole partitions — or, for a global layer, leave it empty: everything
+        // gathers to partition 0 and the global rank computes there.
+        let producer = dq
+            .stages
+            .iter_mut()
+            .find(|s| s.stage_id == producer_stage_id)
+            .ok_or_else(|| {
+                Error::Unsupported(
+                    "auto-distribute: window-over-aggregate produced no stages".into(),
+                )
+            })?;
+        if !computed.is_empty() {
+            let extra = computed
+                .iter()
+                .map(|(sql, name)| format!("{sql} AS {name}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            producer.sql = sanitize_generated_sql(&format!(
+                "SELECT *, {extra} FROM ({}) AS keyed_in",
+                producer.sql
+            ));
+            stage_cols.extend(computed.iter().map(|(_, name)| name.clone()));
+        }
+        if !partition_by.is_empty() {
+            producer.hash_key_cols = hash_key_cols;
+        }
+        let producer_id = producer.stage_id;
+
+        chained_exprs.extend(w.window_expr.iter().cloned());
+        let is_outermost = depth + 1 == n_layers;
+        // A scalar-bearing pre-window HAVING (Q44) filters the combine output on the window
+        // stage's own input, where the co-located scalar stream is visible (partition 0).
+        let (from, upstreams) = if is_outermost && !window_having_sql.is_empty() {
+            let from = format!(
+                "(SELECT * FROM shuffle_input_0 WHERE {}) AS having_in",
+                window_having_sql.join(" AND ")
+            );
+            let mut ups = vec![producer_id];
+            ups.extend(scalar_combine_ids.iter().copied());
+            (from, ups)
+        } else {
+            ("shuffle_input".to_string(), vec![producer_id])
+        };
+        let window_inner =
+            build_window_over_agg_inner(w, &layer_remap, &stage_cols, &mut next_w, &from)?;
+        stage_cols.extend(
+            (0..w.window_expr.len()).map(|k| format!("w{}", next_w - w.window_expr.len() + k)),
+        );
+
+        let window_sql = if is_outermost {
+            let mut projections = between_projections.clone();
+            projections.extend(p.alias_projections.iter().copied());
+            let full_remap = build_window_over_agg_remap(agg, &chained_exprs, &projections);
+            wrap_window_over_agg_output(p, &window_inner, &full_remap)?
+        } else {
+            window_inner
+        };
+
+        let next_id = dq.stages.iter().map(|s| s.stage_id).max().unwrap_or(0) + 1;
+        dq.stages
+            .push(StageDef::new(next_id, window_sql, upstreams, vec![]));
+        producer_stage_id = next_id;
+    }
+    dq.finalize_sql = build_outer_finalize(p.sort, p.limit)?;
+    Ok(dq)
+}
+
+/// Validate one window layer's expressions and return its shared `PARTITION BY`.
+///
+/// Two expression classes distribute exactly over a partition-co-located input:
+///
+/// - **partition-wide aggregate windows** (`sum`/`count`/`min`/`max`/`avg` with no `DISTINCT`,
+///   no `FILTER`) — the original supported class. An `ORDER BY` with an explicit frame (Q51's
+///   cumulative `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`) is also exact: the whole
+///   partition is co-located, so the local framed evaluation *is* the global one.
+/// - **ranking windows** (`rank`/`dense_rank`/`row_number`) — each partition's rows are wholly
+///   on one worker after the hash shuffle, so the local ranking is the global ranking. Their
+///   `ORDER BY` is emitted into the `OVER` clause.
+///
+/// A global layer (empty `PARTITION BY`) is admitted only when every window function in it is a
+/// ranking function: the layer's input then gathers to partition 0 (a tiny post-aggregate
+/// result — never the raw fact) and the global rank computes there (TPC-DS Q44). A global
+/// aggregate window keeps the plain "no shuffle key" rejection.
+fn validate_window_layer(w: &Window) -> Result<Vec<Expr>> {
+    if w.window_expr.is_empty() {
+        return Err(Error::Unsupported(
+            "auto-distribute: window plan has no window expressions".into(),
+        ));
+    }
     let mut partition_by: Option<Vec<Expr>> = None;
     for e in &w.window_expr {
         let Expr::WindowFunction(wf) = e else {
@@ -401,7 +715,7 @@ fn window_over_aggregate_stages_for(
                 "auto-distribute: non-window expression in window list: {e}"
             )));
         };
-        validate_window_func(wf)?;
+        validate_window_over_agg_func(wf)?;
         match &partition_by {
             None => partition_by = Some(wf.params.partition_by.clone()),
             Some(prev) if prev == &wf.params.partition_by => {}
@@ -414,66 +728,67 @@ fn window_over_aggregate_stages_for(
     }
     let partition_by = partition_by.unwrap_or_default();
     if partition_by.is_empty() {
+        let all_ranking = w.window_expr.iter().all(|e| match e {
+            Expr::WindowFunction(wf) => window_func_name(wf)
+                .is_some_and(|n| matches!(n.as_str(), "rank" | "dense_rank" | "row_number")),
+            _ => false,
+        });
+        if !all_ranking {
+            return Err(Error::Unsupported(
+                "auto-distribute: window without PARTITION BY cannot be distributed \
+                 (no partition shuffle key) — falling back to local execution"
+                    .into(),
+            ));
+        }
+    }
+    Ok(partition_by)
+}
+
+/// The lowercased function name of a window expression.
+fn window_func_name(wf: &WindowFunction) -> Option<String> {
+    Some(match &wf.fun {
+        WindowFunctionDefinition::AggregateUDF(f) => f.name().to_ascii_lowercase(),
+        WindowFunctionDefinition::WindowUDF(f) => f.name().to_ascii_lowercase(),
+    })
+}
+
+/// One window expression in a window-over-aggregate layer: a partition-wide aggregate window or a
+/// ranking window (see [`validate_window_layer]).
+fn validate_window_over_agg_func(wf: &WindowFunction) -> Result<()> {
+    let Some(name) = window_func_name(wf) else {
         return Err(Error::Unsupported(
-            "auto-distribute: window without PARTITION BY cannot be distributed \
-             (no partition shuffle key) — falling back to local execution"
-                .into(),
+            "auto-distribute: unsupported window function definition".into(),
+        ));
+    };
+    let ranking = matches!(name.as_str(), "rank" | "dense_rank" | "row_number");
+    if !ranking && !matches!(name.as_str(), "sum" | "count" | "min" | "max" | "avg") {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: window function `{name}` is not supported for distribution \
+             (only SUM/COUNT/MIN/MAX/AVG aggregate windows and RANK/DENSE_RANK/ROW_NUMBER)"
+        )));
+    }
+    if wf.params.distinct {
+        return Err(Error::Unsupported(
+            "auto-distribute: DISTINCT window aggregates are not supported".into(),
         ));
     }
-
-    // Reuse the ordinary aggregation planner verbatim for the partial→combine pipeline: a
-    // no-projection/no-HAVING/no-sort/no-limit `Peeled` makes its final stage emit the raw
-    // `g{j}`/`r{i}` row (`SELECT * FROM (…) AS combined`) instead of aliasing back to source
-    // names, which is exactly the input the window stage below needs. This also gets broadcast
-    // safety, ROLLUP rejection, and (if ever needed) the shuffle-join-chain / DISTINCT paths for
-    // free, without duplicating any of that logic here.
-    let synthetic = Peeled {
-        projection: None,
-        sort: None,
-        limit: None,
-        having: Vec::new(),
-        alias_projections: Vec::new(),
-        agg,
-    };
-    let mut dq = aggregation_stages_for(&synthetic, replicated)?;
-
-    let n_group = agg.group_expr.len();
-    let agg_remap = build_agg_remap(agg);
-    let hash_key_cols: Vec<u32> = partition_by
-        .iter()
-        .map(|e| {
-            let key = e.schema_name().to_string();
-            agg_remap
-                .get(&key)
-                .and_then(|name| remap_name_to_index(name, n_group))
-                .ok_or_else(|| {
-                    Error::Unsupported(format!(
-                        "auto-distribute: window PARTITION BY column `{key}` does not map to a \
-                         group or aggregate output column"
-                    ))
-                })
-        })
-        .collect::<Result<_>>()?;
-
-    // The combine stage (last stage `aggregation_stages_for` produced — stage 1 for the common
-    // single-sharded-table broadcast case, or the tail of a shuffle-join chain) currently has an
-    // empty hash key because it expected to be the terminal stage. Re-target it at the window's
-    // partition columns so the window stage below sees whole partitions.
-    let combine = dq.stages.last_mut().ok_or_else(|| {
-        Error::Unsupported("auto-distribute: window-over-aggregate produced no stages".into())
-    })?;
-    combine.hash_key_cols = hash_key_cols;
-    let combine_id = combine.stage_id;
-
-    let window_inner = build_window_over_agg_inner(w, agg, &agg_remap)?;
-    let full_remap = build_window_over_agg_remap(agg, &w.window_expr, &p.alias_projections);
-    let window_sql = wrap_window_over_agg_output(p, &window_inner, &full_remap)?;
-
-    let next_id = dq.stages.iter().map(|s| s.stage_id).max().unwrap_or(0) + 1;
-    dq.stages
-        .push(StageDef::new(next_id, window_sql, vec![combine_id], vec![]));
-    dq.finalize_sql = build_outer_finalize(p.sort, p.limit)?;
-    Ok(dq)
+    if wf.params.filter.is_some() {
+        return Err(Error::Unsupported(
+            "auto-distribute: FILTER on window functions is not supported".into(),
+        ));
+    }
+    if !ranking && !wf.params.order_by.is_empty() {
+        // A framed aggregate window is exact on a co-located partition, but only frames the
+        // worker dialect can re-parse are admitted (ROWS / RANGE with renderable bounds).
+        window_frame_sql(&wf.params.window_frame)?.ok_or_else(|| {
+            Error::Unsupported(
+                "auto-distribute: window frame is not supported \
+                 (only ROWS / RANGE with unbounded or constant bounds)"
+                    .into(),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Parse a [`build_agg_remap`] value (`"g{j}"` / `"r{i}"`) into its position in the combine
@@ -488,62 +803,1081 @@ fn remap_name_to_index(name: &str, n_group: usize) -> Option<u32> {
     }
 }
 
-/// The window stage's own `SELECT`: every combine-stage column passed through unchanged, plus one
-/// `w{k}` per window expression. `validate_window_func` has already rejected DISTINCT / FILTER /
-/// ORDER BY, so each window function is exactly `func(arg?) OVER (PARTITION BY …)` — safe to
-/// re-emit as plain SQL text once `arg` and the partition columns are remapped to `g{j}`/`r{i}`.
+/// The window stage's own `SELECT`: every producer-stage column passed through unchanged, plus
+/// one `w{k}` per window expression (numbered by `next_w`, so stacked layers keep unique names).
+/// `validate_window_over_agg_func` has already classified each expression, so each is either a
+/// partition-wide (or framed) aggregate window `func(arg?) OVER (…)` or a ranking window
+/// `rank() OVER (… ORDER BY …)` — safe to re-emit as plain SQL text once `arg`, the partition
+/// columns, and the ordering columns are remapped to stage column names. `from` is the stage's
+/// input reference: plain `shuffle_input`, or a filtering subquery when a pre-window HAVING
+/// applies on this stage (Q44's scalar threshold).
 fn build_window_over_agg_inner(
     w: &Window,
-    agg: &Aggregate,
     remap: &HashMap<String, String>,
+    stage_cols: &[String],
+    next_w: &mut usize,
+    from: &str,
 ) -> Result<String> {
-    let n_group = agg.group_expr.len();
-    let n_agg = agg.aggr_expr.len();
-    let mut cols: Vec<String> = (0..n_group).map(|j| format!("g{j}")).collect();
-    cols.extend((0..n_agg).map(|i| format!("r{i}")));
-
-    for (k, e) in w.window_expr.iter().enumerate() {
+    let mut cols: Vec<String> = stage_cols.to_vec();
+    for e in w.window_expr.iter() {
         let Expr::WindowFunction(wf) = e else {
             return Err(Error::Unsupported(format!(
                 "auto-distribute: non-window expression in window list: {e}"
             )));
         };
-        let func_name = match &wf.fun {
-            WindowFunctionDefinition::AggregateUDF(f) => f.name().to_ascii_lowercase(),
-            WindowFunctionDefinition::WindowUDF(f) => f.name().to_ascii_lowercase(),
-        };
+        let func_name = window_func_name(wf).ok_or_else(|| {
+            Error::Unsupported("auto-distribute: unsupported window function definition".into())
+        })?;
+        let ranking = matches!(func_name.as_str(), "rank" | "dense_rank" | "row_number");
         let arg_sql = match wf.params.args.first() {
             Some(arg) => {
-                let key = arg.schema_name().to_string();
-                remap.get(&key).cloned().ok_or_else(|| {
-                    Error::Unsupported(format!(
-                        "auto-distribute: window argument `{key}` does not map to a group or \
-                         aggregate output column"
-                    ))
-                })?
+                if let Expr::Column(c) = arg {
+                    if let Some(mapped) = remap.get(&c.flat_name()).or_else(|| remap.get(&c.name)) {
+                        mapped.clone()
+                    } else {
+                        let key = arg.schema_name().to_string();
+                        remap.get(&key).cloned().ok_or_else(|| {
+                            Error::Unsupported(format!(
+                                "auto-distribute: window argument `{key}` does not map to a \
+                                 group or aggregate output column"
+                            ))
+                        })?
+                    }
+                } else {
+                    let key = arg.schema_name().to_string();
+                    remap.get(&key).cloned().ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "auto-distribute: window argument `{key}` does not map to a group or \
+                             aggregate output column"
+                        ))
+                    })?
+                }
             }
             None => "1".to_string(), // count(*)-style window carries no arg
+        };
+        let map_col = |e: &Expr| -> Result<String> {
+            if let Expr::Column(c) = e {
+                if let Some(mapped) = remap.get(&c.flat_name()).or_else(|| remap.get(&c.name)) {
+                    return Ok(mapped.clone());
+                }
+            }
+            let key = e.schema_name().to_string();
+            remap.get(&key).cloned().ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "auto-distribute: window column `{key}` does not map to a group or aggregate \
+                     output column"
+                ))
+            })
         };
         let part_sql: Vec<String> = wf
             .params
             .partition_by
             .iter()
-            .map(|pb| {
-                let key = pb.schema_name().to_string();
-                remap.get(&key).cloned().ok_or_else(|| {
-                    Error::Unsupported(format!(
-                        "auto-distribute: window PARTITION BY column `{key}` does not map to a \
-                         group or aggregate output column"
-                    ))
-                })
-            })
+            .map(map_col)
             .collect::<Result<_>>()?;
-        cols.push(format!(
-            "{func_name}({arg_sql}) OVER (PARTITION BY {}) AS w{k}",
-            part_sql.join(", ")
+        let mut over = String::new();
+        if !part_sql.is_empty() {
+            over.push_str(&format!("PARTITION BY {}", part_sql.join(", ")));
+        }
+        if !wf.params.order_by.is_empty() {
+            let order_sql: Vec<String> = wf
+                .params
+                .order_by
+                .iter()
+                .map(|s| {
+                    let dir = if s.asc { "ASC" } else { "DESC" };
+                    let nulls = if s.nulls_first {
+                        "NULLS FIRST"
+                    } else {
+                        "NULLS LAST"
+                    };
+                    Ok(format!("{} {dir} {nulls}", map_col(&s.expr)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !over.is_empty() {
+                over.push(' ');
+            }
+            over.push_str(&format!("ORDER BY {}", order_sql.join(", ")));
+            // A framed aggregate window keeps its frame (exact on a co-located partition);
+            // ranking windows never need one emitted.
+            if !ranking {
+                if let Some(frame) = window_frame_sql(&wf.params.window_frame)? {
+                    over.push(' ');
+                    over.push_str(&frame);
+                }
+            }
+        }
+        let call = if wf.params.args.is_empty() {
+            format!("{func_name}()")
+        } else {
+            format!("{func_name}({arg_sql})")
+        };
+        cols.push(format!("{call} OVER ({over}) AS w{next_w}"));
+        *next_w += 1;
+    }
+    Ok(format!("SELECT {} FROM {from}", cols.join(", ")))
+}
+
+/// Render a window frame as SQL text the worker dialect re-parses, or `Ok(None)` when the frame
+/// is outside the renderable set (GROUPS units, non-constant offsets) and the caller must
+/// decline.
+fn window_frame_sql(frame: &WindowFrame) -> Result<Option<String>> {
+    let units = match frame.units {
+        WindowFrameUnits::Rows => "ROWS",
+        WindowFrameUnits::Range => "RANGE",
+        WindowFrameUnits::Groups => return Ok(None),
+    };
+    let bound = |b: &WindowFrameBound| -> Result<Option<String>> {
+        Ok(Some(match b {
+            WindowFrameBound::CurrentRow => "CURRENT ROW".to_string(),
+            WindowFrameBound::Preceding(v) if v.is_null() => "UNBOUNDED PRECEDING".to_string(),
+            WindowFrameBound::Following(v) if v.is_null() => "UNBOUNDED FOLLOWING".to_string(),
+            WindowFrameBound::Preceding(v) => match window_frame_offset(v) {
+                Some(off) => format!("{off} PRECEDING"),
+                None => return Ok(None),
+            },
+            WindowFrameBound::Following(v) => match window_frame_offset(v) {
+                Some(off) => format!("{off} FOLLOWING"),
+                None => return Ok(None),
+            },
+        }))
+    };
+    let (Some(start), Some(end)) = (bound(&frame.start_bound)?, bound(&frame.end_bound)?) else {
+        return Ok(None);
+    };
+    Ok(Some(format!("{units} BETWEEN {start} AND {end}")))
+}
+
+/// A constant frame offset as SQL text (integers and plain numerics only).
+fn window_frame_offset(v: &ScalarValue) -> Option<String> {
+    match v {
+        ScalarValue::UInt8(Some(x)) => Some(x.to_string()),
+        ScalarValue::UInt16(Some(x)) => Some(x.to_string()),
+        ScalarValue::UInt32(Some(x)) => Some(x.to_string()),
+        ScalarValue::UInt64(Some(x)) => Some(x.to_string()),
+        ScalarValue::Int8(Some(x)) if *x >= 0 => Some(x.to_string()),
+        ScalarValue::Int16(Some(x)) if *x >= 0 => Some(x.to_string()),
+        ScalarValue::Int32(Some(x)) if *x >= 0 => Some(x.to_string()),
+        ScalarValue::Int64(Some(x)) if *x >= 0 => Some(x.to_string()),
+        _ => None,
+    }
+}
+
+/// Rewrite one scalar-subquery-bearing HAVING conjunct (Q44's
+/// `avg(x) > 0.9 * (SELECT avg(x) … GROUP BY key-pinned-to-a-literal)`) for evaluation on the
+/// window stage's input: the subquery is planned as a co-located one-row stream (appended to
+/// `streams`) and replaced in the predicate text by `(SELECT m0 FROM shuffle_input_{1+i})` —
+/// position `1+i` in the window stage's upstream list, after the combine producer. The stream
+/// gathers to partition 0; on every other partition both the stream and the (gather-keyed)
+/// combine are empty, so the window stage produces nothing there. A zero-row stream reads as
+/// NULL, matching single-node scalar-subquery-no-rows semantics.
+fn rewrite_scalar_having_conjunct(
+    up: &Unparser,
+    conjunct: &Expr,
+    remap: &HashMap<String, String>,
+    replicated: &[&str],
+    streams: &mut Vec<Vec<StageDef>>,
+) -> Result<String> {
+    use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+
+    // Find the scalar subqueries in the conjunct (exactly one supported per conjunct).
+    let mut found: Vec<Expr> = Vec::new();
+    let _ = conjunct.clone().apply(|node| {
+        if matches!(node, Expr::ScalarSubquery(_)) {
+            found.push(node.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    if found.is_empty() {
+        let mapped = remap_expr_columns(conjunct, remap);
+        return expr_sql(up, &mapped);
+    }
+    if found.len() > 1 {
+        return Err(Error::Unsupported(
+            "auto-distribute: window over an aggregation: multiple scalar subqueries in one \
+             HAVING conjunct are not supported"
+                .into(),
         ));
     }
-    Ok(format!("SELECT {} FROM shuffle_input", cols.join(", ")))
+
+    let stream = plan_scalar_having_stream(
+        match &found[0] {
+            Expr::ScalarSubquery(s) => s.subquery.as_ref(),
+            _ => unreachable!("matched ScalarSubquery above"),
+        },
+        replicated,
+    )?
+    .ok_or_else(|| {
+        Error::Unsupported(
+            "auto-distribute: window over an aggregation: the HAVING's scalar subquery is not \
+             an uncorrelated single-aggregate query over the sharded fact with every GROUP BY \
+             key pinned to a literal"
+                .into(),
+        )
+    })?;
+    let input_pos = streams.len() + 1;
+    streams.push(stream);
+
+    // Replace the subquery with a token, remap columns to stage names, then substitute the
+    // co-located stream reference for the token in the rendered SQL.
+    let token = format!("__WEFT_SCALAR_STREAM_{}__", input_pos - 1);
+    let replaced = conjunct
+        .clone()
+        .transform(|node| {
+            if matches!(node, Expr::ScalarSubquery(_)) {
+                return Ok(Transformed::yes(Expr::Literal(
+                    ScalarValue::Utf8(Some(token.clone())),
+                    None,
+                )));
+            }
+            Ok(Transformed::no(node))
+        })
+        .map(|t| t.data)
+        .map_err(|e| Error::Unsupported(format!("auto-distribute: rewrite scalar HAVING: {e}")))?;
+    let mapped = remap_expr_columns(&replaced, remap);
+    let sql = expr_sql(up, &mapped)?;
+    Ok(sql.replace(
+        &format!("'{token}'"),
+        &format!("(SELECT m0 FROM shuffle_input_{input_pos})"),
+    ))
+}
+
+/// Plan an uncorrelated scalar subquery from a window branch's HAVING as a partial/combine
+/// stage pair whose one-row `m0` output gathers to partition 0 (empty hash key).
+///
+/// Shape (anything else returns `Ok(None)`): at most one single-expression projection layer
+/// over a single non-DISTINCT min/max/sum/count/avg aggregate; no correlation; the aggregate's
+/// `GROUP BY` keys are each pinned to a literal by an equality in the subquery's WHERE (so the
+/// stream yields at most one row — Q44's `GROUP BY ss_store_sk` with `ss_store_sk = 4`); the
+/// body scans exactly one sharded table exactly once with every other table replicated.
+fn plan_scalar_having_stream(
+    subquery: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<Option<Vec<StageDef>>> {
+    let mut sp = subquery;
+    while let LogicalPlan::SubqueryAlias(s) = sp {
+        sp = s.input.as_ref();
+    }
+    // One optional projection layer: a bare passthrough / rename of the aggregate output.
+    if let LogicalPlan::Projection(pj) = sp {
+        if pj.expr.len() != 1 {
+            return Ok(None);
+        }
+        if !matches!(strip_alias(&pj.expr[0]), Expr::Column(_)) {
+            return Ok(None);
+        }
+        sp = pj.input.as_ref();
+    }
+    let LogicalPlan::Aggregate(sub_agg) = sp else {
+        return Ok(None);
+    };
+    if sub_agg.aggr_expr.len() != 1 || plan_contains_outer_reference(subquery) {
+        return Ok(None);
+    }
+    let spec = match AggSpec::classify(&sub_agg.aggr_expr[0]) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    if spec.distinct || !matches!(spec.func.as_str(), "min" | "max" | "sum" | "count" | "avg") {
+        return Ok(None);
+    }
+
+    // The WHERE conjuncts must all be inner-only predicates over the subquery's own FROM body.
+    let mut preds: Vec<&Expr> = Vec::new();
+    let mut body: &LogicalPlan = sub_agg.input.as_ref();
+    while let LogicalPlan::Filter(f) = body {
+        flatten_conjuncts(&f.predicate, &mut preds);
+        body = f.input.as_ref();
+    }
+    if plan_has_filter_or_subquery_expr(body) {
+        return Ok(None);
+    }
+    let scope = PlanScope::of(body);
+    for conjunct in &preds {
+        let mut cols = Vec::new();
+        expr_columns_tagged(conjunct, &mut cols);
+        if !cols
+            .iter()
+            .all(|(c, is_outer)| !is_outer && scope.contains(c))
+        {
+            return Ok(None);
+        }
+    }
+    let mut arg_cols = Vec::new();
+    expr_columns(&sub_agg.aggr_expr[0], &mut arg_cols);
+    if !arg_cols.iter().all(|c| scope.contains(c)) {
+        return Ok(None);
+    }
+
+    // Every GROUP BY key must be pinned to a literal by an equality conjunct, guaranteeing the
+    // stream yields at most one row.
+    for g in &sub_agg.group_expr {
+        let pinned = preds.iter().any(|pr| {
+            let Expr::BinaryExpr(b) = *pr else {
+                return false;
+            };
+            if b.op != Operator::Eq {
+                return false;
+            }
+            let matches_key =
+                |e: &Expr| e == g || e.schema_name().to_string() == g.schema_name().to_string();
+            (matches_key(&b.left) && matches!(b.right.as_ref(), Expr::Literal(..)))
+                || (matches_key(&b.right) && matches!(b.left.as_ref(), Expr::Literal(..)))
+        });
+        if !pinned {
+            return Ok(None);
+        }
+    }
+
+    // Table safety: exactly one sharded table overall, scanned exactly once in the body.
+    let body_tables = base_tables(body);
+    let mut sharded: Vec<&str> = body_tables
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !replicated.contains(t))
+        .collect();
+    sharded.sort_unstable();
+    sharded.dedup();
+    let [fact] = sharded.as_slice() else {
+        return Ok(None);
+    };
+    if count_table_scans(body, fact) != 1 {
+        return Ok(None);
+    }
+
+    let up = Unparser::default();
+    let body_sql = up
+        .plan_to_sql(body)
+        .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse scalar body: {e}")))?
+        .to_string();
+    let tail = sanitize_generated_sql(&extract_from_tail(&body_sql)?);
+    let where_sql = where_clause(&up, &preds)?;
+    let mut psel: Vec<String> = Vec::new();
+    for (j, g) in sub_agg.group_expr.iter().enumerate() {
+        psel.push(format!("{} AS k{j}", expr_sql(&up, g)?));
+    }
+    let group_by = (0..sub_agg.group_expr.len())
+        .map(|j| format!("k{j}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (items, comb) = per_key_agg_parts(&spec.func, &spec.arg_sql, 0)?;
+    psel.extend(items);
+    let partial_sql = sanitize_generated_sql(&format!(
+        "SELECT {} {tail}{where_sql}{}",
+        psel.join(", "),
+        if group_by.is_empty() {
+            String::new()
+        } else {
+            format!(" GROUP BY {group_by}")
+        }
+    ));
+    // The combine keeps the GROUP BY so an empty stream yields zero rows (read as NULL by the
+    // window stage), then gathers to partition 0 (empty hash key).
+    let combine_sql = if group_by.is_empty() {
+        format!("SELECT {comb} AS m0 FROM shuffle_input")
+    } else {
+        format!("SELECT {comb} AS m0 FROM shuffle_input GROUP BY {group_by}")
+    };
+    let n_keys = sub_agg.group_expr.len() as u32;
+    Ok(Some(vec![
+        StageDef::new(0, partial_sql, vec![], (0..n_keys).collect()),
+        StageDef::new(1, combine_sql, vec![0], vec![]),
+    ]))
+}
+
+/// One uncorrelated `IN` subquery over the sharded fact, split out of the aggregate's input
+/// filter chain (TPC-DS Q70's per-state top-5 filter).
+struct AggInputInSplit<'a> {
+    /// Remaining filter conjuncts (subquery-free), applied verbatim on the scan-export stage.
+    regular: Vec<&'a Expr>,
+    /// The exported outer-side key expression (a plain column).
+    outer_key: &'a Expr,
+    /// The subquery plan; must plan through the ordinary machinery to a one-column key stream.
+    subquery: &'a LogicalPlan,
+    /// The join body below the filter chain (broadcast-safe single-sharded-scan tree).
+    body: &'a LogicalPlan,
+}
+
+/// Split one uncorrelated `IN (subquery over the sharded fact)` conjunct out of the aggregate
+/// input's filter chain. Returns `Ok(None)` when there is no such conjunct (the ordinary
+/// pipeline applies) or the shape is not exactly this one (the caller then falls back to the
+/// ordinary pipeline, whose subquery safety checks reject it as before).
+fn split_in_subquery_from_agg_input<'a>(
+    agg: &'a Aggregate,
+    replicated: &[&str],
+) -> Result<Option<AggInputInSplit<'a>>> {
+    let mut conjuncts: Vec<&Expr> = Vec::new();
+    let mut body = agg.input.as_ref();
+    while let LogicalPlan::Filter(f) = body {
+        flatten_conjuncts(&f.predicate, &mut conjuncts);
+        body = f.input.as_ref();
+    }
+    let mut outer_key: Option<&Expr> = None;
+    let mut subquery: Option<&LogicalPlan> = None;
+    let mut regular: Vec<&Expr> = Vec::new();
+    for c in &conjuncts {
+        if let Expr::InSubquery(iq) = *c {
+            if iq.negated || subquery.is_some() || expr_contains_subquery(iq.expr.as_ref()) {
+                return Ok(None);
+            }
+            if plan_contains_outer_reference(&iq.subquery.subquery) {
+                return Ok(None);
+            }
+            // Only split when the subquery reads a sharded table; a replicated-only subquery
+            // evaluates verbatim on every worker through the ordinary pipeline.
+            let mut sub_tables = Vec::new();
+            collect_subquery_tables(&iq.subquery.subquery, &mut sub_tables);
+            for t in base_tables(&iq.subquery.subquery) {
+                sub_tables.push(t);
+            }
+            if !sub_tables.iter().any(|t| !replicated.contains(&t.as_str())) {
+                return Ok(None);
+            }
+            if !matches!(iq.expr.as_ref(), Expr::Column(_)) {
+                return Ok(None);
+            }
+            outer_key = Some(iq.expr.as_ref());
+            subquery = Some(iq.subquery.subquery.as_ref());
+        } else {
+            if expr_contains_subquery(c) {
+                return Ok(None);
+            }
+            regular.push(*c);
+        }
+    }
+    let (Some(outer_key), Some(subquery)) = (outer_key, subquery) else {
+        return Ok(None);
+    };
+    Ok(Some(AggInputInSplit {
+        regular,
+        outer_key,
+        subquery,
+        body,
+    }))
+}
+
+/// Build the partial→combine pipeline for a window-over-aggregate whose aggregate input filter
+/// carries one uncorrelated `IN` subquery over the sharded fact (TPC-DS Q70):
+///
+/// 1. **Key stream**: the subquery plans through the ordinary machinery (a window-over-
+///    aggregate sub-DAG for Q70's per-state rank) and its terminal stage re-targets its hash at
+///    the single key column.
+/// 2. **Scan export** (stage per worker): the join body with the subquery-free conjuncts,
+///    projecting the flattened group columns (`gc{j}`), each aggregate's argument (`aa{i}`),
+///    and the outer IN key (`j0`), hash-shuffled by `j0`.
+/// 3. **Semi + partial**: rows whose `j0` matches the co-located key stream feed the ordinary
+///    partial aggregate (co-location makes the per-partition `IN` globally exact); output hash
+///    follows the grouping shape (gathered for ROLLUP).
+/// 4. **Combine**: the ordinary recombine — `GROUP BY ROLLUP (g{j})` with `grouping()`
+///    recomputation for Q70's ROLLUP, via [`final_group_by_sql`].
+fn agg_pipeline_with_in_producer(
+    agg: &Aggregate,
+    split: &AggInputInSplit<'_>,
+    replicated: &[&str],
+) -> Result<DistributedQuery> {
+    let up = Unparser::default();
+
+    // 1. The key stream, planned recursively (its own strict-mode checks included).
+    let mut sub_dq = plan_distributed_logical(split.subquery, replicated)?;
+    if sub_dq.finalize_sql.is_some() || sub_dq.stages.is_empty() {
+        return Err(Error::Unsupported(
+            "auto-distribute: window over an aggregation: the IN subquery must plan to a \
+             single un-ordered stream"
+                .into(),
+        ));
+    }
+    let key_fields = split.subquery.schema().fields();
+    if key_fields.len() != 1 {
+        return Err(Error::Unsupported(
+            "auto-distribute: window over an aggregation: the IN subquery must project exactly \
+             one key column"
+                .into(),
+        ));
+    }
+    let key_name = key_fields[0].name().clone();
+    let key_terminal = sub_dq.stages.last_mut().expect("non-empty sub stages");
+    if key_terminal.exchange == ExchangeMode::Forward {
+        return Err(Error::Unsupported(
+            "auto-distribute: window over an aggregation: the IN subquery must not be a \
+             single-worker forward"
+                .into(),
+        ));
+    }
+    key_terminal.hash_key_cols = vec![0];
+    let mut stages = sub_dq.stages;
+    let key_stage_id = stages.last().expect("non-empty sub stages").stage_id;
+    let mut next_id = key_stage_id + 1;
+
+    // 2. The scan-export stage: the join body with the subquery-free conjuncts, exporting the
+    // flattened group columns, aggregate arguments, and the outer IN key, hashed by the key.
+    let group_sql: Vec<String> = flattened_group_exprs(&agg.group_expr)
+        .into_iter()
+        .map(|g| expr_sql(&up, g))
+        .collect::<Result<_>>()?;
+    let aggs = agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()?;
+    if aggs.iter().any(|a| a.distinct) {
+        return Err(Error::Unsupported(
+            "auto-distribute: window over an aggregation: DISTINCT aggregates do not compose \
+             with the IN key stream"
+                .into(),
+        ));
+    }
+    let mut aggs = aggs;
+    resolve_grouping_specs(&mut aggs, &agg.group_expr)?;
+    let body_tables = base_tables(split.body);
+    let body_sharded: Vec<&str> = body_tables
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !replicated.contains(t))
+        .collect();
+    let [sharded_name] = body_sharded.as_slice() else {
+        return Err(Error::Unsupported(
+            "auto-distribute: window over an aggregation: the aggregate input must scan \
+             exactly one sharded table for the IN key stream"
+                .into(),
+        ));
+    };
+    reject_unsafe_broadcast_shapes(split.body, sharded_name)?;
+
+    let mut export_cols: Vec<String> = group_sql
+        .iter()
+        .enumerate()
+        .map(|(j, g)| format!("{g} AS gc{j}"))
+        .collect();
+    for (i, a) in aggs.iter().enumerate() {
+        if a.grouping_target.is_some() {
+            continue; // recomputed on the combine — no exported argument
+        }
+        export_cols.push(format!("{} AS aa{i}", a.arg_sql));
+    }
+    export_cols.push(format!("{} AS j0", expr_sql(&up, split.outer_key)?));
+    let j0_idx = (export_cols.len() - 1) as u32;
+    let body_sql = up
+        .plan_to_sql(split.body)
+        .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse agg input: {e}")))?
+        .to_string();
+    let tail = sanitize_generated_sql(&extract_from_tail(&body_sql)?);
+    let where_sql = where_clause(&up, &split.regular)?;
+    let export_sql = sanitize_generated_sql(&format!(
+        "SELECT {} {tail}{where_sql}",
+        export_cols.join(", ")
+    ));
+    let export_id = next_id;
+    next_id += 1;
+    stages.push(StageDef::new(export_id, export_sql, vec![], vec![j0_idx]));
+
+    // 3. The semi + partial stage: rows whose key matches the co-located stream feed the
+    // ordinary partial aggregate.
+    let n_group = group_sql.len();
+    let mut psel: Vec<String> = (0..n_group).map(|j| format!("gc{j} AS g{j}")).collect();
+    for (i, a) in aggs.iter().enumerate() {
+        if a.grouping_target.is_some() {
+            continue;
+        }
+        let (items, _) = partial_combine_sql(&a.func, i, &format!("aa{i}"))?;
+        psel.extend(items);
+    }
+    let group_by = (0..n_group)
+        .map(|j| format!("gc{j}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let semi_sql = sanitize_generated_sql(&format!(
+        "SELECT {} FROM (SELECT * FROM shuffle_input_0 WHERE j0 IN \
+         (SELECT {key_name} FROM shuffle_input_1)) AS semi_in GROUP BY {group_by}",
+        psel.join(", ")
+    ));
+    let semi_id = next_id;
+    next_id += 1;
+    // Coarser grouping-set levels span multiple finest-level keys, so ROLLUP gathers (empty
+    // hash key); an ordinary grouped aggregate hashes by the group key.
+    let semi_hash: Vec<u32> = if is_grouping_set(&agg.group_expr) {
+        vec![]
+    } else {
+        (0..n_group as u32).collect()
+    };
+    stages.push(StageDef::new(
+        semi_id,
+        semi_sql,
+        vec![export_id, key_stage_id],
+        semi_hash,
+    ));
+
+    // 4. The combine stage: the ordinary recombine (ROLLUP-aware), wrapped like the synthetic
+    // aggregation pipeline's final stage (`SELECT * FROM (…) AS combined`).
+    let (_, combine) = partial_and_combine_lists(
+        &(0..n_group).map(|j| format!("g{j}")).collect::<Vec<_>>(),
+        &aggs,
+    )?;
+    let final_group_by = final_group_by_sql(&agg.group_expr, n_group)?;
+    let reject_empty = if is_grouping_set(&agg.group_expr) {
+        " HAVING COUNT(*) > 0"
+    } else {
+        ""
+    };
+    let inner = format!(
+        "SELECT {} FROM shuffle_input GROUP BY {final_group_by}{reject_empty}",
+        combine.join(", ")
+    );
+    let synthetic = Peeled {
+        projection: None,
+        sort: None,
+        limit: None,
+        having: Vec::new(),
+        alias_projections: Vec::new(),
+        agg,
+    };
+    let combine_sql = wrap_output(&synthetic, &inner, &build_remap(&synthetic))?;
+    let combine_id = next_id;
+    stages.push(StageDef::new(
+        combine_id,
+        combine_sql,
+        vec![semi_id],
+        vec![],
+    ));
+
+    Ok(DistributedQuery {
+        stages,
+        finalize_sql: None,
+    })
+}
+
+/// KAN-49b (TPC-DS Q36): a ranking window over a `UNION` (DISTINCT) whose arms are
+/// independently-distributable aggregates over one shared sharded-fact CTE.
+///
+/// Each arm plans through the ordinary machinery (the CTE's partial aggregate never leaves the
+/// workers); the arms' outputs hash-shuffle on the **full row** into a per-partition dedup
+/// (identical rows co-locate, so the local `DISTINCT` is globally exact), and the window then
+/// re-shuffles the tiny deduplicated result by its `PARTITION BY` key — expression keys such as
+/// `CASE WHEN t_class = 0 THEN i_category END` materialize as computed columns on the dedup
+/// stage.
+fn window_over_distinct_union_stages_for(
+    p: &WindowPeeled<'_>,
+    window: &Window,
+    distinct_node: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<DistributedQuery> {
+    let unsupported = |why: &str| {
+        Error::Unsupported(format!(
+            "auto-distribute: window over an aggregation: window over UNION: {why}"
+        ))
+    };
+    let mut arms: Vec<&LogicalPlan> = Vec::new();
+    flatten_distinct_union(distinct_node, &mut arms);
+    if arms.len() < 2 {
+        return Err(unsupported("fewer than two union arms"));
+    }
+    let partition_by = validate_window_layer(window)?;
+    if partition_by.is_empty() {
+        return Err(unsupported("a global window over a union is not supported"));
+    }
+    let up = Unparser::default();
+
+    // Plan each arm; the terminal stage of every arm re-targets its hash at the full row.
+    let mut stages: Vec<StageDef> = Vec::new();
+    let mut arm_outputs: Vec<u32> = Vec::new();
+    for arm in &arms {
+        if !plan_contains_aggregate(arm) {
+            // A raw sharded-scan arm would gather the fact wholesale.
+            return Err(unsupported("a union arm without an aggregate"));
+        }
+        let mut arm_dq = plan_distributed_logical(arm, replicated).map_err(|e| {
+            Error::Unsupported(format!(
+                "auto-distribute: window over an aggregation: window over UNION arm: {e}"
+            ))
+        })?;
+        if arm_dq.finalize_sql.is_some() {
+            return Err(unsupported("a union arm with ORDER BY / LIMIT"));
+        }
+        let width = arm.schema().fields().len() as u32;
+        let offset = stages.iter().map(|s| s.stage_id).max().map_or(0, |m| m + 1);
+        let terminal = arm_dq.stages.last_mut().expect("non-empty arm stages");
+        terminal.hash_key_cols = (0..width).collect();
+        for mut s in arm_dq.stages {
+            s.stage_id += offset;
+            for u in &mut s.upstream_stage_ids {
+                *u += offset;
+            }
+            stages.push(s);
+        }
+        arm_outputs.push(stages.last().expect("arm stage appended").stage_id);
+    }
+    let mut next_id = stages.iter().map(|s| s.stage_id).max().expect("stages") + 1;
+
+    // Union column names come from the first arm (SQL unions match by position).
+    let union_cols: Vec<String> = arms[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for name in &union_cols {
+        remap.insert(name.clone(), name.clone());
+    }
+    for (qualifier, field) in p.window.schema.iter() {
+        if let Some(q) = qualifier {
+            remap.insert(format!("{q}.{}", field.name()), field.name().clone());
+        }
+    }
+
+    // Partition keys: plain columns map positionally; expressions materialize on the dedup
+    // stage so the shuffle can hash them.
+    let mut key_cols: Vec<u32> = Vec::with_capacity(partition_by.len());
+    let mut computed: Vec<(String, String)> = Vec::new();
+    for e in &partition_by {
+        if let Expr::Column(c) = e {
+            if let Some(name) = remap.get(&c.flat_name()).or_else(|| remap.get(&c.name)) {
+                if let Some(idx) = union_cols.iter().position(|u| u == name) {
+                    key_cols.push(idx as u32);
+                    continue;
+                }
+            }
+        }
+        let mapped = remap_expr_columns(e, &remap);
+        ensure_cols_named(&mapped, &union_cols).map_err(|bad| {
+            Error::Unsupported(format!(
+                "auto-distribute: window over an aggregation: window over UNION: PARTITION BY \
+                 expression references `{bad}`, not a union output column"
+            ))
+        })?;
+        let name = format!("c{}", computed.len());
+        key_cols.push((union_cols.len() + computed.len()) as u32);
+        remap.insert(e.schema_name().to_string(), name.clone());
+        computed.push((expr_sql(&up, &mapped)?, name));
+    }
+
+    // The dedup stage: per-partition DISTINCT over the union of arm streams (identical rows
+    // co-locate on the full-row hash), with computed key columns appended.
+    let union_all = (0..arms.len())
+        .map(|i| format!("SELECT * FROM shuffle_input_{i}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let select = if computed.is_empty() {
+        "*".to_string()
+    } else {
+        format!(
+            "*, {}",
+            computed
+                .iter()
+                .map(|(sql, name)| format!("{sql} AS {name}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let dedup_sql = sanitize_generated_sql(&format!(
+        "SELECT DISTINCT {select} FROM ({union_all}) AS all_arms"
+    ));
+    let dedup_id = next_id;
+    next_id += 1;
+    stages.push(StageDef::new(
+        dedup_id,
+        dedup_sql,
+        arm_outputs.clone(),
+        key_cols,
+    ));
+
+    // The window stage over the deduplicated rows.
+    let mut stage_cols = union_cols.clone();
+    stage_cols.extend(computed.iter().map(|(_, name)| name.clone()));
+    let mut next_w = 0usize;
+    let window_inner =
+        build_window_over_agg_inner(window, &remap, &stage_cols, &mut next_w, "shuffle_input")?;
+    let mut full_remap = remap;
+    for (i, e) in window.window_expr.iter().enumerate() {
+        full_remap.insert(e.schema_name().to_string(), format!("w{i}"));
+    }
+    for proj in &p.alias_projections {
+        for e in proj.iter() {
+            let Expr::Alias(a) = e else { continue };
+            let mapped = match a.expr.as_ref() {
+                Expr::Column(c) => full_remap
+                    .get(&c.flat_name())
+                    .or_else(|| full_remap.get(&c.name))
+                    .cloned(),
+                other => full_remap.get(&other.schema_name().to_string()).cloned(),
+            };
+            if let Some(mapped) = mapped {
+                full_remap.insert(a.name.clone(), mapped);
+            }
+        }
+    }
+    let window_sql = wrap_window_over_agg_output(p, &window_inner, &full_remap)?;
+    stages.push(StageDef::new(next_id, window_sql, vec![dedup_id], vec![]));
+
+    Ok(DistributedQuery {
+        stages,
+        finalize_sql: build_outer_finalize(p.sort, p.limit)?,
+    })
+}
+
+/// KAN-49b (TPC-DS Q51): framed windows over a `FULL OUTER JOIN` of two windowed aggregates.
+///
+/// The sharded side runs the ordinary window-over-aggregate pipeline (partial → combine →
+/// partition-shuffled framed window); the replicated side computes once on a single `Forward`
+/// worker. Both sides shuffle by the equijoin key for an exact co-located full join (rows with
+/// equal keys co-locate; preserved-side rows can never straddle partitions), the CASE/renaming
+/// projection over the join re-applies in the join stage, and the outer framed windows compute
+/// after a final partition-keyed shuffle.
+fn window_over_join_stages_for(
+    p: &WindowPeeled<'_>,
+    window: &Window,
+    proj: &datafusion::logical_expr::logical_plan::Projection,
+    replicated: &[&str],
+) -> Result<DistributedQuery> {
+    let unsupported = |why: &str| {
+        Error::Unsupported(format!(
+            "auto-distribute: window over an aggregation: window over join: {why}"
+        ))
+    };
+    let LogicalPlan::Join(join) = proj.input.as_ref() else {
+        return Err(unsupported("projection input is not a join"));
+    };
+    if join.join_type != JoinType::Full {
+        return Err(unsupported(
+            "only a FULL OUTER JOIN of two windowed aggregates",
+        ));
+    }
+    let partition_by = validate_window_layer(window)?;
+    if partition_by.is_empty() {
+        return Err(unsupported("a global window over a join is not supported"));
+    }
+    let up = Unparser::default();
+
+    // Equijoin key pairs (one column per side), from `on` and/or the join filter.
+    let mut key_pairs: Vec<(Column, Column)> = Vec::new();
+    for (l, r) in &join.on {
+        match (l, r) {
+            (Expr::Column(lc), Expr::Column(rc)) => key_pairs.push((lc.clone(), rc.clone())),
+            _ => return Err(unsupported("join key must be a column pair")),
+        }
+    }
+    if let Some(filter) = &join.filter {
+        let mut conjuncts: Vec<&Expr> = Vec::new();
+        flatten_conjuncts(filter, &mut conjuncts);
+        for c in conjuncts {
+            let Expr::BinaryExpr(b) = c else {
+                return Err(unsupported("join filter must be equality keys only"));
+            };
+            if b.op != Operator::Eq {
+                return Err(unsupported("join filter must be equality keys only"));
+            }
+            match (b.left.as_ref(), b.right.as_ref()) {
+                (Expr::Column(lc), Expr::Column(rc)) => key_pairs.push((lc.clone(), rc.clone())),
+                _ => return Err(unsupported("join key must be a column pair")),
+            }
+        }
+    }
+    if key_pairs.is_empty() {
+        return Err(unsupported("no equijoin keys"));
+    }
+
+    // Classify the sides: exactly one may scan sharded tables (planned through the shape
+    // planners); the other must be all-replicated (computed once on a Forward worker).
+    let side_is_sharded = |side: &LogicalPlan| {
+        let mut tables = base_tables(side);
+        collect_subquery_tables(side, &mut tables);
+        tables.iter().any(|t| !replicated.contains(&t.as_str()))
+    };
+    let left_sharded = side_is_sharded(join.left.as_ref());
+    let right_sharded = side_is_sharded(join.right.as_ref());
+    if left_sharded && right_sharded {
+        return Err(unsupported("both join sides scan sharded tables"));
+    }
+
+    let mut stages: Vec<StageDef> = Vec::new();
+    let mut side_terminals: Vec<u32> = Vec::new();
+    for (side, sharded) in [
+        (join.left.as_ref(), left_sharded),
+        (join.right.as_ref(), right_sharded),
+    ] {
+        let key_idx: Vec<u32> = key_pairs
+            .iter()
+            .map(|(lc, rc)| {
+                let key_col = if std::ptr::eq(side, join.left.as_ref()) {
+                    lc
+                } else {
+                    rc
+                };
+                side.schema()
+                    .index_of_column(key_col)
+                    .map(|i| i as u32)
+                    .map_err(|_| {
+                        Error::Unsupported(format!(
+                            "auto-distribute: window over an aggregation: window over join: \
+                             join key `{key_col}` is not a branch output column"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let offset = stages.iter().map(|s| s.stage_id).max().map_or(0, |m| m + 1);
+        if sharded {
+            if !plan_contains_window(side) || !plan_contains_aggregate(side) {
+                return Err(unsupported(
+                    "the sharded join side is not a windowed aggregate branch",
+                ));
+            }
+            let mut side_dq = plan_distributed_logical(side, replicated).map_err(|e| {
+                Error::Unsupported(format!(
+                    "auto-distribute: window over an aggregation: window over join side: {e}"
+                ))
+            })?;
+            if side_dq.finalize_sql.is_some() {
+                return Err(unsupported("a join side with ORDER BY / LIMIT"));
+            }
+            let terminal = side_dq.stages.last_mut().expect("non-empty side stages");
+            terminal.hash_key_cols = key_idx;
+            for mut s in side_dq.stages {
+                s.stage_id += offset;
+                for u in &mut s.upstream_stage_ids {
+                    *u += offset;
+                }
+                stages.push(s);
+            }
+        } else {
+            // All-replicated side: computed exactly once on one worker (every worker holds the
+            // full replicated inputs), its exact output hash-shuffled by the join key.
+            let sql = up
+                .plan_to_sql(side)
+                .map_err(|e| {
+                    Error::Unsupported(format!("auto-distribute: unparse join side: {e}"))
+                })?
+                .to_string();
+            let mut stage = StageDef::new(offset, sanitize_generated_sql(&sql), vec![], key_idx);
+            stage.exchange = ExchangeMode::Forward;
+            stages.push(stage);
+        }
+        side_terminals.push(stages.last().expect("side stage appended").stage_id);
+    }
+    let mut next_id = stages.iter().map(|s| s.stage_id).max().expect("stages") + 1;
+
+    // The join stage: the projection-over-join unparsed with each side replaced by its
+    // shuffle-input placeholder (`shuffle_input_0`/`shuffle_input_1`).
+    let branch_by_node: HashMap<usize, usize> = [
+        (join.left.as_ref() as *const LogicalPlan as usize, 0usize),
+        (join.right.as_ref() as *const LogicalPlan as usize, 1usize),
+    ]
+    .into_iter()
+    .collect();
+    let proj_plan = LogicalPlan::Projection(proj.clone());
+    let (rewritten, changed) =
+        super::dag_splitter::replace_branches(&proj_plan, &branch_by_node, 2)?;
+    if !changed {
+        return Err(unsupported("join sides were not replaced by placeholders"));
+    }
+    let join_sql = up
+        .plan_to_sql(&rewritten)
+        .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse join stage: {e}")))?
+        .to_string();
+
+    // Hash the join output by the outer window's partition columns (expressions materialize as
+    // computed columns on the join stage).
+    let join_cols: Vec<String> = rewritten
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for name in &join_cols {
+        remap.insert(name.clone(), name.clone());
+    }
+    let mut key_cols: Vec<u32> = Vec::with_capacity(partition_by.len());
+    let mut computed: Vec<(String, String)> = Vec::new();
+    for e in &partition_by {
+        if let Expr::Column(c) = e {
+            if let Some(idx) = join_cols.iter().position(|n| n == &c.name) {
+                key_cols.push(idx as u32);
+                continue;
+            }
+        }
+        let mapped = remap_expr_columns(&unqualify(e), &remap);
+        ensure_cols_named(&mapped, &join_cols).map_err(|bad| {
+            Error::Unsupported(format!(
+                "auto-distribute: window over an aggregation: window over join: PARTITION BY \
+                 expression references `{bad}`, not a join output column"
+            ))
+        })?;
+        let name = format!("c{}", computed.len());
+        key_cols.push((join_cols.len() + computed.len()) as u32);
+        remap.insert(e.schema_name().to_string(), name.clone());
+        computed.push((expr_sql(&up, &mapped)?, name));
+    }
+    let join_sql = if computed.is_empty() {
+        sanitize_generated_sql(&join_sql)
+    } else {
+        sanitize_generated_sql(&format!(
+            "SELECT *, {} FROM ({join_sql}) AS keyed_in",
+            computed
+                .iter()
+                .map(|(sql, name)| format!("{sql} AS {name}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    };
+    let join_id = next_id;
+    next_id += 1;
+    stages.push(StageDef::new(
+        join_id,
+        join_sql,
+        side_terminals.clone(),
+        key_cols,
+    ));
+
+    // The outer window stage over the join rows.
+    let mut stage_cols = join_cols.clone();
+    stage_cols.extend(computed.iter().map(|(_, name)| name.clone()));
+    let mut next_w = 0usize;
+    let window_inner =
+        build_window_over_agg_inner(window, &remap, &stage_cols, &mut next_w, "shuffle_input")?;
+    let mut full_remap = remap;
+    for (i, e) in window.window_expr.iter().enumerate() {
+        full_remap.insert(e.schema_name().to_string(), format!("w{i}"));
+    }
+    for proj in &p.alias_projections {
+        for e in proj.iter() {
+            let Expr::Alias(a) = e else { continue };
+            let mapped = match a.expr.as_ref() {
+                Expr::Column(c) => full_remap
+                    .get(&c.flat_name())
+                    .or_else(|| full_remap.get(&c.name))
+                    .cloned(),
+                other => full_remap.get(&other.schema_name().to_string()).cloned(),
+            };
+            if let Some(mapped) = mapped {
+                full_remap.insert(a.name.clone(), mapped);
+            }
+        }
+    }
+    let window_sql = wrap_window_over_agg_output(p, &window_inner, &full_remap)?;
+    stages.push(StageDef::new(next_id, window_sql, vec![join_id], vec![]));
+
+    Ok(DistributedQuery {
+        stages,
+        finalize_sql: build_outer_finalize(p.sort, p.limit)?,
+    })
+}
+
+/// Require every column in an already-remapped expression to name one of `cols` (unqualified).
+fn ensure_cols_named(e: &Expr, cols: &[String]) -> std::result::Result<(), String> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut bad: Option<String> = None;
+    let _ = e.apply(|node| {
+        if let Expr::Column(c) = node {
+            if c.relation.is_some() || !cols.iter().any(|n| n == &c.name) {
+                bad = Some(c.flat_name());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    match bad {
+        Some(name) => Err(name),
+        None => Ok(()),
+    }
 }
 
 /// [`build_agg_remap`] extended with each window expression's own schema name (→ `w{i}`) and
@@ -618,7 +1952,7 @@ fn wrap_window_over_agg_output(
 
 /// Replace any column reference whose flat name is in `remap` with the safe-named column. Local
 /// twin of [`super::stage_planner::remap_columns`] (private to that module).
-fn remap_expr_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
+pub(crate) fn remap_expr_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
     use datafusion::common::tree_node::{Transformed, TreeNode};
     e.clone()
         .transform(|node| {
@@ -899,7 +2233,11 @@ pub(crate) fn reject_explicit_unsupported(lp: &LogicalPlan) -> Result<()> {
 /// Partial `SELECT` item(s) and the combine expression (over those partials) for one per-key
 /// aggregate at output position `i`, mirroring `stage_planner::partial_combine_sql`'s
 /// min/max/sum/count/avg rules (single-result aggregates only — no DISTINCT).
-fn per_key_agg_parts(func: &str, arg_sql: &str, i: usize) -> Result<(Vec<String>, String)> {
+pub(crate) fn per_key_agg_parts(
+    func: &str,
+    arg_sql: &str,
+    i: usize,
+) -> Result<(Vec<String>, String)> {
     match func {
         "sum" => Ok((
             vec![format!("sum({arg_sql}) AS a{i}")],
@@ -961,10 +2299,16 @@ fn per_key_agg_parts(func: &str, arg_sql: &str, i: usize) -> Result<(Vec<String>
 /// `l_quantity < (SELECT 0.2 * avg(l_quantity) …)`, including the AVG partial decomposition and
 /// the scalar's projection over the aggregate) becomes a residual on the same co-located join,
 /// and one ungrouped aggregate layer above the filter is aggregated in a partial/combine pair
-/// after the join. Anything outside that shape (uncorrelated subquery — TPC-H Q11's global
-/// threshold, handled by [`try_uncorrelated_scalar_threshold`] — DISTINCT, a grouped aggregate
-/// on top, a second sharded table anywhere, nested expression subqueries) returns `Ok(None)` so
-/// the caller falls through to the other shapes and ultimately the gather / rejection paths.
+/// after the join. Three TPC-DS Q41 extensions ride the same skeleton: a `(subquery) <cmp> x`
+/// compare with the subquery on the *left* (mirrored into the canonical `o.cmp0 <op> m.m0`
+/// form), a correlation equality repeated inside every arm of a disjunctive residual (factored
+/// out — `(c AND A) OR (c AND B)` ≡ `c AND (A OR B)`), and a `SELECT DISTINCT` wrapper over the
+/// output (re-applied after a full-row hash shuffle of the join output, since duplicate output
+/// rows may land on different partitions). Anything outside that shape (uncorrelated subquery —
+/// TPC-H Q11's global threshold, handled by [`try_uncorrelated_scalar_threshold`] — DISTINCT
+/// over an outer aggregate, a grouped aggregate on top, a second sharded table anywhere, nested
+/// expression subqueries) returns `Ok(None)` so the caller falls through to the other shapes
+/// and ultimately the gather / rejection paths.
 pub(crate) fn try_decorrelate_scalar_subquery(
     lp: &LogicalPlan,
     replicated: &[&str],
@@ -974,6 +2318,11 @@ pub(crate) fn try_decorrelate_scalar_subquery(
     let mut sort = None;
     let mut limit = None;
     let mut projection: Option<&[Expr]> = None;
+    // A `SELECT DISTINCT` wrapper (TPC-DS Q41) — records the DISTINCT node's output width. The
+    // decorrelated join below keeps each outer row whose correlation key's per-key aggregate
+    // satisfies the compare; duplicate *output* rows may still land on different partitions, so
+    // the DISTINCT is re-applied after a full-row hash shuffle (see the tail of this function).
+    let mut distinct: Option<usize> = None;
     let mut node = lp;
     loop {
         match node {
@@ -988,6 +2337,13 @@ pub(crate) fn try_decorrelate_scalar_subquery(
                 node = s.input.as_ref();
             }
             LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
+            LogicalPlan::Distinct(d) => {
+                if distinct.is_some() {
+                    return Ok(None);
+                }
+                distinct = Some(node.schema().fields().len());
+                node = d.input().as_ref();
+            }
             LogicalPlan::Projection(p) => {
                 if projection.is_none() {
                     projection = Some(p.expr.as_slice());
@@ -1025,6 +2381,11 @@ pub(crate) fn try_decorrelate_scalar_subquery(
         }
         _ => None,
     };
+    // A DISTINCT on top of an outer global aggregate is a different shape (dedup over one
+    // combined row vs over the joined rows); keep it on the existing paths.
+    if outer_agg.is_some() && distinct.is_some() {
+        return Ok(None);
+    }
     let mut conjuncts: Vec<&Expr> = Vec::new();
     let mut body = node;
     while let LogicalPlan::Filter(f) = body {
@@ -1061,16 +2422,20 @@ pub(crate) fn try_decorrelate_scalar_subquery(
         ) {
             continue;
         }
-        let (compare, subquery) = match (b.left.as_ref(), b.right.as_ref()) {
-            (Expr::ScalarSubquery(s), other) | (other, Expr::ScalarSubquery(s)) => {
-                (other, s.subquery.as_ref())
+        let (compare, subquery, op) = match (b.left.as_ref(), b.right.as_ref()) {
+            // `(subquery) <cmp> x` (TPC-DS Q41's `(SELECT count(*) …) > 0`) mirrors to
+            // `x <cmp'> (subquery)` so the co-located join below can always write the
+            // compare as `o.cmp0 <op> m.m0`.
+            (Expr::ScalarSubquery(s), other) => {
+                (other, s.subquery.as_ref(), mirror_compare_op(b.op))
             }
+            (other, Expr::ScalarSubquery(s)) => (other, s.subquery.as_ref(), b.op),
             _ => continue,
         };
         if found.is_some() || expr_contains_subquery(compare) {
             return Ok(None);
         }
-        found = Some((i, compare, subquery, b.op));
+        found = Some((i, compare, subquery, op));
     }
     let Some((sub_idx, compare_expr, subplan, compare_op)) = found else {
         return Ok(None);
@@ -1122,22 +2487,21 @@ pub(crate) fn try_decorrelate_scalar_subquery(
     }
     let scope = PlanScope::of(inner_body);
     let mut corr_pairs: Vec<(Expr, Expr)> = Vec::new(); // (outer key, inner key)
-    let mut inner_preds: Vec<&Expr> = Vec::new();
-    for conjunct in inner_conjuncts {
+    let mut inner_preds: Vec<Expr> = Vec::new();
+    let is_inner_only = |e: &Expr| {
         let mut cols = Vec::new();
-        expr_columns_tagged(conjunct, &mut cols);
-        if cols
-            .iter()
+        expr_columns_tagged(e, &mut cols);
+        cols.iter()
             .all(|(c, is_outer)| !is_outer && scope.contains(c))
-        {
-            inner_preds.push(conjunct);
-            continue;
-        }
+    };
+    // Classify one non-inner-only conjunct as a correlation equality
+    // (`<outer col> = <inner col>`), pushing the (outer, inner) key pair.
+    let classify_corr = |conjunct: &Expr, corr_pairs: &mut Vec<(Expr, Expr)>| -> bool {
         let Expr::BinaryExpr(b) = conjunct else {
-            return Ok(None);
+            return false;
         };
         if b.op != Operator::Eq {
-            return Ok(None);
+            return false;
         }
         // A correlation side arrives as `outer_ref(col)` / an out-of-scope column; the inner
         // side must be a plain in-scope column (it becomes the per-key group key).
@@ -1149,7 +2513,7 @@ pub(crate) fn try_decorrelate_scalar_subquery(
             }
         };
         let (Some((lc, l_outer)), Some((rc, r_outer))) = (side(&b.left), side(&b.right)) else {
-            return Ok(None);
+            return false;
         };
         let l_inner = !l_outer && scope.contains(&lc);
         let r_inner = !r_outer && scope.contains(&rc);
@@ -1158,7 +2522,36 @@ pub(crate) fn try_decorrelate_scalar_subquery(
             (false, true) => corr_pairs.push((Expr::Column(lc), Expr::Column(rc))),
             // Both-outer is not a correlation predicate we can group by; both-inner was
             // already classified as an inner-only predicate above.
-            _ => return Ok(None),
+            _ => return false,
+        }
+        true
+    };
+    for conjunct in inner_conjuncts {
+        if is_inner_only(conjunct) {
+            inner_preds.push(conjunct.clone());
+            continue;
+        }
+        // A disjunction may repeat the correlation equality in every arm (TPC-DS Q41's
+        // `(m = o.m AND A) OR (m = o.m AND B)`): factor the shared conjuncts out, then
+        // classify each piece — the residual disjunction must end up inner-only.
+        let (shared, residual) = factor_or_common(conjunct);
+        if shared.is_empty() {
+            if !classify_corr(conjunct, &mut corr_pairs) {
+                return Ok(None);
+            }
+            continue;
+        }
+        for c in &shared {
+            if is_inner_only(c) {
+                inner_preds.push(c.clone());
+            } else if !classify_corr(c, &mut corr_pairs) {
+                return Ok(None);
+            }
+        }
+        if is_inner_only(&residual) {
+            inner_preds.push(residual);
+        } else if !classify_corr(&residual, &mut corr_pairs) {
+            return Ok(None);
         }
     }
     // Uncorrelated scalar subqueries (TPC-H Q11's global HAVING threshold) are handled upstream
@@ -1217,7 +2610,7 @@ pub(crate) fn try_decorrelate_scalar_subquery(
         .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse subquery body: {e}")))?
         .to_string();
     let inner_tail = sanitize_generated_sql(&extract_from_tail(&inner_sql)?);
-    let inner_where = where_clause(&up, &inner_preds)?;
+    let inner_where = where_clause(&up, &inner_preds.iter().collect::<Vec<_>>())?;
     let inner_key_sql: Vec<String> = corr_pairs
         .iter()
         .map(|(_, inner_key)| expr_sql(&up, inner_key))
@@ -1278,6 +2671,12 @@ pub(crate) fn try_decorrelate_scalar_subquery(
                 .collect(),
         },
     };
+    // The DISTINCT must sit directly over the output columns (its schema width then equals the
+    // final stage's select width). A DISTINCT buried between the projection and the filter would
+    // dedup a different row shape — decline rather than change semantics.
+    if distinct.is_some_and(|n| n != output_exprs.len()) {
+        return Ok(None);
+    }
     let mut exports: Vec<(String, String)> = Vec::new();
     let mut col_alias: HashMap<String, String> = HashMap::new();
     let export_cols = |e: &Expr,
@@ -1432,10 +2831,17 @@ pub(crate) fn try_decorrelate_scalar_subquery(
         }
     }
 
-    Ok(Some(DistributedQuery {
+    let mut dq = DistributedQuery {
         stages,
         finalize_sql: build_outer_finalize(sort, limit)?,
-    }))
+    };
+    if let Some(n_cols) = distinct {
+        // Hash-shuffle the join output on the full row so duplicate output rows co-locate, then
+        // dedup per partition — exact for DISTINCT. `finalize_sql` is already set (the driver's
+        // global ORDER BY/LIMIT runs on the deduped gather), so the dedup leaves it alone.
+        append_full_row_dedup(&mut dq, n_cols as u32, None, None)?;
+    }
+    Ok(Some(dq))
 }
 
 /// Rewrite `outer_ref(col)` back to a plain column reference, for re-emitting correlation
@@ -4704,9 +6110,16 @@ pub(crate) fn try_uncorrelated_scalar_threshold(
     Ok(Some(dq))
 }
 
+/// True when any expression anywhere in the subtree carries an expression subquery
+/// (`EXISTS` / `IN` / scalar).
+fn plan_exprs_contain_subquery(lp: &LogicalPlan) -> bool {
+    lp.expressions().iter().any(expr_contains_subquery)
+        || lp.inputs().iter().any(|c| plan_exprs_contain_subquery(c))
+}
+
 /// True when any expression in the subtree carries an `OuterReferenceColumn` (a correlated
 /// reference into an enclosing query scope).
-fn plan_contains_outer_reference(lp: &LogicalPlan) -> bool {
+pub(crate) fn plan_contains_outer_reference(lp: &LogicalPlan) -> bool {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     let expr_has_outer = |e: &Expr| {
         let mut found = false;
@@ -4770,7 +6183,7 @@ fn collect_relation_names(lp: &LogicalPlan, out: &mut HashSet<String>) {
 }
 
 /// Split `a AND b AND …` into its top-level conjuncts (references, no cloning).
-fn flatten_conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+pub(crate) fn flatten_conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     match e {
         Expr::BinaryExpr(b) if b.op == Operator::And => {
             flatten_conjuncts(&b.left, out);
@@ -4780,8 +6193,88 @@ fn flatten_conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+/// Mirror a comparison operator for swapping its operands (`a > b` ⇔ `b < a`); equality
+/// operators are symmetric. Only called with the equality/ordering operators the scalar
+/// compare shapes accept.
+fn mirror_compare_op(op: Operator) -> Operator {
+    match op {
+        Operator::Lt => Operator::Gt,
+        Operator::LtEq => Operator::GtEq,
+        Operator::Gt => Operator::Lt,
+        Operator::GtEq => Operator::LtEq,
+        other => other,
+    }
+}
+
+/// Factor conjuncts shared by every disjunct out of a disjunction:
+/// `(c AND A) OR (c AND B)` ≡ `c AND (A OR B)` (valid in SQL three-valued logic — strong
+/// Kleene AND/OR distribute, and AND is idempotent). Returns the shared conjuncts and the
+/// residual disjunction; `shared` is empty (and the residual is `e` itself) when nothing
+/// factors. Used to lift a correlation equality repeated in every OR arm (TPC-DS Q41's
+/// `(m = o.m AND A) OR (m = o.m AND B)`) into a top-level conjunct the decorrelation can
+/// group by.
+fn factor_or_common(e: &Expr) -> (Vec<Expr>, Expr) {
+    fn flatten_disjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::BinaryExpr(b) if b.op == Operator::Or => {
+                flatten_disjuncts(&b.left, out);
+                flatten_disjuncts(&b.right, out);
+            }
+            other => out.push(other),
+        }
+    }
+    fn conjunct_set(e: &Expr) -> Vec<Expr> {
+        let mut flat = Vec::new();
+        flatten_conjuncts(e, &mut flat);
+        flat.into_iter().cloned().collect()
+    }
+    fn and_of(parts: Vec<Expr>) -> Expr {
+        // An arm made wholly of shared conjuncts leaves TRUE (`c OR (c AND B) ≡ c AND TRUE`).
+        let mut it = parts.into_iter();
+        let Some(mut acc) = it.next() else {
+            return Expr::Literal(ScalarValue::Boolean(Some(true)), None);
+        };
+        for p in it {
+            acc = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(acc),
+                op: Operator::And,
+                right: Box::new(p),
+            });
+        }
+        acc
+    }
+    let mut arms = Vec::new();
+    flatten_disjuncts(e, &mut arms);
+    if arms.len() < 2 {
+        return (Vec::new(), e.clone());
+    }
+    let mut sets: Vec<Vec<Expr>> = arms.iter().map(|a| conjunct_set(a)).collect();
+    let mut shared: Vec<Expr> = Vec::new();
+    for c in &sets[0] {
+        if !shared.contains(c) && sets[1..].iter().all(|s| s.contains(c)) {
+            shared.push(c.clone());
+        }
+    }
+    if shared.is_empty() {
+        return (Vec::new(), e.clone());
+    }
+    for s in &mut sets {
+        s.retain(|c| !shared.contains(c));
+    }
+    let mut it = sets.into_iter().map(and_of);
+    let mut residual = it.next().expect("at least two disjuncts");
+    for arm in it {
+        residual = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(residual),
+            op: Operator::Or,
+            right: Box::new(arm),
+        });
+    }
+    (shared, residual)
+}
+
 /// Every `Column` referenced anywhere in `e`.
-fn expr_columns(e: &Expr, out: &mut Vec<Column>) {
+pub(crate) fn expr_columns(e: &Expr, out: &mut Vec<Column>) {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     let _ = e.apply(|node| {
         if let Expr::Column(c) = node {
@@ -4832,7 +6325,7 @@ fn ensure_gather_not_strict(fact: &str) -> Result<()> {
     Ok(())
 }
 
-fn expr_contains_subquery(e: &Expr) -> bool {
+pub(crate) fn expr_contains_subquery(e: &Expr) -> bool {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     let mut found = false;
     let _ = e.apply(|node| {
@@ -5368,8 +6861,14 @@ pub(crate) fn try_materialize_complex_fact(
 
     // Grouping sets are gatherable when the Unparser round-trip is faithful (TPC-DS Q67/Q70/Q86
     // ROLLUP+rank verified exact). Decline the known-broken compositions:
-    // - ROLLUP + UNION ALL (Q5/Q77/Q80): gather still mismatched single-node at sf=0.01
-    // - ROLLUP + INTERSECT/EXCEPT (Q14): Unparser emits out-of-scope `brand_id` aliases
+    // - ROLLUP + UNION ALL: the gather round-trips the whole query through the Unparser, which
+    //   is not semantics-faithful here (KAN-54 verified distributed ≠ single-node at sf=0.01).
+    //   These now plan through the genuinely-distributed union split instead (KAN-49d:
+    //   Q5/Q77/Q80 — see `try_split_broadcast_union`), which never reaches this fallback.
+    // - ROLLUP + INTERSECT/EXCEPT with a subquery over the sharded fact (Q14): still declined —
+    //   Unparser emits out-of-scope `brand_id` aliases, and the proper composition (semi-shuffle
+    //   the IN over a distributed INTERSECT + a one-row broadcast of the UNION ALL average) is
+    //   not built yet.
     if plan_contains_grouping_set(lp)
         && (plan_contains_union(lp) || plan_contains_intersect_or_except(lp))
     {
@@ -5933,7 +7432,7 @@ fn plan_semi_anti_set_op(
     })
 }
 
-fn build_outer_finalize(
+pub(crate) fn build_outer_finalize(
     sort: Option<&[datafusion::logical_expr::SortExpr]>,
     limit: Option<usize>,
 ) -> Result<Option<String>> {
@@ -5968,7 +7467,7 @@ fn build_outer_finalize(
     Ok(Some(sql))
 }
 
-fn peek_sort_limit(
+pub(crate) fn peek_sort_limit(
     lp: &LogicalPlan,
 ) -> (
     &LogicalPlan,
@@ -6038,6 +7537,400 @@ fn collect_all_tables(lp: &LogicalPlan, out: &mut Vec<String>) {
     for c in lp.inputs() {
         collect_all_tables(c, out);
     }
+}
+
+/// KAN-49a (TPC-DS Q1/Q30/Q81): decorrelate an equality-correlated scalar-aggregate subquery in
+/// a `Filter` into a derived per-key aggregate that is inner-joined into the plan:
+///
+/// ```sql
+/// SELECT … FROM ctr1, store, customer
+/// WHERE ctr1.ctr_total_return >
+///     (SELECT avg(ctr2.ctr_total_return) * 1.2
+///      FROM customer_total_return ctr2
+///      WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk)
+/// ```
+///
+/// becomes, plan-wise,
+///
+/// ```sql
+/// SELECT … FROM ctr1, store, customer
+/// JOIN (SELECT ctr2.ctr_store_sk AS k0, avg(ctr2.ctr_total_return) * 1.2 AS thr0
+///       FROM customer_total_return ctr2 GROUP BY ctr2.ctr_store_sk) AS __weft_decorr_0
+///   ON ctr1.ctr_store_sk = __weft_decorr_0.k0
+/// WHERE ctr1.ctr_total_return > __weft_decorr_0.thr0
+/// ```
+///
+/// Equivalence: the derived table emits at most one row per correlation key, so the inner join
+/// cannot fan out; an outer row whose key has no group is dropped, exactly like the original
+/// compare against a NULL scalar (any comparison with NULL is not-true). This is only valid when
+/// the scalar sits as a direct operand of a top-level comparison conjunct — under `OR`/`CASE`/
+/// `NOT` a NULL scalar takes the other branch instead of dropping the row — so anything else is
+/// left untouched (returns `None` when nothing was decorrelated).
+///
+/// The rewrite is shape-driven rather than result-driven: it exists so
+/// [`super::dag_splitter`] can materialize the derived per-key aggregate as its own branch
+/// (aggregate-over-aggregate over the sharded fact) instead of rejecting the correlated scalar
+/// scan left in the outer skeleton.
+pub(crate) fn rewrite_correlated_scalar_subqueries(lp: &LogicalPlan) -> Option<LogicalPlan> {
+    let mut counter = 0usize;
+    let (plan, changed) = rewrite_correlated_scalar_node(lp, &mut counter);
+    changed.then_some(plan)
+}
+
+fn rewrite_correlated_scalar_node(lp: &LogicalPlan, counter: &mut usize) -> (LogicalPlan, bool) {
+    let mut changed = false;
+    let mut new_inputs = Vec::with_capacity(lp.inputs().len());
+    for input in lp.inputs() {
+        let (rewritten, child_changed) = rewrite_correlated_scalar_node(input, counter);
+        changed |= child_changed;
+        new_inputs.push(rewritten);
+    }
+    let mut node = if changed {
+        match lp.with_new_exprs(lp.expressions(), new_inputs) {
+            Ok(n) => n,
+            Err(_) => return (lp.clone(), false),
+        }
+    } else {
+        lp.clone()
+    };
+    if let LogicalPlan::Filter(f) = &node {
+        if let Some(rewritten) = decorrelate_filter_scalars(f, counter) {
+            node = rewritten;
+            changed = true;
+        }
+    }
+    (node, changed)
+}
+
+/// One extracted decorrelation: the derived per-key aggregate join side plus the conjunct
+/// rewritten to compare against it.
+struct DecorrelatedScalar {
+    derived: LogicalPlan,
+    alias: String,
+    /// Correlation-key columns on the outer (filter-input) side, paired with the derived side's
+    /// `k{j}` columns in order.
+    join_outer_cols: Vec<Column>,
+    /// The conjunct with the scalar subquery replaced by `alias.thr0`.
+    conjunct: Expr,
+}
+
+fn decorrelate_filter_scalars(
+    f: &datafusion::logical_expr::Filter,
+    counter: &mut usize,
+) -> Option<LogicalPlan> {
+    let outer_scope = super::join_chain::JoinSideScope::of(&f.input);
+
+    let mut conjuncts = Vec::new();
+    super::stage_planner::flatten_and_conjuncts(&f.predicate, &mut conjuncts);
+
+    let mut kept: Vec<Expr> = Vec::new();
+    let mut decorrelated: Vec<DecorrelatedScalar> = Vec::new();
+    for conjunct in conjuncts {
+        match extract_scalar_compare(&conjunct).and_then(|(op, operand, sub)| {
+            build_derived_per_key_aggregate(op, operand, sub, &outer_scope, counter)
+        }) {
+            Some(d) => decorrelated.push(d),
+            None => kept.push(conjunct),
+        }
+    }
+    if decorrelated.is_empty() {
+        return None;
+    }
+
+    // Chain the derived per-key aggregates under the (remaining) filter as inner joins on the
+    // correlation keys.
+    let mut input = f.input.as_ref().clone();
+    for d in &decorrelated {
+        let on_left: Vec<Column> = d.join_outer_cols.to_vec();
+        let on_right: Vec<Column> = (0..d.join_outer_cols.len())
+            .map(|j| Column::new(Some(d.alias.as_str()), format!("k{j}")))
+            .collect();
+        input = datafusion::logical_expr::LogicalPlanBuilder::from(input)
+            .join(
+                d.derived.clone(),
+                JoinType::Inner,
+                (on_left, on_right),
+                None,
+            )
+            .ok()?
+            .build()
+            .ok()?;
+    }
+
+    let new_conjuncts: Vec<Expr> = kept
+        .into_iter()
+        .chain(decorrelated.into_iter().map(|d| d.conjunct))
+        .collect();
+    let predicate = new_conjuncts.into_iter().reduce(Expr::and)?;
+    datafusion::logical_expr::LogicalPlanBuilder::from(input)
+        .filter(predicate)
+        .ok()?
+        .build()
+        .ok()
+}
+
+/// Split a top-level conjunct into `(compare op, subquery-free operand, scalar subquery)` when it
+/// is exactly `<operand> <cmp> <scalar>` or `<scalar> <cmp> <operand>` with a comparison whose
+/// NULL outcome always filters the row out.
+fn extract_scalar_compare(
+    conjunct: &Expr,
+) -> Option<(
+    Operator,
+    &Expr,
+    &datafusion::logical_expr::logical_plan::Subquery,
+)> {
+    let Expr::BinaryExpr(b) = conjunct else {
+        return None;
+    };
+    if !matches!(
+        b.op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    ) {
+        return None;
+    }
+    let (operand, sub, op) = match (b.left.as_ref(), b.right.as_ref()) {
+        (Expr::ScalarSubquery(sub), other) | (other, Expr::ScalarSubquery(sub)) => {
+            (other, sub, b.op)
+        }
+        _ => return None,
+    };
+    // The non-subquery operand must not itself carry a subquery (nesting is a different shape).
+    if expr_contains_subquery(operand) {
+        return None;
+    }
+    Some((op, operand, sub))
+}
+
+/// Validate the correlated scalar subquery's shape and build the derived per-key aggregate side
+/// of the decorrelation join. Returns `None` for anything outside the supported shape — the
+/// conjunct then stays as written and the query keeps its original error path.
+fn build_derived_per_key_aggregate(
+    op: Operator,
+    operand: &Expr,
+    sub: &datafusion::logical_expr::logical_plan::Subquery,
+    outer_scope: &super::join_chain::JoinSideScope,
+    counter: &mut usize,
+) -> Option<DecorrelatedScalar> {
+    // The subquery-free operand must read only outer-scope columns (else it is not evaluable
+    // above the join).
+    let mut operand_cols = Vec::new();
+    expr_columns(operand, &mut operand_cols);
+    if !operand_cols.iter().all(|c| outer_scope.contains(c)) {
+        return None;
+    }
+
+    // Shape: [Projection(single expr)] → Aggregate([], one agg) → [Filter] → body.
+    let mut node = sub.subquery.as_ref();
+    let mut scalar_proj: Option<&Expr> = None;
+    while let LogicalPlan::Projection(p) = node {
+        if scalar_proj.is_some() || p.expr.len() != 1 {
+            return None;
+        }
+        scalar_proj = Some(&p.expr[0]);
+        node = p.input.as_ref();
+    }
+    let LogicalPlan::Aggregate(agg) = node else {
+        return None;
+    };
+    if !agg.group_expr.is_empty() || agg.aggr_expr.len() != 1 {
+        return None;
+    }
+    let agg_expr = strip_expr_alias(&agg.aggr_expr[0]);
+    let Expr::AggregateFunction(af) = agg_expr else {
+        return None;
+    };
+    if af.params.distinct
+        || !matches!(
+            af.func.name().to_ascii_lowercase().as_str(),
+            "min" | "max" | "sum" | "count" | "avg"
+        )
+    {
+        return None;
+    }
+    let mut inner_preds: Vec<&Expr> = Vec::new();
+    let mut body = agg.input.as_ref();
+    while let LogicalPlan::Filter(filter) = body {
+        flatten_conjuncts(&filter.predicate, &mut inner_preds);
+        body = filter.input.as_ref();
+    }
+    // Nested expression subqueries inside the body would re-introduce a scan the derived branch
+    // cannot place; plain `Filter` nodes deeper in the body are fine — the branch planner
+    // handles them.
+    if plan_exprs_contain_subquery(body) {
+        return None;
+    }
+
+    // Correlation: equality conjuncts pairing an outer reference with a plain inner column.
+    let body_scope = PlanScope::of(body);
+    let mut outer_cols: Vec<Column> = Vec::new();
+    let mut inner_cols: Vec<Column> = Vec::new();
+    let mut remaining: Vec<&Expr> = Vec::new();
+    for pred in inner_preds {
+        let pair = match pred {
+            Expr::BinaryExpr(b) if b.op == Operator::Eq => {
+                match (b.left.as_ref(), b.right.as_ref()) {
+                    (Expr::OuterReferenceColumn(_, oc), Expr::Column(ic))
+                    | (Expr::Column(ic), Expr::OuterReferenceColumn(_, oc)) => {
+                        Some((oc.clone(), ic.clone()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match pair {
+            Some((oc, ic)) => {
+                outer_cols.push(oc);
+                inner_cols.push(ic);
+            }
+            None => remaining.push(pred),
+        }
+    }
+    if outer_cols.is_empty() {
+        return None;
+    }
+    // Every correlation key must resolve on its own side…
+    if !outer_cols.iter().all(|c| outer_scope.contains(c))
+        || !inner_cols.iter().all(|c| body_scope.contains(c))
+    {
+        return None;
+    }
+    // …and no other outer reference may survive anywhere in the subquery (a correlated residual
+    // predicate would evaluate per shard).
+    let mut tagged: Vec<(Column, bool)> = Vec::new();
+    for e in remaining.iter().copied().chain(scalar_proj) {
+        expr_columns_tagged(e, &mut tagged);
+    }
+    for e in &agg.aggr_expr {
+        expr_columns_tagged(e, &mut tagged);
+    }
+    if tagged.iter().any(|(_, is_outer)| *is_outer) {
+        return None;
+    }
+    if remaining.iter().any(|pred| expr_contains_subquery(pred))
+        || plan_contains_outer_reference(body)
+    {
+        return None;
+    }
+    // The aggregate's argument must read body-scope columns only.
+    let mut arg_cols = Vec::new();
+    expr_columns(agg_expr, &mut arg_cols);
+    if !arg_cols.iter().all(|c| body_scope.contains(c)) {
+        return None;
+    }
+
+    // The scalar's projection over the aggregate (`avg(x) * 1.2`) re-applies per group: swap the
+    // aggregate for the derived `a0` column. Any other surviving reference rejects the shape.
+    let a0 = datafusion::prelude::col("a0");
+    let thr_expr = match scalar_proj {
+        None => a0.clone(),
+        Some(proj) => {
+            let swapped = substitute_agg_with_column(proj, agg_expr, &a0);
+            let mut cols = Vec::new();
+            expr_columns(&swapped, &mut cols);
+            if !cols.iter().all(|c| c.relation.is_none() && c.name == "a0")
+                || contains_aggregate_function(&swapped)
+            {
+                return None;
+            }
+            swapped
+        }
+    };
+
+    let alias = format!("__weft_decorr_{counter}");
+    *counter += 1;
+
+    // Derived side: `SELECT <inner keys> AS k{j}, <thr> AS thr0 FROM <body> [WHERE <remaining>]
+    // GROUP BY <inner keys>` — the per-key aggregate the outer skeleton joins on.
+    let mut derived = body.clone();
+    if !remaining.is_empty() {
+        let pred = remaining.into_iter().cloned().reduce(Expr::and)?;
+        derived = datafusion::logical_expr::LogicalPlanBuilder::from(derived)
+            .filter(pred)
+            .ok()?
+            .build()
+            .ok()?;
+    }
+    let group_exprs: Vec<Expr> = inner_cols.iter().cloned().map(Expr::Column).collect();
+    let aggr_with_alias = agg.aggr_expr[0].clone().alias("a0");
+    derived = datafusion::logical_expr::LogicalPlanBuilder::from(derived)
+        .aggregate(group_exprs.clone(), vec![aggr_with_alias])
+        .ok()?
+        .build()
+        .ok()?;
+    let mut proj_exprs: Vec<Expr> = group_exprs
+        .iter()
+        .enumerate()
+        .map(|(j, g)| g.clone().alias(format!("k{j}")))
+        .collect();
+    proj_exprs.push(thr_expr.alias("thr0"));
+    derived = datafusion::logical_expr::LogicalPlanBuilder::from(derived)
+        .project(proj_exprs)
+        .ok()?
+        .alias(alias.as_str())
+        .ok()?
+        .build()
+        .ok()?;
+
+    let thr_ref = Expr::Column(Column::new(Some(alias.as_str()), "thr0"));
+    let conjunct = Expr::BinaryExpr(BinaryExpr {
+        left: Box::new(operand.clone()),
+        op,
+        right: Box::new(thr_ref),
+    });
+    Some(DecorrelatedScalar {
+        derived,
+        alias,
+        join_outer_cols: outer_cols,
+        conjunct,
+    })
+}
+
+/// The expr without its outermost alias layer, if any.
+fn strip_expr_alias(e: &Expr) -> &Expr {
+    match e {
+        Expr::Alias(a) => a.expr.as_ref(),
+        other => other,
+    }
+}
+
+/// Replace occurrences of `agg` (by structural equality, or by a `Column` naming the aggregate's
+/// output) with `replacement` inside `e`.
+fn substitute_agg_with_column(e: &Expr, agg: &Expr, replacement: &Expr) -> Expr {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    let agg_name = agg.schema_name().to_string();
+    e.clone()
+        .transform(|node| {
+            if node == *agg {
+                return Ok(Transformed::yes(replacement.clone()));
+            }
+            if let Expr::Column(c) = &node {
+                if c.name == agg_name {
+                    return Ok(Transformed::yes(replacement.clone()));
+                }
+            }
+            Ok(Transformed::no(node))
+        })
+        .map(|t| t.data)
+        .unwrap_or_else(|_| e.clone())
+}
+
+fn contains_aggregate_function(e: &Expr) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut found = false;
+    let _ = e.apply(|node| {
+        if matches!(node, Expr::AggregateFunction(_)) {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 #[cfg(test)]
@@ -6367,9 +8260,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn window_over_a_union_of_aggregates_is_rejected() {
-        // TPC-DS Q36 shape: the window sits over a UNION/DISTINCT of aggregates, not a plain
-        // GROUP BY — out of scope for the partial->combine->window composition.
+    async fn window_over_a_union_of_aggregates_plans_dedup_then_window() {
+        // KAN-49b (TPC-DS Q36 shape): the window sits over a UNION (DISTINCT) of independently
+        // distributable aggregate arms — each arm plans through the ordinary machinery, the arm
+        // outputs hash-shuffle on the full row into a per-partition dedup (identical rows
+        // co-locate), and the window re-shuffles the deduplicated rows by its PARTITION BY key.
         let engine = Engine::new();
         engine.register_batches("t", vec![tiny_table()]).unwrap();
         let lp = engine
@@ -6380,12 +8275,29 @@ mod tests {
             )
             .await
             .unwrap();
-        let err = try_window(&lp, &[]).expect_err("window over a UNION is not supported");
-        assert!(format!("{err}").contains("auto-distribute"), "got: {err}");
+        let dq = try_window(&lp, &[])
+            .expect("ok")
+            .expect("window over a UNION of distributable aggregates should plan");
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("SELECT DISTINCT") && s.sql.contains("UNION ALL")),
+            "the dedup stage unions the arm streams before deduplicating: {dq:?}"
+        );
+        let window = dq.stages.last().expect("window stage");
+        assert!(
+            window.sql.contains("avg(v) OVER (PARTITION BY k)"),
+            "the window computes after the partition shuffle: {}",
+            window.sql
+        );
     }
 
     #[tokio::test]
-    async fn window_function_rank_over_aggregate_is_rejected() {
+    async fn window_function_rank_over_aggregate_plans_co_located() {
+        // KAN-49a: a ranking window with a non-empty PARTITION BY is exact after the partition
+        // hash-shuffle (every partition's rows are wholly on one worker), so it plans now —
+        // where it used to be rejected. Global ranking windows (no PARTITION BY) plan too
+        // (KAN-49b): the tiny post-aggregate result gathers to partition 0.
         let engine = Engine::new();
         engine.register_batches("t", vec![tiny_table()]).unwrap();
         let lp = engine
@@ -6395,8 +8307,48 @@ mod tests {
             )
             .await
             .unwrap();
-        let err = try_window(&lp, &[]).expect_err("rank is not a supported window aggregate");
-        assert!(format!("{err}").contains("rank"), "got: {err}");
+        let dq = try_window(&lp, &[])
+            .expect("ok")
+            .expect("rank over a partition co-located aggregate should plan");
+        let window = dq.stages.last().expect("window stage");
+        assert!(
+            window
+                .sql
+                .contains("rank() OVER (PARTITION BY g0 ORDER BY r0 ASC NULLS FIRST)"),
+            "the ranking window computes locally after the partition shuffle: {}",
+            window.sql
+        );
+    }
+
+    #[tokio::test]
+    async fn window_function_global_rank_over_aggregate_plans_gathered() {
+        // KAN-49b (TPC-DS Q44): a global ranking window (no PARTITION BY) over an aggregate is
+        // exact once the tiny combined aggregate output gathers to partition 0 (a
+        // post-aggregation gather — never the raw fact).
+        let engine = Engine::new();
+        engine.register_batches("t", vec![tiny_table()]).unwrap();
+        let lp = engine
+            .logical_plan(
+                "SELECT k, sum(v) AS sv, rank() OVER (ORDER BY sum(v)) AS rk FROM t GROUP BY k, v",
+            )
+            .await
+            .unwrap();
+        let dq = try_window(&lp, &[])
+            .expect("ok")
+            .expect("a global ranking window over an aggregate should plan");
+        let combine = &dq.stages[dq.stages.len() - 2];
+        assert!(
+            combine.hash_key_cols.is_empty(),
+            "the combine gathers to partition 0 for the global rank: {combine:?}"
+        );
+        let window = dq.stages.last().expect("window stage");
+        assert!(
+            window
+                .sql
+                .contains("rank() OVER (ORDER BY r0 ASC NULLS FIRST)"),
+            "the global rank computes on the gathered combine partition: {}",
+            window.sql
+        );
     }
 
     #[tokio::test]

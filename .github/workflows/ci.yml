@@ -62,8 +62,11 @@ jobs:
     runs-on: ubuntu-latest
     # Fail fast rather than burning an hour on a wedged runner. The suite compiles the workspace
     # twice over (see the disk-reclaim step) and then runs the distributed tests serially, so the
-    # honest ceiling is well above the ~10 min this takes on `main`.
-    timeout-minutes: 90
+    # honest ceiling is well above the ~10 min this takes on `main`. 180: the line-tables-only
+    # debuginfo switch (CARGO_PROFILE_*_DEBUG=1 below) invalidated the cached dev/test artifacts,
+    # so the first run after it recompiles the world and blew the old 90 min ceiling — a
+    # completed run re-warms the cache and later runs return to ~45 min.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       # `iceberg` 0.8 is the newest release compatible with the pinned Rust 1.90, and it pulls
@@ -123,6 +126,12 @@ jobs:
         env:
           WEFT_MINIO_TEST: "1"
           WEFT_MINIO_ENDPOINT: "http://127.0.0.1:9000"
+          # Line-tables-only debug info: the full test/dev profiles' debuginfo makes each
+          # weft-execution integration binary ~1-2 GB at link time, and parallel `ld`
+          # processes exhaust the 16 GB runner (collect2: ld terminated with signal 7
+          # [Bus error] on main, 2026-07-30). Assertions/backtraces are unaffected.
+          CARGO_PROFILE_TEST_DEBUG: "1"
+          CARGO_PROFILE_DEV_DEBUG: "1"
 
   # The TPC-H / TPC-DS / distributed gates used to run at the tail of build-test, which made the
   # critical path the SUM of compiling the workspace and replaying every query suite. They only

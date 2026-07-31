@@ -6,6 +6,7 @@
 //! via [`physical_splitter`] so any locally-plannable SQL still gets a distributed job graph.
 
 pub mod dag_splitter;
+pub mod gather_shapes;
 pub mod join_chain;
 pub mod join_order;
 pub mod physical_splitter;

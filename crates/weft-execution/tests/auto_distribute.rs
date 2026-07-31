@@ -13,23 +13,25 @@ use weft_loom::arrow::datatypes::{DataType, Field, Schema};
 use weft_loom::arrow::util::pretty::pretty_format_batches;
 use weft_loom::Engine;
 
-/// Serialize multi-worker outer-join tests and give each worker a fresh port. The bind/drop
-/// `ephemeral_port()` helper races under parallel tests and can also reuse TIME_WAIT ports
-/// across sequential tests, causing silent connects to the wrong worker.
+/// Serialize multi-worker outer-join tests and give each worker a fresh port. All port
+/// allocation in this file goes through `unique_worker_port`: the old grab-release-rebind
+/// `ephemeral_port()` raced under parallel tests (the kernel can hand the same number to
+/// another socket between drop and rebind), and the previous 41000+ seed sat INSIDE the
+/// Linux ephemeral source range (32768..=60999), so the harness's own outbound connections
+/// could steal a worker's port — `serve_worker` swallows the EADDRINUSE and the test then
+/// panicked with "wN did not bind" (~40% flake on loaded CI runners).
 static OUTER_JOIN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static OUTER_JOIN_PORT: AtomicU16 = AtomicU16::new(0);
+static OUTER_JOIN_PORT: std::sync::OnceLock<AtomicU16> = std::sync::OnceLock::new();
 
 fn unique_worker_port() -> u16 {
-    // Seed once from pid so leftover listeners from prior cargo-test processes on 46000+ do not
-    // steal traffic (bind failure is ignored by `let _ = serve_worker(...)`).
-    let prev = OUTER_JOIN_PORT.fetch_add(1, Ordering::Relaxed);
-    if prev == 0 {
-        let seed = 41000 + (std::process::id() as u16 % 20000);
-        OUTER_JOIN_PORT.store(seed.wrapping_add(1), Ordering::Relaxed);
-        seed
-    } else {
-        prev
-    }
+    // Seed the counter exactly once, atomically (`get_or_init` blocks racing callers; the
+    // earlier fetch_add-then-store init could hand out tiny pre-seed values). The base stays
+    // BELOW the ephemeral floor: 10000..=24999 is clear of the ephemeral range above and the
+    // fixed test ports other suites use (50571+). Seeding from the pid keeps two concurrent
+    // cargo-test processes from sharing a base and reusing each other's leftover listeners.
+    OUTER_JOIN_PORT
+        .get_or_init(|| AtomicU16::new(10000 + (std::process::id() as u16 % 15000)))
+        .fetch_add(1, Ordering::Relaxed)
 }
 
 /// rows(k, v, w) where k = i % `groups`, v = i, w = i % 7 — for grouping/aggregation.
@@ -78,19 +80,14 @@ struct Cluster2 {
     cluster: Cluster,
 }
 
-fn ephemeral_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
 /// Block until each worker accepts TCP. `serve_worker` swallows bind errors, so without this a
 /// stolen port turns into a retry loop that only ever reports "never succeeded".
 async fn await_worker_bind(workers: &[(&str, u16)]) {
     for &(label, port) in workers {
         let mut ok = false;
-        for _ in 0..100 {
+        // 10s ceiling: loaded 4-vCPU CI runners can take far longer than the old 2s to
+        // schedule the spawned worker task.
+        for _ in 0..250 {
             if tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .is_ok()
@@ -98,7 +95,7 @@ async fn await_worker_bind(workers: &[(&str, u16)]) {
                 ok = true;
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         }
         assert!(ok, "{label} did not bind on port {port}");
     }
@@ -109,7 +106,7 @@ async fn two_workers(_base: u16) -> Cluster2 {
     const G: i64 = 12;
     // Ephemeral ports avoid cross-crate collisions under `cargo test --workspace`
     // (fixed ports previously hung for minutes on TCP connect when another suite stole them).
-    let (p0, p1) = (ephemeral_port(), ephemeral_port());
+    let (p0, p1) = (unique_worker_port(), unique_worker_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, N / 2, G)]).unwrap();
     let e1 = Arc::new(Engine::new());
@@ -272,8 +269,8 @@ async fn auto_derived_broadcast_join() {
     let expected = single.sql(sql).await.unwrap();
 
     // Two workers: `t` sharded, `dim` replicated in full on each.
-    let p0 = ephemeral_port();
-    let p1 = ephemeral_port();
+    let p0 = unique_worker_port();
+    let p1 = unique_worker_port();
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 150, G)]).unwrap();
     e0.register_batches("dim", vec![dim(G)]).unwrap();
@@ -357,7 +354,7 @@ async fn two_sharded_tables_auto_shuffle_join() {
         .unwrap()
     }
 
-    let (p0, p1) = (ephemeral_port(), ephemeral_port());
+    let (p0, p1) = (unique_worker_port(), unique_worker_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
     e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)])
@@ -504,7 +501,7 @@ async fn multi_dim_broadcast_star_matches_single_node() {
     single.register_batches("dim2", vec![dim2(G)]).unwrap();
     let expected = single.sql(sql).await.unwrap();
 
-    let (p0, p1) = (ephemeral_port(), ephemeral_port());
+    let (p0, p1) = (unique_worker_port(), unique_worker_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
     e0.register_batches("dim", vec![dim(G)]).unwrap();
@@ -559,7 +556,7 @@ async fn three_sharded_tables_left_deep_shuffle_chain() {
     single.register_batches("dim2", vec![dim2(G)]).unwrap();
     let expected = single.sql(sql).await.unwrap();
 
-    let (p0, p1) = (ephemeral_port(), ephemeral_port());
+    let (p0, p1) = (unique_worker_port(), unique_worker_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, 100, G)]).unwrap();
     e0.register_batches("dim", vec![dim_shard(G, 0, G / 2)])
@@ -644,7 +641,7 @@ async fn having_auto_distributes() {
 async fn two_workers_with_dim() -> (Cluster, Engine) {
     const N: i64 = 300;
     const G: i64 = 12;
-    let (p0, p1) = (ephemeral_port(), ephemeral_port());
+    let (p0, p1) = (unique_worker_port(), unique_worker_port());
     let e0 = Arc::new(Engine::new());
     e0.register_batches("t", vec![batch(0, N / 2, G)]).unwrap();
     e0.register_batches("dim", vec![dim(G)]).unwrap();

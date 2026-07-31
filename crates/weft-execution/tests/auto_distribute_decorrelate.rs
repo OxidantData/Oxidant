@@ -51,17 +51,15 @@ const REPLICATED_DIMS: [&str; 4] = ["part", "supplier", "nation", "region"];
 
 /// Serialize port allocation across tests in this binary (same rationale as
 /// `tests/auto_distribute.rs`: bind/drop races steal ports under parallel tests).
-static PORT: AtomicU16 = AtomicU16::new(0);
+static PORT: std::sync::OnceLock<AtomicU16> = std::sync::OnceLock::new();
 
 fn unique_worker_port() -> u16 {
-    let prev = PORT.fetch_add(1, Ordering::Relaxed);
-    if prev == 0 {
-        let seed = 43000 + (std::process::id() as u16 % 20000);
-        PORT.store(seed.wrapping_add(1), Ordering::Relaxed);
-        seed
-    } else {
-        prev
-    }
+    // OnceLock-seeded allocator with the base BELOW the Linux ephemeral source range
+    // (32768..=60999): the harness's own outbound connections can never steal a worker's
+    // port (serve_worker swallows EADDRINUSE; the old in-range bases flaked "did not
+    // bind" / "distributed run never succeeded" on loaded CI runners).
+    PORT.get_or_init(|| AtomicU16::new(12000 + (std::process::id() as u16 % 512)))
+        .fetch_add(1, Ordering::Relaxed)
 }
 
 fn i64f(name: &str) -> Field {

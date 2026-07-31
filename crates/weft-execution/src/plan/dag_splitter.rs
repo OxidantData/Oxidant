@@ -251,7 +251,7 @@ fn branch_fingerprint(branch: &LogicalPlan) -> Option<String> {
 
 /// Whether any expression in the plan (including subquery plans) contains a volatile scalar
 /// function (`rand()`, `now()`, …) whose result may differ across evaluations.
-fn plan_contains_volatile(lp: &LogicalPlan) -> bool {
+pub(crate) fn plan_contains_volatile(lp: &LogicalPlan) -> bool {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 
     let mut volatile = false;
@@ -295,10 +295,31 @@ fn plan_contains_volatile(lp: &LogicalPlan) -> bool {
 /// sharded/replicated union into two independently-planned halves and only then `UNION ALL`-ing
 /// their results (as the two paths above do) could keep a row that should have been deduplicated
 /// against a row that landed in the other half. Keep that shape an honest rejection.
+///
+/// The one exception: a distinct union sitting **directly under an `Aggregate`** (through
+/// `SubqueryAlias` wrappers) with raw row-source arms is *not* split by sharding at all — it is
+/// planned whole by [`super::stage_planner::aggregate_over_distinct_union_stages`] (KAN-49a,
+/// TPC-DS Q75), which co-locates identical rows on one partition *before* dedup, preserving
+/// cross-arm deduplication exactly. That node (and only that node) skips the rejection.
 fn reject_mixed_union_branch(branch: &LogicalPlan, replicated: &[&str]) -> Result<()> {
-    if let LogicalPlan::Distinct(distinct) = branch {
+    reject_mixed_union(branch, replicated, false)
+}
+
+/// `at_aggregate_input` is true exactly when `lp` sits directly under an `Aggregate` through
+/// `SubqueryAlias` wrappers only — the same chain
+/// [`super::stage_planner::aggregate_over_distinct_union_stages`] strips before planning the
+/// co-located dedup, so the guard skips precisely the nodes that composition handles.
+fn reject_mixed_union(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+    at_aggregate_input: bool,
+) -> Result<()> {
+    if let LogicalPlan::Distinct(distinct) = lp {
         if let LogicalPlan::Union(union) = distinct.input().as_ref() {
             if union_has_mixed_sharding(union, replicated) {
+                if at_aggregate_input && union_arms_are_raw_row_sources(union) {
+                    return Ok(());
+                }
                 return Err(Error::Unsupported(
                     "auto-distribute: branch-aware CrossJoin UNION (DISTINCT) has a \
                      replicated-table-only arm plus a sharded-table arm; splitting a distinct \
@@ -308,10 +329,32 @@ fn reject_mixed_union_branch(branch: &LogicalPlan, replicated: &[&str]) -> Resul
             }
         }
     }
-    for input in branch.inputs() {
-        reject_mixed_union_branch(input, replicated)?;
+    let child_at_aggregate_input = match lp {
+        LogicalPlan::Aggregate(_) => true,
+        LogicalPlan::SubqueryAlias(_) => at_aggregate_input,
+        _ => false,
+    };
+    for input in lp.inputs() {
+        reject_mixed_union(input, replicated, child_at_aggregate_input)?;
     }
     Ok(())
+}
+
+/// Every leaf arm of the union is a raw row source (no aggregate / window / distinct / nested
+/// union), the same condition [`super::stage_planner::aggregate_over_distinct_union_stages`]
+/// requires before planning the co-located dedup. Nested distinct unions flatten first (dedup
+/// is idempotent), mirroring the hook.
+fn union_arms_are_raw_row_sources(union: &datafusion::logical_expr::Union) -> bool {
+    fn is_raw(lp: &LogicalPlan) -> bool {
+        match lp {
+            LogicalPlan::Aggregate(_) | LogicalPlan::Window(_) => return false,
+            LogicalPlan::Distinct(d) => return is_raw(d.input().as_ref()),
+            LogicalPlan::Union(u) => return u.inputs.iter().all(|arm| is_raw(arm.as_ref())),
+            _ => {}
+        }
+        lp.inputs().iter().all(|c| is_raw(c))
+    }
+    union.inputs.iter().all(|arm| is_raw(arm.as_ref()))
 }
 
 fn union_has_mixed_sharding(union: &datafusion::logical_expr::Union, replicated: &[&str]) -> bool {
@@ -493,7 +536,7 @@ fn collect_sharded_branches<'a>(
     }
 }
 
-fn node_id(lp: &LogicalPlan) -> usize {
+pub(crate) fn node_id(lp: &LogicalPlan) -> usize {
     lp as *const LogicalPlan as usize
 }
 
@@ -550,7 +593,7 @@ fn collect_tables_with_subqueries(lp: &LogicalPlan, out: &mut HashSet<String>) {
 /// Replace selected branches while preserving every other node. The bool reports whether this
 /// subtree changed, avoiding unnecessary reconstruction (and schema validation) of untouched
 /// replicated branches.
-fn replace_branches(
+pub(crate) fn replace_branches(
     lp: &LogicalPlan,
     branch_by_node: &HashMap<usize, usize>,
     branch_count: usize,
@@ -585,7 +628,7 @@ fn replace_branches(
     Ok((rebuilt, true))
 }
 
-fn placeholder_plan(
+pub(crate) fn placeholder_plan(
     branch: &LogicalPlan,
     branch_i: usize,
     branch_count: usize,
@@ -863,12 +906,14 @@ mod tests {
         );
     }
 
-    /// A plain `UNION` (`DISTINCT`) mixing a sharded arm with a replicated-only arm is *not* safe
-    /// to split the same way: DataFusion lowers it to `Distinct` wrapping `Union`, and splitting
-    /// into two independently-planned halves combined with `UNION ALL` would not reproduce
-    /// deduplication across the two halves. Keep this shape an honest rejection.
+    /// A plain `UNION` (`DISTINCT`) mixing a sharded arm with a replicated-only arm used to be an
+    /// honest rejection: DataFusion lowers it to `Distinct` wrapping `Union`, and splitting into
+    /// two independently-planned halves combined with `UNION ALL` would not reproduce
+    /// deduplication across the two halves. KAN-49a plans it exactly instead — every arm's raw
+    /// rows are hash-shuffled on the full row so duplicates co-locate *before* the per-partition
+    /// `DISTINCT` (see `aggregate_over_distinct_union_stages`).
     #[tokio::test]
-    async fn mixed_union_distinct_branch_is_rejected() {
+    async fn mixed_union_distinct_branch_plans_co_located_dedup() {
         let lp = logical_plan(
             "WITH a AS (\
                  SELECT k, SUM(v) AS s \
@@ -883,8 +928,41 @@ mod tests {
              SELECT a.k, a.s, b.n FROM a CROSS JOIN b",
         )
         .await;
+        let dq = try_branch_dag(&lp, &["d"])
+            .expect("split")
+            .expect("distinct union branch plans via the co-located dedup");
+        assert!(
+            dq.stages.iter().any(|s| s.sql.contains("SELECT DISTINCT")),
+            "expected the co-located dedup stage: {dq:?}"
+        );
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.exchange == ExchangeMode::Forward),
+            "expected a Forward stage for the replicated-only UNION arm: {dq:?}"
+        );
+    }
+
+    /// …but only while every arm is a raw row source. An arm carrying its own aggregate cannot
+    /// use the co-located dedup, and splitting the distinct union by sharding stays rejected.
+    #[tokio::test]
+    async fn mixed_union_distinct_branch_with_aggregated_arm_is_rejected() {
+        let lp = logical_plan(
+            "WITH a AS (\
+                 SELECT k, SUM(v) AS s \
+                 FROM (\
+                     SELECT k, SUM(v) AS v FROM t GROUP BY k \
+                     UNION \
+                     SELECT dk AS k, 1 AS v FROM d\
+                 ) mixed \
+                 GROUP BY k\
+             ), \
+             b AS (SELECT COUNT(*) AS n FROM t) \
+             SELECT a.k, a.s, b.n FROM a CROSS JOIN b",
+        )
+        .await;
         let err =
-            try_branch_dag(&lp, &["d"]).expect_err("distinct UNION arm can't be split safely");
+            try_branch_dag(&lp, &["d"]).expect_err("a non-raw distinct UNION arm can't be split");
         let msg = err.to_string();
         assert!(msg.contains("UNION (DISTINCT)"), "{msg}");
         assert!(msg.contains("cross-arm deduplication"), "{msg}");

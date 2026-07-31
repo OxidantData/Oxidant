@@ -29,8 +29,11 @@
 //! when each join is a single equijoin key. Two sharded-table compositions layer on top of that:
 //!
 //! - **comma-joins** (`FROM a, b WHERE a.k = b.k`, TPC-H Q12) — which DataFusion leaves as a
-//!   `CROSS JOIN` + `Filter` — are normalized into an inner equijoin by
-//!   [`super::join_chain::rewrite_comma_join_filters`] and planned by the ordinary paths.
+//!   `CROSS JOIN` + `Filter` — are normalized up front into a connected chain of keyed inner
+//!   equijoins by [`super::join_order::connect_comma_join_chain`] (so stage SQL never emits a
+//!   plain cross join between large tables — TPC-DS Q6) and planned by the ordinary paths;
+//!   [`super::join_chain::rewrite_comma_join_filters`] remains as the retry for shapes the
+//!   up-front rewrite declines.
 //! - an **aggregate over a pre-aggregated derived table** (TPC-H Q13's count-distribution over a
 //!   LEFT JOIN group-by, TPC-DS Q54's revenue bands over a per-customer `GROUP BY` CTE) is
 //!   composed from the inner distributed aggregation plus one exact outer-aggregate stage
@@ -44,8 +47,10 @@
 //! CTE-heavy outer cross joins are lowered recursively by [`super::dag_splitter`]: each sharded
 //! aggregate branch becomes its own sub-DAG, and a gathered outer stage combines the branch
 //! outputs with any replicated-only inputs.
-//! Ranking windows and global windows (no `PARTITION BY`) return an explicit
-//! [`Error::Unsupported`] so the caller falls back to single-node execution.
+//! Ranking windows distribute too (KAN-49a/KAN-49b): with a `PARTITION BY` they compute after
+//! the partition hash-shuffle; a *global* ranking window (no `PARTITION BY`) gathers the tiny
+//! combined aggregate output to partition 0 and computes there. Other unsupported window shapes
+//! return an explicit [`Error::Unsupported`] so the caller falls back to single-node execution.
 //! Correlated scalar subqueries over sharded tables are either decorrelated into a distributed
 //! per-key aggregate + shuffle join (equality-correlated `min`/`max`/`sum`/`count`, TPC-H Q2 —
 //! see [`super::shape_extensions::try_decorrelate_scalar_subquery`]) or rejected (not
@@ -93,6 +98,14 @@ pub struct DistributedQuery {
 /// equijoin.
 /// Derive a distributed plan from an already-built logical plan.
 pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result<DistributedQuery> {
+    // Comma-join chains (`CROSS JOIN` + WHERE equijoins — TPC-DS Q6) become connected keyed
+    // inner joins before anything else: DataFusion has no join reordering, so a cross join
+    // emitted into stage SQL executes as one on the worker, and `CrossJoinExec` buffers its
+    // whole left input (Q6 at SF10: 16 GB of `date_dim × customer ⋈ customer_address`)
+    // outside the KAN-25 hash-join build guard. The rewrite is semantics-preserving and a
+    // no-op for every other shape (keyed chains, genuine cross products, branch-DAG joins).
+    let connected = super::join_order::connect_comma_join_chain(lp, replicated);
+    let lp = connected.as_ref().unwrap_or(lp);
     // Filter-first inner-join reorder (TPC-DS Q72 at SF10): DataFusion executes inner joins in
     // written order, so a fact⋈fact join placed before the selective dimension filters must
     // stream (or, under the workers' unknown-stats sort-merge reroute, external-sort) the
@@ -143,7 +156,29 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
         if let Some(dq) = try_scalar_subquery_projection(lp, replicated)? {
             return Ok(dq);
         }
+        // KAN-49 wave-3b: a UNION (distinct) of per-channel arms carrying global rank()
+        // windows (TPC-DS Q49) — must run before `try_union_all`, whose arm-peel errors on
+        // the windowed arms.
+        if let Some(dq) = super::gather_shapes::try_ranked_union(lp, replicated)? {
+            return Ok(dq);
+        }
         if let Some(dq) = try_materialize_subquery_fact(lp, replicated)? {
+            return Ok(dq);
+        }
+        // KAN-49 wave-3f: a UNION ALL of per-channel arms whose sharded inputs are shared
+        // derived CTEs (TPC-DS Q23 at the SF10 classification — the channel facts replicate,
+        // the store_sales-derived CTEs plan once and gather into each arm's stage). Must run
+        // before `try_union_all`, whose arm planner errors on these arms instead of declining.
+        if let Some(dq) = super::gather_shapes::try_union_over_derived_ctes(lp, replicated)? {
+            return Ok(dq);
+        }
+        // KAN-49 wave-4 (TPC-DS Q14): a grouping-set (ROLLUP) aggregate over a per-channel
+        // UNION ALL whose arms carry an INTERSECT-derived `IN` key set and a global-AVG HAVING
+        // threshold — both derived tables over the sharded fact. Must run before
+        // `try_union_all`, whose arm planner rejects these subqueries, and before the peel
+        // path, whose subquery safety checks refuse them.
+        if let Some(dq) = super::gather_shapes::try_rollup_union_derived_subqueries(lp, replicated)?
+        {
             return Ok(dq);
         }
         if let Some(dq) = try_union_all(lp, replicated)? {
@@ -153,6 +188,23 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
             return Ok(dq);
         }
         if let Some(dq) = try_non_aggregate(lp, replicated)? {
+            return Ok(dq);
+        }
+        // KAN-49 wave-3b ("gather" wave): the shapes that previously fell into the
+        // strict-refused whole-fact gather — set-op chains under a global count (Q38/Q87),
+        // a FULL OUTER JOIN of distinct-key aggregates (Q97), a HAVING scalar threshold over
+        // a shared derived aggregate (Q24), and IN keys from a self-join of the fact (Q95).
+        if let Some(dq) = super::gather_shapes::try_global_count_over_set_op(lp, replicated)? {
+            return Ok(dq);
+        }
+        if let Some(dq) = super::gather_shapes::try_full_outer_join_global_agg(lp, replicated)? {
+            return Ok(dq);
+        }
+        if let Some(dq) = super::gather_shapes::try_derived_having_scalar_threshold(lp, replicated)?
+        {
+            return Ok(dq);
+        }
+        if let Some(dq) = super::gather_shapes::try_self_join_in_keys(lp, replicated)? {
             return Ok(dq);
         }
         reject_explicit_unsupported(lp)?;
@@ -170,6 +222,11 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
     let mut dq = match primary {
         Ok(dq) => dq,
         Err(primary_error) => {
+            // Debug hook: the gather fallback below replaces this error in strict mode, which
+            // hides *why* no parallel shape matched. `WEFT_TPCDS_DEBUG=1` surfaces it.
+            if std::env::var("WEFT_TPCDS_DEBUG").is_ok() {
+                eprintln!("[plan-debug] primary shape error: {primary_error}");
+            }
             // KAN-26: a comma-join (`CROSS JOIN` + `WHERE` equijoin — TPC-H Q12) becomes a
             // shuffleable inner equijoin once the filter conjuncts are pushed into the join.
             // Retry the whole planner on the normalized plan before the gather / rejection
@@ -182,6 +239,19 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
                 if let Some(rewritten) = crate::plan::join_chain::rewrite_comma_join_filters(lp) {
                     // The recursive call validates and stamps; on failure the original error
                     // drives the usual fallbacks below.
+                    if let Ok(dq) = plan_distributed_logical(&rewritten, replicated) {
+                        return Ok(dq);
+                    }
+                }
+            }
+            // KAN-49a: a correlated scalar-aggregate subquery left in the branch-aware outer
+            // skeleton (TPC-DS Q1/Q30/Q81's per-key avg threshold) decorrelates into a derived
+            // per-key aggregate join — which the retry then materializes as its own branch
+            // instead of rejecting the leftover sharded scan.
+            if reason.contains("still scans unmaterialized sharded table") {
+                if let Some(rewritten) =
+                    super::shape_extensions::rewrite_correlated_scalar_subqueries(lp)
+                {
                     if let Ok(dq) = plan_distributed_logical(&rewritten, replicated) {
                         return Ok(dq);
                     }
@@ -469,7 +539,10 @@ pub(crate) fn aggregation_stages_for(
         )));
     }
     let sharded_name = sharded[0];
-    if let Some(dq) = try_split_broadcast_union(p, sharded_name)? {
+    if let Some(dq) = aggregate_over_distinct_union_stages(p, sharded_name, replicated)? {
+        return Ok(dq);
+    }
+    if let Some(dq) = try_split_broadcast_union(p, sharded_name, replicated)? {
         return Ok(dq);
     }
     if let Some(join) = sharded_null_extended_outer_join(&agg.input, sharded_name) {
@@ -517,6 +590,8 @@ pub(crate) fn aggregation_stages_for(
         .iter()
         .map(AggSpec::classify)
         .collect::<Result<Vec<_>>>()?;
+    let mut aggs = aggs;
+    resolve_grouping_specs(&mut aggs, &agg.group_expr)?;
     let distinct = aggs.iter().any(|a| a.distinct);
 
     let remap = build_remap(p);
@@ -838,9 +913,7 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
         .map(AggSpec::classify)
         .collect::<Result<Vec<_>>>()?;
     if aggs.iter().any(|a| a.distinct) {
-        return Err(Error::Unsupported(
-            "auto-distribute: global COUNT(DISTINCT) not yet supported".into(),
-        ));
+        return global_distinct_aggregation_stages(p, &tail, &aggs);
     }
 
     let remap = build_remap(p);
@@ -864,6 +937,92 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
         stages: vec![
             StageDef::new(0, partial_sql, vec![], vec![]),
             StageDef::new(1, final_sql, vec![0], vec![]),
+        ],
+        finalize_sql: build_finalize(p)?,
+    })
+}
+
+/// Global (ungrouped) aggregation with a `COUNT(DISTINCT x)` in the list (TPC-DS Q28's six
+/// single-row bucket aggregates, cross-joined by [`super::dag_splitter`]).
+///
+/// A per-shard `DISTINCT` + recombine would double-count values that land on more than one
+/// worker, so the raw rows are hash-shuffled **by the DISTINCT argument** instead — every equal
+/// value co-locates on one partition, making each partition's `COUNT(DISTINCT x)` exact:
+///
+/// 1. **Project** every aggregate's argument as `c{i}` (no aggregation), hash-shuffled by the
+///    shared DISTINCT argument column.
+/// 2. **Per-partition aggregate**: `count(DISTINCT c{i})` (exact by co-location) plus the
+///    recombinable partials (`sum`/`count`/`min`/`max`/`avg` pieces) of the non-DISTINCT
+///    aggregates. A global aggregate emits exactly one row per partition — identity values over
+///    an empty bucket (0 counts, NULL sums), so nothing is double- or mis-counted.
+/// 3. **Gather-combine**: `sum` the per-partition distinct counts and recombine the partials on
+///    partition 0; `HAVING COUNT(*) > 0` suppresses the synthetic empty-partition row, same as
+///    the non-DISTINCT global path.
+///
+/// Restricted to DISTINCT **count** aggregates that all share one argument expression; anything
+/// else keeps the honest [`Error::Unsupported`].
+fn global_distinct_aggregation_stages(
+    p: &Peeled<'_>,
+    tail: &str,
+    aggs: &[AggSpec],
+) -> Result<DistributedQuery> {
+    let distinct_args: Vec<&str> = aggs
+        .iter()
+        .filter(|a| a.distinct)
+        .map(|a| a.arg_sql.as_str())
+        .collect();
+    if distinct_args.is_empty()
+        || distinct_args.iter().any(|arg| *arg != distinct_args[0])
+        || aggs.iter().any(|a| a.distinct && a.func != "count")
+    {
+        return Err(Error::Unsupported(
+            "auto-distribute: global DISTINCT aggregates are only supported as \
+             COUNT(DISTINCT x) over a single shared argument"
+                .into(),
+        ));
+    }
+
+    // Stage 0: project each aggregate's argument, hashed by the shared DISTINCT argument.
+    let hash_key = aggs
+        .iter()
+        .position(|a| a.distinct)
+        .expect("at least one distinct aggregate") as u32;
+    let psel: Vec<String> = aggs
+        .iter()
+        .enumerate()
+        .map(|(i, a)| format!("{} AS c{i}", a.arg_sql))
+        .collect();
+    let partial_sql = sanitize_generated_sql(&format!("SELECT {} {tail}", psel.join(", ")));
+
+    // Stage 1: exact per-partition distinct counts + recombinable partials for the rest.
+    let mut mid_sel = Vec::with_capacity(aggs.len());
+    let mut combine = Vec::with_capacity(aggs.len());
+    for (i, a) in aggs.iter().enumerate() {
+        if a.distinct {
+            mid_sel.push(format!("count(DISTINCT c{i}) AS d{i}"));
+            combine.push(format!("sum(d{i}) AS r{i}"));
+        } else {
+            let (sel, comb) = partial_combine_sql(&a.func, i, &format!("c{i}"))?;
+            mid_sel.extend(sel);
+            combine.push(comb);
+        }
+    }
+    let mid_sql =
+        sanitize_generated_sql(&format!("SELECT {} FROM shuffle_input", mid_sel.join(", ")));
+
+    // Stage 2: gather and recombine. The empty-bucket synthetic row reads as NULLs / zero
+    // counts; HAVING COUNT(*) > 0 keeps only partition 0's real row.
+    let inner = format!(
+        "SELECT {} FROM shuffle_input HAVING COUNT(*) > 0",
+        combine.join(", ")
+    );
+    let remap = build_remap(p);
+    let final_sql = wrap_output(p, &inner, &remap)?;
+    Ok(DistributedQuery {
+        stages: vec![
+            StageDef::new(0, partial_sql, vec![], vec![hash_key]),
+            StageDef::new(1, mid_sql, vec![0], vec![]),
+            StageDef::new(2, final_sql, vec![1], vec![]),
         ],
         finalize_sql: build_finalize(p)?,
     })
@@ -1181,13 +1340,22 @@ pub(crate) struct AggSpec {
     pub(crate) arg_sql: String,
     /// Whether the aggregate is `DISTINCT`.
     pub(crate) distinct: bool,
+    /// For a `grouping(col)` aggregate under a grouping set: the flattened group-column index
+    /// `j` the final stage recomputes as `grouping(g{j})` (resolved by
+    /// [`resolve_grouping_specs`]). The partial stage emits nothing for it — a finest-level
+    /// `grouping()` value is always 0 and cannot recombine into the rolled-up levels.
+    pub(crate) grouping_target: Option<u32>,
 }
 
 /// Partial-stage `SELECT` fragment(s) and final-stage combine expression for one aggregate at
 /// output position `i`, given its (DataFusion-canonical, lowercased) function name and argument
 /// SQL. Shared by `global_aggregation_stages` and `recombine_stage_sql`, which differ only in
 /// group-by handling around this per-aggregate decomposition.
-fn partial_combine_sql(func: &str, i: usize, arg_sql: &str) -> Result<(Vec<String>, String)> {
+pub(crate) fn partial_combine_sql(
+    func: &str,
+    i: usize,
+    arg_sql: &str,
+) -> Result<(Vec<String>, String)> {
     match func {
         "sum" => Ok((
             vec![format!("sum({arg_sql}) AS a{i}")],
@@ -1274,8 +1442,45 @@ impl AggSpec {
             func,
             arg_sql,
             distinct: af.params.distinct,
+            grouping_target: None,
         })
     }
+}
+
+/// Resolve `grouping(col)` aggregate specs (valid only under a grouping set) to the flattened
+/// group-column index the final combine recomputes as `grouping(g{j})`. The partial stage
+/// cannot compute a meaningful value — at the finest level `grouping()` is always 0 — so it
+/// emits nothing and the combine evaluates `grouping()` against the real `GROUP BY ROLLUP`.
+pub(crate) fn resolve_grouping_specs(aggs: &mut [AggSpec], group_expr: &[Expr]) -> Result<()> {
+    if !aggs.iter().any(|a| a.func == "grouping") {
+        return Ok(());
+    }
+    if !is_grouping_set(group_expr) {
+        return Err(Error::Unsupported(
+            "auto-distribute: grouping() aggregate without a grouping set".into(),
+        ));
+    }
+    let up = Unparser::default();
+    let flattened = flattened_group_exprs(group_expr)
+        .into_iter()
+        .map(|g| expr_sql(&up, g))
+        .collect::<Result<Vec<_>>>()?;
+    for spec in aggs.iter_mut() {
+        if spec.func != "grouping" {
+            continue;
+        }
+        let j = flattened
+            .iter()
+            .position(|g| g == &spec.arg_sql)
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "auto-distribute: grouping() argument `{}` is not a flattened group column",
+                    spec.arg_sql
+                ))
+            })?;
+        spec.grouping_target = Some(j as u32);
+    }
+    Ok(())
 }
 
 /// Re-combinable path (no DISTINCT): partial aggregates per worker, final recombines.
@@ -1328,6 +1533,9 @@ pub(crate) fn distinct_stage_sql(
         .map(|(j, g)| format!("{g} AS g{j}"))
         .collect();
     for (i, a) in aggs.iter().enumerate() {
+        if a.grouping_target.is_some() {
+            continue; // recomputed on the final stage — see resolve_grouping_specs
+        }
         psel.push(format!("{} AS c{i}", a.arg_sql));
     }
     let partial_sql = sanitize_generated_sql(&format!("SELECT {} {tail}", psel.join(", ")));
@@ -1335,6 +1543,10 @@ pub(crate) fn distinct_stage_sql(
     // Final: re-run each aggregate over the projected columns, grouped by g{j}.
     let mut combine: Vec<String> = (0..group_sql.len()).map(|j| format!("g{j}")).collect();
     for (i, a) in aggs.iter().enumerate() {
+        if let Some(j) = a.grouping_target {
+            combine.push(format!("grouping(g{j}) AS r{i}"));
+            continue;
+        }
         let d = if a.distinct { "DISTINCT " } else { "" };
         combine.push(format!("{}({d}c{i}) AS r{i}", a.func));
     }
@@ -1414,6 +1626,72 @@ pub(crate) fn build_remap(p: &Peeled<'_>) -> HashMap<String, String> {
     remap
 }
 
+/// Expression substitutions for alias-projection names that do **not** map to a single
+/// `g{j}`/`r{i}` column under [`build_remap`]: an alias of an *expression* over aggregate outputs
+/// (TPC-DS Q39's `stddev_samp(inv_quantity_on_hand)*1.000 AS stdev`, referenced by the CTE's
+/// HAVING and output projection as `foo.stdev`) can still be evaluated on the final stage once
+/// its aggregate references are replaced by the recombined `r{i}` columns. Each entry inlines the
+/// fully-remapped expression wherever the alias is referenced; aliases whose expression still
+/// references anything unmapped are omitted (the caller's [`ensure_all_columns_remapped`] then
+/// declines, same as before).
+pub(crate) fn build_expr_substs(
+    p: &Peeled<'_>,
+    remap: &HashMap<String, String>,
+) -> HashMap<String, Expr> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    let mut substs = HashMap::new();
+    for proj in &p.alias_projections {
+        for e in proj.iter() {
+            let Expr::Alias(a) = e else { continue };
+            // The plain name remap already covers this alias — leave it on the cheaper path.
+            if remap.contains_key(&a.name) {
+                continue;
+            }
+            let mut resolved = true;
+            let mapped = a
+                .expr
+                .clone()
+                .transform(|node| {
+                    match &node {
+                        // An aggregate whose recombine lands in `r{i}` (matched by schema name,
+                        // the same key `build_agg_remap` uses) evaluates there.
+                        Expr::AggregateFunction(_) => {
+                            let key = node.schema_name().to_string();
+                            match remap.get(&key) {
+                                Some(safe) => {
+                                    return Ok(Transformed::yes(datafusion::prelude::col(safe)))
+                                }
+                                None => resolved = false,
+                            }
+                        }
+                        Expr::Column(c) => {
+                            match remap.get(&c.flat_name()).or_else(|| remap.get(&c.name)) {
+                                Some(safe) => {
+                                    return Ok(Transformed::yes(datafusion::prelude::col(safe)))
+                                }
+                                None => resolved = false,
+                            }
+                        }
+                        // Aliases the planner sprinkles inside an expression (the schema-name
+                        // alias on a bare aggregate) carry no value — drop them or the inlined
+                        // expression would unparse `x AS name` in operand position.
+                        Expr::Alias(alias) => {
+                            return Ok(Transformed::yes(alias.expr.as_ref().clone()));
+                        }
+                        _ => {}
+                    }
+                    Ok(Transformed::no(node))
+                })
+                .map(|t| t.data)
+                .unwrap_or_else(|_| a.expr.as_ref().clone());
+            if resolved {
+                substs.insert(a.name.clone(), mapped);
+            }
+        }
+    }
+    substs
+}
+
 /// Wrap the combined inner query so the final stage's output matches the original query's columns:
 /// re-apply the output projection with aggregate/group columns remapped to `r{i}`/`g{j}`, each
 /// item explicitly aliased back to its original output name (so a bare `t.k` stays column `k`, and
@@ -1425,6 +1703,7 @@ pub(crate) fn wrap_output(
     remap: &HashMap<String, String>,
 ) -> Result<String> {
     let up = Unparser::default();
+    let substs = build_expr_substs(p, remap);
     // Apply HAVING against remapped `g{j}`/`r{i}` columns *before* the output projection aliases
     // them back to original names (otherwise `WHERE r0 > …` fails against `having_in.sv`).
     let from_sql = if p.having.is_empty() {
@@ -1432,7 +1711,7 @@ pub(crate) fn wrap_output(
     } else {
         let mut preds = Vec::with_capacity(p.having.len());
         for pred in &p.having {
-            let mapped = remap_columns(&unqualify(pred), remap);
+            let mapped = remap_columns(&unqualify(pred), remap, &substs);
             ensure_all_columns_remapped(&mapped)?;
             preds.push(format!("({})", expr_sql(&up, &mapped)?));
         }
@@ -1444,7 +1723,7 @@ pub(crate) fn wrap_output(
             .iter()
             .map(|e| {
                 let name = output_name(e);
-                let sql = expr_sql(&up, &remap_columns(strip_alias(e), remap))?;
+                let sql = expr_sql(&up, &remap_columns(strip_alias(e), remap, &substs))?;
                 Ok(format!("{sql} AS \"{name}\""))
             })
             .collect::<Result<Vec<_>>>()?
@@ -1454,7 +1733,7 @@ pub(crate) fn wrap_output(
     Ok(format!("SELECT {select} FROM {from_sql}"))
 }
 
-fn output_name(e: &Expr) -> String {
+pub(crate) fn output_name(e: &Expr) -> String {
     match e {
         Expr::Alias(a) => a.name.clone(),
         Expr::Column(c) => c.name.clone(),
@@ -1465,7 +1744,7 @@ fn output_name(e: &Expr) -> String {
 /// The expr without its alias layer(s) (so we can re-alias after remapping). Stacked aliases —
 /// TPC-H Q13's `count(Int64(1)) AS count(*) AS custdist` — strip fully: keeping an inner alias
 /// would splice `r0 AS "count(*)" AS "custdist"`, which is not valid SQL.
-fn strip_alias(e: &Expr) -> &Expr {
+pub(crate) fn strip_alias(e: &Expr) -> &Expr {
     match e {
         Expr::Alias(a) => strip_alias(&a.expr),
         other => other,
@@ -1488,12 +1767,21 @@ pub(crate) fn unqualify(e: &Expr) -> Expr {
         .unwrap_or(e.clone())
 }
 
-/// Replace any column reference whose flat name is in `remap` with the safe-named column.
-fn remap_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
+/// Replace any column reference whose flat name is in `remap` with the safe-named column; a
+/// column naming an entry of `substs` (an expression-aliased aggregate output — see
+/// [`build_expr_substs`]) is replaced by that expression instead.
+fn remap_columns(
+    e: &Expr,
+    remap: &HashMap<String, String>,
+    substs: &HashMap<String, Expr>,
+) -> Expr {
     use datafusion::common::tree_node::{Transformed, TreeNode};
     e.clone()
         .transform(|node| {
             if let Expr::Column(c) = &node {
+                if let Some(sub) = substs.get(&c.flat_name()).or_else(|| substs.get(&c.name)) {
+                    return Ok(Transformed::yes(sub.clone()));
+                }
                 if let Some(safe) = remap.get(&c.flat_name()).or_else(|| remap.get(&c.name)) {
                     return Ok(Transformed::yes(datafusion::prelude::col(safe)));
                 }
@@ -1624,14 +1912,31 @@ pub(crate) fn extract_from_tail(input_sql: &str) -> Result<String> {
 /// nothing to place differently; the aggregate has a `DISTINCT` aggregate (not yet composed with
 /// this split); the `Union` sits under a plan node this function does not know how to rebuild
 /// with a narrowed child (only single-child nodes and `Join` are supported — see
-/// [`split_union_by_sharding`]); the narrowed sharded side still contains an aggregate and the
-/// SUM-only guard below does not hold (KAN-54); or the outer aggregate uses
-/// `ROLLUP`/`CUBE`/`GROUPING SETS` (TPC-DS Q5/Q77/Q80) — per-arm `Forward` placement composed
-/// with the grouping-set gather returned wrong answers, so those keep the honest single-node
-/// fallback until the composition is proven correct.
+/// [`split_union_by_sharding`]); or the narrowed sharded side still contains an aggregate and the
+/// SUM-only guard below does not hold (KAN-54).
+///
+/// Grouping sets (`ROLLUP`/`CUBE`/`GROUPING SETS`) compose exactly with this split: the partials
+/// gather to partition 0 (empty hash key), so the final stage sees every finest-level group whole
+/// before rebuilding the super-aggregate levels — the same argument as the single-arm path, with
+/// `HAVING COUNT(*) > 0` suppressing the empty partitions' synthetic grand-total row (KAN-49d,
+/// TPC-DS Q5/Q77/Q80). Two sharded-arm shapes need more than the flat tail-splice and are
+/// planned by dedicated compositions before the naive path runs:
+///
+/// - **a replicated aggregate joined into the sharded arm above its own aggregate**
+///   (Q77's `ss LEFT JOIN sr` — sales-per-key `LEFT JOIN` returns-per-key): splicing the whole
+///   arm per worker attaches the replicated side's per-key *totals* to every worker's partial row
+///   for that key, and the outer SUM re-adds them once per worker (the KAN-54 doubling trap —
+///   verified wrong at sf0.01 before this composition existed). Planned by
+///   [`try_split_union_agg_join`]: per-worker partials of the sharded aggregate co-locate with
+///   the replicated aggregate (computed once), and the join runs **after** the per-key recombine.
+/// - **an aggregate over another mixed union nested inside the sharded arm** (Q5's
+///   `store_sales UNION ALL store_returns` feeding the per-store GROUP BY): planned by
+///   [`try_split_union_nested`], which distributes the arm with the ordinary machinery and
+///   adapts its exact output rows into the outer partial schema.
 fn try_split_broadcast_union(
     p: &Peeled<'_>,
     sharded_name: &str,
+    replicated: &[&str],
 ) -> Result<Option<DistributedQuery>> {
     let agg = p.agg;
     let aggs = agg
@@ -1648,12 +1953,22 @@ fn try_split_broadcast_union(
         return Ok(None);
     };
 
-    // Combining per-arm Forward placement with ROLLUP/CUBE/GROUPING SETS currently returns
-    // wrong answers (TPC-DS Q5/Q77/Q80: distributed ≠ single-node). Decline so
-    // `reject_unsafe_broadcast_shapes` keeps these as honest single-node fallbacks until the
-    // gather + multi-level recombine composition is proven correct.
-    if is_grouping_set(&agg.group_expr) {
-        return Ok(None);
+    // KAN-49d (TPC-DS Q77): a replicated aggregate joined into the sharded arm above the arm's
+    // own aggregate would silently double under the naive path — route it to the join-deferral
+    // composition (or refuse) before anything else runs.
+    if find_replicated_agg_join(&sharded_input, sharded_name).is_some() {
+        return try_split_union_agg_join(p, &sharded_input, sharded_name, &replicated_input);
+    }
+
+    // KAN-49d (TPC-DS Q5): the sharded arm is itself an aggregate over another mixed union.
+    // Distribute the arm recursively, then adapt its exact rows into the outer partial schema.
+    if let Ok(arm_peeled) = peel(&sharded_input) {
+        if arm_peeled.sort.is_none()
+            && arm_peeled.limit.is_none()
+            && split_union_by_sharding(&arm_peeled.agg.input, sharded_name)?.is_some()
+        {
+            return try_split_union_nested(p, &arm_peeled, &replicated_input, replicated);
+        }
     }
 
     // The sharded side keeps every safety check the single-arm path would have run on the whole
@@ -1712,14 +2027,36 @@ fn try_split_broadcast_union(
     let remap = build_remap(p);
 
     let sharded_tail = union_split_tail(&sharded_input)?;
-    let replicated_tail = union_split_tail(&replicated_input)?;
-    let (psel, combine) = partial_and_combine_lists(&group_sql, &aggs)?;
+    let (psel, _combine) = partial_and_combine_lists(&group_sql, &aggs)?;
     let group_by = group_sql.join(", ");
 
     let sharded_partial = sanitize_generated_sql(&format!(
         "SELECT {} {sharded_tail} GROUP BY {group_by}",
         psel.join(", ")
     ));
+    let stages = vec![StageDef::new(0, sharded_partial, vec![], vec![])];
+    split_union_finish(p, &group_sql, &aggs, &remap, stages, &replicated_input).map(Some)
+}
+
+/// Shared tail of every union-split plan: the replicated-side partial (one `Forward` producer)
+/// plus the final combine over the two producer streams.
+///
+/// `stages` is the sharded side's stage DAG; its last stage must already emit the `g{j}`/`a{i}`
+/// partial schema (group columns first, then per-aggregate partials — exactly what
+/// [`partial_and_combine_lists`] produces). This helper assigns that stage's hash key (group-key
+/// hash, or the partition-0 gather for grouping sets), appends the replicated-side partial with
+/// the identical select list, and closes with the recombine + output wrap.
+fn split_union_finish(
+    p: &Peeled<'_>,
+    group_sql: &[String],
+    aggs: &[AggSpec],
+    remap: &HashMap<String, String>,
+    mut stages: Vec<StageDef>,
+    replicated_input: &LogicalPlan,
+) -> Result<DistributedQuery> {
+    let replicated_tail = union_split_tail(replicated_input)?;
+    let (psel, combine) = partial_and_combine_lists(group_sql, aggs)?;
+    let group_by = group_sql.join(", ");
     let replicated_partial = sanitize_generated_sql(&format!(
         "SELECT {} {replicated_tail} GROUP BY {group_by}",
         psel.join(", ")
@@ -1728,20 +2065,27 @@ fn try_split_broadcast_union(
     // Grouping sets (ROLLUP/CUBE/GROUPING SETS — TPC-DS Q77/Q80) gather everything to partition 0
     // instead of hashing by key, same as the single-arm path (see `aggregation_stages_for`): a
     // grand-total level spans multiple finest-level keys, which a per-key hash can't co-locate.
-    let is_grouping_set = is_grouping_set(&agg.group_expr);
-    let hash_key_cols: Vec<u32> = if is_grouping_set {
+    let grouping_set = is_grouping_set(&p.agg.group_expr);
+    let hash_key_cols: Vec<u32> = if grouping_set {
         vec![]
     } else {
         (0..group_sql.len() as u32).collect()
     };
-    let sharded_stage = StageDef::new(0, sharded_partial, vec![], hash_key_cols.clone());
-    let mut replicated_stage = StageDef::new(1, replicated_partial, vec![], hash_key_cols);
+    let sharded_output = stages.last_mut().ok_or_else(|| {
+        Error::Unsupported("auto-distribute: union split has no sharded-side stages".into())
+    })?;
+    sharded_output.hash_key_cols = hash_key_cols.clone();
+    let sharded_output_id = sharded_output.stage_id;
+
+    let replicated_id = sharded_output_id + 1;
+    let mut replicated_stage =
+        StageDef::new(replicated_id, replicated_partial, vec![], hash_key_cols);
     replicated_stage.exchange = ExchangeMode::Forward;
 
-    let final_group_by = final_group_by_sql(&agg.group_expr, group_sql.len())?;
+    let final_group_by = final_group_by_sql(&p.agg.group_expr, group_sql.len())?;
     // Matches `recombine_stage_sql`: with an empty hash key, every rendezvous partition but 0
     // gets zero gathered rows yet would still emit the ROLLUP grand-total row for that emptiness.
-    let reject_empty_partition = if is_grouping_set {
+    let reject_empty_partition = if grouping_set {
         " HAVING COUNT(*) > 0"
     } else {
         ""
@@ -1751,13 +2095,605 @@ fn try_split_broadcast_union(
          AS merged_arms GROUP BY {final_group_by}{reject_empty_partition}",
         combine.join(", ")
     );
-    let final_sql = wrap_output(p, &inner, &remap)?;
-    let combine_stage = StageDef::new(2, final_sql, vec![0, 1], vec![]);
+    let final_sql = wrap_output(p, &inner, remap)?;
+    let combine_stage = StageDef::new(
+        replicated_id + 1,
+        final_sql,
+        vec![sharded_output_id, replicated_id],
+        vec![],
+    );
 
-    Ok(Some(DistributedQuery {
-        stages: vec![sharded_stage, replicated_stage, combine_stage],
+    stages.push(replicated_stage);
+    stages.push(combine_stage);
+    Ok(DistributedQuery {
+        stages,
         finalize_sql: build_finalize(p)?,
-    }))
+    })
+}
+
+/// The outer-partial adapter stage for the two KAN-49d composition paths: regroup the exact arm
+/// rows the sharded-side sub-DAG emits (named as the union's output columns) into the
+/// `g{j}`/`a{i}` partial schema the final combine expects. Summing keeps any row multiplicity
+/// exact — one row per outer key in the common case.
+///
+/// Group keys and aggregate arguments are emitted as **bare column names**, never through the
+/// Unparser: it double-quotes identifiers that collide with reserved words (`channel`), and the
+/// workers' Databricks dialect reads a double-quoted token as a *string literal* — which turned
+/// Q77's `channel` group column into the constant `'channel'` (the qualified naive path is saved
+/// by [`sanitize_generated_sql`]'s dot+quote rewrite, but this stage's columns are unqualified).
+/// [`union_split_outer_cols`] has already guaranteed these are plain columns.
+fn union_split_outer_partial(up: &Unparser, agg: &Aggregate, aggs: &[AggSpec]) -> Result<String> {
+    let bare_col = |e: &Expr| -> Result<String> {
+        match unqualify(e) {
+            Expr::Column(c) => Ok(c.name),
+            other => expr_sql(up, &other),
+        }
+    };
+    let group_unq: Vec<String> = flattened_group_exprs(&agg.group_expr)
+        .into_iter()
+        .map(bare_col)
+        .collect::<Result<_>>()?;
+    let mut unq_aggs = Vec::with_capacity(aggs.len());
+    for (spec, e) in aggs.iter().zip(&agg.aggr_expr) {
+        let arg_sql = match strip_alias(e) {
+            Expr::AggregateFunction(af) => match af.params.args.first() {
+                Some(Expr::Column(c)) => c.name.clone(),
+                _ => agg_arg_sql_unqualified(up, spec, e)?,
+            },
+            _ => agg_arg_sql_unqualified(up, spec, e)?,
+        };
+        unq_aggs.push(AggSpec {
+            func: spec.func.clone(),
+            arg_sql,
+            distinct: spec.distinct,
+            grouping_target: None,
+        });
+    }
+    let (psel, _combine) = partial_and_combine_lists(&group_unq, &unq_aggs)?;
+    Ok(sanitize_generated_sql(&format!(
+        "SELECT {} FROM shuffle_input GROUP BY {}",
+        psel.join(", "),
+        group_unq.join(", ")
+    )))
+}
+
+/// The composition paths feed the outer partial from a sub-DAG whose output columns are the
+/// union's own — so the outer aggregate's group keys and aggregate arguments must all be plain
+/// union output columns, each present among `arm_out_names`. Anything else (expression group
+/// keys, `count(*)`, computed arguments) declines.
+fn union_split_outer_cols(agg: &Aggregate, arm_out_names: &[String]) -> bool {
+    let mut cols = Vec::new();
+    for g in flattened_group_exprs(&agg.group_expr) {
+        let Expr::Column(c) = g else { return false };
+        cols.push(&c.name);
+    }
+    for e in &agg.aggr_expr {
+        let Expr::AggregateFunction(af) = strip_alias(e) else {
+            return false;
+        };
+        for arg in &af.params.args {
+            let Expr::Column(c) = arg else { return false };
+            cols.push(&c.name);
+        }
+    }
+    cols.iter().all(|n| arm_out_names.iter().any(|o| o == *n))
+}
+
+/// True when `lp` is an aggregate at its output (possibly under projections/aliases/filters) —
+/// i.e. its rows are per-key aggregate rows, not raw scan rows. A replicated aggregate joined
+/// against per-worker partial aggregate rows attaches its per-key totals once per worker (the
+/// KAN-54 doubling trap); joined against raw sharded scan rows it attaches once per row, which
+/// the ordinary recombine absorbs — so only the aggregate-output case is unsafe.
+fn peels_to_aggregate_shallow(lp: &LogicalPlan) -> bool {
+    let mut node = lp;
+    loop {
+        match node {
+            LogicalPlan::Projection(p) => node = p.input.as_ref(),
+            LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
+            LogicalPlan::Filter(f) => node = f.input.as_ref(),
+            LogicalPlan::Aggregate(_) => return true,
+            _ => return false,
+        }
+    }
+}
+
+/// Find a join where one side is a fully-replicated subtree producing aggregate rows and the
+/// other side scans the sharded table and also produces aggregate rows (TPC-DS Q77's
+/// `ss LEFT JOIN sr` arm shape). The naive union-split tail would attach the replicated side's
+/// per-key totals to every worker's partial rows, doubling them under the outer SUM.
+fn find_replicated_agg_join<'a>(
+    lp: &'a LogicalPlan,
+    sharded_name: &str,
+) -> Option<&'a datafusion::logical_expr::Join> {
+    if let LogicalPlan::Join(j) = lp {
+        for (maybe_repl, maybe_sharded) in [(&j.left, &j.right), (&j.right, &j.left)] {
+            if count_table_scans(maybe_repl, sharded_name) == 0
+                && count_table_scans(maybe_sharded, sharded_name) >= 1
+                && peels_to_aggregate_shallow(maybe_repl)
+                && peels_to_aggregate_shallow(maybe_sharded)
+            {
+                return Some(j);
+            }
+        }
+    }
+    lp.inputs()
+        .iter()
+        .find_map(|c| find_replicated_agg_join(c, sharded_name))
+}
+
+/// Column-remap scope for [`try_split_union_agg_join`]'s stage C: left-aggregate output columns
+/// resolve to the recombined `laq.g{j}` / `laq.r{i}`, the replicated aggregate's output columns
+/// to `raq.<name>`. Qualified references disambiguate by the two sides' subquery aliases; a bare
+/// name must exist on exactly one side.
+struct ArmSideMaps {
+    left_alias: Option<String>,
+    left_map: HashMap<String, String>,
+    right_alias: Option<String>,
+    right_map: HashMap<String, String>,
+}
+
+fn arm_side_lookup(maps: &ArmSideMaps, c: &datafusion::common::Column) -> Option<String> {
+    match &c.relation {
+        Some(r) => {
+            let rel = r.to_string();
+            if Some(&rel) == maps.left_alias.as_ref() {
+                maps.left_map.get(&c.name).cloned()
+            } else if Some(&rel) == maps.right_alias.as_ref() {
+                maps.right_map.get(&c.name).cloned()
+            } else {
+                None
+            }
+        }
+        None => match (maps.left_map.get(&c.name), maps.right_map.get(&c.name)) {
+            (Some(v), None) => Some(v.clone()),
+            (None, Some(v)) => Some(v.clone()),
+            _ => None,
+        },
+    }
+}
+
+fn remap_arm_side_expr(up: &Unparser, maps: &ArmSideMaps, e: &Expr) -> Result<String> {
+    use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+    let mut unmapped = None;
+    let _ = e.apply(|node| {
+        if let Expr::Column(c) = node {
+            if arm_side_lookup(maps, c).is_none() {
+                unmapped = Some(c.flat_name());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    if let Some(bad) = unmapped {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: union-arm join expression references `{bad}`, which does not map \
+             to either aggregate side"
+        )));
+    }
+    let mapped = e
+        .clone()
+        .transform(|node| {
+            if let Expr::Column(c) = &node {
+                if let Some(t) = arm_side_lookup(maps, c) {
+                    return Ok(Transformed::yes(datafusion::prelude::col(t)));
+                }
+            }
+            Ok(Transformed::no(node))
+        })
+        .map(|t| t.data)
+        .unwrap_or_else(|_| e.clone());
+    expr_sql(up, &mapped)
+}
+
+/// One side of [`try_split_union_agg_join`]'s arm join: an aggregate reached through an optional
+/// `SubqueryAlias` and an optional pure-renaming `Projection`, with the side's final output column
+/// names positionally aligned to the aggregate's schema fields (group fields first, then the
+/// aggregate outputs in `aggr_expr` order).
+struct JoinSide<'a> {
+    alias: Option<String>,
+    agg: &'a Aggregate,
+    out_names: Vec<String>,
+}
+
+fn join_side_agg(side: &LogicalPlan) -> Option<JoinSide<'_>> {
+    let (alias, mut node) = match side {
+        LogicalPlan::SubqueryAlias(s) => (Some(s.alias.to_string()), s.input.as_ref()),
+        other => (None, other),
+    };
+    let renames: Option<&[Expr]> = match node {
+        LogicalPlan::Projection(p) => {
+            node = p.input.as_ref();
+            Some(p.expr.as_slice())
+        }
+        _ => None,
+    };
+    let LogicalPlan::Aggregate(agg) = node else {
+        return None;
+    };
+    let fields = agg.schema.fields();
+    let out_names: Vec<String> = match renames {
+        Some(exprs) => {
+            if exprs.len() != fields.len() {
+                return None;
+            }
+            exprs
+                .iter()
+                .zip(fields.iter())
+                .map(|(e, f)| {
+                    let (base, alias) = match e {
+                        Expr::Alias(a) => (a.expr.as_ref(), Some(a.name.clone())),
+                        other => (other, None),
+                    };
+                    // The projection must be a pure renaming of the aggregate's own outputs:
+                    // either a column reference to the field, or the field's own expression
+                    // (the analyzer keeps `sum(x) AS sales` over `aggr=[[sum(x)]]` — the field
+                    // at that position is by construction that expression's output).
+                    let matches_field = match base {
+                        Expr::Column(c) => c.name == *f.name(),
+                        other => other.schema_name().to_string() == *f.name(),
+                    };
+                    if !matches_field {
+                        return None;
+                    }
+                    Some(alias.unwrap_or_else(|| f.name().clone()))
+                })
+                .collect::<Option<Vec<_>>>()?
+        }
+        None => fields.iter().map(|f| f.name().clone()).collect(),
+    };
+    Some(JoinSide {
+        alias,
+        agg,
+        out_names,
+    })
+}
+
+/// TPC-DS Q77's sharded arm: `Projection over Join(Aggregate(sharded …), Aggregate(replicated …))`
+/// — sales per key `LEFT JOIN` returns per key, both pre-aggregated. The arm must not run per
+/// worker (the replicated side's per-key totals would attach once per worker partial — see
+/// [`find_replicated_agg_join`]). Instead:
+///
+/// 1. **stage A**: the sharded aggregate's ordinary per-worker partial, hash-shuffled by its
+///    group key;
+/// 2. **stage B**: the replicated aggregate evaluated in full exactly once
+///    ([`ExchangeMode::Forward`]), hash-shuffled by the join key so equal keys co-locate;
+/// 3. **stage C**: recombine the left partials **per key first** (`GROUP BY g{j}` over the
+///    co-located partials), then run the join against the replicated side and apply the arm's
+///    projection — the join sees exactly one left row per key, so the replicated totals attach
+///    exactly once. Output gathers to partition 0 (empty hash key).
+///
+/// Stage C emits the arm rows named as the union's output columns; a [`union_split_outer_partial`]
+/// adapter regroups them into the outer partial schema, and [`split_union_finish`] closes with
+/// the replicated-arms partial + recombine as usual.
+///
+/// `Ok(None)` — a safe refusal — when the arm is not exactly this shape: non-equi/full-key join,
+/// a join filter, a non-LEFT/INNER join type, a sharded side that is not a single-scan aggregate
+/// over raw rows, or outer group/aggregate expressions that are not plain union columns.
+fn try_split_union_agg_join(
+    p: &Peeled<'_>,
+    sharded_input: &LogicalPlan,
+    sharded_name: &str,
+    replicated_input: &LogicalPlan,
+) -> Result<Option<DistributedQuery>> {
+    let up = Unparser::default();
+    // Arm shape: (SubqueryAlias)* → Projection → (SubqueryAlias)* → Join.
+    let mut node = sharded_input;
+    while let LogicalPlan::SubqueryAlias(s) = node {
+        node = s.input.as_ref();
+    }
+    let LogicalPlan::Projection(proj) = node else {
+        return Ok(None);
+    };
+    let mut jnode = proj.input.as_ref();
+    while let LogicalPlan::SubqueryAlias(s) = jnode {
+        jnode = s.input.as_ref();
+    }
+    let LogicalPlan::Join(join) = jnode else {
+        return Ok(None);
+    };
+    if !matches!(join.join_type, JoinType::Left | JoinType::Inner) {
+        return Ok(None);
+    }
+    // Sides: (SubqueryAlias)? → (renaming Projection)? → Aggregate; left scans the sharded table
+    // exactly once, right zero (fully replicated).
+    let Some(left) = join_side_agg(&join.left) else {
+        return Ok(None);
+    };
+    let Some(right) = join_side_agg(&join.right) else {
+        return Ok(None);
+    };
+    let left_agg = left.agg;
+    let right_agg = right.agg;
+    if count_table_scans(&join.right, sharded_name) != 0
+        || count_table_scans(&join.left, sharded_name) != 1
+    {
+        return Ok(None);
+    }
+    // The left partial must be the ordinary broadcast case: raw scans / row-level joins only
+    // under the left aggregate (no nested aggregate, no union).
+    let mut nested = Vec::new();
+    collect_aggregates(&left_agg.input, &mut nested);
+    if !nested.is_empty() || split_union_by_sharding(&left_agg.input, sharded_name)?.is_some() {
+        return Ok(None);
+    }
+    if left_agg.group_expr.is_empty() || is_grouping_set(&left_agg.group_expr) {
+        return Ok(None);
+    }
+    let left_aggs = left_agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()?;
+    if left_aggs.iter().any(|a| a.distinct) {
+        return Ok(None);
+    }
+    // Equijoin keys: from `ON` plus equality conjuncts parked in `join.filter` (DataFusion keeps
+    // CTE-arm join conditions there). Any non-equality residual declines — it belongs to a
+    // different shape.
+    let Ok((keys, residual)) = collect_equijoin_keys(&join.on, join.filter.as_ref()) else {
+        return Ok(None);
+    };
+    if residual.is_some() || keys.len() != left_agg.group_expr.len() {
+        return Ok(None);
+    }
+    // Orient each pair (left side first) and require plain columns both sides. One pair per left
+    // group column, and every right group column equated — otherwise a left row can match several
+    // right rows and the outer SUM fans out.
+    let col_name = |e: &Expr| -> Option<String> {
+        match e {
+            Expr::Column(c) => Some(c.name.clone()),
+            _ => None,
+        }
+    };
+    let side_has = |side: &JoinSide, e: &Expr| -> bool {
+        match e {
+            Expr::Column(c) => match &c.relation {
+                Some(r) => Some(r.to_string()) == side.alias,
+                None => side.out_names.iter().any(|n| n == &c.name),
+            },
+            _ => false,
+        }
+    };
+    let mut left_key_names = Vec::new();
+    let mut right_key_names = Vec::new();
+    for (a, b) in &keys {
+        let (Some(an), Some(bn)) = (col_name(a), col_name(b)) else {
+            return Ok(None);
+        };
+        let (a_l, a_r) = (side_has(&left, a), side_has(&right, a));
+        let (b_l, b_r) = (side_has(&left, b), side_has(&right, b));
+        if a_l && b_r && !(a_r && b_l) {
+            left_key_names.push(an);
+            right_key_names.push(bn);
+        } else if b_l && a_r && !(b_r && a_l) {
+            left_key_names.push(bn);
+            right_key_names.push(an);
+        } else {
+            return Ok(None);
+        }
+    }
+    let mut left_group_out: Vec<String> = left.out_names[..left_agg.group_expr.len()].to_vec();
+    let mut left_keys_sorted = left_key_names.clone();
+    left_group_out.sort();
+    left_keys_sorted.sort();
+    if left_group_out != left_keys_sorted {
+        return Ok(None);
+    }
+    let right_group_out = &right.out_names[..right_agg.group_expr.len()];
+    if right_agg.group_expr.is_empty()
+        || !right_group_out.iter().all(|n| right_key_names.contains(n))
+    {
+        return Ok(None);
+    }
+    // The outer aggregate must read plain union columns that the arm projection emits.
+    let arm_out_names: Vec<String> = proj.expr.iter().map(output_name).collect();
+    if !union_split_outer_cols(p.agg, &arm_out_names) {
+        return Ok(None);
+    }
+
+    // Stage A: left partial per worker, hash-shuffled by the left group key.
+    let left_group_sql: Vec<String> = left_agg
+        .group_expr
+        .iter()
+        .map(|g| expr_sql(&up, g))
+        .collect::<Result<_>>()?;
+    let left_tail = union_split_tail(&left_agg.input)?;
+    let (left_psel, left_combine) = partial_and_combine_lists(&left_group_sql, &left_aggs)?;
+    let stage_a_sql = sanitize_generated_sql(&format!(
+        "SELECT {} {left_tail} GROUP BY {}",
+        left_psel.join(", "),
+        left_group_sql.join(", ")
+    ));
+    let stage_a = StageDef::new(
+        0,
+        stage_a_sql,
+        vec![],
+        (0..left_group_sql.len() as u32).collect(),
+    );
+
+    // Stage B: the replicated aggregate in full, once, hash-co-located by the right join key.
+    let right_sql = sanitize_generated_sql(
+        &up.plan_to_sql(&join.right)
+            .map_err(|e| {
+                Error::Unsupported(format!(
+                    "auto-distribute: unparse union-arm replicated aggregate: {e}"
+                ))
+            })?
+            .to_string(),
+    );
+    let right_key_pos: Option<Vec<u32>> = right_key_names
+        .iter()
+        .map(|n| {
+            join.right
+                .schema()
+                .fields()
+                .iter()
+                .position(|f| f.name() == n)
+                .map(|i| i as u32)
+        })
+        .collect();
+    let Some(right_key_pos) = right_key_pos else {
+        return Ok(None);
+    };
+    let mut stage_b = StageDef::new(1, right_sql, vec![], right_key_pos);
+    stage_b.exchange = ExchangeMode::Forward;
+
+    // Stage C: recombine left partials per key, then join, then the arm's projection.
+    let mut left_map = HashMap::new();
+    for (j, name) in left
+        .out_names
+        .iter()
+        .take(left_agg.group_expr.len())
+        .enumerate()
+    {
+        left_map.insert(name.clone(), format!("laq.g{j}"));
+    }
+    for (i, name) in left
+        .out_names
+        .iter()
+        .skip(left_agg.group_expr.len())
+        .take(left_agg.aggr_expr.len())
+        .enumerate()
+    {
+        left_map.insert(name.clone(), format!("laq.r{i}"));
+    }
+    // Also accept the aggregate's internal names (the arm projection may reference either the
+    // renaming projection's outputs or the aggregate's own field/alias names).
+    for (i, a) in left_agg.aggr_expr.iter().enumerate() {
+        left_map
+            .entry(a.schema_name().to_string())
+            .or_insert_with(|| format!("laq.r{i}"));
+        if let Expr::Alias(al) = a {
+            left_map
+                .entry(al.name.clone())
+                .or_insert_with(|| format!("laq.r{i}"));
+        }
+    }
+    let mut right_map = HashMap::new();
+    for name in &right.out_names {
+        right_map.insert(name.clone(), format!("raq.{name}"));
+    }
+    let maps = ArmSideMaps {
+        left_alias: left.alias.clone(),
+        left_map,
+        right_alias: right.alias.clone(),
+        right_map,
+    };
+
+    let group_aliases: Vec<String> = (0..left_group_sql.len()).map(|j| format!("g{j}")).collect();
+    let laq = format!(
+        "SELECT {} FROM shuffle_input_0 GROUP BY {}",
+        left_combine.join(", "),
+        group_aliases.join(", ")
+    );
+    let mut on_parts = Vec::new();
+    for (l, r) in left_key_names.iter().zip(&right_key_names) {
+        let (Some(ls), Some(rs)) = (maps.left_map.get(l), maps.right_map.get(r)) else {
+            return Ok(None);
+        };
+        on_parts.push(format!("{ls} = {rs}"));
+    }
+    let on_sql = on_parts.join(" AND ");
+    let join_kw = if join.join_type == JoinType::Left {
+        "LEFT JOIN"
+    } else {
+        "JOIN"
+    };
+    let select = proj
+        .expr
+        .iter()
+        .map(|e| {
+            let name = output_name(e);
+            let sql = remap_arm_side_expr(&up, &maps, strip_alias(e))?;
+            Ok(format!("{sql} AS \"{name}\""))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let stage_c_sql = sanitize_generated_sql(&format!(
+        "SELECT {select} FROM ({laq}) AS laq {join_kw} (SELECT * FROM shuffle_input_1) AS raq ON {on_sql}"
+    ));
+    let stage_c = StageDef::new(2, stage_c_sql, vec![0, 1], vec![]);
+
+    // Stage D: regroup the exact arm rows into the outer partial schema.
+    let aggs = p
+        .agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()?;
+    let stage_d_sql = union_split_outer_partial(&up, p.agg, &aggs)?;
+    let stage_d = StageDef::new(3, stage_d_sql, vec![2], vec![]);
+
+    let group_sql: Vec<String> = flattened_group_exprs(&p.agg.group_expr)
+        .into_iter()
+        .map(|g| expr_sql(&up, g))
+        .collect::<Result<_>>()?;
+    let remap = build_remap(p);
+    split_union_finish(
+        p,
+        &group_sql,
+        &aggs,
+        &remap,
+        vec![stage_a, stage_b, stage_c, stage_d],
+        replicated_input,
+    )
+    .map(Some)
+}
+
+/// TPC-DS Q5's sharded arm: an aggregate over *another* mixed union nested inside it
+/// (`(store_sales UNION ALL store_returns) ⋈ date_dim ⋈ store GROUP BY s_store_id`). The arm
+/// cannot run per worker — the nested union's replicated arm would repeat on every worker — so
+/// distribute the arm with the ordinary machinery (which plans the inner mixed union with this
+/// same split, minus the grouping-set level) and adapt its exact output rows into the outer
+/// partial schema via [`union_split_outer_partial`].
+fn try_split_union_nested(
+    p: &Peeled<'_>,
+    arm_peeled: &Peeled<'_>,
+    replicated_input: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<Option<DistributedQuery>> {
+    let arm_out_names: Vec<String> = match arm_peeled.projection {
+        Some(exprs) => exprs.iter().map(output_name).collect(),
+        None => arm_peeled
+            .agg
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect(),
+    };
+    if !union_split_outer_cols(p.agg, &arm_out_names) {
+        return Ok(None);
+    }
+    let arm_dq = aggregation_stages_for(arm_peeled, replicated)?;
+    if arm_dq.finalize_sql.is_some() {
+        // The caller already declined arm-level ORDER BY/LIMIT; belt-and-braces.
+        return Ok(None);
+    }
+    let up = Unparser::default();
+    let aggs = p
+        .agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()?;
+    let mut stages = arm_dq.stages;
+    let arm_out_id = stages.last().map(|s| s.stage_id).ok_or_else(|| {
+        Error::Unsupported("auto-distribute: nested union arm produced no stages".into())
+    })?;
+    let d_sql = union_split_outer_partial(&up, p.agg, &aggs)?;
+    stages.push(StageDef::new(
+        arm_out_id + 1,
+        d_sql,
+        vec![arm_out_id],
+        vec![],
+    ));
+    let group_sql: Vec<String> = flattened_group_exprs(&p.agg.group_expr)
+        .into_iter()
+        .map(|g| expr_sql(&up, g))
+        .collect::<Result<_>>()?;
+    let remap = build_remap(p);
+    split_union_finish(p, &group_sql, &aggs, &remap, stages, replicated_input).map(Some)
 }
 
 /// Unparse `lp` and extract its `FROM …` tail — the same unparse-then-slice `agg.input` handling
@@ -1772,11 +2708,292 @@ fn union_split_tail(lp: &LogicalPlan) -> Result<String> {
     Ok(sanitize_generated_sql(&tail))
 }
 
+/// Aggregate over a `DISTINCT` union of raw per-channel projections with the sharded fact in only
+/// some arms (KAN-49a, TPC-DS Q75's `all_sales` CTE):
+///
+/// ```sql
+/// SELECT d_year, i_brand_id, …, SUM(sales_cnt), SUM(sales_amt)
+/// FROM (SELECT … FROM catalog_sales … UNION SELECT … FROM store_sales … UNION SELECT … FROM web_sales …)
+/// GROUP BY d_year, i_brand_id, …
+/// ```
+///
+/// [`try_split_broadcast_union`] must **not** see this shape: splitting a distinct union's arms
+/// by sharding dedups within each half only, so a row present in both halves survives twice
+/// (the guard [`super::dag_splitter::reject_mixed_union_branch`] exists for exactly this). The
+/// exact composition instead co-locates duplicates *before* dedup:
+///
+/// 1. **one producer stage per leaf arm** exporting the arm's raw rows (no aggregation),
+///    hash-shuffled on the **full row**. A sharded arm reads its local shard per worker; an arm
+///    over only replicated tables is computed exactly once on one worker
+///    ([`ExchangeMode::Forward`] — the same placement a replicated `UNION ALL` arm gets).
+/// 2. **dedup + partial aggregate**: `SELECT DISTINCT *` over the per-partition union of all arm
+///    streams, then the partial `GROUP BY`. Identical rows always hash to the same partition
+///    whichever arm (or worker) produced them, so the per-partition dedup is globally exact and
+///    the partials over the deduplicated rows recombine exactly.
+/// 3. **final combine** over the partials, hash-shuffled by the group key — the ordinary
+///    recombine, with the query's HAVING / output projection re-applied via [`wrap_output`].
+///
+/// Arms must be raw row sources (no aggregate / window / distinct / union / expression subquery
+/// of their own) and a sharded arm must scan the sharded table exactly once with a
+/// broadcast-safe join tree. Anything else returns `Ok(None)` when the shape simply isn't this
+/// one (no mixed-sharding distinct union at the aggregate input) and `Err` when it is the shape
+/// but an arm is unsafe — so [`try_split_broadcast_union`] never silently splits a distinct
+/// union this composition declines.
+fn aggregate_over_distinct_union_stages(
+    p: &Peeled<'_>,
+    sharded_name: &str,
+    replicated: &[&str],
+) -> Result<Option<DistributedQuery>> {
+    let agg = p.agg;
+    let mut node = agg.input.as_ref();
+    while let LogicalPlan::SubqueryAlias(s) = node {
+        node = s.input.as_ref();
+    }
+    let LogicalPlan::Distinct(distinct) = node else {
+        return Ok(None);
+    };
+    let LogicalPlan::Union(union) = distinct.input().as_ref() else {
+        return Ok(None);
+    };
+
+    // Leaf arms, flattening nested UNION (distinct is idempotent, so nesting is transparent).
+    let mut arms: Vec<&LogicalPlan> = Vec::new();
+    flatten_distinct_union(node, &mut arms);
+    if arms.len() < 2 {
+        return Ok(None);
+    }
+    let mut saw_sharded = false;
+    let mut saw_replicated = false;
+    for arm in &arms {
+        if base_tables(arm).iter().any(|t| t == sharded_name) {
+            saw_sharded = true;
+        } else {
+            saw_replicated = true;
+        }
+    }
+    // Only the *mixed* shape belongs here — the shape [`super::dag_splitter`]'s mixed-union
+    // guard would otherwise reject. An all-sharded or all-replicated distinct union keeps its
+    // existing handling.
+    if !saw_sharded || !saw_replicated {
+        return Ok(None);
+    }
+
+    let unsupported = |why: String| {
+        Error::Unsupported(format!(
+            "auto-distribute: aggregate over DISTINCT union: {why}"
+        ))
+    };
+    if is_grouping_set(&agg.group_expr) {
+        return Err(unsupported(
+            "ROLLUP / CUBE / GROUPING SETS over a distinct union are not supported".into(),
+        ));
+    }
+    let aggs = agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()?;
+    if aggs.iter().any(|a| a.distinct) {
+        return Err(unsupported(
+            "DISTINCT aggregates over a distinct union are not supported".into(),
+        ));
+    }
+
+    // The union's output column names (taken from its schema) are what the dedup stage reads.
+    let union_cols: Vec<String> = union
+        .schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    if union_cols.is_empty() {
+        return Err(unsupported("union has an empty schema".into()));
+    }
+
+    let up = Unparser::default();
+    // Group keys and aggregate arguments must be readable off the deduplicated union row: they
+    // unqualify to plain union column names.
+    let group_sql: Vec<String> = flattened_group_exprs(&agg.group_expr)
+        .into_iter()
+        .map(|g| expr_sql(&up, &unqualify(g)))
+        .collect::<Result<_>>()?;
+    {
+        let mut cols = Vec::new();
+        for g in flattened_group_exprs(&agg.group_expr) {
+            collect_expr_columns(g, &mut cols);
+        }
+        for e in &agg.aggr_expr {
+            if let Expr::AggregateFunction(af) = strip_alias(e) {
+                for arg in &af.params.args {
+                    collect_expr_columns(arg, &mut cols);
+                }
+            }
+        }
+        if let Some(bad) = cols
+            .iter()
+            .find(|c| !union_cols.iter().any(|u| u == &c.name))
+        {
+            return Err(unsupported(format!(
+                "column `{}` is not a union output column",
+                bad.flat_name()
+            )));
+        }
+    }
+
+    // Producer stages: one per arm, raw rows hash-shuffled on the full union row.
+    let mut stages: Vec<StageDef> = Vec::new();
+    let n_cols = union_cols.len() as u32;
+    for (arm_i, arm) in arms.iter().enumerate() {
+        // Raw arms only: a nested aggregate / window / distinct / union belongs to a different
+        // composition, and an expression subquery could re-scan the sharded fact shard-locally.
+        if !arm_is_raw_row_source(arm) {
+            return Err(unsupported(format!(
+                "arm {arm_i} contains an aggregate, window, distinct, union, or subquery"
+            )));
+        }
+        let arm_tables = base_tables(arm);
+        let arm_is_sharded = arm_tables.iter().any(|t| t == sharded_name);
+        let mut stage_sql = up
+            .plan_to_sql(arm)
+            .map_err(|e| {
+                Error::Unsupported(format!(
+                    "auto-distribute: unparse distinct-union arm {arm_i}: {e}"
+                ))
+            })?
+            .to_string();
+        if arm_is_sharded {
+            // The ordinary broadcast-safety checks, scoped to this arm: a single scan of the
+            // sharded table, no unsafe preserved-side outer join.
+            reject_unsafe_broadcast_shapes(arm, sharded_name)?;
+            if count_table_scans(arm, sharded_name) != 1 {
+                return Err(unsupported(format!(
+                    "arm {arm_i} scans sharded table `{sharded_name}` more than once"
+                )));
+            }
+        } else if arm_tables.iter().any(|t| !replicated.contains(&t.as_str())) {
+            return Err(unsupported(format!(
+                "arm {arm_i} scans a table that is neither sharded nor replicated"
+            )));
+        }
+        stage_sql = sanitize_generated_sql(&stage_sql);
+        let mut stage = StageDef::new(
+            stages.len() as u32,
+            stage_sql,
+            vec![],
+            (0..n_cols).collect(),
+        );
+        if !arm_is_sharded {
+            // A replicated-only arm is identical on every worker: compute it once.
+            stage.exchange = ExchangeMode::Forward;
+        }
+        stages.push(stage);
+    }
+
+    // Dedup + partial aggregate over the co-located arm rows, hash-shuffled by the group key.
+    let arm_reads: Vec<String> = (0..arms.len())
+        .map(|i| format!("SELECT * FROM shuffle_input_{i}"))
+        .collect();
+    let mut psel: Vec<String> = group_sql
+        .iter()
+        .enumerate()
+        .map(|(j, g)| format!("{g} AS g{j}"))
+        .collect();
+    let mut combine: Vec<String> = (0..group_sql.len()).map(|j| format!("g{j}")).collect();
+    for (i, a) in aggs.iter().enumerate() {
+        let arg_sql = agg_arg_sql_unqualified(&up, a, &agg.aggr_expr[i])?;
+        let (sel, comb) = partial_combine_sql(&a.func, i, &arg_sql)?;
+        psel.extend(sel);
+        combine.push(comb);
+    }
+    let dedup_id = stages.len() as u32;
+    let partial_sql = sanitize_generated_sql(&format!(
+        "SELECT {} FROM (SELECT DISTINCT * FROM ({}) AS all_arms) AS deduped GROUP BY {}",
+        psel.join(", "),
+        arm_reads.join(" UNION ALL "),
+        group_sql.join(", "),
+    ));
+    stages.push(StageDef::new(
+        dedup_id,
+        partial_sql,
+        (0..dedup_id).collect(),
+        (0..group_sql.len() as u32).collect(),
+    ));
+
+    // Final combine + output wrap (HAVING / projection), the ordinary recombine shape.
+    let final_group_by = final_group_by_sql(&agg.group_expr, group_sql.len())?;
+    let inner = format!(
+        "SELECT {} FROM shuffle_input GROUP BY {final_group_by}",
+        combine.join(", ")
+    );
+    let remap = build_remap(p);
+    let final_sql = wrap_output(p, &inner, &remap)?;
+    let combine_id = dedup_id + 1;
+    stages.push(StageDef::new(combine_id, final_sql, vec![dedup_id], vec![]));
+
+    Ok(Some(DistributedQuery {
+        stages,
+        finalize_sql: build_finalize(p)?,
+    }))
+}
+
+/// Flatten a `DISTINCT`-over-`UNION` tree into its leaf arms. Nested distinct unions dedup the
+/// same bag (dedup is idempotent), so the leaf list is equivalent to the tree.
+pub(crate) fn flatten_distinct_union<'a>(lp: &'a LogicalPlan, out: &mut Vec<&'a LogicalPlan>) {
+    match lp {
+        LogicalPlan::Distinct(d) => flatten_distinct_union(d.input().as_ref(), out),
+        LogicalPlan::Union(u) => {
+            for input in &u.inputs {
+                flatten_distinct_union(input, out);
+            }
+        }
+        other => out.push(other),
+    }
+}
+
+/// A raw row source: no aggregate, window, distinct, union, or expression subquery anywhere in
+/// the subtree (joins / filters / projections / scans only).
+fn arm_is_raw_row_source(lp: &LogicalPlan) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    match lp {
+        LogicalPlan::Aggregate(_)
+        | LogicalPlan::Window(_)
+        | LogicalPlan::Distinct(_)
+        | LogicalPlan::Union(_) => return false,
+        _ => {}
+    }
+    let mut has_subquery = false;
+    for e in lp.expressions() {
+        let _ = e.apply(|node| {
+            if matches!(
+                node,
+                Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+            ) {
+                has_subquery = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+    }
+    !has_subquery && lp.inputs().iter().all(|c| arm_is_raw_row_source(c))
+}
+
+/// The aggregate argument's SQL with its table qualifier dropped, so it resolves against the
+/// deduplicated union row's plain column names. `count(*)` carries no argument — the classified
+/// spec's literal `1` is reused.
+fn agg_arg_sql_unqualified(up: &Unparser, spec: &AggSpec, original: &Expr) -> Result<String> {
+    if let Expr::AggregateFunction(af) = strip_alias(original) {
+        if let Some(arg) = af.params.args.first() {
+            return expr_sql(up, &unqualify(arg));
+        }
+    }
+    Ok(spec.arg_sql.clone())
+}
+
 /// The partial-stage `SELECT` list (`g{j}` group columns + each aggregate's partial state) and
 /// the corresponding final-stage combine expressions, shared by every partial/combine caller in
 /// this module ([`recombine_stage_sql`], [`global_aggregation_stages`], and
 /// [`try_split_broadcast_union`]).
-fn partial_and_combine_lists(
+pub(crate) fn partial_and_combine_lists(
     group_sql: &[String],
     aggs: &[AggSpec],
 ) -> Result<(Vec<String>, Vec<String>)> {
@@ -1787,6 +3004,12 @@ fn partial_and_combine_lists(
         .collect();
     let mut combine: Vec<String> = (0..group_sql.len()).map(|j| format!("g{j}")).collect();
     for (i, a) in aggs.iter().enumerate() {
+        if let Some(j) = a.grouping_target {
+            // Recomputed against the combine's real `GROUP BY ROLLUP` — see
+            // [`resolve_grouping_specs`]. The partial stage emits nothing for it.
+            combine.push(format!("grouping(g{j}) AS r{i}"));
+            continue;
+        }
         let (sel, comb) = partial_combine_sql(&a.func, i, &a.arg_sql)?;
         psel.extend(sel);
         combine.push(comb);
@@ -1931,7 +3154,14 @@ fn union_of_arms(mut arms: Vec<Arc<LogicalPlan>>) -> Result<LogicalPlan> {
     if arms.len() == 1 {
         return Ok((*arms.remove(0)).clone());
     }
-    Union::try_new(arms)
+    // Strict first: identical schemas rebuild cleanly. When the SQL analyzer's arm coercion
+    // widened a type in only some arms (TPC-DS Q77's `coalesce(returns_, 0)` — Decimal128(17,2)
+    // in one arm vs Decimal128(22,2) in another), the strict rebuild rejects and the loose
+    // rebuild takes the first arm's schema. Loose is safe here because the narrowed side is only
+    // ever *unparsed* for a stage-SQL tail — the worker's SQL planner re-derives the union type
+    // coercion from the text, exactly as it did for the original query.
+    Union::try_new(arms.clone())
+        .or_else(|_| Union::try_new_with_loose_types(arms))
         .map(LogicalPlan::Union)
         .map_err(|e| Error::Unsupported(format!("auto-distribute: rebuild split union: {e}")))
 }
@@ -1957,7 +3187,7 @@ fn union_of_arms(mut arms: Vec<Arc<LogicalPlan>>) -> Result<LogicalPlan> {
 /// at a nested `Aggregate`: below one, the replicated subtree's result is identical and complete on
 /// every worker, which is what lets TPC-DS Q54's `UNION ALL` of two non-sharded facts feed a
 /// `DISTINCT` customer filter safely.
-fn reject_unsafe_broadcast_shapes(lp: &LogicalPlan, sharded_name: &str) -> Result<()> {
+pub(crate) fn reject_unsafe_broadcast_shapes(lp: &LogicalPlan, sharded_name: &str) -> Result<()> {
     if count_table_scans(lp, sharded_name) == 0 {
         return Ok(());
     }
@@ -2226,7 +3456,7 @@ fn peek_as_alias(sql: &str, pos: usize) -> Option<String> {
 }
 
 /// Whether DataFusion's aggregate uses its single-expression grouping-set representation.
-fn is_grouping_set(group_expr: &[Expr]) -> bool {
+pub(crate) fn is_grouping_set(group_expr: &[Expr]) -> bool {
     matches!(group_expr, [Expr::GroupingSet(_)])
 }
 
@@ -2234,7 +3464,7 @@ fn is_grouping_set(group_expr: &[Expr]) -> bool {
 ///
 /// `ROLLUP(a, b)` and `CUBE(a, b)` become `[a, b]`. Explicit grouping sets become the stable,
 /// de-duplicated union returned by DataFusion's own [`GroupingSet::distinct_expr`].
-fn flattened_group_exprs(group_expr: &[Expr]) -> Vec<&Expr> {
+pub(crate) fn flattened_group_exprs(group_expr: &[Expr]) -> Vec<&Expr> {
     match group_expr {
         [Expr::GroupingSet(grouping_set)] => grouping_set.distinct_expr(),
         ordinary => ordinary.iter().collect(),
@@ -2247,7 +3477,7 @@ fn flattened_group_exprs(group_expr: &[Expr]) -> Vec<&Expr> {
 /// never emitted into the partial SELECT list where Databricks would resolve `ROLLUP` as a scalar
 /// function. Keeping the explicit space (`ROLLUP (...)`) also matches the syntax accepted by the
 /// worker parser and by the original TPC-DS queries.
-fn final_group_by_sql(group_expr: &[Expr], flattened_len: usize) -> Result<String> {
+pub(crate) fn final_group_by_sql(group_expr: &[Expr], flattened_len: usize) -> Result<String> {
     let flattened = flattened_group_exprs(group_expr);
     if flattened.len() != flattened_len {
         return Err(Error::Unsupported(format!(

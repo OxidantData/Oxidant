@@ -2,12 +2,13 @@
   "notes": "TPC-DS distributed PLANNER ratchet (sf=0.01). Counts queries a distributed plan can be BUILT for; it does not check the answer. The gate that matters for correctness is bench/distributed/tpcds-execute-baseline.json, which compares distributed results against single-node. CI fails if this supported count drops. Re-baseline after planner gains.",
   "suite": "tpcds",
   "query_count": 99,
-  "supported": 95,
+  "supported": 99,
   "supported_queries": [
     "Q1",
     "Q2",
     "Q3",
     "Q4",
+    "Q5",
     "Q6",
     "Q7",
     "Q8",
@@ -16,6 +17,7 @@
     "Q11",
     "Q12",
     "Q13",
+    "Q14",
     "Q15",
     "Q16",
     "Q17",
@@ -78,8 +80,10 @@
     "Q74",
     "Q75",
     "Q76",
+    "Q77",
     "Q78",
     "Q79",
+    "Q80",
     "Q81",
     "Q82",
     "Q83",
@@ -100,9 +104,5 @@
     "Q98",
     "Q99"
   ],
-  "reason_histogram": {
-    "UNION ALL arm does not scan sharded table `web_sales`": 2,
-    "expected left-deep equijoin chain, found `SubqueryAlias: x`": 1,
-    "sharded table `web_sales` scanned 7\u00d7 (self-join / subquery)": 1
-  }
+  "reason_histogram": {}
 }
