@@ -15,8 +15,10 @@
 //!   exactly there; a partition-0 gate preserves the synthetic zero-input row of a global
 //!   aggregate when the true result is empty.
 //! - **Scalar subqueries in the projection** (Q9): each uncorrelated global-aggregate scalar
-//!   over the sharded fact decomposes into a per-worker partial + one-row combine; the gated
-//!   outer evaluation reads each scalar as a one-row `shuffle_input_{i}`.
+//!   over the sharded fact decomposes into a per-worker partial + one-row combine; scalars
+//!   sharing a body tail (Q9's 15 `store_sales` bands) merge into one FILTER-aggregate scan +
+//!   one multi-column combine; the gated outer evaluation reads each scalar from its one-row
+//!   `shuffle_input_{i}`.
 //! - **Anti-only inline guard**: `NOT EXISTS` over a sharded key stream with a fully-replicated
 //!   outer has no semi gate to co-locate emission — it must keep the gather (strict: refuse),
 //!   not multiply rows once per partition.
@@ -669,7 +671,7 @@ async fn global_non_distinct_self_exists_matches_single_node() {
 // --- Q9: uncorrelated global-aggregate scalar subqueries in the projection ---
 
 #[tokio::test]
-async fn q9_scalar_projection_plans_partial_combine_per_scalar() {
+async fn q9_scalar_projection_merges_same_tail_scalars_into_one_scan() {
     std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
     let planner = tpcds_engine().await;
     let lp = planner.logical_plan(Q9).await.expect("logical plan");
@@ -680,32 +682,69 @@ async fn q9_scalar_projection_plans_partial_combine_per_scalar() {
         std::env::remove_var("WEFT_DISTRIBUTED_STRICT");
         planned.expect("Q9 must plan in strict mode (pre-KAN-55 this was the refused gather)")
     };
-    // 15 scalar subqueries × (partial + combine) + gate + gated outer evaluation.
-    assert_eq!(dq.stages.len(), 32, "per-scalar stage pairs: {dq:?}");
+    // 15 same-tail scalars merge: one FILTER-aggregate partial + one combine + gate + gated
+    // outer evaluation (was 15 × (partial + combine) + gate + outer = 32 stages, 15 scans).
+    assert_eq!(dq.stages.len(), 4, "merged same-tail shape: {dq:?}");
     let partial = &dq.stages[0];
-    assert!(
-        partial.sql.contains("count(1) AS a0") && partial.sql.contains("FROM store_sales"),
-        "per-worker partial over the local shard: {}",
+    assert_eq!(
+        partial.sql.matches("FROM store_sales").count(),
+        1,
+        "one shared scan of the sharded fact: {}",
         partial.sql
     );
+    for band in [
+        "store_sales.ss_quantity BETWEEN 1 AND 20",
+        "store_sales.ss_quantity BETWEEN 21 AND 40",
+        "store_sales.ss_quantity BETWEEN 41 AND 60",
+        "store_sales.ss_quantity BETWEEN 61 AND 80",
+        "store_sales.ss_quantity BETWEEN 81 AND 100",
+    ] {
+        assert!(
+            partial
+                .sql
+                .contains(&format!("count(1) FILTER (WHERE ({band}))")),
+            "per-band count as a FILTER aggregate: {}",
+            partial.sql
+        );
+        assert!(
+            partial.sql.contains(&format!(
+                "sum(store_sales.ss_ext_discount_amt) FILTER (WHERE ({band}))"
+            )),
+            "per-band avg sum-partial as a FILTER aggregate: {}",
+            partial.sql
+        );
+        assert!(
+            partial.sql.contains(&format!(
+                "count(store_sales.ss_net_paid) FILTER (WHERE ({band}))"
+            )),
+            "per-band avg count-partial as a FILTER aggregate: {}",
+            partial.sql
+        );
+    }
     let combine = &dq.stages[1];
+    for j in 0..15 {
+        assert!(
+            combine.sql.contains(&format!("AS s{j}")),
+            "every scalar value a column of the single combine row: {}",
+            combine.sql
+        );
+    }
     assert!(
-        combine.sql.contains("sum(a0) AS m0") && combine.sql.contains("HAVING COUNT(a0) > 0"),
-        "one-row global combine: {}",
+        combine.sql.contains("sum(a0)") && combine.sql.contains("NULLIF(sum(a1c), 0)"),
+        "count/avg recombination over the shared partials: {}",
         combine.sql
     );
     let outer = dq.stages.last().expect("gated outer");
     assert!(outer.sql.contains("__weft_scalar_src"), "{}", outer.sql);
     assert!(
-        outer
-            .sql
-            .contains("EXISTS (SELECT 1 FROM shuffle_input_15)"),
+        outer.sql.contains("EXISTS (SELECT 1 FROM shuffle_input_1)"),
         "the partition-0 gate makes the replicated outer emit exactly once: {}",
         outer.sql
     );
     assert!(
-        outer.sql.contains("(SELECT * FROM shuffle_input_0)"),
-        "each scalar reads its one-row combine: {}",
+        outer.sql.contains("(SELECT s0 FROM shuffle_input_0)")
+            && outer.sql.contains("(SELECT s14 FROM shuffle_input_0)"),
+        "each scalar reads its column of the merged one-row combine: {}",
         outer.sql
     );
     assert!(
@@ -714,6 +753,79 @@ async fn q9_scalar_projection_plans_partial_combine_per_scalar() {
             .any(|s| s.sql == "SELECT * FROM store_sales"),
         "no whole-fact gather: {dq:?}"
     );
+}
+
+/// Mixed projection: two same-tail sharded scalars merge into one FILTER-aggregate scan while a
+/// replicated-body scalar keeps its own per-scalar stage pair.
+#[tokio::test]
+async fn mixed_shared_and_unique_tail_scalars_compose() {
+    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+    let sql = "SELECT (SELECT count(*) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) + \
+                      (SELECT count(*) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40) \
+                      AS bands, \
+               (SELECT count(*) FROM reason) AS n_reasons \
+               FROM reason WHERE r_reason_sk = 1";
+    let planner = tpcds_engine().await;
+    let lp = planner.logical_plan(sql).await.expect("logical plan");
+    let dq = {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WEFT_DISTRIBUTED_STRICT", "1");
+        let planned = plan_distributed_logical(&lp, &REPL_STORE);
+        std::env::remove_var("WEFT_DISTRIBUTED_STRICT");
+        planned.expect("mixed scalar projection must plan in strict mode")
+    };
+    // Merged partial + combine (store_sales), per-scalar partial + combine (reason), gate,
+    // gated outer.
+    assert_eq!(dq.stages.len(), 6, "merged + per-scalar compose: {dq:?}");
+    let partial = &dq.stages[0];
+    assert_eq!(
+        partial.sql.matches("FROM store_sales").count(),
+        1,
+        "one shared scan: {}",
+        partial.sql
+    );
+    assert!(
+        partial
+            .sql
+            .contains("count(1) FILTER (WHERE (store_sales.ss_quantity BETWEEN 1 AND 20)) AS a0")
+            && partial.sql.contains(
+                "count(1) FILTER (WHERE (store_sales.ss_quantity BETWEEN 21 AND 40)) AS a1"
+            ),
+        "one FILTER aggregate per band over the shared scan: {}",
+        partial.sql
+    );
+    let combine = &dq.stages[1];
+    assert!(
+        combine.sql.contains("sum(a0) AS m0") && combine.sql.contains("sum(a1) AS m1"),
+        "one combine row, one column per merged member: {}",
+        combine.sql
+    );
+    // The unique-tail (replicated) reason scalar keeps its per-scalar pair, computed once.
+    let reason_partial = &dq.stages[2];
+    assert!(
+        reason_partial.sql.contains("count(1) AS a0") && reason_partial.sql.contains("FROM reason"),
+        "unique-tail scalar keeps its per-scalar partial: {}",
+        reason_partial.sql
+    );
+    assert_eq!(
+        reason_partial.exchange,
+        weft_execution::driver::ExchangeMode::Forward,
+        "replicated body computes its partial exactly once"
+    );
+    let outer = dq.stages.last().expect("gated outer");
+    assert!(
+        outer.sql.contains("(SELECT s0 FROM shuffle_input_0)")
+            && outer.sql.contains("(SELECT s1 FROM shuffle_input_0)")
+            && outer.sql.contains("(SELECT * FROM shuffle_input_1)"),
+        "merged members read columns of shuffle_input_0, the unique scalar its own input: {}",
+        outer.sql
+    );
+    assert!(
+        outer.sql.contains("EXISTS (SELECT 1 FROM shuffle_input_2)"),
+        "the partition-0 gate is the last upstream: {}",
+        outer.sql
+    );
+    assert_distributed_matches_single_node(sql, &REPL_STORE).await;
 }
 
 #[tokio::test]

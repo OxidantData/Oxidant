@@ -308,6 +308,9 @@ fn stamp_replicated_tables(dq: &mut DistributedQuery, replicated: &[&str]) {
 ///
 /// See [`weft_loom::shard::classify_replicated_tables`]: the largest known table in the plan stays
 /// sharded; smaller tables under `WEFT_AUTO_BROADCAST_THRESHOLD_BYTES` (default 32 GiB) replicate.
+/// When `WEFT_REPLICATE_MAX_ROW_MULTIPLE` is set (off by default) and catalog row counts are
+/// available, a byte-eligible candidate with more than multiple × the largest table's rows stays
+/// sharded too — see [`weft_loom::shard::classify_replicated_tables_with_rows`].
 ///
 /// KAN-55: tables scanned only inside expression subqueries (EXISTS / IN / scalar) are sized too.
 /// They were previously invisible here and defaulted to *sharded*, which made e.g. TPC-DS Q10's
@@ -317,8 +320,8 @@ fn stamp_replicated_tables(dq: &mut DistributedQuery, replicated: &[&str]) {
 pub async fn resolve_replicated_tables(engine: &Engine, lp: &LogicalPlan) -> Vec<String> {
     use std::collections::HashSet;
     use weft_loom::shard::{
-        auto_broadcast_threshold_bytes, classify_replicated_tables,
-        replicated_tables_override_from_env,
+        auto_broadcast_threshold_bytes, classify_replicated_tables_with_rows,
+        replicate_max_row_multiple, replicated_tables_override_from_env,
     };
 
     let mut seen = HashSet::new();
@@ -330,13 +333,25 @@ pub async fn resolve_replicated_tables(engine: &Engine, lp: &LogicalPlan) -> Vec
         .collect();
     // Size tables concurrently: a cache miss lists files (and, for external catalogs,
     // probes namespaces via the catalog CLI) — serializing those multiplies the first-query
-    // latency by the table count. The per-engine estimate cache keeps repeats cheap.
+    // latency by the table count. The per-engine estimate cache keeps repeats cheap. Row
+    // counts ride the same walk (catalog table properties; no extra I/O).
     let estimates =
-        futures::future::join_all(names.iter().map(|name| engine.estimate_table_bytes(name))).await;
-    let sized: Vec<(String, Option<u64>)> = names.into_iter().zip(estimates).collect();
+        futures::future::join_all(names.iter().map(|name| engine.estimate_table_stats(name))).await;
+    let mut sized: Vec<(String, Option<u64>)> = Vec::with_capacity(estimates.len());
+    let mut rows: Vec<Option<u64>> = Vec::with_capacity(estimates.len());
+    for (name, (bytes, row_count)) in names.into_iter().zip(estimates) {
+        sized.push((name, bytes));
+        rows.push(row_count);
+    }
     let override_names = replicated_tables_override_from_env();
     let override_refs: Vec<&str> = override_names.iter().map(String::as_str).collect();
-    classify_replicated_tables(&sized, &override_refs, auto_broadcast_threshold_bytes())
+    classify_replicated_tables_with_rows(
+        &sized,
+        &rows,
+        &override_refs,
+        auto_broadcast_threshold_bytes(),
+        replicate_max_row_multiple(),
+    )
 }
 
 /// Last-line check on the SQL every stage will hand to a worker.
@@ -947,15 +962,18 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
 /// single-row bucket aggregates, cross-joined by [`super::dag_splitter`]).
 ///
 /// A per-shard `DISTINCT` + recombine would double-count values that land on more than one
-/// worker, so the raw rows are hash-shuffled **by the DISTINCT argument** instead — every equal
-/// value co-locates on one partition, making each partition's `COUNT(DISTINCT x)` exact:
+/// worker, so rows are hash-shuffled **by the DISTINCT argument** instead — every equal value
+/// co-locates on one partition, making each partition's `COUNT(DISTINCT x)` exact:
 ///
-/// 1. **Project** every aggregate's argument as `c{i}` (no aggregation), hash-shuffled by the
-///    shared DISTINCT argument column.
-/// 2. **Per-partition aggregate**: `count(DISTINCT c{i})` (exact by co-location) plus the
-///    recombinable partials (`sum`/`count`/`min`/`max`/`avg` pieces) of the non-DISTINCT
-///    aggregates. A global aggregate emits exactly one row per partition — identity values over
-///    an empty bucket (0 counts, NULL sums), so nothing is double- or mis-counted.
+/// 1. **Partial dedup**: `GROUP BY` the DISTINCT argument (emitted as `c{i}`) and pre-aggregate
+///    the recombinable partial state (`sum`/`count`/`min`/`max`/`avg` pieces) of the
+///    non-DISTINCT aggregates per value. One row per *locally distinct* value crosses the
+///    exchange instead of every matching fact row (Q28 at SF10: ~440k raw rows per branch
+///    shrink to the per-worker distinct-value count).
+/// 2. **Per-partition aggregate**: `count(DISTINCT c{i})` (exact by co-location) plus a
+///    recombine of the pre-aggregated state columns. A global aggregate emits exactly one row
+///    per partition — identity values over an empty bucket (0 counts, NULL sums), so nothing is
+///    double- or mis-counted.
 /// 3. **Gather-combine**: `sum` the per-partition distinct counts and recombine the partials on
 ///    partition 0; `HAVING COUNT(*) > 0` suppresses the synthetic empty-partition row, same as
 ///    the non-DISTINCT global path.
@@ -983,19 +1001,34 @@ fn global_distinct_aggregation_stages(
         ));
     }
 
-    // Stage 0: project each aggregate's argument, hashed by the shared DISTINCT argument.
-    let hash_key = aggs
-        .iter()
-        .position(|a| a.distinct)
-        .expect("at least one distinct aggregate") as u32;
-    let psel: Vec<String> = aggs
-        .iter()
-        .enumerate()
-        .map(|(i, a)| format!("{} AS c{i}", a.arg_sql))
-        .collect();
-    let partial_sql = sanitize_generated_sql(&format!("SELECT {} {tail}", psel.join(", ")));
+    // Stage 0: per-worker partial dedup — the DISTINCT argument column(s) first (they all share
+    // one argument, so the first position hashes identically to any), then each non-DISTINCT
+    // aggregate's partial state, grouped by the argument.
+    let mut psel: Vec<String> = Vec::new();
+    let mut group_sql: Vec<String> = Vec::new();
+    for (i, a) in aggs.iter().enumerate() {
+        if a.distinct {
+            psel.push(format!("{} AS c{i}", a.arg_sql));
+            if !group_sql.contains(&a.arg_sql) {
+                group_sql.push(a.arg_sql.clone());
+            }
+        }
+    }
+    for (i, a) in aggs.iter().enumerate() {
+        if a.distinct {
+            continue;
+        }
+        let (sel, _comb) = partial_combine_sql(&a.func, i, &a.arg_sql)?;
+        psel.extend(sel);
+    }
+    let partial_sql = sanitize_generated_sql(&format!(
+        "SELECT {} {tail} GROUP BY {}",
+        psel.join(", "),
+        group_sql.join(", ")
+    ));
 
-    // Stage 1: exact per-partition distinct counts + recombinable partials for the rest.
+    // Stage 1: exact per-partition distinct counts + a recombine of the stage-0 partial state
+    // (under the same `a{i}…` names the gather-combine has always read).
     let mut mid_sel = Vec::with_capacity(aggs.len());
     let mut combine = Vec::with_capacity(aggs.len());
     for (i, a) in aggs.iter().enumerate() {
@@ -1003,8 +1036,8 @@ fn global_distinct_aggregation_stages(
             mid_sel.push(format!("count(DISTINCT c{i}) AS d{i}"));
             combine.push(format!("sum(d{i}) AS r{i}"));
         } else {
-            let (sel, comb) = partial_combine_sql(&a.func, i, &format!("c{i}"))?;
-            mid_sel.extend(sel);
+            mid_sel.extend(recombine_partial_state_sql(&a.func, i)?);
+            let (_sel, comb) = partial_combine_sql(&a.func, i, &format!("c{i}"))?;
             combine.push(comb);
         }
     }
@@ -1021,12 +1054,32 @@ fn global_distinct_aggregation_stages(
     let final_sql = wrap_output(p, &inner, &remap)?;
     Ok(DistributedQuery {
         stages: vec![
-            StageDef::new(0, partial_sql, vec![], vec![hash_key]),
+            // The DISTINCT argument column(s) lead the stage-0 select list; all share one
+            // argument, so hashing by the first position co-locates every equal value.
+            StageDef::new(0, partial_sql, vec![], vec![0]),
             StageDef::new(1, mid_sql, vec![0], vec![]),
             StageDef::new(2, final_sql, vec![1], vec![]),
         ],
         finalize_sql: build_finalize(p)?,
     })
+}
+
+/// Recombine one aggregate's partial state columns (the `a{i}…` emitted by the stage-0 partial
+/// dedup) into per-partition totals under the same names, so the final gather-combine reads
+/// them unchanged. Mirrors the state layout of [`partial_combine_sql`].
+fn recombine_partial_state_sql(func: &str, i: usize) -> Result<Vec<String>> {
+    match func {
+        "sum" | "count" => Ok(vec![format!("sum(a{i}) AS a{i}")]),
+        "min" => Ok(vec![format!("min(a{i}) AS a{i}")]),
+        "max" => Ok(vec![format!("max(a{i}) AS a{i}")]),
+        "avg" => Ok(vec![format!("sum(a{i}s) AS a{i}s, sum(a{i}c) AS a{i}c")]),
+        "stddev" | "var" | "stddev_pop" | "var_pop" => Ok(vec![format!(
+            "sum(a{i}s) AS a{i}s, sum(a{i}q) AS a{i}q, sum(a{i}c) AS a{i}c"
+        )]),
+        other => Err(Error::Unsupported(format!(
+            "auto-distribute: aggregate `{other}` not supported"
+        ))),
+    }
 }
 
 /// Shuffle-join two sharded tables, then run the grouped aggregation.
@@ -3762,7 +3815,7 @@ fn scalar_as_usize(s: &datafusion::scalar::ScalarValue) -> Option<usize> {
 }
 
 /// True when `lp` (or any nested subquery plan) contains a `Distinct` / `DistinctOn` node.
-fn plan_contains_distinct(lp: &LogicalPlan) -> bool {
+pub(crate) fn plan_contains_distinct(lp: &LogicalPlan) -> bool {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     matches!(lp, LogicalPlan::Distinct(_))
         || lp.inputs().iter().any(|c| plan_contains_distinct(c))

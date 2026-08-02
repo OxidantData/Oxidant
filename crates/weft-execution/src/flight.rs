@@ -334,6 +334,30 @@ impl Drop for ShuffleInputGuard {
     }
 }
 
+/// The measured input rows of one upstream for this consumer task, from the ticket's
+/// driver-measured per-bucket totals ([`StageTicket::upstream_bucket_rows`]): the sum of
+/// that upstream's bucket totals over exactly the buckets this task pulls (`read_buckets`
+/// — its own bucket, or its AQE modulus class). `None` when the ticket carries no complete
+/// measurement (older driver, `WEFT_STAGE_INPUT_STATS=0`, or a partial sample) — the
+/// caller then registers the plain MemTable and DataFusion's own statistics apply.
+fn measured_upstream_rows(
+    t: &StageTicket,
+    read_buckets: &[u32],
+    upstream_idx: usize,
+) -> Option<u64> {
+    let np = t.num_partitions as usize;
+    if np == 0 || t.upstream_bucket_rows.len() != t.upstream_stage_ids.len() * np {
+        return None;
+    }
+    let base = upstream_idx * np;
+    Some(
+        read_buckets
+            .iter()
+            .map(|&b| t.upstream_bucket_rows[base + b as usize])
+            .sum(),
+    )
+}
+
 /// KAN-31/KAN-46: reap a producer stage task's spill scope when the task exits without
 /// committing its output into the stage cache — execution error, driver cancel, no-progress
 /// watchdog abort, stage timeout, or the do_get future being dropped because the Flight
@@ -745,8 +769,11 @@ impl Worker {
         )
     }
 
-    /// Run a [`StageTicket`]. First, if it has upstreams, pull this worker's bucket of each upstream
-    /// stage from every worker and register them under this task's localized `shuffle_input` names
+    /// Run a [`StageTicket`]. First, if it has upstreams, pull this partition's bucket of each
+    /// upstream stage from every worker — or, for a ticket-marked `Forward` upstream, only
+    /// from its single producer endpoint, or, when the driver AQE-coalesced the read
+    /// (`coalesce_read_modulus`), this partition's whole modulus class of buckets
+    /// (`p, p+m, …`) — and register them under this task's localized `shuffle_input` names
     /// (one per upstream). Then run the stage SQL. If `produce` is set, hash-partition the result
     /// by `hash_key_cols` and cache it for downstreams (returning empty); otherwise return the
     /// result (the output stage). A stage can both consume *and* produce — an intermediate stage
@@ -756,6 +783,10 @@ impl Worker {
         t: StageTicket,
         progress: &StageProgress,
     ) -> std::result::Result<Vec<RecordBatch>, Status> {
+        // R5-4: the canonical (pre-localization) stage SQL is the stage plan cache's key
+        // component — identical across this stage's tasks, unlike the per-task localized
+        // text below. Captured before the rewrite.
+        let canonical_sql = t.stage_sql.clone();
         // F2: scope this task's shuffle-input tables (and the stage SQL referencing them)
         // to (stage_id, partition_id) so sibling partition tasks on this worker register
         // disjoint MemTables and run concurrently — they previously shared the fixed
@@ -779,18 +810,57 @@ impl Worker {
             engine: self.engine.clone(),
             names: Vec::new(),
         };
+        // R5-4: this task's registered shuffle-input providers (upstream order), handed to
+        // the stage plan cache so a template hit rebinds scans to THIS task's data (and its
+        // measured row totals) instead of re-planning.
+        let mut shuffle_providers = Vec::new();
+        // AQE-coalesced read: a modulus `m < num_partitions` makes this consumer partition
+        // pull its whole modulus class (`p, p+m, …`) of each upstream instead of only bucket
+        // `p`; the driver dispatches exactly `m` such readers, so every producer bucket is
+        // read exactly once. `0` (or an oversized value) is the legacy one-bucket read.
+        let read_mod = if t.coalesce_read_modulus == 0 {
+            t.num_partitions
+        } else {
+            t.coalesce_read_modulus.min(t.num_partitions)
+        };
+        let read_buckets =
+            crate::aqe::coalesced_read_buckets(t.num_partitions, read_mod, t.partition_id);
         let single = t.upstream_stage_ids.len() == 1;
-        for (i, &up_stage) in t.upstream_stage_ids.iter().enumerate() {
+        // Pull every (bucket, endpoint) pair of every upstream concurrently (shuffle reads
+        // take no server-side task slot, so this cannot starve stage tasks), then
+        // concatenate per upstream in the legacy nested-loop order — bucket-major, then
+        // endpoint — which ordered consumers rely on; the first error in that order wins.
+        let per_upstream =
+            futures::future::join_all(t.upstream_stage_ids.iter().map(|&up_stage| {
+                // A `Forward`-mode upstream ran exactly once, on the first endpoint (the driver
+                // dispatches it there); the other endpoints would only serve schema-less
+                // placeholder buckets, so don't round-trip them at all.
+                let endpoints = if t.forward_upstream_stage_ids.contains(&up_stage) {
+                    &t.upstream_endpoints[..t.upstream_endpoints.len().min(1)]
+                } else {
+                    &t.upstream_endpoints[..]
+                };
+                let pulls: Vec<_> = read_buckets
+                    .iter()
+                    .flat_map(|&bucket| {
+                        endpoints
+                            .iter()
+                            .map(move |ep| pull_bucket(ep.clone(), up_stage, bucket))
+                    })
+                    .collect();
+                futures::future::join_all(pulls)
+            }))
+            .await;
+        for (i, results) in per_upstream.into_iter().enumerate() {
             let mut input = Vec::new();
-            for ep in &t.upstream_endpoints {
-                let part = pull_bucket(ep.clone(), up_stage, t.partition_id)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                input.extend(part);
+            for part in results {
+                input.extend(part.map_err(|e| Status::internal(e.to_string()))?);
             }
             // A `Forward`-mode upstream (a replicated-only UNION/aggregation arm — see
-            // `stage_planner::try_split_broadcast_union`) runs on exactly one worker; every other
-            // worker listed in `upstream_endpoints` has no cache entry for that stage, so its
+            // `stage_planner::try_split_broadcast_union`) runs on exactly one worker; unless
+            // the ticket marked it (`forward_upstream_stage_ids`, which restricted the pull
+            // above to that worker), every other worker listed in `upstream_endpoints` has
+            // no cache entry for that stage, so its
             // `do_get` round-trips a placeholder batch with an unknown (zero-field) schema rather
             // than the stage's real schema (see `Worker::read_shuffle` / `do_get_batches_once`).
             // Once at least one batch carries the real schema, drop those schema-less
@@ -815,18 +885,38 @@ impl Worker {
             } else {
                 crate::shuffle::localized_shuffle_input_name(t.stage_id, t.partition_id, Some(i))
             };
-            self.engine
-                .register_batches(&name, input)
-                .map_err(|e| Status::internal(e.to_string()))?;
+            // KAN-2 A3: when the ticket carries the driver's barrier-measured bucket
+            // totals, register the input with that exact row count attached — the
+            // plan-time join-strategy guard then sizes hash builds from measured data.
+            // Otherwise the plain MemTable registration applies (DataFusion's own
+            // batch-derived statistics).
+            let provider = match measured_upstream_rows(&t, &read_buckets, i) {
+                Some(rows) => self.engine.register_batches_with_stats(&name, input, rows),
+                None => self.engine.register_batches(&name, input),
+            }
+            .map_err(|e| Status::internal(e.to_string()))?;
+            shuffle_providers.push(provider);
             shuffle_inputs.names.push(name);
         }
+
+        // R5-4: plan once per stage per worker. The key covers the canonical SQL, snapshot
+        // pins, replicated classification, and these inputs' schemas — everything that
+        // determines the plan; the per-task measured row totals deliberately stay OUT (they
+        // re-enter via the hit-path provider rebind). See weft_loom::stage_plan_cache.
+        let plan_request = self.engine.stage_plan_request(
+            &canonical_sql,
+            t.stage_id,
+            &t.lakehouse_snapshot_pins,
+            &t.replicated_tables,
+            shuffle_providers,
+        );
 
         if t.produce {
             // Producer: run the stage, hash-partition its output into per-downstream buckets,
             // and cache them under this task's `(stage_id, partition_id)` key for downstreams
             // (returning empty). Per-task keys let several producing tasks of one stage
             // coexist on this worker (KAN-32 per-partition intermediate dispatch).
-            let (schema, cache) = self.run_producer_stage(&t, progress).await?;
+            let (schema, cache) = self.run_producer_stage(&t, progress, &plan_request).await?;
             let key = (t.stage_id, t.partition_id);
             {
                 let mut guard = self.stage_outputs.lock().expect("stage cache poisoned");
@@ -855,9 +945,10 @@ impl Worker {
                 weft_loom::shard::with_replicated_tables(&t.replicated_tables, async {
                     let stream = match self
                         .engine
-                        .sql_stream_with_lakehouse_snapshots(
+                        .sql_stream_stage_with_lakehouse_snapshots(
                             &t.stage_sql,
                             &t.lakehouse_snapshot_pins,
+                            Some(&plan_request),
                         )
                         .await
                     {
@@ -934,12 +1025,17 @@ impl Worker {
         &self,
         t: &StageTicket,
         progress: &StageProgress,
+        plan_request: &weft_loom::stage_plan_cache::StagePlanRequest,
     ) -> std::result::Result<(SchemaRef, BucketCache), Status> {
         let key_cols: Vec<usize> = t.hash_key_cols.iter().map(|&c| c as usize).collect();
         weft_loom::shard::with_replicated_tables(&t.replicated_tables, async {
             let stream = match self
                 .engine
-                .sql_stream_with_lakehouse_snapshots(&t.stage_sql, &t.lakehouse_snapshot_pins)
+                .sql_stream_stage_with_lakehouse_snapshots(
+                    &t.stage_sql,
+                    &t.lakehouse_snapshot_pins,
+                    Some(plan_request),
+                )
                 .await
             {
                 Ok(stream) => stream,
@@ -2068,6 +2164,9 @@ mod tests {
             produce: true,
             lakehouse_snapshot_pins: String::new(),
             replicated_tables: String::new(),
+            coalesce_read_modulus: 0,
+            forward_upstream_stage_ids: vec![],
+            upstream_bucket_rows: vec![],
         };
         let mut out = None;
         for _ in 0..50 {
@@ -2110,6 +2209,9 @@ mod tests {
             produce: true,
             lakehouse_snapshot_pins: String::new(),
             replicated_tables: String::new(),
+            coalesce_read_modulus: 0,
+            forward_upstream_stage_ids: vec![],
+            upstream_bucket_rows: vec![],
         };
         for _ in 0..50 {
             if run_stage_on_worker(endpoint.clone(), ticket.clone())
@@ -2152,6 +2254,9 @@ mod tests {
             produce: true,
             lakehouse_snapshot_pins: String::new(),
             replicated_tables: String::new(),
+            coalesce_read_modulus: 0,
+            forward_upstream_stage_ids: vec![],
+            upstream_bucket_rows: vec![],
         };
         worker
             .run_stage(ticket(910), &StageProgress::default())
@@ -2205,6 +2310,9 @@ mod tests {
             produce: true,
             lakehouse_snapshot_pins: String::new(),
             replicated_tables: String::new(),
+            coalesce_read_modulus: 0,
+            forward_upstream_stage_ids: vec![],
+            upstream_bucket_rows: vec![],
         };
         for _ in 0..50 {
             if run_stage_on_worker(endpoint.clone(), ticket.clone())
@@ -2248,6 +2356,9 @@ mod tests {
             produce: false,
             lakehouse_snapshot_pins: String::new(),
             replicated_tables: String::new(),
+            coalesce_read_modulus: 0,
+            forward_upstream_stage_ids: vec![],
+            upstream_bucket_rows: vec![],
         };
         let mut out = None;
         for _ in 0..50 {
@@ -2260,6 +2371,111 @@ mod tests {
             }
         }
         out.expect("consumer over empty typed bucket should plan and run");
+    }
+
+    /// AQE-coalesced read at the worker: a consumer ticket carrying `coalesce_read_modulus = m`
+    /// pulls its whole modulus class (`p, p+m, …`) of each upstream; across the `m` dispatched
+    /// readers every producer bucket must be read exactly once.
+    #[tokio::test]
+    async fn coalesced_consumer_reads_every_bucket_once() {
+        let bind = || {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let (p0, p1) = (bind(), bind());
+        // Worker 0 holds keys 0..8, worker 1 keys 100..108 — 16 rows total, hash-partitioned
+        // into 4 buckets on each worker.
+        let make_engine = |start: i64, end: i64| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from((start..end).collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from((start..end).collect::<Vec<_>>())),
+                ],
+            )
+            .unwrap();
+            let engine = Arc::new(Engine::new());
+            engine.register_batches("t", vec![batch]).unwrap();
+            engine
+        };
+        tokio::spawn(async move {
+            let _ = serve_worker(p0, make_engine(0, 8)).await;
+        });
+        tokio::spawn(async move {
+            let _ = serve_worker(p1, make_engine(100, 108)).await;
+        });
+        let endpoints: Vec<String> = [p0, p1]
+            .iter()
+            .map(|p| format!("http://127.0.0.1:{p}"))
+            .collect();
+
+        // Leaf producer stage 7 on both workers: `SELECT k, v FROM t` into 4 buckets.
+        let producer = |partition_id: u32| StageTicket {
+            stage_id: 7,
+            partition_id,
+            num_partitions: 4,
+            upstream_endpoints: vec![],
+            stage_sql: "SELECT k, v FROM t".into(),
+            plan_fragment: vec![],
+            hash_key_cols: vec![0],
+            upstream_stage_ids: vec![],
+            produce: true,
+            lakehouse_snapshot_pins: String::new(),
+            replicated_tables: String::new(),
+            coalesce_read_modulus: 0,
+            forward_upstream_stage_ids: vec![],
+            upstream_bucket_rows: vec![],
+        };
+        for (i, ep) in endpoints.iter().enumerate() {
+            for _ in 0..50 {
+                if run_stage_on_worker(ep.clone(), producer(i as u32))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        // Coalesced consumer stage 8: modulus 2 over 4 buckets — reader 0 pulls buckets
+        // {0, 2}, reader 1 pulls {1, 3}, each from BOTH workers.
+        let mut seen: Vec<i64> = Vec::new();
+        for p in 0..2u32 {
+            let consume = StageTicket {
+                stage_id: 8,
+                partition_id: p,
+                num_partitions: 4,
+                upstream_endpoints: endpoints.clone(),
+                stage_sql: "SELECT k, v FROM shuffle_input".into(),
+                plan_fragment: vec![],
+                hash_key_cols: vec![],
+                upstream_stage_ids: vec![7],
+                produce: false,
+                lakehouse_snapshot_pins: String::new(),
+                replicated_tables: String::new(),
+                coalesce_read_modulus: 2,
+                forward_upstream_stage_ids: vec![],
+                upstream_bucket_rows: vec![],
+            };
+            let out = run_stage_on_worker(endpoints[0].clone(), consume)
+                .await
+                .expect("coalesced consumer run");
+            for b in &out {
+                let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                seen.extend((0..k.len()).map(|i| k.value(i)));
+            }
+        }
+        seen.sort_unstable();
+        let expected: Vec<i64> = (0..8).chain(100..108).collect();
+        assert_eq!(
+            seen, expected,
+            "every bucket read exactly once across readers"
+        );
     }
 
     #[tokio::test]

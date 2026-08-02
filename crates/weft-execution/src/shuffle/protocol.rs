@@ -99,6 +99,34 @@ pub struct StageTicket {
     /// tickets wire-compatible; workers install this as a task-local overlay for file sharding.
     #[prost(string, tag = "11")]
     pub replicated_tables: String,
+    /// AQE-coalesced shuffle-read modulus decided at the producer's stage barrier
+    /// (`driver::finish_stage_barrier`). When `0 < m < num_partitions`, this consumer partition
+    /// `p` pulls producer buckets `p, p+m, p+2m, …` (every `b ≡ p mod m`) of each upstream
+    /// instead of only bucket `p`, and the driver dispatches exactly `m` reader partitions so
+    /// every producer bucket is read exactly once. `0` (or `>= num_partitions`) keeps the
+    /// legacy one-bucket read.
+    #[prost(uint32, tag = "12")]
+    pub coalesce_read_modulus: u32,
+    /// Subset of `upstream_stage_ids` produced in `ExchangeMode::Forward`: each ran exactly
+    /// once, on the *first* endpoint of `upstream_endpoints` (see the driver's producer
+    /// dispatch), so the consumer pulls those upstreams from that endpoint only instead of
+    /// round-tripping `(workers - 1)` schema-less placeholder buckets from workers that never
+    /// produced the stage. Empty keeps older tickets wire-compatible (pull every endpoint and
+    /// tolerate the placeholders).
+    #[prost(uint32, repeated, tag = "13")]
+    pub forward_upstream_stage_ids: Vec<u32>,
+    /// Driver-measured per-bucket row totals of each upstream stage's output
+    /// (`driver::finish_stage_barrier`, gated by `WEFT_STAGE_INPUT_STATS`): `num_partitions`
+    /// entries per upstream, flattened in `upstream_stage_ids` order — entry
+    /// `i * num_partitions + b` is the total rows of upstream `i`'s bucket `b` summed across
+    /// every producing worker (exact: the barrier counts the full stage output). The worker
+    /// sums the entries of the buckets its consumer partition actually pulls (its AQE modulus
+    /// class) and attaches the result as exact `num_rows` statistics on that upstream's
+    /// `shuffle_input*` scan, so the plan-time join-strategy guard sees the real per-task
+    /// build size instead of unknown statistics. Empty keeps older tickets wire-compatible
+    /// (workers fall back to the MemTable's own DataFusion statistics).
+    #[prost(uint64, repeated, tag = "14")]
+    pub upstream_bucket_rows: Vec<u64>,
 }
 
 /// A pull request for one hash bucket of an already-produced stage output.
@@ -144,6 +172,9 @@ impl ShuffleReadTicket {
 }
 
 /// What a worker decoded a ticket as.
+// One decode per stage task, so the prost message's size is not on a hot path — keep the
+// variant inline rather than boxing it through every consumer.
+#[allow(clippy::large_enum_variant)]
 pub enum Ticket {
     /// Run a stage.
     Stage(StageTicket),
@@ -182,6 +213,9 @@ mod tests {
             produce: false,
             lakehouse_snapshot_pins: r#"{"prod.db.t":{"format":"delta","version":7}}"#.into(),
             replicated_tables: String::new(),
+            coalesce_read_modulus: 2,
+            forward_upstream_stage_ids: vec![0],
+            upstream_bucket_rows: vec![41, 59],
         };
         let bytes = t.to_ticket_bytes();
         match decode_ticket(&bytes).unwrap() {

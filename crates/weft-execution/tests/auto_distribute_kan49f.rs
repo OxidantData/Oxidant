@@ -24,7 +24,7 @@
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
-use weft_execution::driver::{run_stages, Cluster};
+use weft_execution::driver::{run_stages, Cluster, ExchangeMode};
 use weft_execution::flight::serve_worker;
 use weft_execution::plan::plan_distributed_logical;
 use weft_loom::arrow::array::{ArrayRef, Date32Array, Float64Array, Int64Array, StringArray};
@@ -398,6 +398,33 @@ async fn q23_three_cte_union_plans_and_matches() {
     let planner = tpcds_engine().await;
     let dq = strict_plan(&planner, Q23, &REPL_Q23).await;
     assert_no_whole_fact_gather(&dq, "store_sales");
+    // The two per-channel arm stages (grouped aggregates over a replicated channel fact
+    // joined to dims and the gathered CTEs) must run exactly once via
+    // `ExchangeMode::Forward`. A Hash arm here is *correct-but-slow* — with the empty
+    // hash key every one of the 16 rendezvous tasks re-runs the full replicated scan +
+    // join while tasks 1..15 always emit zero rows (Q23 at SF10: 169s vs Spark's 5.8s,
+    // 71.6 GB of spill) — so the end-to-end equality check below cannot catch the
+    // regression; only the exchange assertion does.
+    let arms: Vec<_> = dq
+        .stages
+        .iter()
+        .filter(|s| {
+            !s.upstream_stage_ids.is_empty()
+                && (s.sql.contains("catalog_sales") || s.sql.contains("web_sales"))
+        })
+        .collect();
+    assert_eq!(
+        arms.len(),
+        2,
+        "expected two per-channel arm stages over the replicated facts: {dq:?}"
+    );
+    for arm in &arms {
+        assert_eq!(
+            arm.exchange,
+            ExchangeMode::Forward,
+            "Q23 arm stage must run once (Forward), not once per shuffle partition: {arm:?}"
+        );
+    }
     drop(dq);
     assert_distributed_matches_single_node(Q23, &REPL_Q23, "store_sales").await;
 }

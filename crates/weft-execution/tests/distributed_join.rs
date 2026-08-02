@@ -68,8 +68,10 @@ fn rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
 const SINGLE_SQL: &str = "SELECT o.o_custkey AS k, COUNT(*) AS n, SUM(c.c_val) AS s \
      FROM orders o JOIN customer c ON o.o_custkey = c.c_custkey GROUP BY o.o_custkey";
 
-#[tokio::test]
-async fn two_worker_shuffle_join_matches_single_node() {
+/// `WEFT_SHUFFLE_PARTITIONS` is process-global; serialize these tests.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn shuffle_join_matches_single_node() {
     const CUSTS: i64 = 20;
     const ORDERS: i64 = 200;
 
@@ -162,4 +164,21 @@ async fn two_worker_shuffle_join_matches_single_node() {
         actual, expected,
         "distributed shuffle-join result must equal single-node"
     );
+}
+
+#[tokio::test]
+async fn two_worker_shuffle_join_matches_single_node() {
+    let _guard = ENV_LOCK.lock().await;
+    shuffle_join_matches_single_node().await;
+}
+
+/// Same shuffle join with more shuffle partitions than workers: each multi-upstream
+/// consumer task pulls its bucket of both upstreams from both workers (concurrently, R5-3)
+/// and the result must still equal the single-node join.
+#[tokio::test]
+async fn two_worker_shuffle_join_with_more_partitions_matches_single_node() {
+    let _guard = ENV_LOCK.lock().await;
+    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "4");
+    shuffle_join_matches_single_node().await;
+    std::env::remove_var("WEFT_SHUFFLE_PARTITIONS");
 }

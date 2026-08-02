@@ -19,7 +19,8 @@
 //!   `rank()` windows over a tiny per-item aggregate.
 //! - [`try_union_over_derived_ctes`] — Q23 at the SF10 classification: `UNION ALL` of
 //!   per-channel arms whose only sharded inputs are shared derived CTEs; each distinct CTE is
-//!   planned once (fingerprint dedup) and gathers into every arm's stage.
+//!   planned once (fingerprint dedup) and gathers, and each arm runs exactly once as a
+//!   `Forward` stage pulling the CTEs' bucket 0.
 //! - [`try_cross_scalar_threshold`] (used by the Q23 shape) — a grouped aggregate that
 //!   cross-joins a single-row derived scalar (`best_ss_customer ⋈ max_store_sales`): the
 //!   scalar's own grouped input distributes, a KAN-27 one-row broadcast computes the value,
@@ -1063,21 +1064,25 @@ pub(crate) fn try_derived_having_scalar_threshold(
 ///    `best_ss_customer` through [`try_cross_scalar_threshold`], which splits its single-row
 ///    `max_store_sales` cross-join leaf into a distributed per-customer aggregate plus a KAN-27
 ///    one-row scalar broadcast ([`SCALAR_TOKEN`] literal injection into the combine's HAVING).
-///    Every CTE's terminal stage gathers (empty hash key), so an arm stage reads the full CTE
-///    on partition 0 and nothing on the other partitions.
-/// 2. **Each arm becomes one gathered stage**: the arm plan with its CTE references replaced
-///    by `shuffle_input` placeholders (dag_splitter's `replace_branches`). The arm's grouped
-///    aggregate over (replicated channel ⋈ dims ⋈ CTEs) is then exact on partition 0 — inner
-///    joins against empty placeholder inputs keep every other partition empty.
+///    Every CTE's terminal stage gathers (empty hash key), so its whole output sits in
+///    bucket 0 of every endpoint.
+/// 2. **Each arm becomes one `ExchangeMode::Forward` stage**: the arm plan with its CTE
+///    references replaced by `shuffle_input` placeholders (dag_splitter's
+///    `replace_branches`). The driver runs a Forward stage exactly once (on worker 0),
+///    where the full replicated channel/dim tables and a bucket-0 pull of every CTE make
+///    the arm's grouped aggregate exact — a Hash exchange would instead re-run the whole
+///    arm once per shuffle partition, with partitions 1..n-1 guaranteed empty (correct
+///    but ~partitions× the work; see the note at the emission site).
 /// 3. The arms concatenate in one final `UNION ALL` stage; the query's `ORDER BY`/`LIMIT`
 ///    rides the usual driver-side finalize.
 ///
 /// Restricted to: a top `UNION ALL` (distinct unions decline); arms whose sharded inputs are
 /// all peel-able grouped derived aggregates (no direct sharded base scans); skeletons of
 /// projections / filters / inner joins / grouped aggregates, where every skeleton aggregate
-/// sits above at least one CTE (a replicated-only aggregate would emit rows on *every*
-/// partition); and CTEs whose distributed plans gather their output. At most one CTE may use
-/// the scalar-token machinery (the driver supports a single one-row broadcast per plan).
+/// sits above at least one CTE (conservative: a Forward arm would compute a replicated-only
+/// aggregate exactly once, but an arm with no gathered CTE has no business in this
+/// composition); and CTEs whose distributed plans gather their output. At most one CTE may
+/// use the scalar-token machinery (the driver supports a single one-row broadcast per plan).
 pub(crate) fn try_union_over_derived_ctes(
     lp: &LogicalPlan,
     replicated: &[&str],
@@ -1205,7 +1210,19 @@ pub(crate) fn try_union_over_derived_ctes(
         let upstreams: Vec<u32> = (0..leaves.len())
             .map(|j| rep_output[&rep_of[base + j]])
             .collect();
-        stages.push(StageDef::new(next_id, sql, upstreams, vec![]));
+        // Run the arm exactly once (`ExchangeMode::Forward` → one task on worker 0), not
+        // once per shuffle partition: every worker holds the full replicated channel/dim
+        // tables, and each CTE gather leaves its whole output in bucket 0 of every
+        // endpoint, so a single task pulling bucket 0 from every endpoint computes the
+        // exact arm. A Hash exchange here is correct-but-slow — the empty hash key makes
+        // partitions 1..n-1 emit zero rows while every partition re-runs the full
+        // replicated scan + join (Q23 at SF10: 169s vs Spark's 5.8s, 71.6 GB of spill
+        // from the duplicated work). Per-worker partials over the replicated fact would
+        // instead multiply the arm's rows by the worker count (KAN-54), so Forward
+        // (compute once) is the only correct fast placement.
+        let mut arm = StageDef::new(next_id, sql, upstreams, vec![]);
+        arm.exchange = ExchangeMode::Forward;
+        stages.push(arm);
         arm_stage_ids.push(next_id);
         next_id += 1;
         base += leaves.len();
@@ -1285,8 +1302,10 @@ fn collect_arm_leaves<'a>(
             for i in node.inputs() {
                 collect_arm_leaves(i, replicated, out)?;
             }
-            // A replicated-only aggregate in the arm skeleton computes rows on *every* partition
-            // (no gathered CTE gates it to partition 0) — decline rather than duplicate them.
+            // A replicated-only aggregate in the arm skeleton is declined conservatively
+            // (the arm must read at least one gathered CTE to belong in this composition);
+            // the Forward placement above would compute it exactly once, but there is no
+            // query shape today that needs the relaxation.
             if out.len() == before {
                 return None;
             }

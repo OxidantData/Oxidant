@@ -1,5 +1,7 @@
 //! Route distributable SQL and DataFrame logical plans through the driver/worker cluster.
 
+use std::sync::{Arc, Mutex};
+
 use datafusion::logical_expr::LogicalPlan;
 use weft_common::{Error, Result};
 use weft_execution::autoscale::{
@@ -8,11 +10,76 @@ use weft_execution::autoscale::{
 };
 use weft_execution::driver::{run_stages_obs, Cluster, StageDef};
 use weft_execution::flight::sync_udfs_to_worker;
-use weft_execution::membership::resolve_membership;
+use weft_execution::membership::{resolve_membership, ClusterMembership};
 use weft_execution::plan::plan_distributed_logical;
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 use weft_observability::{ExecutionEvent, QueryTracker};
+
+/// Resolved membership plus the worker-list configuration it was built from.
+type CachedMembership = (Vec<String>, Arc<dyn ClusterMembership>);
+
+/// Per-service caches that keep per-query fixed costs off the driver critical path.
+///
+/// Membership: a fresh `RefreshingMembership` starts cold, so its first `endpoints()`
+/// always re-resolves (DNS/API under k8s). Keying the resolved membership by the
+/// worker-list configuration lets the TTL cache inside `RefreshingMembership` survive
+/// across queries — refresh semantics are unchanged, only the per-query cold start is gone.
+///
+/// UDF sync: `sync_udfs_to_worker` fired per endpoint per query even when the UDF set
+/// never changes (the common case). We remember the last-synced UDF-json hash per
+/// endpoint and skip endpoints already holding the current set; a changed UDF set (hash
+/// mismatch) syncs every stale endpoint exactly as before.
+#[derive(Default)]
+pub struct DistributedCaches {
+    membership: Mutex<Option<CachedMembership>>,
+    udf_synced: Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl DistributedCaches {
+    /// Resolved membership for `workers`, rebuilding only when the worker-list
+    /// configuration changed. (Under k8s the discovery source is env-driven and the
+    /// static list is empty, so the cache then keys on the empty list.)
+    pub fn membership(&self, workers: &[String]) -> Arc<dyn ClusterMembership> {
+        let mut guard = self.membership.lock().expect("membership cache poisoned");
+        if let Some((key, membership)) = guard.as_ref() {
+            if key == workers {
+                return Arc::clone(membership);
+            }
+        }
+        let membership = resolve_membership(workers);
+        *guard = Some((workers.to_vec(), Arc::clone(&membership)));
+        membership
+    }
+
+    /// Endpoints whose last-synced UDF-set hash differs from `hash` (never synced, or stale).
+    pub fn udf_sync_pending(&self, endpoints: &[String], hash: u64) -> Vec<String> {
+        let guard = self.udf_synced.lock().expect("udf sync cache poisoned");
+        endpoints
+            .iter()
+            .filter(|ep| guard.get(*ep) != Some(&hash))
+            .cloned()
+            .collect()
+    }
+
+    /// Record `hash` as the synced UDF set for `endpoints`. Call only after every sync
+    /// succeeded, so a failed sync leaves all endpoints pending for the next query.
+    pub fn udf_mark_synced(&self, endpoints: &[String], hash: u64) {
+        let mut guard = self.udf_synced.lock().expect("udf sync cache poisoned");
+        for ep in endpoints {
+            guard.insert(ep.clone(), hash);
+        }
+    }
+}
+
+/// Content hash of the UDF registration payload, identifying "the same UDF set" without
+/// retaining the JSON per endpoint. In-memory only (per-process hasher keys are fine).
+fn udf_hash(json: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    json.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// If workers or K8s service discovery is configured and `sql` is auto-splittable, run distributed.
 /// Returns `Ok(None)` when the query should fall back to single-node execution.
@@ -33,6 +100,9 @@ pub async fn try_run_distributed(
     // worker stage scans the SAME pinned snapshot (KAN-48) — workers reject unpinned
     // lakehouse scans.
     let (lp, lakehouse_snapshot_pins) = engine.logical_plan_with_lakehouse_snapshots(sql).await?;
+    // Test-only path: a fresh cache per call (no cross-query reuse to assert on here —
+    // `DistributedCaches` itself is unit-tested below).
+    let caches = DistributedCaches::default();
     try_run_distributed_plan(
         engine,
         workers,
@@ -42,6 +112,7 @@ pub async fn try_run_distributed(
         udf_json,
         tracker,
         &lakehouse_snapshot_pins,
+        &caches,
     )
     .await
 }
@@ -50,6 +121,7 @@ pub async fn try_run_distributed(
 /// `lakehouse_snapshot_pins` is the driver's captured table→snapshot JSON map
 /// ([`Engine::capture_lakehouse_snapshots`]), stamped onto every stage so workers resolve
 /// lakehouse tables at the same pinned snapshot; empty when the plan scans no lakehouse tables.
+/// `caches` carries the per-service membership / UDF-sync caches (see [`DistributedCaches`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn try_run_distributed_plan(
     engine: &Engine,
@@ -60,8 +132,9 @@ pub async fn try_run_distributed_plan(
     udf_json: Option<&str>,
     tracker: Option<&QueryTracker>,
     lakehouse_snapshot_pins: &str,
+    caches: &DistributedCaches,
 ) -> Result<Option<Vec<RecordBatch>>> {
-    let membership = resolve_membership(workers);
+    let membership = caches.membership(workers);
     let endpoints = membership.endpoints();
     if endpoints.is_empty() {
         return Ok(None);
@@ -84,8 +157,20 @@ pub async fn try_run_distributed_plan(
     let cluster = Cluster::from_membership(membership);
 
     if let Some(json) = udf_json.filter(|s| !s.is_empty() && *s != "[]") {
-        for ep in &endpoints {
-            sync_udfs_to_worker(ep.clone(), json).await?;
+        // Sync in parallel, and only to endpoints that don't already hold this exact UDF
+        // set (hash match). A failed sync marks nothing, so the next query retries all.
+        let hash = udf_hash(json);
+        let pending = caches.udf_sync_pending(&endpoints, hash);
+        if !pending.is_empty() {
+            futures::future::join_all(
+                pending
+                    .iter()
+                    .map(|ep| sync_udfs_to_worker(ep.clone(), json)),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<()>>()?;
+            caches.udf_mark_synced(&pending, hash);
         }
     }
 
@@ -122,7 +207,12 @@ pub async fn try_run_distributed_plan(
 
     maybe_request_autoscale(&cluster, &dq.stages).await?;
 
-    let mut batches = run_stages_obs(&cluster, &dq.stages, store, operation_id).await?;
+    // WEFT_REOPT_JOIN_ORDER (default off): retain the planner inputs so the driver can
+    // re-sequence the shuffle-join chain's tail by barrier-measured leaf cardinalities at
+    // the last leaf's barrier and splice the re-derived stages onto the dispatched prefix.
+    let reopt = weft_execution::driver::reopt_join_order_enabled()
+        .then_some(weft_execution::driver::ReoptContext { plan, replicated });
+    let mut batches = run_stages_obs(&cluster, &dq.stages, store, operation_id, reopt).await?;
 
     if let Some(finalize) = dq.finalize_sql {
         engine
@@ -302,6 +392,62 @@ mod tests {
         let w = parse_worker_list(Some("127.0.0.1:50561,127.0.0.1:50562"));
         assert_eq!(w.len(), 2);
         assert!(w[0].starts_with("http://"));
+    }
+
+    #[test]
+    fn membership_cached_until_worker_list_changes() {
+        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        // Hermetic: force the static-list path even if a k8s env leaks into the test process.
+        std::env::remove_var("WEFT_WORKER_SERVICE");
+        let caches = DistributedCaches::default();
+        let workers: Vec<String> = WORKERS.iter().map(|s| (*s).to_string()).collect();
+        let first = caches.membership(&workers);
+        let second = caches.membership(&workers);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same worker list must reuse the resolved membership (one resolution)"
+        );
+        assert_eq!(first.endpoints(), workers);
+
+        let changed = vec!["http://127.0.0.1:50562".to_string()];
+        let third = caches.membership(&changed);
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "changed worker list must re-resolve"
+        );
+        assert!(
+            Arc::ptr_eq(&third, &caches.membership(&changed)),
+            "the new list is now the cached one"
+        );
+    }
+
+    #[test]
+    fn udf_sync_skips_only_endpoints_already_holding_current_set() {
+        let caches = DistributedCaches::default();
+        let eps: Vec<String> = ["http://a:1", "http://b:1"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let v1 = udf_hash(r#"[{"name":"f"}]"#);
+        // Nothing synced yet: every endpoint is pending.
+        assert_eq!(caches.udf_sync_pending(&eps, v1), eps);
+
+        caches.udf_mark_synced(&eps, v1);
+        // Unchanged UDF set: no endpoint needs a sync (no RPC).
+        assert!(caches.udf_sync_pending(&eps, v1).is_empty());
+
+        // Changed UDF set: every endpoint is stale and re-syncs.
+        let v2 = udf_hash(r#"[{"name":"f"},{"name":"g"}]"#);
+        assert_eq!(caches.udf_sync_pending(&eps, v2), eps);
+
+        // A newly appeared endpoint is pending even when the others are current.
+        caches.udf_mark_synced(&eps, v2);
+        let mut grown = eps.clone();
+        grown.push("http://c:1".to_string());
+        assert_eq!(
+            caches.udf_sync_pending(&grown, v2),
+            vec!["http://c:1".to_string()]
+        );
     }
 
     #[test]

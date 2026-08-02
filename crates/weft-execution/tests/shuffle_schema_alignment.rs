@@ -50,6 +50,9 @@ fn producer(stage_id: u32, partition_id: u32, sql: &str) -> StageTicket {
         produce: true,
         lakehouse_snapshot_pins: String::new(),
         replicated_tables: String::new(),
+        coalesce_read_modulus: 0,
+        forward_upstream_stage_ids: vec![],
+        upstream_bucket_rows: vec![],
     }
 }
 
@@ -111,6 +114,9 @@ async fn empty_typed_bucket_flows_through_shuffle_input() {
         produce: false,
         lakehouse_snapshot_pins: String::new(),
         replicated_tables: String::new(),
+        coalesce_read_modulus: 0,
+        forward_upstream_stage_ids: vec![],
+        upstream_bucket_rows: vec![],
     };
     let out = run_stage_on_worker(endpoint, consumer)
         .await

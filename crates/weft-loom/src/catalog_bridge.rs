@@ -505,7 +505,16 @@ pub(crate) async fn metadata_to_provider(
             let opts =
                 ListingOptions::new(Arc::new(CsvFormat::default())).with_file_extension(".csv");
             let (opts, file_schema) = apply_partition_columns(opts, md);
-            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".csv").await?
+            sharded_listing_table(
+                state,
+                vec![url],
+                opts,
+                file_schema,
+                table_name,
+                &md.name,
+                ".csv",
+            )
+            .await?
         }
         TableFormat::Json => {
             let loc = crate::shard::ensure_collection_url(&md.location);
@@ -514,7 +523,16 @@ pub(crate) async fn metadata_to_provider(
             let opts =
                 ListingOptions::new(Arc::new(JsonFormat::default())).with_file_extension(".json");
             let (opts, file_schema) = apply_partition_columns(opts, md);
-            sharded_listing_table(state, vec![url], opts, file_schema, table_name, ".json").await?
+            sharded_listing_table(
+                state,
+                vec![url],
+                opts,
+                file_schema,
+                table_name,
+                &md.name,
+                ".json",
+            )
+            .await?
         }
         // Lakehouse formats are handled below because they also return a pinned snapshot identity.
         TableFormat::Delta => {
@@ -541,6 +559,31 @@ pub(crate) async fn metadata_to_provider(
         snapshot_key: None,
         snapshot: None,
     })
+}
+
+/// Row-count table statistic from catalog properties, when the metastore carries one:
+/// Hive/Spark `ANALYZE TABLE` writes `numRows`, and Spark's own statistics use
+/// `spark.sql.statistics.numRows`. `None` when absent or unparseable — callers treat that as
+/// "unknown" and keep byte-only replicate/shard classification for the table. Reading it is
+/// free: the properties ride along on the `load_table` the sizing walk already performs, so
+/// no extra I/O lands on the per-query classification path.
+pub fn row_count_from_properties(properties: &HashMap<String, String>) -> Option<u64> {
+    ["numRows", "spark.sql.statistics.numRows"]
+        .iter()
+        .find_map(|key| properties.get(*key).and_then(|v| v.trim().parse().ok()))
+}
+
+/// Byte size + catalog row-count statistic for a catalog table. The bytes come from the same
+/// listing walk as [`estimate_bytes_for_metadata`]; the row count is read from the metadata's
+/// properties ([`row_count_from_properties`]) — `None` for formats/metastores without one.
+pub async fn estimate_stats_for_metadata(
+    state: &SessionState,
+    md: &TableMetadata,
+) -> (Option<u64>, Option<u64>) {
+    (
+        estimate_bytes_for_metadata(state, md).await,
+        row_count_from_properties(&md.properties),
+    )
 }
 
 /// Sum on-disk / object-store bytes for a catalog table (no shard filter). Returns `None` when
@@ -589,17 +632,21 @@ pub async fn estimate_bytes_for_metadata(state: &SessionState, md: &TableMetadat
 }
 
 /// List+shard files then build a [`ListingTable`], or an empty MemTable when this shard is vacant.
+/// Replicated tables (full file set on every worker) are served through the process-global
+/// [`crate::dim_cache`]: the listing's object metadata fingerprints the data version.
 async fn sharded_listing_table(
     state: &SessionState,
     urls: Vec<datafusion::datasource::listing::ListingTableUrl>,
     opts: datafusion::datasource::listing::ListingOptions,
     schema: Option<datafusion::arrow::datatypes::SchemaRef>,
     table_name: &str,
+    qualified_name: &str,
     file_extension: &str,
 ) -> DfResult<Arc<dyn TableProvider>> {
-    let sharded = crate::shard::apply_file_shard(state, urls, file_extension, Some(table_name))
-        .await
-        .map_err(weft_to_df)?;
+    let sharded =
+        crate::shard::list_visible_file_shard(state, urls, file_extension, Some(table_name))
+            .await
+            .map_err(weft_to_df)?;
     if sharded.is_empty() {
         let schema = schema.ok_or_else(|| {
             DataFusionError::Plan(format!(
@@ -608,9 +655,29 @@ async fn sharded_listing_table(
         })?;
         return crate::shard::empty_table(schema).map_err(weft_to_df);
     }
-    crate::build_listing_table(state, sharded, opts, schema)
+    let dim_cache_fingerprint = crate::shard::is_replicated_table(table_name).then(|| {
+        (
+            crate::dim_cache::fingerprint_object_metas(&sharded),
+            sharded.iter().map(|(_, meta)| meta.size).sum::<u64>(),
+        )
+    });
+    let urls = sharded.into_iter().map(|(url, _)| url).collect();
+    let provider = crate::build_listing_table(state, urls, opts, schema)
         .await
-        .map_err(weft_to_df)
+        .map_err(weft_to_df)?;
+    match dim_cache_fingerprint {
+        Some((fingerprint, source_bytes)) => {
+            crate::dim_cache::memoize_provider(
+                state,
+                qualified_name,
+                fingerprint,
+                source_bytes,
+                provider,
+            )
+            .await
+        }
+        None => Ok(provider),
+    }
 }
 
 /// Configure Hive-style partition columns on a listing table. Glue (and other Hive metastores)
@@ -961,6 +1028,14 @@ async fn parquet_metadata_provider_with_assignment(
         datafusion::execution::object_store::ObjectStoreUrl,
         Vec<datafusion::datasource::listing::PartitionedFile>,
     )> = Vec::new();
+    // A replicated table scans this full resolved file set on every worker; fingerprint it for
+    // the process-global dim cache before `listed` is consumed into file groups below.
+    let dim_cache_fingerprint = crate::shard::is_replicated_table(table_name).then(|| {
+        (
+            crate::dim_cache::fingerprint_object_metas(&listed),
+            listed.iter().map(|(_, meta)| meta.size).sum::<u64>(),
+        )
+    });
     for (url, meta) in listed {
         let mut file = datafusion::datasource::listing::PartitionedFile::new_from_meta(meta);
         file.partition_values = partition_values(
@@ -978,13 +1053,20 @@ async fn parquet_metadata_provider_with_assignment(
             None => groups.push((store_url, vec![file])),
         }
     }
-    Ok(Arc::new(LakehouseTableProvider {
+    let provider: Arc<dyn TableProvider> = Arc::new(LakehouseTableProvider {
         schema: table_schema,
         file_schema,
         partition_fields,
         groups,
         case_insensitive_schema_adapter: md.schema.is_some(),
-    }))
+    });
+    match dim_cache_fingerprint {
+        Some((fingerprint, source_bytes)) => {
+            crate::dim_cache::memoize_provider(state, &md.name, fingerprint, source_bytes, provider)
+                .await
+        }
+        None => Ok(provider),
+    }
 }
 
 async fn resolve_lakehouse_provider(
@@ -1096,6 +1178,14 @@ async fn resolve_lakehouse_provider(
     }
 
     let mut position_delete_cache = HashMap::new();
+    // A replicated lakehouse table scans this full pinned file set on every worker; its decoded
+    // batches are cached process-globally under the snapshot identity (dim cache).
+    let dim_source_bytes = crate::shard::is_replicated_table(table_name).then(|| {
+        files_by_location
+            .iter()
+            .map(|(_, file)| file.size)
+            .sum::<u64>()
+    });
     let mut groups: Vec<(
         datafusion::execution::object_store::ObjectStoreUrl,
         Vec<datafusion::datasource::listing::PartitionedFile>,
@@ -1174,13 +1264,26 @@ async fn resolve_lakehouse_provider(
         }
     }
 
-    let provider = Arc::new(LakehouseTableProvider {
+    let provider: Arc<dyn TableProvider> = Arc::new(LakehouseTableProvider {
         schema: table_schema,
         file_schema,
         partition_fields,
         groups,
         case_insensitive_schema_adapter: md.schema.is_some(),
     });
+    let provider = match dim_source_bytes {
+        Some(source_bytes) => {
+            crate::dim_cache::memoize_provider(
+                state,
+                &md.name,
+                crate::dim_cache::fingerprint_snapshot(&resolved.snapshot),
+                source_bytes,
+                provider,
+            )
+            .await?
+        }
+        None => provider,
+    };
     Ok(ProviderResolution {
         provider,
         snapshot_key: Some(md.name.clone()),
@@ -1221,6 +1324,8 @@ impl TableProvider for LakehouseTableProvider {
         use datafusion::datasource::source::DataSourceExec;
         use datafusion::datasource::table_schema::TableSchema;
 
+        use datafusion::datasource::physical_plan::parquet::CachedParquetFileReaderFactory;
+
         let table_schema =
             TableSchema::new(self.file_schema.clone(), self.partition_fields.clone());
         let mut plans: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>> =
@@ -1230,26 +1335,50 @@ impl TableProvider for LakehouseTableProvider {
                 global: state.config_options().execution.parquet.clone(),
                 ..Default::default()
             };
-            let source = Arc::new(
-                ParquetSource::new(table_schema.clone())
-                    .with_table_parquet_options(parquet_options),
-            );
-            let file_groups = files
-                .iter()
-                .cloned()
-                .map(|file| datafusion::datasource::physical_plan::FileGroup::new(vec![file]))
-                .collect();
+            let metadata_size_hint = parquet_options.global.metadata_size_hint;
+            let mut source = ParquetSource::new(table_schema.clone())
+                .with_table_parquet_options(parquet_options);
+            // Attach the runtime's shared file-metadata cache exactly the way stock
+            // `ParquetFormat::create_physical_plan` does (datafusion-datasource-parquet
+            // 54, file_format.rs). A hand-built `DataSourceExec` otherwise falls back to
+            // `DefaultParquetFileReaderFactory` — no cache — so every task of every stage
+            // re-GETs every file's footer. With the cached factory, repeated scans of a
+            // file (across tasks, stages, and queries in this session) cost at most one
+            // footer fetch per (path, size, mtime) — and the footer
+            // `parquet_footer_file_groups` already read for scan statistics is reused
+            // instead of fetched twice, because both paths key into the same
+            // `DefaultFilesMetadataCache` entry.
+            let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
+            let store = state.runtime_env().object_store(store_url)?;
+            source = source.with_parquet_file_reader_factory(Arc::new(
+                CachedParquetFileReaderFactory::new(store, metadata_cache),
+            ));
+            if let Some(metadata_size_hint) = metadata_size_hint {
+                source = source.with_metadata_size_hint(metadata_size_hint);
+            }
+            let source = Arc::new(source);
+            // Attach parquet-footer statistics (exact row counts) so plan-time consumers see
+            // this table's real size instead of `Statistics::new_unknown`: the KAN-25
+            // build-side budget guard stops rerouting every join to sort-merge on sight, and
+            // DataFusion's own join selection can size/swap build sides and broadcast small
+            // ones. With row deletions (Delta DVs / Iceberg position deletes) the footer
+            // count overstates — the conservative direction for both consumers.
+            let (file_groups, statistics) =
+                parquet_footer_file_groups(state, store_url, &table_schema, files).await;
             let expr_adapter = self.case_insensitive_schema_adapter.then(|| {
                 Arc::new(crate::schema_adapt::CaseInsensitiveExprAdapterFactory)
                     as Arc<dyn datafusion::physical_expr_adapter::PhysicalExprAdapterFactory>
             });
-            let config = FileScanConfigBuilder::new(store_url.clone(), source)
+            let builder = FileScanConfigBuilder::new(store_url.clone(), source)
                 .with_file_groups(file_groups)
                 .with_limit(limit)
                 .with_expr_adapter(expr_adapter)
-                .with_projection_indices(projection.cloned())?
-                .build();
-            plans.push(DataSourceExec::from_data_source(config));
+                .with_projection_indices(projection.cloned())?;
+            let builder = match statistics {
+                Some(stats) => builder.with_statistics(stats),
+                None => builder,
+            };
+            plans.push(DataSourceExec::from_data_source(builder.build()));
         }
         if plans.is_empty() {
             Err(DataFusionError::Execution(
@@ -1259,6 +1388,151 @@ impl TableProvider for LakehouseTableProvider {
             datafusion::physical_plan::union::UnionExec::try_new(plans)
         }
     }
+}
+
+/// Whether [`LakehouseTableProvider`] scans attach parquet-footer statistics (env
+/// `WEFT_PARQUET_SCAN_STATS`, default **true**). `0`/`false`/`off`/`no` restores the
+/// unknown-statistics scans — the escape hatch if footer reads misbehave against some
+/// object store. `WEFT_PREFER_HASH_JOIN` remains the per-session join-strategy override.
+fn parquet_scan_stats_enabled() -> bool {
+    std::env::var("WEFT_PARQUET_SCAN_STATS")
+        .ok()
+        .as_deref()
+        .map(|v| {
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no"))
+        })
+        .unwrap_or(true)
+}
+
+/// Build one single-file [`FileGroup`] per file of a scan's object-store group, reading each
+/// file's parquet footer statistics (row count, byte size) through the runtime's
+/// metadata-cached reader so repeat scans of a table cost no extra I/O. Returns the groups
+/// plus the table-wide aggregate for the [`FileScanConfigBuilder`]: `None` when statistics
+/// are disabled or NO footer could be read (the pre-fix unknown-statistics shape — callers
+/// then keep DataFusion's `Statistics::new_unknown` default).
+///
+/// Statistics are advisory: a file whose footer read fails is kept, stat-less, and the
+/// aggregate degrades to an `Inexact` partial sum — an under-estimate, the direction the
+/// KAN-45/KAN-53 runtime pool-exhaustion retry already backstops. Footer reads NEVER fail
+/// the scan itself.
+///
+/// Only row counts and byte sizes are attached — column-level min/max/null counts are
+/// deliberately DROPPED: they are computed against the declared file schema, but the
+/// physical file columns may differ in name case or type (the gap
+/// [`crate::schema_adapt::CaseInsensitiveExprAdapterFactory`] exists to bridge), and the
+/// parquet opener consumes per-file column statistics as constant-column
+/// (`min == max` / all-null) proofs that rewrite projections to literals before the
+/// expression adapter runs. Row counts are schema-independent, so they stay exact.
+async fn parquet_footer_file_groups(
+    state: &dyn datafusion::catalog::Session,
+    store_url: &datafusion::execution::object_store::ObjectStoreUrl,
+    table_schema: &datafusion::datasource::table_schema::TableSchema,
+    files: &[datafusion::datasource::listing::PartitionedFile],
+) -> (
+    Vec<datafusion::datasource::physical_plan::FileGroup>,
+    Option<datafusion::common::Statistics>,
+) {
+    use datafusion::common::stats::Precision;
+    use datafusion::common::Statistics;
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::file_format::FileFormat;
+    use datafusion::datasource::physical_plan::FileGroup;
+    use futures::StreamExt;
+
+    let plain_groups = || {
+        files
+            .iter()
+            .cloned()
+            .map(|file| FileGroup::new(vec![file]))
+            .collect::<Vec<_>>()
+    };
+    if !parquet_scan_stats_enabled() {
+        return (plain_groups(), None);
+    }
+    let store = match state.runtime_env().object_store(store_url) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!(
+                "warn: could not resolve object store `{store_url}` for parquet footer \
+                 statistics: {e}"
+            );
+            return (plain_groups(), None);
+        }
+    };
+    let file_schema = table_schema.file_schema().clone();
+    let mut per_file = futures::stream::iter(files.iter().cloned().enumerate().map(|(i, file)| {
+        let store = Arc::clone(&store);
+        let schema = file_schema.clone();
+        async move {
+            let stats = ParquetFormat::default()
+                .infer_stats(state, &store, schema, &file.object_meta)
+                .await;
+            (i, file, stats)
+        }
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+    // Footer reads complete out of order; file groups keep the original file order so the
+    // scan's partition layout is identical to the no-statistics shape.
+    per_file.sort_by_key(|(i, _, _)| *i);
+
+    let mut groups = Vec::with_capacity(per_file.len());
+    let mut num_rows = Precision::Exact(0_usize);
+    let mut total_byte_size = Precision::Exact(0_usize);
+    let mut read = 0_usize;
+    let mut missed = 0_usize;
+    for (_, file, stats) in per_file {
+        match stats {
+            Ok(stats) => {
+                read += 1;
+                num_rows = num_rows.add(&stats.num_rows);
+                total_byte_size = total_byte_size.add(&stats.total_byte_size);
+                // Keep ONLY row/byte counts per file — drop the column statistics. They
+                // were computed against the DECLARED file schema, whose column names,
+                // case and types can differ from the physical file columns (exactly the
+                // gap `CaseInsensitiveExprAdapterFactory` bridges at read time): a
+                // case-mismatched column comes back `null_count == num_rows`, and the
+                // parquet opener treats that (or `min == max`) as proof of a constant
+                // column — literal-replacing or file-pruning real data away.
+                let file_stats = Statistics::new_unknown(table_schema.file_schema())
+                    .with_num_rows(stats.num_rows)
+                    .with_total_byte_size(stats.total_byte_size);
+                // Group-level statistics (what `partition_statistics(Some(p))` reads) cover
+                // the full table schema — file columns + partition columns — per
+                // `FileGroup::file_statistics`'s contract.
+                let group_stats = Statistics::new_unknown(table_schema.table_schema())
+                    .with_num_rows(stats.num_rows)
+                    .with_total_byte_size(stats.total_byte_size);
+                groups.push(
+                    FileGroup::new(vec![file.with_statistics(Arc::new(file_stats))])
+                        .with_statistics(Arc::new(group_stats)),
+                );
+            }
+            Err(e) => {
+                missed += 1;
+                eprintln!(
+                    "warn: could not read parquet footer statistics for `{}`: {e}",
+                    file.object_meta.location
+                );
+                groups.push(FileGroup::new(vec![file]));
+            }
+        }
+    }
+    if read == 0 {
+        return (groups, None);
+    }
+    if missed > 0 {
+        num_rows = num_rows.to_inexact();
+        total_byte_size = total_byte_size.to_inexact();
+    }
+    let statistics = Statistics::new_unknown(table_schema.table_schema())
+        .with_num_rows(num_rows)
+        .with_total_byte_size(total_byte_size);
+    (groups, Some(statistics))
 }
 
 async fn infer_listed_parquet_schema(
@@ -1633,6 +1907,110 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!((c, s), (4, 10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dim cache end-to-end (plain-Parquet path): a replicated table is read+decoded once per
+    /// worker per data version. A second engine (new session → fresh provider cache) over the
+    /// same files must be served from the process-global cache (hit, no insert), and restating
+    /// the table must change the fingerprint: miss → fresh rows, never stale cached ones.
+    #[tokio::test]
+    async fn replicated_scan_is_cached_across_engines_and_invalidated_by_restate() {
+        let dir = write_parquet_dir(); // part-0.parquet: x in [1, 2, 3, 4]
+        let location = format!("file://{}/", dir.to_string_lossy());
+        let sql = "SELECT SUM(x) AS s FROM fake.ns.orders";
+
+        fn sum(batches: &[RecordBatch]) -> i64 {
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        }
+
+        // Process-global counters move only via deltas: other tests in this binary share the
+        // cache, and this test's fingerprints are unique to its temp dir.
+        let before = crate::dim_cache::global().stats();
+
+        let engine1 = crate::Engine::new();
+        engine1.register_catalog(
+            "fake",
+            Arc::new(FakeCatalog {
+                location: location.clone(),
+            }),
+        );
+        let first = crate::shard::with_replicated_tables("orders", engine1.sql(sql)).await;
+        assert_eq!(sum(&first.unwrap()), 10);
+        let after_first = crate::dim_cache::global().stats();
+        assert_eq!(
+            (
+                after_first.misses - before.misses,
+                after_first.inserts - before.inserts
+            ),
+            (1, 1),
+            "first scan populates the cache"
+        );
+        assert_eq!(after_first.hits - before.hits, 0);
+
+        // New engine (fresh provider cache), same files → same fingerprint → served from the
+        // dim cache without touching object storage again.
+        let engine2 = crate::Engine::new();
+        engine2.register_catalog(
+            "fake",
+            Arc::new(FakeCatalog {
+                location: location.clone(),
+            }),
+        );
+        let second = crate::shard::with_replicated_tables("orders", engine2.sql(sql)).await;
+        assert_eq!(sum(&second.unwrap()), 10);
+        let after_second = crate::dim_cache::global().stats();
+        assert_eq!(
+            after_second.hits - after_first.hits,
+            1,
+            "second engine hits the cache"
+        );
+        assert_eq!(after_second.misses - after_first.misses, 0);
+        assert_eq!(after_second.inserts - after_first.inserts, 0);
+
+        // Restate the table: rewrite the data file (new size + mtime → new fingerprint).
+        let part = dir.join("part-0.parquet");
+        std::fs::remove_file(&part).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![10_i64, 20]))],
+        )
+        .unwrap();
+        let f = std::fs::File::create(&part).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let engine3 = crate::Engine::new();
+        engine3.register_catalog(
+            "fake",
+            Arc::new(FakeCatalog {
+                location: location.clone(),
+            }),
+        );
+        let third = crate::shard::with_replicated_tables("orders", engine3.sql(sql)).await;
+        assert_eq!(
+            sum(&third.unwrap()),
+            30,
+            "a restated table must serve fresh rows, never the stale cached version"
+        );
+        let after_third = crate::dim_cache::global().stats();
+        assert_eq!(after_third.hits - after_second.hits, 0);
+        assert_eq!(
+            (
+                after_third.misses - after_second.misses,
+                after_third.inserts - after_second.inserts
+            ),
+            (1, 1),
+            "the restated version misses and is cached under its own fingerprint"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2344,5 +2722,340 @@ mod tests {
         assert_eq!(file_schema.field(0).name(), "id");
         assert_eq!(part_cols.len(), 1);
         assert_eq!(part_cols[0].0, "region");
+    }
+
+    // ---- Parquet footer caching on the scan data path (KAN-2) -------------------
+
+    /// Shared log of every `get_ranges(location, ranges)` call a [`CountingStore`] serves —
+    /// the one object-store call parquet footer/metadata fetches AND data-page reads both
+    /// funnel through (DF's metadata fetcher and the arrow row-group readers alike), so a
+    /// test can count footer GETs vs data GETs separately.
+    type GetRangeCalls = Arc<Mutex<Vec<(object_store::path::Path, Vec<std::ops::Range<u64>>)>>>;
+
+    /// See [`GetRangeCalls`]. Delegates everything to the local filesystem.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: object_store::local::LocalFileSystem,
+        calls: GetRangeCalls,
+    }
+
+    impl CountingStore {
+        fn new() -> (Self, GetRangeCalls) {
+            let calls: GetRangeCalls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    inner: object_store::local::LocalFileSystem::new(),
+                    calls: Arc::clone(&calls),
+                },
+                calls,
+            )
+        }
+    }
+
+    impl fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "CountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            options: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &object_store::path::Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<bytes::Bytes>> {
+            self.calls
+                .lock()
+                .expect("counting store poisoned")
+                .push((location.clone(), ranges.to_vec()));
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Drain the recorded `get_ranges` calls.
+    fn take_get_range_calls(
+        calls: &GetRangeCalls,
+    ) -> Vec<(object_store::path::Path, Vec<std::ops::Range<u64>>)> {
+        std::mem::take(&mut *calls.lock().expect("counting store poisoned"))
+    }
+
+    /// Split recorded calls into `(metadata, data)` counts against a file's layout: every
+    /// metadata range (page index, footer, 8-byte tail, and whole-file/tail prefetches) ends
+    /// past `boundary` — the start of the page-index region, or of the footer when the file
+    /// has no index — while data-page ranges end at or before it.
+    fn count_metadata_vs_data(
+        calls: &[(object_store::path::Path, Vec<std::ops::Range<u64>>)],
+        boundary: u64,
+    ) -> (usize, usize) {
+        let mut metadata = 0;
+        let mut data = 0;
+        for (_, ranges) in calls {
+            if ranges.iter().all(|r| r.end > boundary) {
+                metadata += 1;
+            } else {
+                data += 1;
+            }
+        }
+        (metadata, data)
+    }
+
+    /// A parquet file's `(file_size, footer_start, page_index_start)`: `footer_start` is the
+    /// offset of the thrift footer (from the 8-byte tail), `page_index_start` the lowest
+    /// column/offset index offset when the writer emitted a page index.
+    fn parquet_file_layout(path: &std::path::Path) -> (u64, u64, Option<u64>) {
+        use datafusion::parquet::file::metadata::ParquetMetaDataReader;
+
+        let bytes = std::fs::read(path).unwrap();
+        let file_size = u64::try_from(bytes.len()).unwrap();
+        let tail: [u8; 4] = bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap();
+        let footer_start = file_size - 8 - u64::from(u32::from_le_bytes(tail));
+        let file = std::fs::File::open(path).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&file)
+            .unwrap();
+        let page_index_start = metadata
+            .row_groups()
+            .iter()
+            .flat_map(|row_group| row_group.columns())
+            .flat_map(|column| {
+                [column.column_index_offset(), column.offset_index_offset()]
+                    .into_iter()
+                    .flatten()
+            })
+            .map(|offset| u64::try_from(offset).unwrap())
+            .min();
+        (file_size, footer_start, page_index_start)
+    }
+
+    /// The catalog scan's data path reads footers through the runtime's shared file-metadata
+    /// cache: the first scan of a file pays exactly one cold footer fetch — SHARED with the
+    /// `WEFT_PARQUET_SCAN_STATS` prefetch (two cache namespaces would double it) — and a
+    /// second query over the same table pays none at all, while data pages are still re-read
+    /// (only metadata is cached). Before the cached reader factory was attached, EVERY scan
+    /// re-fetched every footer.
+    #[tokio::test]
+    async fn catalog_parquet_scan_caches_footer_across_queries() {
+        // Pin the scan-stats gate ON for the whole test (serialized against the KAN-8 tests
+        // flipping it): then the stats prefetch pays the cold fetch at `Optional` page-index
+        // policy, and the data path must hit the same cache entry.
+        let _env = crate::tests::JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::set_var("WEFT_PARQUET_SCAN_STATS", "1");
+
+        let dir = write_parquet_dir(); // part-0.parquet: x in [1, 2, 3, 4]
+        let (_, footer_start, page_index_start) = parquet_file_layout(&dir.join("part-0.parquet"));
+        let boundary = page_index_start.unwrap_or(footer_start);
+        // The cold fetch goes through the stats prefetch, whose `ParquetFormat::default()`
+        // carries DataFusion's own default `metadata_size_hint` of 512 KiB: for this ~500-byte
+        // file the prefetch range is the whole file, so the tail probe, footer and page index
+        // arrive in ONE ranged GET and land in the metadata cache. A data path on a SEPARATE
+        // cache would pay its own fetch on top of this; every scan before the cached reader
+        // factory was attached paid one of its own.
+        let cold_gets = 1;
+
+        let engine = crate::Engine::new();
+        let (store, calls) = CountingStore::new();
+        let os_url = datafusion::execution::object_store::ObjectStoreUrl::parse("file://").unwrap();
+        engine
+            .ctx
+            .runtime_env()
+            .register_object_store(os_url.as_ref(), Arc::new(store));
+        engine.register_catalog(
+            "fake",
+            Arc::new(SchemaCatalog {
+                location: format!("file://{}", dir.to_string_lossy()),
+                // Declared schema: resolution must not infer (inference shares the same cache
+                // and would pay the cold fetch before the scan even starts).
+                schema: Some(Arc::new(Schema::new(vec![Field::new(
+                    "x",
+                    DataType::Int64,
+                    false,
+                )]))),
+            }),
+        );
+
+        fn sum(batches: &[RecordBatch]) -> i64 {
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        }
+        let sql = "SELECT SUM(x) AS s FROM fake.ns.mixed";
+
+        let _ = take_get_range_calls(&calls);
+        let first = engine.sql(sql).await.unwrap();
+        assert_eq!(sum(&first), 10);
+        let (first_meta, first_data) =
+            count_metadata_vs_data(&take_get_range_calls(&calls), boundary);
+        assert_eq!(
+            first_meta, cold_gets,
+            "first scan must pay exactly one cold footer fetch for the file"
+        );
+        assert!(first_data > 0, "data pages are read on the first scan");
+
+        let second = engine.sql(sql).await.unwrap();
+        assert_eq!(sum(&second), 10);
+        let (second_meta, second_data) =
+            count_metadata_vs_data(&take_get_range_calls(&calls), boundary);
+        assert_eq!(
+            second_meta, 0,
+            "second query must serve the footer from the metadata cache"
+        );
+        assert!(
+            second_data > 0,
+            "data pages are NOT cached — only the footer is"
+        );
+
+        std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `metadata_size_hint` reaches the cached reader factory the way stock DF wires it: with
+    /// the hint covering the footer, the cold fetch is ONE ranged GET instead of two (the
+    /// 8-byte tail probe plus the footer) — the control with the hint explicitly disabled pays
+    /// both — and a re-scan stays at zero either way. (DataFusion's own session default for
+    /// the hint is 512 KiB; `None` here only isolates the decoder's two-fetch behavior.)
+    #[tokio::test]
+    async fn metadata_size_hint_collapses_cold_footer_fetch() {
+        // Stats prefetch OFF so the DATA path pays the cold fetch — the only configuration
+        // where the hint's single-GET prefetch is observable (with stats on, the prefetch
+        // warms the cache before the data path reads).
+        let _env = crate::tests::JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::set_var("WEFT_PARQUET_SCAN_STATS", "0");
+
+        let dir = write_parquet_dir();
+        let part = dir.join("part-0.parquet");
+        let (file_size, footer_start, page_index_start) = parquet_file_layout(&part);
+        let boundary = page_index_start.unwrap_or(footer_start);
+        let location =
+            crate::shard::ensure_collection_url(&format!("file://{}", dir.to_string_lossy()));
+        let md = TableMetadata::new("fake.ns.mixed", location.clone(), TableFormat::Parquet)
+            .with_schema(Arc::new(Schema::new(vec![Field::new(
+                "x",
+                DataType::Int64,
+                false,
+            )])));
+
+        async fn scan_twice(
+            hint: Option<usize>,
+            location: &str,
+            md: &TableMetadata,
+            boundary: u64,
+        ) -> ((usize, usize), (usize, usize)) {
+            let mut config = datafusion::prelude::SessionConfig::new();
+            config.options_mut().execution.parquet.metadata_size_hint = hint;
+            let ctx = SessionContext::new_with_config(config);
+            let (store, calls) = CountingStore::new();
+            let os_url =
+                datafusion::execution::object_store::ObjectStoreUrl::parse("file://").unwrap();
+            ctx.runtime_env()
+                .register_object_store(os_url.as_ref(), Arc::new(store));
+            let state = ctx.state();
+            let root = datafusion::datasource::listing::ListingTableUrl::parse(location).unwrap();
+            let provider =
+                parquet_metadata_provider_with_assignment(&state, md, "mixed", vec![root], None)
+                    .await
+                    .unwrap();
+
+            let mut outcomes = Vec::new();
+            for _ in 0..2 {
+                let plan = provider.scan(&state, None, &[], None).await.unwrap();
+                let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+                    .await
+                    .unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+                outcomes.push(count_metadata_vs_data(
+                    &take_get_range_calls(&calls),
+                    boundary,
+                ));
+            }
+            (outcomes[0], outcomes[1])
+        }
+
+        // Control, hint explicitly disabled: the cold data-path fetch is the 8-byte tail
+        // probe plus the footer (page-index policy `Skip` — the page index is never fetched
+        // on this path).
+        let (control_first, control_second) = scan_twice(None, &location, &md, boundary).await;
+        assert_eq!(control_first.0, 2, "no hint: tail probe + footer");
+        assert!(control_first.1 > 0, "data pages are read");
+        assert_eq!(control_second.0, 0, "warm cache: no footer fetch");
+        assert!(control_second.1 > 0, "data pages are re-read");
+
+        // Hint sized to exactly cover the footer: the prefetch range IS the footer, so the
+        // tail probe is folded in — one ranged GET, not two.
+        let hint = usize::try_from(file_size - footer_start).unwrap();
+        let (hinted_first, hinted_second) = scan_twice(Some(hint), &location, &md, boundary).await;
+        assert_eq!(
+            hinted_first.0, 1,
+            "a hint covering the footer collapses the cold fetch to one GET"
+        );
+        assert!(hinted_first.1 > 0);
+        assert_eq!(hinted_second.0, 0, "warm cache: no footer fetch");
+        assert!(hinted_second.1 > 0);
+
+        std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

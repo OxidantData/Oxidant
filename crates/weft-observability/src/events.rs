@@ -70,6 +70,16 @@ pub enum ExecutionEvent {
         old_partitions: u32,
         new_partitions: u32,
     },
+    /// Adaptive re-optimization (`WEFT_REOPT_JOIN_ORDER`): at the last leaf stage's barrier
+    /// the driver re-sequenced the shuffle-join chain's tail by barrier-measured leaf
+    /// cardinalities and spliced the re-derived stages onto the dispatched prefix.
+    ReoptimizedJoinOrder {
+        operation_id: String,
+        /// Stage ids of the re-planned tail still to dispatch, in the new dispatch order.
+        stage_ids: Vec<i32>,
+        /// Measured leaf row counts and the chosen join order.
+        detail: String,
+    },
     /// Distributed planner rejected the query; Connect fell back to local execution.
     DistributedFallback {
         operation_id: String,

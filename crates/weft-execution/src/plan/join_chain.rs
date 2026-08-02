@@ -746,6 +746,195 @@ fn finish_with_aggregate(
     })
 }
 
+/// A re-planned shuffle-join chain tail plus a human-readable account of the decision
+/// (measured leaf row counts and the chosen order) for observability.
+pub(crate) struct ReplannedTail {
+    pub(crate) stages: Vec<StageDef>,
+    pub(crate) detail: String,
+}
+
+/// Adaptive re-optimization (`WEFT_REOPT_JOIN_ORDER`): re-derive the stage DAG of a
+/// shuffle-join chain with the **tail** joins re-sequenced by barrier-measured leaf
+/// cardinalities, smallest right leaf first. This is the reorder Spark AQE structurally
+/// cannot do — it adapts a join strategy per join but never re-plans the join order of an
+/// already-dispatched stage graph.
+///
+/// Called by the driver at the last leaf stage's barrier, once every chain leaf has a
+/// measured row count. The leftmost leaf and the first join stay fixed: the leftmost leaf
+/// stage's hash key is the first join's left key, while every other leaf stage's SQL and
+/// hash keys are order-invariant — so all already-dispatched leaf stages survive
+/// byte-identical and the re-planned tail splices onto the dispatched prefix (the driver
+/// verifies exactly that before swapping anything in).
+///
+/// Returns `None` — keep the original plan — when the chain is not a permutable shape
+/// (fewer than three joins, any non-inner join, a replicated-dimension fold, a
+/// scalar-token plan), when any leaf lacks a measurement, when a dependency cycle or an
+/// ambiguous ON column makes the tail unplaceable, or when the measured sizes confirm the
+/// current order.
+pub(crate) fn replan_chain_tail(
+    plan: &LogicalPlan,
+    replicated: &[&str],
+    stages: &[StageDef],
+    stage_rows: &HashMap<u32, Vec<u64>>,
+) -> Option<ReplannedTail> {
+    // Re-apply the plan-time front-end transforms so re-derived stage SQL matches the
+    // dispatched stages byte-for-byte (the same pipeline `plan_distributed_logical` ran).
+    let connected = super::join_order::connect_comma_join_chain(plan, replicated);
+    let plan = connected.as_ref().unwrap_or(plan);
+    let reordered = super::join_order::reorder_filtered_dims_first(plan);
+    let plan = reordered.as_ref().unwrap_or(plan);
+
+    let p = super::stage_planner::peel(plan).ok()?;
+    let (leftmost, steps) = extract_equijoin_chain(&p.agg.input).ok()?;
+    // Three joins are the smallest chain with a permutable two-step tail.
+    if steps.len() < 3 || steps.iter().any(|s| s.join_type != JoinType::Inner) {
+        return None;
+    }
+    let tables = base_tables(&p.agg.input);
+    let sharded: Vec<&str> = tables
+        .iter()
+        .filter(|t| !replicated.contains(&t.as_str()))
+        .map(|t| t.as_str())
+        .collect();
+    // Every join must be a sharded–sharded shuffle: a replicated dim folds into its join
+    // stage and has no leaf stage to measure.
+    if !sharded.contains(&leftmost.table) || steps.iter().any(|s| !sharded.contains(&s.right.table))
+    {
+        return None;
+    }
+
+    // Measure every leaf through its dispatched stage: leaf SQL is order-invariant, so
+    // exact SQL equality finds the stage whose barrier counted its output rows. Any leaf
+    // without a match or without a complete barrier sample bails (an undercounted leaf
+    // would steer the order on bad data — the safe direction is no re-optimization).
+    let mut leaf_rows: Vec<u64> = Vec::with_capacity(steps.len() + 1);
+    for scan in std::iter::once(&leftmost).chain(steps.iter().map(|s| &s.right)) {
+        let (sql, _) = leaf_stage_sql(scan);
+        let stage = stages
+            .iter()
+            .find(|s| s.upstream_stage_ids.is_empty() && s.sql == sql)?;
+        leaf_rows.push(stage_rows.get(&stage.stage_id)?.iter().sum());
+    }
+    let mut leaf_names: Vec<String> = vec![scan_alias(&leftmost).to_string()];
+    leaf_names.extend(steps.iter().map(|s| scan_alias(&s.right).to_string()));
+
+    // Placement dependencies (ported from join_order's reorder): the leaves — other than a
+    // step's own right leaf — its ON / residual exprs reference. A step may only be placed
+    // once those are in the chain; an unresolvable or ambiguous column bails the rewrite.
+    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(steps.len());
+    for (si, step) in steps.iter().enumerate() {
+        let own_leaf = si + 1;
+        let mut step_deps = Vec::new();
+        let mut exprs: Vec<&Expr> = step.keys.iter().flat_map(|(l, r)| [l, r]).collect();
+        if let Some(f) = &step.residual_filter {
+            exprs.push(f);
+        }
+        for expr in exprs {
+            for col in expr.column_refs() {
+                let rel = col.relation.as_ref()?.table();
+                let i = chain_leaf_index(rel, &leftmost, &steps)?;
+                if i != own_leaf && !step_deps.contains(&i) {
+                    step_deps.push(i);
+                }
+            }
+        }
+        deps.push(step_deps);
+    }
+
+    // Greedy, deterministic placement: step 0 fixed; repeatedly place the smallest
+    // remaining step (measured right-leaf rows) whose dependencies are all placed
+    // (ties: original order).
+    let mut placed: Vec<usize> = vec![0, 1];
+    let mut remaining: Vec<usize> = (1..steps.len()).collect();
+    let mut new_order: Vec<usize> = vec![0];
+    while !remaining.is_empty() {
+        let mut best: Option<usize> = None; // position within `remaining`
+        for (pos, &si) in remaining.iter().enumerate() {
+            if !deps[si].iter().all(|d| placed.contains(d)) {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some(b) => (leaf_rows[si + 1], si) < (leaf_rows[remaining[b] + 1], remaining[b]),
+            };
+            if better {
+                best = Some(pos);
+            }
+        }
+        let pos = best?; // dependency cycle — keep the original plan
+        let si = remaining.remove(pos);
+        placed.push(si + 1);
+        new_order.push(si);
+    }
+    if new_order.iter().copied().eq(0..steps.len()) {
+        return None;
+    }
+
+    let mut slots: Vec<Option<ChainStep>> = steps.into_iter().map(Some).collect();
+    let permuted: Vec<ChainStep> = new_order
+        .iter()
+        .map(|&i| slots[i].take().expect("each step placed exactly once"))
+        .collect();
+    let dq = build_chain(&p, &sharded, replicated, leftmost, &permuted).ok()?;
+    // A scalar-token plan's positional literal-substitution pipeline must not be re-planned.
+    if dq
+        .stages
+        .iter()
+        .any(|s| s.sql.contains(crate::driver::SCALAR_TOKEN))
+    {
+        return None;
+    }
+
+    let measured: Vec<String> = leaf_names
+        .iter()
+        .zip(leaf_rows.iter())
+        .map(|(n, r)| format!("{n}={r}"))
+        .collect();
+    let chosen: Vec<&str> = new_order
+        .iter()
+        .map(|&i| leaf_names[i + 1].as_str())
+        .collect();
+    let detail = format!(
+        "measured leaf rows [{}]; tail join order after fixed first join: [{}]",
+        measured.join(", "),
+        chosen.join(", ")
+    );
+    tracing::info!(
+        target: "weft.reopt",
+        leaf_rows = ?leaf_rows,
+        original_order = ?(0..new_order.len()).collect::<Vec<_>>(),
+        chosen_order = ?new_order,
+        "re-optimized shuffle-join tail by measured leaf cardinality"
+    );
+    Some(ReplannedTail {
+        stages: dq.stages,
+        detail,
+    })
+}
+
+/// The chain leaf (0 = leftmost, i+1 = `steps[i].right`) a qualified relation resolves to,
+/// or `None` when zero or several leaves match — ambiguity bails the rewrite rather than
+/// guessing, as in `join_order`.
+fn chain_leaf_index(
+    rel: &str,
+    leftmost: &SimpleScan<'_>,
+    steps: &[ChainStep<'_>],
+) -> Option<usize> {
+    let mut found = None;
+    for (idx, scan) in std::iter::once(leftmost)
+        .chain(steps.iter().map(|s| &s.right))
+        .enumerate()
+    {
+        if scan.table == rel || scan.alias == Some(rel) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(idx);
+        }
+    }
+    found
+}
+
 /// KAN-26: normalize `Filter → CROSS JOIN` (a SQL comma-join) into the inner equijoin shape the
 /// broadcast / shuffle-join planners already understand.
 ///
@@ -1038,5 +1227,171 @@ mod tests {
             msg.contains("lineitem__l_orderkey") && msg.contains("missing"),
             "got: {msg}"
         );
+    }
+
+    // --- WEFT_REOPT_JOIN_ORDER: replan_chain_tail -------------------------------------
+
+    /// Build the logical plan for a join-chain aggregate over small in-memory tables and
+    /// derive its distributed stage DAG through the same chain planner the query would use.
+    async fn chain_plan(sql: &str, tables: &[&str]) -> (LogicalPlan, DistributedQuery) {
+        let engine = weft_loom::Engine::new();
+        let int = DataType::Int64;
+        for t in tables {
+            let cols: &[(&str, DataType)] = if *t == "ta" {
+                &[("k", int.clone()), ("g", int.clone())]
+            } else {
+                &[("k", int.clone())]
+            };
+            let schema = Arc::new(Schema::new(
+                cols.iter()
+                    .map(|(n, t)| Field::new(*n, t.clone(), true))
+                    .collect::<Vec<_>>(),
+            ));
+            let batch = RecordBatch::try_new(
+                schema,
+                cols.iter()
+                    .map(|_| Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>)
+                    .collect(),
+            )
+            .unwrap();
+            engine.register_batches(t, vec![batch]).unwrap();
+        }
+        let lp = engine.logical_plan(sql).await.unwrap();
+        let p = super::super::stage_planner::peel(&lp).unwrap();
+        let dq = plan_shuffle_join_chain(&p, tables, &[]).unwrap();
+        (lp, dq)
+    }
+
+    /// The stage SQL of the leaf scanning `tbl` (leaf SQL is the only stage SQL naming a
+    /// base table — join stages read `shuffle_input_*`).
+    fn leaf_sql(dq: &DistributedQuery, tbl: &str) -> String {
+        dq.stages
+            .iter()
+            .find(|s| s.upstream_stage_ids.is_empty() && s.sql.contains(&format!("FROM {tbl}")))
+            .unwrap_or_else(|| panic!("no leaf stage for {tbl}"))
+            .sql
+            .clone()
+    }
+
+    /// Barrier-measured row counts for the leaves named in `rows_by_table`.
+    fn measured(dq: &DistributedQuery, rows_by_table: &[(&str, u64)]) -> HashMap<u32, Vec<u64>> {
+        let mut m = HashMap::new();
+        for (tbl, rows) in rows_by_table {
+            let stage = dq
+                .stages
+                .iter()
+                .find(|s| s.upstream_stage_ids.is_empty() && s.sql.contains(&format!("FROM {tbl}")))
+                .unwrap();
+            m.insert(stage.stage_id, vec![*rows]);
+        }
+        m
+    }
+
+    const CHAIN4: &str = "SELECT ta.g, COUNT(*) AS c FROM ta \
+         JOIN tb ON ta.k = tb.k JOIN tc ON tb.k = tc.k JOIN td ON ta.k = td.k \
+         GROUP BY ta.g";
+    const TABLES4: [&str; 4] = ["ta", "tb", "tc", "td"];
+
+    #[tokio::test]
+    async fn replan_returns_none_when_sizes_confirm_current_order() {
+        let (lp, dq) = chain_plan(CHAIN4, &TABLES4).await;
+        // Tail right leaves already ascending (tc < td): nothing to gain.
+        let rows = measured(&dq, &[("ta", 100), ("tb", 100), ("tc", 200), ("td", 300)]);
+        assert!(replan_chain_tail(&lp, &[], &dq.stages, &rows).is_none());
+    }
+
+    #[tokio::test]
+    async fn replan_permutes_tail_when_a_tail_leaf_is_smallest() {
+        let (lp, dq) = chain_plan(CHAIN4, &TABLES4).await;
+        // td (tiny) is written last but must join before tc (huge).
+        let rows = measured(&dq, &[("ta", 100), ("tb", 100), ("tc", 5000), ("td", 5)]);
+        let replanned = replan_chain_tail(&lp, &[], &dq.stages, &rows)
+            .expect("a smaller tail leaf must trigger a re-plan");
+
+        // Equal total stage count, and every dispatched leaf survives byte-identical
+        // (SQL + hash keys) so the splice can keep its stage id.
+        assert_eq!(replanned.stages.len(), dq.stages.len());
+        for leaf in dq.stages.iter().filter(|s| s.upstream_stage_ids.is_empty()) {
+            let twin = replanned
+                .stages
+                .iter()
+                .find(|s| s.sql == leaf.sql)
+                .unwrap_or_else(|| panic!("leaf lost in re-plan: {}", leaf.sql));
+            assert_eq!(twin.hash_key_cols, leaf.hash_key_cols, "{}", leaf.sql);
+            assert_eq!(twin.exchange, leaf.exchange, "{}", leaf.sql);
+        }
+        // The first tail leaf slot (chain position after the fixed first join) now holds
+        // tiny td; huge tc moved last. build_chain emits leaf stages at positions 3 and 5.
+        assert_eq!(replanned.stages[3].sql, leaf_sql(&dq, "td"));
+        assert_eq!(replanned.stages[5].sql, leaf_sql(&dq, "tc"));
+        assert!(replanned.detail.contains("td=5"), "{}", replanned.detail);
+        assert!(replanned.detail.contains("tc=5000"), "{}", replanned.detail);
+    }
+
+    #[tokio::test]
+    async fn replan_respects_on_dependencies() {
+        // td's join key references tc, so td can never be hoisted ahead of tc no matter how
+        // small it measures; te (tiny, depending only on ta) leapfrogs both.
+        let sql = "SELECT ta.g, COUNT(*) AS c FROM ta \
+                   JOIN tb ON ta.k = tb.k JOIN tc ON ta.k = tc.k \
+                   JOIN td ON tc.k = td.k JOIN te ON ta.k = te.k \
+                   GROUP BY ta.g";
+        let tables = ["ta", "tb", "tc", "td", "te"];
+        let (lp, dq) = chain_plan(sql, &tables).await;
+        let rows = measured(
+            &dq,
+            &[
+                ("ta", 100),
+                ("tb", 100),
+                ("tc", 500),
+                ("td", 100),
+                ("te", 5),
+            ],
+        );
+        let replanned = replan_chain_tail(&lp, &[], &dq.stages, &rows)
+            .expect("te must leapfrog the large tail leaves");
+        // 5-table chain: leaf stages sit at positions 0,1,3,5,7 in build_chain emission
+        // order; the first permutable slot (3) goes to the smallest placeable leaf, te.
+        assert_eq!(replanned.stages[3].sql, leaf_sql(&dq, "te"));
+        // td still follows tc — never hoisted ahead of the leaf its ON references.
+        let pos = |tbl: &str| {
+            replanned
+                .stages
+                .iter()
+                .position(|s| s.sql == leaf_sql(&dq, tbl))
+                .unwrap()
+        };
+        assert!(
+            pos("tc") < pos("td"),
+            "td must stay behind tc: {:?}",
+            replanned
+                .stages
+                .iter()
+                .map(|s| s.sql.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn replan_bails_on_non_inner_short_chain_and_missing_measurement() {
+        // Any non-inner join: no permutation.
+        let left = "SELECT ta.g, COUNT(*) AS c FROM ta \
+                    JOIN tb ON ta.k = tb.k LEFT JOIN tc ON tb.k = tc.k \
+                    JOIN td ON ta.k = td.k GROUP BY ta.g";
+        let (lp, dq) = chain_plan(left, &TABLES4).await;
+        let rows = measured(&dq, &[("ta", 100), ("tb", 100), ("tc", 5000), ("td", 5)]);
+        assert!(replan_chain_tail(&lp, &[], &dq.stages, &rows).is_none());
+
+        // Two joins only: no permutable tail.
+        let short = "SELECT ta.g, COUNT(*) AS c FROM ta \
+                     JOIN tb ON ta.k = tb.k JOIN tc ON tb.k = tc.k GROUP BY ta.g";
+        let (lp, dq) = chain_plan(short, &["ta", "tb", "tc"]).await;
+        let rows = measured(&dq, &[("ta", 100), ("tb", 5000), ("tc", 5)]);
+        assert!(replan_chain_tail(&lp, &[], &dq.stages, &rows).is_none());
+
+        // A leaf without a barrier measurement: no re-optimization on partial data.
+        let (lp, dq) = chain_plan(CHAIN4, &TABLES4).await;
+        let rows = measured(&dq, &[("ta", 100), ("tb", 100), ("tc", 5000)]);
+        assert!(replan_chain_tail(&lp, &[], &dq.stages, &rows).is_none());
     }
 }

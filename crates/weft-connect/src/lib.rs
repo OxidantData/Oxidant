@@ -32,7 +32,7 @@ use weft_loom::arrow::ipc::reader::StreamReader;
 use weft_loom::arrow::ipc::writer::StreamWriter;
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
-use weft_observability::{AppStateStore, QueryTracker, SharedStore};
+use weft_observability::{AppStateStore, ExecutionEvent, QueryTracker, SharedStore};
 use weft_proto::spark::connect as sc;
 use weft_streaming::StreamingQueryManager;
 
@@ -107,6 +107,8 @@ pub struct WeftService {
     /// In-flight operation ids per session (`Interrupt` cancels these via the driver's
     /// query-cancel registry, KAN-17).
     in_flight: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// Cross-query distributed caches (resolved membership, per-endpoint UDF-sync state).
+    distributed_caches: distributed::DistributedCaches,
     /// Runtime observability store (jobs, stages, SQL plans).
     observability: SharedStore,
 }
@@ -128,6 +130,20 @@ fn completed_ops_ttl() -> std::time::Duration {
         .and_then(|s| s.parse().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or_else(|| std::time::Duration::from_secs(3600))
+}
+
+/// `QueryTracker::begin_local_stage` without `&mut self`: on a fresh tracker the stage id
+/// is already 0, so emitting the event directly is identical — and it keeps the tracker
+/// shareable (`Arc`) with the detached plan-explain task (see
+/// [`WeftService::spawn_plan_explain`]).
+fn emit_local_stage_started(tracker: &QueryTracker, name: &str) {
+    tracker.store().emit(ExecutionEvent::StageStarted {
+        operation_id: tracker.operation_id().to_string(),
+        stage_id: 0,
+        name: name.to_string(),
+        num_tasks: 1,
+        submission_time_ms: weft_observability::now_ms(),
+    });
 }
 
 /// Buffer of completed operations retained for `ReattachExecute`. Each entry holds the already
@@ -228,6 +244,7 @@ impl WeftService {
             completed_ops_max: completed_ops_max(),
             completed_ops_ttl: completed_ops_ttl(),
             in_flight: std::sync::Mutex::new(std::collections::HashMap::new()),
+            distributed_caches: distributed::DistributedCaches::default(),
             observability,
         }
     }
@@ -246,6 +263,25 @@ impl WeftService {
             .map(|s| distributed::parse_worker_list(Some(s)))
             .filter(|w| !w.is_empty());
         cfg_workers.unwrap_or_else(|| self.workers.clone())
+    }
+
+    /// Render the observability plan text OFF the query critical path: `Engine::explain`
+    /// runs a full optimize + physical-plan pass whose output only the UI/tracker consumes,
+    /// so it executes as a detached task that fills the tracker when done. The emitted
+    /// `SqlPlanCaptured` payload is identical to a synchronous `set_plan` — it may just
+    /// land after the query's `finish_*` events instead of before them.
+    fn spawn_plan_explain(
+        &self,
+        tracker: &Arc<QueryTracker>,
+        plan: datafusion::logical_expr::LogicalPlan,
+    ) {
+        let engine = Arc::clone(&self.engine);
+        let tracker = Arc::clone(tracker);
+        tokio::spawn(async move {
+            if let Ok(text) = engine.explain(&plan, true).await {
+                tracker.set_plan(text, None);
+            }
+        });
     }
 
     /// Reconcile declared `spark.sql.catalog.<name>.*` config into live, bridged catalogs.
@@ -411,15 +447,15 @@ impl WeftService {
         let relation = if is_query(sql) {
             sql_relation(sql)
         } else {
-            let tracker =
-                QueryTracker::begin(self.observability.clone(), operation_id, truncate_sql(sql));
+            let tracker = Arc::new(QueryTracker::begin(
+                self.observability.clone(),
+                operation_id,
+                truncate_sql(sql),
+            ));
             if let Ok(plan) = self.engine.logical_plan(sql).await {
-                if let Ok(text) = self.engine.explain(&plan, true).await {
-                    tracker.set_plan(text, None);
-                }
+                self.spawn_plan_explain(&tracker, plan);
             }
-            let mut tracker = tracker;
-            tracker.begin_local_stage("command", 1);
+            emit_local_stage_started(&tracker, "command");
             let task_id = self.observability.alloc_task_id();
             tracker.task_started(0, task_id, "driver");
             let start = std::time::Instant::now();
@@ -593,7 +629,11 @@ impl WeftService {
                 let udf_json = self.engine.export_udfs_json();
                 let description = truncate_sql(&sql.query);
                 let tracker = operation_id.map(|op| {
-                    QueryTracker::begin(self.observability.clone(), op, description.clone())
+                    Arc::new(QueryTracker::begin(
+                        self.observability.clone(),
+                        op,
+                        description.clone(),
+                    ))
                 });
                 // Build the logical plan ONCE per query (with the Delta/Iceberg snapshot
                 // pins the workers must scan at — KAN-48): it feeds the observability
@@ -605,10 +645,10 @@ impl WeftService {
                     .logical_plan_with_lakehouse_snapshots(&sql.query)
                     .await
                     .ok();
-                if let (Some(ref t), Some((ref plan, _))) = (&tracker, &plan_and_pins) {
-                    if let Ok(text) = self.engine.explain(plan, true).await {
-                        t.set_plan(text, None);
-                    }
+                // The observability explain is itself a full optimize + physical-plan
+                // pass — run it detached (see `spawn_plan_explain`).
+                if let (Some(t), Some((plan, _))) = (&tracker, &plan_and_pins) {
+                    self.spawn_plan_explain(t, plan.clone());
                 }
                 let replicated = match &plan_and_pins {
                     Some((plan, _)) => {
@@ -628,8 +668,9 @@ impl WeftService {
                             &sql.query,
                             &replicated_refs,
                             Some(&udf_json),
-                            tracker.as_ref(),
+                            tracker.as_deref(),
                             pins,
+                            &self.distributed_caches,
                         )
                         .await
                     }
@@ -659,7 +700,7 @@ impl WeftService {
                                 .map_err(err_to_status)?;
                             batches.push(RecordBatch::new_empty(signed_schema(&schema)));
                         }
-                        if let Some(t) = tracker {
+                        if let Some(t) = &tracker {
                             let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
                             t.finish_success(rows);
                         }
@@ -668,21 +709,17 @@ impl WeftService {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        if let Some(t) = tracker {
+                        if let Some(t) = &tracker {
                             t.finish_error(e.to_string());
                         }
                         return Err(err_to_status(e));
                     }
                 }
-                let local_tracker = tracker.map(|t| {
-                    let mut t = t;
-                    t.begin_local_stage("local", 1);
-                    t
-                });
-                let task_id = local_tracker
-                    .as_ref()
-                    .map(|_| self.observability.alloc_task_id());
-                if let (Some(ref t), Some(tid)) = (&local_tracker, task_id) {
+                if let Some(t) = &tracker {
+                    emit_local_stage_started(t, "local");
+                }
+                let task_id = tracker.as_ref().map(|_| self.observability.alloc_task_id());
+                if let (Some(t), Some(tid)) = (&tracker, task_id) {
                     t.task_started(0, tid, "driver");
                 }
                 let start = std::time::Instant::now();
@@ -704,7 +741,7 @@ impl WeftService {
                     match exec {
                         Ok(v) => v,
                         Err(e) => {
-                            if let Some(t) = local_tracker {
+                            if let Some(t) = &tracker {
                                 t.finish_error(e.to_string());
                             }
                             return Err(err_to_status(e));
@@ -722,7 +759,7 @@ impl WeftService {
                     batches.push(RecordBatch::new_empty(schema));
                 }
                 let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
-                if let (Some(t), Some(tid)) = (local_tracker, task_id) {
+                if let (Some(t), Some(tid)) = (&tracker, task_id) {
                     t.task_finished(
                         0,
                         tid,
@@ -769,12 +806,15 @@ impl WeftService {
                     weft_execution::plan::resolve_replicated_tables(&self.engine, &plan).await;
                 let replicated_refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
                 let udf_json = self.engine.export_udfs_json();
-                let tracker = operation_id
-                    .map(|op| QueryTracker::begin(self.observability.clone(), op, "DataFrame"));
-                if let Some(ref t) = tracker {
-                    if let Ok(text) = self.engine.explain(&plan, true).await {
-                        t.set_plan(text, None);
-                    }
+                let tracker = operation_id.map(|op| {
+                    Arc::new(QueryTracker::begin(
+                        self.observability.clone(),
+                        op,
+                        "DataFrame",
+                    ))
+                });
+                if let Some(t) = &tracker {
+                    self.spawn_plan_explain(t, plan.clone());
                 }
                 match distributed::try_run_distributed_plan(
                     &self.engine,
@@ -783,8 +823,9 @@ impl WeftService {
                     "DataFrame",
                     &replicated_refs,
                     Some(&udf_json),
-                    tracker.as_ref(),
+                    tracker.as_deref(),
                     &lakehouse_snapshot_pins,
+                    &self.distributed_caches,
                 )
                 .await
                 {
@@ -796,7 +837,7 @@ impl WeftService {
                         if batches.is_empty() {
                             batches.push(RecordBatch::new_empty(signed_schema(&schema)));
                         }
-                        if let Some(t) = tracker {
+                        if let Some(t) = &tracker {
                             let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
                             t.finish_success(rows);
                         }
@@ -804,28 +845,24 @@ impl WeftService {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        if let Some(t) = tracker {
+                        if let Some(t) = &tracker {
                             t.finish_error(e.to_string());
                         }
                         return Err(err_to_status(e));
                     }
                 }
-                let local_tracker = tracker.map(|t| {
-                    let mut t = t;
-                    t.begin_local_stage("dataframe", 1);
-                    t
-                });
-                let task_id = local_tracker
-                    .as_ref()
-                    .map(|_| self.observability.alloc_task_id());
-                if let (Some(ref t), Some(tid)) = (&local_tracker, task_id) {
+                if let Some(t) = &tracker {
+                    emit_local_stage_started(t, "dataframe");
+                }
+                let task_id = tracker.as_ref().map(|_| self.observability.alloc_task_id());
+                if let (Some(t), Some(tid)) = (&tracker, task_id) {
                     t.task_started(0, tid, "driver");
                 }
                 let start = std::time::Instant::now();
                 let batches = match self.engine.execute_logical_plan(plan).await {
                     Ok(b) => b,
                     Err(e) => {
-                        if let Some(t) = local_tracker {
+                        if let Some(t) = &tracker {
                             t.finish_error(e.to_string());
                         }
                         return Err(err_to_status(e));
@@ -839,7 +876,7 @@ impl WeftService {
                     batches.push(RecordBatch::new_empty(signed_schema(&schema)));
                 }
                 let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
-                if let (Some(t), Some(tid)) = (local_tracker, task_id) {
+                if let (Some(t), Some(tid)) = (&tracker, task_id) {
                     t.task_finished(
                         0,
                         tid,

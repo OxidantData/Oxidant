@@ -20,12 +20,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::scalar::ScalarValue;
 use weft_common::{Error, Result};
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_observability::{now_ms, ExecutionEvent, SharedStore, StageStatus, TaskStatus};
 
-use crate::aqe::{aqe_enabled, coalesced_partitions};
+use crate::aqe::{aqe_enabled, coalesced_partitions, stage_input_stats_enabled};
 use crate::autoscale::{
     autoscale_enabled, parallelism_demand, recommend_worker_count, task_slots_per_worker,
 };
@@ -146,6 +147,17 @@ async fn cancel_stages_on_workers(workers: &[String], stage_ids: impl Iterator<I
     let _ = futures::future::join_all(futs).await;
 }
 
+/// Evict cached stage outputs on every worker (KAN-18); all errors ignored. Concurrent per
+/// worker — a dead or slow worker must not delay the eviction of the others (or, on the
+/// client's result path, the query's own return).
+async fn clear_stages_on_workers(workers: &[String]) {
+    let futs: Vec<_> = workers
+        .iter()
+        .map(|ep| clear_worker_stages(ep.clone()))
+        .collect();
+    let _ = futures::future::join_all(futs).await;
+}
+
 /// KAN-46: RAII backstop for [`run_stages_obs`] cleanup. When the driver future is dropped
 /// mid-query — tonic cancels the Spark Connect `ExecutePlan` handler future as soon as the
 /// client's call goes away (disconnect, client-side timeout) — ordinary cleanup written
@@ -203,9 +215,7 @@ impl Drop for QueryAbortGuard {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 cancel_stages_on_workers(&workers, stage_ids.iter().copied()).await;
-                for ep in &workers {
-                    let _ = clear_worker_stages(ep.clone()).await;
-                }
+                clear_stages_on_workers(&workers).await;
             });
         }
     }
@@ -540,11 +550,34 @@ impl DistributedPlan {
     }
 }
 
+/// Planner inputs retained for adaptive join-order re-optimization
+/// (`WEFT_REOPT_JOIN_ORDER`): the logical plan the stage DAG was derived from and the
+/// replicated-table classification, so the driver can re-derive the shuffle-join chain's
+/// tail from barrier-measured leaf cardinalities and splice it onto the dispatched prefix
+/// (see [`crate::plan::join_chain::replan_chain_tail`]).
+pub struct ReoptContext<'a> {
+    pub plan: &'a LogicalPlan,
+    pub replicated: &'a [&'a str],
+}
+
+/// Adaptive join-order re-optimization is **off by default** (`WEFT_REOPT_JOIN_ORDER=1` to
+/// enable): when on, the driver front-loads leaf producer stages and, at the last leaf's
+/// stage barrier, re-sequences the shuffle-join chain's tail by barrier-measured leaf row
+/// counts — the reorder Spark AQE structurally lacks (it never re-plans join order once the
+/// stage graph is fixed). Off means byte-identical behavior, dispatch order included.
+pub fn reopt_join_order_enabled() -> bool {
+    std::env::var("WEFT_REOPT_JOIN_ORDER")
+        .ok()
+        .as_deref()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 pub async fn run_distributed(
     cluster: &Cluster,
     plan: &DistributedPlan,
 ) -> Result<Vec<RecordBatch>> {
-    run_stages_obs(cluster, &plan.into_stages(), None, None).await
+    run_stages_obs(cluster, &plan.into_stages(), None, None, None).await
 }
 
 pub async fn run_distributed_with_membership(
@@ -556,6 +589,7 @@ pub async fn run_distributed_with_membership(
         &plan.into_stages(),
         None,
         None,
+        None,
     )
     .await
 }
@@ -564,11 +598,18 @@ pub async fn run_stages_with_membership(
     membership: Arc<dyn ClusterMembership>,
     stages: &[StageDef],
 ) -> Result<Vec<RecordBatch>> {
-    run_stages_obs(&Cluster::from_membership(membership), stages, None, None).await
+    run_stages_obs(
+        &Cluster::from_membership(membership),
+        stages,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<RecordBatch>> {
-    run_stages_obs(cluster, stages, None, None).await
+    run_stages_obs(cluster, stages, None, None, None).await
 }
 
 pub async fn run_stages_obs(
@@ -576,6 +617,7 @@ pub async fn run_stages_obs(
     stages: &[StageDef],
     store: Option<SharedStore>,
     operation_id: Option<String>,
+    reopt: Option<ReoptContext<'_>>,
 ) -> Result<Vec<RecordBatch>> {
     // KAN-17: register a query-level cancel flag so a Spark Connect `Interrupt` stops the
     // driver at the next stage barrier and aborts this plan's stages still running on workers.
@@ -589,8 +631,16 @@ pub async fn run_stages_obs(
     // cancels the handler future), the guard's Drop runs the same cancel + eviction the
     // normal exit path below runs inline.
     let mut abort_guard = QueryAbortGuard::new(cluster, stages, &query_id, watcher);
-    let result =
-        run_stages_obs_inner(cluster, stages, store, operation_id, &query_id, &cancel).await;
+    let result = run_stages_obs_inner(
+        cluster,
+        stages,
+        store,
+        operation_id,
+        &query_id,
+        &cancel,
+        reopt,
+    )
+    .await;
     abort_guard.disarm().abort();
     unregister_query_cancel(&query_id);
     if result.is_err() {
@@ -601,9 +651,7 @@ pub async fn run_stages_obs(
     // KAN-18: evict stage caches on every exit path — success, stage error, cancel, or
     // timeout — so failed/wedged queries don't leak producer buckets on workers. Best-effort
     // per worker: a dead worker must not mask the query's own result.
-    for ep in &cluster.workers {
-        let _ = clear_worker_stages(ep.clone()).await;
-    }
+    clear_stages_on_workers(&cluster.workers).await;
     result
 }
 
@@ -624,9 +672,13 @@ async fn run_stages_obs_inner(
     operation_id: Option<String>,
     query_id: &str,
     cancel: &AtomicBool,
+    reopt: Option<ReoptContext<'_>>,
 ) -> Result<Vec<RecordBatch>> {
     let lineage = Arc::new(StageLineage::new());
-    let stage_map: HashMap<u32, StageDef> =
+    // Owned so a re-optimized join tail can splice in mid-query (WEFT_REOPT_JOIN_ORDER);
+    // with the gate off the clone changes nothing observable.
+    let mut stages: Vec<StageDef> = stages.to_vec();
+    let mut stage_map: HashMap<u32, StageDef> =
         stages.iter().map(|s| (s.stage_id, s.clone())).collect();
     let cluster = cluster.clone();
     // Freeze the planning snapshot for this query: never reshape partitions from membership.
@@ -636,6 +688,18 @@ async fn run_stages_obs_inner(
         .iter()
         .flat_map(|s| s.upstream_stage_ids.iter().copied())
         .collect();
+    // AQE coalesce decisions for this query (producer stage id -> coalesced read modulus),
+    // recorded at each producer's stage barrier. A later consumer stage of THIS query reads
+    // a coalesced upstream through the modulus mapping; the planned partition count stays
+    // frozen at `cluster.num_partitions` everywhere else.
+    let mut coalesced: HashMap<u32, u32> = HashMap::new();
+    // Barrier-measured per-bucket row totals of each producer stage's output (producer stage
+    // id -> `num_partitions` bucket totals, summed across workers), recorded at the same
+    // barrier when `WEFT_STAGE_INPUT_STATS` sampling is on. Consumer tickets carry their
+    // upstreams' totals (`StageTicket::upstream_bucket_rows`) so workers attach exact
+    // per-task row counts to the `shuffle_input*` scans — the plan-time join guard then
+    // sizes hash builds from measured data instead of unknown statistics.
+    let mut stage_rows: HashMap<u32, Vec<u64>> = HashMap::new();
 
     let outputs: Vec<&StageDef> = stages
         .iter()
@@ -646,10 +710,12 @@ async fn run_stages_obs_inner(
     // is matched positionally (so callers may rebase stage ids); the output stage is the last
     // stage of the topologically-ordered list.
     let token_present = stages.iter().any(|s| s.sql.contains(SCALAR_TOKEN));
-    let (output, scalar_stage) = match outputs.as_slice() {
-        [o] if !token_present => (*o, None),
+    // Owned: a re-optimized tail swap rebuilds the stage vec, and the driver re-reads the
+    // (re-derived) output stage from it afterwards.
+    let (mut output, scalar_stage): (StageDef, Option<StageDef>) = match outputs.as_slice() {
+        [o] if !token_present => ((*o).clone(), None),
         [s, o] if token_present && Some(o.stage_id) == stages.last().map(|t| t.stage_id) => {
-            (*o, Some(*s))
+            ((*o).clone(), Some((*s).clone()))
         }
         _ => {
             return Err(Error::Plan(format!(
@@ -660,7 +726,7 @@ async fn run_stages_obs_inner(
     };
 
     if autoscale_enabled() {
-        let demand = parallelism_demand(&cluster, stages);
+        let demand = parallelism_demand(&cluster, &stages);
         let rec = recommend_worker_count(
             cluster.worker_count() as u32,
             cluster.worker_count() as u32,
@@ -695,12 +761,43 @@ async fn run_stages_obs_inner(
     // workers that never produced it simply have no cache entry and `read_shuffle` serves them
     // an empty bucket rather than erroring — so a single real producer is sufficient.
     let mut scalar_literal: Option<String> = None;
-    for stage in stages.iter().filter(|s| s.stage_id != output.stage_id) {
+    // WEFT_REOPT_JOIN_ORDER: when the gate is on (and the plan is re-optimizable — a
+    // scalar-token plan's positional literal pipeline must keep its dispatch order),
+    // stable-partition the worklist so zero-upstream leaf producers dispatch before the
+    // join stages. Topological order is preserved (leaves have no upstreams), and with the
+    // gate off the dispatch order is byte-identical to before.
+    let reopt_active = reopt.is_some() && reopt_join_order_enabled() && !token_present;
+    let mut order: Vec<u32> = stages
+        .iter()
+        .filter(|s| s.stage_id != output.stage_id)
+        .map(|s| s.stage_id)
+        .collect();
+    if reopt_active {
+        order.sort_by_key(|id| {
+            !stage_map
+                .get(id)
+                .is_some_and(|s| s.upstream_stage_ids.is_empty())
+        });
+    }
+    let mut dispatched_ids: HashSet<u32> = HashSet::new();
+    let mut reopt_attempted = false;
+    let mut cursor = 0usize;
+    while cursor < order.len() {
+        let current_id = order[cursor];
+        let current = stage_map
+            .get(&current_id)
+            .cloned()
+            .ok_or_else(|| Error::Plan(format!("stage {current_id} not in the stage list")))?;
         // KAN-27: inline any scalar-subquery tokens (the referenced scalar stages have already
         // run — the stage list is topologically ordered) before dispatching this stage.
-        let stage =
-            &substitute_scalar_tokens(&cluster, stage, stages, scalar_stage, &mut scalar_literal)
-                .await?;
+        let stage = &substitute_scalar_tokens(
+            &cluster,
+            &current,
+            &stages,
+            scalar_stage.as_ref(),
+            &mut scalar_literal,
+        )
+        .await?;
         ensure_stable_membership(&cluster, &planned_workers)?;
         check_query_cancelled(query_id, cancel)?;
         let np = cluster.num_partitions;
@@ -710,18 +807,35 @@ async fn run_stages_obs_inner(
         // upstream when WEFT_SHUFFLE_PARTITIONS exceeds the worker count (SF10 ran 16
         // partitions on 2 workers, and Q18's semi-shuffle plan lost 7/8 of its join rows).
         // Leaf producers still run once per worker: each scans its local shard of the data.
+        // (Under an AQE coalesce decision the fan-in drops to `read_mod` reader partitions,
+        // each consuming a modulus class of upstream buckets — still every bucket exactly
+        // once; see `consumer_read_modulus`.)
         if stage.exchange == ExchangeMode::Hash && !stage.upstream_stage_ids.is_empty() {
+            let read_mod = consumer_read_modulus(stage, &coalesced).unwrap_or(np);
             run_intermediate_stage(
                 &cluster,
                 stage,
                 np,
+                read_mod,
                 &lineage,
                 &stage_map,
                 &store,
                 &operation_id,
+                &stage_rows,
             )
             .await?;
-            finish_stage_barrier(&cluster, stage, np, &store, &operation_id).await;
+            finish_stage_barrier(
+                &cluster,
+                stage,
+                np,
+                &store,
+                &operation_id,
+                &mut coalesced,
+                &mut stage_rows,
+            )
+            .await;
+            dispatched_ids.insert(current_id);
+            cursor += 1;
             continue;
         }
         let mut futs = Vec::new();
@@ -734,7 +848,19 @@ async fn run_stages_obs_inner(
             cluster.workers.iter().cloned().enumerate().collect()
         };
         for (i, endpoint) in producers {
-            let ticket = stage_ticket(stage, i as u32, np, &cluster, true);
+            // Worker-indexed dispatch (leaf / broadcast / forward producers) keeps the
+            // legacy one-bucket read: the AQE modulus mapping only applies to the
+            // per-partition rendezvous dispatch paths below.
+            let ticket = stage_ticket(
+                stage,
+                i as u32,
+                np,
+                0,
+                &cluster,
+                true,
+                &stage_map,
+                &stage_rows,
+            );
             let membership = cluster.membership.clone();
             let ep = endpoint;
             let host = ep
@@ -800,7 +926,49 @@ async fn run_stages_obs_inner(
         for r in futures::future::join_all(futs).await {
             r?;
         }
-        finish_stage_barrier(&cluster, stage, np, &store, &operation_id).await;
+        finish_stage_barrier(
+            &cluster,
+            stage,
+            np,
+            &store,
+            &operation_id,
+            &mut coalesced,
+            &mut stage_rows,
+        )
+        .await;
+        dispatched_ids.insert(current_id);
+        // WEFT_REOPT_JOIN_ORDER trigger: the barrier of the LAST leaf producer (the next
+        // stage to dispatch is the first join stage) is the one moment every chain leaf
+        // has a measured row count while a permutable tail is still pending. Attempt the
+        // re-optimization once per query; any bail keeps the original stages.
+        if reopt_active && !reopt_attempted && stage.upstream_stage_ids.is_empty() {
+            let last_leaf_barrier = order.get(cursor + 1).is_some_and(|next_id| {
+                stage_map
+                    .get(next_id)
+                    .is_some_and(|n| !n.upstream_stage_ids.is_empty())
+            });
+            if last_leaf_barrier {
+                reopt_attempted = true;
+                if let Some(ctx) = &reopt {
+                    if let Some((spliced, remaining, new_output)) = attempt_reopt_tail(
+                        ctx,
+                        &stages,
+                        &stage_rows,
+                        &dispatched_ids,
+                        &store,
+                        &operation_id,
+                    ) {
+                        stage_map = spliced.iter().map(|s| (s.stage_id, s.clone())).collect();
+                        stages = spliced;
+                        order = remaining;
+                        output = new_output;
+                        cursor = 0;
+                        continue;
+                    }
+                }
+            }
+        }
+        cursor += 1;
     }
 
     // Output stage:
@@ -810,9 +978,14 @@ async fn run_stages_obs_inner(
     //
     // KAN-27: the output stage may carry scalar-subquery tokens (e.g. a HAVING threshold);
     // substitute them with the computed literals before dispatch.
-    let output =
-        &substitute_scalar_tokens(&cluster, output, stages, scalar_stage, &mut scalar_literal)
-            .await?;
+    let output = &substitute_scalar_tokens(
+        &cluster,
+        &output,
+        &stages,
+        scalar_stage.as_ref(),
+        &mut scalar_literal,
+    )
+    .await?;
     let scatter_output = output.upstream_stage_ids.is_empty() && output.hash_key_cols.is_empty();
     let mut out = Vec::new();
     ensure_stable_membership(&cluster, &planned_workers)?;
@@ -827,7 +1000,7 @@ async fn run_stages_obs_inner(
         let stage_id = output.stage_id as i32;
         let task_id = alloc_task_id(&store, 0);
         emit_task_started(&store, &operation_id, stage_id, task_id, &host);
-        let ticket = stage_ticket(output, 0, 1, &cluster, false);
+        let ticket = stage_ticket(output, 0, 1, 0, &cluster, false, &stage_map, &stage_rows);
         let start = std::time::Instant::now();
         match run_stage_with_retry(&cluster.membership, endpoint, ticket, &lineage, &stage_map)
             .await
@@ -867,7 +1040,16 @@ async fn run_stages_obs_inner(
     } else if scatter_output {
         let mut futs = Vec::new();
         for (i, endpoint) in cluster.workers.iter().enumerate() {
-            let ticket = stage_ticket(output, i as u32, w, &cluster, false);
+            let ticket = stage_ticket(
+                output,
+                i as u32,
+                w,
+                0,
+                &cluster,
+                false,
+                &stage_map,
+                &stage_rows,
+            );
             let membership = cluster.membership.clone();
             let ep = endpoint.clone();
             let host = executor_id(&ep);
@@ -924,15 +1106,19 @@ async fn run_stages_obs_inner(
         // scopes its shuffle-input registrations per task (`localize_shuffle_input_sql`),
         // so same-worker tasks no longer race — the per-endpoint serialization that used
         // to protect the shared `shuffle_input` table names is gone. Tasks beyond a
-        // worker's slot count queue server-side (`acquire_task_slot`).
+        // worker's slot count queue server-side (`acquire_task_slot`). When AQE coalesced
+        // an upstream, only `read_mod` reader partitions are dispatched, each pulling its
+        // whole modulus class of producer buckets.
+        let read_mod = consumer_read_modulus(output, &coalesced).unwrap_or(w);
         let mut futs = Vec::new();
-        for p in 0..w {
+        for p in 0..read_mod {
             let endpoint = cluster.owner_endpoint(p)?;
             let membership = cluster.membership.clone();
             let output = output.clone();
             let cluster = cluster.clone();
             let lineage = lineage.clone();
             let stage_map = stage_map.clone();
+            let stage_rows = stage_rows.clone();
             let host = executor_id(&endpoint);
             let store_c = store.clone();
             let op_c = operation_id.clone();
@@ -940,7 +1126,16 @@ async fn run_stages_obs_inner(
             let task_id = alloc_task_id(&store, p as i64);
             emit_task_started(&store, &operation_id, stage_id, task_id, &host);
             futs.push(async move {
-                let ticket = stage_ticket(&output, p, w, &cluster, false);
+                let ticket = stage_ticket(
+                    &output,
+                    p,
+                    w,
+                    read_mod,
+                    &cluster,
+                    false,
+                    &stage_map,
+                    &stage_rows,
+                );
                 let start = std::time::Instant::now();
                 let result = run_stage_with_retry(
                     &membership,
@@ -1036,28 +1231,37 @@ fn executor_id(endpoint: &str) -> String {
         .to_string()
 }
 
-/// Run an intermediate (consume + produce) stage: one task per shuffle partition, all
-/// dispatched concurrently (F2). The worker scopes its shuffle-input registrations per
+/// Run an intermediate (consume + produce) stage: one task per shuffle partition — or, when
+/// AQE coalesced an upstream, one task per coalesced reader partition (`read_modulus <
+/// num_partitions`), each pulling its whole modulus class of every upstream — all dispatched
+/// concurrently (F2). The worker scopes its shuffle-input registrations per
 /// task (`localize_shuffle_input_sql`), so same-worker tasks no longer race on a shared
 /// `shuffle_input` table — the per-endpoint serialization (KAN-32) is gone; tasks beyond
-/// a worker's slot count queue server-side (`acquire_task_slot`).
+/// a worker's slot count queue server-side (`acquire_task_slot`). Every task still
+/// hash-partitions its output into the full `num_partitions` buckets, so downstream reads
+/// are unaffected by the coalesced fan-in.
+#[allow(clippy::too_many_arguments)]
 async fn run_intermediate_stage(
     cluster: &Cluster,
     stage: &StageDef,
     num_partitions: u32,
+    read_modulus: u32,
     lineage: &Arc<StageLineage>,
     stage_map: &HashMap<u32, StageDef>,
     store: &Option<SharedStore>,
     operation_id: &Option<String>,
+    stage_rows: &HashMap<u32, Vec<u64>>,
 ) -> Result<()> {
     let mut futs = Vec::new();
-    for p in 0..num_partitions {
+    let num_tasks = read_modulus.clamp(1, num_partitions);
+    for p in 0..num_tasks {
         let endpoint = cluster.owner_endpoint(p)?;
         let membership = cluster.membership.clone();
         let stage = stage.clone();
         let cluster = cluster.clone();
         let lineage = lineage.clone();
         let stage_map = stage_map.clone();
+        let stage_rows = stage_rows.clone();
         let host = executor_id(&endpoint);
         let store_c = store.clone();
         let op_c = operation_id.clone();
@@ -1065,7 +1269,16 @@ async fn run_intermediate_stage(
         let task_id = alloc_task_id(store, p as i64);
         emit_task_started(store, operation_id, stage_id, task_id, &host);
         futs.push(async move {
-            let ticket = stage_ticket(&stage, p, num_partitions, &cluster, true);
+            let ticket = stage_ticket(
+                &stage,
+                p,
+                num_partitions,
+                num_tasks,
+                &cluster,
+                true,
+                &stage_map,
+                &stage_rows,
+            );
             let start = std::time::Instant::now();
             let result =
                 run_stage_with_retry(&membership, endpoint.clone(), ticket, &lineage, &stage_map)
@@ -1119,14 +1332,28 @@ async fn run_intermediate_stage(
 }
 
 /// Emit the StageFinished event for a producer stage and (when AQE is enabled) sample its
-/// per-partition bucket row counts. The sample is observability-only: the planned partition
-/// count is never shrunk mid-query (see [`sample_bucket_row_counts`]).
+/// per-partition bucket row counts, recording a coalesced read modulus in `coalesced` when
+/// every bucket is small. The planned partition count is never shrunk mid-query — producers
+/// already wrote `num_partitions` buckets — so downstream consumers of THIS query read the
+/// coalesced stage through the modulus mapping (`aqe::coalesced_read_buckets`) instead of a
+/// plain `0..new_p` range (which would orphan buckets `new_p..num_partitions-1`).
+///
+/// The same sample — one `bucket_row_counts` action round trip per worker, a local
+/// in-memory row count (KAN-32) shared by both consumers — also feeds the stage-input
+/// statistics path (`WEFT_STAGE_INPUT_STATS`, default on): the exact per-bucket totals
+/// (summed across every producing worker) are recorded in `stage_rows` and ride
+/// downstream tickets as [`StageTicket::upstream_bucket_rows`], so workers attach measured
+/// row counts to their `shuffle_input*` scans and the plan-time join-strategy guard sizes
+/// hash builds from data instead of unknown statistics (Spark AQE's runtime
+/// SMJ→hash/broadcast conversion).
 async fn finish_stage_barrier(
     cluster: &Cluster,
     stage: &StageDef,
     num_partitions: u32,
     store: &Option<SharedStore>,
     operation_id: &Option<String>,
+    coalesced: &mut HashMap<u32, u32>,
+    stage_rows: &mut HashMap<u32, Vec<u64>>,
 ) {
     if let (Some(ref s), Some(ref op)) = (store, operation_id) {
         s.emit(ExecutionEvent::StageFinished {
@@ -1140,16 +1367,21 @@ async fn finish_stage_barrier(
             output_rows: 0,
         });
     }
-    // AQE: sample bucket row counts after producer stage when enabled.
-    // Observability only — never shrink `num_partitions` here. Producers already wrote
-    // `np` buckets; dropping the consumer range to `new_p < np` orphans buckets
-    // `new_p..np-1` (silent row loss). Correct coalesced reads would need the consumer
-    // to pull `p, p+new_p, …` up to the original modulus; until that exists, keep the
-    // planned partition count frozen for the query lifetime.
+    if !aqe_enabled() && !stage_input_stats_enabled() {
+        return;
+    }
+    let per_worker = sample_per_worker_bucket_counts(cluster, stage.stage_id).await;
+    // AQE: on a coalesce decision, remember it for the rest of this query: downstream
+    // consumers dispatch `new_p` reader partitions, partition `p` pulling producer buckets
+    // `p, p+new_p, …` (every `b ≡ p mod new_p`), so each of the `num_partitions` written
+    // buckets is read exactly once while the planned count stays frozen for the query
+    // lifetime.
     if aqe_enabled() {
-        let counts = sample_bucket_row_counts(cluster, stage.stage_id, num_partitions).await;
+        let counts =
+            owner_bucket_row_counts(cluster, stage.stage_id, num_partitions, &per_worker).await;
         if let Ok(new_p) = coalesced_partitions(cluster.worker_count(), num_partitions, &counts) {
             if new_p < num_partitions {
+                coalesced.insert(stage.stage_id, new_p);
                 if let (Some(ref s), Some(ref op)) = (store, operation_id) {
                     s.emit(ExecutionEvent::AqeCoalesced {
                         operation_id: op.clone(),
@@ -1162,30 +1394,181 @@ async fn finish_stage_barrier(
                     target: "weft.aqe",
                     stage_id = stage.stage_id,
                     old_partitions = num_partitions,
-                    suggested_partitions = new_p,
-                    "AQE would coalesce shuffle partitions; keeping planned count to avoid orphaning buckets"
+                    coalesced_partitions = new_p,
+                    "AQE coalesced shuffle read; consumers pull buckets p, p+m, … (planned count unchanged)"
                 );
             }
         }
     }
+    // Stage-input statistics: exact per-bucket totals = every worker's contribution summed
+    // (a Forward producer ran on one worker; the others contribute nothing). Skip the stage
+    // when any worker could not answer — an undercounted build-side estimate would steer
+    // the join guard toward hash where the real build does not fit (the safe direction is
+    // no stats, which falls back to the worker's own MemTable statistics).
+    if stage_input_stats_enabled() && per_worker.values().all(|c| c.is_some()) {
+        let mut totals = vec![0u64; num_partitions as usize];
+        for counts in per_worker.values().flatten() {
+            for (b, n) in counts.iter().enumerate() {
+                if let Some(t) = totals.get_mut(b) {
+                    *t += *n as u64;
+                }
+            }
+        }
+        stage_rows.insert(stage.stage_id, totals);
+    }
 }
 
-/// Sample per-partition row counts of a producer stage's cached output for AQE. Workers
-/// answer a cheap row-count action (KAN-32) — the previous implementation pulled every
-/// partition's bucket over Flight just to count rows, shipping the whole stage output
-/// through the driver after every producer stage (at SF10, ~90M rows for Q18 alone).
-/// Workers that do not know the action (mixed-version cluster) fall back to that pull.
-async fn sample_bucket_row_counts(
+/// WEFT_REOPT_JOIN_ORDER: at the last leaf stage's barrier, re-derive the shuffle-join
+/// chain's tail from the barrier-measured leaf cardinalities and splice it onto the
+/// dispatched prefix. Returns the swapped-in stage DAG (topologically ordered), the
+/// remaining dispatch order, and the re-derived output stage; `None` keeps the original
+/// stages (every bail is zero-cost — nothing has been mutated yet).
+fn attempt_reopt_tail(
+    ctx: &ReoptContext,
+    stages: &[StageDef],
+    stage_rows: &HashMap<u32, Vec<u64>>,
+    dispatched_ids: &HashSet<u32>,
+    store: &Option<SharedStore>,
+    operation_id: &Option<String>,
+) -> Option<(Vec<StageDef>, Vec<u32>, StageDef)> {
+    let replanned =
+        crate::plan::join_chain::replan_chain_tail(ctx.plan, ctx.replicated, stages, stage_rows)?;
+    let spliced = splice_replanned_tail(stages, dispatched_ids, replanned.stages)?;
+    // The spliced DAG must keep the single-output shape (the unconsumed stage, last in
+    // topological order) the output dispatch below relies on.
+    let consumed: HashSet<u32> = spliced
+        .iter()
+        .flat_map(|s| s.upstream_stage_ids.iter().copied())
+        .collect();
+    let mut outputs = spliced.iter().filter(|s| !consumed.contains(&s.stage_id));
+    let (Some(new_output), None) = (outputs.next(), outputs.next()) else {
+        return None;
+    };
+    if Some(new_output.stage_id) != spliced.last().map(|s| s.stage_id) {
+        return None;
+    }
+    let new_output = new_output.clone();
+    // Remaining dispatch order: the spliced DAG in topological order, minus the dispatched
+    // prefix and the output stage. Every remaining stage has upstreams (the trigger fired
+    // at the last leaf), so no further front-loading is needed.
+    let remaining: Vec<u32> = spliced
+        .iter()
+        .map(|s| s.stage_id)
+        .filter(|id| !dispatched_ids.contains(id) && *id != new_output.stage_id)
+        .collect();
+    if let (Some(s), Some(op)) = (store, operation_id) {
+        s.emit(ExecutionEvent::ReoptimizedJoinOrder {
+            operation_id: op.clone(),
+            stage_ids: remaining.iter().map(|&id| id as i32).collect(),
+            detail: replanned.detail.clone(),
+        });
+    }
+    tracing::info!(
+        target: "weft.reopt",
+        tail_stage_ids = ?remaining,
+        detail = %replanned.detail,
+        "spliced re-optimized join tail onto the dispatched prefix"
+    );
+    Some((spliced, remaining, new_output))
+}
+
+/// Splice a re-planned stage DAG onto the already-dispatched prefix
+/// (`WEFT_REOPT_JOIN_ORDER`), preserving every dispatched stage id.
+///
+/// Worker plan caches and the driver's lineage key on stage id + SQL, so a dispatched stage
+/// id's SQL must never change: every dispatched stage requires an exact
+/// (sql, hash_key_cols, exchange) match in the re-planned DAG and keeps its id; the
+/// remaining re-planned stages (the new tail) take the un-dispatched tail's leftover ids in
+/// increasing order, so the stage count and the full id set are preserved and the
+/// cancel-watcher / abort-guard captured id lists stay valid. Upstream references are
+/// rewritten through the id map. ANY mismatch returns `None` — the caller keeps the
+/// original stages untouched.
+fn splice_replanned_tail(
+    stages: &[StageDef],
+    dispatched_ids: &HashSet<u32>,
+    replanned: Vec<StageDef>,
+) -> Option<Vec<StageDef>> {
+    if replanned.len() != stages.len() {
+        return None;
+    }
+    // re-planned stage id -> preserved (final) stage id.
+    let mut id_map: HashMap<u32, u32> = HashMap::new();
+    let mut matched_new: HashSet<u32> = HashSet::new();
+    for &d in dispatched_ids {
+        let old = stages.iter().find(|s| s.stage_id == d)?;
+        let new = replanned.iter().find(|n| {
+            !matched_new.contains(&n.stage_id)
+                && n.sql == old.sql
+                && n.hash_key_cols == old.hash_key_cols
+                && n.exchange == old.exchange
+        })?;
+        id_map.insert(new.stage_id, d);
+        matched_new.insert(new.stage_id);
+    }
+    let mut leftover_ids: Vec<u32> = stages
+        .iter()
+        .map(|s| s.stage_id)
+        .filter(|id| !dispatched_ids.contains(id))
+        .collect();
+    leftover_ids.sort_unstable();
+    let mut leftover_new: Vec<u32> = replanned
+        .iter()
+        .map(|s| s.stage_id)
+        .filter(|id| !matched_new.contains(id))
+        .collect();
+    leftover_new.sort_unstable();
+    if leftover_ids.len() != leftover_new.len() {
+        return None;
+    }
+    for (new_id, final_id) in leftover_new.into_iter().zip(leftover_ids) {
+        id_map.insert(new_id, final_id);
+    }
+    let mut out = Vec::with_capacity(replanned.len());
+    for n in &replanned {
+        let stage_id = *id_map.get(&n.stage_id)?;
+        let upstream_stage_ids = n
+            .upstream_stage_ids
+            .iter()
+            .map(|u| id_map.get(u).copied())
+            .collect::<Option<Vec<_>>>()?;
+        out.push(StageDef {
+            stage_id,
+            upstream_stage_ids,
+            ..n.clone()
+        });
+    }
+    Some(out)
+}
+
+/// Ask every worker for its cached per-partition row counts of a producer stage (the cheap
+/// KAN-32 `bucket_row_counts` action — a local in-memory count, no data movement). `None`
+/// for a worker that errored or predates the action (mixed-version cluster). The action
+/// exists because the pre-KAN-32 sampler pulled every partition's bucket over Flight just
+/// to count rows, shipping the whole stage output through the driver after every producer
+/// stage (at SF10, ~90M rows for Q18 alone).
+async fn sample_per_worker_bucket_counts(
     cluster: &Cluster,
     stage_id: u32,
-    num_partitions: u32,
-) -> Vec<usize> {
-    let mut counts = vec![0usize; num_partitions as usize];
-    let mut per_worker: HashMap<String, Option<Vec<usize>>> = HashMap::new();
+) -> HashMap<String, Option<Vec<usize>>> {
+    let mut per_worker = HashMap::new();
     for ep in &cluster.workers {
         let c = bucket_row_counts(ep.clone(), stage_id).await.ok();
         per_worker.insert(ep.clone(), c);
     }
+    per_worker
+}
+
+/// The AQE owner sample: per-partition row counts of a producer stage's cached output,
+/// taking each bucket's count from its owner worker. Workers that do not know the action
+/// (mixed-version cluster) fall back to pulling the owner's bucket over Flight (the
+/// pre-KAN-32 behavior — expensive, but correct and non-destructive).
+async fn owner_bucket_row_counts(
+    cluster: &Cluster,
+    stage_id: u32,
+    num_partitions: u32,
+    per_worker: &HashMap<String, Option<Vec<usize>>>,
+) -> Vec<usize> {
+    let mut counts = vec![0usize; num_partitions as usize];
     for p in 0..num_partitions {
         let Ok(ep) = cluster.owner_endpoint(p) else {
             continue;
@@ -1196,8 +1579,6 @@ async fn sample_bucket_row_counts(
                     counts[p as usize] = *n;
                 }
             }
-            // Older worker without the row-count action: pull the owner's bucket (the
-            // pre-KAN-32 behavior — expensive, but correct and non-destructive).
             _ => {
                 if let Ok(batches) = pull_bucket_with_retry(ep, stage_id, p).await {
                     counts[p as usize] = batches.iter().map(|b| b.num_rows()).sum();
@@ -1322,12 +1703,72 @@ fn unify_schema(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
         .collect()
 }
 
+/// AQE read modulus for a consumer stage: the smallest coalesced partition count recorded at
+/// any of its upstreams' stage barriers, or `None` when no upstream was coalesced (the no-AQE
+/// path keeps the legacy one-bucket read). One modulus for the whole stage preserves
+/// shuffle-join co-location: bucket `b` of every upstream is read by the same consumer
+/// partition `b % m`. An upstream without a decision simply follows along — all of its
+/// buckets are still read exactly once.
+fn consumer_read_modulus(stage: &StageDef, coalesced: &HashMap<u32, u32>) -> Option<u32> {
+    stage
+        .upstream_stage_ids
+        .iter()
+        .filter_map(|s| coalesced.get(s).copied())
+        .min()
+}
+
+/// The subset of `stage`'s upstreams produced in `ExchangeMode::Forward`: each ran exactly
+/// once, on the first endpoint of the consumer's `upstream_endpoints` (see the producer
+/// dispatch above), so consumers pull those upstreams from that endpoint only.
+pub(crate) fn forward_upstreams(stage: &StageDef, stages: &HashMap<u32, StageDef>) -> Vec<u32> {
+    stage
+        .upstream_stage_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            stages
+                .get(id)
+                .is_some_and(|d| d.exchange == ExchangeMode::Forward)
+        })
+        .collect()
+}
+
+/// The flattened [`StageTicket::upstream_bucket_rows`] for a consumer stage: every
+/// upstream's barrier-measured per-bucket row totals in `upstream_stage_ids` order, or
+/// empty when any upstream has no measurement (`WEFT_STAGE_INPUT_STATS=0`, an incomplete
+/// sample, or a producer this query did not measure) — the worker then registers its
+/// shuffle inputs without measured statistics and falls back to the MemTable's own.
+fn measured_upstream_bucket_rows(
+    stage: &StageDef,
+    num_partitions: u32,
+    stage_rows: &HashMap<u32, Vec<u64>>,
+) -> Vec<u64> {
+    if stage.upstream_stage_ids.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(stage.upstream_stage_ids.len() * num_partitions as usize);
+    for up in &stage.upstream_stage_ids {
+        let Some(rows) = stage_rows.get(up) else {
+            return Vec::new();
+        };
+        if rows.len() != num_partitions as usize {
+            return Vec::new();
+        }
+        out.extend_from_slice(rows);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn stage_ticket(
     stage: &StageDef,
     partition_id: u32,
     num_partitions: u32,
+    coalesce_read_modulus: u32,
     cluster: &Cluster,
     produce: bool,
+    stages: &HashMap<u32, StageDef>,
+    stage_rows: &HashMap<u32, Vec<u64>>,
 ) -> StageTicket {
     StageTicket {
         stage_id: stage.stage_id,
@@ -1345,6 +1786,9 @@ fn stage_ticket(
         produce,
         lakehouse_snapshot_pins: stage.lakehouse_snapshot_pins.clone(),
         replicated_tables: stage.replicated_tables.clone(),
+        coalesce_read_modulus,
+        forward_upstream_stage_ids: forward_upstreams(stage, stages),
+        upstream_bucket_rows: measured_upstream_bucket_rows(stage, num_partitions, stage_rows),
     }
 }
 
@@ -1380,8 +1824,195 @@ mod tests {
 
         stage.plan_fragment = Some(vec![1, 2, 3]);
         let cluster = Cluster::new(vec!["a:1".into()]);
-        let ticket = stage_ticket(&stage, 0, 1, &cluster, true);
+        let stages = HashMap::from([(3, StageDef::new(3, "SELECT 1", vec![], vec![0]))]);
+        let ticket = stage_ticket(&stage, 0, 1, 0, &cluster, true, &stages, &HashMap::new());
         assert_eq!(ticket.plan_fragment, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn stage_ticket_marks_forward_upstreams() {
+        // Upstream 1 is Forward (produced once, on the first endpoint); upstream 0 is an
+        // ordinary hash shuffle. The consumer's ticket must mark only stage 1.
+        let stages = HashMap::from([
+            (0, StageDef::new(0, "SELECT 1", vec![], vec![0])),
+            (1, {
+                let mut s = StageDef::new(1, "SELECT 2", vec![], vec![0]);
+                s.exchange = ExchangeMode::Forward;
+                s
+            }),
+        ]);
+        let consumer = StageDef::new(2, "SELECT * FROM shuffle_input_0", vec![0, 1], vec![]);
+        let cluster = Cluster::new(vec!["a:1".into(), "b:1".into()]);
+        let ticket = stage_ticket(
+            &consumer,
+            0,
+            2,
+            0,
+            &cluster,
+            false,
+            &stages,
+            &HashMap::new(),
+        );
+        assert_eq!(ticket.forward_upstream_stage_ids, vec![1]);
+
+        // A consumer of only hash upstreams marks nothing (legacy pull-everywhere read).
+        let hash_consumer = StageDef::new(3, "SELECT * FROM shuffle_input_0", vec![0], vec![]);
+        let ticket = stage_ticket(
+            &hash_consumer,
+            0,
+            2,
+            0,
+            &cluster,
+            false,
+            &stages,
+            &HashMap::new(),
+        );
+        assert!(ticket.forward_upstream_stage_ids.is_empty());
+    }
+
+    #[test]
+    fn stage_ticket_carries_measured_upstream_bucket_rows() {
+        let stages = HashMap::from([
+            (0, StageDef::new(0, "SELECT 1", vec![], vec![0])),
+            (1, StageDef::new(1, "SELECT 2", vec![], vec![0])),
+        ]);
+        let consumer = StageDef::new(
+            2,
+            "SELECT * FROM shuffle_input_0 JOIN shuffle_input_1 USING (k)",
+            vec![0, 1],
+            vec![],
+        );
+        let cluster = Cluster::new(vec!["a:1".into(), "b:1".into()]);
+        // Both upstreams measured at their barriers: the ticket flattens the per-bucket
+        // totals in upstream order (`num_partitions` entries each).
+        let stage_rows = HashMap::from([(0, vec![10u64, 20]), (1, vec![30u64, 40])]);
+        let ticket = stage_ticket(&consumer, 0, 2, 0, &cluster, false, &stages, &stage_rows);
+        assert_eq!(ticket.upstream_bucket_rows, vec![10, 20, 30, 40]);
+
+        // Any unmeasured upstream (or a partition-count mismatch) drops the whole field —
+        // the worker falls back to its own MemTable statistics rather than trusting a
+        // partial measurement.
+        let partial = HashMap::from([(0, vec![10u64, 20])]);
+        let ticket = stage_ticket(&consumer, 0, 2, 0, &cluster, false, &stages, &partial);
+        assert!(ticket.upstream_bucket_rows.is_empty());
+        let wrong_len = HashMap::from([(0, vec![10u64]), (1, vec![30u64, 40])]);
+        let ticket = stage_ticket(&consumer, 0, 2, 0, &cluster, false, &stages, &wrong_len);
+        assert!(ticket.upstream_bucket_rows.is_empty());
+
+        // A leaf stage never carries measurements.
+        let leaf = StageDef::new(0, "SELECT 1", vec![], vec![0]);
+        let ticket = stage_ticket(&leaf, 0, 2, 0, &cluster, true, &stages, &stage_rows);
+        assert!(ticket.upstream_bucket_rows.is_empty());
+    }
+
+    /// A four-table chain DAG as build_chain emits it: leaves interleaved with joins,
+    /// partial agg, final agg.
+    fn chain4_stages() -> Vec<StageDef> {
+        vec![
+            StageDef::new(0, "SELECT k AS ta__k FROM ta", vec![], vec![0]),
+            StageDef::new(1, "SELECT k AS tb__k FROM tb", vec![], vec![0]),
+            StageDef::new(2, "SELECT … join ta tb", vec![0, 1], vec![1]),
+            StageDef::new(3, "SELECT k AS tc__k FROM tc", vec![], vec![0]),
+            StageDef::new(4, "SELECT … join _ tc", vec![2, 3], vec![1]),
+            StageDef::new(5, "SELECT k AS td__k FROM td", vec![], vec![0]),
+            StageDef::new(6, "SELECT … join _ td", vec![4, 5], vec![0]),
+            StageDef::new(7, "SELECT … final agg", vec![6], vec![]),
+        ]
+    }
+
+    #[test]
+    fn splice_replanned_tail_maps_ids_and_upstreams() {
+        let stages = chain4_stages();
+        let dispatched: HashSet<u32> = [0, 1, 3, 5].into_iter().collect();
+        // The re-planned DAG (fresh sequential ids) permuted the tail joins: the td leaf
+        // sits at position 3, tc at 5; join/final SQL differs (unmatched).
+        let replanned = vec![
+            StageDef::new(0, "SELECT k AS ta__k FROM ta", vec![], vec![0]),
+            StageDef::new(1, "SELECT k AS tb__k FROM tb", vec![], vec![0]),
+            StageDef::new(2, "SELECT … join ta tb (rekeyed)", vec![0, 1], vec![1]),
+            StageDef::new(3, "SELECT k AS td__k FROM td", vec![], vec![0]),
+            StageDef::new(4, "SELECT … join _ td (new)", vec![2, 3], vec![1]),
+            StageDef::new(5, "SELECT k AS tc__k FROM tc", vec![], vec![0]),
+            StageDef::new(6, "SELECT … join _ tc (new)", vec![4, 5], vec![0]),
+            StageDef::new(7, "SELECT … final agg (new)", vec![6], vec![]),
+        ];
+        let spliced = splice_replanned_tail(&stages, &dispatched, replanned).expect("must splice");
+
+        // Equal count, identical id set — cancel-watcher / abort-guard id lists stay valid.
+        assert_eq!(spliced.len(), stages.len());
+        let mut ids: Vec<u32> = spliced.iter().map(|s| s.stage_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..8).collect::<Vec<_>>());
+
+        // Every dispatched leaf kept its id AND its SQL (worker caches key on both).
+        for d in [0u32, 1, 3, 5] {
+            let old = stages.iter().find(|s| s.stage_id == d).unwrap();
+            let new = spliced.iter().find(|s| s.stage_id == d).unwrap();
+            assert_eq!(new.sql, old.sql, "dispatched stage {d} SQL must not change");
+            assert_eq!(new.hash_key_cols, old.hash_key_cols);
+        }
+        // The td leaf moved to chain position 3 but kept stage id 5; the join consuming it
+        // (chain position 4, leftover id 4) rewrote its upstreams through the map.
+        assert_eq!(spliced[3].stage_id, 5);
+        assert_eq!(spliced[3].sql, "SELECT k AS td__k FROM td");
+        assert_eq!(spliced[4].stage_id, 4);
+        assert_eq!(spliced[4].upstream_stage_ids, vec![2, 5]);
+        assert_eq!(spliced[5].stage_id, 3);
+        assert_eq!(spliced[6].upstream_stage_ids, vec![4, 3]);
+        assert_eq!(spliced[7].stage_id, 7);
+        assert_eq!(spliced[7].upstream_stage_ids, vec![6]);
+    }
+
+    #[test]
+    fn splice_replanned_tail_bails_on_mismatch() {
+        let stages = chain4_stages();
+        let original_sql: Vec<String> = stages.iter().map(|s| s.sql.clone()).collect();
+        let dispatched: HashSet<u32> = [0, 1, 3, 5].into_iter().collect();
+
+        // A dispatched leaf's SQL changed in the re-plan: cannot preserve its id → None,
+        // and the input stages stay untouched (zero-cost rollback).
+        let mut bad = chain4_stages();
+        bad[3].sql = "SELECT k AS tc__k FROM tc WHERE k > 0".into();
+        assert!(splice_replanned_tail(&stages, &dispatched, bad).is_none());
+        assert_eq!(
+            stages.iter().map(|s| s.sql.clone()).collect::<Vec<_>>(),
+            original_sql
+        );
+
+        // A hash-key change on a dispatched leaf is a mismatch too.
+        let mut bad = chain4_stages();
+        bad[1].hash_key_cols = vec![1];
+        assert!(splice_replanned_tail(&stages, &dispatched, bad).is_none());
+
+        // Stage-count mismatch → None.
+        let short = chain4_stages()[..7].to_vec();
+        assert!(splice_replanned_tail(&stages, &dispatched, short).is_none());
+    }
+
+    #[test]
+    fn consumer_read_modulus_takes_min_of_coalesced_upstreams() {
+        let stage = StageDef::new(
+            2,
+            "SELECT k FROM shuffle_input_0 JOIN shuffle_input_1 USING (k)",
+            vec![0, 1],
+            vec![0],
+        );
+        let mut coalesced = HashMap::new();
+        // No decision recorded: the legacy one-bucket read (identity modulus).
+        assert_eq!(consumer_read_modulus(&stage, &coalesced), None);
+
+        // Two coalesced upstreams: one shared modulus keeps join co-location.
+        coalesced.insert(0, 4);
+        coalesced.insert(1, 2);
+        assert_eq!(consumer_read_modulus(&stage, &coalesced), Some(2));
+
+        // An upstream without a decision does not block coalescing the read.
+        coalesced.remove(&1);
+        assert_eq!(consumer_read_modulus(&stage, &coalesced), Some(4));
+
+        // A leaf stage has no upstreams and never gets a modulus.
+        let leaf = StageDef::new(0, "SELECT 1", vec![], vec![0]);
+        assert_eq!(consumer_read_modulus(&leaf, &coalesced), None);
     }
 
     #[test]

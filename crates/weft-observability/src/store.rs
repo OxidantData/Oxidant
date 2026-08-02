@@ -435,6 +435,7 @@ impl AppStateStore {
                     });
             }
             ExecutionEvent::AqeCoalesced { .. } => {}
+            ExecutionEvent::ReoptimizedJoinOrder { .. } => {}
             ExecutionEvent::DistributedFallback {
                 operation_id,
                 reason,

@@ -68,6 +68,9 @@ mod tests {
             produce,
             lakehouse_snapshot_pins: String::new(),
             replicated_tables: String::new(),
+            coalesce_read_modulus: 0,
+            forward_upstream_stage_ids: vec![],
+            upstream_bucket_rows: vec![],
         }
     }
 

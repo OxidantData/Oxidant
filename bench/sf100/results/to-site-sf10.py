@@ -3,9 +3,9 @@
 
 Ground truth is per-query JSONL (one record per query: status, hot_s, runDate):
 
-- weft: run-spark-connect.py against the distributed cluster (perf-f1f5-sf10/, after the
-  per-query-overhead fixes: cached table sizing, concurrent partition dispatch, pooled
-  Flight channels, single planning pass, AQE sampling off, 10 GiB shuffle budget).
+- weft: run-spark-connect.py against the distributed cluster (perf-planshape-sf10/, after the
+  plan-shape program: footer/measured statistics, build-side-bounded hash joins, dim + plan
+  caches, FILTER-merge shared scans, Q23 Forward arms, parallel dispatch, AQE off).
 - Spark on EMR: bench/sf100/emr/run-emr-suite.py, same queries and same S3 bytes on the
   same instance spec (1x c6g.2xlarge driver/master, 2x m8g.2xlarge workers/core), re-run
   fresh the same day.
@@ -59,7 +59,7 @@ SUITES = [
         "out": os.path.join(SITE, "tpch.json"),
         "dataset": "TPC-H SF10 Parquet on S3 (`s3://weft-artifacts-…/tpch-sf10/`)",
         "jsonl": {
-            "weft": os.path.join(HERE, "perf-f1f5-sf10", "tpch-sf10.jsonl"),
+            "weft": os.path.join(HERE, "perf-planshape-sf10", "tpch-sf10-v3.json"),
             "emr": os.path.join(HERE, "perf-f1f5-sf10", "tpch-sf10-emr.jsonl"),
         },
     },
@@ -67,7 +67,7 @@ SUITES = [
         "out": os.path.join(SITE, "tpcds.json"),
         "dataset": "TPC-DS SF10 Parquet on S3 (`s3://weft-artifacts-…/tpcds-sf10/`)",
         "jsonl": {
-            "weft": os.path.join(HERE, "perf-f1f5-sf10", "tpcds-sf10.jsonl"),
+            "weft": os.path.join(HERE, "perf-planshape-sf10", "tpcds-sf10-v3.json"),
             "emr": os.path.join(HERE, "perf-f1f5-sf10", "tpcds-sf10-emr.jsonl"),
         },
     },

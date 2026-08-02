@@ -25,6 +25,9 @@ fn stalled_stage_ticket(stage_id: u32) -> StageTicket {
         produce: false,
         lakehouse_snapshot_pins: String::new(),
         replicated_tables: String::new(),
+        coalesce_read_modulus: 0,
+        forward_upstream_stage_ids: vec![],
+        upstream_bucket_rows: vec![],
     }
 }
 

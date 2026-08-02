@@ -6385,6 +6385,15 @@ fn where_clause(up: &Unparser, preds: &[&Expr]) -> Result<String> {
 /// every partition — so a partition-0 gate (`EXISTS` on a gathered one-row stage) makes the
 /// query emit exactly once cluster-wide.
 ///
+/// Scalars whose bodies share the same `FROM` tail (Q9: all 15 read `store_sales`, differing
+/// only in filter conjuncts) merge into ONE partial computing every aggregate as
+/// `agg(arg) FILTER (WHERE …)` over a single shared scan and ONE combine emitting every value as
+/// a column `s{j}` of a single row; scalar `i` then reads `(SELECT s{j} FROM
+/// shuffle_input_{u})`. A FILTER-ed partial equals the body's own `WHERE` partial — the filter
+/// removes the same rows before aggregation — with the same NULL-over-empty convention
+/// (FILTER-count is 0, FILTER-sum/avg NULL). Scalars with a unique tail keep the per-scalar
+/// stage pair.
+///
 /// Anything outside this shape (grouped / DISTINCT / correlated scalar bodies, non-scalar
 /// subqueries in the projection, aggregates or subqueries in the outer body, a sharded table in
 /// the outer body) returns `Ok(None)` and keeps the existing gather / rejection behavior.
@@ -6450,23 +6459,99 @@ pub(crate) fn try_scalar_subquery_projection(
     }
 
     let up = Unparser::default();
-    let mut stages: Vec<StageDef> = Vec::new();
-    let mut combine_ids: Vec<u32> = Vec::new();
+    let mut bodies: Vec<ScalarBodyStages> = Vec::with_capacity(scalars.len());
     for sub in &scalars {
-        let Some((partial_sql, combine_sql, forward_partial)) =
-            global_scalar_body_stages(&up, sub, replicated)?
-        else {
+        let Some(body) = global_scalar_body_stages(&up, sub, replicated)? else {
             return Ok(None);
         };
+        bodies.push(body);
+    }
+
+    // Group scalars by identical body tail: Q9's 15 scalars all read `FROM store_sales` and
+    // differ only in filter conjuncts, so one shared scan computing every aggregate as a
+    // FILTER-ed partial replaces 15 sharded scans with 1. Groups of one keep the per-scalar
+    // stage pair. Group order is first appearance, so a projection whose tails are all unique
+    // emits exactly the per-scalar stages it did before.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_index: HashMap<(String, bool), usize> = HashMap::new();
+    for (i, body) in bodies.iter().enumerate() {
+        let key = (body.inner_tail.clone(), body.forward_partial);
+        let g = match group_index.get(&key) {
+            Some(&g) => g,
+            None => {
+                let g = groups.len();
+                group_index.insert(key, g);
+                groups.push(Vec::new());
+                g
+            }
+        };
+        groups[g].push(i);
+    }
+
+    let mut stages: Vec<StageDef> = Vec::new();
+    let mut combine_ids: Vec<u32> = Vec::new();
+    // Per scalar (textual order): the one-row subquery the projection rewrite substitutes —
+    // `SELECT * FROM shuffle_input_{u}` for a per-scalar combine, `SELECT s{j} FROM
+    // shuffle_input_{u}` for member j of a merged combine (whose single row carries every
+    // member's value as a column).
+    let mut scalar_replacements: Vec<Option<String>> = vec![None; scalars.len()];
+    for group in &groups {
         let pid = stages.len() as u32;
+        let (partial_sql, combine_sql);
+        if group.len() == 1 {
+            let body = &bodies[group[0]];
+            partial_sql = body.partial_sql.clone();
+            combine_sql = body.combine_sql.clone();
+        } else {
+            let mut items: Vec<String> = Vec::new();
+            let mut combs: Vec<String> = Vec::new();
+            let mut projs: Vec<String> = Vec::new();
+            for (j, &i) in group.iter().enumerate() {
+                let body = &bodies[i];
+                items.extend(filter_partial_items(body, j)?);
+                let (_, comb) = per_key_agg_parts(&body.func, &body.arg_sql, j)?;
+                combs.push(format!("{comb} AS m{j}"));
+                let proj = match &body.projection {
+                    Some(e) => {
+                        let mut rename = HashMap::new();
+                        rename.insert("m0".to_string(), format!("m{j}"));
+                        expr_sql(&up, &remap_expr_columns(e, &rename))?
+                    }
+                    None => format!("m{j}"),
+                };
+                projs.push(format!("{proj} AS s{j}"));
+            }
+            partial_sql = sanitize_generated_sql(&format!(
+                "SELECT {} {}",
+                items.join(", "),
+                bodies[group[0]].inner_tail
+            ));
+            // Every member's partial rides the same one row per worker, so a single
+            // `HAVING COUNT(*) > 0` keeps the combined row exactly on the gather partition.
+            // A member that is NULL over empty input reads as a NULL scalar either way — the
+            // per-scalar convention (see global_scalar_body_stages).
+            combine_sql = format!(
+                "SELECT {} FROM (SELECT {} FROM shuffle_input HAVING COUNT(*) > 0) AS combined",
+                projs.join(", "),
+                combs.join(", ")
+            );
+        }
         let mut partial = StageDef::new(pid, partial_sql, vec![], vec![]);
-        if forward_partial {
+        if bodies[group[0]].forward_partial {
             // Replicated body: identical on every worker, so compute the partial exactly once.
             partial.exchange = ExchangeMode::Forward;
         }
         stages.push(partial);
         stages.push(StageDef::new(pid + 1, combine_sql, vec![pid], vec![]));
         combine_ids.push(pid + 1);
+        let upstream = combine_ids.len() - 1;
+        for (j, &i) in group.iter().enumerate() {
+            scalar_replacements[i] = Some(if group.len() == 1 {
+                format!("SELECT * FROM shuffle_input_{upstream}")
+            } else {
+                format!("SELECT s{j} FROM shuffle_input_{upstream}")
+            });
+        }
     }
 
     // Re-emit the original projection with each scalar subquery swapped for its one-row input,
@@ -6480,7 +6565,16 @@ pub(crate) fn try_scalar_subquery_projection(
             ))
         })?
         .to_string();
-    let Ok((rewritten_sql, replaced)) = rewrite_scalar_subqueries(&original_sql, scalars.len())
+    let mut replacements: Vec<String> = Vec::with_capacity(scalars.len());
+    for r in scalar_replacements {
+        let Some(r) = r else {
+            return Err(Error::Unsupported(
+                "auto-distribute: scalar subquery did not map to a combine stage".into(),
+            ));
+        };
+        replacements.push(r);
+    }
+    let Ok((rewritten_sql, replaced)) = rewrite_scalar_subqueries(&original_sql, &replacements)
     else {
         // The textual and logical subquery walks did not correspond 1:1 — not this shape.
         return Ok(None);
@@ -6511,14 +6605,35 @@ pub(crate) fn try_scalar_subquery_projection(
     }))
 }
 
-/// Validate one uncorrelated global-aggregate scalar body and emit its `(partial_sql,
-/// combine_sql, forward_partial)` stage SQL — `Ok(None)` when the body is outside the provable
-/// shape. Mirrors the checks in [`classify_scalar_conjunct`], minus the compare-side handling.
+/// One validated uncorrelated global-aggregate scalar body: its per-scalar stage SQL (used
+/// as-is when no other scalar shares the body tail) plus the pieces
+/// [`try_scalar_subquery_projection`] needs to merge same-tail bodies into one shared
+/// FILTER-aggregate scan.
+struct ScalarBodyStages {
+    partial_sql: String,
+    combine_sql: String,
+    forward_partial: bool,
+    /// Sanitized `FROM …` tail of the body — the merge key.
+    inner_tail: String,
+    /// Body filter conjuncts as ` WHERE …` (empty when unfiltered); becomes each aggregate's
+    /// `FILTER (WHERE …)` clause in the merged partial.
+    inner_where: String,
+    /// Lowercased aggregate name and argument SQL (see [`AggSpec`]).
+    func: String,
+    arg_sql: String,
+    /// The body's projection over the aggregate, validated to reference only the combined value
+    /// as the unqualified column `m0` (`None` = the value itself).
+    projection: Option<Expr>,
+}
+
+/// Validate one uncorrelated global-aggregate scalar body and emit its per-scalar stage SQL plus
+/// the merge pieces — `Ok(None)` when the body is outside the provable shape. Mirrors the checks
+/// in [`classify_scalar_conjunct`], minus the compare-side handling.
 fn global_scalar_body_stages(
     up: &Unparser,
     subquery: &LogicalPlan,
     replicated: &[&str],
-) -> Result<Option<(String, String, bool)>> {
+) -> Result<Option<ScalarBodyStages>> {
     let mut sp = subquery;
     while let LogicalPlan::SubqueryAlias(a) = sp {
         sp = a.input.as_ref();
@@ -6630,6 +6745,7 @@ fn global_scalar_body_stages(
     if let Some(f) = sub_agg.schema.fields().first() {
         m0_remap.insert(f.name().clone(), "m0".to_string());
     }
+    let mut projection_mapped: Option<Expr> = None;
     let proj_sql = match projection {
         Some(exprs) => {
             if expr_contains_subquery(&exprs[0]) {
@@ -6641,7 +6757,9 @@ fn global_scalar_body_stages(
             if !cols.iter().all(|c| c.relation.is_none() && c.name == "m0") {
                 return Ok(None);
             }
-            expr_sql(up, &mapped)?
+            let sql = expr_sql(up, &mapped)?;
+            projection_mapped = Some(mapped);
+            sql
         }
         None => "m0".to_string(),
     };
@@ -6649,28 +6767,64 @@ fn global_scalar_body_stages(
         "SELECT {proj_sql} AS s0 FROM \
          (SELECT {comb} AS m0 FROM shuffle_input HAVING COUNT({guard}) > 0) AS combined"
     );
-    Ok(Some((partial_sql, combine_sql, forward_partial)))
+    Ok(Some(ScalarBodyStages {
+        partial_sql,
+        combine_sql,
+        forward_partial,
+        inner_tail,
+        inner_where,
+        func: spec.func,
+        arg_sql: spec.arg_sql,
+        projection: projection_mapped,
+    }))
+}
+
+/// Member `j`'s partial columns for a merged same-tail scan: the [`per_key_agg_parts`] items
+/// with the body's filter conjuncts re-attached as `agg(arg) FILTER (WHERE …)` (dropped when
+/// the body is unfiltered). Nullability matches the body's own `WHERE` partial exactly —
+/// FILTER-count is 0 (not NULL) over an empty band, FILTER-sum/avg is NULL — because the filter
+/// removes the same rows before aggregation.
+fn filter_partial_items(body: &ScalarBodyStages, j: usize) -> Result<Vec<String>> {
+    let (items, _) = per_key_agg_parts(&body.func, &body.arg_sql, j)?;
+    if body.inner_where.is_empty() {
+        return Ok(items);
+    }
+    items
+        .into_iter()
+        .map(|item| {
+            // `sum(x) AS a1s` → `sum(x) FILTER (WHERE …) AS a1s`; the alias is the last
+            // ` AS ` (an argument CAST's AS sits earlier).
+            let Some(k) = item.rfind(" AS ") else {
+                return Err(Error::Unsupported(format!(
+                    "auto-distribute: partial aggregate `{item}` has no alias"
+                )));
+            };
+            Ok(format!(
+                "{} FILTER ({}){}",
+                &item[..k],
+                body.inner_where.trim_start(),
+                &item[k..]
+            ))
+        })
+        .collect()
 }
 
 /// Parse generated SQL and replace each scalar `(SELECT …)` expression — in textual order — with
-/// a one-row `(SELECT * FROM shuffle_input_{i})` subquery, returning the rewritten SQL and the
-/// replacement count. Only scalar subquery expression nodes are touched (derived tables in FROM
-/// are a different AST node); the count lets the caller verify the logical and textual subquery
-/// walks corresponded 1:1 before trusting the rewrite.
-fn rewrite_scalar_subqueries(sql: &str, inputs: usize) -> Result<(String, usize)> {
+/// the given one-row subquery (`SELECT * FROM shuffle_input_{u}` for a per-scalar combine,
+/// `SELECT s{j} FROM shuffle_input_{u}` for member `j` of a merged same-tail combine), returning
+/// the rewritten SQL and the replacement count. Only scalar subquery expression nodes are
+/// touched (derived tables in FROM are a different AST node); the count lets the caller verify
+/// the logical and textual subquery walks corresponded 1:1 before trusting the rewrite.
+fn rewrite_scalar_subqueries(sql: &str, replacements: &[String]) -> Result<(String, usize)> {
     use std::ops::ControlFlow;
 
     use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Statement, VisitMut, VisitorMut};
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
 
-    let mut replacements: Vec<SqlExpr> = Vec::with_capacity(inputs);
-    for i in 0..inputs {
-        let mut stmts = Parser::parse_sql(
-            &GenericDialect {},
-            &format!("SELECT * FROM shuffle_input_{i}"),
-        )
-        .map_err(|e| {
+    let mut replacement_exprs: Vec<SqlExpr> = Vec::with_capacity(replacements.len());
+    for text in replacements {
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, text).map_err(|e| {
             Error::Unsupported(format!(
                 "auto-distribute: build scalar replacement subquery: {e}"
             ))
@@ -6680,7 +6834,7 @@ fn rewrite_scalar_subqueries(sql: &str, inputs: usize) -> Result<(String, usize)
                 "auto-distribute: scalar replacement subquery did not parse".into(),
             ));
         };
-        replacements.push(SqlExpr::Subquery(q));
+        replacement_exprs.push(SqlExpr::Subquery(q));
     }
 
     struct Rewriter {
@@ -6716,14 +6870,15 @@ fn rewrite_scalar_subqueries(sql: &str, inputs: usize) -> Result<(String, usize)
         )));
     }
     let mut rewriter = Rewriter {
-        replacements,
+        replacements: replacement_exprs,
         count: 0,
     };
     let _ = statements.visit(&mut rewriter);
-    if rewriter.count != inputs {
+    if rewriter.count != replacements.len() {
         return Err(Error::Unsupported(format!(
-            "auto-distribute: scalar replacement saw {} textual subqueries for {inputs} logical",
-            rewriter.count
+            "auto-distribute: scalar replacement saw {} textual subqueries for {} logical",
+            rewriter.count,
+            replacements.len()
         )));
     }
     Ok((statements.remove(0).to_string(), rewriter.count))

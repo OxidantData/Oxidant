@@ -25,6 +25,7 @@ weft-streaming = { workspace = true }
 weft-observability = { workspace = true }
 weft-ui-server = { workspace = true }
 datafusion = "54"  # lower Spark Connect relations/expressions to DataFusion logical plans
+futures = "0.3"
 serde_json = "1"
 tonic = "0.12"
 prost = "0.13"

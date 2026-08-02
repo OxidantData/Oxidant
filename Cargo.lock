@@ -6525,6 +6525,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "datafusion",
+ "futures",
  "prost 0.13.5",
  "reqwest 0.12.28",
  "serde_json",
@@ -6578,6 +6579,7 @@ name = "weft-execution"
 version = "0.0.0"
 dependencies = [
  "arrow-flight",
+ "async-trait",
  "datafusion",
  "datafusion-proto",
  "futures",
@@ -6587,6 +6589,7 @@ dependencies = [
  "tokio",
  "tonic 0.14.6",
  "tracing",
+ "weft-catalog",
  "weft-common",
  "weft-loom",
  "weft-observability",
@@ -6622,6 +6625,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-sts",
+ "bytes",
  "chrono",
  "datafusion",
  "delta_kernel",
@@ -6635,6 +6639,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "weft-catalog",
  "weft-common",
  "weft-datasource",

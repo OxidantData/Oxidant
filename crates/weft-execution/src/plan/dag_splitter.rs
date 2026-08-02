@@ -20,6 +20,15 @@
 //!   inlines as N structurally identical subtrees; deduplicating by plan fingerprint (volatile
 //!   expressions excluded — they must re-evaluate per reference) leaves one sub-DAG whose
 //!   shuffle output every outer placeholder pulls.
+//! - **Branches sharing one scan merge into one sub-DAG.** TPC-DS Q88's eight time-bucket
+//!   `count(*)` aggregates differ only in their `time_dim` predicates, so the identical-branch
+//!   fingerprint keeps them distinct and each plans its own sharded scan + aggregate sub-DAG
+//!   (17 stages, eight full fact scans). Branches whose peeled aggregate inputs are structurally
+//!   identical *modulo their filter predicates* now plan together: one leaf stage scans the
+//!   shared tail once, computing every branch's partial aggregates as
+//!   `agg(…) FILTER (WHERE <branch predicate>)`, and one combine stage emits all branches'
+//!   values as columns. `COUNT(DISTINCT)`-carrying branches (TPC-DS Q28) can't compute in a
+//!   FILTER-merged leaf — they keep their own sub-DAGs.
 //!
 //! ## Why any join type at the outer skeleton is safe
 //!
@@ -39,12 +48,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
-use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, LogicalPlanBuilder};
 use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
 
+use super::shape_extensions::ensure_subquery_tables_replicated;
 use super::stage_planner::{
-    base_tables, peel, plan_distributed_logical, sanitize_generated_sql, DistributedQuery,
+    base_tables, count_table_scans, expr_sql, extract_from_tail, flatten_and_conjuncts,
+    partial_combine_sql, peel, plan_contains_distinct, plan_distributed_logical,
+    reject_unsafe_broadcast_shapes, sanitize_generated_sql, strip_alias, AggSpec, DistributedQuery,
 };
 use crate::driver::{ExchangeMode, StageDef};
 
@@ -102,10 +114,36 @@ pub(crate) fn try_branch_dag(
         }
     }
 
-    let mut rep_queries: HashMap<usize, DistributedQuery> = HashMap::with_capacity(reps.len());
     for &r in &reps {
+        reject_mixed_union_branch(branches[r].node, replicated)?;
+    }
+
+    // TPC-DS Q88: representatives whose peeled aggregate inputs are structurally identical
+    // modulo their filter predicates would otherwise each plan their own scan + aggregate
+    // sub-DAG (Q88: eight full store_sales scans, 17 stages). Group them into one shared-scan
+    // sub-DAG — one leaf computing every branch's partials as
+    // `agg(…) FILTER (WHERE <branch predicate>)`, one combine emitting all branches' columns —
+    // and point every member's outer placeholder at the shared combine output. Ineligible
+    // branches (DISTINCT-carrying, GROUP BY, HAVING, volatile, …) keep their own sub-DAGs.
+    // Merging requires the outer skeleton to re-assert the original output columns explicitly:
+    // a merged group's combine row carries every member branch's columns, and a wildcard outer
+    // would expand them all at every placeholder position.
+    let (merged_dqs, merged_members) = if skeleton_has_output_projection(lp) {
+        plan_merge_groups(&branches, &reps, replicated)
+    } else {
+        (HashMap::new(), HashMap::new())
+    };
+    let merged: HashSet<usize> = merged_members.values().flatten().copied().collect();
+
+    let mut rep_queries: HashMap<usize, DistributedQuery> = HashMap::with_capacity(reps.len());
+    for (leader, dq) in merged_dqs {
+        rep_queries.insert(leader, dq);
+    }
+    for &r in &reps {
+        if merged.contains(&r) {
+            continue;
+        }
         let branch = &branches[r];
-        reject_mixed_union_branch(branch.node, replicated)?;
         let dq = match branch.kind {
             BranchKind::Sharded => {
                 let dq = plan_branch(branch.node, replicated).map_err(|e| {
@@ -171,9 +209,19 @@ pub(crate) fn try_branch_dag(
     let mut next_id = 0u32;
     let mut rep_output: HashMap<usize, u32> = HashMap::with_capacity(reps.len());
     for &r in &reps {
+        if rep_output.contains_key(&r) {
+            continue; // already emitted as part of a shared-scan merge group
+        }
         let dq = rep_queries.remove(&r).expect("representative planned");
         let output = append_branch(&mut stages, &mut next_id, dq, r)?;
         rep_output.insert(r, output);
+        if let Some(members) = merged_members.get(&r) {
+            // Every member's placeholder points at the shared combine output, exactly like a
+            // deduplicated identical branch's occurrences.
+            for &m in members {
+                rep_output.insert(m, output);
+            }
+        }
     }
     // One upstream per *occurrence* (positions map to `shuffle_input_{i}` names on the worker);
     // deduplicated occurrences repeat their representative's output stage id, which the worker
@@ -232,6 +280,305 @@ fn forward_branch_query(branch: &LogicalPlan, branch_i: usize) -> Result<Distrib
         }],
         finalize_sql: None,
     })
+}
+
+/// One branch representative eligible for shared-scan merging: a bare global aggregate (through
+/// `SubqueryAlias` wrappers) over a tail structurally identical to other branches' tails once
+/// every `Filter` is factored out (TPC-DS Q88's eight time-bucket counts over the same star
+/// join). `None` from [`mergeable_branch`] for anything a FILTER-merged leaf cannot reproduce.
+struct MergeableBranch {
+    /// The branch's aggregates, classified (never DISTINCT).
+    aggs: Vec<AggSpec>,
+    /// SQL of the branch's full row predicate — the AND of every stripped `Filter` conjunct —
+    /// or `None` when the branch carries no filter.
+    predicate_sql: Option<String>,
+    /// Output column names the shared combine stage re-aliases this branch's values to.
+    out_names: Vec<String>,
+    /// Fingerprint of the filter-stripped tail (the merge group key).
+    tail_fp: String,
+    /// The filter-stripped aggregate input shared by the whole group.
+    tail: LogicalPlan,
+}
+
+/// Group merge-eligible representative branches by their shared filter-stripped tail and plan
+/// one shared-scan sub-DAG per group of ≥2. Returns each merged sub-DAG keyed by its group's
+/// first representative, plus that representative's full member list. A group whose merged
+/// planning fails falls back to ordinary per-branch sub-DAGs.
+fn plan_merge_groups(
+    branches: &[Branch<'_>],
+    reps: &[usize],
+    replicated: &[&str],
+) -> (HashMap<usize, DistributedQuery>, HashMap<usize, Vec<usize>>) {
+    let mut mergeable: HashMap<usize, MergeableBranch> = HashMap::new();
+    let mut fp_to_group: HashMap<String, Vec<usize>> = HashMap::new();
+    for &r in reps {
+        if branches[r].kind != BranchKind::Sharded {
+            continue;
+        }
+        if let Some(m) = mergeable_branch(branches[r].node, replicated) {
+            fp_to_group.entry(m.tail_fp.clone()).or_default().push(r);
+            mergeable.insert(r, m);
+        }
+    }
+
+    let mut dqs = HashMap::new();
+    let mut members_of = HashMap::new();
+    for group in fp_to_group.into_values() {
+        if group.len() < 2 {
+            continue;
+        }
+        // Every member's outputs share the one combine row; duplicate column names would
+        // collide there, so such a group stays on per-branch sub-DAGs.
+        let mut seen = HashSet::new();
+        if !group
+            .iter()
+            .flat_map(|r| mergeable[r].out_names.iter())
+            .all(|name| seen.insert(name))
+        {
+            continue;
+        }
+        let members: Vec<&MergeableBranch> = group.iter().map(|r| &mergeable[r]).collect();
+        match merged_shared_scan_query(&members) {
+            Ok(dq) => {
+                dqs.insert(group[0], dq);
+                members_of.insert(group[0], group);
+            }
+            Err(e) => {
+                if std::env::var("WEFT_TPCDS_DEBUG").is_ok() {
+                    eprintln!("[plan-debug] shared-scan branch merge declined: {e}");
+                }
+            }
+        }
+    }
+    (dqs, members_of)
+}
+
+/// Classify a branch representative for shared-scan merging. `None` for anything a
+/// FILTER-merged leaf cannot reproduce: a GROUP BY / HAVING / ORDER BY / LIMIT above the
+/// aggregate, an output projection doing more than renaming the aggregate's outputs in order,
+/// a DISTINCT aggregate (TPC-DS Q28 — it keeps its co-located shuffle sub-DAG), a volatile
+/// expression, an unqualified or multiply-qualified output schema, or a tail that isn't a
+/// single-scan broadcast shape over INNER joins only.
+fn mergeable_branch(branch: &LogicalPlan, replicated: &[&str]) -> Option<MergeableBranch> {
+    let p = peel(branch).ok()?;
+    if p.sort.is_some()
+        || p.limit.is_some()
+        || !p.having.is_empty()
+        || !p.alias_projections.is_empty()
+        || !p.agg.group_expr.is_empty()
+        || plan_contains_volatile(branch)
+    {
+        return None;
+    }
+    // The output projection may only rename the aggregate's outputs, in order (Q88's
+    // `count(*) AS h8_30_to_9` aliasing) — the shared combine re-aliases each recombined value
+    // to that name. Any other expression over the aggregate output belongs to the branch's own
+    // sub-DAG.
+    if let Some(exprs) = p.projection {
+        let renames_in_order = exprs.len() == p.agg.aggr_expr.len()
+            && exprs.iter().zip(&p.agg.aggr_expr).all(|(proj, agg)| {
+                strip_alias(proj).schema_name().to_string()
+                    == strip_alias(agg).schema_name().to_string()
+            });
+        if !renames_in_order {
+            return None;
+        }
+    }
+    let aggs = p
+        .agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()
+        .ok()?;
+    if aggs.iter().any(|a| a.distinct) {
+        return None;
+    }
+    // The merged outer projection references branch outputs as `alias.column`: an unqualified
+    // or multiply-qualified schema cannot be re-aliased unambiguously, and duplicate names
+    // would collide on the shared combine row.
+    let schema = branch.schema();
+    let mut qualifier = None;
+    let mut out_names = Vec::with_capacity(schema.fields().len());
+    for (q, field) in schema.iter() {
+        match (&qualifier, q) {
+            (None, Some(q)) => qualifier = Some(q.clone()),
+            (Some(prev), Some(q)) if prev == q => {}
+            _ => return None,
+        }
+        out_names.push(field.name().clone());
+    }
+    {
+        let mut seen = HashSet::new();
+        if !out_names.iter().all(|name| seen.insert(name)) {
+            return None;
+        }
+    }
+
+    let (tail, conjuncts) = strip_filters(&p.agg.input)?;
+    // The shared tail must broadcast like any single-sharded aggregate input: exactly one
+    // sharded base table scanned once, only INNER joins (a predicate stripped off a preserved
+    // outer-join side would not commute to a post-join FILTER), no DISTINCT, and no
+    // sharded-table subqueries (checked on the original input, predicates included).
+    let tables = base_tables(&tail);
+    let sharded: Vec<&str> = tables
+        .iter()
+        .filter(|t| !replicated.contains(&t.as_str()))
+        .map(String::as_str)
+        .collect();
+    if sharded.len() != 1
+        || count_table_scans(&tail, sharded[0]) != 1
+        || !only_inner_joins(&tail)
+        || plan_contains_distinct(&tail)
+        || reject_unsafe_broadcast_shapes(&tail, sharded[0]).is_err()
+        || ensure_subquery_tables_replicated(&p.agg.input, &sharded, replicated).is_err()
+    {
+        return None;
+    }
+
+    let up = Unparser::default();
+    let predicate_sql = if conjuncts.is_empty() {
+        None
+    } else {
+        let mut parts = Vec::with_capacity(conjuncts.len());
+        for c in &conjuncts {
+            parts.push(format!("({})", expr_sql(&up, c).ok()?));
+        }
+        Some(parts.join(" AND "))
+    };
+    let tail_fp = format!("{tail}");
+    Some(MergeableBranch {
+        aggs,
+        predicate_sql,
+        out_names,
+        tail_fp,
+        tail,
+    })
+}
+
+/// Remove every `Filter` node from `lp`, returning the stripped plan plus the removed conjuncts
+/// (AND-able, in tree order). `None` when a node refuses to rebuild — the caller simply
+/// declines the merge. The conjuncts are only sound to reapply as a post-join row predicate
+/// when every join below is INNER; [`mergeable_branch`] checks that on the stripped tail.
+fn strip_filters(lp: &LogicalPlan) -> Option<(LogicalPlan, Vec<Expr>)> {
+    if let LogicalPlan::Filter(f) = lp {
+        let (input, mut conjuncts) = strip_filters(&f.input)?;
+        let mut mine = Vec::new();
+        flatten_and_conjuncts(&f.predicate, &mut mine);
+        mine.append(&mut conjuncts);
+        return Some((input, mine));
+    }
+    let inputs = lp.inputs();
+    if inputs.is_empty() {
+        return Some((lp.clone(), Vec::new()));
+    }
+    let mut conjuncts = Vec::new();
+    let mut stripped = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let (plan, mut preds) = strip_filters(input)?;
+        conjuncts.append(&mut preds);
+        stripped.push(plan);
+    }
+    let plan = lp.with_new_exprs(lp.expressions(), stripped).ok()?;
+    Some((plan, conjuncts))
+}
+
+/// Every join in `lp` is INNER, so a stripped row predicate commutes past it unchanged.
+fn only_inner_joins(lp: &LogicalPlan) -> bool {
+    let local = match lp {
+        LogicalPlan::Join(join) => join.join_type == JoinType::Inner,
+        _ => true,
+    };
+    local && lp.inputs().iter().all(|input| only_inner_joins(input))
+}
+
+/// Plan one shared sub-DAG for a merge group: a single leaf stage scans the group's
+/// filter-stripped tail once, computing every member branch's partial aggregates as
+/// `agg(…) FILTER (WHERE <branch predicate>)`, and one gather-combine stage recombines each
+/// branch's partials into its output columns (aliased back to the branch's original output
+/// names, which the outer placeholders resolve through their own aliases). The FILTER clause
+/// round-trips through the workers' Databricks-dialect parser (covered end-to-end by the Q88
+/// shape test). Both stages gather to partition 0 like any global aggregation.
+fn merged_shared_scan_query(members: &[&MergeableBranch]) -> Result<DistributedQuery> {
+    let input_sql = Unparser::default()
+        .plan_to_sql(&members[0].tail)
+        .map_err(|e| {
+            Error::Unsupported(format!("auto-distribute: unparse shared branch tail: {e}"))
+        })?
+        .to_string();
+    let tail = sanitize_generated_sql(&extract_from_tail(&input_sql)?);
+
+    let mut psel = Vec::new();
+    let mut combine = Vec::new();
+    let mut n = 0usize;
+    for member in members {
+        let filter = member
+            .predicate_sql
+            .as_ref()
+            .map(|p| format!(" FILTER (WHERE {p})"))
+            .unwrap_or_default();
+        for (a, out_name) in member.aggs.iter().zip(&member.out_names) {
+            psel.extend(partial_filter_items(&a.func, n, &a.arg_sql, &filter)?);
+            let (_sel, comb) = partial_combine_sql(&a.func, n, &a.arg_sql)?;
+            let expr = comb.strip_suffix(&format!(" AS r{n}")).ok_or_else(|| {
+                Error::Unsupported("auto-distribute: unexpected aggregate combine fragment".into())
+            })?;
+            combine.push(format!("{expr} AS \"{out_name}\""));
+            n += 1;
+        }
+    }
+
+    let leaf_sql = sanitize_generated_sql(&format!("SELECT {} {tail}", psel.join(", ")));
+    // The empty-bucket synthetic row reads as NULLs / zero counts; HAVING COUNT(*) > 0 keeps
+    // only partition 0's real row (same guard as the single-branch global path).
+    let combine_sql = sanitize_generated_sql(&format!(
+        "SELECT {} FROM shuffle_input HAVING COUNT(*) > 0",
+        combine.join(", ")
+    ));
+    Ok(DistributedQuery {
+        stages: vec![
+            StageDef::new(0, leaf_sql, vec![], vec![]),
+            StageDef::new(1, combine_sql, vec![0], vec![]),
+        ],
+        finalize_sql: None,
+    })
+}
+
+/// [`partial_combine_sql`]'s partial SELECT fragments with an aggregate `FILTER (WHERE …)`
+/// clause spliced onto each partial (a shared-scan leaf gates every branch's partials to that
+/// branch's predicate). `n` is the flat aggregate position across the whole merge group.
+fn partial_filter_items(func: &str, n: usize, arg_sql: &str, filter: &str) -> Result<Vec<String>> {
+    match func {
+        "sum" | "count" | "min" | "max" => Ok(vec![format!("{func}({arg_sql}){filter} AS a{n}")]),
+        "avg" => Ok(vec![format!(
+            "sum({arg_sql}){filter} AS a{n}s, count({arg_sql}){filter} AS a{n}c"
+        )]),
+        "stddev" | "var" | "stddev_pop" | "var_pop" => Ok(vec![format!(
+            "sum({arg_sql}){filter} AS a{n}s, sum(({arg_sql})*({arg_sql})){filter} AS a{n}q, \
+             count({arg_sql}){filter} AS a{n}c"
+        )]),
+        other => Err(Error::Unsupported(format!(
+            "auto-distribute: aggregate `{other}` not supported"
+        ))),
+    }
+}
+
+/// Whether the outer skeleton re-asserts the query's output columns in an explicit `Projection`
+/// above the branching node (DataFusion expands `SELECT *` at plan time, so this is the norm).
+/// Shared-scan merging requires it: a merged group's combine row carries every member branch's
+/// columns, and a wildcard outer stage would over-expand that wider row at every placeholder.
+fn skeleton_has_output_projection(lp: &LogicalPlan) -> bool {
+    let mut node = lp;
+    loop {
+        match node {
+            LogicalPlan::Projection(_) => return true,
+            LogicalPlan::Limit(l) => node = &l.input,
+            LogicalPlan::Sort(s) => node = &s.input,
+            LogicalPlan::Filter(f) => node = f.input.as_ref(),
+            LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
+            _ => return false,
+        }
+    }
 }
 
 /// Structural fingerprint for branch deduplication: the full plan tree below any top-level

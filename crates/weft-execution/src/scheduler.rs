@@ -7,7 +7,7 @@ use std::time::Duration;
 use weft_common::{Error, Result};
 use weft_loom::arrow::record_batch::RecordBatch;
 
-use crate::driver::StageDef;
+use crate::driver::{forward_upstreams, ExchangeMode, StageDef};
 use crate::flight::{
     health_check_worker, heartbeat_worker, pull_bucket_with_retry, run_stage_on_worker,
 };
@@ -158,7 +158,12 @@ async fn run_stage_inner_impl(
     let mut last_err = None;
 
     for attempt in 0..max {
-        if !worker_accepts_task(primary.clone()).await {
+        // Skip the slot probe on the first attempt: a saturated worker queues the task
+        // server-side (`acquire_task_slot`, bounded by `WEFT_TASK_SLOT_WAIT_MS`) instead of
+        // rejecting it, so the probe is a wasted RTT on the happy path. Retries and
+        // alternate-endpoint fallbacks still probe — skipping a genuinely full or dead
+        // worker there saves the whole stage-dispatch round trip.
+        if attempt > 0 && !worker_accepts_task(primary.clone()).await {
             last_err = Some(Error::Execution(format!(
                 "worker has no free task slots: {primary}"
             )));
@@ -238,16 +243,43 @@ async fn recompute_upstream_producers(
     lineage: &SharedLineage,
     stages: &std::collections::HashMap<u32, StageDef>,
 ) -> Result<()> {
+    // AQE: a coalesced consumer reads a whole modulus class of buckets, not just its own —
+    // the readability probe must cover the same set the consumer will pull.
+    let read_mod = if consumer.coalesce_read_modulus == 0 {
+        consumer.num_partitions
+    } else {
+        consumer.coalesce_read_modulus.min(consumer.num_partitions)
+    };
+    let needed = crate::aqe::coalesced_read_buckets(
+        consumer.num_partitions,
+        read_mod,
+        consumer.partition_id,
+    );
     for &up_stage in &consumer.upstream_stage_ids {
         let stage_def = stages
             .get(&up_stage)
             .ok_or_else(|| Error::Execution(format!("recompute: unknown stage {up_stage}")))?;
-        for (i, ep) in consumer.upstream_endpoints.iter().enumerate() {
-            let readable = pull_bucket_with_retry(ep.clone(), up_stage, consumer.partition_id)
-                .await
-                .map(|b| !b.is_empty())
-                .unwrap_or(false);
-            if readable {
+        // A Forward upstream is produced once, on the first endpoint — the only endpoint
+        // its consumers read (`StageTicket::forward_upstream_stage_ids`); probing the rest
+        // would only see their placeholder buckets.
+        let probe_endpoints = if stage_def.exchange == ExchangeMode::Forward {
+            &consumer.upstream_endpoints[..consumer.upstream_endpoints.len().min(1)]
+        } else {
+            &consumer.upstream_endpoints[..]
+        };
+        for (i, ep) in probe_endpoints.iter().enumerate() {
+            let mut all_readable = true;
+            for &bucket in &needed {
+                let readable = pull_bucket_with_retry(ep.clone(), up_stage, bucket)
+                    .await
+                    .map(|b| !b.is_empty())
+                    .unwrap_or(false);
+                if !readable {
+                    all_readable = false;
+                    break;
+                }
+            }
+            if all_readable {
                 continue;
             }
             let target = healthy_endpoints(std::slice::from_ref(ep))
@@ -272,6 +304,14 @@ async fn recompute_upstream_producers(
                 produce: true,
                 lakehouse_snapshot_pins: stage_def.lakehouse_snapshot_pins.clone(),
                 replicated_tables: stage_def.replicated_tables.clone(),
+                // A re-run producer keeps the legacy one-bucket read of its own upstreams.
+                coalesce_read_modulus: 0,
+                // …but still skips placeholder endpoints of any Forward upstreams it has.
+                forward_upstream_stage_ids: forward_upstreams(stage_def, stages),
+                // A re-run producer is dispatched outside its query's stage barriers, so the
+                // driver holds no measured row counts for its upstreams; the worker falls
+                // back to its own MemTable statistics.
+                upstream_bucket_rows: vec![],
             };
             run_stage_inner(membership, target, producer_ticket, lineage, stages).await?;
         }
@@ -290,7 +330,14 @@ pub async fn healthy_endpoints(endpoints: &[String]) -> Vec<String> {
     out
 }
 
+/// Test-only count of driver→worker slot probes, asserted by the R5-2 tests (the first
+/// task attempt must not probe; retries must).
+#[cfg(test)]
+static SLOT_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 async fn worker_accepts_task(endpoint: String) -> bool {
+    #[cfg(test)]
+    SLOT_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     match heartbeat_worker(endpoint.clone()).await {
         Ok(heartbeat) => heartbeat.has_available_slot(),
         Err(e) if action_unimplemented(&e) => health_check_worker(endpoint).await.is_ok(),
@@ -347,5 +394,87 @@ mod tests {
         assert!(needs_upstream_recompute(&Error::Execution(
             "shuffle bucket empty".into()
         )));
+    }
+
+    fn leaf_ticket() -> StageTicket {
+        StageTicket {
+            stage_id: 0,
+            partition_id: 0,
+            num_partitions: 1,
+            upstream_endpoints: vec![],
+            stage_sql: "SELECT 1 AS v".into(),
+            plan_fragment: vec![],
+            hash_key_cols: vec![],
+            upstream_stage_ids: vec![],
+            produce: false,
+            lakehouse_snapshot_pins: String::new(),
+            replicated_tables: String::new(),
+            coalesce_read_modulus: 0,
+            forward_upstream_stage_ids: vec![],
+            upstream_bucket_rows: vec![],
+        }
+    }
+
+    /// R5-2: the first task attempt dispatches without the heartbeat slot probe (a
+    /// saturated worker queues the task server-side); retries still probe. One test
+    /// function for both phases so the process-global probe counter can't race.
+    #[tokio::test]
+    async fn slot_probe_skipped_on_first_attempt_fires_on_retry() {
+        use std::sync::atomic::Ordering;
+
+        // Happy path against a live worker: attempt 0 succeeds with no probe at all.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let engine = Arc::new(weft_loom::Engine::new());
+        tokio::spawn(async move {
+            let _ = crate::flight::serve_worker(port, engine).await;
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let mut up = false;
+        for _ in 0..50 {
+            if health_check_worker(endpoint.clone()).await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(up, "worker did not become ready at {endpoint}");
+        let membership: Arc<dyn ClusterMembership> =
+            Arc::new(crate::membership::StaticMembership::new(vec![
+                endpoint.clone()
+            ]));
+        let lineage = Arc::new(crate::lineage::StageLineage::new());
+        let stages = std::collections::HashMap::new();
+        let before = SLOT_PROBES.load(Ordering::SeqCst);
+        let out = run_stage_inner_impl(&membership, endpoint, leaf_ticket(), &lineage, &stages)
+            .await
+            .expect("leaf stage on a live worker");
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(
+            SLOT_PROBES.load(Ordering::SeqCst) - before,
+            0,
+            "a first-attempt dispatch must not heartbeat-probe the worker"
+        );
+
+        // Dead endpoint: attempt 0 dispatches (and fails fast at connect); every later
+        // attempt probes the worker before re-dispatching.
+        let dead_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let dead = format!("http://127.0.0.1:{dead_port}");
+        let membership: Arc<dyn ClusterMembership> =
+            Arc::new(crate::membership::StaticMembership::new(vec![dead.clone()]));
+        let before = SLOT_PROBES.load(Ordering::SeqCst);
+        run_stage_inner_impl(&membership, dead, leaf_ticket(), &lineage, &stages)
+            .await
+            .expect_err("a dead worker must fail all attempts");
+        assert_eq!(
+            SLOT_PROBES.load(Ordering::SeqCst) - before,
+            (task_max_retries() - 1) as usize,
+            "every retry attempt must still probe the worker"
+        );
     }
 }

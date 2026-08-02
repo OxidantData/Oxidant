@@ -84,6 +84,30 @@ async fn driver_clears_stage_cache_on_success() {
     assert_stage_cache_cleared(&endpoint, 0, cluster.num_partitions).await;
 }
 
+/// The end-of-query sweep must reach EVERY worker, not just the first: with two workers the
+/// producer caches buckets on both, and both must be evicted on the success path.
+#[tokio::test]
+async fn driver_clears_stage_cache_on_every_worker() {
+    let (ep0, _e0) = start_worker().await;
+    let (ep1, _e1) = start_worker().await;
+    let cluster = Cluster::new(vec![ep0.clone(), ep1.clone()]);
+    let stages = vec![
+        StageDef::new(0, "SELECT 1 AS k, 2 AS v", vec![], vec![0]),
+        StageDef::new(
+            1,
+            "SELECT k, sum(v) AS s FROM shuffle_input GROUP BY k",
+            vec![0],
+            vec![],
+        ),
+    ];
+    run_stages(&cluster, &stages)
+        .await
+        .expect("two-stage query over two workers");
+    for ep in [&ep0, &ep1] {
+        assert_stage_cache_cleared(ep, 0, cluster.num_partitions).await;
+    }
+}
+
 #[tokio::test]
 async fn shuffle_input_deregistered_after_stage_exit() {
     let (endpoint, engine) = start_worker().await;
@@ -99,6 +123,9 @@ async fn shuffle_input_deregistered_after_stage_exit() {
         produce: true,
         lakehouse_snapshot_pins: String::new(),
         replicated_tables: String::new(),
+        coalesce_read_modulus: 0,
+        forward_upstream_stage_ids: vec![],
+        upstream_bucket_rows: vec![],
     };
     run_stage_on_worker(endpoint.clone(), producer)
         .await
@@ -116,6 +143,9 @@ async fn shuffle_input_deregistered_after_stage_exit() {
         produce: false,
         lakehouse_snapshot_pins: String::new(),
         replicated_tables: String::new(),
+        coalesce_read_modulus: 0,
+        forward_upstream_stage_ids: vec![],
+        upstream_bucket_rows: vec![],
     };
 
     // Success path: the table is dropped when the stage task returns.

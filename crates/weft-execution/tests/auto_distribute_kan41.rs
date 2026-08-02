@@ -161,8 +161,18 @@ async fn run_distributed(
     planner: &Engine,
     sql: &str,
 ) -> (weft_execution::plan::DistributedQuery, Vec<RecordBatch>) {
+    run_distributed_with(cluster, planner, sql, &REPLICATED).await
+}
+
+/// [`run_distributed`] with an explicit replicated-table list (per-shape engine layouts).
+async fn run_distributed_with(
+    cluster: &Cluster,
+    planner: &Engine,
+    sql: &str,
+    replicated: &[&str],
+) -> (weft_execution::plan::DistributedQuery, Vec<RecordBatch>) {
     let lp = planner.logical_plan(sql).await.expect("logical plan");
-    let dq = plan_distributed_logical(&lp, &REPLICATED).expect("plan_distributed_logical");
+    let dq = plan_distributed_logical(&lp, replicated).expect("plan_distributed_logical");
     let mut out = None;
     for _ in 0..150 {
         match run_stages(cluster, &dq.stages).await {
@@ -407,5 +417,216 @@ async fn q11_shape_distributed_matches_single_node() {
         rows_sorted(&actual),
         rows_sorted(&expected),
         "distributed must equal single-node (deduplicated branch feeds every alias)"
+    );
+}
+
+// --- Q88: time-bucket aggregate branches sharing one star scan ---
+
+/// Replicated `time_dim`: sk 1=(8,45), 2=(9,10), 3=(9,45), 4=(12,15) — one sk per Q88
+/// half-hour bucket, plus an hour no branch selects.
+fn q88_time_dim() -> RecordBatch {
+    batch(
+        vec![i64f("t_time_sk"), i64f("t_hour"), i64f("t_minute")],
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(Int64Array::from(vec![8, 9, 9, 12])),
+            Arc::new(Int64Array::from(vec![45, 10, 45, 15])),
+        ],
+    )
+}
+
+/// Replicated `household_demographics`: sk 1 qualifies (dep 2, vehicle 3 ≤ 2+2), sk 2 (dep 5)
+/// matches no disjunct.
+fn q88_household() -> RecordBatch {
+    batch(
+        vec![
+            i64f("hd_demo_sk"),
+            i64f("hd_dep_count"),
+            i64f("hd_vehicle_count"),
+        ],
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![2, 5])),
+            Arc::new(Int64Array::from(vec![3, 1])),
+        ],
+    )
+}
+
+/// Replicated `store`: only store 1 is named 'ese'.
+fn q88_store() -> RecordBatch {
+    batch(
+        vec![i64f("s_store_sk"), utf8f("s_store_name")],
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["ese", "other"])),
+        ],
+    )
+}
+
+/// Q88 fact rows `(time_sk, hdemo_sk, store_sk)`.
+fn q88_sales(rows: &[(i64, i64, i64)]) -> RecordBatch {
+    batch(
+        vec![
+            i64f("ss_sold_time_sk"),
+            i64f("ss_hdemo_sk"),
+            i64f("ss_store_sk"),
+        ],
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+}
+
+/// Bucket-1 rows span both shards (so single-shard counting is visibly wrong), one row lands
+/// in no bucket (hour 12), one fails the household disjunct, one fails the store name.
+fn q88_shard0() -> RecordBatch {
+    q88_sales(&[(1, 1, 1), (2, 1, 1), (3, 1, 1), (4, 1, 1)])
+}
+fn q88_shard1() -> RecordBatch {
+    q88_sales(&[(1, 1, 1), (2, 1, 1), (1, 2, 1), (2, 1, 2)])
+}
+
+/// Planner/ground-truth engine holding the full Q88 dataset.
+fn q88_engine() -> Engine {
+    let e = Engine::new();
+    e.register_batches("time_dim", vec![q88_time_dim()])
+        .unwrap();
+    e.register_batches("household_demographics", vec![q88_household()])
+        .unwrap();
+    e.register_batches("store", vec![q88_store()]).unwrap();
+    e.register_batches("store_sales", vec![q88_shard0(), q88_shard1()])
+        .unwrap();
+    e
+}
+
+/// `store_sales` sharded row-wise over two workers; the Q88 dimensions fully replicated.
+async fn q88_two_workers() -> Cluster {
+    let (p0, p1) = (unique_worker_port(), unique_worker_port());
+    for (i, port) in [p0, p1].into_iter().enumerate() {
+        let e = Arc::new(Engine::new());
+        e.register_batches("time_dim", vec![q88_time_dim()])
+            .unwrap();
+        e.register_batches("household_demographics", vec![q88_household()])
+            .unwrap();
+        e.register_batches("store", vec![q88_store()]).unwrap();
+        let shard = if i == 0 { q88_shard0() } else { q88_shard1() };
+        e.register_batches("store_sales", vec![shard]).unwrap();
+        tokio::spawn(async move {
+            let _ = serve_worker(port, e).await;
+        });
+    }
+    Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ])
+}
+
+const Q88_REPLICATED: [&str; 3] = ["household_demographics", "time_dim", "store"];
+
+/// Q88's shape, minimized to three half-hour buckets: three `count(*)` aggregates over the
+/// same `store_sales ⋈ time_dim ⋈ household_demographics ⋈ store` star join, differing only in
+/// their `time_dim` predicates. Expected row: (2, 2, 1).
+const Q88_SHAPE: &str = "
+SELECT *
+FROM
+  (SELECT count(*) h8_30_to_9
+   FROM store_sales, household_demographics, time_dim, store
+   WHERE ss_sold_time_sk = time_dim.t_time_sk
+     AND ss_hdemo_sk = household_demographics.hd_demo_sk
+     AND ss_store_sk = s_store_sk
+     AND time_dim.t_hour = 8 AND time_dim.t_minute >= 30
+     AND ((household_demographics.hd_dep_count = 2 AND household_demographics.hd_vehicle_count <= 2+2)
+          OR (household_demographics.hd_dep_count = 0 AND household_demographics.hd_vehicle_count <= 0+2))
+     AND store.s_store_name = 'ese') s1,
+  (SELECT count(*) h9_to_9_30
+   FROM store_sales, household_demographics, time_dim, store
+   WHERE ss_sold_time_sk = time_dim.t_time_sk
+     AND ss_hdemo_sk = household_demographics.hd_demo_sk
+     AND ss_store_sk = s_store_sk
+     AND time_dim.t_hour = 9 AND time_dim.t_minute < 30
+     AND ((household_demographics.hd_dep_count = 2 AND household_demographics.hd_vehicle_count <= 2+2)
+          OR (household_demographics.hd_dep_count = 0 AND household_demographics.hd_vehicle_count <= 0+2))
+     AND store.s_store_name = 'ese') s2,
+  (SELECT count(*) h9_30_to_10
+   FROM store_sales, household_demographics, time_dim, store
+   WHERE ss_sold_time_sk = time_dim.t_time_sk
+     AND ss_hdemo_sk = household_demographics.hd_demo_sk
+     AND ss_store_sk = s_store_sk
+     AND time_dim.t_hour = 9 AND time_dim.t_minute >= 30
+     AND ((household_demographics.hd_dep_count = 2 AND household_demographics.hd_vehicle_count <= 2+2)
+          OR (household_demographics.hd_dep_count = 0 AND household_demographics.hd_vehicle_count <= 0+2))
+     AND store.s_store_name = 'ese') s3";
+
+/// Branches differing only in row predicates share ONE scan: a single leaf stage computes every
+/// bucket's partial as `count(*) FILTER (WHERE <bucket predicate>)` over the shared star join
+/// (Q88 had 8 branch sub-DAGs — 17 stages, 8 full fact scans — at SF10).
+#[tokio::test]
+async fn q88_shape_merges_time_bucket_branches_into_one_scan() {
+    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+    let planner = q88_engine();
+    let lp = planner.logical_plan(Q88_SHAPE).await.expect("logical plan");
+    let dq = plan_distributed_logical(&lp, &Q88_REPLICATED).expect("Q88 shape should plan");
+
+    assert_eq!(
+        dq.stages.len(),
+        3,
+        "one shared leaf + one combine + the outer projection: {dq:?}"
+    );
+    let fact_leaves: Vec<_> = dq
+        .stages
+        .iter()
+        .filter(|s| s.upstream_stage_ids.is_empty() && s.sql.contains("store_sales"))
+        .collect();
+    assert_eq!(
+        fact_leaves.len(),
+        1,
+        "exactly one leaf stage scans the fact: {dq:?}"
+    );
+    let leaf = fact_leaves[0];
+    assert!(
+        leaf.sql.contains("FILTER (WHERE"),
+        "the shared leaf gates each branch's partial to its own predicate: {}",
+        leaf.sql
+    );
+    assert!(
+        !leaf.sql.contains(" WHERE "),
+        "branch predicates live in the FILTER clauses, not the shared tail: {}",
+        leaf.sql
+    );
+    let outer = dq.stages.last().unwrap();
+    assert_eq!(outer.upstream_stage_ids.len(), 3, "{outer:?}");
+    assert!(
+        outer
+            .upstream_stage_ids
+            .iter()
+            .all(|id| *id == outer.upstream_stage_ids[0]),
+        "every bucket placeholder pulls the shared combine output: {outer:?}"
+    );
+}
+
+/// End-to-end: bucket-1 rows span both shards; the merged scan must equal single-node.
+#[tokio::test]
+async fn q88_shape_distributed_matches_single_node() {
+    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+    let planner = q88_engine();
+    let expected = planner.sql(Q88_SHAPE).await.expect("single-node");
+    assert!(
+        expected.iter().map(RecordBatch::num_rows).sum::<usize>() > 0,
+        "test data must produce a non-empty result"
+    );
+    let cluster = q88_two_workers().await;
+    let (_, actual) = run_distributed_with(&cluster, &planner, Q88_SHAPE, &Q88_REPLICATED).await;
+    assert_eq!(
+        rows_sorted(&actual),
+        rows_sorted(&expected),
+        "distributed must equal single-node (one shared scan, FILTER-merged buckets)"
     );
 }

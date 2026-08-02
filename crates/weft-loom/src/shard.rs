@@ -224,6 +224,87 @@ pub fn classify_replicated_tables(
     out
 }
 
+/// Row-count multiple for row-aware auto-broadcast exclusion
+/// (`WEFT_REPLICATE_MAX_ROW_MULTIPLE`). **Unset (the default) disables the rule**:
+/// classification stays byte-only, exactly as before. Set to a positive value (e.g. `4.0`)
+/// to also keep a byte-eligible candidate sharded when its row count exceeds multiple × the
+/// largest (by bytes) table's row count — see [`classify_replicated_tables_with_rows`]. `0`,
+/// a negative value, or an unparseable value disables the rule.
+///
+/// Defaulted OFF because the exclusion leaves two or more tables sharded, which only the
+/// shuffle-join-chain planner shapes support — and only when the chain roots at a sharded
+/// table. TPC-DS's `item`-first comma chains (Q37/Q82) and trailing-replicated-outer-join
+/// chains (Q72) reject a 2-sharded classification and fall back to single-node execution,
+/// which is worse than today's byte-only broadcast plan for those queries. Enable it for
+/// workloads whose multi-fact queries join fact-first.
+pub fn replicate_max_row_multiple() -> Option<f64> {
+    std::env::var("WEFT_REPLICATE_MAX_ROW_MULTIPLE")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|m| *m > 0.0)
+}
+
+/// Row-aware variant of [`classify_replicated_tables`].
+///
+/// `rows` is parallel to `sized` (entry `i` is the row-count estimate for `sized[i]`;
+/// `None` = unknown). When `max_row_multiple` is `Some(m)` and the largest-by-bytes table's
+/// row count is known, an auto-replicated candidate whose own row count exceeds `m ×` the
+/// largest table's is EXCLUDED from the replicate set (kept sharded) even though its bytes
+/// are under `threshold`. Bytes are the wrong axis for scan cost here: a replicated table is
+/// re-scanned in full on every worker, so its row count — not its compressed size — bounds
+/// the per-worker scan (TPC-DS SF10 `inventory`: 117M rows in ~0.5 GB parquet vs the
+/// 14.4M-row byte-largest `catalog_sales`).
+///
+/// Byte-for-byte identical to [`classify_replicated_tables`] when `max_row_multiple` is
+/// `None` (or non-positive), when the largest table's row count is unknown, or per candidate
+/// when that candidate's row count is unknown. `override_names` always win. A candidate at
+/// exactly `m ×` the largest table's rows still replicates (the rule fires on strictly
+/// greater).
+pub fn classify_replicated_tables_with_rows(
+    sized: &[(String, Option<u64>)],
+    rows: &[Option<u64>],
+    override_names: &[&str],
+    threshold: u64,
+    max_row_multiple: Option<f64>,
+) -> Vec<String> {
+    let out = classify_replicated_tables(sized, override_names, threshold);
+    let Some(multiple) = max_row_multiple.filter(|m| *m > 0.0) else {
+        return out;
+    };
+    // The anchor is the largest-by-bytes table — the one the byte rule always keeps sharded.
+    let Some((anchor_idx, _)) = sized
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (_, s))| s.map(|sz| (i, sz)))
+        .max_by_key(|(_, sz)| *sz)
+    else {
+        return out;
+    };
+    let Some(anchor_rows) = rows.get(anchor_idx).copied().flatten() else {
+        return out;
+    };
+    let overrides: Vec<String> = override_names
+        .iter()
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    out.into_iter()
+        .filter(|name| {
+            if overrides.iter().any(|o| o == name) {
+                return true; // force-include wins
+            }
+            let Some(idx) = sized.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)) else {
+                return true;
+            };
+            match rows.get(idx).copied().flatten() {
+                // Unknown candidate rows → keep the byte-rule decision for this table.
+                None => true,
+                Some(candidate_rows) => (candidate_rows as f64) <= multiple * (anchor_rows as f64),
+            }
+        })
+        .collect()
+}
+
 /// Sum object sizes under `urls` (no shard filter). Used for auto-broadcast sizing.
 pub async fn sum_listing_bytes(
     state: &SessionState,
@@ -609,6 +690,161 @@ mod tests {
 
         let disabled = classify_replicated_tables(&sized, &["nation"], 0);
         assert_eq!(disabled, vec!["nation".to_string()]);
+    }
+
+    /// TPC-DS SF10 shape: `catalog_sales` is the byte anchor (~1+ GB, 14.4M rows) while
+    /// `inventory` is byte-small (~0.5 GB) but 8× the rows (117M). With a 4.0 row multiple
+    /// the byte rule would replicate inventory, the row rule keeps it sharded instead.
+    #[test]
+    fn classify_row_multiple_excludes_row_heavy_candidate() {
+        let sized = vec![
+            ("catalog_sales".into(), Some(1_500_000_000)),
+            ("inventory".into(), Some(500_000_000)),
+            ("item".into(), Some(50_000_000)),
+        ];
+        let rows = vec![Some(14_400_000), Some(117_000_000), Some(300_000)];
+        let got = classify_replicated_tables_with_rows(
+            &sized,
+            &rows,
+            &[],
+            32 * 1024 * 1024 * 1024,
+            Some(4.0),
+        );
+        assert!(got.contains(&"item".to_string()));
+        assert!(
+            !got.iter().any(|t| t == "inventory"),
+            "8× the anchor's rows must stay sharded: {got:?}"
+        );
+        assert!(!got.iter().any(|t| t == "catalog_sales"));
+    }
+
+    /// A candidate at exactly `multiple ×` the anchor's rows still replicates — the rule
+    /// fires only on strictly greater.
+    #[test]
+    fn classify_row_multiple_boundary_keeps_replicate() {
+        let sized = vec![
+            ("fact".into(), Some(1_000_000_000)),
+            ("candidate".into(), Some(100_000_000)),
+        ];
+        let rows = vec![Some(1_000_000), Some(4_000_000)];
+        let got = classify_replicated_tables_with_rows(
+            &sized,
+            &rows,
+            &[],
+            32 * 1024 * 1024 * 1024,
+            Some(4.0),
+        );
+        assert!(
+            got.contains(&"candidate".to_string()),
+            "exactly 4× the anchor's rows must still replicate: {got:?}"
+        );
+        // One row past the boundary excludes it.
+        let rows = vec![Some(1_000_000), Some(4_000_001)];
+        let got = classify_replicated_tables_with_rows(
+            &sized,
+            &rows,
+            &[],
+            32 * 1024 * 1024 * 1024,
+            Some(4.0),
+        );
+        assert!(!got.iter().any(|t| t == "candidate"));
+    }
+
+    /// The `WEFT_REPLICATED_TABLES` force-include wins over the row-multiple exclusion.
+    #[test]
+    fn classify_row_multiple_override_wins() {
+        let sized = vec![
+            ("catalog_sales".into(), Some(1_500_000_000)),
+            ("inventory".into(), Some(500_000_000)),
+        ];
+        let rows = vec![Some(14_400_000), Some(117_000_000)];
+        let got = classify_replicated_tables_with_rows(
+            &sized,
+            &rows,
+            &["inventory"],
+            32 * 1024 * 1024 * 1024,
+            Some(4.0),
+        );
+        assert!(got.contains(&"inventory".to_string()));
+    }
+
+    /// Counts unavailable ⇒ byte-for-byte legacy behavior: no row counts at all, unknown
+    /// anchor rows with a known candidate, unknown candidate rows, and a disabled rule all
+    /// reproduce `classify_replicated_tables` exactly.
+    #[test]
+    fn classify_row_multiple_counts_unavailable_is_legacy() {
+        let sized = vec![
+            ("catalog_sales".into(), Some(1_500_000_000)),
+            ("inventory".into(), Some(500_000_000)),
+            ("item".into(), Some(50_000_000)),
+        ];
+        let threshold = 32 * 1024 * 1024 * 1024;
+        let legacy = classify_replicated_tables(&sized, &[], threshold);
+
+        let no_rows = vec![None, None, None];
+        assert_eq!(
+            classify_replicated_tables_with_rows(&sized, &no_rows, &[], threshold, Some(4.0)),
+            legacy
+        );
+
+        // Anchor rows unknown, candidate rows known → no exclusion.
+        let anchor_unknown = vec![None, Some(117_000_000), Some(300_000)];
+        assert_eq!(
+            classify_replicated_tables_with_rows(
+                &sized,
+                &anchor_unknown,
+                &[],
+                threshold,
+                Some(4.0)
+            ),
+            legacy
+        );
+
+        // Candidate rows unknown → that candidate keeps the byte decision.
+        let candidate_unknown = vec![Some(14_400_000), None, Some(300_000)];
+        assert_eq!(
+            classify_replicated_tables_with_rows(
+                &sized,
+                &candidate_unknown,
+                &[],
+                threshold,
+                Some(4.0)
+            ),
+            legacy
+        );
+
+        // Rule disabled → identical even with full counts.
+        let rows = vec![Some(14_400_000), Some(117_000_000), Some(300_000)];
+        assert_eq!(
+            classify_replicated_tables_with_rows(&sized, &rows, &[], threshold, None),
+            legacy
+        );
+        assert_eq!(
+            classify_replicated_tables_with_rows(&sized, &rows, &[], threshold, Some(0.0)),
+            legacy
+        );
+    }
+
+    /// `WEFT_REPLICATE_MAX_ROW_MULTIPLE`: unset / `0` / negative / unparseable disable the
+    /// rule; a positive value enables it.
+    #[test]
+    fn replicate_max_row_multiple_env_parsing() {
+        std::env::remove_var("WEFT_REPLICATE_MAX_ROW_MULTIPLE");
+        assert_eq!(replicate_max_row_multiple(), None);
+
+        std::env::set_var("WEFT_REPLICATE_MAX_ROW_MULTIPLE", "4.0");
+        assert_eq!(replicate_max_row_multiple(), Some(4.0));
+
+        std::env::set_var("WEFT_REPLICATE_MAX_ROW_MULTIPLE", "0");
+        assert_eq!(replicate_max_row_multiple(), None);
+
+        std::env::set_var("WEFT_REPLICATE_MAX_ROW_MULTIPLE", "-1.5");
+        assert_eq!(replicate_max_row_multiple(), None);
+
+        std::env::set_var("WEFT_REPLICATE_MAX_ROW_MULTIPLE", "not-a-number");
+        assert_eq!(replicate_max_row_multiple(), None);
+
+        std::env::remove_var("WEFT_REPLICATE_MAX_ROW_MULTIPLE");
     }
 
     #[tokio::test]

@@ -768,8 +768,89 @@ async fn q28_global_count_distinct_branches_plan_and_match() {
             .any(|s| s.sql == "SELECT * FROM store_sales"),
         "no whole-fact gather: {dq:?}"
     );
+    // The COUNT(DISTINCT) amplifier: stage 0 was a raw-row projection, so every matching fact
+    // row crossed the exchange. It is now a per-worker partial dedup — GROUP BY the DISTINCT
+    // argument plus the non-DISTINCT aggregates' partial state — so only one row per locally
+    // distinct value shuffles.
+    let leaves: Vec<_> = dq
+        .stages
+        .iter()
+        .filter(|s| s.upstream_stage_ids.is_empty())
+        .collect();
+    assert_eq!(leaves.len(), 6, "one stage-0 per bucket branch: {dq:?}");
+    assert!(
+        leaves.iter().all(|s| s.sql.contains("GROUP BY")),
+        "stage 0 is a partial dedup, not a raw projection: {leaves:?}"
+    );
     drop(dq);
     assert_distributed_matches_single_node(Q28, &REPL_STORE_SALES, "store_sales").await;
+}
+
+/// A branch carrying COUNT(DISTINCT) cannot compute in a FILTER-merged shared-scan leaf, so it
+/// keeps its own sub-DAG while the plain aggregate branches over the same tail merge into one
+/// shared scan. Expected row over the test data: (10, 190, 1).
+const Q28_MIXED: &str = "
+SELECT *
+FROM
+  (SELECT count(*) C1 FROM store_sales WHERE ss_quantity = 3 AND ss_list_price > 2.5) A1,
+  (SELECT sum(ss_list_price) S2 FROM store_sales WHERE ss_quantity BETWEEN 6 AND 10) A2,
+  (SELECT count(DISTINCT ss_list_price) D3 FROM store_sales WHERE ss_quantity = 3 AND ss_list_price < 2.5) A3";
+
+#[tokio::test]
+async fn q28_mixed_distinct_branches_merge_only_non_distinct() {
+    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+    let planner = tpcds_engine().await;
+    let dq = strict_plan(&planner, Q28_MIXED, &REPL_STORE_SALES).await;
+
+    assert_eq!(
+        dq.stages.len(),
+        6,
+        "merged leaf + combine, the distinct branch's 3-stage sub-DAG, and the outer stage: {dq:?}"
+    );
+    let fact_leaves: Vec<_> = dq
+        .stages
+        .iter()
+        .filter(|s| s.upstream_stage_ids.is_empty() && s.sql.contains("store_sales"))
+        .collect();
+    assert_eq!(
+        fact_leaves.len(),
+        2,
+        "the two plain branches share one scan; the distinct branch keeps its own: {dq:?}"
+    );
+    let merged: Vec<_> = fact_leaves
+        .iter()
+        .filter(|s| s.sql.contains("FILTER (WHERE"))
+        .collect();
+    let distinct: Vec<_> = fact_leaves
+        .iter()
+        .filter(|s| !s.sql.contains("FILTER (WHERE"))
+        .collect();
+    assert_eq!(
+        merged.len(),
+        1,
+        "the shared leaf gates each merged branch's partial to its own predicate: {dq:?}"
+    );
+    assert_eq!(distinct.len(), 1, "{dq:?}");
+    assert!(
+        distinct[0].sql.contains("GROUP BY"),
+        "the distinct branch's stage 0 is the partial dedup: {}",
+        distinct[0].sql
+    );
+    assert!(
+        dq.stages.iter().any(|s| s.sql.contains("count(DISTINCT c")),
+        "the distinct branch's per-partition exact count survives: {dq:?}"
+    );
+    let outer = dq.stages.last().unwrap();
+    assert_eq!(
+        outer.upstream_stage_ids[0], outer.upstream_stage_ids[1],
+        "the two merged placeholders pull the shared combine output: {outer:?}"
+    );
+    assert_ne!(
+        outer.upstream_stage_ids[0], outer.upstream_stage_ids[2],
+        "the distinct branch keeps its own sub-DAG output: {outer:?}"
+    );
+    drop(dq);
+    assert_distributed_matches_single_node(Q28_MIXED, &REPL_STORE_SALES, "store_sales").await;
 }
 
 // --- Q39: CTE self-join with expression-aliased aggregate outputs (stddev/mean) ---

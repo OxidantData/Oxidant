@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use datafusion::prelude::SessionContext;
@@ -24,6 +24,18 @@ use weft_common::{Error, Result};
 
 pub mod catalog_bridge;
 pub mod shard;
+
+/// Shuffle-input scans carrying driver-measured row counts (runtime join-strategy
+/// conversion input). See [`measured_scan::MeasuredStatsTable`].
+pub mod measured_scan;
+
+/// Process-global cache of decoded replicated (dimension) table scans — a replicated table is
+/// read + decoded once per worker per data version, then served from memory. See [`dim_cache`].
+pub mod dim_cache;
+
+/// Worker-side stage plan cache (R5-4 / KAN-2): a distributed stage is planned once per
+/// worker, not once per task. See [`stage_plan_cache`].
+pub mod stage_plan_cache;
 
 /// `sts:AssumeRole` credential provider for S3 access (Hadoop-AWS `fs.s3a.assumed.role.arn`
 /// equivalent) — see [`assume_role_credentials::AssumeRoleCredentialProvider`].
@@ -1872,11 +1884,14 @@ fn contains_hash_join(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> bo
 /// Estimated in-memory bytes of a hash join's build (left) side, from the child's plan
 /// statistics. Prefers row count × schema row width (`total_byte_size` under-reports for
 /// compressed scans — e.g. it is the Parquet file size); `None` when the plan carries no
-/// usable statistics (e.g. a Glue/S3 parquet scan without collected statistics, or a
-/// join-output build side). `None` is NOT "fits the budget": with a bounded pool the
-/// caller treats it as a sort-merge reroute (see [`Engine::plan_time_smj_reroute`]) —
-/// an unaccounted hash build (KAN-57) can OOM-kill the worker before the runtime
-/// pool-exhaustion retry ever fires (SF10: TPC-H Q16/Q21, TPC-DS Q11).
+/// usable statistics (a join- or aggregate-output build side, a CSV/JSON scan, or footer
+/// statistics disabled via `WEFT_PARQUET_SCAN_STATS` — catalog Parquet/Delta/Iceberg scans
+/// otherwise carry exact footer row counts, see
+/// [`catalog_bridge::parquet_footer_file_groups`]). `None` is NOT "fits the budget": with a
+/// bounded pool the caller treats it as a sort-merge reroute (see
+/// [`Engine::plan_time_smj_reroute`]) — an unaccounted hash build (KAN-57) can OOM-kill the
+/// worker before the runtime pool-exhaustion retry ever fires (SF10: TPC-H Q16/Q21, TPC-DS
+/// Q11).
 fn hash_join_build_estimated_bytes(
     hj: &datafusion::physical_plan::joins::HashJoinExec,
 ) -> Option<usize> {
@@ -1921,6 +1936,126 @@ fn hash_join_build_estimate_unknown(plan: &dyn datafusion::physical_plan::Execut
         .any(|c| hash_join_build_estimate_unknown(c.as_ref()))
 }
 
+// ---- KAN-2 (TPC-DS Q62 wedge): build hash joins on row-BOUNDED sides only -------------
+
+/// A provable UPPER BOUND on `plan`'s output rows: its own `Exact` row statistic, or such
+/// a statistic seen through row-preserving / row-non-increasing single-child wrappers
+/// (projection, filter, repartition, coalesce, sort — a filter only drops rows, the rest
+/// preserve them). `None` when any operator on the path can multiply rows relative to its
+/// known input (a join above all) — an `Inexact` statistic is an estimate, NOT a bound:
+/// DataFusion 54.1.0 estimates a column-stats-less inner join output as
+/// `Inexact(min(left, right))` rows (the NDV falls back to the row counts, see
+/// [`join_chain_output_statistics_report_usable_inexact_num_rows`]), which for a
+/// foreign-key star join UNDERESTIMATES the real (fact-sized) output by orders of
+/// magnitude.
+fn provable_row_bound(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> Option<usize> {
+    use datafusion::common::stats::Precision;
+    if let Ok(stats) = plan.partition_statistics(None) {
+        if let Precision::Exact(rows) = stats.num_rows {
+            return Some(rows);
+        }
+    }
+    let is_wrapper = (plan as &dyn std::any::Any)
+        .is::<datafusion::physical_plan::projection::ProjectionExec>()
+        || (plan as &dyn std::any::Any).is::<datafusion::physical_plan::filter::FilterExec>()
+        || (plan as &dyn std::any::Any)
+            .is::<datafusion::physical_plan::repartition::RepartitionExec>()
+        || (plan as &dyn std::any::Any)
+            .is::<datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+        || (plan as &dyn std::any::Any).is::<datafusion::physical_plan::sorts::sort::SortExec>();
+    if is_wrapper && plan.children().len() == 1 {
+        return provable_row_bound(plan.children()[0].as_ref());
+    }
+    None
+}
+
+/// The KAN-2 physical optimizer rule: an INNER hash join whose build (left) side has NO
+/// provable row bound while its probe (right) side has one is re-seated to build on the
+/// bounded side (via the same [`HashJoinExec::swap_inputs`] DataFusion's own
+/// `JoinSelection` uses, preserving the partition mode).
+///
+/// Why this exists (the TPC-DS Q62 SF10 wedge): the Q62 stage-0 arm is a comma-join chain
+/// `web_sales × warehouse × ship_mode × web_site × date_dim` with the fact FIRST. With
+/// footer row counts but no column statistics, every chain-intermediate reports
+/// `Inexact(min(l, r))` ≈ 20 rows for what is really the full 7.2M-row fact-wide output.
+/// `JoinSelection` compares those raw values precision-blind
+/// (`should_swap_join_order`: `Inexact(20) > Exact(20)` is false), so the swap never fires;
+/// worse, the phantom-tiny estimate passes the `CollectLeft` thresholds, so each of the
+/// three upper joins COALESCED the whole chain intermediate to one partition and
+/// single-thread hash-built it (three ever-wider 7.2M-row tables) while the KAN-25 guard
+/// read `Inexact(20) × row width` ≈ 3 KB and saw no risk: ~100x slowdown under the shared
+/// bounded pool, slow progress rather than an error, so neither the budget guard nor the
+/// runtime pool retry could engage (local repro: 29 s auto vs 1.2 s sort-merge at 3M
+/// rows). After the re-seat, every build side is a positively-sized dimension scan
+/// (exact/bounded rows), which is also what the KAN-25 budget guard needs to make sound
+/// reroute decisions — a genuinely large bounded build now reroutes to sort-merge instead
+/// of hiding behind an inexact chain estimate.
+///
+/// Restricted to INNER joins: outer/semi/anti joins swap semantics along with sides, and
+/// their DataFusion estimates already clamp to the preserved side's row count. Firing only
+/// on (unbounded build, bounded probe) keeps every positively-sized plan byte-for-byte
+/// unchanged — the star shapes whose builds are already exact dims (TPC-DS Q37/Q82) and
+/// plans with no provable side at all are left alone.
+#[derive(Debug)]
+struct PreferBoundedJoinBuildSide;
+
+impl datafusion::physical_optimizer::PhysicalOptimizerRule for PreferBoundedJoinBuildSide {
+    fn optimize(
+        &self,
+        plan: std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        _config: &datafusion::common::config::ConfigOptions,
+    ) -> datafusion::common::Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>>
+    {
+        use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+        plan.transform_up(|p| {
+            let Some(hj) = as_hash_join(p.as_ref()) else {
+                return Ok(Transformed::no(p));
+            };
+            if *hj.join_type() != datafusion::logical_expr::JoinType::Inner || hj.null_aware {
+                return Ok(Transformed::no(p));
+            }
+            if provable_row_bound(hj.left().as_ref()).is_some()
+                || provable_row_bound(hj.right().as_ref()).is_none()
+            {
+                return Ok(Transformed::no(p));
+            }
+            Ok(Transformed::yes(hj.swap_inputs(*hj.partition_mode())?))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "prefer_bounded_join_build_side"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// The engine's physical optimizer pipeline: DataFusion 54.1.0's stock rules plus
+/// [`PreferBoundedJoinBuildSide`] inserted immediately after `JoinSelection` — crucially
+/// BEFORE `EnforceDistribution`, so a re-seated join's inputs are (re-)partitioned for the
+/// NEW build/probe sides (`HashJoinExec::swap_inputs` is only valid before distribution
+/// enforcement has repartitioned the children). If the stock pipeline ever loses the
+/// `join_selection` anchor (an upstream reshuffle), the rule is inserted before
+/// `EnforceDistribution` instead; with neither anchor present the stock pipeline is kept
+/// whole — a mis-positioned swap could silently break partitioning, which is worse than
+/// no rule at all.
+fn physical_optimizer_rules(
+) -> Vec<std::sync::Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>> {
+    let mut rules = datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new().rules;
+    let position = rules
+        .iter()
+        .position(|r| r.name() == "join_selection")
+        .map(|i| i + 1)
+        .or_else(|| rules.iter().position(|r| r.name() == "EnforceDistribution"));
+    if let Some(i) = position {
+        rules.insert(i, std::sync::Arc::new(PreferBoundedJoinBuildSide));
+    }
+    rules
+}
+
 /// Whether an execution error is the bounded memory pool denying a reservation.
 /// DataFusion renders `DataFusionError::ResourcesExhausted` as "Resources Exhausted: …";
 /// match textually so wrapped / contextual errors still count.
@@ -1929,6 +2064,10 @@ fn is_pool_exhausted(err: &datafusion::error::DataFusionError) -> bool {
         .to_ascii_lowercase()
         .contains("resources exhausted")
 }
+
+/// `(bytes, catalog row-count statistic)` pair behind [`Engine::estimate_table_stats`];
+/// aliased so the per-engine TTL cache field stays readable.
+type TableStats = (Option<u64>, Option<u64>);
 
 /// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
 /// operators behind the same surface in Phase 1.
@@ -1973,6 +2112,27 @@ pub struct Engine {
     /// Drives the KAN-25 hash-join memory guard ([`Engine::collect_join_guarded`]); `None`
     /// (unbounded pool) disables the guard entirely.
     memory_pool_bytes: Option<usize>,
+    /// Test/diagnostic observability for the plan-time join-strategy guard: how often the
+    /// KAN-53 auto selection rerouted a plan to sort-merge on this engine
+    /// ([`Engine::plan_time_smj_reroute`] returning true). Read via
+    /// [`Engine::plan_time_smj_reroute_count`].
+    plan_time_smj_reroutes: AtomicU64,
+    /// How many tables were registered with driver-measured statistics on this engine
+    /// ([`Engine::register_batches_with_stats`]) — the worker-side observable that the
+    /// stage-input statistics path (KAN-2 A3) actually engaged. Read via
+    /// [`Engine::measured_stats_registration_count`].
+    measured_stats_registrations: AtomicU64,
+    /// This engine's identity in the process-global stage plan cache
+    /// ([`stage_plan_cache`], R5-4): two engines in one process never share plan templates
+    /// (a template embeds its engine's base-table providers). Unique per engine, from the
+    /// same sequence as the managed-warehouse id.
+    plan_cache_id: u64,
+    /// Bumped on every non-shuffle catalog mutation (register/deregister/DDL/UDF sync) —
+    /// the stage plan cache's staleness guard for a template's embedded base-table
+    /// providers. Per-task localized `shuffle_input__s*_p*` registrations are exempt
+    /// (their schemas ride in the cache key instead; bumping on every task would
+    /// invalidate the cache constantly). Read into [`stage_plan_cache::StagePlanKey`].
+    catalog_version: AtomicU64,
     /// Last-activity timestamp of the engine's memory pool (grow/shrink/try_grow) — a
     /// worker-wide operator-progress signal for the stage no-progress watchdog (KAN-47).
     pool_activity: progress_pool::PoolActivity,
@@ -1980,13 +2140,13 @@ pub struct Engine {
     /// Kept out of the shared OS temp root so the watchdog can size it cheaply; removed
     /// on `Drop` like [`Engine::warehouse`].
     spill_dir: PathBuf,
-    /// Cached `estimate_table_bytes` results, keyed by the lowercased table name as passed
-    /// (catalog-qualified or bare). Auto-broadcast sizing runs per query, and the uncached
-    /// path shells out to the Glue CLI + S3 LISTs for every table — a multi-second fixed tax
-    /// per query (the SF10 per-query floor). Sizes only steer the replicate/shard heuristic
-    /// (never correctness), so a bounded TTL (`WEFT_TABLE_BYTES_CACHE_TTL_MS`, default 1h,
-    /// 0 disables) is safe against data growth.
-    table_bytes_cache: Mutex<HashMap<String, (Option<u64>, std::time::Instant)>>,
+    /// Cached `estimate_table_stats` results (bytes + catalog row-count statistic), keyed by
+    /// the lowercased table name as passed (catalog-qualified or bare). Auto-broadcast sizing
+    /// runs per query, and the uncached path shells out to the Glue CLI + S3 LISTs for every
+    /// table — a multi-second fixed tax per query (the SF10 per-query floor). Sizes/row counts
+    /// only steer the replicate/shard heuristic (never correctness), so a bounded TTL
+    /// (`WEFT_TABLE_BYTES_CACHE_TTL_MS`, default 1h, 0 disables) is safe against data growth.
+    table_bytes_cache: Mutex<HashMap<String, (TableStats, std::time::Instant)>>,
 }
 
 impl Engine {
@@ -2014,6 +2174,19 @@ impl Engine {
     ///   pool, the per-join build-side budget (as a pool fraction) above which `auto` mode
     ///   re-plans a query with sort-merge joins (KAN-25/KAN-53; see
     ///   [`Engine::collect_join_guarded`]).
+    ///
+    /// KAN-2 R2 dynamic-filter knobs (hash-join build-side → probe-side scan filters, the
+    /// star-shape fast path; the pushdown itself is pinned on session-wide):
+    /// - `WEFT_DYN_FILTER_INLIST_MAX_DISTINCT` (usize, default **150 = stock DataFusion**) —
+    ///   max distinct build-side join keys per build partition pushed into the probe-side
+    ///   scan as a transparent `IN (SET)` membership filter. We shipped a raised default
+    ///   (100k) briefly: at SF10 the hash-set construction cost (distinct × build
+    ///   partitions × joins) made TPC-DS Q4/Q11/Q18/Q21 3–6× SLOWER — stock caps win.
+    /// - `WEFT_DYN_FILTER_INLIST_MAX_BYTES` (usize, default **128 KiB = stock DataFusion**)
+    ///   — max build-side join-key bytes per build partition for the `IN (SET)` strategy.
+    ///   Above either cap the membership degrades to an opaque hash-table lookup (batch
+    ///   filtering only; min/max bounds still prune — and bounds carry the row-group
+    ///   pruning for clustered keys like `ss_sold_date_sk`).
     pub fn new() -> Self {
         let memory_limit = std::env::var("WEFT_MEMORY_LIMIT_BYTES")
             .ok()
@@ -2073,6 +2246,26 @@ impl Engine {
             opts.execution.parquet.reorder_filters = true;
             opts.execution.parquet.binary_as_string = true;
             opts.execution.parquet.schema_force_view_types = true;
+            // KAN-2 R2: hash-join dynamic filters — the build side publishes a runtime
+            // bounds+membership filter over the probe-side join keys, and the
+            // probe-side parquet scan absorbs it for row-group/page-index/bloom
+            // pruning (proven on the worker star shape by the `dynamic_filter_*`
+            // tests). Pin the pushdown ON explicitly: the DataFusion default is
+            // already `true`, but an upstream default flip must not silently disable
+            // the fact-scan pruning this engine's star joins rely on. The IN-list
+            // membership caps stay at stock (150 distinct values / 128 KiB of keys
+            // per build partition): raising them (tried 100k / 32 MiB at SF10) made
+            // TPC-DS Q4/Q11/Q18/Q21 3–6x slower — hash-set construction cost is
+            // distinct × build partitions × joins, and the opaque hash-table lookup
+            // + min/max bounds (collected either way) already give the pruning that
+            // matters for clustered fact keys. Env overrides remain for tuning;
+            // worst-case extra build-side memory is ≈
+            // `WEFT_DYN_FILTER_INLIST_MAX_BYTES` × target partitions per join.
+            opts.optimizer.enable_join_dynamic_filter_pushdown = true;
+            opts.optimizer.hash_join_inlist_pushdown_max_distinct_values =
+                env_usize("WEFT_DYN_FILTER_INLIST_MAX_DISTINCT").unwrap_or(150);
+            opts.optimizer.hash_join_inlist_pushdown_max_size =
+                env_usize("WEFT_DYN_FILTER_INLIST_MAX_BYTES").unwrap_or(128 * 1024);
             if let Some(b) = env_bool("WEFT_COALESCE_BATCHES") {
                 opts.execution.coalesce_batches = b;
             }
@@ -2123,7 +2316,17 @@ impl Engine {
                 .with_temp_file_path(&spill_dir)
                 .build_arc()
                 .expect("runtime env");
-            (activity, SessionContext::new_with_config_rt(config, env))
+            // `SessionContext::new_with_config_rt` + the engine's physical optimizer rules
+            // (stock DataFusion pipeline + the KAN-2 bounded-build-side rule, see
+            // [`physical_optimizer_rules`]). KAN-53's query-scoped re-plans inherit them
+            // via `SessionStateBuilder::new_from_existing`.
+            let state = datafusion::execution::session_state::SessionStateBuilder::new()
+                .with_config(config)
+                .with_runtime_env(env)
+                .with_default_features()
+                .with_physical_optimizer_rules(physical_optimizer_rules())
+                .build();
+            (activity, SessionContext::new_with_state(state))
         };
         register_spark_function_aliases(&ctx);
         spark_functions::register(&ctx);
@@ -2155,6 +2358,10 @@ impl Engine {
             created_tables: Mutex::new(HashMap::new()),
             require_lakehouse_snapshot_pins: Arc::new(AtomicBool::new(false)),
             memory_pool_bytes: memory_limit,
+            plan_time_smj_reroutes: AtomicU64::new(0),
+            measured_stats_registrations: AtomicU64::new(0),
+            plan_cache_id: id,
+            catalog_version: AtomicU64::new(0),
             pool_activity,
             spill_dir,
             table_bytes_cache: Mutex::new(HashMap::new()),
@@ -2179,7 +2386,10 @@ impl Engine {
     pub fn register_udfs_json(&self, json: &str) -> Result<()> {
         let mut reg = self.udf_registry.lock().unwrap();
         reg.import_json(json)?;
-        reg.apply_to_context(&self.ctx)
+        reg.apply_to_context(&self.ctx)?;
+        // UDF definitions are resolved into plan templates; a re-sync invalidates them.
+        self.note_catalog_change("<udfs>");
+        Ok(())
     }
 
     /// Export registered UDFs for broadcast to workers.
@@ -2313,10 +2523,11 @@ impl Engine {
         if let Some(cv) = create_view {
             let mut temp = self.temp_views.lock().unwrap();
             if cv.temporary {
-                temp.insert(cv.name);
+                temp.insert(cv.name.clone());
             } else {
                 temp.remove(&cv.name);
             }
+            self.note_catalog_change(&cv.name);
         }
         Ok(batches)
     }
@@ -2334,6 +2545,7 @@ impl Engine {
             .collect()
             .await
             .map_err(|e| Error::Execution(e.to_string()))?;
+        self.note_catalog_change(&low.name);
         Ok(())
     }
 
@@ -2381,6 +2593,7 @@ impl Engine {
             .collect()
             .await
             .map_err(|e| Error::Execution(e.to_string()))?;
+        self.note_catalog_change(&ctas.name);
         Ok(())
     }
 
@@ -2676,7 +2889,26 @@ impl Engine {
         if !Self::smj_replan_allowed() {
             return false;
         }
-        hash_join_build_exceeds(plan, budget) || hash_join_build_estimate_unknown(plan)
+        let reroute =
+            hash_join_build_exceeds(plan, budget) || hash_join_build_estimate_unknown(plan);
+        if reroute {
+            self.plan_time_smj_reroutes.fetch_add(1, Ordering::Relaxed);
+        }
+        reroute
+    }
+
+    /// Test/diagnostic observability: how many times the plan-time join-strategy guard
+    /// rerouted a plan to sort-merge on this engine (KAN-53 auto selection).
+    #[doc(hidden)]
+    pub fn plan_time_smj_reroute_count(&self) -> u64 {
+        self.plan_time_smj_reroutes.load(Ordering::Relaxed)
+    }
+
+    /// Test/diagnostic observability: how many tables were registered with driver-measured
+    /// statistics on this engine (the KAN-2 A3 stage-input statistics path engaging).
+    #[doc(hidden)]
+    pub fn measured_stats_registration_count(&self) -> u64 {
+        self.measured_stats_registrations.load(Ordering::Relaxed)
     }
 
     /// The join strategy a KAN-53 stall-retry flip re-plans with (`true` = hash): the
@@ -2885,7 +3117,24 @@ impl Engine {
         &self,
         query: &str,
     ) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let df = self.plan_spark(query).await?;
+        self.sql_stream_stage(query, None).await
+    }
+
+    /// [`Engine::sql_stream`] for one distributed stage task (R5-4 / KAN-2): when
+    /// `plan_request` is set, the parse + Spark-rewrite + name-resolution front-end is served
+    /// from the worker's [`stage_plan_cache`] — the first task of the stage on this engine
+    /// plans (publishing the template), the rest hit it. A hit rebinds the template's
+    /// `shuffle_input*` scans to THIS task's registered providers (carrying this task's
+    /// measured row totals, KAN-2 A3), so the per-task optimize + physical planning below —
+    /// including the KAN-25/KAN-53 join guards — sees exactly the same inputs as an uncached
+    /// plan. `query` is the task's localized stage SQL, used only on a miss (the template is
+    /// built from it); the request key carries the canonical pre-localization SQL.
+    pub async fn sql_stream_stage(
+        &self,
+        query: &str,
+        plan_request: Option<&stage_plan_cache::StagePlanRequest>,
+    ) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        let df = self.plan_spark_stage(query, plan_request).await?;
         // KAN-53 stall-retry (mirrors `collect_join_guarded`): plan the retried stage with
         // the join strategy opposite to the first attempt's — the flip bypasses the
         // auto/forced selection below.
@@ -2965,6 +3214,107 @@ impl Engine {
         catalog_bridge::with_lakehouse_snapshots(pins_json, self.sql_stream(query)).await
     }
 
+    /// [`Engine::sql_stream_stage`] under driver-serialized snapshot pins, mirroring
+    /// [`Engine::sql_stream_with_lakehouse_snapshots`]. The pins scope covers both the
+    /// miss-path planning and the hit-path provider rebind; the pins JSON itself is a stage
+    /// plan cache key component, so a re-pinned snapshot (KAN-48) never hits a stale
+    /// template.
+    pub async fn sql_stream_stage_with_lakehouse_snapshots(
+        &self,
+        query: &str,
+        pins_json: &str,
+        plan_request: Option<&stage_plan_cache::StagePlanRequest>,
+    ) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        catalog_bridge::with_lakehouse_snapshots(
+            pins_json,
+            self.sql_stream_stage(query, plan_request),
+        )
+        .await
+    }
+
+    /// Build one stage task's [`stage_plan_cache::StagePlanRequest`]: fills the cache key's
+    /// engine identity and current catalog version from this engine; the caller (the Flight
+    /// worker) supplies the canonical pre-localization stage SQL, the driver's snapshot pins
+    /// and replicated classification verbatim from the ticket, and this task's registered
+    /// shuffle-input providers in upstream order (each carrying its measured row totals when
+    /// the ticket shipped them — those stay OUT of the key and re-enter per task via the
+    /// hit-path rebind; see the [`stage_plan_cache`] module docs).
+    pub fn stage_plan_request(
+        &self,
+        canonical_sql: &str,
+        stage_id: u32,
+        pins_json: &str,
+        replicated_csv: &str,
+        shuffle_inputs: Vec<Arc<dyn datafusion::catalog::TableProvider>>,
+    ) -> stage_plan_cache::StagePlanRequest {
+        stage_plan_cache::StagePlanRequest::new(
+            self.plan_cache_id,
+            self.catalog_version.load(Ordering::Relaxed),
+            stage_id,
+            canonical_sql,
+            pins_json,
+            replicated_csv,
+            shuffle_inputs,
+        )
+    }
+
+    /// `plan_spark` front-end with the stage plan cache in front of it (R5-4). With no
+    /// `plan_request` (or a disabled cache) this is exactly [`Engine::plan_spark`].
+    /// Otherwise: hit → rebind the cached template to this task's shuffle-input providers
+    /// and wrap it as the query DataFrame (optimize + physical planning still run per task,
+    /// downstream of here); miss → plan fresh and publish the template; concurrent
+    /// same-stage tasks single-flight on one build.
+    async fn plan_spark_stage(
+        &self,
+        query: &str,
+        plan_request: Option<&stage_plan_cache::StagePlanRequest>,
+    ) -> Result<datafusion::dataframe::DataFrame> {
+        let Some(request) = plan_request else {
+            return self.plan_spark(query).await;
+        };
+        loop {
+            let Some(lookup) = stage_plan_cache::global().lookup(request.key()) else {
+                return self.plan_spark(query).await;
+            };
+            match lookup {
+                stage_plan_cache::PlanLookup::Hit(template) => {
+                    let plan = stage_plan_cache::rebind_shuffle_inputs(
+                        &template,
+                        request.stage_id(),
+                        request.shuffle_inputs(),
+                    )
+                    .map_err(|e| Error::Execution(format!("stage plan cache rebind: {e}")))?;
+                    return self
+                        .ctx
+                        .execute_logical_plan(plan)
+                        .await
+                        .map_err(|e| Error::Plan(e.to_string()));
+                }
+                stage_plan_cache::PlanLookup::Build(ticket) => {
+                    return match self.plan_spark(query).await {
+                        Ok(df) => {
+                            stage_plan_cache::global()
+                                .complete_build(ticket, Some(df.logical_plan().clone()));
+                            Ok(df)
+                        }
+                        // Planning failures are never cached, but waiters must be released.
+                        Err(e) => {
+                            stage_plan_cache::global().complete_build(ticket, None);
+                            Err(e)
+                        }
+                    };
+                }
+                // Another task of this stage is planning right now; re-lookup once it
+                // publishes (a `Some(None)` slot — its build failed — loops into a fresh
+                // build attempt here, which fails the same way, matching uncached behavior).
+                // A dropped sender (builder cancelled) is treated the same as a failure.
+                stage_plan_cache::PlanLookup::Wait(mut rx) => {
+                    let _ = rx.wait_for(|slot| slot.is_some()).await;
+                }
+            }
+        }
+    }
+
     /// Run a row-returning `query` and return its result batches **plus** execution statistics —
     /// the substrate for Databricks-style observability (duration, rows, bytes scanned).
     ///
@@ -3005,29 +3355,78 @@ impl Engine {
     /// Register an in-memory table of `batches` under `name` — the worker-side landing zone
     /// for shuffle input, so a downstream stage can read it as an ordinary table. Idempotent: any
     /// existing table of the same name is replaced (a worker reuses its engine across queries, so
-    /// `shuffle_input` is re-registered each time).
-    pub fn register_batches(&self, name: &str, batches: Vec<RecordBatch>) -> Result<()> {
+    /// `shuffle_input` is re-registered each time). Returns the registered provider (the stage
+    /// plan cache rebinds templates to it, R5-4).
+    pub fn register_batches(
+        &self,
+        name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
         use datafusion::datasource::MemTable;
-        use std::sync::Arc;
 
         let schema = match batches.first() {
             Some(b) => b.schema(),
             None => return Err(Error::Plan(format!("register `{name}`: no batches"))),
         };
-        let table = MemTable::try_new(schema, vec![batches])
-            .map_err(|e| Error::Execution(format!("mem table `{name}`: {e}")))?;
+        let table: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(
+            MemTable::try_new(schema, vec![batches])
+                .map_err(|e| Error::Execution(format!("mem table `{name}`: {e}")))?,
+        );
         // Drop any prior registration so re-registering the same name doesn't error.
         let _ = self.ctx.deregister_table(name);
         self.ctx
-            .register_table(name, Arc::new(table))
+            .register_table(name, table.clone())
             .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
-        Ok(())
+        self.note_catalog_change(name);
+        Ok(table)
     }
 
     /// Deregister a table previously registered via [`Self::register_batches`] (e.g. a finished
     /// stage's `shuffle_input`). A missing name is a no-op.
     pub fn deregister_table(&self, name: &str) {
         let _ = self.ctx.deregister_table(name);
+        self.note_catalog_change(name);
+    }
+
+    /// Bump the stage plan cache's catalog-version guard ([`Engine::catalog_version`]) for a
+    /// catalog mutation — EXCEPT a per-task localized shuffle-input registration
+    /// (`shuffle_input__s*_p*`), whose per-task churn is covered by the cache key's input
+    /// schema fingerprints instead (bumping on it would invalidate every stage's template
+    /// on every task).
+    fn note_catalog_change(&self, table_name: &str) {
+        if stage_plan_cache::is_localized_shuffle_input_name(table_name) {
+            return;
+        }
+        self.catalog_version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Register an in-memory table of `batches` under `name` carrying a driver-measured
+    /// exact row count — the worker-side landing zone for shuffle input when the consumer's
+    /// `StageTicket` carries the producer stage's barrier-measured bucket totals
+    /// (`WEFT_STAGE_INPUT_STATS`). The physical scan reports `measured_rows` as an exact
+    /// `num_rows` statistic (plus the batches' real in-memory byte size; column statistics
+    /// stay unknown), so the plan-time join-strategy guard sizes hash-join build sides from
+    /// measured data instead of recomputing — or failing to find — statistics. Like
+    /// [`Self::register_batches`], any existing table of the same name is replaced, and the
+    /// registered provider is returned.
+    pub fn register_batches_with_stats(
+        &self,
+        name: &str,
+        batches: Vec<RecordBatch>,
+        measured_rows: u64,
+    ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        let table: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(
+            measured_scan::MeasuredStatsTable::try_new(batches, measured_rows as usize)
+                .map_err(|e| Error::Execution(format!("mem table `{name}`: {e}")))?,
+        );
+        let _ = self.ctx.deregister_table(name);
+        self.ctx
+            .register_table(name, table.clone())
+            .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
+        self.measured_stats_registrations
+            .fetch_add(1, Ordering::Relaxed);
+        self.note_catalog_change(name);
+        Ok(table)
     }
 
     /// Snapshot of the session state, for building a `FunctionRegistry`/codec when
@@ -3043,7 +3442,9 @@ impl Engine {
         self.ctx
             .register_parquet(name, path, ParquetReadOptions::default())
             .await
-            .map_err(|e| Error::Execution(format!("register parquet `{name}`: {e}")))
+            .map_err(|e| Error::Execution(format!("register parquet `{name}`: {e}")))?;
+        self.note_catalog_change(name);
+        Ok(())
     }
 
     /// Register a Delta Lake table directory under `name`.
@@ -3072,6 +3473,7 @@ impl Engine {
         self.ctx
             .register_table(name, table)
             .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
+        self.note_catalog_change(name);
         Ok(())
     }
 
@@ -3092,6 +3494,7 @@ impl Engine {
             self.require_lakehouse_snapshot_pins.clone(),
         ));
         self.ctx.register_catalog(name, bridge);
+        self.note_catalog_change(name);
     }
 
     /// Whether `name` is qualified with a registered external catalog (`catalog.db.table`, or
@@ -3878,9 +4281,23 @@ impl Engine {
     /// Glue+S3. Only the replicate/shard heuristic consumes these sizes, so bounded staleness
     /// is safe: a stale size changes performance, never results.
     pub async fn estimate_table_bytes(&self, table_name: &str) -> Option<u64> {
+        self.estimate_table_stats(table_name).await.0
+    }
+
+    /// Estimate total file bytes + catalog row-count statistic for a scanned table. The row
+    /// count is read from the catalog table's properties (`numRows` / Spark statistics keys)
+    /// on the same `load_table` the byte-sizing walk already performs — no extra I/O — and is
+    /// `None` for session-registered tables and metastores without statistics. Callers treat
+    /// a `None` row count as "unknown" and keep byte-only replicate/shard classification for
+    /// that table (`WEFT_REPLICATE_MAX_ROW_MULTIPLE`).
+    ///
+    /// Shares the [`Engine::estimate_table_bytes`] cache and TTL
+    /// (`WEFT_TABLE_BYTES_CACHE_TTL_MS`): both estimates steer only the auto-broadcast
+    /// heuristic, so bounded staleness is safe.
+    pub async fn estimate_table_stats(&self, table_name: &str) -> TableStats {
         let key = table_name.to_ascii_lowercase();
         let Some(ttl) = table_bytes_cache_ttl() else {
-            return self.estimate_table_bytes_uncached(table_name).await;
+            return self.estimate_table_stats_uncached(table_name).await;
         };
         let fresh = self
             .table_bytes_cache
@@ -3888,28 +4305,29 @@ impl Engine {
             .expect("table_bytes_cache poisoned")
             .get(&key)
             .filter(|(_, at)| at.elapsed() < ttl)
-            .map(|(bytes, _)| *bytes);
-        if let Some(bytes) = fresh {
-            return bytes;
+            .map(|(stats, _)| *stats);
+        if let Some(stats) = fresh {
+            return stats;
         }
-        let bytes = self.estimate_table_bytes_uncached(table_name).await;
+        let stats = self.estimate_table_stats_uncached(table_name).await;
         self.table_bytes_cache
             .lock()
             .expect("table_bytes_cache poisoned")
-            .insert(key, (bytes, std::time::Instant::now()));
-        bytes
+            .insert(key, (stats, std::time::Instant::now()));
+        stats
     }
 
-    /// The uncached sizing walk behind [`Engine::estimate_table_bytes`].
-    async fn estimate_table_bytes_uncached(&self, table_name: &str) -> Option<u64> {
+    /// The uncached sizing walk behind [`Engine::estimate_table_stats`].
+    async fn estimate_table_stats_uncached(&self, table_name: &str) -> TableStats {
         let bare = table_name.rsplit('.').next().unwrap_or(table_name);
 
-        // Session-registered ListingTable (e.g. `register_parquet`).
+        // Session-registered ListingTable (e.g. `register_parquet`): sized from the listing;
+        // there is no catalog metadata, so no row-count statistic.
         if let Ok(provider) = self.ctx.table_provider(bare).await {
             if let Some(bytes) =
                 estimate_listing_provider_bytes(&self.ctx.state(), provider.as_ref()).await
             {
-                return Some(bytes);
+                return (Some(bytes), None);
             }
         }
 
@@ -3922,13 +4340,13 @@ impl Engine {
             .cloned()
             .collect();
         for cat in catalogs {
-            if let Some(bytes) =
-                estimate_bytes_in_catalog(&self.ctx.state(), cat.as_ref(), bare).await
+            if let Some(stats) =
+                estimate_stats_in_catalog(&self.ctx.state(), cat.as_ref(), bare).await
             {
-                return Some(bytes);
+                return stats;
             }
         }
-        None
+        (None, None)
     }
 
     /// Schema (database) names in the built-in in-process catalog — backs `listDatabases` for the
@@ -3984,11 +4402,11 @@ fn table_bytes_cache_ttl() -> Option<std::time::Duration> {
     (ms > 0).then_some(std::time::Duration::from_millis(ms))
 }
 
-async fn estimate_bytes_in_catalog(
+async fn estimate_stats_in_catalog(
     state: &datafusion::execution::context::SessionState,
     catalog: &dyn weft_catalog::CatalogProvider,
     table: &str,
-) -> Option<u64> {
+) -> Option<TableStats> {
     let top = catalog.list_namespaces(&[]).await.ok()?;
     let mut namespaces = top;
     // One level of nesting is enough for Hive/Glue (`db`) and covers Unity-style parents.
@@ -4008,14 +4426,18 @@ async fn estimate_bytes_in_catalog(
     }
     for ns in namespaces {
         if let Ok(md) = catalog.load_table(&ns, table).await {
-            if let Some(bytes) = catalog_bridge::estimate_bytes_for_metadata(state, &md).await {
-                return Some(bytes);
+            let (bytes, rows) = catalog_bridge::estimate_stats_for_metadata(state, &md).await;
+            if bytes.is_some() {
+                return Some((bytes, rows));
             }
         }
     }
     // Also try empty namespace (flat catalogs).
     if let Ok(md) = catalog.load_table(&[], table).await {
-        return catalog_bridge::estimate_bytes_for_metadata(state, &md).await;
+        let (bytes, rows) = catalog_bridge::estimate_stats_for_metadata(state, &md).await;
+        if bytes.is_some() {
+            return Some((bytes, rows));
+        }
     }
     None
 }
@@ -6575,8 +6997,11 @@ mod tests {
     // ---- KAN-25: hash-join build-side memory guard -----------------------------
 
     /// Serializes the join-guard tests that mutate `WEFT_SORT_MERGE_FALLBACK` /
-    /// `WEFT_TARGET_PARTITIONS` / `WEFT_BATCH_SIZE` (process-global env).
-    static JOIN_GUARD_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// `WEFT_TARGET_PARTITIONS` / `WEFT_BATCH_SIZE` (process-global env). `pub(crate)` so
+    /// `catalog_bridge`'s footer-cache tests serialize their `WEFT_PARQUET_SCAN_STATS`
+    /// pinning against the same flips.
+    pub(crate) static JOIN_GUARD_ENV_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     /// `(k, v)` Int64 batches, `rows` total split across 4 partitions; keys are `i % key_mod`
     /// so the big table joins the small one exactly once per row.
@@ -7356,6 +7781,666 @@ mod tests {
         assert_eq!(c, 1_000);
     }
 
+    // ---- KAN-8: parquet footer statistics on catalog scans ----------------------
+
+    /// Write `rows` `(k, v)` Int64 rows as parquet part files in a fresh temp dir — the
+    /// on-disk counterpart of [`join_guard_kv_batches`], for catalog-parquet scan tests.
+    fn write_kv_parquet_dir(rows: i64) -> std::path::PathBuf {
+        use datafusion::parquet::arrow::ArrowWriter;
+        let dir = std::env::temp_dir().join(format!(
+            "weft-scan-stats-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, batch) in join_guard_kv_batches(rows, rows).into_iter().enumerate() {
+            let f = std::fs::File::create(dir.join(format!("part-{i}.parquet"))).unwrap();
+            let mut w = ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        dir
+    }
+
+    /// Register a parquet dir as a CATALOG parquet table — the `LakehouseTableProvider` path
+    /// Glue/Hive/REST parquet (and Delta/Iceberg) scans take — rather than
+    /// `register_parquet`'s DataFusion `ListingTable` (which collects footer statistics on
+    /// its own via `datafusion.execution.collect_statistics=true`).
+    async fn register_catalog_parquet(engine: &Engine, name: &str, dir: &std::path::Path) {
+        let md = weft_catalog::TableMetadata::new(
+            name,
+            format!("file://{}", dir.display()),
+            weft_catalog::TableFormat::Parquet,
+        );
+        let provider = catalog_bridge::metadata_to_provider(&engine.ctx.state(), &md, name, false)
+            .await
+            .unwrap()
+            .provider;
+        engine.ctx.register_table(name, provider).unwrap();
+    }
+
+    /// KAN-8: catalog parquet scans carry exact footer row counts — the statistics the
+    /// KAN-25 build-side budget guard and DataFusion's own join selection key on. Deliberate
+    /// behavior change: before footer-stat attachment every catalog parquet scan reported
+    /// `Statistics::new_unknown`, so the unknown-estimate reroute sent every such join to
+    /// sort-merge. `WEFT_PARQUET_SCAN_STATS=0` restores the old shape (the escape hatch).
+    #[tokio::test]
+    async fn catalog_parquet_scan_attaches_footer_row_counts() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
+        let engine = Engine::new();
+        // 4 + 6 rows across two files: the table aggregate must sum footers exactly.
+        let dir = write_kv_parquet_dir(4);
+        {
+            use arrow::array::Int64Array;
+            use arrow::datatypes::{DataType, Field, Schema};
+            use datafusion::parquet::arrow::ArrowWriter;
+            // Replace the helper's four 1-row files with a 4-row and a 6-row file.
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                std::fs::remove_file(entry.unwrap().path()).unwrap();
+            }
+            let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+            for (part, rows) in [(0, 4_i64), (1, 6_i64)] {
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int64Array::from((0..rows).collect::<Vec<i64>>()))],
+                )
+                .unwrap();
+                let f = std::fs::File::create(dir.join(format!("part-{part}.parquet"))).unwrap();
+                let mut w = ArrowWriter::try_new(f, schema.clone(), None).unwrap();
+                w.write(&batch).unwrap();
+                w.close().unwrap();
+            }
+        }
+        let md = weft_catalog::TableMetadata::new(
+            "t",
+            format!("file://{}", dir.display()),
+            weft_catalog::TableFormat::Parquet,
+        );
+        let provider = catalog_bridge::metadata_to_provider(&engine.ctx.state(), &md, "t", false)
+            .await
+            .unwrap()
+            .provider;
+        let scan = provider
+            .scan(&engine.ctx.state(), None, &[], None)
+            .await
+            .unwrap();
+        let stats = scan.partition_statistics(None).unwrap();
+        assert!(
+            matches!(
+                stats.num_rows,
+                datafusion::common::stats::Precision::Exact(10)
+            ),
+            "footer row counts must sum to an exact table row count, got {:?}",
+            stats.num_rows
+        );
+        // Per-file counts keep the original file order (part-0 = 4 rows), and column-level
+        // statistics must be STRIPPED: computed against the declared schema they would
+        // misdescribe case/type-mismatched file columns, and the parquet opener reads
+        // per-file min==max / all-null stats as constant-column proofs (the
+        // `declared_schema_matches_columns_case_insensitively` regression).
+        let part0 = scan.partition_statistics(Some(0)).unwrap();
+        assert!(
+            matches!(
+                part0.num_rows,
+                datafusion::common::stats::Precision::Exact(4)
+            ),
+            "partition 0 must be part-0.parquet's footer count, got {:?}",
+            part0.num_rows
+        );
+        assert!(
+            part0
+                .column_statistics
+                .iter()
+                .all(|c| c.min_value.get_value().is_none()
+                    && c.max_value.get_value().is_none()
+                    && c.null_count.get_value().is_none()),
+            "per-file column statistics must be stripped, got {:?}",
+            part0.column_statistics
+        );
+        // The escape hatch: statistics disabled → the pre-KAN-8 unknown shape.
+        std::env::set_var("WEFT_PARQUET_SCAN_STATS", "0");
+        let scan = provider
+            .scan(&engine.ctx.state(), None, &[], None)
+            .await
+            .unwrap();
+        let stats = scan.partition_statistics(None).unwrap();
+        assert_eq!(
+            stats.num_rows.get_value(),
+            None,
+            "WEFT_PARQUET_SCAN_STATS=0 must restore unknown statistics"
+        );
+        std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KAN-8: with footer statistics attached, the default `auto` join selection no longer
+    /// reroutes a catalog-parquet join whose build side fits the KAN-25 budget — the hash
+    /// fast path Spark also takes. Deliberate behavior change: pre-KAN-8 this exact shape
+    /// rerouted to sort-merge because every catalog parquet scan was stats-unknown (the
+    /// SF10 TPC-DS all-sort-merge plans).
+    #[tokio::test]
+    async fn auto_join_selection_statted_parquet_small_build_keeps_hash() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        let big = write_kv_parquet_dir(100_000);
+        let small = write_kv_parquet_dir(1_000);
+        register_catalog_parquet(&engine, "p_big", &big).await;
+        register_catalog_parquet(&engine, "p_small", &small).await;
+        let query = "SELECT COUNT(*) AS c FROM p_big b JOIN p_small s ON b.k = s.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(contains_hash_join(plan.as_ref()));
+        assert!(
+            !hash_join_build_estimate_unknown(plan.as_ref()),
+            "footer statistics must give every build side an estimate"
+        );
+        assert!(
+            !engine.plan_time_smj_reroute(plan.as_ref()),
+            "a footer-sized build under the budget must keep the hash join"
+        );
+        let batches = engine.sql(query).await.unwrap();
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, 1_000);
+        let _ = std::fs::remove_dir_all(&big);
+        let _ = std::fs::remove_dir_all(&small);
+    }
+
+    /// KAN-8 escape hatch: `WEFT_PARQUET_SCAN_STATS=0` restores stats-unknown scans, and the
+    /// KAN-25 unknown-estimate reroute engages exactly as before (bounded pool ⇒ sort-merge)
+    /// — the two unknown-stats selections are still reachable and still correct.
+    #[tokio::test]
+    async fn auto_join_selection_parquet_stats_disabled_reroutes_sort_merge() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        std::env::set_var("WEFT_PARQUET_SCAN_STATS", "0");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        let big = write_kv_parquet_dir(100_000);
+        let small = write_kv_parquet_dir(1_000);
+        register_catalog_parquet(&engine, "p_big", &big).await;
+        register_catalog_parquet(&engine, "p_small", &small).await;
+        let query = "SELECT COUNT(*) AS c FROM p_big b JOIN p_small s ON b.k = s.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(contains_hash_join(plan.as_ref()));
+        assert!(
+            hash_join_build_estimate_unknown(plan.as_ref()),
+            "statistics disabled must make the build-side estimate unknown again"
+        );
+        assert!(
+            engine.plan_time_smj_reroute(plan.as_ref()),
+            "unknown estimate + bounded pool must reroute to sort-merge"
+        );
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("unknown-estimate join must complete via sort-merge");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, 1_000);
+        std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
+        let _ = std::fs::remove_dir_all(&big);
+        let _ = std::fs::remove_dir_all(&small);
+    }
+
+    /// KAN-8: statistics change the DEFAULT, not the guard — a catalog-parquet build whose
+    /// footer-derived estimate exceeds the KAN-25 budget still reroutes to sort-merge and
+    /// completes (the SF10 OOM shape the reroute exists for). The sort-merge path stays the
+    /// safety valve for builds that genuinely do not fit.
+    #[tokio::test]
+    async fn auto_join_selection_statted_parquet_large_build_still_reroutes() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
+        std::env::set_var("WEFT_TARGET_PARTITIONS", "2");
+        let engine = Engine::new_with_memory_limit(64 * 1024 * 1024);
+        std::env::remove_var("WEFT_TARGET_PARTITIONS");
+        // 1.5M (k, v) Int64 rows ≈ 24 MB estimated build — over the 16 MiB budget (64 MiB
+        // pool × 0.25). The aggregates over BOTH value columns keep the build side from
+        // being pruned to keys, mirroring `join_guard_runtime_retry_when_estimate_underreports`
+        // (a keys-only build is the shape DataFusion already handles well).
+        const ROWS: i64 = 1_500_000;
+        let left = write_kv_parquet_dir(ROWS);
+        let right = write_kv_parquet_dir(ROWS);
+        register_catalog_parquet(&engine, "p_left", &left).await;
+        register_catalog_parquet(&engine, "p_right", &right).await;
+        let query = "SELECT COUNT(*) AS c, SUM(l.v) AS s, SUM(r.v) AS t \
+             FROM p_left l JOIN p_right r ON l.k = r.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        let budget = engine.hash_join_build_budget().unwrap();
+        assert!(
+            hash_join_build_exceeds(plan.as_ref(), budget),
+            "the footer-derived oversized build must trip the budget estimate"
+        );
+        assert!(
+            engine.plan_time_smj_reroute(plan.as_ref()),
+            "a known over-budget build must still reroute to sort-merge"
+        );
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("rerouted sort-merge join must complete under the bounded pool");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let s = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, ROWS);
+        assert_eq!(s, ROWS * (ROWS - 1) / 2);
+        let _ = std::fs::remove_dir_all(&left);
+        let _ = std::fs::remove_dir_all(&right);
+    }
+
+    // ---- KAN-8 follow-up: multi-join chains (the TPC-DS Q37/Q82 stage-0 shape) ----
+
+    /// Row counts for the Q37/Q82 join-chain fixture: a 100k-row fact table whose
+    /// keys each match exactly one row of dims 1..3.
+    const JOIN_CHAIN_FACT: i64 = 100_000;
+    const JOIN_CHAIN_DIMS: [i64; 3] = [100, 1_000, 10_000];
+
+    /// The Q37/Q82 stage-0 shape: a 3-join chain over catalog-parquet tables with a
+    /// partial-style aggregate on top.
+    const JOIN_CHAIN_SQL: &str = "SELECT COUNT(*) AS c, SUM(f.v) AS s \
+        FROM fact f \
+        JOIN dim1 d1 ON f.k1 = d1.k \
+        JOIN dim2 d2 ON f.k2 = d2.k \
+        JOIN dim3 d3 ON f.k3 = d3.k";
+
+    /// `(k1, k2, k3, v)` Int64 fact-table parquet dir for multi-join chain tests:
+    /// `kN = i % key_mods[N]`, so every fact row matches exactly one row of each
+    /// [`write_kv_parquet_dir`] dim table of `key_mods[N]` rows. Four part files,
+    /// mirroring [`write_kv_parquet_dir`].
+    fn write_fact_parquet_dir(rows: i64, key_mods: [i64; 3]) -> std::path::PathBuf {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!(
+            "weft-scan-stats-fact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Int64, false),
+            Field::new("k2", DataType::Int64, false),
+            Field::new("k3", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let per = rows / 4;
+        for p in 0..4_i64 {
+            let idx: Vec<i64> = (p * per..(p + 1) * per).collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        idx.iter().map(|&i| i % key_mods[0]).collect::<Vec<i64>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        idx.iter().map(|&i| i % key_mods[1]).collect::<Vec<i64>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        idx.iter().map(|&i| i % key_mods[2]).collect::<Vec<i64>>(),
+                    )),
+                    Arc::new(Int64Array::from(idx)),
+                ],
+            )
+            .unwrap();
+            let f = std::fs::File::create(dir.join(format!("part-{p}.parquet"))).unwrap();
+            let mut w = ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        dir
+    }
+
+    /// Register the 4-table join-chain fixture as catalog-parquet tables; returns
+    /// the temp dirs to clean up.
+    async fn register_join_chain(engine: &Engine) -> [std::path::PathBuf; 4] {
+        let fact = write_fact_parquet_dir(JOIN_CHAIN_FACT, JOIN_CHAIN_DIMS);
+        let dim1 = write_kv_parquet_dir(JOIN_CHAIN_DIMS[0]);
+        let dim2 = write_kv_parquet_dir(JOIN_CHAIN_DIMS[1]);
+        let dim3 = write_kv_parquet_dir(JOIN_CHAIN_DIMS[2]);
+        register_catalog_parquet(engine, "fact", &fact).await;
+        register_catalog_parquet(engine, "dim1", &dim1).await;
+        register_catalog_parquet(engine, "dim2", &dim2).await;
+        register_catalog_parquet(engine, "dim3", &dim3).await;
+        [fact, dim1, dim2, dim3]
+    }
+
+    /// Whether any hash join in `plan` builds on another hash join's output — a
+    /// join-chain build side (the unbounded-build shape the KAN-2
+    /// [`PreferBoundedJoinBuildSide`] rule re-seats onto row-bounded inputs).
+    fn build_side_contains_hash_join(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> bool {
+        if let Some(hj) = as_hash_join(plan) {
+            if contains_hash_join(hj.left().as_ref()) {
+                return true;
+            }
+        }
+        plan.children()
+            .iter()
+            .any(|c| build_side_contains_hash_join(c.as_ref()))
+    }
+
+    /// The highest hash join in `plan` that has another hash join below it (the
+    /// output join of a join chain).
+    fn top_hash_join(
+        plan: &dyn datafusion::physical_plan::ExecutionPlan,
+    ) -> Option<&datafusion::physical_plan::joins::HashJoinExec> {
+        if let Some(hj) = as_hash_join(plan) {
+            if contains_hash_join(hj.left().as_ref()) || contains_hash_join(hj.right().as_ref()) {
+                return Some(hj);
+            }
+        }
+        // Consume the children Vec by value so the returned reference borrows from
+        // `plan`, not from the temporary Vec.
+        for child in plan.children() {
+            if let Some(hj) = top_hash_join(child.as_ref()) {
+                return Some(hj);
+            }
+        }
+        None
+    }
+
+    /// Assert the join-chain aggregate row: every fact row matches exactly one row of
+    /// each dim, so the count is the fact row count and the sum is over all `f.v`.
+    fn assert_join_chain_result(batches: &[RecordBatch]) {
+        use arrow::array::Int64Array;
+        let get = |col: usize| {
+            batches[0]
+                .column(col)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(get(0), JOIN_CHAIN_FACT);
+        assert_eq!(get(1), JOIN_CHAIN_FACT * (JOIN_CHAIN_FACT - 1) / 2);
+    }
+
+    /// Q37/Q82 regression guard (KAN-8): with footer statistics attached, the default
+    /// `auto` join selection must NOT reroute a multi-join CHAIN over catalog-parquet
+    /// tables to sort-merge. Pre-KAN-8 every catalog scan was stats-unknown, so the
+    /// unknown-estimate reroute flipped the WHOLE stage-0 chain to sort-merge (the
+    /// 10.8x/9.1x SF10 outliers: external sorts of the 117M-row replicated inventory
+    /// etc.). With footer row counts, DataFusion 54.1.0 estimates each join output as
+    /// `Inexact(min(l, r))` rows — proven directly by
+    /// [`join_chain_output_statistics_report_usable_inexact_num_rows`] — which the
+    /// KAN-25 guard reads as a usable build-side estimate. (KAN-2 follow-up: those
+    /// inexact chain estimates no longer place join outputs on BUILD sides — see
+    /// [`auto_join_selection_q62_arm_chain_builds_row_bounded_sides`] — so the kept
+    /// hash chain builds on the exact dims, as SF10 Q37/Q82's own plans already did.)
+    #[tokio::test]
+    async fn auto_join_selection_statted_parquet_join_chain_keeps_hash() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
+        assert_eq!(join_preference(), JoinPreference::Auto);
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        let dirs = register_join_chain(&engine).await;
+        let plan = engine.physical_plan(JOIN_CHAIN_SQL).await.unwrap();
+        // The fixture plans as a left-deep 3-hash-join chain. With the KAN-2
+        // bounded-build-side rule the two UPPER builds are the exact dims (their chain
+        // inputs report only phantom `Inexact(100)` estimates), not the join outputs —
+        // the same build sides SF10 Q37/Q82's plans already picked via DataFusion's raw
+        // comparison (the item-side estimate exceeds date_dim's there).
+        let display = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(false)
+            .to_string();
+        assert_eq!(
+            display.matches("HashJoinExec").count(),
+            3,
+            "expected a 3-hash-join chain, got:\n{display}"
+        );
+        assert!(
+            !build_side_contains_hash_join(plan.as_ref()),
+            "no build side may be a join output (KAN-2 bounded builds), got:\n{display}"
+        );
+        assert!(
+            !hash_join_build_estimate_unknown(plan.as_ref()),
+            "footer statistics must give every build side an estimate"
+        );
+        assert!(
+            !engine.plan_time_smj_reroute(plan.as_ref()),
+            "a footer-sized multi-join chain under the budget must keep its hash joins"
+        );
+        assert_eq!(engine.plan_time_smj_reroute_count(), 0);
+        let batches = engine.sql(JOIN_CHAIN_SQL).await.unwrap();
+        assert_join_chain_result(&batches);
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Non-vacuity for the Q37/Q82 guard: `WEFT_PARQUET_SCAN_STATS=0` restores the
+    /// pre-KAN-8 unknown-statistics scans, and the SAME multi-join chain reroutes to
+    /// sort-merge exactly as pre-fix — so
+    /// [`auto_join_selection_statted_parquet_join_chain_keeps_hash`] is sensitive to
+    /// footer statistics, not passing vacuously.
+    #[tokio::test]
+    async fn auto_join_selection_join_chain_stats_disabled_reroutes_sort_merge() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        std::env::set_var("WEFT_PARQUET_SCAN_STATS", "0");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        let dirs = register_join_chain(&engine).await;
+        let plan = engine.physical_plan(JOIN_CHAIN_SQL).await.unwrap();
+        assert!(contains_hash_join(plan.as_ref()));
+        assert!(
+            hash_join_build_estimate_unknown(plan.as_ref()),
+            "statistics disabled must make the chain's build-side estimates unknown again"
+        );
+        assert!(
+            engine.plan_time_smj_reroute(plan.as_ref()),
+            "unknown estimates + bounded pool must reroute the whole chain to sort-merge"
+        );
+        let batches = engine
+            .sql(JOIN_CHAIN_SQL)
+            .await
+            .expect("unknown-estimate join chain must complete via sort-merge");
+        assert_join_chain_result(&batches);
+        std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Assumption check behind the Q37/Q82 guard, directly against DataFusion 54.1.0:
+    /// with exact scan row counts but NO column statistics (footer attachment strips
+    /// them, see [`catalog_parquet_scan_attaches_footer_row_counts`]), a join chain's
+    /// OUTPUT statistics report `num_rows = Inexact(min(l, r))` —
+    /// `estimate_inner_join_cardinality` derives the join selectivity from
+    /// row-count-bounded max-distinct estimates when NDVs are absent
+    /// (datafusion-physical-plan-54.1.0 `joins/utils.rs`), and
+    /// `Precision::Inexact::get_value()` is `Some`, so the KAN-25 guard's
+    /// [`hash_join_build_estimated_bytes`] treats a join-output side as
+    /// estimable instead of rerouting it to sort-merge. (KAN-2: that estimate is a
+    /// phantom for foreign-key chains — the chain output is the PROBE side now; the
+    /// guard sizes the exact dim builds it is placed on.)
+    #[tokio::test]
+    async fn join_chain_output_statistics_report_usable_inexact_num_rows() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
+        // Unbounded pool: this pins the statistics themselves, not the guard decision.
+        let engine = Engine::new();
+        let fact = write_fact_parquet_dir(JOIN_CHAIN_FACT, JOIN_CHAIN_DIMS);
+        let dim1 = write_kv_parquet_dir(JOIN_CHAIN_DIMS[0]);
+        let dim2 = write_kv_parquet_dir(JOIN_CHAIN_DIMS[1]);
+        register_catalog_parquet(&engine, "fact", &fact).await;
+        register_catalog_parquet(&engine, "dim1", &dim1).await;
+        register_catalog_parquet(&engine, "dim2", &dim2).await;
+        let plan = engine
+            .physical_plan(
+                "SELECT COUNT(*) AS c FROM fact f \
+                 JOIN dim1 d1 ON f.k1 = d1.k JOIN dim2 d2 ON f.k2 = d2.k",
+            )
+            .await
+            .unwrap();
+        // The upper of the two hash joins carries the CHAIN's output statistics:
+        // min(fact ⋈ dim1) = 100 inexact rows in, min(100, 1_000) = 100 out.
+        let top = top_hash_join(plan.as_ref()).expect("a 2-join chain");
+        let stats =
+            datafusion::physical_plan::ExecutionPlan::partition_statistics(top, None).unwrap();
+        assert!(
+            matches!(
+                stats.num_rows,
+                datafusion::common::stats::Precision::Inexact(100)
+            ),
+            "join-chain output must be Inexact(min(l, r)) rows, got {:?}",
+            stats.num_rows
+        );
+        assert!(
+            stats.num_rows.get_value().is_some(),
+            "an Inexact num_rows must read as a usable estimate"
+        );
+        // The guard-facing consequence (KAN-2): the chain output sits on the top join's
+        // PROBE side (its phantom 100-row estimate must never seat a build), and the
+        // dim BUILD side is exactly sized — the propagation the Q37/Q82 fix relies on.
+        assert!(
+            contains_hash_join(top.right().as_ref()),
+            "the fixture must probe the top join with the lower join's output"
+        );
+        assert!(
+            !contains_hash_join(top.left().as_ref()),
+            "the fixture must build the top join on the exact dim (KAN-2)"
+        );
+        assert!(
+            hash_join_build_estimated_bytes(top).is_some(),
+            "the dim build side must be estimable to the KAN-25 guard"
+        );
+        let _ = std::fs::remove_dir_all(&fact);
+        let _ = std::fs::remove_dir_all(&dim1);
+        let _ = std::fs::remove_dir_all(&dim2);
+    }
+
+    // ---- KAN-2 A3: driver-measured row counts on shuffle-input scans --------------
+
+    /// A3: a shuffle-input table registered with its barrier-measured row count gives the
+    /// join guard a real build-side estimate, so a measured-small build keeps the hash
+    /// join under the bounded pool — the runtime SMJ→hash conversion. (DataFusion 54's
+    /// MemTable already reports exact batch-derived statistics; the measured path makes
+    /// the number the driver counted at the stage barrier authoritative and skips the
+    /// per-batch statistics recomputation at plan time.)
+    #[tokio::test]
+    async fn auto_join_selection_measured_small_build_keeps_hash() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        engine
+            .register_batches_with_stats("big", join_guard_kv_batches(100_000, 100_000), 100_000)
+            .unwrap();
+        engine
+            .register_batches_with_stats("small", join_guard_kv_batches(1_000, 1_000), 1_000)
+            .unwrap();
+        assert_eq!(engine.measured_stats_registration_count(), 2);
+        let query = "SELECT COUNT(*) AS c FROM big b JOIN small s ON b.k = s.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(contains_hash_join(plan.as_ref()));
+        assert!(
+            !hash_join_build_estimate_unknown(plan.as_ref()),
+            "measured row counts must give every build side an estimate"
+        );
+        assert!(
+            !engine.plan_time_smj_reroute(plan.as_ref()),
+            "a measured build under the budget must keep the hash join"
+        );
+        assert_eq!(engine.plan_time_smj_reroute_count(), 0);
+        let batches = engine.sql(query).await.unwrap();
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, 1_000);
+    }
+
+    /// A3: the safety valve stays — a build whose MEASURED row count blows the budget
+    /// still reroutes to sort-merge and completes. Statistics change the default, not the
+    /// guard.
+    #[tokio::test]
+    async fn auto_join_selection_measured_large_build_still_reroutes() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        std::env::set_var("WEFT_TARGET_PARTITIONS", "2");
+        let engine = Engine::new_with_memory_limit(64 * 1024 * 1024);
+        std::env::remove_var("WEFT_TARGET_PARTITIONS");
+        // 1.5M (k, v) Int64 rows ≈ 24 MB estimated build — over the 16 MiB budget (64 MiB
+        // pool × 0.25).
+        const ROWS: i64 = 1_500_000;
+        engine
+            .register_batches_with_stats("left_t", join_guard_kv_batches(ROWS, ROWS), ROWS as u64)
+            .unwrap();
+        engine
+            .register_batches_with_stats("right_t", join_guard_kv_batches(ROWS, ROWS), ROWS as u64)
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c, SUM(l.v) AS s, SUM(r.v) AS t \
+             FROM left_t l JOIN right_t r ON l.k = r.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        let budget = engine.hash_join_build_budget().unwrap();
+        assert!(
+            hash_join_build_exceeds(plan.as_ref(), budget),
+            "the measured oversized build must trip the budget estimate"
+        );
+        assert!(
+            engine.plan_time_smj_reroute(plan.as_ref()),
+            "a measured over-budget build must still reroute to sort-merge"
+        );
+        assert!(engine.plan_time_smj_reroute_count() > 0);
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("rerouted sort-merge join must complete under the bounded pool");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let s = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, ROWS);
+        assert_eq!(s, ROWS * (ROWS - 1) / 2);
+    }
+
     #[tokio::test]
     async fn join_guard_runtime_retry_when_estimate_underreports() {
         // Wide strings on both sides; the aggregates over BOTH string columns keep the
@@ -7477,5 +8562,636 @@ mod tests {
         assert_eq!(sl, LEFT * 400);
         assert_eq!(sr, LEFT * 400);
         std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+    }
+
+    // ---- KAN-2 R2: hash-join dynamic filters on the worker star shape --------
+    //
+    // DataFusion 54.1.0's dynamic-filter pipeline: a hash join's build side publishes
+    // a runtime `DynamicFilterPhysicalExpr` over the probe-side join keys (min/max
+    // bounds + membership), pushed toward the probe-side scan in the Post
+    // filter-pushdown phase (`optimizer.enable_join_dynamic_filter_pushdown`, default
+    // true, gated on the probe side being the join's preserved side). The parquet
+    // `DataSourceExec` absorbs it into its scan predicate, where `PruningPredicate`
+    // snapshots it for row-group statistics / page-index / bloom pruning — the
+    // star-shape fast path (sharded parquet fact ⋈ replicated MemTable dims, inner
+    // equijoins). These tests prove the pipeline actually fires on that shape through
+    // the engine's own `create_physical_plan` path, and pin the correctness guard (no
+    // filter may attach when the fact side is the join's preserved side).
+
+    /// Serializes the dynamic-filter tests that mutate `WEFT_DYN_FILTER_*`
+    /// (process-global env read at `Engine` construction).
+    static DYN_FILTER_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// `(k, v)` Int64 single-file parquet dir, keys `0..rows` ASCENDING in
+    /// `row_group_rows`-row row groups — a clustered/sorted join key so min/max bounds
+    /// pruning has disjoint row-group ranges to eliminate. `v` duplicates `k`. (parquet
+    /// 58's `ArrowWriter` buffers batches into one big row group by default, so the max
+    /// row-group size must be pinned to get multiple groups.)
+    fn write_sorted_kv_parquet_dir(rows: i64, row_group_rows: i64) -> std::path::PathBuf {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        let dir = std::env::temp_dir().join(format!(
+            "weft-dyn-filter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(row_group_rows as usize))
+            .build();
+        let f = std::fs::File::create(dir.join("part-0.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
+        let mut start = 0;
+        while start < rows {
+            let end = (start + row_group_rows).min(rows);
+            let idx: Vec<i64> = (start..end).collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(idx.clone())),
+                    Arc::new(Int64Array::from(idx)),
+                ],
+            )
+            .unwrap();
+            w.write(&batch).unwrap();
+            start = end;
+        }
+        w.close().unwrap();
+        dir
+    }
+
+    /// Register a single-batch MemTable dim of `(k, v)` Int64 rows with keys
+    /// `start..start+rows` — the replicated-dimension side of the star shape.
+    fn register_kv_dim(engine: &Engine, name: &str, start: i64, rows: i64) {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let idx: Vec<i64> = (start..start + rows).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(idx.clone())),
+                Arc::new(Int64Array::from(idx)),
+            ],
+        )
+        .unwrap();
+        engine.register_batches(name, vec![batch]).unwrap();
+    }
+
+    /// Render `plan`'s tree text (the `EXPLAIN` shape) for plan-structure assertions.
+    fn plan_tree_text(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> String {
+        datafusion::physical_plan::displayable(plan)
+            .indent(false)
+            .to_string()
+    }
+
+    /// Whether any `DataSourceExec` line of the plan text carries a `DynamicFilter` in
+    /// its scan predicate — the observable proof that a join's dynamic filter was
+    /// pushed all the way into a (parquet) scan.
+    fn scan_predicate_has_dynamic_filter(
+        plan: &dyn datafusion::physical_plan::ExecutionPlan,
+    ) -> bool {
+        plan_tree_text(plan)
+            .lines()
+            .any(|l| l.contains("DataSourceExec") && l.contains("DynamicFilter"))
+    }
+
+    /// Sum a parquet pruning metric (`row_groups_pruned_statistics`, ...) across the
+    /// whole executed plan tree as `(pruned, matched)`.
+    fn pruning_metric_sums(
+        plan: &dyn datafusion::physical_plan::ExecutionPlan,
+        metric_name: &str,
+    ) -> (usize, usize) {
+        use datafusion::physical_plan::metrics::MetricValue;
+        fn visit(
+            plan: &dyn datafusion::physical_plan::ExecutionPlan,
+            metric_name: &str,
+            acc: &mut (usize, usize),
+        ) {
+            if let Some(set) = plan.metrics() {
+                for metric in set.iter() {
+                    if let MetricValue::PruningMetrics {
+                        name,
+                        pruning_metrics,
+                    } = metric.value()
+                    {
+                        if name.as_ref() == metric_name {
+                            acc.0 += pruning_metrics.pruned();
+                            acc.1 += pruning_metrics.matched();
+                        }
+                    }
+                }
+            }
+            for child in plan.children() {
+                visit(child.as_ref(), metric_name, acc);
+            }
+        }
+        let mut acc = (0, 0);
+        visit(plan, metric_name, &mut acc);
+        acc
+    }
+
+    /// The single Int64 value of a one-row aggregate result.
+    fn int64_scalar(batches: &[RecordBatch]) -> i64 {
+        use arrow::array::Int64Array;
+        batches
+            .iter()
+            .map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .sum()
+    }
+
+    /// R2 Phase 0: the dynamic-filter pipeline FIRES on the worker star shape — a
+    /// sharded parquet fact (clustered join key) inner-joined to a replicated
+    /// MemTable dim. (a) The plan carries a `DynamicFilter` inside the fact scan's
+    /// predicate; (b) after execution the scan's row-group statistics pruning has
+    /// eliminated the row groups outside the dim's key range (the fact's key is
+    /// sorted, so the filter's min/max bounds disjoint-prune 9 of 10 row groups);
+    /// and the result is exact.
+    #[tokio::test]
+    async fn dynamic_filter_fires_and_prunes_row_groups_on_star_join() {
+        let _env = DYN_FILTER_ENV_LOCK.lock().await;
+        let engine = Engine::new();
+        // 100k fact rows in 10 disjoint 10k-key row groups; the dim covers exactly
+        // the 50_000..60_000 group.
+        let fact = write_sorted_kv_parquet_dir(100_000, 10_000);
+        register_catalog_parquet(&engine, "fact", &fact).await;
+        register_kv_dim(&engine, "dim", 50_000, 10_000);
+        let query = "SELECT COUNT(*) AS c FROM fact f JOIN dim d ON f.k = d.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        // (a) plan structure: a hash join whose dynamic filter reaches the scan.
+        let text = plan_tree_text(plan.as_ref());
+        assert!(
+            contains_hash_join(plan.as_ref()),
+            "the star shape must plan a hash join, got:\n{text}"
+        );
+        assert!(
+            scan_predicate_has_dynamic_filter(plan.as_ref()),
+            "the join's dynamic filter must reach the fact scan's predicate, got:\n{text}"
+        );
+        // (b) execution: exact result + row-group pruning from the filter's bounds.
+        let batches = engine.execute_plan(plan.clone()).await.unwrap();
+        assert_eq!(int64_scalar(&batches), 10_000);
+        let (pruned, matched) = pruning_metric_sums(plan.as_ref(), "row_groups_pruned_statistics");
+        assert!(
+            pruned > 0,
+            "dynamic-filter bounds must prune fact row groups \
+             (pruned={pruned}, matched={matched}), plan:\n{}",
+            plan_tree_text(plan.as_ref())
+        );
+        assert!(
+            matched > 0,
+            "the dim's own row group must survive pruning (pruned={pruned})"
+        );
+        let _ = std::fs::remove_dir_all(&fact);
+    }
+
+    /// R2 Phase 0 correctness guard: when the FACT side is the join's preserved side
+    /// (`fact LEFT JOIN dim` — every fact row must appear, matched or not), no dynamic
+    /// filter may attach to the fact scan: filtering the non-preserved side would drop
+    /// rows the join must emit with NULLs. (JoinSelection swaps this shape to
+    /// `dim RIGHT JOIN fact`, whose probe side — the fact — is exactly the side
+    /// `JoinType::Right` does NOT preserve, so `allow_join_dynamic_filter_pushdown`
+    /// gates the filter off.) The exact count is the second half of the guard: a
+    /// wrongly-attached filter would drop the 90k unmatched fact rows.
+    #[tokio::test]
+    async fn dynamic_filter_absent_when_fact_side_is_preserved() {
+        let _env = DYN_FILTER_ENV_LOCK.lock().await;
+        let engine = Engine::new();
+        let fact = write_sorted_kv_parquet_dir(100_000, 10_000);
+        register_catalog_parquet(&engine, "fact", &fact).await;
+        register_kv_dim(&engine, "dim", 50_000, 10_000);
+        let query = "SELECT COUNT(*) AS c FROM fact f LEFT JOIN dim d ON f.k = d.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        let text = plan_tree_text(plan.as_ref());
+        assert!(
+            !scan_predicate_has_dynamic_filter(plan.as_ref()),
+            "no dynamic filter may attach when the fact side is preserved, got:\n{text}"
+        );
+        let batches = engine.execute_plan(plan.clone()).await.unwrap();
+        assert_eq!(
+            int64_scalar(&batches),
+            100_000,
+            "LEFT JOIN must emit every fact row exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&fact);
+    }
+
+    /// R2 Phase 1: the dynamic-filter config is pinned and the knobs map to the
+    /// session options — pushdown pinned ON (deliberate; DataFusion's own default is
+    /// also `true` today), and the IN-list caps default to STOCK DataFusion values
+    /// (150 distinct / 128 KiB per build partition; a raised 100k/32 MiB default was
+    /// measured 3–6x slower on TPC-DS Q4/Q11/Q18/Q21 at SF10) with env overriding.
+    #[tokio::test]
+    async fn dyn_filter_knobs_map_to_session_config() {
+        /// `(pushdown pinned, max distinct, max bytes)` from the engine's live session
+        /// config (values copied out before the temporary `SessionState` drops).
+        fn dyn_filter_config(engine: &Engine) -> (bool, usize, usize) {
+            let state = engine.ctx.state();
+            let o = &state.config().options().optimizer;
+            (
+                o.enable_join_dynamic_filter_pushdown,
+                o.hash_join_inlist_pushdown_max_distinct_values,
+                o.hash_join_inlist_pushdown_max_size,
+            )
+        }
+        let _env = DYN_FILTER_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_DYN_FILTER_INLIST_MAX_DISTINCT");
+        std::env::remove_var("WEFT_DYN_FILTER_INLIST_MAX_BYTES");
+        let engine = Engine::new();
+        assert_eq!(
+            dyn_filter_config(&engine),
+            (true, 150, 128 * 1024),
+            "pushdown pinned on + stock IN-list caps by default (raised caps regressed SF10)"
+        );
+        std::env::set_var("WEFT_DYN_FILTER_INLIST_MAX_DISTINCT", "12345");
+        std::env::set_var("WEFT_DYN_FILTER_INLIST_MAX_BYTES", "65536");
+        let engine = Engine::new();
+        std::env::remove_var("WEFT_DYN_FILTER_INLIST_MAX_DISTINCT");
+        std::env::remove_var("WEFT_DYN_FILTER_INLIST_MAX_BYTES");
+        assert_eq!(
+            dyn_filter_config(&engine),
+            (true, 12_345, 65_536),
+            "env vars must override the stock defaults"
+        );
+    }
+
+    /// R2 Phase 1: the IN-list caps switch the membership strategy. A 10k-distinct-key
+    /// dim (10k × 8 B = 80 KB of keys — under either byte cap) exceeds the stock
+    /// 150-distinct cap, so the default session degrades to the opaque `hash_lookup`
+    /// membership (decoded-batch filtering only; min/max bounds still prune); raising
+    /// the cap via env keeps it on the transparent `IN (SET)` strategy the scan can
+    /// also prune statistics/bloom filters with. The strategy is observable in the
+    /// plan text AFTER execution, once the build side has published the real filter
+    /// into the placeholder `DynamicFilter`.
+    #[tokio::test]
+    async fn dyn_filter_inlist_knobs_switch_membership_strategy() {
+        let _env = DYN_FILTER_ENV_LOCK.lock().await;
+        let fact = write_sorted_kv_parquet_dir(100_000, 10_000);
+        let query = "SELECT COUNT(*) AS c FROM fact f JOIN dim d ON f.k = d.k";
+
+        // weft defaults (env unset): stock 150-distinct cap → opaque hash-table
+        // lookup for a 10k-value dim (results stay exact either way).
+        std::env::remove_var("WEFT_DYN_FILTER_INLIST_MAX_DISTINCT");
+        std::env::remove_var("WEFT_DYN_FILTER_INLIST_MAX_BYTES");
+        let engine = Engine::new();
+        register_catalog_parquet(&engine, "fact", &fact).await;
+        register_kv_dim(&engine, "dim", 0, 10_000);
+        let plan = engine.physical_plan(query).await.unwrap();
+        let batches = engine.execute_plan(plan.clone()).await.unwrap();
+        assert_eq!(int64_scalar(&batches), 10_000);
+        let text = plan_tree_text(plan.as_ref());
+        assert!(
+            text.contains("hash_lookup"),
+            "stock caps must degrade to the opaque lookup, got:\n{text}"
+        );
+
+        // Raised distinct cap via env: the same 10k-value dim uses the transparent
+        // IN-list strategy.
+        std::env::set_var("WEFT_DYN_FILTER_INLIST_MAX_DISTINCT", "100000");
+        let engine = Engine::new();
+        std::env::remove_var("WEFT_DYN_FILTER_INLIST_MAX_DISTINCT");
+        register_catalog_parquet(&engine, "fact", &fact).await;
+        register_kv_dim(&engine, "dim", 0, 10_000);
+        let plan = engine.physical_plan(query).await.unwrap();
+        let batches = engine.execute_plan(plan.clone()).await.unwrap();
+        assert_eq!(int64_scalar(&batches), 10_000);
+        let text = plan_tree_text(plan.as_ref());
+        assert!(
+            text.contains(" IN (SET) ("),
+            "raised cap must use the transparent IN-list strategy, got:\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(&fact);
+    }
+
+    /// R2 SMJ interaction (measurement only — KAN-53 behavior deliberately
+    /// unchanged): with a bounded pool, the KAN-53 `auto` guard reroutes the star
+    /// join to sort-merge once the dim's estimated key-only build side (rows × 8 B)
+    /// exceeds `WEFT_HASH_JOIN_MAX_BUILD_FRACTION` of the pool — and sort-merge joins
+    /// carry NO dynamic filters, so the reroute forfeits fact-scan row-group pruning
+    /// along with the hash join. Below the budget the hash plan and its dynamic
+    /// filter survive. 64 MiB pool × 0.25 = 16 MiB budget ⇒ the crossover sits at
+    /// ~2M dim rows (at production pool sizes, e.g. 26 GiB × 0.25 ≈ 6.5 GiB, only
+    /// ~800M-row dims reroute — TPC-DS's 2M-row customer is far inside the budget).
+    /// The 4M-row fact keeps the dim the SMALLER side at every measured size, so the
+    /// dim stays the hash build and the dynamic filter points at the fact scan
+    /// (JoinSelection builds the smaller side; a dim bigger than the fact flips the
+    /// filter onto the dim's own MemTable scan, which cannot absorb it).
+    #[tokio::test]
+    async fn bounded_pool_smj_reroute_drops_dynamic_filters() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        // Sorting is irrelevant to the plan-shape measurement — the plain 4-file kv
+        // helper (unique keys) is enough, and catalog-parquet registration gives the
+        // guard real footer row counts.
+        let fact = write_kv_parquet_dir(4_000_000);
+        let query = "SELECT COUNT(*) AS c FROM fact f JOIN dim d ON f.k = d.k";
+
+        // Under budget: a 1M-row dim ≈ 8 MB key-only build < 16 MiB ⇒ hash join
+        // kept, dynamic filter intact.
+        let engine = Engine::new_with_memory_limit(64 * 1024 * 1024);
+        register_catalog_parquet(&engine, "fact", &fact).await;
+        register_kv_dim(&engine, "dim", 0, 1_000_000);
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(
+            !engine.plan_time_smj_reroute(plan.as_ref()),
+            "an 8 MB build under the 16 MiB budget must keep the hash join"
+        );
+        assert!(
+            scan_predicate_has_dynamic_filter(plan.as_ref()),
+            "the kept hash join must carry its dynamic filter into the fact scan, got:\n{}",
+            plan_tree_text(plan.as_ref())
+        );
+
+        // Over budget: a 3M-row dim ≈ 24 MB > 16 MiB ⇒ reroute ⇒ no dynamic filter.
+        let engine = Engine::new_with_memory_limit(64 * 1024 * 1024);
+        register_catalog_parquet(&engine, "fact", &fact).await;
+        register_kv_dim(&engine, "dim", 0, 3_000_000);
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(
+            engine.plan_time_smj_reroute(plan.as_ref()),
+            "a 24 MB build over the 16 MiB budget must reroute to sort-merge"
+        );
+        let logical = engine.logical_plan(query).await.unwrap();
+        let (_ctx, smj) = engine.sort_merge_physical_plan(logical).await.unwrap();
+        let text = plan_tree_text(smj.as_ref());
+        assert!(
+            text.contains("SortMergeJoin"),
+            "the reroute must produce a sort-merge plan, got:\n{text}"
+        );
+        assert!(
+            !scan_predicate_has_dynamic_filter(smj.as_ref()),
+            "sort-merge joins carry no dynamic filters — the reroute forfeits fact \
+             pruning, got:\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(&fact);
+    }
+
+    // ---- KAN-2: Q62 stage-0 wedge (multi-dim comma-join arm chain) ----
+
+    /// Write `batches` as one-part-per-batch parquet files in a fresh temp dir.
+    fn write_parquet_dir(tag: &str, batches: Vec<RecordBatch>) -> std::path::PathBuf {
+        use datafusion::parquet::arrow::ArrowWriter;
+        let dir = std::env::temp_dir().join(format!(
+            "weft-q62-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, batch) in batches.into_iter().enumerate() {
+            let f = std::fs::File::create(dir.join(format!("part-{i}.parquet"))).unwrap();
+            let mut w = ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        dir
+    }
+
+    /// The Q62 stage-0 fixture: a wide-ish `web_sales` fact (`rows`) plus the four
+    /// replicated dims, all as catalog parquet (footer row counts attached, column
+    /// stats stripped — the worker stage shape).
+    async fn register_q62_fixture(engine: &Engine, rows: i64) -> [std::path::PathBuf; 5] {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let idx: Vec<i64> = (0..rows).collect();
+        let strs = |tag: &str| -> Arc<StringArray> {
+            Arc::new(StringArray::from(
+                idx.iter()
+                    .map(|&i| format!("{tag}-{:040}", i % 10_000))
+                    .collect::<Vec<String>>(),
+            ))
+        };
+        let ws_schema = Arc::new(Schema::new(vec![
+            Field::new("ws_sold_date_sk", DataType::Int64, false),
+            Field::new("ws_ship_date_sk", DataType::Int64, true),
+            Field::new("ws_warehouse_sk", DataType::Int64, false),
+            Field::new("ws_ship_mode_sk", DataType::Int64, false),
+            Field::new("ws_web_site_sk", DataType::Int64, false),
+            Field::new("ws_c1", DataType::Int64, false),
+            Field::new("ws_c2", DataType::Int64, false),
+            Field::new("ws_s1", DataType::Utf8, false),
+            Field::new("ws_s2", DataType::Utf8, false),
+        ]));
+        let ws = RecordBatch::try_new(
+            ws_schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    idx.iter().map(|&i| i % 73_000).collect::<Vec<i64>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    idx.iter()
+                        .map(|&i| {
+                            // ~1/8 NULL ship dates (undelivered rows, like TPC-DS).
+                            if i % 8 == 0 {
+                                None
+                            } else {
+                                Some((i * 7) % 73_000)
+                            }
+                        })
+                        .collect::<Vec<Option<i64>>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    idx.iter().map(|&i| i % 20).collect::<Vec<i64>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    idx.iter().map(|&i| i % 20).collect::<Vec<i64>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    idx.iter().map(|&i| i % 54).collect::<Vec<i64>>(),
+                )),
+                Arc::new(Int64Array::from(idx.clone())),
+                Arc::new(Int64Array::from(
+                    idx.iter().map(|&i| i * 3).collect::<Vec<i64>>(),
+                )),
+                strs("a") as Arc<dyn arrow::array::Array>,
+                strs("b") as Arc<dyn arrow::array::Array>,
+            ],
+        )
+        .unwrap();
+        let dim = |name: &str, key: &str, val: &str, n: i64| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(key, DataType::Int64, false),
+                Field::new(val, DataType::Utf8, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from((0..n).collect::<Vec<i64>>())),
+                    Arc::new(StringArray::from(
+                        (0..n)
+                            .map(|i| format!("{name}-{:020}", i))
+                            .collect::<Vec<String>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+        let warehouse = dim("warehouse", "w_warehouse_sk", "w_warehouse_name", 20);
+        let ship_mode = dim("ship_mode", "sm_ship_mode_sk", "sm_type", 20);
+        let web_site = dim("web_site", "web_site_sk", "web_name", 54);
+        // date_dim: 73k rows, d_month_seq arranged so BETWEEN 12 AND 23 keeps ~1/10
+        // (the stage's d_month_seq BETWEEN 1200 AND 1211 shape at 1/12 the labels).
+        let dd_schema = Arc::new(Schema::new(vec![
+            Field::new("d_date_sk", DataType::Int64, false),
+            Field::new("d_month_seq", DataType::Int64, false),
+        ]));
+        let date_dim = RecordBatch::try_new(
+            dd_schema,
+            vec![
+                Arc::new(Int64Array::from((0..73_000).collect::<Vec<i64>>())),
+                Arc::new(Int64Array::from(
+                    (0..73_000).map(|i| i % 120).collect::<Vec<i64>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let dirs = [
+            write_parquet_dir("ws", vec![ws]),
+            write_parquet_dir("wh", vec![warehouse]),
+            write_parquet_dir("sm", vec![ship_mode]),
+            write_parquet_dir("site", vec![web_site]),
+            write_parquet_dir("dd", vec![date_dim]),
+        ];
+        register_catalog_parquet(engine, "web_sales", &dirs[0]).await;
+        register_catalog_parquet(engine, "warehouse", &dirs[1]).await;
+        register_catalog_parquet(engine, "ship_mode", &dirs[2]).await;
+        register_catalog_parquet(engine, "web_site", &dirs[3]).await;
+        register_catalog_parquet(engine, "date_dim", &dirs[4]).await;
+        dirs
+    }
+
+    /// The Q62 stage-0 web_sales arm SQL, verbatim shape (comma joins rewritten as
+    /// CROSS JOIN + WHERE by the stage planner, substr-wrapped warehouse subquery).
+    const Q62_STAGE_SQL: &str = "SELECT sq1.w_substr AS g0, ship_mode.sm_type AS g1, \
+        web_site.web_name AS g2, \
+        sum(CASE WHEN ((web_sales.ws_ship_date_sk - web_sales.ws_sold_date_sk) <= 30) \
+            THEN 1 ELSE 0 END) AS a0 \
+        FROM web_sales \
+        CROSS JOIN (SELECT substr(`warehouse`.w_warehouse_name, 1, 20) AS w_substr, \
+            `warehouse`.* FROM \"warehouse\") AS sq1 \
+        CROSS JOIN ship_mode CROSS JOIN web_site CROSS JOIN date_dim \
+        WHERE date_dim.d_month_seq BETWEEN 12 AND 23 \
+         AND web_sales.ws_ship_date_sk = date_dim.d_date_sk \
+         AND web_sales.ws_warehouse_sk = sq1.w_warehouse_sk \
+         AND web_sales.ws_ship_mode_sk = ship_mode.sm_ship_mode_sk \
+         AND web_sales.ws_web_site_sk = web_site.web_site_sk \
+        GROUP BY sq1.w_substr, ship_mode.sm_type, web_site.web_name";
+
+    /// Q62 stage-0 regression guard (KAN-2): the comma-join arm chain — 7.2M-row fact
+    /// FIRST, then four replicated dims — must plan every hash join with a row-BOUNDED
+    /// build side. Pre-fix, DataFusion 54.1.0's `Inexact(min(l, r))` chain estimates
+    /// (≈20 phantom rows for the fact-wide intermediates) made `JoinSelection` keep —
+    /// and `CollectLeft`-collect — the CHAIN OUTPUT as the build side of the three upper
+    /// joins (SF10: three ever-wider 7.2M-row single-partition hash builds under a shared
+    /// 12 GiB pool ≈ 100x wedge, slow progress, no pool error for the runtime retry;
+    /// local repro: 29 s vs 1.2 s sort-merge at 3M rows). The KAN-25 guard read the same
+    /// phantom estimates and saw no risk. [`PreferBoundedJoinBuildSide`] re-seats the
+    /// builds onto the positively-sized dims — after which the guard ALSO sees true build
+    /// sizes, so the hash fast path is kept (no wholesale sort-merge reroute, KAN-8).
+    #[tokio::test]
+    async fn auto_join_selection_q62_arm_chain_builds_row_bounded_sides() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("WEFT_PREFER_HASH_JOIN");
+        std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
+        assert_eq!(join_preference(), JoinPreference::Auto);
+        let engine = Engine::new_with_memory_limit(1024 * 1024 * 1024);
+        let dirs = register_q62_fixture(&engine, 300_000).await;
+        let plan = engine.physical_plan(Q62_STAGE_SQL).await.unwrap();
+        let display = plan_tree_text(plan.as_ref());
+        assert_eq!(
+            display.matches("HashJoinExec").count(),
+            4,
+            "expected the 4-join hash chain (no sort-merge reroute), got:\n{display}"
+        );
+        // The statistics enabler of the pre-fix pathology, still true post-fix: the
+        // chain-output estimate is the phantom `Inexact(min(l, r))` — what changed is
+        // that no hash join BUILDS on it anymore.
+        fn check_builds(plan: &dyn datafusion::physical_plan::ExecutionPlan) {
+            if let Some(hj) = as_hash_join(plan) {
+                let build = hj.left();
+                // Row-bounded, or a leaf scan: the rule swaps at JoinSelection time,
+                // when a filtered dim is still `FilterExec(scan)` and provably bounded;
+                // FilterPushdown runs later and folds that filter INTO the scan (its
+                // footer-exact rows then read Inexact), but a leaf scan's rows are
+                // table-bounded either way. The phantom estimates this guards against
+                // only ever come from JOIN outputs.
+                assert!(
+                    provable_row_bound(build.as_ref()).is_some() || build.children().is_empty(),
+                    "hash join build side must be row-bounded or a leaf scan, got:\n{}",
+                    plan_tree_text(plan)
+                );
+                assert!(
+                    !contains_hash_join(build.as_ref()),
+                    "no hash join may build on a join output, got:\n{}",
+                    plan_tree_text(plan)
+                );
+            }
+            for c in plan.children() {
+                check_builds(c.as_ref());
+            }
+        }
+        check_builds(plan.as_ref());
+        assert!(
+            !build_side_contains_hash_join(plan.as_ref()),
+            "the arm chain must build on dims, got:\n{display}"
+        );
+        // With builds on the dims, the dynamic filters prune the FACT scan (the star
+        // fast path) instead of the tiny dim scans.
+        assert!(
+            scan_predicate_has_dynamic_filter(plan.as_ref()),
+            "dim builds must push dynamic filters into the fact scan, got:\n{display}"
+        );
+        assert!(
+            !engine.plan_time_smj_reroute(plan.as_ref()),
+            "bounded tiny dim builds must keep the hash plan (no guard reroute)"
+        );
+        assert_eq!(engine.plan_time_smj_reroute_count(), 0);
+        // Full result parity with the sort-merge re-plan (the pre-fix escape hatch):
+        // the swapped build/probe sides must not mis-map a single output row.
+        let batches = engine.sql(Q62_STAGE_SQL).await.unwrap();
+        let logical = engine.logical_plan(Q62_STAGE_SQL).await.unwrap();
+        let (smj_ctx, smj) = engine.sort_merge_physical_plan(logical).await.unwrap();
+        let smj_batches = datafusion::physical_plan::collect(smj, smj_ctx.task_ctx())
+            .await
+            .unwrap();
+        let sorted_lines = |batches: &[RecordBatch]| {
+            let pretty = arrow::util::pretty::pretty_format_batches(batches)
+                .unwrap()
+                .to_string();
+            let mut lines: Vec<String> = pretty.lines().map(str::to_string).collect();
+            lines.sort_unstable();
+            lines
+        };
+        assert!(!batches.is_empty());
+        assert_eq!(
+            sorted_lines(&batches),
+            sorted_lines(&smj_batches),
+            "hash (bounded builds) and sort-merge results must match row-for-row"
+        );
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }
