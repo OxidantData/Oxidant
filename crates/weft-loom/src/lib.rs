@@ -33,6 +33,8 @@ pub mod measured_scan;
 /// read + decoded once per worker per data version, then served from memory. See [`dim_cache`].
 pub mod dim_cache;
 
+/// Disk-caching object_store wrapper for remote analytical reads (`WEFT_S3_CACHE_DIR`).
+pub mod s3_cache;
 /// Worker-side stage plan cache (R5-4 / KAN-2): a distributed stage is planned once per
 /// worker, not once per task. See [`stage_plan_cache`].
 pub mod stage_plan_cache;

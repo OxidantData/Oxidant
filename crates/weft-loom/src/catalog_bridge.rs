@@ -842,9 +842,12 @@ fn ensure_remote_store(
     }
     match builder.build() {
         Ok(store) => {
+            // KAN-2 throughput: serve repeat parquet reads from local NVMe when
+            // `WEFT_S3_CACHE_DIR` is set (S3 re-reads were the Q39-class residual).
+            let store = crate::s3_cache::DiskCachingStore::from_env(Arc::new(store));
             state
                 .runtime_env()
-                .register_object_store(os_url.as_ref(), Arc::new(store));
+                .register_object_store(os_url.as_ref(), store);
             REGISTERED_BUCKET_ROLES
                 .lock()
                 .expect("bucket-role registry poisoned")

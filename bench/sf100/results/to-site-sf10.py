@@ -59,7 +59,7 @@ SUITES = [
         "out": os.path.join(SITE, "tpch.json"),
         "dataset": "TPC-H SF10 Parquet on S3 (`s3://weft-artifacts-…/tpch-sf10/`)",
         "jsonl": {
-            "weft": os.path.join(HERE, "tpcds-gap", "tpch-sf10-v5b.jsonl"),
+            "weft": os.path.join(HERE, "tpcds-gap", "tpch-sf10-v11-cache.jsonl"),
             "emr": os.path.join(HERE, "perf-f1f5-sf10", "tpch-sf10-emr.jsonl"),
         },
     },
@@ -67,7 +67,7 @@ SUITES = [
         "out": os.path.join(SITE, "tpcds.json"),
         "dataset": "TPC-DS SF10 Parquet on S3 (`s3://weft-artifacts-…/tpcds-sf10/`)",
         "jsonl": {
-            "weft": os.path.join(HERE, "tpcds-gap", "tpcds-sf10-v8.jsonl"),
+            "weft": os.path.join(HERE, "tpcds-gap", "tpcds-sf10-v11-cache.jsonl"),
             "emr": os.path.join(HERE, "perf-f1f5-sf10", "tpcds-sf10-emr.jsonl"),
         },
     },
