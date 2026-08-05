@@ -7,7 +7,7 @@ import WarpFeatureRail from "../components/WarpFeatureRail";
 import DiffBlock from "../components/DiffBlock";
 import WovenField from "../components/WovenField";
 import ThreadDivider from "../components/ThreadDivider";
-import { benchmarks, speedupVs } from "../lib/benchmarks";
+import { benchmarks, pctFasterVs, speedupVs } from "../lib/benchmarks";
 
 const REPO = "https://github.com/vamzi/weft";
 
@@ -31,7 +31,7 @@ const FEATURES = [
 ];
 
 function Hero() {
-  const vsSpark = speedupVs("spark");
+  const vsSpark = pctFasterVs("spark");
   return (
     <section className="relative isolate overflow-hidden border-b border-hairline">
       <WovenField />
@@ -51,7 +51,7 @@ function Hero() {
               {vsSpark && (
                 <>
                   {" "}
-                  Measured <span className="font-semibold text-body">{vsSpark.toFixed(1)}× faster
+                  Measured <span className="font-semibold text-body">{vsSpark.toFixed(0)}% faster
                   than Spark</span> on ClickBench.
                 </>
               )}

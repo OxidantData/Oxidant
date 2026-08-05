@@ -43,8 +43,72 @@ pub struct ShardAssignment {
     pub count: usize,
 }
 
+/// Test-only gate serializing process-global shard-env mutation against readers.
+/// `from_env` reads `WEFT_WORKER_COUNT`/`WEFT_SHARD_INDEX` on EVERY catalog listing, so
+/// a test that sets them (`explicit_assignment_task_local_wins_over_env`) holds the
+/// write side for its whole env window; every other test thread's `from_env` then waits
+/// the window out instead of listing a shard it should not (the
+/// `without_declared_schema_merge_fails` flake: a two-file fixture listing lost the
+/// file the leaked {0/2} assignment gave worker 1, so the Int32/Int64 merge conflict
+/// the test expects never materialized). Compiled out of non-test builds — production
+/// workers set the env once at boot and never mutate it.
+#[cfg(test)]
+static SHARD_ENV_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(test)]
+thread_local! {
+    /// Set while this thread holds the write side of [`SHARD_ENV_GATE`]: the holder's
+    /// own `from_env` calls must bypass the read side — a `RwLock` read under a held
+    /// write deadlocks.
+    static SHARD_ENV_GATE_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Read side of [`SHARD_ENV_GATE`] for [`ShardAssignment::from_env`]. Poison-tolerant:
+/// a panicking env-mutating test must not fail every later `from_env` caller.
+#[cfg(test)]
+fn shard_env_read_guard() -> Option<std::sync::RwLockReadGuard<'static, ()>> {
+    if SHARD_ENV_GATE_HELD.with(|held| held.get()) {
+        None
+    } else {
+        Some(
+            SHARD_ENV_GATE
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
+/// The write side of [`SHARD_ENV_GATE`]: tests hold one for the whole span they have
+/// `WEFT_WORKER_COUNT`/`WEFT_SHARD_INDEX` set.
+#[cfg(test)]
+pub(crate) struct ShardEnvWriteGuard {
+    _guard: std::sync::RwLockWriteGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl ShardEnvWriteGuard {
+    pub(crate) fn take() -> Self {
+        let guard = SHARD_ENV_GATE
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        SHARD_ENV_GATE_HELD.with(|held| held.set(true));
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShardEnvWriteGuard {
+    fn drop(&mut self) {
+        SHARD_ENV_GATE_HELD.with(|held| held.set(false));
+    }
+}
+
 impl ShardAssignment {
     pub fn from_env() -> Option<Self> {
+        // Test builds: wait out any in-flight shard-env mutation (`SHARD_ENV_GATE`).
+        #[cfg(test)]
+        let _gate = shard_env_read_guard();
+
         // A task-scoped explicit assignment (in-process workers / tests) wins over the
         // process-global env, which can only name one shard per process.
         if let Ok(assignment) = SHARD_ASSIGNMENT_CONTEXT.try_with(|a| *a) {
@@ -966,6 +1030,9 @@ mod tests {
     /// so two workers in one test process resolve disjoint shards of the same table.
     #[tokio::test]
     async fn explicit_assignment_task_local_wins_over_env() {
+        // Hold the shard-env gate for the whole window the process env names a shard, so
+        // concurrent tests' catalog listings wait it out instead of observing it.
+        let _env = ShardEnvWriteGuard::take();
         std::env::set_var("WEFT_WORKER_COUNT", "2");
         std::env::set_var("WEFT_SHARD_INDEX", "0");
         let files = vec![(dummy_url("a.parquet"), 100), (dummy_url("b.parquet"), 60)];

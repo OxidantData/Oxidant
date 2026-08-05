@@ -52,8 +52,14 @@ export default function BenchmarkChart({
                       : { width: `${pct}%`, backgroundColor: engineColor(e.key) }
                   }
                 />
-                {/* "×N slower than Weft" tick at the bar's end */}
-                {!pending && !e.highlight && weftTotal && (
+                {/* "Weft N% faster" tick at the bar's end (falls back to the time ratio
+                    when Weft is not the faster side) */}
+                {!pending && !e.highlight && weftTotal && e.total! > weftTotal && (
+                  <span className="ml-2 whitespace-nowrap text-[11px] font-medium tabular-nums text-muted">
+                    Weft {((1 - weftTotal / e.total!) * 100).toFixed(0)}% faster
+                  </span>
+                )}
+                {!pending && !e.highlight && weftTotal && e.total! <= weftTotal && (
                   <span className="ml-2 whitespace-nowrap text-[11px] font-medium tabular-nums text-muted">
                     {(e.total! / weftTotal).toFixed(2)}× Weft
                   </span>

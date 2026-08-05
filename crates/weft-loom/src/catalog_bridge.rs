@@ -1862,9 +1862,19 @@ mod tests {
     }
 
     fn write_parquet_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // pid + nanos is NOT unique enough: several tests in this process call this
+        // helper, and two near-simultaneous callers land on the same (coarse) clock
+        // tick — they then share one dir, and the first finisher's `remove_dir_all`
+        // deletes the other's files mid-scan (ENOENT in
+        // `catalog_parquet_scan_caches_footer_across_queries`, E-LOOM-FLAKE). The
+        // process-unique sequence makes every dir distinct (same pattern as
+        // `shard::tests::write_parts_with_rows`).
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "weft-cat-{}-{}",
+            "weft-cat-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -2379,9 +2389,17 @@ mod tests {
     /// Write two Parquet files into a fresh dir where column `v` is Int32 in one file and Int64 in
     /// the other — the cross-file type mismatch that breaks schema inference. Returns the dir.
     fn write_mixed_int_parquet_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // The two callers of this helper run concurrently in this test binary, and
+        // pid + nanos collides whenever they land on the same clock tick: they share
+        // one dir and the first finisher's `remove_dir_all` deletes the other's files
+        // mid-scan (ENOENT). The process-unique sequence makes every dir distinct
+        // (same pattern as `shard::tests::write_parts_with_rows`).
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "weft-mixed-{}-{:?}",
+            "weft-mixed-{}-{}-{:?}",
             std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

@@ -658,6 +658,81 @@ pub fn embedded_baseline_supported() -> usize {
 mod tests {
     use super::*;
 
+    /// KAN-2 throughput residual audit: run every TPC-DS query through the production
+    /// pre-split path (`logical_plan` → `Engine::optimize_logical_plan` → shape split).
+    /// The pre-split optimizer must never cost a query its distributed plan — a query
+    /// whose *unoptimized* plan splits must also split after optimization (the driver
+    /// falls back to the original plan on `Unsupported`, but for TPC-DS the rewritten
+    /// shapes are expected to stay inside the splitter's vocabulary) — and the rewrite
+    /// must not multiply the stage DAG past the driver's explosion guard (the v12 Q4
+    /// 66-stage do_get failure: ~15 stages became 66 tiny ones).
+    #[tokio::test]
+    async fn pre_split_optimizer_keeps_tpcds_distributed_coverage() {
+        use datafusion::logical_expr::LogicalPlan;
+        use weft_execution::plan::plan_distributed_logical;
+
+        let dir = std::env::temp_dir().join("weft-tpcds-sf0.01");
+        // Data generation shells out to the duckdb CLI (dsdgen); the CI `clippy + test`
+        // job runs the workspace suite without it (the query-gates job installs it and
+        // exercises the same path through `tpcds-distributed --execute`). Skip — rather
+        // than fail — only when generation is impossible; any real generation error still
+        // panics.
+        if let Err(e) = tpcds_data::generate(0.01, &dir) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                eprintln!("[pre-split-audit] skipping: {e}");
+                return;
+            }
+            panic!("data generation failed: {e}");
+        }
+        let engine = Engine::new();
+        register_tpcds(&engine, &dir).await;
+
+        // Mirror of `try_plan_with_facts` over an already-built plan: first sharded-fact
+        // candidate that splits wins.
+        let split = |lp: &LogicalPlan| -> Option<usize> {
+            for fact in FACT_TABLES {
+                let replicated: Vec<&str> = tpcds_data::TABLES
+                    .iter()
+                    .copied()
+                    .filter(|t| *t != fact)
+                    .collect();
+                if let Ok(dq) = plan_distributed_logical(lp, &replicated) {
+                    return Some(dq.stages.len());
+                }
+            }
+            None
+        };
+
+        let mut lost_distribution = Vec::new();
+        for (name, sql) in queries() {
+            let lp = engine.logical_plan(sql).await.unwrap();
+            let before = split(&lp);
+            let optimized = engine.optimize_logical_plan(lp.clone()).unwrap();
+            if format!("{}", optimized.display_indent()) == format!("{}", lp.display_indent()) {
+                continue; // Skip class or no-op rewrite: identical plan, identical split.
+            }
+            let after = split(&optimized);
+            match (before, after) {
+                (Some(n_before), Some(n_after)) => {
+                    eprintln!(
+                        "[pre-split-audit] {name}: rewritten, stages {n_before} -> {n_after}"
+                    );
+                    assert!(
+                        n_after <= 40 || n_after <= n_before,
+                        "{name}: rewrite exploded the stage DAG ({n_before} -> {n_after}) — \
+                         the v12 Q4 failure signature"
+                    );
+                }
+                (Some(_), None) => lost_distribution.push(name),
+                (None, _) => {}
+            }
+        }
+        assert!(
+            lost_distribution.is_empty(),
+            "queries whose distributed plan the pre-split rewrite breaks: {lost_distribution:?}"
+        );
+    }
+
     fn report(verified: &[&str], mismatched: &[&str], errored: &[&str]) -> ExecuteReport {
         let own = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect();
         ExecuteReport {

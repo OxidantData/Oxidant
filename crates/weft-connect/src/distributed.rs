@@ -117,6 +117,12 @@ pub async fn try_run_distributed(
     .await
 }
 
+/// Defense-in-depth cap on the stage-DAG size a pre-split-optimized plan may grow to
+/// before [`try_run_distributed_plan`] prefers the unoptimized split. The v12 Q4 failure
+/// mode multiplied ~15 stages into 66 tiny ones and workers died under the orchestration
+/// load (do_get transport error); healthy TPC-DS/TPC-H stage DAGs stay well under 40.
+const STAGE_EXPLOSION_GUARD: usize = 40;
+
 /// Like [`try_run_distributed`], but accepts an already-built logical plan (DataFrame API path).
 /// `lakehouse_snapshot_pins` is the driver's captured table→snapshot JSON map
 /// ([`Engine::capture_lakehouse_snapshots`]), stamped onto every stage so workers resolve
@@ -159,6 +165,30 @@ pub async fn try_run_distributed_plan(
         let original_display = format!("{}", plan.display_indent());
         if optimized_display != original_display {
             split_result = plan_distributed_logical(plan, replicated);
+        }
+    }
+    // Stage-explosion guard (defense in depth): if the rewrite multiplied the stage DAG
+    // past the orchestration budget, the unoptimized split is the safer plan — the v12 Q4
+    // failure mode grew ~15 stages into 66 tiny ones and workers died under the
+    // orchestration load (do_get transport error). Only the over-budget case pays for the
+    // comparison split.
+    if let Ok(dq) = &split_result {
+        if dq.stages.len() > STAGE_EXPLOSION_GUARD {
+            let optimized_display = format!("{}", optimized.display_indent());
+            let original_display = format!("{}", plan.display_indent());
+            if optimized_display != original_display {
+                if let Ok(original_dq) = plan_distributed_logical(plan, replicated) {
+                    if original_dq.stages.len() < dq.stages.len() {
+                        tracing::warn!(
+                            optimized_stages = dq.stages.len(),
+                            original_stages = original_dq.stages.len(),
+                            "pre-split optimization exploded the stage DAG; using the \
+                             unoptimized split instead"
+                        );
+                        split_result = Ok(original_dq);
+                    }
+                }
+            }
         }
     }
     let mut dq = match split_result {

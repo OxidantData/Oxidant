@@ -291,6 +291,10 @@ write_env() {
   local role="$1"
   umask 022
   mkdir -p /etc/weft
+  # S3 disk cache (PR #76): on by default — the SF10 benchmark configuration. The engine
+  # treats unset/empty as disabled, so an operator can still turn it off per node.
+  mkdir -p /var/lib/weft/s3cache
+  chown weft:weft /var/lib/weft/s3cache
   # Atomic: render into a temp file in the same directory, then rename. A
   # bootstrap kill (TimeoutStartSec, power loss) mid-write must never leave a
   # truncated env file behind — systemd's EnvironmentFile= would silently load
@@ -309,6 +313,7 @@ TMPDIR=${SPILL_MOUNT}
 HOME=/var/lib/weft
 WEFT_WORKER_COUNT=${WORKER_COUNT}
 WEFT_WORKER_PORT=50561
+WEFT_S3_CACHE_DIR=/var/lib/weft/s3cache
 EOF
     if [[ -n "${MEMORY_LIMIT_BYTES}" && "${MEMORY_LIMIT_BYTES}" != "None" ]]; then
       echo "WEFT_MEMORY_LIMIT_BYTES=${MEMORY_LIMIT_BYTES}"
@@ -420,6 +425,17 @@ if [[ "${ROLE}" == "worker" ]]; then
     PEER_IDS+=("${INSTANCE_ID}")
   fi
   IFS=$'\n' PEER_IDS=($(printf '%s\n' "${PEER_IDS[@]}" | sort -u))
+  # Loud-fail on an incomplete peer list: assigning a shard index from fewer than
+  # WORKER_COUNT peers silently duplicates an index on another worker (the doomed
+  # shard is then read by NOBODY — wrong query results, no error). Note this cannot
+  # cover the instance-refresh transitional case (an early replacement legitimately
+  # sees a full list that still contains a doomed old worker and takes its slot);
+  # that one self-heals via weft-shard-resolve.timer re-resolving against settled
+  # membership.
+  if (( ${#PEER_IDS[@]} < WORKER_COUNT )); then
+    log "ERROR: only ${#PEER_IDS[@]} of ${WORKER_COUNT} worker peers visible; refusing to assign a shard index from an incomplete list"
+    exit 1
+  fi
   SHARD_INDEX=-1
   for i in "${!PEER_IDS[@]}"; do
     if [[ "${PEER_IDS[$i]}" == "${INSTANCE_ID}" ]]; then

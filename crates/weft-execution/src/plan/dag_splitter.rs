@@ -1981,7 +1981,7 @@ mod tests {
     }
 
     /// One engine holding every table the three queries touch (a few rows each).
-    async fn tpcds_plan(sql: &str) -> LogicalPlan {
+    async fn tpcds_engine() -> Engine {
         let engine = Engine::new();
         engine
             .register_batches("customer", vec![customer()])
@@ -2096,7 +2096,11 @@ mod tests {
         engine
             .register_batches("item", vec![i64_table(&["i_item_sk"], &[&[1]])])
             .unwrap();
-        engine.logical_plan(sql).await.unwrap()
+        engine
+    }
+
+    async fn tpcds_plan(sql: &str) -> LogicalPlan {
+        tpcds_engine().await.logical_plan(sql).await.unwrap()
     }
 
     fn stage_by_id(dq: &DistributedQuery, id: u32) -> &StageDef {
@@ -2136,6 +2140,71 @@ mod tests {
         assert!(
             outer.sql.to_uppercase().contains("CASE"),
             "ratio join-condition residuals stay in the outer stage: {}",
+            outer.sql
+        );
+        let finalize = dq.finalize_sql.expect("two-phase TopK finalize");
+        assert!(
+            finalize.contains("ORDER BY") && finalize.contains("LIMIT 100"),
+            "{finalize}"
+        );
+    }
+
+    /// KAN-2 throughput residual: Q4's real driver path pre-optimizes the plan before the
+    /// split (`Engine::optimize_logical_plan` — union-extended rules). The six `year_total`
+    /// occurrences prune to single-fact slices (the contradictory `sale_type` arms fold
+    /// away, the `dyear` predicates reach the `date_dim` scans) and the rewritten plan must
+    /// still split: six distinct slice sub-DAGs feed the keyed outer stage — not the v12
+    /// 66-stage explosion that failed workers with do_get transport errors.
+    #[tokio::test]
+    async fn q4_optimized_plan_splits_into_per_slice_subdags() {
+        let engine = tpcds_engine().await;
+        let lp = engine.logical_plan(Q4).await.unwrap();
+        let opt = engine.optimize_logical_plan(lp).unwrap();
+        let display = format!("{}", opt.display_indent());
+        assert!(
+            !display.contains("Union"),
+            "every year_total occurrence prunes to its sale_type slice: {display}"
+        );
+        let dq = plan_distributed_logical(&opt, &["customer", "date_dim"])
+            .expect("optimized Q4 still plans distributed");
+        assert!(
+            dq.stages.len() <= 30,
+            "slice sub-DAGs, not the 66-stage explosion: {} stages\n{dq:?}",
+            dq.stages.len()
+        );
+        let outer = dq.stages.last().unwrap();
+        assert_eq!(
+            outer.upstream_stage_ids.len(),
+            6,
+            "six pruned year_total slices feed the outer stage: {dq:?}"
+        );
+        assert!(
+            !outer
+                .upstream_stage_ids
+                .iter()
+                .all(|&id| id == outer.upstream_stage_ids[0]),
+            "distinct slices no longer dedup to one sub-DAG: {dq:?}"
+        );
+        // Each of the three fact tables is scanned by exactly two slices (firstyear +
+        // secyear) — the unoptimized plan scanned each fact once for all six occurrences.
+        let scans = |fact: &str| {
+            dq.stages
+                .iter()
+                .filter(|s| s.sql.contains(&format!("JOIN {fact} ON")))
+                .count()
+        };
+        assert_eq!(
+            (
+                scans("store_sales"),
+                scans("catalog_sales"),
+                scans("web_sales")
+            ),
+            (2, 2, 2),
+            "one scan per (fact, year) slice:\n{dq:?}"
+        );
+        assert!(
+            outer.sql.to_uppercase().contains("CASE"),
+            "ratio-CASE residuals stay in the outer stage: {}",
             outer.sql
         );
         let finalize = dq.finalize_sql.expect("two-phase TopK finalize");

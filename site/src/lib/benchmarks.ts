@@ -63,3 +63,23 @@ export function speedupVs(otherKey: string, suite: Benchmarks = benchmarks): num
   if (!weft?.total || !other?.total) return null;
   return other.total / weft.total;
 }
+
+/**
+ * Weft's wall-clock time saved vs another engine, as a percentage
+ * (e.g. 80 = Weft completes in 20% of the other engine's time), or null.
+ * Negative when the other engine is faster. This is the site's headline
+ * convention: "% faster" always means (other − weft) ÷ other.
+ */
+export function pctFasterVs(otherKey: string, suite: Benchmarks = benchmarks): number | null {
+  const weft = suite.engines.find((e) => e.key === "weft");
+  const other = suite.engines.find((e) => e.key === otherKey);
+  if (!weft?.total || !other?.total) return null;
+  return (1 - weft.total / other.total) * 100;
+}
+
+/** Like [`pctFasterVs`] but keyed on the highlighted engine rather than `weft`. */
+export function pctFasterOfHighlight(other: Engine, suite: Benchmarks): number | null {
+  const weft = suite.engines.find((e) => e.key === "weft") ?? suite.engines.find((e) => e.highlight);
+  if (!weft?.total || other.total == null) return null;
+  return (1 - weft.total / other.total) * 100;
+}

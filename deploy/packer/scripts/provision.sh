@@ -58,11 +58,15 @@ rm -f "${STAGED_BINARY}"
 
 echo "[provision] installing bootstrap + systemd units"
 install -m 0755 /tmp/weft-files/bootstrap.sh /usr/local/lib/weft/bootstrap.sh
+install -m 0755 /tmp/weft-files/shard-resolve.sh /usr/local/lib/weft/shard-resolve.sh
 install -m 0644 /tmp/weft-files/systemd/weft-bootstrap.service /etc/systemd/system/weft-bootstrap.service
 install -m 0644 /tmp/weft-files/systemd/weft-driver.service /etc/systemd/system/weft-driver.service
 install -m 0644 /tmp/weft-files/systemd/weft-worker.service /etc/systemd/system/weft-worker.service
+install -m 0644 /tmp/weft-files/systemd/weft-shard-resolve.service /etc/systemd/system/weft-shard-resolve.service
+install -m 0644 /tmp/weft-files/systemd/weft-shard-resolve.timer /etc/systemd/system/weft-shard-resolve.timer
 systemctl daemon-reload
 systemctl enable weft-bootstrap.service
+systemctl enable weft-shard-resolve.timer
 # Role units are enabled at boot by bootstrap based on the weft:role tag.
 systemctl disable weft-driver.service weft-worker.service 2>/dev/null || true
 

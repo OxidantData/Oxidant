@@ -2,11 +2,18 @@
 # Start the weft-sf10 cluster after scripts/sf10-stop.sh: scales the ASGs back
 # (driver 1, workers 2), waits for instances, prints the new driver public IP.
 #
-# After this you MUST redeploy the engine and env (fresh AMI instances):
-#   bash bench/sf100/results/deploy-sf10.sh target/linux-al2023/release/weft
-#   # then restore env customizations captured in
-#   # bench/sf100/results/cluster-state/weft.env.{driver,worker} to
-#   # /etc/weft/weft.env on each node and restart weft-driver/weft-worker.
+# The baked AMI (ami-06062f1fc09e4e2fa and later) brings nodes up fully
+# configured — WEFT_PREFER_HASH_JOIN=auto, S3 disk cache on, spill on the
+# right disk, no manual repair. To run the LATEST engine build instead of the
+# baked binary, redeploy it:
+#   WEFT_SF10_DRIVER=<ip> WEFT_SF10_W0=<w0> WEFT_SF10_W1=<w1> \
+#     bash bench/sf100/results/deploy-sf10.sh target/linux-al2023/release/weft
+# Caveat: a CloudFormation instance *refresh* (stack AmiId change) can hand two
+# workers the same shard index (E-EC2-SHARD-REFRESH) — weft-shard-resolve.timer
+# self-heals within minutes on AMI v3+; on older AMIs check
+# `grep SHARD_INDEX /etc/weft/weft.env` on both workers and
+# `sudo systemctl restart weft-bootstrap && sudo systemctl restart weft-worker`
+# on the duplicate.
 # Note: the driver gets a NEW public IP — update SSH commands and the
 # sc:// endpoint accordingly.
 set -euo pipefail

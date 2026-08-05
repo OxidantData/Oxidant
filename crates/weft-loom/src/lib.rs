@@ -2151,6 +2151,165 @@ pub struct Engine {
     table_bytes_cache: Mutex<HashMap<String, (TableStats, std::time::Instant)>>,
 }
 
+/// How much rewriting a plan tolerates before the distributed stage split, gating
+/// [`Engine::optimize_logical_plan`]. The splitter's handlers pattern-match specific
+/// plan shapes, so the pre-split optimizer must stay inside the vocabulary they can
+/// re-render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreSplitRewrite {
+    /// `extract_equijoin_predicate` + `push_down_filter` only — the proven default
+    /// (TPC-DS Q78/Q39 group-key predicates reach the scans; every node type in the
+    /// plan keeps its identity).
+    Standard,
+    /// The plan contains a `Union`: additionally fold constant predicates
+    /// ([`FoldConstantFilters`] — filter-scoped, unlike `simplify_expressions`), then run
+    /// `eliminate_filter`, `propagate_empty_relation`, and `optimize_unions` so
+    /// predicates pushed into union arms *prune the arms they contradict*. TPC-DS
+    /// Q4's six `year_total` occurrences each carry a different `sale_type = 's'/'c'/'w'`
+    /// predicate; pushed through the arm projections those become literal comparisons
+    /// (`'c' = 's'`) that fold to `false`, the arm collapses to an `EmptyRelation`, and
+    /// the union drops it — each occurrence degenerates to the single fact slice it
+    /// filters (and the `dyear` group-key predicate reaches the `date_dim` scan).
+    /// Pushdown *without* the pruning rules is the v12 failure mode: per-branch
+    /// predicates only made the shared union arms textually distinct, defeating
+    /// stage-level CSE (Q4 went from ~15 stages to 66 and workers failed under the
+    /// tiny-stage orchestration load — do_get transport error).
+    UnionExtended,
+    /// Shape classes the splitter pattern-matches in their unoptimized form — return
+    /// the plan byte-for-byte untouched:
+    /// - SQL table aliases (`JOIN date_dim d1`): a `SubqueryAlias` wrapping exactly one
+    ///   `TableScan` plus passthrough `Filter`/`Projection` nodes. `PushDownFilter`
+    ///   re-qualifies pushed predicates to the *base* table name (`date_dim.d_year`),
+    ///   but the splitter's broadcast/replicated path re-renders the scan with the
+    ///   alias (`FROM date_dim AS d1`) — the worker then fails with "No field named
+    ///   date_dim.d_year. Did you mean 'd1.d_year'?" (TPC-DS Q72). CTE `SubqueryAlias`
+    ///   nodes (over aggregates/joins — TPC-DS Q78/Q39) are NOT this class and still
+    ///   qualify.
+    /// - `EXISTS` / `IN` / scalar subquery expressions: pushing predicates inside them
+    ///   moves their filters into the inner `TableScan`, which the splitter's subquery
+    ///   handlers cannot re-render
+    ///   (`auto_distribute::exists_subquery_over_replicated_dim`).
+    /// - `Window`: the splitter's window handlers match the unoptimized frame shape;
+    ///   pushing outer predicates through the frame (TPC-DS Q47/Q57's `avg() OVER` /
+    ///   `rank() OVER` CTE families) left no distributed shape the splitter recognizes
+    ///   ("no distributed semi/anti or decorrelated shape matched").
+    Skip,
+}
+
+/// Filter-scoped constant folding for the union-extended pre-split rule set
+/// ([`PreSplitRewrite::UnionExtended`]). The stock `SimplifyExpressions` rule is *not*
+/// used: it also simplifies projection/aggregate expressions, and folding
+/// `CAST(0 AS DECIMAL(7,2))` to a bare decimal literal makes the stage-SQL unparser emit
+/// `0.00`, which re-parses as `DECIMAL(3,2)` — the union's downstream decimal coercion
+/// then shifts result scales and distributed results no longer match single-node
+/// byte-for-byte (TPC-DS Q5: `1141124.71` vs `1141124.710000000000000`).
+///
+/// Union arm pruning only needs *predicates* folded (`'c' = 's'` → `false` so
+/// `EliminateFilter` can drop the arm; `d_year = 2001 + 1` → `d_year = 2002`), so this
+/// rule simplifies only `Filter` predicates and `TableScan` filter lists — emptying the
+/// scan outright when a folded `false` lands in it — and never touches projection or
+/// aggregate expressions, whose casts and literals round-trip through the unparser
+/// byte-for-byte.
+#[derive(Debug, Default)]
+struct FoldConstantFilters;
+
+impl FoldConstantFilters {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl datafusion::optimizer::OptimizerRule for FoldConstantFilters {
+    fn name(&self) -> &str {
+        "fold_constant_filters"
+    }
+
+    fn apply_order(&self) -> Option<datafusion::optimizer::ApplyOrder> {
+        Some(datafusion::optimizer::ApplyOrder::BottomUp)
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
+        &self,
+        plan: datafusion::logical_expr::LogicalPlan,
+        config: &dyn datafusion::optimizer::OptimizerConfig,
+    ) -> datafusion::common::Result<
+        datafusion::common::tree_node::Transformed<datafusion::logical_expr::LogicalPlan>,
+    > {
+        use datafusion::common::tree_node::Transformed;
+        use datafusion::common::{DFSchema, DFSchemaRef, ScalarValue};
+        use datafusion::logical_expr::simplify::SimplifyContext;
+        use datafusion::logical_expr::utils::merge_schema;
+        use datafusion::logical_expr::{EmptyRelation, Expr, Filter, LogicalPlan};
+        use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+        use std::sync::Arc;
+
+        // Same simplification context as `SimplifyExpressions`, scoped to predicates:
+        // filter-pushdownable providers keep the full inner schema visible (a pushed
+        // predicate may reference columns outside the scan's output projection).
+        let schema = if !plan.inputs().is_empty() {
+            DFSchemaRef::new(merge_schema(&plan.inputs()))
+        } else if let LogicalPlan::TableScan(scan) = &plan {
+            Arc::new(DFSchema::try_from_qualified_schema(
+                scan.table_name.clone(),
+                &scan.source.schema(),
+            )?)
+        } else {
+            Arc::new(DFSchema::empty())
+        };
+        let info = SimplifyContext::builder()
+            .with_schema(schema)
+            .with_config_options(config.options())
+            .with_query_execution_start_time(config.query_execution_start_time())
+            .build();
+        let simplifier = ExprSimplifier::new(info);
+
+        match plan {
+            LogicalPlan::Filter(filter) => {
+                let simplified = simplifier.simplify(filter.predicate.clone())?;
+                if simplified == filter.predicate {
+                    Ok(Transformed::no(LogicalPlan::Filter(filter)))
+                } else {
+                    Ok(Transformed::yes(LogicalPlan::Filter(Filter::try_new(
+                        simplified,
+                        filter.input,
+                    )?)))
+                }
+            }
+            LogicalPlan::TableScan(mut scan) => {
+                let output_schema = scan.projected_schema.clone();
+                let mut simplified_filters = Vec::with_capacity(scan.filters.len());
+                for expr in scan.filters.iter().cloned() {
+                    let simplified = simplifier.simplify(expr)?;
+                    if matches!(
+                        &simplified,
+                        Expr::Literal(ScalarValue::Boolean(Some(false)), _)
+                    ) {
+                        // A constant-false scan filter yields zero rows — empty the scan
+                        // so `PropagateEmptyRelation` can prune the union arm.
+                        return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
+                            EmptyRelation {
+                                produce_one_row: false,
+                                schema: output_schema,
+                            },
+                        )));
+                    }
+                    simplified_filters.push(simplified);
+                }
+                if simplified_filters == scan.filters {
+                    return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+                }
+                scan.filters = simplified_filters;
+                Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+            }
+            _ => Ok(Transformed::no(plan)),
+        }
+    }
+}
+
 impl Engine {
     /// Create a fresh engine with default session state.
     ///
@@ -2725,41 +2884,24 @@ impl Engine {
         catalog_bridge::capture_lakehouse_snapshots(self.logical_plan(query)).await
     }
 
-    /// Gate for [`Engine::optimize_logical_plan`]: only plans in the shape class the stage
-    /// splitter provably tolerates after rewriting may be optimized pre-split.
-    ///
-    /// Excluded classes (the splitter's handlers pattern-match their unoptimized form;
-    /// rewriting them broke distribution on the cluster):
-    /// - SQL table aliases (`JOIN date_dim d1`): a `SubqueryAlias` wrapping exactly one
-    ///   `TableScan` plus passthrough `Filter`/`Projection` nodes. `PushDownFilter`
-    ///   re-qualifies pushed predicates to the *base* table name (`date_dim.d_year`), but
-    ///   the splitter's broadcast/replicated path re-renders the scan with the alias
-    ///   (`FROM date_dim AS d1`) — the worker then fails with "No field named
-    ///   date_dim.d_year. Did you mean 'd1.d_year'?" (TPC-DS Q72). CTE `SubqueryAlias`
-    ///   nodes (over aggregates/joins — TPC-DS Q78/Q39) are NOT this class and still
-    ///   qualify.
-    /// - `EXISTS` / `IN` / scalar subquery expressions: pushing predicates inside them
-    ///   moves their filters into the inner `TableScan`, which the splitter's subquery
-    ///   handlers cannot re-render (`auto_distribute::exists_subquery_over_replicated_dim`).
-    /// - `Union` / `Intersect` / `Except`: per-branch predicates pushed into the branch
-    ///   scans make them textually distinct (e.g. `'s' = 's'` vs `'c' = 'c'` on Q4's
-    ///   three identical customer scans), so stage-level CSE can no longer merge the
-    ///   branches — Q4 went from ~15 stages to 66 and workers failed under the tiny-stage
-    ///   orchestration load (do_get transport error).
-    /// - `Window`: the splitter's window handlers match the unoptimized frame shape;
-    ///   pushing outer predicates through the frame (TPC-DS Q47/Q57's `avg() OVER` /
-    ///   `rank() OVER` CTE families) left no distributed shape the splitter recognizes
-    ///   ("no distributed semi/anti or decorrelated shape matched").
-    fn splittable_after_rewrite(lp: &datafusion::logical_expr::LogicalPlan) -> bool {
+    /// Classify a driver-side plan for [`Engine::optimize_logical_plan`] (see
+    /// [`PreSplitRewrite`] for the classes). `Skip` wins over `UnionExtended` when a plan
+    /// contains both a union and a skipped class (e.g. a window over a union).
+    fn pre_split_rewrite_class(lp: &datafusion::logical_expr::LogicalPlan) -> PreSplitRewrite {
         use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
         use datafusion::logical_expr::{Expr, LogicalPlan};
 
-        let mut rejected = false;
+        let mut class = PreSplitRewrite::Standard;
         let _ = lp.apply(|node| {
             match node {
-                LogicalPlan::Union(_) | LogicalPlan::Window(_) => {
-                    rejected = true;
+                LogicalPlan::Window(_) => {
+                    class = PreSplitRewrite::Skip;
                     return Ok(TreeNodeRecursion::Stop);
+                }
+                LogicalPlan::Union(_) => {
+                    class = PreSplitRewrite::UnionExtended;
+                    // Keep walking: a Window or subquery expression elsewhere in the plan
+                    // still forces Skip.
                 }
                 LogicalPlan::SubqueryAlias(alias) => {
                     // Walk past passthrough nodes: a bare TableScan at the end means this
@@ -2770,7 +2912,7 @@ impl Engine {
                             LogicalPlan::Filter(f) => inner = f.input.as_ref(),
                             LogicalPlan::Projection(p) => inner = p.input.as_ref(),
                             LogicalPlan::TableScan(_) => {
-                                rejected = true;
+                                class = PreSplitRewrite::Skip;
                                 return Ok(TreeNodeRecursion::Stop);
                             }
                             _ => break,
@@ -2788,7 +2930,7 @@ impl Engine {
                             })
                             .unwrap_or(false);
                         if has_subquery {
-                            rejected = true;
+                            class = PreSplitRewrite::Skip;
                             return Ok(TreeNodeRecursion::Stop);
                         }
                     }
@@ -2796,23 +2938,31 @@ impl Engine {
             }
             Ok(TreeNodeRecursion::Continue)
         });
-        !rejected
+        class
     }
 
-    /// Apply `extract_equijoin_predicate` + `push_down_filter` to a driver-side plan so the
-    /// distributed stage splitter sees predicates where they belong (below aggregates and
-    /// join sides) rather than where the SQL text put them. Without this the splitter
-    /// unparses the *unoptimized* plan and no pushdown can cross a stage boundary — e.g.
-    /// TPC-DS Q78's `ss_sold_year=2000` landed in the final stage while leaf stages scanned
-    /// and grouped every year of all three fact tables (6.3s → 1.5s at SF10 once pushed).
+    /// Apply optimizer rules to a driver-side plan so the distributed stage splitter sees
+    /// predicates where they belong (below aggregates and join sides) rather than where the
+    /// SQL text put them. Without this the splitter unparses the *unoptimized* plan and no
+    /// pushdown can cross a stage boundary — e.g. TPC-DS Q78's `ss_sold_year=2000` landed in
+    /// the final stage while leaf stages scanned and grouped every year of all three fact
+    /// tables (6.3s → 1.5s at SF10 once pushed).
+    ///
+    /// The rule set is class-dependent ([`PreSplitRewrite`]): the standard pair
+    /// (`extract_equijoin_predicate` + `push_down_filter`) for ordinary plans, plus
+    /// filter-scoped constant folding ([`FoldConstantFilters`]) and `eliminate_filter` /
+    /// `propagate_empty_relation` / `optimize_unions` for union plans so pushed
+    /// predicates prune contradictory arms (TPC-DS Q4: six shared `year_total` union
+    /// occurrences collapse to single-fact slices instead of defeating stage CSE — the
+    /// v12 66-stage do_get failure).
     ///
     /// Two deliberate restrictions versus running `Optimizer::optimize`:
     /// - Rule subset: rules like `eliminate_distinct` / `replace_distinct_aggregate`
     ///   rewrite node *types* (TPC-DS Q37's aggregate-free `GROUP BY` becomes a `Distinct`)
     ///   into shapes the splitter does not yet recognize, which would de-distribute those
-    ///   queries to a single-node Forward stage. These two rules only normalize equijoin
-    ///   keys and move/merge `Filter` nodes (including `infer_join_predicates` into
-    ///   outer-join sides), leaving every plan's node-type vocabulary intact.
+    ///   queries to a single-node Forward stage. The chosen rules only normalize equijoin
+    ///   keys, move/merge/fold `Filter` nodes, and prune empty union arms, leaving every
+    ///   surviving plan's node-type vocabulary intact.
     /// - Plan tree only (no expr-subquery descent): the stock driver applies rules via
     ///   `rewrite_with_subqueries`, which also rewrites plans inside `EXISTS` / scalar
     ///   subquery *expressions* (pushing their predicates into the inner `TableScan`).
@@ -2826,16 +2976,38 @@ impl Engine {
         use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
         use datafusion::logical_expr::LogicalPlan;
         use datafusion::optimizer::{
-            extract_equijoin_predicate::ExtractEquijoinPredicate, push_down_filter::PushDownFilter,
+            eliminate_filter::EliminateFilter,
+            extract_equijoin_predicate::ExtractEquijoinPredicate, optimize_unions::OptimizeUnions,
+            propagate_empty_relation::PropagateEmptyRelation, push_down_filter::PushDownFilter,
             ApplyOrder, OptimizerConfig, OptimizerRule,
         };
         use std::sync::Arc;
 
         // Shape gate: leave plan classes the splitter cannot re-render after rewriting
         // exactly as they are (today's behavior), rather than emitting broken stage SQL.
-        if !Self::splittable_after_rewrite(&lp) {
-            return Ok(lp);
-        }
+        let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> =
+            match Self::pre_split_rewrite_class(&lp) {
+                PreSplitRewrite::Skip => return Ok(lp),
+                PreSplitRewrite::Standard => vec![
+                    Arc::new(ExtractEquijoinPredicate::new()),
+                    Arc::new(PushDownFilter::new()),
+                ],
+                PreSplitRewrite::UnionExtended => vec![
+                    // Same pushdown pair first — outer predicates reach the union arms…
+                    Arc::new(ExtractEquijoinPredicate::new()),
+                    Arc::new(PushDownFilter::new()),
+                    // …then fold constant *predicates* only (`'c' = 's'` → `false`;
+                    // `d_year = 2001 + 1` → `d_year = 2002`) — never projection
+                    // expressions, whose decimal casts must survive the unparser
+                    // byte-for-byte (TPC-DS Q5) — collapse the false arms to
+                    // `EmptyRelation`, drop them from the union, and flatten
+                    // single-input / nested unions.
+                    Arc::new(FoldConstantFilters::new()),
+                    Arc::new(EliminateFilter::new()),
+                    Arc::new(PropagateEmptyRelation::new()),
+                    Arc::new(OptimizeUnions::new()),
+                ],
+            };
 
         /// Mirror of datafusion-optimizer's private driver `Rewriter`, dispatched through
         /// `TreeNode::rewrite` (plan tree only) rather than `rewrite_with_subqueries`.
@@ -2868,10 +3040,6 @@ impl Engine {
             }
         }
 
-        let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![
-            Arc::new(ExtractEquijoinPredicate::new()),
-            Arc::new(PushDownFilter::new()),
-        ];
         let state = self.ctx.state();
         let config: &dyn OptimizerConfig = &state;
         let mut plan = lp;
@@ -7473,6 +7641,169 @@ mod tests {
         );
     }
 
+    /// KAN-2 throughput: union plans get the extended rule set — outer `sale_type`/`dyear`
+    /// predicates push into the arms, contradictory arms fold to `EmptyRelation` and drop
+    /// out, and each shared-CTE occurrence collapses to the single fact slice it filters
+    /// (TPC-DS Q4's six `year_total` occurrences). Without the pruning rules pushdown alone
+    /// only made the shared arms textually distinct, defeating stage CSE — the v12 Q4
+    /// 66-stage explosion that failed workers with do_get transport errors.
+    #[tokio::test]
+    async fn optimize_logical_plan_union_arm_pruning() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let engine = Engine::new();
+        let mk = |name: &str, cols: Vec<&str>| {
+            let schema = Arc::new(Schema::new(
+                cols.iter()
+                    .map(|n| Field::new(*n, DataType::Int64, false))
+                    .collect::<Vec<_>>(),
+            ));
+            let batch = RecordBatch::try_new(
+                schema,
+                cols.iter()
+                    .map(|_| Arc::new(Int64Array::from(vec![1, 2])) as _)
+                    .collect(),
+            )
+            .unwrap();
+            engine.register_batches(name, vec![batch]).unwrap();
+        };
+        mk("customer", vec!["c_customer_sk", "c_customer_id"]);
+        mk(
+            "store_sales",
+            vec!["ss_customer_sk", "ss_sold_date_sk", "ss_sales_price"],
+        );
+        mk(
+            "catalog_sales",
+            vec!["cs_bill_customer_sk", "cs_sold_date_sk", "cs_sales_price"],
+        );
+        mk("date_dim", vec!["d_date_sk", "d_year"]);
+
+        // Miniature Q4: a two-arm union CTE (per-arm `sale_type` literal) referenced twice
+        // with contradictory per-occurrence predicates.
+        let sql = "WITH yt AS (\
+                       SELECT c_customer_sk AS customer_sk, d_year AS dyear, \
+                              SUM(ss_sales_price) AS year_total, 's' AS sale_type \
+                       FROM customer, store_sales, date_dim \
+                       WHERE c_customer_sk = ss_customer_sk AND ss_sold_date_sk = d_date_sk \
+                       GROUP BY c_customer_sk, d_year \
+                       UNION ALL \
+                       SELECT c_customer_sk AS customer_sk, d_year AS dyear, \
+                              SUM(cs_sales_price) AS year_total, 'c' AS sale_type \
+                       FROM customer, catalog_sales, date_dim \
+                       WHERE c_customer_sk = cs_bill_customer_sk AND cs_sold_date_sk = d_date_sk \
+                       GROUP BY c_customer_sk, d_year) \
+                   SELECT a.customer_sk FROM yt a, yt b \
+                   WHERE a.customer_sk = b.customer_sk \
+                     AND a.sale_type = 's' AND b.sale_type = 'c' \
+                     AND a.dyear = 2001 AND b.dyear = 2001 + 1";
+        let lp = engine.logical_plan(sql).await.unwrap();
+        let opt = engine.optimize_logical_plan(lp).unwrap();
+        let display = format!("{}", opt.display_indent());
+
+        // Each occurrence pruned to its one matching arm: no Union survives, and each fact
+        // is scanned exactly once (store by the 's' occurrence, catalog by the 'c' one).
+        assert!(
+            !display.contains("Union"),
+            "every union arm must prune to the matching slice:\n{display}"
+        );
+        assert_eq!(
+            display.matches("TableScan: store_sales").count(),
+            1,
+            "the 's' occurrence keeps only the store_sales arm:\n{display}"
+        );
+        assert_eq!(
+            display.matches("TableScan: catalog_sales").count(),
+            1,
+            "the 'c' occurrence keeps only the catalog_sales arm:\n{display}"
+        );
+        // The group-key year predicates (incl. the folded `2001 + 1`) reach the scans.
+        assert!(
+            display.contains("d_year = Int64(2001)"),
+            "dyear = 2001 must push below the aggregate:\n{display}"
+        );
+        assert!(
+            display.contains("d_year = Int64(2002)"),
+            "dyear = 2001 + 1 must fold and push below the aggregate:\n{display}"
+        );
+    }
+
+    /// KAN-2 throughput: a window over a union stays `Skip` — the skipped classes win over
+    /// the union-extended rule set (TPC-DS Q47/Q57's window CTE families broke the
+    /// splitter's window handlers when outer predicates moved through the frame).
+    #[tokio::test]
+    async fn optimize_logical_plan_window_over_union_stays_untouched() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let engine = Engine::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as _,
+                Arc::new(Int64Array::from(vec![10, 20])) as _,
+            ],
+        )
+        .unwrap();
+        engine.register_batches("t1", vec![batch.clone()]).unwrap();
+        engine.register_batches("t2", vec![batch]).unwrap();
+        let sql = "WITH u AS (SELECT k, v FROM t1 UNION ALL SELECT k, v FROM t2) \
+                   SELECT k, RANK() OVER (ORDER BY v) AS r FROM u WHERE k = 1";
+        let lp = engine.logical_plan(sql).await.unwrap();
+        let before = format!("{}", lp.display_indent());
+        let after = format!(
+            "{}",
+            engine.optimize_logical_plan(lp).unwrap().display_indent()
+        );
+        assert_eq!(before, after, "window-over-union must be left untouched");
+    }
+
+    /// KAN-2 throughput: the union-extended rule set folds constant *predicates* but must
+    /// never simplify projection expressions — folding `CAST(0 AS DECIMAL(7,2))` to a bare
+    /// decimal literal makes the stage-SQL unparser emit `0.00`, which re-parses as
+    /// `DECIMAL(3,2)`; downstream decimal coercion then shifts result scales and
+    /// distributed results drift from single-node (TPC-DS Q5:
+    /// `1141124.71` vs `1141124.710000000000000`).
+    #[tokio::test]
+    async fn optimize_logical_plan_preserves_decimal_casts_in_projections() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let engine = Engine::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sk", DataType::Int64, false),
+            Field::new("price", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as _,
+                Arc::new(Int64Array::from(vec![10, 20])) as _,
+            ],
+        )
+        .unwrap();
+        engine.register_batches("t1", vec![batch.clone()]).unwrap();
+        engine.register_batches("t2", vec![batch]).unwrap();
+        // Union plan (extended rule set) with an explicit decimal cast in the arm
+        // projections and a foldable constant predicate outside.
+        let sql = "SELECT u.z, u.price FROM \
+                     (SELECT sk, price, CAST(0 AS DECIMAL(7,2)) AS z FROM t1 \
+                      UNION ALL SELECT sk, price, CAST(0 AS DECIMAL(7,2)) AS z FROM t2) u \
+                   WHERE u.sk = 2001 + 1";
+        let lp = engine.logical_plan(sql).await.unwrap();
+        let opt = engine.optimize_logical_plan(lp).unwrap();
+        let display = format!("{}", opt.display_indent());
+        assert!(
+            display.contains("CAST(Int64(0) AS Decimal128(7, 2))"),
+            "the decimal cast must survive optimization byte-for-byte:\n{display}"
+        );
+        assert!(
+            display.contains("Int64(2002)"),
+            "the constant predicate must still fold (2001 + 1 → 2002):\n{display}"
+        );
+    }
+
     /// KAN-45/KAN-53: with `WEFT_PREFER_HASH_JOIN=true` forced (no `auto` selection, no
     /// `WEFT_SORT_MERGE_FALLBACK`), an over-budget build estimate must NOT reroute to a
     /// sort-merge plan — the query runs the hash plan (and, if the actual build fits the
@@ -9348,7 +9679,18 @@ mod tests {
         std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
         std::env::remove_var("WEFT_PARQUET_SCAN_STATS");
         assert_eq!(join_preference(), JoinPreference::Auto);
+        // Pin two partitions for the whole test: the sort-merge parity re-plan below
+        // registers partitions × 8 `ExternalSorter` consumers on the 1 GiB
+        // `FairSpillPool`, which caps each spilling consumer at pool/num_consumers — at
+        // the host's core count that share (1 GiB / ~100 sorters ≈ 9 MiB) is smaller
+        // than one wide chain-intermediate batch's FIRST reservation (~10 MiB, which an
+        // empty sorter cannot spill its way to), so the re-plan dies with "Not enough
+        // memory to continue external sort" whenever parallel test load keeps every
+        // sorter registered at once (E-LOOM-FLAKE). At 2 partitions the ~64 MiB share
+        // always admits a batch; spilling bounds the rest.
+        std::env::set_var("WEFT_TARGET_PARTITIONS", "2");
         let engine = Engine::new_with_memory_limit(1024 * 1024 * 1024);
+        std::env::remove_var("WEFT_TARGET_PARTITIONS");
         let dirs = register_q62_fixture(&engine, 300_000).await;
         let plan = engine.physical_plan(Q62_STAGE_SQL).await.unwrap();
         let display = plan_tree_text(plan.as_ref());
