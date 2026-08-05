@@ -1,6 +1,8 @@
 import clickbenchRaw from "../data/benchmarks.json";
 import tpchRaw from "../data/tpch.json";
 import tpcdsRaw from "../data/tpcds.json";
+import tpchNocacheRaw from "../data/tpch-nocache.json";
+import tpcdsNocacheRaw from "../data/tpcds-nocache.json";
 
 export interface Engine {
   key: string;
@@ -33,6 +35,8 @@ export interface Benchmarks {
 export const benchmarks = clickbenchRaw as Benchmarks;
 export const tpchBenchmarks = tpchRaw as Benchmarks;
 export const tpcdsBenchmarks = tpcdsRaw as Benchmarks;
+export const tpchNocacheBenchmarks = tpchNocacheRaw as Benchmarks;
+export const tpcdsNocacheBenchmarks = tpcdsNocacheRaw as Benchmarks;
 
 /** One distinct, solid color per engine — shared by every chart so bars/legends stay consistent.
  *  Weft keeps the brand orange; the others get clearly distinguishable hues (not faint grey). */

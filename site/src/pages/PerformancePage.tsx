@@ -7,6 +7,8 @@ import {
   benchmarks,
   tpchBenchmarks,
   tpcdsBenchmarks,
+  tpchNocacheBenchmarks,
+  tpcdsNocacheBenchmarks,
   type Benchmarks,
   type Engine,
 } from "../lib/benchmarks";
@@ -252,7 +254,7 @@ export default function PerformancePage() {
       <SuiteSection
         eyebrow="TPC-H SF10"
         title="Decision-support, head-to-head with Spark"
-        blurb="Official Q1–Q22 over the same SF10 Parquet bytes on S3, on the same 3-node spec (1x c6g.2xlarge + 2x m8g.2xlarge), re-run fresh the same day with identical temperature (2 runs/query, hot = run 2): Weft distributed in strict mode via Spark Connect — with the S3 disk cache (a Databricks/Snowflake-style local-NVMe object cache on every worker) — vs stock Apache Spark 3.5.6 on EMR 7.13.0/YARN, which re-reads S3 on every query. It is a sweep: Weft 15.3s vs Spark 87.3s hot — 82% faster, winning all 22 queries. The cache is not the win: strip it from both engines and Weft still takes 69.0s vs 88.6s (21% faster, 16 of 22) — the wins are the engine: real table statistics, per-query hash-join selection (auto, not per-deployment), driver-side predicate pushdown before the stage split, runtime-measured shuffle cardinalities, and a plan cache that plans each stage once per worker — leak-free. The one pass Spark still takes is the truly cold, cacheless stream (105.7s vs our 118.3s — its S3A prefetcher reads ahead, ours does not yet); with the cache on, even the first-touch pass is a dead heat (104.1s vs 105.7s). Correctness is table stakes and Weft meets it: 22/22 golden-clean against DuckDB SF10."
+        blurb="Official Q1–Q22 over the same SF10 Parquet bytes on S3, on the same 3-node spec (1x c6g.2xlarge + 2x m8g.2xlarge), re-run fresh the same day with identical temperature (2 runs/query, hot = run 2): Weft distributed in strict mode via Spark Connect — with the S3 disk cache (a Databricks/Snowflake-style local-NVMe object cache on every worker) — vs stock Apache Spark 3.5.6 on EMR 7.13.0/YARN, which re-reads S3 on every query. It is a sweep: Weft 15.3s vs Spark 87.3s hot — 82% faster, winning all 22 queries. The cache is not the win: strip it from both engines and Weft still takes 69.0s vs 87.3s (21% faster, 16 of 22) — the wins are the engine: real table statistics, per-query hash-join selection (auto, not per-deployment), driver-side predicate pushdown before the stage split, runtime-measured shuffle cardinalities, and a plan cache that plans each stage once per worker — leak-free. The one pass Spark still takes is the truly cold, cacheless stream (105.7s vs our 118.3s — its S3A prefetcher reads ahead, ours does not yet); with the cache on, even the first-touch pass is a dead heat (104.1s vs 105.7s). Correctness is table stakes and Weft meets it: 22/22 golden-clean against DuckDB SF10."
         suite={tpchBenchmarks}
       />
 
@@ -263,8 +265,48 @@ export default function PerformancePage() {
       <SuiteSection
         eyebrow="TPC-DS SF10"
         title="Retail warehouse, 99 queries each"
-        blurb="Same hardware, same bytes, all 99 queries on both engines, same temperature. The SF10 marathon is a rout: Weft 56.4s vs Spark 282.8s hot — 80% faster, winning 98 of 99 outright with Q72 a 4.3s-vs-4.4s coin flip at the boundary. The last holdout fell this run: Q4, the UNION-shaped self-join that trailed Spark 1.3x, dropped 11.4s → 3.25s (Spark: 8.8s) when the driver began pruning contradictory union arms before the stage split — each of its six year_total occurrences collapses to the single fact slice its sale_type filter keeps (Q11 rode along, 4.5s → 1.6s). Underneath it, the S3 disk cache lands each table on local NVMe once per worker instead of re-downloading ~250MB/node from S3 on every query. The cache is not the win either: off on both engines, Weft still takes 254.0s vs 286.8s (10% faster, 58 of 99), and the cache-filling first pass is a 48% rout (168.9s vs 325.2s) — only the truly cold, cacheless stream goes to Spark (365.3s vs 325.2s, its S3A prefetch edge; the open I/O work). 99/99 end-to-end under strict mode, every query golden-validated against DuckDB SF10. Per-query chart omitted (99 bars); totals tell the story."
+        blurb="Same hardware, same bytes, all 99 queries on both engines, same temperature. The SF10 marathon is a rout: Weft 56.4s vs Spark 282.8s hot — 80% faster, winning 98 of 99 outright with Q72 a 4.3s-vs-4.4s coin flip at the boundary. The last holdout fell this run: Q4, the UNION-shaped self-join that trailed Spark 1.3x, dropped 11.4s → 3.25s (Spark: 8.8s) when the driver began pruning contradictory union arms before the stage split — each of its six year_total occurrences collapses to the single fact slice its sale_type filter keeps (Q11 rode along, 4.5s → 1.6s). Underneath it, the S3 disk cache lands each table on local NVMe once per worker instead of re-downloading ~250MB/node from S3 on every query. The cache is not the win either: off on both engines, Weft still takes 254.0s vs 282.8s (10% faster, 58 of 99), and the cache-filling first pass is a 48% rout (168.9s vs 325.2s) — only the truly cold, cacheless stream goes to Spark (365.3s vs 325.2s, its S3A prefetch edge; the open I/O work). 99/99 end-to-end under strict mode, every query golden-validated against DuckDB SF10. Per-query chart omitted (99 bars); totals tell the story."
         suite={tpcdsBenchmarks}
+        showPerQuery={false}
+      />
+
+      <div className="my-12">
+        <ThreadDivider node={0.5} />
+      </div>
+
+      <section className="mt-16">
+        <div className="max-w-3xl">
+          <span className="weft-eyebrow">Cache off — the control</span>
+          <h2 className="mt-2 text-2xl font-bold tracking-tight">
+            Same fight, no cache on either side
+          </h2>
+          <p className="mt-3 text-muted">
+            The sections above run Weft with its S3 disk cache on (the default, and the
+            benchmarked configuration). These two run the identical suites with the cache
+            disabled — both engines re-read S3 on every query, so what remains is pure
+            engine: planning, join strategy, execution. Weft still wins both suites, and
+            the only pass that flips is the truly cold stream, where Spark&apos;s S3A
+            prefetcher reads ahead and Weft&apos;s first touch does not yet.
+          </p>
+        </div>
+      </section>
+
+      <SuiteSection
+        eyebrow="TPC-H SF10 · cache off"
+        title="Decision-support, cache disabled"
+        blurb="The control for the headline: cache off on both engines, identical everything else. Weft 69.0s vs Spark 87.3s hot — 21% faster, winning 16 of 22. Compare the cache-on section: 15.3s vs 87.3s (82% faster) — the cache multiplies the win, it does not create it. Cold-vs-cold (first touches, nothing cached anywhere): Spark 105.7s vs Weft 118.3s — 11% to Spark, the S3A prefetch edge on the one streaming pass; every subsequent pass belongs to Weft."
+        suite={tpchNocacheBenchmarks}
+      />
+
+      <div className="my-12">
+        <ThreadDivider node={0.2} />
+      </div>
+
+      <SuiteSection
+        eyebrow="TPC-DS SF10 · cache off"
+        title="Retail warehouse, cache disabled"
+        blurb="The 99-query control: Weft 254.0s vs Spark 282.8s hot — 10% faster, 58 of 99 wins with both engines re-reading S3 on every query. With the cache on it becomes 56.4s vs 282.8s (80% faster): each table downloads once per cluster instead of once per query. The cold, cacheless first pass goes to Spark (325.2s vs 365.3s, ~11%) — S3A prefetch again, the open I/O workstream; after one pass the cache makes the point moot. 99/99 golden-validated against DuckDB SF10 here too. Per-query chart omitted (99 bars)."
+        suite={tpcdsNocacheBenchmarks}
         showPerQuery={false}
       />
 
