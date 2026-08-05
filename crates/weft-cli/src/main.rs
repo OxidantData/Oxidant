@@ -17,8 +17,21 @@ use weft_execution::driver::{run_distributed, Cluster, DistributedPlan};
 use weft_execution::flight::serve_worker;
 use weft_loom::Engine;
 
-#[tokio::main]
-async fn main() {
+// Deep SQL (nested derived tables + large CASE trees in generated stage SQL) recurses well past
+// tokio's 2 MiB default worker-thread stack inside DataFusion's parser/optimizer once the async
+// serve layers above it consume their share (KAN-2: TPC-DS Q39/Q70 stage re-parse overflowed on
+// workers). Give every runtime thread a generous stack — production driver, worker, and server
+// all enter through here.
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(32 * 1024 * 1024)
+        .build()
+        .expect("tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() {
     // TODO(issue #1): replace this hand-rolled arg handling with clap.
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str);

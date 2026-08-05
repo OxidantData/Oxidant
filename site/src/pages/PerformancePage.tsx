@@ -252,7 +252,7 @@ export default function PerformancePage() {
       <SuiteSection
         eyebrow="TPC-H SF10"
         title="Decision-support, head-to-head with Spark"
-        blurb="Official Q1–Q22 over the same SF10 Parquet bytes on S3, on the same 3-node spec (1x c6g.2xlarge + 2x m8g.2xlarge), re-run fresh the same day with identical temperature (2 runs/query, hot = run 2): Weft distributed in strict mode via Spark Connect vs stock Apache Spark 3.5.6 on EMR 7.13.0/YARN. Weft takes this round: 85.3s vs 87.3s hot (0.98x), winning 11 of 22 queries outright — after starting the day at 6.7x Spark. The climb came from engineering, not hardware: real table statistics from parquet footers, hash joins chosen per query instead of forced sort-merge, runtime-measured shuffle cardinalities, and a plan cache that plans each stage once per worker. Correctness is table stakes and Weft meets it: 22/22 golden-clean against DuckDB SF10."
+        blurb="Official Q1–Q22 over the same SF10 Parquet bytes on S3, on the same 3-node spec (1x c6g.2xlarge + 2x m8g.2xlarge), re-run fresh the same day with identical temperature (2 runs/query, hot = run 2): Weft distributed in strict mode via Spark Connect vs stock Apache Spark 3.5.6 on EMR 7.13.0/YARN. Weft takes this round: 85.5s vs 87.3s hot (0.98x), winning 11 of 22 queries outright — after starting the day at 6.7x Spark. The climb came from engineering, not hardware: real table statistics from parquet footers, hash joins chosen per query instead of forced sort-merge, runtime-measured shuffle cardinalities, a plan cache that plans each stage once per worker, and a leak fix in that cache that keeps the hundredth query as fast as the first. Correctness is table stakes and Weft meets it: 22/22 golden-clean against DuckDB SF10."
         suite={tpchBenchmarks}
       />
 
@@ -263,7 +263,7 @@ export default function PerformancePage() {
       <SuiteSection
         eyebrow="TPC-DS SF10"
         title="Retail warehouse, 99 queries each"
-        blurb="Same hardware, same bytes, all 99 queries on both engines, same temperature. Spark still takes the SF10 marathon: 282.8s vs 370.8s hot (1.31x) — but the gap was 2.33x yesterday and 8.5x the publish before, and Weft now wins 35 of the 99 outright with a 1.15x median ratio. The six plan-shape outliers that dominated the last run collapsed: Q23 169s→8.5s, Q37/Q9 now beat Spark, Q88 13.5s→2.8s. Q28 (6.1x) is the lone remaining structural gap — its six COUNT(DISTINCT) branches still scan separately. 99/99 end-to-end under strict mode, every query golden-validated against DuckDB SF10. Per-query chart omitted (99 bars); totals tell the story."
+        blurb="Same hardware, same bytes, all 99 queries on both engines, same temperature. The SF10 marathon is now a photo finish: 295.5s vs 282.8s hot (1.045x) — the gap was 1.31x two days ago and 8.5x at the first publish — with Weft winning 47 of the 99 outright and a 1.15x median ratio. The last structural outliers collapsed: Q28's six COUNT(DISTINCT) branches now share one scan (7.9s→1.6s), Q72 14.2s→5.4s, Q44 8.2s→2.5s. What remains is raw per-row throughput, led by Q39 (8.8s vs 1.3s) — not plan shapes. 99/99 end-to-end under strict mode, every query golden-validated against DuckDB SF10. Per-query chart omitted (99 bars); totals tell the story."
         suite={tpcdsBenchmarks}
         showPerQuery={false}
       />

@@ -22,6 +22,13 @@
 //!
 //! Replicated dimensions that appear in the chain fold into the next shuffle-join stage as
 //! local broadcast joins (always `JOIN`, since the dim is complete on every worker).
+//! Replicated dimensions *trailing* the last sharded shuffle boundary (TPC-DS Q72's
+//! `LEFT JOIN promotion` / `LEFT JOIN catalog_returns` after `catalog_sales ⋈ inventory`)
+//! fold into the final chain stage the same way — matching and null-extension are key-local
+//! against a complete right side — with outer joins keeping their `LEFT JOIN` keyword and
+//! ON-clause residuals. Shapes where that fold is unsafe (a `Filter` still parked above the
+//! chain, a non-INNER/LEFT trailing join, a boundary that null-extends, or a reference the
+//! stage's FROM cannot bind) keep the historical rejection instead of planning wrong.
 
 use std::collections::HashMap;
 
@@ -42,7 +49,7 @@ pub(crate) fn plan_shuffle_join_chain(
     sharded: &[&str],
     replicated: &[&str],
 ) -> Result<DistributedQuery> {
-    let (leftmost, steps) = extract_equijoin_chain(&p.agg.input)?;
+    let (leftmost, steps, crossed_filter) = extract_equijoin_chain(&p.agg.input)?;
     if steps.is_empty() {
         return Err(Error::Unsupported(
             "auto-distribute: expected at least one equijoin between sharded tables".into(),
@@ -77,7 +84,7 @@ pub(crate) fn plan_shuffle_join_chain(
 
     ensure_semi_anti_aggs_ok(p, &steps)?;
 
-    build_chain(p, sharded, replicated, leftmost, &steps)
+    build_chain(p, sharded, replicated, leftmost, &steps, crossed_filter)
 }
 
 struct ChainStep<'a> {
@@ -188,16 +195,29 @@ fn collect_column_relations(e: &Expr, out: &mut Vec<String>) {
     });
 }
 
-fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<ChainStep<'_>>)> {
-    fn walk(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<ChainStep<'_>>)> {
+/// Flatten the left-deep equijoin chain under `lp` into its leftmost scan + one step per
+/// join. Also reports whether the walk crossed any `Filter` on the spine above/between the
+/// joins: such a predicate is NOT captured in the chain (the steps carry only their own ON /
+/// residual filters), so it would be silently dropped from the plan — callers folding
+/// trailing joins into the final stage must refuse rather than ship an unfiltered plan
+/// ([`super::join_order::distribute_chain_filter`] normally lands those conjuncts on scans
+/// and step residuals first).
+fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<ChainStep<'_>>, bool)> {
+    fn walk<'a>(
+        lp: &'a LogicalPlan,
+        crossed_filter: &mut bool,
+    ) -> Result<(SimpleScan<'a>, Vec<ChainStep<'a>>)> {
         match lp {
-            LogicalPlan::Projection(p) => walk(p.input.as_ref()),
-            LogicalPlan::Filter(f) => walk(f.input.as_ref()),
+            LogicalPlan::Projection(p) => walk(p.input.as_ref(), crossed_filter),
+            LogicalPlan::Filter(f) => {
+                *crossed_filter = true;
+                walk(f.input.as_ref(), crossed_filter)
+            }
             // KAN-11: CTE / subquery aliases wrap otherwise left-deep equijoin trees.
-            LogicalPlan::SubqueryAlias(s) => walk(s.input.as_ref()),
-            LogicalPlan::Sort(s) => walk(s.input.as_ref()),
-            LogicalPlan::Limit(l) => walk(l.input.as_ref()),
-            LogicalPlan::Distinct(d) => walk(d.input().as_ref()),
+            LogicalPlan::SubqueryAlias(s) => walk(s.input.as_ref(), crossed_filter),
+            LogicalPlan::Sort(s) => walk(s.input.as_ref(), crossed_filter),
+            LogicalPlan::Limit(l) => walk(l.input.as_ref(), crossed_filter),
+            LogicalPlan::Distinct(d) => walk(d.input().as_ref(), crossed_filter),
             LogicalPlan::Join(j) => {
                 supported_shuffle_join_type(j.join_type)?;
                 let (keys, residual_filter) = equijoin_keys(j)?;
@@ -213,7 +233,7 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
                         }],
                     )),
                     Err(_) => {
-                        let (leftmost, mut steps) = walk(j.left.as_ref())?;
+                        let (leftmost, mut steps) = walk(j.left.as_ref(), crossed_filter)?;
                         steps.push(ChainStep {
                             right,
                             keys,
@@ -230,7 +250,9 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
             ))),
         }
     }
-    walk(lp)
+    let mut crossed_filter = false;
+    let (leftmost, steps) = walk(lp, &mut crossed_filter)?;
+    Ok((leftmost, steps, crossed_filter))
 }
 
 /// Extract one or more equijoin key pairs plus any non-equality residual (KAN-10 / D-2.7 / D-2.9).
@@ -311,7 +333,15 @@ fn relation_of(e: &Expr) -> Result<String> {
     }
 }
 
-fn flatten_expr(e: &Expr, alias_by_relation: &HashMap<String, String>) -> Expr {
+/// Flatten qualified column references to the names the chain's final stage binds. Columns
+/// from a replicated dimension folded into that stage keep their qualified raw name
+/// (`alias.col` — the fold joins the raw table into the stage's FROM); every other relation's
+/// columns arrive on shuffle inputs under the flattened `alias__col` name.
+fn flatten_expr(
+    e: &Expr,
+    alias_by_relation: &HashMap<String, String>,
+    replicated_aliases: &[String],
+) -> Expr {
     use datafusion::common::tree_node::{Transformed, TreeNode};
     e.clone()
         .transform(|node| {
@@ -319,9 +349,12 @@ fn flatten_expr(e: &Expr, alias_by_relation: &HashMap<String, String>) -> Expr {
                 if let Some(rel) = &c.relation {
                     let rname = rel.table();
                     if let Some(alias) = alias_by_relation.get(rname) {
-                        return Ok(Transformed::yes(datafusion::prelude::col(flat_col(
-                            alias, &c.name,
-                        ))));
+                        let rewritten = if replicated_aliases.iter().any(|a| a == alias) {
+                            datafusion::common::Column::new(Some(alias.as_str()), c.name.clone())
+                        } else {
+                            datafusion::common::Column::from_name(flat_col(alias, &c.name))
+                        };
+                        return Ok(Transformed::yes(Expr::Column(rewritten)));
                     }
                 }
             }
@@ -374,6 +407,7 @@ fn build_chain(
     replicated: &[&str],
     leftmost: SimpleScan<'_>,
     steps: &[ChainStep<'_>],
+    crossed_filter: bool,
 ) -> Result<DistributedQuery> {
     let mut alias_by_relation: HashMap<String, String> = HashMap::new();
     let left_alias = scan_alias(&leftmost).to_string();
@@ -399,7 +433,6 @@ fn build_chain(
         alias_by_relation.insert(right_alias.clone(), right_alias.clone());
 
         let right_is_sharded = sharded.contains(&step.right.table);
-        let is_last = i + 1 == n;
 
         if !right_is_sharded {
             if !replicated.contains(&step.right.table) {
@@ -409,22 +442,6 @@ fn build_chain(
                 )));
             }
             pending_bcast.push(i);
-            if is_last {
-                if matches!(left_side, LeftSide::Leaf) {
-                    return Err(Error::Unsupported(
-                        "auto-distribute: join chain has no sharded–sharded shuffle boundary"
-                            .into(),
-                    ));
-                }
-                // Trailing broadcasts: fold into final agg by synthesizing a no-op right?
-                // Require the last step to be sharded for now.
-                return Err(Error::Unsupported(
-                    "auto-distribute: trailing replicated-only joins after the last sharded \
-                     shuffle join are not yet folded — mark them replicated and keep a sharded \
-                     table as the rightmost join, or use the broadcast (1-sharded) path"
-                        .into(),
-                ));
-            }
             continue;
         }
 
@@ -524,67 +541,163 @@ fn build_chain(
         let join_kw = sql_join_keyword(step.join_type)?;
         let mut join_from =
             format!("FROM shuffle_input_0 AS l {join_kw} shuffle_input_1 AS r ON {on_sql}");
-        for &bi in &pending_bcast {
-            let b = &steps[bi];
-            let b_alias = scan_alias(&b.right);
-            let mut on_parts = Vec::with_capacity(b.keys.len());
-            for (b_left, b_right) in &b.keys {
-                let b_left_col = column_name(b_left)?;
-                let b_left_rel = relation_of(b_left)?;
-                let b_left_alias = alias_by_relation
-                    .get(&b_left_rel)
-                    .cloned()
-                    .unwrap_or(b_left_rel);
-                let b_right_col = column_name(b_right)?;
-                on_parts.push(format!(
-                    "l.{} = {b_alias}.{b_right_col}",
-                    flat_col(&b_left_alias, &b_left_col)
-                ));
-            }
-            // Replicated dims are complete on every worker — always an inner JOIN fold.
-            join_from.push_str(&format!(
-                " JOIN {} AS {b_alias} ON {}",
-                b.right.table,
-                on_parts.join(" AND ")
-            ));
-            if let Some(pred) = &b.right.filter_sql {
-                join_from.push_str(&format!(" AND ({pred})"));
-            }
-            alias_by_relation.insert(b.right.table.to_string(), b_alias.to_string());
-            alias_by_relation.insert(b_alias.to_string(), b_alias.to_string());
-        }
 
-        // INNER joins may push the residual to a post-join WHERE (equivalent there); outer joins
-        // already folded theirs into the ON clause above.
-        let residual_sql = if inner_join {
-            pending_bcast
-                .iter()
-                .filter_map(|&bi| steps[bi].residual_filter.as_ref())
-                .chain(step.residual_filter.iter())
-                .map(|residual| {
-                    expr_sql(
-                        &up,
-                        &flatten_join_residual(
-                            residual,
-                            &alias_by_relation,
-                            &right_alias,
-                            &replicated_aliases,
-                        ),
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-        if !residual_sql.is_empty() {
-            join_from.push_str(&format!(" WHERE {}", residual_sql.join(" AND ")));
+        // INNER joins may push residuals to a post-join WHERE (equivalent there); outer joins
+        // already folded theirs into the ON clause above. Collected raw and flattened when the
+        // WHERE is appended, so trailing-folded dims resolve to their raw qualified names.
+        let mut where_residuals: Vec<Expr> = Vec::new();
+
+        // Aliases folded into this stage's FROM so far (emission order), for the raw /
+        // `l.` / `r.` reference resolution in [`fold_key_sql`].
+        let mut folded_aliases: Vec<String> = Vec::new();
+        for &bi in &pending_bcast {
+            // Replicated dims are complete on every worker — the established mid-chain fold
+            // always emits an inner JOIN.
+            emit_dim_fold(
+                &mut join_from,
+                &steps[bi],
+                "JOIN",
+                &mut alias_by_relation,
+                &right_alias,
+                &mut folded_aliases,
+                &mut where_residuals,
+                &up,
+            )?;
+        }
+        if inner_join {
+            // The boundary step's own residual follows the pending dims' (emission order).
+            where_residuals.extend(step.residual_filter.clone());
         }
         pending_bcast.clear();
 
-        if is_last {
+        let trailing = &steps[i + 1..];
+        let last_sharded = !trailing.iter().any(|s| sharded.contains(&s.right.table));
+        let mut replicated_final = replicated_aliases.clone();
+        if last_sharded {
+            // Trailing replicated-only joins after the last sharded shuffle boundary fold
+            // into this final stage (KAN-2 / TPC-DS Q72): their right sides are complete on
+            // every worker, so matching and null-extension are key-local — the same argument
+            // as the mid-chain fold, one stage later. Any shape where the fold is unsafe
+            // keeps the historical rejection (never a wrong plan).
+            if !trailing.is_empty() {
+                let unsafe_rejection = || {
+                    Error::Unsupported(
+                        "auto-distribute: trailing replicated-only joins after the last sharded \
+                         shuffle join are not folded here — mark them replicated and keep a \
+                         sharded table as the rightmost join, or use the broadcast (1-sharded) \
+                         path"
+                            .into(),
+                    )
+                };
+                // A `Filter` crossed above the chain was never captured: folding now would
+                // silently drop it from the plan. (`distribute_chain_filter` normally lands
+                // those conjuncts on scans / step residuals first; when it declines, we do.)
+                if crossed_filter {
+                    return Err(unsafe_rejection());
+                }
+                // Null-extension below the fold must not be re-filtered by it: an outer (or
+                // semi/anti) boundary, or any earlier non-INNER/LEFT step, declines.
+                if !inner_join
+                    || steps[..i]
+                        .iter()
+                        .any(|s| !matches!(s.join_type, JoinType::Inner | JoinType::Left))
+                {
+                    return Err(unsafe_rejection());
+                }
+                // The right aliases earlier LEFT steps null-extend: a trailing INNER fold
+                // referencing one would re-filter the null-extended rows away.
+                let null_extended: Vec<String> = steps[..i]
+                    .iter()
+                    .filter(|s| s.join_type == JoinType::Left)
+                    .map(|s| scan_alias(&s.right).to_string())
+                    .collect();
+                // Aliases the co-located shuffle inputs carry: the leftmost leaf and every
+                // sharded step up to the boundary.
+                let mut stream_aliases: Vec<String> = vec![left_alias.clone()];
+                for s in &steps[..=i] {
+                    if sharded.contains(&s.right.table) {
+                        stream_aliases.push(scan_alias(&s.right).to_string());
+                    }
+                }
+                for t in trailing {
+                    if !replicated.contains(&t.right.table) {
+                        return Err(Error::Unsupported(format!(
+                            "auto-distribute: `{}` must be listed in replicated",
+                            t.right.table
+                        )));
+                    }
+                    // Only INNER / LEFT folds are provably key-local against a complete
+                    // replicated right side (RIGHT/FULL would duplicate preserved dim rows on
+                    // every worker; SEMI/ANTI keep their own dedicated paths).
+                    if !matches!(t.join_type, JoinType::Inner | JoinType::Left) {
+                        return Err(unsafe_rejection());
+                    }
+                    // Every relation the fold's keys / residual references must already be
+                    // bound in this stage's FROM: a shuffle input, an earlier fold, or (for
+                    // the residual) the step's own right side. Key pairs are oriented first —
+                    // the chain-side reference is the one that must resolve.
+                    let t_alias = scan_alias(&t.right).to_string();
+                    let mut refs: Vec<String> = Vec::new();
+                    for (lk, rk) in &t.keys {
+                        let Ok((chain_key, _)) = orient_fold_key(lk, rk, t) else {
+                            return Err(unsafe_rejection());
+                        };
+                        let rel = relation_of(chain_key)?;
+                        refs.push(alias_by_relation.get(&rel).cloned().unwrap_or(rel));
+                    }
+                    let mut residual_refs = Vec::new();
+                    if let Some(residual) = &t.residual_filter {
+                        collect_column_relations(residual, &mut residual_refs);
+                    }
+                    let residual_ok = residual_refs.iter().all(|rel| {
+                        let alias = alias_by_relation
+                            .get(rel)
+                            .cloned()
+                            .unwrap_or_else(|| rel.clone());
+                        stream_aliases.iter().any(|a| a == &alias)
+                            || folded_aliases.iter().any(|a| a == &alias)
+                            || alias == t_alias
+                    });
+                    let keys_ok = refs.iter().all(|alias| {
+                        stream_aliases.iter().any(|a| a == alias)
+                            || folded_aliases.iter().any(|a| a == alias)
+                    });
+                    if !keys_ok || !residual_ok {
+                        return Err(unsafe_rejection());
+                    }
+                    if t.join_type == JoinType::Inner
+                        && refs
+                            .iter()
+                            .chain(residual_refs.iter())
+                            .any(|alias| null_extended.iter().any(|ne| ne == alias))
+                    {
+                        return Err(unsafe_rejection());
+                    }
+                    emit_dim_fold(
+                        &mut join_from,
+                        t,
+                        sql_join_keyword(t.join_type)?,
+                        &mut alias_by_relation,
+                        &right_alias,
+                        &mut folded_aliases,
+                        &mut where_residuals,
+                        &up,
+                    )?;
+                    replicated_final.push(t_alias);
+                }
+            }
+            append_where_clause(
+                &mut join_from,
+                &where_residuals,
+                &alias_by_relation,
+                &right_alias,
+                &replicated_final,
+                &up,
+            )?;
             return finish_with_aggregate(
                 p,
                 &alias_by_relation,
+                &replicated_final,
                 &join_from,
                 left_stage_id,
                 right_id,
@@ -592,6 +705,15 @@ fn build_chain(
                 &mut next_id,
             );
         }
+
+        append_where_clause(
+            &mut join_from,
+            &where_residuals,
+            &alias_by_relation,
+            &right_alias,
+            &replicated_aliases,
+            &up,
+        )?;
 
         // Intermediate join output; hash by next sharded join's left key(s) when possible.
         // After FULL/RIGHT, unmatched right rows have NULL on the left join key — carry
@@ -651,6 +773,141 @@ fn build_chain(
     ))
 }
 
+/// The stage-SQL text a folded join's left-key column binds to: the boundary's left shuffle
+/// input (`l.<flat>`), its right shuffle input (`r.<flat>` — TPC-DS Q72's `warehouse` and
+/// `date_dim d2` folds key on the `inventory` side of the `catalog_sales ⋈ inventory`
+/// boundary), or a replicated dim already folded raw into this stage's FROM (`alias.col`,
+/// matching [`flatten_expr`]'s rule for folded dims).
+fn fold_key_sql(
+    chain_key: &Expr,
+    alias_by_relation: &HashMap<String, String>,
+    right_alias: &str,
+    folded_aliases: &[String],
+) -> Result<String> {
+    let name = column_name(chain_key)?;
+    let rel = relation_of(chain_key)?;
+    let alias = alias_by_relation.get(&rel).cloned().unwrap_or(rel);
+    Ok(if alias == right_alias {
+        format!("r.{}", flat_col(&alias, &name))
+    } else if folded_aliases.iter().any(|a| a == &alias) {
+        format!("{alias}.{name}")
+    } else {
+        format!("l.{}", flat_col(&alias, &name))
+    })
+}
+
+/// Orient a fold step's equijoin pair as `(chain-side key, the folded dim's column)`: exactly
+/// one side may reference the step's own right leaf — a pair touching it twice or never
+/// cannot key this fold (the check [`super::join_order`]'s re-root applies too). Written
+/// `ON` clauses park either way up (Q72's `JOIN warehouse ON (w_warehouse_sk =
+/// inv_warehouse_sk)` is dim-first), so emission cannot assume the written order.
+fn orient_fold_key<'e>(
+    left: &'e Expr,
+    right: &'e Expr,
+    step: &ChainStep<'_>,
+) -> Result<(&'e Expr, String)> {
+    let alias = scan_alias(&step.right);
+    let refs_right = |e: &Expr| match e {
+        Expr::Column(c) => c
+            .relation
+            .as_ref()
+            .is_some_and(|r| r.table() == alias || r.table() == step.right.table),
+        _ => false,
+    };
+    match (refs_right(left), refs_right(right)) {
+        (false, true) => Ok((left, column_name(right)?)),
+        (true, false) => Ok((right, column_name(left)?)),
+        _ => Err(Error::Unsupported(format!(
+            "auto-distribute: join key ({left}, {right}) does not connect `{}` to the chain",
+            step.right.table
+        ))),
+    }
+}
+
+/// Emit one replicated-dimension fold into a chain stage's FROM: `<kw> <table> AS <alias> ON
+/// <keys> [AND (<residual>)] [AND (<scan filter>)]`. Replicated right sides are complete on
+/// every worker, so matching / null-extension is key-local; `join_kw` is `JOIN` for inner
+/// folds and `LEFT JOIN` for outer ones (an outer fold's residual stays in its ON clause —
+/// moving it to the stage WHERE would re-filter null-extended rows). An inner fold's
+/// residual is collected raw into `where_residuals` and flattened only when the WHERE is
+/// appended, after every fold is bound.
+#[allow(clippy::too_many_arguments)]
+fn emit_dim_fold(
+    join_from: &mut String,
+    step: &ChainStep<'_>,
+    join_kw: &str,
+    alias_by_relation: &mut HashMap<String, String>,
+    right_alias: &str,
+    folded_aliases: &mut Vec<String>,
+    where_residuals: &mut Vec<Expr>,
+    up: &Unparser,
+) -> Result<()> {
+    let b_alias = scan_alias(&step.right).to_string();
+    let mut on_parts = Vec::with_capacity(step.keys.len());
+    for (b_left, b_right) in &step.keys {
+        let (chain_key, dim_col) = orient_fold_key(b_left, b_right, step)?;
+        on_parts.push(format!(
+            "{} = {b_alias}.{dim_col}",
+            fold_key_sql(chain_key, alias_by_relation, right_alias, folded_aliases)?
+        ));
+    }
+    join_from.push_str(&format!(
+        " {join_kw} {} AS {b_alias} ON {}",
+        step.right.table,
+        on_parts.join(" AND ")
+    ));
+    alias_by_relation.insert(step.right.table.to_string(), b_alias.clone());
+    alias_by_relation.insert(b_alias.clone(), b_alias.clone());
+    folded_aliases.push(b_alias);
+    if let Some(residual) = &step.residual_filter {
+        if join_kw == "JOIN" {
+            // Inner emission: the residual rides the stage WHERE (equivalent there) —
+            // collected raw and flattened once every fold is bound.
+            where_residuals.push(residual.clone());
+        } else {
+            let flattened =
+                flatten_join_residual(residual, alias_by_relation, right_alias, folded_aliases);
+            join_from.push_str(&format!(" AND ({})", expr_sql(up, &flattened)?));
+        }
+    }
+    if let Some(pred) = &step.right.filter_sql {
+        join_from.push_str(&format!(" AND ({pred})"));
+    }
+    Ok(())
+}
+
+/// Append the stage WHERE clause for the collected inner-join residuals, flattening each
+/// against the physical names bound in the stage's FROM (stream flats for the shuffle
+/// inputs, raw qualified names for folded dims).
+fn append_where_clause(
+    join_from: &mut String,
+    where_residuals: &[Expr],
+    alias_by_relation: &HashMap<String, String>,
+    right_alias: &str,
+    replicated_aliases: &[String],
+    up: &Unparser,
+) -> Result<()> {
+    if where_residuals.is_empty() {
+        return Ok(());
+    }
+    let parts = where_residuals
+        .iter()
+        .map(|residual| {
+            expr_sql(
+                up,
+                &flatten_join_residual(
+                    residual,
+                    alias_by_relation,
+                    right_alias,
+                    replicated_aliases,
+                ),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    join_from.push_str(&format!(" WHERE {}", parts.join(" AND ")));
+    Ok(())
+}
+
 /// True when any column in `e` is qualified by one of `relations` (used to keep outer-join
 /// residuals from referencing a replicated dim whose alias is bound later in the FROM clause).
 fn expr_references_relations(e: &Expr, relations: &[String]) -> bool {
@@ -692,9 +949,11 @@ fn next_sharded_left_keys(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_with_aggregate(
     p: &Peeled<'_>,
     alias_by_relation: &HashMap<String, String>,
+    replicated_aliases: &[String],
     join_from: &str,
     left_stage_id: u32,
     right_id: u32,
@@ -706,7 +965,7 @@ fn finish_with_aggregate(
         .agg
         .group_expr
         .iter()
-        .map(|g| expr_sql(&up, &flatten_expr(g, alias_by_relation)))
+        .map(|g| expr_sql(&up, &flatten_expr(g, alias_by_relation, replicated_aliases)))
         .collect::<Result<_>>()?;
     let aggs: Vec<AggSpec> = p
         .agg
@@ -716,7 +975,10 @@ fn finish_with_aggregate(
             let mut spec = AggSpec::classify(a)?;
             if let Expr::AggregateFunction(af) = a {
                 if let Some(arg) = af.params.args.first() {
-                    spec.arg_sql = expr_sql(&up, &flatten_expr(arg, alias_by_relation))?;
+                    spec.arg_sql = expr_sql(
+                        &up,
+                        &flatten_expr(arg, alias_by_relation, replicated_aliases),
+                    )?;
                 }
             }
             Ok(spec)
@@ -781,11 +1043,13 @@ pub(crate) fn replan_chain_tail(
     // dispatched stages byte-for-byte (the same pipeline `plan_distributed_logical` ran).
     let connected = super::join_order::connect_comma_join_chain(plan, replicated);
     let plan = connected.as_ref().unwrap_or(plan);
+    let rerooted = super::join_order::reroot_inner_chain_at_sharded(plan, replicated);
+    let plan = rerooted.as_ref().unwrap_or(plan);
     let reordered = super::join_order::reorder_filtered_dims_first(plan);
     let plan = reordered.as_ref().unwrap_or(plan);
 
     let p = super::stage_planner::peel(plan).ok()?;
-    let (leftmost, steps) = extract_equijoin_chain(&p.agg.input).ok()?;
+    let (leftmost, steps, _) = extract_equijoin_chain(&p.agg.input).ok()?;
     // Three joins are the smallest chain with a permutable two-step tail.
     if steps.len() < 3 || steps.iter().any(|s| s.join_type != JoinType::Inner) {
         return None;
@@ -875,7 +1139,7 @@ pub(crate) fn replan_chain_tail(
         .iter()
         .map(|&i| slots[i].take().expect("each step placed exactly once"))
         .collect();
-    let dq = build_chain(&p, &sharded, replicated, leftmost, &permuted).ok()?;
+    let dq = build_chain(&p, &sharded, replicated, leftmost, &permuted, false).ok()?;
     // A scalar-token plan's positional literal-substitution pipeline must not be re-planned.
     if dq
         .stages

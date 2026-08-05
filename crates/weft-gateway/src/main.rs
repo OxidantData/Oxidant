@@ -54,8 +54,17 @@ struct ScaleResponse {
     worker_endpoints: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() {
+// See weft-cli: generous thread stacks for deep SQL parser/optimizer recursion.
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(32 * 1024 * 1024)
+        .build()
+        .expect("tokio runtime")
+        .block_on(gateway_main())
+}
+
+async fn gateway_main() {
     let port: u16 = std::env::var("WEFT_GATEWAY_PORT")
         .ok()
         .and_then(|s| s.parse().ok())

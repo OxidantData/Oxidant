@@ -78,7 +78,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
-use datafusion::datasource::provider_as_source;
+use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::expr::{Exists, InSubquery};
 use datafusion::logical_expr::{Expr, LogicalPlan, Subquery, TableScan};
@@ -292,6 +292,10 @@ impl StagePlanCache {
     /// build) caches nothing. Either way waiters on the placeholder are released.
     pub fn complete_build(&self, ticket: BuildTicket, plan: Option<LogicalPlan>) {
         let BuildTicket { key, done } = ticket;
+        // Never cache a template holding live shuffle-input batches — strip their sources to
+        // schema-only empty MemTables first (the hit path rebinds real providers anyway). A
+        // strip failure simply forgoes the cache.
+        let plan = plan.and_then(|p| strip_shuffle_input_sources(&p).ok());
         {
             let mut inner = self.inner.lock().expect("stage plan cache poisoned");
             match &plan {
@@ -502,6 +506,94 @@ fn rebind_subquery_exprs(
             providers,
         })?
         .data)
+}
+
+/// Strip a freshly-built template's localized shuffle-input scan sources before caching:
+/// every `shuffle_input__s*_p*(_{i})` `TableScan` gets a schema-only EMPTY `MemTable` as its
+/// source. The hit path ([`rebind_shuffle_inputs`]) always swaps in the hitting task's
+/// provider for these scans, so the builder's provider is never read from a cached template —
+/// but it *is* retained by the cache, and that provider (the building task's `MemTable` /
+/// `MeasuredStatsTable`) pins the task's entire pulled shuffle input. A 256-entry cache of
+/// such templates holds GiB-scale Arrow buffers outside the DataFusion memory pool (KAN-2:
+/// the ~11-12 GiB worker RSS plateau that degraded SF10 queries 2-10x until a worker
+/// restart). Stripping restores the "few KB per template" the cache budget assumes. `Err`
+/// aborts the cache insert (the stage is simply not cached — it is never cached holding live
+/// input data).
+pub fn strip_shuffle_input_sources(plan: &LogicalPlan) -> DfResult<LogicalPlan> {
+    if let LogicalPlan::TableScan(scan) = plan {
+        if is_localized_shuffle_input_name(scan.table_name.table()) {
+            let empty = MemTable::try_new(scan.source.schema(), vec![vec![]])?;
+            let filters = scan
+                .filters
+                .iter()
+                .cloned()
+                .map(strip_subquery_exprs)
+                .collect::<DfResult<Vec<_>>>()?;
+            return Ok(LogicalPlan::TableScan(TableScan::try_new(
+                scan.table_name.clone(),
+                provider_as_source(Arc::new(empty)),
+                scan.projection.clone(),
+                filters,
+                scan.fetch,
+            )?));
+        }
+    }
+    let exprs = plan
+        .expressions()
+        .into_iter()
+        .map(strip_subquery_exprs)
+        .collect::<DfResult<Vec<_>>>()?;
+    let inputs = plan
+        .inputs()
+        .into_iter()
+        .map(strip_shuffle_input_sources)
+        .collect::<DfResult<Vec<_>>>()?;
+    plan.with_new_exprs(exprs, inputs)
+}
+
+/// Strip shuffle-input scans inside `expr`'s embedded subquery plans (the rest of the
+/// expression tree is untouched) — the [`strip_shuffle_input_sources`] analog of
+/// [`rebind_subquery_exprs`].
+fn strip_subquery_exprs(expr: Expr) -> DfResult<Expr> {
+    struct SubqueryStripper;
+    impl SubqueryStripper {
+        fn strip(&self, subquery: Subquery) -> DfResult<Subquery> {
+            let Subquery {
+                subquery,
+                outer_ref_columns,
+                spans,
+            } = subquery;
+            Ok(Subquery {
+                subquery: Arc::new(strip_shuffle_input_sources(&subquery)?),
+                outer_ref_columns,
+                spans,
+            })
+        }
+    }
+    impl TreeNodeRewriter for SubqueryStripper {
+        type Node = Expr;
+        fn f_up(&mut self, expr: Expr) -> DfResult<Transformed<Expr>> {
+            Ok(match expr {
+                Expr::ScalarSubquery(subquery) => {
+                    Transformed::yes(Expr::ScalarSubquery(self.strip(subquery)?))
+                }
+                Expr::Exists(Exists { subquery, negated }) => {
+                    Transformed::yes(Expr::Exists(Exists::new(self.strip(subquery)?, negated)))
+                }
+                Expr::InSubquery(InSubquery {
+                    expr,
+                    subquery,
+                    negated,
+                }) => Transformed::yes(Expr::InSubquery(InSubquery::new(
+                    expr,
+                    self.strip(subquery)?,
+                    negated,
+                ))),
+                other => Transformed::no(other),
+            })
+        }
+    }
+    expr.rewrite(&mut SubqueryStripper).map(|t| t.data)
 }
 
 #[cfg(test)]
@@ -937,6 +1029,117 @@ mod tests {
             .unwrap();
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(rows, 1, "the IN subquery must read the hitting task's data");
+    }
+
+    #[test]
+    fn strip_empties_localized_scans_and_keeps_base_scans() {
+        let localized = LogicalPlan::TableScan(
+            TableScan::try_new(
+                "shuffle_input__s7_p3",
+                provider_as_source(kv_table(&[(1, 2), (3, 4)])),
+                None,
+                vec![],
+                None,
+            )
+            .unwrap(),
+        );
+        let base_provider = kv_table(&[(9, 9)]);
+        let base = LogicalPlan::TableScan(
+            TableScan::try_new(
+                "orders",
+                provider_as_source(Arc::clone(&base_provider)),
+                None,
+                vec![],
+                None,
+            )
+            .unwrap(),
+        );
+
+        let stripped = strip_shuffle_input_sources(&localized).expect("strip localized");
+        let LogicalPlan::TableScan(scan) = stripped else {
+            panic!("strip must keep the TableScan node")
+        };
+        let provider = source_as_provider(&scan.source).unwrap();
+        let mem = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<MemTable>()
+            .expect("stripped source must be an empty MemTable");
+        assert_eq!(
+            mem.batches
+                .iter()
+                .map(|p| p.try_read().unwrap().len())
+                .sum::<usize>(),
+            0,
+            "the cached template must not retain the building task's batches"
+        );
+        assert_eq!(mem.schema(), kv_schema(), "schema must be preserved");
+
+        let stripped_base = strip_shuffle_input_sources(&base).expect("strip base");
+        let LogicalPlan::TableScan(scan) = stripped_base else {
+            panic!("strip must keep the TableScan node")
+        };
+        assert!(
+            Arc::ptr_eq(&source_as_provider(&scan.source).unwrap(), &base_provider),
+            "non-localized scans keep the builder's provider"
+        );
+    }
+
+    #[test]
+    fn complete_build_stores_stripped_template_and_hit_rebinds() {
+        std::env::remove_var("WEFT_STAGE_PLAN_CACHE_ENTRIES");
+        let cache = StagePlanCache::with_cap(4);
+        let req = request(
+            1,
+            1,
+            7,
+            "SELECT k, v FROM shuffle_input__s7_p0",
+            "",
+            "",
+            vec![kv_table(&[(1, 2)])],
+        );
+        let PlanLookup::Build(ticket) = cache.lookup(req.key()).unwrap() else {
+            panic!("first lookup must own the build");
+        };
+        let live = LogicalPlan::TableScan(
+            TableScan::try_new(
+                "shuffle_input__s7_p0",
+                provider_as_source(kv_table(&[(1, 2), (3, 4)])),
+                None,
+                vec![],
+                None,
+            )
+            .unwrap(),
+        );
+        cache.complete_build(ticket, Some(live));
+
+        let Some(PlanLookup::Hit(template)) = cache.lookup(req.key()) else {
+            panic!("second lookup must hit the stripped template");
+        };
+        let LogicalPlan::TableScan(scan) = &template else {
+            panic!("template must be a TableScan")
+        };
+        let provider = source_as_provider(&scan.source).unwrap();
+        let mem = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<MemTable>()
+            .expect("cached source must be an empty MemTable");
+        assert_eq!(
+            mem.batches
+                .iter()
+                .map(|p| p.try_read().unwrap().len())
+                .sum::<usize>(),
+            0,
+            "the cache must not pin the building task's pulled shuffle input"
+        );
+
+        // The hit path rebinds the hitting task's provider over the empty shell.
+        let hitting = kv_table(&[(5, 50)]);
+        let rebound = rebind_shuffle_inputs(&template, 7, std::slice::from_ref(&hitting)).unwrap();
+        let LogicalPlan::TableScan(scan) = rebound else {
+            panic!("rebind must keep the TableScan node")
+        };
+        assert!(
+            Arc::ptr_eq(&source_as_provider(&scan.source).unwrap(), &hitting),
+            "rebind must install the hitting task's provider"
+        );
     }
 
     #[tokio::test]

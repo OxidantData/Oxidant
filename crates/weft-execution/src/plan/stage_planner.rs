@@ -106,6 +106,14 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
     // no-op for every other shape (keyed chains, genuine cross products, branch-DAG joins).
     let connected = super::join_order::connect_comma_join_chain(lp, replicated);
     let lp = connected.as_ref().unwrap_or(lp);
+    // Re-root a dim-leftmost inner chain at a sharded leaf (TPC-DS Q37/Q82 under the row-aware
+    // classification): the shuffle-join-chain planner requires a sharded leftmost table, and
+    // inner joins are symmetric, so rotating the chain preserves semantics. Runs before the
+    // filter-first reorder so the reorder permutes the chain around its final root; a no-op
+    // (returns `None`) for sharded-leftmost and single-sharded chains, so those plans stay
+    // byte-for-byte stable.
+    let rerooted = super::join_order::reroot_inner_chain_at_sharded(lp, replicated);
+    let lp = rerooted.as_ref().unwrap_or(lp);
     // Filter-first inner-join reorder (TPC-DS Q72 at SF10): DataFusion executes inner joins in
     // written order, so a fact⋈fact join placed before the selective dimension filters must
     // stream (or, under the workers' unknown-stats sort-merge reroute, external-sort) the
@@ -115,6 +123,17 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
     // already matches, so unaffected queries keep their plans byte-for-byte.
     let reordered = super::join_order::reorder_filtered_dims_first(lp);
     let lp = reordered.as_ref().unwrap_or(lp);
+    // KAN-2 (TPC-DS Q72 at the 2-sharded classification): distribute a WHERE `Filter` above a
+    // keyed chain with two or more sharded leaves onto the chain — single-table conjuncts push
+    // onto their leaf's scan, cross-table conjuncts become the residual of the join placing
+    // their last referenced leaf. The chain extractor walks past `Filter` nodes and would
+    // silently drop them; with trailing replicated joins now folded into the final chain stage
+    // (Q72's LEFT JOIN promotion / catalog_returns) instead of rejected, a dropped `Filter`
+    // would be a wrong answer. A no-op for one-sharded chains (the broadcast path unparses the
+    // filter into its stage tail) and for every shape the rewrite declines (subquery-bearing
+    // conjuncts, outer-join-side references, ambiguous columns).
+    let distributed = super::join_order::distribute_chain_filter(lp, replicated);
+    let lp = distributed.as_ref().unwrap_or(lp);
     let primary: Result<DistributedQuery> = (|| {
         // Correlated scalar min/max/sum/count subqueries (TPC-H Q2) get a real shuffle-join
         // plan here instead of the whole-fact gather they'd otherwise fall into below.
@@ -293,6 +312,10 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
             }
         }
     };
+    // Identical-stage CSE runs over the fully assembled DAG, whatever shape path built it: the
+    // peel / branch-DAG block above, every early-returning shape handler, and the gather
+    // fallback. It preserves each path's byte-for-byte stages unless two are wholly identical.
+    cse_identical_stages(&mut dq.stages);
     stamp_replicated_tables(&mut dq, replicated);
     Ok(dq)
 }
@@ -300,7 +323,12 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
 fn stamp_replicated_tables(dq: &mut DistributedQuery, replicated: &[&str]) {
     let csv = replicated.join(",");
     for stage in &mut dq.stages {
-        stage.replicated_tables = csv.clone();
+        // A stage whose stamp was set deliberately keeps it: the replicated-slice producer of
+        // a union split (`split_union_finish`) drops its per-worker-sliced tables so the
+        // workers' file sharder slices those scans for that stage only.
+        if stage.replicated_tables.is_empty() {
+            stage.replicated_tables = csv.clone();
+        }
     }
 }
 
@@ -308,9 +336,9 @@ fn stamp_replicated_tables(dq: &mut DistributedQuery, replicated: &[&str]) {
 ///
 /// See [`weft_loom::shard::classify_replicated_tables`]: the largest known table in the plan stays
 /// sharded; smaller tables under `WEFT_AUTO_BROADCAST_THRESHOLD_BYTES` (default 32 GiB) replicate.
-/// When `WEFT_REPLICATE_MAX_ROW_MULTIPLE` is set (off by default) and catalog row counts are
-/// available, a byte-eligible candidate with more than multiple × the largest table's rows stays
-/// sharded too — see [`weft_loom::shard::classify_replicated_tables_with_rows`].
+/// With catalog row counts available, the row-aware rule (`WEFT_REPLICATE_MAX_ROW_MULTIPLE`, on
+/// by default at 4.0) keeps a byte-eligible candidate sharded when it has more than multiple ×
+/// the largest table's rows — see [`weft_loom::shard::classify_replicated_tables_with_rows`].
 ///
 /// KAN-55: tables scanned only inside expression subqueries (EXISTS / IN / scalar) are sized too.
 /// They were previously invisible here and defaulted to *sharded*, which made e.g. TPC-DS Q10's
@@ -376,6 +404,115 @@ fn validate_stage_sql(dq: &mut DistributedQuery) -> Result<()> {
         dq.finalize_sql = Some(rewritten);
     }
     Ok(())
+}
+
+/// Identical-stage CSE over the assembled stage DAG (TPC-DS Q44/Q36).
+///
+/// Shape-aware dedup happens earlier, at the *plan* level ([`super::dag_splitter::branch_fingerprint`]):
+/// structurally identical branches plan once. That fingerprint covers whole branches, but two
+/// branches that differ anywhere above the leaves — Q44's `rank() ASC` / `rank() DESC` window
+/// ORDER BYs — still re-plan byte-identical sub-DAGs underneath (the same aggregate partials and
+/// combines, the same HAVING-scalar partial/combine pairs): Q44 assembled 11 stages where stages
+/// 0≡5, 1≡6, 2≡7, 3≡8, running 4 `store_sales` scans for 2 distinct inputs.
+///
+/// This pass merges stages whose entire dispatch contract is identical — same SQL, same exchange
+/// mode, same hash key, same upstream ids — and rewrites every consumer's `upstream_stage_ids` at
+/// the survivor. It runs to a **fixpoint**: merging leaves makes their (previously distinct only
+/// in upstream id) combines identical, which then merge on the next pass.
+///
+/// Soundness rules:
+///
+/// - Consumer SQL names upstream outputs **positionally** (`shuffle_input` / `shuffle_input_N`
+///   bind to the Nth listed upstream, not to a stage id), so retargeting an upstream id needs no
+///   SQL rewrite; a stage read by several consumers (or twice by one — Q39's `[1, 1]`) is already
+///   a supported scheduler shape.
+/// - Only **consumed** stages merge. Unconsumed stages carry positional meaning the driver
+///   pattern-matches on: the output stage (`run_stages_obs_inner` requires exactly one) and the
+///   KAN-27 scalar combine (the unique non-output stage nobody lists as an upstream). Merging
+///   either away would break those contracts.
+/// - Volatile SQL never merges: a `rand()`-bearing stage must re-evaluate per reference, the
+///   stage-level analog of [`super::dag_splitter::plan_contains_volatile`].
+/// - Stages carrying a physical `plan_fragment` never merge (the SQL dispatch path this pass
+///   reasons about does not apply to them).
+///
+/// Stage ids stay sparse (a merged-away id simply disappears); uniqueness and topological order
+/// are preserved because a duplicate always merges into an *earlier* stage, so every remaining
+/// consumer still follows its upstreams.
+fn cse_identical_stages(stages: &mut Vec<StageDef>) {
+    while cse_merge_pass(stages) {}
+}
+
+/// One CSE pass: merge every mergeable stage into the earliest identical stage, returning whether
+/// anything merged (so the caller can re-run — newly identical consumers surface only after their
+/// upstream ids are rewritten).
+fn cse_merge_pass(stages: &mut Vec<StageDef>) -> bool {
+    use std::collections::HashSet;
+    let consumed: HashSet<u32> = stages
+        .iter()
+        .flat_map(|s| s.upstream_stage_ids.iter().copied())
+        .collect();
+    // (sql, exchange, hash key, upstreams, replicate stamp) — the full dispatch contract of a
+    // stage. The stamp is query-uniform for most stages, but a union split's sliced producer
+    // carries a deliberate per-stage stamp (`split_union_finish`) that changes what its workers
+    // scan — such a stage is only identical to one stamped the same way.
+    type CseKey = (String, u8, Vec<u32>, Vec<u32>, String);
+    let mut representative: HashMap<CseKey, u32> = HashMap::new();
+    let mut merge_into: HashMap<u32, u32> = HashMap::new();
+    for s in stages.iter() {
+        if !consumed.contains(&s.stage_id)
+            || s.plan_fragment.is_some()
+            || sql_contains_volatile(&s.sql)
+        {
+            continue;
+        }
+        let key = (
+            s.sql.clone(),
+            s.exchange as u8,
+            s.hash_key_cols.clone(),
+            s.upstream_stage_ids.clone(),
+            s.replicated_tables.clone(),
+        );
+        match representative.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                merge_into.insert(s.stage_id, *e.get());
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(s.stage_id);
+            }
+        }
+    }
+    if merge_into.is_empty() {
+        return false;
+    }
+    stages.retain(|s| !merge_into.contains_key(&s.stage_id));
+    for s in stages.iter_mut() {
+        for u in &mut s.upstream_stage_ids {
+            if let Some(&rep) = merge_into.get(u) {
+                *u = rep;
+            }
+        }
+    }
+    true
+}
+
+/// Whether generated stage SQL invokes a volatile function (`rand()`, `now()`, …) whose result
+/// may differ across evaluations. Conservative substring scan over the lowercased SQL: a false
+/// positive only forgoes the merge, while the functions DataFusion marks volatile unparse to
+/// exactly these spellings. SQL-level CSE cannot resolve UDF signatures the way the plan-level
+/// [`super::dag_splitter::plan_contains_volatile`] can, so planner-emitted SQL is the scope.
+fn sql_contains_volatile(sql: &str) -> bool {
+    const VOLATILE: [&str; 8] = [
+        "rand(",
+        "random(",
+        "now(",
+        "today(",
+        "uuid(",
+        "current_time", // also prefixes current_timestamp
+        "current_date",
+        "localtimestamp",
+    ];
+    let lower = sql.to_ascii_lowercase();
+    VOLATILE.iter().any(|f| lower.contains(f))
 }
 
 /// SQL convenience wrapper around [`plan_distributed_logical`].
@@ -612,6 +749,15 @@ pub(crate) fn aggregation_stages_for(
 
     let remap = build_remap(p);
 
+    // Two-phase grouping sets (TPC-DS Q67 at SF10: the gather below funnelled 4.84M finest-level
+    // partial rows into ONE partition for a single-threaded ROLLUP): hash the partial by the
+    // first grouping column instead, roll up per partition, and fix up the grand total.
+    if !distinct {
+        if let Some(dq) = grouping_set_two_phase_stages(p, &group_sql, &aggs, &tail, &remap)? {
+            return Ok(dq);
+        }
+    }
+
     let (partial_sql, final_sql) = if distinct {
         distinct_stage_sql(&up, p, &group_sql, &aggs, &tail, &remap)?
     } else {
@@ -619,8 +765,10 @@ pub(crate) fn aggregation_stages_for(
     };
 
     // Coarser grouping-set levels span multiple finest-level keys. Hashing by all `g{j}` columns
-    // would therefore split (for example) a ROLLUP grand total across every worker. Gather the
-    // already-compressed finest-level partials to one partition for the final grouping set.
+    // would therefore split (for example) a ROLLUP grand total across every worker. The shapes
+    // [`grouping_set_two_phase_stages`] cannot distribute key by `g0` instead (handled above);
+    // everything else gathers the already-compressed finest-level partials to one partition for
+    // the final grouping set.
     let hash_key_cols: Vec<u32> = if is_grouping_set(&agg.group_expr) {
         vec![]
     } else {
@@ -958,8 +1106,9 @@ fn global_aggregation_stages(p: &Peeled<'_>, sharded: &[&str]) -> Result<Distrib
     })
 }
 
-/// Global (ungrouped) aggregation with a `COUNT(DISTINCT x)` in the list (TPC-DS Q28's six
-/// single-row bucket aggregates, cross-joined by [`super::dag_splitter`]).
+/// Global (ungrouped) aggregation with a `COUNT(DISTINCT x)` in the list (a DISTINCT-carrying
+/// CrossJoin branch no shared-scan merge group claims — e.g. TPC-DS Q28's bucket aggregates
+/// before merging, or a singleton / DISTINCT-incompatible branch — see [`super::dag_splitter`]).
 ///
 /// A per-shard `DISTINCT` + recombine would double-count values that land on more than one
 /// worker, so rows are hash-shuffled **by the DISTINCT argument** instead — every equal value
@@ -1067,7 +1216,7 @@ fn global_distinct_aggregation_stages(
 /// Recombine one aggregate's partial state columns (the `a{i}…` emitted by the stage-0 partial
 /// dedup) into per-partition totals under the same names, so the final gather-combine reads
 /// them unchanged. Mirrors the state layout of [`partial_combine_sql`].
-fn recombine_partial_state_sql(func: &str, i: usize) -> Result<Vec<String>> {
+pub(crate) fn recombine_partial_state_sql(func: &str, i: usize) -> Result<Vec<String>> {
     match func {
         "sum" | "count" => Ok(vec![format!("sum(a{i}) AS a{i}")]),
         "min" => Ok(vec![format!("min(a{i}) AS a{i}")]),
@@ -1570,6 +1719,162 @@ pub(crate) fn recombine_stage_sql(
     Ok((partial_sql, final_sql))
 }
 
+/// Whether a grouping set distributes as a **two-phase** rollup: every grouping level except the
+/// grand total contains the first flattened group column `g0`.
+///
+/// `ROLLUP(a, b, …)` always qualifies — its levels are prefixes of the written list, so every
+/// non-grand-total level starts with `a`. Explicit `GROUPING SETS` qualify level-by-level (any
+/// level containing `g0` co-locates when hashed by `g0`), except a duplicated `()` level: the
+/// fixup *sums* per-partition grand-total partials, so it cannot reproduce the duplicate
+/// grand-total rows single-node emits for a repeated empty set — that shape keeps the gather
+/// plan (duplicate non-empty levels are fine: their rows pass through the fixup verbatim).
+/// `CUBE` never qualifies (it emits sibling levels like `(b)` that a `g0` hash would split).
+/// When this returns false the caller keeps the partition-0 gather plan.
+fn grouping_set_shares_first_column(group_expr: &[Expr]) -> bool {
+    let [Expr::GroupingSet(gs)] = group_expr else {
+        return false;
+    };
+    let Some(first) = flattened_group_exprs(group_expr).into_iter().next() else {
+        return false;
+    };
+    match gs {
+        GroupingSet::Rollup(_) => true,
+        GroupingSet::Cube(_) => false,
+        GroupingSet::GroupingSets(levels) => {
+            levels
+                .iter()
+                .all(|level| level.is_empty() || level.iter().any(|e| e == first))
+                && levels.iter().filter(|level| level.is_empty()).count() <= 1
+        }
+    }
+}
+
+/// Two-phase distributed grouping sets (TPC-DS Q67), replacing the partition-0 gather
+/// [`aggregation_stages_for`] otherwise falls into for a grouping set (see
+/// [`recombine_stage_sql`]'s empty-partition note): the gather funnelled every finest-level
+/// partial row into one partition for a single-threaded `ROLLUP` (Q67 at SF10: 4.84M rows, a
+/// 3.8s one-core stage).
+///
+/// Three stages instead of two:
+///
+/// 1. **Partial** (unchanged SQL): finest-level `GROUP BY` per worker — but hash-shuffled by
+///    `g0` only. Every level of the grouping set except the grand total contains `g0` (see
+///    [`grouping_set_shares_first_column`]), so every such level's groups land wholly on one
+///    partition; finest-level rows with `g0 NULL` hash-consistently co-locate too.
+/// 2. **Per-partition rollup**: the same `GROUP BY ROLLUP (…)` recombine the gather plan runs
+///    once, now parallel — each partition rolls up only its `g0` slice. Levels containing `g0`
+///    come out **exact** (no cross-partition combine needed); the grand-total level yields one
+///    *partial* row per partition (its slice's total), tagged `grouping(g0) AS __gid` = 1 so the
+///    fixup can find it. The `HAVING COUNT(*) > 0` empty-partition guard carries over verbatim:
+///    it drops the synthetic grand-total row of a partition whose bucket is empty, so an empty
+///    input still yields zero rows cluster-wide. Output is hash-shuffled by `g0` again: exact
+///    rows stay in their partition class, and every grand-total partial (`g0 NULL`, `__gid = 1`)
+///    lands in the single NULL bucket — the "grand-total partials hash to one bucket" funnel.
+/// 3. **Grand-total fixup / output**: per-partition `UNION ALL` of the exact rows
+///    (`WHERE __gid = 0`, a passthrough) and the combined grand total (`WHERE __gid = 1` —
+///    ≤ #partitions rows, all in the NULL bucket, recombined there by one task; every other
+///    partition's synthetic empty-input row is dropped by the same `HAVING COUNT(*) > 0` guard).
+///    Recombining rides the ordinary [`partial_combine_sql`] decomposition: `sum`/`count`/`min`/
+///    `max` re-aggregate the partials' `r{i}` directly; `avg`/`stddev`/`var*` re-aggregate the
+///    component columns stage 2 carried along (`a{i}s`/`a{i}q`/`a{i}c`); `grouping()` outputs
+///    take `max(r{i})` (every grand-total partial has grouping = 1, and `max` preserves the
+///    `grouping()` return type).
+///
+/// Returns `Ok(None)` for shapes the two-phase plan cannot reproduce exactly — no grouping set,
+/// no grouping columns, or a level that does not share `g0` (CUBE, or explicit sets like
+/// `(b), (a, b)`) — so the caller keeps the gather plan. HAVING / output projections need no
+/// special casing: stage 3 emits the same `g{j}`/`r{i}` schema the gather plan's combine emitted,
+/// so [`wrap_output`] composes unchanged.
+fn grouping_set_two_phase_stages(
+    p: &Peeled<'_>,
+    group_sql: &[String],
+    aggs: &[AggSpec],
+    tail: &str,
+    remap: &HashMap<String, String>,
+) -> Result<Option<DistributedQuery>> {
+    if group_sql.is_empty() || !grouping_set_shares_first_column(&p.agg.group_expr) {
+        return Ok(None);
+    }
+
+    // Stage 0: the ordinary finest-level partial (identical SQL to the gather plan's), keyed by
+    // g0 — select position 0 — instead of gathered.
+    let (psel, _combine) = partial_and_combine_lists(group_sql, aggs)?;
+    let group_by = group_sql.join(", ");
+    let partial_sql = sanitize_generated_sql(&format!(
+        "SELECT {} {tail} GROUP BY {group_by}",
+        psel.join(", ")
+    ));
+
+    // Stage 1: per-partition rollup. `r{i}` is the final value for the exact rows and the
+    // per-partition value for the grand-total partial; avg/stddev/var additionally carry their
+    // recombine components for the stage-2 grand-total fixup.
+    let mut rollup_sel: Vec<String> = (0..group_sql.len()).map(|j| format!("g{j}")).collect();
+    for (i, a) in aggs.iter().enumerate() {
+        if let Some(j) = a.grouping_target {
+            rollup_sel.push(format!("grouping(g{j}) AS r{i}"));
+            continue;
+        }
+        let (_sel, comb) = partial_combine_sql(&a.func, i, &a.arg_sql)?;
+        rollup_sel.push(comb);
+        if matches!(
+            a.func.as_str(),
+            "avg" | "stddev" | "var" | "stddev_pop" | "var_pop"
+        ) {
+            rollup_sel.extend(recombine_partial_state_sql(&a.func, i)?);
+        }
+    }
+    rollup_sel.push("grouping(g0) AS __gid".to_string());
+    let final_group_by = final_group_by_sql(&p.agg.group_expr, group_sql.len())?;
+    let rollup_sql = sanitize_generated_sql(&format!(
+        "SELECT {} FROM shuffle_input GROUP BY {final_group_by} HAVING COUNT(*) > 0",
+        rollup_sel.join(", ")
+    ));
+
+    // Stage 2: exact rows pass through; grand-total partials combine on the NULL bucket.
+    let mut passthrough: Vec<String> = (0..group_sql.len()).map(|j| format!("g{j}")).collect();
+    let mut grand: Vec<String> = (0..group_sql.len())
+        .map(|j| format!("NULL AS g{j}"))
+        .collect();
+    for (i, a) in aggs.iter().enumerate() {
+        passthrough.push(format!("r{i}"));
+        let comb = if a.grouping_target.is_some() {
+            format!("max(r{i}) AS r{i}")
+        } else {
+            match a.func.as_str() {
+                "sum" | "count" => format!("sum(r{i}) AS r{i}"),
+                "min" => format!("min(r{i}) AS r{i}"),
+                "max" => format!("max(r{i}) AS r{i}"),
+                // The component columns stage 1 carried are the ordinary recombine input.
+                "avg" | "stddev" | "var" | "stddev_pop" | "var_pop" => {
+                    partial_combine_sql(&a.func, i, &a.arg_sql)?.1
+                }
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "auto-distribute: aggregate `{other}` not supported"
+                    )))
+                }
+            }
+        };
+        grand.push(comb);
+    }
+    let inner = format!(
+        "SELECT {} FROM shuffle_input WHERE __gid = 0 UNION ALL \
+         SELECT {} FROM shuffle_input WHERE __gid = 1 HAVING COUNT(*) > 0",
+        passthrough.join(", "),
+        grand.join(", ")
+    );
+    let final_sql = wrap_output(p, &inner, remap)?;
+
+    Ok(Some(DistributedQuery {
+        stages: vec![
+            StageDef::new(0, partial_sql, vec![], vec![0]),
+            StageDef::new(1, rollup_sql, vec![0], vec![0]),
+            StageDef::new(2, final_sql, vec![1], vec![]),
+        ],
+        finalize_sql: build_finalize(p)?,
+    }))
+}
+
 /// DISTINCT path: shuffle the raw grouping + argument columns by group key, run the original
 /// aggregate in the final stage (exact, since each group is co-located on one worker).
 pub(crate) fn distinct_stage_sql(
@@ -1713,7 +2018,7 @@ pub(crate) fn build_expr_substs(
                             let key = node.schema_name().to_string();
                             match remap.get(&key) {
                                 Some(safe) => {
-                                    return Ok(Transformed::yes(datafusion::prelude::col(safe)))
+                                    return Ok(Transformed::yes(datafusion::prelude::col(safe)));
                                 }
                                 None => resolved = false,
                             }
@@ -1721,7 +2026,7 @@ pub(crate) fn build_expr_substs(
                         Expr::Column(c) => {
                             match remap.get(&c.flat_name()).or_else(|| remap.get(&c.name)) {
                                 Some(safe) => {
-                                    return Ok(Transformed::yes(datafusion::prelude::col(safe)))
+                                    return Ok(Transformed::yes(datafusion::prelude::col(safe)));
                                 }
                                 None => resolved = false,
                             }
@@ -1952,11 +2257,15 @@ pub(crate) fn extract_from_tail(input_sql: &str) -> Result<String> {
 /// - the sharded arm(s) become an ordinary partial-aggregate producer stage (one per worker,
 ///   hash-shuffled by the outer `GROUP BY` key) — unchanged from the single-arm path.
 /// - the replicated-only arm(s) become a **second** producer stage using the very same partial
-///   SQL shape and the same hash key, but run on exactly one worker
+///   SQL shape and the same hash key. Its placement is chosen by [`replicated_slice_tables`]:
+///   on a multi-worker cluster every worker computes the partial over a disjoint 1/W file
+///   slice of each replicated arm's anchor table (TPC-DS Q71 — the `store_sales`/`web_sales`
+///   arms no longer serialize on one worker); otherwise exactly one worker computes it
 ///   ([`ExchangeMode::Forward`] — see the driver's producer loop): every worker holds identical
-///   data for these arms, so computing the (already-exact) partial there once and shuffling it
-///   by the shared group key merges correctly with the sharded arms' genuine per-worker partials,
-///   instead of being replicated once per worker and multiplying the total.
+///   data for these arms, so computing the (already-exact) partial once per disjoint slice —
+///   or once total for `Forward` — and shuffling it by the shared group key merges correctly
+///   with the sharded arms' genuine per-worker partials, instead of being replicated once per
+///   worker and multiplying the total.
 /// - the final combine stage reads *both* producer stages (`shuffle_input_0`/`shuffle_input_1`,
 ///   the same multi-upstream shape [`crate::plan::join_chain`] uses for shuffle joins) and
 ///   recombines exactly as the single-arm path would.
@@ -2011,7 +2320,13 @@ fn try_split_broadcast_union(
     // own aggregate would silently double under the naive path — route it to the join-deferral
     // composition (or refuse) before anything else runs.
     if find_replicated_agg_join(&sharded_input, sharded_name).is_some() {
-        return try_split_union_agg_join(p, &sharded_input, sharded_name, &replicated_input);
+        return try_split_union_agg_join(
+            p,
+            &sharded_input,
+            sharded_name,
+            &replicated_input,
+            replicated,
+        );
     }
 
     // KAN-49d (TPC-DS Q5): the sharded arm is itself an aggregate over another mixed union.
@@ -2089,17 +2404,45 @@ fn try_split_broadcast_union(
         psel.join(", ")
     ));
     let stages = vec![StageDef::new(0, sharded_partial, vec![], vec![])];
-    split_union_finish(p, &group_sql, &aggs, &remap, stages, &replicated_input).map(Some)
+    split_union_finish(
+        p,
+        &group_sql,
+        &aggs,
+        &remap,
+        stages,
+        &replicated_input,
+        replicated,
+    )
+    .map(Some)
 }
 
-/// Shared tail of every union-split plan: the replicated-side partial (one `Forward` producer)
-/// plus the final combine over the two producer streams.
+/// Shared tail of every union-split plan: the replicated-side partial producer plus the final
+/// combine over the two producer streams.
 ///
 /// `stages` is the sharded side's stage DAG; its last stage must already emit the `g{j}`/`a{i}`
 /// partial schema (group columns first, then per-aggregate partials — exactly what
 /// [`partial_and_combine_lists`] produces). This helper assigns that stage's hash key (group-key
 /// hash, or the partition-0 gather for grouping sets), appends the replicated-side partial with
 /// the identical select list, and closes with the recombine + output wrap.
+///
+/// The replicated-side partial has two placements, chosen by [`replicated_slice_tables`]:
+///
+/// - **one worker** ([`ExchangeMode::Forward`], the original design): every worker holds
+///   identical data for these arms, so computing the (already-exact) partial once and
+///   shuffling it by the shared group key merges correctly with the sharded arms' genuine
+///   per-worker partials, instead of being replicated once per worker and multiplying totals.
+/// - **replicated-slice producers** (multi-worker clusters): the stage runs on EVERY worker,
+///   each scanning a disjoint 1/W slice of each replicated arm's anchor table — the same
+///   size-weighted file assignment sharded tables use (`weft_loom::shard`). The stage's
+///   replicate stamp drops the sliced tables so the workers' file sharder treats them as
+///   sharded for this stage only; every other replicated table in the stage (the shared
+///   dimensions) is still scanned in full, so each arm's joins stay co-located within its
+///   slice. Per-slice partials have the same shape as the sharded side's per-worker partials
+///   and recombine exactly in the unchanged combine below. The result is deterministic
+///   regardless of worker count: the file→worker assignment is a pure function of the
+///   (location-sorted) listing, so every worker derives the same disjoint cover, and exact
+///   recombination makes the output independent of how the rows were partitioned.
+#[allow(clippy::too_many_arguments)]
 fn split_union_finish(
     p: &Peeled<'_>,
     group_sql: &[String],
@@ -2107,6 +2450,7 @@ fn split_union_finish(
     remap: &HashMap<String, String>,
     mut stages: Vec<StageDef>,
     replicated_input: &LogicalPlan,
+    replicated: &[&str],
 ) -> Result<DistributedQuery> {
     let replicated_tail = union_split_tail(replicated_input)?;
     let (psel, combine) = partial_and_combine_lists(group_sql, aggs)?;
@@ -2134,7 +2478,20 @@ fn split_union_finish(
     let replicated_id = sharded_output_id + 1;
     let mut replicated_stage =
         StageDef::new(replicated_id, replicated_partial, vec![], hash_key_cols);
-    replicated_stage.exchange = ExchangeMode::Forward;
+    match replicated_slice_tables(replicated_input) {
+        Some(slice_tables) => {
+            // Sliced placement: dispatch to every worker (default worker-indexed exchange) and
+            // drop the sliced tables from this stage's replicate stamp so their scans shard.
+            // `stamp_replicated_tables` preserves a non-empty stamp.
+            let kept: Vec<&str> = replicated
+                .iter()
+                .filter(|t| !slice_tables.iter().any(|s| s.eq_ignore_ascii_case(t)))
+                .copied()
+                .collect();
+            replicated_stage.replicated_tables = kept.join(",");
+        }
+        None => replicated_stage.exchange = ExchangeMode::Forward,
+    }
 
     let final_group_by = final_group_by_sql(&p.agg.group_expr, group_sql.len())?;
     // Matches `recombine_stage_sql`: with an empty hash key, every rendezvous partition but 0
@@ -2163,6 +2520,187 @@ fn split_union_finish(
         stages,
         finalize_sql: build_finalize(p)?,
     })
+}
+
+/// One sliced anchor table per replicated arm for the replicated-slice producer placement, or
+/// `None` to keep the single-`Forward` placement. Slicing is **all-or-nothing** across the
+/// replicated arms: the stage SQL computes every replicated arm, so an arm without a sliced
+/// anchor would be scanned in full on every worker and its partials would multiply in the
+/// combine — any arm that cannot provide a safe anchor keeps the whole stage on `Forward`.
+///
+/// An anchor is safe when, within its arm:
+///
+/// - it is scanned exactly once in the whole replicated side (arm-unique — a table shared by
+///   two arms, or self-joined within one, would need co-located slices the independent
+///   per-table file assignment cannot give);
+/// - every join on the path from its scan to the arm root keeps it on the inner / preserved
+///   side (slicing the null-extended side of an outer join would re-emit the preserved side's
+///   unmatched rows on every worker);
+/// - it is not force-included by `WEFT_REPLICATED_TABLES` (the workers' env override would
+///   replicate it anyway and multiply the arm).
+///
+/// Everything else in the arm stays fully replicated, so the anchor's file slice alone
+/// partitions the arm's joined rows: an inner join distributes over a disjoint union on any
+/// one side, so the per-slice join outputs form a disjoint cover of the full arm output.
+/// When several tables qualify, the first in scan order wins (TPC-DS per-channel arms write
+/// the channel fact first); the choice is performance-only — correctness holds for any single
+/// anchor per arm.
+///
+/// Guards beyond the arm shape: the driver must know of more than one worker
+/// (`WEFT_WORKER_COUNT` — the same env the workers shard files by; helm and the EC2 bootstrap
+/// both set it on the driver/connect server), and the replicated side must be raw row sources
+/// outside the `Union` itself ([`replicated_arms_for_slicing`]) — an inner aggregate, window,
+/// distinct, or expression subquery would read per-slice state that does not recombine (the
+/// KAN-54 trap shifted to the replicated side). The outer aggregate's own partials already
+/// recombine exactly, or [`partial_and_combine_lists`] would have rejected the query before
+/// this split was chosen.
+fn replicated_slice_tables(replicated_input: &LogicalPlan) -> Option<Vec<String>> {
+    if crate::driver::expected_worker_count_from_env().unwrap_or(1) <= 1 {
+        return None;
+    }
+    let forced = weft_loom::shard::replicated_tables_override_from_env();
+    let arms = replicated_arms_for_slicing(replicated_input)?;
+    let mut picked = Vec::with_capacity(arms.len());
+    for arm in &arms {
+        // Scan order, deduplicated: the written-first table (the channel fact) wins ties.
+        let mut seen = std::collections::HashSet::new();
+        let tables: Vec<String> = base_tables(arm)
+            .into_iter()
+            .filter(|t| seen.insert(t.clone()))
+            .collect();
+        let anchor = tables.into_iter().find(|t| {
+            !forced.iter().any(|f| f.eq_ignore_ascii_case(t))
+                && count_table_scans(replicated_input, t) == 1
+                && slice_placement_safe(arm, t)
+        });
+        picked.push(anchor?);
+    }
+    Some(picked)
+}
+
+/// The replicated side's leaf union arms for slice analysis, or `None` when any node outside
+/// the `Union` itself is not a raw row source (an aggregate / window / distinct / expression
+/// subquery) — per-slice evaluation of those does not recombine, so slicing must not happen.
+/// Without a `Union` (a single replicated arm) the whole side is the one arm; dims joined
+/// above the union stay out of the arm list (they are never slice anchors).
+fn replicated_arms_for_slicing(lp: &LogicalPlan) -> Option<Vec<&LogicalPlan>> {
+    fn raw_except_union(lp: &LogicalPlan) -> bool {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        match lp {
+            LogicalPlan::Aggregate(_) | LogicalPlan::Window(_) | LogicalPlan::Distinct(_) => false,
+            LogicalPlan::Union(u) => u.inputs.iter().all(|i| raw_except_union(i)),
+            _ => {
+                let mut has_subquery = false;
+                for e in lp.expressions() {
+                    let _ = e.apply(|node| {
+                        if matches!(
+                            node,
+                            Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                        ) {
+                            has_subquery = true;
+                            return Ok(TreeNodeRecursion::Stop);
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    });
+                }
+                !has_subquery && lp.inputs().iter().all(|c| raw_except_union(c))
+            }
+        }
+    }
+    if !raw_except_union(lp) {
+        return None;
+    }
+    let mut node = lp;
+    loop {
+        match node {
+            LogicalPlan::Union(u) => {
+                // `split_union_by_sharding` flattens nested unions before bucketing, but its
+                // rebuild fallback can keep one nested — flatten defensively so every
+                // returned arm is a leaf subtree.
+                fn flatten_union_refs<'a>(lp: &'a LogicalPlan, out: &mut Vec<&'a LogicalPlan>) {
+                    match lp {
+                        LogicalPlan::Union(u) => {
+                            for input in &u.inputs {
+                                flatten_union_refs(input, out);
+                            }
+                        }
+                        other => out.push(other),
+                    }
+                }
+                let mut arms: Vec<&LogicalPlan> = Vec::new();
+                for input in &u.inputs {
+                    flatten_union_refs(input, &mut arms);
+                }
+                return Some(arms);
+            }
+            LogicalPlan::Join(_) => {
+                let children = node.inputs();
+                match (contains_union(children[0]), contains_union(children[1])) {
+                    (true, false) => node = children[0],
+                    (false, true) => node = children[1],
+                    // No union below: the whole side is one arm. A union under both join
+                    // sides is not a shape this split produces — refuse to analyze it.
+                    (false, false) => return Some(vec![lp]),
+                    (true, true) => return None,
+                }
+            }
+            _ => {
+                let children = node.inputs();
+                if children.len() == 1 {
+                    node = children[0];
+                } else {
+                    return Some(vec![lp]);
+                }
+            }
+        }
+    }
+}
+
+/// Any `Union` node in the subtree.
+fn contains_union(lp: &LogicalPlan) -> bool {
+    if matches!(lp, LogicalPlan::Union(_)) {
+        return true;
+    }
+    lp.inputs().iter().any(|c| contains_union(c))
+}
+
+/// Whether slicing `table`'s files partitions the arm's output exactly: every join between
+/// the table's scan and the arm root must keep the scan's side inner or preserved. Cross
+/// joins and inner joins distribute over a disjoint union on either side; for outer and
+/// semi/anti joins only the preserved (left for Left\*, right for Right\*) side may be
+/// sliced — slicing the null-extended side of an outer join would re-emit the preserved
+/// side's unmatched rows once per worker.
+fn slice_placement_safe(lp: &LogicalPlan, table: &str) -> bool {
+    match lp {
+        LogicalPlan::TableScan(s) => s.table_name.table() == table,
+        LogicalPlan::Join(j) => {
+            let left_has = count_table_scans(&j.left, table) > 0;
+            let right_has = count_table_scans(&j.right, table) > 0;
+            match (left_has, right_has) {
+                (true, false) => {
+                    matches!(
+                        j.join_type,
+                        JoinType::Inner | JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti
+                    ) && slice_placement_safe(&j.left, table)
+                }
+                (false, true) => {
+                    matches!(
+                        j.join_type,
+                        JoinType::Inner
+                            | JoinType::Right
+                            | JoinType::RightSemi
+                            | JoinType::RightAnti
+                    ) && slice_placement_safe(&j.right, table)
+                }
+                // Scanned on both sides (a self-join): independent slices would lose matches.
+                _ => false,
+            }
+        }
+        other => {
+            let children = other.inputs();
+            children.len() == 1 && slice_placement_safe(children[0], table)
+        }
+    }
 }
 
 /// The outer-partial adapter stage for the two KAN-49d composition paths: regroup the exact arm
@@ -2428,6 +2966,7 @@ fn try_split_union_agg_join(
     sharded_input: &LogicalPlan,
     sharded_name: &str,
     replicated_input: &LogicalPlan,
+    replicated: &[&str],
 ) -> Result<Option<DistributedQuery>> {
     let up = Unparser::default();
     // Arm shape: (SubqueryAlias)* → Projection → (SubqueryAlias)* → Join.
@@ -2690,6 +3229,7 @@ fn try_split_union_agg_join(
         &remap,
         vec![stage_a, stage_b, stage_c, stage_d],
         replicated_input,
+        replicated,
     )
     .map(Some)
 }
@@ -2747,7 +3287,16 @@ fn try_split_union_nested(
         .map(|g| expr_sql(&up, g))
         .collect::<Result<_>>()?;
     let remap = build_remap(p);
-    split_union_finish(p, &group_sql, &aggs, &remap, stages, replicated_input).map(Some)
+    split_union_finish(
+        p,
+        &group_sql,
+        &aggs,
+        &remap,
+        stages,
+        replicated_input,
+        replicated,
+    )
+    .map(Some)
 }
 
 /// Unparse `lp` and extract its `FROM …` tail — the same unparse-then-slice `agg.input` handling
@@ -4226,7 +4775,39 @@ mod grouping_set_tests {
     use weft_loom::arrow::util::pretty::pretty_format_batches;
     use weft_loom::Engine;
 
-    use super::{final_group_by_sql, flattened_group_exprs, plan_distributed_logical};
+    use super::{
+        final_group_by_sql, flattened_group_exprs, grouping_set_shares_first_column,
+        plan_distributed_logical,
+    };
+
+    #[test]
+    fn two_phase_admission_rule() {
+        // ROLLUP always qualifies (every non-grand-total level starts with the first column).
+        assert!(grouping_set_shares_first_column(&[Expr::GroupingSet(
+            GroupingSet::Rollup(vec![col("a"), col("b")])
+        )]));
+        // CUBE never does (sibling levels like (b) split under a g0 hash).
+        assert!(!grouping_set_shares_first_column(&[Expr::GroupingSet(
+            GroupingSet::Cube(vec![col("a"), col("b")])
+        )]));
+        // Explicit sets qualify level-by-level on the first *flattened* column: here the levels
+        // are written (b), (a, b) so b is first and shared — hash by b.
+        assert!(grouping_set_shares_first_column(&[Expr::GroupingSet(
+            GroupingSet::GroupingSets(vec![vec![col("b")], vec![col("a"), col("b")], vec![]])
+        )]));
+        // …but (b), (a, b) written with a first does not share a.
+        assert!(!grouping_set_shares_first_column(&[Expr::GroupingSet(
+            GroupingSet::GroupingSets(vec![vec![col("a")], vec![col("b")]])
+        )]));
+        // A duplicated grand-total level cannot be reproduced by summing per-partition partials.
+        assert!(!grouping_set_shares_first_column(&[Expr::GroupingSet(
+            GroupingSet::GroupingSets(vec![vec![col("a")], vec![], vec![]])
+        )]));
+        // No grouping columns at all: the caller's global-aggregate path owns this.
+        assert!(!grouping_set_shares_first_column(&[Expr::GroupingSet(
+            GroupingSet::GroupingSets(vec![vec![]])
+        )]));
+    }
 
     fn table() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -4273,7 +4854,7 @@ mod grouping_set_tests {
     }
 
     #[tokio::test]
-    async fn rollup_uses_finest_partial_group_and_matches_single_node() {
+    async fn rollup_two_phase_keyed_partial_rollup_and_fixup_match_single_node() {
         let engine = Engine::new();
         engine.register_batches("t", vec![table()]).unwrap();
         let sql = "SELECT k1, k2, SUM(v) AS total FROM t \
@@ -4282,29 +4863,54 @@ mod grouping_set_tests {
         let logical = engine.logical_plan(sql).await.unwrap();
         let dq = plan_distributed_logical(&logical, &[]).expect("ROLLUP should distribute");
 
-        assert_eq!(dq.stages.len(), 2);
-        assert!(
-            dq.stages[0].hash_key_cols.is_empty(),
-            "coarser ROLLUP levels require a gather"
+        // Two-phase plan: keyed partial → per-partition rollup → grand-total fixup.
+        assert_eq!(dq.stages.len(), 3, "{dq:?}");
+        assert_eq!(
+            dq.stages[0].hash_key_cols,
+            vec![0],
+            "the finest-level partial hashes by g0 so every g0-bearing rollup level co-locates"
         );
         assert!(!dq.stages[0].sql.contains("ROLLUP"), "{}", dq.stages[0].sql);
         assert!(dq.stages[0].sql.contains("AS g0"), "{}", dq.stages[0].sql);
         assert!(dq.stages[0].sql.contains("AS g1"), "{}", dq.stages[0].sql);
+        assert_eq!(dq.stages[1].upstream_stage_ids, vec![0]);
+        assert_eq!(
+            dq.stages[1].hash_key_cols,
+            vec![0],
+            "exact rows stay in their g0 class; grand-total partials (g0 NULL) funnel to one bucket"
+        );
         assert!(
             dq.stages[1]
                 .sql
                 .contains("GROUP BY ROLLUP (g0, g1) HAVING COUNT(*) > 0"),
-            "{}",
+            "the per-partition rollup keeps the empty-partition guard: {}",
             dq.stages[1].sql
         );
+        assert!(
+            dq.stages[1].sql.contains("grouping(g0) AS __gid"),
+            "grand-total partials are tagged for the fixup: {}",
+            dq.stages[1].sql
+        );
+        assert_eq!(dq.stages[2].upstream_stage_ids, vec![1]);
+        assert!(
+            dq.stages[2].sql.contains("__gid = 0")
+                && dq.stages[2].sql.contains("__gid = 1 HAVING COUNT(*) > 0"),
+            "the fixup passes exact rows through and combines ≤ #partitions grand totals: {}",
+            dq.stages[2].sql
+        );
 
+        // Single-partition simulation of the three-stage pipeline.
         let partial = engine.sql(&dq.stages[0].sql).await.unwrap();
         let partial_schema = partial[0].schema();
-        let final_engine = Engine::new();
-        final_engine
+        let mid_engine = Engine::new();
+        mid_engine
             .register_batches("shuffle_input", partial)
             .unwrap();
-        let combined = final_engine.sql(&dq.stages[1].sql).await.unwrap();
+        let mid = mid_engine.sql(&dq.stages[1].sql).await.unwrap();
+        let mid_schema = mid[0].schema();
+        let final_engine = Engine::new();
+        final_engine.register_batches("shuffle_input", mid).unwrap();
+        let combined = final_engine.sql(&dq.stages[2].sql).await.unwrap();
         final_engine.register_batches("result", combined).unwrap();
         let actual = final_engine
             .sql(dq.finalize_sql.as_deref().expect("ORDER BY finalize"))
@@ -4316,8 +4922,8 @@ mod grouping_set_tests {
             pretty_format_batches(&expected).unwrap().to_string()
         );
 
-        // Every non-zero consumer partition receives a typed empty shuffle bucket. It must not
-        // manufacture another ROLLUP grand-total row.
+        // A partition with a typed empty shuffle bucket must not manufacture a ROLLUP
+        // grand-total row at either the rollup or the fixup stage.
         let empty_engine = Engine::new();
         empty_engine
             .register_batches(
@@ -4327,6 +4933,216 @@ mod grouping_set_tests {
             .unwrap();
         let empty = empty_engine.sql(&dq.stages[1].sql).await.unwrap();
         assert_eq!(empty.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        let empty_fix = Engine::new();
+        empty_fix
+            .register_batches("shuffle_input", vec![RecordBatch::new_empty(mid_schema)])
+            .unwrap();
+        let empty = empty_fix.sql(&dq.stages[2].sql).await.unwrap();
+        assert_eq!(empty.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    }
+
+    #[tokio::test]
+    async fn rollup_two_phase_avg_count_and_grouping_match_single_node() {
+        // Non-associative aggregates (AVG rides SUM/COUNT components) and grouping() outputs
+        // recompute correctly through the grand-total fixup.
+        let engine = Engine::new();
+        engine.register_batches("t", vec![table()]).unwrap();
+        let sql = "SELECT k1, k2, grouping(k1) AS gk, COUNT(*) AS c, AVG(v) AS av \
+                   FROM t GROUP BY ROLLUP (k1, k2) \
+                   ORDER BY k1 NULLS FIRST, k2 NULLS FIRST";
+        let logical = engine.logical_plan(sql).await.unwrap();
+        let dq = plan_distributed_logical(&logical, &[]).expect("ROLLUP should distribute");
+        assert_eq!(dq.stages.len(), 3, "{dq:?}");
+        assert!(
+            dq.stages[1]
+                .sql
+                .contains("sum(a2s) AS a2s, sum(a2c) AS a2c"),
+            "the per-partition rollup carries AVG's recombine components: {}",
+            dq.stages[1].sql
+        );
+        assert!(
+            dq.stages[2].sql.contains("max(r0) AS r0"),
+            "grouping() recombines as max (1 on every grand-total partial): {}",
+            dq.stages[2].sql
+        );
+
+        let partial = engine.sql(&dq.stages[0].sql).await.unwrap();
+        let mid_engine = Engine::new();
+        mid_engine
+            .register_batches("shuffle_input", partial)
+            .unwrap();
+        let mid = mid_engine.sql(&dq.stages[1].sql).await.unwrap();
+        let final_engine = Engine::new();
+        final_engine.register_batches("shuffle_input", mid).unwrap();
+        let combined = final_engine.sql(&dq.stages[2].sql).await.unwrap();
+        final_engine.register_batches("result", combined).unwrap();
+        let actual = final_engine
+            .sql(dq.finalize_sql.as_deref().expect("ORDER BY finalize"))
+            .await
+            .unwrap();
+        let expected = engine.sql(sql).await.unwrap();
+        assert_eq!(
+            pretty_format_batches(&actual).unwrap().to_string(),
+            pretty_format_batches(&expected).unwrap().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_grouping_set_shapes_keep_the_gather_plan() {
+        // A level that does not contain the first flattened column ((k2) here, plus every CUBE
+        // sibling level) would split across a g0 hash — the partition-0 gather stays.
+        for sql in [
+            "SELECT k1, k2, SUM(v) AS total FROM t \
+             GROUP BY GROUPING SETS ((k1, k2), (k2), ())",
+            "SELECT k1, k2, SUM(v) AS total FROM t GROUP BY CUBE (k1, k2)",
+        ] {
+            let engine = Engine::new();
+            engine.register_batches("t", vec![table()]).unwrap();
+            let logical = engine.logical_plan(sql).await.unwrap();
+            let dq = plan_distributed_logical(&logical, &[]).expect("should distribute");
+            assert_eq!(dq.stages.len(), 2, "gather plan kept for {sql}: {dq:?}");
+            assert!(
+                dq.stages[0].hash_key_cols.is_empty(),
+                "partial still gathers to partition 0 for {sql}"
+            );
+            assert!(
+                dq.stages[1].sql.contains("HAVING COUNT(*) > 0"),
+                "the gather combine keeps its empty-partition guard for {sql}: {}",
+                dq.stages[1].sql
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cse_tests {
+    use crate::driver::{ExchangeMode, StageDef};
+
+    use super::{cse_identical_stages, sql_contains_volatile};
+
+    fn stage(id: u32, sql: &str, upstreams: &[u32]) -> StageDef {
+        StageDef::new(id, sql, upstreams.to_vec(), vec![])
+    }
+
+    fn summary(stages: &[StageDef]) -> Vec<(u32, String, Vec<u32>)> {
+        stages
+            .iter()
+            .map(|s| (s.stage_id, s.sql.clone(), s.upstream_stage_ids.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn identical_stages_merge_and_consumers_retarget() {
+        // Leaves 0≡2 merge immediately; their combines 1≡3 become identical only once stage 3's
+        // upstream rewrites 2→0 — the fixpoint cascade. Stage 4 then reads stage 1 twice (the
+        // Q39-style multi-consumer pull the scheduler already supports).
+        let mut stages = vec![
+            stage(0, "SELECT k, sum(v) AS a0 FROM t GROUP BY k", &[]),
+            stage(1, "SELECT sum(a0) AS r0 FROM shuffle_input", &[0]),
+            stage(2, "SELECT k, sum(v) AS a0 FROM t GROUP BY k", &[]),
+            stage(3, "SELECT sum(a0) AS r0 FROM shuffle_input", &[2]),
+            stage(
+                4,
+                "SELECT * FROM shuffle_input_0 JOIN shuffle_input_1 USING (k)",
+                &[1, 3],
+            ),
+        ];
+        cse_identical_stages(&mut stages);
+        let expected: Vec<(u32, String, Vec<u32>)> = vec![
+            (
+                0,
+                "SELECT k, sum(v) AS a0 FROM t GROUP BY k".to_string(),
+                vec![],
+            ),
+            (
+                1,
+                "SELECT sum(a0) AS r0 FROM shuffle_input".to_string(),
+                vec![0],
+            ),
+            (
+                4,
+                "SELECT * FROM shuffle_input_0 JOIN shuffle_input_1 USING (k)".to_string(),
+                vec![1, 1],
+            ),
+        ];
+        assert_eq!(summary(&stages), expected);
+    }
+
+    #[test]
+    fn same_sql_with_different_upstreams_does_not_merge() {
+        let mut stages = vec![
+            stage(0, "SELECT * FROM a", &[]),
+            stage(1, "SELECT * FROM b", &[]),
+            stage(2, "SELECT sum(x) FROM shuffle_input", &[0]),
+            stage(3, "SELECT sum(x) FROM shuffle_input", &[1]),
+            stage(
+                4,
+                "SELECT * FROM shuffle_input_0 JOIN shuffle_input_1 USING (k)",
+                &[2, 3],
+            ),
+        ];
+        let before = summary(&stages);
+        cse_identical_stages(&mut stages);
+        assert_eq!(summary(&stages), before);
+    }
+
+    #[test]
+    fn hash_key_or_exchange_difference_does_not_merge() {
+        let mut keyed = stage(0, "SELECT k, sum(v) AS a0 FROM t GROUP BY k", &[]);
+        keyed.hash_key_cols = vec![0];
+        let gathered = stage(1, "SELECT k, sum(v) AS a0 FROM t GROUP BY k", &[]);
+        let mut forwarded = stage(2, "SELECT k, sum(v) AS a0 FROM t GROUP BY k", &[]);
+        forwarded.hash_key_cols = vec![0];
+        forwarded.exchange = ExchangeMode::Forward;
+        let mut stages = vec![
+            keyed,
+            gathered,
+            forwarded,
+            stage(3, "SELECT * FROM shuffle_input", &[0]),
+        ];
+        // All three producers are consumed by stage 3, so consumption itself is not what
+        // protects them here.
+        stages[3].upstream_stage_ids = vec![0, 1, 2];
+        let before = summary(&stages);
+        cse_identical_stages(&mut stages);
+        assert_eq!(summary(&stages), before);
+    }
+
+    #[test]
+    fn volatile_stage_sql_never_merges() {
+        assert!(sql_contains_volatile("SELECT rand() AS r FROM t"));
+        assert!(sql_contains_volatile("SELECT x FROM t WHERE ts < now()"));
+        assert!(sql_contains_volatile(
+            "SELECT CURRENT_TIMESTAMP AS ts FROM t"
+        ));
+        assert!(!sql_contains_volatile("SELECT k, sum(v) FROM t GROUP BY k"));
+        let mut stages = vec![
+            stage(0, "SELECT rand() AS r, k FROM t", &[]),
+            stage(1, "SELECT rand() AS r, k FROM t", &[]),
+            stage(
+                2,
+                "SELECT * FROM shuffle_input_0 JOIN shuffle_input_1 USING (k)",
+                &[0, 1],
+            ),
+        ];
+        let before = summary(&stages);
+        cse_identical_stages(&mut stages);
+        assert_eq!(summary(&stages), before);
+    }
+
+    #[test]
+    fn unconsumed_output_stage_never_merges() {
+        // Stages 0 and 2 are byte-identical, but stage 2 is the (unconsumed) output stage:
+        // merging it away — or merging its consumed twin into it — would break the driver's
+        // exactly-one-output contract.
+        let mut stages = vec![
+            stage(0, "SELECT sum(v) AS r0 FROM t", &[]),
+            stage(1, "SELECT r0 + 1 FROM shuffle_input", &[0]),
+            stage(2, "SELECT sum(v) AS r0 FROM t", &[]),
+        ];
+        let before = summary(&stages);
+        cse_identical_stages(&mut stages);
+        assert_eq!(summary(&stages), before);
     }
 }
 

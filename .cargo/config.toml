@@ -1,0 +1,11 @@
+# Workspace-wide cargo configuration.
+
+[env]
+# Generated distributed stage SQL (nested derived tables, large CASE trees — e.g. TPC-DS
+# Q39's HAVING-wrapped stddev combine, Q70's rollup arms) recurses several MiB deep inside
+# DataFusion's SQL parser/optimizer when workers re-parse it, on top of the async serve
+# layers' frames. tokio's 2 MiB default thread stack is not enough in unoptimized builds
+# (KAN-2: `auto_distribute*` e2e tests overflowed). Production binaries set an explicit
+# `thread_stack_size` in `main`; this covers `cargo test` / `cargo run` processes, whose
+# threads (libtest threads and tokio runtimes without an explicit size) honor RUST_MIN_STACK.
+RUST_MIN_STACK = "33554432"

@@ -86,6 +86,10 @@ pub struct Worker {
     keep_spill: bool,
     task_slots: usize,
     active_tasks: Arc<Mutex<usize>>,
+    /// Explicit shard assignment for file-list sharding (in-process workers / tests sharing
+    /// one process env). Installed as a task-local around every stage execution; `None`
+    /// leaves `ShardAssignment::from_env` authoritative (live workers).
+    shard_assignment: Option<weft_loom::shard::ShardAssignment>,
     /// Bounded-wait admission for stage tasks (F2): the driver dispatches all of a stage's
     /// partition tasks concurrently, so tasks beyond `task_slots` must queue here until a
     /// slot frees instead of bouncing back to the driver as `resource_exhausted`.
@@ -120,12 +124,25 @@ impl Worker {
             keep_spill: false,
             task_slots: slots,
             active_tasks: Arc::new(Mutex::new(0)),
+            shard_assignment: None,
             task_slots_sem: Arc::new(tokio::sync::Semaphore::new(slots)),
             last_task_status: Arc::new(Mutex::new(None)),
             stage_cancels: Arc::new(Mutex::new(HashMap::new())),
             stage_inserted: Arc::new(Mutex::new(HashMap::new())),
             stage_output_ttl: stage_output_ttl(),
         }
+    }
+
+    /// Wrap an engine as a worker whose stage executions shard file listings by an explicit
+    /// assignment instead of the process env — the in-process multi-worker harness form,
+    /// where `WEFT_SHARD_INDEX` cannot differ per worker.
+    pub fn with_shard_assignment(
+        engine: Arc<Engine>,
+        assignment: weft_loom::shard::ShardAssignment,
+    ) -> Self {
+        let mut worker = Self::new(engine);
+        worker.shard_assignment = Some(assignment);
+        worker
     }
 
     /// Wrap an engine with an explicit spill store (tests / custom budgets).
@@ -138,6 +155,7 @@ impl Worker {
             keep_spill: false,
             task_slots: slots,
             active_tasks: Arc::new(Mutex::new(0)),
+            shard_assignment: None,
             task_slots_sem: Arc::new(tokio::sync::Semaphore::new(slots)),
             last_task_status: Arc::new(Mutex::new(None)),
             stage_cancels: Arc::new(Mutex::new(HashMap::new())),
@@ -779,6 +797,26 @@ impl Worker {
     /// result (the output stage). A stage can both consume *and* produce — an intermediate stage
     /// of a multi-shuffle DAG.
     async fn run_stage(
+        &self,
+        t: StageTicket,
+        progress: &StageProgress,
+    ) -> std::result::Result<Vec<RecordBatch>, Status> {
+        // In-process workers (tests / local harnesses) carry an explicit shard assignment:
+        // scope it around the whole stage so every file-listing resolution — producer and
+        // output paths, including their collect fallbacks — sees this worker's shard.
+        match self.shard_assignment {
+            Some(assignment) => {
+                weft_loom::shard::with_shard_assignment(
+                    assignment,
+                    self.run_stage_inner(t, progress),
+                )
+                .await
+            }
+            None => self.run_stage_inner(t, progress).await,
+        }
+    }
+
+    async fn run_stage_inner(
         &self,
         t: StageTicket,
         progress: &StageProgress,
@@ -1580,6 +1618,16 @@ impl FlightService for Worker {
 /// Serve a worker on `0.0.0.0:port` until the process exits.
 pub async fn serve_worker(port: u16, engine: Arc<Engine>) -> Result<()> {
     serve_flight_worker(port, Worker::new(engine)).await
+}
+
+/// Serve a worker whose stage executions shard file listings by an explicit assignment
+/// (in-process multi-worker tests, where the process env can name only one shard).
+pub async fn serve_worker_with_assignment(
+    port: u16,
+    engine: Arc<Engine>,
+    assignment: weft_loom::shard::ShardAssignment,
+) -> Result<()> {
+    serve_flight_worker(port, Worker::with_shard_assignment(engine, assignment)).await
 }
 
 /// Serve a worker constructed with an explicit spill store (threshold / mixture tests).

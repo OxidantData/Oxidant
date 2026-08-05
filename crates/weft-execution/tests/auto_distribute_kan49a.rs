@@ -9,9 +9,12 @@
 //!   is decorrelated into a per-key aggregate branch (`GROUP BY k`) inner-joined into the
 //!   gathered outer skeleton — the fact is never gathered whole.
 //! - **Global aggregates with COUNT(DISTINCT)** (Q28): the cross product of six single-row
-//!   global aggregates over the sharded fact. Each branch shuffles raw rows by the DISTINCT
-//!   argument so equal values co-locate; per-partition exact distinct counts + recombinable
-//!   partials then gather-combine into the single row.
+//!   global aggregates over the sharded fact, each carrying `count(DISTINCT ss_list_price)`.
+//!   Since every branch's DISTINCT argument is the same column, the six branches share ONE
+//!   scan of the fact: a single partial dedup GROUPs BY the shared argument (narrowed to the
+//!   OR of the branch predicates), carrying each branch's FILTER'd partials plus a per-branch
+//!   predicate marker; per-partition exact distinct counts over the co-located groups plus the
+//!   recombinable partials then gather-combine into the single row.
 //! - **CTE self-join with expression-aliased aggregate outputs** (Q39): the `inv` branch's
 //!   HAVING / projection references `stdev`/`mean`, aliases of *expressions* over aggregate
 //!   outputs (`stddev_samp(x)*1.0 AS stdev`); the remap inlines those expressions in terms of
@@ -40,6 +43,20 @@ use weft_loom::arrow::datatypes::{DataType, Field, Schema};
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::arrow::util::display::{ArrayFormatter, FormatOptions};
 use weft_loom::Engine;
+
+/// Run an e2e body on a runtime with large worker stacks: unoptimized builds plan the
+/// deeply-nested stage SQL (e.g. Q39's HAVING-wrapped stddev combine, Q70's rollup arms) with
+/// frames far bigger than tokio's 2 MiB default allows — the same guard
+/// `branch_dag_keyed_outer.rs` / `auto_distribute_replicated_slice.rs` document.
+fn run_e2e(fut: impl std::future::Future<Output = ()>) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(32 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("e2e runtime");
+    rt.block_on(fut);
+}
 
 const Q1: &str = include_str!("../../../bench/tpcds/queries/q1.sql");
 const Q28: &str = include_str!("../../../bench/tpcds/queries/q28.sql");
@@ -697,98 +714,158 @@ async fn assert_distributed_matches_single_node(sql: &str, replicated: &[&str], 
 
 // --- Q1 / Q30 / Q81: correlated scalar threshold over a derived per-key aggregate ---
 
-#[tokio::test]
-async fn q1_correlated_avg_threshold_plans_and_matches() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q1, &REPL_STORE_RETURNS).await;
-    assert!(
-        !dq.stages
-            .iter()
-            .any(|s| s.sql.contains("__weft_materialize_gate")
-                || s.sql.contains("__weft_subquery_gate")),
-        "no whole-fact gather: {dq:?}"
-    );
-    assert!(
-        dq.stages
-            .iter()
-            .any(|s| s.sql.contains("shuffle_input") && s.sql.contains("AS ctr1")),
-        "the ctr1 branch output feeds the gathered outer stage: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q1, &REPL_STORE_RETURNS, "store_returns").await;
+#[test]
+fn q1_correlated_avg_threshold_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q1, &REPL_STORE_RETURNS).await;
+        assert!(
+            !dq.stages
+                .iter()
+                .any(|s| s.sql.contains("__weft_materialize_gate")
+                    || s.sql.contains("__weft_subquery_gate")),
+            "no whole-fact gather: {dq:?}"
+        );
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("shuffle_input") && s.sql.contains("AS ctr1")),
+            "the ctr1 branch output feeds the gathered outer stage: {dq:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q1, &REPL_STORE_RETURNS, "store_returns").await;
+    });
 }
 
-#[tokio::test]
-async fn q30_correlated_avg_threshold_plans_and_matches() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q30, &REPL_WEB_RETURNS).await;
-    assert!(
-        !dq.stages
-            .iter()
-            .any(|s| s.sql.contains("__weft_materialize_gate")
-                || s.sql.contains("__weft_subquery_gate")),
-        "no whole-fact gather: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q30, &REPL_WEB_RETURNS, "web_returns").await;
+#[test]
+fn q30_correlated_avg_threshold_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q30, &REPL_WEB_RETURNS).await;
+        assert!(
+            !dq.stages
+                .iter()
+                .any(|s| s.sql.contains("__weft_materialize_gate")
+                    || s.sql.contains("__weft_subquery_gate")),
+            "no whole-fact gather: {dq:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q30, &REPL_WEB_RETURNS, "web_returns").await;
+    });
 }
 
-#[tokio::test]
-async fn q81_correlated_avg_threshold_plans_and_matches() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q81, &REPL_CATALOG_RETURNS).await;
-    assert!(
-        !dq.stages
-            .iter()
-            .any(|s| s.sql.contains("__weft_materialize_gate")
-                || s.sql.contains("__weft_subquery_gate")),
-        "no whole-fact gather: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q81, &REPL_CATALOG_RETURNS, "catalog_returns").await;
+#[test]
+fn q81_correlated_avg_threshold_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q81, &REPL_CATALOG_RETURNS).await;
+        assert!(
+            !dq.stages
+                .iter()
+                .any(|s| s.sql.contains("__weft_materialize_gate")
+                    || s.sql.contains("__weft_subquery_gate")),
+            "no whole-fact gather: {dq:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q81, &REPL_CATALOG_RETURNS, "catalog_returns").await;
+    });
 }
 
 // --- Q28: cross product of global aggregates with COUNT(DISTINCT) ---
 
-#[tokio::test]
-async fn q28_global_count_distinct_branches_plan_and_match() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q28, &REPL_STORE_SALES).await;
-    assert!(
-        dq.stages.iter().any(|s| s.sql.contains("count(DISTINCT c")),
-        "per-partition exact distinct counts exist: {dq:?}"
-    );
-    assert!(
-        !dq.stages
+#[test]
+fn q28_global_count_distinct_branches_plan_and_match() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q28, &REPL_STORE_SALES).await;
+        // All six bucket branches carry `count(DISTINCT ss_list_price)`, so they merge into one
+        // shared-scan sub-DAG: one partial-dedup leaf + one per-partition distinct stage + one
+        // gather-combine, then the outer cross-join stage. Before the distinct-aware merge this
+        // was six 3-stage sub-DAGs — six full scans/shuffles of the fact.
+        assert_eq!(
+            dq.stages.len(),
+            4,
+            "merged single-scan sub-DAG + outer stage: {dq:?}"
+        );
+        let leaves: Vec<_> = dq
+            .stages
             .iter()
-            .any(|s| s.sql == "SELECT * FROM store_sales"),
-        "no whole-fact gather: {dq:?}"
+            .filter(|s| s.upstream_stage_ids.is_empty())
+            .collect();
+        assert_eq!(
+            leaves.len(),
+            1,
+            "one scan of store_sales across all six branches: {dq:?}"
+        );
+        let leaf = leaves[0];
+        assert!(
+        leaf.sql.contains("GROUP BY store_sales.ss_list_price"),
+        "stage 0 is a partial dedup over the shared DISTINCT argument, not a raw projection: {}",
+        leaf.sql
     );
-    // The COUNT(DISTINCT) amplifier: stage 0 was a raw-row projection, so every matching fact
-    // row crossed the exchange. It is now a per-worker partial dedup — GROUP BY the DISTINCT
-    // argument plus the non-DISTINCT aggregates' partial state — so only one row per locally
-    // distinct value shuffles.
-    let leaves: Vec<_> = dq
-        .stages
-        .iter()
-        .filter(|s| s.upstream_stage_ids.is_empty())
-        .collect();
-    assert_eq!(leaves.len(), 6, "one stage-0 per bucket branch: {dq:?}");
-    assert!(
-        leaves.iter().all(|s| s.sql.contains("GROUP BY")),
-        "stage 0 is a partial dedup, not a raw projection: {leaves:?}"
+        assert_eq!(
+        leaf.hash_key_cols,
+        vec![0],
+        "the dedup shuffles by the DISTINCT argument column so equal values co-locate: {leaf:?}"
     );
-    drop(dq);
-    assert_distributed_matches_single_node(Q28, &REPL_STORE_SALES, "store_sales").await;
+        assert_eq!(
+            leaf.sql.matches("FILTER (WHERE").count(),
+            24,
+            "each branch gates its marker + avg partials + count partial to its own predicate: {}",
+            leaf.sql
+        );
+        assert_eq!(
+            leaf.sql.matches("count(*) FILTER (WHERE").count(),
+            6,
+            "one predicate marker per bucket branch: {}",
+            leaf.sql
+        );
+        assert!(
+            leaf.sql.contains(" OR "),
+            "the leaf scan is narrowed to the union of the six branch predicates: {}",
+            leaf.sql
+        );
+        let mid = &dq.stages[1];
+        assert_eq!(
+            mid.sql.matches("count(DISTINCT CASE WHEN").count(),
+            6,
+            "per-partition exact distinct counts over the co-located groups: {}",
+            mid.sql
+        );
+        let combine = &dq.stages[2];
+        assert!(
+            combine.sql.contains("sum(d0) AS \"b1_cntd\"")
+                && combine.sql.contains("sum(d5) AS \"b6_cntd\""),
+            "the gather-combine sums each branch's per-partition distinct counts: {}",
+            combine.sql
+        );
+        assert!(
+            !dq.stages
+                .iter()
+                .any(|s| s.sql == "SELECT * FROM store_sales"),
+            "no whole-fact gather: {dq:?}"
+        );
+        let outer = dq.stages.last().unwrap();
+        assert!(
+            outer
+                .upstream_stage_ids
+                .iter()
+                .all(|&id| id == combine.stage_id),
+            "every branch placeholder pulls the shared combine output: {outer:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q28, &REPL_STORE_SALES, "store_sales").await;
+    });
 }
 
-/// A branch carrying COUNT(DISTINCT) cannot compute in a FILTER-merged shared-scan leaf, so it
-/// keeps its own sub-DAG while the plain aggregate branches over the same tail merge into one
-/// shared scan. Expected row over the test data: (10, 190, 1).
+/// A branch carrying COUNT(DISTINCT) shares a scan only with siblings carrying the *same*
+/// DISTINCT argument; as the only distinct-carrying branch here it keeps its own co-located
+/// sub-DAG, while the plain aggregate branches over the same tail merge into one shared scan.
+/// Expected row over the test data: (10, 190, 1).
 const Q28_MIXED: &str = "
 SELECT *
 FROM
@@ -796,131 +873,141 @@ FROM
   (SELECT sum(ss_list_price) S2 FROM store_sales WHERE ss_quantity BETWEEN 6 AND 10) A2,
   (SELECT count(DISTINCT ss_list_price) D3 FROM store_sales WHERE ss_quantity = 3 AND ss_list_price < 2.5) A3";
 
-#[tokio::test]
-async fn q28_mixed_distinct_branches_merge_only_non_distinct() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q28_MIXED, &REPL_STORE_SALES).await;
+#[test]
+fn q28_mixed_distinct_branches_merge_only_non_distinct() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q28_MIXED, &REPL_STORE_SALES).await;
 
-    assert_eq!(
+        assert_eq!(
         dq.stages.len(),
         6,
         "merged leaf + combine, the distinct branch's 3-stage sub-DAG, and the outer stage: {dq:?}"
     );
-    let fact_leaves: Vec<_> = dq
-        .stages
-        .iter()
-        .filter(|s| s.upstream_stage_ids.is_empty() && s.sql.contains("store_sales"))
-        .collect();
-    assert_eq!(
-        fact_leaves.len(),
-        2,
-        "the two plain branches share one scan; the distinct branch keeps its own: {dq:?}"
-    );
-    let merged: Vec<_> = fact_leaves
-        .iter()
-        .filter(|s| s.sql.contains("FILTER (WHERE"))
-        .collect();
-    let distinct: Vec<_> = fact_leaves
-        .iter()
-        .filter(|s| !s.sql.contains("FILTER (WHERE"))
-        .collect();
-    assert_eq!(
-        merged.len(),
-        1,
-        "the shared leaf gates each merged branch's partial to its own predicate: {dq:?}"
-    );
-    assert_eq!(distinct.len(), 1, "{dq:?}");
-    assert!(
-        distinct[0].sql.contains("GROUP BY"),
-        "the distinct branch's stage 0 is the partial dedup: {}",
-        distinct[0].sql
-    );
-    assert!(
-        dq.stages.iter().any(|s| s.sql.contains("count(DISTINCT c")),
-        "the distinct branch's per-partition exact count survives: {dq:?}"
-    );
-    let outer = dq.stages.last().unwrap();
-    assert_eq!(
-        outer.upstream_stage_ids[0], outer.upstream_stage_ids[1],
-        "the two merged placeholders pull the shared combine output: {outer:?}"
-    );
-    assert_ne!(
-        outer.upstream_stage_ids[0], outer.upstream_stage_ids[2],
-        "the distinct branch keeps its own sub-DAG output: {outer:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q28_MIXED, &REPL_STORE_SALES, "store_sales").await;
+        let fact_leaves: Vec<_> = dq
+            .stages
+            .iter()
+            .filter(|s| s.upstream_stage_ids.is_empty() && s.sql.contains("store_sales"))
+            .collect();
+        assert_eq!(
+            fact_leaves.len(),
+            2,
+            "the two plain branches share one scan; the distinct branch keeps its own: {dq:?}"
+        );
+        let merged: Vec<_> = fact_leaves
+            .iter()
+            .filter(|s| s.sql.contains("FILTER (WHERE"))
+            .collect();
+        let distinct: Vec<_> = fact_leaves
+            .iter()
+            .filter(|s| !s.sql.contains("FILTER (WHERE"))
+            .collect();
+        assert_eq!(
+            merged.len(),
+            1,
+            "the shared leaf gates each merged branch's partial to its own predicate: {dq:?}"
+        );
+        assert_eq!(distinct.len(), 1, "{dq:?}");
+        assert!(
+            distinct[0].sql.contains("GROUP BY"),
+            "the distinct branch's stage 0 is the partial dedup: {}",
+            distinct[0].sql
+        );
+        assert!(
+            dq.stages.iter().any(|s| s.sql.contains("count(DISTINCT c")),
+            "the distinct branch's per-partition exact count survives: {dq:?}"
+        );
+        let outer = dq.stages.last().unwrap();
+        assert_eq!(
+            outer.upstream_stage_ids[0], outer.upstream_stage_ids[1],
+            "the two merged placeholders pull the shared combine output: {outer:?}"
+        );
+        assert_ne!(
+            outer.upstream_stage_ids[0], outer.upstream_stage_ids[2],
+            "the distinct branch keeps its own sub-DAG output: {outer:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q28_MIXED, &REPL_STORE_SALES, "store_sales").await;
+    });
 }
 
 // --- Q39: CTE self-join with expression-aliased aggregate outputs (stddev/mean) ---
 
-#[tokio::test]
-async fn q39_expression_aliased_having_plans_and_matches() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q39, &REPL_INVENTORY).await;
-    assert!(
-        !dq.stages
-            .iter()
-            .any(|s| s.sql.contains("__weft_materialize_gate")
-                || s.sql.contains("__weft_subquery_gate")),
-        "no whole-fact gather: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q39, &REPL_INVENTORY, "inventory").await;
+#[test]
+fn q39_expression_aliased_having_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q39, &REPL_INVENTORY).await;
+        assert!(
+            !dq.stages
+                .iter()
+                .any(|s| s.sql.contains("__weft_materialize_gate")
+                    || s.sql.contains("__weft_subquery_gate")),
+            "no whole-fact gather: {dq:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q39, &REPL_INVENTORY, "inventory").await;
+    });
 }
 
 // --- Q47 / Q57: stacked ranking + aggregate windows over a GROUP BY ---
 
-#[tokio::test]
-async fn q47_stacked_windows_plan_and_match() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q47, &REPL_STORE_SALES).await;
-    assert!(
-        dq.stages
-            .iter()
-            .any(|s| { s.sql.contains("rank() OVER (PARTITION BY") && s.sql.contains("ORDER BY") }),
-        "the ranking window computes locally after the partition shuffle: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q47, &REPL_STORE_SALES, "store_sales").await;
+#[test]
+fn q47_stacked_windows_plan_and_match() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q47, &REPL_STORE_SALES).await;
+        assert!(
+            dq.stages.iter().any(|s| {
+                s.sql.contains("rank() OVER (PARTITION BY") && s.sql.contains("ORDER BY")
+            }),
+            "the ranking window computes locally after the partition shuffle: {dq:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q47, &REPL_STORE_SALES, "store_sales").await;
+    });
 }
 
-#[tokio::test]
-async fn q57_stacked_windows_plan_and_match() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q57, &REPL_CATALOG_SALES).await;
-    assert!(
-        dq.stages
-            .iter()
-            .any(|s| { s.sql.contains("rank() OVER (PARTITION BY") && s.sql.contains("ORDER BY") }),
-        "the ranking window computes locally after the partition shuffle: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q57, &REPL_CATALOG_SALES, "catalog_sales").await;
+#[test]
+fn q57_stacked_windows_plan_and_match() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q57, &REPL_CATALOG_SALES).await;
+        assert!(
+            dq.stages.iter().any(|s| {
+                s.sql.contains("rank() OVER (PARTITION BY") && s.sql.contains("ORDER BY")
+            }),
+            "the ranking window computes locally after the partition shuffle: {dq:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q57, &REPL_CATALOG_SALES, "catalog_sales").await;
+    });
 }
 
 // --- Q75: aggregate over a DISTINCT union with mixed sharding ---
 
-#[tokio::test]
-async fn q75_distinct_union_mixed_sharding_plans_and_matches() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q75, &REPL_STORE_SALES).await;
-    assert!(
-        dq.stages.iter().any(|s| s.sql.contains("SELECT DISTINCT")),
-        "the co-located dedup stage exists: {dq:?}"
-    );
-    assert!(
-        !dq.stages
-            .iter()
-            .any(|s| s.sql.contains("__weft_materialize_gate")
-                || s.sql.contains("__weft_subquery_gate")),
-        "no whole-fact gather: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q75, &REPL_STORE_SALES, "store_sales").await;
+#[test]
+fn q75_distinct_union_mixed_sharding_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q75, &REPL_STORE_SALES).await;
+        assert!(
+            dq.stages.iter().any(|s| s.sql.contains("SELECT DISTINCT")),
+            "the co-located dedup stage exists: {dq:?}"
+        );
+        assert!(
+            !dq.stages
+                .iter()
+                .any(|s| s.sql.contains("__weft_materialize_gate")
+                    || s.sql.contains("__weft_subquery_gate")),
+            "no whole-fact gather: {dq:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q75, &REPL_STORE_SALES, "store_sales").await;
+    });
 }

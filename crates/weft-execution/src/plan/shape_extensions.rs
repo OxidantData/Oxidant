@@ -395,9 +395,11 @@ fn window_stages_for(p: &WindowPeeled<'_>, replicated: &[&str]) -> Result<Distri
 ///   `Projection` layers between them fold into the remap, and a `Filter` there is a
 ///   HAVING-equivalent that applies on the combine stage's output before any window computes.
 /// - **ROLLUP / CUBE / GROUPING SETS** aggregates compose (Q67/Q70/Q86): the ordinary machinery
-///   already gathers finest-level partials to one partition and reconstructs every rollup level
-///   there (`grouping()` outputs included — recomputed against the combine's real
-///   `GROUP BY ROLLUP`); the window then re-shuffles the tiny combined output by its
+///   distributes them two-phase — finest-level partials hashed by the first grouping column, a
+///   per-partition `GROUP BY ROLLUP` for every level containing it, a tiny grand-total fixup
+///   (`grouping()` outputs included — recomputed against the real rollup and combined as
+///   `max`) — and gathers only the levels no single hash key co-locates (CUBE, Q70's IN-key
+///   pipeline); the window then re-shuffles the tiny combined output by its
 ///   `PARTITION BY` key. Super-aggregate rows carry NULL grouping columns, and NULL keys
 ///   hash-consistently land on one partition, so per-partition window semantics match
 ///   single-node exactly.

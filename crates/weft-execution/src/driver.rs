@@ -22,6 +22,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::scalar::ScalarValue;
+use futures::future::BoxFuture;
+use futures::stream::{FuturesUnordered, StreamExt};
+use futures::FutureExt;
 use weft_common::{Error, Result};
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_observability::{now_ms, ExecutionEvent, SharedStore, StageStatus, TaskStatus};
@@ -30,6 +33,7 @@ use crate::aqe::{aqe_enabled, coalesced_partitions, stage_input_stats_enabled};
 use crate::autoscale::{
     autoscale_enabled, parallelism_demand, recommend_worker_count, task_slots_per_worker,
 };
+use crate::dag_dispatch::StageDag;
 use crate::flight::{
     bucket_row_counts, cancel_stage_on_worker, clear_worker_stages, pull_bucket_with_retry,
 };
@@ -573,6 +577,34 @@ pub fn reopt_join_order_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Dependency-aware concurrent stage dispatch is **on by default** (env
+/// `WEFT_CONCURRENT_STAGES`): a stage dispatches as soon as ALL of its upstream stages
+/// complete instead of waiting for the whole previous stage, so independent branch arms
+/// (TPC-DS Q4/Q61/Q78 shapes) overlap — a consumer still waits for every upstream, so
+/// per-consumer barrier semantics are unchanged. `0`/`false`/`off`/`no` restores the
+/// strictly-sequential dispatch (also the automatic fallback while `WEFT_REOPT_JOIN_ORDER`
+/// re-optimization is active, since it splices the stage list mid-dispatch).
+///
+/// KNOWN ANOMALY (KAN-2 follow-up): at SF10, simple linear star-scan queries
+/// (Q63/Q13/Q96 class) run their leaf scan task ~2x slower with concurrent dispatch on
+/// (Q63 hot 10.0s vs 2.97s with it off) — same worker, same shard, same stage SQL, and
+/// nothing to overlap in a linear chain, so the mechanism is not yet understood. Measured
+/// on the full 99-query matrix the arm-overlap win outweighs the penalty ~5:1
+/// (319s on vs 369s off), so the default stays on; set the env off for star-scan-heavy
+/// workloads until the leaf slowdown is root-caused.
+pub fn concurrent_stages_enabled() -> bool {
+    std::env::var("WEFT_CONCURRENT_STAGES")
+        .ok()
+        .as_deref()
+        .map(|v| {
+            !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
 pub async fn run_distributed(
     cluster: &Cluster,
     plan: &DistributedPlan,
@@ -767,63 +799,112 @@ async fn run_stages_obs_inner(
     // join stages. Topological order is preserved (leaves have no upstreams), and with the
     // gate off the dispatch order is byte-identical to before.
     let reopt_active = reopt.is_some() && reopt_join_order_enabled() && !token_present;
-    let mut order: Vec<u32> = stages
-        .iter()
-        .filter(|s| s.stage_id != output.stage_id)
-        .map(|s| s.stage_id)
-        .collect();
-    if reopt_active {
-        order.sort_by_key(|id| {
-            !stage_map
-                .get(id)
-                .is_some_and(|s| s.upstream_stage_ids.is_empty())
-        });
-    }
-    let mut dispatched_ids: HashSet<u32> = HashSet::new();
-    let mut reopt_attempted = false;
-    let mut cursor = 0usize;
-    while cursor < order.len() {
-        let current_id = order[cursor];
-        let current = stage_map
-            .get(&current_id)
-            .cloned()
-            .ok_or_else(|| Error::Plan(format!("stage {current_id} not in the stage list")))?;
-        // KAN-27: inline any scalar-subquery tokens (the referenced scalar stages have already
-        // run — the stage list is topologically ordered) before dispatching this stage.
-        let stage = &substitute_scalar_tokens(
+    // WEFT_CONCURRENT_STAGES (default on): dispatch each stage as soon as every one of its
+    // upstreams has completed instead of waiting out the whole previous stage — independent
+    // branch arms overlap, while a consumer still waits for ALL of its upstreams (the stage
+    // barrier becomes per-consumer, not globally ordered). The reopt path splices a
+    // re-planned tail mid-dispatch, so it keeps the strictly-sequential loop.
+    if concurrent_stages_enabled() && !reopt_active {
+        run_stages_concurrent(
             &cluster,
-            &current,
             &stages,
+            &stage_map,
+            output.stage_id,
             scalar_stage.as_ref(),
             &mut scalar_literal,
+            &planned_workers,
+            query_id,
+            cancel,
+            &lineage,
+            &store,
+            &operation_id,
+            &mut coalesced,
+            &mut stage_rows,
         )
         .await?;
-        ensure_stable_membership(&cluster, &planned_workers)?;
-        check_query_cancelled(query_id, cancel)?;
-        let np = cluster.num_partitions;
-        // KAN-32: an intermediate stage (consumes upstream buckets and produces new ones)
-        // must run once per *shuffle partition*, not once per worker — per-worker dispatch
-        // only ever consumes buckets 0..workers-1, silently dropping the rest of the
-        // upstream when WEFT_SHUFFLE_PARTITIONS exceeds the worker count (SF10 ran 16
-        // partitions on 2 workers, and Q18's semi-shuffle plan lost 7/8 of its join rows).
-        // Leaf producers still run once per worker: each scans its local shard of the data.
-        // (Under an AQE coalesce decision the fan-in drops to `read_mod` reader partitions,
-        // each consuming a modulus class of upstream buckets — still every bucket exactly
-        // once; see `consumer_read_modulus`.)
-        if stage.exchange == ExchangeMode::Hash && !stage.upstream_stage_ids.is_empty() {
-            let read_mod = consumer_read_modulus(stage, &coalesced).unwrap_or(np);
-            run_intermediate_stage(
+    } else {
+        let mut order: Vec<u32> = stages
+            .iter()
+            .filter(|s| s.stage_id != output.stage_id)
+            .map(|s| s.stage_id)
+            .collect();
+        if reopt_active {
+            order.sort_by_key(|id| {
+                !stage_map
+                    .get(id)
+                    .is_some_and(|s| s.upstream_stage_ids.is_empty())
+            });
+        }
+        let mut dispatched_ids: HashSet<u32> = HashSet::new();
+        let mut reopt_attempted = false;
+        let mut cursor = 0usize;
+        while cursor < order.len() {
+            let current_id = order[cursor];
+            let current = stage_map
+                .get(&current_id)
+                .cloned()
+                .ok_or_else(|| Error::Plan(format!("stage {current_id} not in the stage list")))?;
+            // KAN-27: inline any scalar-subquery tokens (the referenced scalar stages have already
+            // run — the stage list is topologically ordered) before dispatching this stage.
+            let stage = &substitute_scalar_tokens(
+                &cluster,
+                &current,
+                &stages,
+                scalar_stage.as_ref(),
+                &mut scalar_literal,
+            )
+            .await?;
+            ensure_stable_membership(&cluster, &planned_workers)?;
+            check_query_cancelled(query_id, cancel)?;
+            let np = cluster.num_partitions;
+            // KAN-32: an intermediate stage (consumes upstream buckets and produces new ones)
+            // must run once per *shuffle partition*, not once per worker — per-worker dispatch
+            // only ever consumes buckets 0..workers-1, silently dropping the rest of the
+            // upstream when WEFT_SHUFFLE_PARTITIONS exceeds the worker count (SF10 ran 16
+            // partitions on 2 workers, and Q18's semi-shuffle plan lost 7/8 of its join rows).
+            // Leaf producers still run once per worker: each scans its local shard of the data.
+            // (Under an AQE coalesce decision the fan-in drops to `read_mod` reader partitions,
+            // each consuming a modulus class of upstream buckets — still every bucket exactly
+            // once; see `consumer_read_modulus`.)
+            if stage.exchange == ExchangeMode::Hash && !stage.upstream_stage_ids.is_empty() {
+                let read_mod = consumer_read_modulus(stage, &coalesced).unwrap_or(np);
+                let futs = intermediate_task_futures(
+                    &cluster,
+                    stage,
+                    np,
+                    read_mod,
+                    &lineage,
+                    &stage_map,
+                    &store,
+                    &operation_id,
+                    &stage_rows,
+                )?;
+                join_stage_tasks(futs).await?;
+                finish_stage_barrier(
+                    &cluster,
+                    stage,
+                    np,
+                    &store,
+                    &operation_id,
+                    &mut coalesced,
+                    &mut stage_rows,
+                )
+                .await;
+                dispatched_ids.insert(current_id);
+                cursor += 1;
+                continue;
+            }
+            let futs = producer_task_futures(
                 &cluster,
                 stage,
                 np,
-                read_mod,
                 &lineage,
                 &stage_map,
                 &store,
                 &operation_id,
                 &stage_rows,
-            )
-            .await?;
+            )?;
+            join_stage_tasks(futs).await?;
             finish_stage_barrier(
                 &cluster,
                 stage,
@@ -835,140 +916,39 @@ async fn run_stages_obs_inner(
             )
             .await;
             dispatched_ids.insert(current_id);
-            cursor += 1;
-            continue;
-        }
-        let mut futs = Vec::new();
-        let producers: Vec<(usize, String)> = if stage.exchange == ExchangeMode::Forward {
-            let first = cluster.workers.first().cloned().ok_or_else(|| {
-                Error::Execution("forward producer stage requires at least one worker".into())
-            })?;
-            vec![(0, first)]
-        } else {
-            cluster.workers.iter().cloned().enumerate().collect()
-        };
-        for (i, endpoint) in producers {
-            // Worker-indexed dispatch (leaf / broadcast / forward producers) keeps the
-            // legacy one-bucket read: the AQE modulus mapping only applies to the
-            // per-partition rendezvous dispatch paths below.
-            let ticket = stage_ticket(
-                stage,
-                i as u32,
-                np,
-                0,
-                &cluster,
-                true,
-                &stage_map,
-                &stage_rows,
-            );
-            let membership = cluster.membership.clone();
-            let ep = endpoint;
-            let host = ep
-                .trim_start_matches("http://")
-                .trim_start_matches("https://")
-                .to_string();
-            let lineage = lineage.clone();
-            let stage_map = stage_map.clone();
-            let store_c = store.clone();
-            let op_c = operation_id.clone();
-            let stage_id = stage.stage_id as i32;
-            let task_id = store
-                .as_ref()
-                .map(|s| s.alloc_task_id())
-                .unwrap_or(i as i64);
-            if let (Some(ref s), Some(ref op)) = (&store_c, &op_c) {
-                s.emit(ExecutionEvent::TaskStarted {
-                    operation_id: op.clone(),
-                    stage_id,
-                    task_id,
-                    executor_id: host.to_string(),
-                    launch_time_ms: now_ms(),
+            // WEFT_REOPT_JOIN_ORDER trigger: the barrier of the LAST leaf producer (the next
+            // stage to dispatch is the first join stage) is the one moment every chain leaf
+            // has a measured row count while a permutable tail is still pending. Attempt the
+            // re-optimization once per query; any bail keeps the original stages.
+            if reopt_active && !reopt_attempted && stage.upstream_stage_ids.is_empty() {
+                let last_leaf_barrier = order.get(cursor + 1).is_some_and(|next_id| {
+                    stage_map
+                        .get(next_id)
+                        .is_some_and(|n| !n.upstream_stage_ids.is_empty())
                 });
-            }
-            futs.push(async move {
-                let start = std::time::Instant::now();
-                let result =
-                    run_stage_with_retry(&membership, ep, ticket, &lineage, &stage_map).await;
-                if let (Some(s), Some(op)) = (store_c, op_c) {
-                    match &result {
-                        Ok(batches) => {
-                            let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
-                            s.emit(ExecutionEvent::TaskFinished {
-                                operation_id: op,
-                                stage_id,
-                                task_id,
-                                executor_id: host.clone(),
-                                status: TaskStatus::Success,
-                                duration_ms: start.elapsed().as_millis() as i64,
-                                shuffle_read_bytes: 0,
-                                shuffle_write_bytes: rows * 8,
-                                output_rows: rows,
-                            });
-                        }
-                        Err(_) => {
-                            s.emit(ExecutionEvent::TaskFinished {
-                                operation_id: op,
-                                stage_id,
-                                task_id,
-                                executor_id: host.clone(),
-                                status: TaskStatus::Failed,
-                                duration_ms: start.elapsed().as_millis() as i64,
-                                shuffle_read_bytes: 0,
-                                shuffle_write_bytes: 0,
-                                output_rows: 0,
-                            });
+                if last_leaf_barrier {
+                    reopt_attempted = true;
+                    if let Some(ctx) = &reopt {
+                        if let Some((spliced, remaining, new_output)) = attempt_reopt_tail(
+                            ctx,
+                            &stages,
+                            &stage_rows,
+                            &dispatched_ids,
+                            &store,
+                            &operation_id,
+                        ) {
+                            stage_map = spliced.iter().map(|s| (s.stage_id, s.clone())).collect();
+                            stages = spliced;
+                            order = remaining;
+                            output = new_output;
+                            cursor = 0;
+                            continue;
                         }
                     }
                 }
-                result
-            });
-        }
-        for r in futures::future::join_all(futs).await {
-            r?;
-        }
-        finish_stage_barrier(
-            &cluster,
-            stage,
-            np,
-            &store,
-            &operation_id,
-            &mut coalesced,
-            &mut stage_rows,
-        )
-        .await;
-        dispatched_ids.insert(current_id);
-        // WEFT_REOPT_JOIN_ORDER trigger: the barrier of the LAST leaf producer (the next
-        // stage to dispatch is the first join stage) is the one moment every chain leaf
-        // has a measured row count while a permutable tail is still pending. Attempt the
-        // re-optimization once per query; any bail keeps the original stages.
-        if reopt_active && !reopt_attempted && stage.upstream_stage_ids.is_empty() {
-            let last_leaf_barrier = order.get(cursor + 1).is_some_and(|next_id| {
-                stage_map
-                    .get(next_id)
-                    .is_some_and(|n| !n.upstream_stage_ids.is_empty())
-            });
-            if last_leaf_barrier {
-                reopt_attempted = true;
-                if let Some(ctx) = &reopt {
-                    if let Some((spliced, remaining, new_output)) = attempt_reopt_tail(
-                        ctx,
-                        &stages,
-                        &stage_rows,
-                        &dispatched_ids,
-                        &store,
-                        &operation_id,
-                    ) {
-                        stage_map = spliced.iter().map(|s| (s.stage_id, s.clone())).collect();
-                        stages = spliced;
-                        order = remaining;
-                        output = new_output;
-                        cursor = 0;
-                        continue;
-                    }
-                }
             }
+            cursor += 1;
         }
-        cursor += 1;
     }
 
     // Output stage:
@@ -1231,17 +1211,115 @@ fn executor_id(endpoint: &str) -> String {
         .to_string()
 }
 
-/// Run an intermediate (consume + produce) stage: one task per shuffle partition — or, when
-/// AQE coalesced an upstream, one task per coalesced reader partition (`read_modulus <
-/// num_partitions`), each pulling its whole modulus class of every upstream — all dispatched
-/// concurrently (F2). The worker scopes its shuffle-input registrations per
-/// task (`localize_shuffle_input_sql`), so same-worker tasks no longer race on a shared
-/// `shuffle_input` table — the per-endpoint serialization (KAN-32) is gone; tasks beyond
-/// a worker's slot count queue server-side (`acquire_task_slot`). Every task still
-/// hash-partitions its output into the full `num_partitions` buckets, so downstream reads
-/// are unaffected by the coalesced fan-in.
+/// Build one cold task future per producer slot of a leaf / broadcast / forward stage
+/// (worker-indexed dispatch; a `Forward` producer runs exactly once on the first worker —
+/// see the dispatch-loop comment above for why a single real producer is sufficient). Each
+/// task's `TaskStarted` event is emitted synchronously, before the future exists: the
+/// futures only run once the caller polls them (sequential path: [`join_stage_tasks`];
+/// concurrent path: `FuturesUnordered`), so a wave of ready stages attributes all of its
+/// `TaskStarted` events before any task of the wave can finish. Worker-indexed dispatch
+/// keeps the legacy one-bucket read: the AQE modulus mapping only applies to the
+/// per-partition rendezvous dispatch path ([`intermediate_task_futures`]).
 #[allow(clippy::too_many_arguments)]
-async fn run_intermediate_stage(
+fn producer_task_futures(
+    cluster: &Cluster,
+    stage: &StageDef,
+    num_partitions: u32,
+    lineage: &Arc<StageLineage>,
+    stage_map: &HashMap<u32, StageDef>,
+    store: &Option<SharedStore>,
+    operation_id: &Option<String>,
+    stage_rows: &HashMap<u32, Vec<u64>>,
+) -> Result<Vec<BoxFuture<'static, Result<()>>>> {
+    let producers: Vec<(usize, String)> = if stage.exchange == ExchangeMode::Forward {
+        let first = cluster.workers.first().cloned().ok_or_else(|| {
+            Error::Execution("forward producer stage requires at least one worker".into())
+        })?;
+        vec![(0, first)]
+    } else {
+        cluster.workers.iter().cloned().enumerate().collect()
+    };
+    let mut futs = Vec::new();
+    for (i, endpoint) in producers {
+        let ticket = stage_ticket(
+            stage,
+            i as u32,
+            num_partitions,
+            0,
+            cluster,
+            true,
+            stage_map,
+            stage_rows,
+        );
+        let membership = cluster.membership.clone();
+        let ep = endpoint;
+        let host = executor_id(&ep);
+        let lineage = lineage.clone();
+        let stage_map = stage_map.clone();
+        let store_c = store.clone();
+        let op_c = operation_id.clone();
+        let stage_id = stage.stage_id as i32;
+        let task_id = store
+            .as_ref()
+            .map(|s| s.alloc_task_id())
+            .unwrap_or(i as i64);
+        emit_task_started(store, operation_id, stage_id, task_id, &host);
+        futs.push(
+            async move {
+                let start = std::time::Instant::now();
+                let result =
+                    run_stage_with_retry(&membership, ep, ticket, &lineage, &stage_map).await;
+                match &result {
+                    Ok(batches) => {
+                        let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+                        emit_task_finished(
+                            &store_c,
+                            &op_c,
+                            stage_id,
+                            task_id,
+                            &host,
+                            TaskStatus::Success,
+                            start.elapsed().as_millis() as i64,
+                            0,
+                            rows * 8,
+                            rows,
+                        );
+                    }
+                    Err(_) => {
+                        emit_task_finished(
+                            &store_c,
+                            &op_c,
+                            stage_id,
+                            task_id,
+                            &host,
+                            TaskStatus::Failed,
+                            start.elapsed().as_millis() as i64,
+                            0,
+                            0,
+                            0,
+                        );
+                    }
+                }
+                result.map(|_| ())
+            }
+            .boxed(),
+        );
+    }
+    Ok(futs)
+}
+
+/// Build one cold task future per shuffle partition of an intermediate (consume + produce)
+/// stage — or, when AQE coalesced an upstream, one task per coalesced reader partition
+/// (`read_modulus < num_partitions`), each pulling its whole modulus class of every
+/// upstream. The worker scopes its shuffle-input registrations per task
+/// (`localize_shuffle_input_sql`), so same-worker tasks no longer race on a shared
+/// `shuffle_input` table — the per-endpoint serialization (KAN-32) is gone; tasks beyond a
+/// worker's slot count queue server-side (`acquire_task_slot`). Every task still
+/// hash-partitions its output into the full `num_partitions` buckets, so downstream reads
+/// are unaffected by the coalesced fan-in. `TaskStarted` events are emitted synchronously
+/// (see [`producer_task_futures`]).
+#[allow(clippy::too_many_arguments)]
+fn intermediate_task_futures(
     cluster: &Cluster,
     stage: &StageDef,
     num_partitions: u32,
@@ -1251,72 +1329,85 @@ async fn run_intermediate_stage(
     store: &Option<SharedStore>,
     operation_id: &Option<String>,
     stage_rows: &HashMap<u32, Vec<u64>>,
-) -> Result<()> {
+) -> Result<Vec<BoxFuture<'static, Result<()>>>> {
     let mut futs = Vec::new();
     let num_tasks = read_modulus.clamp(1, num_partitions);
     for p in 0..num_tasks {
         let endpoint = cluster.owner_endpoint(p)?;
+        let ticket = stage_ticket(
+            stage,
+            p,
+            num_partitions,
+            num_tasks,
+            cluster,
+            true,
+            stage_map,
+            stage_rows,
+        );
         let membership = cluster.membership.clone();
-        let stage = stage.clone();
-        let cluster = cluster.clone();
         let lineage = lineage.clone();
         let stage_map = stage_map.clone();
-        let stage_rows = stage_rows.clone();
         let host = executor_id(&endpoint);
         let store_c = store.clone();
         let op_c = operation_id.clone();
         let stage_id = stage.stage_id as i32;
         let task_id = alloc_task_id(store, p as i64);
         emit_task_started(store, operation_id, stage_id, task_id, &host);
-        futs.push(async move {
-            let ticket = stage_ticket(
-                &stage,
-                p,
-                num_partitions,
-                num_tasks,
-                &cluster,
-                true,
-                &stage_map,
-                &stage_rows,
-            );
-            let start = std::time::Instant::now();
-            let result =
-                run_stage_with_retry(&membership, endpoint.clone(), ticket, &lineage, &stage_map)
-                    .await;
-            match &result {
-                Ok(batches) => {
-                    let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
-                    emit_task_finished(
-                        &store_c,
-                        &op_c,
-                        stage_id,
-                        task_id,
-                        &host,
-                        TaskStatus::Success,
-                        start.elapsed().as_millis() as i64,
-                        rows * 8,
-                        0,
-                        rows,
-                    );
+        futs.push(
+            async move {
+                let start = std::time::Instant::now();
+                let result = run_stage_with_retry(
+                    &membership,
+                    endpoint.clone(),
+                    ticket,
+                    &lineage,
+                    &stage_map,
+                )
+                .await;
+                match &result {
+                    Ok(batches) => {
+                        let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+                        emit_task_finished(
+                            &store_c,
+                            &op_c,
+                            stage_id,
+                            task_id,
+                            &host,
+                            TaskStatus::Success,
+                            start.elapsed().as_millis() as i64,
+                            rows * 8,
+                            0,
+                            rows,
+                        );
+                    }
+                    Err(_) => {
+                        emit_task_finished(
+                            &store_c,
+                            &op_c,
+                            stage_id,
+                            task_id,
+                            &host,
+                            TaskStatus::Failed,
+                            start.elapsed().as_millis() as i64,
+                            0,
+                            0,
+                            0,
+                        );
+                    }
                 }
-                Err(_) => {
-                    emit_task_finished(
-                        &store_c,
-                        &op_c,
-                        stage_id,
-                        task_id,
-                        &host,
-                        TaskStatus::Failed,
-                        start.elapsed().as_millis() as i64,
-                        0,
-                        0,
-                        0,
-                    );
-                }
+                result.map(|_| ())
             }
-            result.map(|_| ())
-        });
+            .boxed(),
+        );
     }
+    Ok(futs)
+}
+
+/// Await one stage's task futures to completion. Every task runs to completion even when a
+/// sibling fails (join_all drains the set, so a failed task's siblings still free their
+/// worker slots); the first task error — in task order, matching the pre-concurrency
+/// behavior — is surfaced.
+async fn join_stage_tasks(futs: Vec<BoxFuture<'static, Result<()>>>) -> Result<()> {
     let mut first_err = None;
     for r in futures::future::join_all(futs).await {
         if let Err(e) = r {
@@ -1329,6 +1420,136 @@ async fn run_intermediate_stage(
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Dependency-aware concurrent dispatch of every non-output stage (`WEFT_CONCURRENT_STAGES`,
+/// default on): a stage is dispatched as soon as ALL of its upstream stages have completed
+/// ([`StageDag`] computes the dependency sets, including the implicit KAN-27 scalar-token
+/// edge), so independent branch arms overlap instead of serializing behind the previous
+/// stage's barrier. A consumer still waits for every upstream, and each completed stage's
+/// barrier ([`finish_stage_barrier`]) runs inline in this loop before its dependents are
+/// released, so a consumer's ticket construction observes the complete AQE / stage-rows
+/// state of all of its upstreams — the same snapshots the sequential loop produced.
+///
+/// Failure semantics: the first stage error skips every transitive dependent (they can
+/// never become ready) and is returned immediately. Dropping the still in-flight sibling
+/// stages cancels their Flight streams client-side; the caller's exit path then runs the
+/// same best-effort cancel + eviction sweep on the workers the sequential path runs. No
+/// new concurrency bound is introduced: in-flight tasks stay bounded by the per-stage task
+/// counts and the workers' server-side task slots, exactly as within one stage today.
+#[allow(clippy::too_many_arguments)]
+async fn run_stages_concurrent(
+    cluster: &Cluster,
+    stages: &[StageDef],
+    stage_map: &HashMap<u32, StageDef>,
+    output_stage_id: u32,
+    scalar_stage: Option<&StageDef>,
+    scalar_literal: &mut Option<String>,
+    planned_workers: &[String],
+    query_id: &str,
+    cancel: &AtomicBool,
+    lineage: &Arc<StageLineage>,
+    store: &Option<SharedStore>,
+    operation_id: &Option<String>,
+    coalesced: &mut HashMap<u32, u32>,
+    stage_rows: &mut HashMap<u32, Vec<u64>>,
+) -> Result<()> {
+    let mut dag = StageDag::new(stages, output_stage_id, scalar_stage.map(|s| s.stage_id));
+    let np = cluster.num_partitions;
+    let mut in_flight: FuturesUnordered<BoxFuture<'static, (u32, Result<()>)>> =
+        FuturesUnordered::new();
+    loop {
+        // Dispatch every stage whose upstreams all completed. The task futures are cold,
+        // so this sweep emits every ready stage's TaskStarted events before any task of
+        // the wave is polled (deterministic per-stage event attribution).
+        while let Some(id) = dag.take_ready() {
+            let current = stage_map
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| Error::Plan(format!("stage {id} not in the stage list")))?;
+            // KAN-27: the scalar-token edge in the dependency layer guarantees the scalar
+            // stage completed before this stage dispatches.
+            let stage =
+                substitute_scalar_tokens(cluster, &current, stages, scalar_stage, scalar_literal)
+                    .await?;
+            ensure_stable_membership(cluster, planned_workers)?;
+            check_query_cancelled(query_id, cancel)?;
+            let task_futs =
+                if stage.exchange == ExchangeMode::Hash && !stage.upstream_stage_ids.is_empty() {
+                    let read_mod = consumer_read_modulus(&stage, coalesced).unwrap_or(np);
+                    intermediate_task_futures(
+                        cluster,
+                        &stage,
+                        np,
+                        read_mod,
+                        lineage,
+                        stage_map,
+                        store,
+                        operation_id,
+                        stage_rows,
+                    )?
+                } else {
+                    producer_task_futures(
+                        cluster,
+                        &stage,
+                        np,
+                        lineage,
+                        stage_map,
+                        store,
+                        operation_id,
+                        stage_rows,
+                    )?
+                };
+            in_flight.push(
+                async move {
+                    let result = join_stage_tasks(task_futs).await;
+                    (id, result)
+                }
+                .boxed(),
+            );
+        }
+        let Some((id, result)) = in_flight.next().await else {
+            break;
+        };
+        match result {
+            Ok(()) => {
+                let stage = stage_map
+                    .get(&id)
+                    .expect("dispatched stage is in the stage map");
+                finish_stage_barrier(
+                    cluster,
+                    stage,
+                    np,
+                    store,
+                    operation_id,
+                    coalesced,
+                    stage_rows,
+                )
+                .await;
+                dag.complete(id);
+            }
+            Err(e) => {
+                // Skip every transitive dependent (it can never become ready now) and
+                // surface the stage's own error immediately — waiting out in-flight
+                // siblings would let a wedged arm delay the failure to the stage timeout.
+                let skipped = dag.fail(id);
+                tracing::warn!(
+                    target: "weft.driver",
+                    stage_id = id,
+                    ?skipped,
+                    "stage failed; skipping its dependents and surfacing the error"
+                );
+                return Err(e);
+            }
+        }
+    }
+    if dag.unfinished() != 0 {
+        return Err(Error::Plan(format!(
+            "stage DAG has a dependency cycle: {} stage(s) never became dispatchable",
+            dag.unfinished()
+        )));
+    }
+    Ok(())
 }
 
 /// Emit the StageFinished event for a producer stage and (when AQE is enabled) sample its

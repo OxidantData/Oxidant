@@ -761,8 +761,19 @@ fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
         .and_then(|s| s.parse().ok())
 }
 
-#[tokio::main]
-async fn main() {
+// See weft-cli: generated stage SQL can recurse past tokio's 2 MiB default thread stack inside
+// DataFusion's parser/optimizer mid-execution (TPC-DS Q39/Q70); the bench harness drives the
+// same distributed paths.
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(32 * 1024 * 1024)
+        .build()
+        .expect("tokio runtime")
+        .block_on(bench_main())
+}
+
+async fn bench_main() {
     let args: Vec<String> = std::env::args().collect();
     let rows = args
         .iter()

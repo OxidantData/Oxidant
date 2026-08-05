@@ -271,8 +271,12 @@ fn reorder_under_filter(filter: &Filter) -> Option<LogicalPlan> {
         acc = Arc::new(LogicalPlan::Join(join));
     }
 
-    // Re-apply the caps above the reordered chain, innermost last.
-    let mut out = acc;
+    reapply_caps(acc, caps)
+}
+
+/// Re-apply the caps a rewrite descended through above the rebuilt chain, innermost last.
+fn reapply_caps(chain: Arc<LogicalPlan>, caps: Vec<Cap>) -> Option<LogicalPlan> {
+    let mut out = chain;
     for cap in caps.into_iter().rev() {
         out = match cap {
             Cap::Projection(p) => Arc::new(LogicalPlan::Projection(
@@ -604,6 +608,539 @@ fn connect_under_filter(filter: &Filter, replicated: &[&str]) -> Option<LogicalP
         acc = Arc::new(LogicalPlan::Join(join));
     }
 
+    Some((*acc).clone())
+}
+
+/// KAN-2 (TPC-DS Q72 at the 2-sharded classification): distribute a `Filter` sitting above a
+/// **keyed** inner-join chain (with optional projection / alias / outer-join caps) onto the
+/// chain itself — single-table conjuncts push onto their leaf's scan, cross-table conjuncts
+/// become the residual of the join placing their last referenced leaf — so nothing remains in
+/// a `Filter` above the chain. The shuffle-join chain extractor walks *past* `Filter` nodes
+/// and would silently drop such a predicate; once the chain planner folds trailing replicated
+/// joins (Q72's `LEFT JOIN promotion` / `LEFT JOIN catalog_returns`) into the final stage
+/// instead of rejecting them, a dropped `Filter` becomes a wrong answer rather than a
+/// rejection. This is the keyed-chain counterpart of [`connect_comma_join_chain`]'s
+/// distribution (which the comma-join shape already gets): Q72's six WHERE conjuncts
+/// (`cd_marital_status`, `hd_buy_potential`, `d1.d_year`, the `d_week_seq` equality, the
+/// quantity comparison, the ship-date comparison) ride ONE `Filter` above the
+/// `catalog_sales ⋈ inventory` chain because the driver-side planner is analyzer-only — no
+/// predicate pushdown.
+///
+/// The rewrite fires only when the chain holds **at least two sharded leaves** — a
+/// one-sharded chain belongs to the broadcast path, which unparses the `Filter` into its
+/// stage tail and must keep it. It is semantics-preserving: inner joins commute and a
+/// conjunctive predicate evaluates over the same row set whether applied above the chain or
+/// at the placing join.
+///
+/// Returns `None` — plan untouched, original rejection/fallback paths preserved — for
+/// anything outside the narrow shape: a non-inner chain member or non-simple leaf, an
+/// ambiguously-resolving column, a conjunct referencing an outer-join cap's null-extended
+/// leaf (pushing it below the outer join would change which rows null-extend), a
+/// subquery-bearing conjunct (the dedicated subquery paths own those), or a cross-table
+/// conjunct mixing replicated and sharded leaves whose last referenced leaf is sharded (a
+/// folded replicated dim's columns are not in the shuffle stream the sharded step's ON/WHERE
+/// can reference).
+pub(crate) fn distribute_chain_filter(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+) -> Option<LogicalPlan> {
+    let out = lp
+        .clone()
+        .transform_up(|node| {
+            let LogicalPlan::Filter(f) = &node else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(rebuilt) = distribute_under_filter(f, replicated) else {
+                return Ok(Transformed::no(node));
+            };
+            Ok(Transformed::yes(rebuilt))
+        })
+        .ok()?;
+    out.transformed.then_some(out.data)
+}
+
+/// One step of the [`distribute_chain_filter`] rewrite: see the function for the contract.
+fn distribute_under_filter(filter: &Filter, replicated: &[&str]) -> Option<LogicalPlan> {
+    // Descend the same chain-transparent caps the filter-first reorder allows.
+    let mut caps: Vec<Cap> = Vec::new();
+    let mut cursor = filter.input.as_ref();
+    let chain_root = loop {
+        match cursor {
+            LogicalPlan::Join(j) if j.join_type == JoinType::Inner => break cursor,
+            LogicalPlan::Projection(p) => {
+                caps.push(Cap::Projection(p.clone()));
+                cursor = p.input.as_ref();
+            }
+            LogicalPlan::SubqueryAlias(a) => {
+                caps.push(Cap::SubqueryAlias(a.clone()));
+                cursor = a.input.as_ref();
+            }
+            LogicalPlan::Join(j) if j.join_type == JoinType::Left => {
+                caps.push(Cap::OuterJoinLeft(j.clone()));
+                cursor = j.left.as_ref();
+            }
+            LogicalPlan::Join(j) if j.join_type == JoinType::Right => {
+                caps.push(Cap::OuterJoinRight(j.clone()));
+                cursor = j.right.as_ref();
+            }
+            _ => return None,
+        }
+    };
+
+    let mut steps: Vec<Step> = Vec::new();
+    let leftmost = flatten_chain_scans(chain_root, &mut steps)?;
+    if steps.is_empty() {
+        return None;
+    }
+    let mut leaves: Vec<Arc<LogicalPlan>> = vec![leftmost];
+    leaves.extend(steps.iter().map(|s| s.right.clone()));
+    let sharded: Vec<bool> = leaves
+        .iter()
+        .map(|l| leaf_table_name(l).is_some_and(|t| !replicated.contains(&t)))
+        .collect();
+    // Only a chain the shuffle-join-chain planner will own; the broadcast path keeps its
+    // Filter (it unparses into the single sharded stage's tail).
+    if sharded.iter().filter(|&&s| s).count() < 2 {
+        return None;
+    }
+
+    // Classify every conjunct: a single-table conjunct pushes onto its leaf's scan (exactly
+    // the KAN-26 comma-join convention), any other conjunct becomes a residual of the step
+    // placing the last leaf it references. A column resolving to no inner-chain leaf — an
+    // outer-join cap's null-extended side, a projected-away name, or an ambiguous duplicate —
+    // declines the whole rewrite rather than mis-place the predicate.
+    let mut conjuncts = Vec::new();
+    flatten_and_conjuncts(&filter.predicate, &mut conjuncts);
+    let mut leaf_preds: Vec<Vec<Expr>> = vec![Vec::new(); leaves.len()];
+    let mut step_residuals: Vec<Vec<Expr>> = vec![Vec::new(); steps.len()];
+    for conjunct in conjuncts {
+        // The dedicated subquery paths own subquery-bearing conjuncts (decorrelation,
+        // materialization, semi/anti cascades) — never redistribute those.
+        if expr_has_subquery(&conjunct) {
+            return None;
+        }
+        let mut owners: Vec<usize> = Vec::new();
+        for col in conjunct.column_refs() {
+            let i = leaf_of(col, &leaves)?;
+            if !owners.contains(&i) {
+                owners.push(i);
+            }
+        }
+        match owners.len() {
+            // No columns at all (a constant predicate): leftmost side, matching the KAN-26 /
+            // connector convention — it filters every row identically either way.
+            0 => leaf_preds[0].push(conjunct),
+            1 => leaf_preds[owners[0]].push(conjunct),
+            _ => {
+                let last = *owners.iter().max().expect("owners is non-empty");
+                // A folded replicated dim is joined into the stage as the raw table — its
+                // columns are not in the shuffle stream a *sharded* step's ON/WHERE can
+                // reference. Decline rather than emit a dangling reference.
+                if sharded[last] && owners.iter().any(|&o| !sharded[o]) {
+                    return None;
+                }
+                step_residuals[last - 1].push(conjunct);
+            }
+        }
+    }
+
+    // Wrap each filtered leaf, AND each step's new residuals into its own join filter, and
+    // rebuild the chain in its ORIGINAL order — placement distributes the predicate, it
+    // never permutes the chain.
+    let wrap = |idx: usize| -> Option<Arc<LogicalPlan>> {
+        match leaf_preds[idx].iter().cloned().reduce(Expr::and) {
+            None => Some(leaves[idx].clone()),
+            Some(p) => Some(Arc::new(LogicalPlan::Filter(
+                Filter::try_new(p, leaves[idx].clone()).ok()?,
+            ))),
+        }
+    };
+    let mut acc: Arc<LogicalPlan> = wrap(0)?;
+    for (si, step) in steps.iter().enumerate() {
+        let new_filter = step
+            .filter
+            .clone()
+            .into_iter()
+            .chain(step_residuals[si].iter().cloned())
+            .reduce(Expr::and);
+        let join = Join::try_new(
+            acc,
+            wrap(si + 1)?,
+            step.on.clone(),
+            new_filter,
+            JoinType::Inner,
+            step.join_constraint,
+            step.null_equality,
+            step.null_aware,
+        )
+        .ok()?;
+        acc = Arc::new(LogicalPlan::Join(join));
+    }
+
+    // The outer caps re-wrap unchanged; the Filter itself is fully consumed — every conjunct
+    // landed on a scan or a step, so nothing may stay above the rebuilt chain.
+    reapply_caps(acc, caps)
+}
+
+/// KAN-2 (TPC-DS Q37/Q82 at the row-aware classification): re-root an inner-join chain whose
+/// **written leftmost leaf is replicated** so a sharded leaf becomes the chain root, which the
+/// shuffle-join-chain planner requires.
+///
+/// The row-aware replicate/shard classification (`WEFT_REPLICATE_MAX_ROW_MULTIPLE`, on by
+/// default) can keep a mid-chain table sharded while the query's written-first table stays a
+/// replicated dim — Q37's `FROM item, inventory, date_dim, catalog_sales` with `inventory` and
+/// `catalog_sales` sharded. [`connect_comma_join_chain`] and [`reorder_filtered_dims_first`]
+/// both deliberately root the chain at the written leftmost leaf, so the chain planner then
+/// rejected the query ("requires a sharded leftmost table") and it fell back to single-node
+/// execution. Inner joins are symmetric, so rotating the chain to start at a sharded leaf is
+/// semantics-preserving — with two care points this rewrite handles explicitly:
+///
+/// - **No re-rooting across non-inner joins**: only a contiguous *inner* chain is rotated
+///   (outer/semi/anti members make the chain opaque, exactly like the reorder above); an
+///   outer join *above* the chain is a cap — the inner product on its preserved side may be
+///   rotated without changing which rows null-extend (same argument as the reorder's caps).
+/// - **Side-specific join conditions**: a step may only be placed once every leaf its ON /
+///   residual expressions reference is in the chain, and each ON pair is re-oriented so its
+///   right expression references the leaf that step brings in. When the re-oriented left key
+///   references a *replicated* dim (which folds into the stage and never becomes a shuffle
+///   input), it is substituted with an equivalent column from the query's own equality web —
+///   Q37's `cs_item_sk = i_item_sk` becomes `cs_item_sk = inv_item_sk` through
+///   `inv_item_sk = i_item_sk`. Conjunctive inner-join equality is transitive, so the result
+///   set is unchanged; without a carried equivalent the rewrite declines.
+///
+/// The rewrite fires only when the written leftmost leaf is replicated **and at least two
+/// leaves are sharded** — a single-sharded chain is the broadcast path's, which does not care
+/// about join order, so those plans stay byte-for-byte stable. Anything unexpected (an
+/// ambiguously-resolving column, a placement cycle, an ON pair that does not touch the
+/// incoming leaf, a trailing replicated leaf) declines the rewrite and the query keeps its
+/// original plan and error/fallback path.
+pub(crate) fn reroot_inner_chain_at_sharded(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+) -> Option<LogicalPlan> {
+    reroot_node(lp, replicated)
+}
+
+/// Descend the plan spine through chain-transparent nodes and re-root the first inner-join
+/// chain found. Caps re-wrap unchanged above the rotated chain.
+fn reroot_node(node: &LogicalPlan, replicated: &[&str]) -> Option<LogicalPlan> {
+    match node {
+        LogicalPlan::Join(j) => match j.join_type {
+            JoinType::Inner => reroot_chain(node, replicated),
+            JoinType::Left => {
+                let new_left = reroot_node(&j.left, replicated)?;
+                node.with_new_exprs(node.expressions(), vec![new_left, j.right.as_ref().clone()])
+                    .ok()
+            }
+            JoinType::Right => {
+                let new_right = reroot_node(&j.right, replicated)?;
+                node.with_new_exprs(node.expressions(), vec![j.left.as_ref().clone(), new_right])
+                    .ok()
+            }
+            _ => None,
+        },
+        LogicalPlan::Limit(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::Projection(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Distinct(_) => {
+            let input = node.inputs().into_iter().next()?;
+            let new_input = reroot_node(input, replicated)?;
+            node.with_new_exprs(node.expressions(), vec![new_input])
+                .ok()
+        }
+        _ => None,
+    }
+}
+
+/// A chain leaf for the re-root: like [`is_simple_leaf`] but also seeing through the `Filter`
+/// wrappers [`connect_comma_join_chain`] pushes single-table predicates down into.
+fn is_chain_leaf(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Filter(f) => is_chain_leaf(f.input.as_ref()),
+        _ => is_simple_leaf(plan),
+    }
+}
+
+/// The base table a chain leaf scans, through `Filter` / `SubqueryAlias` wrappers.
+fn leaf_table_name(plan: &LogicalPlan) -> Option<&str> {
+    match plan {
+        LogicalPlan::TableScan(s) => Some(s.table_name.table()),
+        LogicalPlan::SubqueryAlias(a) => leaf_table_name(a.input.as_ref()),
+        LogicalPlan::Filter(f) => leaf_table_name(f.input.as_ref()),
+        _ => None,
+    }
+}
+
+/// [`flatten_chain`] over [`is_chain_leaf`] leaves, so chains whose leaves carry pushed-down
+/// filters (every connected comma chain with single-table predicates) stay re-rootable.
+fn flatten_chain_scans(node: &LogicalPlan, steps: &mut Vec<Step>) -> Option<Arc<LogicalPlan>> {
+    match node {
+        LogicalPlan::Join(j) if j.join_type == JoinType::Inner => {
+            let leftmost = flatten_chain_scans(&j.left, steps)?;
+            if !is_chain_leaf(&j.right) {
+                return None;
+            }
+            steps.push(Step {
+                right: j.right.clone(),
+                on: j.on.clone(),
+                filter: j.filter.clone(),
+                join_constraint: j.join_constraint,
+                null_equality: j.null_equality,
+                null_aware: j.null_aware,
+            });
+            Some(leftmost)
+        }
+        leaf if is_chain_leaf(leaf) => Some(Arc::new(node.clone())),
+        _ => None,
+    }
+}
+
+/// The `(leaf index, column)` a join expression resolves to, for dependency / equality-web
+/// analysis. Non-column expressions never resolve (they are not join keys here).
+fn column_leaf<'e>(e: &'e Expr, leaves: &[Arc<LogicalPlan>]) -> Option<(usize, &'e Column)> {
+    let Expr::Column(c) = e else { return None };
+    let i = leaf_of(c, leaves)?;
+    Some((i, c))
+}
+
+/// `a.k = b.k` with plain columns on both sides — a join-edge conjunct whether it sits in
+/// `on` or is parked in `join.filter`. Returns cloned `(left, right)` column exprs.
+fn as_column_equality(e: &Expr) -> Option<(Expr, Expr)> {
+    let Expr::BinaryExpr(b) = e else { return None };
+    if b.op != Operator::Eq {
+        return None;
+    }
+    if !matches!(b.left.as_ref(), Expr::Column(_)) || !matches!(b.right.as_ref(), Expr::Column(_)) {
+        return None;
+    }
+    Some((b.left.as_ref().clone(), b.right.as_ref().clone()))
+}
+
+/// Union-find over the chain's equality web: `(leaf index, column name)` keys joined by every
+/// column-equality the query's ON clauses / join filters state. Used to substitute a join key
+/// that references a folded replicated dim with an equivalent column a shuffle input carries.
+#[derive(Default)]
+struct EqualityWeb {
+    parent: std::collections::HashMap<(usize, String), (usize, String)>,
+    member: std::collections::HashMap<(usize, String), Column>,
+}
+
+impl EqualityWeb {
+    fn find(&self, key: &(usize, String)) -> (usize, String) {
+        let mut root = key.clone();
+        while let Some(p) = self.parent.get(&root) {
+            root = p.clone();
+        }
+        root
+    }
+
+    fn link(&mut self, a: (usize, String), b: (usize, String), ca: &Column, cb: &Column) {
+        self.member.entry(a.clone()).or_insert_with(|| ca.clone());
+        self.member.entry(b.clone()).or_insert_with(|| cb.clone());
+        let (ra, rb) = (self.find(&a), self.find(&b));
+        if ra != rb {
+            self.parent.insert(rb, ra);
+        }
+    }
+
+    /// The equality-web peer of `key` carried by an already-placed shuffle input: a qualified
+    /// column on a placed sharded leaf (smallest leaf index wins, so the chain root — always
+    /// placed — is preferred). `skip` excludes the join step's own right leaf.
+    fn carried_peer(
+        &self,
+        key: &(usize, String),
+        placed: &[usize],
+        sharded: &[bool],
+        skip: usize,
+    ) -> Option<Column> {
+        let root = self.find(key);
+        self.member
+            .iter()
+            .filter(|(k, c)| {
+                self.find(k) == root
+                    && k.0 != skip
+                    && sharded[k.0]
+                    && placed.contains(&k.0)
+                    && c.relation.is_some()
+            })
+            .min_by_key(|(k, _)| k.0)
+            .map(|(_, c)| c.clone())
+    }
+}
+
+fn reroot_chain(chain_root: &LogicalPlan, replicated: &[&str]) -> Option<LogicalPlan> {
+    let mut steps: Vec<Step> = Vec::new();
+    let leftmost = flatten_chain_scans(chain_root, &mut steps)?;
+    let mut leaves: Vec<Arc<LogicalPlan>> = vec![leftmost];
+    leaves.extend(steps.iter().map(|s| s.right.clone()));
+    let n = leaves.len();
+
+    let sharded: Vec<bool> = leaves
+        .iter()
+        .map(|l| leaf_table_name(l).is_some_and(|t| !replicated.contains(&t)))
+        .collect();
+    // Byte-stability: a chain already rooted at a sharded leaf keeps its written shape, and a
+    // chain with fewer than two sharded leaves belongs to the broadcast path (order-free).
+    if sharded[0] || sharded.iter().filter(|&&s| s).count() < 2 {
+        return None;
+    }
+    // The new root: the first sharded leaf in written order.
+    let root_idx = (1..n).find(|&i| sharded[i])?;
+
+    // Placement dependencies per step (every leaf its ON / residual exprs reference, other
+    // than the leaf it brings in) plus the equality web for key substitution. Any column that
+    // resolves to no leaf (or ambiguously) bails the whole rewrite rather than guess.
+    // Equality conjuncts parked in `join.filter` register too: the chain planner promotes them
+    // to hash keys downstream, so they are part of the query's equality web.
+    let mut web = EqualityWeb::default();
+    let mut refs: Vec<Vec<usize>> = Vec::with_capacity(steps.len());
+    let link_pair = |web: &mut EqualityWeb, l: &Expr, r: &Expr, leaves: &[Arc<LogicalPlan>]| {
+        if let (Some((li, lc)), Some((ri, rc))) = (column_leaf(l, leaves), column_leaf(r, leaves)) {
+            web.link((li, lc.name.clone()), (ri, rc.name.clone()), lc, rc);
+        }
+    };
+    for step in &steps {
+        // A subquery in a step's ON / filter correlates through outer references that
+        // `column_refs` cannot see — placement could miss them, so decline (the dedicated
+        // subquery paths own those shapes).
+        if step
+            .on
+            .iter()
+            .any(|(l, r)| expr_has_subquery(l) || expr_has_subquery(r))
+            || step.filter.as_ref().is_some_and(expr_has_subquery)
+        {
+            return None;
+        }
+        let mut step_refs = Vec::new();
+        let mut exprs: Vec<&Expr> = step.on.iter().flat_map(|(l, r)| [l, r]).collect();
+        if let Some(f) = &step.filter {
+            exprs.push(f);
+        }
+        for expr in exprs {
+            for col in expr.column_refs() {
+                let i = leaf_of(col, &leaves)?;
+                if !step_refs.contains(&i) {
+                    step_refs.push(i);
+                }
+            }
+        }
+        for (l, r) in &step.on {
+            link_pair(&mut web, l, r, &leaves);
+        }
+        if let Some(f) = &step.filter {
+            let mut conjuncts = Vec::new();
+            flatten_and_conjuncts(f, &mut conjuncts);
+            for c in &conjuncts {
+                if let Some((a, b)) = as_column_equality(c) {
+                    link_pair(&mut web, &a, &b, &leaves);
+                }
+            }
+        }
+        refs.push(step_refs);
+    }
+
+    // The old leftmost leaf is no longer the root: the first step referencing it adopts it as
+    // its incoming right leaf (a connected chain always has one — the first step).
+    let adopt = refs.iter().position(|r| r.contains(&0))?;
+    let new_right: Vec<usize> = (0..steps.len())
+        .map(|j| if j == adopt { 0 } else { j + 1 })
+        .collect();
+    let deps: Vec<Vec<usize>> = refs
+        .iter()
+        .enumerate()
+        .map(|(j, r)| r.iter().copied().filter(|&i| i != new_right[j]).collect())
+        .collect();
+
+    // Greedy, deterministic placement from the new root: placeable steps go in original
+    // order; an unplaceable remainder (dependency cycle) declines the rewrite.
+    let mut placed: Vec<usize> = vec![root_idx];
+    let mut remaining: Vec<usize> = (0..steps.len()).collect();
+    let mut order: Vec<usize> = Vec::with_capacity(steps.len());
+    while !remaining.is_empty() {
+        let pos = remaining.iter().position(|&j| {
+            !placed.contains(&new_right[j]) && deps[j].iter().all(|d| placed.contains(d))
+        })?;
+        let j = remaining.remove(pos);
+        placed.push(new_right[j]);
+        order.push(j);
+    }
+    // The shuffle chain builder cannot fold trailing replicated-only joins: the last placed
+    // step must bring in a sharded leaf.
+    if !sharded[*placed.last()?] {
+        return None;
+    }
+
+    // Rebuild the chain in placed order, re-orienting each equijoin pair (whether it sits in
+    // `on` or is parked as a `join.filter` equality conjunct) so its right expression
+    // references the incoming leaf, and substituting folded-dim left keys through the web.
+    let orient = |a: &Expr,
+                  b: &Expr,
+                  rj: usize,
+                  placed_so_far: &[usize],
+                  leaves: &[Arc<LogicalPlan>],
+                  sharded: &[bool],
+                  web: &EqualityWeb|
+     -> Option<(Expr, Expr)> {
+        let (mut left, right) = match (column_leaf(a, leaves), column_leaf(b, leaves)) {
+            (Some((ai, _)), Some((bi, _))) if bi == rj && ai != rj => (a.clone(), b.clone()),
+            (Some((ai, _)), Some((bi, _))) if ai == rj && bi != rj => (b.clone(), a.clone()),
+            // A pair that never touches the incoming leaf (or twice) cannot key this join.
+            _ => return None,
+        };
+        let (li, lname) = {
+            let (i, c) = column_leaf(&left, leaves)?;
+            (i, c.name.clone())
+        };
+        if !sharded[li] {
+            left = Expr::Column(web.carried_peer(&(li, lname), placed_so_far, sharded, rj)?);
+        }
+        Some((left, right))
+    };
+    let mut acc = leaves[root_idx].clone();
+    let mut placed_so_far: Vec<usize> = vec![root_idx];
+    for &j in &order {
+        let rj = new_right[j];
+        let mut on: Vec<(Expr, Expr)> = Vec::with_capacity(steps[j].on.len());
+        for (a, b) in &steps[j].on {
+            on.push(orient(a, b, rj, &placed_so_far, &leaves, &sharded, &web)?);
+        }
+        // Filter conjuncts: column equalities get the same re-orientation/substitution (the
+        // chain planner re-promotes them to hash keys); everything else stays residual.
+        let mut new_filter: Option<Expr> = None;
+        if let Some(f) = &steps[j].filter {
+            let mut conjuncts = Vec::new();
+            flatten_and_conjuncts(f, &mut conjuncts);
+            for c in conjuncts {
+                let part = match as_column_equality(&c) {
+                    Some((a, b)) => {
+                        let (l, r) = orient(&a, &b, rj, &placed_so_far, &leaves, &sharded, &web)?;
+                        l.eq(r)
+                    }
+                    None => c,
+                };
+                new_filter = Some(match new_filter {
+                    None => part,
+                    Some(prev) => prev.and(part),
+                });
+            }
+        }
+        let join = Join::try_new(
+            acc,
+            leaves[rj].clone(),
+            on,
+            new_filter,
+            JoinType::Inner,
+            steps[j].join_constraint,
+            steps[j].null_equality,
+            steps[j].null_aware,
+        )
+        .ok()?;
+        acc = Arc::new(LogicalPlan::Join(join));
+        placed_so_far.push(rj);
+    }
     Some((*acc).clone())
 }
 
@@ -967,5 +1504,336 @@ mod tests {
         )
         .await;
         assert!(connect_comma_join_chain(&lp, &[]).is_none());
+    }
+
+    // --- reroot_inner_chain_at_sharded ----------------------------------------
+
+    /// The Q37 shape in miniature: replicated `item` dim written first, sharded `inventory`
+    /// mid-chain, sharded `catalog_sales` last; the two sharded tables equijoin only through
+    /// `item`. All-int columns keep the fixture tiny.
+    async fn star_plan(sql: &str) -> LogicalPlan {
+        let engine = Engine::new();
+        let int = DataType::Int64;
+        engine
+            .register_batches(
+                "item",
+                vec![table(&[
+                    ("i_item_sk", int.clone()),
+                    ("i_item_id", int.clone()),
+                ])],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "inventory",
+                vec![table(&[
+                    ("inv_item_sk", int.clone()),
+                    ("inv_date_sk", int.clone()),
+                    ("inv_quantity_on_hand", int.clone()),
+                ])],
+            )
+            .unwrap();
+        engine
+            .register_batches("date_dim", vec![table(&[("d_date_sk", int.clone())])])
+            .unwrap();
+        engine
+            .register_batches(
+                "catalog_sales",
+                vec![table(&[
+                    ("cs_item_sk", int.clone()),
+                    ("cs_quantity", int.clone()),
+                ])],
+            )
+            .unwrap();
+        engine.logical_plan(sql).await.unwrap()
+    }
+
+    /// The outermost inner join of the re-rooted chain (its last-placed step).
+    fn top_inner_join(lp: &LogicalPlan) -> datafusion::logical_expr::Join {
+        fn walk(node: &LogicalPlan) -> Option<datafusion::logical_expr::Join> {
+            match node {
+                LogicalPlan::Join(j) if j.join_type == JoinType::Inner => Some(j.clone()),
+                other => walk(other.inputs().into_iter().next()?),
+            }
+        }
+        walk(lp).expect("an inner join in the plan")
+    }
+
+    /// The equijoin pair of the chain's last-placed step that references `relation`, whether
+    /// it sits in `on` or is parked as a `join.filter` equality conjunct (DataFusion's SQL
+    /// planner parks written `JOIN ... ON` equalities in the filter).
+    fn top_join_key(lp: &LogicalPlan, relation: &str) -> (Expr, Expr) {
+        let top = top_inner_join(lp);
+        let mut candidates: Vec<(Expr, Expr)> = top.on.clone();
+        if let Some(f) = &top.filter {
+            let mut conjuncts = Vec::new();
+            flatten_and_conjuncts(f, &mut conjuncts);
+            candidates.extend(conjuncts.iter().filter_map(as_column_equality));
+        }
+        candidates
+            .into_iter()
+            .find(|(a, b)| {
+                [a, b].iter().any(|e| {
+                    matches!(e, Expr::Column(c)
+                        if c.relation.as_ref().map(|r| r.table()) == Some(relation))
+                })
+            })
+            .unwrap_or_else(|| panic!("no join key referencing {relation}: {top:?}"))
+    }
+
+    fn assert_col(e: &Expr, relation: &str, name: &str) {
+        let Expr::Column(c) = e else {
+            panic!("expected a column, found {e}")
+        };
+        assert_eq!(
+            c.relation.as_ref().map(|r| r.table()),
+            Some(relation),
+            "column {e} relation"
+        );
+        assert_eq!(c.name, name);
+    }
+
+    /// Dim-leftmost keyed chain with two sharded tables: re-rooted at the first sharded leaf
+    /// (`inventory`), and the trailing `catalog_sales` join's key — written against the folded
+    /// `item` dim — is substituted through the equality web to the carried `inventory` key.
+    #[tokio::test]
+    async fn reroots_dim_leftmost_chain_to_sharded_fact() {
+        let lp = star_plan(
+            "SELECT i_item_id, sum(cs_quantity) AS q \
+             FROM item \
+             JOIN inventory ON (inventory.inv_item_sk = item.i_item_sk) \
+             JOIN date_dim ON (date_dim.d_date_sk = inventory.inv_date_sk) \
+             JOIN catalog_sales ON (catalog_sales.cs_item_sk = item.i_item_sk) \
+             GROUP BY i_item_id",
+        )
+        .await;
+        let replicated = ["item", "date_dim"];
+        let rerooted =
+            reroot_inner_chain_at_sharded(&lp, &replicated).expect("must re-root to inventory");
+        assert_eq!(
+            join_tree_leaf_names(&rerooted),
+            vec!["inventory", "item", "date_dim", "catalog_sales"]
+        );
+        // `cs_item_sk = i_item_sk` became `inv_item_sk = cs_item_sk`: conjunctive inner-join
+        // equality is transitive, and `item` folds into the stage (never a shuffle input).
+        let (left, right) = top_join_key(&rerooted, "catalog_sales");
+        assert_col(&left, "inventory", "inv_item_sk");
+        assert_col(&right, "catalog_sales", "cs_item_sk");
+        // Re-rooting converges: the new leftmost leaf is sharded, so a second pass is a no-op.
+        assert!(reroot_inner_chain_at_sharded(&rerooted, &replicated).is_none());
+    }
+
+    /// The same shape as a comma chain (Q37's written form): after the connector attaches the
+    /// WHERE equijoins (rooted at the written leftmost `item`), the re-root rotates the
+    /// connected chain to `inventory`.
+    #[tokio::test]
+    async fn reroots_connected_comma_chain() {
+        let lp = star_plan(
+            "SELECT i_item_id, sum(cs_quantity) AS q \
+             FROM item, inventory, date_dim, catalog_sales \
+             WHERE inventory.inv_item_sk = item.i_item_sk \
+               AND date_dim.d_date_sk = inventory.inv_date_sk \
+               AND catalog_sales.cs_item_sk = item.i_item_sk \
+               AND inventory.inv_quantity_on_hand BETWEEN 100 AND 500 \
+             GROUP BY i_item_id",
+        )
+        .await;
+        let replicated = ["item", "date_dim"];
+        let connected = connect_comma_join_chain(&lp, &replicated).expect("must connect");
+        assert_eq!(
+            join_tree_leaf_names(&connected),
+            vec!["item", "inventory", "date_dim", "catalog_sales"]
+        );
+        let rerooted =
+            reroot_inner_chain_at_sharded(&connected, &replicated).expect("must re-root");
+        assert_eq!(
+            join_tree_leaf_names(&rerooted),
+            vec!["inventory", "item", "date_dim", "catalog_sales"]
+        );
+        let (left, right) = top_join_key(&rerooted, "catalog_sales");
+        assert_col(&left, "inventory", "inv_item_sk");
+        assert_col(&right, "catalog_sales", "cs_item_sk");
+    }
+
+    /// A chain containing a non-inner member is opaque: no re-rooting across it.
+    #[tokio::test]
+    async fn non_inner_chain_member_blocks_reroot() {
+        let lp = star_plan(
+            "SELECT i_item_id, sum(cs_quantity) AS q \
+             FROM item \
+             JOIN inventory ON (inventory.inv_item_sk = item.i_item_sk) \
+             FULL JOIN catalog_sales ON (catalog_sales.cs_item_sk = item.i_item_sk) \
+             GROUP BY i_item_id",
+        )
+        .await;
+        assert!(reroot_inner_chain_at_sharded(&lp, &["item", "date_dim"]).is_none());
+    }
+
+    /// A chain already rooted at a sharded leaf keeps its written shape (byte-stability).
+    #[tokio::test]
+    async fn sharded_leftmost_chain_is_untouched() {
+        let lp = star_plan(
+            "SELECT i_item_id, sum(cs_quantity) AS q \
+             FROM inventory \
+             JOIN item ON (inventory.inv_item_sk = item.i_item_sk) \
+             JOIN catalog_sales ON (catalog_sales.cs_item_sk = item.i_item_sk) \
+             GROUP BY i_item_id",
+        )
+        .await;
+        assert!(reroot_inner_chain_at_sharded(&lp, &["item", "date_dim"]).is_none());
+    }
+
+    /// Fewer than two sharded leaves: the broadcast path owns the chain — leave its order alone.
+    #[tokio::test]
+    async fn single_sharded_chain_is_untouched() {
+        let lp = star_plan(
+            "SELECT i_item_id, sum(inv_quantity_on_hand) AS q \
+             FROM item \
+             JOIN inventory ON (inventory.inv_item_sk = item.i_item_sk) \
+             JOIN date_dim ON (date_dim.d_date_sk = inventory.inv_date_sk) \
+             GROUP BY i_item_id",
+        )
+        .await;
+        assert!(reroot_inner_chain_at_sharded(&lp, &["item", "date_dim"]).is_none());
+    }
+
+    /// An outer join above the inner chain is a cap: the preserved-side inner product re-roots
+    /// while the outer join itself is never crossed.
+    #[tokio::test]
+    async fn reroots_inner_chain_below_outer_join_cap() {
+        let lp = star_plan(
+            "SELECT i_item_id, sum(cs_quantity) AS q \
+             FROM item \
+             JOIN inventory ON (inventory.inv_item_sk = item.i_item_sk) \
+             JOIN catalog_sales ON (catalog_sales.cs_item_sk = item.i_item_sk) \
+             LEFT JOIN date_dim ON (date_dim.d_date_sk = inventory.inv_date_sk) \
+             GROUP BY i_item_id",
+        )
+        .await;
+        let replicated = ["item", "date_dim"];
+        let rerooted =
+            reroot_inner_chain_at_sharded(&lp, &replicated).expect("must re-root below the cap");
+        assert_eq!(
+            join_tree_leaf_names(&rerooted),
+            vec!["inventory", "item", "catalog_sales"]
+        );
+    }
+
+    // --- distribute_chain_filter -----------------------------------------------
+
+    /// The `join.filter` of the inner chain step whose right leaf scans `table` (where the
+    /// rewrite parks cross-table residuals), seeing through any outer-join cap above.
+    fn step_filter_for(lp: &LogicalPlan, table: &str) -> Option<Expr> {
+        fn walk(node: &LogicalPlan, table: &str) -> Option<Expr> {
+            match node {
+                LogicalPlan::Join(j) if j.join_type == JoinType::Inner => {
+                    if leaf_table_name(&j.right) == Some(table) {
+                        return j.filter.clone();
+                    }
+                    walk(&j.left, table)
+                }
+                other => walk(other.inputs().into_iter().next()?, table),
+            }
+        }
+        walk(lp, table)
+    }
+
+    fn conjunct_count(e: &Expr) -> usize {
+        let mut conjuncts = Vec::new();
+        flatten_and_conjuncts(e, &mut conjuncts);
+        conjuncts.len()
+    }
+
+    /// The Q72 distribution shape in miniature: a keyed chain with two sharded leaves and a
+    /// `WHERE` mixing single-table conjuncts (push onto their dim scans) with a cross-table
+    /// comparison (residual of the step placing its last referenced leaf).
+    const DISTRIBUTE_Q: &str = "SELECT a.id, sum(f.v) AS s \
+         FROM f \
+         JOIN big ON (f.big_sk = big.k) \
+         JOIN a ON (f.a_sk = a.k) \
+         JOIN b ON (f.b_sk = b.k) \
+         LEFT JOIN c ON (f.c_sk = c.k) \
+         WHERE a.flag = 'x' AND b.flag = 'y' AND f.v > big.k \
+         GROUP BY a.id";
+
+    #[tokio::test]
+    async fn distributes_where_conjuncts_onto_keyed_chain() {
+        let lp = logical_plan(DISTRIBUTE_Q).await;
+        let rewritten =
+            distribute_chain_filter(&lp, &["a", "b", "c"]).expect("must distribute the filter");
+        // The chain keeps its written order (placement never permutes).
+        assert_eq!(join_tree_leaf_names(&rewritten), vec!["f", "big", "a", "b"]);
+        // Exactly the two pushed-down leaf filters remain — nothing stays above the chain.
+        assert_eq!(count_filters(&rewritten), 2);
+        assert!(matches!(
+            chain_root_input(&rewritten, 2),
+            LogicalPlan::Filter(_)
+        ));
+        assert!(matches!(
+            chain_root_input(&rewritten, 3),
+            LogicalPlan::Filter(_)
+        ));
+        assert!(!matches!(
+            chain_root_input(&rewritten, 1),
+            LogicalPlan::Filter(_)
+        ));
+        // The cross-table comparison joins the step placing its last leaf (`big`) as a
+        // residual in its join filter, alongside the written equijoin.
+        let step_filter = step_filter_for(&rewritten, "big").expect("big step has a filter");
+        assert_eq!(conjunct_count(&step_filter), 2, "{step_filter}");
+        // Fully consumed: a second pass finds no chain filter left to distribute.
+        assert!(distribute_chain_filter(&rewritten, &["a", "b", "c"]).is_none());
+    }
+
+    /// A one-sharded chain belongs to the broadcast path, which unparses the `Filter` into its
+    /// stage tail — the rewrite must leave it exactly where it is.
+    #[tokio::test]
+    async fn one_sharded_chain_keeps_its_filter() {
+        let lp = logical_plan(DISTRIBUTE_Q).await;
+        assert!(distribute_chain_filter(&lp, &["big", "a", "b", "c"]).is_none());
+    }
+
+    /// A subquery-bearing conjunct belongs to the dedicated subquery paths: the rewrite
+    /// declines and the filter stays parked (the chain planner then refuses to fold).
+    #[tokio::test]
+    async fn subquery_conjunct_declines_distribution() {
+        let lp = logical_plan(
+            "SELECT a.id, sum(f.v) AS s FROM f \
+             JOIN big ON (f.big_sk = big.k) JOIN a ON (f.a_sk = a.k) \
+             WHERE a.flag = 'x' AND f.v > (SELECT avg(b.k) FROM b) \
+             GROUP BY a.id",
+        )
+        .await;
+        assert!(distribute_chain_filter(&lp, &["a", "b"]).is_none());
+    }
+
+    /// A conjunct referencing an outer-join cap's null-extended leaf cannot move below the
+    /// outer join (it would re-filter null-extended rows): the rewrite declines.
+    #[tokio::test]
+    async fn outer_join_cap_side_conjunct_declines() {
+        let lp = logical_plan(
+            "SELECT a.id, sum(f.v) AS s FROM f \
+             JOIN big ON (f.big_sk = big.k) JOIN a ON (f.a_sk = a.k) \
+             LEFT JOIN c ON (f.c_sk = c.k) \
+             WHERE c.k IS NOT NULL \
+             GROUP BY a.id",
+        )
+        .await;
+        assert!(distribute_chain_filter(&lp, &["a", "c"]).is_none());
+    }
+
+    /// A cross-table conjunct mixing a replicated leaf with a LATER sharded leaf would have
+    /// to reference the folded dim from the sharded step's ON/WHERE, where its columns are
+    /// not bound: the rewrite declines rather than dangle the reference.
+    #[tokio::test]
+    async fn cross_conjunct_on_folded_dim_and_later_sharded_declines() {
+        let lp = logical_plan(
+            "SELECT a.id, sum(f.v) AS s FROM f \
+             JOIN a ON (f.a_sk = a.k) JOIN big ON (f.big_sk = big.k) \
+             WHERE a.k = big.k \
+             GROUP BY a.id",
+        )
+        .await;
+        assert!(distribute_chain_filter(&lp, &["a"]).is_none());
     }
 }

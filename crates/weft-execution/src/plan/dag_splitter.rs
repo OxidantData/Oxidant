@@ -27,12 +27,18 @@
 //!   identical *modulo their filter predicates* now plan together: one leaf stage scans the
 //!   shared tail once, computing every branch's partial aggregates as
 //!   `agg(…) FILTER (WHERE <branch predicate>)`, and one combine stage emits all branches'
-//!   values as columns. `COUNT(DISTINCT)`-carrying branches (TPC-DS Q28) can't compute in a
-//!   FILTER-merged leaf — they keep their own sub-DAGs.
+//!   values as columns. `COUNT(DISTINCT)`-carrying branches (TPC-DS Q28's six bucket aggregates
+//!   over `store_sales`) merge the same way when every branch's DISTINCT argument is the *same
+//!   column*: the shared leaf GROUPs BY that argument (one scan, narrowed to the OR of the
+//!   branch predicates), carrying each branch's FILTER'd partials plus a per-branch predicate
+//!   marker, and the co-located distinct machinery recomputes every branch's exact distinct
+//!   count from the deduped groups. Branches whose DISTINCT arguments differ (or whose DISTINCT
+//!   aggregate isn't a count) would need a GROUP BY over the argument product — cardinality
+//!   multiplication — so they keep their own sub-DAGs.
 //!
 //! ## Why any join type at the outer skeleton is safe
 //!
-//! Each materialized branch's final stage always writes with empty `hash_key_cols`, so — per
+//! By default each materialized branch's final stage writes with empty `hash_key_cols`, so — per
 //! [`crate::shuffle::partition::hash_partition`]'s "empty key list = global gather" rule — its
 //! *entire* output lands in partition 0 and every other rendezvous partition of the gathered
 //! outer stage sees zero rows from it. A `CROSS`/`INNER` join of such branches is therefore
@@ -43,6 +49,13 @@
 //! (never-empty) preserved side would re-emit its full contents once per worker. See
 //! [`is_branch_gated`], which [`try_branch_dag`] enforces before accepting a non-cross outer
 //! skeleton.
+//!
+//! The one exception to the always-gather default is [`outer_keying`]: when the outer skeleton
+//! is an equijoin tree over the branch outputs whose keys are all branch-output columns (TPC-DS
+//! Q4/Q39/Q78), the branch outputs hash-shuffle by those keys instead and the outer stage runs
+//! key-partitioned on every worker — the per-partition equijoin of co-located slices is exactly
+//! the global equijoin restricted to that key bucket. The admission rule is deliberately
+//! conservative; every non-admitted shape keeps the byte-identical gather plan above.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -52,11 +65,12 @@ use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, LogicalPlanBuilder};
 use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
 
-use super::shape_extensions::ensure_subquery_tables_replicated;
+use super::shape_extensions::{build_outer_finalize, ensure_subquery_tables_replicated};
 use super::stage_planner::{
     base_tables, count_table_scans, expr_sql, extract_from_tail, flatten_and_conjuncts,
     partial_combine_sql, peel, plan_contains_distinct, plan_distributed_logical,
-    reject_unsafe_broadcast_shapes, sanitize_generated_sql, strip_alias, AggSpec, DistributedQuery,
+    recombine_partial_state_sql, reject_unsafe_broadcast_shapes, sanitize_generated_sql,
+    strip_alias, AggSpec, DistributedQuery,
 };
 use crate::driver::{ExchangeMode, StageDef};
 
@@ -124,7 +138,7 @@ pub(crate) fn try_branch_dag(
     // sub-DAG — one leaf computing every branch's partials as
     // `agg(…) FILTER (WHERE <branch predicate>)`, one combine emitting all branches' columns —
     // and point every member's outer placeholder at the shared combine output. Ineligible
-    // branches (DISTINCT-carrying, GROUP BY, HAVING, volatile, …) keep their own sub-DAGs.
+    // branches (DISTINCT-incompatible, GROUP BY, HAVING, volatile, …) keep their own sub-DAGs.
     // Merging requires the outer skeleton to re-assert the original output columns explicitly:
     // a merged group's combine row carries every member branch's columns, and a wildcard outer
     // would expand them all at every placeholder position.
@@ -196,6 +210,11 @@ pub(crate) fn try_branch_dag(
         ));
     }
     reject_remaining_sharded_scans(&rewritten, replicated)?;
+    // TPC-DS Q4/Q39/Q78: when the outer skeleton over the branch outputs is an equijoin tree
+    // keyed on branch-output columns, hash-shuffle the branch outputs by those keys instead of
+    // gathering each to partition 0, and run the outer stage key-partitioned on every worker.
+    // `None` keeps the byte-identical gather plan (see [`outer_keying`]).
+    let keying = outer_keying(&rewritten, &rep_of, &merged, &rep_queries);
     let outer_sql = Unparser::default()
         .plan_to_sql(&rewritten)
         .map_err(|e| {
@@ -214,6 +233,16 @@ pub(crate) fn try_branch_dag(
         }
         let dq = rep_queries.remove(&r).expect("representative planned");
         let output = append_branch(&mut stages, &mut next_id, dq, r)?;
+        if let Some(keys) = keying.as_ref().and_then(|k| k.rep_keys.get(&r)) {
+            // Re-target the branch's output shuffle at the skeleton's equijoin key columns.
+            // The stage's output rows are the branch's output columns in schema order (the
+            // same assumption the window-over-join planner's terminal retarget relies on).
+            stages
+                .iter_mut()
+                .find(|s| s.stage_id == output)
+                .expect("branch output stage appended")
+                .hash_key_cols = keys.clone();
+        }
         rep_output.insert(r, output);
         if let Some(members) = merged_members.get(&r) {
             // Every member's placeholder points at the shared combine output, exactly like a
@@ -232,11 +261,20 @@ pub(crate) fn try_branch_dag(
         next_id,
         sanitize_generated_sql(&outer_sql),
         upstream_stage_ids,
+        // The outer stage is the driver-pulled output stage (`produce = false`): its own
+        // `hash_key_cols` is never used to partition anything. What matters is that its
+        // *upstreams* hash-shuffled by the join keys (stamped above), so each rendezvous
+        // partition of this stage already sees a co-located key slice of every branch.
         vec![],
     ));
     Ok(Some(DistributedQuery {
         stages,
-        finalize_sql: None,
+        // Keyed admission with an outer `ORDER BY`/`LIMIT`: each partition's copy of the
+        // outer stage keeps its own top-k, and the driver-side finalize merges them (the
+        // standard two-phase TopK — `build_outer_finalize` re-sorts/re-limits the
+        // concatenation). The gather plan keeps `None`: partition 0 held every row, so the
+        // in-stage `ORDER BY`/`LIMIT` was already global.
+        finalize_sql: keying.and_then(|k| k.finalize),
     }))
 }
 
@@ -287,7 +325,7 @@ fn forward_branch_query(branch: &LogicalPlan, branch_i: usize) -> Result<Distrib
 /// every `Filter` is factored out (TPC-DS Q88's eight time-bucket counts over the same star
 /// join). `None` from [`mergeable_branch`] for anything a FILTER-merged leaf cannot reproduce.
 struct MergeableBranch {
-    /// The branch's aggregates, classified (never DISTINCT).
+    /// The branch's aggregates, classified.
     aggs: Vec<AggSpec>,
     /// SQL of the branch's full row predicate — the AND of every stripped `Filter` conjunct —
     /// or `None` when the branch carries no filter.
@@ -298,10 +336,16 @@ struct MergeableBranch {
     tail_fp: String,
     /// The filter-stripped aggregate input shared by the whole group.
     tail: LogicalPlan,
+    /// `Some(arg)` when the branch carries `COUNT(DISTINCT arg)` aggregates — all of them over
+    /// this one argument (TPC-DS Q28). Distinct-carrying branches merge only with siblings
+    /// sharing the argument: the merged leaf GROUPs BY it, so branches with different arguments
+    /// (or non-count DISTINCT aggregates) stay on their own sub-DAGs. Part of the group key.
+    distinct_arg: Option<String>,
 }
 
-/// Group merge-eligible representative branches by their shared filter-stripped tail and plan
-/// one shared-scan sub-DAG per group of ≥2. Returns each merged sub-DAG keyed by its group's
+/// Group merge-eligible representative branches by their shared filter-stripped tail (and, for
+/// `COUNT(DISTINCT)`-carrying branches, their shared DISTINCT argument) and plan one
+/// shared-scan sub-DAG per group of ≥2. Returns each merged sub-DAG keyed by its group's
 /// first representative, plus that representative's full member list. A group whose merged
 /// planning fails falls back to ordinary per-branch sub-DAGs.
 fn plan_merge_groups(
@@ -310,20 +354,23 @@ fn plan_merge_groups(
     replicated: &[&str],
 ) -> (HashMap<usize, DistributedQuery>, HashMap<usize, Vec<usize>>) {
     let mut mergeable: HashMap<usize, MergeableBranch> = HashMap::new();
-    let mut fp_to_group: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut fp_to_group: HashMap<(String, Option<String>), Vec<usize>> = HashMap::new();
     for &r in reps {
         if branches[r].kind != BranchKind::Sharded {
             continue;
         }
         if let Some(m) = mergeable_branch(branches[r].node, replicated) {
-            fp_to_group.entry(m.tail_fp.clone()).or_default().push(r);
+            fp_to_group
+                .entry((m.tail_fp.clone(), m.distinct_arg.clone()))
+                .or_default()
+                .push(r);
             mergeable.insert(r, m);
         }
     }
 
     let mut dqs = HashMap::new();
     let mut members_of = HashMap::new();
-    for group in fp_to_group.into_values() {
+    for ((_tail_fp, distinct_arg), group) in fp_to_group {
         if group.len() < 2 {
             continue;
         }
@@ -338,7 +385,11 @@ fn plan_merge_groups(
             continue;
         }
         let members: Vec<&MergeableBranch> = group.iter().map(|r| &mergeable[r]).collect();
-        match merged_shared_scan_query(&members) {
+        let planned = match &distinct_arg {
+            Some(arg) => merged_shared_distinct_scan_query(&members, arg),
+            None => merged_shared_scan_query(&members),
+        };
+        match planned {
             Ok(dq) => {
                 dqs.insert(group[0], dq);
                 members_of.insert(group[0], group);
@@ -356,9 +407,10 @@ fn plan_merge_groups(
 /// Classify a branch representative for shared-scan merging. `None` for anything a
 /// FILTER-merged leaf cannot reproduce: a GROUP BY / HAVING / ORDER BY / LIMIT above the
 /// aggregate, an output projection doing more than renaming the aggregate's outputs in order,
-/// a DISTINCT aggregate (TPC-DS Q28 — it keeps its co-located shuffle sub-DAG), a volatile
-/// expression, an unqualified or multiply-qualified output schema, or a tail that isn't a
-/// single-scan broadcast shape over INNER joins only.
+/// a volatile expression, an unqualified or multiply-qualified output schema, a tail that isn't
+/// a single-scan broadcast shape over INNER joins only, or DISTINCT aggregates the merged leaf
+/// cannot recombine — only `COUNT(DISTINCT arg)` aggregates all sharing one argument (TPC-DS
+/// Q28) are mergeable, and only with siblings carrying the same argument.
 fn mergeable_branch(branch: &LogicalPlan, replicated: &[&str]) -> Option<MergeableBranch> {
     let p = peel(branch).ok()?;
     if p.sort.is_some()
@@ -391,9 +443,24 @@ fn mergeable_branch(branch: &LogicalPlan, replicated: &[&str]) -> Option<Mergeab
         .map(AggSpec::classify)
         .collect::<Result<Vec<_>>>()
         .ok()?;
-    if aggs.iter().any(|a| a.distinct) {
-        return None;
-    }
+    // A DISTINCT-carrying branch (TPC-DS Q28) merges only through the co-located dedup leaf,
+    // which GROUPs BY one shared argument: every DISTINCT aggregate must be a count over that
+    // one argument (the same restriction [`super::stage_planner::global_distinct_aggregation_stages`]
+    // applies to a lone branch). Mixed arguments would multiply the grouping cardinality;
+    // non-count DISTINCT cannot recombine from per-group markers.
+    let first_distinct = aggs.iter().find(|a| a.distinct);
+    let distinct_arg = match first_distinct {
+        None => None,
+        Some(first) => {
+            if aggs
+                .iter()
+                .any(|a| a.distinct && (a.func != "count" || a.arg_sql != first.arg_sql))
+            {
+                return None;
+            }
+            Some(first.arg_sql.clone())
+        }
+    };
     // The merged outer projection references branch outputs as `alias.column`: an unqualified
     // or multiply-qualified schema cannot be re-aliased unambiguously, and duplicate names
     // would collide on the shared combine row.
@@ -453,6 +520,7 @@ fn mergeable_branch(branch: &LogicalPlan, replicated: &[&str]) -> Option<Mergeab
         out_names,
         tail_fp,
         tail,
+        distinct_arg,
     })
 }
 
@@ -560,6 +628,128 @@ fn partial_filter_items(func: &str, n: usize, arg_sql: &str, filter: &str) -> Re
         other => Err(Error::Unsupported(format!(
             "auto-distribute: aggregate `{other}` not supported"
         ))),
+    }
+}
+
+/// Plan one shared sub-DAG for a merge group whose members carry `COUNT(DISTINCT <arg>)` over a
+/// single shared argument (TPC-DS Q28's six bucket aggregates over `store_sales`). The group
+/// reuses the lone-branch co-located machinery's three-stage shape (see
+/// [`super::stage_planner::global_distinct_aggregation_stages`]) with **one** scan of the tail:
+///
+/// 1. **Partial dedup** (`stage 0`, hash-shuffled by the argument): scans the shared tail once —
+///    narrowed to the OR of every member's row predicate (a row matching no member contributes
+///    to no aggregate) — and GROUPs BY the shared DISTINCT argument. Per member it carries the
+///    recombinable partial state of the member's plain aggregates as
+///    `agg(…) FILTER (WHERE <member predicate>)`, plus one marker
+///    `count(*) FILTER (WHERE <member predicate>) AS f{k}` recording whether the group holds any
+///    row the member's predicate matched.
+/// 2. **Per-partition aggregate** (`stage 1`): `count(DISTINCT CASE WHEN f{k} > 0 THEN c END)`
+///    is exact by co-location — a group contributes to member `k`'s distinct count iff any
+///    co-located row matched that member's predicate — plus a recombine of the partial state.
+/// 3. **Gather-combine** (`stage 2`): `sum(d{k})` per distinct aggregate and the plain
+///    recombines, aliased to each member's original output names; `HAVING COUNT(*) > 0`
+///    suppresses the synthetic empty-partition row, same as the other global paths.
+fn merged_shared_distinct_scan_query(
+    members: &[&MergeableBranch],
+    distinct_arg: &str,
+) -> Result<DistributedQuery> {
+    let input_sql = Unparser::default()
+        .plan_to_sql(&members[0].tail)
+        .map_err(|e| {
+            Error::Unsupported(format!("auto-distribute: unparse shared branch tail: {e}"))
+        })?
+        .to_string();
+    let tail = sanitize_generated_sql(&extract_from_tail(&input_sql)?);
+
+    // The leaf's select list leads with the DISTINCT argument (hash key position 0), then
+    // carries each member's FILTER'd partial state and predicate marker. `n` is the flat
+    // non-DISTINCT partial position across the whole group; `k` is the member position.
+    let mut psel = vec![format!("{distinct_arg} AS c")];
+    let mut mid_sel = Vec::new();
+    let mut combine = Vec::new();
+    let mut n = 0usize;
+    for (k, member) in members.iter().enumerate() {
+        let filter = member
+            .predicate_sql
+            .as_ref()
+            .map(|p| format!(" FILTER (WHERE {p})"))
+            .unwrap_or_default();
+        psel.push(format!("count(*){filter} AS f{k}"));
+        mid_sel.push(format!(
+            "count(DISTINCT CASE WHEN f{k} > 0 THEN c END) AS d{k}"
+        ));
+        for (a, out_name) in member.aggs.iter().zip(&member.out_names) {
+            if a.distinct {
+                combine.push(format!("sum(d{k}) AS \"{out_name}\""));
+                continue;
+            }
+            psel.extend(partial_filter_items(&a.func, n, &a.arg_sql, &filter)?);
+            mid_sel.extend(recombine_partial_state_sql(&a.func, n)?);
+            let (_sel, comb) = partial_combine_sql(&a.func, n, &a.arg_sql)?;
+            let expr = comb.strip_suffix(&format!(" AS r{n}")).ok_or_else(|| {
+                Error::Unsupported("auto-distribute: unexpected aggregate combine fragment".into())
+            })?;
+            combine.push(format!("{expr} AS \"{out_name}\""));
+            n += 1;
+        }
+    }
+
+    // Narrow the scan to the union of the members' predicates — only when every member carries
+    // one (a predicate-less member's aggregates must see every row) and the tail accepts a
+    // trailing WHERE. Without it the FILTER'd aggregates are still exact over the full tail.
+    let union_pred = if members.iter().all(|m| m.predicate_sql.is_some())
+        && tail_allows_trailing_where(&members[0].tail)
+    {
+        let parts: Vec<String> = members
+            .iter()
+            .map(|m| {
+                format!(
+                    "({})",
+                    m.predicate_sql.as_deref().expect("predicate checked above")
+                )
+            })
+            .collect();
+        format!(" WHERE {}", parts.join(" OR "))
+    } else {
+        String::new()
+    };
+    let leaf_sql = sanitize_generated_sql(&format!(
+        "SELECT {} {tail}{union_pred} GROUP BY {distinct_arg}",
+        psel.join(", ")
+    ));
+    let mid_sql =
+        sanitize_generated_sql(&format!("SELECT {} FROM shuffle_input", mid_sel.join(", ")));
+    // The empty-bucket synthetic row reads as NULLs / zero counts; HAVING COUNT(*) > 0 keeps
+    // only partition 0's real row (same guard as the single-branch global path).
+    let combine_sql = sanitize_generated_sql(&format!(
+        "SELECT {} FROM shuffle_input HAVING COUNT(*) > 0",
+        combine.join(", ")
+    ));
+    Ok(DistributedQuery {
+        stages: vec![
+            // Equal argument values must co-locate: hash-shuffle by the leading argument column.
+            StageDef::new(0, leaf_sql, vec![], vec![0]),
+            StageDef::new(1, mid_sql, vec![0], vec![]),
+            StageDef::new(2, combine_sql, vec![1], vec![]),
+        ],
+        finalize_sql: None,
+    })
+}
+
+/// Whether a `WHERE …` clause can be spliced between the shared tail's `FROM …` and the merged
+/// leaf's `GROUP BY`: only scan / projection / join shapes unparse as a bare `FROM …` clause
+/// with no trailing clauses of their own (a `LIMIT` / `ORDER BY` / grouping in the tail would
+/// invalidate the splice). A `SubqueryAlias` unparses as a self-contained derived table, so its
+/// contents don't matter here.
+fn tail_allows_trailing_where(lp: &LogicalPlan) -> bool {
+    match lp {
+        LogicalPlan::TableScan(_) | LogicalPlan::SubqueryAlias(_) => true,
+        LogicalPlan::Projection(p) => tail_allows_trailing_where(p.input.as_ref()),
+        LogicalPlan::Join(j) => {
+            tail_allows_trailing_where(j.left.as_ref())
+                && tail_allows_trailing_where(j.right.as_ref())
+        }
+        _ => false,
     }
 }
 
@@ -818,6 +1008,592 @@ fn is_branch_gated(lp: &LogicalPlan) -> bool {
         // Aggregate re-grouping a branch — a global `COUNT(*)` over zero rows is one row, not
         // zero) is treated as *not* gated rather than risk a false "safe".
         _ => false,
+    }
+}
+
+/// Keyed-execution admission for the branch-DAG outer skeleton (TPC-DS Q4/Q39/Q78).
+///
+/// With the default gather, every branch output lands whole in partition 0 and the outer join
+/// stage — which runs once per shuffle partition — computes the entire skeleton on one core
+/// while the other partitions see empty inputs. When the skeleton is an *equijoin tree* over
+/// the branch outputs whose join keys are all branch-output columns, the branch outputs can
+/// hash-shuffle by those keys instead and the outer stage runs key-partitioned on every
+/// worker: [`crate::shuffle::partition::hash_partition`] is deterministic (fnv1a over the
+/// order-faithful row encoding), so every row tuple that could join lands in one bucket, and
+/// the per-partition join of the co-located slices is exactly the global join restricted to
+/// that bucket.
+///
+/// [`outer_keying`] derives the per-branch key columns (and the driver-side TopK merge) or
+/// returns `None`; every `None` keeps the byte-identical gather plan.
+struct OuterKeying {
+    /// Hash-key column indices into each representative branch's output schema — one entry per
+    /// deduplicated representative (every occurrence of a representative resolves to the same
+    /// columns, or keying is declined). Same class order for every branch, so equal composite
+    /// keys hash identically across stages.
+    rep_keys: HashMap<usize, Vec<u32>>,
+    /// `ORDER BY`/`LIMIT` over the driver-concatenated result when the outer plan carries
+    /// either: each partition's copy of the outer stage applies the same TopK locally, and
+    /// this finalize merges the per-partition winners (two-phase TopK).
+    finalize: Option<String>,
+}
+
+/// One leaf of the outer join tree: a materialized branch placeholder (`shuffle_input[_i]`,
+/// occurrence index `Some(i)`) or a replicated-only subplan (`None`) re-evaluated in full on
+/// every partition — always co-located, never a shuffle-key constraint.
+struct OuterLeaf<'a> {
+    occurrence: Option<usize>,
+    schema: &'a datafusion::common::DFSchema,
+}
+
+/// One join node of the outer skeleton plus the leaf spans of its two inputs (contiguous
+/// in-order ranges into the walk's leaf vector).
+struct OuterJoinEdge<'a> {
+    join: &'a datafusion::logical_expr::Join,
+    left_span: (usize, usize),
+    right_span: (usize, usize),
+}
+
+/// One placeholder leaf's output column in the outer join tree: `(leaf index, column index)`.
+type LeafColumn = (usize, usize);
+/// One equi pair of leaf columns.
+type EquiPair = (LeafColumn, LeafColumn);
+
+/// Where a join-condition column resolves inside the outer join tree.
+#[derive(Clone, Copy)]
+enum OuterColumn {
+    /// A column of a placeholder leaf, at that leaf's output index.
+    Placeholder { leaf: usize, col: usize },
+    /// A column of a replicated-only leaf: present in full on every partition, so it never
+    /// constrains co-location.
+    Replicated,
+}
+
+/// Derive the keyed execution plan for an admissible outer skeleton, or `None` to keep the
+/// gather. The admission rule, each step conservative (any doubt → `None`):
+///
+/// 1. **Top chain**: only `Projection`/`Filter`/`SubqueryAlias` above the join-tree root, with
+///    an optional plain `Sort` and/or literal `Limit` at the very top. `LIMIT` without
+///    `ORDER BY` declines (per-partition top-k is not single-node-equivalent), as do
+///    `OFFSET` and fused `Sort.fetch` (neither composes through the two-phase finalize), and
+///    any volatile expression anywhere in the skeleton (single-node evaluates it once; keying
+///    would re-evaluate per partition).
+/// 2. **Join tree**: every join is `INNER`, `LEFT`, or `RIGHT`. `LEFT` requires a placeholder
+///    on its preserved (left) side, `RIGHT` on its right side — a replicated preserved side
+///    would re-emit its unmatched rows once per partition. (`FULL`/semi/anti decline.) Leaves
+///    are placeholders or replicated-only subplans; anything else (mid-tree aggregate, union,
+///    window, sort, …) declines.
+/// 3. **Co-location**: placeholder-to-placeholder equi conditions union the referenced
+///    (leaf, column) pairs into equivalence classes. Every class must hold *exactly one
+///    column of every placeholder leaf* (so one composite key — one column per class, same
+///    class order everywhere — co-locates every joined row), all columns of a class must
+///    share one data type (the hash encodes typed key bytes), and every join between two
+///    placeholder-bearing sides must equate the FULL composite key — a partially-covered edge
+///    would let matched rows land on different partitions.
+/// 4. **LEFT/RIGHT null-extension safety**: the preserved side is placeholder-keyed and the
+///    non-preserved side either co-locates by the same key (placeholder) or is present in
+///    full (replicated), so a preserved-side row finds all of its matches on its own key
+///    partition and is null-extended there exactly when no global match exists — the same
+///    argument `join_chain.rs` makes for key-partitioned outer joins. NULL keys never satisfy
+///    the equi predicate on any partition, so their null-extension is partition-local too.
+/// 5. **Stamplable branches**: no occurrence may belong to a shared-scan *merge* group (a
+///    merged combine row carries several branches' columns, not one branch's schema), every
+///    occurrence of one representative must resolve to the same key columns, and the
+///    representative's output stage must exchange by `Hash` or `Forward`.
+fn outer_keying(
+    rewritten: &LogicalPlan,
+    rep_of: &[usize],
+    merged: &HashSet<usize>,
+    rep_queries: &HashMap<usize, DistributedQuery>,
+) -> Option<OuterKeying> {
+    if plan_contains_volatile(rewritten) {
+        return None;
+    }
+    let mut predicates: Vec<&Expr> = Vec::new();
+    let (join_root, sort, limit) = strip_keyable_top(rewritten, &mut predicates)?;
+
+    let mut leaves = Vec::new();
+    let mut edges = Vec::new();
+    let mut leaf_by_ptr = HashMap::new();
+    collect_outer_joins(
+        join_root,
+        &mut leaves,
+        &mut edges,
+        &mut leaf_by_ptr,
+        &mut predicates,
+    )?;
+    let placeholder_leaves: Vec<usize> = (0..leaves.len())
+        .filter(|&i| leaves[i].occurrence.is_some())
+        .collect();
+    // Keying needs at least two co-located placeholders; a lone branch joined only against
+    // replicated tables gains nothing and keeps the gather.
+    if placeholder_leaves.len() < 2 {
+        return None;
+    }
+    let span_has_placeholder =
+        |span: (usize, usize)| (span.0..span.0 + span.1).any(|i| leaves[i].occurrence.is_some());
+
+    // Join-type admission.
+    for edge in &edges {
+        let ph_left = span_has_placeholder(edge.left_span);
+        let ph_right = span_has_placeholder(edge.right_span);
+        match edge.join.join_type {
+            JoinType::Inner => {}
+            JoinType::Left if ph_left => {}
+            JoinType::Right if ph_right => {}
+            _ => return None,
+        }
+    }
+
+    // Union every placeholder-to-placeholder equi pair into key classes. A pair comes from a
+    // join's `on` (assigned to that edge) or from a plain `col = col` conjunct of any `Filter`
+    // in the skeleton — including Q39's/Q4's comma-join `WHERE` floating above a
+    // predicate-less cross join — assigned to the deepest edge whose two inputs separate the
+    // pair's leaves. Everything else in those predicates (same-side conjuncts, cross-side
+    // residuals like Q4's ratio CASE) is row-local and preserved verbatim in the outer stage
+    // SQL; the per-edge coverage check below separately guarantees every keyed edge equates
+    // the full composite key.
+    let mut parent: HashMap<LeafColumn, LeafColumn> = HashMap::new();
+    let mut edge_pairs: Vec<Vec<EquiPair>> = vec![Vec::new(); edges.len()];
+    for (i, edge) in edges.iter().enumerate() {
+        for (le, re) in &edge.join.on {
+            record_equi_pair(
+                le,
+                re,
+                Some(i),
+                join_root,
+                &edges,
+                &leaves,
+                &leaf_by_ptr,
+                &mut parent,
+                &mut edge_pairs,
+            )?;
+        }
+    }
+    let mut conjuncts: Vec<Expr> = Vec::new();
+    for pred in &predicates {
+        flatten_and_conjuncts(pred, &mut conjuncts);
+    }
+    for edge in &edges {
+        if let Some(f) = &edge.join.filter {
+            flatten_and_conjuncts(f, &mut conjuncts);
+        }
+    }
+    for c in &conjuncts {
+        let Expr::BinaryExpr(be) = c else {
+            continue;
+        };
+        if be.op != datafusion::logical_expr::Operator::Eq {
+            continue;
+        }
+        record_equi_pair(
+            be.left.as_ref(),
+            be.right.as_ref(),
+            None,
+            join_root,
+            &edges,
+            &leaves,
+            &leaf_by_ptr,
+            &mut parent,
+            &mut edge_pairs,
+        )?;
+    }
+
+    let members: Vec<LeafColumn> = parent.keys().copied().collect();
+    let mut classes: Vec<Vec<LeafColumn>> = Vec::new();
+    {
+        let mut by_root: HashMap<LeafColumn, usize> = HashMap::new();
+        for member in members {
+            let root = uf_find(&mut parent, member);
+            match by_root.get(&root) {
+                Some(&i) => classes[i].push(member),
+                None => {
+                    by_root.insert(root, classes.len());
+                    classes.push(vec![member]);
+                }
+            }
+        }
+    }
+    // No placeholder-placeholder equi key anywhere (cross/scalar skeleton): keep the gather.
+    if classes.is_empty() {
+        return None;
+    }
+    for class in &classes {
+        // Exactly one column of every placeholder leaf per class.
+        if class.len() != placeholder_leaves.len() {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        if !class.iter().all(|(leaf, _)| seen.insert(*leaf)) {
+            return None;
+        }
+        // One shared type per class: the shuffle hash encodes typed key bytes, so equal
+        // logical keys with different physical types could land in different buckets.
+        let (l0, c0) = class[0];
+        let dt = leaves[l0].schema.field(c0).data_type();
+        if class
+            .iter()
+            .any(|&(l, c)| leaves[l].schema.field(c).data_type() != dt)
+        {
+            return None;
+        }
+    }
+    // Deterministic class order — every leaf's key column list must follow the same order or
+    // the composite hashes would not line up.
+    classes.sort_by_key(|class| class.iter().copied().min().unwrap_or((usize::MAX, 0)));
+
+    // Every join between two placeholder-bearing sides must equate the full composite key.
+    for (edge, pairs) in edges.iter().zip(&edge_pairs) {
+        if !(span_has_placeholder(edge.left_span) && span_has_placeholder(edge.right_span)) {
+            continue;
+        }
+        let mut covered = HashSet::new();
+        for (a, b) in pairs {
+            covered.insert(uf_find(&mut parent, *a));
+            covered.insert(uf_find(&mut parent, *b));
+        }
+        if covered.len() != classes.len() {
+            return None;
+        }
+    }
+
+    // One ordered key-column list per leaf, then per representative branch.
+    let mut leaf_keys: Vec<Vec<u32>> = vec![Vec::new(); leaves.len()];
+    for class in &classes {
+        for &(leaf, col) in class {
+            leaf_keys[leaf].push(col as u32);
+        }
+    }
+    let mut rep_keys: HashMap<usize, Vec<u32>> = HashMap::new();
+    for &i in &placeholder_leaves {
+        let occurrence = leaves[i].occurrence.expect("placeholder leaf");
+        let rep = *rep_of.get(occurrence)?;
+        // A merged shared-scan combine carries every member branch's columns on one row, so
+        // a single branch's schema indices do not address it.
+        if merged.contains(&rep) {
+            return None;
+        }
+        let dq = rep_queries.get(&rep)?;
+        let terminal = dq.stages.last()?;
+        if !matches!(
+            terminal.exchange,
+            ExchangeMode::Hash | ExchangeMode::Forward
+        ) {
+            return None;
+        }
+        let keys = &leaf_keys[i];
+        match rep_keys.get(&rep) {
+            Some(prev) if prev != keys => return None,
+            Some(_) => {}
+            None => {
+                rep_keys.insert(rep, keys.clone());
+            }
+        }
+    }
+
+    let finalize = build_outer_finalize(sort, limit).ok()?;
+    Some(OuterKeying { rep_keys, finalize })
+}
+
+/// The peeled top of an admissible outer skeleton: the join-tree root plus the `ORDER BY` /
+/// `LIMIT` the driver-side finalize must reproduce.
+type KeyableTop<'a> = (
+    &'a LogicalPlan,
+    Option<&'a [datafusion::logical_expr::SortExpr]>,
+    Option<usize>,
+);
+
+/// Validate the unary chain above the outer join-tree root and peel any top `Sort`/`Limit`
+/// for the driver-side finalize, recording every `Filter` predicate it passes (those may
+/// carry the comma-join equi conditions — see [`outer_keying`]). `None` for anything that is
+/// not a row-local pass-through (see [`outer_keying`] step 1).
+fn strip_keyable_top<'a>(
+    lp: &'a LogicalPlan,
+    predicates: &mut Vec<&'a Expr>,
+) -> Option<KeyableTop<'a>> {
+    let mut sort: Option<&[datafusion::logical_expr::SortExpr]> = None;
+    let mut limit: Option<usize> = None;
+    let mut node = lp;
+    loop {
+        match node {
+            LogicalPlan::Sort(s) => {
+                // A fused TopK (`ORDER BY … FETCH`) cannot merge per-partition results
+                // through the plain finalize; only unbounded sorts admit keying.
+                if s.fetch.is_some() || sort.is_some() {
+                    return None;
+                }
+                sort = Some(s.expr.as_slice());
+                node = &s.input;
+            }
+            LogicalPlan::Limit(l) => {
+                if limit.is_some() {
+                    return None;
+                }
+                // OFFSET does not compose per-partition (each partition would have to keep
+                // skip+fetch rows); keep the gather.
+                match l.skip.as_deref() {
+                    None => {}
+                    Some(Expr::Literal(scalar, _)) if literal_usize(scalar) == Some(0) => {}
+                    _ => return None,
+                }
+                match l.fetch.as_deref() {
+                    None => {}
+                    Some(Expr::Literal(scalar, _)) => limit = Some(literal_usize(scalar)?),
+                    _ => return None,
+                }
+                node = &l.input;
+            }
+            LogicalPlan::Projection(p) => node = &p.input,
+            LogicalPlan::Filter(f) => {
+                predicates.push(&f.predicate);
+                node = f.input.as_ref();
+            }
+            LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
+            LogicalPlan::Join(_) => break,
+            _ => return None,
+        }
+    }
+    // LIMIT without ORDER BY picks an arbitrary subset; a per-partition top-k would not
+    // reproduce single-node's choice.
+    if limit.is_some() && sort.is_none() {
+        return None;
+    }
+    Some((node, sort, limit))
+}
+
+/// Walk the outer join tree, collecting leaves (placeholders / replicated-only subplans),
+/// join edges, and every `Filter` predicate along the way. `None` for any shape
+/// [`outer_keying`] step 2 declines. Returns the subtree's leaf span as `(start, count)`
+/// into `leaves` (contiguous, in-order).
+fn collect_outer_joins<'a>(
+    node: &'a LogicalPlan,
+    leaves: &mut Vec<OuterLeaf<'a>>,
+    edges: &mut Vec<OuterJoinEdge<'a>>,
+    leaf_by_ptr: &mut HashMap<usize, usize>,
+    predicates: &mut Vec<&'a Expr>,
+) -> Option<(usize, usize)> {
+    let mut n = node;
+    while let LogicalPlan::SubqueryAlias(s) = n {
+        n = s.input.as_ref();
+    }
+    if !plan_contains_placeholder(n) {
+        let start = leaves.len();
+        leaf_by_ptr.insert(node_id(n), start);
+        leaves.push(OuterLeaf {
+            occurrence: None,
+            schema: n.schema(),
+        });
+        return Some((start, 1));
+    }
+    match n {
+        LogicalPlan::TableScan(scan) => {
+            let occurrence = placeholder_occurrence(scan.table_name.table())?;
+            let start = leaves.len();
+            leaf_by_ptr.insert(node_id(n), start);
+            leaves.push(OuterLeaf {
+                occurrence: Some(occurrence),
+                schema: n.schema(),
+            });
+            Some((start, 1))
+        }
+        LogicalPlan::Join(join) => {
+            match join.join_type {
+                JoinType::Inner | JoinType::Left | JoinType::Right => {}
+                _ => return None,
+            }
+            let left_span =
+                collect_outer_joins(&join.left, leaves, edges, leaf_by_ptr, predicates)?;
+            let right_span =
+                collect_outer_joins(&join.right, leaves, edges, leaf_by_ptr, predicates)?;
+            edges.push(OuterJoinEdge {
+                join,
+                left_span,
+                right_span,
+            });
+            Some((left_span.0, left_span.1 + right_span.1))
+        }
+        // Row-local nodes between joins (a per-alias filter or renaming projection the
+        // optimizer left around a placeholder) keep the same leaf span; the shuffle still
+        // co-locates the underlying branch rows. A filter's conjuncts may carry the equi
+        // conditions (comma-join `WHERE`), so record them for [`record_equi_pair`].
+        LogicalPlan::Filter(f) => {
+            predicates.push(&f.predicate);
+            collect_outer_joins(&f.input, leaves, edges, leaf_by_ptr, predicates)
+        }
+        LogicalPlan::Projection(p) => {
+            collect_outer_joins(&p.input, leaves, edges, leaf_by_ptr, predicates)
+        }
+        _ => None,
+    }
+}
+
+/// Whether any `shuffle_input` placeholder scan sits below `lp`.
+fn plan_contains_placeholder(lp: &LogicalPlan) -> bool {
+    if let LogicalPlan::TableScan(scan) = lp {
+        if placeholder_occurrence(scan.table_name.table()).is_some() {
+            return true;
+        }
+    }
+    lp.inputs().iter().any(|i| plan_contains_placeholder(i))
+}
+
+/// The branch occurrence a placeholder table name stands for (`shuffle_input` → 0,
+/// `shuffle_input_{i}` → `i`), mirroring [`placeholder_plan`]'s naming.
+fn placeholder_occurrence(table: &str) -> Option<usize> {
+    if table == "shuffle_input" {
+        return Some(0);
+    }
+    table
+        .strip_prefix("shuffle_input_")
+        .and_then(|suffix| suffix.parse::<usize>().ok())
+}
+
+/// Resolve a join-condition column through the pass-through nodes of a join input subtree to
+/// the leaf column it reads. `None` when the reference does not bottom out at a collected
+/// leaf (an expression projection, an ambiguous qualifier) — the caller declines keying.
+fn resolve_outer_column(
+    subtree: &LogicalPlan,
+    col: &datafusion::common::Column,
+    leaves: &[OuterLeaf],
+    leaf_by_ptr: &HashMap<usize, usize>,
+) -> Option<OuterColumn> {
+    let mut idx = subtree.schema().index_of_column(col).ok()?;
+    let mut node = subtree;
+    loop {
+        let mut n = node;
+        while let LogicalPlan::SubqueryAlias(s) = n {
+            n = s.input.as_ref();
+        }
+        match n {
+            LogicalPlan::Join(join) => {
+                let left_width = join.left.schema().fields().len();
+                if idx < left_width {
+                    node = &join.left;
+                } else {
+                    node = &join.right;
+                    idx -= left_width;
+                }
+            }
+            LogicalPlan::Filter(f) => node = f.input.as_ref(),
+            LogicalPlan::Projection(p) => {
+                let Expr::Column(c) = strip_alias(&p.expr[idx]) else {
+                    return None;
+                };
+                idx = p.input.schema().index_of_column(c).ok()?;
+                node = p.input.as_ref();
+            }
+            _ => {
+                let &leaf = leaf_by_ptr.get(&node_id(n))?;
+                return Some(match leaves[leaf].occurrence {
+                    Some(_) => OuterColumn::Placeholder { leaf, col: idx },
+                    None => OuterColumn::Replicated,
+                });
+            }
+        }
+    }
+}
+
+/// Process one candidate equi pair `(le, re)`: when both sides resolve to *different*
+/// placeholder leaves, union their (leaf, column) classes and assign the pair to `forced_edge`
+/// (a join's own `on` pair) or to the deepest edge straddling the two leaves (a floating
+/// filter conjunct). Anything else — a non-column expression, a same-leaf equality, a
+/// replicated side — is a row-local residual that needs no co-location. A column that fails
+/// to resolve at all declines (`None`).
+#[allow(clippy::too_many_arguments)]
+fn record_equi_pair(
+    le: &Expr,
+    re: &Expr,
+    forced_edge: Option<usize>,
+    join_root: &LogicalPlan,
+    edges: &[OuterJoinEdge],
+    leaves: &[OuterLeaf],
+    leaf_by_ptr: &HashMap<usize, usize>,
+    parent: &mut HashMap<LeafColumn, LeafColumn>,
+    edge_pairs: &mut [Vec<EquiPair>],
+) -> Option<()> {
+    let (Expr::Column(lc), Expr::Column(rc)) = (le, re) else {
+        return Some(());
+    };
+    let lt = resolve_outer_column(join_root, lc, leaves, leaf_by_ptr)?;
+    let rt = resolve_outer_column(join_root, rc, leaves, leaf_by_ptr)?;
+    let (
+        OuterColumn::Placeholder { leaf: lf, col: cf },
+        OuterColumn::Placeholder { leaf: rg, col: cg },
+    ) = (lt, rt)
+    else {
+        return Some(());
+    };
+    if lf == rg {
+        return Some(());
+    }
+    uf_union(parent, (lf, cf), (rg, cg));
+    let edge_i = match forced_edge {
+        Some(i) => i,
+        None => deepest_straddling_edge(edges, lf, rg)?,
+    };
+    edge_pairs[edge_i].push(((lf, cf), (rg, cg)));
+    Some(())
+}
+
+/// The deepest (smallest-span) join edge whose two inputs separate leaves `a` and `b` — the
+/// edge at which their rows first meet. `None` when no edge straddles the pair (the caller
+/// declines keying).
+fn deepest_straddling_edge(edges: &[OuterJoinEdge], a: usize, b: usize) -> Option<usize> {
+    let in_span = |span: (usize, usize), leaf: usize| leaf >= span.0 && leaf < span.0 + span.1;
+    let mut best: Option<usize> = None;
+    for (i, e) in edges.iter().enumerate() {
+        let straddles = (in_span(e.left_span, a) && in_span(e.right_span, b))
+            || (in_span(e.right_span, a) && in_span(e.left_span, b));
+        if !straddles {
+            continue;
+        }
+        let len = e.left_span.1 + e.right_span.1;
+        match best {
+            Some(j) if edges[j].left_span.1 + edges[j].right_span.1 <= len => {}
+            _ => best = Some(i),
+        }
+    }
+    best
+}
+
+fn uf_find(parent: &mut HashMap<LeafColumn, LeafColumn>, x: LeafColumn) -> LeafColumn {
+    let mut root = x;
+    loop {
+        let &p = parent.get(&root).unwrap_or(&root);
+        if p == root {
+            break;
+        }
+        root = p;
+    }
+    let mut cur = x;
+    while let Some(&p) = parent.get(&cur) {
+        if p == cur || p == root {
+            break;
+        }
+        parent.insert(cur, root);
+        cur = p;
+    }
+    root
+}
+
+fn uf_union(parent: &mut HashMap<LeafColumn, LeafColumn>, a: LeafColumn, b: LeafColumn) {
+    parent.entry(a).or_insert(a);
+    parent.entry(b).or_insert(b);
+    let ra = uf_find(parent, a);
+    let rb = uf_find(parent, b);
+    if ra != rb {
+        parent.insert(ra, rb);
+    }
+}
+
+/// Literal `LIMIT`/`OFFSET` value, or `None` for any non-literal or negative expression.
+fn literal_usize(s: &datafusion::scalar::ScalarValue) -> Option<usize> {
+    use datafusion::scalar::ScalarValue::*;
+    match s {
+        Int64(Some(v)) if *v >= 0 => Some(*v as usize),
+        Int32(Some(v)) if *v >= 0 => Some(*v as usize),
+        UInt64(Some(v)) => Some(*v as usize),
+        UInt32(Some(v)) => Some(*v as usize),
+        _ => None,
     }
 }
 
@@ -1132,6 +1908,416 @@ mod tests {
         engine.register_batches("t", vec![fact()]).unwrap();
         engine.register_batches("d", vec![dim()]).unwrap();
         engine.logical_plan(sql).await.unwrap()
+    }
+
+    // ---- Miniature TPC-DS schemas for the keyed-outer (Q4/Q39/Q78) shapes ----
+
+    const Q4: &str = include_str!("../../../../bench/tpcds/queries/q4.sql");
+    const Q39: &str = include_str!("../../../../bench/tpcds/queries/q39.sql");
+    const Q78: &str = include_str!("../../../../bench/tpcds/queries/q78.sql");
+
+    fn i64f(name: &str) -> Field {
+        Field::new(name, DataType::Int64, false)
+    }
+
+    fn strf(name: &str) -> Field {
+        Field::new(name, DataType::Utf8, false)
+    }
+
+    /// An all-Int64 single-batch table from row-major values (plan-shape tests never read the
+    /// rows, but the tables must exist for `logical_plan`).
+    fn i64_table(cols: &[&str], rows: &[&[i64]]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(
+            cols.iter().map(|c| i64f(c)).collect::<Vec<_>>(),
+        ));
+        let arrays: Vec<weft_loom::arrow::array::ArrayRef> = (0..cols.len())
+            .map(|c| {
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r[c]).collect::<Vec<i64>>(),
+                )) as weft_loom::arrow::array::ArrayRef
+            })
+            .collect();
+        RecordBatch::try_new(schema, arrays).unwrap()
+    }
+
+    fn customer() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                i64f("c_customer_sk"),
+                strf("c_customer_id"),
+                strf("c_first_name"),
+                strf("c_last_name"),
+                strf("c_preferred_cust_flag"),
+                strf("c_birth_country"),
+                strf("c_login"),
+                strf("c_email_address"),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["cust1", "cust2"])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+                Arc::new(StringArray::from(vec!["Y", "N"])),
+                Arc::new(StringArray::from(vec!["US", "CA"])),
+                Arc::new(StringArray::from(vec!["l1", "l2"])),
+                Arc::new(StringArray::from(vec!["e1", "e2"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn warehouse() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                i64f("w_warehouse_sk"),
+                strf("w_warehouse_name"),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["w1", "w2"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// One engine holding every table the three queries touch (a few rows each).
+    async fn tpcds_plan(sql: &str) -> LogicalPlan {
+        let engine = Engine::new();
+        engine
+            .register_batches("customer", vec![customer()])
+            .unwrap();
+        engine
+            .register_batches("warehouse", vec![warehouse()])
+            .unwrap();
+        engine
+            .register_batches(
+                "store_sales",
+                vec![i64_table(
+                    &[
+                        "ss_customer_sk",
+                        "ss_sold_date_sk",
+                        "ss_item_sk",
+                        "ss_ticket_number",
+                        "ss_quantity",
+                        "ss_wholesale_cost",
+                        "ss_sales_price",
+                        "ss_ext_list_price",
+                        "ss_ext_wholesale_cost",
+                        "ss_ext_discount_amt",
+                        "ss_ext_sales_price",
+                    ],
+                    &[&[1, 10, 1, 100, 2, 5, 10, 12, 6, 1, 11]],
+                )],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "catalog_sales",
+                vec![i64_table(
+                    &[
+                        "cs_bill_customer_sk",
+                        "cs_sold_date_sk",
+                        "cs_item_sk",
+                        "cs_order_number",
+                        "cs_quantity",
+                        "cs_wholesale_cost",
+                        "cs_sales_price",
+                        "cs_ext_list_price",
+                        "cs_ext_wholesale_cost",
+                        "cs_ext_discount_amt",
+                        "cs_ext_sales_price",
+                    ],
+                    &[&[1, 10, 1, 200, 3, 4, 9, 12, 5, 1, 10]],
+                )],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "web_sales",
+                vec![i64_table(
+                    &[
+                        "ws_bill_customer_sk",
+                        "ws_sold_date_sk",
+                        "ws_item_sk",
+                        "ws_order_number",
+                        "ws_quantity",
+                        "ws_wholesale_cost",
+                        "ws_sales_price",
+                        "ws_ext_list_price",
+                        "ws_ext_wholesale_cost",
+                        "ws_ext_discount_amt",
+                        "ws_ext_sales_price",
+                    ],
+                    &[&[2, 11, 2, 300, 4, 3, 8, 12, 4, 1, 9]],
+                )],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "store_returns",
+                vec![i64_table(&["sr_ticket_number", "sr_item_sk"], &[&[100, 1]])],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "catalog_returns",
+                vec![i64_table(&["cr_order_number", "cr_item_sk"], &[&[200, 1]])],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "web_returns",
+                vec![i64_table(&["wr_order_number", "wr_item_sk"], &[&[300, 2]])],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "date_dim",
+                vec![i64_table(
+                    &["d_date_sk", "d_year", "d_moy"],
+                    &[&[10, 2001, 1]],
+                )],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "inventory",
+                vec![i64_table(
+                    &[
+                        "inv_item_sk",
+                        "inv_warehouse_sk",
+                        "inv_date_sk",
+                        "inv_quantity_on_hand",
+                    ],
+                    &[&[1, 1, 10, 50]],
+                )],
+            )
+            .unwrap();
+        engine
+            .register_batches("item", vec![i64_table(&["i_item_sk"], &[&[1]])])
+            .unwrap();
+        engine.logical_plan(sql).await.unwrap()
+    }
+
+    fn stage_by_id(dq: &DistributedQuery, id: u32) -> &StageDef {
+        dq.stages
+            .iter()
+            .find(|s| s.stage_id == id)
+            .expect("stage id present")
+    }
+
+    /// TPC-DS Q4: the deduplicated `year_total` union branch feeds six self-join occurrences
+    /// equijoined on `customer_id` (the branch's first output column). The branch output
+    /// hash-shuffles by that column instead of gathering to partition 0, the outer stage keeps
+    /// the ratio-CASE residuals, and the driver finalize merges the per-partition TopK.
+    #[tokio::test]
+    async fn q4_outer_self_join_keys_the_deduped_branch_output() {
+        let lp = tpcds_plan(Q4).await;
+        let dq = plan_distributed_logical(&lp, &["customer", "date_dim"]).expect("Q4 plans");
+        let outer = dq.stages.last().unwrap();
+        assert_eq!(
+            outer.upstream_stage_ids.len(),
+            6,
+            "six year_total occurrences: {dq:?}"
+        );
+        assert!(
+            outer
+                .upstream_stage_ids
+                .iter()
+                .all(|&id| id == outer.upstream_stage_ids[0]),
+            "identical occurrences dedup into one sub-DAG: {dq:?}"
+        );
+        let branch_out = stage_by_id(&dq, outer.upstream_stage_ids[0]);
+        assert_eq!(
+            branch_out.hash_key_cols,
+            vec![0],
+            "hash-shuffle the branch output by customer_id: {branch_out:?}"
+        );
+        assert!(
+            outer.sql.to_uppercase().contains("CASE"),
+            "ratio join-condition residuals stay in the outer stage: {}",
+            outer.sql
+        );
+        let finalize = dq.finalize_sql.expect("two-phase TopK finalize");
+        assert!(
+            finalize.contains("ORDER BY") && finalize.contains("LIMIT 100"),
+            "{finalize}"
+        );
+    }
+
+    /// TPC-DS Q39: the `inv` aggregate branch self-joins on the two-column key
+    /// `(i_item_sk, w_warehouse_sk)` with `d_moy` residuals and an `ORDER BY` (no LIMIT). The
+    /// branch output keys on both group columns — class order follows the branch schema
+    /// (`w_warehouse_sk` at index 1, `i_item_sk` at 2).
+    #[tokio::test]
+    async fn q39_self_join_keys_on_item_and_warehouse() {
+        let lp = tpcds_plan(Q39).await;
+        let dq =
+            plan_distributed_logical(&lp, &["item", "warehouse", "date_dim"]).expect("Q39 plans");
+        let outer = dq.stages.last().unwrap();
+        assert_eq!(outer.upstream_stage_ids.len(), 2, "inv self-join: {dq:?}");
+        for &id in &outer.upstream_stage_ids {
+            assert_eq!(
+                stage_by_id(&dq, id).hash_key_cols,
+                vec![1, 2],
+                "composite key (w_warehouse_sk, i_item_sk): {dq:?}"
+            );
+        }
+        assert!(
+            outer.sql.contains("d_moy"),
+            "d_moy residuals preserved: {}",
+            outer.sql
+        );
+        let finalize = dq.finalize_sql.expect("ORDER BY finalize");
+        assert!(
+            finalize.contains("ORDER BY") && !finalize.contains("LIMIT"),
+            "{finalize}"
+        );
+    }
+
+    /// TPC-DS Q78: `ss LEFT JOIN ws LEFT JOIN cs` on (sold_year, item, customer). The sharded
+    /// `ss` branch's combine output keys on [0,1,2]; the replicated-only `ws`/`cs` aggregate
+    /// arms materialize as `Forward` stages that hash-partition by the same key instead of
+    /// gathering to partition 0 — LEFT null-extension is key-local.
+    #[tokio::test]
+    async fn q78_left_chain_keys_branch_and_forward_arms() {
+        let lp = tpcds_plan(Q78).await;
+        let replicated = [
+            "date_dim",
+            "store_returns",
+            "web_sales",
+            "web_returns",
+            "catalog_sales",
+            "catalog_returns",
+        ];
+        let dq = plan_distributed_logical(&lp, &replicated).expect("Q78 plans");
+        let outer = dq.stages.last().unwrap();
+        assert_eq!(outer.upstream_stage_ids.len(), 3, "ss/ws/cs: {dq:?}");
+        let mut forwards = 0;
+        for &id in &outer.upstream_stage_ids {
+            let s = stage_by_id(&dq, id);
+            assert_eq!(
+                s.hash_key_cols,
+                vec![0, 1, 2],
+                "(sold_year, item, customer) key: {s:?}"
+            );
+            if s.exchange == ExchangeMode::Forward {
+                forwards += 1;
+            }
+        }
+        assert_eq!(forwards, 2, "ws/cs are keyed Forward arms: {dq:?}");
+        assert!(
+            outer.sql.to_uppercase().contains("LEFT OUTER JOIN"),
+            "outer chain preserved: {}",
+            outer.sql
+        );
+        let finalize = dq.finalize_sql.expect("two-phase TopK finalize");
+        assert!(
+            finalize.contains("ORDER BY") && finalize.contains("LIMIT 100"),
+            "{finalize}"
+        );
+    }
+
+    /// The plain equijoin skeleton (no TopK) keys both branch outputs; with neither `ORDER BY`
+    /// nor `LIMIT` the driver concatenation is the full result, so no finalize is added.
+    #[tokio::test]
+    async fn inner_equijoin_branches_key_without_finalize() {
+        let lp = logical_plan(
+            "WITH a AS (SELECT k, SUM(v) AS s FROM t GROUP BY k), \
+                 b AS (SELECT k, COUNT(*) AS n FROM t GROUP BY k) \
+             SELECT a.k, a.s, b.n FROM a JOIN b ON a.k = b.k",
+        )
+        .await;
+        let dq = plan_distributed_logical(&lp, &[]).expect("join of two branches plans");
+        let outer = dq.stages.last().unwrap();
+        assert_eq!(outer.upstream_stage_ids.len(), 2, "{dq:?}");
+        for &id in &outer.upstream_stage_ids {
+            assert_eq!(
+                stage_by_id(&dq, id).hash_key_cols,
+                vec![0],
+                "both branches keyed by k: {dq:?}"
+            );
+        }
+        assert!(
+            dq.finalize_sql.is_none(),
+            "no ORDER BY/LIMIT → no finalize: {dq:?}"
+        );
+    }
+
+    /// A RIGHT join keys exactly like LEFT when the placeholder sits on the preserved side
+    /// (Q78 with the sides flipped).
+    #[tokio::test]
+    async fn right_join_keys_when_placeholder_is_preserved() {
+        let lp = logical_plan(
+            "WITH a AS (SELECT k, SUM(v) AS s FROM t GROUP BY k), \
+                 b AS (SELECT k, COUNT(*) AS n FROM t GROUP BY k) \
+             SELECT a.k, a.s, b.n FROM a RIGHT JOIN b ON a.k = b.k",
+        )
+        .await;
+        let dq = plan_distributed_logical(&lp, &[]).expect("right join plans");
+        let outer = dq.stages.last().unwrap();
+        assert_eq!(outer.upstream_stage_ids.len(), 2, "{dq:?}");
+        for &id in &outer.upstream_stage_ids {
+            assert_eq!(stage_by_id(&dq, id).hash_key_cols, vec![0], "{dq:?}");
+        }
+    }
+
+    /// Assert the gather invariant on the stages that matter: every branch *output* stage
+    /// (the outer stage's upstreams) has an empty hash key, so all rows gather to partition 0.
+    fn assert_branch_outputs_gather(dq: &DistributedQuery) {
+        let outer = dq.stages.last().unwrap();
+        for &id in &outer.upstream_stage_ids {
+            assert!(
+                stage_by_id(dq, id).hash_key_cols.is_empty(),
+                "branch output stage {id} must gather: {dq:?}"
+            );
+        }
+    }
+
+    /// `LIMIT` without `ORDER BY` picks an arbitrary subset; a per-partition top-k would not
+    /// reproduce single-node's choice, so the equijoin keeps the byte-identical gather.
+    #[tokio::test]
+    async fn limit_without_order_by_keeps_the_gather() {
+        let lp = logical_plan(
+            "WITH a AS (SELECT k, SUM(v) AS s FROM t GROUP BY k), \
+                 b AS (SELECT k, COUNT(*) AS n FROM t GROUP BY k) \
+             SELECT a.k, a.s, b.n FROM a JOIN b ON a.k = b.k LIMIT 5",
+        )
+        .await;
+        let dq = plan_distributed_logical(&lp, &[]).expect("join of two branches plans");
+        assert_branch_outputs_gather(&dq);
+        assert!(dq.finalize_sql.is_none(), "{dq:?}");
+    }
+
+    /// A FULL join null-extends both sides; admission declines it conservatively and the
+    /// skeleton keeps the gather.
+    #[tokio::test]
+    async fn full_join_of_branches_keeps_the_gather() {
+        let lp = logical_plan(
+            "WITH a AS (SELECT k, SUM(v) AS s FROM t GROUP BY k), \
+                 b AS (SELECT k, COUNT(*) AS n FROM t GROUP BY k) \
+             SELECT a.k, a.s, b.n FROM a FULL JOIN b ON a.k = b.k",
+        )
+        .await;
+        let dq = plan_distributed_logical(&lp, &[]).expect("full join of two branches plans");
+        assert_branch_outputs_gather(&dq);
+        assert!(dq.finalize_sql.is_none(), "{dq:?}");
+    }
+
+    /// Two independent key families (`a⋈b` on `k`, `a⋈c` on `v2`) cannot co-locate both joins
+    /// with one shuffle key: the one-column-per-leaf-per-class check declines the keying.
+    #[tokio::test]
+    async fn independent_key_families_keep_the_gather() {
+        let lp = logical_plan(
+            "WITH a AS (SELECT k, SUM(v) AS v2 FROM t GROUP BY k), \
+                 b AS (SELECT k, COUNT(*) AS n FROM t GROUP BY k), \
+                 c AS (SELECT k, MAX(v) AS m FROM t GROUP BY k) \
+             SELECT a.k, b.n, c.m FROM a JOIN b ON a.k = b.k JOIN c ON a.v2 = c.m",
+        )
+        .await;
+        let dq = plan_distributed_logical(&lp, &[]).expect("two key families still plan");
+        assert_branch_outputs_gather(&dq);
+        assert!(dq.finalize_sql.is_none(), "{dq:?}");
     }
 
     #[tokio::test]
@@ -1452,13 +2638,29 @@ mod tests {
                 "volatile branch must not be deduplicated"
             );
         }
-        // ...and the plan keeps one sub-DAG per occurrence (partial+combine each, plus outer).
+        // ...and the plan keeps one volatile combine per occurrence (the volatile-free partial
+        // scan may be shared by `cse_identical_stages` — the invariant is that `random()` is
+        // still evaluated once per occurrence, in two distinct combine stages).
         let dq = plan_distributed_logical(&lp, &[]).expect("volatile self-join still plans");
+        let outer = dq.stages.last().unwrap();
+        let mut upstreams = outer.upstream_stage_ids.clone();
+        upstreams.dedup();
         assert_eq!(
-            dq.stages.len(),
-            5,
+            upstreams.len(),
+            2,
             "volatile branches are not deduplicated: {dq:?}"
         );
+        for &id in &outer.upstream_stage_ids {
+            let combine = dq
+                .stages
+                .iter()
+                .find(|s| s.stage_id == id)
+                .expect("combine stage");
+            assert!(
+                combine.sql.contains("random()"),
+                "each occurrence re-evaluates the volatile expression: {dq:?}"
+            );
+        }
     }
 
     /// KAN-41 (TPC-DS Q58): an aggregate branch over only replicated tables is collected for
@@ -1507,5 +2709,193 @@ mod tests {
             branches.iter().all(|b| b.kind == BranchKind::Sharded),
             "no branch may be classified replicated-aggregate: {branches:?}"
         );
+    }
+
+    /// TPC-DS Q28 in miniature: two branches carrying `COUNT(DISTINCT v)` over the same sharded
+    /// scan — differing only in their row predicates — merge into ONE scan whose leaf GROUPs BY
+    /// the shared DISTINCT argument, gates every per-branch partial and predicate marker with
+    /// its own branch's `FILTER (WHERE …)`, and narrows the scan to the OR of the predicates.
+    #[tokio::test]
+    async fn distinct_branches_sharing_one_arg_merge_into_one_scan() {
+        let lp = logical_plan(
+            "SELECT * FROM \
+               (SELECT avg(v) AS a1_avg, count(v) AS a1_cnt, count(DISTINCT v) AS a1_cntd \
+                FROM t WHERE k BETWEEN 0 AND 5) a1, \
+               (SELECT avg(v) AS a2_avg, count(v) AS a2_cnt, count(DISTINCT v) AS a2_cntd \
+                FROM t WHERE k BETWEEN 6 AND 10) a2",
+        )
+        .await;
+        let dq = plan_distributed_logical(&lp, &[]).expect("compatible distinct branches plan");
+
+        assert_eq!(
+            dq.stages.len(),
+            4,
+            "leaf + per-partition distinct + gather-combine + outer: {dq:?}"
+        );
+        let leaves: Vec<_> = dq
+            .stages
+            .iter()
+            .filter(|s| s.upstream_stage_ids.is_empty())
+            .collect();
+        assert_eq!(leaves.len(), 1, "one shared scan of t: {dq:?}");
+        let leaf = &leaves[0];
+        assert!(
+            leaf.sql.contains("GROUP BY t.v"),
+            "partial dedup groups by the shared DISTINCT argument: {}",
+            leaf.sql
+        );
+        assert_eq!(
+            leaf.hash_key_cols,
+            vec![0],
+            "shuffle by the DISTINCT argument column: {leaf:?}"
+        );
+        // FILTER predicates land on the right aggregates: each branch's marker, avg partials,
+        // and count partial carry that branch's own predicate.
+        assert_eq!(
+            leaf.sql.matches("FILTER (WHERE").count(),
+            8,
+            "four gated partials per branch: {}",
+            leaf.sql
+        );
+        assert!(
+            leaf.sql
+                .contains("count(*) FILTER (WHERE ((t.k BETWEEN 0 AND 5))) AS f0"),
+            "branch 1's predicate marker: {}",
+            leaf.sql
+        );
+        assert!(
+            leaf.sql
+                .contains("count(*) FILTER (WHERE ((t.k BETWEEN 6 AND 10))) AS f1"),
+            "branch 2's predicate marker: {}",
+            leaf.sql
+        );
+        assert!(
+            leaf.sql
+                .contains("sum(t.v) FILTER (WHERE ((t.k BETWEEN 0 AND 5))) AS a0s"),
+            "branch 1's avg partial: {}",
+            leaf.sql
+        );
+        assert!(
+            leaf.sql
+                .contains("sum(t.v) FILTER (WHERE ((t.k BETWEEN 6 AND 10))) AS a2s"),
+            "branch 2's avg partial: {}",
+            leaf.sql
+        );
+        assert!(
+            leaf.sql
+                .contains("WHERE (((t.k BETWEEN 0 AND 5))) OR (((t.k BETWEEN 6 AND 10)))"),
+            "the scan is narrowed to the union of the branch predicates: {}",
+            leaf.sql
+        );
+        // Per-partition exact distinct counts keyed off the markers, then the gather-combine
+        // re-aliased to each branch's original output names.
+        let mid = &dq.stages[1].sql;
+        assert!(
+            mid.contains("count(DISTINCT CASE WHEN f0 > 0 THEN c END) AS d0")
+                && mid.contains("count(DISTINCT CASE WHEN f1 > 0 THEN c END) AS d1"),
+            "{mid}"
+        );
+        let combine = &dq.stages[2].sql;
+        assert!(
+            combine.contains("sum(d0) AS \"a1_cntd\"")
+                && combine.contains("sum(d1) AS \"a2_cntd\""),
+            "{combine}"
+        );
+        assert!(
+            combine.contains("(sum(a0s) / NULLIF(sum(a0c), 0)) AS \"a1_avg\""),
+            "avg recombines from the FILTER'd per-branch partials: {combine}"
+        );
+        let outer = dq.stages.last().unwrap();
+        assert!(
+            outer.upstream_stage_ids.iter().all(|&id| id == 2),
+            "both placeholders pull the shared combine output: {outer:?}"
+        );
+    }
+
+    /// Branches whose DISTINCT arguments differ cannot share one GROUP BY — a single leaf
+    /// grouping by both arguments would multiply cardinality — so each keeps its own
+    /// co-located distinct sub-DAG (and its own scan).
+    #[tokio::test]
+    async fn distinct_branches_with_different_args_do_not_merge() {
+        let lp = logical_plan(
+            "SELECT * FROM \
+               (SELECT count(DISTINCT v) AS d1 FROM t WHERE k > 0) a1, \
+               (SELECT count(DISTINCT k) AS d2 FROM t WHERE k > 1) a2",
+        )
+        .await;
+        let dq = plan_distributed_logical(&lp, &[]).expect("incompatible branches still plan");
+
+        assert_eq!(
+            dq.stages.len(),
+            7,
+            "two 3-stage co-located sub-DAGs + outer: {dq:?}"
+        );
+        let leaves: Vec<_> = dq
+            .stages
+            .iter()
+            .filter(|s| s.upstream_stage_ids.is_empty())
+            .collect();
+        assert_eq!(
+            leaves.len(),
+            2,
+            "each DISTINCT argument keeps its own scan: {dq:?}"
+        );
+        assert!(
+            leaves.iter().all(|s| s.sql.contains("GROUP BY")),
+            "each branch's stage 0 is its own partial dedup: {leaves:?}"
+        );
+        assert!(
+            !dq.stages.iter().any(|s| s.sql.contains("FILTER (WHERE")),
+            "no FILTER-merged leaf: {dq:?}"
+        );
+    }
+
+    /// Mergeability rules for DISTINCT-carrying branches: only `COUNT(DISTINCT arg)` aggregates
+    /// all sharing one argument are eligible; mixed arguments or a non-count DISTINCT decline
+    /// (they keep their own sub-DAGs, planned by the co-located machinery or honestly rejected).
+    #[tokio::test]
+    async fn distinct_branch_mergeability_rules() {
+        // Mixed DISTINCT arguments in one branch: not mergeable.
+        let lp = logical_plan(
+            "SELECT * FROM \
+               (SELECT count(DISTINCT v) AS dv, count(DISTINCT k) AS dk FROM t WHERE k > 0) a1, \
+               (SELECT count(*) AS n FROM t) a2",
+        )
+        .await;
+        let mut branches = Vec::new();
+        collect_sharded_branches(&lp, &[], &mut branches);
+        assert_eq!(branches.len(), 2);
+        assert!(
+            mergeable_branch(branches[0].node, &[]).is_none(),
+            "mixed DISTINCT arguments must decline the merge"
+        );
+        let plain = mergeable_branch(branches[1].node, &[]).expect("plain branch merges");
+        assert!(plain.distinct_arg.is_none());
+
+        // A non-count DISTINCT aggregate: not mergeable.
+        let lp = logical_plan(
+            "SELECT * FROM \
+               (SELECT sum(DISTINCT v) AS sv FROM t WHERE k > 0) a1, \
+               (SELECT count(*) AS n FROM t) a2",
+        )
+        .await;
+        let mut branches = Vec::new();
+        collect_sharded_branches(&lp, &[], &mut branches);
+        assert!(
+            mergeable_branch(branches[0].node, &[]).is_none(),
+            "sum(DISTINCT) must decline the merge"
+        );
+
+        // COUNT(DISTINCT) alongside plain aggregates: mergeable, keyed on the argument.
+        let lp = logical_plan(
+            "SELECT * FROM \
+               (SELECT count(DISTINCT v) AS dv, sum(v) AS s FROM t WHERE k > 0) a1, \
+               (SELECT count(*) AS n FROM t) a2",
+        )
+        .await;
+        let mut branches = Vec::new();
+        collect_sharded_branches(&lp, &[], &mut branches);
+        let m = mergeable_branch(branches[0].node, &[]).expect("count-distinct branch merges");
+        assert_eq!(m.distinct_arg.as_deref(), Some("t.v"));
     }
 }

@@ -29,6 +29,11 @@ pub const DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 tokio::task_local! {
     /// Driver-classified replicate set for the current stage (lowercase names).
     static REPLICATED_TABLES_CONTEXT: Arc<HashSet<String>>;
+    /// Explicit shard assignment for the current task. In-process workers (tests, local
+    /// multi-worker harnesses) cannot use the process-global env — `WEFT_SHARD_INDEX` holds
+    /// one value per process — so a worker built with an explicit assignment installs it
+    /// here around stage execution. Live workers never set this; their env is authoritative.
+    static SHARD_ASSIGNMENT_CONTEXT: ShardAssignment;
 }
 
 /// Shard assignment for this process, if configured for a multi-worker cluster.
@@ -40,6 +45,11 @@ pub struct ShardAssignment {
 
 impl ShardAssignment {
     pub fn from_env() -> Option<Self> {
+        // A task-scoped explicit assignment (in-process workers / tests) wins over the
+        // process-global env, which can only name one shard per process.
+        if let Ok(assignment) = SHARD_ASSIGNMENT_CONTEXT.try_with(|a| *a) {
+            return Some(assignment);
+        }
         let count: usize = std::env::var("WEFT_WORKER_COUNT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -170,6 +180,17 @@ where
     REPLICATED_TABLES_CONTEXT.scope(Arc::new(set), future).await
 }
 
+/// Run `future` with an explicit shard assignment (see [`SHARD_ASSIGNMENT_CONTEXT`]).
+/// In-process workers install this around stage execution so each worker resolves its own
+/// file shard despite sharing one process env; production workers leave it unset and read
+/// `WEFT_WORKER_COUNT` / `WEFT_SHARD_INDEX` via [`ShardAssignment::from_env`].
+pub async fn with_shard_assignment<F, T>(assignment: ShardAssignment, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    SHARD_ASSIGNMENT_CONTEXT.scope(assignment, future).await
+}
+
 /// Byte cap for auto-broadcast (`WEFT_AUTO_BROADCAST_THRESHOLD_BYTES`). Default 32 GiB.
 /// `0` disables size-based auto-replication (env override only).
 pub fn auto_broadcast_threshold_bytes() -> u64 {
@@ -225,23 +246,22 @@ pub fn classify_replicated_tables(
 }
 
 /// Row-count multiple for row-aware auto-broadcast exclusion
-/// (`WEFT_REPLICATE_MAX_ROW_MULTIPLE`). **Unset (the default) disables the rule**:
-/// classification stays byte-only, exactly as before. Set to a positive value (e.g. `4.0`)
-/// to also keep a byte-eligible candidate sharded when its row count exceeds multiple × the
-/// largest (by bytes) table's row count — see [`classify_replicated_tables_with_rows`]. `0`,
-/// a negative value, or an unparseable value disables the rule.
+/// (`WEFT_REPLICATE_MAX_ROW_MULTIPLE`). **On by default at `4.0`**: a byte-eligible replicate
+/// candidate whose row count exceeds multiple × the largest (by bytes) table's row count stays
+/// sharded — see [`classify_replicated_tables_with_rows`]. Set the env to a different positive
+/// value to tune, or to `0` / a negative / unparseable value to disable the rule and restore
+/// byte-only classification.
 ///
-/// Defaulted OFF because the exclusion leaves two or more tables sharded, which only the
-/// shuffle-join-chain planner shapes support — and only when the chain roots at a sharded
-/// table. TPC-DS's `item`-first comma chains (Q37/Q82) and trailing-replicated-outer-join
-/// chains (Q72) reject a 2-sharded classification and fall back to single-node execution,
-/// which is worse than today's byte-only broadcast plan for those queries. Enable it for
-/// workloads whose multi-fact queries join fact-first.
+/// Defaulting ON is safe because the shuffle-join-chain planner re-roots a dim-leftmost inner
+/// chain at a sharded leaf (`join_order::reroot_inner_chain_at_sharded`): TPC-DS Q37/Q82's
+/// `item`-first comma chains used to reject the resulting 2-sharded classification and fall
+/// back to single-node execution, which is why the rule originally shipped gated off.
 pub fn replicate_max_row_multiple() -> Option<f64> {
-    std::env::var("WEFT_REPLICATE_MAX_ROW_MULTIPLE")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|m| *m > 0.0)
+    const DEFAULT_MULTIPLE: f64 = 4.0;
+    match std::env::var("WEFT_REPLICATE_MAX_ROW_MULTIPLE") {
+        Ok(s) => s.trim().parse::<f64>().ok().filter(|m| *m > 0.0),
+        Err(_) => Some(DEFAULT_MULTIPLE),
+    }
 }
 
 /// Row-aware variant of [`classify_replicated_tables`].
@@ -825,15 +845,15 @@ mod tests {
         );
     }
 
-    /// `WEFT_REPLICATE_MAX_ROW_MULTIPLE`: unset / `0` / negative / unparseable disable the
-    /// rule; a positive value enables it.
+    /// `WEFT_REPLICATE_MAX_ROW_MULTIPLE`: unset defaults ON (4.0); `0` / negative /
+    /// unparseable disable the rule; another positive value overrides the default.
     #[test]
     fn replicate_max_row_multiple_env_parsing() {
         std::env::remove_var("WEFT_REPLICATE_MAX_ROW_MULTIPLE");
-        assert_eq!(replicate_max_row_multiple(), None);
-
-        std::env::set_var("WEFT_REPLICATE_MAX_ROW_MULTIPLE", "4.0");
         assert_eq!(replicate_max_row_multiple(), Some(4.0));
+
+        std::env::set_var("WEFT_REPLICATE_MAX_ROW_MULTIPLE", "8.0");
+        assert_eq!(replicate_max_row_multiple(), Some(8.0));
 
         std::env::set_var("WEFT_REPLICATE_MAX_ROW_MULTIPLE", "0");
         assert_eq!(replicate_max_row_multiple(), None);
@@ -864,6 +884,115 @@ mod tests {
             2,
             "task-local overlay replicates full file list"
         );
+    }
+
+    /// Replicated-slice producers (the union-split replicated arms) shard a table the
+    /// classification marked replicated, on every worker, exactly once per slice. The walk is
+    /// the same [`assign_known_files_by_size`] sharded tables use: W=1 must hand the whole
+    /// list to the single worker, W=2 must split into disjoint halves covering every file,
+    /// and W > files must leave the extra workers empty without dropping or duplicating a
+    /// file.
+    #[test]
+    fn slice_assignment_covers_w1_disjoint_w2_and_degenerate_w_gt_files() {
+        let files = vec![
+            (dummy_url("large.parquet"), 100),
+            (dummy_url("medium.parquet"), 60),
+            (dummy_url("small.parquet"), 40),
+        ];
+        let paths = |v: &[(ListingTableUrl, u64)]| {
+            v.iter()
+                .map(|(u, _)| u.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // W=1: one worker owns every file — byte-identical to an unsharded scan.
+        let only = apply_known_file_shard_with(
+            files.clone(),
+            Some("store_sales"),
+            Some(ShardAssignment { index: 0, count: 1 }),
+        );
+        assert_eq!(only.len(), files.len(), "W=1 keeps the full file list");
+
+        // W=2: disjoint slices whose union is the full list, assigned deterministically.
+        let w0 = apply_known_file_shard_with(
+            files.clone(),
+            Some("store_sales"),
+            Some(ShardAssignment { index: 0, count: 2 }),
+        );
+        let w1 = apply_known_file_shard_with(
+            files.clone(),
+            Some("store_sales"),
+            Some(ShardAssignment { index: 1, count: 2 }),
+        );
+        let mut all: Vec<String> = paths(&w0).into_iter().chain(paths(&w1)).collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            files.len(),
+            "W=2 slices are disjoint and complete"
+        );
+        assert!(
+            !w0.is_empty() && !w1.is_empty(),
+            "3 files over 2 workers give both a non-empty slice"
+        );
+        // Determinism: the same input list yields the same assignment on every worker.
+        let w0_again = apply_known_file_shard_with(
+            files.clone(),
+            Some("store_sales"),
+            Some(ShardAssignment { index: 0, count: 2 }),
+        );
+        assert_eq!(paths(&w0), paths(&w0_again), "slice assignment is stable");
+
+        // W=4 > 3 files: some workers own no files; coverage stays disjoint and complete.
+        let mut union: Vec<String> = Vec::new();
+        let mut empty = 0;
+        for index in 0..4 {
+            let slice = apply_known_file_shard_with(
+                files.clone(),
+                Some("store_sales"),
+                Some(ShardAssignment { index, count: 4 }),
+            );
+            empty += usize::from(slice.is_empty());
+            union.extend(paths(&slice));
+        }
+        union.sort();
+        union.dedup();
+        assert_eq!(union.len(), files.len(), "degenerate W keeps full coverage");
+        assert!(empty >= 1, "more workers than files leaves an empty slice");
+    }
+
+    /// The task-local assignment an in-process worker installs beats the process-global env,
+    /// so two workers in one test process resolve disjoint shards of the same table.
+    #[tokio::test]
+    async fn explicit_assignment_task_local_wins_over_env() {
+        std::env::set_var("WEFT_WORKER_COUNT", "2");
+        std::env::set_var("WEFT_SHARD_INDEX", "0");
+        let files = vec![(dummy_url("a.parquet"), 100), (dummy_url("b.parquet"), 60)];
+        let env_shard = apply_known_file_shard(files.clone(), Some("orders"));
+        assert_eq!(env_shard.len(), 1, "env shard 0 owns the larger file");
+
+        let other = with_shard_assignment(ShardAssignment { index: 1, count: 2 }, async {
+            apply_known_file_shard(files.clone(), Some("orders"))
+        })
+        .await;
+        assert_eq!(
+            other.len(),
+            1,
+            "task-local assignment {{1/2}} overrides env {{0/2}}"
+        );
+        assert_ne!(
+            env_shard[0].0.as_str(),
+            other[0].0.as_str(),
+            "the two in-process workers hold disjoint files"
+        );
+        // Outside the scope the env answer is unchanged.
+        assert_eq!(
+            apply_known_file_shard(files, Some("orders"))[0].0.as_str(),
+            env_shard[0].0.as_str()
+        );
+        std::env::remove_var("WEFT_WORKER_COUNT");
+        std::env::remove_var("WEFT_SHARD_INDEX");
     }
 
     #[test]

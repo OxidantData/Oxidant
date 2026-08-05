@@ -9,6 +9,7 @@
 
 pub mod aqe;
 pub mod autoscale;
+pub mod dag_dispatch;
 pub mod driver;
 pub mod fault_inject;
 pub mod flight;

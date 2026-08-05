@@ -5,10 +5,12 @@
 //!
 //! Shapes under test:
 //!
-//! - **Window over a ROLLUP aggregate** (Q67/Q70/Q86): the ROLLUP partial-aggregate gathers
-//!   finest-level partials to one partition, the combine reconstructs every rollup level there
-//!   (super-aggregate rows with NULL grouping columns included), and the ranking window then
-//!   re-shuffles the tiny combined output by its `PARTITION BY` key — including keys that are
+//! - **Window over a ROLLUP aggregate** (Q67/Q70/Q86): the ROLLUP partial-aggregate hashes
+//!   finest-level partials by the first grouping column, a per-partition ROLLUP reconstructs
+//!   every level containing it (a tiny fixup stage combines the per-partition grand totals;
+//!   Q70's IN-key path keeps the partition-0 gather), and the ranking window then re-shuffles
+//!   the combined output (super-aggregate rows with NULL grouping columns included) by its
+//!   `PARTITION BY` key — including keys that are
 //!   *expressions* over `grouping()` outputs (Q70/Q86's
 //!   `PARTITION BY grouping(a)+grouping(b), CASE WHEN grouping(b)=0 THEN a END`), materialized
 //!   as computed columns on the combine stage so the shuffle can hash them.
@@ -46,6 +48,20 @@ use weft_loom::arrow::datatypes::{DataType, Field, Schema};
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::arrow::util::display::{ArrayFormatter, FormatOptions};
 use weft_loom::Engine;
+
+/// Run an e2e body on a runtime with large worker stacks: unoptimized builds plan the
+/// deeply-nested stage SQL (e.g. Q39's HAVING-wrapped stddev combine, Q70's rollup arms) with
+/// frames far bigger than tokio's 2 MiB default allows — the same guard
+/// `branch_dag_keyed_outer.rs` / `auto_distribute_replicated_slice.rs` document.
+fn run_e2e(fut: impl std::future::Future<Output = ()>) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(32 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("e2e runtime");
+    rt.block_on(fut);
+}
 
 const Q36: &str = include_str!("../../../bench/tpcds/queries/q36.sql");
 const Q44: &str = include_str!("../../../bench/tpcds/queries/q44.sql");
@@ -460,145 +476,227 @@ fn assert_no_fact_gather(dq: &weft_execution::plan::DistributedQuery) {
     );
 }
 
+/// The identical-stage CSE's postcondition: no two stages share the full dispatch contract
+/// (sql, exchange, hash key, upstreams) — every mergeable duplicate collapsed to one stage.
+fn assert_no_identical_stages(dq: &weft_execution::plan::DistributedQuery) {
+    let mut seen = std::collections::HashSet::new();
+    for s in &dq.stages {
+        let key = format!(
+            "{:?}|{:?}|{:?}|{}",
+            s.exchange, s.hash_key_cols, s.upstream_stage_ids, s.sql
+        );
+        assert!(seen.insert(key), "duplicate stage survived CSE: {dq:?}");
+    }
+}
+
 // --- Q67 / Q70 / Q86: ranking window over a ROLLUP aggregate ---
 
-#[tokio::test]
-async fn q67_rank_over_rollup_plans_and_matches() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q67, &REPL_STORE_SALES).await;
-    assert_no_fact_gather(&dq);
-    assert!(
-        dq.stages.iter().any(|s| s.sql.contains("GROUP BY ROLLUP")),
-        "the combine reconstructs the rollup levels: {dq:?}"
-    );
-    assert!(
-        dq.stages
+#[test]
+fn q67_rank_over_rollup_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q67, &REPL_STORE_SALES).await;
+        assert_no_fact_gather(&dq);
+        assert!(
+            dq.stages.iter().any(|s| s.sql.contains("GROUP BY ROLLUP")),
+            "the combine reconstructs the rollup levels: {dq:?}"
+        );
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("rank() OVER (PARTITION BY")),
+            "the ranking window computes after the partition shuffle: {dq:?}"
+        );
+        // Two-phase grouping sets (the Q67 SF10 win): the finest-level partial hash-shuffles by the
+        // first rollup column (i_category = g0) instead of gathering 4.84M rows to one partition; a
+        // per-partition ROLLUP computes every g0-bearing level exactly and tags each partition's
+        // grand-total partial (`__gid = 1`); the fixup stage passes the exact rows through and
+        // combines the ≤ #partitions grand totals on the NULL-g0 bucket. The
+        // `HAVING COUNT(*) > 0` empty-partition guard rides both stages.
+        let partial = &dq.stages[0];
+        assert_eq!(
+            partial.hash_key_cols,
+            vec![0],
+            "the partial keys on g0, not a partition-0 gather: {dq:?}"
+        );
+        let rollup = dq
+            .stages
             .iter()
-            .any(|s| s.sql.contains("rank() OVER (PARTITION BY")),
-        "the ranking window computes after the partition shuffle: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q67, &REPL_STORE_SALES, "store_sales").await;
+            .find(|s| s.sql.contains("GROUP BY ROLLUP"))
+            .expect("per-partition rollup stage");
+        assert_eq!(rollup.hash_key_cols, vec![0], "{dq:?}");
+        assert!(
+            rollup.sql.contains("grouping(g0) AS __gid")
+                && rollup.sql.contains("HAVING COUNT(*) > 0"),
+            "grand-total partials tagged; empty-partition guard kept: {dq:?}"
+        );
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("__gid = 0")
+                    && s.sql.contains("__gid = 1 HAVING COUNT(*) > 0")),
+            "the grand-total fixup funnels ≤ #partitions rows: {dq:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q67, &REPL_STORE_SALES, "store_sales").await;
+    });
 }
 
-#[tokio::test]
-async fn q70_rank_over_rollup_with_windowed_in_subquery_plans_and_matches() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q70, &REPL_STORE_SALES).await;
-    assert_no_fact_gather(&dq);
-    assert!(
-        dq.stages
-            .iter()
-            .any(|s| s.sql.contains("GROUP BY ROLLUP") && s.sql.contains("grouping(")),
-        "the combine recomputes grouping() at the rolled-up levels: {dq:?}"
-    );
-    assert!(
-        dq.stages
-            .iter()
-            .any(|s| s.sql.contains("IN (SELECT") && s.sql.contains("shuffle_input_")),
-        "the IN filter is evaluated against the co-located subquery stream: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q70, &REPL_STORE_SALES, "store_sales").await;
+#[test]
+fn q70_rank_over_rollup_with_windowed_in_subquery_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q70, &REPL_STORE_SALES).await;
+        assert_no_fact_gather(&dq);
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("GROUP BY ROLLUP") && s.sql.contains("grouping(")),
+            "the combine recomputes grouping() at the rolled-up levels: {dq:?}"
+        );
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("IN (SELECT") && s.sql.contains("shuffle_input_")),
+            "the IN filter is evaluated against the co-located subquery stream: {dq:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q70, &REPL_STORE_SALES, "store_sales").await;
+    });
 }
 
-#[tokio::test]
-async fn q86_rank_over_rollup_grouping_expr_key_plans_and_matches() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q86, &REPL_WEB_SALES).await;
-    assert_no_fact_gather(&dq);
-    assert!(
-        dq.stages
-            .iter()
-            .any(|s| s.sql.contains("GROUP BY ROLLUP") && s.sql.contains("grouping(")),
-        "the combine recomputes grouping() at the rolled-up levels: {dq:?}"
-    );
-    assert!(
-        dq.stages
-            .iter()
-            .any(|s| s.sql.contains("rank() OVER (PARTITION BY")),
-        "the ranking window computes after the partition shuffle: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q86, &REPL_WEB_SALES, "web_sales").await;
+#[test]
+fn q86_rank_over_rollup_grouping_expr_key_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q86, &REPL_WEB_SALES).await;
+        assert_no_fact_gather(&dq);
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("GROUP BY ROLLUP") && s.sql.contains("grouping(")),
+            "the combine recomputes grouping() at the rolled-up levels: {dq:?}"
+        );
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("rank() OVER (PARTITION BY")),
+            "the ranking window computes after the partition shuffle: {dq:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q86, &REPL_WEB_SALES, "web_sales").await;
+    });
 }
 
 // --- Q44: global rank() over a per-item aggregate with a scalar-subquery HAVING ---
 
-#[tokio::test]
-async fn q44_global_rank_over_scalar_having_plans_and_matches() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q44, &REPL_STORE_SALES).await;
-    assert_no_fact_gather(&dq);
-    assert!(
-        dq.stages
-            .iter()
-            .any(|s| s.sql.contains("rank() OVER (ORDER BY")),
-        "the global ranking window computes on the gathered combine partition: {dq:?}"
-    );
-    // The two branches' identical scalar subqueries each plan a partial/combine pair whose
-    // one-row output gathers to partition 0 and rides the window stage as a co-located input:
-    // the branch HAVING reads it as `(SELECT m0 FROM shuffle_input_1)`.
-    assert!(
-        dq.stages
-            .iter()
-            .any(|s| s.sql.contains("(SELECT m0 FROM shuffle_input_1)")),
-        "a co-located scalar stream feeds the branch HAVING stage: {dq:?}"
-    );
-    assert!(
-        dq.stages
-            .iter()
-            .any(|s| s.sql.contains("shuffle_input_0") && s.sql.contains("shuffle_input_1")),
-        "the outer skeleton joins both rank branches from shuffle inputs: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q44, &REPL_STORE_SALES, "store_sales").await;
+#[test]
+fn q44_global_rank_over_scalar_having_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q44, &REPL_STORE_SALES).await;
+        assert_no_fact_gather(&dq);
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("rank() OVER (ORDER BY")),
+            "the global ranking window computes on the gathered combine partition: {dq:?}"
+        );
+        // The two branches' identical scalar subqueries each plan a partial/combine pair whose
+        // one-row output gathers to partition 0 and rides the window stage as a co-located input:
+        // the branch HAVING reads it as `(SELECT m0 FROM shuffle_input_1)`.
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("(SELECT m0 FROM shuffle_input_1)")),
+            "a co-located scalar stream feeds the branch HAVING stage: {dq:?}"
+        );
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("shuffle_input_0") && s.sql.contains("shuffle_input_1")),
+            "the outer skeleton joins both rank branches from shuffle inputs: {dq:?}"
+        );
+        // Identical-stage CSE: the two window branches re-planned byte-identical aggregate and
+        // HAVING-scalar sub-DAGs (their branch fingerprints differ only on the window ORDER BY
+        // direction, so plan-level dedup can't fire). The generic stage CSE merges them: 11 → 7
+        // stages, 4 store_sales scans → 2; only the ASC/DESC window stages stay distinct.
+        assert_eq!(dq.stages.len(), 7, "{dq:?}");
+        assert_eq!(
+            dq.stages
+                .iter()
+                .filter(|s| s.sql.contains("store_sales"))
+                .count(),
+            2,
+            "each distinct store_sales input scans once: {dq:?}"
+        );
+        assert_no_identical_stages(&dq);
+        drop(dq);
+        assert_distributed_matches_single_node(Q44, &REPL_STORE_SALES, "store_sales").await;
+    });
 }
 
 // --- Q36: ranking window over a UNION sharing one aggregate CTE ---
 
-#[tokio::test]
-async fn q36_window_over_shared_cte_union_plans_and_matches() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q36, &REPL_STORE_SALES).await;
-    assert_no_fact_gather(&dq);
-    assert!(
-        dq.stages.iter().any(|s| s.sql.contains("UNION")),
-        "the union evaluates over the gathered CTE rows: {dq:?}"
-    );
-    assert!(
-        dq.stages
-            .iter()
-            .any(|s| s.sql.contains("rank() OVER (PARTITION BY")),
-        "the ranking window computes locally over the union: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q36, &REPL_STORE_SALES, "store_sales").await;
+#[test]
+fn q36_window_over_shared_cte_union_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q36, &REPL_STORE_SALES).await;
+        assert_no_fact_gather(&dq);
+        assert!(
+            dq.stages.iter().any(|s| s.sql.contains("UNION")),
+            "the union evaluates over the gathered CTE rows: {dq:?}"
+        );
+        assert!(
+            dq.stages
+                .iter()
+                .any(|s| s.sql.contains("rank() OVER (PARTITION BY")),
+            "the ranking window computes locally over the union: {dq:?}"
+        );
+        // The shared `results` CTE inlines per union arm, so the arms' partials are byte-identical
+        // (stage 2 ≡ stage 0 before CSE): the stage-level CSE merges them — one store_sales scan
+        // saved — while the arms' distinct combine projections stay separate.
+        assert_eq!(dq.stages.len(), 8, "{dq:?}");
+        assert_eq!(
+            dq.stages
+                .iter()
+                .filter(|s| s.sql.contains("store_sales"))
+                .count(),
+            2,
+            "the shared CTE scans store_sales once per distinct input: {dq:?}"
+        );
+        assert_no_identical_stages(&dq);
+        drop(dq);
+        assert_distributed_matches_single_node(Q36, &REPL_STORE_SALES, "store_sales").await;
+    });
 }
 
 // --- Q51: framed windows over a FULL OUTER JOIN of two windowed aggregates ---
 
-#[tokio::test]
-async fn q51_window_over_full_join_of_windowed_aggregates_plans_and_matches() {
-    std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
-    let planner = tpcds_engine().await;
-    let dq = strict_plan(&planner, Q51, &REPL_STORE_SALES).await;
-    assert_no_fact_gather(&dq);
-    assert!(
-        dq.stages.iter().any(|s| s.sql.contains("FULL JOIN")),
-        "the two windowed branches full-join on the co-located key: {dq:?}"
-    );
-    assert!(
-        dq.stages.iter().any(|s| s
-            .sql
-            .contains("ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW")),
-        "the framed cumulative windows ride the partition shuffle: {dq:?}"
-    );
-    drop(dq);
-    assert_distributed_matches_single_node(Q51, &REPL_STORE_SALES, "store_sales").await;
+#[test]
+fn q51_window_over_full_join_of_windowed_aggregates_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("WEFT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q51, &REPL_STORE_SALES).await;
+        assert_no_fact_gather(&dq);
+        assert!(
+            dq.stages.iter().any(|s| s.sql.contains("FULL JOIN")),
+            "the two windowed branches full-join on the co-located key: {dq:?}"
+        );
+        assert!(
+            dq.stages.iter().any(|s| s
+                .sql
+                .contains("ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW")),
+            "the framed cumulative windows ride the partition shuffle: {dq:?}"
+        );
+        drop(dq);
+        assert_distributed_matches_single_node(Q51, &REPL_STORE_SALES, "store_sales").await;
+    });
 }
