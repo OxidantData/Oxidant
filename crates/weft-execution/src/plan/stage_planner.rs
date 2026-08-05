@@ -528,6 +528,10 @@ pub async fn plan_distributed(
     replicated: &[&str],
 ) -> Result<DistributedQuery> {
     let (lp, lakehouse_snapshot_pins) = engine.logical_plan_with_lakehouse_snapshots(sql).await?;
+    // Optimize before splitting: stage SQL is unparsed from this plan, and no pushdown can
+    // cross a stage boundary once the plan is cut. The stock optimizer moves outer filters
+    // into the scans/group-bys below (TPC-DS Q78's year predicate, KAN-2 throughput).
+    let lp = engine.optimize_logical_plan(lp)?;
     let mut query = match plan_distributed_logical(&lp, replicated) {
         Ok(dq) => Ok(dq),
         Err(Error::Unsupported(_)) => {
@@ -5253,5 +5257,218 @@ mod peel_remap_tests {
             !upper.contains("AS DOUBLE") && !upper.contains("AS FLOAT64"),
             "AVG recombine must not force DOUBLE; got:\n{sql}"
         );
+    }
+}
+
+/// The driver optimizes the logical plan BEFORE the stage split (`plan_distributed`):
+/// otherwise stage SQL is unparsed from the raw SQL shape and no pushdown can cross a
+/// stage boundary (TPC-DS Q78's `ss_sold_year=2000` stayed in the final stage while leaf
+/// stages scanned and grouped every year of all three fact tables — 6.3s vs 1.5s at SF10).
+#[cfg(test)]
+mod driver_side_optimization_tests {
+    use std::sync::Arc;
+
+    use weft_loom::arrow::array::{Int64Array, RecordBatch};
+    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+    use weft_loom::Engine;
+
+    use super::plan_distributed;
+
+    fn fact(date_col: &str, item_col: &str, cust_col: &str, qty_col: &str) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(date_col, DataType::Int64, false),
+            Field::new(item_col, DataType::Int64, false),
+            Field::new(cust_col, DataType::Int64, false),
+            Field::new(qty_col, DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![10, 20, 10])),
+                Arc::new(Int64Array::from(vec![100, 200, 100])),
+                Arc::new(Int64Array::from(vec![5, 7, 9])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn date_dim() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d_date_sk", DataType::Int64, false),
+            Field::new("d_year", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![1999, 2000, 2000])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn outer_filter_pushes_into_cte_leaf_stage_before_split() {
+        let engine = Engine::new();
+        engine
+            .register_batches(
+                "store_sales",
+                vec![fact(
+                    "ss_sold_date_sk",
+                    "ss_item_sk",
+                    "ss_customer_sk",
+                    "ss_quantity",
+                )],
+            )
+            .unwrap();
+        engine
+            .register_batches("date_dim", vec![date_dim()])
+            .unwrap();
+        let sql = "WITH ss AS (\
+                       SELECT d_year AS ss_sold_year, ss_item_sk, ss_customer_sk, \
+                              SUM(ss_quantity) AS ss_qty \
+                       FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk \
+                       GROUP BY d_year, ss_item_sk, ss_customer_sk) \
+                   SELECT ss_sold_year, ss_item_sk, ss_customer_sk, ss_qty FROM ss \
+                   WHERE ss_sold_year = 2000 \
+                   ORDER BY ss_sold_year, ss_item_sk, ss_customer_sk LIMIT 100";
+        let dq = plan_distributed(&engine, sql, &[])
+            .await
+            .expect("CTE agg shape should distribute");
+        assert!(
+            dq.stages.len() >= 2,
+            "expected a multi-stage plan, got: {dq:?}"
+        );
+        // The fact shard scan stays unfiltered (the inner join with the filtered date_dim
+        // eliminates non-2000 rows); the win is the pushed predicate on the date_dim leaf.
+        let dim_stages: Vec<_> = dq
+            .stages
+            .iter()
+            .filter(|s| s.sql.contains("FROM date_dim"))
+            .collect();
+        assert!(!dim_stages.is_empty(), "{dq:?}");
+        for st in &dim_stages {
+            assert!(
+                st.sql.contains("d_year = 2000"),
+                "year filter not pushed into the date_dim leaf stage: {}",
+                st.sql
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn outer_filter_propagates_through_left_join_equality_into_right_cte() {
+        let engine = Engine::new();
+        engine
+            .register_batches(
+                "store_sales",
+                vec![fact(
+                    "ss_sold_date_sk",
+                    "ss_item_sk",
+                    "ss_customer_sk",
+                    "ss_quantity",
+                )],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "web_sales",
+                vec![fact(
+                    "ws_sold_date_sk",
+                    "ws_item_sk",
+                    "ws_bill_customer_sk",
+                    "ws_quantity",
+                )],
+            )
+            .unwrap();
+        engine
+            .register_batches("date_dim", vec![date_dim()])
+            .unwrap();
+        let sql = "WITH ss AS (\
+                       SELECT d_year AS ss_sold_year, ss_item_sk, ss_customer_sk, \
+                              SUM(ss_quantity) AS ss_qty \
+                       FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk \
+                       GROUP BY d_year, ss_item_sk, ss_customer_sk), \
+                   ws AS (\
+                       SELECT d_year AS ws_sold_year, ws_item_sk, ws_bill_customer_sk AS ws_customer_sk, \
+                              SUM(ws_quantity) AS ws_qty \
+                       FROM web_sales JOIN date_dim ON ws_sold_date_sk = d_date_sk \
+                       GROUP BY d_year, ws_item_sk, ws_bill_customer_sk) \
+                   SELECT ss_sold_year, ss_item_sk, ss_customer_sk, ss_qty, ws_qty \
+                   FROM ss LEFT JOIN ws ON ws_sold_year = ss_sold_year \
+                       AND ws_item_sk = ss_item_sk AND ws_customer_sk = ss_customer_sk \
+                   WHERE ss_sold_year = 2000 \
+                   ORDER BY ss_sold_year, ss_item_sk, ss_customer_sk LIMIT 100";
+        let dq = plan_distributed(&engine, sql, &[])
+            .await
+            .expect("two-CTE left-join shape should distribute");
+        // Both CTEs' date_dim scans must carry the filter: the ss side via the plain
+        // group-key pushdown, the ws side via the LEFT JOIN equality inference
+        // (ws_sold_year = ss_sold_year = 2000). Identical scans may CSE-merge, so assert
+        // the invariant over every date_dim stage rather than counting them.
+        let dim_stages: Vec<_> = dq
+            .stages
+            .iter()
+            .filter(|s| s.sql.contains("FROM date_dim"))
+            .collect();
+        assert!(
+            !dim_stages.is_empty(),
+            "no date_dim leaf stage in the split: {dq:?}"
+        );
+        for st in &dim_stages {
+            assert!(
+                st.sql.contains("d_year = 2000"),
+                "year filter not pushed into a date_dim leaf stage: {}",
+                st.sql
+            );
+        }
+        for table in ["store_sales", "web_sales"] {
+            assert!(
+                dq.stages.iter().any(|s| s.sql.contains(table)),
+                "no stage scans {table}: {dq:?}"
+            );
+        }
+    }
+
+    /// SQL table aliases (`JOIN date_dim d1`) are the class the splitter cannot re-render
+    /// after predicate re-qualification (TPC-DS Q72 broke with "No field named
+    /// date_dim.d_year. Did you mean 'd1.d_year'?" on workers). The shape gate must leave
+    /// such plans unoptimized — no pushed year filter in any date_dim stage — while the
+    /// split itself still succeeds.
+    #[tokio::test]
+    async fn aliased_dim_shape_is_left_unoptimized() {
+        let engine = Engine::new();
+        engine
+            .register_batches(
+                "catalog_sales",
+                vec![fact(
+                    "cs_sold_date_sk",
+                    "cs_item_sk",
+                    "cs_bill_customer_sk",
+                    "cs_quantity",
+                )],
+            )
+            .unwrap();
+        engine
+            .register_batches("date_dim", vec![date_dim()])
+            .unwrap();
+        let sql = "SELECT d1.d_year, cs_item_sk, SUM(cs_quantity) AS q \
+                   FROM catalog_sales JOIN date_dim d1 ON cs_sold_date_sk = d1.d_date_sk \
+                   WHERE d1.d_year = 2000 \
+                   GROUP BY d1.d_year, cs_item_sk \
+                   ORDER BY d1.d_year, cs_item_sk LIMIT 100";
+        let dq = plan_distributed(&engine, sql, &[])
+            .await
+            .expect("aliased-dim shape should still distribute");
+        for st in dq.stages.iter().filter(|s| s.sql.contains("FROM date_dim")) {
+            assert!(
+                !st.sql.contains("date_dim.d_year"),
+                "the shape gate must keep the optimizer's base-qualified pushdown out of \
+                 aliased-dim stages (the splitter's own alias-qualified rendering is the \
+                 pre-existing behavior): {}",
+                st.sql
+            );
+        }
     }
 }

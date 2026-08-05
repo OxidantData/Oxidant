@@ -140,7 +140,28 @@ pub async fn try_run_distributed_plan(
         return Ok(None);
     }
 
-    let mut dq = match plan_distributed_logical(plan, replicated) {
+    // Optimize the driver-side plan before the stage split: stage SQL is unparsed from
+    // this plan and no pushdown can cross a stage boundary once cut — TPC-DS Q78's outer
+    // year filter otherwise stays in the final stage while leaf stages scan/group every
+    // year (KAN-2 throughput; 6.3s → 1.5s at SF10). Fail-open: correctness never depends
+    // on the rewrite (DataFusion runs these same two rules on every single-node query),
+    // so an optimizer hiccup keeps the original plan.
+    let optimized = engine
+        .optimize_logical_plan(plan.clone())
+        .unwrap_or_else(|_| plan.clone());
+    let mut split_result = plan_distributed_logical(&optimized, replicated);
+    if split_result.is_err() {
+        // The rewritten shape can fall outside the splitter's vocabulary even when the
+        // original shape splits fine (the optimizer moves past shape classes the gate
+        // cannot enumerate). Optimization is strictly best-effort: retry with the
+        // original plan before declaring the query undistributable.
+        let optimized_display = format!("{}", optimized.display_indent());
+        let original_display = format!("{}", plan.display_indent());
+        if optimized_display != original_display {
+            split_result = plan_distributed_logical(plan, replicated);
+        }
+    }
+    let mut dq = match split_result {
         Ok(d) => d,
         Err(Error::Unsupported(reason)) => {
             record_distributed_fallback(tracker, &reason);

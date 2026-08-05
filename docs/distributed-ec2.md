@@ -488,7 +488,7 @@ Graviton **arm64** AMI required (`c6g` / `m8g`).
 | Engine env (SF100) | Value | Where |
 |--------------------|-------|-------|
 | `WEFT_DISTRIBUTED_STRICT` | `1` | driver (`--distributed-strict true`) |
-| `WEFT_PREFER_HASH_JOIN` | `false` | driver + workers (`--prefer-hash-join false`) |
+| `WEFT_PREFER_HASH_JOIN` | `auto` | driver + workers (default; forced values are legacy — see `docs/runtime-contract.md`) |
 | `WEFT_MEMORY_LIMIT_BYTES` | `42949672960` (40 Gi) | workers (DataFusion spill pool) |
 | `WEFT_SHUFFLE_SPILL_BYTES` | `8589934592` (8 Gi) | workers (shuffle cache threshold) |
 | `WEFT_SHUFFLE_PARTITIONS` | `32` | driver (≈ worker vCPU; > worker count spreads shuffle + reduces skew) |

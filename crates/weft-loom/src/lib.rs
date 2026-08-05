@@ -2725,6 +2725,178 @@ impl Engine {
         catalog_bridge::capture_lakehouse_snapshots(self.logical_plan(query)).await
     }
 
+    /// Gate for [`Engine::optimize_logical_plan`]: only plans in the shape class the stage
+    /// splitter provably tolerates after rewriting may be optimized pre-split.
+    ///
+    /// Excluded classes (the splitter's handlers pattern-match their unoptimized form;
+    /// rewriting them broke distribution on the cluster):
+    /// - SQL table aliases (`JOIN date_dim d1`): a `SubqueryAlias` wrapping exactly one
+    ///   `TableScan` plus passthrough `Filter`/`Projection` nodes. `PushDownFilter`
+    ///   re-qualifies pushed predicates to the *base* table name (`date_dim.d_year`), but
+    ///   the splitter's broadcast/replicated path re-renders the scan with the alias
+    ///   (`FROM date_dim AS d1`) — the worker then fails with "No field named
+    ///   date_dim.d_year. Did you mean 'd1.d_year'?" (TPC-DS Q72). CTE `SubqueryAlias`
+    ///   nodes (over aggregates/joins — TPC-DS Q78/Q39) are NOT this class and still
+    ///   qualify.
+    /// - `EXISTS` / `IN` / scalar subquery expressions: pushing predicates inside them
+    ///   moves their filters into the inner `TableScan`, which the splitter's subquery
+    ///   handlers cannot re-render (`auto_distribute::exists_subquery_over_replicated_dim`).
+    /// - `Union` / `Intersect` / `Except`: per-branch predicates pushed into the branch
+    ///   scans make them textually distinct (e.g. `'s' = 's'` vs `'c' = 'c'` on Q4's
+    ///   three identical customer scans), so stage-level CSE can no longer merge the
+    ///   branches — Q4 went from ~15 stages to 66 and workers failed under the tiny-stage
+    ///   orchestration load (do_get transport error).
+    /// - `Window`: the splitter's window handlers match the unoptimized frame shape;
+    ///   pushing outer predicates through the frame (TPC-DS Q47/Q57's `avg() OVER` /
+    ///   `rank() OVER` CTE families) left no distributed shape the splitter recognizes
+    ///   ("no distributed semi/anti or decorrelated shape matched").
+    fn splittable_after_rewrite(lp: &datafusion::logical_expr::LogicalPlan) -> bool {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::logical_expr::{Expr, LogicalPlan};
+
+        let mut rejected = false;
+        let _ = lp.apply(|node| {
+            match node {
+                LogicalPlan::Union(_) | LogicalPlan::Window(_) => {
+                    rejected = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                LogicalPlan::SubqueryAlias(alias) => {
+                    // Walk past passthrough nodes: a bare TableScan at the end means this
+                    // SubqueryAlias is an SQL table alias, not a relation-valued subquery.
+                    let mut inner = alias.input.as_ref();
+                    loop {
+                        match inner {
+                            LogicalPlan::Filter(f) => inner = f.input.as_ref(),
+                            LogicalPlan::Projection(p) => inner = p.input.as_ref(),
+                            LogicalPlan::TableScan(_) => {
+                                rejected = true;
+                                return Ok(TreeNodeRecursion::Stop);
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                _ => {
+                    for e in node.expressions() {
+                        let has_subquery = e
+                            .exists(|sub| {
+                                Ok(matches!(
+                                    sub,
+                                    Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                                ))
+                            })
+                            .unwrap_or(false);
+                        if has_subquery {
+                            rejected = true;
+                            return Ok(TreeNodeRecursion::Stop);
+                        }
+                    }
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        !rejected
+    }
+
+    /// Apply `extract_equijoin_predicate` + `push_down_filter` to a driver-side plan so the
+    /// distributed stage splitter sees predicates where they belong (below aggregates and
+    /// join sides) rather than where the SQL text put them. Without this the splitter
+    /// unparses the *unoptimized* plan and no pushdown can cross a stage boundary — e.g.
+    /// TPC-DS Q78's `ss_sold_year=2000` landed in the final stage while leaf stages scanned
+    /// and grouped every year of all three fact tables (6.3s → 1.5s at SF10 once pushed).
+    ///
+    /// Two deliberate restrictions versus running `Optimizer::optimize`:
+    /// - Rule subset: rules like `eliminate_distinct` / `replace_distinct_aggregate`
+    ///   rewrite node *types* (TPC-DS Q37's aggregate-free `GROUP BY` becomes a `Distinct`)
+    ///   into shapes the splitter does not yet recognize, which would de-distribute those
+    ///   queries to a single-node Forward stage. These two rules only normalize equijoin
+    ///   keys and move/merge `Filter` nodes (including `infer_join_predicates` into
+    ///   outer-join sides), leaving every plan's node-type vocabulary intact.
+    /// - Plan tree only (no expr-subquery descent): the stock driver applies rules via
+    ///   `rewrite_with_subqueries`, which also rewrites plans inside `EXISTS` / scalar
+    ///   subquery *expressions* (pushing their predicates into the inner `TableScan`).
+    ///   The splitter's subquery handlers pattern-match the unoptimized subquery shape —
+    ///   mutating it produces stage SQL with dangling table qualifiers (`dim.d_key`
+    ///   instead of `d.d_key`). `TreeNode::rewrite` traverses only the plan tree.
+    pub fn optimize_logical_plan(
+        &self,
+        lp: datafusion::logical_expr::LogicalPlan,
+    ) -> Result<datafusion::logical_expr::LogicalPlan> {
+        use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
+        use datafusion::logical_expr::LogicalPlan;
+        use datafusion::optimizer::{
+            extract_equijoin_predicate::ExtractEquijoinPredicate, push_down_filter::PushDownFilter,
+            ApplyOrder, OptimizerConfig, OptimizerRule,
+        };
+        use std::sync::Arc;
+
+        // Shape gate: leave plan classes the splitter cannot re-render after rewriting
+        // exactly as they are (today's behavior), rather than emitting broken stage SQL.
+        if !Self::splittable_after_rewrite(&lp) {
+            return Ok(lp);
+        }
+
+        /// Mirror of datafusion-optimizer's private driver `Rewriter`, dispatched through
+        /// `TreeNode::rewrite` (plan tree only) rather than `rewrite_with_subqueries`.
+        struct PlanOnlyRewriter<'a> {
+            apply_order: ApplyOrder,
+            rule: &'a dyn OptimizerRule,
+            config: &'a dyn OptimizerConfig,
+        }
+        impl TreeNodeRewriter for PlanOnlyRewriter<'_> {
+            type Node = LogicalPlan;
+            fn f_down(
+                &mut self,
+                node: LogicalPlan,
+            ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+                if self.apply_order == ApplyOrder::TopDown {
+                    self.rule.rewrite(node, self.config)
+                } else {
+                    Ok(Transformed::no(node))
+                }
+            }
+            fn f_up(
+                &mut self,
+                node: LogicalPlan,
+            ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+                if self.apply_order == ApplyOrder::BottomUp {
+                    self.rule.rewrite(node, self.config)
+                } else {
+                    Ok(Transformed::no(node))
+                }
+            }
+        }
+
+        let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![
+            Arc::new(ExtractEquijoinPredicate::new()),
+            Arc::new(PushDownFilter::new()),
+        ];
+        let state = self.ctx.state();
+        let config: &dyn OptimizerConfig = &state;
+        let mut plan = lp;
+        for rule in &rules {
+            plan = match rule.apply_order() {
+                Some(apply_order) => {
+                    let mut rewriter = PlanOnlyRewriter {
+                        apply_order,
+                        rule: rule.as_ref(),
+                        config,
+                    };
+                    plan.rewrite(&mut rewriter)
+                        .map_err(|e| Error::Plan(e.to_string()))?
+                        .data
+                }
+                None => {
+                    rule.rewrite(plan, config)
+                        .map_err(|e| Error::Plan(e.to_string()))?
+                        .data
+                }
+            };
+        }
+        Ok(plan)
+    }
+
     /// Run an arbitrary planning future while capturing the exact Delta/Iceberg identities
     /// it resolves — the generic counterpart of [`Engine::logical_plan_with_lakehouse_snapshots`]
     /// for callers that build a logical plan without SQL (the Spark Connect DataFrame path).
@@ -7241,6 +7413,64 @@ mod tests {
         assert_eq!(c, LEFT);
         assert_eq!(s, LEFT * (LEFT - 1) / 2);
         std::env::remove_var("WEFT_SORT_MERGE_FALLBACK");
+    }
+
+    /// KAN-2 throughput: the pre-split optimizer's shape gate. SQL table aliases
+    /// (`JOIN date_dim d1`) must be left untouched (the splitter re-renders them with
+    /// the alias while pushed predicates carry the base qualifier — TPC-DS Q72's
+    /// "No field named date_dim.d_year" worker failure); CTE group-key filters
+    /// (TPC-DS Q78/Q39) must be rewritten so the predicate reaches the scan.
+    #[tokio::test]
+    async fn optimize_logical_plan_shape_gate() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let engine = Engine::new();
+        let mk = |name: &str, cols: Vec<&str>| {
+            let schema = Arc::new(Schema::new(
+                cols.iter()
+                    .map(|n| Field::new(*n, DataType::Int64, false))
+                    .collect::<Vec<_>>(),
+            ));
+            let batch = RecordBatch::try_new(
+                schema,
+                cols.iter()
+                    .map(|_| Arc::new(Int64Array::from(vec![1, 2])) as _)
+                    .collect(),
+            )
+            .unwrap();
+            engine.register_batches(name, vec![batch]).unwrap();
+        };
+        mk(
+            "catalog_sales",
+            vec!["cs_sold_date_sk", "cs_item_sk", "cs_quantity"],
+        );
+        mk("date_dim", vec!["d_date_sk", "d_year"]);
+
+        // Aliased dim: the gate leaves the plan byte-for-byte identical.
+        let aliased = "SELECT d1.d_year, cs_item_sk, SUM(cs_quantity) AS q \
+                       FROM catalog_sales JOIN date_dim d1 ON cs_sold_date_sk = d1.d_date_sk \
+                       WHERE d1.d_year = 2000 GROUP BY d1.d_year, cs_item_sk";
+        let lp = engine.logical_plan(aliased).await.unwrap();
+        let before = format!("{}", lp.display_indent());
+        let after = format!(
+            "{}",
+            engine.optimize_logical_plan(lp).unwrap().display_indent()
+        );
+        assert_eq!(before, after, "aliased-dim shape must be left untouched");
+
+        // CTE group-key filter: rewritten so the predicate reaches the date_dim scan.
+        let cte = "WITH ss AS (\
+                       SELECT d_year AS y, cs_item_sk, SUM(cs_quantity) AS q \
+                       FROM catalog_sales JOIN date_dim ON cs_sold_date_sk = d_date_sk \
+                       GROUP BY d_year, cs_item_sk) \
+                   SELECT * FROM ss WHERE y = 2000";
+        let lp = engine.logical_plan(cte).await.unwrap();
+        let opt = engine.optimize_logical_plan(lp).unwrap();
+        let display = format!("{}", opt.display_indent());
+        assert!(
+            display.contains("Filter: date_dim.d_year = Int64(2000)"),
+            "group-key filter must reach the scan:\n{display}"
+        );
     }
 
     /// KAN-45/KAN-53: with `WEFT_PREFER_HASH_JOIN=true` forced (no `auto` selection, no

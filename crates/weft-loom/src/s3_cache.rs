@@ -51,6 +51,32 @@ struct Entry {
     last_validated: std::time::Instant,
 }
 
+/// Sidecar next to each cached file recording the object identity it was
+/// downloaded from (`{size}\n{e_tag or "-"}`). This is what lets a fresh
+/// process re-adopt on-disk bytes after a restart instead of re-downloading:
+/// the in-memory index starts empty, so adoption validates the sidecar against
+/// a fresh S3 HEAD (size + etag) plus the on-disk length before trusting it.
+/// Written after the data file's atomic rename; a crash between the two just
+/// forces a re-download (fail-safe). Missing/corrupt sidecar ⇒ re-download.
+fn sidecar_path(file: &std::path::Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.meta", file.display()))
+}
+
+fn write_sidecar(file: &std::path::Path, size: u64, e_tag: Option<&str>) {
+    let side = sidecar_path(file);
+    let tmp = side.with_extension(format!("tmp{}", std::process::id()));
+    let body = format!("{size}\n{}\n", e_tag.unwrap_or("-"));
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, &side);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn remove_sidecar(file: &std::path::Path) {
+    let _ = std::fs::remove_file(sidecar_path(file));
+}
+
 type MaterializeResult = std::result::Result<std::path::PathBuf, Arc<std::io::Error>>;
 type Cell = OnceCell<std::path::PathBuf>;
 
@@ -221,7 +247,7 @@ impl DiskCachingStore {
             )
         })?;
         // Re-adopt a present entry (and its on-disk file) when the object is unchanged —
-        // covers both TTL revalidation and process restarts (index starts empty).
+        // covers TTL revalidation within this process's lifetime.
         {
             let mut map = self.state.map.lock().expect("s3 cache map poisoned");
             if let Some(entry) = map.get_mut(location) {
@@ -237,10 +263,34 @@ impl DiskCachingStore {
                     .total_bytes
                     .fetch_sub(stale_bytes, Ordering::Relaxed);
                 drop(map);
-                let _ = std::fs::remove_file(stale);
+                let _ = std::fs::remove_file(&stale);
+                remove_sidecar(&stale);
             }
         }
         let file = self.local_file(location);
+        // Process-restart adoption: the in-memory index starts empty, so validate the
+        // on-disk file's sidecar against the HEAD above (size + etag + on-disk length)
+        // and skip the download when the bytes are provably for this object version.
+        if let Some(bytes) = self.adopt_on_disk(&file, &meta) {
+            self.state.total_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.state
+                .map
+                .lock()
+                .expect("s3 cache map poisoned")
+                .insert(
+                    location.clone(),
+                    Entry {
+                        file: file.clone(),
+                        bytes,
+                        size: meta.size,
+                        e_tag: meta.e_tag.clone(),
+                        last_used: std::time::Instant::now(),
+                        last_validated: std::time::Instant::now(),
+                    },
+                );
+            self.evict_if_needed();
+            return Ok(file);
+        }
         let tmp = file.with_extension(format!("part{}", std::process::id()));
         let mut stream = self
             .inner
@@ -265,6 +315,7 @@ impl DiskCachingStore {
         out.sync_all().await?;
         drop(out);
         std::fs::rename(&tmp, &file)?;
+        write_sidecar(&file, meta.size, meta.e_tag.as_deref());
         self.state.total_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.state
             .map
@@ -285,6 +336,28 @@ impl DiskCachingStore {
         Ok(file)
     }
 
+    /// Validate the on-disk file for `location` against a fresh HEAD: sidecar
+    /// identity (size + etag) must match the object version, and the file's
+    /// on-disk length must match the sidecar (catches truncated downloads).
+    /// Returns the byte count to charge against the LRU budget on adoption.
+    fn adopt_on_disk(&self, file: &std::path::Path, meta: &ObjectMeta) -> Option<u64> {
+        let raw = std::fs::read_to_string(sidecar_path(file)).ok()?;
+        let mut lines = raw.lines();
+        let size: u64 = lines.next()?.parse().ok()?;
+        let e_tag = match lines.next()? {
+            "-" => None,
+            s => Some(s.to_string()),
+        };
+        if size != meta.size || e_tag != meta.e_tag {
+            return None;
+        }
+        let len = std::fs::metadata(file).ok()?.len();
+        if len != size {
+            return None;
+        }
+        Some(len)
+    }
+
     /// LRU-evict least-recently-used entries until the cache fits its budget.
     fn evict_if_needed(&self) {
         let mut map = self.state.map.lock().expect("s3 cache map poisoned");
@@ -301,6 +374,7 @@ impl DiskCachingStore {
                 .total_bytes
                 .fetch_sub(entry.bytes, Ordering::Relaxed);
             let _ = std::fs::remove_file(&entry.file);
+            remove_sidecar(&entry.file);
         }
     }
 
@@ -312,6 +386,7 @@ impl DiskCachingStore {
                 .total_bytes
                 .fetch_sub(entry.bytes, Ordering::Relaxed);
             let _ = std::fs::remove_file(&entry.file);
+            remove_sidecar(&entry.file);
         }
     }
 
@@ -750,5 +825,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r[0].as_ref(), b"new");
+    }
+
+    #[tokio::test]
+    async fn restart_readopts_on_disk_entry_via_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner =
+            Arc::new(MockStore::default().with_object("a/b.parquet", b"persistent".to_vec()));
+        let gets = Arc::clone(&inner);
+        // First process: materialize (one download), then drop the store entirely —
+        // the in-memory index dies with it, leaving only the on-disk file + sidecar.
+        let first = cache(Arc::clone(&inner), dir.path(), 60_000, 1 << 20);
+        let _ = first
+            .get_ranges(&Path::from("a/b.parquet"), std::slice::from_ref(&(0..10)))
+            .await
+            .unwrap();
+        assert_eq!(gets.gets.load(Ordering::Relaxed), 1);
+        drop(first);
+
+        // Second process (fresh index): must re-adopt the on-disk bytes after a HEAD
+        // instead of re-downloading the object.
+        let second = cache(inner, dir.path(), 60_000, 1 << 20);
+        let r = second
+            .get_ranges(&Path::from("a/b.parquet"), std::slice::from_ref(&(0..10)))
+            .await
+            .unwrap();
+        assert_eq!(r[0].as_ref(), b"persistent");
+        assert_eq!(
+            gets.gets.load(Ordering::Relaxed),
+            1,
+            "restart must re-adopt the on-disk copy, not re-download"
+        );
+        assert_eq!(gets.heads.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn restart_redownloads_when_object_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(MockStore::default().with_object("c.parquet", b"v1".to_vec()));
+        let gets = Arc::clone(&inner);
+        let first = cache(Arc::clone(&inner), dir.path(), 60_000, 1 << 20);
+        let _ = first
+            .get_ranges(&Path::from("c.parquet"), std::slice::from_ref(&(0..2)))
+            .await
+            .unwrap();
+        drop(first);
+        // Object overwritten in S3 (new size + etag) after the sidecar was written.
+        gets.objects
+            .write()
+            .unwrap()
+            .insert(Path::from("c.parquet"), Bytes::from_static(b"v2-longer"));
+        let second = cache(inner, dir.path(), 60_000, 1 << 20);
+        let r = second
+            .get_ranges(&Path::from("c.parquet"), std::slice::from_ref(&(0..9)))
+            .await
+            .unwrap();
+        assert_eq!(r[0].as_ref(), b"v2-longer");
+        assert_eq!(gets.gets.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn restart_redownloads_when_sidecar_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(MockStore::default().with_object("m.parquet", b"data".to_vec()));
+        let gets = Arc::clone(&inner);
+        let first = cache(Arc::clone(&inner), dir.path(), 60_000, 1 << 20);
+        let _ = first
+            .get_ranges(&Path::from("m.parquet"), std::slice::from_ref(&(0..4)))
+            .await
+            .unwrap();
+        drop(first);
+        // A sidecar-less file is untrusted (crash between data + sidecar write, or a
+        // foreign file in the cache dir): fall back to a full download.
+        let orphans: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().ends_with(".meta"))
+            .collect();
+        assert_eq!(orphans.len(), 1);
+        std::fs::remove_file(&orphans[0]).unwrap();
+        let second = cache(inner, dir.path(), 60_000, 1 << 20);
+        let r = second
+            .get_ranges(&Path::from("m.parquet"), std::slice::from_ref(&(0..4)))
+            .await
+            .unwrap();
+        assert_eq!(r[0].as_ref(), b"data");
+        assert_eq!(gets.gets.load(Ordering::Relaxed), 2);
     }
 }

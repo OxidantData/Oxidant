@@ -157,12 +157,14 @@ Parameters:
 
   PreferHashJoin:
     Type: String
-    Default: 'true'
-    AllowedValues: ['true', 'false']
+    Default: 'auto'
+    AllowedValues: ['auto', 'true', 'false']
     Description: >
-      WEFT_PREFER_HASH_JOIN on driver and workers. Keep true (KAN-45): the sort-merge
-      path (false) can deadlock under the bounded FairSpillPool at scale — DataFusion 54
-      HashJoinInput does not spill, but a pool overflow fails fast instead of wedging.
+      WEFT_PREFER_HASH_JOIN on driver and workers. Keep auto (KAN-53): the engine picks
+      hash vs sort-merge per query from build-side statistics — forced values are legacy.
+      Forcing false (sort-merge everywhere) is severely pathological on big fact joins
+      (TPC-DS SF10 Q4: 178s single-node vs 40s hash; distributed Q72 6.7s auto vs 22s
+      forced) and forcing true risks an OOM on unbounded builds (KAN-57).
 
   ShufflePartitions:
     Type: String
