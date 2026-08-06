@@ -23,6 +23,12 @@ variable "oxidant_binary_url" {
   description = "HTTPS URL to a linux oxidant binary. Leave empty when staging a local binary via build-ami.sh."
 }
 
+variable "engine_version" {
+  type        = string
+  default     = env("GIT_SHA")
+  description = "Engine version stamp written to /etc/oxidant/VERSION (build-ami.sh exports GIT_SHA)."
+}
+
 variable "architecture" {
   type        = string
   default     = "arm64"
@@ -51,8 +57,8 @@ variable "associate_public_ip_address" {
 }
 
 locals {
-  timestamp     = formatdate("YYYYMMDD-hhmmss", timestamp())
-  ami_name      = "${var.ami_name_prefix}-${var.architecture}-${local.timestamp}"
+  timestamp = formatdate("YYYYMMDD-hhmmss", timestamp())
+  ami_name  = "${var.ami_name_prefix}-${var.architecture}-${local.timestamp}"
   instance_type = var.instance_type != "" ? var.instance_type : (
     var.architecture == "arm64" ? "t4g.large" : "t3.large"
   )
@@ -87,10 +93,11 @@ source "amazon-ebs" "oxidant" {
   }
 
   tags = {
-    Name         = local.ami_name
-    Project      = "oxidant"
-    Component    = "runtime"
-    Architecture = var.architecture
+    Name          = local.ami_name
+    Project       = "oxidant"
+    Component     = "runtime"
+    Architecture  = var.architecture
+    EngineVersion = var.engine_version
   }
 }
 
@@ -112,6 +119,7 @@ build {
   provisioner "shell" {
     environment_vars = [
       "OXIDANT_BINARY_URL=${var.oxidant_binary_url}",
+      "OXIDANT_ENGINE_VERSION=${var.engine_version}",
     ]
     script          = "${path.root}/scripts/provision.sh"
     execute_command = "chmod +x {{ .Path }}; sudo -E {{ .Path }}"

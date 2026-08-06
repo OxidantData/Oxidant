@@ -57,7 +57,7 @@ fn usage() {
     eprintln!("oxidant {}", env!("CARGO_PKG_VERSION"));
     eprintln!("usage:");
     eprintln!(
-        "  oxidant spark server --port <PORT> [--ui-port <PORT>] [--no-ui] [--mode local|local-cluster] [--workers <N>]"
+        "  oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui] [--mode local|local-cluster] [--workers <N>]"
     );
     eprintln!("  oxidant history-server --dir <LOG_DIR> [--port <PORT>]");
     eprintln!("  oxidant worker --port <PORT> [--data <parquet> --table <name>]");
@@ -80,6 +80,7 @@ async fn run_server(args: &[String]) -> oxidant_common::Result<()> {
                 .unwrap_or(4040),
         )
     };
+    let ui_bind = ui_bind_addr(args);
     let catalogs = catalog_conf(args);
     if !catalogs.is_empty() {
         eprintln!("Declared {} catalog config entrie(s)", catalogs.len());
@@ -97,11 +98,12 @@ async fn run_server(args: &[String]) -> oxidant_common::Result<()> {
     }
     eprintln!("Oxidant Spark Connect server listening on sc://0.0.0.0:{port}");
     if let Some(ui) = ui_port {
-        eprintln!("Oxidant UI at http://0.0.0.0:{ui}");
+        eprintln!("Oxidant UI at http://{ui_bind}:{ui}");
     }
     let mut config = ServerConfig {
         port,
         ui_port,
+        ui_bind: Some(ui_bind),
         catalogs,
         ..Default::default()
     };
@@ -115,6 +117,14 @@ async fn run_server(args: &[String]) -> oxidant_common::Result<()> {
 enum ServerMode {
     Local,
     LocalCluster { workers: usize },
+}
+
+/// `--ui-bind <ADDR>`: interface for the monitoring UI (no auth). Defaults to
+/// 0.0.0.0, matching Spark; public AMI images should pass 127.0.0.1.
+fn ui_bind_addr(args: &[String]) -> std::net::IpAddr {
+    flag(args, "--ui-bind")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::net::IpAddr::from([0, 0, 0, 0]))
 }
 
 fn server_mode(args: &[String]) -> oxidant_common::Result<ServerMode> {
@@ -184,7 +194,12 @@ async fn run_history_server(args: &[String]) -> oxidant_common::Result<()> {
         })?;
     let store = Arc::new(AppStateStore::load_event_log(std::path::Path::new(&dir)));
     eprintln!("Oxidant history server on http://0.0.0.0:{port} (log: {dir})");
-    serve_ui(UiServerConfig { port, store }).await
+    serve_ui(UiServerConfig {
+        port,
+        store,
+        bind: std::net::IpAddr::from([0, 0, 0, 0]),
+    })
+    .await
 }
 
 /// Collect startup catalog config from repeated `--catalog-conf key=value` flags and the
@@ -330,5 +345,23 @@ mod tests {
             "0",
         ]));
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn ui_bind_parses_loopback() {
+        let a = args(&["oxidant", "spark", "server", "--ui-bind", "127.0.0.1"]);
+        assert_eq!(ui_bind_addr(&a), std::net::IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[test]
+    fn ui_bind_defaults_to_all_interfaces() {
+        let a = args(&["oxidant", "spark", "server"]);
+        assert_eq!(ui_bind_addr(&a), std::net::IpAddr::from([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn ui_bind_invalid_value_falls_back_to_default() {
+        let a = args(&["oxidant", "spark", "server", "--ui-bind", "not-an-ip"]);
+        assert_eq!(ui_bind_addr(&a), std::net::IpAddr::from([0, 0, 0, 0]));
     }
 }

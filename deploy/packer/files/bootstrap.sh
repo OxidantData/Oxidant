@@ -311,10 +311,15 @@ AWS_REGION=${REGION}
 AWS_DEFAULT_REGION=${REGION}
 TMPDIR=${SPILL_MOUNT}
 HOME=/var/lib/oxidant
-OXIDANT_WORKER_COUNT=${WORKER_COUNT}
-OXIDANT_WORKER_PORT=50561
 OXIDANT_S3_CACHE_DIR=/var/lib/oxidant/s3cache
 EOF
+    # Cluster membership vars are meaningless on a standalone single node.
+    if [[ "${role}" != "standalone" ]]; then
+      cat <<EOF
+OXIDANT_WORKER_COUNT=${WORKER_COUNT}
+OXIDANT_WORKER_PORT=50561
+EOF
+    fi
     if [[ -n "${MEMORY_LIMIT_BYTES}" && "${MEMORY_LIMIT_BYTES}" != "None" ]]; then
       echo "OXIDANT_MEMORY_LIMIT_BYTES=${MEMORY_LIMIT_BYTES}"
     fi
@@ -338,11 +343,12 @@ EOF
       if [[ "${DISTRIBUTED_STRICT}" == "true" || "${DISTRIBUTED_STRICT}" == "1" ]]; then
         echo "OXIDANT_DISTRIBUTED_STRICT=1"
       fi
-    else
+    elif [[ "${role}" == "worker" ]]; then
       cat <<EOF
 OXIDANT_SHARD_INDEX=${SHARD_INDEX}
 EOF
     fi
+    # standalone: no cluster vars at all — the server runs single-node.
   } > "${tmp}"
   chown root:oxidant "${tmp}"
   chmod 640 "${tmp}"
@@ -363,13 +369,18 @@ enable_role_unit() {
   # reason: bootstrap must not wait on any other unit's job.
   systemctl daemon-reload
   if [[ "${role}" == "driver" ]]; then
-    systemctl disable oxidant-worker.service 2>/dev/null || true
-    systemctl stop --no-block oxidant-worker.service 2>/dev/null || true
+    systemctl disable oxidant-worker.service oxidant-standalone.service 2>/dev/null || true
+    systemctl stop --no-block oxidant-worker.service oxidant-standalone.service 2>/dev/null || true
     systemctl enable oxidant-driver.service
-  else
-    systemctl disable oxidant-driver.service 2>/dev/null || true
-    systemctl stop --no-block oxidant-driver.service 2>/dev/null || true
+  elif [[ "${role}" == "worker" ]]; then
+    systemctl disable oxidant-driver.service oxidant-standalone.service 2>/dev/null || true
+    systemctl stop --no-block oxidant-driver.service oxidant-standalone.service 2>/dev/null || true
     systemctl enable oxidant-worker.service
+  else
+    # standalone: single-node Connect server, no driver/worker split.
+    systemctl disable oxidant-driver.service oxidant-worker.service 2>/dev/null || true
+    systemctl stop --no-block oxidant-driver.service oxidant-worker.service 2>/dev/null || true
+    systemctl enable oxidant-standalone.service
   fi
 }
 
@@ -405,7 +416,9 @@ CATALOG_CONF="$(tag_value oxidant:catalog-conf)"
 DISTRIBUTED_STRICT="$(tag_value oxidant:distributed-strict)"
 PREFER_HASH_JOIN="$(tag_value oxidant:prefer-hash-join)"
 
-ROLE="${ROLE:-worker}"
+# No role tag = Marketplace single-node AMI path: boot straight into a
+# standalone Spark Connect server (no shard index, no Route53, no ASG).
+ROLE="${ROLE:-standalone}"
 WORKER_COUNT="${WORKER_COUNT:-1}"
 SHUFFLE_PARTITIONS="${SHUFFLE_PARTITIONS:-${WORKER_COUNT}}"
 DISTRIBUTED_STRICT="${DISTRIBUTED_STRICT:-false}"
