@@ -75,7 +75,10 @@ jobs:
       # runner leaves free and kills the job with no log to show for it. Reclaiming the preinstalled
       # SDKs buys ~25 GB. This can go away once the toolchain moves to 1.92+ and `iceberg` 0.9 can
       # share the workspace's Arrow.
+      # Only worthwhile (and only safe) on throwaway GitHub-hosted VMs; the self-hosted
+      # runner has no preinstalled SDKs to reclaim and keeps its tools directory across jobs.
       - name: Reclaim runner disk
+        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -83,6 +86,9 @@ jobs:
           df -h /
       - name: Start MinIO service container
         run: |
+          # Self-hosted runners are persistent: a canceled earlier job can leave the
+          # container behind, and docker run --name then fails with a name conflict.
+          docker rm -f oxidant-minio 2>/dev/null || true
           docker run -d --name oxidant-minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
