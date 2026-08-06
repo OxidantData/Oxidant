@@ -3,7 +3,7 @@ import DiffBlock from "../components/DiffBlock";
 import CodeBlock from "../components/CodeBlock";
 import ThreadDivider from "../components/ThreadDivider";
 
-const REPO = "https://github.com/vamzi/weft";
+const REPO = "https://github.com/OxidantData/Oxidant";
 
 function FlowCard({
   label,
@@ -25,7 +25,7 @@ function FlowCard({
           ? "border-dashed border-hairline bg-bg-subtle"
           : "border-hairline bg-surface";
   return (
-    <div className={`rounded-weft border p-4 ${ring}`}>
+    <div className={`rounded-oxidant border p-4 ${ring}`}>
       <div className="flex items-center gap-2">
         <span className="font-mono text-[11px] uppercase tracking-wide text-muted">{label}</span>
         {tone === "engine" && (
@@ -52,14 +52,14 @@ function FlowCard({
 
 export default function ArchitecturePage() {
   return (
-    <div className="weft-container py-14">
+    <div className="oxidant-container py-14">
       <div className="max-w-3xl">
-        <span className="weft-eyebrow">How Weft is woven</span>
+        <span className="oxidant-eyebrow">How Oxidant is woven</span>
         <h1 className="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">
           A loom, not a fork of Spark.
         </h1>
         <p className="mt-4 text-lg text-muted">
-          Weft accepts the plans your Spark client already produces and weaves them into Arrow on a
+          Oxidant accepts the plans your Spark client already produces and weaves them into Arrow on a
           native Rust core. Here's the honest version — what's load-bearing today, and what's still
           on the frame.
         </p>
@@ -67,7 +67,7 @@ export default function ArchitecturePage() {
 
       {/* The metaphor */}
       <section className="mt-12">
-        <div className="weft-card p-6 sm:p-8">
+        <div className="oxidant-card p-6 sm:p-8">
           <LoomDiagram />
         </div>
         <p className="mt-3 text-sm text-muted">
@@ -97,7 +97,7 @@ export default function ArchitecturePage() {
           />
           <FlowCard
             label="front door"
-            title="weft-connect"
+            title="oxidant-connect"
             body="A native Spark Connect gRPC server. Lowers both SQL strings and DataFrame relation trees straight to DataFusion logical plans; streams Arrow back."
           />
           <FlowCard
@@ -109,7 +109,7 @@ export default function ArchitecturePage() {
           <FlowCard
             label="storage"
             title="Open tables"
-            body="Parquet, Delta, and Iceberg via weft-datasource, through a lazy pluggable catalog (Hive Metastore reference provider)."
+            body="Parquet, Delta, and Iceberg via oxidant-datasource, through a lazy pluggable catalog (Hive Metastore reference provider)."
           />
         </div>
 
@@ -121,7 +121,7 @@ export default function ArchitecturePage() {
             body="warp (plan IR), heddle (optimizer), and the physical layer are forward-looking scaffolding today — the live path is Connect → Loom, with DataFusion's optimizer plus Loom's tuning doing the work."
           />
           <FlowCard
-            label="weft-hvm"
+            label="oxidant-hvm"
             tone="research"
             title="Bend → HVM2 backend"
             body="An opt-in, feature-gated research bet for irregular/recursive workloads no columnar engine serves well. It wins zero ClickBench queries by design — that's not the benchmark it's for."
@@ -170,10 +170,10 @@ export default function ArchitecturePage() {
           <CodeBlock
             lines={[
               { text: "# native server, no JVM", comment: true },
-              { text: "weft spark server --port 50051" },
+              { text: "oxidant spark server --port 50051" },
               { text: "" },
               { text: "# optional: wire an external catalog, the Spark way", comment: true },
-              { text: "weft spark server --port 50051 \\" },
+              { text: "oxidant spark server --port 50051 \\" },
               { text: "  --catalog-conf spark.sql.catalog.prod.type=hive" },
             ]}
           />

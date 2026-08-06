@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy / update the Weft EC2 ASG CloudFormation stack.
+# Deploy / update the Oxidant EC2 ASG CloudFormation stack.
 #
 # Required:
 #   --ami ami-...
@@ -7,7 +7,7 @@
 #   --subnets subnet-abc,subnet-def
 #
 # Optional (see template Parameters):
-#   --stack NAME                 (default weft-cluster)
+#   --stack NAME                 (default oxidant-cluster)
 #   --region REGION              (default $AWS_REGION or us-west-2)
 #   --driver-type TYPE
 #   --worker-type TYPE
@@ -21,7 +21,7 @@
 #   --driver-root-size GiB --worker-root-size GiB
 #   --driver-spill-size GiB --worker-spill-size GiB
 #   --key-name NAME
-#   --hosted-zone-name weft.internal
+#   --hosted-zone-name oxidant.internal
 #   --catalog-conf 'spark.sql.catalog.glue.type=glue;...'
 #   --distributed-strict true|false
 #   --prefer-hash-join true|false
@@ -29,8 +29,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TEMPLATE="${ROOT}/deploy/cloudformation/weft-cluster.yaml"
-STACK="weft-cluster"
+TEMPLATE="${ROOT}/deploy/cloudformation/oxidant-cluster.yaml"
+STACK="oxidant-cluster"
 REGION="${AWS_REGION:-${REGION:-us-west-2}}"
 AMI=""
 VPC=""
@@ -53,7 +53,7 @@ WORKER_ROOT=40
 DRIVER_SPILL=100
 WORKER_SPILL=200
 KEY_NAME=""
-HOSTED_ZONE="weft.internal"
+HOSTED_ZONE="oxidant.internal"
 EXTRA_PARAMS=()
 
 usage() {

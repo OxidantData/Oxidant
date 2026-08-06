@@ -1,0 +1,27 @@
+[package]
+name = "oxidant-cli"
+description = "The `oxidant` binary: launches the Spark Connect server and dev utilities."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "oxidant"
+path = "src/main.rs"
+
+[dependencies]
+oxidant-common = { workspace = true }
+oxidant-connect = { workspace = true }
+oxidant-loom = { workspace = true }
+oxidant-execution = { workspace = true }
+oxidant-ui-server = { workspace = true }
+oxidant-observability = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# TODO(deps): clap = { version = "4", features = ["derive"] } for real subcommand parsing.
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+datafusion = "54"

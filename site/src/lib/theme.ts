@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 
 export type Theme = "light" | "dark";
 
-const STORAGE_KEY = "weft-theme";
+const STORAGE_KEY = "oxidant-theme";
 
 function readInitial(): Theme {
   if (typeof document === "undefined") return "light";

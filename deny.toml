@@ -1,4 +1,4 @@
-# cargo-deny policy for the Weft engine repo.
+# cargo-deny policy for the Oxidant engine repo.
 # Consumed by `cargo deny check` in scripts/daily-maintenance.sh.
 #
 # Intentionally PERMISSIVE to start: the DataFusion/Arrow/tonic tree is large and a
@@ -41,8 +41,8 @@ allow = []
 deny = []
 
 [sources]
-# Only crates.io and the pinned vamzi/weft git dependency are trusted sources.
+# Only crates.io and the pinned OxidantData/Oxidant git dependency are trusted sources.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/vamzi/weft"]
+allow-git = ["https://github.com/OxidantData/Oxidant"]

@@ -12,7 +12,7 @@ from sf100_common import TPCDS_TABLES, load_queries, qualify_sql  # noqa: E402
 
 import duckdb  # noqa: E402
 
-DB = "/tmp/weft-sf10/tpcds-sf10.db"
+DB = "/tmp/oxidant-sf10/tpcds-sf10.db"
 ENDPOINT = "sc://35.85.61.45:50051"
 
 

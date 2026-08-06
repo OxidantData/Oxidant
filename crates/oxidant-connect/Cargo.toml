@@ -1,0 +1,43 @@
+[package]
+name = "oxidant-connect"
+description = "Spark Connect gRPC server: session lifecycle, Config/AnalyzePlan/ExecutePlan, reattachable execution, Arrow IPC results."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-common = { workspace = true }
+oxidant-proto = { workspace = true }
+oxidant-plan = { workspace = true }
+oxidant-sql = { workspace = true }
+oxidant-analyzer = { workspace = true }
+oxidant-optimizer = { workspace = true }
+oxidant-physical = { workspace = true }
+oxidant-execution = { workspace = true, features = ["k8s"] }
+oxidant-catalog = { workspace = true }
+oxidant-catalog-hive = { workspace = true }
+oxidant-catalog-glue = { workspace = true }
+oxidant-catalog-rest = { workspace = true }
+oxidant-loom = { workspace = true }
+oxidant-streaming = { workspace = true }
+oxidant-observability = { workspace = true }
+oxidant-ui-server = { workspace = true }
+datafusion = "54"  # lower Spark Connect relations/expressions to DataFusion logical plans
+futures = "0.3"
+serde_json = "1"
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+tokio-stream = "0.1"
+uuid = { version = "1", features = ["v4"] }
+# Phase 3: HTTP client to forward artifacts and UDF registrations to the co-located pyworker sidecar.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+tokio-stream = "0.1"
+tonic = "0.12"

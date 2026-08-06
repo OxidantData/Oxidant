@@ -5,11 +5,11 @@ export default function StagesPage() {
   const { data: stages, error } = usePolling(() => api.stages(true));
   const maxDur = Math.max(...(stages?.map((s) => s.executorRunTime) ?? [1]), 1);
 
-  if (error) return <div className="weft-card text-danger">{error}</div>;
-  if (!stages?.length) return <div className="weft-card text-muted">No stages yet.</div>;
+  if (error) return <div className="oxidant-card text-danger">{error}</div>;
+  if (!stages?.length) return <div className="oxidant-card text-muted">No stages yet.</div>;
 
   return (
-    <div className="weft-card overflow-x-auto">
+    <div className="oxidant-card overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
           <tr className="text-muted">

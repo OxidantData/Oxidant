@@ -1,6 +1,6 @@
 # Catalogs: bring your own metastore
 
-Weft resolves table names through Apache DataFusion's catalog API, which already supports
+Oxidant resolves table names through Apache DataFusion's catalog API, which already supports
 three-part names (`catalog.namespace.table`) and **lazy, asynchronous** table loading. An external
 metastore plugs into that path so a query hits the catalog only when it first references one of its
 tables — no eager registration of every table.
@@ -10,8 +10,8 @@ spark.sql.catalog.prod.type = hive          ┐ config (Spark-compatible)
 spark.sql.catalog.prod.uri  = thrift://…     ┘
         │
         ▼
-CatalogRegistry ── register ─▶ DataFusion catalog bridge ── lazy load_table ─▶ weft CatalogProvider
-   (weft-connect)                (weft-loom::catalog_bridge)                     (HiveCatalog / yours)
+CatalogRegistry ── register ─▶ DataFusion catalog bridge ── lazy load_table ─▶ oxidant CatalogProvider
+   (oxidant-connect)                (oxidant-loom::catalog_bridge)                     (HiveCatalog / yours)
 ```
 
 ## Configure an external catalog (zero code)
@@ -33,17 +33,17 @@ spark.catalog.tableExists("prod.sales.orders")
 At server start instead:
 
 ```
-weft spark server --port 50051 \
+oxidant spark server --port 50051 \
   --catalog-conf spark.sql.catalog.prod.type=hive \
   --catalog-conf spark.sql.catalog.prod.uri=thrift://hms.internal:9083
-# or: WEFT_CATALOG_CONF="spark.sql.catalog.prod.type=hive;spark.sql.catalog.prod.uri=thrift://hms:9083"
+# or: OXIDANT_CATALOG_CONF="spark.sql.catalog.prod.type=hive;spark.sql.catalog.prod.uri=thrift://hms:9083"
 ```
 
 Supported `type` values today: **`hive`** (Hive Metastore over Thrift), **`glue`**
 (AWS Glue Data Catalog via the AWS CLI + instance role / IRSA), and **`rest`** /
 `unity` / `iceberg` (Iceberg REST). Glue options: `region`, optional `warehouse`
 (`s3://bucket/prefix` for CTAS without `LOCATION`). The AWS CLI path is taken only
-from `WEFT_AWS_BIN` (never from catalog options).
+from `OXIDANT_AWS_BIN` (never from catalog options).
 
 EC2 ASG walkthrough (create Glue DB/table, IAM, `CatalogConf`):
 [`distributed-ec2.md`](distributed-ec2.md). K8s/IRSA notes:
@@ -51,13 +51,13 @@ EC2 ASG walkthrough (create Glue DB/table, IAM, `CatalogConf`):
 
 ## Bring your own catalog (Rust)
 
-Implement the async [`CatalogProvider`](../crates/weft-catalog/src/lib.rs) trait and register it.
+Implement the async [`CatalogProvider`](../crates/oxidant-catalog/src/lib.rs) trait and register it.
 The trait is small: list namespaces/tables and resolve one table to a `TableMetadata`
 (location + format + optional schema/credentials). The engine turns that metadata into a reader via
 its shared Parquet/Delta/Iceberg path.
 
 ```rust
-use weft_catalog::{CatalogProvider, Result, TableFormat, TableMetadata};
+use oxidant_catalog::{CatalogProvider, Result, TableFormat, TableMetadata};
 
 #[async_trait::async_trait]
 impl CatalogProvider for MyCatalog {
@@ -72,9 +72,9 @@ impl CatalogProvider for MyCatalog {
 // engine.register_catalog("my", Arc::new(MyCatalog::new()));
 ```
 
-`weft-catalog-hive` is the reference implementation; mirror its structure for a new provider crate,
-then wire its `type` string into `weft-connect`'s `build_provider` factory
-(`crates/weft-connect/src/catalog.rs`).
+`oxidant-catalog-hive` is the reference implementation; mirror its structure for a new provider crate,
+then wire its `type` string into `oxidant-connect`'s `build_provider` factory
+(`crates/oxidant-connect/src/catalog.rs`).
 
 ## What works / what's next (v1)
 

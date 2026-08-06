@@ -21,7 +21,7 @@ export default function PerQueryChart({
 
   if (measured.length === 0) {
     return (
-      <div className="weft-card flex h-56 items-center justify-center p-6 text-sm text-muted">
+      <div className="oxidant-card flex h-56 items-center justify-center p-6 text-sm text-muted">
         Per-query results appear here once the benchmark has run.
       </div>
     );
@@ -51,7 +51,7 @@ export default function PerQueryChart({
   const barW = Math.max(1.2, (groupW * 0.8) / measured.length);
 
   return (
-    <div className="weft-card p-5 sm:p-6">
+    <div className="oxidant-card p-5 sm:p-6">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <h3 className="text-sm font-semibold">
           Per-query hot time (Q{queryBase}–Q{queryBase + n - 1})
@@ -70,7 +70,7 @@ export default function PerQueryChart({
           </div>
           <button
             onClick={() => setLogScale((s) => !s)}
-            className="rounded-weft-sm border border-hairline px-2 py-1 text-xs text-muted hover:text-body"
+            className="rounded-oxidant-sm border border-hairline px-2 py-1 text-xs text-muted hover:text-body"
           >
             {logScale ? "log" : "linear"}
           </button>
@@ -86,7 +86,7 @@ export default function PerQueryChart({
               x2={W - 8}
               y1={padT + plotH - f * plotH}
               y2={padT + plotH - f * plotH}
-              stroke="var(--weft-border)"
+              stroke="var(--oxidant-border)"
               strokeWidth={1}
             />
           ))}

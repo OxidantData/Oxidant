@@ -1,4 +1,4 @@
-# Deploying Weft as a self-hosted data platform on AWS
+# Deploying Oxidant as a self-hosted data platform on AWS
 
 > **Status: outline / contract for the full platform** (SSO, gateway operator, Terraform).
 > For a **runnable** distributed data-plane today:
@@ -9,7 +9,7 @@
 > The Terraform modules and complete Helm control-plane referenced below are **not all in-tree
 > yet**. This document remains the long-term user-facing deploy guide.
 
-Weft deploys entirely into **your own AWS account** (self-hosted, single-account). You get a
+Oxidant deploys entirely into **your own AWS account** (self-hosted, single-account). You get a
 Databricks-like workspace: SSO login, EKS-backed compute clusters you spin up and down, a local or
 external (HMS / Glue / Unity) catalog with Unity-Catalog-style ACLs, and a web UI for SQL,
 notebooks, dashboards, and scheduled jobs.
@@ -37,8 +37,8 @@ notebooks, dashboards, and scheduled jobs.
    per-cluster IAM roles for IRSA.
 2. **Build & push images** — the connect-server, worker, gateway, cluster-manager, scheduler, and
    pyworker images to ECR (`deploy/docker/`).
-3. **Install the platform** — `helm install weft deploy/helm/weft` with your RDS endpoint, OIDC/SAML
-   config, workspace bucket, and Anthropic secret ARN as values. Installs the `WeftCluster` CRD,
+3. **Install the platform** — `helm install oxidant deploy/helm/oxidant` with your RDS endpoint, OIDC/SAML
+   config, workspace bucket, and Anthropic secret ARN as values. Installs the `OxidantCluster` CRD,
    the control-plane Deployments, IRSA ServiceAccounts, HPAs, and NetworkPolicies.
 4. **Configure SSO** — point the gateway at your IdP; enable SCIM so users/groups sync.
 5. **First query** — log in, create a cluster, create a local catalog + table over an `s3://`

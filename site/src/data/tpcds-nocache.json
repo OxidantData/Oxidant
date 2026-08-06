@@ -1,18 +1,18 @@
 {
-  "dataset": "TPC-DS SF10 Parquet on S3 (`s3://weft-artifacts-…/tpcds-sf10/`) — Weft cache off",
+  "dataset": "TPC-DS SF10 Parquet on S3 (`s3://oxidant-artifacts-…/tpcds-sf10/`) — Oxidant cache off",
   "machine": "ec2 1x c6g.2xlarge driver/master + 2x m8g.2xlarge workers/core (arm64, us-west-2)",
   "runDate": "2026-08-05",
   "queryCount": 99,
   "commonCount": 99,
-  "method": "Same query text, same SF10 Parquet bytes on S3, same 3-node spec, same day — but Weft's S3 disk cache DISABLED (WEFT_S3_CACHE_DIR unset), so both engines re-read S3 on every query: the apples-to-apples control for the cache-on sections above. Weft: DISTRIBUTED strict mode via Spark Connect (run-spark-connect.py), every query golden-validated vs DuckDB SF10. Spark: the same stock EMR 7.13.0/YARN run as above. Both engines: 2 runs per query, hot = run 2 (identical temperature semantics).",
+  "method": "Same query text, same SF10 Parquet bytes on S3, same 3-node spec, same day — but Oxidant's S3 disk cache DISABLED (OXIDANT_S3_CACHE_DIR unset), so both engines re-read S3 on every query: the apples-to-apples control for the cache-on sections above. Oxidant: DISTRIBUTED strict mode via Spark Connect (run-spark-connect.py), every query golden-validated vs DuckDB SF10. Spark: the same stock EMR 7.13.0/YARN run as above. Both engines: 2 runs per query, hot = run 2 (identical temperature semantics).",
   "engines": [
     {
-      "key": "weft-dist",
-      "name": "Weft (distributed, cache off)",
+      "key": "oxidant-dist",
+      "name": "Oxidant (distributed, cache off)",
       "highlight": true,
       "total": 254.0,
       "totalAll": 254.0,
-      "source": "measured distributed, S3 disk cache disabled (ec2/weft-sf10, 1 driver + 2 workers)",
+      "source": "measured distributed, S3 disk cache disabled (ec2/oxidant-sf10, 1 driver + 2 workers)",
       "perQuery": [
         0.413,
         1.715,

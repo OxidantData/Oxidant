@@ -1,4 +1,4 @@
-/** Near-invisible woven backdrop (warp + weft hairlines) for hero / closing bands. Decorative. */
+/** Near-invisible woven backdrop (warp + oxidant hairlines) for hero / closing bands. Decorative. */
 export default function WovenField({ dense = false }: { dense?: boolean }) {
   return (
     <div

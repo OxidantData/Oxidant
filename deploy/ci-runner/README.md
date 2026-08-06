@@ -33,13 +33,13 @@ So the usual order is: trigger `bench.yml` (Actions tab → "Run workflow") so a
 
 Registering a self-hosted runner needs a **registration token**, which needs **repo-admin**.
 The `gh` CLI in this environment is authenticated as `kaicoder03`, which is *not* an admin of
-`vamzi/weft` (the runners API returns 403), so this step is yours:
+`OxidantData/Oxidant` (the runners API returns 403), so this step is yours:
 
 - **UI:** repo → Settings → Actions → Runners → "New self-hosted runner" → copy the token from the
   `./config.sh --token <TOKEN>` line, **or**
 - **CLI (with your own admin PAT):**
   ```sh
-  gh api -X POST repos/vamzi/weft/actions/runners/registration-token --jq .token
+  gh api -X POST repos/OxidantData/Oxidant/actions/runners/registration-token --jq .token
   ```
 
 The token expires in ~1 hour and is single-use — mint it right before launching.
@@ -47,12 +47,12 @@ The token expires in ~1 hour and is single-use — mint it right before launchin
 ## Launch
 
 ```sh
-export WEFT_RUNNER_TOKEN="<registration-token-from-above>"
+export OXIDANT_RUNNER_TOKEN="<registration-token-from-above>"
 ./deploy/ci-runner/launch-ephemeral-runner.sh
 ```
 
 Override any default inline, e.g. `REGION=us-west-2 INSTANCE_TYPE=c6a.4xlarge
-VOLUME_GB=120 KEY_NAME=weft-platform ./deploy/ci-runner/launch-ephemeral-runner.sh`.
+VOLUME_GB=120 KEY_NAME=oxidant-platform ./deploy/ci-runner/launch-ephemeral-runner.sh`.
 
 ## Security — this is a public repo, treat the runner as hostile-input
 
@@ -64,7 +64,7 @@ a malicious pull request can run arbitrary code on it. This setup is built to be
 - **Ephemeral.** A fresh box per job, destroyed after — no state survives between runs.
 - **No credentials on the box.** No IAM instance profile, no repo secrets used by the job; the
   dataset is a public download. Nothing to steal.
-- **Not the control plane.** Do **not** reuse the `weft-platform-control` EC2 box — it holds the
+- **Not the control plane.** Do **not** reuse the `oxidant-platform-control` EC2 box — it holds the
   gateway's JWT secret + cloud creds. Keep CADENCE-arbitrary build code far away from it.
 - If you later add `pull_request` triggers, turn on "Require approval for all outside
   collaborators" (Settings → Actions → General) first.
@@ -75,7 +75,7 @@ Self-termination handles the happy path. If a launch wedges before the job runs,
 
 ```sh
 aws ec2 describe-instances --region "${REGION:-us-west-2}" \
-  --filters Name=tag:Name,Values=weft-ci-runner Name=instance-state-name,Values=running,pending \
+  --filters Name=tag:Name,Values=oxidant-ci-runner Name=instance-state-name,Values=running,pending \
   --query 'Reservations[].Instances[].InstanceId' --output text
 aws ec2 terminate-instances --region "${REGION:-us-west-2}" --instance-ids <id>
 ```

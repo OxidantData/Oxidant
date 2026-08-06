@@ -28,8 +28,8 @@ but returned semantically wrong results.
 Converted all `"ColumnName"` identifiers in `bench/clickbench/queries.sql` to
 `` `ColumnName` `` (backtick-quoted). Backtick-quoted identifiers are recognized as identifiers by
 both the Databricks and Generic dialects. Also fixed the two inline SQL strings in
-`crates/weft-bench/src/main.rs` that used `\"EventDate\"` for the same reason.
+`crates/oxidant-bench/src/main.rs` that used `\"EventDate\"` for the same reason.
 
 ## Acceptance criterion (met)
 
-`cargo run -p weft-bench -- clickbench --rows 20000` exits 0 (43/43).
+`cargo run -p oxidant-bench -- clickbench --rows 20000` exits 0 (43/43).

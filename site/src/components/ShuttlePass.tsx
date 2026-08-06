@@ -2,7 +2,7 @@ import { benchmarks, engineColor, type Engine } from "../lib/benchmarks";
 import { useInView, prefersReducedMotion } from "../lib/useInView";
 
 /**
- * The Shuttle Pass — Weft's kinetic benchmark reveal (replaces a plain bar teaser). Each engine is
+ * The Shuttle Pass — Oxidant's kinetic benchmark reveal (replaces a plain bar teaser). Each engine is
  * a warp lane; a shuttle travels a thread whose length is strictly linear in total seconds (no
  * truncated axis). All launch together at constant speed on scroll-in, so the fastest engine's
  * (shortest) thread completes first — the race *shows* the win instead of asserting it.
@@ -22,14 +22,14 @@ export default function ShuttlePass() {
 
   if (engines.length === 0) {
     return (
-      <div className="weft-card p-8 text-center text-sm text-muted">
+      <div className="oxidant-card p-8 text-center text-sm text-muted">
         The benchmark race appears here once results are published.
       </div>
     );
   }
 
   return (
-    <div ref={ref} className="weft-card overflow-hidden p-6 sm:p-8">
+    <div ref={ref} className="oxidant-card overflow-hidden p-6 sm:p-8">
       <div className="mb-6 flex flex-wrap items-baseline justify-between gap-2">
         <h3 className="text-sm font-semibold uppercase tracking-wide">The shuttle pass</h3>
         <span className="text-xs text-muted">
@@ -50,10 +50,10 @@ export default function ShuttlePass() {
               </div>
               <div className="relative h-7">
                 {/* the full track (the run) */}
-                <div className="absolute inset-0 rounded-weft-sm bg-bg-subtle" />
+                <div className="absolute inset-0 rounded-oxidant-sm bg-bg-subtle" />
                 {/* the thread the shuttle weaves */}
                 <div
-                  className="absolute inset-y-0 left-0 flex items-center justify-end rounded-weft-sm"
+                  className="absolute inset-y-0 left-0 flex items-center justify-end rounded-oxidant-sm"
                   style={{
                     width: launched ? `${pct}%` : "0%",
                     backgroundColor: engineColor(e.key),
@@ -65,14 +65,14 @@ export default function ShuttlePass() {
                   {/* the shuttle at the leading edge */}
                   <span
                     className="mr-[-5px] h-3 w-3 rotate-45 rounded-[2px] shadow-sm"
-                    style={{ backgroundColor: e.highlight ? "var(--weft-accent)" : "var(--weft-text)" }}
+                    style={{ backgroundColor: e.highlight ? "var(--oxidant-accent)" : "var(--oxidant-text)" }}
                   />
                 </div>
                 {/* time label settles in when the thread lands */}
                 <span
                   className="absolute right-2 top-1/2 -translate-y-1/2 text-xs font-semibold tabular-nums"
                   style={{
-                    color: pct > 78 ? "var(--weft-accent-contrast)" : "var(--weft-text)",
+                    color: pct > 78 ? "var(--oxidant-accent-contrast)" : "var(--oxidant-text)",
                     opacity: launched ? 1 : 0,
                     transition: reduce ? "none" : "opacity .3s ease",
                     transitionDelay: reduce ? "0ms" : `${durMs + i * 60}ms`,

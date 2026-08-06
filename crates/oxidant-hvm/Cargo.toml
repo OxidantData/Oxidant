@@ -1,0 +1,22 @@
+[package]
+name = "oxidant-hvm"
+description = "Opt-in parallel backend: compiles routed plan fragments to Bend and drives the HVM2 runtime. Gated."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Off by default: the engine ships on oxidant-loom alone. Enabling `hvm` pulls in the runtime.
+default = []
+hvm = []
+# CUDA path is a Phase-2 stretch on RTX-4090-class hardware, behind its own flag.
+cuda = ["hvm"]
+
+[dependencies]
+oxidant-common = { workspace = true }
+oxidant-plan = { workspace = true }
+oxidant-physical = { workspace = true }
+# TODO(deps, feature = "hvm"): hvm = "2" (driven as a Rust library — HVM2 has no FFI/IO,
+#   so the host marshals bounded inputs in and reads results back out).

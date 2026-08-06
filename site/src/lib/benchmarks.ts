@@ -39,10 +39,10 @@ export const tpchNocacheBenchmarks = tpchNocacheRaw as Benchmarks;
 export const tpcdsNocacheBenchmarks = tpcdsNocacheRaw as Benchmarks;
 
 /** One distinct, solid color per engine — shared by every chart so bars/legends stay consistent.
- *  Weft keeps the brand orange; the others get clearly distinguishable hues (not faint grey). */
+ *  Oxidant keeps the brand orange; the others get clearly distinguishable hues (not faint grey). */
 export const ENGINE_COLORS: Record<string, string> = {
-  weft: "var(--weft-accent)", // brand orange
-  "weft-dist": "var(--weft-accent)", // brand orange (distributed TPC-H/DS suites)
+  oxidant: "var(--oxidant-accent)", // brand orange
+  "oxidant-dist": "var(--oxidant-accent)", // brand orange (distributed TPC-H/DS suites)
   sail: "#2563eb", // blue
   spark: "#64748b", // slate
   "spark-emr": "#64748b", // slate (Spark on EMR, TPC-H/DS head-to-head)
@@ -51,7 +51,7 @@ export const ENGINE_COLORS: Record<string, string> = {
 };
 
 export function engineColor(key: string): string {
-  return ENGINE_COLORS[key] ?? "var(--weft-text-muted)";
+  return ENGINE_COLORS[key] ?? "var(--oxidant-text-muted)";
 }
 
 export function isMeasured(e: Engine): boolean {
@@ -60,30 +60,30 @@ export function isMeasured(e: Engine): boolean {
 
 export const measuredEngines = benchmarks.engines.filter(isMeasured);
 
-/** Weft's speedup vs another engine as a multiple (e.g. 1.24 = 24% faster), or null. */
+/** Oxidant's speedup vs another engine as a multiple (e.g. 1.24 = 24% faster), or null. */
 export function speedupVs(otherKey: string, suite: Benchmarks = benchmarks): number | null {
-  const weft = suite.engines.find((e) => e.key === "weft");
+  const oxidant = suite.engines.find((e) => e.key === "oxidant");
   const other = suite.engines.find((e) => e.key === otherKey);
-  if (!weft?.total || !other?.total) return null;
-  return other.total / weft.total;
+  if (!oxidant?.total || !other?.total) return null;
+  return other.total / oxidant.total;
 }
 
 /**
- * Weft's wall-clock time saved vs another engine, as a percentage
- * (e.g. 80 = Weft completes in 20% of the other engine's time), or null.
+ * Oxidant's wall-clock time saved vs another engine, as a percentage
+ * (e.g. 80 = Oxidant completes in 20% of the other engine's time), or null.
  * Negative when the other engine is faster. This is the site's headline
- * convention: "% faster" always means (other − weft) ÷ other.
+ * convention: "% faster" always means (other − oxidant) ÷ other.
  */
 export function pctFasterVs(otherKey: string, suite: Benchmarks = benchmarks): number | null {
-  const weft = suite.engines.find((e) => e.key === "weft");
+  const oxidant = suite.engines.find((e) => e.key === "oxidant");
   const other = suite.engines.find((e) => e.key === otherKey);
-  if (!weft?.total || !other?.total) return null;
-  return (1 - weft.total / other.total) * 100;
+  if (!oxidant?.total || !other?.total) return null;
+  return (1 - oxidant.total / other.total) * 100;
 }
 
-/** Like [`pctFasterVs`] but keyed on the highlighted engine rather than `weft`. */
+/** Like [`pctFasterVs`] but keyed on the highlighted engine rather than `oxidant`. */
 export function pctFasterOfHighlight(other: Engine, suite: Benchmarks): number | null {
-  const weft = suite.engines.find((e) => e.key === "weft") ?? suite.engines.find((e) => e.highlight);
-  if (!weft?.total || other.total == null) return null;
-  return (1 - weft.total / other.total) * 100;
+  const oxidant = suite.engines.find((e) => e.key === "oxidant") ?? suite.engines.find((e) => e.highlight);
+  if (!oxidant?.total || other.total == null) return null;
+  return (1 - oxidant.total / other.total) * 100;
 }

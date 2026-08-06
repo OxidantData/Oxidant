@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Launch an AMD (c6a) EC2 box that dumps TPC-H + TPC-DS SF100 Parquet into
-# s3://weft-artifacts-*/{tpch,tpcds}-sf100/ then self-terminates.
+# s3://oxidant-artifacts-*/{tpch,tpcds}-sf100/ then self-terminates.
 #
 # Prereq: scripts already uploaded to s3://$BUCKET/bench/sf100/dump-to-s3.sh
-#   aws s3 cp bench/sf100/dump-to-s3.sh s3://weft-artifacts-$ACCOUNT/bench/sf100/
+#   aws s3 cp bench/sf100/dump-to-s3.sh s3://oxidant-artifacts-$ACCOUNT/bench/sf100/
 #
 # Usage:
 #   ./bench/sf100/launch-dump-ec2.sh
@@ -11,11 +11,11 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-us-west-2}"
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-BUCKET="${BUCKET:-weft-artifacts-${ACCOUNT}}"
+BUCKET="${BUCKET:-oxidant-artifacts-${ACCOUNT}}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-c6a.4xlarge}"
 VOLUME_GB="${VOLUME_GB:-400}"
-KEY_NAME="${KEY_NAME:-weft-sf100-bench}"
-IAM_PROFILE="${IAM_PROFILE:-weft-glue-profile}"
+KEY_NAME="${KEY_NAME:-oxidant-sf100-bench}"
+IAM_PROFILE="${IAM_PROFILE:-oxidant-glue-profile}"
 
 AMI_ID="$(aws ssm get-parameter --region "$REGION" \
   --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
@@ -50,7 +50,7 @@ export AWS_DEFAULT_REGION=${REGION}
 export BUCKET=${BUCKET}
 export SF=100
 export SUITES="tpch tpcds"
-export WORK=/data/weft-sf100
+export WORK=/data/oxidant-sf100
 export SKIP_GLUE=1
 
 # Log everything; keep the box up on failure so we can inspect.
@@ -77,7 +77,7 @@ IID="$(aws ec2 run-instances --region "$REGION" \
   --iam-instance-profile "Name=${IAM_PROFILE}" \
   --instance-initiated-shutdown-behavior terminate \
   --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=${VOLUME_GB},VolumeType=gp3,Iops=6000,Throughput=500,DeleteOnTermination=true}" \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=weft-sf100-dump},{Key=Purpose,Value=tpch-tpcds-sf100-s3-dump}]" \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=oxidant-sf100-dump},{Key=Purpose,Value=tpch-tpcds-sf100-s3-dump}]" \
   --user-data "file://${USER_DATA}" \
   --query 'Instances[0].InstanceId' --output text)"
 

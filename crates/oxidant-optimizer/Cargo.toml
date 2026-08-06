@@ -1,0 +1,12 @@
+[package]
+name = "oxidant-optimizer"
+description = "The 'heddle' pass: logical optimization + cost-based backend routing (Loom CPU vs Oxidant-HVM)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-common = { workspace = true }
+oxidant-plan = { workspace = true }

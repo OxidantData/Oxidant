@@ -1,8 +1,8 @@
 name: release
 
 # One-click semver release: bumps Cargo.toml workspace version, commits, tags,
-# and pushes — which triggers weft-image.yml to publish the versioned Docker
-# manifest (vamzi/weft:X.Y.Z, X.Y, X, latest).
+# and pushes — which triggers oxidant-image.yml to publish the versioned Docker
+# manifest (vamzi/oxidant:X.Y.Z, X.Y, X, latest).
 #
 # Usage: Actions → release → Run workflow → choose patch / minor / major
 #
@@ -69,9 +69,9 @@ jobs:
             echo "| New version | \`${{ steps.ver.outputs.version }}\` |"
             echo "| Git tag | \`${{ steps.ver.outputs.tag }}\` |"
             echo ""
-            echo "The **weft-image** workflow will now publish:"
-            echo "- \`vamzi/weft:${{ steps.ver.outputs.version }}\`"
-            echo "- \`vamzi/weft:$(echo ${{ steps.ver.outputs.version }} | cut -d. -f1,2)\`"
-            echo "- \`vamzi/weft:$(echo ${{ steps.ver.outputs.version }} | cut -d. -f1)\`"
-            echo "- \`vamzi/weft:latest\`"
+            echo "The **oxidant-image** workflow will now publish:"
+            echo "- \`vamzi/oxidant:${{ steps.ver.outputs.version }}\`"
+            echo "- \`vamzi/oxidant:$(echo ${{ steps.ver.outputs.version }} | cut -d. -f1,2)\`"
+            echo "- \`vamzi/oxidant:$(echo ${{ steps.ver.outputs.version }} | cut -d. -f1)\`"
+            echo "- \`vamzi/oxidant:latest\`"
           } >> "$GITHUB_STEP_SUMMARY"

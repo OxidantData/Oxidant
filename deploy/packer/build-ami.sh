@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build the Weft runtime AMI with Packer.
+# Build the Oxidant runtime AMI with Packer.
 #
 # Usage:
-#   ./deploy/packer/build-ami.sh --binary ./target/release/weft
-#   ./deploy/packer/build-ami.sh --binary /tmp/weft-linux-out/weft --arch arm64
-#   ./deploy/packer/build-ami.sh --binary-url https://example.com/weft --arch x86_64
+#   ./deploy/packer/build-ami.sh --binary ./target/release/oxidant
+#   ./deploy/packer/build-ami.sh --binary /tmp/oxidant-linux-out/oxidant --arch arm64
+#   ./deploy/packer/build-ami.sh --binary-url https://example.com/oxidant --arch x86_64
 #
 # Optional env:
 #   AWS_REGION / REGION   (default us-west-2)
@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${BINARY_PATH}" && -z "${BINARY_URL}" ]]; then
-  echo "error: pass --binary /path/to/weft or --binary-url https://..." >&2
+  echo "error: pass --binary /path/to/oxidant or --binary-url https://..." >&2
   exit 1
 fi
 
@@ -59,9 +59,9 @@ if [[ -n "${BINARY_PATH}" ]]; then
         ;;
     esac
   fi
-  cp -f "${BINARY_PATH}" "${FILES_DIR}/weft"
-  chmod 0755 "${FILES_DIR}/weft"
-  trap 'rm -f "${FILES_DIR}/weft"' EXIT
+  cp -f "${BINARY_PATH}" "${FILES_DIR}/oxidant"
+  chmod 0755 "${FILES_DIR}/oxidant"
+  trap 'rm -f "${FILES_DIR}/oxidant"' EXIT
 fi
 
 ARCH="${ARCH:-arm64}"
@@ -79,12 +79,12 @@ export GIT_SHA
 GIT_SHA="$(git -C "${ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 cd "${PKR_DIR}"
-packer init weft-runtime.pkr.hcl
+packer init oxidant-runtime.pkr.hcl
 
 ARGS=(
   -var "region=${REGION}"
   -var "architecture=${ARCH}"
-  -var "weft_binary_url=${BINARY_URL}"
+  -var "oxidant_binary_url=${BINARY_URL}"
 )
 if [[ -n "${INSTANCE_TYPE}" ]]; then
   ARGS+=(-var "instance_type=${INSTANCE_TYPE}")
@@ -94,4 +94,4 @@ if [[ -n "${SUBNET_ID}" ]]; then
 fi
 
 echo "[packer] architecture=${ARCH} region=${REGION}"
-packer build "${ARGS[@]}" weft-runtime.pkr.hcl
+packer build "${ARGS[@]}" oxidant-runtime.pkr.hcl

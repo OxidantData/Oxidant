@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Engine-agnostic ClickBench runner — drives ANY Spark Connect endpoint.
 
-Every engine in this harness (Weft, Sail, Apache Spark, Spark+Gluten/Velox) speaks the
+Every engine in this harness (Oxidant, Sail, Apache Spark, Spark+Gluten/Velox) speaks the
 **Spark Connect** protocol, so one stock PySpark client drives all four. That is the whole
 point: identical SQL text, identical dataset, identical client, identical machine — the only
 variable is the engine behind `sc://`.
@@ -37,13 +37,13 @@ def load_statements(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--remote", required=True, help="sc://host:port")
-    ap.add_argument("--queries", required=True, help="queries.spark.sql (or queries.weft.sql)")
+    ap.add_argument("--queries", required=True, help="queries.spark.sql (or queries.oxidant.sql)")
     ap.add_argument("--register-mode", default="sql", choices=["sql", "dataframe"],
                     help="sql: run --register-file DDL; dataframe: read.parquet + typed casts")
     ap.add_argument("--register-file", default=None, help="engine-specific DDL (register-mode=sql)")
     ap.add_argument("--data", default=None, help="parquet path (register-mode=dataframe)")
     ap.add_argument("--out", required=True, help="output results JSON path")
-    ap.add_argument("--engine", required=True, help="engine label, e.g. weft / sail / spark / gluten")
+    ap.add_argument("--engine", required=True, help="engine label, e.g. oxidant / sail / spark / gluten")
     ap.add_argument("--data-size", type=int, default=14779976446)
     ap.add_argument("--machine", default="c6a.4xlarge")
     ap.add_argument("--tags", default="")

@@ -12,7 +12,7 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-${REGION:-us-west-2}}"
 ACCOUNT="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
-BUCKET="${BUCKET:-weft-artifacts-${ACCOUNT}}"
+BUCKET="${BUCKET:-oxidant-artifacts-${ACCOUNT}}"
 SF="${SF:-100}"
 SUITE="${SUITE:?Set SUITE=tpch or SUITE=tpcds}"
 DELETE_DATA="${DELETE_DATA:-0}"

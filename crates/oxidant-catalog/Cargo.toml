@@ -1,0 +1,18 @@
+[package]
+name = "oxidant-catalog"
+description = "Pluggable catalog SPI + registry: bring your own metastore (Hive, Unity, Glue) or implement CatalogProvider."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-common = { workspace = true }
+async-trait = "0.1"
+# Arrow `SchemaRef` for `TableMetadata.schema`. Pulled from DataFusion's re-export so the whole
+# workspace shares one `arrow` version (the same one `oxidant-loom` embeds and the bridge consumes).
+datafusion = { version = "54", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -4,16 +4,16 @@ import { usePolling } from "@/lib/usePolling";
 export default function ExecutorsPage() {
   const { data: executors, error } = usePolling(() => api.executors());
 
-  if (error) return <div className="weft-card text-danger">{error}</div>;
+  if (error) return <div className="oxidant-card text-danger">{error}</div>;
   if (!executors?.length)
     return (
-      <div className="weft-card text-muted">
+      <div className="oxidant-card text-muted">
         No executors registered. Configure workers for distributed mode.
       </div>
     );
 
   return (
-    <div className="weft-card overflow-x-auto">
+    <div className="oxidant-card overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
           <tr className="text-muted">

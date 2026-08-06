@@ -19,7 +19,7 @@ OUT = os.path.join(REPO, "site", "src", "data", "benchmarks.json")
 
 # Fixed display order + labels. `key` matches results/<key>.json and run-engine.sh.
 ENGINES = [
-    {"key": "weft", "name": "Weft", "highlight": True},
+    {"key": "oxidant", "name": "Oxidant", "highlight": True},
     {"key": "sail", "name": "Sail", "highlight": False},
     {"key": "spark", "name": "Spark", "highlight": False},
     {"key": "gluten", "name": "Spark + Gluten", "highlight": False},

@@ -1,0 +1,11 @@
+[package]
+name = "oxidant-common"
+description = "Shared error model, config, session identity, and Arrow⇄Spark type mapping for Oxidant."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# TODO(deps, Rust >= 1.80): arrow = "53", thiserror = "1", serde = { version = "1", features = ["derive"] }

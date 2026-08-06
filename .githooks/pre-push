@@ -12,8 +12,8 @@ cargo fmt --all -- --check
 echo "[pre-push] clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
 
-echo "[pre-push] build weft CLI..."
-cargo build -p weft-cli
+echo "[pre-push] build oxidant CLI..."
+cargo build -p oxidant-cli
 
 echo "[pre-push] test..."
 cargo test --workspace

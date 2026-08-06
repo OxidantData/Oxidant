@@ -1,9 +1,9 @@
-[run] strict mode: connect pod must have WEFT_DISTRIBUTED_STRICT=1 (values-sf100.yaml sets connect.distributedStrict); fallback is a hard failure
+[run] strict mode: connect pod must have OXIDANT_DISTRIBUTED_STRICT=1 (values-sf100.yaml sets connect.distributedStrict); fallback is a hard failure
 [preflight] SKIPPED (--skip-worker-preflight)
 [run] endpoint=sc://18.236.223.115:50051 suite=tpch sf=10.0 catalog=glue glue_db=tpch_sf10 queries=21 resume_skip=0
-/private/tmp/weft-smoke-venv/lib/python3.14/site-packages/pyspark/sql/connect/utils.py:41: FutureWarning: PySpark does not yet fully support pandas >= 3.0.0. Some features may not work correctly. It is recommended to use pandas < 3.0.0 for now.
+/private/tmp/oxidant-smoke-venv/lib/python3.14/site-packages/pyspark/sql/connect/utils.py:41: FutureWarning: PySpark does not yet fully support pandas >= 3.0.0. Some features may not work correctly. It is recommended to use pandas < 3.0.0 for now.
   require_minimum_pandas_version()
-/private/tmp/weft-smoke-venv/lib/python3.14/site-packages/pyspark/testing/utils.py:127: FutureWarning: PySpark does not yet fully support pandas >= 3.0.0. Some features may not work correctly. It is recommended to use pandas < 3.0.0 for now.
+/private/tmp/oxidant-smoke-venv/lib/python3.14/site-packages/pyspark/testing/utils.py:127: FutureWarning: PySpark does not yet fully support pandas >= 3.0.0. Some features may not work correctly. It is recommended to use pandas < 3.0.0 for now.
   require_minimum_pandas_version()
 Q1    try1 10.8293s rows=4 checksum=357a47c5b9c9…
 Q1    HOT  10.8293s

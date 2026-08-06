@@ -1,10 +1,10 @@
-# Weft
+# Oxidant
 
-**A drop-in Apache Spark replacement.** Weft speaks the [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)
+**A drop-in Apache Spark replacement.** Oxidant speaks the [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)
 protocol, so unmodified PySpark and Spark SQL clients connect with a one-line URL change — no JVM.
 
-> **Weft starts where Sail ends.** A lean vectorized CPU core (**Loom**) beats Sail on the
-> queries that dominate ClickBench, and an opt-in HVM2/Bend backend (**Weft-HVM**) opens a
+> **Oxidant starts where Sail ends.** A lean vectorized CPU core (**Loom**) beats Sail on the
+> queries that dominate ClickBench, and an opt-in HVM2/Bend backend (**Oxidant-HVM**) opens a
 > second front for the embarrassingly-parallel, irregular workloads no columnar engine serves well.
 
 ## Status
@@ -18,20 +18,20 @@ and [`docs/ISSUES.md`](docs/ISSUES.md) for issue history.
 ## Architecture (one screen)
 
 ```
-PySpark / Spark SQL  ──Spark Connect gRPC──▶  weft-connect
+PySpark / Spark SQL  ──Spark Connect gRPC──▶  oxidant-connect
                                                   │
-                              weft-plan (warp) ─ weft-analyzer ─ weft-optimizer (heddle) ─ weft-physical
+                              oxidant-plan (warp) ─ oxidant-analyzer ─ oxidant-optimizer (heddle) ─ oxidant-physical
                                                   │
                             ┌─────────────────────┴─────────────────────┐
-                     weft-loom (CPU)                              weft-hvm (parallel/GPU)
+                     oxidant-loom (CPU)                              oxidant-hvm (parallel/GPU)
               vectorized Arrow, DataFusion→native          Bend codegen → HVM2 (opt-in, gated)
                                                   │
-                              weft-execution (local | driver/worker + Arrow Flight)
+                              oxidant-execution (local | driver/worker + Arrow Flight)
                                                   │
-                              weft-datasource (Parquet/Delta/Iceberg) ─ weft-catalog (Unity/Glue/Hive)
+                              oxidant-datasource (Parquet/Delta/Iceberg) ─ oxidant-catalog (Unity/Glue/Hive)
 ```
 
-Everything between operators is Apache Arrow. `weft-hvm` is the *only* place data leaves Arrow,
+Everything between operators is Apache Arrow. `oxidant-hvm` is the *only* place data leaves Arrow,
 and only for coarse, routed fragments — never the columnar hot loop.
 
 ## Why not "just compile everything to Bend"?
@@ -61,7 +61,7 @@ those deps are stubbed out today (see each crate's `Cargo.toml` TODOs).
 ## Run (target UX, not yet implemented)
 
 ```sh
-weft spark server --port 50051
+oxidant spark server --port 50051
 ```
 ```python
 from pyspark.sql import SparkSession

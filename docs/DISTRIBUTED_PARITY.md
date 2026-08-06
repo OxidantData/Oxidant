@@ -1,11 +1,11 @@
 # Distributed execution gaps vs EMR / Photon / Lakesail
 
 Gap analysis. For the closing checklist — every remaining item with an acceptance test,
-such that finishing all of them earns the "Weft distributes the load" claim — see
+such that finishing all of them earns the "Oxidant distributes the load" claim — see
 [DISTRIBUTED_DONE.md](DISTRIBUTED_DONE.md).
 
-**Status (2026-07-25):** Connect SQL can fan out to workers when `WEFT_WORKERS` or
-`WEFT_WORKER_SERVICE` is set. File-list sharding + replicated dims make multi-worker
+**Status (2026-07-25):** Connect SQL can fan out to workers when `OXIDANT_WORKERS` or
+`OXIDANT_WORKER_SERVICE` is set. File-list sharding + replicated dims make multi-worker
 scans disjoint. Full TPC-DS plan coverage is still incomplete — unsupported shapes
 fall back to local driver execution.
 
@@ -16,8 +16,8 @@ fall back to local driver execution.
 | Cluster pods during SF100 | **1 driver**, `worker_min=worker_max=0` |
 | Harness comment | `SQL path is driver Connect only` — scales workers to 0 |
 | Gateway routing | `cluster_client` → Spark Connect `Sql` on driver Service |
-| Connect execution (then) | `weft-connect` → `Engine::sql` (local DataFusion/`weft-loom`) |
-| `weft-execution` | Used by CLI `weft driver` / tests only — **not** by Connect |
+| Connect execution (then) | `oxidant-connect` → `Engine::sql` (local DataFusion/`oxidant-loom`) |
+| `oxidant-execution` | Used by CLI `oxidant driver` / tests only — **not** by Connect |
 | CPU/memory | One pod requesting 28 CPU / 200Gi on one node; no cross-node shuffle |
 
 Intra-pod DataFusion threading can use many cores on that one box. That is **not**
@@ -41,10 +41,10 @@ Fallback: unsupported plan shapes → Engine::sql on driver
 
 1. [x] **Wire Connect SQL → `plan_distributed` + `run_stages`** when workers are configured;
    fall back to local `Engine::sql` on `Unsupported`.
-2. [x] **Inject worker endpoints into the driver** (`WEFT_WORKERS` + `WEFT_WORKER_SERVICE` DNS).
+2. [x] **Inject worker endpoints into the driver** (`OXIDANT_WORKERS` + `OXIDANT_WORKER_SERVICE` DNS).
 3. [x] **K8s wiring**: headless Service for worker StatefulSet; NetworkPolicy allowing
    driver↔worker Arrow Flight (`50561`) inside the cluster namespace.
-4. [x] **Same catalog on workers**: workers load `WEFT_CATALOG_CONF` / Glue like the driver.
+4. [x] **Same catalog on workers**: workers load `OXIDANT_CATALOG_CONF` / Glue like the driver.
 
 ### P0 — Parallel scans (otherwise N workers each read the full table)
 
@@ -52,8 +52,8 @@ Fallback: unsupported plan shapes → Engine::sql on driver
    `worker_index / worker_count` so each worker scans a disjoint shard.
 6. [x] **Replicated vs sharded table policy**: small dims auto-replicated from Glue/Parquet
    (or lakehouse) file sizes — tables smaller than the query's largest scan and under
-   `WEFT_AUTO_BROADCAST_THRESHOLD_BYTES` (default 32 GiB). Optional
-   `WEFT_REPLICATED_TABLES` force-include override only.
+   `OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES` (default 32 GiB). Optional
+   `OXIDANT_REPLICATED_TABLES` force-include override only.
 
 ### P1 — TPC-DS / Photon-class plan coverage
 
@@ -72,21 +72,21 @@ Fallback: unsupported plan shapes → Engine::sql on driver
     Also still unsupported: global windows (no `PARTITION BY`), global `COUNT(DISTINCT)` without
     gather.
 10. [x] Shuffle spill + `do_exchange` streaming.
-    Ticket/cache path spills stage buckets to disk when over budget (`WEFT_SHUFFLE_SPILL_BYTES`,
-    default 256 MiB; files under `WEFT_SPILL_DIR` or temp). Streaming `do_exchange` appends
+    Ticket/cache path spills stage buckets to disk when over budget (`OXIDANT_SHUFFLE_SPILL_BYTES`,
+    default 256 MiB; files under `OXIDANT_SPILL_DIR` or temp). Streaming `do_exchange` appends
     incrementally with the same spill budget (`do_exchange_streams_large_partition_under_memory_budget`).
 
 ### P1 — Cluster semantics
 
-11. [x] `DnsMembership` / `WEFT_WORKER_SERVICE` (headless Service A records) instead of
-    static `WEFT_WORKERS` only. (`WEFT_WORKERS` remains as fallback.)
+11. [x] `DnsMembership` / `OXIDANT_WORKER_SERVICE` (headless Service A records) instead of
+    static `OXIDANT_WORKERS` only. (`OXIDANT_WORKERS` remains as fallback.)
 12. [x] Autoscaling that tracks query parallelism (not idle Flight pods).
-    See `weft-orchestrator` / `weft-execution` `autoscale` modules and gateway wiring.
+    See `oxidant-orchestrator` / `oxidant-execution` `autoscale` modules and gateway wiring.
 13. [x] Fault retry / speculative tasks — implemented in
-    [`scheduler.rs`](../crates/weft-execution/src/scheduler.rs); proven by
-    `cargo test -p weft-cli --test cli_fault_tolerance` (worker kill via
-    `WEFT_FAULT_EXIT_*`, restart, retry / lineage recompute). **Speculation default stays off**
-    (`WEFT_SPECULATIVE` unset → false): fault recovery is covered by retries + alternate worker +
+    [`scheduler.rs`](../crates/oxidant-execution/src/scheduler.rs); proven by
+    `cargo test -p oxidant-cli --test cli_fault_tolerance` (worker kill via
+    `OXIDANT_FAULT_EXIT_*`, restart, retry / lineage recompute). **Speculation default stays off**
+    (`OXIDANT_SPECULATIVE` unset → false): fault recovery is covered by retries + alternate worker +
     upstream recompute without duplicating stage work; the 5 s straggler timeout would add latency
     on fast queries and we have no measured SF/TPC straggler win yet on this path.
 
@@ -99,7 +99,7 @@ Fallback: unsupported plan shapes → Engine::sql on driver
 
 ## Comparable engines (what “done” looks like)
 
-| Capability | EMR Spark | Photon | Lakesail | Weft `/api/sql` (this branch) |
+| Capability | EMR Spark | Photon | Lakesail | Oxidant `/api/sql` (this branch) |
 |------------|-----------|--------|----------|-------------------------------|
 | Multi-executor scan | yes | yes | yes | **yes** (file-list shard + workers) |
 | Shuffle across nodes | yes | yes | yes | **yes** (Flight; spill on ticket/cache path) |
@@ -108,11 +108,11 @@ Fallback: unsupported plan shapes → Engine::sql on driver
 
 ## Deploy checklist before SF100 re-run
 
-1. Ship `weft` images with Connect distributed path + loom file sharding.
-2. Ship `weft-platform` orchestrator with worker Service, Flight NetworkPolicy,
-   `WEFT_WORKERS` / `WEFT_WORKER_SERVICE` / `WEFT_WORKER_COUNT` /
-   `WEFT_AUTO_BROADCAST_THRESHOLD_BYTES` (optional) / `WEFT_REPLICATED_TABLES`
-   (optional override) / `WEFT_POD_NAME`. See platform `docs/DISTRIBUTED_DEPLOY.md`
+1. Ship `oxidant` images with Connect distributed path + loom file sharding.
+2. Ship `oxidant-platform` orchestrator with worker Service, Flight NetworkPolicy,
+   `OXIDANT_WORKERS` / `OXIDANT_WORKER_SERVICE` / `OXIDANT_WORKER_COUNT` /
+   `OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES` (optional) / `OXIDANT_REPLICATED_TABLES`
+   (optional override) / `OXIDANT_POD_NAME`. See platform `docs/DISTRIBUTED_DEPLOY.md`
    for build/push/verify steps.
 3. Create cluster with `worker_min=worker_max=N` (N>1), confirm driver env and worker
    shard logs (`applied file-list shard`).

@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 ###############################################################################
-# Weft Spark Connect server  —  `weft spark server --port 50051`
+# Oxidant Spark Connect server  —  `oxidant spark server --port 50051`
 #
 # This is the per-user "cluster" driver pod image. The control plane materializes
-# it via crates/weft-orchestrator (see manifests.rs): the container runs
-#     command: ["weft"]  args: ["spark","server","--port","50051"]
+# it via crates/oxidant-orchestrator (see manifests.rs): the container runs
+#     command: ["oxidant"]  args: ["spark","server","--port","50051"]
 # under PodSecurity `restricted` admission — runAsNonRoot, readOnlyRootFilesystem,
 # drop ALL capabilities, seccomp=RuntimeDefault, no auto-mounted ServiceAccount token.
 #
@@ -15,7 +15,7 @@
 #   * carry NO cloud credentials: catalog/storage access is per-cluster IRSA.
 #
 # Build context is the repository root (the Cargo workspace):
-#   docker build -f deploy/docker/connect-server.Dockerfile -t weft/connect-server:<tag> .
+#   docker build -f deploy/docker/connect-server.Dockerfile -t oxidant/connect-server:<tag> .
 ###############################################################################
 
 # Cargo profile to compile with. `release-ci` (see the root Cargo.toml) drops LTO
@@ -26,7 +26,7 @@ ARG CARGO_PROFILE=release-ci
 # ---- chef: pin the toolchain + cargo-chef -----------------------------------
 # rust:1.90 matches rust-toolchain.toml. The full (non-slim) image already has the
 # C toolchain that ring + zstd-sys compile against; the workspace needs no protoc
-# (weft-proto compiles the vendored Spark protos with pure-Rust `protox`).
+# (oxidant-proto compiles the vendored Spark protos with pure-Rust `protox`).
 # cargo-chef comes from its own published image rather than `cargo install`, which
 # compiles it from source on every cold cache.
 FROM lukemathwalker/cargo-chef:0.1.73-rust-1.90-bookworm AS chef
@@ -37,26 +37,26 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-# ---- builder: cook deps (cached across source edits), then build `weft` -------
+# ---- builder: cook deps (cached across source edits), then build `oxidant` -------
 FROM chef AS builder
 ARG CARGO_PROFILE
 COPY --from=planner /build/recipe.json recipe.json
 # Scoped to the one crate we actually ship: an unscoped cook builds dependencies
 # for all 24 workspace members. Must use the same profile as the build below, or
 # the cooked artifacts land in a different target dir and get recompiled.
-RUN cargo chef cook --profile "$CARGO_PROFILE" --locked --recipe-path recipe.json -p weft-cli --bin weft
+RUN cargo chef cook --profile "$CARGO_PROFILE" --locked --recipe-path recipe.json -p oxidant-cli --bin oxidant
 COPY . .
-# The `weft` binary lives in the `weft-cli` crate ([[bin]] name = "weft").
-RUN cargo build --profile "$CARGO_PROFILE" --locked -p weft-cli --bin weft \
- && strip "target/$CARGO_PROFILE/weft" \
- && install -D "target/$CARGO_PROFILE/weft" /out/weft
+# The `oxidant` binary lives in the `oxidant-cli` crate ([[bin]] name = "oxidant").
+RUN cargo build --profile "$CARGO_PROFILE" --locked -p oxidant-cli --bin oxidant \
+ && strip "target/$CARGO_PROFILE/oxidant" \
+ && install -D "target/$CARGO_PROFILE/oxidant" /out/oxidant
 # Pre-create the spill mount-point owned by the runtime uid so the image also works
 # under `docker run --read-only` with tmpfs/volume mounts (K8s emptyDir handles this
 # in-cluster via fsGroup). /tmp already exists in the distroless base.
-RUN install -d -o 65532 -g 65532 /rootfs/var/lib/weft/spill
+RUN install -d -o 65532 -g 65532 /rootfs/var/lib/oxidant/spill
 
 # ---- awscli: the engine resolves Glue (and HMS) catalogs by shelling out to `aws`
-# (weft-catalog-glue). Bundle it so a *cluster* can list/read the catalog itself —
+# (oxidant-catalog-glue). Bundle it so a *cluster* can list/read the catalog itself —
 # arch-correct via TARGETARCH (don't default it; that pinned amd64 on arm64 builds).
 FROM debian:bookworm-slim AS awscli
 ARG TARGETARCH
@@ -77,9 +77,9 @@ RUN apt-get update \
  && groupadd -g 65532 nonroot \
  && useradd -u 65532 -g 65532 -m -d /home/nonroot -s /usr/sbin/nologin nonroot
 
-LABEL org.opencontainers.image.title="weft-connect-server" \
-      org.opencontainers.image.description="Weft Spark Connect server (per-user cluster driver)" \
-      org.opencontainers.image.source="https://gitlab.com/weftlabs/weft"
+LABEL org.opencontainers.image.title="oxidant-connect-server" \
+      org.opencontainers.image.description="Oxidant Spark Connect server (per-user cluster driver)" \
+      org.opencontainers.image.source="https://github.com/OxidantData/Oxidant"
 
 # Spark Connect gRPC endpoint. Point PySpark at sc://<service>:50051.
 EXPOSE 50051
@@ -91,23 +91,23 @@ USER 65532:65532
 # Read-only rootfs survival: the engine stages sort/aggregation spill and Delta/
 # catalog scratch under std::env::temp_dir() (== $TMPDIR). Keep every writable path
 # on an emptyDir mount, and keep HOME off the read-only rootfs.
-#   - Shuffle spill: set WEFT_SHUFFLE_SPILL_BYTES (threshold) and point TMPDIR at a
-#     writable spill volume. WEFT_SHUFFLE_SPILL_DIR is DEBUG-ONLY (force-spill).
-#     The old WEFT_SPILL_DIR name is unused by the engine — do not set it.
-#   - WEFT_MEMORY_LIMIT_BYTES (unset here) bounds the spill pool; set it from the
+#   - Shuffle spill: set OXIDANT_SHUFFLE_SPILL_BYTES (threshold) and point TMPDIR at a
+#     writable spill volume. OXIDANT_SHUFFLE_SPILL_DIR is DEBUG-ONLY (force-spill).
+#     The old OXIDANT_SPILL_DIR name is unused by the engine — do not set it.
+#   - OXIDANT_MEMORY_LIMIT_BYTES (unset here) bounds the spill pool; set it from the
 #     pod's memory limit to make aggregations spill instead of OOM-killing.
 ENV TMPDIR=/tmp \
     HOME=/tmp \
-    WEFT_AWS_BIN=/usr/local/aws-cli/v2/current/bin/aws \
+    OXIDANT_AWS_BIN=/usr/local/aws-cli/v2/current/bin/aws \
     RUST_BACKTRACE=1
 
-COPY --from=builder /out/weft /usr/local/bin/weft
+COPY --from=builder /out/oxidant /usr/local/bin/oxidant
 COPY --from=awscli /usr/local/aws-cli /usr/local/aws-cli
-COPY --from=builder --chown=65532:65532 /rootfs/var/lib/weft/spill /var/lib/weft/spill
+COPY --from=builder --chown=65532:65532 /rootfs/var/lib/oxidant/spill /var/lib/oxidant/spill
 
 # Default command; the orchestrator overrides command/args per cluster but keeps
 # this exact invocation.
-ENTRYPOINT ["/usr/local/bin/weft"]
+ENTRYPOINT ["/usr/local/bin/oxidant"]
 CMD ["spark", "server", "--port", "50051"]
 
 ###############################################################################
@@ -120,15 +120,15 @@ CMD ["spark", "server", "--port", "50051"]
 #                                seccompProfile.type: RuntimeDefault
 #   volumes (emptyDir or PVC):
 #     - name: tmp    mountPath: /tmp                 # $TMPDIR scratch
-#     - name: spill  mountPath: /var/lib/weft/spill  # TMPDIR for threshold spill
+#     - name: spill  mountPath: /var/lib/oxidant/spill  # TMPDIR for threshold spill
 #
 # Standalone (outside K8s):
 #   docker run --read-only \
-#     --tmpfs /tmp --tmpfs /var/lib/weft/spill \
-#     -p 50051:50051 weft/connect-server:<tag>
+#     --tmpfs /tmp --tmpfs /var/lib/oxidant/spill \
+#     -p 50051:50051 oxidant/connect-server:<tag>
 #
 # Credentials: NONE are baked in. In-cluster, catalog/storage auth is per-cluster
 # least-privilege IRSA (the pod's ServiceAccount role). The AWS CLI *binary* is
-# bundled (see awscli stage + WEFT_AWS_BIN) so Glue catalog resolution can shell
+# bundled (see awscli stage + OXIDANT_AWS_BIN) so Glue catalog resolution can shell
 # out to `aws glue …`; identity still comes from IRSA / the environment.
 ###############################################################################

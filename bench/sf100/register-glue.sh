@@ -18,7 +18,7 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-${REGION:-us-west-2}}"
 ACCOUNT="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
-BUCKET="${BUCKET:-weft-artifacts-${ACCOUNT}}"
+BUCKET="${BUCKET:-oxidant-artifacts-${ACCOUNT}}"
 SF="${SF:-100}"
 SUITE="${SUITE:?Set SUITE=tpch or SUITE=tpcds}"
 FORMAT="${FORMAT:-parquet}" # parquet | delta | iceberg
@@ -40,7 +40,7 @@ esac
 case "$SUITE" in
   tpch)
     TABLES=(nation region supplier customer part partsupp orders lineitem)
-    DESC="TPC-H SF${SF} (${FORMAT}, Weft bench)"
+    DESC="TPC-H SF${SF} (${FORMAT}, Oxidant bench)"
     ;;
   tpcds)
     TABLES=(
@@ -49,7 +49,7 @@ case "$SUITE" in
       promotion reason ship_mode store store_returns store_sales time_dim warehouse
       web_page web_returns web_sales web_site
     )
-    DESC="TPC-DS SF${SF} (${FORMAT}, Weft bench)"
+    DESC="TPC-DS SF${SF} (${FORMAT}, Oxidant bench)"
     ;;
   *)
     echo "SUITE must be tpch or tpcds"; exit 2

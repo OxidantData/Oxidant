@@ -1,0 +1,115 @@
+# Minimal data-plane chart: one Spark Connect driver + N Flight workers.
+# Full control-plane (gateway/SSO/Terraform) is out of scope — see docs/distributed-k8s.md.
+#
+# SHARDING CONTRACT (workers):
+#   OXIDANT_WORKER_COUNT  = StatefulSet replica count (must be fixed; never HPA-scaled)
+#   OXIDANT_POD_NAME      = metadata.name (StatefulSet ordinal: oxidant-worker-0, …)
+#   ShardAssignment::from_env parses the trailing ordinal from OXIDANT_POD_NAME.
+# Autoscaling is incompatible with that contract — see worker.autoscaling below.
+
+replicaCount: 1
+
+# Shared IRSA / RBAC surface for connect + workers (S3 + Glue).
+serviceAccount:
+  create: true
+  name: oxidant
+  annotations: {}
+  # Example IRSA (fill in real ARNs in an overlay — do not invent account IDs here):
+  # annotations:
+  #   eks.amazonaws.com/role-arn: "arn:aws:iam::AWS_ACCOUNT_ID:role/OXIDANT_IRSA_ROLE_NAME"
+
+connect:
+  enabled: true
+  image: oxidant/connect-server:latest
+  imagePullPolicy: IfNotPresent
+  replicas: 1
+  port: 50051
+  serviceType: ClusterIP
+  # Bundled in connect-server.Dockerfile (awscli stage).
+  awsBin: /usr/local/aws-cli/v2/current/bin/aws
+  # TWO SEPARATE memory pools (see values-sf100.yaml invariant):
+  #   memoryLimitBytes  → DataFusion spill pool (joins/sorts/aggs)
+  #   shuffleSpillBytes → SpillStore shuffle-bucket cache threshold
+  # Invariant when set: memoryLimitBytes + shuffleSpillBytes + headroom
+  #   <= container memory limit.
+  # Both empty (default): SpillStore::from_env returns None and the in-memory
+  # shuffle cache is UNBOUNDED — fine for Kind smoke, NOT safe for large queries
+  # out of the box. Set both explicitly for any real workload (see SF100 overlay).
+  memoryLimitBytes: ""
+  # Threshold for hash-shuffle spill (bytes). Spill files land under
+  # $TMPDIR/oxidant-shuffle-spill/… — chart sets TMPDIR to the spill volume.
+  # Takes precedence over memoryLimitBytes inside SpillStore::from_env.
+  shuffleSpillBytes: ""
+  # DEBUG ONLY: set OXIDANT_SHUFFLE_SPILL_DIR and force EVERY shuffle bucket to disk.
+  # Invalidates benchmark timings. Default off.
+  forceShuffleSpill: false
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  # Optional extra affinity (nodeAffinity / podAffinity). Do not set podAntiAffinity here.
+  affinity: {}
+  # When true, fail queries that cannot be planned distributed (server-side).
+  distributedStrict: false
+  # Shuffle bucket count (OXIDANT_SHUFFLE_PARTITIONS on the driver). Empty → worker.replicas.
+  # Must stay pinned: an unpinned modulus is recomputed from live DNS membership between
+  # stages, which silently drops rows when a worker blips. See connect-server.yaml.
+  #
+  # Do NOT raise this above worker.replicas yet. AQE coalescing (OXIDANT_AQE, on by default)
+  # only engages when partitions exceed workers, and it lowers num_partitions after the
+  # producer stage while the consumer then reads only the reduced range — the buckets
+  # above it are never pulled. Keeping partitions == replicas keeps that path dormant.
+  shufflePartitions: ""
+
+worker:
+  image: oxidant/worker:latest
+  imagePullPolicy: IfNotPresent
+  port: 50561
+  # Fixed replica count — also emitted as OXIDANT_WORKER_COUNT on every worker pod.
+  replicas: 2
+  # Same two-pool model as connect (above). Both empty by default → unbounded
+  # shuffle cache (SpillStore::from_env is None). Not safe for SF-scale queries.
+  memoryLimitBytes: ""
+  # Threshold for hash-shuffle spill (bytes). Prefer this over memoryLimitBytes for
+  # shuffle. Chart sets TMPDIR=/var/lib/oxidant/spill so default_spill_root() lands on
+  # the PVC (or emptyDir spill volume), NOT node ephemeral via /tmp.
+  shuffleSpillBytes: ""
+  # DEBUG ONLY: sets OXIDANT_SHUFFLE_SPILL_DIR → force_spill=true (every bucket to disk).
+  # Never enable for publishable benchmarks. Default off.
+  forceShuffleSpill: false
+  # DataFusion hash joins keep their build side in memory and fail fast when the bounded
+  # pool fills. Keep true (KAN-45): the sort-merge path (false) can deadlock under the
+  # bounded FairSpillPool at scale (upstream: delta-io/delta-rs#4614).
+  preferHashJoin: true
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  # Optional extra affinity (nodeAffinity / podAffinity). Chart always adds
+  # required podAntiAffinity on app=oxidant-worker / kubernetes.io/hostname.
+  affinity: {}
+  # Spill volume (PVC via volumeClaimTemplates, or emptyDir when disabled).
+  # Mounted at /var/lib/oxidant/spill; TMPDIR points here so threshold spill uses it.
+  # Do NOT set OXIDANT_SHUFFLE_SPILL_DIR in production — that forces all-spill.
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 8Gi
+    accessModes:
+      - ReadWriteOnce
+  # HPA + fixed OXIDANT_WORKER_COUNT are incoherent: scaling changes the shard modulus
+  # while pods still advertise the render-time count → silent data loss or duplication.
+  # Chart FAILS to render when this is true. Keep false; pin replicas instead.
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+
+# Optional control-plane stub. Disabled by default — gateway.Dockerfile is not in-tree yet.
+gateway:
+  enabled: false
+  image: oxidant/gateway:latest
+  port: 8080
+  env:
+    OXIDANT_ORCHESTRATOR: k8s
+    OXIDANT_WORKER_IMAGE: oxidant/worker:latest
+    OXIDANT_CLUSTER_IMAGE: oxidant/connect-server:latest

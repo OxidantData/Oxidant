@@ -20,7 +20,7 @@ Glue databases (coexist; harness picks one)::
     {suite}_sf{SF}_iceberg  iceberg   table_type=ICEBERG + metadata_location
     {suite}_sf{SF}_delta    delta     classification=delta + provider=delta
 
-Weft's Glue detector (branch ``vamzi/lakehouse-s3-formats``) precedence:
+Oxidant's Glue detector (branch ``vamzi/lakehouse-s3-formats``) precedence:
 ``table_type=ICEBERG`` → ``spark.sql.sources.provider`` / ``provider`` →
 ``classification`` → Parquet. Parameters below are chosen for that order.
 
@@ -32,7 +32,7 @@ Examples::
   # Dry-run against an existing dump prefix (touches nothing)
   python3 bench/sf100/build-lakehouse.py \\
     --suite tpcds --sf 100 \\
-    --source-prefix s3://weft-artifacts-ACCOUNT/tpcds-sf100 \\
+    --source-prefix s3://oxidant-artifacts-ACCOUNT/tpcds-sf100 \\
     --formats iceberg,delta --dry-run
 
   # Local rehearsal (see rehearse-local.sh)
@@ -170,7 +170,7 @@ def list_parquet_files(table_uri: str, *, include_delta_log: bool = False) -> li
 
     By default skips ``_delta_log/`` and Iceberg ``metadata/`` (data files only).
     Pass ``include_delta_log=True`` to mimic a naive engine listing that only filters
-    on the ``.parquet`` extension (Weft ``ListingOptions.with_file_extension``).
+    on the ``.parquet`` extension (Oxidant ``ListingOptions.with_file_extension``).
     """
     if is_s3(table_uri):
         import s3fs  # noqa: WPS433 — optional until S3 path used
@@ -411,7 +411,7 @@ def register_glue_parquet_style(
     dry_run: bool,
     summary: Summary,
 ) -> None:
-    """Create/replace a Glue EXTERNAL_TABLE with parameters Weft detect_format understands."""
+    """Create/replace a Glue EXTERNAL_TABLE with parameters Oxidant detect_format understands."""
     location = location if location.endswith("/") else location + "/"
     if fmt == "iceberg":
         if not metadata_location:
@@ -474,7 +474,7 @@ def register_glue_parquet_style(
     glue = boto3.client("glue", region_name=region)
     try:
         glue.create_database(
-            DatabaseInput={"Name": database, "Description": f"Weft SF lakehouse ({fmt})"}
+            DatabaseInput={"Name": database, "Description": f"Oxidant SF lakehouse ({fmt})"}
         )
     except glue.exceptions.AlreadyExistsException:
         pass

@@ -6,21 +6,21 @@
 #   Driver:  1× c6g.xlarge  (4 vCPU / 8 GiB)  + 100 GiB gp3 root
 #   Workers: 2× m8g.8xlarge (32 vCPU / 128 GiB) + 500 GiB gp3 spill each
 #            ASG Min=Max=Desired=2 (pinned; arm64 AMI required)
-#   Env:     WEFT_DISTRIBUTED_STRICT=1, WEFT_PREFER_HASH_JOIN=false,
-#            WEFT_MEMORY_LIMIT_BYTES=42949672960, WEFT_SHUFFLE_SPILL_BYTES=8589934592,
-#            WEFT_SHUFFLE_PARTITIONS=32 (driver; ≈ worker vCPU, reduces shuffle skew)
+#   Env:     OXIDANT_DISTRIBUTED_STRICT=1, OXIDANT_PREFER_HASH_JOIN=false,
+#            OXIDANT_MEMORY_LIMIT_BYTES=42949672960, OXIDANT_SHUFFLE_SPILL_BYTES=8589934592,
+#            OXIDANT_SHUFFLE_PARTITIONS=32 (driver; ≈ worker vCPU, reduces shuffle skew)
 #   Data:    Glue Parquet tpch_sf100 / tpcds_sf100
 #   Connect: driver instance IP only — do NOT use an NLB (ExposeConnect=false)
 #
 # Prerequisites:
-#   - Stack from deploy/cloudformation/weft-cluster.yaml (see docs/distributed-ec2.md)
+#   - Stack from deploy/cloudformation/oxidant-cluster.yaml (see docs/distributed-ec2.md)
 #   - Connect at CONNECT=sc://<driver-ip>:50051 (or omit CONNECT + set STACK to auto-resolve)
-#   - WEFT_DISTRIBUTED_STRICT=1 on the driver (--distributed-strict true)
+#   - OXIDANT_DISTRIBUTED_STRICT=1 on the driver (--distributed-strict true)
 #   - Glue SF100 Parquet registered; WorkerCount=2 with stable shard indices
-#   - Optional: leave WEFT_REPLICATED_TABLES unset to validate KAN-1 auto-broadcast
+#   - Optional: leave OXIDANT_REPLICATED_TABLES unset to validate KAN-1 auto-broadcast
 #
 # Usage:
-#   STACK=weft-sf100 ./bench/sf100/remeasure-distributed.sh
+#   STACK=oxidant-sf100 ./bench/sf100/remeasure-distributed.sh
 #   CONNECT=sc://$DRIVER_IP:50051 SUITE=tpch ./bench/sf100/remeasure-distributed.sh
 #
 # Deploy / tear-down helpers:
@@ -30,7 +30,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
-STACK="${STACK:-weft-sf100}"
+STACK="${STACK:-oxidant-sf100}"
 SUITE="${SUITE:-all}"   # all | tpch | tpcds
 SF="${SF:-100}"         # scale factor; SF=10 for the cheap iteration loop
 SF_INT="${SF%.*}"       # 100 -> tpch_sf100, 10 -> tpch_sf10
@@ -70,7 +70,7 @@ elif [[ "${CONNECT}" == *elb.amazonaws.com* || "${CONNECT}" == *DEPRECATED-NLB* 
 fi
 
 mkdir -p "$OUT_DIR"
-export WEFT_DISTRIBUTED_STRICT=1
+export OXIDANT_DISTRIBUTED_STRICT=1
 
 run_suite() {
   local suite="$1" db="$2" out="$3"

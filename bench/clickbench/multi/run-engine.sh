@@ -2,13 +2,13 @@
 # Boot ONE engine's Spark Connect server, register `hits` (engine-specific DDL), run the 43
 # queries × 3 via the stock PySpark client, write results/<engine>.json, then stop the server.
 #
-#   bash run-engine.sh <weft|sail|spark|gluten>
+#   bash run-engine.sh <oxidant|sail|spark|gluten>
 #
 # Env: BENCH_DATA = path to hits.parquet (default: bench/clickbench/hits.parquet)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
-ENGINE="${1:?usage: run-engine.sh <weft|sail|spark|gluten>}"
+ENGINE="${1:?usage: run-engine.sh <oxidant|sail|spark|gluten>}"
 DATA="${BENCH_DATA:-$REPO/bench/clickbench/hits.parquet}"
 RESULTS="$HERE/results"; mkdir -p "$RESULTS"
 LOGS="$HERE/logs"; mkdir -p "$LOGS"
@@ -35,24 +35,24 @@ wait_for_port() {  # host port timeout_s
   exec 3>&- 3<&- 2>/dev/null || true
 }
 
-# Registration: Weft uses SQL DDL (its connect server wants CREATE EXTERNAL TABLE, and it
-# case-folds bare identifiers so it runs the quoted queries.weft.sql); the Spark-family engines
+# Registration: Oxidant uses SQL DDL (its connect server wants CREATE EXTERNAL TABLE, and it
+# case-folds bare identifiers so it runs the quoted queries.oxidant.sql); the Spark-family engines
 # register via the DataFrame API in runner.py (--register-mode dataframe). Both expose EventTime
 # as TIMESTAMP and EventDate as DATE — the raw columns are int epoch-seconds / int days.
 REG="$HERE/.register-$ENGINE.sql"
 REG_MODE="dataframe"                       # default for spark-family
 QUERIES="$HERE/queries.spark.sql"
 case "$ENGINE" in
-  weft)
-    VENV="$HERE/.venv-weft"; REMOTE="sc://localhost:50051"; HOSTPORT="localhost 50051"
-    REG_MODE="sql"; QUERIES="$HERE/queries.weft.sql"
+  oxidant)
+    VENV="$HERE/.venv-oxidant"; REMOTE="sc://localhost:50051"; HOSTPORT="localhost 50051"
+    REG_MODE="sql"; QUERIES="$HERE/queries.oxidant.sql"
     # to_timestamp_seconds(EventTime) → extract/date_trunc work (Q18/Q42); EventDate int→DATE.
     cat > "$REG" <<SQL
 CREATE EXTERNAL TABLE hits_raw STORED AS PARQUET LOCATION '$DATA' OPTIONS ('binary_as_string' 'true')
 CREATE VIEW hits AS SELECT * EXCEPT ("EventTime", "EventDate"), to_timestamp_seconds("EventTime") AS "EventTime", CAST(CAST("EventDate" AS INTEGER) AS DATE) AS "EventDate" FROM hits_raw
 SQL
-    echo "[run] starting weft server …"
-    "$REPO/target/release/weft" spark server --port 50051 >"$LOGS/weft.log" 2>&1 &
+    echo "[run] starting oxidant server …"
+    "$REPO/target/release/oxidant" spark server --port 50051 >"$LOGS/oxidant.log" 2>&1 &
     SERVER_PID=$!
     ;;
   sail)

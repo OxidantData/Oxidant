@@ -1,0 +1,13 @@
+[package]
+name = "oxidant-analyzer"
+description = "Resolves the unresolved warp IR (names, types, functions) against the catalog into a logical plan."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-common = { workspace = true }
+oxidant-plan = { workspace = true }
+oxidant-catalog = { workspace = true }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sail (LakeSail OSS) — a Rust Spark Connect server, `pip install pysail`. This is the engine
-# Weft's headline result is measured against, so a fresh same-box Sail number is the apples-to-
+# Oxidant's headline result is measured against, so a fresh same-box Sail number is the apples-to-
 # apples baseline. Sail speaks Spark Connect, so the same PySpark client drives it.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

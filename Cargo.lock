@@ -4128,6 +4128,328 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
+name = "oxidant-analyzer"
+version = "0.0.0"
+dependencies = [
+ "oxidant-catalog",
+ "oxidant-common",
+ "oxidant-plan",
+]
+
+[[package]]
+name = "oxidant-bench"
+version = "0.0.0"
+dependencies = [
+ "datafusion",
+ "oxidant-connect",
+ "oxidant-execution",
+ "oxidant-loom",
+ "oxidant-proto",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic 0.12.3",
+ "tpchgen",
+]
+
+[[package]]
+name = "oxidant-catalog"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "oxidant-common",
+ "tokio",
+]
+
+[[package]]
+name = "oxidant-catalog-glue"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "oxidant-catalog",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "oxidant-catalog-hive"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "oxidant-catalog",
+ "tokio",
+]
+
+[[package]]
+name = "oxidant-catalog-rest"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "oxidant-catalog",
+ "oxidant-common",
+ "serde_json",
+]
+
+[[package]]
+name = "oxidant-cli"
+version = "0.0.0"
+dependencies = [
+ "datafusion",
+ "oxidant-common",
+ "oxidant-connect",
+ "oxidant-execution",
+ "oxidant-loom",
+ "oxidant-observability",
+ "oxidant-ui-server",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "oxidant-common"
+version = "0.0.0"
+
+[[package]]
+name = "oxidant-connect"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "futures",
+ "oxidant-analyzer",
+ "oxidant-catalog",
+ "oxidant-catalog-glue",
+ "oxidant-catalog-hive",
+ "oxidant-catalog-rest",
+ "oxidant-common",
+ "oxidant-execution",
+ "oxidant-loom",
+ "oxidant-observability",
+ "oxidant-optimizer",
+ "oxidant-physical",
+ "oxidant-plan",
+ "oxidant-proto",
+ "oxidant-sql",
+ "oxidant-streaming",
+ "oxidant-ui-server",
+ "prost 0.13.5",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.12.3",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "oxidant-datasource"
+version = "0.0.0"
+dependencies = [
+ "apache-avro 0.17.0",
+ "arrow",
+ "bytes",
+ "chrono",
+ "delta_kernel",
+ "delta_kernel_default_engine",
+ "futures",
+ "iceberg",
+ "object_store",
+ "oxidant-common",
+ "parquet 58.3.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "oxidant-execution"
+version = "0.0.0"
+dependencies = [
+ "arrow-flight",
+ "async-trait",
+ "datafusion",
+ "datafusion-proto",
+ "futures",
+ "oxidant-catalog",
+ "oxidant-common",
+ "oxidant-loom",
+ "oxidant-observability",
+ "oxidant-physical",
+ "prost 0.14.4",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic 0.14.6",
+ "tracing",
+]
+
+[[package]]
+name = "oxidant-gateway"
+version = "0.0.0"
+dependencies = [
+ "axum 0.8.9",
+ "oxidant-common",
+ "oxidant-execution",
+ "oxidant-orchestrator",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "oxidant-hvm"
+version = "0.0.0"
+dependencies = [
+ "oxidant-common",
+ "oxidant-physical",
+ "oxidant-plan",
+]
+
+[[package]]
+name = "oxidant-loom"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-sts",
+ "bytes",
+ "chrono",
+ "datafusion",
+ "delta_kernel",
+ "delta_kernel_default_engine",
+ "futures",
+ "iceberg",
+ "object_store",
+ "oxidant-catalog",
+ "oxidant-common",
+ "oxidant-datasource",
+ "oxidant-physical",
+ "oxidant-plan",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "oxidant-observability"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "oxidant-optimizer"
+version = "0.0.0"
+dependencies = [
+ "oxidant-common",
+ "oxidant-plan",
+]
+
+[[package]]
+name = "oxidant-orchestrator"
+version = "0.0.0"
+dependencies = [
+ "oxidant-common",
+ "oxidant-execution",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "oxidant-physical"
+version = "0.0.0"
+dependencies = [
+ "oxidant-common",
+ "oxidant-optimizer",
+ "oxidant-plan",
+]
+
+[[package]]
+name = "oxidant-plan"
+version = "0.0.0"
+dependencies = [
+ "oxidant-common",
+]
+
+[[package]]
+name = "oxidant-proto"
+version = "0.0.0"
+dependencies = [
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "protox",
+ "tonic 0.12.3",
+ "tonic-build",
+]
+
+[[package]]
+name = "oxidant-spark-compat"
+version = "0.0.0"
+dependencies = [
+ "datafusion",
+ "oxidant-loom",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "oxidant-sql"
+version = "0.0.0"
+dependencies = [
+ "oxidant-common",
+ "oxidant-plan",
+]
+
+[[package]]
+name = "oxidant-streaming"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "datafusion",
+ "oxidant-common",
+ "oxidant-loom",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "oxidant-ui-server"
+version = "0.0.0"
+dependencies = [
+ "axum 0.8.9",
+ "futures",
+ "http-body-util",
+ "oxidant-common",
+ "oxidant-observability",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6434,328 +6756,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "weft-analyzer"
-version = "0.0.0"
-dependencies = [
- "weft-catalog",
- "weft-common",
- "weft-plan",
-]
-
-[[package]]
-name = "weft-bench"
-version = "0.0.0"
-dependencies = [
- "datafusion",
- "serde",
- "serde_json",
- "tokio",
- "tonic 0.12.3",
- "tpchgen",
- "weft-connect",
- "weft-execution",
- "weft-loom",
- "weft-proto",
-]
-
-[[package]]
-name = "weft-catalog"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "datafusion",
- "tokio",
- "weft-common",
-]
-
-[[package]]
-name = "weft-catalog-glue"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "serde_json",
- "tokio",
- "weft-catalog",
-]
-
-[[package]]
-name = "weft-catalog-hive"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "tokio",
- "weft-catalog",
-]
-
-[[package]]
-name = "weft-catalog-rest"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "serde_json",
- "weft-catalog",
- "weft-common",
-]
-
-[[package]]
-name = "weft-cli"
-version = "0.0.0"
-dependencies = [
- "datafusion",
- "tempfile",
- "tokio",
- "weft-common",
- "weft-connect",
- "weft-execution",
- "weft-loom",
- "weft-observability",
- "weft-ui-server",
-]
-
-[[package]]
-name = "weft-common"
-version = "0.0.0"
-
-[[package]]
-name = "weft-connect"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "datafusion",
- "futures",
- "prost 0.13.5",
- "reqwest 0.12.28",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic 0.12.3",
- "tracing",
- "uuid",
- "weft-analyzer",
- "weft-catalog",
- "weft-catalog-glue",
- "weft-catalog-hive",
- "weft-catalog-rest",
- "weft-common",
- "weft-execution",
- "weft-loom",
- "weft-observability",
- "weft-optimizer",
- "weft-physical",
- "weft-plan",
- "weft-proto",
- "weft-sql",
- "weft-streaming",
- "weft-ui-server",
-]
-
-[[package]]
-name = "weft-datasource"
-version = "0.0.0"
-dependencies = [
- "apache-avro 0.17.0",
- "arrow",
- "bytes",
- "chrono",
- "delta_kernel",
- "delta_kernel_default_engine",
- "futures",
- "iceberg",
- "object_store",
- "parquet 58.3.0",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "url",
- "weft-common",
-]
-
-[[package]]
-name = "weft-execution"
-version = "0.0.0"
-dependencies = [
- "arrow-flight",
- "async-trait",
- "datafusion",
- "datafusion-proto",
- "futures",
- "prost 0.14.4",
- "serde_json",
- "tempfile",
- "tokio",
- "tonic 0.14.6",
- "tracing",
- "weft-catalog",
- "weft-common",
- "weft-loom",
- "weft-observability",
- "weft-physical",
-]
-
-[[package]]
-name = "weft-gateway"
-version = "0.0.0"
-dependencies = [
- "axum 0.8.9",
- "serde",
- "serde_json",
- "tokio",
- "weft-common",
- "weft-execution",
- "weft-orchestrator",
-]
-
-[[package]]
-name = "weft-hvm"
-version = "0.0.0"
-dependencies = [
- "weft-common",
- "weft-physical",
- "weft-plan",
-]
-
-[[package]]
-name = "weft-loom"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "aws-config",
- "aws-sdk-sts",
- "bytes",
- "chrono",
- "datafusion",
- "delta_kernel",
- "delta_kernel_default_engine",
- "futures",
- "iceberg",
- "object_store",
- "rayon",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "weft-catalog",
- "weft-common",
- "weft-datasource",
- "weft-physical",
- "weft-plan",
-]
-
-[[package]]
-name = "weft-observability"
-version = "0.0.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "weft-optimizer"
-version = "0.0.0"
-dependencies = [
- "weft-common",
- "weft-plan",
-]
-
-[[package]]
-name = "weft-orchestrator"
-version = "0.0.0"
-dependencies = [
- "serde",
- "serde_json",
- "tokio",
- "weft-common",
- "weft-execution",
-]
-
-[[package]]
-name = "weft-physical"
-version = "0.0.0"
-dependencies = [
- "weft-common",
- "weft-optimizer",
- "weft-plan",
-]
-
-[[package]]
-name = "weft-plan"
-version = "0.0.0"
-dependencies = [
- "weft-common",
-]
-
-[[package]]
-name = "weft-proto"
-version = "0.0.0"
-dependencies = [
- "prost 0.13.5",
- "prost-types 0.13.5",
- "protox",
- "tonic 0.12.3",
- "tonic-build",
-]
-
-[[package]]
-name = "weft-spark-compat"
-version = "0.0.0"
-dependencies = [
- "datafusion",
- "serde",
- "serde_json",
- "tokio",
- "weft-loom",
-]
-
-[[package]]
-name = "weft-sql"
-version = "0.0.0"
-dependencies = [
- "weft-common",
- "weft-plan",
-]
-
-[[package]]
-name = "weft-streaming"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "chrono",
- "datafusion",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "uuid",
- "weft-common",
- "weft-loom",
-]
-
-[[package]]
-name = "weft-ui-server"
-version = "0.0.0"
-dependencies = [
- "axum 0.8.9",
- "futures",
- "http-body-util",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "weft-common",
- "weft-observability",
 ]
 
 [[package]]

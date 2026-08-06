@@ -32,7 +32,7 @@ same value when ``round(f, k) == d`` where:
   * trailing zeros are stripped before string comparison (``Decimal.normalize``),
     so ``Decimal('1.230000')`` and ``1.23`` canonicalize identically.
 
-The engine's f64→decimal cast *truncates* (observed on weft: AVG → DECIMAL(19,6)
+The engine's f64→decimal cast *truncates* (observed on oxidant: AVG → DECIMAL(19,6)
 via toward-zero truncation), so ``ROUND_DOWN`` (toward zero) is accepted as an
 alternative rounding mode. A BENIGN verdict is only emitted when one concrete
 per-column (mode, scale) assignment makes the transformed golden checksum equal

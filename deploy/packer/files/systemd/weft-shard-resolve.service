@@ -1,9 +1,0 @@
-[Unit]
-Description=Weft worker shard-index re-resolution (instance-refresh self-heal)
-Documentation=https://github.com/weftlabs/weft
-After=weft-worker.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/lib/weft/shard-resolve.sh
-TimeoutStartSec=60

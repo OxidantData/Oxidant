@@ -11,57 +11,57 @@
   }
   body {
     margin: 0;
-    background-color: var(--weft-bg);
-    color: var(--weft-text);
-    font-family: var(--weft-font-ui);
+    background-color: var(--oxidant-bg);
+    color: var(--oxidant-text);
+    font-family: var(--oxidant-font-ui);
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
   * {
-    border-color: var(--weft-border);
+    border-color: var(--oxidant-border);
   }
 }
 
 @layer components {
-  .weft-card {
-    @apply rounded-weft border border-hairline bg-surface;
+  .oxidant-card {
+    @apply rounded-oxidant border border-hairline bg-surface;
   }
-  .weft-btn {
-    @apply inline-flex items-center justify-center gap-2 rounded-weft-sm px-4 py-2 text-sm
+  .oxidant-btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-oxidant-sm px-4 py-2 text-sm
       font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50;
   }
-  .weft-btn-primary {
-    @apply weft-btn bg-accent text-accent-contrast hover:bg-accent-hover;
+  .oxidant-btn-primary {
+    @apply oxidant-btn bg-accent text-accent-contrast hover:bg-accent-hover;
   }
-  .weft-btn-ghost {
-    @apply weft-btn border border-hairline bg-surface text-body hover:bg-bg-subtle;
+  .oxidant-btn-ghost {
+    @apply oxidant-btn border border-hairline bg-surface text-body hover:bg-bg-subtle;
   }
   /* Centered page column. */
-  .weft-container {
+  .oxidant-container {
     @apply mx-auto w-full max-w-content px-5 sm:px-6;
   }
   /* Small uppercase eyebrow label. */
-  .weft-eyebrow {
+  .oxidant-eyebrow {
     @apply text-xs font-semibold uppercase tracking-wider text-accent;
   }
   /* Code text on the dark surface — solid, theme-independent (Tailwind opacity-on-var drops). */
-  .weft-code-line {
-    color: var(--weft-code-text);
+  .oxidant-code-line {
+    color: var(--oxidant-code-text);
   }
-  .weft-code-dim {
-    color: var(--weft-code-text-dim);
+  .oxidant-code-dim {
+    color: var(--oxidant-code-text-dim);
   }
 }
 
 /* ── Weaving motifs ─────────────────────────────────────────────────────────────────────
- * Weft owns the loom: warp (vertical) + weft (horizontal) threads. All built from theme
+ * Oxidant owns the loom: warp (vertical) + oxidant (horizontal) threads. All built from theme
  * tokens only — orange accent + hairline border — so they theme automatically in dark mode. */
 @layer components {
   /* A near-invisible woven texture for hero / closing bands. */
   .woven-field {
     background-image:
-      repeating-linear-gradient(90deg, var(--weft-border) 0 1px, transparent 1px 28px),
-      repeating-linear-gradient(0deg, var(--weft-border) 0 1px, transparent 1px 28px);
+      repeating-linear-gradient(90deg, var(--oxidant-border) 0 1px, transparent 1px 28px),
+      repeating-linear-gradient(0deg, var(--oxidant-border) 0 1px, transparent 1px 28px);
     background-size: 28px 28px;
     -webkit-mask-image: radial-gradient(120% 85% at 50% 0%, #000 28%, transparent 78%);
     mask-image: radial-gradient(120% 85% at 50% 0%, #000 28%, transparent 78%);
@@ -73,7 +73,7 @@
     position: absolute;
     inset: 0 auto 0 38%;
     width: 1px;
-    background: linear-gradient(var(--weft-accent), transparent 70%);
+    background: linear-gradient(var(--oxidant-accent), transparent 70%);
     opacity: 0.22;
   }
   /* Denser variant for the closing band — the cloth "finishes". */
@@ -85,18 +85,18 @@
 
 /* SVG warp-weave hatch fill for benchmark bars (referenced by id from React). */
 
-@keyframes weft-shuttle-glide {
+@keyframes oxidant-shuttle-glide {
   0% { transform: translateX(-6%); opacity: 0; }
   15% { opacity: 1; }
   100% { transform: translateX(0); opacity: 1; }
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .weft-anim-shuttle {
-    animation: weft-shuttle-glide 0.9s cubic-bezier(0.22, 1, 0.36, 1) both;
+  .oxidant-anim-shuttle {
+    animation: oxidant-shuttle-glide 0.9s cubic-bezier(0.22, 1, 0.36, 1) both;
   }
   /* Threads/bars that grow on scroll-in: width is set inline; transition handles the motion. */
-  .weft-grow {
+  .oxidant-grow {
     transition: width 0.7s cubic-bezier(0.22, 1, 0.36, 1);
   }
 }

@@ -5,7 +5,7 @@ interface Feature {
 
 /**
  * Features hung off a single vertical warp thread — alternating indent, each connected by a short
- * weft tick + orange pickup node. Deliberately asymmetric so it never reads as a 2×2 feature grid.
+ * oxidant tick + orange pickup node. Deliberately asymmetric so it never reads as a 2×2 feature grid.
  */
 export default function WarpFeatureRail({ features }: { features: Feature[] }) {
   return (
@@ -18,7 +18,7 @@ export default function WarpFeatureRail({ features }: { features: Feature[] }) {
             key={f.title}
             className={`group relative ${i % 2 === 1 ? "sm:ml-16" : ""} transition-transform duration-150 hover:translate-x-0.5`}
           >
-            {/* weft tick + pickup node */}
+            {/* oxidant tick + pickup node */}
             <span
               aria-hidden
               className="absolute -left-4 top-3 h-px w-4 bg-hairline transition-colors group-hover:bg-accent sm:-left-7 sm:w-7"

@@ -3,7 +3,7 @@
 
 Ground truth is per-query JSONL (one record per query: status, hot_s, runDate):
 
-- weft: run-spark-connect.py against the distributed cluster (perf-planshape-sf10/, after the
+- oxidant: run-spark-connect.py against the distributed cluster (perf-planshape-sf10/, after the
   plan-shape program: footer/measured statistics, build-side-bounded hash joins, dim + plan
   caches, FILTER-merge shared scans, Q23 Forward arms, parallel dispatch, AQE off).
 - Spark on EMR: bench/sf100/emr/run-emr-suite.py, same queries and same S3 bytes on the
@@ -11,7 +11,7 @@ Ground truth is per-query JSONL (one record per query: status, hot_s, runDate):
   fresh the same day.
 
 Both engines use identical temperature semantics: 2 runs per query, hot = best of run 2
-(the earlier publish compared weft cold-single-run vs Spark best-of-2 — fixed here).
+(the earlier publish compared oxidant cold-single-run vs Spark best-of-2 — fixed here).
 
 perQuery is positional (Q1 -> index 0); failed queries stay `null` so the site
 renders them as gaps, never dropped. failedQueries holds the canonical 1-based
@@ -32,7 +32,7 @@ SITE = os.path.join(REPO, "site", "src", "data")
 
 MACHINE = "ec2 1x c6g.2xlarge driver/master + 2x m8g.2xlarge workers/core (arm64, us-west-2)"
 METHOD = (
-    "Same query text, same SF10 Parquet bytes on S3, same 3-node spec, same day. Weft: "
+    "Same query text, same SF10 Parquet bytes on S3, same 3-node spec, same day. Oxidant: "
     "DISTRIBUTED strict mode via Spark Connect (run-spark-connect.py), every query "
     "golden-validated vs DuckDB SF10. Spark: stock EMR 7.13.0 on YARN (run-emr-suite.py), "
     "temp views over the same S3 prefix. Both engines: 2 runs per query, hot = run 2 "
@@ -40,11 +40,11 @@ METHOD = (
 )
 
 ENGINES = {
-    "weft": {
-        "key": "weft-dist",
-        "name": "Weft (distributed, 2 workers)",
+    "oxidant": {
+        "key": "oxidant-dist",
+        "name": "Oxidant (distributed, 2 workers)",
         "highlight": True,
-        "source": "measured distributed (ec2/weft-sf10, 1 driver + 2 workers)",
+        "source": "measured distributed (ec2/oxidant-sf10, 1 driver + 2 workers)",
     },
     "emr": {
         "key": "spark-emr",
@@ -57,17 +57,17 @@ ENGINES = {
 SUITES = [
     {
         "out": os.path.join(SITE, "tpch.json"),
-        "dataset": "TPC-H SF10 Parquet on S3 (`s3://weft-artifacts-…/tpch-sf10/`)",
+        "dataset": "TPC-H SF10 Parquet on S3 (`s3://oxidant-artifacts-…/tpch-sf10/`)",
         "jsonl": {
-            "weft": os.path.join(HERE, "ds-throughput", "tpch-sf10-v13.jsonl"),
+            "oxidant": os.path.join(HERE, "ds-throughput", "tpch-sf10-v13.jsonl"),
             "emr": os.path.join(HERE, "perf-f1f5-sf10", "tpch-sf10-emr.jsonl"),
         },
     },
     {
         "out": os.path.join(SITE, "tpcds.json"),
-        "dataset": "TPC-DS SF10 Parquet on S3 (`s3://weft-artifacts-…/tpcds-sf10/`)",
+        "dataset": "TPC-DS SF10 Parquet on S3 (`s3://oxidant-artifacts-…/tpcds-sf10/`)",
         "jsonl": {
-            "weft": os.path.join(HERE, "ds-throughput", "tpcds-sf10-v13-final.jsonl"),
+            "oxidant": os.path.join(HERE, "ds-throughput", "tpcds-sf10-v13-final.jsonl"),
             "emr": os.path.join(HERE, "perf-f1f5-sf10", "tpcds-sf10-emr.jsonl"),
         },
     },

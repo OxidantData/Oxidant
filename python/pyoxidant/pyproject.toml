@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pyoxidant"
+version = "0.0.0"
+description = "Launch a Oxidant Spark Connect server; then point any PySpark client at sc://localhost:50051."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "Oxidant Data", email = "hello@oxidantdata.com" }]
+keywords = ["spark", "spark-connect", "pyspark", "arrow", "olap"]
+
+# pyoxidant only *starts the server*. Users keep their stock client:
+#   pip install pyspark-client
+# and connect via SparkSession.builder.remote("sc://localhost:50051").
+[project.optional-dependencies]
+client = ["pyspark-client>=4.0"]
+
+[project.scripts]
+pyoxidant = "pyoxidant:_main"
+
+[tool.maturin]
+# TODO: build the `oxidant` binary (crates/oxidant-cli) and ship it inside the wheel,
+# mirroring how pysail packages the Rust server. Until then this is a pure-Python shim.
+bindings = "bin"

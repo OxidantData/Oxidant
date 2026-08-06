@@ -1,0 +1,161 @@
+{{- /*
+  Autoscaling + file-list sharding are mutually exclusive.
+
+  ShardAssignment::from_env requires a fixed OXIDANT_WORKER_COUNT and stable ordinals
+  (StatefulSet pod names oxidant-worker-0 .. N-1). An HPA that changes replica count
+  while pods still advertise the render-time OXIDANT_WORKER_COUNT either drops shards
+  (data loss) or keeps every worker reading the full table (silent duplication).
+  Do not "helpfully" re-enable this; pin worker.replicas instead.
+*/ -}}
+{{- if .Values.worker.autoscaling.enabled }}
+{{- fail "worker.autoscaling.enabled is incompatible with OXIDANT_WORKER_COUNT file-list sharding (see values.yaml comment and docs/distributed-k8s.md). Set worker.autoscaling.enabled=false and pin worker.replicas." }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: oxidant-worker
+  labels:
+    app: oxidant-worker
+spec:
+  serviceName: oxidant-worker
+  replicas: {{ .Values.worker.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: oxidant-worker
+  template:
+    metadata:
+      labels:
+        app: oxidant-worker
+    spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        # One worker per node — topology must survive lowered CPU requests.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: oxidant-worker
+              topologyKey: kubernetes.io/hostname
+        {{- with .Values.worker.affinity }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: {{ .Values.worker.image }}
+          imagePullPolicy: {{ .Values.worker.imagePullPolicy }}
+          args: ["worker", "--port", "{{ .Values.worker.port }}"]
+          ports:
+            - name: flight
+              containerPort: {{ .Values.worker.port }}
+          env:
+            # File-list sharding (crates/oxidant-loom/src/shard.rs). Both required when count > 1.
+            - name: OXIDANT_WORKER_COUNT
+              value: {{ .Values.worker.replicas | quote }}
+            - name: OXIDANT_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OXIDANT_AWS_BIN
+              value: {{ .Values.connect.awsBin | quote }}
+            # Threshold spill lands under temp_dir()/oxidant-shuffle-spill/… — point TMPDIR
+            # at the spill volume so default_spill_root() uses the PVC, not /tmp emptyDir.
+            # Do NOT set OXIDANT_SHUFFLE_SPILL_DIR here: that enables force_spill (every bucket
+            # to disk) and invalidates benchmark timings. See worker.forceShuffleSpill.
+            - name: TMPDIR
+              value: /var/lib/oxidant/spill
+            - name: HOME
+              value: /tmp
+            {{- if .Values.worker.shuffleSpillBytes }}
+            - name: OXIDANT_SHUFFLE_SPILL_BYTES
+              value: {{ .Values.worker.shuffleSpillBytes | quote }}
+            {{- end }}
+            {{- if .Values.worker.memoryLimitBytes }}
+            - name: OXIDANT_MEMORY_LIMIT_BYTES
+              value: {{ .Values.worker.memoryLimitBytes | quote }}
+            {{- end }}
+            - name: OXIDANT_PREFER_HASH_JOIN
+              value: {{ .Values.worker.preferHashJoin | quote }}
+            {{- if .Values.worker.forceShuffleSpill }}
+            - name: OXIDANT_SHUFFLE_SPILL_DIR
+              value: /var/lib/oxidant/spill
+            {{- end }}
+          readinessProbe:
+            tcpSocket:
+              port: flight
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: flight
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: spill
+              mountPath: /var/lib/oxidant/spill
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.worker.persistence.enabled }}
+        - name: spill
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.worker.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: spill
+      spec:
+        accessModes:
+          {{- toYaml .Values.worker.persistence.accessModes | nindent 10 }}
+        {{- if .Values.worker.persistence.storageClass }}
+        storageClassName: {{ .Values.worker.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.worker.persistence.size }}
+  {{- end }}
+---
+# Headless Service — DNS discovery for OXIDANT_WORKER_SERVICE (do not give this a clusterIP).
+# publishNotReadyAddresses stays false so DNS only returns Ready workers (readinessProbe).
+apiVersion: v1
+kind: Service
+metadata:
+  name: oxidant-worker
+  labels:
+    app: oxidant-worker
+spec:
+  clusterIP: None
+  selector:
+    app: oxidant-worker
+  ports:
+    - name: flight
+      port: {{ .Values.worker.port }}
+      targetPort: {{ .Values.worker.port }}

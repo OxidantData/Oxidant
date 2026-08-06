@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Download DuckDB's pre-built TPC-H / TPC-DS SF100 databases, export each table as
-# Parquet into s3://weft-artifacts-<account>/<prefix>/<table>/, and register Glue
-# EXTERNAL_TABLE entries (empty Columns — Weft infers Parquet schema at read time).
+# Parquet into s3://oxidant-artifacts-<account>/<prefix>/<table>/, and register Glue
+# EXTERNAL_TABLE entries (empty Columns — Oxidant infers Parquet schema at read time).
 #
 # Usage (on a box with ~150 GB free disk + AWS creds that can s3:PutObject + glue:*):
 #   ./bench/sf100/dump-to-s3.sh              # both suites
@@ -11,10 +11,10 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-us-west-2}"
 ACCOUNT="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
-BUCKET="${BUCKET:-weft-artifacts-${ACCOUNT}}"
+BUCKET="${BUCKET:-oxidant-artifacts-${ACCOUNT}}"
 SF="${SF:-100}"
 SUITES="${SUITES:-tpch tpcds}"
-WORK="${WORK:-/data/weft-sf${SF}}"
+WORK="${WORK:-/data/oxidant-sf${SF}}"
 DUCKDB_BIN="${DUCKDB_BIN:-duckdb}"
 DUCKDB_VERSION="${DUCKDB_VERSION:-v1.3.2}"
 # Set SKIP_GLUE=1 when the instance role can write S3 but not mutate Glue;

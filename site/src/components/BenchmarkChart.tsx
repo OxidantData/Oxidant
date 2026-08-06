@@ -12,15 +12,15 @@ export default function BenchmarkChart({
   engines: Engine[];
   title?: string;
 }) {
-  const weftTotal =
-    (engines.find((e) => e.key === "weft") ?? engines.find((e) => e.highlight))?.total ?? null;
+  const oxidantTotal =
+    (engines.find((e) => e.key === "oxidant") ?? engines.find((e) => e.highlight))?.total ?? null;
   const measured = engines.filter((e) => e.total != null) as (Engine & { total: number })[];
   const max = measured.length ? Math.max(...measured.map((e) => e.total)) : 1;
   // Fastest first; pending (null) last — matches the ShuttlePass order.
   const ordered = [...engines].sort((a, b) => (a.total ?? Infinity) - (b.total ?? Infinity));
 
   return (
-    <div className="weft-card p-5 sm:p-6">
+    <div className="oxidant-card p-5 sm:p-6">
       <div className="mb-5 flex items-baseline justify-between">
         <h3 className="text-sm font-semibold">{title}</h3>
         <span className="text-xs text-muted">seconds · lower is better</span>
@@ -39,12 +39,12 @@ export default function BenchmarkChart({
                   </span>
                 )}
               </div>
-              <div className="relative flex h-7 items-center overflow-hidden rounded-weft-sm bg-bg-subtle">
+              <div className="relative flex h-7 items-center overflow-hidden rounded-oxidant-sm bg-bg-subtle">
                 <div
                   className={
                     pending
-                      ? "h-full rounded-weft-sm border border-dashed border-hairline bg-[repeating-linear-gradient(45deg,transparent,transparent_6px,var(--weft-border)_6px,var(--weft-border)_7px)]"
-                      : "h-full rounded-weft-sm"
+                      ? "h-full rounded-oxidant-sm border border-dashed border-hairline bg-[repeating-linear-gradient(45deg,transparent,transparent_6px,var(--oxidant-border)_6px,var(--oxidant-border)_7px)]"
+                      : "h-full rounded-oxidant-sm"
                   }
                   style={
                     pending
@@ -52,16 +52,16 @@ export default function BenchmarkChart({
                       : { width: `${pct}%`, backgroundColor: engineColor(e.key) }
                   }
                 />
-                {/* "Weft N% faster" tick at the bar's end (falls back to the time ratio
-                    when Weft is not the faster side) */}
-                {!pending && !e.highlight && weftTotal && e.total! > weftTotal && (
+                {/* "Oxidant N% faster" tick at the bar's end (falls back to the time ratio
+                    when Oxidant is not the faster side) */}
+                {!pending && !e.highlight && oxidantTotal && e.total! > oxidantTotal && (
                   <span className="ml-2 whitespace-nowrap text-[11px] font-medium tabular-nums text-muted">
-                    Weft {((1 - weftTotal / e.total!) * 100).toFixed(0)}% faster
+                    Oxidant {((1 - oxidantTotal / e.total!) * 100).toFixed(0)}% faster
                   </span>
                 )}
-                {!pending && !e.highlight && weftTotal && e.total! <= weftTotal && (
+                {!pending && !e.highlight && oxidantTotal && e.total! <= oxidantTotal && (
                   <span className="ml-2 whitespace-nowrap text-[11px] font-medium tabular-nums text-muted">
-                    {(e.total! / weftTotal).toFixed(2)}× Weft
+                    {(e.total! / oxidantTotal).toFixed(2)}× Oxidant
                   </span>
                 )}
               </div>

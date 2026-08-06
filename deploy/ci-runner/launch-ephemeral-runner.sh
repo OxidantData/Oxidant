@@ -8,25 +8,25 @@
 # triggering bench.yml (Actions tab -> Run workflow) so a job is queued for it to pick up.
 #
 # Prereq: a runner REGISTRATION TOKEN (needs repo-admin, which the kaicoder03 gh login lacks):
-#   gh api -X POST repos/vamzi/weft/actions/runners/registration-token --jq .token
+#   gh api -X POST repos/OxidantData/Oxidant/actions/runners/registration-token --jq .token
 #   ...or repo Settings -> Actions -> Runners -> New self-hosted runner.
 #
 # Usage:
-#   export WEFT_RUNNER_TOKEN="<registration-token>"
+#   export OXIDANT_RUNNER_TOKEN="<registration-token>"
 #   ./deploy/ci-runner/launch-ephemeral-runner.sh
 #
 # Tunables (env, with defaults):
-#   REGION=us-west-2  INSTANCE_TYPE=c6a.4xlarge  VOLUME_GB=120  KEY_NAME=weft-platform
-#   REPO_URL=https://github.com/vamzi/weft  LABELS=self-hosted,linux,x64,clickbench
+#   REGION=us-west-2  INSTANCE_TYPE=c6a.4xlarge  VOLUME_GB=120  KEY_NAME=oxidant-platform
+#   REPO_URL=https://github.com/OxidantData/Oxidant  LABELS=self-hosted,linux,x64,clickbench
 #   SUBNET_ID=...  SECURITY_GROUP_IDS=...   (optional; default VPC/SG if unset)
 set -euo pipefail
 
-: "${WEFT_RUNNER_TOKEN:?Set WEFT_RUNNER_TOKEN to a runner registration token (see header)}"
+: "${OXIDANT_RUNNER_TOKEN:?Set OXIDANT_RUNNER_TOKEN to a runner registration token (see header)}"
 REGION="${REGION:-us-west-2}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-c6a.4xlarge}"
 VOLUME_GB="${VOLUME_GB:-120}"
-KEY_NAME="${KEY_NAME:-weft-platform}"
-REPO_URL="${REPO_URL:-https://github.com/vamzi/weft}"
+KEY_NAME="${KEY_NAME:-oxidant-platform}"
+REPO_URL="${REPO_URL:-https://github.com/OxidantData/Oxidant}"
 LABELS="${LABELS:-self-hosted,linux,x64,clickbench}"
 
 echo "[runner] resolving latest Ubuntu 24.04 (amd64) AMI in ${REGION} …"
@@ -62,8 +62,8 @@ sudo -u ubuntu bash -lc "
   tar xzf runner.tar.gz
   sudo ./bin/installdependencies.sh
   ./config.sh --unattended --ephemeral --replace \
-    --url ${REPO_URL} --token ${WEFT_RUNNER_TOKEN} \
-    --name weft-ci-\$(hostname) --labels ${LABELS}
+    --url ${REPO_URL} --token ${OXIDANT_RUNNER_TOKEN} \
+    --name oxidant-ci-\$(hostname) --labels ${LABELS}
   ./run.sh || true
 "
 
@@ -80,7 +80,7 @@ INSTANCE_ID="$(aws ec2 run-instances --region "$REGION" \
   --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" \
   --instance-initiated-shutdown-behavior terminate \
   --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=${VOLUME_GB},VolumeType=gp3,DeleteOnTermination=true}" \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=weft-ci-runner},{Key=Purpose,Value=clickbench-ephemeral}]' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=oxidant-ci-runner},{Key=Purpose,Value=clickbench-ephemeral}]' \
   --user-data "file://${USER_DATA}" \
   "${EXTRA[@]}" \
   --query 'Instances[0].InstanceId' --output text)"

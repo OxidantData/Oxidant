@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run TPC-H / TPC-DS against a plain Spark Connect endpoint (sc://host:port).
 
-Talks to the Helm-deployed ``weft-connect`` Service with stock
+Talks to the Helm-deployed ``oxidant-connect`` Service with stock
 ``pyspark-client>=4.0`` (pure Python, no JVM). Records per-query wall time and a
 result checksum so Parquet / Iceberg / Delta runs can be compared later.
 
@@ -10,18 +10,18 @@ Examples::
   pip install "pyspark-client>=4.0"
 
   # Smoke a subset against a port-forwarded connect server
-  WEFT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \\
+  OXIDANT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \\
       --endpoint sc://localhost:50051 \\
       --suite tpcds --sf 100 --glue-db tpcds_sf100 \\
       --only 1,3,6 --json /tmp/tpcds-sc.jsonl
 
   # Full resumable sweep
-  WEFT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \\
+  OXIDANT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \\
       --endpoint sc://$CONNECT_HOST:50051 \\
       --suite tpcds --sf 100 --glue-db tpcds_sf100 \\
       --json results/tpcds-sf100-parquet.jsonl --resume
 
-The server must have ``WEFT_DISTRIBUTED_STRICT=1`` (SF100 Helm overlay sets this on
+The server must have ``OXIDANT_DISTRIBUTED_STRICT=1`` (SF100 Helm overlay sets this on
 the connect pod). When the client env / ``--strict`` flag is set, this runner
 refuses to start without it and treats distributed-fallback errors as hard fails.
 """
@@ -54,12 +54,12 @@ from sf100_common import (  # noqa: E402
 def _strict_requested(flag: bool) -> bool:
     if flag:
         return True
-    v = os.environ.get("WEFT_DISTRIBUTED_STRICT", "")
+    v = os.environ.get("OXIDANT_DISTRIBUTED_STRICT", "")
     return v == "1" or v.lower() == "true"
 
 
 def _ready_worker_count(namespace: str) -> tuple[int, int]:
-    """Return (ready_count, total_count) for pods labeled app=weft-worker."""
+    """Return (ready_count, total_count) for pods labeled app=oxidant-worker."""
     import subprocess
 
     out = subprocess.check_output(
@@ -70,7 +70,7 @@ def _ready_worker_count(namespace: str) -> tuple[int, int]:
             "get",
             "pods",
             "-l",
-            "app=weft-worker",
+            "app=oxidant-worker",
             "-o",
             "json",
         ],
@@ -89,7 +89,7 @@ def _ready_worker_count(namespace: str) -> tuple[int, int]:
 def assert_workers_ready(namespace: str, expected: int) -> None:
     """Refuse to run unless Ready worker pods == expected shard count.
 
-    Each worker shards by its own WEFT_POD_NAME ordinal over WEFT_WORKER_COUNT, while
+    Each worker shards by its own OXIDANT_POD_NAME ordinal over OXIDANT_WORKER_COUNT, while
     the driver discovers live endpoints via DNS. If a worker is not Ready, DNS omits
     it and the remaining workers still only read their own shard → silent row loss.
     """
@@ -101,8 +101,8 @@ def assert_workers_ready(namespace: str, expected: int) -> None:
     )
     if ready != expected:
         raise SystemExit(
-            f"preflight failed: {ready} Ready weft-worker pods (total={total}), "
-            f"expected {expected} (== WEFT_WORKER_COUNT). "
+            f"preflight failed: {ready} Ready oxidant-worker pods (total={total}), "
+            f"expected {expected} (== OXIDANT_WORKER_COUNT). "
             "A missing worker silently drops its shard. "
             "Wait for StatefulSet Ready, or pass --skip-worker-preflight (unsafe)."
         )
@@ -114,7 +114,7 @@ class WorkerGate:
     The one-shot preflight above only proves the cluster was healthy at t=0. A worker
     that restarts, is evicted, or fails a liveness probe *during* a sweep drops out of
     headless DNS, so the driver plans for fewer endpoints while the survivors still
-    shard over the render-time WEFT_WORKER_COUNT. Every query after that point returns
+    shard over the render-time OXIDANT_WORKER_COUNT. Every query after that point returns
     a subset of the data, faster, and reports success — a resumable SF100 sweep is one
     long process, so a single blip can quietly poison the rest of the run.
 
@@ -146,7 +146,7 @@ class WorkerGate:
         ready = self.observe()
         if ready is not None and ready != self.expected:
             raise SystemExit(
-                f"worker gate failed {when} {query}: {ready} Ready weft-worker pods, "
+                f"worker gate failed {when} {query}: {ready} Ready oxidant-worker pods, "
                 f"expected {self.expected}. Rows from the missing shard are dropped "
                 "silently, so every result from here on is void. Restore the "
                 "StatefulSet and re-run with --resume (completed queries are kept)."
@@ -155,7 +155,7 @@ class WorkerGate:
 
 
 def _canonical_cell(v) -> str:
-    """Normalize cell values so Spark vs Weft decimals/floats compare as multisets (KAN-8)."""
+    """Normalize cell values so Spark vs Oxidant decimals/floats compare as multisets (KAN-8)."""
     if v is None:
         return "NULL"
     # Decimal / DecimalType often stringify with trailing zeros inconsistently.
@@ -227,7 +227,7 @@ def _build_spark(endpoint: str, catalog: str, region: str, warehouse: str | None
             'pyspark-client is required: pip install "pyspark-client>=4.0"'
         ) from e
 
-    # Weft registers catalogs via spark.sql.catalog.<name>.type=glue (docs/catalogs.md).
+    # Oxidant registers catalogs via spark.sql.catalog.<name>.type=glue (docs/catalogs.md).
     builder = (
         SparkSession.builder.remote(endpoint)
         .config(f"spark.sql.catalog.{catalog}.type", "glue")
@@ -254,8 +254,8 @@ def main() -> int:
     )
     ap.add_argument(
         "--endpoint",
-        default=os.environ.get("WEFT_CONNECT", "sc://localhost:50051"),
-        help="Spark Connect URI (default sc://localhost:50051 or $WEFT_CONNECT)",
+        default=os.environ.get("OXIDANT_CONNECT", "sc://localhost:50051"),
+        help="Spark Connect URI (default sc://localhost:50051 or $OXIDANT_CONNECT)",
     )
     ap.add_argument("--suite", choices=["tpch", "tpcds"], required=True)
     ap.add_argument("--sf", type=float, default=100)
@@ -271,7 +271,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--warehouse",
-        default=os.environ.get("WEFT_WAREHOUSE", ""),
+        default=os.environ.get("OXIDANT_WAREHOUSE", ""),
         help="Optional glue catalog warehouse URI",
     )
     ap.add_argument(
@@ -288,7 +288,7 @@ def main() -> int:
     ap.add_argument(
         "--strict",
         action="store_true",
-        help="Require WEFT_DISTRIBUTED_STRICT (also honoured from the env var)",
+        help="Require OXIDANT_DISTRIBUTED_STRICT (also honoured from the env var)",
     )
     ap.add_argument(
         "--tries",
@@ -299,22 +299,22 @@ def main() -> int:
     ap.add_argument(
         "--query-timeout",
         type=float,
-        default=float(os.environ.get("WEFT_QUERY_TIMEOUT", "300")),
-        help="Per-query wall-clock timeout in seconds (default 300 / $WEFT_QUERY_TIMEOUT). "
+        default=float(os.environ.get("OXIDANT_QUERY_TIMEOUT", "300")),
+        help="Per-query wall-clock timeout in seconds (default 300 / $OXIDANT_QUERY_TIMEOUT). "
         "A wedged/deadlocked query fails fast and the Spark session is recreated instead of "
         "hanging the whole suite.",
     )
     ap.add_argument("--machine", default="eks/sf100")
     ap.add_argument(
         "--namespace",
-        default=os.environ.get("WEFT_NAMESPACE", "weft"),
-        help="K8s namespace for worker preflight (default weft / $WEFT_NAMESPACE)",
+        default=os.environ.get("OXIDANT_NAMESPACE", "oxidant"),
+        help="K8s namespace for worker preflight (default oxidant / $OXIDANT_NAMESPACE)",
     )
     ap.add_argument(
         "--worker-count",
         type=int,
-        default=int(os.environ.get("WEFT_WORKER_COUNT", "0") or "0"),
-        help="Expected Ready weft-worker pods (== chart worker.replicas / WEFT_WORKER_COUNT)",
+        default=int(os.environ.get("OXIDANT_WORKER_COUNT", "0") or "0"),
+        help="Expected Ready oxidant-worker pods (== chart worker.replicas / OXIDANT_WORKER_COUNT)",
     )
     ap.add_argument(
         "--skip-worker-preflight",
@@ -326,19 +326,19 @@ def main() -> int:
     strict = _strict_requested(args.strict)
     if strict:
         print(
-            "[run] strict mode: connect pod must have WEFT_DISTRIBUTED_STRICT=1 "
+            "[run] strict mode: connect pod must have OXIDANT_DISTRIBUTED_STRICT=1 "
             "(values-sf100.yaml sets connect.distributedStrict); fallback is a hard failure",
             flush=True,
         )
     else:
         print(
-            "[run] warning: WEFT_DISTRIBUTED_STRICT unset — distributed fallback "
-            "will quietly run single-node. Export WEFT_DISTRIBUTED_STRICT=1 or pass --strict.",
+            "[run] warning: OXIDANT_DISTRIBUTED_STRICT unset — distributed fallback "
+            "will quietly run single-node. Export OXIDANT_DISTRIBUTED_STRICT=1 or pass --strict.",
             flush=True,
         )
         if args.sf >= 100:
             raise SystemExit(
-                "refusing SF>=100 without WEFT_DISTRIBUTED_STRICT=1 or --strict "
+                "refusing SF>=100 without OXIDANT_DISTRIBUTED_STRICT=1 or --strict "
                 "(silent single-node fallback is not publishable)"
             )
 

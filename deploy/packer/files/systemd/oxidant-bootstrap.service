@@ -1,0 +1,26 @@
+[Unit]
+Description=Oxidant instance bootstrap (env, spill mount, DNS, shard index)
+Documentation=https://github.com/OxidantData/Oxidant
+After=network-online.target
+Wants=network-online.target
+# Role units (oxidant-driver/oxidant-worker) must only ever start AFTER this unit
+# has completed: they Require us and we run Before them. Bootstrap itself
+# never starts the role units (that would close the dependency cycle, KAN-58);
+# UserData starts them on first boot, this ordering on reboots.
+Before=oxidant-driver.service oxidant-worker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/oxidant/bootstrap.sh
+# Shutdown path: remove ONLY this instance's IP from the worker A RRSet
+# (remove_self_dns). Keep it fast — the network is going away, and a miss is
+# pruned by the next worker boot's full re-sync anyway.
+ExecStop=/usr/local/lib/oxidant/bootstrap.sh --deregister
+# wait_for_workers alone may burn 240s on a cold start waiting for ASG peers;
+# 300s was too tight and killed bootstrap before it wrote /etc/oxidant/oxidant.env.
+TimeoutStartSec=600
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

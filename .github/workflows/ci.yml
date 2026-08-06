@@ -1,6 +1,6 @@
 name: CI
 
-# Rust CI for Weft on free GitHub-hosted runners (public repo = unlimited minutes).
+# Rust CI for Oxidant on free GitHub-hosted runners (public repo = unlimited minutes).
 # Mirrors the gates from .gitlab-ci.yml that fit a hosted runner (4 vCPU / 16 GB):
 # rustfmt, clippy, workspace tests, the ClickBench/TPC-H/correctness coverage gates, and the
 # Spark-SQL parity ratchet (the `parity` job — fails any PR that drops Spark golden-SQL parity
@@ -83,7 +83,7 @@ jobs:
           df -h /
       - name: Start MinIO service container
         run: |
-          docker run -d --name weft-minio \
+          docker run -d --name oxidant-minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin123 \
@@ -95,7 +95,7 @@ jobs:
           curl -fsS http://127.0.0.1:9000/minio/health/live
           docker run --rm --network host \
             -e MC_HOST_local=http://minioadmin:minioadmin123@127.0.0.1:9000 \
-            minio/mc mb --ignore-existing local/weft-test
+            minio/mc mb --ignore-existing local/oxidant-test
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
           rustup show
@@ -109,10 +109,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace
-      - name: Build weft CLI (integration tests in weft-cli spawn the binary)
-        run: cargo build -p weft-cli
+      - name: Build oxidant CLI (integration tests in oxidant-cli spawn the binary)
+        run: cargo build -p oxidant-cli
       - name: local-cluster CLI parse smoke
-        run: cargo test -p weft-cli local_cluster_mode_parses --bin weft
+        run: cargo test -p oxidant-cli local_cluster_mode_parses --bin oxidant
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       # Not nextest. It runs every test in its own process and schedules the whole workspace in
@@ -124,10 +124,10 @@ jobs:
       - name: test (workspace)
         run: cargo test --workspace
         env:
-          WEFT_MINIO_TEST: "1"
-          WEFT_MINIO_ENDPOINT: "http://127.0.0.1:9000"
+          OXIDANT_MINIO_TEST: "1"
+          OXIDANT_MINIO_ENDPOINT: "http://127.0.0.1:9000"
           # Line-tables-only debug info: the full test/dev profiles' debuginfo makes each
-          # weft-execution integration binary ~1-2 GB at link time, and parallel `ld`
+          # oxidant-execution integration binary ~1-2 GB at link time, and parallel `ld`
           # processes exhaust the 16 GB runner (collect2: ld terminated with signal 7
           # [Bus error] on main, 2026-07-30). Assertions/backtraces are unaffected.
           CARGO_PROFILE_TEST_DEBUG: "1"
@@ -135,7 +135,7 @@ jobs:
 
   # The TPC-H / TPC-DS / distributed gates used to run at the tail of build-test, which made the
   # critical path the SUM of compiling the workspace and replaying every query suite. They only
-  # need the `weft-bench` binary, so they run here in parallel against the same shared cache.
+  # need the `oxidant-bench` binary, so they run here in parallel against the same shared cache.
   # Note these execute in the dev profile — `[profile.dev.package."*"] opt-level = 2` in the root
   # Cargo.toml is what keeps that tractable, since it optimizes datafusion/arrow while leaving
   # workspace crates cheap to compile.
@@ -152,34 +152,34 @@ jobs:
         with:
           shared-key: workspace
           save-if: "false" # build-test writes this cache
-      - name: Build weft-bench once (every gate below reuses this binary)
-        run: cargo build -p weft-bench
+      - name: Build oxidant-bench once (every gate below reuses this binary)
+        run: cargo build -p oxidant-bench
       - name: TPC-H coverage (Q1/Q3/Q5/Q6/Q10)
-        run: cargo run -p weft-bench -- tpch
+        run: cargo run -p oxidant-bench -- tpch
       - name: TPC-H distributed (3 workers, sf0.05)
-        run: cargo run -p weft-bench -- tpch-distributed --sf 0.05 --workers 3
+        run: cargo run -p oxidant-bench -- tpch-distributed --sf 0.05 --workers 3
         env:
-          WEFT_TPCH_DIST_REQUIRE_ALL: "1"
+          OXIDANT_TPCH_DIST_REQUIRE_ALL: "1"
       - name: Install DuckDB CLI (TPC-DS dsdgen + oracle)
         run: |
           curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.3.2/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
           sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
           duckdb --version
       - name: TPC-DS coverage (Q1–Q99, sf0.01, pass-set ratchet)
-        run: cargo run -p weft-bench -- tpcds --sf 0.01
+        run: cargo run -p oxidant-bench -- tpcds --sf 0.01
       - name: TPC-DS distributed planner ratchet (95/99 floor, sf0.01)
-        run: cargo run -p weft-bench -- tpcds-distributed --sf 0.01
+        run: cargo run -p oxidant-bench -- tpcds-distributed --sf 0.01
       # The planner ratchet above only proves a distributed plan can be BUILT. This runs every
       # distributable query on a real two-worker cluster and compares row-for-row against
       # single-node. It fails on ANY mismatch or execution error, and on any query dropping out of
       # bench/distributed/tpcds-execute-baseline.json. Full sweep, not a sample: sampling eight
       # queries is how 24 wrong-or-broken queries were counted as "distributed" for so long.
       - name: TPC-DS distributed EXECUTE correctness ratchet (95 verified, sf0.01, 2 workers)
-        run: cargo run -p weft-bench -- tpcds-distributed --execute --sf 0.01 --workers 2
+        run: cargo run -p oxidant-bench -- tpcds-distributed --execute --sf 0.01 --workers 2
       - name: Distributed correctness gate
-        run: cargo run -p weft-bench -- correctness-distributed --rows 2000
+        run: cargo run -p oxidant-bench -- correctness-distributed --rows 2000
         env:
-          WEFT_DIST_TPCDS_SAMPLE: "8"
+          OXIDANT_DIST_TPCDS_SAMPLE: "8"
 
   # ClickBench / correctness coverage on small synthetic data. Required gate: all 43 queries must
   # pass. Fixed by switching queries.sql identifiers from ANSI double-quotes to backtick-quotes so
@@ -199,13 +199,13 @@ jobs:
           shared-key: workspace
           save-if: "false" # build-test writes this cache
       - name: ClickBench coverage (43 queries, engine-direct)
-        run: cargo run -p weft-bench -- clickbench --rows 20000
+        run: cargo run -p oxidant-bench -- clickbench --rows 20000
       - name: ClickBench coverage (43 queries, live Spark Connect over gRPC)
-        run: cargo run -p weft-bench -- clickbench-grpc --rows 20000
+        run: cargo run -p oxidant-bench -- clickbench-grpc --rows 20000
       - name: correctness (gRPC/Arrow-IPC vs engine-direct + ground truth)
-        run: cargo run -p weft-bench -- correctness --rows 5000
+        run: cargo run -p oxidant-bench -- correctness --rows 5000
 
-  # Spark-SQL parity ratchet: replays Apache Spark v4.0.0's own golden SQL corpus through weft and
+  # Spark-SQL parity ratchet: replays Apache Spark v4.0.0's own golden SQL corpus through oxidant and
   # fails the PR if strict OR semantic parity drops below the committed parity/baseline.json floor
   # (or the corpus size changes). This is the gate that protects the Spark-compatibility work — a PR
   # can only hold or improve parity. To LAND a gain, re-baseline (see PARITY_SWARM_PLAYBOOK.md §6).
@@ -219,7 +219,7 @@ jobs:
         run: |
           rustup show
           rustc --version && cargo --version
-      # Deliberately NOT on the shared workspace cache. weft-parity depends only on weft-loom
+      # Deliberately NOT on the shared workspace cache. oxidant-parity depends only on oxidant-loom
       # (+ datafusion), so it resolves a narrower feature set than the whole-workspace build and
       # cannot reuse those artifacts — pointed at the shared cache it re-compiled datafusion from
       # scratch and went from 2 min to 20 min, making it the critical path. Its own small,
@@ -233,12 +233,12 @@ jobs:
         with:
           key: spark-parity-v2
           cache-on-failure: "true"
-      - name: Build weft-parity
-        run: cargo build -p weft-spark-compat --bin weft-parity
+      - name: Build oxidant-parity
+        run: cargo build -p oxidant-spark-compat --bin oxidant-parity
       - name: Ratchet against parity/baseline.json
         run: |
           set -o pipefail
-          ./target/debug/weft-parity ratchet --baseline parity/baseline.json --out-dir parity | tee parity-run.log
+          ./target/debug/oxidant-parity ratchet --baseline parity/baseline.json --out-dir parity | tee parity-run.log
       - name: Publish parity headline to job summary
         if: always()
         run: |

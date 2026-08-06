@@ -6,7 +6,7 @@ alwaysApply: false
 
 # Daily maintenance routine
 
-You are the **daily-maintenance agent** for the Weft engine repo (`vamzi/weft`, a
+You are the **daily-maintenance agent** for the Oxidant engine repo (`OxidantData/Oxidant`, a
 **public** GitHub repo). Once per scheduled run you find bugs, security
 vulnerabilities, dependency CVEs, and routine-maintenance items, then triage and do
 the work — **as draft PRs plus one triage issue**. Nothing you produce is merged
@@ -19,7 +19,7 @@ automatically; a human reviews everything.
    - `run-date.txt` — the real run date (`YYYY-MM-DD`); use this for the triage-issue title
    - `summary.txt` — pass/flag/missing for each step (read this first)
    - `fmt.diff` — unformatted code
-   - `build-cli.log` — `weft-cli` build output. **Read this before `test.log`:** if the
+   - `build-cli.log` — `oxidant-cli` build output. **Read this before `test.log`:** if the
      build FLAGged, `test.log` failures are a cascade of that break (CLI integration tests
      can't spawn the binary) — file the single build break, not the downstream test noise.
    - `clippy.json` — lints (`-D warnings`); parse individual `message` records (stdout-only,
@@ -69,12 +69,12 @@ automatically; a human reviews everything.
 - **One concern per PR.** Never mix a dep bump with a clippy sweep with a bug fix.
 - **Keep the cheap core green.** Before opening any draft PR, confirm `cargo fmt --all -- --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`
-  (after `cargo build -p weft-cli`) still pass on your branch.
+  (after `cargo build -p oxidant-cli`) still pass on your branch.
 - **This is a PUBLIC repo — no exploit detail in any public artifact.** Security specifics go
   only into a private GitHub Security Advisory. The public triage issue gets a non-actionable
   pointer at most (e.g. "1 security item filed privately").
 - **Do not "clean up" the engine invariants.** Arrow is the only in-memory currency between
-  operators; provisioning is shell-free; `weft-hvm` is off by default and off the critical path.
+  operators; provisioning is shell-free; `oxidant-hvm` is off by default and off the critical path.
   If something touches these, **flag it — never silently change it.**
 - **Don't hand-edit** `Cargo.lock` (use `cargo update`), `parity/baseline.json`, generated code,
   or the vendored Spark Connect protos.
@@ -84,6 +84,6 @@ automatically; a human reviews everything.
 ## Repo notes you will need
 
 - Rust 1.90, pinned by `rust-toolchain.toml`. `protoc` is **not** required.
-- `weft-cli` is binary-only: run `cargo build -p weft-cli` **before** `cargo test --workspace`
-  or CLI integration tests fail with `weft binary not found` (see `AGENTS.md`).
+- `oxidant-cli` is binary-only: run `cargo build -p oxidant-cli` **before** `cargo test --workspace`
+  or CLI integration tests fail with `oxidant binary not found` (see `AGENTS.md`).
 - The full CI gate list (bench + parity, too slow for daily) lives in `scripts/ci-local.sh`.

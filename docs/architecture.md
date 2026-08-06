@@ -1,18 +1,18 @@
-# Weft Architecture
+# Oxidant Architecture
 
 This is the canonical in-repo architecture doc. It condenses the full project plan; when
 the two disagree, this file wins for day-to-day engineering.
 
 **Related maps:** [CODEMAP.md](CODEMAP.md) (ownership), [TODOS.md](TODOS.md) (open work),
 [AGENT_INDEXING.md](AGENT_INDEXING.md) (CodeGraph / GitNexus). Control-plane architecture
-lives in the private **weft-platform** repo (`docs/ARCHITECTURE.md`).
+lives in the private **oxidant-platform** repo (`docs/ARCHITECTURE.md`).
 
 ## Thesis
 
 A drop-in Apache Spark replacement that **beats Sail on CPU** with a lean vectorized core
-(**Loom**), and opens a **second front** — HVM2/Bend (**Weft-HVM**) — for the
+(**Loom**), and opens a **second front** — HVM2/Bend (**Oxidant-HVM**) — for the
 embarrassingly-parallel, irregular workloads no columnar engine serves well.
-*"Weft starts where Sail ends."*
+*"Oxidant starts where Sail ends."*
 
 ## The decision that shapes everything
 
@@ -45,32 +45,32 @@ benchmark; HVM2 is a **gated research bet** for a *different* workload class.
 ```mermaid
 flowchart TD
   Client["Unmodified PySpark / Spark SQL (sc://)"] -->|Spark Connect gRPC| FE
-  FE["weft-connect (gRPC server)"] --> WARP["weft-plan (warp IR)"]
-  SQL["weft-sql"] --> WARP
-  WARP --> RES["weft-analyzer"] --> OPT["weft-optimizer (heddle: opt + backend routing)"] --> PHY["weft-physical"]
-  PHY -->|columnar/SIMD ops, default| LOOM["weft-loom (CPU: DataFusion→native)"]
-  PHY -->|irregular/parallel fragments| HVM["weft-hvm (Bend→HVM2, opt-in)"]
-  PHY --> EXEC["weft-execution (local | driver/worker + Arrow Flight)"]
+  FE["oxidant-connect (gRPC server)"] --> WARP["oxidant-plan (warp IR)"]
+  SQL["oxidant-sql"] --> WARP
+  WARP --> RES["oxidant-analyzer"] --> OPT["oxidant-optimizer (heddle: opt + backend routing)"] --> PHY["oxidant-physical"]
+  PHY -->|columnar/SIMD ops, default| LOOM["oxidant-loom (CPU: DataFusion→native)"]
+  PHY -->|irregular/parallel fragments| HVM["oxidant-hvm (Bend→HVM2, opt-in)"]
+  PHY --> EXEC["oxidant-execution (local | driver/worker + Arrow Flight)"]
   EXEC --> LOOM
   EXEC --> HVM
-  LOOM --> DS["weft-datasource (Parquet/Delta/Iceberg)"] --> OBJ[("S3/Azure/GCS/local")]
-  DS --> CAT["weft-catalog (Unity/Glue/Hive/mem)"]
+  LOOM --> DS["oxidant-datasource (Parquet/Delta/Iceberg)"] --> OBJ[("S3/Azure/GCS/local")]
+  DS --> CAT["oxidant-catalog (Unity/Glue/Hive/mem)"]
   LOOM -->|Arrow batches| FE
   HVM -->|Arrow batches| FE
 ```
 
-**Boundary contract:** everything between operators is Apache Arrow. `weft-hvm` is the only
+**Boundary contract:** everything between operators is Apache Arrow. `oxidant-hvm` is the only
 place data leaves Arrow, and only for coarse routed fragments — never the columnar hot loop.
 
-**External catalogs:** `weft-catalog` is a pluggable, async `CatalogProvider` SPI; `weft-loom`
+**External catalogs:** `oxidant-catalog` is a pluggable, async `CatalogProvider` SPI; `oxidant-loom`
 bridges it onto DataFusion's `CatalogProvider`/`SchemaProvider` so an external metastore resolves
 table names **lazily** (the catalog is hit only when a query first references a table). Configure
 one the Spark way — `spark.sql.catalog.<name>.type=hive` — or implement the trait. Hive Metastore
-ships as the reference provider (`weft-catalog-hive`). See [catalogs.md](catalogs.md).
+ships as the reference provider (`oxidant-catalog-hive`). See [catalogs.md](catalogs.md).
 
 ## How a GROUP BY actually runs
 
-In `weft-loom`: a cache-efficient **radix-partitioned, open-addressing hash table with an
+In `oxidant-loom`: a cache-efficient **radix-partitioned, open-addressing hash table with an
 inline hash salt** (DuckDB/DataFusion design), morsel-driven across cores, spilling
 partitions independently under memory pressure, with strategy adapted to estimated
 cardinality. The *only* thing an interaction net should ever touch is the

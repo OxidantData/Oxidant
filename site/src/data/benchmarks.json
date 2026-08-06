@@ -7,8 +7,8 @@
   "method": "Spark Connect, stock PySpark client, 3 tries/query, hot = min(try2, try3)",
   "engines": [
     {
-      "key": "weft",
-      "name": "Weft",
+      "key": "oxidant",
+      "name": "Oxidant",
       "highlight": true,
       "total": 41.428,
       "totalAll": 44.664,

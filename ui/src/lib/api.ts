@@ -1,4 +1,4 @@
-export const APP_ID = "weft-local";
+export const APP_ID = "oxidant-local";
 
 export interface JobData {
   jobId: number;

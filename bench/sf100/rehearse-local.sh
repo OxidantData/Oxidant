@@ -9,7 +9,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK="${WORK:-$(mktemp -d -t weft-sf001-XXXXXX)}"
+WORK="${WORK:-$(mktemp -d -t oxidant-sf001-XXXXXX)}"
 cleanup() {
   if [[ "${KEEP_WORK:-0}" != "1" ]]; then
     rm -rf "$WORK"

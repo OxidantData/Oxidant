@@ -1,4 +1,4 @@
-# Running distributed Weft on EC2 (CloudFormation + ASG)
+# Running distributed Oxidant on EC2 (CloudFormation + ASG)
 
 This is the **EKS-free** data-plane path: one Spark Connect driver EC2 instance + N
 Arrow Flight worker instances in fixed-size Auto Scaling Groups, discovered via a
@@ -13,9 +13,9 @@ For the future full platform (SSO, gateway operator, Terraform), see
 ## Architecture
 
 ```
-PySpark / weft-bench  -->  weft driver :50051  (direct IP — no LB)
+PySpark / oxidant-bench  -->  oxidant driver :50051  (direct IP — no LB)
                               |
-                              |  WEFT_WORKER_SERVICE DNS (multi-A)
+                              |  OXIDANT_WORKER_SERVICE DNS (multi-A)
                               v
                          worker EC2s :50561 (Flight)
                               |
@@ -26,14 +26,14 @@ PySpark / weft-bench  -->  weft driver :50051  (direct IP — no LB)
 
 | Piece | Implementation |
 |-------|----------------|
-| AMI | Packer AL2023 image (`deploy/packer/`) with `weft`, AWS CLI v2, hardened `weft` user (uid 65532), systemd units |
-| Driver | ASG `Min=Max=Desired=1`, `weft spark server --port 50051` |
+| AMI | Packer AL2023 image (`deploy/packer/`) with `oxidant`, AWS CLI v2, hardened `oxidant` user (uid 65532), systemd units |
+| Driver | ASG `Min=Max=Desired=1`, `oxidant spark server --port 50051` |
 | Workers | ASG `Min=Max=Desired=WorkerCount` (pinned — no scale policies) |
 | Discovery | Private hosted zone; workers UPSERT `workers.<stack>.<zone>` with all InService private IPs |
-| Sharding | Boot assigns `WEFT_SHARD_INDEX` = position in sorted InService instance IDs |
-| Spill | Optional second EBS volume mounted at `/var/lib/weft/spill` (`TMPDIR`) |
+| Sharding | Boot assigns `OXIDANT_SHARD_INDEX` = position in sorted InService instance IDs |
+| Spill | Optional second EBS volume mounted at `/var/lib/oxidant/spill` (`TMPDIR`) |
 | Auth | Instance profiles only — no credentials in the AMI |
-| Catalog | Optional `WEFT_CATALOG_CONF` (Glue) on **driver and workers** via the `CatalogConf` stack parameter |
+| Catalog | Optional `OXIDANT_CATALOG_CONF` (Glue) on **driver and workers** via the `CatalogConf` stack parameter |
 
 Workers are **not** behind a single L4 VIP for Flight (shuffle state is per-worker).
 Connect clients talk to the **single driver IP** (private from VPC/VPN/bastion, or
@@ -41,7 +41,7 @@ public IP + `ClientCidr` for laptop honesty runs).
 
 ### Do not put Spark Connect behind an NLB
 
-**Bad approach — do not use for Weft data-plane / SF100 / TPC honesty runs.**
+**Bad approach — do not use for Oxidant data-plane / SF100 / TPC honesty runs.**
 
 An internet-facing Network Load Balancer on `:50051` (`ExposeConnect=true`) is the
 wrong model for this workload:
@@ -50,7 +50,7 @@ wrong model for this workload:
 |---------|--------------------------|
 | One Connect driver | Nothing to load-balance; Databricks / LakeSail / OSS Spark Connect also terminate on the driver (or a control-plane proxy), not an L4 VIP in front of query compute |
 | Workers are stateful Flight peers | Shuffle and shard index are per-instance; never put workers behind a shared VIP |
-| Honesty / bench runs | NLB health checks + target registration add minutes of false “unhealthy” while `weft-driver` is already listening — wasted wall clock, not signal |
+| Honesty / bench runs | NLB health checks + target registration add minutes of false “unhealthy” while `oxidant-driver` is already listening — wasted wall clock, not signal |
 | Failure mode | ASG + TG health can mark the only driver unhealthy and black-hole clients even when `:50051` accepts connections |
 
 Keep `ExposeConnect=false` (the default). Resolve the driver instance IP and use
@@ -66,7 +66,7 @@ Follow these sections in order:
 3. [Bake the AMI](#1-bake-the-ami)
 4. [Deploy the CloudFormation stack](#2-deploy-the-cloudformation-stack)
 5. [Verify the cluster](#3-verify-the-cluster)
-6. [Point Weft at Glue](#4-point-weft-at-the-glue-catalog)
+6. [Point Oxidant at Glue](#4-point-oxidant-at-the-glue-catalog)
 7. [Run a query](#5-run-a-query)
 8. [Operate / tear down](#operate--tear-down)
 
@@ -78,7 +78,7 @@ Follow these sections in order:
 
 - AWS CLI v2 configured for the target account/region
 - [Packer](https://developer.hashicorp.com/packer) ≥ 1.9 (Amazon plugin installed via `packer init`)
-- Rust toolchain matching [`rust-toolchain.toml`](../rust-toolchain.toml) (to build `weft`), **or** a pre-built linux/amd64 `weft` binary
+- Rust toolchain matching [`rust-toolchain.toml`](../rust-toolchain.toml) (to build `oxidant`), **or** a pre-built linux/amd64 `oxidant` binary
 - Python 3 + `pip install "pyspark-client>=4.0"` for Connect clients
 - Rights in the account for: EC2, Auto Scaling, IAM, Route53 (private zones), CloudFormation, S3, Glue, and (optional) ELBv2
 
@@ -95,11 +95,11 @@ This template does **not** create a VPC. You need:
 
 ### Why worker count is fixed
 
-Same contract as the Helm chart: file-list sharding uses a fixed `WEFT_WORKER_COUNT`
-plus a stable `WEFT_SHARD_INDEX` per worker. Changing N under an ASG scaling policy
+Same contract as the Helm chart: file-list sharding uses a fixed `OXIDANT_WORKER_COUNT`
+plus a stable `OXIDANT_SHARD_INDEX` per worker. Changing N under an ASG scaling policy
 without coordinated re-assignment silently duplicates or drops shards. The template
 sets `MinSize = MaxSize = DesiredCapacity = WorkerCount` and adds **no** scaling
-policies. Bootstrap also pins `WEFT_SHUFFLE_PARTITIONS` to `WorkerCount` on the driver.
+policies. Bootstrap also pins `OXIDANT_SHUFFLE_PARTITIONS` to `WorkerCount` on the driver.
 See [`distributed-k8s.md`](distributed-k8s.md) for the membership / silent-row-loss
 failure modes — they apply identically here.
 
@@ -107,8 +107,8 @@ failure modes — they apply identically here.
 
 ## Prepare S3 + Glue Data Catalog
 
-Weft’s Glue provider (`weft-catalog-glue`) shells out to the AWS CLI
-(`WEFT_AWS_BIN`, default `/usr/local/bin/aws` on the AMI). Credentials come from the
+Oxidant’s Glue provider (`oxidant-catalog-glue`) shells out to the AWS CLI
+(`OXIDANT_AWS_BIN`, default `/usr/local/bin/aws` on the AMI). Credentials come from the
 **instance profile** (IMDSv2). Tables must already exist in Glue and point at readable
 S3 locations (Parquet is the well-supported path for remote object stores today; see
 [`catalogs.md`](catalogs.md)).
@@ -117,9 +117,9 @@ S3 locations (Parquet is the well-supported path for remote object stores today;
 
 ```sh
 export AWS_REGION=us-west-2
-export BUCKET=my-weft-data          # globally unique
+export BUCKET=my-oxidant-data          # globally unique
 export PREFIX=warehouse            # CTAS default root (optional)
-export GLUE_DB=weft_demo
+export GLUE_DB=oxidant_demo
 
 aws s3 mb "s3://${BUCKET}" --region "${AWS_REGION}"
 ```
@@ -135,7 +135,7 @@ aws s3 sync ./my-parquet/ "s3://${BUCKET}/${GLUE_DB}/orders/" --region "${AWS_RE
 
 ```sh
 aws glue create-database --region "${AWS_REGION}" \
-  --database-input "{\"Name\":\"${GLUE_DB}\",\"Description\":\"Weft EC2 demo\"}"
+  --database-input "{\"Name\":\"${GLUE_DB}\",\"Description\":\"Oxidant EC2 demo\"}"
 ```
 
 ### 3. Register a Glue table
@@ -181,12 +181,12 @@ aws glue get-table --region "${AWS_REGION}" \
 
 ```text
 DataBucketArns:
-  arn:aws:s3:::my-weft-data,arn:aws:s3:::my-weft-data/*
+  arn:aws:s3:::my-oxidant-data,arn:aws:s3:::my-oxidant-data/*
 
 EnableGlueAccess: true
 
 CatalogConf (≤256 chars, applied to driver AND workers):
-  spark.sql.catalog.glue.type=glue;spark.sql.catalog.glue.region=us-west-2;spark.sql.catalog.glue.warehouse=s3://my-weft-data/warehouse
+  spark.sql.catalog.glue.type=glue;spark.sql.catalog.glue.region=us-west-2;spark.sql.catalog.glue.warehouse=s3://my-oxidant-data/warehouse
 ```
 
 | Key | Required | Meaning |
@@ -206,17 +206,17 @@ against external catalogs yet — always qualify (see [`catalogs.md`](catalogs.m
 From the repository root:
 
 ```sh
-cargo build -p weft-cli --release
+cargo build -p oxidant-cli --release
 
 # cross-check: binary must be linux/amd64 if you bake from macOS — build in CI,
 # in a linux container, or pass --binary-url to a linux artifact instead.
-./deploy/packer/build-ami.sh --binary ./target/release/weft --region "${AWS_REGION}"
+./deploy/packer/build-ami.sh --binary ./target/release/oxidant --region "${AWS_REGION}"
 ```
 
 Or:
 
 ```sh
-./deploy/packer/build-ami.sh --binary-url https://example.com/releases/weft-linux-amd64
+./deploy/packer/build-ami.sh --binary-url https://example.com/releases/oxidant-linux-amd64
 ```
 
 Packer prints a new `ami-…` id. Save it:
@@ -227,12 +227,12 @@ export AMI_ID=ami-0123456789abcdef0
 
 The image:
 
-- Installs `/usr/local/bin/weft` and AWS CLI v2
-- Creates non-root user `weft` (uid/gid **65532**)
+- Installs `/usr/local/bin/oxidant` and AWS CLI v2
+- Creates non-root user `oxidant` (uid/gid **65532**)
 - Requires **IMDSv2** on the builder (launch templates also set `HttpTokens=required`)
 - Disables SSH password auth; prefer SSM Session Manager
 - Enables `dnf-automatic` for security updates
-- Ships `weft-bootstrap.service` + role units (`weft-driver` / `weft-worker`)
+- Ships `oxidant-bootstrap.service` + role units (`oxidant-driver` / `oxidant-worker`)
 
 Details: [`deploy/packer/README.md`](../deploy/packer/README.md).
 
@@ -248,7 +248,7 @@ export SUBNETS=subnet-aaa,subnet-bbb   # private preferred; public only if lapto
   --ami "${AMI_ID}" \
   --vpc "${VPC_ID}" \
   --subnets "${SUBNETS}" \
-  --stack weft-demo \
+  --stack oxidant-demo \
   --region "${AWS_REGION}" \
   --driver-type m6i.xlarge \
   --worker-type m6i.2xlarge \
@@ -264,7 +264,7 @@ export SUBNETS=subnet-aaa,subnet-bbb   # private preferred; public only if lapto
   --client-cidr 10.0.0.0/8
 ```
 
-Template: [`deploy/cloudformation/weft-cluster.yaml`](../deploy/cloudformation/weft-cluster.yaml).
+Template: [`deploy/cloudformation/oxidant-cluster.yaml`](../deploy/cloudformation/oxidant-cluster.yaml).
 
 > **SF100 honesty runs** use a fixed Graviton topology — see
 > [SF100 topology (canonical)](#sf100-topology-canonical) below. Do not publish
@@ -274,7 +274,7 @@ What the stack creates:
 
 - IAM instance profiles (SSM + optional S3/Glue; workers also get Route53 change on the private zone)
 - Security groups (Connect `50051` from `ClientCidr`; Flight `50561` driver→workers and worker↔worker)
-- Private hosted zone (`HostedZoneName`, default `weft.internal`)
+- Private hosted zone (`HostedZoneName`, default `oxidant.internal`)
 - Driver LT + ASG (size 1) and worker LT + ASG (size `WorkerCount`)
 - **No NLB** in the supported path (`ExposeConnect=false`)
 
@@ -289,16 +289,16 @@ What the stack creates:
 | `WorkerCount` | `2` | Fixed worker ASG size |
 | `DriverRootVolumeSize` / `Type` | `40` / `gp3` | Driver root EBS |
 | `WorkerRootVolumeSize` / `Type` | `40` / `gp3` | Worker root EBS |
-| `DriverSpillVolumeSize` / `Type` | `100` / `gp3` | Extra volume → `/var/lib/weft/spill` (`0` = skip) |
-| `WorkerSpillVolumeSize` / `Type` | `200` / `gp3` | Extra volume → `/var/lib/weft/spill` (`0` = skip) |
-| `MemoryLimitBytes` | empty | `WEFT_MEMORY_LIMIT_BYTES` |
-| `ShuffleSpillBytes` | empty | `WEFT_SHUFFLE_SPILL_BYTES` |
-| `CatalogConf` | empty | `WEFT_CATALOG_CONF` on driver **and** workers (≤256 chars) |
+| `DriverSpillVolumeSize` / `Type` | `100` / `gp3` | Extra volume → `/var/lib/oxidant/spill` (`0` = skip) |
+| `WorkerSpillVolumeSize` / `Type` | `200` / `gp3` | Extra volume → `/var/lib/oxidant/spill` (`0` = skip) |
+| `MemoryLimitBytes` | empty | `OXIDANT_MEMORY_LIMIT_BYTES` |
+| `ShuffleSpillBytes` | empty | `OXIDANT_SHUFFLE_SPILL_BYTES` |
+| `CatalogConf` | empty | `OXIDANT_CATALOG_CONF` on driver **and** workers (≤256 chars) |
 | `DataBucketArns` | empty | S3 ARNs on the instance profiles |
 | `EnableGlueAccess` | `false` | Glue `Get*` API permissions on instance profiles |
 | `ExposeConnect` | `false` | **Deprecated / do not use** — creates an internet-facing Connect NLB (bad for this data plane; see above) |
 | `ClientCidr` | `10.0.0.0/8` | Who may hit driver `:50051` (use your laptop `/32` for public-IP honesty runs) |
-| `HostedZoneName` | `weft.internal` | Private zone created in the VPC |
+| `HostedZoneName` | `oxidant.internal` | Private zone created in the VPC |
 | `KeyName` | empty | Optional SSH key (SSM preferred) |
 
 When `MemoryLimitBytes` and `ShuffleSpillBytes` are both empty, `SpillStore::from_env`
@@ -315,7 +315,7 @@ Stack outputs include `ConnectEndpoint`, `WorkerDnsName`, ASG names, and `Hosted
 Wait until both ASGs show healthy capacity:
 
 ```sh
-STACK=weft-demo
+STACK=oxidant-demo
 aws autoscaling describe-auto-scaling-groups --region "${AWS_REGION}" \
   --auto-scaling-group-names "${STACK}-driver" "${STACK}-workers" \
   --query 'AutoScalingGroups[].{Name:AutoScalingGroupName,Desired:DesiredCapacity,InService:length(Instances[?LifecycleState==`InService`])}'
@@ -338,33 +338,33 @@ On the instance:
 aws sts get-caller-identity
 aws glue get-databases --region "$AWS_REGION" --query 'DatabaseList[].Name'
 
-# Weft env + services
-cat /etc/weft/weft.env
-systemctl status weft-bootstrap weft-driver --no-pager
-journalctl -u weft-bootstrap -u weft-driver -e --no-pager | tail -n 80
+# Oxidant env + services
+cat /etc/oxidant/oxidant.env
+systemctl status oxidant-bootstrap oxidant-driver --no-pager
+journalctl -u oxidant-bootstrap -u oxidant-driver -e --no-pager | tail -n 80
 
 # workers should resolve via private DNS
-getent hosts "$(grep WEFT_WORKER_SERVICE /etc/weft/weft.env | cut -d= -f2)"
+getent hosts "$(grep OXIDANT_WORKER_SERVICE /etc/oxidant/oxidant.env | cut -d= -f2)"
 ```
 
-Expect `/etc/weft/weft.env` on the **driver** to include roughly:
+Expect `/etc/oxidant/oxidant.env` on the **driver** to include roughly:
 
 ```bash
-WEFT_AWS_BIN=/usr/local/bin/aws
+OXIDANT_AWS_BIN=/usr/local/bin/aws
 AWS_REGION=us-west-2
-WEFT_WORKER_SERVICE=workers.weft-demo.weft.internal
-WEFT_WORKER_COUNT=2
-WEFT_SHUFFLE_PARTITIONS=2
-WEFT_CATALOG_CONF="spark.sql.catalog.glue.type=glue;..."
-TMPDIR=/var/lib/weft/spill
+OXIDANT_WORKER_SERVICE=workers.oxidant-demo.oxidant.internal
+OXIDANT_WORKER_COUNT=2
+OXIDANT_SHUFFLE_PARTITIONS=2
+OXIDANT_CATALOG_CONF="spark.sql.catalog.glue.type=glue;..."
+TMPDIR=/var/lib/oxidant/spill
 ```
 
-On a **worker**, expect `WEFT_SHARD_INDEX=0` or `1` (not both the same), plus the same
-`WEFT_CATALOG_CONF` / `WEFT_WORKER_COUNT`.
+On a **worker**, expect `OXIDANT_SHARD_INDEX=0` or `1` (not both the same), plus the same
+`OXIDANT_CATALOG_CONF` / `OXIDANT_WORKER_COUNT`.
 
 ---
 
-## 4. Point Weft at the Glue catalog
+## 4. Point Oxidant at the Glue catalog
 
 There are two complementary ways to register Glue. For **distributed** queries both
 driver and workers must know the catalog — prefer stack `CatalogConf` (section 2).
@@ -372,8 +372,8 @@ driver and workers must know the catalog — prefer stack `CatalogConf` (section
 ### Option A — stack parameter (recommended)
 
 Pass `--catalog-conf` / `CatalogConf` at deploy time (shown above). Bootstrap writes
-`WEFT_CATALOG_CONF` into `/etc/weft/weft.env` for every instance. The CLI reads that env
-at process start (`weft spark server` and `weft worker`).
+`OXIDANT_CATALOG_CONF` into `/etc/oxidant/oxidant.env` for every instance. The CLI reads that env
+at process start (`oxidant spark server` and `oxidant worker`).
 
 After changing `CatalogConf`, update the stack and **instance-refresh / replace**
 instances so bootstrap re-runs (launch template tag change alone does not restart
@@ -391,20 +391,20 @@ spark = (
     SparkSession.builder.remote("sc://<driver-or-nlb>:50051")
     .config("spark.sql.catalog.glue.type", "glue")
     .config("spark.sql.catalog.glue.region", "us-west-2")
-    .config("spark.sql.catalog.glue.warehouse", "s3://my-weft-data/warehouse")
+    .config("spark.sql.catalog.glue.warehouse", "s3://my-oxidant-data/warehouse")
     .getOrCreate()
 )
 ```
 
 Client-side config registers the catalog on the **Connect server (driver)**. Workers
-still need `WEFT_CATALOG_CONF` (Option A) so distributed stages can resolve Glue/Parquet
+still need `OXIDANT_CATALOG_CONF` (Option A) so distributed stages can resolve Glue/Parquet
 locations when they execute. Do not rely on client-only config for multi-worker scans.
 
 ### How Glue auth works on EC2
 
 1. Instance profile (from `EnableGlueAccess` + `DataBucketArns`) provides credentials via IMDSv2.
-2. `WEFT_AWS_BIN=/usr/local/bin/aws` points at the AMI’s AWS CLI v2.
-3. `weft-catalog-glue` runs `aws glue get-databases|get-tables|get-table …`.
+2. `OXIDANT_AWS_BIN=/usr/local/bin/aws` points at the AMI’s AWS CLI v2.
+3. `oxidant-catalog-glue` runs `aws glue get-databases|get-tables|get-table …`.
 4. Table `StorageDescriptor.Location` (`s3://…`) is read with the same role’s S3 permissions.
 
 No static keys belong in the AMI, user-data, or `CatalogConf`.
@@ -416,7 +416,7 @@ No static keys belong in the AMI, user-data, or `CatalogConf`.
 ### Discover the Connect endpoint (driver IP — never NLB)
 
 ```sh
-STACK=weft-demo
+STACK=oxidant-demo
 # Prefer public IP for laptop clients (SG must allow ClientCidr); else PrivateIpAddress.
 DRIVER_IP=$(aws ec2 describe-instances --region "${AWS_REGION}" \
   --filters "Name=tag:Name,Values=${STACK}-driver" "Name=instance-state-name,Values=running" \
@@ -445,8 +445,8 @@ spark = SparkSession.builder.remote(ENDPOINT).getOrCreate()
 spark.sql("SELECT 1 AS hello").show()
 
 # Fully-qualified Glue table (catalog.database.table)
-spark.sql("SELECT count(*) AS n FROM glue.weft_demo.orders").show()
-spark.sql("SELECT * FROM glue.weft_demo.orders LIMIT 10").show()
+spark.sql("SELECT count(*) AS n FROM glue.oxidant_demo.orders").show()
+spark.sql("SELECT * FROM glue.oxidant_demo.orders LIMIT 10").show()
 ```
 
 ### Distributed lakehouse harness (optional)
@@ -455,13 +455,13 @@ If you populated SF-scale Glue tables with [`bench/sf100/`](../bench/sf100/):
 
 ```sh
 # Wrapper auto-resolves the driver IP when CONNECT is unset:
-STACK=weft-sf100 SUITE=all ./bench/sf100/remeasure-distributed.sh
+STACK=oxidant-sf100 SUITE=all ./bench/sf100/remeasure-distributed.sh
 
 # Or explicit:
 CONNECT=sc://<driver-ip>:50051 SUITE=all ./bench/sf100/remeasure-distributed.sh
 
 # Or call the harness directly:
-WEFT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
+OXIDANT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
   --endpoint sc://<driver-ip>:50051 \
   --suite tpch --sf 100 --glue-db tpch_sf100 \
   --region "${AWS_REGION}" \
@@ -477,24 +477,24 @@ The harness sets `spark.sql.catalog.glue.type=glue` on the client; keep stack
 
 **Keep this table in sync with any published SF100 EC2 numbers** (KAN-14). Same
 instance shapes as the EKS overlay
-[`deploy/helm/weft/values-sf100.yaml`](../deploy/helm/weft/values-sf100.yaml) —
+[`deploy/helm/oxidant/values-sf100.yaml`](../deploy/helm/oxidant/values-sf100.yaml) —
 Graviton **arm64** AMI required (`c6g` / `m8g`).
 
-| Role | Count | Instance type | vCPU / RAM | Root EBS | Spill EBS (`/var/lib/weft/spill`) | ASG |
+| Role | Count | Instance type | vCPU / RAM | Root EBS | Spill EBS (`/var/lib/oxidant/spill`) | ASG |
 |------|------:|---------------|------------|----------|-----------------------------------|-----|
 | Driver (Spark Connect `:50051`) | 1 | **`c6g.xlarge`** | 4 / 8 GiB | **100 GiB gp3** | 0 (optional; root is enough for driver) | Min=Max=Desired=**1** |
 | Workers (Flight `:50561`) | 2 | **`m8g.8xlarge`** | 32 / 128 GiB | 40 GiB gp3 (default) | **500 GiB gp3** each | Min=Max=Desired=**2** (pinned; no scale policies) |
 
 | Engine env (SF100) | Value | Where |
 |--------------------|-------|-------|
-| `WEFT_DISTRIBUTED_STRICT` | `1` | driver (`--distributed-strict true`) |
-| `WEFT_PREFER_HASH_JOIN` | `auto` | driver + workers (default; forced values are legacy — see `docs/runtime-contract.md`) |
-| `WEFT_MEMORY_LIMIT_BYTES` | `42949672960` (40 Gi) | workers (DataFusion spill pool) |
-| `WEFT_SHUFFLE_SPILL_BYTES` | `8589934592` (8 Gi) | workers (shuffle cache threshold) |
-| `WEFT_SHUFFLE_PARTITIONS` | `32` | driver (≈ worker vCPU; > worker count spreads shuffle + reduces skew) |
-| `WEFT_WORKER_COUNT` / shards | `2` | fixed; matches ASG size |
+| `OXIDANT_DISTRIBUTED_STRICT` | `1` | driver (`--distributed-strict true`) |
+| `OXIDANT_PREFER_HASH_JOIN` | `auto` | driver + workers (default; forced values are legacy — see `docs/runtime-contract.md`) |
+| `OXIDANT_MEMORY_LIMIT_BYTES` | `42949672960` (40 Gi) | workers (DataFusion spill pool) |
+| `OXIDANT_SHUFFLE_SPILL_BYTES` | `8589934592` (8 Gi) | workers (shuffle cache threshold) |
+| `OXIDANT_SHUFFLE_PARTITIONS` | `32` | driver (≈ worker vCPU; > worker count spreads shuffle + reduces skew) |
+| `OXIDANT_WORKER_COUNT` / shards | `2` | fixed; matches ASG size |
 | Catalog | Glue Parquet `tpch_sf100` / `tpcds_sf100` | `CatalogConf` on driver **and** workers |
-| Dataset | `s3://weft-artifacts-<account>/{tpch,tpcds}-sf100/` | Parquet only for publishable runs |
+| Dataset | `s3://oxidant-artifacts-<account>/{tpch,tpcds}-sf100/` | Parquet only for publishable runs |
 
 Memory invariant (same as Helm SF100): `memoryLimitBytes + shuffleSpillBytes + headroom
 ≤ instance RAM`. On `m8g.8xlarge` (128 GiB) that is 40 Gi + 8 Gi tracked ≈ 48 Gi, leaving
@@ -507,17 +507,17 @@ limit. Worker cgroup is `MemoryMax=112G` / `MemoryHigh=96G`.
 > every multi-fact TPC-H join (Q2/Q3/Q4/Q5/Q7/Q8) blew past the 56 Gi worker cgroup and
 > the stage aborted — the driver reported `register `result`: no batches` while the
 > single-table scans (Q1/Q6) still passed. `m8g.8xlarge` (128 GiB, 40 Gi pool) plus
-> `WEFT_SHUFFLE_PARTITIONS=32` (≈ worker vCPU; removes the 2-bucket skew that pinned all
+> `OXIDANT_SHUFFLE_PARTITIONS=32` (≈ worker vCPU; removes the 2-bucket skew that pinned all
 > shuffle onto one worker) gives the join real headroom. Keep `values-sf100.yaml` in sync.
 
 ### Deploy recipe (copy/paste)
 
-Bake an **arm64** Weft AMI first (`./deploy/packer/build-ami.sh` with a
-`linux/aarch64` `weft` binary), then:
+Bake an **arm64** Oxidant AMI first (`./deploy/packer/build-ami.sh` with a
+`linux/aarch64` `oxidant` binary), then:
 
 ```sh
 export AWS_REGION=us-west-2
-export BUCKET=weft-artifacts-$(aws sts get-caller-identity --query Account --output text)
+export BUCKET=oxidant-artifacts-$(aws sts get-caller-identity --query Account --output text)
 export AMI_ID=ami-…                 # arm64 Packer output
 export VPC_ID=vpc-…
 export SUBNETS=subnet-…,subnet-…    # public subnets only if the laptop hits the driver public IP
@@ -527,7 +527,7 @@ MY_IP=$(curl -fsS https://checkip.amazonaws.com)/32
   --ami "${AMI_ID}" \
   --vpc "${VPC_ID}" \
   --subnets "${SUBNETS}" \
-  --stack weft-sf100 \
+  --stack oxidant-sf100 \
   --region "${AWS_REGION}" \
   --driver-type c6g.xlarge \
   --worker-type m8g.8xlarge \
@@ -551,7 +551,7 @@ MY_IP=$(curl -fsS https://checkip.amazonaws.com)/32
 **Never** pass `--expose-connect true` for SF100. Connect to the driver IP:
 
 ```sh
-STACK=weft-sf100 SUITE=all ./bench/sf100/remeasure-distributed.sh
+STACK=oxidant-sf100 SUITE=all ./bench/sf100/remeasure-distributed.sh
 # or SUITE=tpch / SUITE=tpcds
 ```
 
@@ -563,27 +563,27 @@ definition of done D-4.* in [`DISTRIBUTED_DONE.md`](DISTRIBUTED_DONE.md).
 
 ## Bootstrap contract (AMI)
 
-`/usr/local/lib/weft/bootstrap.sh` (oneshot `weft-bootstrap.service`):
+`/usr/local/lib/oxidant/bootstrap.sh` (oneshot `oxidant-bootstrap.service`):
 
-1. Mounts the spill volume (if present) at `/var/lib/weft/spill` — detection is
+1. Mounts the spill volume (if present) at `/var/lib/oxidant/spill` — detection is
    name-agnostic: the largest unmounted, unpartitioned, non-root whole disk
    wins (plain `lsblk` scan; Nitro NVMe enumeration order is not stable, so no
    `/dev/nvmeX` name hints). Persists via `/etc/fstab`; safe to re-run.
-2. Reads instance tags (`weft:role`, `weft:worker-count`, `weft:worker-asg`,
-   `weft:catalog-conf`, …)
-3. **Workers:** waits for InService peers, assigns `WEFT_SHARD_INDEX`, UPSERTs the
+2. Reads instance tags (`oxidant:role`, `oxidant:worker-count`, `oxidant:worker-asg`,
+   `oxidant:catalog-conf`, …)
+3. **Workers:** waits for InService peers, assigns `OXIDANT_SHARD_INDEX`, UPSERTs the
    shared Route53 A RRSet from the InService peers **plus its own IP** (self may
    not be InService yet on a cold start; dead instances are pruned on every boot)
-4. Writes `/etc/weft/weft.env` **atomically** (temp file + rename — a killed
+4. Writes `/etc/oxidant/oxidant.env` **atomically** (temp file + rename — a killed
    bootstrap can never leave a truncated env file) and **enables** (never starts)
-   `weft-driver` or `weft-worker`
+   `oxidant-driver` or `oxidant-worker`
 
 Ordering (KAN-58): the role units declare `Requires=`/`After=` on
-`weft-bootstrap.service` and bootstrap declares `Before=` on them — so bootstrap
+`oxidant-bootstrap.service` and bootstrap declares `Before=` on them — so bootstrap
 must never `systemctl start`/`--now` a role unit from inside its own oneshot
 (that closed the cycle that deadlocked fresh instances until `TimeoutStartSec`).
-First boot: UserData runs `systemctl start weft-bootstrap.service`, waits for it,
-then `systemctl enable --now weft-<role>`. Reboots: the WantedBy/Requires/After
+First boot: UserData runs `systemctl start oxidant-bootstrap.service`, waits for it,
+then `systemctl enable --now oxidant-<role>`. Reboots: the WantedBy/Requires/After
 graph re-runs bootstrap (idempotent) before the role unit. Shutdown / scale-in:
 `ExecStop` runs `bootstrap.sh --deregister`, which removes **only this
 instance's IP** from the RRSet — never a full re-sync (at stop time the ASG may
@@ -593,8 +593,8 @@ worker boot's full re-sync.
 
 | Role | Env written |
 |------|-------------|
-| Driver | `WEFT_WORKER_SERVICE`, `WEFT_WORKER_PORT=50561`, `WEFT_WORKER_COUNT`, `WEFT_SHUFFLE_PARTITIONS`, `WEFT_AWS_BIN`, `AWS_REGION`, spill/`TMPDIR`, optional memory/shuffle thresholds, optional `WEFT_CATALOG_CONF` |
-| Worker | `WEFT_WORKER_COUNT`, `WEFT_SHARD_INDEX`, same AWS/spill/catalog/memory |
+| Driver | `OXIDANT_WORKER_SERVICE`, `OXIDANT_WORKER_PORT=50561`, `OXIDANT_WORKER_COUNT`, `OXIDANT_SHUFFLE_PARTITIONS`, `OXIDANT_AWS_BIN`, `AWS_REGION`, spill/`TMPDIR`, optional memory/shuffle thresholds, optional `OXIDANT_CATALOG_CONF` |
+| Worker | `OXIDANT_WORKER_COUNT`, `OXIDANT_SHARD_INDEX`, same AWS/spill/catalog/memory |
 
 ---
 
@@ -607,7 +607,7 @@ worker boot's full re-sync.
 - [ ] Driver SG: Connect **50051** only from `ClientCidr` (tighten further in production)
 - [ ] Prefer SSM over SSH; `KeyName` optional
 - [ ] Spill + root EBS encrypted (`Encrypted: true` in the template)
-- [ ] Do **not** set `WEFT_SHUFFLE_SPILL_DIR` (force-spill; invalidates benches)
+- [ ] Do **not** set `OXIDANT_SHUFFLE_SPILL_DIR` (force-spill; invalidates benches)
 - [ ] Private subnets + VPC endpoints/NAT for S3 and `glue.<region>.amazonaws.com`
 
 ---
@@ -619,8 +619,8 @@ worker boot's full re-sync.
 ./deploy/cloudformation/deploy-stack.sh --ami ami-new ... # same flags as create
 
 # Tear down the compute stack (does not delete your S3 data or Glue DB)
-aws cloudformation delete-stack --region "${AWS_REGION}" --stack-name weft-demo
-aws cloudformation wait stack-delete-complete --region "${AWS_REGION}" --stack-name weft-demo
+aws cloudformation delete-stack --region "${AWS_REGION}" --stack-name oxidant-demo
+aws cloudformation wait stack-delete-complete --region "${AWS_REGION}" --stack-name oxidant-demo
 
 # Optional: drop Glue demo objects
 aws glue delete-table --region "${AWS_REGION}" --database-name "${GLUE_DB}" --name orders
@@ -633,23 +633,23 @@ aws glue delete-database --region "${AWS_REGION}" --name "${GLUE_DB}"
 
 | Symptom | Likely cause |
 |---------|----------------|
-| Inflated / duplicated aggregates | Missing `WEFT_SHARD_INDEX` / `WEFT_WORKER_COUNT` on workers, or the **same** `WEFT_SHARD_INDEX` on every worker (each then reads shard 0's file subset, so single-file tables count 2× and size-balanced multi-file tables ~1× with skew) — check `/etc/weft/weft.env` on *every* worker |
-| Fresh instance: bootstrap "starting" for 5 min, then no `/etc/weft/weft.env` and the role unit never starts | Pre-KAN-58 AMI: bootstrap started the role unit from inside its own oneshot while the role unit `Requires=`/`After=` bootstrap — a circular wait killed at `TimeoutStartSec`. Rebake from current `deploy/packer`; live fix: copy the repo `bootstrap.sh` over `/usr/local/lib/weft/bootstrap.sh`, then `systemctl reset-failed weft-bootstrap && systemctl start weft-bootstrap && systemctl start weft-<role>` |
-| Queries fail on dead worker IPs ("no free task slots") | Stale A records in `workers.<zone>` — instances killed without `ExecStop` (or pre-KAN-58 deregistration, which re-synced the full InService set and could re-add the dying IP). `sudo systemctl restart weft-bootstrap` on any live worker forces a full re-sync that prunes dead IPs; graceful stops now remove only the instance's own IP |
+| Inflated / duplicated aggregates | Missing `OXIDANT_SHARD_INDEX` / `OXIDANT_WORKER_COUNT` on workers, or the **same** `OXIDANT_SHARD_INDEX` on every worker (each then reads shard 0's file subset, so single-file tables count 2× and size-balanced multi-file tables ~1× with skew) — check `/etc/oxidant/oxidant.env` on *every* worker |
+| Fresh instance: bootstrap "starting" for 5 min, then no `/etc/oxidant/oxidant.env` and the role unit never starts | Pre-KAN-58 AMI: bootstrap started the role unit from inside its own oneshot while the role unit `Requires=`/`After=` bootstrap — a circular wait killed at `TimeoutStartSec`. Rebake from current `deploy/packer`; live fix: copy the repo `bootstrap.sh` over `/usr/local/lib/oxidant/bootstrap.sh`, then `systemctl reset-failed oxidant-bootstrap && systemctl start oxidant-bootstrap && systemctl start oxidant-<role>` |
+| Queries fail on dead worker IPs ("no free task slots") | Stale A records in `workers.<zone>` — instances killed without `ExecStop` (or pre-KAN-58 deregistration, which re-synced the full InService set and could re-add the dying IP). `sudo systemctl restart oxidant-bootstrap` on any live worker forces a full re-sync that prunes dead IPs; graceful stops now remove only the instance's own IP |
 | Driver fails membership vs count | Route53 A set size ≠ `WorkerCount` — wait for all workers InService; check worker Route53 IAM |
-| Workers never receive tasks | Driver cannot resolve `WEFT_WORKER_SERVICE` — private zone VPC association / SG |
+| Workers never receive tasks | Driver cannot resolve `OXIDANT_WORKER_SERVICE` — private zone VPC association / SG |
 | `aws glue … EntityNotFound` | Wrong database/table name or region in `CatalogConf` |
 | `AccessDenied` on Glue/S3 | Deployed with `--glue false` or incomplete `DataBucketArns` (need bucket **and** `/*`) |
-| Catalog works locally on driver but distributed scan fails | Workers missing `WEFT_CATALOG_CONF` — set stack `CatalogConf`, replace instances |
+| Catalog works locally on driver but distributed scan fails | Workers missing `OXIDANT_CATALOG_CONF` — set stack `CatalogConf`, replace instances |
 | Spill fills root volume | Spill size `0`, or no eligible device: bootstrap picks the largest **unmounted, unpartitioned, non-root** whole disk (no fixed device names) — `lsblk -f` and the bootstrap log line `no spill block device found` tell you which disks were skipped and why (mounted / has partitions) |
 | OOM on large queries | Empty memory/shuffle thresholds — set `MemoryLimitBytes` + `ShuffleSpillBytes` |
 | `CatalogConf` deploy error / truncated tag | Value must be ≤256 characters |
 
 ```sh
 # on an instance (via SSM)
-journalctl -u weft-bootstrap -u weft-driver -u weft-worker -e
-cat /etc/weft/weft.env
-sudo -u weft /usr/local/bin/aws glue get-databases --region "$AWS_REGION"
+journalctl -u oxidant-bootstrap -u oxidant-driver -u oxidant-worker -e
+cat /etc/oxidant/oxidant.env
+sudo -u oxidant /usr/local/bin/aws glue get-databases --region "$AWS_REGION"
 ```
 
 ---
@@ -658,11 +658,11 @@ sudo -u weft /usr/local/bin/aws glue get-databases --region "$AWS_REGION"
 
 | Path | Role |
 |------|------|
-| [`deploy/packer/weft-runtime.pkr.hcl`](../deploy/packer/weft-runtime.pkr.hcl) | Packer AMI |
+| [`deploy/packer/oxidant-runtime.pkr.hcl`](../deploy/packer/oxidant-runtime.pkr.hcl) | Packer AMI |
 | [`deploy/packer/files/bootstrap.sh`](../deploy/packer/files/bootstrap.sh) | Boot: spill mount + shard index + DNS upsert + atomic env (+ catalog); shutdown: self-IP DNS deregistration |
-| [`deploy/packer/files/systemd/`](../deploy/packer/files/systemd/) | `weft-bootstrap` / `weft-driver` / `weft-worker` |
+| [`deploy/packer/files/systemd/`](../deploy/packer/files/systemd/) | `oxidant-bootstrap` / `oxidant-driver` / `oxidant-worker` |
 | [`deploy/packer/build-ami.sh`](../deploy/packer/build-ami.sh) | AMI build wrapper |
-| [`deploy/cloudformation/weft-cluster.yaml`](../deploy/cloudformation/weft-cluster.yaml) | CFN stack |
+| [`deploy/cloudformation/oxidant-cluster.yaml`](../deploy/cloudformation/oxidant-cluster.yaml) | CFN stack |
 | [`deploy/cloudformation/deploy-stack.sh`](../deploy/cloudformation/deploy-stack.sh) | Deploy wrapper |
 | [`docs/catalogs.md`](catalogs.md) | Catalog SPI + Spark `spark.sql.catalog.*` keys |
-| [`crates/weft-catalog-glue/`](../crates/weft-catalog-glue/) | Glue provider (AWS CLI shell-out) |
+| [`crates/oxidant-catalog-glue/`](../crates/oxidant-catalog-glue/) | Glue provider (AWS CLI shell-out) |

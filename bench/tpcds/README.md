@@ -1,6 +1,6 @@
 # TPC-DS harness
 
-Runs the full TPC-DS suite (Q1–Q99) through Weft for correctness and timing.
+Runs the full TPC-DS suite (Q1–Q99) through Oxidant for correctness and timing.
 
 Data is generated with DuckDB’s `tpcds` extension (`CALL dsdgen(sf = …)`) and exported as
 **Parquet** so the same CLI can scale from CI (`sf=0.01`) to large factors on bigger hardware.
@@ -11,7 +11,7 @@ truth). Result cells compare with exact integer equality and **0.1% relative** t
 non-integral floats (so Q66-style ratio drift passes without collapsing distinct keys).
 
 CI enforces a pass-set ratchet in [`baseline.json`](baseline.json) — coverage can only hold or
-rise. Any query failure exits non-zero (including `WEFT_TPCDS_ONLY`).
+rise. Any query failure exits non-zero (including `OXIDANT_TPCDS_ONLY`).
 
 ## Requirements
 
@@ -24,14 +24,14 @@ rise. Any query failure exits non-zero (including `WEFT_TPCDS_ONLY`).
 
 ```bash
 # CI / local smoke (default --sf 0.01)
-cargo run -p weft-bench -- tpcds
-cargo run -p weft-bench -- tpcds --sf 0.01 --data /tmp/weft-tpcds-sf0.01
+cargo run -p oxidant-bench -- tpcds
+cargo run -p oxidant-bench -- tpcds --sf 0.01 --data /tmp/oxidant-tpcds-sf0.01
 
 # Single query debug (still exits non-zero on FAIL/MISMATCH)
-WEFT_TPCDS_ONLY=Q66 WEFT_TPCDS_DEBUG=1 cargo run -p weft-bench -- tpcds --sf 0.01
+OXIDANT_TPCDS_ONLY=Q66 OXIDANT_TPCDS_DEBUG=1 cargo run -p oxidant-bench -- tpcds --sf 0.01
 
 # Execute-only without DuckDB (not for CI / ratchet trust)
-WEFT_TPCDS_ALLOW_NO_ORACLE=1 cargo run -p weft-bench -- tpcds --sf 0.01 --data /tmp/already-generated
+OXIDANT_TPCDS_ALLOW_NO_ORACLE=1 cargo run -p oxidant-bench -- tpcds --sf 0.01 --data /tmp/already-generated
 ```
 
 ### Large scale factors (external hardware)
@@ -41,9 +41,9 @@ plan for disk ≈ raw TPC-DS size (SF100 ~100 GB, SF1000 ~1 TB) plus headroo
 RAM/workers for the joins. Not a CI target on GitHub-hosted runners.
 
 ```bash
-cargo run -p weft-bench --release -- tpcds --sf 100  --data /data/tpcds-sf100
-cargo run -p weft-bench --release -- tpcds --sf 500  --data /data/tpcds-sf500
-cargo run -p weft-bench --release -- tpcds --sf 1000 --data /data/tpcds-sf1000
+cargo run -p oxidant-bench --release -- tpcds --sf 100  --data /data/tpcds-sf100
+cargo run -p oxidant-bench --release -- tpcds --sf 500  --data /data/tpcds-sf500
+cargo run -p oxidant-bench --release -- tpcds --sf 1000 --data /data/tpcds-sf1000
 ```
 
 Generation is idempotent when `store_sales.parquet` exists and `scale_factor.txt` matches `--sf`.

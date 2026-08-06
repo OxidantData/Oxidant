@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from golden_common import run_check  # noqa: E402
 
-DB = "/tmp/weft-sf10/tpch-sf10.db"
+DB = "/tmp/oxidant-sf10/tpch-sf10.db"
 
 
 def main():

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run TPC-H / TPC-DS on EMR (Spark on YARN) over the weft SF10 parquet bytes in S3.
+"""Run TPC-H / TPC-DS on EMR (Spark on YARN) over the oxidant SF10 parquet bytes in S3.
 
-Apples-to-apples counterpart of bench/sf100/run-spark-connect.py (which drives weft):
+Apples-to-apples counterpart of bench/sf100/run-spark-connect.py (which drives oxidant):
 same query text, same SF10 data files, same per-query wall-clock methodology. Tables
 are exposed as Spark temp views over s3://<bucket>/{tpch,tpcds}-sf10/<table>/ — the
-Glue DBs are weft-specific schema-less registrations (0-column StorageDescriptors),
+Glue DBs are oxidant-specific schema-less registrations (0-column StorageDescriptors),
 so Spark infers schema from the parquet footers. Same bytes, same queries.
 
 On the EMR master (after scp'ing this file + the query dirs up):
@@ -13,7 +13,7 @@ On the EMR master (after scp'ing this file + the query dirs up):
       --suite tpcds --queries-dir queries/tpcds --runs 2 --out /tmp/tpcds-sf10-emr.jsonl
 
 Each query runs `--runs` times; run 1 is the cold number, the best of the rest is hot
-(matches the weft harness's cold/hot semantics). JSONL schema mirrors
+(matches the oxidant harness's cold/hot semantics). JSONL schema mirrors
 run-spark-connect.py so the site tooling can merge both engines.
 """
 
@@ -68,11 +68,11 @@ TPCDS_TABLES = [
 
 
 def substitute_sf(sql: str, sf: float) -> str:
-    return sql.replace("__WEFT_SF__", f"{sf:g}")
+    return sql.replace("__OXIDANT_SF__", f"{sf:g}")
 
 
 # Standard-SQL interval field precision (TPC-H Q1's `interval '90' day (3)`) is a
-# parse error on Spark — weft/DataFusion accept it. Dropping the precision annotation
+# parse error on Spark — oxidant/DataFusion accept it. Dropping the precision annotation
 # is semantics-preserving ('90' fits DAY(3)); documented here so the comparison stays
 # honest: this is a Spark dialect gap, not a query change.
 _INTERVAL_PRECISION = re.compile(r"(interval\s+'[^']*'\s+\w+)\s*\(\s*\d+\s*\)", re.I)
@@ -104,7 +104,7 @@ def load_queries(qdir: Path, sf: float, only: str) -> list[tuple[str, str]]:
 
 
 # Single-worker executor so collect() can be bounded by a wall-clock timeout,
-# mirroring the weft harness (a wedged query fails fast instead of hanging the suite).
+# mirroring the oxidant harness (a wedged query fails fast instead of hanging the suite).
 _EXEC = ThreadPoolExecutor(max_workers=1)
 
 
@@ -112,7 +112,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="TPC-H/DS SF10 runner for Spark on EMR/YARN")
     ap.add_argument("--suite", choices=["tpch", "tpcds"], required=True)
     ap.add_argument("--sf", type=float, default=10)
-    ap.add_argument("--bucket", default="weft-artifacts-810738286322")
+    ap.add_argument("--bucket", default="oxidant-artifacts-810738286322")
     ap.add_argument("--prefix", default="", help="S3 prefix (default <suite>-sf<sf>)")
     ap.add_argument("--queries-dir", required=True)
     ap.add_argument("--runs", type=int, default=2, help="runs per query (1st=cold)")
@@ -121,7 +121,7 @@ def main() -> int:
         "--query-timeout",
         type=float,
         default=900,
-        help="per-query wall-clock timeout in seconds (default 900, matches weft runs)",
+        help="per-query wall-clock timeout in seconds (default 900, matches oxidant runs)",
     )
     ap.add_argument("--out", required=True, help="JSONL output path")
     args = ap.parse_args()
@@ -134,7 +134,7 @@ def main() -> int:
     def new_session():
         s = (
             SparkSession.builder.appName(
-                f"weft-compare-{args.suite}-sf{int(args.sf)}"
+                f"oxidant-compare-{args.suite}-sf{int(args.sf)}"
             ).getOrCreate()
         )
         for t in tables:

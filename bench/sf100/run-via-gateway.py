@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run TPC-H / TPC-DS against Weft on EKS via the control-plane gateway.
+"""Run TPC-H / TPC-DS against Oxidant on EKS via the control-plane gateway.
 
 Qualifies bare table names to ``glue.<db>.<table>``, posts each query to
 ``POST /api/sql`` (optionally pinned to a cluster), uses ClickBench timing
@@ -63,16 +63,16 @@ def http_json(method: str, url: str, token: str | None, body: dict | None = None
 
 
 def admin_password() -> str:
-    if pw := os.environ.get("WEFT_ADMIN_PASSWORD"):
+    if pw := os.environ.get("OXIDANT_ADMIN_PASSWORD"):
         return pw
     out = subprocess.check_output(
         [
             "kubectl",
             "-n",
-            "weft-system",
+            "oxidant-system",
             "get",
             "secret",
-            "weft-gateway-jwt",
+            "oxidant-gateway-jwt",
             "-o",
             "jsonpath={.data.admin-password}",
         ],
@@ -97,8 +97,8 @@ def ensure_glue_connection(gw: str, token: str) -> None:
             "options": {
                 "region": os.environ.get("AWS_REGION", "us-west-2"),
                 "warehouse": os.environ.get(
-                    "WEFT_WAREHOUSE",
-                    "s3://weft-artifacts-810738286322/warehouse",
+                    "OXIDANT_WAREHOUSE",
+                    "s3://oxidant-artifacts-810738286322/warehouse",
                 ),
             },
         },
@@ -166,13 +166,13 @@ def wait_driver_ready(cluster_id: str, timeout_s: int = 180) -> None:
     """Block until the cluster driver pod is Ready (post-OOM restart)."""
     if not cluster_id:
         return
-    ns = f"weft-cl-{cluster_id}"
+    ns = f"oxidant-cl-{cluster_id}"
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
             out = subprocess.check_output(
                 [
-                    "kubectl", "-n", ns, "get", "pods", "-l", "weft.io/role=driver",
+                    "kubectl", "-n", ns, "get", "pods", "-l", "oxidant.io/role=driver",
                     "-o", "jsonpath={.items[0].status.conditions[?(@.type==\"Ready\")].status}",
                 ],
                 text=True,
@@ -188,7 +188,7 @@ def wait_driver_ready(cluster_id: str, timeout_s: int = 180) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gateway", default=os.environ.get("WEFT_GATEWAY", ""))
+    ap.add_argument("--gateway", default=os.environ.get("OXIDANT_GATEWAY", ""))
     ap.add_argument("--suite", choices=["tpch", "tpcds"], required=True)
     ap.add_argument("--sf", type=float, default=100)
     ap.add_argument("--glue-db", default="")
@@ -202,7 +202,7 @@ def main() -> int:
     ap.add_argument(
         "--worker-count",
         type=int,
-        default=int(os.environ.get("WEFT_WORKER_COUNT", "2")),
+        default=int(os.environ.get("OXIDANT_WORKER_COUNT", "2")),
         help="Worker replicas when --distributed (min 2).",
     )
     ap.add_argument("--worker-size", default="xlarge")
@@ -226,7 +226,7 @@ def main() -> int:
         "POST",
         f"{gw}/api/auth/login",
         None,
-        {"username": os.environ.get("WEFT_ADMIN_USER", "admin"), "password": pw},
+        {"username": os.environ.get("OXIDANT_ADMIN_USER", "admin"), "password": pw},
     )["token"]
     ensure_glue_connection(gw, token)
 
@@ -298,7 +298,7 @@ def main() -> int:
         "queryCount": len(queries),
         "commonCount": sum(1 for t in per_query if t is not None),
         "method": (
-            "Weft on EKS via gateway POST /api/sql; Glue catalog; "
+            "Oxidant on EKS via gateway POST /api/sql; Glue catalog; "
             "3 tries/query; hot = min(try2, try3); no_limit"
             + (
                 f"; distributed ({args.worker_count} workers)"
@@ -308,8 +308,8 @@ def main() -> int:
         ),
         "engines": [
             {
-                "key": "weft",
-                "name": "Weft",
+                "key": "oxidant",
+                "name": "Oxidant",
                 "highlight": True,
                 "total": total_all,
                 "totalAll": total_all,

@@ -6,10 +6,10 @@ export default function EnvironmentPage() {
   const props = env?.sparkProperties ?? {};
   const keys = Object.keys(props).sort();
 
-  if (error) return <div className="weft-card text-danger">{error}</div>;
+  if (error) return <div className="oxidant-card text-danger">{error}</div>;
 
   return (
-    <div className="weft-card overflow-x-auto">
+    <div className="oxidant-card overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
           <tr className="text-muted">

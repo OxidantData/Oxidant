@@ -43,8 +43,8 @@ jobs:
       # Prebuilt binary. `cargo install cargo-llvm-cov --locked` compiled it from source
       # on every run, which cost more than the coverage pass itself.
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Build weft CLI (integration tests spawn the binary under llvm-cov target dir)
-        run: cargo build -p weft-cli --target-dir target/llvm-cov-target
+      - name: Build oxidant CLI (integration tests spawn the binary under llvm-cov target dir)
+        run: cargo build -p oxidant-cli --target-dir target/llvm-cov-target
       - name: Generate HTML coverage report
         run: cargo llvm-cov --workspace --html
       - name: Upload coverage HTML

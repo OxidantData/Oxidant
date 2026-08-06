@@ -50,16 +50,16 @@ gitnexus doctor
 git check-ignore -v .codegraph .gitnexus
 ```
 
-## Multi-repo group (`weft`)
+## Multi-repo group (`oxidant`)
 
-After **both** this repo and `weft-platform` are analyzed:
+After **both** this repo and `oxidant-platform` are analyzed:
 
 ```sh
-gitnexus group create weft
-gitnexus group add weft engine /absolute/path/to/weft
-gitnexus group add weft platform /absolute/path/to/weft-platform
-gitnexus group sync weft
-gitnexus group status weft
+gitnexus group create oxidant
+gitnexus group add oxidant engine /absolute/path/to/oxidant
+gitnexus group add oxidant platform /absolute/path/to/oxidant-platform
+gitnexus group sync oxidant
+gitnexus group status oxidant
 ```
 
 Use group tools when work spans the Spark Connect / governance boundary that platform
@@ -80,5 +80,5 @@ If indexes are missing, use committed docs and normal search — do not block on
 
 ```sh
 ./scripts/index-agents.sh
-gitnexus group sync weft   # if you use the multi-repo group
+gitnexus group sync oxidant   # if you use the multi-repo group
 ```

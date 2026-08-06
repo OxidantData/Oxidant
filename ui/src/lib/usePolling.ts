@@ -37,6 +37,6 @@ export function useAppMeta() {
   return usePolling(async () => {
     const apps = (await api.applications()) as { name?: string }[];
     const jobs = await api.jobs();
-    return { name: apps[0]?.name ?? "Weft", jobCount: jobs.length };
+    return { name: apps[0]?.name ?? "Oxidant", jobCount: jobs.length };
   });
 }

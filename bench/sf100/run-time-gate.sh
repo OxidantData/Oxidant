@@ -3,7 +3,7 @@
 # gate (starts after the cluster is READY).
 #
 # Prereq: Glue DBs tpch_sf100 / tpcds_sf100 populated; kubectl context on
-# weft-platform; gateway reachable (WEFT_GATEWAY or port-forward on :18080).
+# oxidant-platform; gateway reachable (OXIDANT_GATEWAY or port-forward on :18080).
 #
 # Usage:
 #   ./bench/sf100/run-time-gate.sh
@@ -13,7 +13,7 @@ set -euo pipefail
 # SF100 is expensive. Pick an explicit mode (default: refuse):
 #   DISTRIBUTED_SF100=1  — multi-worker cluster (worker_min=worker_max=N, no worker scale-down)
 #   ALLOW_SINGLE_NODE_GATE=1 — legacy driver-only profiling (scales workers to 0 after create)
-# See docs/DISTRIBUTED_PARITY.md and weft-platform docs/DISTRIBUTED_DEPLOY.md.
+# See docs/DISTRIBUTED_PARITY.md and oxidant-platform docs/DISTRIBUTED_DEPLOY.md.
 DISTRIBUTED_SF100="${DISTRIBUTED_SF100:-0}"
 ALLOW_SINGLE_NODE_GATE="${ALLOW_SINGLE_NODE_GATE:-0}"
 if [[ "$DISTRIBUTED_SF100" != "1" && "$ALLOW_SINGLE_NODE_GATE" != "1" ]]; then
@@ -26,7 +26,7 @@ fi
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-GW="${WEFT_GATEWAY:-http://127.0.0.1:18080}"
+GW="${OXIDANT_GATEWAY:-http://127.0.0.1:18080}"
 GATE_SECS="${GATE_SECS:-1200}"
 if [[ "$DISTRIBUTED_SF100" == "1" ]]; then
   MACHINE="${MACHINE:-eks/distributed-sf100}"
@@ -36,7 +36,7 @@ if [[ "$DISTRIBUTED_SF100" == "1" ]]; then
   PATCH_FAT="${PATCH_FAT:-0}"
   # Honest distributed numbers: unsupported plan shapes must fail, not silently
   # fall back to a single-node driver run (DISTRIBUTED_DONE D-0.2 / D-4.3).
-  export WEFT_DISTRIBUTED_STRICT="${WEFT_DISTRIBUTED_STRICT:-1}"
+  export OXIDANT_DISTRIBUTED_STRICT="${OXIDANT_DISTRIBUTED_STRICT:-1}"
 else
   MACHINE="${MACHINE:-eks/r6g.8xlarge-spot-bench}"
   SIZE="${SIZE:-xlarge}"   # use xlarge until gateway image knows "bench"; then SIZE=bench
@@ -49,9 +49,9 @@ fi
 FAT_CPU="${FAT_CPU:-28}"
 FAT_MEM="${FAT_MEM:-200Gi}"
 
-ADMIN_PW="${WEFT_ADMIN_PASSWORD:-$(kubectl -n weft-system get secret weft-gateway-jwt -o jsonpath='{.data.admin-password}' | base64 -d)}"
+ADMIN_PW="${OXIDANT_ADMIN_PASSWORD:-$(kubectl -n oxidant-system get secret oxidant-gateway-jwt -o jsonpath='{.data.admin-password}' | base64 -d)}"
 TOKEN="$(curl -sS -X POST "$GW/api/auth/login" -H 'content-type: application/json' \
-  -d "{\"username\":\"${WEFT_ADMIN_USER:-admin}\",\"password\":\"${ADMIN_PW}\"}" \
+  -d "{\"username\":\"${OXIDANT_ADMIN_USER:-admin}\",\"password\":\"${ADMIN_PW}\"}" \
   | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')"
 
 auth=(-H "authorization: Bearer $TOKEN" -H 'content-type: application/json')
@@ -75,20 +75,20 @@ for i in $(seq 1 90); do
 done
 [[ "${STATE:-}" == "RUNNING" ]] || { echo "[gate] cluster never became RUNNING"; exit 1; }
 
-NS="weft-cl-${CLUSTER_ID}"
+NS="oxidant-cl-${CLUSTER_ID}"
 DRV="$(kubectl -n "$NS" get deploy -o jsonpath='{.items[0].metadata.name}')"
 
 if [[ "$DISTRIBUTED_SF100" == "1" ]]; then
-  echo "[gate] setting WEFT_DISTRIBUTED_STRICT=1 on driver ${NS}/${DRV}"
-  kubectl -n "$NS" set env deploy/"$DRV" WEFT_DISTRIBUTED_STRICT=1
+  echo "[gate] setting OXIDANT_DISTRIBUTED_STRICT=1 on driver ${NS}/${DRV}"
+  kubectl -n "$NS" set env deploy/"$DRV" OXIDANT_DISTRIBUTED_STRICT=1
 fi
 
 if [[ "$PATCH_FAT" == "1" ]]; then
   echo "[gate] raising ResourceQuota + patching driver ${NS}/${DRV} → ${FAT_CPU} CPU / ${FAT_MEM}"
   # Namespace quota is sized to worker_size at create time; raise it before the fat pod.
-  kubectl -n "$NS" patch resourcequota weft-cluster-quota --type=merge -p="{\"spec\":{\"hard\":{\"requests.cpu\":\"${FAT_CPU}\",\"requests.memory\":\"${FAT_MEM}\",\"pods\":\"2\"}}}"
+  kubectl -n "$NS" patch resourcequota oxidant-cluster-quota --type=merge -p="{\"spec\":{\"hard\":{\"requests.cpu\":\"${FAT_CPU}\",\"requests.memory\":\"${FAT_MEM}\",\"pods\":\"2\"}}}"
   # Ensure xlarge-pool toleration (live gateway may omit it when pool label is absent).
-  kubectl -n "$NS" patch deploy "$DRV" --type=strategic -p='{"spec":{"template":{"spec":{"tolerations":[{"key":"weft.io/pool","operator":"Equal","value":"xlarge","effect":"NoSchedule"}]}}}}'
+  kubectl -n "$NS" patch deploy "$DRV" --type=strategic -p='{"spec":{"template":{"spec":{"tolerations":[{"key":"oxidant.io/pool","operator":"Equal","value":"xlarge","effect":"NoSchedule"}]}}}}'
   # Recreate (not RollingUpdate): single-node pools cannot surge an 8→14 CPU pod.
   kubectl -n "$NS" patch deploy "$DRV" --type=json -p="[
     {\"op\":\"replace\",\"path\":\"/spec/strategy\",\"value\":{\"type\":\"Recreate\"}},
@@ -99,13 +99,13 @@ if [[ "$PATCH_FAT" == "1" ]]; then
   ]"
   # Single-node mode only: drop workers so the fat driver runs alone.
   if [[ "$DISTRIBUTED_SF100" != "1" ]]; then
-    kubectl -n "$NS" scale sts -l weft.io/role=worker --replicas=0 2>/dev/null || true
+    kubectl -n "$NS" scale sts -l oxidant.io/role=worker --replicas=0 2>/dev/null || true
   fi
   # Nudge the ReplicaSet out of FailedCreate backoff after the quota raise.
   kubectl -n "$NS" annotate deploy "$DRV" "kubectl.kubernetes.io/restartedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
   kubectl -n "$NS" rollout status deploy/"$DRV" --timeout=600s
   # Confirm scheduled on a fat node
-  NODE="$(kubectl -n "$NS" get pod -l weft.io/role=driver -o jsonpath='{.items[0].spec.nodeName}')"
+  NODE="$(kubectl -n "$NS" get pod -l oxidant.io/role=driver -o jsonpath='{.items[0].spec.nodeName}')"
   TYPE="$(kubectl get node "$NODE" -o jsonpath='{.metadata.labels.node\.kubernetes\.io/instance-type}')"
   echo "[gate] driver on ${NODE} (${TYPE})"
 fi

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Prepare TPC-H Parquet for weft-bench tpch-bench.
+# Prepare TPC-H Parquet for oxidant-bench tpch-bench.
 #
 # Default SF100 uses DuckDB's pre-built database (~27 GB):
 #   https://blobs.duckdb.org/data/tpch-sf100.db
 #
 # Usage:
 #   SF=100 DATA_ROOT=/data ./bench/tpch/prepare.sh
-#   SF=1   DATA_ROOT=/tmp/weft-bench ./bench/tpch/prepare.sh   # generates via dbgen
+#   SF=1   DATA_ROOT=/tmp/oxidant-bench ./bench/tpch/prepare.sh   # generates via dbgen
 set -euo pipefail
 
 SF="${SF:-100}"

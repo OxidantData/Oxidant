@@ -4,12 +4,12 @@
 # gets the full machine — the only fair way to compare on a single host.
 #
 #   bash bench/clickbench/multi/run-all.sh                 # all four
-#   ENGINES="weft sail" bash .../run-all.sh                # subset
+#   ENGINES="oxidant sail" bash .../run-all.sh                # subset
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
 DATA="${BENCH_DATA:-$REPO/bench/clickbench/hits.parquet}"
-ENGINES="${ENGINES:-weft sail spark gluten}"
+ENGINES="${ENGINES:-oxidant sail spark gluten}"
 
 if [ ! -f "$DATA" ]; then
   echo "[all] downloading hits.parquet (~14.78 GB) → $DATA"

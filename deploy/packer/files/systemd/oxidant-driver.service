@@ -1,0 +1,37 @@
+[Unit]
+Description=Oxidant Spark Connect driver
+Documentation=https://github.com/OxidantData/Oxidant
+# Requires+After oxidant-bootstrap: the driver must not start before bootstrap
+# has written /etc/oxidant/oxidant.env and (for the cluster) finished DNS/spill
+# setup. oxidant-bootstrap never starts this unit from inside its oneshot —
+# that closes a dependency cycle and deadlocks boot (KAN-58). UserData starts
+# this unit on first boot; the multi-user.target graph does on reboots.
+After=network-online.target oxidant-bootstrap.service
+Wants=network-online.target
+Requires=oxidant-bootstrap.service
+
+[Service]
+Type=simple
+User=oxidant
+Group=oxidant
+EnvironmentFile=-/etc/oxidant/oxidant.env
+WorkingDirectory=/var/lib/oxidant
+ExecStart=/usr/local/bin/oxidant spark server --port 50051
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+# Match container PodSecurity posture where practical.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/oxidant /tmp
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

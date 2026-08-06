@@ -1,4 +1,4 @@
-# Weft — drop-in Apache Spark replacement on a vectorized CPU core (Loom) with an
+# Oxidant — drop-in Apache Spark replacement on a vectorized CPU core (Loom) with an
 # opt-in HVM2/Bend parallel backend. See plan: docs/architecture.md.
 #
 # This is the workspace skeleton. Crates are intentionally dependency-free today so
@@ -14,37 +14,37 @@ members = ["crates/*"]
 version = "0.0.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-repository = "https://gitlab.com/weftlabs/weft"
-authors = ["Weft Labs <hello@weftlabs.dev>"]
+repository = "https://github.com/OxidantData/Oxidant"
+authors = ["Oxidant Data <hello@oxidantdata.com>"]
 rust-version = "1.72"
 
 # Internal crates are wired as path dependencies here so the dependency DAG is
 # expressed once and inherited via `{ workspace = true }` in each crate.
 [workspace.dependencies]
-weft-common     = { path = "crates/weft-common" }
-weft-proto      = { path = "crates/weft-proto" }
-weft-plan       = { path = "crates/weft-plan" }
-weft-sql        = { path = "crates/weft-sql" }
-weft-analyzer   = { path = "crates/weft-analyzer" }
-weft-catalog    = { path = "crates/weft-catalog" }
-weft-catalog-hive = { path = "crates/weft-catalog-hive" }
-weft-catalog-glue = { path = "crates/weft-catalog-glue" }
-weft-catalog-rest = { path = "crates/weft-catalog-rest" }
-weft-optimizer  = { path = "crates/weft-optimizer" }
-weft-physical   = { path = "crates/weft-physical" }
-weft-datasource = { path = "crates/weft-datasource" }
-weft-loom       = { path = "crates/weft-loom" }
-weft-hvm        = { path = "crates/weft-hvm" }
-weft-execution  = { path = "crates/weft-execution" }
-weft-connect    = { path = "crates/weft-connect" }
+oxidant-common     = { path = "crates/oxidant-common" }
+oxidant-proto      = { path = "crates/oxidant-proto" }
+oxidant-plan       = { path = "crates/oxidant-plan" }
+oxidant-sql        = { path = "crates/oxidant-sql" }
+oxidant-analyzer   = { path = "crates/oxidant-analyzer" }
+oxidant-catalog    = { path = "crates/oxidant-catalog" }
+oxidant-catalog-hive = { path = "crates/oxidant-catalog-hive" }
+oxidant-catalog-glue = { path = "crates/oxidant-catalog-glue" }
+oxidant-catalog-rest = { path = "crates/oxidant-catalog-rest" }
+oxidant-optimizer  = { path = "crates/oxidant-optimizer" }
+oxidant-physical   = { path = "crates/oxidant-physical" }
+oxidant-datasource = { path = "crates/oxidant-datasource" }
+oxidant-loom       = { path = "crates/oxidant-loom" }
+oxidant-hvm        = { path = "crates/oxidant-hvm" }
+oxidant-execution  = { path = "crates/oxidant-execution" }
+oxidant-connect    = { path = "crates/oxidant-connect" }
 # Control-plane / platform crates (Databricks-like layer; see ~/.claude/plans).
 # Spark parity harness (golden SQL tests + scoreboard).
-weft-spark-compat = { path = "crates/weft-spark-compat" }
-weft-streaming   = { path = "crates/weft-streaming" }
-weft-orchestrator = { path = "crates/weft-orchestrator" }
-weft-gateway     = { path = "crates/weft-gateway" }
-weft-observability = { path = "crates/weft-observability" }
-weft-ui-server   = { path = "crates/weft-ui-server" }
+oxidant-spark-compat = { path = "crates/oxidant-spark-compat" }
+oxidant-streaming   = { path = "crates/oxidant-streaming" }
+oxidant-orchestrator = { path = "crates/oxidant-orchestrator" }
+oxidant-gateway     = { path = "crates/oxidant-gateway" }
+oxidant-observability = { path = "crates/oxidant-observability" }
+oxidant-ui-server   = { path = "crates/oxidant-ui-server" }
 
 [profile.release]
 opt-level = 3
@@ -52,7 +52,7 @@ lto = "thin"
 codegen-units = 1
 
 # Optimize third-party deps (datafusion, arrow) even in debug builds. The bench
-# gates in CI (`cargo run -p weft-bench -- tpcds ...`) run whole query suites
+# gates in CI (`cargo run -p oxidant-bench -- tpcds ...`) run whole query suites
 # through these crates; unoptimized they dominate the job. Workspace crates stay
 # at opt-level 0 so compile time is unaffected, and deps are cached after run 1.
 [profile.dev.package."*"]

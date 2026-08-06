@@ -1,7 +1,7 @@
 # Rust
 /target
 **/*.rs.bk
-# Cargo.lock IS committed: the workspace ships a binary (weft-cli), so we pin deps.
+# Cargo.lock IS committed: the workspace ships a binary (oxidant-cli), so we pin deps.
 
 # Python
 __pycache__/

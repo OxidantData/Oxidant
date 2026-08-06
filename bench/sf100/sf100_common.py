@@ -200,12 +200,12 @@ def qualify_sql(sql: str, glue_db: str, tables: list[str], catalog: str = "glue"
 
 
 def substitute_sf(sql: str, sf: float) -> str:
-    """Resolve the `__WEFT_SF__` scale-factor placeholder.
+    """Resolve the `__OXIDANT_SF__` scale-factor placeholder.
 
     TPC-H Q11's HAVING fraction is spec-defined as 0.0001/SF; `q11.sql` carries
     the token so every SF runs the correct threshold (KAN-30).
     """
-    return sql.replace("__WEFT_SF__", f"{sf:g}")
+    return sql.replace("__OXIDANT_SF__", f"{sf:g}")
 
 
 def load_queries(suite: str, sf: float = 1) -> list[tuple[str, str]]:

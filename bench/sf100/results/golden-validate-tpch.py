@@ -2,7 +2,7 @@
 """Golden validation: engine (Spark Connect) TPC-H SF10 results vs DuckDB answers.
 
 For each query: run through the engine (glue.tpch_sf10.*) and through DuckDB
-(/tmp/weft-sf10/tpch-sf10.db), then compare canonical checksums using the SAME
+(/tmp/oxidant-sf10/tpch-sf10.db), then compare canonical checksums using the SAME
 canonicalization as bench/sf100/run-spark-connect.py (_result_checksum).
 """
 import argparse
@@ -17,7 +17,7 @@ from sf100_common import load_queries, qualify_sql  # noqa: E402
 import duckdb  # noqa: E402
 
 SPARK_CONNECT = "sc://18.236.223.115:50051"
-DB = "/tmp/weft-sf10/tpch-sf10.db"
+DB = "/tmp/oxidant-sf10/tpch-sf10.db"
 
 
 def canonical_cell(v):

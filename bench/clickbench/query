@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Run one SQL statement (stdin) against a running Weft Spark Connect server and print the
+# Run one SQL statement (stdin) against a running Oxidant Spark Connect server and print the
 # elapsed wall-clock seconds on the LAST line of stderr (ClickBench contract).
 set -euo pipefail
-PORT="${WEFT_PORT:-50051}"
+PORT="${OXIDANT_PORT:-50051}"
 exec python3 - "$PORT" <<'PY'
 import sys, time
 port = sys.argv[1]
 sql = sys.stdin.read()
-# TODO(issue #1): once weft-connect is live, use the stock pyspark client:
+# TODO(issue #1): once oxidant-connect is live, use the stock pyspark client:
 #   from pyspark.sql import SparkSession
 #   spark = SparkSession.builder.remote(f"sc://localhost:{port}").getOrCreate()
 #   t = time.monotonic(); spark.sql(sql).toPandas(); dt = time.monotonic() - t

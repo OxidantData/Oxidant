@@ -1,7 +1,7 @@
 import { useId } from "react";
 
 /**
- * Warp/weft thread divider — replaces a plain border between sections. A horizontal weft baseline
+ * Warp/oxidant thread divider — replaces a plain border between sections. A horizontal oxidant baseline
  * crossed by evenly spaced warp ticks, with one orange "shuttle rest" node. `node` is 0–1 across.
  */
 export default function ThreadDivider({
@@ -26,17 +26,17 @@ export default function ThreadDivider({
     >
       <defs>
         <pattern id={pid} width="22" height="12" patternUnits="userSpaceOnUse">
-          <line x1="0" y1="2" x2="0" y2="10" stroke="var(--weft-border)" strokeWidth="1" />
+          <line x1="0" y1="2" x2="0" y2="10" stroke="var(--oxidant-border)" strokeWidth="1" />
         </pattern>
       </defs>
-      <line x1="0" y1="6" x2={W} y2="6" stroke="var(--weft-border)" strokeWidth="1" />
+      <line x1="0" y1="6" x2={W} y2="6" stroke="var(--oxidant-border)" strokeWidth="1" />
       <rect x="0" y="0" width={W} height="12" fill={`url(#${pid})`} />
       <circle
         cx={cx}
         cy="6"
         r="3.5"
-        fill="var(--weft-accent)"
-        className={glide ? "weft-anim-shuttle" : ""}
+        fill="var(--oxidant-accent)"
+        className={glide ? "oxidant-anim-shuttle" : ""}
         style={{ transformBox: "fill-box", transformOrigin: "center" }}
       />
     </svg>

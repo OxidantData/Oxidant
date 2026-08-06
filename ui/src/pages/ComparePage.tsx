@@ -3,16 +3,16 @@ import { api, fmtBytes, fmtMs, jobDuration, type JobData, type StageData } from 
 import { usePolling } from "@/lib/usePolling";
 
 export default function ComparePage() {
-  const { data: weftJobs } = usePolling(() => api.jobs());
-  const { data: weftStages } = usePolling(() => api.stages(false));
+  const { data: oxidantJobs } = usePolling(() => api.jobs());
+  const { data: oxidantStages } = usePolling(() => api.stages(false));
   const [sparkUrl, setSparkUrl] = useState(
-    () => localStorage.getItem("weft.sparkUrl") || "http://localhost:4040"
+    () => localStorage.getItem("oxidant.sparkUrl") || "http://localhost:4040"
   );
   const [result, setResult] = useState<React.ReactNode>(null);
   const [loading, setLoading] = useState(false);
 
   async function compare() {
-    localStorage.setItem("weft.sparkUrl", sparkUrl);
+    localStorage.setItem("oxidant.sparkUrl", sparkUrl);
     setLoading(true);
     try {
       const base = sparkUrl.replace(/\/$/, "");
@@ -30,16 +30,16 @@ export default function ComparePage() {
           `${base}/api/v1/applications/${appId}/stages`
         )) as StageData[];
       }
-      const weftDur = (weftJobs ?? []).reduce(
+      const oxidantDur = (oxidantJobs ?? []).reduce(
         (a, j) => a + (jobDuration(j) ?? 0),
         0
       );
       const sparkDur = sparkJobs.reduce((a, j) => a + (jobDuration(j) ?? 0), 0);
       const delta =
-        weftDur && sparkDur
-          ? (((sparkDur - weftDur) / sparkDur) * 100).toFixed(1)
+        oxidantDur && sparkDur
+          ? (((sparkDur - oxidantDur) / sparkDur) * 100).toFixed(1)
           : null;
-      const weftShuffle = (weftStages ?? []).reduce(
+      const oxidantShuffle = (oxidantStages ?? []).reduce(
         (a, s) => a + (s.shuffleReadBytes || 0),
         0
       );
@@ -51,13 +51,13 @@ export default function ComparePage() {
       setResult(
         <div className="space-y-4">
           <div className="grid gap-4 md:grid-cols-2">
-            <div className="weft-card">
-              <h3 className="mb-2 font-semibold">Weft</h3>
-              <p>Jobs: {(weftJobs ?? []).length}</p>
-              <p>Total duration: {fmtMs(weftDur)}</p>
-              <p>Shuffle read: {fmtBytes(weftShuffle)}</p>
+            <div className="oxidant-card">
+              <h3 className="mb-2 font-semibold">Oxidant</h3>
+              <p>Jobs: {(oxidantJobs ?? []).length}</p>
+              <p>Total duration: {fmtMs(oxidantDur)}</p>
+              <p>Shuffle read: {fmtBytes(oxidantShuffle)}</p>
             </div>
-            <div className="weft-card">
+            <div className="oxidant-card">
               <h3 className="mb-2 font-semibold">Spark</h3>
               <p>Jobs: {sparkJobs.length}</p>
               <p>Total duration: {fmtMs(sparkDur)}</p>
@@ -65,23 +65,23 @@ export default function ComparePage() {
             </div>
           </div>
           {delta != null && (
-            <div className="weft-card">
-              <p className={weftDur < sparkDur ? "text-success" : "text-danger"}>
-                Weft is {Math.abs(Number(delta))}%{" "}
-                {weftDur < sparkDur ? "faster" : "slower"} than Spark (job wall-clock sum)
+            <div className="oxidant-card">
+              <p className={oxidantDur < sparkDur ? "text-success" : "text-danger"}>
+                Oxidant is {Math.abs(Number(delta))}%{" "}
+                {oxidantDur < sparkDur ? "faster" : "slower"} than Spark (job wall-clock sum)
               </p>
             </div>
           )}
           <div className="grid gap-4 md:grid-cols-2">
-            <div className="weft-card">
-              <h4 className="mb-2 font-medium">Weft stages</h4>
+            <div className="oxidant-card">
+              <h4 className="mb-2 font-medium">Oxidant stages</h4>
               <pre className="font-mono text-xs">
-                {(weftStages ?? [])
+                {(oxidantStages ?? [])
                   .map((s) => `Stage ${s.stageId}: ${s.name} (${fmtMs(s.executorRunTime)})`)
                   .join("\n") || "—"}
               </pre>
             </div>
-            <div className="weft-card">
+            <div className="oxidant-card">
               <h4 className="mb-2 font-medium">Spark stages</h4>
               <pre className="font-mono text-xs">
                 {sparkStages
@@ -94,7 +94,7 @@ export default function ComparePage() {
       );
     } catch (e) {
       setResult(
-        <div className="weft-card text-danger">
+        <div className="oxidant-card text-danger">
           Compare failed: {e instanceof Error ? e.message : String(e)}
         </div>
       );
@@ -105,14 +105,14 @@ export default function ComparePage() {
 
   return (
     <div className="space-y-4">
-      <div className="weft-card space-y-2">
+      <div className="oxidant-card space-y-2">
         <label className="text-sm text-muted">Spark UI / History Server base URL</label>
         <input
           className="w-full max-w-lg rounded-md border border-border bg-bg px-3 py-2 text-sm"
           value={sparkUrl}
           onChange={(e) => setSparkUrl(e.target.value)}
         />
-        <button className="weft-btn" onClick={compare} disabled={loading}>
+        <button className="oxidant-btn" onClick={compare} disabled={loading}>
           {loading ? "Loading…" : "Compare"}
         </button>
       </div>

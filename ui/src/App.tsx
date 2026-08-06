@@ -22,9 +22,9 @@ export default function App() {
   return (
     <div className="min-h-screen">
       <header className="flex items-center gap-4 border-b border-border px-5 py-3">
-        <h1 className="text-lg font-semibold text-accent">Weft</h1>
+        <h1 className="text-lg font-semibold text-accent">Oxidant</h1>
         <span className="text-sm text-muted">
-          {meta?.name ?? "Weft"} · jobs: {meta?.jobCount ?? 0}
+          {meta?.name ?? "Oxidant"} · jobs: {meta?.jobCount ?? 0}
         </span>
       </header>
       <nav className="flex flex-wrap gap-1 border-b border-border px-5 py-2">

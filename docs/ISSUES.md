@@ -6,15 +6,15 @@ parallel, #2 depends on #1.
 ## ✅ Phase 0 EXIT MET (2026-06-24)
 
 All 43 ClickBench queries run to completion on the **real 14.78 GB / 100 M-row dataset**, on a
-real `c6a.4xlarge` (us-west-2), driven through the live `weft-connect` Spark Connect server over
+real `c6a.4xlarge` (us-west-2), driven through the live `oxidant-connect` Spark Connect server over
 gRPC — **43/43 passing, hot total 52.851 s** (Sail's published baseline: 56.3 s; same hardware,
 same dataset, 3 tries, hot = min(try2,try3)).
 
-Honest framing: this is *parity-class*, not a Weft-engineered win — it rides on DataFusion 54
+Honest framing: this is *parity-class*, not a Oxidant-engineered win — it rides on DataFusion 54
 (newer than Sail's pinned build) + a warm reused server. Beating Sail with a real margin is
 **Phase 1's** job (native heavy operators). Getting here required: DataFusion 43→54 (fixed the
 high-card `GROUP BY` `group_column` panic), gRPC 128 MB + Arrow chunking (fixed the oversized-
-message failures), and a bounded spill pool (`WEFT_MEMORY_LIMIT_BYTES`) so the heavy queries
+message failures), and a bounded spill pool (`OXIDANT_MEMORY_LIMIT_BYTES`) so the heavy queries
 spill instead of OOM-killing on 32 GB. Heaviest queries today: Q23 8.98 s (`SELECT *`+LIKE+sort),
 Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Phase 1 targets.
 
@@ -34,8 +34,8 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
   manifest-list → manifests via avro), then DataFusion 54's native reader. `Engine::register_
   delta`/`register_iceberg`, both tested. v1 limits: no DV / MoR deletes / partition pruning.
 - **1.4 — config sweep DONE; conclusion: we're at the DataFusion 54 ceiling.** Knobs are
-  env-tunable in `Engine::new` (`WEFT_BATCH_SIZE`, `WEFT_COALESCE_BATCHES`,
-  `WEFT_REPARTITION_AGGREGATIONS`, alongside `WEFT_TARGET_PARTITIONS`). Swept locally against the
+  env-tunable in `Engine::new` (`OXIDANT_BATCH_SIZE`, `OXIDANT_COALESCE_BATCHES`,
+  `OXIDANT_REPARTITION_AGGREGATIONS`, alongside `OXIDANT_TARGET_PARTITIONS`). Swept locally against the
   synthetic ClickBench at 3 M rows (`scratchpad/local-sweep.sh`, 11 configs, hot=min(try2,try3)):
   - **The defaults are optimal.** Baseline hot total 0.368 s. Lowering `target_partitions`
     (tp4 +137%, tp8 +18%) or disabling `repartition_aggregations` (+83%) is sharply worse —
@@ -50,12 +50,12 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
     hash-agg is already strong. The durable separation comes from the **Phase 2 HVM2 GPU path**, not
     CPU config. Caveat: synthetic/local signal, not the c6a absolutes — a real run would only need
     to confirm the `batch_size` candidate.
-- **1.5a — DONE:** single-stage driver/worker over Arrow Flight (`weft-execution::flight`).
+- **1.5a — DONE:** single-stage driver/worker over Arrow Flight (`oxidant-execution::flight`).
 - **1.5b — DONE (local MVP):** distributed shuffle plus Sail-style Forward coverage. The planner
   now handles AVG/COUNT(DISTINCT), multi-stage DAGs, broadcast joins, global ORDER BY/LIMIT, and
   falls back to a single Forward stage for locally plannable shapes it cannot split. The runtime has
   Flight shuffle, shuffle spill, `do_exchange`, task slots/retries, K8s membership, Spark Connect
-  distributed routing, and `weft spark server --mode local-cluster`. TPC-H distributed and
+  distributed routing, and `oxidant spark server --mode local-cluster`. TPC-H distributed and
   correctness-distributed are CI gates; Forward correctness assumes the selected worker has a full
   table view (shared storage or full replication).
 - Reusable benchmarking instance: `scratchpad/c6a.sh {up|run|stop|start|down}` (stopped between
@@ -66,22 +66,22 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
 - **#1 — DONE (core slice).** A real tonic `SparkConnectService` is live: vendored protos
   compiled with `protox` (no `protoc`), `ExecutePlan(SQL)` runs through DataFusion and streams
   Arrow IPC + `ResultComplete`; `AnalyzePlan(SparkVersion)` + `Config` handle session
-  bootstrap. Validated end-to-end by `crates/weft-connect/tests/select_one.rs` (boots the
+  bootstrap. Validated end-to-end by `crates/oxidant-connect/tests/select_one.rs` (boots the
   server, runs `SELECT 1` over gRPC, decodes Arrow, asserts `1`). **The full 43-query
-  ClickBench suite also runs over this live server** via `weft-bench clickbench-grpc`
+  ClickBench suite also runs over this live server** via `oxidant-bench clickbench-grpc`
   (`CREATE EXTERNAL TABLE` + queries -> Parquet scan -> Arrow IPC, **43/43**).
   **PySpark parity (DONE — validated against stock PySpark):** stock `pyspark-connect 4.0` on
   Python 3.11 drives the server end-to-end — `spark.sql(...).{collect,toPandas,show}()`, DDL
   (create + collect), GROUP BY/AVG, filters, `range()`. Implemented: `SqlCommand.input`
   (`spark.sql` — query → lazy `SqlCommandResult` relation handle; DDL/DML → eager exec +
   `LocalRelation`), `LocalRelation` execution, the `ShowString` relation (`.show()` formats a box
-  table), `AnalyzePlan(Schema)` with Arrow→Spark `DataType` conversion (`weft-connect::types`),
+  table), `AnalyzePlan(Schema)` with Arrow→Spark `DataType` conversion (`oxidant-connect::types`),
   real `Config` get/set (a session store seeded with `spark.sql.session.timeZone=UTC`), and a
   zero-row/zero-column result always emitting a schema-carrying `ArrowBatch` (so `collect()`'s
-  `assert table is not None` holds). Covered by `crates/weft-connect/tests/pyspark_parity.rs`
+  `assert table is not None` holds). Covered by `crates/oxidant-connect/tests/pyspark_parity.rs`
   (6 tests).
 - **DataFrame API (DONE — validated against stock PySpark).** Spark Connect relation/expression
-  trees lower to DataFusion logical plans in `weft-connect::translate` (no SQL): `Read`, `Project`,
+  trees lower to DataFusion logical plans in `oxidant-connect::translate` (no SQL): `Read`, `Project`,
   `Filter`, `Aggregate` (groupBy/agg incl. `count(*)`/multi-agg/no-group), `Sort`, `Limit`/`Offset`,
   `Join` (inner/outer/semi/anti/cross; `using`-column coalescing **and** `plan_id`-resolved
   conditions like `df.a == df2.b`, incl. self-joins), `SetOp` (union/intersect/except),
@@ -102,18 +102,18 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
   column naming) — all validated with stock PySpark.
   **Still open:** Python UDFs (`CommonInlineUserDefinedFunction`), pivot without an explicit value
   list, `Stat` ops (describe/summary/crosstab/…), `Catalog`/`MlRelation`, streaming, reattach.
-- **#2 — DONE (subset).** DataFusion embedded in `weft-loom`; `weft-bench tpch` runs the
+- **#2 — DONE (subset).** DataFusion embedded in `oxidant-loom`; `oxidant-bench tpch` runs the
   Q1/Q3/Q5/Q6/Q10 subset on synthetic tables — **5/5 pass** with structurally-correct row
   counts (Q1's 6 returnflag×linestatus groups, Q5's 6-table ASIA-region join). Gated in CI
   (`tpch-coverage`). Oracle-diff correctness (vs DuckDB) still to add.
-- **#3 — local coverage DONE.** `weft-bench` runs all **43/43** ClickBench queries through
-  Loom/DataFusion on a synthetic `hits` table (`cargo run -p weft-bench -- clickbench`),
+- **#3 — local coverage DONE.** `oxidant-bench` runs all **43/43** ClickBench queries through
+  Loom/DataFusion on a synthetic `hits` table (`cargo run -p oxidant-bench -- clickbench`),
   emitting a ClickBench-format `results.json`; gated in CI (`clickbench-coverage`). The
   official `c6a.4xlarge` run (real 14 GB via the Spark Connect client) is still to wire.
 
-## #1 — `weft-connect`: Spark Connect gRPC skeleton + session + `ExecutePlan(SQL)→Arrow`
+## #1 — `oxidant-connect`: Spark Connect gRPC skeleton + session + `ExecutePlan(SQL)→Arrow`
 
-Stand up the tonic gRPC server. `weft-proto` compiles vendored `apache/spark` protos via
+Stand up the tonic gRPC server. `oxidant-proto` compiles vendored `apache/spark` protos via
 `protox` (no `protoc` needed). Implement:
 - `Config` (Set/Get/GetAll/Unset/IsModifiable);
 - `AnalyzePlan` (`SparkVersion`, `Schema`);
@@ -126,9 +126,9 @@ SparkSession.builder.remote("sc://localhost:50051").getOrCreate().sql("SELECT 1"
 ```
 returns `1`.
 
-## #2 — `weft-loom`: embed DataFusion behind the warp IR; pass a 10-query TPC-H subset
+## #2 — `oxidant-loom`: embed DataFusion behind the warp IR; pass a 10-query TPC-H subset
 
-Lower `weft-plan` → DataFusion `LogicalPlan`; wire `weft-datasource` Parquet reads.
+Lower `oxidant-plan` → DataFusion `LogicalPlan`; wire `oxidant-datasource` Parquet reads.
 **Definition of done:** TPC-H Q1/Q3/Q5/Q6/Q10 on SF1 return results matching a Spark oracle.
 **Blocked by:** #1.
 

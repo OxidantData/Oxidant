@@ -2,9 +2,9 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "node:path";
 
-// Project page at https://vamzi.github.io/weft/ → assets must resolve under /weft/.
-// Override with VITE_BASE='/' for a custom domain / user page.
-const base = process.env.VITE_BASE ?? "/weft/";
+// Production site at https://oxidantdata.com/ (apex) → assets resolve under /.
+// Override with VITE_BASE='/path/' for path-hosted deploys (e.g. GitHub Pages project pages).
+const base = process.env.VITE_BASE ?? "/";
 
 export default defineConfig({
   base,

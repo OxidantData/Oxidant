@@ -8,7 +8,7 @@ W0=172.31.50.17
 W1=172.31.41.60
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 OUT="$REPO/bench/sf100/results/matrix-sf10"
-PY=/tmp/weft-smoke-venv/bin/python3
+PY=/tmp/oxidant-smoke-venv/bin/python3
 QUERIES="${QUERIES:-4,5,8,9,10,11,12,13,14,15,16,17,18,19,21,22}"
 TIMEOUT="${TIMEOUT:-240}"
 
@@ -18,15 +18,15 @@ sshw() { # sshw <worker-ip> <cmd>
     ec2-user@"$1" "$2" 2>/dev/null
 }
 rss() { # rss <worker-ip> -> KB
-  sshw "$1" "ps -eo rss,comm | awk '\$2==\"weft\"{print \$1}'"
+  sshw "$1" "ps -eo rss,comm | awk '\$2==\"oxidant\"{print \$1}'"
 }
 driver_rss() {
   ssh -i "$KEY" -o IdentitiesOnly=yes -o ConnectTimeout=10 ec2-user@$DRIVER \
-    "ps -eo rss,comm | awk '\$2==\"weft\"{print \$1}'" 2>/dev/null
+    "ps -eo rss,comm | awk '\$2==\"oxidant\"{print \$1}'" 2>/dev/null
 }
 restart_workers() {
-  sshw "$W0" 'sudo systemctl restart weft-worker' &
-  sshw "$W1" 'sudo systemctl restart weft-worker' &
+  sshw "$W0" 'sudo systemctl restart oxidant-worker' &
+  sshw "$W1" 'sudo systemctl restart oxidant-worker' &
   wait
   sleep 8
 }

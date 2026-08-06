@@ -1,0 +1,13 @@
+[package]
+name = "oxidant-physical"
+description = "Physical plan: operator selection + the ExecutionPlan trait both backends implement."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-common = { workspace = true }
+oxidant-plan = { workspace = true }
+oxidant-optimizer = { workspace = true }

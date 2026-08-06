@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Packer provisioner: harden AL2023 and install Weft runtime bits.
+# Packer provisioner: harden AL2023 and install Oxidant runtime bits.
 set -euo pipefail
 
-WEFT_UID=65532
-WEFT_GID=65532
-WEFT_BINARY_URL="${WEFT_BINARY_URL:-}"
-# Staged by build-ami.sh into files/weft → uploaded under /tmp/weft-files/weft.
-STAGED_BINARY="/tmp/weft-files/weft"
+OXIDANT_UID=65532
+OXIDANT_GID=65532
+OXIDANT_BINARY_URL="${OXIDANT_BINARY_URL:-}"
+# Staged by build-ami.sh into files/oxidant → uploaded under /tmp/oxidant-files/oxidant.
+STAGED_BINARY="/tmp/oxidant-files/oxidant"
 
 echo "[provision] updating packages"
 dnf -y update
@@ -34,41 +34,41 @@ if ! /usr/local/bin/aws --version 2>/dev/null | grep -q 'aws-cli/2'; then
 fi
 /usr/local/bin/aws --version
 
-echo "[provision] creating weft user ${WEFT_UID}:${WEFT_GID}"
-groupadd -g "${WEFT_GID}" weft 2>/dev/null || true
-useradd -u "${WEFT_UID}" -g "${WEFT_GID}" -m -d /var/lib/weft -s /sbin/nologin weft 2>/dev/null || true
-mkdir -p /var/lib/weft/spill /etc/weft /usr/local/lib/weft
-chown -R weft:weft /var/lib/weft
-chmod 755 /var/lib/weft /var/lib/weft/spill
+echo "[provision] creating oxidant user ${OXIDANT_UID}:${OXIDANT_GID}"
+groupadd -g "${OXIDANT_GID}" oxidant 2>/dev/null || true
+useradd -u "${OXIDANT_UID}" -g "${OXIDANT_GID}" -m -d /var/lib/oxidant -s /sbin/nologin oxidant 2>/dev/null || true
+mkdir -p /var/lib/oxidant/spill /etc/oxidant /usr/local/lib/oxidant
+chown -R oxidant:oxidant /var/lib/oxidant
+chmod 755 /var/lib/oxidant /var/lib/oxidant/spill
 
-echo "[provision] installing weft binary"
+echo "[provision] installing oxidant binary"
 if [[ -f "${STAGED_BINARY}" ]]; then
-  install -m 0755 "${STAGED_BINARY}" /usr/local/bin/weft
-elif [[ -n "${WEFT_BINARY_URL}" ]]; then
-  curl -fsSLo /usr/local/bin/weft "${WEFT_BINARY_URL}"
-  chmod 0755 /usr/local/bin/weft
+  install -m 0755 "${STAGED_BINARY}" /usr/local/bin/oxidant
+elif [[ -n "${OXIDANT_BINARY_URL}" ]]; then
+  curl -fsSLo /usr/local/bin/oxidant "${OXIDANT_BINARY_URL}"
+  chmod 0755 /usr/local/bin/oxidant
 else
-  echo "[provision] ERROR: stage files/weft via build-ami.sh --binary, or set -var weft_binary_url=..." >&2
+  echo "[provision] ERROR: stage files/oxidant via build-ami.sh --binary, or set -var oxidant_binary_url=..." >&2
   exit 1
 fi
 # Binary is linux/amd64; a quick existence check is enough in the bake host.
-test -x /usr/local/bin/weft
+test -x /usr/local/bin/oxidant
 # Do not leave the staged upload in /tmp for the AMI.
 rm -f "${STAGED_BINARY}"
 
 echo "[provision] installing bootstrap + systemd units"
-install -m 0755 /tmp/weft-files/bootstrap.sh /usr/local/lib/weft/bootstrap.sh
-install -m 0755 /tmp/weft-files/shard-resolve.sh /usr/local/lib/weft/shard-resolve.sh
-install -m 0644 /tmp/weft-files/systemd/weft-bootstrap.service /etc/systemd/system/weft-bootstrap.service
-install -m 0644 /tmp/weft-files/systemd/weft-driver.service /etc/systemd/system/weft-driver.service
-install -m 0644 /tmp/weft-files/systemd/weft-worker.service /etc/systemd/system/weft-worker.service
-install -m 0644 /tmp/weft-files/systemd/weft-shard-resolve.service /etc/systemd/system/weft-shard-resolve.service
-install -m 0644 /tmp/weft-files/systemd/weft-shard-resolve.timer /etc/systemd/system/weft-shard-resolve.timer
+install -m 0755 /tmp/oxidant-files/bootstrap.sh /usr/local/lib/oxidant/bootstrap.sh
+install -m 0755 /tmp/oxidant-files/shard-resolve.sh /usr/local/lib/oxidant/shard-resolve.sh
+install -m 0644 /tmp/oxidant-files/systemd/oxidant-bootstrap.service /etc/systemd/system/oxidant-bootstrap.service
+install -m 0644 /tmp/oxidant-files/systemd/oxidant-driver.service /etc/systemd/system/oxidant-driver.service
+install -m 0644 /tmp/oxidant-files/systemd/oxidant-worker.service /etc/systemd/system/oxidant-worker.service
+install -m 0644 /tmp/oxidant-files/systemd/oxidant-shard-resolve.service /etc/systemd/system/oxidant-shard-resolve.service
+install -m 0644 /tmp/oxidant-files/systemd/oxidant-shard-resolve.timer /etc/systemd/system/oxidant-shard-resolve.timer
 systemctl daemon-reload
-systemctl enable weft-bootstrap.service
-systemctl enable weft-shard-resolve.timer
-# Role units are enabled at boot by bootstrap based on the weft:role tag.
-systemctl disable weft-driver.service weft-worker.service 2>/dev/null || true
+systemctl enable oxidant-bootstrap.service
+systemctl enable oxidant-shard-resolve.timer
+# Role units are enabled at boot by bootstrap based on the oxidant:role tag.
+systemctl disable oxidant-driver.service oxidant-worker.service 2>/dev/null || true
 
 echo "[provision] hardening ssh / imds posture helpers"
 # Password auth off; AMI is intended for SSM Session Manager (no required KeyName).

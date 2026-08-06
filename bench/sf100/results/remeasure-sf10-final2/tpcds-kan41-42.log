@@ -1,4 +1,4 @@
-[run] strict mode: connect pod must have WEFT_DISTRIBUTED_STRICT=1 (values-sf100.yaml sets connect.distributedStrict); fallback is a hard failure
+[run] strict mode: connect pod must have OXIDANT_DISTRIBUTED_STRICT=1 (values-sf100.yaml sets connect.distributedStrict); fallback is a hard failure
 [preflight] SKIPPED (--skip-worker-preflight)
 [run] endpoint=sc://18.236.223.115:50051 suite=tpcds sf=10.0 catalog=glue glue_db=tpcds_sf10 queries=6 resume_skip=0
 Q11   FAIL try1 (600.0764s): TimeoutError: query exceeded 600s (possible server-side wedge/deadlock)

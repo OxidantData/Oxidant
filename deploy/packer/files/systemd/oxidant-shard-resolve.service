@@ -1,0 +1,9 @@
+[Unit]
+Description=Oxidant worker shard-index re-resolution (instance-refresh self-heal)
+Documentation=https://github.com/OxidantData/Oxidant
+After=oxidant-worker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/oxidant/shard-resolve.sh
+TimeoutStartSec=60

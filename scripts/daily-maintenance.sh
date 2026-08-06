@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Daily-maintenance scan for the Weft engine repo.
+# Daily-maintenance scan for the Oxidant engine repo.
 #
 # This is the DETERMINISTIC half of the daily automation: it runs the cheap-core
 # quality + security gates and writes machine-readable reports under
@@ -73,11 +73,11 @@ echo "# daily-maintenance scan ($RUN_DATE) — reports in $OUT/"
 # --- formatting: non-zero exit means the tree is unformatted (a finding) ---
 run "rustfmt-check"   "fmt.diff"        cargo fmt --all -- --check
 
-# --- weft-cli MUST be built before tests/clippy (binary-only crate; AGENTS.md).
+# --- oxidant-cli MUST be built before tests/clippy (binary-only crate; AGENTS.md).
 #     If this FLAGs, test.log below is unreliable (CLI integration tests can't spawn
 #     the binary) — the agent must read build-cli.log before triaging test failures.
 #     --locked so the scan never silently rewrites Cargo.lock. ---
-run "build-weft-cli"  "build-cli.log"   cargo build --locked -p weft-cli
+run "build-oxidant-cli"  "build-cli.log"   cargo build --locked -p oxidant-cli
 
 # --- clippy: JSON on stdout for per-lint parsing; stderr split out so it stays valid.
 #     -D warnings = the gate. ---

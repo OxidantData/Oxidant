@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install build prerequisites for the Weft ClickBench entry (Amazon Linux 2023 or Ubuntu).
+# Install build prerequisites for the Oxidant ClickBench entry (Amazon Linux 2023 or Ubuntu).
 set -euo pipefail
 
 if command -v dnf >/dev/null 2>&1; then

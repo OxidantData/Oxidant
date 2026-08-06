@@ -29,4 +29,4 @@ echo "==> gitnexus analyze ($ROOT)"
 gitnexus analyze --skip-agents-md
 
 echo "done. Verify with: codegraph status && gitnexus doctor"
-echo "Multi-repo: after indexing weft-platform too, see docs/AGENT_INDEXING.md (group weft)."
+echo "Multi-repo: after indexing oxidant-platform too, see docs/AGENT_INDEXING.md (group oxidant)."

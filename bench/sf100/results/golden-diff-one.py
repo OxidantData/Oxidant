@@ -24,7 +24,7 @@ def canonical_cell(v) -> str:
         return f"{v:.12g}"
     return repr(v)
 
-DB = "/tmp/weft-sf10/tpch-sf10.db"
+DB = "/tmp/oxidant-sf10/tpch-sf10.db"
 ENDPOINT = "sc://35.85.61.45:50051"
 
 

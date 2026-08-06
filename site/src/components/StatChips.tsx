@@ -2,12 +2,12 @@ import { useEffect, useState } from "react";
 import { benchmarks, pctFasterVs } from "../lib/benchmarks";
 import { useInView, prefersReducedMotion } from "../lib/useInView";
 
-/** "Weft is N% faster than X" chips that count up from 0 once in view. Honest: only renders
+/** "Oxidant is N% faster than X" chips that count up from 0 once in view. Honest: only renders
  *  engines with a measured total; falls back to a pending note. "% faster" = wall-clock time
- *  saved vs the other engine: (other − weft) ÷ other. */
+ *  saved vs the other engine: (other − oxidant) ÷ other. */
 export default function StatChips() {
   const cards = benchmarks.engines
-    .filter((e) => e.key !== "weft")
+    .filter((e) => e.key !== "oxidant")
     .map((e) => ({ name: e.name, pct: pctFasterVs(e.key) }))
     .filter((c): c is { name: string; pct: number } => c.pct != null);
 
@@ -51,7 +51,7 @@ function Chip({ name, pct, go }: { name: string; pct: number; go: boolean }) {
   }, [go, pct]);
 
   return (
-    <div className="rounded-weft border border-hairline bg-surface px-4 py-2.5">
+    <div className="rounded-oxidant border border-hairline bg-surface px-4 py-2.5">
       <span className="text-xl font-bold tabular-nums text-accent">{val.toFixed(0)}%</span>
       <span className="ml-2 text-sm text-muted">faster than {name}</span>
     </div>

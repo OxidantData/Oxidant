@@ -1,0 +1,19 @@
+[package]
+name = "oxidant-proto"
+description = "Generated Spark Connect protobuf + gRPC types. Protos vendored from apache/spark (target Spark 4.x)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+prost = "0.13"
+prost-types = "0.13"
+tonic = "0.12"
+
+[build-dependencies]
+# protox is a pure-Rust protobuf compiler — no `protoc` binary required.
+protox = "0.7"
+# Keep default features: "transport" makes tonic-build emit the client `connect` ctor.
+tonic-build = "0.12"

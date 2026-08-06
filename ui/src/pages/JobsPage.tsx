@@ -4,12 +4,12 @@ import { usePolling } from "@/lib/usePolling";
 export default function JobsPage() {
   const { data: jobs, error } = usePolling(() => api.jobs());
 
-  if (error) return <div className="weft-card text-danger">{error}</div>;
+  if (error) return <div className="oxidant-card text-danger">{error}</div>;
   if (!jobs?.length)
-    return <div className="weft-card text-muted">No jobs yet. Run a query via PySpark.</div>;
+    return <div className="oxidant-card text-muted">No jobs yet. Run a query via PySpark.</div>;
 
   return (
-    <div className="weft-card overflow-x-auto">
+    <div className="oxidant-card overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
           <tr className="text-muted">

@@ -1,6 +1,6 @@
 # SF100 on S3 + Glue (+ EC2 CF or EKS)
 
-Publish TPC-H / TPC-DS **SF100** against Weft:
+Publish TPC-H / TPC-DS **SF100** against Oxidant:
 
 ### Canonical compute topology
 
@@ -13,13 +13,13 @@ iron). Full EC2 deploy recipe:
 | Driver / Connect | 1 | `c6g.xlarge` (4 vCPU / 8 GiB, arm64) | 100 GiB gp3 root |
 | Workers | 2 (min=max=2) | `m8g.8xlarge` (32 vCPU / 128 GiB, arm64) | 500 GiB gp3 spill each |
 
-EKS: [`deploy/helm/weft/values-sf100.yaml`](../../deploy/helm/weft/values-sf100.yaml).
+EKS: [`deploy/helm/oxidant/values-sf100.yaml`](../../deploy/helm/oxidant/values-sf100.yaml).
 EC2 remeasure (driver IP only — **no NLB**):
-`STACK=weft-sf100 SUITE=all ./bench/sf100/remeasure-distributed.sh`.
+`STACK=oxidant-sf100 SUITE=all ./bench/sf100/remeasure-distributed.sh`.
 
 1. Dump DuckDB’s pre-built SF100 databases to
-   `s3://weft-artifacts-<account>/{tpch,tpcds}-sf100/<table>/` as Parquet.
-2. Register Glue databases `tpch_sf100` / `tpcds_sf100` (empty Columns — Weft
+   `s3://oxidant-artifacts-<account>/{tpch,tpcds}-sf100/<table>/` as Parquet.
+2. Register Glue databases `tpch_sf100` / `tpcds_sf100` (empty Columns — Oxidant
    infers Parquet schema).
 3. *(Optional lakehouse)* Lay Iceberg + Delta **metadata** over the same Parquet
    objects and register sibling Glue databases (see [Lakehouse formats](#lakehouse-formats-iceberg--delta)).
@@ -40,7 +40,7 @@ numbers from this harness yet.
 
 | Artifact | Location |
 |----------|----------|
-| Parquet | `s3://weft-artifacts-810738286322/tpch-sf100/`, `…/tpcds-sf100/` |
+| Parquet | `s3://oxidant-artifacts-810738286322/tpch-sf100/`, `…/tpcds-sf100/` |
 | Glue (Parquet) | `tpch_sf100.*`, `tpcds_sf100.*` |
 | Glue (Iceberg) | `tpch_sf100_iceberg.*`, `tpcds_sf100_iceberg.*` |
 | Glue (Delta) | `tpch_sf100_delta.*`, `tpcds_sf100_delta.*` |
@@ -56,8 +56,8 @@ Existing `glue.tpch.*` (~SF10, ~60 M lineitem rows) is left untouched.
 ./bench/sf100/launch-dump-ec2.sh
 
 # watch
-aws s3 cp s3://weft-artifacts-810738286322/bench/sf100/dump.log - 
-aws s3 ls s3://weft-artifacts-810738286322/bench/sf100/DUMP_COMPLETE
+aws s3 cp s3://oxidant-artifacts-810738286322/bench/sf100/dump.log - 
+aws s3 ls s3://oxidant-artifacts-810738286322/bench/sf100/DUMP_COMPLETE
 ```
 
 Then register Glue from a principal that can mutate the catalog (the dump
@@ -70,21 +70,21 @@ SUITE=tpcds SF=100 ./bench/sf100/register-glue.sh
 
 ## Helm data-plane (sharding contract)
 
-Workers are a **StatefulSet** (`weft-worker-0`, `weft-worker-1`, …). Each worker pod
+Workers are a **StatefulSet** (`oxidant-worker-0`, `oxidant-worker-1`, …). Each worker pod
 must have:
 
 | Env | Source | Why |
 |-----|--------|-----|
-| `WEFT_WORKER_COUNT` | `worker.replicas` | Shard modulus; must be fixed |
-| `WEFT_POD_NAME` | `fieldRef: metadata.name` | Trailing ordinal → shard index |
-| `TMPDIR` | `/var/lib/weft/spill` | Threshold spill root on the PVC |
-| `WEFT_SHUFFLE_SPILL_BYTES` | `worker.shuffleSpillBytes` | Spill threshold (not force-spill) |
-| `WEFT_MEMORY_LIMIT_BYTES` | `worker.memoryLimitBytes` | Fallback threshold / DF pool |
+| `OXIDANT_WORKER_COUNT` | `worker.replicas` | Shard modulus; must be fixed |
+| `OXIDANT_POD_NAME` | `fieldRef: metadata.name` | Trailing ordinal → shard index |
+| `TMPDIR` | `/var/lib/oxidant/spill` | Threshold spill root on the PVC |
+| `OXIDANT_SHUFFLE_SPILL_BYTES` | `worker.shuffleSpillBytes` | Spill threshold (not force-spill) |
+| `OXIDANT_MEMORY_LIMIT_BYTES` | `worker.memoryLimitBytes` | Fallback threshold / DF pool |
 
-Do **not** set `WEFT_SHUFFLE_SPILL_DIR` for benchmarks (`forceShuffleSpill` is debug-only
+Do **not** set `OXIDANT_SHUFFLE_SPILL_DIR` for benchmarks (`forceShuffleSpill` is debug-only
 and forces every shuffle bucket to disk).
 
-`ShardAssignment::from_env` (`crates/weft-loom/src/shard.rs`) returns `None` when the
+`ShardAssignment::from_env` (`crates/oxidant-loom/src/shard.rs`) returns `None` when the
 sharding env is missing, and **every worker then reads the whole table** (silent
 duplication). Autoscaling is **chart-rejected**. A **not-Ready** worker is a different
 failure: remaining workers still only read their own shard → silent row loss. The chart
@@ -93,9 +93,9 @@ adds Flight readiness probes; the Spark Connect runner preflights Ready pod coun
 SF100 topology overlay:
 
 ```sh
-helm upgrade --install weft deploy/helm/weft \
-  --namespace weft \
-  -f deploy/helm/weft/values-sf100.yaml \
+helm upgrade --install oxidant deploy/helm/oxidant \
+  --namespace oxidant \
+  -f deploy/helm/oxidant/values-sf100.yaml \
   --set connect.image=$CONNECT_REF \
   --set worker.image=$WORKER_REF
 ```
@@ -105,35 +105,35 @@ See [`docs/distributed-k8s.md`](../../docs/distributed-k8s.md).
 ## Run via Spark Connect (direct)
 
 Requires `pyspark-client>=4.0` (pure Python, no JVM). The connect pod should have
-`WEFT_DISTRIBUTED_STRICT=1` (SF100 overlay sets `connect.distributedStrict: true`).
+`OXIDANT_DISTRIBUTED_STRICT=1` (SF100 overlay sets `connect.distributedStrict: true`).
 
 ```sh
 pip install "pyspark-client>=4.0"
-kubectl -n weft port-forward svc/weft-connect 50051:50051
+kubectl -n oxidant port-forward svc/oxidant-connect 50051:50051
 
-WEFT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
+OXIDANT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
   --endpoint sc://localhost:50051 \
   --suite tpcds --sf 100 --glue-db tpcds_sf100 \
-  --namespace weft --worker-count 2 \
+  --namespace oxidant --worker-count 2 \
   --only 1,3,6 \
   --json /tmp/tpcds-sc.jsonl
 
 # Full sweep (resumable JSONL)
-WEFT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
+OXIDANT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
   --endpoint sc://localhost:50051 \
   --suite tpcds --sf 100 --glue-db tpcds_sf100 \
-  --namespace weft --worker-count 2 \
+  --namespace oxidant --worker-count 2 \
   --json results/tpcds-sf100-parquet.jsonl --resume
 ```
 
-Preflight (default for SF≥100): refuses to start unless Ready `app=weft-worker` pods
-equal `--worker-count` (or `$WEFT_WORKER_COUNT`). Override only with
+Preflight (default for SF≥100): refuses to start unless Ready `app=oxidant-worker` pods
+equal `--worker-count` (or `$OXIDANT_WORKER_COUNT`). Override only with
 `--skip-worker-preflight` (unsafe).
 
 The same check also brackets **every query**, before and after. The one-shot preflight
 only proves the cluster was healthy at t=0; a worker that restarts or fails a probe
 mid-sweep drops out of headless DNS, and the survivors keep sharding over the
-render-time `WEFT_WORKER_COUNT`, so every later query silently returns a subset —
+render-time `OXIDANT_WORKER_COUNT`, so every later query silently returns a subset —
 faster, and marked `ok`. A resumable sweep is one long process, so one blip would
 otherwise poison the rest of the run. On mismatch the runner aborts; fix the
 StatefulSet and re-run with `--resume` (completed queries are kept). Successful
@@ -142,12 +142,12 @@ records carry `workers_ready` so results stay auditable after the fact.
 Each JSONL record includes `wall_s` / `hot_s`, `row_count`, and a SHA-256 `checksum`
 of the collected rows for cross-format comparison.
 
-SF≥100 refuses to start without `WEFT_DISTRIBUTED_STRICT=1` or `--strict`.
+SF≥100 refuses to start without `OXIDANT_DISTRIBUTED_STRICT=1` or `--strict`.
 
 ## Golden checks (KAN-50)
 
 `results/golden-check-tpch.py` and `results/golden-check-tpcds.py` recompute each
-query's answer with DuckDB (`/tmp/weft-sf10/{tpch,tpcds}-sf10.db`) and compare it
+query's answer with DuckDB (`/tmp/oxidant-sf10/{tpch,tpcds}-sf10.db`) and compare it
 against a suite JSONL's recorded engine checksums, printing a three-way verdict per
 query — **MATCH / BENIGN / MISMATCH** — with benign queries listed separately in the
 summary:
@@ -184,7 +184,7 @@ reclassifies heuristic BENIGN as MISMATCH.
 
 **One Parquet copy, three catalog entries.** Iceberg and Delta are metadata over the
 same objects `dump-to-s3.sh` already wrote — so format timing comparisons are not
-confounded by different row-group layouts. Weft cannot write Iceberg/Delta (Glue
+confounded by different row-group layouts. Oxidant cannot write Iceberg/Delta (Glue
 `build_table_input` rejects those write targets); generation is intentionally
 out-of-band via PyIceberg / delta-rs.
 
@@ -202,19 +202,19 @@ pip install -r bench/sf100/requirements.txt
 # Always dry-run first (no AWS writes)
 python3 bench/sf100/build-lakehouse.py \
   --suite tpcds --sf 100 \
-  --source-prefix s3://weft-artifacts-$ACCOUNT/tpcds-sf100 \
+  --source-prefix s3://oxidant-artifacts-$ACCOUNT/tpcds-sf100 \
   --formats iceberg,delta \
   --dry-run
 
 # Operator run (creates metadata + Glue DBs)
 python3 bench/sf100/build-lakehouse.py \
   --suite tpcds --sf 100 \
-  --source-prefix s3://weft-artifacts-$ACCOUNT/tpcds-sf100 \
-  --iceberg-warehouse s3://weft-artifacts-$ACCOUNT/tpcds-sf100-iceberg \
+  --source-prefix s3://oxidant-artifacts-$ACCOUNT/tpcds-sf100 \
+  --iceberg-warehouse s3://oxidant-artifacts-$ACCOUNT/tpcds-sf100-iceberg \
   --formats iceberg,delta
 ```
 
-**Glue parameters (paired with Weft `detect_format` on `vamzi/lakehouse-s3-formats`):**
+**Glue parameters (paired with Oxidant `detect_format` on `vamzi/lakehouse-s3-formats`):**
 
 | Format | Glue DB | Parameters set |
 |--------|---------|----------------|

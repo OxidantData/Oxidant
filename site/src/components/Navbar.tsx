@@ -1,7 +1,7 @@
 import { Link, NavLink } from "react-router-dom";
 import { useTheme } from "../lib/theme";
 
-const REPO = "https://github.com/vamzi/weft";
+const REPO = "https://github.com/OxidantData/Oxidant";
 
 function ThemeToggle() {
   const { theme, toggle } = useTheme();
@@ -9,7 +9,7 @@ function ThemeToggle() {
     <button
       onClick={toggle}
       aria-label="Toggle theme"
-      className="weft-btn-ghost h-9 w-9 px-0"
+      className="oxidant-btn-ghost h-9 w-9 px-0"
       title={theme === "dark" ? "Switch to light" : "Switch to dark"}
     >
       {theme === "dark" ? "☀" : "☾"}
@@ -24,10 +24,10 @@ export default function Navbar() {
     }`;
   return (
     <header className="sticky top-0 z-20 border-b border-hairline bg-bg/80 backdrop-blur">
-      <div className="weft-container flex h-14 items-center justify-between">
+      <div className="oxidant-container flex h-14 items-center justify-between">
         <Link to="/" className="flex items-center gap-2">
-          <img src="weft.svg" alt="Weft" className="h-7 w-7" />
-          <span className="text-base font-semibold tracking-tight">Weft</span>
+          <img src="oxidant.svg" alt="Oxidant" className="h-7 w-7" />
+          <span className="text-base font-semibold tracking-tight">Oxidant</span>
         </Link>
         <nav className="flex items-center gap-5 sm:gap-6">
           <NavLink to="/" end className={link}>
@@ -46,7 +46,7 @@ export default function Navbar() {
             Docs
           </a>
           <ThemeToggle />
-          <a href={REPO} className="weft-btn-primary hidden sm:inline-flex">
+          <a href={REPO} className="oxidant-btn-primary hidden sm:inline-flex">
             GitHub
           </a>
         </nav>
