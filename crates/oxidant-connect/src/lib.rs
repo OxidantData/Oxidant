@@ -55,6 +55,10 @@ pub struct ServerConfig {
     pub port: u16,
     /// Monitoring UI HTTP port (Spark default 4040). `None` disables the UI server.
     pub ui_port: Option<u16>,
+    /// Interface the UI HTTP listener binds to. `None` binds `0.0.0.0` (all
+    /// interfaces, Spark's posture). The UI has no auth — public AMIs should
+    /// pass `127.0.0.1` and reach the UI over an SSH tunnel.
+    pub ui_bind: Option<std::net::IpAddr>,
     /// Shared observability store for the UI. Created automatically when `ui_port` is set.
     pub observability: Option<SharedStore>,
     /// Catalogs to declare at startup, as flat `spark.sql.catalog.<name>.*` entries (e.g.
@@ -72,6 +76,7 @@ impl Default for ServerConfig {
         Self {
             port: 50051,
             ui_port: Some(4040),
+            ui_bind: None,
             observability: None,
             catalogs: std::collections::HashMap::new(),
             workers: distributed::parse_worker_list(None),
@@ -1888,6 +1893,9 @@ fn err_to_status(e: Error) -> Status {
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let port = config.port;
     let ui_port = config.ui_port;
+    let ui_bind = config
+        .ui_bind
+        .unwrap_or_else(|| std::net::IpAddr::from([0, 0, 0, 0]));
     let store = config
         .observability
         .clone()
@@ -1902,13 +1910,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             if let Err(e) = oxidant_ui_server::serve(oxidant_ui_server::UiServerConfig {
                 port: ui_port,
                 store: ui_store,
+                bind: ui_bind,
             })
             .await
             {
                 eprintln!("oxidant ui server error: {e}");
             }
         });
-        eprintln!("Oxidant UI listening on http://0.0.0.0:{ui_port}");
+        eprintln!("Oxidant UI listening on http://{ui_bind}:{ui_port}");
     }
 
     serve_instance(service, port).await

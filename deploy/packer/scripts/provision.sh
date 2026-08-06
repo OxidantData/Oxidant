@@ -62,13 +62,40 @@ install -m 0755 /tmp/oxidant-files/shard-resolve.sh /usr/local/lib/oxidant/shard
 install -m 0644 /tmp/oxidant-files/systemd/oxidant-bootstrap.service /etc/systemd/system/oxidant-bootstrap.service
 install -m 0644 /tmp/oxidant-files/systemd/oxidant-driver.service /etc/systemd/system/oxidant-driver.service
 install -m 0644 /tmp/oxidant-files/systemd/oxidant-worker.service /etc/systemd/system/oxidant-worker.service
+install -m 0644 /tmp/oxidant-files/systemd/oxidant-standalone.service /etc/systemd/system/oxidant-standalone.service
 install -m 0644 /tmp/oxidant-files/systemd/oxidant-shard-resolve.service /etc/systemd/system/oxidant-shard-resolve.service
 install -m 0644 /tmp/oxidant-files/systemd/oxidant-shard-resolve.timer /etc/systemd/system/oxidant-shard-resolve.timer
 systemctl daemon-reload
 systemctl enable oxidant-bootstrap.service
 systemctl enable oxidant-shard-resolve.timer
 # Role units are enabled at boot by bootstrap based on the oxidant:role tag.
+# oxidant-standalone is ENABLED here (Marketplace single-node: no UserData
+# exists to start it, and Requires= would deadlock — it Wants bootstrap only).
+# Cluster images: bootstrap disables + cancels it before it starts.
 systemctl disable oxidant-driver.service oxidant-worker.service 2>/dev/null || true
+systemctl enable oxidant-standalone.service
+
+echo "[provision] writing version stamp, MOTD, and quickstart"
+mkdir -p /usr/local/share/oxidant
+cat > /etc/oxidant/VERSION <<EOF
+engine=${OXIDANT_ENGINE_VERSION:-unknown}
+built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+cat > /etc/motd <<'EOF'
+===============================================================================
+ Oxidant — the fast Apache Spark-compatible analytics runtime
+ AGPLv3 open source | commercial licensing: hello@oxidantdata.com
+ Docs: https://oxidantdata.com  |  Repo: https://github.com/OxidantData/Oxidant
+
+ This instance is running the Oxidant Spark Connect server on port 50051.
+ Point any PySpark client at it:
+     SparkSession.builder.remote("sc://<this-host>:50051").getOrCreate()
+
+ Monitoring UI (loopback only): ssh -L 4040:localhost:4040 ec2-user@<this-host>
+ Quickstart: /usr/local/share/oxidant/QUICKSTART.md
+===============================================================================
+EOF
+install -m 0644 /tmp/oxidant-files/QUICKSTART.md /usr/local/share/oxidant/QUICKSTART.md
 
 echo "[provision] hardening ssh / imds posture helpers"
 # Password auth off; AMI is intended for SSM Session Manager (no required KeyName).
