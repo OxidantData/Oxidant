@@ -20,13 +20,11 @@ on:
     branches: [main]
     paths-ignore:
       - "docs/**"
-      - "site/**"
       - "**/*.md"
       - "LICENSE"
   pull_request:
     paths-ignore:
       - "docs/**"
-      - "site/**"
       - "**/*.md"
       - "LICENSE"
   workflow_dispatch:
@@ -209,7 +207,8 @@ jobs:
   # fails the PR if strict OR semantic parity drops below the committed parity/baseline.json floor
   # (or the corpus size changes). This is the gate that protects the Spark-compatibility work — a PR
   # can only hold or improve parity. To LAND a gain, re-baseline parity/baseline.json (strict to the
-  # 3-run minimum — ±1 tie-flake) and refresh site/public/parity.{html,json}.
+  # 3-run minimum — ±1 tie-flake); the marketing site (separate private repo) consumes
+  # parity/parity.html + parity/scoreboard.json.
   parity:
     name: Spark SQL parity ratchet
     runs-on: ubuntu-latest
