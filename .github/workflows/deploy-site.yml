@@ -1,7 +1,9 @@
-name: Deploy showcase site to GitHub Pages
+name: Deploy showcase site to S3 + CloudFront
 
-# Builds site/ (Vite/React) and publishes it to GitHub Pages.
-# One-time setup: repo Settings → Pages → Source = "GitHub Actions".
+# Builds site/ (Vite/React) and publishes it to the oxidantdata.com static
+# hosting stack: private S3 bucket fronted by CloudFront (OAC). Auth is via
+# GitHub Actions OIDC — the IAM role ARN lives in the repo variable
+# AWS_SITE_DEPLOY_ROLE_ARN (see deploy/site/README.md for the full setup).
 on:
   push:
     branches: [main]
@@ -11,17 +13,21 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
   id-token: write
+  contents: read
 
 # Let a newer run cancel an in-progress one, but don't cancel a running deploy.
 concurrency:
-  group: pages
+  group: site-deploy
   cancel-in-progress: false
 
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: oxidantdata.com
+  CLOUDFRONT_DISTRIBUTION_ID: E3BG86EZYJNHTO
+
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -30,22 +36,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "20"
           cache: npm
           cache-dependency-path: site/package-lock.json
       - run: npm ci
       - run: npm run build
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          path: site/dist
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          role-to-assume: ${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Sync site to S3
+        run: aws s3 sync dist "s3://$S3_BUCKET" --delete
+      - name: Invalidate CloudFront cache
+        run: aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" --paths "/*"
