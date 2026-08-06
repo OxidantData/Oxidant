@@ -15,6 +15,7 @@ ignore = []
 # Allow the common permissive licenses already present across the dependency tree.
 version = 2
 allow = [
+  "AGPL-3.0-or-later",   # the workspace's own crates
   "MIT",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",

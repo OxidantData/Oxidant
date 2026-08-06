@@ -1,0 +1,6 @@
+This crate vendors Spark Connect protocol buffer definitions derived from
+the Apache Spark project (https://github.com/apache/spark), licensed under
+the Apache License, Version 2.0 — see the LICENSE file in this directory.
+
+Apache Spark is a trademark of the Apache Software Foundation. This project
+is not affiliated with, sponsored by, or endorsed by the ASF.

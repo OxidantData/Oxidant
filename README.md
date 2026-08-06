@@ -71,4 +71,7 @@ spark.sql("SELECT count(*) FROM parquet.`hits.parquet`").show()
 
 ## License
 
-Apache-2.0. See [`LICENSE`](LICENSE).
+GNU Affero General Public License v3.0 — see [`LICENSE`](LICENSE). Snapshots
+at or before commit `b18eead` remain available under Apache-2.0. Commercial
+licensing: [`COMMERCIAL.md`](COMMERCIAL.md). Trademark policy:
+[`TRADEMARK.md`](TRADEMARK.md).

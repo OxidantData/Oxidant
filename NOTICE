@@ -1,0 +1,36 @@
+Oxidant (formerly Weft)
+=======================
+
+Copyright (C) 2025-2026 Vamsi Krishna Kothapalli and the Oxidant Data
+contributors.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3 of the License (see LICENSE). This program is
+distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+
+Commercial licenses are available for organizations that cannot use AGPLv3 —
+see COMMERCIAL.md. The Oxidant and Weft names and logos are trademarks — see
+TRADEMARK.md.
+
+Third-party components
+----------------------
+
+- The vendored Spark Connect protocol buffer definitions (in the
+  `crates/*-proto` crate) are derived from the Apache Spark project and are
+  licensed under the Apache License, Version 2.0 (see the LICENSE file inside
+  that crate). Apache Spark is a trademark of the Apache Software Foundation;
+  this project is not affiliated with, sponsored by, or endorsed by the ASF.
+- This project depends on Apache DataFusion, Apache Arrow, tonic, and other
+  open-source crates under Apache-2.0 / MIT / BSD licenses; see Cargo.lock and
+  deny.toml for the full dependency license inventory.
+
+Historical license
+------------------
+
+Snapshots of this repository at or before commit b18eead (August 2026) were
+released under the Apache License, Version 2.0. Those historical snapshots
+remain available under Apache-2.0. All subsequent development is licensed
+AGPL-3.0-or-later.
