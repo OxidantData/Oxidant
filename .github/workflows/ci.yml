@@ -208,7 +208,8 @@ jobs:
   # Spark-SQL parity ratchet: replays Apache Spark v4.0.0's own golden SQL corpus through oxidant and
   # fails the PR if strict OR semantic parity drops below the committed parity/baseline.json floor
   # (or the corpus size changes). This is the gate that protects the Spark-compatibility work — a PR
-  # can only hold or improve parity. To LAND a gain, re-baseline (see PARITY_SWARM_PLAYBOOK.md §6).
+  # can only hold or improve parity. To LAND a gain, re-baseline parity/baseline.json (strict to the
+  # 3-run minimum — ±1 tie-flake) and refresh site/public/parity.{html,json}.
   parity:
     name: Spark SQL parity ratchet
     runs-on: ubuntu-latest

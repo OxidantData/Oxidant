@@ -1,8 +1,7 @@
 # Spark output column-naming (the strict-parity lever)
 
-> Read `HANDOFF.md` first for the overall mission, how to run the harness, and the faithfulness rule;
-> this doc is the deep dive for the biggest **strict** lever. Everything is on branch
-> `feat/spark-parity-harness`.
+> Read `START_HERE.md` first for the overall mission, how to run the harness, and the faithfulness
+> rule; this doc is the deep dive for the biggest **strict** lever.
 
 ## DONE so far — wave 1 (commit `74f36a2`, 2026-06-25): strict 669→988 (+319), semantic held
 
@@ -242,7 +241,7 @@ divergences (a name *and* the int/bigint type) and need both fixed. Target: land
 `schema-only` fall and `pass` climb, ratchet green throughout. This is the work that takes strict
 from ~5% toward the ROADMAP's ~55–75% ceiling.
 
-## Guardrails recap (from HANDOFF.md §8)
+## Guardrails recap (from START_HERE.md §4)
 - Faithful production behavior over the score — Spark-compatible names are correct, a comparison-time
   renamer is not.
 - Ratchet is the arbiter; integrate a rule only if the full corpus holds/raises.

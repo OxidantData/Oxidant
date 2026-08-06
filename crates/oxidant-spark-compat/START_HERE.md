@@ -48,7 +48,7 @@ run can exceed a 2-minute shell timeout — give it room or run it in the backgr
 2. **The real regression gate is NOT "no bad bucket rose" — it's "no file lost a strict pass."** Unblocking
    a cascade (CREATE TABLE USING, a function wave) makes previously-unrunnable rows execute and hit
    *pre-existing* downstream gaps, so correctness/exec-error/decimal/etc. **rise — that is honest
-   unmasking, not regression.** Verify the real line with the **stash audit** (§6).
+   unmasking, not regression.** Verify the real line with the **stash audit** (§7).
 3. **The ratchet only gates strict + semantic + blocks_total** (`src/bin/parity.rs`). Both must not drop;
    bad buckets are not gated.
 4. **Stay in lane.** Parity changes belong in
@@ -88,7 +88,24 @@ Highest leverage first:
    legitimately differs on. Faithful ceiling ≈ 85–95% semantic / 55–75% strict. Don't chase strict at the
    cost of correctness; present the residual as an itemized opt-in list.
 
-## 6. The stash audit (run this to prove faithfulness after any cascade-unblocking change)
+## 6. How to add a Spark UDF (the proven pattern)
+
+Each function is additive: a new file `crates/oxidant-loom/src/spark_functions/<name>.rs` with a
+`pub fn register(ctx)`, plus one `mod` line and one `register` call in `spark_functions/mod.rs`.
+**Templates to copy:** `spark_functions/mod.rs` (`typeof`, minimal scalar), `spark_encoding.rs`
+(array/per-row scalar), `try_arithmetic.rs` (numeric, NULL-on-error), `spark_aggregates.rs`
+(AggregateUDF).
+
+**DataFusion 54 `ScalarUDFImpl` gotchas (already in the templates):**
+- `#[derive(Debug, PartialEq, Eq, Hash)]` on the struct (the trait requires `Eq` + `Hash`).
+- Exactly four methods: `name`, `signature`, `return_type`, `invoke_with_args` — **no `as_any`**.
+- Materialize args: `args.args[i].clone().into_array(args.number_rows)?` then downcast.
+- **MSRV is 1.72**: no `Arc::unwrap_or_clone` (use `(*arc).clone()`), no other >1.72 APIs.
+- Tests: DataFusion's parser rejects Spark literal suffixes (`1L`, `1.0D`); use `CAST(...)`.
+- When unsure of exact Spark output, read the golden: grep the function in `spark-tests/inputs/`,
+  read the matching `spark-tests/results/*.sql.out`, match it byte-for-byte.
+
+## 7. The stash audit (run this to prove faithfulness after any cascade-unblocking change)
 
 ```bash
 cp parity/parity.json /tmp/after.json                 # your built tree's result
@@ -100,10 +117,8 @@ cp parity/parity.json /tmp/before.json && git stash pop && cargo build -q -p oxi
 
 (After `git stash` the new untracked `spark_*.rs` files orphan harmlessly — their `mod` lines are stashed.)
 
-## 7. Doc map
+## 8. Doc map
 
-- **`HANDOFF.md`** — detailed per-iteration changelog + bucket table + ranked next steps + the
-  "how to add a Spark UDF" template (§7).
 - **`ROADMAP.md`** — per-cluster verdicts, the oxidant-sql dialect-layer architecture, the honest-ceiling §0/§4.
 - **`CREATE_TABLE_USING_DESIGN.md`** — CTU spec; non-CTAS subset landed, follow-ons specced.
 - **`COLUMN_NAMING_PASS.md`** — output column-naming deep-dive.
