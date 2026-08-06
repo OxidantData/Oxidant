@@ -41,7 +41,6 @@ Architecture: [architecture.md](architecture.md).
 |------|---------|
 | `python/pyoxidant/` | Pip helper that launches Connect for stock PySpark |
 | `bench/` | ClickBench / TPC harnesses + install scripts |
-| `site/` | Vite/React marketing + charts (GitHub Pages) |
 | `parity/` | Spark golden baseline ratchet (`baseline.json`) |
 | `docs/` | Architecture, catalogs, deployment, runtime contract |
 | `deploy/docker/` | connect-server / worker container images |

@@ -18,11 +18,10 @@ documented in [`docs/distributed-ec2.md`](docs/distributed-ec2.md).
 ## Cursor Cloud specific instructions
 
 Oxidant is a Rust workspace implementing a drop-in Apache Spark replacement that speaks the
-Spark Connect gRPC protocol. There are two runnable products in this repo:
-
-1. **Oxidant engine** (Rust) — the `oxidant` binary (`crates/oxidant-cli`) starts a Spark Connect
-   server that real PySpark / Spark SQL clients connect to. This is the core product.
-2. **Showcase site** (`site/`) — a React 18 + Vite 5 + TypeScript marketing/benchmark site.
+Spark Connect gRPC protocol. The runnable product in this repo is the **Oxidant engine**
+(Rust) — the `oxidant` binary (`crates/oxidant-cli`) starts a Spark Connect server that real
+PySpark / Spark SQL clients connect to. The marketing/benchmark site lives in a separate
+private repo.
 
 The README's "stubbed deps / does not yet execute queries" note is outdated: the workspace
 pulls in real DataFusion/Arrow/tonic and the engine executes SQL end-to-end.
@@ -33,15 +32,13 @@ pulls in real DataFusion/Arrow/tonic and the engine executes SQL end-to-end.
   Connect protos with the pure-Rust `protox` crate.
 - A clean `cargo build --workspace` takes a few minutes the first time.
 
-### Standard commands (see `CONTRIBUTING.md` / `site/README.md`)
+### Standard commands (see `CONTRIBUTING.md`)
 - Rust: `cargo build --workspace`, `cargo test --workspace`, `cargo fmt --all -- --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`.
 - Bench/coverage gates (CI, runnable locally): `cargo run -p oxidant-bench -- clickbench --rows 20000`,
   `cargo run -p oxidant-bench -- clickbench-grpc --rows 20000`, `cargo run -p oxidant-bench -- tpch`.
 - Spark-SQL parity gate: `cargo build -p oxidant-spark-compat --bin oxidant-parity` then
   `./target/debug/oxidant-parity ratchet --baseline parity/baseline.json --out-dir parity`.
-- Site: `npm install` then `npm run dev` (serves http://localhost:5174/oxidant/),
-  `npm run typecheck`, `npm run build` — all run from inside `site/`.
 
 ### Running the engine + a hello-world query
 - Start the server: `./target/debug/oxidant spark server --port 50051`
