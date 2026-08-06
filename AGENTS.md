@@ -11,9 +11,9 @@
 | [docs/catalogs.md](docs/catalogs.md) | External catalog SPI (Hive / Glue / REST) |
 | [docs/runtime-contract.md](docs/runtime-contract.md) | Engine image env contract |
 
-Deployment options: the AWS Marketplace AMI or the GHCR container image
-(`ghcr.io/oxidantdata/oxidant`); EC2 autoscaling via CloudFormation is documented in
-[`docs/distributed-ec2.md`](docs/distributed-ec2.md).
+Deployment options: the free Community AMI on AWS Marketplace (listing in progress) or
+`docker pull ghcr.io/oxidantdata/oxidant`; EC2 autoscaling via CloudFormation is
+documented in [`docs/distributed-ec2.md`](docs/distributed-ec2.md).
 
 ## Cursor Cloud specific instructions
 

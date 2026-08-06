@@ -3,8 +3,8 @@
 > **Status: outline / contract for the full platform** (SSO, gateway operator, Terraform).
 > For a **runnable** data-plane today:
 >
-> - **AWS Marketplace AMI** (see [`marketplace.md`](marketplace.md)) or the
->   `ghcr.io/oxidantdata/oxidant` container image
+> - **Free Community AMI on AWS Marketplace** (listing in progress) or
+>   `docker pull ghcr.io/oxidantdata/oxidant`
 > - **EC2 / ASG autoscaling via CloudFormation:** [`distributed-ec2.md`](distributed-ec2.md)
 >
 > The Terraform modules and complete control plane referenced below are **not all in-tree

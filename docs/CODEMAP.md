@@ -58,5 +58,4 @@ Architecture: [architecture.md](architecture.md).
 | `runtime-contract.md` | Contract for oxidant-platform consumers |
 | `distributed-ec2.md` | Packer AMI + CFN/ASG data plane |
 | `deployment.md` | Self-hosted platform deploy outline |
-| `marketplace.md` | AWS Marketplace AMI publishing runbook |
 | `catalogs.md` | External catalog SPI |

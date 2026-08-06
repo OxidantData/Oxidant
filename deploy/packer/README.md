@@ -2,7 +2,7 @@
 
 Builds the hardened runtime AMI used by
 [`deploy/cloudformation/oxidant-cluster.yaml`](../cloudformation/oxidant-cluster.yaml)
-and by the AWS Marketplace listing (see [`docs/marketplace.md`](../../docs/marketplace.md)).
+and by the free Community AMI on AWS Marketplace (listing in progress).
 
 See [`docs/distributed-ec2.md`](../../docs/distributed-ec2.md) for the full bake →
 deploy flow.

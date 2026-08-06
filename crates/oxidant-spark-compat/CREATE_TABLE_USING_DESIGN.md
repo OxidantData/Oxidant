@@ -18,7 +18,7 @@
 - **feasible_this_iteration:** True
 - **recommended_scope:** GO for a focused subset this iteration: the NON-CTAS path `CREATE TABLE [IF NOT EXISTS] name (col_defs) USING {parquet|orc|csv|json} [PARTITIONED BY (cols)] [drop trailing COMMENT/TBLPROPERTIES]` lowered to `CREATE EXTERNAL TABLE`, bundled with MANDATORY INSERT count-row suppression. DEFER within the same module (follow-on): CTAS (`USING fmt AS SELECT …` via COPY-then-CREATE EXTERNAL), partitioned CTAS, inline OPTIONS, and exotic column types (varchar(n), timestamp_ntz, nested struct). The deferred items keep failing exactly as today (no regression). This subset already covers the bulk: 62 files / 4,151 blocks / 781 INSERTs.
 - **estimated_unlock:** Large — the single biggest corpus lever. Certain core: the ~62 CREATE blocks + 781 INSERT blocks (currently all failing: parser-unsupported / missing-relation) flip to byte-exact `struct<>` STRICT passes once the table is real and the INSERT count is suppressed — realistically ~70-85% succeed (varchar/exotic-type CREATEs and a few INSERTs excepted) ≈ +600 to +800 strict from these trivial blocks ALONE. Plus a few hundred of the ~922 downstream missing-relation SELECTs become correct (strict where naming/types align, otherwise semantic via schema-only). Headline: strict +600 to +1000, semantic +400 to +900 incremental — consistent with ROADMAP's ~900 create-table-using ceiling, with the honest caveat that a big share of the strict gain is mechanical CREATE/INSERT `struct<>` blocks rather than complex query results.
-- **files_touched:** ['/Users/vamsi/projects/oxidant/crates/oxidant-loom/src/lib.rs', '/Users/vamsi/projects/oxidant/crates/oxidant-loom/src/spark_create_table.rs']
+- **files_touched:** ['crates/oxidant-loom/src/lib.rs', 'crates/oxidant-loom/src/spark_create_table.rs']
 - **risks:** See risks field above.
 
 ## Design
@@ -49,7 +49,7 @@ TYPE COVERAGE (bounded, verified in datafusion-sql-54 planner.rs:690): int/bigin
 
 VALIDATION PLAN (read-only here; for the implementer): cargo run -p oxidant-spark-compat --bin oxidant-parity -- golden, then oxidant-parity file null-handling.sql.out (expect CREATE+INSERT blocks now PASS, SELECTs now produce rows); diff buckets vs parity/baseline.json and CONFIRM correctness/missing-error/null-semantics/decimal-precision/datetime did NOT rise (watch postgreSQL/insert.sql for expected-error INSERTs that oxidant may accept too leniently — that is a pre-existing leniency, separate lever). Re-baseline only if the ratchet holds/raises.
 
-## Proposed implementation sketch — `/Users/vamsi/projects/oxidant/crates/oxidant-loom/src/spark_create_table.rs`
+## Proposed implementation sketch — `crates/oxidant-loom/src/spark_create_table.rs`
 
 (NOT yet wired into the tree; reference for the impl swarm.)
 

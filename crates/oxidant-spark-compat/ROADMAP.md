@@ -131,7 +131,7 @@ Distinguishing **measured** (from parity.json buckets) vs **estimated** (spec au
 
 **Recommendation:** treat **semantic parity as the product goal and column-naming-driven strict as the headline metric**, and explicitly *cap* investment in error-text strict matching once it starts trading against the faithfulness principle. The faithfulness constraint (no lossy rewrites — create-table-using and the leniency cluster are the live examples) is itself a permanent ceiling on strict-via-shortcut, and that is the correct trade: a faithful 70% strict engine is worth more than a 95% strict engine that silently returns wrong results for real users.
 
-**Relevant file:** `/Users/vamsi/projects/oxidant/crates/oxidant-loom/src/lib.rs` — `normalize_spark_sql` (L70), `next_token` (L79), `strip_temporary_view` (L93); plug-in points `Engine::sql` (L203-213) and `Engine::schema` (L217-225); `SessionContext` construction for the function-registry loop (~L196).
+**Relevant file:** `crates/oxidant-loom/src/lib.rs` — `normalize_spark_sql` (L70), `next_token` (L79), `strip_temporary_view` (L93); plug-in points `Engine::sql` (L203-213) and `Engine::schema` (L217-225); `SessionContext` construction for the function-registry loop (~L196).
 
 ## Function-registration backlog (mined)
 

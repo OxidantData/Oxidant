@@ -11,9 +11,9 @@ protocol, so unmodified PySpark and Spark SQL clients connect with a one-line UR
 
 Pre-alpha scaffold. The workspace compiles but does not yet execute queries. See
 [`docs/architecture.md`](docs/architecture.md) for the full plan and
-[`docs/CODEMAP.md`](docs/CODEMAP.md) for the ownership map. Deploy via the AWS
-Marketplace AMI (see [`docs/marketplace.md`](docs/marketplace.md)) or the
-`ghcr.io/oxidantdata/oxidant` container image; EC2 autoscaling via CloudFormation is
+[`docs/CODEMAP.md`](docs/CODEMAP.md) for the ownership map. Deploy via the free
+Community AMI on AWS Marketplace (listing in progress) or
+`docker pull ghcr.io/oxidantdata/oxidant`; EC2 autoscaling via CloudFormation is
 documented in [`docs/distributed-ec2.md`](docs/distributed-ec2.md).
 
 ## Architecture (one screen)

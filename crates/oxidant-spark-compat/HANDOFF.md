@@ -340,7 +340,6 @@ agents may add deps (`regex`, `serde_json`) — declare them in `oxidant-loom/Ca
   two follow-ons (int/bigint type, aggregate names) remain.**
 - `crates/oxidant-spark-compat/ROADMAP.md` — the per-cluster verdicts + dialect-layer architecture.
 - `crates/oxidant-spark-compat/README.md` — harness internals + how to run.
-- Memory: `~/.claude/.../memory/spark-parity-harness.md`.
-- My parity commits: `c9a6dd6`, `1c4694f`, `f927cbe`, `cb81580`, `f0c1947`, `55b4c54`, `8458824`,
+- Parity commits: `c9a6dd6`, `1c4694f`, `f927cbe`, `cb81580`, `f0c1947`, `55b4c54`, `8458824`,
   `070429b`, `e8057e3` (UDF wave 4 + binary rendering), `57e7aa5` (typed literals) — interleaved
   with the concurrent platform commits.
