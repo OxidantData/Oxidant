@@ -46,8 +46,7 @@ Supported `type` values today: **`hive`** (Hive Metastore over Thrift), **`glue`
 from `OXIDANT_AWS_BIN` (never from catalog options).
 
 EC2 ASG walkthrough (create Glue DB/table, IAM, `CatalogConf`):
-[`distributed-ec2.md`](distributed-ec2.md). K8s/IRSA notes:
-[`distributed-k8s.md`](distributed-k8s.md).
+[`distributed-ec2.md`](distributed-ec2.md).
 
 ## Bring your own catalog (Rust)
 

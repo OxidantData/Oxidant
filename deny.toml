@@ -1,9 +1,9 @@
 # cargo-deny policy for the Oxidant engine repo.
-# Consumed by `cargo deny check` in scripts/daily-maintenance.sh.
+# Run locally with `cargo deny check`.
 #
 # Intentionally PERMISSIVE to start: the DataFusion/Arrow/tonic tree is large and a
-# strict policy would drown day one in duplicate-version and license noise. The daily
-# automation tightens this over time via `chore(deps)` PRs.
+# strict policy would drown day one in duplicate-version and license noise. Tighten
+# this over time via `chore(deps)` PRs.
 
 [advisories]
 # RUSTSEC advisory DB. Vulnerabilities and unmaintained crates are the real signal.

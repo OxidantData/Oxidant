@@ -19,7 +19,7 @@
 #     --build-arg CONNECT_IMAGE=oxidant/connect-server:<tag> -t oxidant/worker:<tag> .
 #
 # Prefer no second image at all? Drop this file and run the connect-server image
-# with `command: ["oxidant"]  args: ["worker"]` (Helm `worker.command`). The
+# with `command: ["oxidant"]  args: ["worker"]`. The
 # orchestrator already does exactly that via OXIDANT_WORKER_IMAGE.
 ###############################################################################
 ARG CONNECT_IMAGE=oxidant/connect-server:latest
@@ -34,7 +34,7 @@ EXPOSE 50561
 
 # Inherits from the connect-server base:
 #   USER 65532:65532, /usr/local/bin/oxidant ENTRYPOINT, TMPDIR/HOME=/tmp,
-#   and the read-only-rootfs posture. Helm sets TMPDIR to the spill volume and
+#   and the read-only-rootfs posture. Deployments should set TMPDIR to the spill volume and
 #   OXIDANT_SHUFFLE_SPILL_BYTES for threshold spill (OXIDANT_SHUFFLE_SPILL_DIR is
 #   force-spill / debug-only; OXIDANT_SPILL_DIR is unused legacy).
 CMD ["worker", "--port", "50561"]

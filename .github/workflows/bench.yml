@@ -5,7 +5,7 @@ name: ClickBench (self-hosted)
 # self-hosted runner labelled `clickbench`. Mirrors the GitLab `clickbench-nightly` job.
 #
 # DORMANT BY DESIGN: this is workflow_dispatch-only, so it never auto-runs and costs nothing
-# until you (a) stand up + register the runner — see deploy/ci-runner/README.md — and (b)
+# until you (a) stand up + register a self-hosted runner labelled `clickbench` — and (b)
 # manually click "Run workflow". With no `clickbench`-labelled runner registered, a manual run
 # just sits queued (self-hosted minutes are free); it cannot launch any EC2 capacity on its own.
 #

@@ -344,33 +344,6 @@ export default function PerformancePage() {
             </li>
           </ul>
         </div>
-        <div className="min-w-0">
-          <h3 className="mb-3 text-lg font-semibold">Reproduce SF10</h3>
-          <CodeBlock
-            lines={[
-              { text: "# oxidant: driver up at sc://<driver>:50051 (scripts/sf10-start.sh)", comment: true },
-              { text: "python3 bench/sf100/run-spark-connect.py \\" },
-              { text: "  --endpoint sc://<driver>:50051 --suite tpch --sf 10 \\" },
-              { text: "  --glue-db tpch_sf10 --strict --worker-count 2 \\" },
-              { text: "  --skip-worker-preflight --query-timeout 900 \\" },
-              { text: "  --json bench/sf100/results/tpch-sf10.jsonl" },
-              { text: "# spark: on the EMR master (same instance spec)", comment: true },
-              { text: "spark-submit --master yarn --deploy-mode client \\" },
-              { text: "  bench/sf100/emr/run-emr-suite.py --suite tpch \\" },
-              { text: "  --queries-dir bench/tpch/queries --runs 2 \\" },
-              { text: "  --out /tmp/tpch-sf10-emr.jsonl" },
-              { text: "# then regenerate this page's data", comment: true },
-              { text: "python3 bench/sf100/results/to-site-sf10.py" },
-            ]}
-          />
-          <p className="mt-3 text-xs text-muted">
-            Scripts:{" "}
-            <a className="text-accent hover:underline" href={`${REPO}/tree/main/bench/sf100`}>
-              bench/sf100
-            </a>
-            .
-          </p>
-        </div>
       </section>
     </div>
   );

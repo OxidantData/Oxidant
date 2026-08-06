@@ -27,9 +27,9 @@ Oxidant is dual-licensed:
 
 ## Purchasing
 
-- **AWS Marketplace AMI (paid hourly)** — the simplest commercial path:
-  subscribe, launch, and billing is handled entirely by AWS alongside your
-  EC2 usage. See `docs/marketplace.md` (listing in progress).
+- **Free Community AMI on AWS Marketplace** (listing in progress) — the simplest
+  way to run the engine: subscribe, launch, and your EC2 usage is billed by AWS.
+  The engine AMI itself is free; it does not by itself grant a commercial license.
 - **Direct commercial / enterprise license** — contact
   **hello@oxidantdata.com** or open an issue at
   <https://github.com/OxidantData/Oxidant/issues>.

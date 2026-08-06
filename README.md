@@ -10,10 +10,11 @@ protocol, so unmodified PySpark and Spark SQL clients connect with a one-line UR
 ## Status
 
 Pre-alpha scaffold. The workspace compiles but does not yet execute queries. See
-[`docs/architecture.md`](docs/architecture.md) for the full plan,
-[`docs/TODOS.md`](docs/TODOS.md) / [`docs/CODEMAP.md`](docs/CODEMAP.md) for open work and
-ownership maps, [`docs/AGENT_INDEXING.md`](docs/AGENT_INDEXING.md) for CodeGraph/GitNexus,
-and [`docs/ISSUES.md`](docs/ISSUES.md) for issue history.
+[`docs/architecture.md`](docs/architecture.md) for the full plan and
+[`docs/CODEMAP.md`](docs/CODEMAP.md) for the ownership map. Deploy via the free
+Community AMI on AWS Marketplace (listing in progress) or
+`docker pull ghcr.io/oxidantdata/oxidant`; EC2 autoscaling via CloudFormation is
+documented in [`docs/distributed-ec2.md`](docs/distributed-ec2.md).
 
 ## Architecture (one screen)
 
