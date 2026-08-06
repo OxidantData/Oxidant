@@ -237,7 +237,7 @@ export default function PerformancePage() {
             <CodeBlock
               lines={[
                 { text: "# on a fresh c6a.4xlarge (Ubuntu 24.04)", comment: true },
-                { text: "git clone https://github.com/OxidantData/Oxidant && cd oxidant" },
+                { text: "git clone https://github.com/OxidantData/Oxidant && cd Oxidant" },
                 { text: "bash bench/clickbench/multi/bootstrap.sh" },
                 { text: "bash bench/clickbench/multi/run-all.sh" },
                 { text: "python3 bench/clickbench/multi/to-site.py" },
