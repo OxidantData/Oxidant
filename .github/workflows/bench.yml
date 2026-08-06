@@ -35,6 +35,10 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
+      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
+      - name: Add Rust toolchain to PATH (self-hosted runner)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
           rustup show
