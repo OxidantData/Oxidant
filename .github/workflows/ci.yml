@@ -1,13 +1,13 @@
 name: CI
 
 # Rust CI for Oxidant. The heavy gates (clippy+test, query/coverage gates, Spark parity) run on
-# the self-hosted c7a.4xlarge x64 runner (labels self-hosted/linux/x64/oxidant); rustfmt stays on
+# the self-hosted t3.xlarge x64 spot runner (labels self-hosted/linux/x64/oxidant); rustfmt stays on
 # GitHub-hosted `ubuntu-latest` as a fast canary that also proves hosted runners still work.
 # Mirrors the gates from .gitlab-ci.yml that fit a hosted runner (4 vCPU / 16 GB):
 # rustfmt, clippy, workspace tests, the ClickBench/TPC-H/correctness coverage gates, and the
 # Spark-SQL parity ratchet (the `parity` job — fails any PR that drops Spark golden-SQL parity
 # below the committed parity/baseline.json floor). Two heavier gates live elsewhere:
-#   - ClickBench on real 14.78 GB data -> bench.yml, self-hosted c6a.4xlarge
+#   - ClickBench on real 14.78 GB data -> bench.yml, same self-hosted runner
 #   - llvm-cov line coverage (informational) -> coverage-nightly.yml
 #
 # BUILD TIME: every compiling job restores ONE cargo cache via `shared-key: workspace` below.
@@ -69,6 +69,10 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
+      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
+      - name: Add Rust toolchain to PATH (self-hosted runner)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       # `iceberg` 0.8 is the newest release compatible with the pinned Rust 1.90, and it pulls
       # `parquet`/`arrow` 57 alongside the workspace's 58. `cargo test --workspace` therefore builds
       # two full Arrow stacks plus a test binary per crate, which overruns the ~14 GB a standard
@@ -150,6 +154,10 @@ jobs:
     runs-on: [self-hosted, linux, x64, oxidant]
     steps:
       - uses: actions/checkout@v4
+      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
+      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
+      - name: Add Rust toolchain to PATH (self-hosted runner)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
           rustup show
@@ -168,6 +176,8 @@ jobs:
           OXIDANT_TPCH_DIST_REQUIRE_ALL: "1"
       - name: Install DuckDB CLI (TPC-DS dsdgen + oracle)
         run: |
+          # unzip is absent on the self-hosted box's minimal Ubuntu image (present on GitHub-hosted).
+          command -v unzip >/dev/null || { sudo apt-get update -y && sudo apt-get install -y unzip; }
           curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.3.2/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
           sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
           duckdb --version
@@ -196,6 +206,10 @@ jobs:
     runs-on: [self-hosted, linux, x64, oxidant]
     steps:
       - uses: actions/checkout@v4
+      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
+      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
+      - name: Add Rust toolchain to PATH (self-hosted runner)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
           rustup show
@@ -223,6 +237,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
+      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
+      - name: Add Rust toolchain to PATH (self-hosted runner)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
           rustup show
