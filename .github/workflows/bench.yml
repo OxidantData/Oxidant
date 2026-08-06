@@ -29,9 +29,9 @@ concurrency:
 jobs:
   clickbench:
     name: ClickBench 43 queries vs Sail
-    # Only a runner advertising ALL these labels picks this up. Register the EC2 runner with:
-    #   ./config.sh --labels self-hosted,linux,x64,clickbench --ephemeral ...
-    runs-on: [self-hosted, linux, x64, clickbench]
+    # Only a runner advertising ALL these labels picks this up — the persistent EC2 runner
+    # oxidant-ci-x64-1 (see deploy/ci-runner/) registers with exactly these.
+    runs-on: [self-hosted, linux, x64, oxidant]
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4

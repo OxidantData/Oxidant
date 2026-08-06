@@ -64,7 +64,7 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
-            runner: ubuntu-latest
+            runner: [self-hosted, linux, x64, oxidant]
           - platform: linux/arm64
             arch: arm64
             runner: ubuntu-24.04-arm
