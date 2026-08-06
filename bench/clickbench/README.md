@@ -16,7 +16,7 @@ all 43 queries through the live `oxidant-connect` Spark Connect server, 3 tries,
 
 **Oxidant is ~19% faster than Sail** on identical hardware + dataset + methodology. (Caveat: the
 current margin rides partly on a newer DataFusion + a warm reused server; native operators for
-the durable lead are tracked in `docs/ISSUES.md` Phase 1.)
+the durable lead are still being built.)
 
 ## Reproduce
 

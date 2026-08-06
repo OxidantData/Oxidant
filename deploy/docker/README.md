@@ -4,9 +4,9 @@ Production Dockerfiles for the Oxidant engine images. Everything builds from the
 workspace at the repository root; the **build context for every image is the repo
 root**, e.g. `docker build -f deploy/docker/<name>.Dockerfile -t <ref> .`.
 
-Runnable distributed deploy (Kind / BYO EKS) is documented in
-[`docs/distributed-k8s.md`](../../docs/distributed-k8s.md). Helm chart:
-[`deploy/helm/oxidant/`](../helm/oxidant/).
+The multi-arch image is published to GHCR as `ghcr.io/oxidantdata/oxidant` (see
+`.github/workflows/oxidant-image.yml`). A runnable EC2/ASG deployment is documented in
+[`docs/distributed-ec2.md`](../../docs/distributed-ec2.md).
 
 | File | Image | Binary / crate | Entry | Port |
 |------|-------|----------------|-------|------|
@@ -16,7 +16,7 @@ Runnable distributed deploy (Kind / BYO EKS) is documented in
 
 > The `worker` and `connect-server` images are the **same `oxidant` binary** — `worker`
 > is `connect-server` with a different default command, so they share every layer.
-> You may point both Helm refs at `connect-server` and override the worker command.
+> You may run `connect-server` for both roles and override the worker command.
 
 ## Build
 
@@ -58,7 +58,7 @@ BuildKit is required (the `# syntax=` directive + the per-Dockerfile
 
 ## Security posture
 
-Images target PodSecurity **`restricted`** (as stamped by Helm / the orchestrator):
+Images target PodSecurity **`restricted`** (as stamped by the orchestrator):
 
 | Control | How the image satisfies it |
 |---------|----------------------------|
@@ -92,7 +92,7 @@ volumes:
 - { name: spill, emptyDir: {} }
 ```
 
-The image defaults `TMPDIR=/tmp` and `HOME=/tmp`. The Helm chart overrides `TMPDIR` to
+The image defaults `TMPDIR=/tmp` and `HOME=/tmp`. Point `TMPDIR` at
 `/var/lib/oxidant/spill` (PVC or emptyDir) so threshold shuffle spill
 (`OXIDANT_SHUFFLE_SPILL_BYTES` / `OXIDANT_MEMORY_LIMIT_BYTES`) lands on that volume via
 `default_spill_root()`. **`OXIDANT_SHUFFLE_SPILL_DIR` is debug-only** — when set, the engine
@@ -107,24 +107,25 @@ docker run --read-only --tmpfs /tmp --tmpfs /var/lib/oxidant/spill \
   -p 50051:50051 oxidant/connect-server:$TAG
 ```
 
-## Mapping to Helm (`deploy/helm/oxidant`)
+## Running the published image
 
-Minimal data-plane values (gateway off by default):
+The multi-arch engine image is published to GHCR as `ghcr.io/oxidantdata/oxidant`.
+One image covers both roles — override the command per role:
 
-```yaml
-connect:
-  enabled: true
-  image: <registry>/oxidant/connect-server:<tag>
-worker:
-  image: <registry>/oxidant/worker:<tag>
-  replicas: 2
-gateway:
-  enabled: false
+```sh
+# Spark Connect driver
+docker run --read-only --tmpfs /tmp --tmpfs /var/lib/oxidant/spill \
+  -p 50051:50051 ghcr.io/oxidantdata/oxidant:latest
+
+# Arrow Flight worker (same image, different command)
+docker run --read-only --tmpfs /tmp --tmpfs /var/lib/oxidant/spill \
+  ghcr.io/oxidantdata/oxidant:latest worker --port 50561
 ```
 
-The chart wires `OXIDANT_WORKER_SERVICE=oxidant-worker.<ns>.svc.cluster.local` on the
-driver and ships the emptyDir / securityContext mounts above. See
-[`docs/distributed-k8s.md`](../../docs/distributed-k8s.md).
+Set `OXIDANT_WORKER_SERVICE` on the driver so it can discover workers (see
+[`docs/runtime-contract.md`](../../docs/runtime-contract.md) for the full env
+contract). An EC2/ASG deployment via CloudFormation is documented in
+[`docs/distributed-ec2.md`](../../docs/distributed-ec2.md).
 
 ---
 

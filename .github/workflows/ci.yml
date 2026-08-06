@@ -5,7 +5,7 @@ name: CI
 # rustfmt, clippy, workspace tests, the ClickBench/TPC-H/correctness coverage gates, and the
 # Spark-SQL parity ratchet (the `parity` job — fails any PR that drops Spark golden-SQL parity
 # below the committed parity/baseline.json floor). Two heavier gates live elsewhere:
-#   - ClickBench on real 14.78 GB data -> bench.yml, self-hosted c6a.4xlarge (see deploy/ci-runner/)
+#   - ClickBench on real 14.78 GB data -> bench.yml, self-hosted c6a.4xlarge
 #   - llvm-cov line coverage (informational) -> coverage-nightly.yml
 #
 # BUILD TIME: every compiling job restores ONE cargo cache via `shared-key: workspace` below.

@@ -1,13 +1,15 @@
 name: oxidant-image
 
-# Build & publish the open-source Oxidant ENGINE image to Docker Hub as `vamzi/oxidant`.
+# Build & publish the open-source Oxidant ENGINE image to GHCR as
+# `ghcr.io/oxidantdata/oxidant`.
 #
 # This is the `oxidant` binary (crate oxidant-cli) in a hardened distroless image. The
 # control-plane gateway provisions per-user compute pods from THIS one image,
 # overriding the command per role:
 #     oxidant spark server --port 50051   -> Spark Connect driver  ("cluster")
 #     oxidant worker       --port 50561   -> Arrow Flight worker    (same image, diff args)
-# so a single `vamzi/oxidant` image covers both; no separate worker image is needed.
+# so a single `ghcr.io/oxidantdata/oxidant` image covers both; no separate worker image
+# is needed.
 #
 # Multi-arch (amd64 + arm64) built on NATIVE runners — amd64 on ubuntu-latest, arm64
 # on ubuntu-24.04-arm — then merged into one manifest. No QEMU emulation, so each
@@ -17,12 +19,12 @@ name: oxidant-image
 # SCOPE — engine only. The proprietary control-plane GATEWAY image is built in the
 # PRIVATE GitLab repo and is deliberately NOT built or published here.
 #
-# BUILD CACHE lives in Docker Hub as `vamzi/oxidant:buildcache-{amd64,arm64}` — see the
-# comment on cache-to below for why this is not the GitHub Actions cache.
+# BUILD CACHE lives in GHCR as `ghcr.io/oxidantdata/oxidant:buildcache-{amd64,arm64}` —
+# see the comment on cache-to below for why this is not the GitHub Actions cache.
 #
-# Repo secrets required (Settings -> Secrets and variables -> Actions):
-#   DOCKERHUB_USERNAME   Docker Hub account that can push to vamzi/oxidant (vamzi)
-#   DOCKERHUB_TOKEN      Docker Hub access token with Read/Write
+# Auth: the built-in GITHUB_TOKEN with `packages: write` (no repo secrets needed).
+# First push note: an org admin may need to link the `oxidant` package to this repo
+# and mark it public under the org's package settings.
 
 on:
   push:
@@ -44,13 +46,14 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: oxidant-image-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  IMAGE: docker.io/vamzi/oxidant
+  IMAGE: ghcr.io/oxidantdata/oxidant
 
 jobs:
   # Build each arch on its own native runner and push BY DIGEST (no tag yet).
@@ -78,11 +81,12 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # Tagged releases get the fully tuned `release` profile (thin LTO, one codegen
       # unit). Everything else builds with `release-ci`, which trades a small amount of
@@ -111,7 +115,7 @@ jobs:
           # repository with LRU eviction; a `mode=max` export of this build (cargo-chef
           # cook layer + full cargo registry, times two architectures) blows past that,
           # so the two arch scopes evicted each other and most runs started cold. A
-          # Docker Hub cache tag has no such cap. `type=gha` stays as a secondary read
+          # registry cache tag has no such cap. `type=gha` stays as a secondary read
           # source so a run that happens to still have a warm Actions cache can use it.
           cache-from: |
             type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
@@ -145,11 +149,12 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Tags
         id: meta
@@ -175,7 +180,7 @@ jobs:
         run: |
           docker buildx imagetools inspect "${{ env.IMAGE }}:latest" || true
           {
-            echo "### Published multi-arch \`vamzi/oxidant\` (amd64 + arm64)"
+            echo "### Published multi-arch \`ghcr.io/oxidantdata/oxidant\` (amd64 + arm64)"
             echo '```'
             echo "${{ steps.meta.outputs.tags }}"
             echo '```'

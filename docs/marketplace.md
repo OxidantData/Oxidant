@@ -97,8 +97,8 @@ python3 -c "from pyspark.sql import SparkSession; \
 
 - **Patch cadence**: rebuild the AMI on engine releases and for base-OS CVE
   waves (AWS notifies on scan findings for published AMIs; stale images get
-  delisted). The daily-maintenance automation (`scripts/daily-maintenance.sh`)
-  already tracks Rust-side CVEs.
+  delisted). Track Rust-side CVEs with `cargo audit` / `cargo deny`
+  (policy in `deny.toml`).
 - **Version lifecycle**: Marketplace versions map 1:1 to AMI ids; deprecate
   old versions when a new one publishes (customers on deprecated versions
   keep running but can't launch new instances).

@@ -1,8 +1,7 @@
 # Oxidant (OSS) — code map
 
 Quick ownership map for the open query engine.
-Architecture: [architecture.md](architecture.md). Open work: [TODOS.md](TODOS.md).
-Agent indexes: [AGENT_INDEXING.md](AGENT_INDEXING.md).
+Architecture: [architecture.md](architecture.md).
 
 ## Crates
 
@@ -44,12 +43,11 @@ Agent indexes: [AGENT_INDEXING.md](AGENT_INDEXING.md).
 | `bench/` | ClickBench / TPC harnesses + install scripts |
 | `site/` | Vite/React marketing + charts (GitHub Pages) |
 | `parity/` | Spark golden baseline ratchet (`baseline.json`) |
-| `docs/` | Architecture, issues, next steps, catalogs, runtime contract |
+| `docs/` | Architecture, catalogs, deployment, runtime contract |
 | `deploy/docker/` | connect-server / worker container images |
-| `deploy/helm/oxidant/` | Kind / EKS Helm chart (driver + workers) |
 | `deploy/packer/` | Hardened AL2023 AMI for EC2 driver/workers |
-| `deploy/cloudformation/` | CFN + ASG data plane (no EKS) |
-| `scripts/` | CI local, daily maintenance, `index-agents.sh` |
+| `deploy/cloudformation/` | CFN + ASG data plane |
+| `scripts/` | CI local, repo rename helper |
 
 ## Docs map
 
@@ -57,11 +55,8 @@ Agent indexes: [AGENT_INDEXING.md](AGENT_INDEXING.md).
 |------|---------|
 | `architecture.md` | Canonical engine design |
 | `CODEMAP.md` | This file |
-| `TODOS.md` | Indexed open work |
-| `AGENT_INDEXING.md` | CodeGraph + GitNexus |
-| `NEXT_STEPS.md` | Resume / phase narrative |
-| `ISSUES.md` | Issue-level history |
 | `runtime-contract.md` | Contract for oxidant-platform consumers |
 | `distributed-ec2.md` | Packer AMI + CFN/ASG data plane |
-| `distributed-k8s.md` | Kind / EKS Helm data plane |
+| `deployment.md` | Self-hosted platform deploy outline |
+| `marketplace.md` | AWS Marketplace AMI publishing runbook |
 | `catalogs.md` | External catalog SPI |

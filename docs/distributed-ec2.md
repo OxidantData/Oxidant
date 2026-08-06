@@ -5,7 +5,6 @@ Arrow Flight worker instances in fixed-size Auto Scaling Groups, discovered via 
 private Route53 multi-A name. It matches the OSS runtime contract in
 [`runtime-contract.md`](runtime-contract.md).
 
-For Kubernetes (Kind / EKS + Helm), see [`distributed-k8s.md`](distributed-k8s.md).
 For catalog SPI details (Hive / Glue / REST), see [`catalogs.md`](catalogs.md).
 For the future full platform (SSO, gateway operator, Terraform), see
 [`deployment.md`](deployment.md).
@@ -95,13 +94,11 @@ This template does **not** create a VPC. You need:
 
 ### Why worker count is fixed
 
-Same contract as the Helm chart: file-list sharding uses a fixed `OXIDANT_WORKER_COUNT`
+File-list sharding uses a fixed `OXIDANT_WORKER_COUNT`
 plus a stable `OXIDANT_SHARD_INDEX` per worker. Changing N under an ASG scaling policy
 without coordinated re-assignment silently duplicates or drops shards. The template
 sets `MinSize = MaxSize = DesiredCapacity = WorkerCount` and adds **no** scaling
 policies. Bootstrap also pins `OXIDANT_SHUFFLE_PARTITIONS` to `WorkerCount` on the driver.
-See [`distributed-k8s.md`](distributed-k8s.md) for the membership / silent-row-loss
-failure modes — they apply identically here.
 
 ---
 
@@ -172,10 +169,6 @@ aws glue get-table --region "${AWS_REGION}" \
   --database-name "${GLUE_DB}" --name orders \
   --query 'Table.{Name:Name,Location:StorageDescriptor.Location}'
 ```
-
-> Lakehouse / SF100: the repo’s [`bench/sf100/`](../bench/sf100/) scripts can materialize
-> TPC-H/DS tables into S3 + Glue. Point the stack’s `DataBucketArns` at that bucket and
-> use the printed database name as `glue.<db>.<table>` in queries.
 
 ### 4. Note the ARNs and catalog conf you will pass to CloudFormation
 
@@ -303,8 +296,8 @@ What the stack creates:
 
 When `MemoryLimitBytes` and `ShuffleSpillBytes` are both empty, `SpillStore::from_env`
 stays off and the in-memory shuffle cache is **unbounded** — fine for smoke tests,
-not safe for large queries. Set both for real workloads (same invariant as the Helm
-SF100 overlay: memory + shuffle spill + headroom ≤ instance RAM).
+not safe for large queries. Set both for real workloads (the SF100 invariant below:
+memory + shuffle spill + headroom ≤ instance RAM).
 
 Stack outputs include `ConnectEndpoint`, `WorkerDnsName`, ASG names, and `HostedZoneId`.
 
@@ -449,35 +442,11 @@ spark.sql("SELECT count(*) AS n FROM glue.oxidant_demo.orders").show()
 spark.sql("SELECT * FROM glue.oxidant_demo.orders LIMIT 10").show()
 ```
 
-### Distributed lakehouse harness (optional)
-
-If you populated SF-scale Glue tables with [`bench/sf100/`](../bench/sf100/):
-
-```sh
-# Wrapper auto-resolves the driver IP when CONNECT is unset:
-STACK=oxidant-sf100 SUITE=all ./bench/sf100/remeasure-distributed.sh
-
-# Or explicit:
-CONNECT=sc://<driver-ip>:50051 SUITE=all ./bench/sf100/remeasure-distributed.sh
-
-# Or call the harness directly:
-OXIDANT_DISTRIBUTED_STRICT=1 python3 bench/sf100/run-spark-connect.py \
-  --endpoint sc://<driver-ip>:50051 \
-  --suite tpch --sf 100 --glue-db tpch_sf100 \
-  --region "${AWS_REGION}" \
-  --json results/tpch-sf100-ec2.jsonl --resume --skip-worker-preflight
-```
-
-The harness sets `spark.sql.catalog.glue.type=glue` on the client; keep stack
-`CatalogConf` aligned so workers resolve the same catalog.
-
 ---
 
 ## SF100 topology (canonical)
 
-**Keep this table in sync with any published SF100 EC2 numbers** (KAN-14). Same
-instance shapes as the EKS overlay
-[`deploy/helm/oxidant/values-sf100.yaml`](../deploy/helm/oxidant/values-sf100.yaml) —
+**Keep this table in sync with any published SF100 EC2 numbers** (KAN-14).
 Graviton **arm64** AMI required (`c6g` / `m8g`).
 
 | Role | Count | Instance type | vCPU / RAM | Root EBS | Spill EBS (`/var/lib/oxidant/spill`) | ASG |
@@ -496,7 +465,7 @@ Graviton **arm64** AMI required (`c6g` / `m8g`).
 | Catalog | Glue Parquet `tpch_sf100` / `tpcds_sf100` | `CatalogConf` on driver **and** workers |
 | Dataset | `s3://oxidant-artifacts-<account>/{tpch,tpcds}-sf100/` | Parquet only for publishable runs |
 
-Memory invariant (same as Helm SF100): `memoryLimitBytes + shuffleSpillBytes + headroom
+Memory invariant: `memoryLimitBytes + shuffleSpillBytes + headroom
 ≤ instance RAM`. On `m8g.8xlarge` (128 GiB) that is 40 Gi + 8 Gi tracked ≈ 48 Gi, leaving
 ~80 Gi native headroom for Arrow / S3 / Glue CLI — do not raise both pools to the full
 limit. Worker cgroup is `MemoryMax=112G` / `MemoryHigh=96G`.
@@ -508,7 +477,7 @@ limit. Worker cgroup is `MemoryMax=112G` / `MemoryHigh=96G`.
 > the stage aborted — the driver reported `register `result`: no batches` while the
 > single-table scans (Q1/Q6) still passed. `m8g.8xlarge` (128 GiB, 40 Gi pool) plus
 > `OXIDANT_SHUFFLE_PARTITIONS=32` (≈ worker vCPU; removes the 2-bucket skew that pinned all
-> shuffle onto one worker) gives the join real headroom. Keep `values-sf100.yaml` in sync.
+> shuffle onto one worker) gives the join real headroom.
 
 ### Deploy recipe (copy/paste)
 
@@ -548,16 +517,8 @@ MY_IP=$(curl -fsS https://checkip.amazonaws.com)/32
   --client-cidr "${MY_IP}"
 ```
 
-**Never** pass `--expose-connect true` for SF100. Connect to the driver IP:
-
-```sh
-STACK=oxidant-sf100 SUITE=all ./bench/sf100/remeasure-distributed.sh
-# or SUITE=tpch / SUITE=tpcds
-```
-
-Cross-links: EKS twin in [`distributed-k8s.md` § SF100 topology](distributed-k8s.md#sf100-topology);
-harness notes in [`bench/sf100/README.md`](../bench/sf100/README.md);
-definition of done D-4.* in [`DISTRIBUTED_DONE.md`](DISTRIBUTED_DONE.md).
+**Never** pass `--expose-connect true` for SF100. Connect to the driver IP
+(`sc://<driver-ip>:50051`) as shown in [Run a query](#5-run-a-query).
 
 ---
 

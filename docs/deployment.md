@@ -1,12 +1,13 @@
 # Deploying Oxidant as a self-hosted data platform on AWS
 
 > **Status: outline / contract for the full platform** (SSO, gateway operator, Terraform).
-> For a **runnable** distributed data-plane today:
+> For a **runnable** data-plane today:
 >
-> - **EC2 / ASG (no EKS):** [`distributed-ec2.md`](distributed-ec2.md)
-> - **Kind or BYO EKS:** [`distributed-k8s.md`](distributed-k8s.md)
+> - **AWS Marketplace AMI** (see [`marketplace.md`](marketplace.md)) or the
+>   `ghcr.io/oxidantdata/oxidant` container image
+> - **EC2 / ASG autoscaling via CloudFormation:** [`distributed-ec2.md`](distributed-ec2.md)
 >
-> The Terraform modules and complete Helm control-plane referenced below are **not all in-tree
+> The Terraform modules and complete control plane referenced below are **not all in-tree
 > yet**. This document remains the long-term user-facing deploy guide.
 
 Oxidant deploys entirely into **your own AWS account** (self-hosted, single-account). You get a
@@ -26,7 +27,7 @@ notebooks, dashboards, and scheduled jobs.
 ## Prerequisites
 
 - An AWS account + admin credentials for `terraform apply`.
-- `terraform`, `kubectl`, `helm`, and the AWS CLI installed.
+- `terraform`, `kubectl`, and the AWS CLI installed.
 - An OIDC or SAML IdP (Okta / Azure AD / Google / Cognito) for SSO.
 - An Anthropic API key (for the AI assist feature) — stored in Secrets Manager, never in the browser.
 
@@ -37,8 +38,9 @@ notebooks, dashboards, and scheduled jobs.
    per-cluster IAM roles for IRSA.
 2. **Build & push images** — the connect-server, worker, gateway, cluster-manager, scheduler, and
    pyworker images to ECR (`deploy/docker/`).
-3. **Install the platform** — `helm install oxidant deploy/helm/oxidant` with your RDS endpoint, OIDC/SAML
-   config, workspace bucket, and Anthropic secret ARN as values. Installs the `OxidantCluster` CRD,
+3. **Install the platform** — deploy the control-plane services with your RDS endpoint, OIDC/SAML
+   config, workspace bucket, and Anthropic secret ARN as configuration, pulling the engine image
+   from `ghcr.io/oxidantdata/oxidant`. Installs the `OxidantCluster` CRD,
    the control-plane Deployments, IRSA ServiceAccounts, HPAs, and NetworkPolicies.
 4. **Configure SSO** — point the gateway at your IdP; enable SCIM so users/groups sync.
 5. **First query** — log in, create a cluster, create a local catalog + table over an `s3://`

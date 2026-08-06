@@ -3,8 +3,7 @@
 This is the canonical in-repo architecture doc. It condenses the full project plan; when
 the two disagree, this file wins for day-to-day engineering.
 
-**Related maps:** [CODEMAP.md](CODEMAP.md) (ownership), [TODOS.md](TODOS.md) (open work),
-[AGENT_INDEXING.md](AGENT_INDEXING.md) (CodeGraph / GitNexus). Control-plane architecture
+**Related maps:** [CODEMAP.md](CODEMAP.md) (ownership). Control-plane architecture
 lives in the private **oxidant-platform** repo (`docs/ARCHITECTURE.md`).
 
 ## Thesis

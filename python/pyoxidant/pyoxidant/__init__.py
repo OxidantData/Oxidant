@@ -35,7 +35,7 @@ class SparkConnectServer:
         if binary is None:
             raise RuntimeError(
                 "the `oxidant` binary was not found on PATH; build it with "
-                "`cargo build --release --bin oxidant` (see docs/ISSUES.md #1)"
+                "`cargo build --release --bin oxidant`"
             )
         self._proc = subprocess.Popen(
             [binary, "spark", "server", "--port", str(self.port)]

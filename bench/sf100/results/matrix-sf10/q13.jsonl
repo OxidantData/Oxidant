@@ -1,1 +1,0 @@
-{"catalog": "glue", "endpoint": "sc://18.236.223.115:50051", "error": "TimeoutError: query exceeded 240s (possible server-side wedge/deadlock)", "glue_db": "tpch_sf10", "machine": "eks/sf100", "query": "Q13", "runDate": "2026-07-28T16:26:07Z", "sf": 10.0, "status": "fail", "strict": true, "suite": "tpch"}

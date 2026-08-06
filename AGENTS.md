@@ -4,18 +4,16 @@
 
 | Doc | Use when |
 |-----|----------|
-| [docs/TODOS.md](docs/TODOS.md) | Picking work / open gates |
 | [docs/CODEMAP.md](docs/CODEMAP.md) | Crate / bench / site ownership |
 | [docs/architecture.md](docs/architecture.md) | Engine design (Loom / HVM / Connect) |
 | [docs/distributed-ec2.md](docs/distributed-ec2.md) | EC2 ASG data plane (Packer + CFN) |
-| [docs/distributed-k8s.md](docs/distributed-k8s.md) | Kind / EKS Helm data plane |
-| [docs/AGENT_INDEXING.md](docs/AGENT_INDEXING.md) | CodeGraph + GitNexus install / re-index |
-| [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) | Phase resume narrative |
+| [docs/deployment.md](docs/deployment.md) | Self-hosted platform deploy outline |
+| [docs/catalogs.md](docs/catalogs.md) | External catalog SPI (Hive / Glue / REST) |
+| [docs/runtime-contract.md](docs/runtime-contract.md) | Engine image env contract |
 
-If `.codegraph/` / `.gitnexus/` exist (run `./scripts/index-agents.sh` locally), prefer
-CodeGraph `codegraph_explore` and GitNexus `query` / `impact` / `detect_changes`. For
-platform↔engine cross-repo work, use GitNexus group `oxidant` (see AGENT_INDEXING). If
-indexes are missing, use the docs above — do not block. Never commit index directories.
+Deployment options: the AWS Marketplace AMI or the GHCR container image
+(`ghcr.io/oxidantdata/oxidant`); EC2 autoscaling via CloudFormation is documented in
+[`docs/distributed-ec2.md`](docs/distributed-ec2.md).
 
 ## Cursor Cloud specific instructions
 
@@ -65,8 +63,7 @@ driver/worker cluster (`oxidant worker --port ...`, `oxidant driver --workers h:
 Not needed for the basic single-server flow.
 
 For **EC2 / CloudFormation + ASG** (Packer AMI, fixed worker count, Route53 discovery),
-see [`docs/distributed-ec2.md`](docs/distributed-ec2.md). For **Kubernetes / EKS**
-(Helm: one connect-server + N workers), see [`docs/distributed-k8s.md`](docs/distributed-k8s.md).
+see [`docs/distributed-ec2.md`](docs/distributed-ec2.md).
 Local TPC-H distributed gate:
 `cargo run -p oxidant-bench -- tpch-distributed --sf 0.01 --workers 2`.
 
@@ -133,22 +130,3 @@ Databricks dialect. Some Unparser output is **invalid on round-trip**:
 | Spark SQL parity ratchet | yes | `oxidant-parity ratchet --baseline parity/baseline.json` |
 | line coverage | no (informational) | `cargo llvm-cov --workspace --html` |
 
-## Daily maintenance routine
-
-A Cursor **Scheduled Agent** runs a daily bug / security-vuln / dependency-CVE /
-maintenance pass over this repo. It is grounded on a deterministic scan and bounded by
-strict guardrails — it opens **draft PRs + one triage issue** and merges nothing.
-
-- **Playbook (the contract):** `.cursor/rules/daily-maintenance.mdc` — procedure, the
-  finding→delivery routing table, and the hard guardrails (never push to `main`, one
-  concern per PR, ≤5 PRs/day, no exploit detail in public since this repo is public →
-  security findings go to a private GitHub Security Advisory).
-- **Scan (run it yourself too):** `bash scripts/daily-maintenance.sh` runs the cheap-core
-  gates (fmt, clippy, test, `cargo audit`, `cargo deny`, dep-update check) and writes
-  machine-readable reports to `target/daily-maintenance/`. It deliberately skips the heavy
-  bench/parity gates in `scripts/ci-local.sh`.
-- **Env:** `.cursor/environment.json` boots Rust 1.90 and installs `cargo-audit` +
-  `cargo-deny`. Policy for the latter is `deny.toml` (starts permissive, tightened over
-  time by the daily `chore(deps)` PRs).
-- **Scheduling** is configured in the Cursor dashboard (not version-controlled); the
-  repo owns *what* runs, the dashboard only fixes *when*.
