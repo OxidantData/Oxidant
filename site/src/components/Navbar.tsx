@@ -1,4 +1,4 @@
-import { Link, NavLink } from "react-router-dom";
+import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { useTheme } from "../lib/theme";
 
 const REPO = "https://github.com/OxidantData/Oxidant";
@@ -22,6 +22,18 @@ export default function Navbar() {
     `text-sm font-medium transition-colors ${
       isActive ? "text-accent" : "text-muted hover:text-body"
     }`;
+  const navigate = useNavigate();
+  const location = useLocation();
+  // HashRouter owns the URL fragment, so #pricing can't be a real anchor — scroll imperatively.
+  const goToPricing = () => {
+    const scroll = () =>
+      document.getElementById("pricing")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (location.pathname === "/") scroll();
+    else {
+      navigate("/");
+      setTimeout(scroll, 100);
+    }
+  };
   return (
     <header className="sticky top-0 z-20 border-b border-hairline bg-bg/80 backdrop-blur">
       <div className="oxidant-container flex h-14 items-center justify-between">
@@ -36,6 +48,9 @@ export default function Navbar() {
           <NavLink to="/performance" className={link}>
             Benchmarks
           </NavLink>
+          <button onClick={goToPricing} className="text-sm font-medium text-muted transition-colors hover:text-body">
+            Pricing
+          </button>
           <NavLink to="/architecture" className={link}>
             Architecture
           </NavLink>
