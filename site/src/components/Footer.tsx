@@ -20,6 +20,25 @@ export default function Footer() {
           </a>
         </div>
       </div>
+      <div className="border-t border-hairline">
+        <div className="oxidant-container flex flex-col items-center justify-between gap-2 py-4 text-xs text-muted sm:flex-row">
+          <span>© OxidantData</span>
+          <div className="flex items-center gap-4">
+            <a href={`${REPO}/blob/main/LICENSE`} className="hover:text-body">
+              AGPLv3
+            </a>
+            <a href={`${REPO}/blob/main/COMMERCIAL.md`} className="hover:text-body">
+              Commercial license
+            </a>
+            <span
+              className="rounded-full border border-warning/40 bg-warning/10 px-2 py-0.5 text-[11px] font-medium text-warning"
+              title="Oxidant is pre-alpha: the core engine runs the published benchmarks end-to-end, but expect rough edges."
+            >
+              pre-alpha
+            </span>
+          </div>
+        </div>
+      </div>
     </footer>
   );
 }
