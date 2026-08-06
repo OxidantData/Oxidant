@@ -1,6 +1,8 @@
 name: CI
 
-# Rust CI for Oxidant on free GitHub-hosted runners (public repo = unlimited minutes).
+# Rust CI for Oxidant. The heavy gates (clippy+test, query/coverage gates, Spark parity) run on
+# the self-hosted c7a.4xlarge x64 runner (labels self-hosted/linux/x64/oxidant); rustfmt stays on
+# GitHub-hosted `ubuntu-latest` as a fast canary that also proves hosted runners still work.
 # Mirrors the gates from .gitlab-ci.yml that fit a hosted runner (4 vCPU / 16 GB):
 # rustfmt, clippy, workspace tests, the ClickBench/TPC-H/correctness coverage gates, and the
 # Spark-SQL parity ratchet (the `parity` job — fails any PR that drops Spark golden-SQL parity
@@ -57,7 +59,7 @@ jobs:
 
   build-test:
     name: clippy + test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, oxidant]
     # Fail fast rather than burning an hour on a wedged runner. The suite compiles the workspace
     # twice over (see the disk-reclaim step) and then runs the distributed tests serially, so the
     # honest ceiling is well above the ~10 min this takes on `main`. 180: the line-tables-only
@@ -139,7 +141,7 @@ jobs:
   # workspace crates cheap to compile.
   query-gates:
     name: TPC-H + TPC-DS + distributed gates
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, oxidant]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
@@ -185,7 +187,7 @@ jobs:
   # bench/clickbench/COVERAGE_GATE_KNOWN_ISSUES.md for the historical context.
   coverage:
     name: coverage gates
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, oxidant]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
@@ -211,7 +213,7 @@ jobs:
   # parity/parity.html + parity/scoreboard.json.
   parity:
     name: Spark SQL parity ratchet
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, oxidant]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
