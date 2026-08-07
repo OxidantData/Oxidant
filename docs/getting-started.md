@@ -40,8 +40,11 @@ Download `oxidant_<ver>_amd64.deb` (or `_arm64.deb`) from
 sudo dpkg -i oxidant_<ver>_amd64.deb
 ```
 
-The package installs `oxidant` to `/usr/bin` and has no runtime dependencies. Each
-release also attaches an `.rpm` for Fedora/RHEL (`sudo dnf install ./oxidant-<ver>-1.x86_64.rpm`).
+The package installs `oxidant` to `/usr/bin` (sample tables included, auto-discovered
+from `/usr/share/oxidant/sample-data`). Each release also attaches an `.rpm`
+(`sudo dnf install ./oxidant-<ver>-1.x86_64.rpm`). The Linux binaries are built on
+Ubuntu 22.04 and need **glibc ≥ 2.35** (Ubuntu 22.04+, Debian 12+, Fedora 36+) — on
+older distro glibcs (RHEL 9, Amazon Linux 2023, Debian 11) use the Docker image below.
 
 ### 4. Docker (no install, sample data included)
 
