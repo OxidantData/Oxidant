@@ -1,16 +1,25 @@
 # Getting started
 
 Run the Oxidant engine, then run your first query three ways: the Web UI, the `oxidant sql`
-CLI, or a stock PySpark client.
+CLI, or a stock PySpark client. The quickest path is Docker — the image ships with sample
+tables preloaded, so your first query needs no setup at all.
 
-## Option A — Docker (no build)
+## Quickstart — Docker (no build, sample data included)
 
 ```sh
-docker run -p 50051:50051 -p 4040:4040 ghcr.io/oxidantdata/oxidant
+docker run --rm -p 4040:4040 -p 50051:50051 ghcr.io/oxidantdata/oxidant:latest
 ```
 
-- Spark Connect gRPC listens on `sc://localhost:50051`.
 - The monitoring UI, SQL editor, notebook, and REST API listen on <http://localhost:4040>.
+- Spark Connect gRPC listens on `sc://localhost:50051`.
+- A `samples` schema (TPC-H tables in four formats) is preloaded — see
+  [Sample data](#sample-data) below.
+
+Open <http://localhost:4040>, go to the **SQL Editor**, and run:
+
+```sql
+SELECT count(*) FROM samples.tpch_nation   -- 25
+```
 
 ## Option B — build the binary from source
 
@@ -22,8 +31,11 @@ git clone https://github.com/OxidantData/Oxidant.git
 cd Oxidant
 cargo build -p oxidant-cli        # binary at ./target/debug/oxidant
 
-./target/debug/oxidant spark server --port 50051
+./target/debug/oxidant spark server --port 50051 --sample-data sample-data
 ```
+
+`--sample-data sample-data` points at the committed sample tables in the repo (same contents
+as the Docker image); drop the flag for a clean server without the `samples` schema.
 
 The server starts Spark Connect gRPC on `50051` and the HTTP UI + REST API on `4040`:
 
@@ -36,7 +48,7 @@ Useful server flags (full text: `oxidant` with no args):
 
 ```text
 oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui]
-                     [--mode local|local-cluster] [--workers <N>]
+                     [--mode local|local-cluster] [--workers <N>] [--sample-data <DIR>]
                      [--catalog-conf key=value]...
 ```
 
@@ -44,7 +56,25 @@ oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-u
 - `--ui-bind` — interface for the UI (default `0.0.0.0`; use `127.0.0.1` on shared hosts — the UI has no auth).
 - `--no-ui` — disable the HTTP UI + REST API entirely.
 - `--mode local-cluster --workers N` — embed N in-process workers (see [workers.md](workers.md)).
+- `--sample-data` — register a sample-data tree as the `samples` schema at startup (env: `OXIDANT_SAMPLE_DATA_DIR`).
 - `--catalog-conf` — register an external catalog at startup (see [catalogs-glue.md](catalogs-glue.md)).
+
+## Sample data
+
+The bundled sample data is TPC-H SF 0.01, all 8 tables, in four physical formats — same rows
+in every format. Tables live in the `samples` schema of the built-in `spark_catalog` catalog:
+
+| Format | Tables |
+|---|---|
+| Parquet (primary) | `samples.tpch_{nation,region,supplier,customer,part,partsupp,orders,lineitem}` |
+| CSV | same 8, suffixed `_csv` (e.g. `samples.tpch_nation_csv`) |
+| Delta Lake | `samples.tpch_{nation,customer,orders,lineitem}_delta` |
+| Apache Iceberg | `samples.tpch_{nation,customer,orders,lineitem}_iceberg` |
+
+Row counts: nation 25, region 5, supplier 100, customer 1500, part 2000, partsupp 8000,
+orders 15000, lineitem 60175. The data files are committed under
+[`sample-data/`](../sample-data/README.md) in the repo (~19 MB) and baked into the Docker
+image at `/opt/oxidant/sample-data`.
 
 ## First query — pick a client
 
@@ -53,7 +83,7 @@ oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-u
 Open <http://localhost:4040>, go to the **SQL Editor** page, type:
 
 ```sql
-SELECT 1 AS hello
+SELECT count(*) FROM samples.tpch_nation
 ```
 
 Press **Cmd/Ctrl+Enter** — the results table renders below, and the statement appears in the
@@ -62,7 +92,7 @@ recent-statements list. More in [web-ui.md](web-ui.md).
 ### 2. `oxidant sql` CLI
 
 ```sh
-oxidant sql -e "SELECT 1 AS hello"
+oxidant sql -e "SELECT count(*) FROM samples.tpch_nation"
 ```
 
 Point at a non-default server with `--url http://host:4040` or `OXIDANT_URL`. Formats, files,
@@ -80,7 +110,7 @@ pip install "pyspark-client>=4.0"
 from pyspark.sql import SparkSession
 
 spark = SparkSession.builder.remote("sc://localhost:50051").getOrCreate()
-spark.sql("SELECT 1 AS hello").show()
+spark.sql("SELECT count(*) FROM samples.tpch_nation").show()
 ```
 
 ## Smoke-test SQL quirk (pre-alpha)
@@ -92,6 +122,10 @@ spark.sql("SELECT 1 AS hello").show()
 SELECT 1 AS hello;
 SELECT * FROM VALUES (1, 'a'), (2, 'b') AS t(num, letter);
 ```
+
+Also, `CREATE DATABASE` / `CREATE SCHEMA` via SQL is not implemented yet (the Spark Catalog
+RPC is unimplemented) — schemas arrive via external catalogs or `--sample-data`, and tables
+via `CREATE TABLE` / `CREATE EXTERNAL TABLE`.
 
 ## Next steps
 
