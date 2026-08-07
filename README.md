@@ -18,6 +18,22 @@ Community AMI on AWS Marketplace (listing in progress) or
 `docker pull ghcr.io/oxidantdata/oxidant`; EC2 autoscaling via CloudFormation is
 documented in [`docs/distributed-ec2.md`](docs/distributed-ec2.md).
 
+## Install
+
+Prebuilt binaries for macOS (Apple Silicon + Intel) and Linux (x86_64 + arm64):
+
+1. **Shell installer** —
+   `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/OxidantData/Oxidant/releases/latest/download/oxidant-installer.sh | sh`
+2. **Homebrew** — `brew install oxidantdata/tap/oxidant`
+3. **.deb** (Debian/Ubuntu) — download from
+   [GitHub Releases](https://github.com/OxidantData/Oxidant/releases/latest), then
+   `sudo dpkg -i oxidant_<ver>_amd64.deb` (an `.rpm` is attached too)
+4. **Docker** — `docker pull ghcr.io/oxidantdata/oxidant`
+5. **Source** — `cargo build -p oxidant-cli` (see [Build](#build))
+
+AWS AMI / Marketplace: coming soon. Details and first query:
+[`docs/getting-started.md`](docs/getting-started.md).
+
 ## Architecture (one screen)
 
 ```
