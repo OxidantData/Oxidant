@@ -1,9 +1,42 @@
 # Getting started
 
-Run the Oxidant engine, then run your first query three ways: the Web UI, the `oxidant sql`
-CLI, or a stock PySpark client.
+Install the Oxidant engine, run the server, then run your first query three ways: the
+Web UI, the `oxidant sql` CLI, or a stock PySpark client.
 
-## Option A — Docker (no build)
+## Install Oxidant
+
+Pick whichever fits your platform — every path installs the same `oxidant` binary
+(except Docker, which needs no install). Prebuilt binaries cover Apple Silicon and
+Intel Macs plus x86_64 and arm64 Linux (glibc).
+
+### 1. Shell installer (macOS + Linux)
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/OxidantData/Oxidant/releases/latest/download/oxidant-installer.sh | sh
+```
+
+Installs `oxidant` into `~/.cargo/bin` (or `$CARGO_HOME/bin` if set); the script
+prints the exact path and how to add it to `PATH`.
+
+### 2. Homebrew (macOS + Linux)
+
+```sh
+brew install oxidantdata/tap/oxidant
+```
+
+### 3. Debian / Ubuntu (.deb)
+
+Download `oxidant_<ver>_amd64.deb` (or `_arm64.deb`) from
+[GitHub Releases](https://github.com/OxidantData/Oxidant/releases/latest), then:
+
+```sh
+sudo dpkg -i oxidant_<ver>_amd64.deb
+```
+
+The package installs `oxidant` to `/usr/bin` and has no runtime dependencies. Each
+release also attaches an `.rpm` for Fedora/RHEL (`sudo dnf install ./oxidant-<ver>-1.x86_64.rpm`).
+
+### 4. Docker (no install)
 
 ```sh
 docker run -p 50051:50051 -p 4040:4040 ghcr.io/oxidantdata/oxidant
@@ -12,7 +45,7 @@ docker run -p 50051:50051 -p 4040:4040 ghcr.io/oxidantdata/oxidant
 - Spark Connect gRPC listens on `sc://localhost:50051`.
 - The monitoring UI, SQL editor, notebook, and REST API listen on <http://localhost:4040>.
 
-## Option B — build the binary from source
+### 5. Build from source
 
 Rust 1.90 is pinned by `rust-toolchain.toml` and installs automatically via rustup. No
 `protoc` needed.
@@ -21,9 +54,24 @@ Rust 1.90 is pinned by `rust-toolchain.toml` and installs automatically via rust
 git clone https://github.com/OxidantData/Oxidant.git
 cd Oxidant
 cargo build -p oxidant-cli        # binary at ./target/debug/oxidant
-
-./target/debug/oxidant spark server --port 50051
 ```
+
+### Coming soon: AWS AMI / Marketplace
+
+A free Community AMI on AWS Marketplace is in progress (listing pending) — until
+then, use any install path above on an EC2 instance. EC2 autoscaling via
+CloudFormation is documented in [distributed-ec2.md](distributed-ec2.md).
+
+> **Glue catalog users:** install the AWS CLI separately (`brew install awscli` /
+> `apt install awscli`) — it is not bundled. See [catalogs-glue.md](catalogs-glue.md).
+
+## Run the server
+
+```sh
+oxidant spark server --port 50051
+```
+
+(From a source build: `./target/debug/oxidant spark server --port 50051`.)
 
 The server starts Spark Connect gRPC on `50051` and the HTTP UI + REST API on `4040`:
 

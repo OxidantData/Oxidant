@@ -65,3 +65,10 @@ opt-level = 2
 inherits = "release"
 lto = false
 codegen-units = 16
+
+# The profile that 'dist' builds release binaries with (dist-workspace.toml →
+# .github/workflows/binaries.yml). Same tuning as `release`; kept as a separate
+# name so cargo-dist builds are explicit and can diverge later without touching
+# the image-build profiles above.
+[profile.dist]
+inherits = "release"
