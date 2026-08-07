@@ -29,9 +29,9 @@ concurrency:
 jobs:
   clickbench:
     name: ClickBench 43 queries vs Sail
-    # Only a runner advertising ALL these labels picks this up — the persistent EC2 runner
-    # oxidant-ci-x64-1 (see deploy/ci-runner/) registers with exactly these.
-    runs-on: [self-hosted, linux, x64, oxidant]
+    # Blacksmith managed runner (per-minute billing). 16 vCPU keeps the hot-timing
+    # comparison against Sail's published numbers meaningful.
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4

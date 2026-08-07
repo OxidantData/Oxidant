@@ -64,7 +64,7 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
-            runner: [self-hosted, linux, x64, oxidant]
+            runner: blacksmith-4vcpu-ubuntu-2404
           - platform: linux/arm64
             arch: arm64
             runner: ubuntu-24.04-arm

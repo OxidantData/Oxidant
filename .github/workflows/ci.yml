@@ -1,13 +1,15 @@
 name: CI
 
-# Rust CI for Oxidant. The heavy gates (clippy+test, query/coverage gates, Spark parity) run on
-# the self-hosted t3.xlarge x64 spot runner (labels self-hosted/linux/x64/oxidant); rustfmt stays on
-# GitHub-hosted `ubuntu-latest` as a fast canary that also proves hosted runners still work.
-# Mirrors the gates from .gitlab-ci.yml that fit a hosted runner (4 vCPU / 16 GB):
-# rustfmt, clippy, workspace tests, the ClickBench/TPC-H/correctness coverage gates, and the
-# Spark-SQL parity ratchet (the `parity` job — fails any PR that drops Spark golden-SQL parity
-# below the committed parity/baseline.json floor). Two heavier gates live elsewhere:
-#   - ClickBench on real 14.78 GB data -> bench.yml, same self-hosted runner
+# Rust CI for Oxidant. The heavy gates run on Blacksmith managed runners
+# (blacksmith-4vcpu-ubuntu-2404, per-minute billing); rustfmt stays on GitHub-hosted
+# `ubuntu-latest` as a fast canary that also proves hosted runners still work.
+# Per-run tiers:
+#   - every PR/push: rustfmt, clippy+test (the Spark-SQL parity ratchet is folded into it
+#     as steps — fails anything that drops parity below parity/baseline.json), coverage gates
+#   - main pushes, PRs labeled `full-gates`, manual dispatch: query-gates (TPC-H/TPC-DS/
+#     distributed suites) — skipped on routine PRs to keep iteration cheap
+# Heavier gates live elsewhere:
+#   - ClickBench on real 14.78 GB data -> bench.yml, Blacksmith 16-vCPU runner
 #   - llvm-cov line coverage (informational) -> coverage-nightly.yml
 #
 # BUILD TIME: every compiling job restores ONE cargo cache via `shared-key: workspace` below.
@@ -15,8 +17,7 @@ name: CI
 # over, and the four caches evicted each other against the 10 GB per-repo Actions cache cap.
 # `build-test` is the only writer; the rest set `save-if: false`. A shared key with several
 # writers does not work -- GitHub lets exactly one job reserve a key, so they race and the
-# job that happens to finish first defines what everyone restores next run. `parity` is the
-# one job left out of the sharing; see the note above its cache step.
+# job that happens to finish first defines what everyone restores next run.
 on:
   push:
     branches: [main]
@@ -59,7 +60,7 @@ jobs:
 
   build-test:
     name: clippy + test
-    runs-on: [self-hosted, linux, x64, oxidant]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # Fail fast rather than burning an hour on a wedged runner. The suite compiles the workspace
     # twice over (see the disk-reclaim step) and then runs the distributed tests serially, so the
     # honest ceiling is well above the ~10 min this takes on `main`. 180: the line-tables-only
@@ -79,10 +80,7 @@ jobs:
       # runner leaves free and kills the job with no log to show for it. Reclaiming the preinstalled
       # SDKs buys ~25 GB. This can go away once the toolchain moves to 1.92+ and `iceberg` 0.9 can
       # share the workspace's Arrow.
-      # Only worthwhile (and only safe) on throwaway GitHub-hosted VMs; the self-hosted
-      # runner has no preinstalled SDKs to reclaim and keeps its tools directory across jobs.
       - name: Reclaim runner disk
-        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -142,6 +140,37 @@ jobs:
           # [Bus error] on main, 2026-07-30). Assertions/backtraces are unaffected.
           CARGO_PROFILE_TEST_DEBUG: "1"
           CARGO_PROFILE_DEV_DEBUG: "1"
+      # Spark-SQL parity ratchet, folded in from the old standalone parity job: the binary
+      # compiles incrementally on this job's workspace artifacts, and one fewer job means one
+      # fewer checkout + cache restore. Fails the run if parity drops below parity/baseline.json.
+      - name: Build oxidant-parity
+        run: cargo build -p oxidant-spark-compat --bin oxidant-parity
+      - name: Spark parity ratchet (vs parity/baseline.json)
+        run: |
+          set -o pipefail
+          ./target/debug/oxidant-parity ratchet --baseline parity/baseline.json --out-dir parity | tee parity-run.log
+      - name: Publish parity headline to job summary
+        if: always()
+        run: |
+          {
+            echo "## Spark parity gate"
+            echo ""
+            echo '```'
+            grep -E '^(parity:|✓|✗)' parity-run.log 2>/dev/null || echo "(no headline — see logs)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload parity scoreboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-scoreboard
+          path: |
+            parity/parity.json
+            parity/report.md
+            parity/parity.html
+            parity/scoreboard.json
+          retention-days: 30
+          if-no-files-found: ignore
 
   # The TPC-H / TPC-DS / distributed gates used to run at the tail of build-test, which made the
   # critical path the SUM of compiling the workspace and replaying every query suite. They only
@@ -149,9 +178,15 @@ jobs:
   # Note these execute in the dev profile — `[profile.dev.package."*"] opt-level = 2` in the root
   # Cargo.toml is what keeps that tractable, since it optimizes datafusion/arrow while leaving
   # workspace crates cheap to compile.
+  # Runs on every main push (main is the fully-gated record), on PRs labeled `full-gates`,
+  # and on manual dispatch. Routine PRs skip this job to keep iteration cheap and fast.
   query-gates:
     name: TPC-H + TPC-DS + distributed gates
-    runs-on: [self-hosted, linux, x64, oxidant]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-gates'))
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
@@ -203,7 +238,7 @@ jobs:
   # bench/clickbench/COVERAGE_GATE_KNOWN_ISSUES.md for the historical context.
   coverage:
     name: coverage gates
-    runs-on: [self-hosted, linux, x64, oxidant]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
@@ -224,68 +259,3 @@ jobs:
         run: cargo run -p oxidant-bench -- clickbench-grpc --rows 20000
       - name: correctness (gRPC/Arrow-IPC vs engine-direct + ground truth)
         run: cargo run -p oxidant-bench -- correctness --rows 5000
-
-  # Spark-SQL parity ratchet: replays Apache Spark v4.0.0's own golden SQL corpus through oxidant and
-  # fails the PR if strict OR semantic parity drops below the committed parity/baseline.json floor
-  # (or the corpus size changes). This is the gate that protects the Spark-compatibility work — a PR
-  # can only hold or improve parity. To LAND a gain, re-baseline parity/baseline.json (strict to the
-  # 3-run minimum — ±1 tie-flake); the marketing site (separate private repo) consumes
-  # parity/parity.html + parity/scoreboard.json.
-  parity:
-    name: Spark SQL parity ratchet
-    runs-on: [self-hosted, linux, x64, oxidant]
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
-      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
-      - name: Add Rust toolchain to PATH (self-hosted runner)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
-        run: |
-          rustup show
-          rustc --version && cargo --version
-      # Deliberately NOT on the shared workspace cache. oxidant-parity depends only on oxidant-loom
-      # (+ datafusion), so it resolves a narrower feature set than the whole-workspace build and
-      # cannot reuse those artifacts — pointed at the shared cache it re-compiled datafusion from
-      # scratch and went from 2 min to 20 min, making it the critical path. Its own small,
-      # exactly-matching cache is worth the extra entry.
-      # -v2 because `[profile.dev.package."*"] opt-level = 2` invalidates every dependency
-      # artifact without changing anything rust-cache hashes. On the old key the job restored a
-      # full hit of opt-level 0 artifacts, rebuilt datafusion anyway, and could not save over an
-      # existing key -- so it paid the cold build on every run. Bump this whenever a profile
-      # change makes previously cached artifacts unusable.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: spark-parity-v2
-          cache-on-failure: "true"
-      - name: Build oxidant-parity
-        run: cargo build -p oxidant-spark-compat --bin oxidant-parity
-      - name: Ratchet against parity/baseline.json
-        run: |
-          set -o pipefail
-          ./target/debug/oxidant-parity ratchet --baseline parity/baseline.json --out-dir parity | tee parity-run.log
-      - name: Publish parity headline to job summary
-        if: always()
-        run: |
-          {
-            echo "## Spark parity gate"
-            echo ""
-            echo '```'
-            grep -E '^(parity:|✓|✗)' parity-run.log 2>/dev/null || echo "(no headline — see logs)"
-            echo '```'
-            echo ""
-            echo "Baseline: \`parity/baseline.json\`. Parity may only hold or improve."
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload parity scoreboard
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: parity-scoreboard
-          path: |
-            parity/parity.json
-            parity/report.md
-            parity/parity.html
-            parity/scoreboard.json
-          retention-days: 30
-          if-no-files-found: ignore
