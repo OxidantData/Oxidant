@@ -33,9 +33,9 @@ benchmarks in `bench/`; the Python helper package in `python/pyoxidant`.
 ## Ground rules (non-negotiable, from the architecture)
 
 1. **Arrow is the currency between operators.** Don't invent a second in-memory format.
-2. **The columnar hot loop stays in `oxidant-loom`.** Never lift columns into HVM2 per-row.
-3. **`oxidant-hvm` is off by default and off the critical path.** The engine must be correct
-   and competitive on `oxidant-loom` alone.
+2. **The columnar hot loop stays in `oxidant-loom`.**
+3. **One backend, no second runtime.** Execution work lands as Loom operators — see
+   [`docs/HVM_VERDICT.md`](docs/HVM_VERDICT.md) for the removed HVM2 bet and why.
 4. **Every claim is measured.** Performance changes ride with a ClickBench/TPC-H number.
 
 ## Commit / MR conventions

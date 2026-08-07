@@ -5,7 +5,7 @@
 | Doc | Use when |
 |-----|----------|
 | [docs/CODEMAP.md](docs/CODEMAP.md) | Crate / bench / site ownership |
-| [docs/architecture.md](docs/architecture.md) | Engine design (Loom / HVM / Connect) |
+| [docs/architecture.md](docs/architecture.md) | Engine design (Loom / Connect) |
 | [docs/distributed-ec2.md](docs/distributed-ec2.md) | EC2 ASG data plane (Packer + CFN) |
 | [docs/deployment.md](docs/deployment.md) | Self-hosted platform deploy outline |
 | [docs/catalogs.md](docs/catalogs.md) | External catalog SPI (Hive / Glue / REST) |

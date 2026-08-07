@@ -14,7 +14,7 @@ Architecture: [architecture.md](architecture.md).
 | `crates/oxidant-sql/` | Spark SQL dialect → warp IR | `src/lib.rs` |
 | `crates/oxidant-plan/` | Warp unresolved logical IR | `src/lib.rs` |
 | `crates/oxidant-analyzer/` | Name/type resolve vs catalog | `src/lib.rs` |
-| `crates/oxidant-optimizer/` | Hedle opts + Loom vs HVM routing | `src/lib.rs` |
+| `crates/oxidant-optimizer/` | Heddle logical opts (single Loom backend) | `src/lib.rs` |
 | `crates/oxidant-physical/` | Physical plan / `ExecutionPlan` | `src/lib.rs` |
 | `crates/oxidant-datasource/` | Parquet/CSV/JSON + Delta/Iceberg resolvers | `src/lib.rs` |
 | `crates/oxidant-catalog/` | Catalog SPI + registry | `src/lib.rs` |
@@ -23,7 +23,6 @@ Architecture: [architecture.md](architecture.md).
 | `crates/oxidant-catalog-rest/` | Iceberg REST / Unity-compatible | `src/lib.rs` |
 | `crates/oxidant-proto/` | Vendored Spark Connect protos (protox) | `src/lib.rs` |
 | `crates/oxidant-common/` | Shared errors, config, session identity | `src/lib.rs` |
-| `crates/oxidant-hvm/` | Opt-in Bend→HVM2 backend (feature-gated) | `src/lib.rs` |
 | `crates/oxidant-streaming/` | Structured Streaming micro-batch | `src/lib.rs` |
 | `crates/oxidant-observability/` | Events, Spark REST DTOs, app state | `src/lib.rs` |
 | `crates/oxidant-ui-server/` | Spark-compat `/api/v1` + embedded UI | `src/lib.rs` |
@@ -53,6 +52,7 @@ Architecture: [architecture.md](architecture.md).
 | Path | Purpose |
 |------|---------|
 | `architecture.md` | Canonical engine design |
+| `HVM_VERDICT.md` | HVM2/Bend backend verdict + removal record |
 | `CODEMAP.md` | This file |
 | `runtime-contract.md` | Contract for oxidant-platform consumers |
 | `distributed-ec2.md` | Packer AMI + CFN/ASG data plane |
