@@ -15,4 +15,7 @@ python/
 scratchpad/
 **/*.parquet
 **/*.tbl
+# Exception: the committed sample-data tree ships IN the image (the bundled `samples` schema,
+# see the Dockerfile). Its parquet data files must survive the blanket exclusion above.
+!sample-data/**/*.parquet
 **/.DS_Store

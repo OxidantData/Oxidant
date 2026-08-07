@@ -35,6 +35,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - "sample-data/**"
       - "deploy/docker/connect-server.Dockerfile"
       - ".github/workflows/oxidant-image.yml"
   workflow_dispatch:
