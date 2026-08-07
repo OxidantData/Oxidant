@@ -66,7 +66,7 @@ fn usage() {
     eprintln!("oxidant {}", env!("CARGO_PKG_VERSION"));
     eprintln!("usage:");
     eprintln!(
-        "  oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui] [--mode local|local-cluster] [--workers <N>]"
+        "  oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui] [--mode local|local-cluster] [--workers <N>] [--sample-data <DIR>]"
     );
     eprintln!("  oxidant history-server --dir <LOG_DIR> [--port <PORT>]");
     eprintln!("  oxidant worker --port <PORT> [--data <parquet> --table <name>]");
@@ -101,6 +101,7 @@ async fn run_server(args: &[String]) -> oxidant_common::Result<()> {
     if !catalogs.is_empty() {
         eprintln!("Declared {} catalog config entrie(s)", catalogs.len());
     }
+    let sample_data_dir = sample_data_dir(args);
     let workers = match mode {
         ServerMode::Local => Vec::new(),
         ServerMode::LocalCluster { workers } => start_local_cluster_workers(workers).await?,
@@ -121,6 +122,7 @@ async fn run_server(args: &[String]) -> oxidant_common::Result<()> {
         ui_port,
         ui_bind: Some(ui_bind),
         catalogs,
+        sample_data_dir,
         ..Default::default()
     };
     if !workers.is_empty() {
@@ -247,6 +249,22 @@ fn catalog_conf(args: &[String]) -> std::collections::HashMap<String, String> {
         }
     }
     out
+}
+
+/// `--sample-data <DIR>` (or `OXIDANT_SAMPLE_DATA_DIR`): preload the bundled sample tables
+/// under the `samples` schema at startup. The flag wins over the env var; an empty value is
+/// treated as unset.
+fn sample_data_dir(args: &[String]) -> Option<std::path::PathBuf> {
+    sample_data_dir_from(
+        flag(args, "--sample-data"),
+        std::env::var("OXIDANT_SAMPLE_DATA_DIR").ok(),
+    )
+}
+
+fn sample_data_dir_from(flag: Option<String>, env: Option<String>) -> Option<std::path::PathBuf> {
+    flag.or(env)
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 async fn run_worker(args: &[String]) -> oxidant_common::Result<()> {
@@ -734,6 +752,22 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(opts.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn sample_data_dir_prefers_flag_then_env_and_skips_empty() {
+        let flag = Some("data/samples".to_string());
+        let env = Some("/opt/oxidant/sample-data".to_string());
+        assert_eq!(
+            sample_data_dir_from(flag.clone(), env.clone()),
+            Some(std::path::PathBuf::from("data/samples"))
+        );
+        assert_eq!(
+            sample_data_dir_from(None, env),
+            Some(std::path::PathBuf::from("/opt/oxidant/sample-data"))
+        );
+        assert_eq!(sample_data_dir_from(None, Some("  ".to_string())), None);
+        assert_eq!(sample_data_dir_from(None, None), None);
     }
 
     #[test]

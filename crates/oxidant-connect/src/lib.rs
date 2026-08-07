@@ -70,6 +70,10 @@ pub struct ServerConfig {
     /// `http(s)://host:port`, comma-separated in env as `OXIDANT_WORKERS`). When non-empty,
     /// auto-splittable queries route through the driver.
     pub workers: Vec<String>,
+    /// Optional sample-data directory (`oxidant spark server --sample-data <DIR>` /
+    /// `OXIDANT_SAMPLE_DATA_DIR`). When set, the bundled TPC-H tables found under it are
+    /// registered as the `samples` schema at startup — best-effort, never blocks boot.
+    pub sample_data_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -81,6 +85,7 @@ impl Default for ServerConfig {
             observability: None,
             catalogs: std::collections::HashMap::new(),
             workers: distributed::parse_worker_list(None),
+            sample_data_dir: None,
         }
     }
 }
@@ -1910,6 +1915,7 @@ fn err_to_status(e: Error) -> Status {
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let port = config.port;
     let ui_port = config.ui_port;
+    let sample_data_dir = config.sample_data_dir.clone();
     let ui_bind = config
         .ui_bind
         .unwrap_or_else(|| std::net::IpAddr::from([0, 0, 0, 0]));
@@ -1920,6 +1926,20 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let mut cfg = config;
     cfg.observability = Some(store.clone());
     let service = Arc::new(OxidantService::with_config(cfg));
+
+    // Bundled sample data: register the `samples` schema before accepting connections so the
+    // first client already sees the tables. Best-effort — registration logs and skips on
+    // error and never fails boot.
+    if let Some(dir) = sample_data_dir {
+        let registered = service.engine().register_sample_tables(&dir).await;
+        if registered > 0 {
+            eprintln!(
+                "Oxidant sample data: {registered} table(s) registered under `{SAMPLES}` from {}",
+                dir.display(),
+                SAMPLES = oxidant_loom::SAMPLES_SCHEMA,
+            );
+        }
+    }
 
     if let Some(ui_port) = ui_port {
         let ui_store = store.clone();
