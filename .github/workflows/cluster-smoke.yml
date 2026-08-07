@@ -39,7 +39,8 @@ jobs:
           docker pull "${{ inputs.image }}"
           for w in worker1 worker2; do
             docker run --rm -d --network oxidant-smoke --name "$w" "${{ inputs.image }}" \
-              worker --port 50561
+              worker --port 50561 \
+              --data /opt/oxidant/sample-data/parquet/tpch_lineitem.parquet --table lineitem
           done
           # Strict mode: any query the distributed planner rejects is an ERROR,
           # not a silent local fallback — so a success below is proof of real
@@ -73,7 +74,14 @@ jobs:
 
       - name: Run a distributed query (strict) and a samples query
         run: |
-          SQL_DIST="SELECT l_returnflag, COUNT(*) AS c, SUM(l_quantity) AS s FROM parquet.\`/opt/oxidant/sample-data/parquet/tpch_lineitem.parquet\` GROUP BY l_returnflag"
+          # Stage SQL re-parses on workers, so the table must exist everywhere by the
+          # same name: workers register it via --data/--table at startup; the driver
+          # gets the same bare name as a ListingTable over the same in-image file.
+          curl -sf -X POST "http://localhost:4040/api/v1/statements?wait=true&timeout=60" \
+            -H 'Content-Type: application/json' \
+            -d '{"sql":"CREATE EXTERNAL TABLE lineitem STORED AS PARQUET LOCATION '"'"'/opt/oxidant/sample-data/parquet/tpch_lineitem.parquet'"'"'"}' | tee ddl.json
+          python3 -c "import json; d=json.load(open('ddl.json')); assert d['status']=='succeeded', d; print('driver table registered')"
+          SQL_DIST="SELECT l_returnflag, COUNT(*) AS c, SUM(l_quantity) AS s FROM lineitem GROUP BY l_returnflag"
           curl -sf -X POST "http://localhost:4040/api/v1/statements?wait=true&timeout=120" \
             -H 'Content-Type: application/json' \
             -d "{\"sql\":\"$SQL_DIST\"}" | tee dist.json
