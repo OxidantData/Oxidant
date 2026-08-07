@@ -98,14 +98,17 @@ Useful server flags (full text: `oxidant` with no args):
 
 ```text
 oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui]
-                     [--mode local|local-cluster] [--workers <N>] [--sample-data <DIR>]
-                     [--catalog-conf key=value]...
+                     [--mode local|local-cluster] [--workers <N|host:port,...>]
+                     [--sample-data <DIR>] [--catalog-conf key=value]...
 ```
 
 - `--ui-port` — HTTP port for the UI + REST API (default `4040`).
 - `--ui-bind` — interface for the UI (default `0.0.0.0`; use `127.0.0.1` on shared hosts — the UI has no auth).
 - `--no-ui` — disable the HTTP UI + REST API entirely.
-- `--mode local-cluster --workers N` — embed N in-process workers (see [workers.md](workers.md)).
+- `--workers host:port,...` — attach remote Flight workers; the driver then routes
+  distributable queries across them (static list — see [workers.md](workers.md)).
+- `--mode local-cluster --workers N` — embed N in-process workers instead of remote ones
+  (see [workers.md](workers.md)). With no workers at all, the driver runs every query itself.
 - `--sample-data` — register a sample-data tree as the `samples` schema at startup (env: `OXIDANT_SAMPLE_DATA_DIR`).
 - `--catalog-conf` — register an external catalog at startup (see [catalogs-glue.md](catalogs-glue.md)).
 

@@ -44,6 +44,8 @@ mod translate;
 mod types;
 mod udf;
 
+pub use distributed::parse_worker_list;
+
 /// Max gRPC message size (Spark Connect defaults to 128 MB; we allow 256 MB headroom).
 const MAX_MSG: usize = 256 * 1024 * 1024;
 /// Rows per Arrow result chunk, so a single gRPC message never carries an oversized batch.
