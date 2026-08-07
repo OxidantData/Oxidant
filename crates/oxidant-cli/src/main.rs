@@ -3,6 +3,7 @@
 //! ```text
 //! oxidant spark server --port 50051         # Spark Connect server; point PySpark at sc://host:50051
 //! oxidant spark server --mode local-cluster --workers 2
+//! oxidant spark server --workers host1:50561,host2:50561   # attach remote Flight workers
 //! oxidant worker --port 50561 [--data hits.parquet --table t]   # a distributed Flight worker
 //! oxidant driver --workers h:p,h:p \         # orchestrate a 2-stage distributed aggregation
 //!   --partial-sql "SELECT k, COUNT(*) c, SUM(v) s FROM t GROUP BY k" \
@@ -66,7 +67,7 @@ fn usage() {
     eprintln!("oxidant {}", env!("CARGO_PKG_VERSION"));
     eprintln!("usage:");
     eprintln!(
-        "  oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui] [--mode local|local-cluster] [--workers <N>] [--sample-data <DIR>]"
+        "  oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui] [--mode local|local-cluster] [--workers <N|host:port,...>] [--sample-data <DIR>]"
     );
     eprintln!("  oxidant history-server --dir <LOG_DIR> [--port <PORT>]");
     eprintln!("  oxidant worker --port <PORT> [--data <parquet> --table <name>]");
@@ -103,15 +104,19 @@ async fn run_server(args: &[String]) -> oxidant_common::Result<()> {
     }
     let sample_data_dir = sample_data_dir(args);
     let workers = match mode {
-        ServerMode::Local => Vec::new(),
+        ServerMode::Local => static_workers(args)?,
         ServerMode::LocalCluster { workers } => start_local_cluster_workers(workers).await?,
     };
     if !workers.is_empty() {
         let csv = workers.join(",");
-        // Mirror the generated endpoints into the process environment for helper paths that still
+        // Mirror the endpoints into the process environment for helper paths that still
         // consult OXIDANT_WORKERS, while passing the explicit list below as the authoritative config.
         std::env::set_var("OXIDANT_WORKERS", &csv);
-        eprintln!("Oxidant local-cluster workers: {csv}");
+        let origin = match mode {
+            ServerMode::Local => "static",
+            ServerMode::LocalCluster { .. } => "local-cluster",
+        };
+        eprintln!("Oxidant {origin} workers: {csv}");
     }
     eprintln!("Oxidant Spark Connect server listening on sc://0.0.0.0:{port}");
     if let Some(ui) = ui_port {
@@ -150,10 +155,17 @@ fn server_mode(args: &[String]) -> oxidant_common::Result<ServerMode> {
     match mode.as_str() {
         "local" | "single-node" => Ok(ServerMode::Local),
         "local-cluster" => {
-            let workers = flag(args, "--workers")
-                .or_else(|| std::env::var("OXIDANT_DEFAULT_PARALLELISM").ok())
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(2);
+            let raw = flag(args, "--workers")
+                .or_else(|| std::env::var("OXIDANT_DEFAULT_PARALLELISM").ok());
+            let workers = match raw {
+                None => 2,
+                Some(s) => s.parse::<usize>().map_err(|_| {
+                    oxidant_common::Error::Io(format!(
+                        "local-cluster expects a worker count for --workers, got `{s}` \
+                         (remote host:port,... endpoints attach in the default local mode)"
+                    ))
+                })?,
+            };
             if workers == 0 {
                 return Err(oxidant_common::Error::Io(
                     "local-cluster requires at least one worker".into(),
@@ -165,6 +177,28 @@ fn server_mode(args: &[String]) -> oxidant_common::Result<ServerMode> {
             "unknown spark server mode `{other}` (expected local or local-cluster)"
         ))),
     }
+}
+
+/// `--workers` in the default local mode: a static list of remote Flight worker endpoints
+/// (`host:port,...` — scheme defaults to `http://`). A bare number is the in-process worker
+/// *count* and only makes sense with `--mode local-cluster`; reject it here so the two
+/// meanings can't be confused silently.
+fn static_workers(args: &[String]) -> oxidant_common::Result<Vec<String>> {
+    let Some(raw) = flag(args, "--workers") else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Err(oxidant_common::Error::Io(
+            "empty --workers value (expected host:port,... worker endpoints)".into(),
+        ));
+    }
+    if raw.parse::<usize>().is_ok() {
+        return Err(oxidant_common::Error::Io(format!(
+            "`--workers {raw}` is a worker count, which requires `--mode local-cluster`; \
+             to attach remote workers pass endpoints instead: `--workers host:port,...`"
+        )));
+    }
+    Ok(oxidant_connect::parse_worker_list(Some(&raw)))
 }
 
 async fn start_local_cluster_workers(count: usize) -> oxidant_common::Result<Vec<String>> {
@@ -667,6 +701,55 @@ mod tests {
             "0",
         ]));
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn local_cluster_mode_rejects_non_numeric_workers() {
+        let parsed = server_mode(&args(&[
+            "oxidant",
+            "spark",
+            "server",
+            "--mode",
+            "local-cluster",
+            "--workers",
+            "host1:50561",
+        ]));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn static_workers_parses_endpoint_list() {
+        let a = args(&[
+            "oxidant",
+            "spark",
+            "server",
+            "--workers",
+            "host1:50561, http://host2:50562",
+        ]);
+        assert_eq!(
+            static_workers(&a).unwrap(),
+            vec![
+                "http://host1:50561".to_string(),
+                "http://host2:50562".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn static_workers_rejects_bare_count_without_local_cluster() {
+        let a = args(&["oxidant", "spark", "server", "--workers", "3"]);
+        let Err(oxidant_common::Error::Io(msg)) = static_workers(&a) else {
+            panic!("expected Io error for a bare worker count in local mode");
+        };
+        assert!(msg.contains("local-cluster"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn static_workers_absent_is_empty_and_blank_is_an_error() {
+        assert!(static_workers(&args(&["oxidant", "spark", "server"]))
+            .unwrap()
+            .is_empty());
+        assert!(static_workers(&args(&["oxidant", "spark", "server", "--workers", " "])).is_err());
     }
 
     #[test]

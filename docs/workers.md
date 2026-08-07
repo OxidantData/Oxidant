@@ -1,15 +1,32 @@
-# Adding workers
+# Drivers and workers
 
 Oxidant runs **single-node by default**: with no workers registered, the driver executes every
 query locally. That is the right setup for development and small data. Add workers when you
 want distributed scans and shuffles across more CPU than one process has.
 
-Check what mode a running server is in:
+## Start the driver
+
+Every install path (curl installer, brew, deb/rpm, Docker, source) ships the same `oxidant`
+binary, and the driver is simply the Spark Connect server:
+
+```sh
+oxidant spark server --port 50051
+```
+
+(From a source build: `./target/debug/oxidant spark server --port 50051`.)
+
+This starts Spark Connect gRPC on `50051` plus the Web UI / REST API on `4040`. With no
+workers registered it executes every query itself — there is nothing else to set up.
+
+Check what mode a running driver is in:
 
 ```sh
 curl -s http://localhost:4040/api/v1/cluster/status
 # {"mode":"single-node","workers":[],"version":"…"}
 ```
+
+`mode` is `single-node` (no workers), `local-cluster` (in-process workers, below), or
+`distributed` (remote workers attached).
 
 ## Local cluster (in-process workers)
 
@@ -26,7 +43,8 @@ hosts (below) for real clusters.
 
 ## Multiple hosts
 
-Run one driver plus a worker process on each additional machine.
+Run one driver plus a worker process on each additional machine. A worker is the same
+`oxidant` binary as the driver, started with the `worker` subcommand.
 
 On every worker host:
 
@@ -40,14 +58,22 @@ On the driver host, pass the static worker list at startup:
 oxidant spark server --port 50051 --workers host1:50561,host2:50561
 ```
 
+The startup log confirms registration (`Oxidant static workers: http://host1:50561,...`),
+and the status endpoint then reports `"mode":"distributed"` with the worker list.
+
 Equivalent alternatives:
 
 - Environment: `OXIDANT_WORKERS=host1:50561,host2:50561`
 - Per session, from any Spark Connect client: set the conf `spark.oxidant.workers` to the
-  same comma-separated list.
+  same comma-separated list (overrides the startup list for that session).
 
 **Registration is static.** The driver takes the worker set at startup; there is no dynamic
 join/leave. To add, remove, or replace workers, restart the driver with the new list.
+
+**Don't mix the two meanings of `--workers`.** In the default local mode it takes remote
+endpoints (`host:port,...`); with `--mode local-cluster` it takes an in-process worker
+*count*. A bare number without `--mode local-cluster` (or endpoints with it) is rejected at
+startup with a hint, rather than silently ignored.
 
 ## Docker workers
 
