@@ -8,6 +8,8 @@
 //!   --partial-sql "SELECT k, COUNT(*) c, SUM(v) s FROM t GROUP BY k" \
 //!   --final-sql   "SELECT k, SUM(c) c, SUM(s) s FROM shuffle_input GROUP BY k" \
 //!   --hash-keys 0
+//! oxidant sql -e "SELECT 1"                 # run SQL via the REST statement API (UI port)
+//! oxidant mcp                               # stdio MCP server over the same API
 //! ```
 
 use std::sync::Arc;
@@ -16,6 +18,11 @@ use oxidant_connect::{serve, ServerConfig};
 use oxidant_execution::driver::{run_distributed, Cluster, DistributedPlan};
 use oxidant_execution::flight::serve_worker;
 use oxidant_loom::Engine;
+
+mod client;
+mod mcp;
+#[cfg(test)]
+mod testutil;
 
 // Deep SQL (nested derived tables + large CASE trees in generated stage SQL) recurses well past
 // tokio's 2 MiB default worker-thread stack inside DataFusion's parser/optimizer once the async
@@ -40,6 +47,8 @@ async fn async_main() {
         Some("worker") => run_worker(&args).await,
         Some("driver") => run_driver(&args).await,
         Some("history-server") => run_history_server(&args).await,
+        Some("sql") => run_sql(&args).await,
+        Some("mcp") => run_mcp(&args).await,
         // `oxidant spark server ...` (and the bare `server` alias) keep the Spark Connect path.
         _ if args.iter().any(|a| a == "server") => run_server(&args).await,
         _ => {
@@ -63,6 +72,13 @@ fn usage() {
     eprintln!("  oxidant worker --port <PORT> [--data <parquet> --table <name>]");
     eprintln!(
         "  oxidant driver --workers <h:p,h:p> --partial-sql <SQL> --final-sql <SQL> --hash-keys <c,c>"
+    );
+    eprintln!(
+        "  oxidant sql (-e <SQL> | -f <FILE> | stdin) [--format table|csv|json] [--url <URL>] [--timeout <SECS>]"
+    );
+    eprintln!("  oxidant mcp [--url <URL>]");
+    eprintln!(
+        "  sql/mcp talk to the REST statement API on the UI port (default $OXIDANT_URL or http://localhost:4040)"
     );
 }
 
@@ -302,6 +318,269 @@ async fn run_driver(args: &[String]) -> oxidant_common::Result<()> {
     Ok(())
 }
 
+/// `oxidant mcp [--url U]` — serve the statements API as MCP tools on stdin/stdout.
+async fn run_mcp(args: &[String]) -> oxidant_common::Result<()> {
+    let url = client::resolve_url(flag(args, "--url"));
+    // Protocol frames own stdout; this is the one allowed diagnostic and it goes to stderr.
+    eprintln!("oxidant mcp server on stdio (statements API: {url})");
+    mcp::serve(&url).await
+}
+
+/// Where `oxidant sql` reads the statement text from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SqlSource {
+    /// `-e <SQL>`
+    Inline(String),
+    /// `-f <FILE>`
+    File(String),
+    /// Neither flag: slurp stdin.
+    Stdin,
+}
+
+/// `--format table|csv|json` for `oxidant sql` (default `table`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Table,
+    Csv,
+    Json,
+}
+
+impl OutputFormat {
+    fn parse(s: &str) -> oxidant_common::Result<Self> {
+        match s {
+            "table" => Ok(Self::Table),
+            "csv" => Ok(Self::Csv),
+            "json" => Ok(Self::Json),
+            other => Err(oxidant_common::Error::Io(format!(
+                "unknown --format `{other}` (expected table, csv or json)"
+            ))),
+        }
+    }
+}
+
+/// Parsed `oxidant sql` arguments.
+#[derive(Debug, PartialEq, Eq)]
+struct SqlOptions {
+    source: SqlSource,
+    format: OutputFormat,
+    url: String,
+    timeout_secs: u64,
+}
+
+fn sql_options(args: &[String]) -> oxidant_common::Result<SqlOptions> {
+    let source = match (flag(args, "-e"), flag(args, "-f")) {
+        (Some(sql), None) => SqlSource::Inline(sql),
+        (None, Some(path)) => SqlSource::File(path),
+        (Some(_), Some(_)) => {
+            return Err(oxidant_common::Error::Io(
+                "pass only one of -e <SQL> or -f <FILE>".into(),
+            ));
+        }
+        (None, None) => SqlSource::Stdin,
+    };
+    let format = match flag(args, "--format") {
+        Some(f) => OutputFormat::parse(&f)?,
+        None => OutputFormat::Table,
+    };
+    let timeout_secs = match flag(args, "--timeout") {
+        Some(t) => t.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| {
+            oxidant_common::Error::Io(format!(
+                "invalid --timeout `{t}` (expected a positive number of seconds)"
+            ))
+        })?,
+        None => client::DEFAULT_STATEMENT_TIMEOUT.as_secs(),
+    };
+    Ok(SqlOptions {
+        source,
+        format,
+        url: client::resolve_url(flag(args, "--url")),
+        timeout_secs,
+    })
+}
+
+/// `oxidant sql ...` — run one statement to completion via the REST API and print the result.
+/// Failed/canceled statements exit non-zero with the server error on stderr (via `main`).
+async fn run_sql(args: &[String]) -> oxidant_common::Result<()> {
+    let opts = sql_options(args)?;
+    let sql = read_sql(&opts.source).await?;
+    let client = client::StatementClient::new(&opts.url)?;
+    let terminal = client::run_to_completion(
+        &client,
+        &sql,
+        std::time::Duration::from_secs(opts.timeout_secs),
+    )
+    .await?;
+    let id = terminal["statementId"].as_str().unwrap_or("?").to_string();
+    match terminal["status"].as_str().unwrap_or("unknown") {
+        "succeeded" => print_result(&client, &id, opts.format).await,
+        "failed" => {
+            let detail = terminal["error"].as_str().unwrap_or("no error detail");
+            Err(oxidant_common::Error::Execution(format!(
+                "statement {id} failed: {detail}"
+            )))
+        }
+        other => Err(oxidant_common::Error::Execution(format!(
+            "statement {id} ended with status `{other}`"
+        ))),
+    }
+}
+
+/// Resolve the SQL text from `-e`/`-f`/stdin and reject empty input.
+async fn read_sql(source: &SqlSource) -> oxidant_common::Result<String> {
+    use tokio::io::AsyncReadExt;
+    let raw = match source {
+        SqlSource::Inline(sql) => sql.clone(),
+        SqlSource::File(path) => std::fs::read_to_string(path)
+            .map_err(|e| oxidant_common::Error::Io(format!("read {path}: {e}")))?,
+        SqlSource::Stdin => {
+            let mut buf = String::new();
+            tokio::io::stdin()
+                .read_to_string(&mut buf)
+                .await
+                .map_err(|e| oxidant_common::Error::Io(format!("read stdin: {e}")))?;
+            buf
+        }
+    };
+    let sql = raw.trim();
+    if sql.is_empty() {
+        return Err(oxidant_common::Error::Io(
+            "no SQL provided (use -e <SQL>, -f <FILE>, or pipe SQL on stdin)".into(),
+        ));
+    }
+    Ok(sql.to_string())
+}
+
+/// Fetch and print the result of a succeeded statement in the requested format.
+async fn print_result(
+    client: &client::StatementClient,
+    id: &str,
+    format: OutputFormat,
+) -> oxidant_common::Result<()> {
+    match format {
+        OutputFormat::Csv => {
+            let client::ResultBody::Csv(text) = client
+                .get_result(id, client::ResultFormat::Csv, None)
+                .await?
+            else {
+                return Err(oxidant_common::Error::Execution(
+                    "statements API returned JSON for a CSV result request".into(),
+                ));
+            };
+            // The API's CSV payload already ends with a newline.
+            print!("{text}");
+            Ok(())
+        }
+        OutputFormat::Json => {
+            let client::ResultBody::Json(doc) = client
+                .get_result(id, client::ResultFormat::Json, None)
+                .await?
+            else {
+                return Err(oxidant_common::Error::Execution(
+                    "statements API returned CSV for a JSON result request".into(),
+                ));
+            };
+            let pretty = serde_json::to_string_pretty(&doc)
+                .map_err(|e| oxidant_common::Error::Io(format!("encode result json: {e}")))?;
+            println!("{pretty}");
+            Ok(())
+        }
+        OutputFormat::Table => {
+            let client::ResultBody::Json(doc) = client
+                .get_result(id, client::ResultFormat::Json, None)
+                .await?
+            else {
+                return Err(oxidant_common::Error::Execution(
+                    "statements API returned CSV for a JSON result request".into(),
+                ));
+            };
+            print!("{}", render_table(&doc));
+            Ok(())
+        }
+    }
+}
+
+/// Render a result document (`{"schema":{"fields":[{"name",...}]},"rows":[{...}],...}`) as an
+/// aligned ASCII table with a header, followed by a `(N rows)` line (`[truncated]` when the
+/// server cut rows at the result limit).
+fn render_table(doc: &serde_json::Value) -> String {
+    let mut columns: Vec<String> = doc["schema"]["fields"]
+        .as_array()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|f| f["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let empty_rows = Vec::new();
+    let rows: &Vec<serde_json::Value> = doc["rows"].as_array().unwrap_or(&empty_rows);
+    // Defensive fallback: no schema doc — derive columns from the first row's keys.
+    if columns.is_empty() {
+        if let Some(first) = rows.first().and_then(serde_json::Value::as_object) {
+            columns = first.keys().cloned().collect();
+        }
+    }
+    let cell = |row: &serde_json::Value, col: &str| -> String {
+        match row.get(col) {
+            None | Some(serde_json::Value::Null) => "null".to_string(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+        }
+    };
+    let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    for row in rows {
+        for (i, col) in columns.iter().enumerate() {
+            widths[i] = widths[i].max(cell(row, col).len());
+        }
+    }
+    // One table cell: ` value ` left-aligned and right-padded to the column width.
+    let push_cell = |out: &mut String, value: &str, width: usize| {
+        out.push(' ');
+        out.push_str(value);
+        for _ in value.len()..width {
+            out.push(' ');
+        }
+        out.push_str(" |");
+    };
+    let mut out = String::new();
+    if !columns.is_empty() {
+        let border = |out: &mut String| {
+            out.push('+');
+            for w in &widths {
+                for _ in 0..*w + 2 {
+                    out.push('-');
+                }
+                out.push('+');
+            }
+            out.push('\n');
+        };
+        border(&mut out);
+        out.push('|');
+        for (col, w) in columns.iter().zip(&widths) {
+            push_cell(&mut out, col, *w);
+        }
+        out.push('\n');
+        border(&mut out);
+        for row in rows {
+            out.push('|');
+            for (col, w) in columns.iter().zip(&widths) {
+                push_cell(&mut out, &cell(row, col), *w);
+            }
+            out.push('\n');
+        }
+        border(&mut out);
+    }
+    let count = rows.len();
+    out.push('(');
+    out.push_str(&count.to_string());
+    out.push_str(if count == 1 { " row)" } else { " rows)" });
+    if doc["truncated"].as_bool().unwrap_or(false) {
+        out.push_str(" [truncated]");
+    }
+    out.push('\n');
+    out
+}
+
 /// Read the value following `--name` in `args`.
 fn flag(args: &[String], name: &str) -> Option<String> {
     let eq = format!("{name}=");
@@ -365,5 +644,144 @@ mod tests {
     fn ui_bind_invalid_value_falls_back_to_default() {
         let a = args(&["oxidant", "spark", "server", "--ui-bind", "not-an-ip"]);
         assert_eq!(ui_bind_addr(&a), std::net::IpAddr::from([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn sql_options_parse_inline_with_defaults() {
+        let opts = sql_options(&args(&[
+            "oxidant",
+            "sql",
+            "-e",
+            "SELECT 1",
+            "--url",
+            "http://h:9/",
+        ]))
+        .unwrap();
+        assert_eq!(opts.source, SqlSource::Inline("SELECT 1".to_string()));
+        assert_eq!(opts.format, OutputFormat::Table);
+        assert_eq!(opts.url, "http://h:9");
+        assert_eq!(opts.timeout_secs, 300);
+    }
+
+    #[test]
+    fn sql_options_parse_file_source_and_csv_format() {
+        let opts = sql_options(&args(&[
+            "oxidant",
+            "sql",
+            "-f",
+            "/tmp/q.sql",
+            "--format=csv",
+            "--timeout",
+            "5",
+            "--url",
+            "http://h:9",
+        ]))
+        .unwrap();
+        assert_eq!(opts.source, SqlSource::File("/tmp/q.sql".to_string()));
+        assert_eq!(opts.format, OutputFormat::Csv);
+        assert_eq!(opts.timeout_secs, 5);
+    }
+
+    #[test]
+    fn sql_options_default_source_is_stdin() {
+        let opts = sql_options(&args(&["oxidant", "sql", "--url", "http://h:9"])).unwrap();
+        assert_eq!(opts.source, SqlSource::Stdin);
+    }
+
+    #[test]
+    fn sql_options_rejects_e_and_f_together() {
+        let parsed = sql_options(&args(&["oxidant", "sql", "-e", "SELECT 1", "-f", "q.sql"]));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn sql_options_reject_unknown_format_and_bad_timeout() {
+        let parsed = sql_options(&args(&[
+            "oxidant", "sql", "-e", "SELECT 1", "--format", "xml",
+        ]));
+        assert!(parsed.is_err());
+        let parsed = sql_options(&args(&[
+            "oxidant",
+            "sql",
+            "-e",
+            "SELECT 1",
+            "--timeout",
+            "soon",
+        ]));
+        assert!(parsed.is_err());
+        let parsed = sql_options(&args(&[
+            "oxidant",
+            "sql",
+            "-e",
+            "SELECT 1",
+            "--timeout",
+            "0",
+        ]));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn sql_options_accept_json_format() {
+        let opts = sql_options(&args(&[
+            "oxidant",
+            "sql",
+            "-e",
+            "SELECT 1",
+            "--format",
+            "json",
+            "--url",
+            "http://h:9",
+        ]))
+        .unwrap();
+        assert_eq!(opts.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn mcp_url_comes_from_flag_env_or_default() {
+        let a = args(&["oxidant", "mcp", "--url", "http://h:4040/"]);
+        assert_eq!(client::resolve_url(flag(&a, "--url")), "http://h:4040");
+        let a = args(&["oxidant", "mcp"]);
+        assert!(!client::resolve_url(flag(&a, "--url")).is_empty());
+    }
+
+    #[test]
+    fn render_table_aligns_columns_and_counts_rows() {
+        let doc = serde_json::json!({
+            "schema": { "fields": [{ "name": "k", "type": "Int32" }, { "name": "label", "type": "String" }] },
+            "rows": [
+                { "k": 1, "label": "one" },
+                { "k": 22, "label": null },
+            ],
+            "rowCount": 2,
+            "truncated": false,
+        });
+        let rendered = render_table(&doc);
+        let expected = "+----+-------+\n\
+                        | k  | label |\n\
+                        +----+-------+\n\
+                        | 1  | one   |\n\
+                        | 22 | null  |\n\
+                        +----+-------+\n\
+                        (2 rows)\n";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn render_table_marks_truncation_and_empty_results() {
+        let doc = serde_json::json!({
+            "schema": { "fields": [{ "name": "hello", "type": "Int32" }] },
+            "rows": [{ "hello": 1 }],
+            "rowCount": 1,
+            "truncated": true,
+        });
+        assert!(render_table(&doc).ends_with("(1 row) [truncated]\n"));
+
+        let empty = serde_json::json!({
+            "schema": { "fields": [] },
+            "rows": [],
+            "rowCount": 0,
+            "truncated": false,
+        });
+        assert_eq!(render_table(&empty), "(0 rows)\n");
     }
 }

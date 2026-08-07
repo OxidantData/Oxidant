@@ -4195,6 +4195,7 @@ dependencies = [
 name = "oxidant-cli"
 version = "0.0.0"
 dependencies = [
+ "axum 0.8.9",
  "datafusion",
  "oxidant-common",
  "oxidant-connect",
@@ -4203,6 +4204,7 @@ dependencies = [
  "oxidant-observability",
  "oxidant-ui-server",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
