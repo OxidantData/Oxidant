@@ -24,6 +24,10 @@ on:
 
 permissions:
   contents: write
+  # Dispatching binaries.yml / oxidant-image.yml via the API needs actions:write —
+  # without it the bumper's final step 403s ("Resource not accessible by
+  # integration") after the tag is already pushed (bit v0.1.1's release run).
+  actions: write
 
 jobs:
   release:
