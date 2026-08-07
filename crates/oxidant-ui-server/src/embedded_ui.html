@@ -43,6 +43,36 @@
     .bar { height: 8px; background: var(--accent); border-radius: 4px; }
     .bar-wrap { background: var(--border); border-radius: 4px; height: 8px; flex: 1; }
     .flex { display: flex; align-items: center; gap: 8px; }
+    textarea { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; width: 100%; font-family: var(--mono); font-size: 13px; padding: 10px 12px; resize: vertical; }
+    textarea:focus { outline: none; border-color: var(--accent); }
+    .btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    .btn-secondary:hover { border-color: var(--muted); }
+    .btn[disabled], .btn-secondary[disabled] { opacity: 0.5; cursor: default; }
+    .editor-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; align-items: start; }
+    @media (max-width: 900px) { .editor-grid { grid-template-columns: 1fr; } }
+    .error-pane { background: rgba(220,38,38,0.08); border: 1px solid var(--danger); color: var(--danger); border-radius: 6px; padding: 12px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; }
+    .note { color: var(--muted); font-size: 12px; margin: 8px 0; }
+    .muted { color: var(--muted); }
+    .result-wrap { overflow-x: auto; }
+    .status-succeeded { color: var(--success); }
+    .status-failed { color: var(--danger); }
+    .status-canceled, .status-pending, .status-running { color: var(--warning); }
+    .stmt-item { padding: 8px 10px; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 13px; }
+    .stmt-item:hover { background: rgba(255,255,255,0.03); }
+    .stmt-sql { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .nb-cell { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .nb-toolbar { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; align-items: center; }
+    .nb-tag { border: 1px solid var(--border); border-radius: 4px; color: var(--muted); padding: 2px 8px; font-size: 12px; }
+    .nb-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 12px; }
+    .nb-btn:hover { color: var(--text); border-color: var(--muted); }
+    .nb-btn[disabled] { opacity: 0.4; cursor: default; }
+    .nb-output { margin-top: 10px; overflow-x: auto; }
+    .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 12px 0 6px; }
+    .md p { margin: 6px 0; }
+    .md code { font-family: var(--mono); background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+    .md pre { font-family: var(--mono); font-size: 12px; background: var(--bg); padding: 12px; border-radius: 6px; overflow: auto; margin: 8px 0; white-space: pre-wrap; }
+    .md ul { padding-left: 20px; margin: 6px 0; }
+    .md a { color: var(--accent); }
   </style>
 </head>
 <body>
@@ -54,6 +84,8 @@
     <button data-tab="jobs" class="active">Jobs</button>
     <button data-tab="stages">Stages</button>
     <button data-tab="sql">SQL</button>
+    <button data-tab="editor">Editor</button>
+    <button data-tab="notebook">Notebook</button>
     <button data-tab="executors">Executors</button>
     <button data-tab="environment">Environment</button>
     <button data-tab="compare">Compare</button>
@@ -62,6 +94,8 @@
     <section id="panel-jobs" class="panel"></section>
     <section id="panel-stages" class="panel hidden"></section>
     <section id="panel-sql" class="panel hidden"></section>
+    <section id="panel-editor" class="panel hidden"></section>
+    <section id="panel-notebook" class="panel hidden"></section>
     <section id="panel-executors" class="panel hidden"></section>
     <section id="panel-environment" class="panel hidden"></section>
     <section id="panel-compare" class="panel hidden"></section>
@@ -216,6 +250,456 @@
       }
     }
 
+    /* ---------- SQL editor + notebook (REST statements API) ---------- */
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const TERMINAL = { succeeded: 1, failed: 1, canceled: 1 };
+    const RESULT_LIMIT = 500;
+
+    async function readJson(r) {
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      return d;
+    }
+
+    const stmtApi = {
+      submit: (sql) => fetch('/api/v1/statements?wait=true&timeout=60', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql }),
+      }).then(readJson),
+      list: () => fetch('/api/v1/statements').then(readJson),
+      get: (id) => fetch('/api/v1/statements/' + id).then(readJson),
+      result: (id, limit) => fetch('/api/v1/statements/' + id + '/result?format=json&limit=' + (limit || RESULT_LIMIT)).then(readJson),
+      cancel: (id) => fetch('/api/v1/statements/' + id + '/cancel', { method: 'POST' }).then(readJson),
+    };
+
+    // Poll a pending/running statement every 1s until it reaches a terminal status.
+    async function waitStatement(doc, onUpdate) {
+      let cur = doc;
+      while (!TERMINAL[cur.status]) {
+        if (onUpdate) onUpdate(cur);
+        await new Promise(r => setTimeout(r, 1000));
+        cur = await stmtApi.get(cur.statementId);
+      }
+      if (onUpdate) onUpdate(cur);
+      return cur;
+    }
+
+    // Submit with ?wait=true&timeout=60; keep polling if still running after that.
+    async function runStatement(sql, onUpdate) {
+      return waitStatement(await stmtApi.submit(sql), onUpdate);
+    }
+
+    function cellHtml(v) {
+      if (v === null || v === undefined) return '<td class="muted">NULL</td>';
+      if (typeof v === 'object') return '<td>' + esc(JSON.stringify(v)) + '</td>';
+      return '<td>' + esc(String(v)) + '</td>';
+    }
+
+    // Schema-aware result table; caps rendered rows (fetch limit) with a "showing N of M" note.
+    function resultTableHtml(res, fullRowCount) {
+      const fields = (res.schema && res.schema.fields) || [];
+      const cols = fields.length ? fields.map(f => f.name) : Object.keys(res.rows[0] || {});
+      const typeOf = (c) => { const f = fields.find(f => f.name === c); return f ? f.type : ''; };
+      const total = fullRowCount != null ? fullRowCount : res.rowCount;
+      let html = total > res.rows.length
+        ? `<div class="note">Showing ${res.rows.length.toLocaleString()} of ${total.toLocaleString()} rows (limit ${RESULT_LIMIT}).</div>`
+        : `<div class="note">${res.rows.length.toLocaleString()} row${res.rows.length === 1 ? '' : 's'}</div>`;
+      html += '<div class="result-wrap"><table><thead><tr>' +
+        cols.map(c => `<th>${esc(c)} <span class="muted">${esc(typeOf(c))}</span></th>`).join('') +
+        '</tr></thead><tbody>' +
+        res.rows.map(r => '<tr>' + cols.map(c => cellHtml(r[c])).join('') + '</tr>').join('') +
+        '</tbody></table></div>';
+      return html;
+    }
+
+    /* ---------- Editor panel ---------- */
+    let editorBusy = false;
+    let editorRunId = null;
+
+    function renderEditor() {
+      const el = document.getElementById('panel-editor');
+      el.innerHTML = `<div class="editor-grid">
+        <div>
+          <div class="card">
+            <label for="editor-sql">SQL — Cmd/Ctrl+Enter to run</label>
+            <textarea id="editor-sql" rows="8" spellcheck="false">SELECT 1 AS hello</textarea>
+            <div class="flex" style="margin-top:12px">
+              <button class="btn" id="editor-run">Run</button>
+              <button class="btn-secondary" id="editor-cancel" disabled>Cancel</button>
+              <span class="note" id="editor-status" style="margin:0"></span>
+            </div>
+          </div>
+          <div id="editor-error" style="margin-bottom:16px"></div>
+          <div id="editor-result"></div>
+        </div>
+        <div class="card">
+          <div class="flex" style="justify-content:space-between;margin-bottom:8px">
+            <strong>Recent statements</strong>
+            <button class="nb-btn" id="editor-refresh">Refresh</button>
+          </div>
+          <div id="editor-statements"><span class="muted">Loading…</span></div>
+        </div>
+      </div>`;
+      document.getElementById('editor-run').onclick = runEditor;
+      document.getElementById('editor-cancel').onclick = cancelEditor;
+      document.getElementById('editor-refresh').onclick = loadEditorStatements;
+      document.getElementById('editor-sql').addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); runEditor(); }
+      });
+      loadEditorStatements();
+    }
+
+    function setEditorRunning(running) {
+      document.getElementById('editor-run').disabled = running;
+      document.getElementById('editor-cancel').disabled = !running;
+    }
+
+    function setEditorStatus(doc) {
+      const el = document.getElementById('editor-status');
+      if (!doc) { el.textContent = ''; return; }
+      el.innerHTML = `<span class="status-${doc.status}">${doc.status}</span>` +
+        (doc.durationMs != null ? ' · ' + fmtMs(doc.durationMs) : '') +
+        (doc.rowCount != null ? ' · ' + doc.rowCount.toLocaleString() + ' rows' : '');
+    }
+
+    // Render a terminal statement doc into the given result/error containers.
+    async function showStatementResult(doc, resultEl, errorEl) {
+      if (doc.status === 'failed') {
+        resultEl.innerHTML = '';
+        errorEl.innerHTML = `<div class="error-pane">${esc(doc.error || 'statement failed')}</div>`;
+        return;
+      }
+      if (doc.status === 'canceled') {
+        resultEl.innerHTML = '<div class="card muted">Statement canceled.</div>';
+        return;
+      }
+      if (doc.status !== 'succeeded') return;
+      const res = await stmtApi.result(doc.statementId, RESULT_LIMIT);
+      resultEl.innerHTML = '<div class="card">' + resultTableHtml(res, doc.rowCount) + '</div>';
+    }
+
+    async function runEditor() {
+      if (editorBusy) return;
+      const sql = document.getElementById('editor-sql').value.trim();
+      if (!sql) return;
+      editorBusy = true;
+      setEditorRunning(true);
+      setEditorStatus(null);
+      document.getElementById('editor-error').innerHTML = '';
+      document.getElementById('editor-result').innerHTML = '';
+      try {
+        const doc = await runStatement(sql, (d) => { editorRunId = d.statementId; setEditorStatus(d); });
+        await showStatementResult(doc, document.getElementById('editor-result'), document.getElementById('editor-error'));
+      } catch (e) {
+        document.getElementById('editor-error').innerHTML = `<div class="error-pane">${esc(e.message)}</div>`;
+      } finally {
+        editorBusy = false;
+        editorRunId = null;
+        setEditorRunning(false);
+        loadEditorStatements();
+      }
+    }
+
+    async function cancelEditor() {
+      if (!editorRunId) return;
+      try { await stmtApi.cancel(editorRunId); } catch (_) { /* already terminal — the poll loop surfaces it */ }
+    }
+
+    async function loadEditorStatements() {
+      const el = document.getElementById('editor-statements');
+      if (!el) return;
+      try {
+        const d = await stmtApi.list();
+        const stmts = d.statements || [];
+        if (!stmts.length) { el.innerHTML = '<span class="muted">No statements yet.</span>'; return; }
+        el.innerHTML = stmts.map(s => `<div class="stmt-item" data-id="${s.statementId}">
+          <div class="flex" style="justify-content:space-between">
+            <span class="status-${s.status}">${s.status}</span>
+            <span class="muted">${fmtMs(s.durationMs)}</span>
+          </div>
+          <div class="stmt-sql" title="${esc(s.sql)}">${esc(s.sql)}</div>
+        </div>`).join('');
+        el.querySelectorAll('.stmt-item').forEach(item => { item.onclick = () => loadStatement(item.dataset.id); });
+      } catch (e) {
+        el.innerHTML = `<span class="muted">Failed to load: ${esc(e.message)}</span>`;
+      }
+    }
+
+    // Click a recent statement: reload its status/result into the editor panes.
+    async function loadStatement(id) {
+      const resultEl = document.getElementById('editor-result');
+      const errorEl = document.getElementById('editor-error');
+      errorEl.innerHTML = '';
+      resultEl.innerHTML = '<div class="card muted">Loading…</div>';
+      try {
+        const doc = await waitStatement(await stmtApi.get(id), setEditorStatus);
+        await showStatementResult(doc, resultEl, errorEl);
+      } catch (e) {
+        resultEl.innerHTML = '';
+        errorEl.innerHTML = `<div class="error-pane">${esc(e.message)}</div>`;
+      }
+    }
+
+    /* ---------- Notebook panel ---------- */
+    const NB_KEY = 'oxidant.notebook.v1';
+    const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    let notebook = loadNotebook();
+    const nbOutputs = {};  // cellId -> { running, doc, result, error } (in-memory only)
+    let nbRunningAll = false;
+
+    function loadNotebook() {
+      try {
+        const d = JSON.parse(localStorage.getItem(NB_KEY) || 'null');
+        if (d && Array.isArray(d.cells)) {
+          const cells = d.cells
+            .filter(c => c && (c.type === 'sql' || c.type === 'md' || c.type === 'markdown'))
+            .map(c => ({ id: c.id || uid(), type: c.type === 'markdown' ? 'md' : c.type, source: String(c.source || '') }));
+          if (cells.length) return { cells };
+        }
+      } catch (_) {}
+      return { cells: [{ id: uid(), type: 'sql', source: 'SELECT 1 AS hello' }] };
+    }
+
+    function saveNotebook() {
+      localStorage.setItem(NB_KEY, JSON.stringify({
+        version: 1,
+        cells: notebook.cells.map(c => ({ type: c.type, source: c.source })),
+      }));
+    }
+
+    // Tiny Markdown renderer (headings, bold/italic, inline code, code fences, lists,
+    // links) — hand-rolled so the binary stays self-contained (no CDN / air-gap).
+    function mdInline(s) {
+      let out = esc(s);
+      const codes = [];
+      out = out.replace(/`([^`]+)`/g, (m, c) => { codes.push(c); return '\u0000' + (codes.length - 1) + '\u0000'; });
+      out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      out = out.replace(/\*([^*\s][^*]*)\*/g, '<em>$1</em>');
+      out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+      out = out.replace(/\u0000(\d+)\u0000/g, (m, i) => '<code>' + codes[+i] + '</code>');
+      return out;
+    }
+
+    function renderMarkdown(src) {
+      const out = [];
+      let inFence = false, fence = [], inList = false;
+      const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
+      for (const line of src.split('\n')) {
+        if (line.trim().startsWith('```')) {
+          if (inFence) { out.push('<pre>' + esc(fence.join('\n')) + '</pre>'); fence = []; inFence = false; }
+          else { closeList(); inFence = true; }
+          continue;
+        }
+        if (inFence) { fence.push(line); continue; }
+        const h = line.match(/^(#{1,6})\s+(.*)$/);
+        if (h) { closeList(); const lvl = h[1].length; out.push('<h' + lvl + '>' + mdInline(h[2]) + '</h' + lvl + '>'); continue; }
+        const li = line.match(/^\s*[-*]\s+(.*)$/);
+        if (li) { if (!inList) { out.push('<ul>'); inList = true; } out.push('<li>' + mdInline(li[1]) + '</li>'); continue; }
+        closeList();
+        if (!line.trim()) continue;
+        out.push('<p>' + mdInline(line) + '</p>');
+      }
+      closeList();
+      if (inFence) out.push('<pre>' + esc(fence.join('\n')) + '</pre>');
+      return out.join('\n');
+    }
+
+    function renderNotebook() {
+      const el = document.getElementById('panel-notebook');
+      el.innerHTML = `<div class="card">
+        <div class="flex" style="flex-wrap:wrap">
+          <button class="btn" id="nb-add-sql">+ SQL cell</button>
+          <button class="btn-secondary" id="nb-add-md">+ Markdown cell</button>
+          <button class="btn-secondary" id="nb-run-all">Run all</button>
+          <button class="btn-secondary" id="nb-export">Export</button>
+          <button class="btn-secondary" id="nb-import">Import</button>
+          <input type="file" id="nb-file" accept="application/json" class="hidden" />
+          <span class="note" id="nb-status" style="margin:0"></span>
+        </div>
+      </div>
+      <div id="nb-cells"></div>`;
+      document.getElementById('nb-add-sql').onclick = () => addNbCell('sql');
+      document.getElementById('nb-add-md').onclick = () => addNbCell('md');
+      document.getElementById('nb-run-all').onclick = runAllNbCells;
+      document.getElementById('nb-export').onclick = exportNotebook;
+      document.getElementById('nb-import').onclick = () => document.getElementById('nb-file').click();
+      document.getElementById('nb-file').onchange = (e) => {
+        const f = e.target.files && e.target.files[0];
+        if (f) importNotebook(f);
+        e.target.value = '';
+      };
+      renderNbCells();
+    }
+
+    function addNbCell(type) {
+      notebook.cells.push({ id: uid(), type, source: '' });
+      saveNotebook();
+      renderNbCells();
+    }
+
+    function nbCellHtml(c, i) {
+      const n = notebook.cells.length;
+      const rows = Math.min(12, Math.max(3, c.source.split('\n').length + 1));
+      return `<div class="nb-cell" data-id="${c.id}">
+        <div class="nb-toolbar">
+          <span class="nb-tag">${c.type === 'sql' ? 'SQL' : 'Markdown'}</span>
+          ${c.type === 'sql' ? '<button class="nb-btn" data-act="run">Run</button>' : ''}
+          <button class="nb-btn" data-act="up" ${i === 0 ? 'disabled' : ''}>&#8593;</button>
+          <button class="nb-btn" data-act="down" ${i === n - 1 ? 'disabled' : ''}>&#8595;</button>
+          <button class="nb-btn" data-act="del">Delete</button>
+        </div>
+        <textarea rows="${rows}" spellcheck="false">${esc(c.source)}</textarea>
+        ${c.type === 'md' ? `<div class="md nb-output" id="nb-prev-${c.id}"></div>` : ''}
+        ${c.type === 'sql' ? `<div class="nb-output" id="nb-out-${c.id}"></div>` : ''}
+      </div>`;
+    }
+
+    function renderNbCells() {
+      const wrap = document.getElementById('nb-cells');
+      if (!notebook.cells.length) {
+        wrap.innerHTML = '<div class="card muted">Empty notebook. Add a cell to get started.</div>';
+        return;
+      }
+      wrap.innerHTML = notebook.cells.map((c, i) => nbCellHtml(c, i)).join('');
+      notebook.cells.forEach((c, i) => bindNbCell(c, i));
+      notebook.cells.forEach(c => {
+        if (c.type === 'md') paintNbPreview(c.id);
+        else if (nbOutputs[c.id]) paintNbOutput(c.id);
+      });
+    }
+
+    function bindNbCell(c, i) {
+      const root = document.querySelector('.nb-cell[data-id="' + c.id + '"]');
+      if (!root) return;
+      const ta = root.querySelector('textarea');
+      // Keep cell.source in sync as the user types WITHOUT re-rendering (a re-render
+      // would clobber the textarea); full renders happen on structural ops only.
+      ta.addEventListener('input', () => {
+        c.source = ta.value;
+        saveNotebook();
+        if (c.type === 'md') paintNbPreview(c.id);
+      });
+      ta.addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && c.type === 'sql') { e.preventDefault(); runNbCell(c.id); }
+      });
+      root.querySelectorAll('.nb-btn[data-act]').forEach(b => {
+        b.onclick = () => {
+          const act = b.dataset.act;
+          if (act === 'run') runNbCell(c.id);
+          else if (act === 'del') {
+            notebook.cells = notebook.cells.filter(x => x.id !== c.id);
+            delete nbOutputs[c.id];
+            saveNotebook();
+            renderNbCells();
+          } else if (act === 'up' || act === 'down') {
+            const j = act === 'up' ? i - 1 : i + 1;
+            if (j < 0 || j >= notebook.cells.length) return;
+            const tmp = notebook.cells[i];
+            notebook.cells[i] = notebook.cells[j];
+            notebook.cells[j] = tmp;
+            saveNotebook();
+            renderNbCells();
+          }
+        };
+      });
+    }
+
+    function paintNbPreview(id) {
+      const el = document.getElementById('nb-prev-' + id);
+      const c = notebook.cells.find(x => x.id === id);
+      if (el && c) el.innerHTML = renderMarkdown(c.source);
+    }
+
+    async function runNbCell(id) {
+      const c = notebook.cells.find(x => x.id === id);
+      if (!c || c.type !== 'sql' || !c.source.trim()) return;
+      if (nbOutputs[id] && nbOutputs[id].running) return;
+      nbOutputs[id] = { running: true };
+      paintNbOutput(id);
+      try {
+        const doc = await runStatement(c.source, (d) => { nbOutputs[id] = { running: !TERMINAL[d.status], doc: d }; paintNbOutput(id); });
+        if (doc.status === 'succeeded') {
+          nbOutputs[id] = { doc, result: await stmtApi.result(doc.statementId, RESULT_LIMIT) };
+        } else {
+          nbOutputs[id] = { doc };
+        }
+      } catch (e) {
+        nbOutputs[id] = { error: e.message };
+      }
+      paintNbOutput(id);
+    }
+
+    function paintNbOutput(id) {
+      const el = document.getElementById('nb-out-' + id);
+      if (!el) return;
+      const o = nbOutputs[id];
+      if (!o) { el.innerHTML = ''; return; }
+      if (o.running) {
+        el.innerHTML = `<div class="note">Running… ${o.doc ? `<span class="status-${o.doc.status}">${o.doc.status}</span>` : ''}</div>`;
+        return;
+      }
+      if (o.error) { el.innerHTML = `<div class="error-pane">${esc(o.error)}</div>`; return; }
+      if (o.doc && o.doc.status === 'failed') { el.innerHTML = `<div class="error-pane">${esc(o.doc.error || 'statement failed')}</div>`; return; }
+      if (o.doc && o.doc.status === 'canceled') { el.innerHTML = '<div class="note">Canceled.</div>'; return; }
+      if (o.doc && o.result) {
+        el.innerHTML = `<div class="note">succeeded · ${fmtMs(o.doc.durationMs)}</div>` + resultTableHtml(o.result, o.doc.rowCount);
+      }
+    }
+
+    async function runAllNbCells() {
+      if (nbRunningAll) return;
+      nbRunningAll = true;
+      const status = document.getElementById('nb-status');
+      try {
+        for (const c of notebook.cells) {
+          if (c.type !== 'sql') continue;
+          status.textContent = 'Running cell ' + (notebook.cells.indexOf(c) + 1) + ' of ' + notebook.cells.length + '…';
+          await runNbCell(c.id);
+        }
+      } finally {
+        status.textContent = '';
+        nbRunningAll = false;
+      }
+    }
+
+    function exportNotebook() {
+      const data = JSON.stringify({
+        version: 1,
+        cells: notebook.cells.map(c => ({ type: c.type, source: c.source })),
+      }, null, 2);
+      const blob = new Blob([data], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'oxidant-notebook.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(a.href);
+    }
+
+    function importNotebook(file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const d = JSON.parse(String(reader.result));
+          const cells = ((d && d.cells) || [])
+            .filter(c => c && (c.type === 'sql' || c.type === 'md' || c.type === 'markdown'))
+            .map(c => ({ id: uid(), type: c.type === 'markdown' ? 'md' : c.type, source: String(c.source || '') }));
+          if (!cells.length) throw new Error('no cells in file');
+          notebook = { cells };
+          Object.keys(nbOutputs).forEach(k => delete nbOutputs[k]);
+          saveNotebook();
+          renderNotebook();
+        } catch (e) {
+          alert('Import failed: ' + e.message);
+        }
+      };
+      reader.readAsText(file);
+    }
+
+    renderEditor();
+    renderNotebook();
     refresh();
     setInterval(refresh, 2000);
     try {

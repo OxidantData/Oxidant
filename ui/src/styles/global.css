@@ -33,4 +33,38 @@ body {
   .status-SUCCEEDED, .status-COMPLETE, .status-SUCCESS { @apply text-success; }
   .status-FAILED { @apply text-danger; }
   .status-RUNNING, .status-ACTIVE { @apply text-warning; }
+  /* REST statement lifecycle statuses (lowercase, per the API contract). */
+  .stmt-succeeded { @apply text-success; }
+  .stmt-failed { @apply text-danger; }
+  .stmt-canceled, .stmt-pending, .stmt-running { @apply text-warning; }
+  .nb-btn {
+    @apply rounded border border-border px-2 py-0.5 text-xs text-muted hover:border-muted hover:text-text disabled:opacity-40;
+  }
 }
+
+/* Rendered Markdown cells (class applied to the container, output of lib/markdown.ts). */
+.md-preview h1, .md-preview h2, .md-preview h3,
+.md-preview h4, .md-preview h5, .md-preview h6 {
+  margin: 12px 0 6px;
+  font-weight: 600;
+}
+.md-preview p { margin: 6px 0; }
+.md-preview code {
+  font-family: var(--oxidant-font-mono);
+  background: var(--oxidant-bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.md-preview pre {
+  font-family: var(--oxidant-font-mono);
+  font-size: 12px;
+  background: var(--oxidant-bg);
+  padding: 12px;
+  border-radius: 6px;
+  overflow: auto;
+  margin: 8px 0;
+  white-space: pre-wrap;
+}
+.md-preview ul { padding-left: 20px; margin: 6px 0; list-style: disc; }
+.md-preview a { color: var(--oxidant-accent); }
