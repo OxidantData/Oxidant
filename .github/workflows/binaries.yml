@@ -413,6 +413,16 @@ jobs:
       - name: Upload packages to the GitHub Release
         run: gh release upload "${{ needs.plan.outputs.tag }}" dist-packages/* --clobber
 
+      # The curl|sh installer only installs the binary (cargo-dist ships no data
+      # files), so the bundled sample tables need a standalone download for that
+      # install path — documented in docs/getting-started.md. One matrix leg is
+      # enough; the archive is platform-independent.
+      - name: Upload sample-data archive to the GitHub Release
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          tar -czf sample-data.tar.gz sample-data
+          gh release upload "${{ needs.plan.outputs.tag }}" sample-data.tar.gz --clobber
+
   announce:
     needs:
       - plan
