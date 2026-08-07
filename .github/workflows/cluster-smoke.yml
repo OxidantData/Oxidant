@@ -40,7 +40,8 @@ jobs:
           for w in worker1 worker2; do
             docker run --rm -d --network oxidant-smoke --name "$w" "${{ inputs.image }}" \
               worker --port 50561 \
-              --data /opt/oxidant/sample-data/parquet/tpch_lineitem.parquet --table lineitem
+              --data /opt/oxidant/sample-data/parquet/tpch_lineitem.parquet \
+              --table samples.tpch_lineitem
           done
           # Strict mode: any query the distributed planner rejects is an ERROR,
           # not a silent local fallback — so a success below is proof of real
@@ -72,16 +73,13 @@ jobs:
           curl -sf http://localhost:4040/ | tee ui.html | grep -qi "oxidant"
           echo "UI OK ($(wc -c < ui.html) bytes)"
 
-      - name: Run a distributed query (strict) and a samples query
+      - name: Run a distributed query (strict)
         run: |
-          # Stage SQL re-parses on workers, so the table must exist everywhere by the
-          # same name: workers register it via --data/--table at startup; the driver
-          # gets the same bare name as a ListingTable over the same in-image file.
-          curl -sf -X POST "http://localhost:4040/api/v1/statements?wait=true&timeout=60" \
-            -H 'Content-Type: application/json' \
-            -d '{"sql":"CREATE EXTERNAL TABLE lineitem STORED AS PARQUET LOCATION '"'"'/opt/oxidant/sample-data/parquet/tpch_lineitem.parquet'"'"'"}' | tee ddl.json
-          python3 -c "import json; d=json.load(open('ddl.json')); assert d['status']=='succeeded', d; print('driver table registered')"
-          SQL_DIST="SELECT l_returnflag, COUNT(*) AS c, SUM(l_quantity) AS s FROM lineitem GROUP BY l_returnflag"
+          # Stage SQL re-parses on workers, so the table must exist under the same name
+          # on both sides of the wire — no DDL needed (strict mode rejects DDL):
+          # the driver preloads samples.tpch_lineitem from the image's sample-data env,
+          # and the workers registered the same 3-part name via --table above.
+          SQL_DIST="SELECT l_returnflag, COUNT(*) AS c, SUM(l_quantity) AS s FROM samples.tpch_lineitem GROUP BY l_returnflag"
           curl -sf -X POST "http://localhost:4040/api/v1/statements?wait=true&timeout=120" \
             -H 'Content-Type: application/json' \
             -d "{\"sql\":\"$SQL_DIST\"}" | tee dist.json
@@ -94,10 +92,6 @@ jobs:
           assert d['rowCount'] == 4, d
           print('distributed query OK:', d['rowCount'], 'groups,', d['durationMs'], 'ms')
           EOF
-          curl -sf -X POST "http://localhost:4040/api/v1/statements?wait=true&timeout=60" \
-            -H 'Content-Type: application/json' \
-            -d '{"sql":"SELECT count(*) AS n FROM samples.tpch_nation"}' | tee samples.json
-          python3 -c "import json; d=json.load(open('samples.json')); assert d['status']=='succeeded', d; print('samples query OK')"
 
       - name: Assert observability API sees the queries and executors
         run: |
