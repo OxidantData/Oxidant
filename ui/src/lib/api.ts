@@ -53,12 +53,56 @@ export interface ExecutorSummary {
   totalShuffleWrite: number;
 }
 
+export interface StatementSchema {
+  fields: { name: string; type: string }[];
+}
+
+/** Newest-first list entry from `GET /api/v1/statements`. */
+export interface StatementSummary {
+  statementId: string;
+  sql: string;
+  status: string;
+  submittedAtMs: number;
+  durationMs?: number;
+}
+
+/** Full status document from `GET /api/v1/statements/{id}` (and `?wait=true` submit). */
+export interface StatementDoc extends StatementSummary {
+  error?: string;
+  rowCount?: number;
+  schema?: StatementSchema;
+}
+
+/** Result document from `GET /api/v1/statements/{id}/result?format=json`. */
+export interface StatementResult {
+  schema: StatementSchema;
+  rows: Record<string, unknown>[];
+  rowCount: number;
+  truncated: boolean;
+}
+
 const base = `/api/v1/applications/${APP_ID}`;
 
+/** Read a JSON body, surfacing the API's `{"error": "..."}` message on non-2xx. */
+async function readJson<T>(r: Response, path: string): Promise<T> {
+  const data = (await r.json().catch(() => null)) as ({ error?: string } & T) | null;
+  if (!r.ok) throw new Error(data?.error ?? `${r.status} ${path}`);
+  return data as T;
+}
+
 async function get<T>(path: string): Promise<T> {
-  const r = await fetch(path);
-  if (!r.ok) throw new Error(`${r.status} ${path}`);
-  return r.json();
+  return readJson<T>(await fetch(path), path);
+}
+
+async function post<T>(path: string, body?: unknown): Promise<T> {
+  return readJson<T>(
+    await fetch(path, {
+      method: "POST",
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }),
+    path
+  );
 }
 
 export const api = {
@@ -72,7 +116,37 @@ export const api = {
     get<{ sparkProperties: Record<string, string> }>(`${base}/environment`),
   sparkProxy: (url: string) =>
     get<unknown>(`/api/v1/spark-proxy?url=${encodeURIComponent(url)}`),
+  statements: {
+    list: () => get<{ statements: StatementSummary[] }>("/api/v1/statements"),
+    submit: (sql: string, waitTimeoutSecs = 60) =>
+      post<StatementDoc>(`/api/v1/statements?wait=true&timeout=${waitTimeoutSecs}`, { sql }),
+    get: (id: string) => get<StatementDoc>(`/api/v1/statements/${id}`),
+    result: (id: string, limit = 500) =>
+      get<StatementResult>(`/api/v1/statements/${id}/result?format=json&limit=${limit}`),
+    cancel: (id: string) =>
+      post<{ statementId: string; status: string }>(`/api/v1/statements/${id}/cancel`),
+  },
 };
+
+const TERMINAL_STATUSES = new Set(["succeeded", "failed", "canceled"]);
+
+/**
+ * Submit SQL via `?wait=true&timeout=60` and keep polling `GET /{id}` every 1s
+ * while it is still pending/running. `onUpdate` fires on each status snapshot.
+ */
+export async function runStatement(
+  sql: string,
+  onUpdate?: (doc: StatementDoc) => void
+): Promise<StatementDoc> {
+  let doc = await api.statements.submit(sql);
+  while (!TERMINAL_STATUSES.has(doc.status)) {
+    onUpdate?.(doc);
+    await new Promise((r) => setTimeout(r, 1000));
+    doc = await api.statements.get(doc.statementId);
+  }
+  onUpdate?.(doc);
+  return doc;
+}
 
 export function fmtMs(ms?: number | null): string {
   if (ms == null) return "—";

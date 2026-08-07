@@ -3,6 +3,8 @@ import { useAppMeta } from "@/lib/usePolling";
 import JobsPage from "@/pages/JobsPage";
 import StagesPage from "@/pages/StagesPage";
 import SqlPage from "@/pages/SqlPage";
+import EditorPage from "@/pages/EditorPage";
+import NotebookPage from "@/pages/NotebookPage";
 import ExecutorsPage from "@/pages/ExecutorsPage";
 import EnvironmentPage from "@/pages/EnvironmentPage";
 import ComparePage from "@/pages/ComparePage";
@@ -11,6 +13,8 @@ const tabs = [
   { to: "/", label: "Jobs", end: true },
   { to: "/stages", label: "Stages" },
   { to: "/sql", label: "SQL" },
+  { to: "/editor", label: "Editor" },
+  { to: "/notebook", label: "Notebook" },
   { to: "/executors", label: "Executors" },
   { to: "/environment", label: "Environment" },
   { to: "/compare", label: "Compare" },
@@ -46,6 +50,8 @@ export default function App() {
           <Route path="/" element={<JobsPage />} />
           <Route path="/stages" element={<StagesPage />} />
           <Route path="/sql" element={<SqlPage />} />
+          <Route path="/editor" element={<EditorPage />} />
+          <Route path="/notebook" element={<NotebookPage />} />
           <Route path="/executors" element={<ExecutorsPage />} />
           <Route path="/environment" element={<EnvironmentPage />} />
           <Route path="/compare" element={<ComparePage />} />
