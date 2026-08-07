@@ -41,7 +41,7 @@ Architecture: [architecture.md](architecture.md).
 | `python/pyoxidant/` | Pip helper that launches Connect for stock PySpark |
 | `bench/` | ClickBench / TPC harnesses + install scripts |
 | `parity/` | Spark golden baseline ratchet (`baseline.json`) |
-| `docs/` | Architecture, catalogs, deployment, runtime contract |
+| `docs/` | User guides (getting started, UI, REST API, CLI, MCP, workers, Glue) + architecture, catalogs, deployment, runtime contract |
 | `deploy/docker/` | connect-server / worker container images |
 | `deploy/packer/` | Hardened AL2023 AMI for EC2 driver/workers |
 | `deploy/cloudformation/` | CFN + ASG data plane |
@@ -51,6 +51,14 @@ Architecture: [architecture.md](architecture.md).
 
 | Path | Purpose |
 |------|---------|
+| `README.md` | Docs index (start here) |
+| `getting-started.md` | Install/run + first query (UI, `oxidant sql`, PySpark) |
+| `web-ui.md` | Monitoring UI, SQL editor, notebooks |
+| `api.md` | REST statement API reference |
+| `cli.md` | `oxidant sql` CLI reference |
+| `mcp.md` | `oxidant mcp` MCP server setup/tools |
+| `workers.md` | Adding workers (local-cluster / multi-host / Docker) |
+| `catalogs-glue.md` | Glue catalog end-to-end |
 | `architecture.md` | Canonical engine design |
 | `HVM_VERDICT.md` | HVM2/Bend backend verdict + removal record |
 | `CODEMAP.md` | This file |

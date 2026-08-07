@@ -4,6 +4,14 @@
 
 | Doc | Use when |
 |-----|----------|
+| [docs/README.md](docs/README.md) | Docs index (user guides + internals) |
+| [docs/getting-started.md](docs/getting-started.md) | Install/run + first query (UI, CLI, PySpark) |
+| [docs/web-ui.md](docs/web-ui.md) | Monitoring UI, SQL editor, notebooks |
+| [docs/api.md](docs/api.md) | REST statement API reference |
+| [docs/cli.md](docs/cli.md) | `oxidant sql` CLI reference |
+| [docs/mcp.md](docs/mcp.md) | `oxidant mcp` MCP server setup/tools |
+| [docs/workers.md](docs/workers.md) | Adding workers (local-cluster / multi-host) |
+| [docs/catalogs-glue.md](docs/catalogs-glue.md) | Glue catalog end-to-end |
 | [docs/CODEMAP.md](docs/CODEMAP.md) | Crate / bench / site ownership |
 | [docs/architecture.md](docs/architecture.md) | Engine design (Loom / Connect) |
 | [docs/distributed-ec2.md](docs/distributed-ec2.md) | EC2 ASG data plane (Packer + CFN) |
