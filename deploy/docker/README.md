@@ -10,7 +10,7 @@ The multi-arch image is published to GHCR as `ghcr.io/oxidantdata/oxidant` (see
 
 | File | Image | Binary / crate | Entry | Port |
 |------|-------|----------------|-------|------|
-| `connect-server.Dockerfile` | `connect-server` | `oxidant` (crate `oxidant-cli`) | `oxidant spark server --port 50051` | 50051 (gRPC) |
+| `connect-server.Dockerfile` | `connect-server` | `oxidant` (crate `oxidant-cli`) | `oxidant spark server --port 50051` | 50051 (gRPC), 4040 (HTTP: UI + REST API) |
 | `worker.Dockerfile` | `worker` | `oxidant` (same binary, rebased on `connect-server`) | `oxidant worker` | 50561 (Flight) |
 | `gateway.Dockerfile` | `gateway` *(not in tree yet)* | `oxidant-gateway` + kubectl + SPA | `oxidant-gateway` | 8080 |
 
@@ -104,7 +104,7 @@ Standalone:
 
 ```sh
 docker run --read-only --tmpfs /tmp --tmpfs /var/lib/oxidant/spill \
-  -p 50051:50051 oxidant/connect-server:$TAG
+  -p 50051:50051 -p 4040:4040 oxidant/connect-server:$TAG
 ```
 
 ## Running the published image
@@ -113,9 +113,10 @@ The multi-arch engine image is published to GHCR as `ghcr.io/oxidantdata/oxidant
 One image covers both roles — override the command per role:
 
 ```sh
-# Spark Connect driver
+# Spark Connect driver (gRPC on 50051; monitoring UI, SQL editor, and REST API
+# at http://localhost:4040)
 docker run --read-only --tmpfs /tmp --tmpfs /var/lib/oxidant/spill \
-  -p 50051:50051 ghcr.io/oxidantdata/oxidant:latest
+  -p 50051:50051 -p 4040:4040 ghcr.io/oxidantdata/oxidant:latest
 
 # Arrow Flight worker (same image, different command)
 docker run --read-only --tmpfs /tmp --tmpfs /var/lib/oxidant/spill \

@@ -84,6 +84,10 @@ LABEL org.opencontainers.image.title="oxidant-connect-server" \
 # Spark Connect gRPC endpoint. Point PySpark at sc://<service>:50051.
 EXPOSE 50051
 
+# HTTP endpoint: monitoring UI, SQL editor/notebook, and the REST statement API
+# (http://<host>:4040). Disabled when the container is run with `--no-ui`.
+EXPOSE 4040
+
 # PodSecurity `restricted`: a fixed non-root uid that is never 0. distroless
 # `nonroot` is uid/gid 65532, matching the orchestrator's RUN_AS.
 USER 65532:65532

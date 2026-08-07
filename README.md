@@ -9,9 +9,11 @@ protocol, so unmodified PySpark and Spark SQL clients connect with a one-line UR
 
 ## Status
 
-Pre-alpha scaffold. The workspace compiles but does not yet execute queries. See
-[`docs/architecture.md`](docs/architecture.md) for the full plan and
-[`docs/CODEMAP.md`](docs/CODEMAP.md) for the ownership map. Deploy via the free
+Pre-alpha, and runnable: the engine executes SQL end-to-end over Spark Connect — point a
+stock PySpark client at it, browse the built-in Web UI (monitoring, SQL editor, notebooks) on
+port 4040, run SQL over the REST API, or use the `oxidant sql` CLI. **Quickstart:**
+[`docs/getting-started.md`](docs/getting-started.md) · **All docs:**
+[`docs/README.md`](docs/README.md). Deploy via the free
 Community AMI on AWS Marketplace (listing in progress) or
 `docker pull ghcr.io/oxidantdata/oxidant`; EC2 autoscaling via CloudFormation is
 documented in [`docs/distributed-ec2.md`](docs/distributed-ec2.md).
@@ -59,16 +61,20 @@ cargo test  --workspace
 The runtime crates that will pull in DataFusion/Arrow/tonic require **Rust ≥ 1.80** and **protoc**;
 those deps are stubbed out today (see each crate's `Cargo.toml` TODOs).
 
-## Run (target UX, not yet implemented)
+## Run
 
 ```sh
-oxidant spark server --port 50051
+oxidant spark server --port 50051   # gRPC on 50051, Web UI + REST API on 4040
 ```
 ```python
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession  # pip install "pyspark-client>=4.0"
 spark = SparkSession.builder.remote("sc://localhost:50051").getOrCreate()
 spark.sql("SELECT count(*) FROM parquet.`hits.parquet`").show()
 ```
+
+Or open the SQL editor at http://localhost:4040, or run `oxidant sql -e "SELECT 1 AS hello"`.
+Full walkthrough (Docker, all clients, smoke-test SQL quirks):
+[`docs/getting-started.md`](docs/getting-started.md).
 
 ## License
 
