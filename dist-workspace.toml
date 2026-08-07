@@ -1,0 +1,49 @@
+# dist (https://axodotdev.github.io/cargo-dist/) — builds the `oxidant` release
+# binaries on every `v*` tag push: per-platform tarballs + checksums, the
+# `oxidant-installer.sh` curl|sh installer, and the Homebrew formula (pushed to
+# OxidantData/homebrew-tap). The tag itself is cut by .github/workflows/release.yml
+# (manual semver bump). The generated CI is hand-maintained as
+# .github/workflows/binaries.yml — see `allow-dirty` below.
+
+# Only the `oxidant` binary ships. The other workspace bins (oxidant-bench,
+# oxidant-parity, oxidant-gateway) are internal tools, not user installs.
+# NOTE: this matches the dist app name set in crates/oxidant-cli/dist.toml.
+[workspace]
+members = ["cargo:."]
+packages = ["oxidant"]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = ["github"]
+# Target platforms (gnu, not musl, for native-dep safety)
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+]
+# Installers: curl|sh shell script + Homebrew formula. No npm/msi/powershell.
+installers = ["shell", "homebrew"]
+# A GitHub repo to push Homebrew formulas to (CI uses the HOMEBREW_TAP_TOKEN secret)
+tap = "OxidantData/homebrew-tap"
+# Formula (and app) name is `oxidant`, not the crate name `oxidant-cli`
+formula = "oxidant"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# Run `dist plan` on pull requests (cheap config validation, no uploads)
+pr-run-mode = "plan"
+# Where to host releases
+hosting = ["github"]
+# Build just the shippable package, not --workspace (24 crates incl. bench/parity)
+precise-builds = true
+# Message printed by the shell installer on success
+install-success-msg = "oxidant installed — start a server with: oxidant spark server --port 50051"
+# dist normally generates .github/workflows/release.yml and keeps it in sync.
+# That filename is taken by our manual semver-bump workflow, so the generated
+# pipeline lives at .github/workflows/binaries.yml with hand edits (tag filter
+# `v*`, extra deb/rpm packaging job). If you bump cargo-dist-version, run
+# `dist generate` locally and re-apply those edits to binaries.yml.
+allow-dirty = ["ci"]
