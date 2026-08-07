@@ -9,6 +9,10 @@
 #   3. Homebrew tap commits use the github-actions[bot] identity
 #   4. extra `package-linux` job: builds the two Linux targets natively and adds
 #      .deb/.rpm packages (nfpm) to the same GitHub Release
+#   5. added `workflow_dispatch` — tag-push triggers have proven unreliable in
+#      this repo (two v0.1.0 tag pushes produced zero workflow events), and a
+#      GITHUB_TOKEN push would not cascade anyway, so release.yml now fires this
+#      pipeline explicitly via `gh workflow run --ref <tag>`
 # If you bump cargo-dist-version in dist-workspace.toml, regenerate locally with
 # `dist generate` and re-apply these edits.
 #
@@ -52,6 +56,9 @@ permissions:
 # will be marked as a prerelease.
 on:
   pull_request:
+  # Fired explicitly by release.yml after it pushes a release tag (tag-push
+  # triggers are unreliable here); the dist jobs key off github.ref being a tag.
+  workflow_dispatch:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
