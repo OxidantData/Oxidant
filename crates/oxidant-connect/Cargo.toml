@@ -25,7 +25,9 @@ oxidant-streaming = { workspace = true }
 oxidant-observability = { workspace = true }
 oxidant-ui-server = { workspace = true }
 datafusion = "54"  # lower Spark Connect relations/expressions to DataFusion logical plans
+axum = "0.8"  # REST statement API routes (merged into the ui-server router)
 futures = "0.3"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tonic = "0.12"
 prost = "0.13"
@@ -41,3 +43,5 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 tokio-stream = "0.1"
 tonic = "0.12"
+tower = "0.5"  # oneshot route tests for the REST statement API
+http-body-util = "0.1"
