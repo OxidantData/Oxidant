@@ -57,7 +57,12 @@ jobs:
 
       - name: Commit, tag, push
         run: |
-          git add Cargo.toml
+          # Sync Cargo.lock with the new workspace version — `cargo metadata
+          # --no-deps` does NOT rewrite member versions, `cargo tree` does
+          # (the Dockerfile builds with `--locked`; v0.1.0's image build died
+          # on the stale lock).
+          cargo tree --depth 0 -p oxidant-cli > /dev/null
+          git add Cargo.toml Cargo.lock
           git commit -m "chore: release ${{ steps.ver.outputs.tag }} [skip ci]"
           git tag -a "${{ steps.ver.outputs.tag }}" -m "release ${{ steps.ver.outputs.tag }}"
           git push origin main
