@@ -17,7 +17,13 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/OxidantData/Oxidant/rel
 ```
 
 Installs `oxidant` into `~/.cargo/bin` (or `$CARGO_HOME/bin` if set); the script
-prints the exact path and how to add it to `PATH`.
+prints the exact path and how to add it to `PATH`. This path installs the binary
+only — for the sample tables, also grab the standalone archive (see
+[Sample data](#sample-data)):
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/OxidantData/Oxidant/releases/latest/download/sample-data.tar.gz | tar -xz
+```
 
 ### 2. Homebrew (macOS + Linux)
 
@@ -34,8 +40,11 @@ Download `oxidant_<ver>_amd64.deb` (or `_arm64.deb`) from
 sudo dpkg -i oxidant_<ver>_amd64.deb
 ```
 
-The package installs `oxidant` to `/usr/bin` and has no runtime dependencies. Each
-release also attaches an `.rpm` for Fedora/RHEL (`sudo dnf install ./oxidant-<ver>-1.x86_64.rpm`).
+The package installs `oxidant` to `/usr/bin` (sample tables included, auto-discovered
+from `/usr/share/oxidant/sample-data`). Each release also attaches an `.rpm`
+(`sudo dnf install ./oxidant-<ver>-1.x86_64.rpm`). The Linux binaries are built on
+Ubuntu 22.04 and need **glibc ≥ 2.35** (Ubuntu 22.04+, Debian 12+, Fedora 36+) — on
+older distro glibcs (RHEL 9, Amazon Linux 2023, Debian 11) use the Docker image below.
 
 ### 4. Docker (no install, sample data included)
 
@@ -129,10 +138,12 @@ orders 15000, lineitem 60175. The data files are committed under
 [`sample-data/`](../sample-data/README.md) in the repo (~19 MB) and baked into the Docker
 image at `/opt/oxidant/sample-data`.
 
-Binary installs ship the same tree: release tarballs and the curl|sh installer put a
-`sample-data/` dir next to the `oxidant` binary, and the `.deb`/`.rpm` place it at
-`/usr/share/oxidant/sample-data` — the server auto-discovers either location at startup,
-so the `samples` schema is available with no flags at all. `--sample-data` /
+Most binary installs ship the same tree, and the server auto-discovers it at startup
+with no flags at all: release tarballs carry `sample-data/` next to the binary, the
+`.deb`/`.rpm` place it at `/usr/share/oxidant/sample-data`, and Homebrew installs it
+under the formula prefix at `share/oxidant/sample-data`. The curl|sh installer is the
+one exception — it installs the binary only, so point the server at the standalone
+archive (above) with `--sample-data sample-data`. `--sample-data` /
 `OXIDANT_SAMPLE_DATA_DIR` override the discovery; with no bundled tree installed (e.g. a
 source build), the server starts clean with no `samples` schema, as before.
 

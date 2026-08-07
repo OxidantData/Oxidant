@@ -81,9 +81,10 @@ Registration is best-effort: a missing directory or unreadable table is logged a
 never a boot failure.
 
 When neither the flag nor the env var is set, the server auto-discovers a bundled tree,
-checking in order: `<dir of the oxidant binary>/sample-data` (release tarballs and the
-curl|sh installer), `<binary dir>/../share/oxidant/sample-data` (prefix installs), and
-`/usr/share/oxidant/sample-data` (deb/rpm). The first directory that exists and contains a
+checking in order: `<dir of the oxidant binary>/sample-data` (release tarballs),
+`<binary dir>/../share/oxidant/sample-data` (prefix installs — e.g. Homebrew), and
+`/usr/share/oxidant/sample-data` (deb/rpm). The curl|sh installer installs the binary
+only — download `sample-data.tar.gz` from the release and pass `--sample-data` there. The first directory that exists and contains a
 `parquet/` subdir wins; with no match there is no `samples` schema and no behavior change.
 So binary installs (curl tarball / deb) load the `samples` schema with zero flags —
 pass `--sample-data` / `OXIDANT_SAMPLE_DATA_DIR` to override, and omit both for a clean
