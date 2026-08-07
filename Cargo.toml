@@ -1,9 +1,9 @@
-# Oxidant — drop-in Apache Spark replacement on a vectorized CPU core (Loom) with an
-# opt-in HVM2/Bend parallel backend. See plan: docs/architecture.md.
+# Oxidant — drop-in Apache Spark replacement on a vectorized CPU core (Loom).
+# See plan: docs/architecture.md.
 #
 # This is the workspace skeleton. Crates are intentionally dependency-free today so
 # the tree builds green offline on Rust 1.72+. Real dependencies (DataFusion, Arrow,
-# tonic/prost, delta-kernel-rs, iceberg-rust, hvm) are listed as TODOs inside each
+# tonic/prost, delta-kernel-rs, iceberg-rust) are listed as TODOs inside each
 # crate's Cargo.toml and require Rust >= 1.80 + protoc when added.
 
 [workspace]
@@ -34,7 +34,6 @@ oxidant-optimizer  = { path = "crates/oxidant-optimizer" }
 oxidant-physical   = { path = "crates/oxidant-physical" }
 oxidant-datasource = { path = "crates/oxidant-datasource" }
 oxidant-loom       = { path = "crates/oxidant-loom" }
-oxidant-hvm        = { path = "crates/oxidant-hvm" }
 oxidant-execution  = { path = "crates/oxidant-execution" }
 oxidant-connect    = { path = "crates/oxidant-connect" }
 # Control-plane / platform crates (Databricks-like layer).

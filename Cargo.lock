@@ -4301,15 +4301,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxidant-hvm"
-version = "0.0.0"
-dependencies = [
- "oxidant-common",
- "oxidant-physical",
- "oxidant-plan",
-]
-
-[[package]]
 name = "oxidant-loom"
 version = "0.0.0"
 dependencies = [
