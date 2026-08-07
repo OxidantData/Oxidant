@@ -4,9 +4,10 @@
 #   1. workers come up; the driver registers them via --workers (KAN-21 fix path)
 #   2. /api/v1/cluster/status reports mode "distributed" with both endpoints
 #   3. the embedded Web UI loads; /health answers
-#   4. a distributed GROUP BY over the bundled sample parquet runs under
-#      OXIDANT_DISTRIBUTED_STRICT=1 — strict mode turns local fallback into an
-#      error, so success proves the query genuinely executed across the workers
+#   4. a GROUP BY over a parquet table registered on BOTH sides executes
+#      distributed — proven by the per-stage summary lines the workers emit at
+#      every stage-task exit ("Oxidant stage summary", flight.rs), not by
+#      trusting that the planner routed it
 #   5. observability: the query shows up in the Spark-history-style API
 #      (/api/v1/applications/{id}/sql) and executors are listed
 # Dispatch-only; runs in Actions because GHCR pull bandwidth from a dev machine
@@ -41,13 +42,13 @@ jobs:
             docker run --rm -d --network oxidant-smoke --name "$w" "${{ inputs.image }}" \
               worker --port 50561 \
               --data /opt/oxidant/sample-data/parquet/tpch_lineitem.parquet \
-              --table samples.tpch_lineitem
+              --table lineitem
           done
-          # Strict mode: any query the distributed planner rejects is an ERROR,
-          # not a silent local fallback — so a success below is proof of real
-          # distributed execution, not of "it ran somewhere".
+          # Bare table name on both sides: a fresh worker engine has no `samples`
+          # schema, so qualified --table names kill it at startup (KAN-64), and
+          # strict mode rejects DDL (KAN-63) — so no OXIDANT_DISTRIBUTED_STRICT
+          # here; distribution is proven from worker stage summaries instead.
           docker run --rm -d --network oxidant-smoke --name driver -p 4040:4040 \
-            -e OXIDANT_DISTRIBUTED_STRICT=1 \
             "${{ inputs.image }}" \
             spark server --workers worker1:50561,worker2:50561
 
@@ -73,25 +74,45 @@ jobs:
           curl -sf http://localhost:4040/ | tee ui.html | grep -qi "oxidant"
           echo "UI OK ($(wc -c < ui.html) bytes)"
 
-      - name: Run a distributed query (strict)
+      - name: Run a distributed GROUP BY and prove it on worker stage summaries
         run: |
-          # Stage SQL re-parses on workers, so the table must exist under the same name
-          # on both sides of the wire — no DDL needed (strict mode rejects DDL):
-          # the driver preloads samples.tpch_lineitem from the image's sample-data env,
-          # and the workers registered the same 3-part name via --table above.
-          SQL_DIST="SELECT l_returnflag, COUNT(*) AS c, SUM(l_quantity) AS s FROM samples.tpch_lineitem GROUP BY l_returnflag"
-          curl -sf -X POST "http://localhost:4040/api/v1/statements?wait=true&timeout=120" \
+          # Stage SQL re-parses on workers, so the table must exist under the same
+          # bare name on both sides of the wire: workers registered `lineitem` via
+          # --data/--table at startup; the driver gets the same name as a real
+          # ListingTable over the same in-image file (DDL runs locally).
+          curl -sf -X POST "http://localhost:4040/api/v1/statements?wait=true&timeout=60" \
             -H 'Content-Type: application/json' \
-            -d "{\"sql\":\"$SQL_DIST\"}" | tee dist.json
-          echo
+            -d '{"sql":"CREATE EXTERNAL TABLE lineitem STORED AS PARQUET LOCATION '"'"'/opt/oxidant/sample-data/parquet/tpch_lineitem.parquet'"'"'"}' | tee ddl.json
+          python3 -c "import json; d=json.load(open('ddl.json')); assert d['status']=='succeeded', d; print('driver table registered')"
+          # Retry absorbs the worker Flight-server boot race (cli_driver_worker.rs
+          # retries the driver for the same reason).
+          OK=""
+          for i in $(seq 1 12); do
+            curl -sf -X POST "http://localhost:4040/api/v1/statements?wait=true&timeout=60" \
+              -H 'Content-Type: application/json' \
+              -d '{"sql":"SELECT l_returnflag, COUNT(*) AS c, SUM(l_quantity) AS s FROM lineitem GROUP BY l_returnflag"}' > dist.json || true
+            STATUS=$(python3 -c "import json; print(json.load(open('dist.json')).get('status',''))" 2>/dev/null || echo curl-error)
+            [ "$STATUS" = "succeeded" ] && OK=1 && break
+            echo "attempt $i: $STATUS — retrying in 5s"; sleep 5
+          done
+          cat dist.json; echo
+          [ -n "$OK" ] || { echo "distributed query never succeeded"; exit 1; }
           python3 - <<'EOF'
           import json
           d = json.load(open('dist.json'))
-          assert d['status'] == 'succeeded', d
-          # 4 returnflag groups (A/F/N/R) — strict mode, so this ran on the workers.
+          # 4 returnflag groups (A/F/N/R).
           assert d['rowCount'] == 4, d
           print('distributed query OK:', d['rowCount'], 'groups,', d['durationMs'], 'ms')
           EOF
+          # Proof it executed on the workers: every stage-task exit emits a summary
+          # line on the worker that ran it (flight.rs stage_summary_line). A
+          # single-file scan may only hand tasks to one worker, so assert on the
+          # combined count and print the per-worker split for tightening later.
+          W1=$(docker logs worker1 2>&1 | grep -c "Oxidant stage summary" || true)
+          W2=$(docker logs worker2 2>&1 | grep -c "Oxidant stage summary" || true)
+          echo "stage summaries: worker1=$W1 worker2=$W2"
+          [ $((W1 + W2)) -ge 1 ] || { echo "no stage summaries on any worker — query did not execute distributed"; exit 1; }
+          echo "worker stage execution OK"
 
       - name: Assert observability API sees the queries and executors
         run: |
