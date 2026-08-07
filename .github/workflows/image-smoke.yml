@@ -41,7 +41,10 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"sql":"SELECT count(*) AS n FROM samples.tpch_nation"}' | tee result.json
           echo
-          python3 -c "import json; d=json.load(open('result.json')); assert d['status']=='succeeded', d; print('image-smoke OK:', d['status'], d.get('rowCount'), 'row')"
+          ID=$(python3 -c "import json; d=json.load(open('result.json')); assert d['status']=='succeeded', d; print(d['statementId'])")
+          curl -sf "http://localhost:4040/api/v1/statements/$ID/result?format=json" | tee rows.json
+          echo
+          python3 -c "import json; rows=json.load(open('rows.json'))['rows']; assert rows and rows[0].get('n')==25, rows; print('image-smoke OK: samples.tpch_nation = 25')"
 
       - name: Container logs on failure
         if: failure()
