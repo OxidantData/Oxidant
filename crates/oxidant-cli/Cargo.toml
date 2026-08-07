@@ -18,12 +18,17 @@ oxidant-loom = { workspace = true }
 oxidant-execution = { workspace = true }
 oxidant-ui-server = { workspace = true }
 oxidant-observability = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `time` (statement polling), `io-std`/`io-util` (the `mcp` stdio JSON-RPC stream).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-std", "io-util"] }
+# `sql`/`mcp` talk to the REST statement API (`oxidant-connect::rest`) over HTTP.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde_json = "1"
 # TODO(deps): clap = { version = "4", features = ["derive"] } for real subcommand parsing.
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
 datafusion = "54"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-serde_json = "1"
+# Mock statements-API server for `client`/`mcp` unit tests.
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
