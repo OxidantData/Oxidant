@@ -21,7 +21,7 @@
 //! path — routing through it would regress. It is kept as a correct, tested building block for
 //! places where Oxidant already owns the data and the boundary (e.g. the distributed shuffle reduce,
 //! where inputs are pre-aggregated partials and small). The durable benchmark margin lives in
-//! distributed scale-out and the Bend niche — not in reimplementing DataFusion's columnar core.
+//! distributed scale-out — not in reimplementing DataFusion's columnar core.
 
 use std::collections::HashMap;
 use std::sync::Arc;

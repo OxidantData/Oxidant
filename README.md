@@ -3,9 +3,9 @@
 **A drop-in Apache Spark replacement.** Oxidant speaks the [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)
 protocol, so unmodified PySpark and Spark SQL clients connect with a one-line URL change — no JVM.
 
-> **Oxidant starts where Sail ends.** A lean vectorized CPU core (**Loom**) beats Sail on the
-> queries that dominate ClickBench, and an opt-in HVM2/Bend backend (**Oxidant-HVM**) opens a
-> second front for the embarrassingly-parallel, irregular workloads no columnar engine serves well.
+> **Oxidant starts where Sail ends.** A lean vectorized CPU core (**Loom**) — a single
+> execution backend, no second runtime — beats Sail on the queries that dominate
+> ClickBench.
 
 ## Status
 
@@ -23,25 +23,22 @@ PySpark / Spark SQL  ──Spark Connect gRPC──▶  oxidant-connect
                                                   │
                               oxidant-plan (warp) ─ oxidant-analyzer ─ oxidant-optimizer (heddle) ─ oxidant-physical
                                                   │
-                            ┌─────────────────────┴─────────────────────┐
-                     oxidant-loom (CPU)                              oxidant-hvm (parallel/GPU)
-              vectorized Arrow, DataFusion→native          Bend codegen → HVM2 (opt-in, gated)
+                                            oxidant-loom (CPU)
+                                   vectorized Arrow, DataFusion→native
                                                   │
                               oxidant-execution (local | driver/worker + Arrow Flight)
                                                   │
                               oxidant-datasource (Parquet/Delta/Iceberg) ─ oxidant-catalog (Unity/Glue/Hive)
 ```
 
-Everything between operators is Apache Arrow. `oxidant-hvm` is the *only* place data leaves Arrow,
-and only for coarse, routed fragments — never the columnar hot loop.
+Everything between operators is Apache Arrow — no operator, present or planned, leaves it.
 
 ## Why not "just compile everything to Bend"?
 
-Because HVM2 (Bend's runtime) has no data plane: 24-bit numerics (a `SUM`/`COUNT` overflows at
-16.7M), no hash-table primitive, no columnar/SIMD type, a 4 GB heap, no I/O/FFI, and a CUDA-only,
-RTX-4090-only GPU path the maintainers themselves call "less stable." On ClickBench — pure
-columnar/SIMD work — HVM2 loses every query. So Loom (vectorized native) carries the benchmark;
-HVM2 is a gated research bet for a *different* workload class. See `docs/architecture.md` §3, §6.
+HVM2 (Bend's runtime) has no data plane — 24-bit numerics, no hash table, no
+columnar/SIMD type, a 4 GB heap, no I/O/FFI, a CUDA-only GPU path — so it cannot run
+Oxidant's workload class at all. The scaffold was removed; verdict and rationale:
+[`docs/HVM_VERDICT.md`](docs/HVM_VERDICT.md).
 
 ## North star
 

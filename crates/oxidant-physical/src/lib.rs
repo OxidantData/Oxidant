@@ -1,8 +1,9 @@
-//! `oxidant-physical` — physical planning and the backend-agnostic execution contract.
+//! `oxidant-physical` — physical planning and the execution contract.
 //!
 //! Lowers a resolved logical plan to physical operators, carrying the [`Backend`] tag
-//! that heddle assigned. Both backends implement [`ExecutionPlan`], which streams Arrow
-//! `RecordBatch`es — the universal currency between operators.
+//! that heddle assigned. [`ExecutionPlan`] streams Arrow `RecordBatch`es — the
+//! universal currency between operators — and is implemented by the single vectorized
+//! backend, `oxidant-loom`.
 
 use oxidant_common::Result;
 use oxidant_optimizer::Backend;

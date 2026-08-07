@@ -1,27 +1,25 @@
-//! `oxidant-optimizer` (codename **heddle**) — logical optimization and backend routing.
+//! `oxidant-optimizer` (codename **heddle**) — logical optimization.
 //!
 //! Beyond the usual rewrites (predicate/projection pushdown, constant folding, join
-//! reorder), heddle owns Oxidant's distinctive job: deciding, per plan fragment, whether it
-//! runs on the vectorized CPU core ([`oxidant-loom`](../oxidant_loom/index.html)) or is routed
-//! to the parallel backend ([`oxidant-hvm`](../oxidant_hvm/index.html)).
-//!
-//! Routing default is **CPU**. A fragment is eligible for `oxidant-hvm` only if it is
-//! compute-bound, massively fine-grained-parallel, fits 24-bit numerics, and is NOT a
-//! columnar scan/filter/hash-aggregate (those always stay on Loom — see architecture §3).
+//! reorder), heddle owns plan-level decisions for Oxidant's single execution backend:
+//! the vectorized CPU core ([`oxidant-loom`](../oxidant_loom/index.html)). The
+//! Bend→HVM2 second-backend bet was evaluated and removed — see
+//! `docs/HVM_VERDICT.md`; irregular/graph compute is planned as Loom-native
+//! operators, not a second runtime.
 
 use oxidant_plan::LogicalPlan;
 
-/// Which execution backend a plan fragment should run on.
+/// Which execution backend a plan fragment runs on. Oxidant has exactly one backend —
+/// the vectorized Loom engine — so this is a tag (kept for the
+/// `oxidant-physical` [`ExecutionPlan`](../oxidant_physical/index.html) contract and
+/// `EXPLAIN` output), not a routing choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// Vectorized Arrow CPU engine. The default and the home of the columnar hot loop.
+    /// Vectorized Arrow CPU engine. The only backend; home of the columnar hot loop.
     Loom,
-    /// Bend → HVM2 backend. Opt-in, routed fragments only, gated behind a feature flag.
-    Hvm,
 }
 
-/// Decide the backend for a (sub)plan. Conservative default: everything is `Loom` until
-/// the HVM2 go/no-go gate (Phase 2) proves a fragment class where `Hvm` wins.
+/// Decide the backend for a (sub)plan. Single-backend engine: everything is `Loom`.
 pub fn route(_plan: &LogicalPlan) -> Backend {
     Backend::Loom
 }

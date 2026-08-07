@@ -1,6 +1,6 @@
 [package]
 name = "oxidant-physical"
-description = "Physical plan: operator selection + the ExecutionPlan trait both backends implement."
+description = "Physical plan: operator selection + the ExecutionPlan trait."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
