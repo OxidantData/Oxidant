@@ -126,6 +126,13 @@ orders 15000, lineitem 60175. The data files are committed under
 [`sample-data/`](../sample-data/README.md) in the repo (~19 MB) and baked into the Docker
 image at `/opt/oxidant/sample-data`.
 
+Binary installs ship the same tree: release tarballs and the curl|sh installer put a
+`sample-data/` dir next to the `oxidant` binary, and the `.deb`/`.rpm` place it at
+`/usr/share/oxidant/sample-data` — the server auto-discovers either location at startup,
+so the `samples` schema is available with no flags at all. `--sample-data` /
+`OXIDANT_SAMPLE_DATA_DIR` override the discovery; with no bundled tree installed (e.g. a
+source build), the server starts clean with no `samples` schema, as before.
+
 ## First query — pick a client
 
 ### 1. Web UI SQL editor

@@ -31,3 +31,7 @@ contents:
     dst: /usr/share/doc/oxidant/LICENSE
   - src: README.md
     dst: /usr/share/doc/oxidant/README.md
+  # Bundled TPC-H SF 0.01 samples — auto-discovered by the server as the `samples` schema
+  # (no --sample-data flag needed) at this fixed path.
+  - src: sample-data/
+    dst: /usr/share/oxidant/sample-data/
