@@ -3819,6 +3819,102 @@ impl Engine {
         Ok(())
     }
 
+    /// Register a sample-data directory (`oxidant spark server --sample-data <DIR>` /
+    /// `OXIDANT_SAMPLE_DATA_DIR`) under the `samples` schema of the built-in catalog, so a
+    /// first-time user can immediately `SELECT count(*) FROM samples.tpch_nation` with zero
+    /// setup. Recognized layout (every subdir optional):
+    ///
+    /// - `parquet/<name>.parquet` → `samples.<name>` (the primary tables)
+    /// - `csv/<name>.csv`         → `samples.<name>_csv`
+    /// - `delta/<name>/`          → `samples.<name>_delta`
+    /// - `iceberg/<name>/`        → `samples.<name>_iceberg`
+    ///
+    /// Best-effort: a missing directory or a table that fails to register is logged and
+    /// skipped — sample data must never block server boot. Returns the number of tables
+    /// registered.
+    pub async fn register_sample_tables(&self, dir: impl AsRef<std::path::Path>) -> usize {
+        let dir = dir.as_ref();
+        if !dir.is_dir() {
+            eprintln!(
+                "oxidant: sample-data directory {} not found; no sample tables registered",
+                dir.display()
+            );
+            return 0;
+        }
+        let dir = match dir.canonicalize() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(
+                    "oxidant: cannot resolve sample-data directory {}: {e}",
+                    dir.display()
+                );
+                return 0;
+            }
+        };
+        let catalog_name = self.default_catalog_name();
+        let Some(catalog) = self.ctx.catalog(&catalog_name) else {
+            return 0;
+        };
+        // Get-or-create the `samples` schema in the built-in catalog.
+        let schema = match catalog.schema(SAMPLES_SCHEMA) {
+            Some(s) => s,
+            None => {
+                let provider = Arc::new(datafusion::catalog::MemorySchemaProvider::new());
+                if let Err(e) = catalog.register_schema(SAMPLES_SCHEMA, provider.clone()) {
+                    eprintln!("oxidant: cannot create `{SAMPLES_SCHEMA}` schema: {e}");
+                    return 0;
+                }
+                provider
+            }
+        };
+        let mut registered = 0;
+        for (sub, format, suffix) in [
+            ("parquet", oxidant_catalog::TableFormat::Parquet, ""),
+            ("csv", oxidant_catalog::TableFormat::Csv, "_csv"),
+            ("delta", oxidant_catalog::TableFormat::Delta, "_delta"),
+            ("iceberg", oxidant_catalog::TableFormat::Iceberg, "_iceberg"),
+        ] {
+            let Ok(entries) = std::fs::read_dir(dir.join(sub)) else {
+                continue;
+            };
+            // Sort for deterministic registration order (and deterministic logs).
+            let mut tables: Vec<(String, std::path::PathBuf)> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let path = e.path();
+                    sample_table_stem(&path, sub).map(|stem| (stem, path))
+                })
+                .collect();
+            tables.sort();
+            for (stem, path) in tables {
+                let table_name = format!("{stem}{suffix}");
+                let qualified = format!("{SAMPLES_SCHEMA}.{table_name}");
+                let md = oxidant_catalog::TableMetadata::new(
+                    &qualified,
+                    path.to_string_lossy().as_ref(),
+                    format,
+                );
+                let provider =
+                    catalog_bridge::metadata_to_provider(&self.ctx.state(), &md, &qualified, false)
+                        .await;
+                match provider {
+                    Ok(res) => match schema.register_table(table_name.clone(), res.provider) {
+                        Ok(_) => {
+                            registered += 1;
+                            eprintln!("oxidant: registered sample table `{qualified}`");
+                            self.note_catalog_change(&qualified);
+                        }
+                        Err(e) => {
+                            eprintln!("oxidant: sample table `{qualified}`: {e} (skipped)")
+                        }
+                    },
+                    Err(e) => eprintln!("oxidant: sample table `{qualified}`: {e} (skipped)"),
+                }
+            }
+        }
+        registered
+    }
+
     /// Register an external catalog under `name`, bridging it into DataFusion's catalog API so
     /// `SELECT … FROM {name}.namespace.table` (and `spark.read.table("{name}.ns.t")`) resolve
     /// **lazily** — the catalog is hit only when a query first references one of its tables.
@@ -4735,6 +4831,32 @@ async fn estimate_listing_provider_bytes(
     let urls = listing.table_paths().clone();
     let ext = listing.options().file_extension.as_str();
     shard::sum_listing_bytes(state, urls, ext).await.ok()
+}
+
+/// The schema in the built-in catalog that holds the bundled sample tables
+/// ([`Engine::register_sample_tables`]; `samples.tpch_nation`, …).
+pub const SAMPLES_SCHEMA: &str = "samples";
+
+/// Table-name stem for one entry of a sample-data subdir: `parquet`/`csv` tables are files
+/// with a matching extension; `delta`/`iceberg` tables are directories. Anything else (wrong
+/// extension, stray file) returns `None`.
+fn sample_table_stem(path: &std::path::Path, sub: &str) -> Option<String> {
+    match sub {
+        "parquet" | "csv" => {
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some(sub) {
+                path.file_stem()?.to_str().map(str::to_string)
+            } else {
+                None
+            }
+        }
+        _ => {
+            if path.is_dir() {
+                path.file_name()?.to_str().map(str::to_string)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Freshness window for the per-engine [`Engine::estimate_table_bytes`] cache

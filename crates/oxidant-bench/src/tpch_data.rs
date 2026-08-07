@@ -24,48 +24,74 @@ pub const TABLES: [&str; 8] = [
 /// Generate scale-factor `sf` TPC-H data as CSV (with headers) under `dir`. Idempotent: if
 /// `lineitem.csv` already exists the generation is skipped (so reruns are cheap).
 pub fn generate(sf: f64, dir: &Path) -> std::io::Result<()> {
+    generate_prefixed(sf, dir, "")
+}
+
+/// Like [`generate`], but each file is named `<prefix><name>.csv` — the committed
+/// `sample-data/` tree carries the `tpch_` table-name prefix its SQL-visible tables use.
+pub fn generate_prefixed(sf: f64, dir: &Path, prefix: &str) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
-    if dir.join("lineitem.csv").exists() {
+    if dir.join(format!("{prefix}lineitem.csv")).exists() {
         return Ok(());
     }
     // Each table: write its header, then every generated row via the CSV formatter. `part=1,
     // part_count=1` generates the whole table in one shot.
-    write_csv(dir, "nation", NationCsv::header(), || {
+    write_csv(dir, &format!("{prefix}nation"), NationCsv::header(), || {
         NationGenerator::new(sf, 1, 1)
             .into_iter()
             .map(NationCsv::new)
     })?;
-    write_csv(dir, "region", RegionCsv::header(), || {
+    write_csv(dir, &format!("{prefix}region"), RegionCsv::header(), || {
         RegionGenerator::new(sf, 1, 1)
             .into_iter()
             .map(RegionCsv::new)
     })?;
-    write_csv(dir, "supplier", SupplierCsv::header(), || {
-        SupplierGenerator::new(sf, 1, 1)
-            .into_iter()
-            .map(SupplierCsv::new)
-    })?;
-    write_csv(dir, "customer", CustomerCsv::header(), || {
-        CustomerGenerator::new(sf, 1, 1)
-            .into_iter()
-            .map(CustomerCsv::new)
-    })?;
-    write_csv(dir, "part", PartCsv::header(), || {
+    write_csv(
+        dir,
+        &format!("{prefix}supplier"),
+        SupplierCsv::header(),
+        || {
+            SupplierGenerator::new(sf, 1, 1)
+                .into_iter()
+                .map(SupplierCsv::new)
+        },
+    )?;
+    write_csv(
+        dir,
+        &format!("{prefix}customer"),
+        CustomerCsv::header(),
+        || {
+            CustomerGenerator::new(sf, 1, 1)
+                .into_iter()
+                .map(CustomerCsv::new)
+        },
+    )?;
+    write_csv(dir, &format!("{prefix}part"), PartCsv::header(), || {
         PartGenerator::new(sf, 1, 1).into_iter().map(PartCsv::new)
     })?;
-    write_csv(dir, "partsupp", PartSuppCsv::header(), || {
-        PartSuppGenerator::new(sf, 1, 1)
-            .into_iter()
-            .map(PartSuppCsv::new)
-    })?;
-    write_csv(dir, "orders", OrderCsv::header(), || {
+    write_csv(
+        dir,
+        &format!("{prefix}partsupp"),
+        PartSuppCsv::header(),
+        || {
+            PartSuppGenerator::new(sf, 1, 1)
+                .into_iter()
+                .map(PartSuppCsv::new)
+        },
+    )?;
+    write_csv(dir, &format!("{prefix}orders"), OrderCsv::header(), || {
         OrderGenerator::new(sf, 1, 1).into_iter().map(OrderCsv::new)
     })?;
-    write_csv(dir, "lineitem", LineItemCsv::header(), || {
-        LineItemGenerator::new(sf, 1, 1)
-            .into_iter()
-            .map(LineItemCsv::new)
-    })?;
+    write_csv(
+        dir,
+        &format!("{prefix}lineitem"),
+        LineItemCsv::header(),
+        || {
+            LineItemGenerator::new(sf, 1, 1)
+                .into_iter()
+                .map(LineItemCsv::new)
+        },
+    )?;
     Ok(())
 }
 

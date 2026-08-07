@@ -4141,6 +4141,7 @@ name = "oxidant-bench"
 version = "0.0.0"
 dependencies = [
  "datafusion",
+ "iceberg",
  "oxidant-connect",
  "oxidant-execution",
  "oxidant-loom",

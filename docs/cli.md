@@ -70,3 +70,24 @@ oxidant sql -f report.sql --format csv > report.csv
 - A `succeeded` statement prints rows in the selected format and exits `0`.
 - A `failed` statement prints the server-side error to stderr and exits non-zero, so
   `oxidant sql -e ... && next-step` works in scripts.
+
+## Server flags: `--sample-data` (bundled sample tables)
+
+`oxidant spark server` accepts `--sample-data <DIR>` (env: `OXIDANT_SAMPLE_DATA_DIR`). When
+set, the server registers the sample-data tree at `<DIR>` as the `samples` schema of the
+built-in `spark_catalog` catalog at startup — parquet tables under their bare names
+(`samples.tpch_nation`, …), CSV as `…_csv`, Delta as `…_delta`, Iceberg as `…_iceberg`.
+Registration is best-effort: a missing directory or unreadable table is logged and skipped,
+never a boot failure. Without the flag there is no `samples` schema and no behavior change.
+
+```sh
+# From a repo checkout (the committed tree is ./sample-data):
+./target/debug/oxidant spark server --port 50051 --sample-data sample-data
+
+# Or via the environment (this is how the Docker image preloads it):
+OXIDANT_SAMPLE_DATA_DIR=/opt/oxidant/sample-data oxidant spark server --port 50051
+```
+
+Then from this CLI: `oxidant sql -e "SELECT count(*) FROM samples.tpch_nation"`. See
+[getting-started.md](getting-started.md#sample-data) for the table list and
+[sample-data/README.md](../sample-data/README.md) for regeneration.

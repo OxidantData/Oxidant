@@ -6,6 +6,12 @@ first reference. For Hive Metastore and Iceberg REST/Unity catalogs, see
 [`catalogs.md`](catalogs.md); for the full EC2/ASG walkthrough (IAM stack parameters, S3
 setup), see [`distributed-ec2.md`](distributed-ec2.md).
 
+> **Glue is optional.** Without any `--catalog-conf`, the engine serves its built-in local
+> catalog (`spark_catalog`, current database `default`) — an in-memory catalog where
+> `CREATE TABLE`/`CREATE EXTERNAL TABLE` land, plus the bundled `samples` schema when the
+> server is started with `--sample-data` (see [getting-started.md](getting-started.md)). No
+> cloud account or metastore is needed to query data.
+
 ## How auth works
 
 Oxidant's Glue provider (`oxidant-catalog-glue`) does not use an AWS SDK directly — it **shells

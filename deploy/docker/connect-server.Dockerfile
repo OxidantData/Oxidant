@@ -103,11 +103,18 @@ USER 65532:65532
 ENV TMPDIR=/tmp \
     HOME=/tmp \
     OXIDANT_AWS_BIN=/usr/local/aws-cli/v2/current/bin/aws \
+    OXIDANT_SAMPLE_DATA_DIR=/opt/oxidant/sample-data \
     RUST_BACKTRACE=1
 
 COPY --from=builder /out/oxidant /usr/local/bin/oxidant
 COPY --from=awscli /usr/local/aws-cli /usr/local/aws-cli
 COPY --from=builder --chown=65532:65532 /rootfs/var/lib/oxidant/spill /var/lib/oxidant/spill
+
+# Bundled TPC-H sample data (parquet/csv/delta/iceberg, ~19 MB). The engine registers it as
+# the `samples` schema at boot (OXIDANT_SAMPLE_DATA_DIR above), so a first-time user can open
+# the UI and query `samples.tpch_nation` immediately. Read-only data; delete it (or unset the
+# env) to slim a production image.
+COPY --chown=65532:65532 sample-data/ /opt/oxidant/sample-data/
 
 # Default command; the orchestrator overrides command/args per cluster but keeps
 # this exact invocation.
