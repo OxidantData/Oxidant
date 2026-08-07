@@ -1,8 +1,12 @@
 name: release
 
-# One-click semver release: bumps Cargo.toml workspace version, commits, tags,
-# and pushes — which triggers oxidant-image.yml to publish the versioned GHCR
-# manifest (ghcr.io/oxidantdata/oxidant:X.Y.Z, X.Y, X, latest).
+# One-click semver release: bumps Cargo.toml workspace version, commits, tags
+# (annotated), pushes, then explicitly dispatches the two release pipelines:
+# binaries.yml (GitHub Release: tarballs, curl installer, Homebrew formula,
+# .deb/.rpm) and oxidant-image.yml (GHCR manifest ghcr.io/oxidantdata/oxidant
+# :X.Y.Z, :X.Y, :X). Tag pushes are NOT relied upon: GITHUB_TOKEN pushes don't
+# cascade to other workflows, and tag-push triggers have proven unreliable in
+# this repo — workflow_dispatch via the API always lands.
 #
 # Usage: Actions → release → Run workflow → choose patch / minor / major
 #
@@ -55,8 +59,19 @@ jobs:
         run: |
           git add Cargo.toml
           git commit -m "chore: release ${{ steps.ver.outputs.tag }} [skip ci]"
-          git tag "${{ steps.ver.outputs.tag }}"
-          git push origin main --follow-tags
+          git tag -a "${{ steps.ver.outputs.tag }}" -m "release ${{ steps.ver.outputs.tag }}"
+          git push origin main
+          git push origin "refs/tags/${{ steps.ver.outputs.tag }}"
+
+      - name: Dispatch release pipelines
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # workflow_dispatch is exempt from the GITHUB_TOKEN cascade suppression
+          # (and tag-push triggers are unreliable in this repo), so fire both
+          # release pipelines explicitly on the new tag.
+          gh workflow run binaries.yml --ref "${{ steps.ver.outputs.tag }}"
+          gh workflow run oxidant-image.yml --ref "${{ steps.ver.outputs.tag }}"
 
       - name: Job summary
         run: |
@@ -69,9 +84,9 @@ jobs:
             echo "| New version | \`${{ steps.ver.outputs.version }}\` |"
             echo "| Git tag | \`${{ steps.ver.outputs.tag }}\` |"
             echo ""
-            echo "The **oxidant-image** workflow will now publish:"
+            echo "Dispatched **binaries** (GitHub Release: tarballs, curl installer,"
+            echo "Homebrew formula, .deb/.rpm) and **oxidant-image**, publishing:"
             echo "- \`ghcr.io/oxidantdata/oxidant:${{ steps.ver.outputs.version }}\`"
             echo "- \`ghcr.io/oxidantdata/oxidant:$(echo ${{ steps.ver.outputs.version }} | cut -d. -f1,2)\`"
             echo "- \`ghcr.io/oxidantdata/oxidant:$(echo ${{ steps.ver.outputs.version }} | cut -d. -f1)\`"
-            echo "- \`ghcr.io/oxidantdata/oxidant:latest\`"
           } >> "$GITHUB_STEP_SUMMARY"
