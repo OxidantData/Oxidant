@@ -33,6 +33,7 @@ use sc::spark_connect_service_client::SparkConnectServiceClient;
 use tonic::transport::Channel;
 
 mod distributed_coverage;
+mod sample_data;
 mod suite;
 mod tpcds;
 mod tpcds_data;
@@ -850,6 +851,12 @@ async fn bench_main() {
                 }
             }
         }
+        Some("sample-data") => {
+            // Regenerate the committed sample-data/ tree (TPC-H SF 0.01 in csv/parquet/delta/
+            // iceberg). `--data <DIR>` overrides the output dir (default ./sample-data).
+            let dir = data.clone().unwrap_or_else(|| "sample-data".to_string());
+            sample_data::run(Path::new(&dir)).await;
+        }
         Some("tpcds-distributed") => {
             let sf: f64 = flag(&args, "--sf").unwrap_or(0.01);
             let dir = data.clone().unwrap_or_else(|| {
@@ -910,8 +917,8 @@ async fn bench_main() {
         Some(other) => {
             eprintln!(
                 "unknown subcommand: {other}; try `clickbench`, `clickbench-grpc`, `correctness`, \
-                 `correctness-distributed`, `tpch`, `tpch-bench`, `tpch-distributed`, \
-                 `tpcds`, or `tpcds-distributed`"
+                 `correctness-distributed`, `sample-data`, `tpch`, `tpch-bench`, \
+                 `tpch-distributed`, `tpcds`, or `tpcds-distributed`"
             );
             std::process::exit(2);
         }
