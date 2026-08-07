@@ -1,0 +1,128 @@
+# cluster-smoke — verify a real multi-container stack: one driver container plus
+# two worker containers on a shared docker network, all from the published GHCR
+# image. Asserts, in order:
+#   1. workers come up; the driver registers them via --workers (KAN-21 fix path)
+#   2. /api/v1/cluster/status reports mode "distributed" with both endpoints
+#   3. the embedded Web UI loads; /health answers
+#   4. a distributed GROUP BY over the bundled sample parquet runs under
+#      OXIDANT_DISTRIBUTED_STRICT=1 — strict mode turns local fallback into an
+#      error, so success proves the query genuinely executed across the workers
+#   5. observability: the query shows up in the Spark-history-style API
+#      (/api/v1/applications/{id}/sql) and executors are listed
+# Dispatch-only; runs in Actions because GHCR pull bandwidth from a dev machine
+# should not gate verification. Companion to image-smoke.yml (single container).
+name: cluster-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Full image ref to smoke test"
+        required: true
+        default: "ghcr.io/oxidantdata/oxidant:latest"
+
+permissions:
+  packages: read
+
+jobs:
+  smoke:
+    name: driver + 2 workers + UI/observability
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Start two workers and the driver
+        run: |
+          set -e
+          docker network create oxidant-smoke
+          docker pull "${{ inputs.image }}"
+          for w in worker1 worker2; do
+            docker run --rm -d --network oxidant-smoke --name "$w" "${{ inputs.image }}" \
+              worker --port 50561
+          done
+          # Strict mode: any query the distributed planner rejects is an ERROR,
+          # not a silent local fallback — so a success below is proof of real
+          # distributed execution, not of "it ran somewhere".
+          docker run --rm -d --network oxidant-smoke --name driver -p 4040:4040 \
+            -e OXIDANT_DISTRIBUTED_STRICT=1 \
+            "${{ inputs.image }}" \
+            spark server --workers worker1:50561,worker2:50561
+
+      - name: Assert cluster status is distributed with both workers
+        run: |
+          for i in $(seq 1 30); do
+            OUT=$(curl -sf http://localhost:4040/api/v1/cluster/status) && break
+            sleep 2
+          done
+          echo "$OUT" | tee status.json
+          python3 - <<'EOF'
+          import json
+          s = json.load(open('status.json'))
+          assert s['mode'] == 'distributed', s
+          assert len(s['workers']) == 2, s
+          print('cluster status OK:', s['mode'], s['workers'])
+          EOF
+          docker logs driver 2>&1 | grep -m1 "Oxidant static workers"
+
+      - name: Assert the Web UI and health endpoint load
+        run: |
+          curl -sf http://localhost:4040/health | grep -q ok
+          curl -sf http://localhost:4040/ | tee ui.html | grep -qi "oxidant"
+          echo "UI OK ($(wc -c < ui.html) bytes)"
+
+      - name: Run a distributed query (strict) and a samples query
+        run: |
+          SQL_DIST="SELECT l_returnflag, COUNT(*) AS c, SUM(l_quantity) AS s FROM parquet.\`/opt/oxidant/sample-data/parquet/tpch_lineitem.parquet\` GROUP BY l_returnflag"
+          curl -sf -X POST "http://localhost:4040/api/v1/statements?wait=true&timeout=120" \
+            -H 'Content-Type: application/json' \
+            -d "{\"sql\":\"$SQL_DIST\"}" | tee dist.json
+          echo
+          python3 - <<'EOF'
+          import json
+          d = json.load(open('dist.json'))
+          assert d['status'] == 'succeeded', d
+          # 4 returnflag groups (A/F/N/R) — strict mode, so this ran on the workers.
+          assert d['rowCount'] == 4, d
+          print('distributed query OK:', d['rowCount'], 'groups,', d['durationMs'], 'ms')
+          EOF
+          curl -sf -X POST "http://localhost:4040/api/v1/statements?wait=true&timeout=60" \
+            -H 'Content-Type: application/json' \
+            -d '{"sql":"SELECT count(*) AS n FROM samples.tpch_nation"}' | tee samples.json
+          python3 -c "import json; d=json.load(open('samples.json')); assert d['status']=='succeeded', d; print('samples query OK')"
+
+      - name: Assert observability API sees the queries and executors
+        run: |
+          curl -sf http://localhost:4040/api/v1/applications | tee apps.json
+          python3 - <<'EOF'
+          import json, subprocess
+          apps = json.load(open('apps.json'))
+          assert len(apps) >= 1, apps
+          app_id = apps[0]['id'] if isinstance(apps, list) else apps['applications'][0]['id']
+          base = f'http://localhost:4040/api/v1/applications/{app_id}'
+          def get(path):
+              out = subprocess.run(['curl', '-sf', base + path], capture_output=True, text=True, check=True)
+              print(path, '->', out.stdout[:400])
+              return json.loads(out.stdout)
+          sql = get('/sql')
+          jobs = get('/jobs')
+          stages = get('/stages')
+          executors = get('/executors')
+          blob = json.dumps(sql)
+          assert 'l_returnflag' in blob or 'tpch_lineitem' in blob, 'distributed query missing from /sql'
+          assert len(executors) >= 1, executors
+          print('observability OK: app', app_id, '| jobs', len(jobs), '| stages', len(stages), '| executors', len(executors))
+          EOF
+
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          echo '=== driver ==='; docker logs driver 2>&1 | tail -30
+          echo '=== worker1 ==='; docker logs worker1 2>&1 | tail -15
+          echo '=== worker2 ==='; docker logs worker2 2>&1 | tail -15
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f driver worker1 worker2 > /dev/null 2>&1 || true
+          docker network rm oxidant-smoke > /dev/null 2>&1 || true
