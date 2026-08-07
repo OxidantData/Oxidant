@@ -1,0 +1,48 @@
+# image-smoke — verify the published GHCR image end-to-end (dispatch-only).
+# Pulls the given image, starts it, and proves the bundled sample data works:
+# zero flags, auto-discovery at /opt/oxidant/sample-data, samples.tpch_nation = 25.
+# Runs inside Actions because GHCR pull bandwidth from a dev machine is not
+# something a verification should depend on; the package may also still be
+# private, in which case only GITHUB_TOKEN can pull it.
+name: image-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Full image ref to smoke test"
+        required: true
+        default: "ghcr.io/oxidantdata/oxidant:0.1.0"
+
+permissions:
+  packages: read
+
+jobs:
+  smoke:
+    name: docker run + samples query
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Pull and start the image
+        run: |
+          docker pull "${{ inputs.image }}"
+          docker run --rm -d -p 4040:4040 --name oxidant "${{ inputs.image }}"
+
+      - name: Query the preloaded samples
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:4040/api/v1/cluster/status && break
+            sleep 2
+          done
+          echo
+          curl -sf -X POST "http://localhost:4040/api/v1/statements?wait=true&timeout=60" \
+            -H 'Content-Type: application/json' \
+            -d '{"sql":"SELECT count(*) AS n FROM samples.tpch_nation"}' | tee result.json
+          echo
+          python3 -c "import json; d=json.load(open('result.json')); assert d['status']=='succeeded', d; print('image-smoke OK:', d['status'], d.get('rowCount'), 'row')"
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs oxidant 2>&1 | tail -40
