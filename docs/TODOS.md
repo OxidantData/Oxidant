@@ -19,6 +19,9 @@ GitHub Release. Future items:
 - [ ] Submit `oxidant` to Homebrew core once the project meets homebrew-core's
       notability requirements — until then the tap is
       [OxidantData/homebrew-tap](https://github.com/OxidantData/homebrew-tap).
+- [ ] Homebrew users currently get no sample data (the cargo-dist-generated formula
+      installs only the binary) — workaround: `--sample-data` pointing at a repo clone;
+      revisit with a custom formula later.
 - [ ] musl static builds (`x86_64_`/`aarch64-unknown-linux-musl`) for Alpine and
       minimal containers — needs a native-dep audit (ring, zstd-sys) for musl
       safety; gnu targets ship today.

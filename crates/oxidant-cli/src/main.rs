@@ -253,18 +253,41 @@ fn catalog_conf(args: &[String]) -> std::collections::HashMap<String, String> {
 
 /// `--sample-data <DIR>` (or `OXIDANT_SAMPLE_DATA_DIR`): preload the bundled sample tables
 /// under the `samples` schema at startup. The flag wins over the env var; an empty value is
-/// treated as unset.
+/// treated as unset. When neither is set, a bundled sample-data tree installed next to the
+/// binary is auto-discovered (release tarballs / curl|sh / deb / rpm layouts).
 fn sample_data_dir(args: &[String]) -> Option<std::path::PathBuf> {
-    sample_data_dir_from(
+    let explicit = sample_data_dir_from(
         flag(args, "--sample-data"),
         std::env::var("OXIDANT_SAMPLE_DATA_DIR").ok(),
-    )
+    );
+    if explicit.is_some() {
+        return explicit;
+    }
+    let exe = std::env::current_exe().ok()?;
+    resolve_sample_data_dir(exe.parent()?)
 }
 
 fn sample_data_dir_from(flag: Option<String>, env: Option<String>) -> Option<std::path::PathBuf> {
     flag.or(env)
         .filter(|s| !s.trim().is_empty())
         .map(std::path::PathBuf::from)
+}
+
+/// Sample-data auto-discovery. `exe_dir` is the directory of the current executable; the
+/// first candidate that exists and contains a `parquet/` subdir (sanity check that it is
+/// really a sample-data tree) wins. Returns None when nothing matches (no `samples` schema
+/// — the pre-discovery behavior). Checked in order:
+/// 1. `<exe_dir>/sample-data` — release tarballs + the curl|sh installer
+/// 2. `<exe_dir>/../share/oxidant/sample-data` — prefix layouts (/usr/local/bin/…)
+/// 3. `/usr/share/oxidant/sample-data` — deb / rpm packages (packaging/nfpm.yaml)
+fn resolve_sample_data_dir(exe_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    [
+        exe_dir.join("sample-data"),
+        exe_dir.join("../share/oxidant/sample-data"),
+        std::path::PathBuf::from("/usr/share/oxidant/sample-data"),
+    ]
+    .into_iter()
+    .find(|dir| dir.join("parquet").is_dir())
 }
 
 async fn run_worker(args: &[String]) -> oxidant_common::Result<()> {
@@ -768,6 +791,63 @@ mod tests {
         );
         assert_eq!(sample_data_dir_from(None, Some("  ".to_string())), None);
         assert_eq!(sample_data_dir_from(None, None), None);
+    }
+
+    /// A fake installed tree: `mkdir -p <root>/<rel>/parquet`.
+    fn make_sample_tree(root: &std::path::Path, rel: &str) {
+        std::fs::create_dir_all(root.join(rel).join("parquet")).unwrap();
+    }
+
+    #[test]
+    fn discovery_finds_sample_data_next_to_exe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("bin");
+        make_sample_tree(tmp.path(), "bin/sample-data");
+        assert_eq!(
+            resolve_sample_data_dir(&exe_dir),
+            Some(exe_dir.join("sample-data"))
+        );
+    }
+
+    #[test]
+    fn discovery_falls_through_to_prefix_share_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("usr/local/bin");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        make_sample_tree(tmp.path(), "usr/local/share/oxidant/sample-data");
+        assert_eq!(
+            resolve_sample_data_dir(&exe_dir),
+            Some(exe_dir.join("../share/oxidant/sample-data"))
+        );
+    }
+
+    #[test]
+    fn discovery_prefers_sibling_dir_over_prefix_share_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("bin");
+        make_sample_tree(tmp.path(), "bin/sample-data");
+        make_sample_tree(tmp.path(), "share/oxidant/sample-data");
+        assert_eq!(
+            resolve_sample_data_dir(&exe_dir),
+            Some(exe_dir.join("sample-data"))
+        );
+    }
+
+    #[test]
+    fn discovery_requires_the_parquet_sanity_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("bin");
+        // A `sample-data` dir without `parquet/` is not a sample-data tree.
+        std::fs::create_dir_all(exe_dir.join("sample-data/csv")).unwrap();
+        assert_eq!(resolve_sample_data_dir(&exe_dir), None);
+    }
+
+    #[test]
+    fn discovery_returns_none_when_nothing_is_installed() {
+        // Assumes the host has no /usr/share/oxidant/sample-data (true unless the deb/rpm is
+        // installed — dev machines and CI runners don't have it).
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_sample_data_dir(tmp.path()), None);
     }
 
     #[test]
