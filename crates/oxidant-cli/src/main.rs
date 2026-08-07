@@ -198,6 +198,8 @@ async fn run_history_server(args: &[String]) -> oxidant_common::Result<()> {
         port,
         store,
         bind: std::net::IpAddr::from([0, 0, 0, 0]),
+        // The history server replays an event log — no live engine, so no REST statements.
+        merge_router: None,
     })
     .await
 }

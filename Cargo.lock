@@ -4202,6 +4202,8 @@ dependencies = [
  "oxidant-loom",
  "oxidant-observability",
  "oxidant-ui-server",
+ "reqwest 0.12.28",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -4215,8 +4217,10 @@ name = "oxidant-connect"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "axum 0.8.9",
  "datafusion",
  "futures",
+ "http-body-util",
  "oxidant-analyzer",
  "oxidant-catalog",
  "oxidant-catalog-glue",
@@ -4235,10 +4239,12 @@ dependencies = [
  "oxidant-ui-server",
  "prost 0.13.5",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-stream",
  "tonic 0.12.3",
+ "tower 0.5.3",
  "tracing",
  "uuid",
 ]

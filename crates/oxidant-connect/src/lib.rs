@@ -38,6 +38,7 @@ use sc::spark_connect_service_server::{SparkConnectService, SparkConnectServiceS
 
 mod catalog;
 mod distributed;
+pub mod rest;
 mod streaming;
 mod translate;
 mod types;
@@ -897,6 +898,22 @@ impl OxidantService {
                 Ok((batches, None))
             }
         }
+    }
+
+    /// Execute a SQL statement end-to-end through the exact `Sql`-relation arm of
+    /// [`Self::base_relation_batches`]: the logical plan is built once
+    /// (`logical_plan_with_lakehouse_snapshots`), auto-splittable queries route through
+    /// [`distributed::try_run_distributed_plan`], and everything else runs locally via
+    /// `engine.sql_with_stats` / `engine.sql` — with the same unsigned→signed normalization
+    /// and observability tracking as gRPC, so statements appear on the monitoring /sql page
+    /// under `operation_id`. Exposed for the REST statement API in [`rest`].
+    pub async fn execute_sql(
+        &self,
+        sql: &str,
+        operation_id: &str,
+    ) -> std::result::Result<(Vec<RecordBatch>, Option<oxidant_loom::QueryStats>), Status> {
+        self.base_relation_batches(&sql_relation(sql), Some(operation_id))
+            .await
     }
 
     /// Look up a config key: stored value, else a lenient default (so PySpark's `conf.get` never
@@ -1902,15 +1919,19 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .unwrap_or_else(|| Arc::new(AppStateStore::new()));
     let mut cfg = config;
     cfg.observability = Some(store.clone());
-    let service = OxidantService::with_config(cfg);
+    let service = Arc::new(OxidantService::with_config(cfg));
 
     if let Some(ui_port) = ui_port {
         let ui_store = store.clone();
+        // The REST statement API shares the service (and the UI's HTTP listener): statements
+        // submitted over HTTP get the same distributed routing + observability as gRPC.
+        let rest_router = rest::router(Arc::clone(&service));
         tokio::spawn(async move {
             if let Err(e) = oxidant_ui_server::serve(oxidant_ui_server::UiServerConfig {
                 port: ui_port,
                 store: ui_store,
                 bind: ui_bind,
+                merge_router: Some(rest_router),
             })
             .await
             {
@@ -1920,15 +1941,20 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         eprintln!("Oxidant UI listening on http://{ui_bind}:{ui_port}");
     }
 
-    serve_instance(service, port).await
+    serve_shared(service, port).await
 }
 
 /// Serve a pre-built service instance (tests with a seeded engine).
 pub async fn serve_instance(service: OxidantService, port: u16) -> Result<()> {
+    serve_shared(Arc::new(service), port).await
+}
+
+/// Serve a shared service instance (the REST statement API holds the other `Arc`).
+async fn serve_shared(service: Arc<OxidantService>, port: u16) -> Result<()> {
     let addr = format!("0.0.0.0:{port}")
         .parse()
         .map_err(|e| Error::Io(format!("bad listen addr: {e}")))?;
-    let grpc = SparkConnectServiceServer::new(service)
+    let grpc = SparkConnectServiceServer::from_arc(service)
         .max_decoding_message_size(MAX_MSG)
         .max_encoding_message_size(MAX_MSG);
     tonic::transport::Server::builder()

@@ -20,12 +20,22 @@ pub struct UiServerConfig {
     /// Interface to bind the UI HTTP listener on. Use `127.0.0.1` on
     /// shared/public machines (the UI has no auth) and reach it via SSH tunnel.
     pub bind: std::net::IpAddr,
+    /// Extra routes merged into the app router before the SPA fallback — e.g. the REST
+    /// statement-execution API, which lives in `oxidant-connect` (it owns the query engine;
+    /// this crate cannot depend on it without a cycle). `None` for the standalone
+    /// history server.
+    pub merge_router: Option<Router>,
 }
 
 /// Start the UI HTTP server and serve until shutdown.
 pub async fn serve(config: UiServerConfig) -> Result<()> {
     let addr = SocketAddr::from((config.bind, config.port));
-    let app = app_router(config.store).layer(
+    let mut app = app_router(config.store);
+    if let Some(extra) = config.merge_router {
+        // The merged router carries no fallback, so the SPA fallback below stays in effect.
+        app = app.merge(extra);
+    }
+    let app = app.layer(
         CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -62,6 +72,7 @@ mod tests {
             port,
             store,
             bind: std::net::IpAddr::from([127, 0, 0, 1]),
+            merge_router: None,
         };
         let server = tokio::spawn(serve(config));
         // Wait for the listener, then confirm loopback serves a page.
