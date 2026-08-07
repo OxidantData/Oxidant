@@ -344,11 +344,12 @@ jobs:
           git push
 
   # HAND-ADDED (not dist-generated): .deb/.rpm packages via nfpm.
-  # Builds the two Linux targets on NATIVE runners (no cross-linking; the same
-  # runner families dist itself uses above), packages each with nfpm
-  # (packaging/nfpm.yaml), and attaches the packages to the GitHub Release that
-  # the dist `host` job just created. Runs after `host` because the Release must
-  # exist before `gh release upload`; skipped on PRs because `host` is skipped.
+  # Builds the two Linux targets on native-arch runners inside manylinux_2_34
+  # containers (glibc 2.34 floor — KAN-61, matching the dist tarball legs),
+  # packages each with nfpm (packaging/nfpm.yaml), and attaches the packages to
+  # the GitHub Release that the dist `host` job just created. Runs after `host`
+  # because the Release must exist before `gh release upload`; skipped on PRs
+  # because `host` is skipped.
   package-linux:
     name: package-linux (${{ matrix.target }})
     needs:
@@ -361,10 +362,16 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             pkg-arch: amd64
+            img-arch: x86_64
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
             pkg-arch: arm64
+            img-arch: aarch64
     runs-on: ${{ matrix.runner }}
+    # KAN-61: build inside manylinux_2_34 (AlmaLinux 9, glibc 2.34) so the packaged
+    # binaries run on RHEL 9 / Amazon Linux 2023 and newer — same container family
+    # and floor as the dist tarball builds (see dist-workspace.toml).
+    container: quay.io/pypa/manylinux_2_34_${{ matrix.img-arch }}:2026.08.05-1
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CARGO_INCREMENTAL: "0"
@@ -375,10 +382,18 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+      # manylinux has git/gcc/cmake/perl but no Rust toolchain and no gh CLI.
+      - name: Set up Rust toolchain + GitHub CLI
         run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
           rustup show
           rustc --version && cargo --version
+          curl --proto '=https' --tlsv1.2 -LsSfO \
+            "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_linux_${{ matrix.pkg-arch }}.rpm"
+          dnf install -y "gh_2.97.0_linux_${{ matrix.pkg-arch }}.rpm"
+          gh --version
 
       # Read-only restore of the shared CI cargo cache (see ci.yml for why there
       # is exactly one writer); tag builds never save back.
@@ -394,8 +409,8 @@ jobs:
       - name: Install nfpm
         run: |
           curl --proto '=https' --tlsv1.2 -LsSfO \
-            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_${{ matrix.pkg-arch }}.deb"
-          sudo dpkg -i "nfpm_${NFPM_VERSION}_${{ matrix.pkg-arch }}.deb"
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm-${NFPM_VERSION}-1.${{ matrix.img-arch }}.rpm"
+          dnf install -y "nfpm-${NFPM_VERSION}-1.${{ matrix.img-arch }}.rpm"
           nfpm --version
 
       - name: Package .deb + .rpm
