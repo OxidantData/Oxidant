@@ -5,11 +5,13 @@ alternative to the [Web UI editor](web-ui.md) and to a full PySpark client.
 
 ```text
 oxidant sql [--url http://localhost:4040] (-e "<sql>" | -f <file.sql> | stdin)
-            [--format table|csv|json]
+            [--format table|csv|json] [--timeout <secs>]
 ```
 
 The server URL comes from `--url`, or from the `OXIDANT_URL` environment variable; the default
-is `http://localhost:4040`.
+is `http://localhost:4040`. Long-running statements are polled until they finish; `--timeout`
+caps the total wait (default 300 seconds, after which the command exits non-zero while the
+statement keeps running server-side — cancel it via the API or Web UI).
 
 ## SQL input
 
