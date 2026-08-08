@@ -80,11 +80,21 @@ export default forwardRef<
 
   function updatePopupPosition() {
     const el = textareaRef.current;
+    const popup = popupRef.current;
     if (!el) return;
     const coords = getCaretCoordinates(el, el.selectionStart ?? 0);
     const rect = el.getBoundingClientRect();
-    const top = rect.top + coords.top - el.scrollTop + 18;
-    const left = rect.left + coords.left - el.scrollLeft;
+    let top = rect.top + coords.top - el.scrollTop + 18;
+    let left = rect.left + coords.left - el.scrollLeft;
+
+    // Clamp to viewport so the popup never renders off-screen.
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const pw = popup?.offsetWidth ?? 220;
+    const ph = popup?.offsetHeight ?? 120;
+    left = Math.max(4, Math.min(left, vw - pw - 4));
+    top = Math.max(4, Math.min(top, vh - ph - 4));
+
     setPopupPos({ top, left });
   }
 
@@ -179,18 +189,25 @@ export default forwardRef<
   }
 
   useEffect(() => {
+    const el = textareaRef.current;
+    if (!el || !open) return;
+
     function onScroll() {
-      if (open) updatePopupPosition();
+      updatePopupPosition();
     }
     function onClick(e: MouseEvent) {
       if (!popupRef.current?.contains(e.target as Node)) {
         setOpen(false);
       }
     }
-    window.addEventListener("scroll", onScroll, true);
+
+    // Listen on window and every scrollable ancestor so the popup follows the
+    // caret inside nested scroll containers (e.g. NotebookPage cells list).
+    const targets = [window, ...scrollableAncestors(el)];
+    targets.forEach((t) => t.addEventListener("scroll", onScroll, true));
     window.addEventListener("click", onClick);
     return () => {
-      window.removeEventListener("scroll", onScroll, true);
+      targets.forEach((t) => t.removeEventListener("scroll", onScroll, true));
       window.removeEventListener("click", onClick);
     };
   }, [open]);
@@ -255,6 +272,26 @@ function kindBadgeClass(kind: AutocompleteSuggestion["kind"]): string {
     default:
       return "bg-muted/20 text-muted";
   }
+}
+
+function scrollableAncestors(el: HTMLElement): HTMLElement[] {
+  const out: HTMLElement[] = [];
+  let cur: HTMLElement | null = el.parentElement;
+  while (cur) {
+    const style = window.getComputedStyle(cur);
+    const overflowY = style.overflowY;
+    const overflowX = style.overflowX;
+    if (
+      overflowY === "auto" ||
+      overflowY === "scroll" ||
+      overflowX === "auto" ||
+      overflowX === "scroll"
+    ) {
+      out.push(cur);
+    }
+    cur = cur.parentElement;
+  }
+  return out;
 }
 
 /**

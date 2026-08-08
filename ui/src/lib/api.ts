@@ -115,6 +115,9 @@ export interface ClusterStatus {
 
 const base = `/api/v1/applications/${APP_ID}`;
 
+export const DEFAULT_ROW_LIMIT = 100;
+export const MAX_ROW_LIMIT = 10_000;
+
 /** Read a JSON body, surfacing the API's `{"error": "..."}` message on non-2xx. */
 async function readJson<T>(r: Response, path: string): Promise<T> {
   const data = (await r.json().catch(() => null)) as ({ error?: string } & T) | null;
@@ -220,9 +223,28 @@ export function fmtMs(ms?: number | null): string {
 
 export function fmtBytes(n?: number): string {
   if (n == null || n === 0) return "0";
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let value = n;
+  let unitIdx = 0;
+  while (value >= 1024 && unitIdx < units.length - 1) {
+    value /= 1024;
+    unitIdx++;
+  }
+  return `${value.toFixed(1)} ${units[unitIdx]}`;
+}
+
+export function downloadBlob(
+  content: string | Blob,
+  filename: string,
+  contentType: string
+) {
+  const blob = content instanceof Blob ? content : new Blob([content], { type: contentType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 export function jobDuration(j: JobData): number | null {

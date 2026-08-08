@@ -1,7 +1,10 @@
 import { useCallback, useRef, useState } from "react";
 import {
   api,
+  DEFAULT_ROW_LIMIT,
+  downloadBlob,
   fmtMs,
+  MAX_ROW_LIMIT,
   runStatement,
   type StatementDoc,
   type StatementResult,
@@ -12,9 +15,6 @@ import CatalogSidebar from "@/components/CatalogSidebar";
 import SqlAutocompleteTextarea, {
   type SqlAutocompleteTextareaHandle,
 } from "@/components/SqlAutocompleteTextarea";
-
-const DEFAULT_ROW_LIMIT = 100;
-const MAX_ROW_LIMIT = 10_000;
 
 export default function EditorPage() {
   const [sql, setSql] = useState("SELECT 1 AS hello");
@@ -262,15 +262,4 @@ export default function EditorPage() {
   );
 }
 
-function downloadBlob(
-  content: string,
-  filename: string,
-  contentType: string
-) {
-  const blob = new Blob([content], { type: contentType });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(a.href);
-}
+

@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import {
   api,
+  DEFAULT_ROW_LIMIT,
+  downloadBlob,
   fmtMs,
+  MAX_ROW_LIMIT,
   runStatement,
   type StatementDoc,
   type StatementResult,
@@ -29,9 +32,6 @@ interface CellOutput {
 }
 
 const STORAGE_KEY = "oxidant.notebook.v1";
-const DEFAULT_ROW_LIMIT = 100;
-const MAX_ROW_LIMIT = 10_000;
-
 function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
@@ -412,15 +412,4 @@ export default function NotebookPage() {
   );
 }
 
-function downloadBlob(
-  content: string,
-  filename: string,
-  contentType: string
-) {
-  const blob = new Blob([content], { type: contentType });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(a.href);
-}
+

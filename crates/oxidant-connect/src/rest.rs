@@ -33,6 +33,7 @@ use datafusion::arrow::json::{ArrayWriter, WriterBuilder};
 use oxidant_catalog::DEFAULT_CATALOG;
 use oxidant_loom::arrow::array::Array;
 use oxidant_loom::arrow::record_batch::RecordBatch;
+use oxidant_loom::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sysinfo::{Pid, System};
@@ -106,14 +107,44 @@ fn format_event(event: &tracing::Event<'_>) -> String {
 
 struct LogVisitor(String);
 
-impl tracing::field::Visit for LogVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+impl LogVisitor {
+    fn push_field(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Display) {
         if !self.0.is_empty() {
             self.0.push_str(", ");
         }
         self.0.push_str(field.name());
         self.0.push_str("=");
-        self.0.push_str(&format!("{:?}", value));
+        self.0.push_str(&value.to_string());
+    }
+}
+
+impl tracing::field::Visit for LogVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.push_field(field, &format!("{:?}", value));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.push_field(field, &format!("{:?}", value));
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.push_field(field, &value);
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.push_field(field, &value);
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.push_field(field, &value);
+    }
+
+    fn record_error(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &(dyn std::error::Error + 'static),
+    ) {
+        self.push_field(field, &value);
     }
 }
 
@@ -131,6 +162,16 @@ pub fn init_logging() {
         .finish()
         .with(buffer)
         .try_init();
+}
+
+/// Cached sysinfo `System` for process metrics. Kept in a `Mutex` so successive
+/// `refresh_process_specifics` calls can compute a meaningful CPU percentage.
+static SYSTEM: OnceLock<std::sync::Mutex<System>> = OnceLock::new();
+
+fn system_snapshot() -> System {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    sys
 }
 
 /// Statement lifecycle, serialized lowercase exactly as the API contract spells it.
@@ -407,13 +448,54 @@ impl StatementStore {
     }
 }
 
-/// `{"name","type"}` pairs of a result's Arrow schema (type names via `Display`, e.g. "Int64").
 /// Backtick-quote an identifier, stripping any existing backticks first so we
 /// do not double-quote. This is Spark SQL's identifier-quoting rule.
 fn quote_identifier(id: &str) -> String {
     format!("`{}`", id.replace('`', ""))
 }
 
+/// Fetch column (name, type) pairs for a fully qualified table, or None if the
+/// table cannot be described.
+async fn fetch_columns(
+    engine: Arc<Engine>,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Option<Vec<(String, String)>> {
+    let ns_parts: Vec<&str> = namespace.split('.').collect();
+    let quoted_ns = ns_parts
+        .iter()
+        .map(|p| quote_identifier(p))
+        .collect::<Vec<_>>()
+        .join(".");
+    let qualified = format!(
+        "{}.{n}.{t}",
+        quote_identifier(catalog),
+        n = quoted_ns,
+        t = quote_identifier(table)
+    );
+    let sql = format!("DESCRIBE TABLE {qualified}");
+    let batches = engine.sql(&sql).await.ok()?;
+    let mut columns = Vec::new();
+    for batch in batches {
+        let col_names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>();
+        let data_types = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>();
+        if let (Some(names), Some(types)) = (col_names, data_types) {
+            for i in 0..names.len() {
+                columns.push((names.value(i).to_string(), types.value(i).to_string()));
+            }
+        }
+    }
+    Some(columns)
+}
+
+/// `{"name","type"}` pairs of a result's Arrow schema (type names via `Display`, e.g. "Int64").
 fn schema_fields(batches: &[RecordBatch]) -> Option<Vec<(String, String)>> {
     batches.first().map(|b| {
         b.schema()
@@ -778,7 +860,8 @@ async fn list_tables(
     let engine = state.service.engine();
     let registry = state.service.registry();
     let namespace = q.namespace.as_deref().unwrap_or("default");
-    let ns_parts: Vec<String> = namespace.split(',').map(|s| s.to_string()).collect();
+    // Namespaces are dot-joined everywhere else; split on '.' for consistency.
+    let ns_parts: Vec<String> = namespace.split('.').map(|s| s.to_string()).collect();
     let table_names = if catalog == DEFAULT_CATALOG {
         let schema = ns_parts
             .last()
@@ -806,46 +889,17 @@ async fn list_columns(
 ) -> Response {
     let engine = state.service.engine();
     let namespace = q.namespace.as_deref().unwrap_or("default");
-    // Quote each identifier part to avoid SQL injection / reserved-word issues.
-    let ns_parts: Vec<&str> = namespace.split('.').collect();
-    let quoted_ns = ns_parts
-        .iter()
-        .map(|p| quote_identifier(p))
-        .collect::<Vec<_>>()
-        .join(".");
-    let qualified = format!(
-        "{}.{n}.{t}",
-        quote_identifier(&catalog),
-        n = quoted_ns,
-        t = quote_identifier(&table)
-    );
-    let sql = format!("DESCRIBE TABLE {qualified}");
-    match engine.sql(&sql).await {
-        Ok(batches) => {
-            let mut columns = Vec::new();
-            for batch in batches {
-                let col_names = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::StringArray>();
-                let data_types = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::StringArray>();
-                if let (Some(names), Some(types)) = (col_names, data_types) {
-                    for i in 0..names.len() {
-                        columns.push(json!({
-                            "name": names.value(i).to_string(),
-                            "type": types.value(i).to_string(),
-                        }));
-                    }
-                }
-            }
+    match fetch_columns(engine, &catalog, namespace, &table).await {
+        Some(columns) => {
+            let columns: Vec<Value> = columns
+                .into_iter()
+                .map(|(name, ty)| json!({ "name": name, "type": ty }))
+                .collect();
             Json(json!({ "columns": columns })).into_response()
         }
-        Err(e) => error_response(
+        None => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("describe table: {e}"),
+            "describe table: unable to fetch columns",
         ),
     }
 }
@@ -898,7 +952,7 @@ async fn autocomplete_catalog(
             push("namespace", &ns, format!("{current}.{ns}"));
         }
     } else {
-        // We have a catalog (and maybe namespace) prefix. Try to resolve it.
+        // We have a catalog (and maybe namespace/table) prefix. Try to resolve it.
         let first = parts[0];
         let (catalog, namespace_parts) = if registry.contains(first) {
             (first.to_string(), parts[1..parts.len() - 1].to_vec())
@@ -931,25 +985,62 @@ async fn autocomplete_catalog(
             }
         }
 
-        // Suggest tables in the resolved namespace.
-        let table_names = if catalog == DEFAULT_CATALOG {
-            let schema = ns_vec
-                .last()
-                .cloned()
-                .unwrap_or_else(|| "default".to_string());
-            engine.builtin_table_names(&schema)
-        } else if let Some(provider) = registry.provider(&catalog) {
-            provider.list_tables(&ns_vec).await.unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        for t in table_names {
-            let qualified = if namespace_str.is_empty() {
-                format!("{catalog}.{t}")
+        let mut resolved_table = false;
+        if let Some(table) = namespace_parts.last() {
+            // The last part might be a table; if so, suggest its columns.
+            let col_namespace = namespace_parts[..namespace_parts.len() - 1].join(".");
+            if let Some(columns) =
+                fetch_columns(Arc::clone(&engine), &catalog, &col_namespace, table).await
+            {
+                resolved_table = true;
+                for (name, _ty) in columns {
+                    let qualified = if namespace_str.is_empty() {
+                        format!("{catalog}.{table}.{name}")
+                    } else {
+                        format!("{catalog}.{namespace_str}.{name}")
+                    };
+                    push("column", &name, qualified);
+                }
+            }
+        }
+
+        // If the last part was not a resolvable table, fall back to table suggestions.
+        if !resolved_table {
+            let table_namespace = if namespace_parts.len() > 1 {
+                namespace_parts[..namespace_parts.len() - 1].join(".")
             } else {
-                format!("{catalog}.{namespace_str}.{t}")
+                namespace_str.clone()
             };
-            push("table", &t, qualified);
+            let table_ns_vec: Vec<String> = if namespace_parts.len() > 1 {
+                namespace_parts[..namespace_parts.len() - 1]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                ns_vec.clone()
+            };
+            let table_names = if catalog == DEFAULT_CATALOG {
+                let schema = table_ns_vec
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_string());
+                engine.builtin_table_names(&schema)
+            } else if let Some(provider) = registry.provider(&catalog) {
+                provider
+                    .list_tables(&table_ns_vec)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            for t in table_names {
+                let qualified = if table_namespace.is_empty() {
+                    format!("{catalog}.{t}")
+                } else {
+                    format!("{catalog}.{table_namespace}.{t}")
+                };
+                push("table", &t, qualified);
+            }
         }
     }
 
@@ -986,11 +1077,19 @@ async fn cluster_status(State(state): State<RestState>) -> Json<Value> {
     }))
 }
 
-/// Snapshot current process CPU and memory via sysinfo.
+/// Snapshot current process CPU and memory via sysinfo. Uses a cached `System`
+/// so that successive calls can compute a delta-based CPU percentage.
 fn process_metrics() -> (Option<u64>, Option<u64>, Option<f32>) {
-    let mut sys = System::new_all();
-    sys.refresh_all();
     let pid = Pid::from_u32(std::process::id());
+    let mut sys = SYSTEM
+        .get_or_init(|| std::sync::Mutex::new(system_snapshot()))
+        .lock()
+        .expect("system metrics poisoned");
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        false,
+        sysinfo::ProcessRefreshKind::everything(),
+    );
     sys.process(pid)
         .map(|p| {
             let mem = p.memory();
@@ -1392,5 +1491,17 @@ mod tests {
         assert!(suggestions
             .iter()
             .any(|s| s["kind"] == "table" && s["name"] == "acme_orders"));
+
+        // Table-qualified prefix suggests columns.
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/autocomplete?prefix=spark_catalog.default.acme_orders.i",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let suggestions = body["suggestions"].as_array().unwrap();
+        assert!(suggestions
+            .iter()
+            .any(|s| s["kind"] == "column" && s["name"] == "id"));
     }
 }
