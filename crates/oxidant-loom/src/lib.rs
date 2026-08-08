@@ -4126,10 +4126,24 @@ impl Engine {
                     segments.push(bare_table);
                 }
                 let (cat, ns, tbl) = self.resolve_table_ref(&segments);
-                let qualified = if cat == oxidant_catalog::DEFAULT_CATALOG {
-                    format!("{}.{tbl}", ns.join("."))
-                } else {
-                    format!("{cat}.{}.{tbl}", ns.join("."))
+                // `USE CATALOG <external>` leaves no current database (KAN-84): the schema
+                // probe below can't be qualified into SQL (`{cat}..{tbl}` is a syntax error).
+                // Probe the provider with the empty namespace instead and surface its contract
+                // error (Glue/Hive: "needs a database …"). In-tree providers all require a
+                // namespace, so this errors; a flat provider accepting the empty namespace
+                // falls through with the parts joined without the empty segment.
+                if cat != oxidant_catalog::DEFAULT_CATALOG && ns.is_empty() {
+                    self.load_catalog_table(&cat, &ns, &tbl).await?;
+                }
+                let qualified = {
+                    let mut parts: Vec<&str> = if cat == oxidant_catalog::DEFAULT_CATALOG {
+                        Vec::new()
+                    } else {
+                        vec![cat.as_str()]
+                    };
+                    parts.extend(ns.iter().map(String::as_str));
+                    parts.push(&tbl);
+                    parts.join(".")
                 };
                 let schema = self.schema(&format!("SELECT * FROM {qualified}")).await?;
                 let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
@@ -4342,10 +4356,21 @@ impl Engine {
                 }
                 let segments = parse_qualified_name(name);
                 let (cat, ns, tbl) = self.resolve_table_ref(&segments);
-                let qualified = if cat == oxidant_catalog::DEFAULT_CATALOG {
-                    format!("{}.{tbl}", ns.join("."))
-                } else {
-                    format!("{cat}.{}.{tbl}", ns.join("."))
+                // Same KAN-84 empty-namespace handling as `SHOW COLUMNS` (see [`Engine::run_show`]):
+                // probe the provider with the empty namespace and surface its contract error
+                // rather than building `{cat}..{tbl}` SQL.
+                if cat != oxidant_catalog::DEFAULT_CATALOG && ns.is_empty() {
+                    self.load_catalog_table(&cat, &ns, &tbl).await?;
+                }
+                let qualified = {
+                    let mut parts: Vec<&str> = if cat == oxidant_catalog::DEFAULT_CATALOG {
+                        Vec::new()
+                    } else {
+                        vec![cat.as_str()]
+                    };
+                    parts.extend(ns.iter().map(String::as_str));
+                    parts.push(&tbl);
+                    parts.join(".")
                 };
                 let schema = self.schema(&format!("SELECT * FROM {qualified}")).await?;
                 // Metadata for the detailed/JSON forms: local `CREATE TABLE ... USING` tables read
@@ -4601,6 +4626,17 @@ impl Engine {
 
     /// Apply a parsed `USE` statement, updating the session's current catalog/namespace.
     /// `USE` produces no result rows (Spark's `struct<>`).
+    ///
+    /// KAN-84 — `USE CATALOG <catalog>` follows Spark's `CatalogManager.setCurrentCatalog`:
+    /// switching catalogs CLEARS the current-namespace override, and the switch is a no-op
+    /// when the catalog is already current (a `USE glue.db1` … `USE CATALOG glue` sequence
+    /// keeps `db1`, matching Spark). Spark then resolves bare names against the new catalog's
+    /// `defaultNamespace()` — `["default"]` for the builtin session catalog. oxidant's
+    /// external providers carry no default-namespace metadata, so switching to an external
+    /// catalog leaves the namespace EMPTY ("no database selected"): bare-name SHOW/DESCRIBE
+    /// forms then probe the provider with the empty namespace and surface its contract error
+    /// (Glue: "a Glue table reference needs a database, e.g. `catalog.database.table`"), and
+    /// the KAN-81 sizing walk restricts its namespace search to that one catalog.
     async fn run_use(&self, stmt: &UseStmt) -> Result<Vec<RecordBatch>> {
         match stmt {
             UseStmt::Catalog { catalog } => {
@@ -4610,7 +4646,14 @@ impl Engine {
                     )));
                 }
                 let mut current = self.current.lock().expect("current poisoned");
-                current.0 = catalog.clone();
+                if current.0 != *catalog {
+                    current.0 = catalog.clone();
+                    current.1 = if *catalog == oxidant_catalog::DEFAULT_CATALOG {
+                        vec![oxidant_catalog::DEFAULT_NAMESPACE.to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                }
             }
             UseStmt::Namespace { catalog, namespace } => {
                 if let Some(cat) = catalog {
@@ -4681,7 +4724,13 @@ impl Engine {
         namespace: &[String],
         table: &str,
     ) -> Result<oxidant_catalog::TableMetadata> {
-        let qualified = format!("{catalog}.{}.{table}", namespace.join("."));
+        // Join only the non-empty qualifier parts: an empty namespace (the `USE CATALOG
+        // <external>` state, KAN-84) must not produce a `catalog..table` double dot.
+        let qualified = std::iter::once(catalog)
+            .chain(namespace.iter().map(String::as_str))
+            .chain(std::iter::once(table))
+            .collect::<Vec<_>>()
+            .join(".");
         let provider = self.oxidant_catalog(catalog).ok_or_else(|| {
             Error::Plan(format!(
                 "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{qualified}` cannot be found"
@@ -6197,8 +6246,13 @@ mod tests {
                 Ok(vec![])
             }
         }
-        async fn list_tables(&self, _namespace: &[String]) -> oxidant_catalog::Result<Vec<String>> {
-            Ok(self.tables.keys().cloned().collect())
+        async fn list_tables(&self, namespace: &[String]) -> oxidant_catalog::Result<Vec<String>> {
+            let prefix = format!("{}.", namespace.join("."));
+            Ok(self
+                .tables
+                .keys()
+                .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string))
+                .collect())
         }
         async fn load_table(
             &self,
@@ -6351,9 +6405,10 @@ mod tests {
         let engine = Engine::new();
         engine.register_catalog("testcat", catalog.clone());
         engine.register_catalog("othercat", other.clone());
-        // `USE testcat` keeps the default namespace; clear it to exercise the
-        // external-catalog-with-empty-namespace path directly.
-        *engine.current.lock().expect("current poisoned") = ("testcat".to_string(), vec![]);
+        // KAN-84: reachable from SQL now — `USE CATALOG testcat` leaves the external catalog's
+        // namespace empty (no default-namespace metadata on providers), which is exactly the
+        // external-catalog-with-empty-namespace branch under test.
+        engine.sql("USE CATALOG testcat").await.unwrap();
 
         let stats = engine.estimate_table_stats("orders").await;
         assert_eq!(
@@ -6593,6 +6648,131 @@ mod tests {
         let (catalog, namespace) = engine.current_catalog_and_namespace();
         assert_eq!(catalog, "spark_catalog");
         assert_eq!(namespace, vec!["default".to_string()]);
+    }
+
+    // ---------------------------------------------------------------------
+    // KAN-84 — `USE CATALOG <catalog>` resets the current namespace (Spark's
+    // `CatalogManager.setCurrentCatalog`: the namespace override is cleared on a switch and
+    // the switch is a no-op when the catalog is already current). Builtin `spark_catalog`
+    // resets to its default namespace `["default"]`; external catalogs have no
+    // default-namespace metadata, so their namespace becomes EMPTY.
+    // ---------------------------------------------------------------------
+
+    /// `USE CATALOG <external>` sets the catalog and clears the namespace (empty = "no
+    /// database selected", per the provider contract).
+    #[tokio::test]
+    async fn use_catalog_external_clears_current_namespace() {
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+        engine.sql("USE CATALOG testcat").await.unwrap();
+        let (catalog, namespace) = engine.current_catalog_and_namespace();
+        assert_eq!(catalog, "testcat");
+        assert!(
+            namespace.is_empty(),
+            "external catalog switch clears the namespace: {namespace:?}"
+        );
+    }
+
+    /// `USE <catalog>.<db>` sets both (namespace given explicitly — nothing to reset).
+    #[tokio::test]
+    async fn use_catalog_dot_namespace_sets_both() {
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+        engine.sql("USE testcat.db1").await.unwrap();
+        let (catalog, namespace) = engine.current_catalog_and_namespace();
+        assert_eq!(catalog, "testcat");
+        assert_eq!(namespace, vec!["db1".to_string()]);
+    }
+
+    /// Switching back to the builtin catalog resets the current database to `default` — Spark
+    /// resets the v1 session catalog's database on any catalog switch
+    /// (`setCurrentCatalog` → `setCurrentDatabase(default)`), so `spark_catalog` → `testcat` →
+    /// `spark_catalog` lands on `["default"]`, not whatever namespace the external catalog had.
+    #[tokio::test]
+    async fn use_catalog_builtin_resets_namespace_to_default() {
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+        engine.sql("USE testcat.db1").await.unwrap();
+        engine.sql("USE CATALOG spark_catalog").await.unwrap();
+        let (catalog, namespace) = engine.current_catalog_and_namespace();
+        assert_eq!(catalog, "spark_catalog");
+        assert_eq!(namespace, vec!["default".to_string()]);
+    }
+
+    /// Spark's `setCurrentCatalog` is a no-op when the catalog is already current — the
+    /// namespace override survives a redundant `USE CATALOG`.
+    #[tokio::test]
+    async fn use_catalog_same_catalog_is_noop() {
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+        engine.sql("USE testcat.db1").await.unwrap();
+        engine.sql("USE CATALOG testcat").await.unwrap();
+        let (catalog, namespace) = engine.current_catalog_and_namespace();
+        assert_eq!(catalog, "testcat");
+        assert_eq!(
+            namespace,
+            vec!["db1".to_string()],
+            "re-USE of the current catalog keeps the namespace (Spark no-op)"
+        );
+    }
+
+    /// Bare `SHOW TABLES` after `USE CATALOG <external>` (no current database) lists the union
+    /// across the catalog's top-level namespaces — the `SHOW TABLES IN <cat>` shape — instead
+    /// of erroring.
+    #[tokio::test]
+    async fn show_tables_after_use_catalog_lists_across_namespaces() {
+        use arrow::array::StringArray;
+        let dir = kan81_parquet_dir("usecat-show");
+        let mut tables = HashMap::new();
+        tables.insert(
+            "db1.orders".to_string(),
+            format!("file://{}/", dir.display()),
+        );
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(tables)));
+        engine.sql("USE CATALOG testcat").await.unwrap();
+
+        let batches = engine.sql("SHOW TABLES").await.unwrap();
+        let rows: Vec<(String, String)> = batches
+            .iter()
+            .flat_map(|b| {
+                let ns = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                let t = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..b.num_rows())
+                    .map(|i| (ns.value(i).to_string(), t.value(i).to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            rows.contains(&("db1".to_string(), "orders".to_string())),
+            "union across top-level namespaces: {rows:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bare single-table SHOW after `USE CATALOG <external>` can't be qualified (no current
+    /// database): the provider is probed with the empty namespace and its contract error
+    /// surfaces — never a raw `testcat..orders` SQL syntax error.
+    #[tokio::test]
+    async fn show_columns_after_use_catalog_surfaces_provider_error() {
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+        engine.sql("USE CATALOG testcat").await.unwrap();
+        let err = engine.sql("SHOW COLUMNS IN orders").await.unwrap_err();
+        assert!(
+            matches!(err, Error::Plan(_)),
+            "provider contract error, got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains(".."),
+            "must not leak the double-dot SQL shape: {err}"
+        );
+        // Same for DESCRIBE.
+        let err = engine.sql("DESCRIBE orders").await.unwrap_err();
+        assert!(
+            matches!(err, Error::Plan(_)),
+            "provider contract error, got {err:?}"
+        );
     }
 
     #[tokio::test]
