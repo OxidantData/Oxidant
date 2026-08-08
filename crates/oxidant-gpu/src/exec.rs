@@ -20,6 +20,45 @@ use datafusion::physical_plan::{
 use crate::ffi;
 use crate::spec::GpuOpSpec;
 
+/// Cast the shim's float-computed columns back to the declared decimal types.
+/// Passes everything else through unchanged; any non-decimal mismatch is left
+/// for the schema guard in `execute()` to report.
+fn coerce_shim_batch(
+    batch: datafusion::arrow::record_batch::RecordBatch,
+    declared: &SchemaRef,
+) -> Result<datafusion::arrow::record_batch::RecordBatch> {
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::datatypes::DataType;
+
+    let got_schema = batch.schema();
+    if got_schema.fields().len() != declared.fields().len() {
+        return Ok(batch); // the schema guard below reports this properly
+    }
+    let mut columns = batch.columns().to_vec();
+    let mut changed = false;
+    for (i, field) in declared.fields().iter().enumerate() {
+        let got_ty = got_schema.field(i).data_type();
+        let declared_ty = field.data_type();
+        if got_ty == declared_ty {
+            continue;
+        }
+        match (got_ty, declared_ty) {
+            (DataType::Float64, DataType::Decimal128(_, _))
+            | (DataType::Float64, DataType::Decimal256(_, _)) => {
+                columns[i] = cast(columns[i].as_ref(), declared_ty)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                changed = true;
+            }
+            _ => {} // guard below reports it
+        }
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    datafusion::arrow::record_batch::RecordBatch::try_new(declared.clone(), columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
 /// Single-partition leaf producing the shim's final aggregate results. Its schema
 /// is copied verbatim from the replaced final `AggregateExec`, so everything above
 /// (projection / ORDER BY / LIMIT) sees exactly the plan it was built against.
@@ -99,6 +138,12 @@ impl ExecutionPlan for GpuScanAggExec {
             )));
         }
         let batch = ffi::exec_spec(&self.spec)?;
+        // The shim computes in float64 (libcudf decimal aggregation is narrower
+        // than the CPU path's); coerce its output to the declared decimal types
+        // at the FFI boundary. Tradeoff, documented in the crate README: GPU
+        // aggregates over decimal inputs are float-computed and cast back —
+        // exact through ~15 significant digits, rounding beyond that.
+        let batch = coerce_shim_batch(batch, &self.schema())?;
         // The shim contract is "return FINAL results in the declared schema". Guard
         // it loosely (names + types; nullability/metadata may legitimately differ)
         // so a misbehaving shim fails loudly instead of answering the wrong query.
@@ -120,5 +165,56 @@ impl ExecutionPlan for GpuScanAggExec {
             schema,
             futures::stream::once(async move { Ok(batch) }),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Decimal128Array, Float64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn float64_shim_output_coerces_to_declared_decimal() {
+        let got_schema = Arc::new(Schema::new(vec![Field::new(
+            "sum(li_one.l_extendedprice)",
+            DataType::Float64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            got_schema,
+            vec![Arc::new(Float64Array::from(vec![20506615920.80]))],
+        )
+        .unwrap();
+        let declared = Arc::new(Schema::new(vec![Field::new(
+            "sum(li_one.l_extendedprice)",
+            DataType::Decimal128(25, 2),
+            true,
+        )]));
+        let out = coerce_shim_batch(batch, &declared).unwrap();
+        assert_eq!(
+            out.schema().field(0).data_type(),
+            &DataType::Decimal128(25, 2)
+        );
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        // 20506615920.80 at scale 2 = 2050661592080 exactly (53-bit mantissa
+        // covers ~15 significant digits; this sum has 12)
+        assert_eq!(col.value(0), 2050661592080i128);
+    }
+
+    #[test]
+    fn matching_types_pass_through_unchanged() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Float64Array::from(vec![1.5]))],
+        )
+        .unwrap();
+        let out = coerce_shim_batch(batch, &schema).unwrap();
+        assert_eq!(out.column(0).len(), 1);
     }
 }
