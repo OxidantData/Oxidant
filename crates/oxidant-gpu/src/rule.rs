@@ -7,18 +7,23 @@
 //! AggregateExec mode=Final|FinalPartitioned|Single
 //!   └ (AggregateExec mode=Partial — required unless Single)
 //!   └ FilterExec                       — zero or more, every conjunct supported
-//!   └ ProjectionExec                   — only bare columns keeping their names
+//!   └ ProjectionExec                   — bare columns keeping their names, plus
+//!                                        CSE-shared arithmetic trees (alias
+//!                                        `__common_expr_N`), substituted back
+//!                                        into the aggregation inputs that
+//!                                        reference them
 //!   └ CoalescePartitionsExec / RepartitionExec — pass-through
 //!   └ DataSourceExec over FileScanConfig with a ParquetSource
-//!        — local file:// URL, exactly one file, no pushed limit,
-//!          no partition values; a pushed-down scan predicate must also
-//!          consist only of supported conjuncts
+//!        — local file:// URL, one or more part files (KAN-75), no pushed
+//!          limit, no partition values, no file ranges; a pushed-down scan
+//!          predicate must also consist only of supported conjuncts
 //! ```
 //!
 //! plus: every group key is a bare column, every aggregate is
-//! sum/avg/count/min/max over a bare column (`count(*)`/`count(1)` allowed),
-//! nothing DISTINCT, no in-aggregate ORDER BY, no grouping sets, and every
-//! referenced column has a shim-supported dtype.
+//! sum/avg/count/min/max over a bare column OR an arithmetic (+,-,*,/) tree over
+//! columns and supported literals (KAN-76 — emitted as `derived_columns`;
+//! `count(*)`/`count(1)` allowed), nothing DISTINCT, no in-aggregate ORDER BY,
+//! no grouping sets, and every referenced column has a shim-supported dtype.
 //!
 //! On match the whole subtree is replaced by one [`GpuScanAggExec`] carrying the
 //! final aggregate's schema (the GPU computes FINAL results; anything above —
@@ -50,7 +55,8 @@ use datafusion::physical_plan::ExecutionPlan;
 
 use crate::exec::GpuScanAggExec;
 use crate::spec::{
-    AggFunc, AggSpec, CmpOp, ColumnSpec, FilterSpec, GpuOpSpec, LiteralSpec, LiteralType,
+    AggFunc, AggSpec, ArithOp, CmpOp, ColumnSpec, DerivedColumn, FilterSpec, GpuExpr, GpuOpSpec,
+    LiteralSpec, LiteralType,
 };
 
 /// `&Arc<dyn ExecutionPlan>` → `&dyn Any` via trait upcasting (DataFusion 54
@@ -109,46 +115,59 @@ fn try_gpu_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<GpuScanAggExec> {
     // Walk from the final aggregate to the scan through the whitelisted node types,
     // collecting FilterExec predicates on the way.
     let mut filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+    // Computed entries of pass-through projections (DataFusion's common-subexpr
+    // elimination materializes shared aggregate inputs as `__common_expr_N`):
+    // alias → arithmetic tree, leaves already resolved to base columns.
+    let mut common_exprs: Vec<(String, GpuExpr)> = Vec::new();
     let mut partial_agg: Option<&AggregateExec> = None;
     let mut node: &Arc<dyn ExecutionPlan> = agg.input();
-    let scan: &DataSourceExec =
-        loop {
-            let any = upcast_plan(node);
-            if let Some(a) = any.downcast_ref::<AggregateExec>() {
-                if *a.mode() != AggregateMode::Partial || partial_agg.is_some() {
-                    return None;
-                }
-                partial_agg = Some(a);
-                node = a.input();
-            } else if let Some(f) = any.downcast_ref::<FilterExec>() {
-                filters.push(f.predicate().clone());
-                node = f.input();
-            } else if let Some(p) = any.downcast_ref::<ProjectionExec>() {
-                // Only a pure re-projection (bare columns keeping their own names —
-                // ProjectionPushdown leaves one behind until its later passes):
-                // everything here is extracted by NAME from the file schema, so a
-                // subset/reorder is a no-op for the spec. A rename or a computed
-                // expression is not offloadable.
-                if !p.expr().iter().all(|pe| {
-                    downcast_expr::<Column>(&pe.expr).is_some_and(|c| c.name() == pe.alias)
-                }) {
-                    return None;
-                }
-                node = p.input();
-            } else if any.is::<CoalescePartitionsExec>() || any.is::<RepartitionExec>() {
-                let children = node.children();
-                if children.len() != 1 {
-                    return None;
-                }
-                node = children[0];
-            } else if let Some(s) = any.downcast_ref::<DataSourceExec>() {
-                break s;
-            } else {
+    let scan: &DataSourceExec = loop {
+        let any = upcast_plan(node);
+        if let Some(a) = any.downcast_ref::<AggregateExec>() {
+            if *a.mode() != AggregateMode::Partial || partial_agg.is_some() {
                 return None;
             }
-        };
+            partial_agg = Some(a);
+            node = a.input();
+        } else if let Some(f) = any.downcast_ref::<FilterExec>() {
+            filters.push(f.predicate().clone());
+            node = f.input();
+        } else if let Some(p) = any.downcast_ref::<ProjectionExec>() {
+            for pe in p.expr() {
+                if let Some(c) = downcast_expr::<Column>(&pe.expr) {
+                    // Bare column keeping its own name — ProjectionPushdown
+                    // leaves one behind until its later passes: everything
+                    // here is extracted by NAME from the file schema, so a
+                    // subset/reorder is a no-op for the spec. A rename is not
+                    // offloadable.
+                    if c.name() != pe.alias {
+                        return None;
+                    }
+                } else {
+                    // A computed entry: only offloadable as an arithmetic
+                    // tree (KAN-76); aggregate inputs referencing the alias
+                    // get it substituted back.
+                    let expr = gpu_expr(&pe.expr, &common_exprs)?;
+                    common_exprs.push((pe.alias.clone(), expr));
+                }
+            }
+            node = p.input();
+        } else if any.is::<CoalescePartitionsExec>() || any.is::<RepartitionExec>() {
+            let children = node.children();
+            if children.len() != 1 {
+                return None;
+            }
+            node = children[0];
+        } else if let Some(s) = any.downcast_ref::<DataSourceExec>() {
+            break s;
+        } else {
+            return None;
+        }
+    };
 
-    // The scan must be a single local parquet file with nothing else going on.
+    // The scan must be local parquet part files with nothing else going on: any
+    // number of files across any number of file groups (KAN-75), all local with
+    // no partition values, no file ranges, and no pushed limit.
     let scan_any: &dyn Any = scan.data_source().as_ref();
     let cfg: &FileScanConfig = scan_any.downcast_ref()?;
     let source_any: &dyn Any = cfg.file_source.as_ref();
@@ -156,21 +175,31 @@ fn try_gpu_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<GpuScanAggExec> {
     if !cfg.object_store_url.as_str().starts_with("file://") {
         return None;
     }
-    if cfg.limit.is_some() || cfg.file_groups.len() != 1 {
+    if cfg.limit.is_some() {
         return None;
     }
-    let group = &cfg.file_groups[0];
-    if group.len() != 1 {
+    let mut files: Vec<String> = Vec::new();
+    for group in &cfg.file_groups {
+        for file in group.iter() {
+            if !file.partition_values.is_empty() {
+                return None;
+            }
+            if file.range.is_some() {
+                // A byte-range read would make the shim (which reads whole files)
+                // scan different rows than the CPU plan.
+                return None;
+            }
+            // object_store::path::Path strips the leading '/', but the shim opens
+            // paths with plain filesystem calls — restore the absolute form (our
+            // local tables are always registered with absolute LOCATIONs).
+            files.push(format!("/{}", file.object_meta.location));
+        }
+    }
+    if files.is_empty() {
         return None;
     }
-    let file = group.iter().next()?;
-    if !file.partition_values.is_empty() {
-        return None;
-    }
-    // object_store::path::Path strips the leading '/', but the shim opens the
-    // path with plain filesystem calls — restore the absolute form (our local
-    // tables are always registered with absolute LOCATIONs).
-    let table_path = format!("/{}", file.object_meta.location);
+    // Kept for display/back-compat; the shim scans `files`.
+    let table_path = files[0].clone();
     // A predicate pushed into the scan by FilterPushdown must be extracted too —
     // silently dropping it would aggregate rows the query filters out.
     if let Some(pushed) = cfg.file_source.filter() {
@@ -198,10 +227,15 @@ fn try_gpu_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<GpuScanAggExec> {
     }
 
     // Aggregations: function + source column from the partial aggregate, output
-    // alias from the final one (paired by position — they are built 1:1).
+    // alias from the final one (paired by position — they are built 1:1). An
+    // input that is not a bare column must be an arithmetic tree over columns
+    // and literals (KAN-76), interned as a `_gpu_derived_N` column.
     if agg.aggr_expr().len() != src_agg.aggr_expr().len() {
         return None;
     }
+    // (serialized expr, definition, base columns) — identical expressions share
+    // one derived column, so the shim never evaluates the same tree twice.
+    let mut derived: Vec<(String, DerivedColumn, Vec<String>)> = Vec::new();
     let mut aggregations: Vec<AggSpec> = Vec::new();
     for (final_expr, src_expr) in agg.aggr_expr().iter().zip(src_agg.aggr_expr().iter()) {
         let func = match src_expr.fun().name() {
@@ -222,12 +256,22 @@ fn try_gpu_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<GpuScanAggExec> {
         let col = match args.as_slice() {
             [] if func == AggFunc::Count => None,
             [arg] => {
+                // Numeric casts are transparent (e.g. avg over an Int64 column
+                // plans as `avg(CAST(l_quantity AS Float64))` — still a bare
+                // column input, no derived column needed).
+                let arg = unwrap_numeric_casts(arg)?;
                 if let Some(c) = downcast_expr::<Column>(arg) {
-                    Some(c.name().to_string())
+                    match common_exprs.iter().find(|(alias, _)| alias == c.name()) {
+                        // A CSE'd shared input: aggregate the substituted tree as
+                        // a derived column like any other expression input.
+                        Some((_, sub)) => Some(intern_derived(&mut derived, sub.clone())?),
+                        None => Some(c.name().to_string()),
+                    }
                 } else if func == AggFunc::Count && downcast_expr::<Literal>(arg).is_some() {
                     None // count(*) plans as count(1)
                 } else {
-                    return None; // e.g. sum(price * discount) — expression input
+                    let expr = gpu_expr(arg, &common_exprs)?;
+                    Some(intern_derived(&mut derived, expr)?)
                 }
             }
             _ => return None,
@@ -247,17 +291,28 @@ fn try_gpu_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<GpuScanAggExec> {
         }
     }
 
-    // Column read set: filter columns + group keys + aggregate inputs, deduped in
-    // first-use order, each with a shim-supported dtype from the file schema.
+    // Column read set: filter columns + group keys + aggregation inputs, deduped
+    // in first-use order, each with a shim-supported dtype from the file schema.
+    // An aggregation pointing at a derived column contributes that expression's
+    // BASE columns instead (the shim computes the derived column itself).
     let file_schema = cfg.file_source.table_schema().file_schema();
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut columns: Vec<ColumnSpec> = Vec::new();
-    let names = filter_specs
+    let mut read_names: Vec<&str> = filter_specs
         .iter()
         .map(|f| f.col.as_str())
         .chain(group_by.iter().map(|g| g.as_str()))
-        .chain(aggregations.iter().filter_map(|a| a.col.as_deref()));
-    for name in names {
+        .collect();
+    for a in &aggregations {
+        let Some(col) = a.col.as_deref() else {
+            continue;
+        };
+        match derived.iter().find(|(_, d, _)| d.name == col) {
+            Some((_, _, base_cols)) => read_names.extend(base_cols.iter().map(|c| c.as_str())),
+            None => read_names.push(col),
+        }
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut columns: Vec<ColumnSpec> = Vec::new();
+    for name in read_names {
         if !seen.insert(name) {
             continue;
         }
@@ -270,7 +325,9 @@ fn try_gpu_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<GpuScanAggExec> {
 
     let spec = GpuOpSpec {
         table_path,
+        files,
         columns,
+        derived_columns: derived.into_iter().map(|(_, d, _)| d).collect(),
         filters: filter_specs,
         group_by,
         aggregations,
@@ -340,6 +397,115 @@ fn flip(op: CmpOp) -> CmpOp {
         CmpOp::GtEq => CmpOp::LtEq,
         CmpOp::Eq => CmpOp::Eq,
         CmpOp::NotEq => CmpOp::NotEq,
+    }
+}
+
+/// A cast between shim-supported numeric types is transparent: the shim computes
+/// in float64 anyway (see `exec::coerce_shim_batch`), so `CAST(x AS Float64)` and
+/// decimal-alignment casts change nothing row-wise. Casts to any other type are
+/// NOT transparent (string/date semantics would change) and refuse.
+fn unwrap_numeric_casts(mut expr: &Arc<dyn PhysicalExpr>) -> Option<&Arc<dyn PhysicalExpr>> {
+    while let Some(cast) = downcast_expr::<CastExpr>(expr) {
+        if !is_numeric_dtype(cast.cast_type()) {
+            return None;
+        }
+        expr = cast.expr();
+    }
+    Some(expr)
+}
+
+/// Shim-supported numeric dtypes — the transparent-cast vocabulary.
+fn is_numeric_dtype(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
+/// KAN-76: an aggregate input that is not a bare column must be an arithmetic
+/// (+,-,*,/) tree whose leaves are columns and/or supported literals, modulo
+/// transparent numeric casts ([`unwrap_numeric_casts`]). Anything else —
+/// function calls, non-numeric casts, subqueries — is not offloadable.
+///
+/// `common` maps CSE projection aliases (`__common_expr_N`) to their already
+/// extracted trees: a column leaf naming one is substituted inline.
+fn gpu_expr(expr: &Arc<dyn PhysicalExpr>, common: &[(String, GpuExpr)]) -> Option<GpuExpr> {
+    let expr = unwrap_numeric_casts(expr)?;
+    if let Some(c) = downcast_expr::<Column>(expr) {
+        if let Some((_, sub)) = common.iter().find(|(alias, _)| alias == c.name()) {
+            return Some(sub.clone());
+        }
+        return Some(GpuExpr::Col {
+            col: c.name().to_string(),
+        });
+    }
+    if let Some(v) = literal_value(expr) {
+        return Some(GpuExpr::Lit {
+            lit: literal_spec(v)?,
+        });
+    }
+    let binary: &BinaryExpr = downcast_expr(expr)?;
+    let op = match binary.op() {
+        Operator::Plus => ArithOp::Add,
+        Operator::Minus => ArithOp::Sub,
+        Operator::Multiply => ArithOp::Mul,
+        Operator::Divide => ArithOp::Div,
+        _ => return None,
+    };
+    Some(GpuExpr::Arith {
+        op,
+        lhs: Box::new(gpu_expr(binary.left(), common)?),
+        rhs: Box::new(gpu_expr(binary.right(), common)?),
+    })
+}
+
+/// Intern `expr` as a `_gpu_derived_N` column: identical expressions (same
+/// serialized form) reuse the same name; each entry also records its base
+/// columns so the read set can include them. `None` only on a serialization
+/// failure (never expected — the tree is plain data).
+fn intern_derived(
+    derived: &mut Vec<(String, DerivedColumn, Vec<String>)>,
+    expr: GpuExpr,
+) -> Option<String> {
+    let key = serde_json::to_string(&expr).ok()?;
+    if let Some((_, d, _)) = derived.iter().find(|(k, _, _)| *k == key) {
+        return Some(d.name.clone());
+    }
+    let name = format!("_gpu_derived_{}", derived.len());
+    let mut base_cols = Vec::new();
+    collect_cols(&expr, &mut base_cols);
+    derived.push((
+        key,
+        DerivedColumn {
+            name: name.clone(),
+            expr,
+        },
+        base_cols,
+    ));
+    Some(name)
+}
+
+/// Every column leaf of a derived expression, left to right (dedup happens at
+/// the read-set level).
+fn collect_cols(expr: &GpuExpr, out: &mut Vec<String>) {
+    match expr {
+        GpuExpr::Col { col } => out.push(col.clone()),
+        GpuExpr::Lit { .. } => {}
+        GpuExpr::Arith { lhs, rhs, .. } => {
+            collect_cols(lhs, out);
+            collect_cols(rhs, out);
+        }
     }
 }
 

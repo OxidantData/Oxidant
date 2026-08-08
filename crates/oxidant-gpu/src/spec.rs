@@ -1,8 +1,9 @@
 //! The JSON operation spec handed to the GPU shim.
 //!
 //! [`GpuOpSpec`] is the whole contract between the DataFusion plan rule and the shim
-//! (`libcudf_shim` in a `--features gpu` build, `csrc/mock_shim.c` otherwise): a
-//! single parquet file, the columns to read, conjunctive column-vs-literal filters,
+//! (`libcudf_shim` in a `--features gpu` build, `csrc/mock_shim.c` otherwise): a set
+//! of local parquet part files (KAN-75), the columns to read, conjunctive
+//! column-vs-literal filters, derived columns to evaluate after filtering (KAN-76),
 //! group-by keys, and the aggregations to compute. The shim answers with ONE Arrow
 //! record batch (C Data Interface struct array) holding the FINAL aggregate results:
 //! group-by columns (named per [`GpuOpSpec::group_by`]) followed by the aggregations
@@ -13,12 +14,21 @@ use serde::Serialize;
 /// Root spec: everything the shim needs to run scan + filter + group-by aggregate.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GpuOpSpec {
-    /// Absolute local path of the single parquet file to scan.
+    /// Absolute local path of the FIRST part file (`files[0]`) — kept for
+    /// display/back-compat (`GpuScanAggExec`'s DisplayAs); the shim reads `files`.
     pub table_path: String,
-    /// Columns the shim must read (filter columns + group keys + aggregation inputs),
-    /// in first-use order, with the dtype vocabulary of [`LiteralType`]'s siblings
+    /// Every part file of the table, absolute local paths (KAN-75). Always
+    /// populated; the shim scans ALL of them.
+    pub files: Vec<String>,
+    /// Columns the shim must read (filter columns + group keys + the base columns
+    /// of every aggregation input), in first-use order, with the dtype vocabulary
+    /// of [`LiteralType`]'s siblings
     /// (`int64`, `float64`, `string`, `date32`, `timestamp(us)`, `decimal128(p,s)`, ...).
     pub columns: Vec<ColumnSpec>,
+    /// Derived columns (KAN-76): arithmetic expressions the shim evaluates AFTER
+    /// applying `filters`, appending each as a new column. Aggregations may
+    /// reference their names; [`GpuOpSpec::columns`] carries their base columns.
+    pub derived_columns: Vec<DerivedColumn>,
     /// Conjunctive (AND-ed) column-vs-literal comparisons.
     pub filters: Vec<FilterSpec>,
     /// Group-by key column names (empty for a whole-table aggregation).
@@ -32,6 +42,45 @@ pub struct GpuOpSpec {
 pub struct ColumnSpec {
     pub name: String,
     pub dtype: String,
+}
+
+/// A shim-computed column (KAN-76): `expr` is evaluated row-wise after filtering
+/// and appended under `name` (a synthesized `_gpu_derived_N`), where aggregations
+/// can reference it like any base column.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DerivedColumn {
+    pub name: String,
+    pub expr: GpuExpr,
+}
+
+/// The restricted expression language of a derived column: columns, literals, and
+/// arithmetic over them. Serialized untagged to exactly the shim contract:
+/// `{"col": "name"}` | `{"lit": LiteralSpec}` |
+/// `{"op": "add|sub|mul|div", "lhs": GpuExpr, "rhs": GpuExpr}`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum GpuExpr {
+    Col {
+        col: String,
+    },
+    Lit {
+        lit: LiteralSpec,
+    },
+    Arith {
+        op: ArithOp,
+        lhs: Box<GpuExpr>,
+        rhs: Box<GpuExpr>,
+    },
+}
+
+/// Arithmetic operators for [`GpuExpr::Arith`] (JSON lowercase names).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 /// `col <op> literal` — always column on the left, literal on the right.
@@ -107,12 +156,18 @@ pub enum AggFunc {
 mod tests {
     use super::*;
 
-    /// The serialized JSON must match the shim contract exactly (KAN-70): key names,
-    /// operator symbols, lowercase func/type names, `null` col for count-star.
+    /// The serialized JSON must match the shim contract exactly (KAN-70/75/76):
+    /// key names, operator symbols, lowercase func/type names, `null` col for
+    /// count-star, `files` always populated with `table_path == files[0]`, and
+    /// derived columns as untagged col/lit/op expression trees.
     #[test]
     fn spec_serializes_to_shim_contract_json() {
         let spec = GpuOpSpec {
-            table_path: "/data/lineitem.parquet".to_string(),
+            table_path: "/data/lineitem/part-0.parquet".to_string(),
+            files: vec![
+                "/data/lineitem/part-0.parquet".to_string(),
+                "/data/lineitem/part-1.parquet".to_string(),
+            ],
             columns: vec![
                 ColumnSpec {
                     name: "l_shipdate".to_string(),
@@ -123,6 +178,27 @@ mod tests {
                     dtype: "float64".to_string(),
                 },
             ],
+            derived_columns: vec![DerivedColumn {
+                name: "_gpu_derived_0".to_string(),
+                expr: GpuExpr::Arith {
+                    op: ArithOp::Mul,
+                    lhs: Box::new(GpuExpr::Col {
+                        col: "l_extendedprice".to_string(),
+                    }),
+                    rhs: Box::new(GpuExpr::Arith {
+                        op: ArithOp::Sub,
+                        lhs: Box::new(GpuExpr::Lit {
+                            lit: LiteralSpec {
+                                ty: LiteralType::Float,
+                                value: "1.0".to_string(),
+                            },
+                        }),
+                        rhs: Box::new(GpuExpr::Col {
+                            col: "l_discount".to_string(),
+                        }),
+                    }),
+                },
+            }],
             filters: vec![
                 FilterSpec {
                     col: "l_shipdate".to_string(),
@@ -145,7 +221,7 @@ mod tests {
             aggregations: vec![
                 AggSpec {
                     func: AggFunc::Sum,
-                    col: Some("l_extendedprice".to_string()),
+                    col: Some("_gpu_derived_0".to_string()),
                     alias: "revenue".to_string(),
                 },
                 AggSpec {
@@ -157,10 +233,18 @@ mod tests {
         };
         let json = serde_json::to_value(&spec).unwrap();
         let expected = serde_json::json!({
-            "table_path": "/data/lineitem.parquet",
+            "table_path": "/data/lineitem/part-0.parquet",
+            "files": ["/data/lineitem/part-0.parquet", "/data/lineitem/part-1.parquet"],
             "columns": [
                 {"name": "l_shipdate", "dtype": "date32"},
                 {"name": "l_extendedprice", "dtype": "float64"},
+            ],
+            "derived_columns": [
+                {"name": "_gpu_derived_0", "expr": {
+                    "op": "mul",
+                    "lhs": {"col": "l_extendedprice"},
+                    "rhs": {"op": "sub", "lhs": {"lit": {"type": "float", "value": "1.0"}}, "rhs": {"col": "l_discount"}},
+                }},
             ],
             "filters": [
                 {"col": "l_shipdate", "op": ">=", "literal": {"type": "date", "value": "1994-01-01"}},
@@ -168,7 +252,7 @@ mod tests {
             ],
             "group_by": ["l_returnflag"],
             "aggregations": [
-                {"func": "sum", "col": "l_extendedprice", "alias": "revenue"},
+                {"func": "sum", "col": "_gpu_derived_0", "alias": "revenue"},
                 {"func": "count", "col": null, "alias": "cnt"},
             ],
         });
@@ -209,6 +293,15 @@ mod tests {
         ];
         for (ty, s) in tys {
             assert_eq!(serde_json::to_value(ty).unwrap(), s);
+        }
+        let arith = [
+            (ArithOp::Add, "add"),
+            (ArithOp::Sub, "sub"),
+            (ArithOp::Mul, "mul"),
+            (ArithOp::Div, "div"),
+        ];
+        for (op, s) in arith {
+            assert_eq!(serde_json::to_value(op).unwrap(), s);
         }
     }
 }
