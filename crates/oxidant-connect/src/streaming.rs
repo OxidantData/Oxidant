@@ -7,6 +7,7 @@ use oxidant_streaming::{StreamingQueryManager, Trigger};
 use tonic::Status;
 
 use crate::OxidantService;
+use oxidant_loom::Engine;
 
 impl OxidantService {
     #[allow(dead_code)]
@@ -14,9 +15,13 @@ impl OxidantService {
         &self.streaming
     }
 
-    /// Handle `WriteStreamOperationStart` — register a streaming query.
+    /// Handle `WriteStreamOperationStart` — register a streaming query. The batch loop runs on
+    /// the CALLER's session engine handle (KAN-85): a `USE CATALOG` before starting the stream
+    /// steers its batches, exactly as it steers the session's queries. The session cell lives
+    /// in the shared registry, so the spawned task holding this handle is safe.
     pub(crate) async fn handle_write_stream_start(
         &self,
+        engine: &Engine,
         start: &sc::WriteStreamOperationStart,
     ) -> Result<sc::WriteStreamOperationStartResult, Status> {
         let name = if start.query_name.is_empty() {
@@ -62,7 +67,7 @@ impl OxidantService {
             .await;
         // Kick off batches: once/availableNow run to completion; processing-time loops.
         let mgr = self.streaming.clone();
-        let eng = self.engine.clone();
+        let eng = engine.clone();
         let qid = id.id.clone();
         match trigger {
             Trigger::ProcessingTime(interval) => {
@@ -93,9 +98,11 @@ impl OxidantService {
         })
     }
 
-    /// Handle `StreamingQueryCommand`.
+    /// Handle `StreamingQueryCommand`. `ProcessAllAvailable` runs batches on the caller's
+    /// session engine handle (KAN-85, same as the start path); status/stop don't touch it.
     pub(crate) async fn handle_streaming_query_command(
         &self,
+        engine: &Engine,
         cmd: &sc::StreamingQueryCommand,
     ) -> Result<sc::StreamingQueryCommandResult, Status> {
         let qid = cmd
@@ -141,7 +148,7 @@ impl OxidantService {
             Some(sc::streaming_query_command::Command::ProcessAllAvailable(true)) => {
                 let rows = self
                     .streaming
-                    .process_all_available(&qid.id, &self.engine)
+                    .process_all_available(&qid.id, engine)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?;
                 Some(sc::streaming_query_command_result::ResultType::Status(

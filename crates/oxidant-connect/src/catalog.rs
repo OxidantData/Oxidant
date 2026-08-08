@@ -95,6 +95,11 @@ pub async fn build_provider(
 }
 
 /// Serve a Spark `Catalog` relation, returning the result rows as Arrow batches.
+///
+/// KAN-85: the current catalog/namespace pointers live on the (per-session) engine — the SAME
+/// state SQL `USE` drives — so `spark.catalog.setCurrentCatalog("glue")` and a later SQL
+/// `SHOW TABLES` see one consistent session state. `registry` is still the provider map
+/// (`catalog_names`/`contains`/`provider`).
 pub async fn handle_catalog(
     engine: &Engine,
     registry: &CatalogRegistry,
@@ -107,19 +112,28 @@ pub async fn handle_catalog(
         .ok_or_else(|| Status::invalid_argument("empty Catalog request"))?;
     match ct {
         CatType::ListCatalogs(_) => list_catalogs(registry),
-        CatType::CurrentCatalog(_) => Ok(scalar_string("name", &registry.current_catalog())),
+        CatType::CurrentCatalog(_) => Ok(scalar_string(
+            "name",
+            &engine.current_catalog_and_namespace().0,
+        )),
         CatType::SetCurrentCatalog(s) => {
-            registry
+            // Same semantics as SQL `USE CATALOG` (KAN-84 namespace reset, KAN-87 matching).
+            engine
                 .set_current_catalog(&s.catalog_name)
+                .await
                 .map_err(err_to_status)?;
             Ok(empty_result())
         }
         CatType::CurrentDatabase(_) => Ok(scalar_string(
             "name",
-            &registry.current_namespace().join("."),
+            &engine.current_catalog_and_namespace().1.join("."),
         )),
         CatType::SetCurrentDatabase(s) => {
-            registry.set_current_namespace(&s.db_name);
+            // Same semantics as SQL `USE <db>` (KAN-86 existence validation included).
+            engine
+                .set_current_namespace(&s.db_name)
+                .await
+                .map_err(err_to_status)?;
             Ok(empty_result())
         }
         CatType::ListDatabases(l) => list_databases(engine, registry, l.pattern.as_deref()).await,
@@ -187,7 +201,7 @@ async fn list_databases(
     registry: &CatalogRegistry,
     pattern: Option<&str>,
 ) -> Result<Vec<RecordBatch>, Status> {
-    let catalog = registry.current_catalog();
+    let catalog = engine.current_catalog_and_namespace().0;
     let namespaces = namespaces_of(engine, registry, &catalog).await?;
 
     let mut names = StringBuilder::new();
@@ -224,10 +238,11 @@ async fn list_tables(
     pattern: Option<&str>,
 ) -> Result<Vec<RecordBatch>, Status> {
     // Resolve which (catalog, namespace) to list: an explicit db_name may be catalog-qualified;
-    // otherwise use the current catalog + current/just-given database.
+    // otherwise use the session's current catalog + current/just-given database (engine state,
+    // KAN-85 — the same pointers SQL `USE` drives).
     let (catalog, namespace) = match db_name {
-        Some(db) => resolve_namespace(registry, db),
-        None => (registry.current_catalog(), registry.current_namespace()),
+        Some(db) => resolve_namespace(engine, registry, db),
+        None => engine.current_catalog_and_namespace(),
     };
 
     let table_names = tables_of(engine, registry, &catalog, &namespace).await?;
@@ -284,9 +299,9 @@ async fn table_exists(
         None => return Ok(false),
     };
     let (catalog, namespace) = if ns_parts.is_empty() {
-        (registry.current_catalog(), registry.current_namespace())
+        engine.current_catalog_and_namespace()
     } else {
-        resolve_namespace(registry, &ns_parts.join("."))
+        resolve_namespace(engine, registry, &ns_parts.join("."))
     };
 
     if let Some(provider) = registry.provider(&catalog) {
@@ -305,7 +320,7 @@ async fn database_exists(
     registry: &CatalogRegistry,
     db_name: &str,
 ) -> Result<bool, Status> {
-    let (catalog, namespace) = resolve_namespace(registry, db_name);
+    let (catalog, namespace) = resolve_namespace(engine, registry, db_name);
     if let Some(provider) = registry.provider(&catalog) {
         return provider
             .namespace_exists(&namespace)
@@ -352,15 +367,21 @@ async fn tables_of(
 
 /// Split a (possibly catalog-qualified) database identifier into `(catalog, namespace)`.
 /// If the first part names a registered catalog, it's the catalog and the rest is the namespace;
-/// otherwise the whole thing is a namespace in the current catalog.
-fn resolve_namespace(registry: &CatalogRegistry, db: &str) -> (String, Vec<String>) {
+/// otherwise the whole thing is a namespace in the session's current catalog (engine state,
+/// KAN-85).
+fn resolve_namespace(
+    engine: &Engine,
+    registry: &CatalogRegistry,
+    db: &str,
+) -> (String, Vec<String>) {
     let parts = split_ident(db);
     if let Some((first, rest)) = parts.split_first() {
         if !rest.is_empty() && registry.contains(first) {
             return (first.clone(), rest.to_vec());
         }
     }
-    (registry.current_catalog(), parts)
+    let (catalog, _) = engine.current_catalog_and_namespace();
+    (catalog, parts)
 }
 
 fn matches_pattern(name: &str, pattern: Option<&str>) -> bool {
@@ -504,7 +525,14 @@ mod tests {
 
     fn parquet_dir() -> std::path::PathBuf {
         use oxidant_loom::arrow::array::Int64Array;
-        let dir = std::env::temp_dir().join(format!("oxidant-conn-cat-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "oxidant-conn-cat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let schema = Arc::new(Sch::new(vec![F::new("x", Dt::Int64, false)]));
         let batch = RecordBatch::try_new(
@@ -544,8 +572,10 @@ mod tests {
         let provider: Arc<dyn OxidantCat> = Arc::new(FakeCat { location });
         engine.register_catalog("prod", provider.clone());
         registry.register("prod", provider);
-        registry.set_current_catalog("prod").unwrap();
-        registry.set_current_namespace("sales");
+        // KAN-85: the current catalog/namespace pointers live on the engine (the same state
+        // SQL `USE` drives), not on the registry's provider map.
+        engine.set_current_catalog("prod").await.unwrap();
+        engine.set_current_namespace("sales").await.unwrap();
 
         // listCatalogs includes the external catalog.
         let b = handle_catalog(
@@ -653,6 +683,70 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// KAN-85 unification: the Catalog RPC and SQL `USE` operate on the SAME per-session
+    /// state — `spark.catalog.setCurrentCatalog("prod")` must steer a later SQL `SHOW TABLES`
+    /// in that session, and must not leak into another session.
+    #[tokio::test]
+    async fn rpc_set_current_then_sql_read_is_consistent_per_session() {
+        use sc::catalog::CatType;
+        let dir = parquet_dir();
+        let location = format!("file://{}", dir.to_string_lossy());
+
+        let engine = Engine::new();
+        let registry = CatalogRegistry::new();
+        let provider: Arc<dyn OxidantCat> = Arc::new(FakeCat { location });
+        engine.register_catalog("prod", provider.clone());
+        registry.register("prod", provider);
+
+        let s1 = engine.for_session("s1");
+        let s2 = engine.for_session("s2");
+
+        // The RPC sets s1's current catalog/namespace (same state SQL USE drives).
+        handle_catalog(
+            &s1,
+            &registry,
+            &op(CatType::SetCurrentCatalog(sc::SetCurrentCatalog {
+                catalog_name: "prod".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+        handle_catalog(
+            &s1,
+            &registry,
+            &op(CatType::SetCurrentDatabase(sc::SetCurrentDatabase {
+                db_name: "sales".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+
+        // SQL SHOW TABLES in s1 lists prod.sales' tables.
+        let batches = s1.sql("SHOW TABLES").await.unwrap();
+        let names: Vec<String> = batches.iter().flat_map(|b| col_strings(b, 1)).collect();
+        assert_eq!(names, vec!["orders".to_string()], "{names:?}");
+
+        // The RPC reads the same state back for s1 …
+        let b = handle_catalog(
+            &s1,
+            &registry,
+            &op(CatType::CurrentCatalog(sc::CurrentCatalog {})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(col_strings(&b[0], 0), vec!["prod".to_string()]);
+        // … while s2 stays on the builtin default.
+        let b = handle_catalog(
+            &s2,
+            &registry,
+            &op(CatType::CurrentCatalog(sc::CurrentCatalog {})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(col_strings(&b[0], 0), vec!["spark_catalog".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

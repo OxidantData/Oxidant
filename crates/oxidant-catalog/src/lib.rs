@@ -157,12 +157,20 @@ pub trait CatalogProvider: Send + Sync {
     async fn load_table(&self, namespace: &[String], table: &str) -> Result<TableMetadata>;
 
     /// Whether `namespace.table` exists. Default: probe [`load_table`](Self::load_table) and treat
-    /// a not-found (`Plan`/`Io`) error as `false`; providers with a cheaper existence check should
-    /// override.
+    /// a not-found ([`Error::Plan`]) error as `false`; providers with a cheaper existence check
+    /// should override.
+    ///
+    /// The contract behind the classification (see `classify_glue_failure` in
+    /// oxidant-catalog-glue): [`Error::Plan`] covers a genuine "doesn't exist" (Glue's
+    /// `EntityNotFoundException`, a REST catalog's 404) AND unusable/malformed references
+    /// (Glue's `single_db` rejecting an empty/multi-segment namespace, a table with no
+    /// location) — both read as `false`. A backend/system failure ([`Error::Io`]: throttling,
+    /// auth, network, ...) must NOT be reported as "table does not exist" — callers (Spark
+    /// Connect `TableExists`) would silently mislead clients, so it propagates as `Err`.
     async fn table_exists(&self, namespace: &[String], table: &str) -> Result<bool> {
         match self.load_table(namespace, table).await {
             Ok(_) => Ok(true),
-            Err(Error::Plan(_)) | Err(Error::Io(_)) => Ok(false),
+            Err(Error::Plan(_)) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -281,6 +289,12 @@ impl CatalogRegistry {
     }
 
     /// The current catalog name.
+    ///
+    /// KAN-85 note: these current-pointer accessors serve the SPI type's own consumers/tests.
+    /// The Connect service's per-session catalog/namespace state lives on the engine handles
+    /// (`Engine::for_session` / `Engine::set_current_catalog`), NOT here — SQL `USE` and the
+    /// `spark.catalog.setCurrent*` RPCs share that per-session state, so don't reintroduce
+    /// reads/writes of these pointers on request paths.
     pub fn current_catalog(&self) -> String {
         self.lock().current_catalog.clone()
     }
@@ -393,6 +407,51 @@ mod tests {
             .unwrap());
         assert!(c.namespace_exists(&["ns".to_string()]).await.unwrap());
         assert!(!c.namespace_exists(&["nope".to_string()]).await.unwrap());
+    }
+
+    /// KAN-83: `table_exists` must only read a genuine not-found (`Error::Plan`) as `false` —
+    /// a backend failure (`Error::Io`: throttling, auth, network, ...) propagates as `Err`
+    /// instead of being swallowed into "table does not exist".
+    #[tokio::test]
+    async fn table_exists_only_plan_maps_to_false() {
+        // Ok → true, Plan → false (the existing fake's missing-key error is Plan).
+        let c = fake();
+        assert!(c.table_exists(&["ns".to_string()], "orders").await.unwrap());
+        assert!(!c
+            .table_exists(&["ns".to_string()], "missing")
+            .await
+            .unwrap());
+
+        // Io → Err (a Glue `ThrottlingException`/`AccessDeniedException` surfaces as Io).
+        struct ThrottledCatalog;
+        #[async_trait]
+        impl CatalogProvider for ThrottledCatalog {
+            fn name(&self) -> &str {
+                "throttled"
+            }
+            async fn list_namespaces(&self, _parent: &[String]) -> Result<Vec<Vec<String>>> {
+                Ok(vec![])
+            }
+            async fn list_tables(&self, _namespace: &[String]) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn load_table(
+                &self,
+                _namespace: &[String],
+                _table: &str,
+            ) -> Result<TableMetadata> {
+                Err(Error::Io(
+                    "aws glue GetTable: ThrottlingException: rate exceeded".to_string(),
+                ))
+            }
+        }
+        match ThrottledCatalog
+            .table_exists(&["ns".to_string()], "orders")
+            .await
+        {
+            Err(Error::Io(msg)) => assert!(msg.contains("ThrottlingException")),
+            other => panic!("expected Err(Error::Io), got {other:?}"),
+        }
     }
 
     #[test]
