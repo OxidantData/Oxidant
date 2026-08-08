@@ -19,13 +19,17 @@ use futures::TryStreamExt;
 
 use oxidant_gpu::exec::GpuScanAggExec;
 use oxidant_gpu::rule::GpuOffloadRule;
-use oxidant_gpu::spec::{AggFunc, CmpOp, GpuOpSpec, LiteralType};
+use oxidant_gpu::spec::{
+    AggFunc, ArithOp, CmpOp, DerivedColumn, GpuExpr, GpuOpSpec, LiteralSpec, LiteralType,
+};
 
 fn lineitem_batch() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("l_orderkey", DataType::Int64, false),
         Field::new("l_quantity", DataType::Int64, false),
         Field::new("l_extendedprice", DataType::Float64, false),
+        Field::new("l_discount", DataType::Float64, false),
+        Field::new("l_tax", DataType::Float64, false),
         Field::new("l_returnflag", DataType::Utf8, false),
         Field::new("l_shipdate", DataType::Date32, false),
     ]));
@@ -36,6 +40,12 @@ fn lineitem_batch() -> RecordBatch {
             Arc::new(Int64Array::from(vec![10, 30, 5, 24, 60, 15, 8, 100])),
             Arc::new(Float64Array::from(vec![
                 100.0, 200.5, 50.25, 75.0, 300.0, 125.5, 80.0, 400.0,
+            ])),
+            Arc::new(Float64Array::from(vec![
+                0.06, 0.03, 0.07, 0.05, 0.08, 0.06, 0.04, 0.07,
+            ])),
+            Arc::new(Float64Array::from(vec![
+                0.07, 0.08, 0.05, 0.06, 0.07, 0.08, 0.05, 0.06,
             ])),
             Arc::new(StringArray::from(vec![
                 "A", "N", "A", "R", "N", "A", "N", "R",
@@ -50,16 +60,22 @@ fn lineitem_batch() -> RecordBatch {
     .unwrap()
 }
 
-/// A context configured like the engine's (oxidant-loom `Engine::new_inner`):
-/// filters pushed into the parquet decoder, string-view reads.
-async fn fixture_ctx() -> (SessionContext, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("lineitem.parquet");
+/// Write one parquet part file of the lineitem fixture into `dir`.
+fn write_part(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
     let batch = lineitem_batch();
     let file = std::fs::File::create(&path).unwrap();
     let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
+    path
+}
+
+/// A context configured like the engine's (oxidant-loom `Engine::new_inner`):
+/// filters pushed into the parquet decoder, string-view reads.
+async fn fixture_ctx() -> (SessionContext, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_part(dir.path(), "lineitem.parquet");
 
     let mut config = SessionConfig::new();
     {
@@ -144,6 +160,9 @@ async fn rule_fires_on_q6_shape() {
         "path: {}",
         spec.table_path
     );
+    // Single-file table: files == [table_path].
+    assert_eq!(spec.files, vec![spec.table_path.clone()]);
+    assert!(spec.derived_columns.is_empty());
     assert!(spec.group_by.is_empty());
     assert_eq!(spec.aggregations.len(), 1);
     assert_eq!(spec.aggregations[0].func, AggFunc::Sum);
@@ -341,21 +360,217 @@ async fn rule_ignores_unsupported_aggregate() {
     );
 }
 
-/// Aggregates over expressions (the real TPC-H Q6 arg is a product) are not
-/// offloadable — only bare columns.
+/// KAN-75: a table registered as a DIRECTORY of parquet part files is offloadable
+/// — spec.files must carry every part file's absolute path.
 #[tokio::test(flavor = "multi_thread")]
-async fn rule_ignores_expression_aggregate() {
-    let (ctx, _dir) = fixture_ctx().await;
+async fn rule_fires_on_multi_file_dir_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut part_paths: Vec<String> = [
+        write_part(dir.path(), "part-0.parquet"),
+        write_part(dir.path(), "part-1.parquet"),
+        write_part(dir.path(), "part-2.parquet"),
+    ]
+    .into_iter()
+    .map(|p| p.to_str().unwrap().to_string())
+    .collect();
+    part_paths.sort();
+
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.parquet.pushdown_filters = true;
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_parquet(
+        "lineitem",
+        dir.path().to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+
     let plan = offload_plan(
         &ctx,
-        "SELECT sum(l_extendedprice * l_quantity) FROM lineitem WHERE l_quantity < 24",
+        "SELECT sum(l_extendedprice) FROM lineitem WHERE l_quantity < 24",
     )
     .await;
     let text = plan_text(&plan);
     assert!(
-        !text.contains("GpuScanAggExec"),
-        "sum(col*col) must stay on CPU:\n{text}"
+        text.contains("GpuScanAggExec"),
+        "directory scan must offload:\n{text}"
     );
+
+    let spec = gpu_spec(&plan);
+    let mut files = spec.files.clone();
+    files.sort();
+    assert_eq!(files, part_paths, "spec: {spec:?}");
+    assert_eq!(spec.table_path, spec.files[0]);
+}
+
+/// KAN-76: the REAL TPC-H Q6 — its aggregate input is a product of two columns,
+/// which must become a derived column the aggregation references.
+#[tokio::test(flavor = "multi_thread")]
+async fn rule_fires_on_real_q6_derived_product() {
+    let (ctx, _dir) = fixture_ctx().await;
+    let plan = offload_plan(
+        &ctx,
+        "SELECT sum(l_extendedprice * l_discount) AS revenue FROM lineitem \
+         WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' \
+         AND l_discount >= 0.05 AND l_discount <= 0.07 AND l_quantity < 24",
+    )
+    .await;
+    let text = plan_text(&plan);
+    assert!(text.contains("GpuScanAggExec"), "plan:\n{text}");
+    assert!(!text.contains("AggregateExec"), "plan:\n{text}");
+
+    let spec = gpu_spec(&plan);
+    // The product is interned as _gpu_derived_0 and the aggregation points at it.
+    assert_eq!(
+        spec.derived_columns,
+        vec![DerivedColumn {
+            name: "_gpu_derived_0".to_string(),
+            expr: GpuExpr::Arith {
+                op: ArithOp::Mul,
+                lhs: Box::new(GpuExpr::Col {
+                    col: "l_extendedprice".to_string()
+                }),
+                rhs: Box::new(GpuExpr::Col {
+                    col: "l_discount".to_string()
+                }),
+            },
+        }],
+        "spec: {spec:?}"
+    );
+    assert_eq!(spec.aggregations.len(), 1);
+    assert_eq!(spec.aggregations[0].func, AggFunc::Sum);
+    assert_eq!(spec.aggregations[0].col.as_deref(), Some("_gpu_derived_0"));
+    // The read set carries the product's BASE columns (plus the filter columns),
+    // never the derived name.
+    let cols = sorted(spec.columns.iter().map(|c| c.name.clone()).collect());
+    assert_eq!(
+        cols,
+        vec!["l_discount", "l_extendedprice", "l_quantity", "l_shipdate"],
+        "spec: {spec:?}"
+    );
+}
+
+/// KAN-76: the full Q1 aggregate list — two distinct arithmetic inputs become two
+/// derived columns; the bare-column avg stays a direct column reference.
+#[tokio::test(flavor = "multi_thread")]
+async fn rule_fires_on_full_q1_derived_aggregates() {
+    let (ctx, _dir) = fixture_ctx().await;
+    let plan = offload_plan(
+        &ctx,
+        "SELECT l_returnflag, \
+         sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price, \
+         sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, \
+         avg(l_quantity) AS avg_qty \
+         FROM lineitem WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag",
+    )
+    .await;
+    let text = plan_text(&plan);
+    assert!(text.contains("GpuScanAggExec"), "plan:\n{text}");
+
+    let spec = gpu_spec(&plan);
+    let one = || GpuExpr::Lit {
+        lit: LiteralSpec {
+            ty: LiteralType::Float,
+            value: "1".to_string(),
+        },
+    };
+    let price_minus_disc = || GpuExpr::Arith {
+        op: ArithOp::Mul,
+        lhs: Box::new(GpuExpr::Col {
+            col: "l_extendedprice".to_string(),
+        }),
+        rhs: Box::new(GpuExpr::Arith {
+            op: ArithOp::Sub,
+            lhs: Box::new(one()),
+            rhs: Box::new(GpuExpr::Col {
+                col: "l_discount".to_string(),
+            }),
+        }),
+    };
+    assert_eq!(
+        spec.derived_columns,
+        vec![
+            DerivedColumn {
+                name: "_gpu_derived_0".to_string(),
+                expr: price_minus_disc(),
+            },
+            DerivedColumn {
+                name: "_gpu_derived_1".to_string(),
+                expr: GpuExpr::Arith {
+                    op: ArithOp::Mul,
+                    lhs: Box::new(price_minus_disc()),
+                    rhs: Box::new(GpuExpr::Arith {
+                        op: ArithOp::Add,
+                        lhs: Box::new(one()),
+                        rhs: Box::new(GpuExpr::Col {
+                            col: "l_tax".to_string(),
+                        }),
+                    }),
+                },
+            },
+        ],
+        "spec: {spec:?}"
+    );
+    let agg_cols: Vec<Option<String>> = spec.aggregations.iter().map(|a| a.col.clone()).collect();
+    assert_eq!(
+        agg_cols,
+        vec![
+            Some("_gpu_derived_0".to_string()),
+            Some("_gpu_derived_1".to_string()),
+            Some("l_quantity".to_string()), // avg over a bare col stays direct
+        ],
+        "spec: {spec:?}"
+    );
+    assert!(spec
+        .aggregations
+        .iter()
+        .all(|a| a.func == AggFunc::Sum || a.func == AggFunc::Avg));
+}
+
+/// Identical expression inputs across aggregations share ONE derived column —
+/// the shim must not evaluate the same tree twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn rule_dedupes_identical_derived_exprs() {
+    let (ctx, _dir) = fixture_ctx().await;
+    let plan = offload_plan(
+        &ctx,
+        "SELECT sum(l_extendedprice * l_discount), avg(l_extendedprice * l_discount) \
+         FROM lineitem WHERE l_quantity < 24",
+    )
+    .await;
+    let text = plan_text(&plan);
+    assert!(text.contains("GpuScanAggExec"), "plan:\n{text}");
+
+    let spec = gpu_spec(&plan);
+    assert_eq!(spec.derived_columns.len(), 1, "spec: {spec:?}");
+    let agg_cols: Vec<Option<String>> = spec.aggregations.iter().map(|a| a.col.clone()).collect();
+    assert_eq!(
+        agg_cols,
+        vec![
+            Some("_gpu_derived_0".to_string()),
+            Some("_gpu_derived_0".to_string())
+        ],
+        "spec: {spec:?}"
+    );
+}
+
+/// Non-arithmetic aggregate inputs still refuse: function calls and operators
+/// outside +,-,*,/ (a transparent numeric cast is fine, but modulo is not).
+#[tokio::test(flavor = "multi_thread")]
+async fn rule_ignores_non_arithmetic_aggregate_input() {
+    let (ctx, _dir) = fixture_ctx().await;
+    for sql in [
+        "SELECT sum(extract(year from l_shipdate)) FROM lineitem WHERE l_quantity < 24",
+        "SELECT sum(l_quantity % 2) FROM lineitem WHERE l_quantity < 24",
+    ] {
+        let plan = offload_plan(&ctx, sql).await;
+        let text = plan_text(&plan);
+        assert!(
+            !text.contains("GpuScanAggExec"),
+            "`{sql}` must stay on CPU:\n{text}"
+        );
+    }
 }
 
 /// A non-comparison filter conjunct (LIKE) keeps the query on CPU.
@@ -398,7 +613,9 @@ async fn rule_ignores_non_parquet_scan() {
 fn dummy_spec() -> GpuOpSpec {
     GpuOpSpec {
         table_path: "/unused/by/mock.parquet".to_string(),
+        files: vec!["/unused/by/mock.parquet".to_string()],
         columns: vec![],
+        derived_columns: vec![],
         filters: vec![],
         group_by: vec![],
         aggregations: vec![],

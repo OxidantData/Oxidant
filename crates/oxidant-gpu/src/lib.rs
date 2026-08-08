@@ -3,8 +3,10 @@
 //! NVIDIA libcudf benchmarks 3.8x–9.0x faster than Oxidant's CPU path per TPC-H SF10
 //! query, so the engine grows GPU offload behind a conservative DataFusion physical
 //! optimizer rule: [`rule::GpuOffloadRule`] matches ONLY a final-stage aggregation
-//! over conjunctive column-vs-literal filters over a single local parquet file
-//! (TPC-H Q1/Q6 shapes) and replaces that subtree with [`exec::GpuScanAggExec`],
+//! over conjunctive column-vs-literal filters over local parquet part files
+//! (TPC-H Q1/Q6 shapes, KAN-75 multi-file; aggregate inputs may be arithmetic
+//! expressions over columns/literals, KAN-76 derived columns) and replaces that
+//! subtree with [`exec::GpuScanAggExec`],
 //! which ships a JSON [`spec::GpuOpSpec`] through a plain-C FFI shim
 //! ([`ffi::exec_spec`]) and streams the Arrow C Data Interface result back.
 //!
