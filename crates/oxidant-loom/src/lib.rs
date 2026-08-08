@@ -4128,10 +4128,13 @@ impl Engine {
                 let (cat, ns, tbl) = self.resolve_table_ref(&segments);
                 // `USE CATALOG <external>` leaves no current database (KAN-84): the schema
                 // probe below can't be qualified into SQL (`{cat}..{tbl}` is a syntax error).
-                // Probe the provider with the empty namespace instead and surface its contract
-                // error (Glue/Hive: "needs a database …"). In-tree providers all require a
-                // namespace, so this errors; a flat provider accepting the empty namespace
-                // falls through with the parts joined without the empty segment.
+                // Probe the provider with the empty namespace instead: its not-found Plan
+                // (Glue/Hive: "needs a database …") surfaces Spark-shaped via
+                // `load_catalog_table` as `[TABLE_OR_VIEW_NOT_FOUND] The table or view
+                // `cat.tbl` cannot be found`; backend failures (Io/…) pass through unchanged.
+                // In-tree providers all require a namespace, so this errors; a flat provider
+                // accepting the empty namespace falls through with the parts joined without
+                // the empty segment.
                 if cat != oxidant_catalog::DEFAULT_CATALOG && ns.is_empty() {
                     self.load_catalog_table(&cat, &ns, &tbl).await?;
                 }
@@ -4143,7 +4146,7 @@ impl Engine {
                     };
                     parts.extend(ns.iter().map(String::as_str));
                     parts.push(&tbl);
-                    parts.join(".")
+                    join_table_name_parts(parts)
                 };
                 let schema = self.schema(&format!("SELECT * FROM {qualified}")).await?;
                 let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
@@ -4193,7 +4196,12 @@ impl Engine {
             ShowStmt::TblProperties { table, key } => {
                 let segments = parse_qualified_name(table);
                 let (cat, ns, tbl) = self.resolve_table_ref(&segments);
-                let qualified = format!("{cat}.{}.{tbl}", ns.join("."));
+                let qualified = join_table_name_parts(
+                    [cat.as_str()]
+                        .into_iter()
+                        .chain(ns.iter().map(String::as_str))
+                        .chain([tbl.as_str()]),
+                );
                 let props: HashMap<String, String> = if cat == oxidant_catalog::DEFAULT_CATALOG {
                     self.created_table_meta(&tbl)
                         .map(|m| m.properties)
@@ -4251,7 +4259,12 @@ impl Engine {
             ShowStmt::CreateTable { table } => {
                 let segments = parse_qualified_name(table);
                 let (cat, ns, tbl) = self.resolve_table_ref(&segments);
-                let qualified = format!("{cat}.{}.{tbl}", ns.join("."));
+                let qualified = join_table_name_parts(
+                    [cat.as_str()]
+                        .into_iter()
+                        .chain(ns.iter().map(String::as_str))
+                        .chain([tbl.as_str()]),
+                );
                 if cat == oxidant_catalog::DEFAULT_CATALOG {
                     let meta = self.created_table_meta(&tbl).ok_or_else(|| {
                         Error::Plan(format!(
@@ -4357,8 +4370,9 @@ impl Engine {
                 let segments = parse_qualified_name(name);
                 let (cat, ns, tbl) = self.resolve_table_ref(&segments);
                 // Same KAN-84 empty-namespace handling as `SHOW COLUMNS` (see [`Engine::run_show`]):
-                // probe the provider with the empty namespace and surface its contract error
-                // rather than building `{cat}..{tbl}` SQL.
+                // probe the provider with the empty namespace — its not-found Plan surfaces as
+                // `TABLE_OR_VIEW_NOT_FOUND` via `load_catalog_table`, backend failures pass
+                // through — rather than building `{cat}..{tbl}` SQL.
                 if cat != oxidant_catalog::DEFAULT_CATALOG && ns.is_empty() {
                     self.load_catalog_table(&cat, &ns, &tbl).await?;
                 }
@@ -4370,7 +4384,7 @@ impl Engine {
                     };
                     parts.extend(ns.iter().map(String::as_str));
                     parts.push(&tbl);
-                    parts.join(".")
+                    join_table_name_parts(parts)
                 };
                 let schema = self.schema(&format!("SELECT * FROM {qualified}")).await?;
                 // Metadata for the detailed/JSON forms: local `CREATE TABLE ... USING` tables read
@@ -4634,9 +4648,10 @@ impl Engine {
     /// `defaultNamespace()` — `["default"]` for the builtin session catalog. oxidant's
     /// external providers carry no default-namespace metadata, so switching to an external
     /// catalog leaves the namespace EMPTY ("no database selected"): bare-name SHOW/DESCRIBE
-    /// forms then probe the provider with the empty namespace and surface its contract error
-    /// (Glue: "a Glue table reference needs a database, e.g. `catalog.database.table`"), and
-    /// the KAN-81 sizing walk restricts its namespace search to that one catalog.
+    /// forms then probe the provider with the empty namespace, whose not-found Plan surfaces
+    /// Spark-shaped as `[TABLE_OR_VIEW_NOT_FOUND] The table or view `cat.tbl` cannot be found`
+    /// (via `load_catalog_table`; backend failures pass through unchanged), and the KAN-81
+    /// sizing walk restricts its namespace search to that one catalog.
     async fn run_use(&self, stmt: &UseStmt) -> Result<Vec<RecordBatch>> {
         match stmt {
             UseStmt::Catalog { catalog } => {
@@ -4724,13 +4739,12 @@ impl Engine {
         namespace: &[String],
         table: &str,
     ) -> Result<oxidant_catalog::TableMetadata> {
-        // Join only the non-empty qualifier parts: an empty namespace (the `USE CATALOG
-        // <external>` state, KAN-84) must not produce a `catalog..table` double dot.
-        let qualified = std::iter::once(catalog)
-            .chain(namespace.iter().map(String::as_str))
-            .chain(std::iter::once(table))
-            .collect::<Vec<_>>()
-            .join(".");
+        let qualified = join_table_name_parts(
+            [catalog]
+                .into_iter()
+                .chain(namespace.iter().map(String::as_str))
+                .chain([table]),
+        );
         let provider = self.oxidant_catalog(catalog).ok_or_else(|| {
             Error::Plan(format!(
                 "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{qualified}` cannot be found"
@@ -5607,7 +5621,9 @@ fn parse_describe(query: &str) -> Option<DescribeStmt> {
 /// A parsed `USE` statement (see [`parse_use`]).
 #[derive(Debug, PartialEq, Eq)]
 enum UseStmt {
-    /// `USE CATALOG <catalog>` — switch only the current catalog, namespace unchanged.
+    /// `USE CATALOG <catalog>` — switch the current catalog, resetting the current namespace
+    /// (KAN-84: empty for external catalogs, `["default"]` for the builtin) unless the catalog
+    /// is already current (Spark's no-op switch).
     Catalog { catalog: String },
     /// `USE <namespace>` (current catalog unchanged) or `USE <catalog>.<namespace>` (switches
     /// both). Spark's default `USE <db>` behavior: a single unqualified segment changes only the
@@ -5624,7 +5640,7 @@ enum UseStmt {
 /// whitespace are ignored.
 ///
 /// Recognized forms:
-/// - `USE CATALOG <catalog>` — catalog switch only.
+/// - `USE CATALOG <catalog>` — catalog switch (resets the current namespace, KAN-84).
 /// - `USE <catalog>.<namespace>` — a dotted name switches both catalog and namespace.
 /// - `USE <namespace>` — a single unqualified segment switches only the current namespace,
 ///   matching Spark's `USE <db>`.
@@ -5662,6 +5678,17 @@ fn parse_use(query: &str) -> Option<UseStmt> {
         }
         _ => None,
     }
+}
+
+/// Join a resolved table name's parts (catalog?, namespace…, table) with `.`, dropping empty
+/// segments: an empty namespace (the `USE CATALOG <external>` "no database selected" state,
+/// KAN-84) must never produce a `catalog..table` double dot in display names or probe SQL.
+fn join_table_name_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Split a (possibly backtick-quoted) dotted identifier like `glue.clickbench` or
@@ -6751,28 +6778,35 @@ mod tests {
     }
 
     /// A bare single-table SHOW after `USE CATALOG <external>` can't be qualified (no current
-    /// database): the provider is probed with the empty namespace and its contract error
-    /// surfaces — never a raw `testcat..orders` SQL syntax error.
+    /// database): the provider is probed with the EMPTY namespace and the not-found surfaces
+    /// Spark-shaped as `TABLE_OR_VIEW_NOT_FOUND` naming `testcat.orders` — never a raw
+    /// `testcat..orders` SQL syntax error.
     #[tokio::test]
-    async fn show_columns_after_use_catalog_surfaces_provider_error() {
+    async fn show_columns_after_use_catalog_probes_empty_namespace() {
+        let catalog = Arc::new(RecordingCatalog::new(HashMap::new()));
         let engine = Engine::new();
-        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+        engine.register_catalog("testcat", catalog.clone());
         engine.sql("USE CATALOG testcat").await.unwrap();
         let err = engine.sql("SHOW COLUMNS IN orders").await.unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "not-found Plan, got {err:?}");
         assert!(
-            matches!(err, Error::Plan(_)),
-            "provider contract error, got {err:?}"
+            err.to_string().contains("testcat.orders"),
+            "the error names the qualified table: {err}"
         );
         assert!(
             !err.to_string().contains(".."),
             "must not leak the double-dot SQL shape: {err}"
         );
+        assert!(
+            catalog
+                .load_calls()
+                .contains(&(vec![], "orders".to_string())),
+            "the provider saw the empty-namespace probe: {:?}",
+            catalog.load_calls()
+        );
         // Same for DESCRIBE.
         let err = engine.sql("DESCRIBE orders").await.unwrap_err();
-        assert!(
-            matches!(err, Error::Plan(_)),
-            "provider contract error, got {err:?}"
-        );
+        assert!(matches!(err, Error::Plan(_)), "not-found Plan, got {err:?}");
     }
 
     #[tokio::test]

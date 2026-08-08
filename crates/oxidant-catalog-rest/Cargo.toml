@@ -12,3 +12,8 @@ oxidant-catalog = { workspace = true }
 oxidant-common = { workspace = true }
 async-trait = "0.1"
 serde_json = "1"
+
+[dev-dependencies]
+# Stub-endpoint integration test drives the async CatalogProvider surface (a raw
+# std::net::TcpListener mini-HTTP server stands in for the REST catalog).
+tokio = { version = "1", features = ["macros", "rt"] }

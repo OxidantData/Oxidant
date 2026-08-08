@@ -4224,6 +4224,7 @@ dependencies = [
  "oxidant-catalog",
  "oxidant-common",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

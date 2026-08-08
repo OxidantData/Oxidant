@@ -160,11 +160,13 @@ pub trait CatalogProvider: Send + Sync {
     /// a not-found ([`Error::Plan`]) error as `false`; providers with a cheaper existence check
     /// should override.
     ///
-    /// Only `Plan` maps to `false`: that's the provider contract's "genuine doesn't exist"
-    /// signal (e.g. Glue's `EntityNotFoundException` — see `classify_glue_failure` in
-    /// oxidant-catalog-glue). A backend failure (`Error::Io`: throttling, auth, network, ...)
-    /// must NOT be reported as "table does not exist" — callers (Spark Connect `TableExists`)
-    /// would silently mislead clients, so it propagates as `Err`.
+    /// The contract behind the classification (see `classify_glue_failure` in
+    /// oxidant-catalog-glue): [`Error::Plan`] covers a genuine "doesn't exist" (Glue's
+    /// `EntityNotFoundException`, a REST catalog's 404) AND unusable/malformed references
+    /// (Glue's `single_db` rejecting an empty/multi-segment namespace, a table with no
+    /// location) — both read as `false`. A backend/system failure ([`Error::Io`]: throttling,
+    /// auth, network, ...) must NOT be reported as "table does not exist" — callers (Spark
+    /// Connect `TableExists`) would silently mislead clients, so it propagates as `Err`.
     async fn table_exists(&self, namespace: &[String], table: &str) -> Result<bool> {
         match self.load_table(namespace, table).await {
             Ok(_) => Ok(true),
