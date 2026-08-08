@@ -13,6 +13,10 @@ oxidant-plan = { workspace = true }
 oxidant-physical = { workspace = true }
 oxidant-datasource = { workspace = true }
 oxidant-catalog = { workspace = true }
+# KAN-70 GPU offload spike: registers its conservative plan rule into the engine's
+# physical optimizer pipeline only when OXIDANT_GPU_OFFLOAD=1 (see
+# `physical_optimizer_rules` in src/lib.rs). Default builds link its CPU mock shim.
+oxidant-gpu = { workspace = true }
 async-trait = "0.1"
 # Phase 0 backend. The whole workspace shares this one `arrow` (re-exported below) so
 # Arrow IPC bytes produced here line up with whatever encodes them downstream.

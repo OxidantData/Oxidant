@@ -4310,6 +4310,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxidant-gpu"
+version = "0.1.1"
+dependencies = [
+ "arrow",
+ "cc",
+ "datafusion",
+ "futures",
+ "parquet 58.3.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "oxidant-loom"
 version = "0.1.1"
 dependencies = [
@@ -4327,6 +4342,7 @@ dependencies = [
  "oxidant-catalog",
  "oxidant-common",
  "oxidant-datasource",
+ "oxidant-gpu",
  "oxidant-physical",
  "oxidant-plan",
  "rayon",

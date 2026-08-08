@@ -10,6 +10,7 @@ Architecture: [architecture.md](architecture.md).
 | `crates/oxidant-cli/` | `oxidant` binary: spark server, worker, driver | `src/main.rs` |
 | `crates/oxidant-connect/` | Spark Connect gRPC + DataFrame translate | `src/lib.rs` |
 | `crates/oxidant-loom/` | Vectorized CPU engine (DataFusion 54) | `src/lib.rs` |
+| `crates/oxidant-gpu/` | GPU offload spike (KAN-70): plan rule + C FFI shim (mock by default; env-gated via `OXIDANT_GPU_OFFLOAD`) | `src/lib.rs` |
 | `crates/oxidant-execution/` | Local + distributed Flight driver/worker/shuffle | `src/lib.rs` |
 | `crates/oxidant-sql/` | Spark SQL dialect → warp IR | `src/lib.rs` |
 | `crates/oxidant-plan/` | Warp unresolved logical IR | `src/lib.rs` |

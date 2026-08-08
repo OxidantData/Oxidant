@@ -2055,6 +2055,10 @@ fn physical_optimizer_rules(
     if let Some(i) = position {
         rules.insert(i, std::sync::Arc::new(PreferBoundedJoinBuildSide));
     }
+    // KAN-70 GPU offload spike: appends the conservative scan+filter+aggregate
+    // offload rule immediately before `EnforceDistribution` — but only when
+    // `OXIDANT_GPU_OFFLOAD=1` is set; otherwise the pipeline is untouched.
+    oxidant_gpu::register_if_enabled(&mut rules);
     rules
 }
 
