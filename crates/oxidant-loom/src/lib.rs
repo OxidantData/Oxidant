@@ -4692,22 +4692,65 @@ impl Engine {
                 }
             }
             UseStmt::Namespace { catalog, namespace } => {
-                if let Some(cat) = catalog {
-                    let Some(canonical) = self.canonical_catalog_name(cat) else {
-                        return Err(Error::Plan(format!(
-                            "[CATALOG_NOT_FOUND] The catalog `{cat}` not found"
-                        )));
-                    };
-                    let mut current = self.current.lock().expect("current poisoned");
-                    current.0 = canonical;
-                    current.1 = namespace.clone();
-                } else {
-                    let mut current = self.current.lock().expect("current poisoned");
-                    current.1 = namespace.clone();
+                let canonical = match catalog {
+                    Some(cat) => Some(self.canonical_catalog_name(cat).ok_or_else(|| {
+                        Error::Plan(format!("[CATALOG_NOT_FOUND] The catalog `{cat}` not found"))
+                    })?),
+                    None => None,
+                };
+                let target_catalog = canonical
+                    .clone()
+                    .unwrap_or_else(|| self.current_catalog_and_namespace().0);
+                // KAN-86: the namespace must exist (Spark's `setCurrentNamespace` →
+                // `SCHEMA_NOT_FOUND`) — validated BEFORE any state changes, so a failed USE
+                // leaves the session untouched.
+                self.validate_namespace(&target_catalog, namespace).await?;
+                let mut current = self.current.lock().expect("current poisoned");
+                if let Some(cat) = canonical {
+                    current.0 = cat;
                 }
+                current.1 = namespace.clone();
             }
         }
         Ok(vec![])
+    }
+
+    /// Validate a `USE` target namespace exists — Spark's `setCurrentNamespace` runs
+    /// `assertNamespaceExist` and raises `[SCHEMA_NOT_FOUND] The schema \`db\` cannot be found`
+    /// (KAN-86). The builtin catalog checks DataFusion's registered schemas; an external
+    /// catalog is walked level-by-level via `list_namespaces` (cheap in-process since KAN-82),
+    /// so a multi-part namespace on a single-level provider (Glue) fails `SCHEMA_NOT_FOUND` at
+    /// the second level. A backend failure (`Error::Io`) propagates — a namespace is never
+    /// silently accepted when validation itself fails.
+    async fn validate_namespace(&self, catalog: &str, namespace: &[String]) -> Result<()> {
+        if namespace.is_empty() {
+            return Ok(());
+        }
+        let not_found = || {
+            Error::Plan(format!(
+                "[SCHEMA_NOT_FOUND] The schema `{}` cannot be found",
+                namespace.join(".")
+            ))
+        };
+        if catalog == oxidant_catalog::DEFAULT_CATALOG {
+            if self.builtin_namespaces().contains(&namespace.join(".")) {
+                return Ok(());
+            }
+            return Err(not_found());
+        }
+        let Some(provider) = self.oxidant_catalog(catalog) else {
+            // Unreachable: the caller validates the catalog first.
+            return Err(not_found());
+        };
+        let mut prefix: Vec<String> = Vec::new();
+        for segment in namespace {
+            let children = provider.list_namespaces(&prefix).await?;
+            prefix.push(segment.clone());
+            if !children.iter().any(|child| child == &prefix) {
+                return Err(not_found());
+            }
+        }
+        Ok(())
     }
 
     /// The session's current catalog + current namespace, set by `USE` (default:
@@ -6677,12 +6720,79 @@ mod tests {
     #[tokio::test]
     async fn use_namespace_updates_current_namespace() {
         let engine = Engine::new();
+        // KAN-86: USE validates existence — register the schema first.
+        engine
+            .ctx()
+            .catalog(oxidant_catalog::DEFAULT_CATALOG)
+            .unwrap()
+            .register_schema(
+                "somedb",
+                Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
+            )
+            .unwrap();
         let batches = engine.sql("USE somedb").await.unwrap();
         assert!(batches.is_empty(), "USE should yield no batches");
         let (catalog, namespace) = engine.current_catalog_and_namespace();
         // Current catalog is unchanged (bare `USE <db>` only switches the namespace).
         assert_eq!(catalog, "spark_catalog");
         assert_eq!(namespace, vec!["somedb".to_string()]);
+    }
+
+    /// KAN-86: `USE <missing-db>` fails with Spark's `[SCHEMA_NOT_FOUND]` shape and leaves the
+    /// session state untouched — for both the builtin catalog and an external one.
+    #[tokio::test]
+    async fn use_missing_namespace_errors_schema_not_found() {
+        let engine = Engine::new();
+        let err = engine.sql("USE nosuchdb").await.unwrap_err();
+        match err {
+            Error::Plan(msg) => {
+                assert!(msg.contains("[SCHEMA_NOT_FOUND]"), "{msg}");
+                assert!(msg.contains("nosuchdb"), "{msg}");
+            }
+            other => panic!("expected Plan, got {other:?}"),
+        }
+        let (catalog, namespace) = engine.current_catalog_and_namespace();
+        assert_eq!(catalog, "spark_catalog");
+        assert_eq!(namespace, vec!["default".to_string()]);
+
+        // External: same shape, validated against the provider's namespace listing.
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+        let err = engine.sql("USE testcat.nosuchdb").await.unwrap_err();
+        match err {
+            Error::Plan(msg) => assert!(msg.contains("[SCHEMA_NOT_FOUND]"), "{msg}"),
+            other => panic!("expected Plan, got {other:?}"),
+        }
+        // The failed USE changed nothing.
+        assert_eq!(engine.current_catalog_and_namespace().0, "spark_catalog");
+    }
+
+    /// KAN-86: external validation actually walks the provider's namespace listing, and an
+    /// existing external namespace validates cleanly.
+    #[tokio::test]
+    async fn use_external_namespace_validates_via_list_namespaces() {
+        let catalog = Arc::new(RecordingCatalog::new(HashMap::new()));
+        let engine = Engine::new();
+        engine.register_catalog("testcat", catalog.clone());
+
+        engine.sql("USE testcat.db1").await.unwrap();
+        assert_eq!(
+            engine.current_catalog_and_namespace(),
+            ("testcat".to_string(), vec!["db1".to_string()])
+        );
+        assert!(
+            catalog.list_calls().contains(&Vec::new()),
+            "validation listed top-level namespaces: {:?}",
+            catalog.list_calls()
+        );
+
+        // A second level on a single-level provider is SCHEMA_NOT_FOUND (its list_namespaces
+        // returns no children for a non-empty parent).
+        let err = engine.sql("USE testcat.db1.deeper").await.unwrap_err();
+        match err {
+            Error::Plan(msg) => assert!(msg.contains("[SCHEMA_NOT_FOUND]"), "{msg}"),
+            other => panic!("expected Plan, got {other:?}"),
+        }
     }
 
     #[tokio::test]
