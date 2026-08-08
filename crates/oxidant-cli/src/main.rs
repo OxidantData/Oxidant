@@ -336,7 +336,7 @@ async fn run_worker(args: &[String]) -> oxidant_common::Result<()> {
             catalogs.len()
         );
     }
-    let service = oxidant_connect::OxidantService::with_catalogs(catalogs);
+    let service = oxidant_connect::OxidantService::with_catalogs(catalogs).await;
     let engine = service.engine();
     // Optionally register a Parquet table so a driver query has data to read.
     if let (Some(data), Some(table)) = (flag(args, "--data"), flag(args, "--table")) {

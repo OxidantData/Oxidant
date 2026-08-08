@@ -311,13 +311,14 @@ impl OxidantService {
 
     /// Build a service with external catalogs declared up front (flat `spark.sql.catalog.*`
     /// entries). The catalogs are bridged into the engine before any client connects.
-    pub fn with_catalogs(catalogs: std::collections::HashMap<String, String>) -> Self {
+    pub async fn with_catalogs(catalogs: std::collections::HashMap<String, String>) -> Self {
         Self::with_config(ServerConfig {
             catalogs,
             ..Default::default()
         })
+        .await
     }
-    pub fn with_config(config: ServerConfig) -> Self {
+    pub async fn with_config(config: ServerConfig) -> Self {
         let store = config
             .observability
             .clone()
@@ -328,7 +329,7 @@ impl OxidantService {
                 .lock()
                 .expect("config poisoned")
                 .extend(config.catalogs);
-            svc.sync_catalogs();
+            svc.sync_catalogs().await;
         }
         if !config.workers.is_empty() {
             svc.workers = config.workers;
@@ -349,13 +350,13 @@ impl OxidantService {
         svc
     }
 
-    fn sync_catalogs(&self) {
+    async fn sync_catalogs(&self) {
         let snapshot = self.config.lock().expect("config poisoned").clone();
         for (name, opts) in catalog::group_catalog_options(&snapshot) {
             if self.registry.contains(&name) {
                 continue;
             }
-            if let Ok(provider) = catalog::build_provider(&name, &opts) {
+            if let Ok(provider) = catalog::build_provider(&name, &opts).await {
                 self.engine.register_catalog(&name, provider.clone());
                 self.registry.register(&name, provider);
             }
@@ -1189,7 +1190,7 @@ impl SparkConnectService for OxidantService {
                     }
                 }
                 // A `spark.sql.catalog.*` change may have declared a new catalog — reconcile.
-                self.sync_catalogs();
+                self.sync_catalogs().await;
                 self.sync_observability_env();
                 Vec::new()
             }
@@ -1927,7 +1928,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .unwrap_or_else(|| Arc::new(AppStateStore::new()));
     let mut cfg = config;
     cfg.observability = Some(store.clone());
-    let service = Arc::new(OxidantService::with_config(cfg));
+    let service = Arc::new(OxidantService::with_config(cfg).await);
 
     // Bundled sample data: register the `samples` schema before accepting connections so the
     // first client already sees the tables. Best-effort — registration logs and skips on

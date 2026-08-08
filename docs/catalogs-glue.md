@@ -14,18 +14,17 @@ setup), see [`distributed-ec2.md`](distributed-ec2.md).
 
 ## How auth works
 
-Oxidant's Glue provider (`oxidant-catalog-glue`) does not use an AWS SDK directly — it **shells
-out to the AWS CLI** (`aws glue get-databases|get-tables|get-table …`), and table locations
-(`s3://…`) are read with the same credentials. So any identity the AWS CLI can use works:
+Oxidant's Glue provider (`oxidant-catalog-glue`) uses the official AWS SDK for Rust
+(`aws-sdk-glue`) in-process — no `aws` CLI subprocess — and table locations (`s3://…`) are read
+with the same credentials. So any identity in the standard AWS credential chain works:
 
 - **EC2:** an IAM instance profile, picked up via IMDSv2 — no static keys anywhere.
 - **Anywhere else:** standard AWS credential environment variables
-  (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`) or a configured CLI
-  profile.
+  (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`), shared
+  config/credentials files, or container credentials (IRSA on EKS).
 
-The CLI binary path is taken only from `OXIDANT_AWS_BIN` (never from catalog options). The
-Docker image and the EC2 AMI already bundle AWS CLI v2 and set this; on a bare-metal install,
-`aws` must be on `PATH` or set `OXIDANT_AWS_BIN=/path/to/aws`.
+No CLI binary or extra env wiring is needed on the server. (The Docker image and EC2 AMI still
+bundle AWS CLI v2 for operator scripts; the engine itself no longer uses it.)
 
 **Region precedence:** the `spark.sql.catalog.glue.region` option → `AWS_REGION` →
 `AWS_DEFAULT_REGION` → `us-west-2`.
@@ -97,8 +96,7 @@ reads don't need `warehouse` at all.
 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
-| `aws: command not found` / spawn error | No AWS CLI where the server runs. Install AWS CLI v2, or set `OXIDANT_AWS_BIN=/path/to/aws` |
-| `aws glue … EntityNotFound` | Wrong database/table name, or wrong region — set `spark.sql.catalog.glue.region` explicitly |
+| `EntityNotFoundException` on `GetTable` | Wrong database/table name, or wrong region — set `spark.sql.catalog.glue.region` explicitly |
 | `AccessDenied` on Glue or S3 | The identity (instance profile / env creds) lacks `glue:Get*` or S3 read on the bucket **and** `bucket/*`; on EC2 check the instance profile |
 | Auth works locally but not from Oxidant | Credentials must be visible to the **server** process (or every worker), not your client shell |
 | Works single-node, fails distributed | Workers missing the catalog — pass the same `OXIDANT_CATALOG_CONF` to `oxidant worker` |

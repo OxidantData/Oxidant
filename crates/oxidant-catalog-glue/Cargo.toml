@@ -1,6 +1,6 @@
 [package]
 name = "oxidant-catalog-glue"
-description = "AWS Glue Data Catalog provider for Oxidant. Shells out to the `aws glue` CLI (EC2 instance role provides credentials via IMDS), so no heavy AWS SDK is pulled. Shared by the gateway and the cluster-side engine."
+description = "AWS Glue Data Catalog provider for Oxidant, built on the official AWS SDK for Rust (in-process `aws-sdk-glue`; credentials via the standard AWS chain — env, shared config, instance role / IRSA). Shared by the gateway and the cluster-side engine."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,6 +10,14 @@ rust-version.workspace = true
 [dependencies]
 oxidant-catalog = { workspace = true }
 async-trait = "0.1"
-serde_json = "1"
-# Only `process` is needed: we shell out to the `aws glue` CLI rather than link the AWS SDK.
-tokio = { version = "1", features = ["process"] }
+# Official AWS SDK for the Glue metadata ops (GetDatabases/GetTables/GetTable/CreateTable) —
+# replaces the old `aws glue` CLI shell-out (KAN-82: ~0.5–2s per subprocess spawn, stderr
+# string-matching, and a hard dependency on the `aws` binary). Pinned (not "1") to versions
+# whose MSRV matches this workspace's toolchain — the same pin discipline as oxidant-loom's
+# aws-config/aws-sdk-sts.
+aws-config = "=1.8.13"
+aws-sdk-glue = "=1.137.0"
+
+[dev-dependencies]
+# Stub-endpoint integration test: a raw TcpListener mini-HTTP server stands in for Glue.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
