@@ -309,6 +309,11 @@ impl OxidantService {
         Arc::clone(&self.engine)
     }
 
+    /// Borrow the catalog registry (current catalog / namespace pointers and registered providers).
+    pub fn registry(&self) -> Arc<oxidant_catalog::CatalogRegistry> {
+        Arc::clone(&self.registry)
+    }
+
     /// Build a service with external catalogs declared up front (flat `spark.sql.catalog.*`
     /// entries). The catalogs are bridged into the engine before any client connects.
     pub fn with_catalogs(catalogs: std::collections::HashMap<String, String>) -> Self {

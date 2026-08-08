@@ -5,9 +5,11 @@ import StagesPage from "@/pages/StagesPage";
 import SqlPage from "@/pages/SqlPage";
 import EditorPage from "@/pages/EditorPage";
 import NotebookPage from "@/pages/NotebookPage";
+import CatalogPage from "@/pages/CatalogPage";
 import ExecutorsPage from "@/pages/ExecutorsPage";
 import EnvironmentPage from "@/pages/EnvironmentPage";
 import ComparePage from "@/pages/ComparePage";
+import ClusterPage from "@/pages/ClusterPage";
 
 const tabs = [
   { to: "/", label: "Jobs", end: true },
@@ -15,6 +17,8 @@ const tabs = [
   { to: "/sql", label: "SQL" },
   { to: "/editor", label: "Editor" },
   { to: "/notebook", label: "Notebook" },
+  { to: "/catalog", label: "Catalog" },
+  { to: "/cluster", label: "Cluster" },
   { to: "/executors", label: "Executors" },
   { to: "/environment", label: "Environment" },
   { to: "/compare", label: "Compare" },
@@ -24,7 +28,7 @@ export default function App() {
   const { data: meta } = useAppMeta();
 
   return (
-    <div className="min-h-screen">
+    <div className="flex h-screen flex-col overflow-hidden">
       <header className="flex items-center gap-4 border-b border-border px-5 py-3">
         <h1 className="text-lg font-semibold text-accent">Oxidant</h1>
         <span className="text-sm text-muted">
@@ -45,13 +49,15 @@ export default function App() {
           </NavLink>
         ))}
       </nav>
-      <main className="mx-auto max-w-6xl p-5">
+      <main className="flex-1 overflow-auto p-4">
         <Routes>
           <Route path="/" element={<JobsPage />} />
           <Route path="/stages" element={<StagesPage />} />
           <Route path="/sql" element={<SqlPage />} />
           <Route path="/editor" element={<EditorPage />} />
           <Route path="/notebook" element={<NotebookPage />} />
+          <Route path="/catalog" element={<CatalogPage />} />
+          <Route path="/cluster" element={<ClusterPage />} />
           <Route path="/executors" element={<ExecutorsPage />} />
           <Route path="/environment" element={<EnvironmentPage />} />
           <Route path="/compare" element={<ComparePage />} />
