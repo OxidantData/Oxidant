@@ -818,7 +818,12 @@ struct AutocompleteQuery {
 async fn list_catalogs(State(state): State<RestState>) -> Json<Value> {
     let registry = state.service.registry();
     let names = registry.catalog_names();
-    let current = registry.current_catalog();
+    let current = state
+        .service
+        .engine()
+        .for_session(crate::REST_SESSION_ID)
+        .current_catalog_and_namespace()
+        .0;
     let catalogs: Vec<Value> = names
         .into_iter()
         .map(|name| {
@@ -928,13 +933,18 @@ async fn autocomplete_catalog(
         }
     };
 
+    // The REST session's current catalog (KAN-85) — shared by both branches below.
+    let current = engine
+        .for_session(crate::REST_SESSION_ID)
+        .current_catalog_and_namespace()
+        .0;
+
     if parts.len() <= 1 {
         // Suggest catalogs.
         for name in registry.catalog_names() {
             push("catalog", &name, name.clone());
         }
         // Suggest namespaces in the current catalog.
-        let current = registry.current_catalog();
         let namespaces = if current == DEFAULT_CATALOG {
             engine.builtin_namespaces()
         } else if let Some(provider) = registry.provider(&current) {
@@ -957,10 +967,7 @@ async fn autocomplete_catalog(
         let (catalog, namespace_parts) = if registry.contains(first) {
             (first.to_string(), parts[1..parts.len() - 1].to_vec())
         } else {
-            (
-                registry.current_catalog(),
-                parts[..parts.len() - 1].to_vec(),
-            )
+            (current.clone(), parts[..parts.len() - 1].to_vec())
         };
         let namespace_str = namespace_parts.join(".");
         let ns_vec: Vec<String> = namespace_parts.iter().map(|s| s.to_string()).collect();

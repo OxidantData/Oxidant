@@ -2079,38 +2079,46 @@ type TableStats = (Option<u64>, Option<u64>);
 /// operators behind the same surface in Phase 1.
 pub struct Engine {
     ctx: Arc<SessionContext>,
-    /// Per-engine managed warehouse directory. Spark's `CREATE TABLE … USING <fmt>` is lowered to
-    /// a real `CREATE EXTERNAL TABLE … LOCATION '<warehouse>/<name>/'` whose data lives in actual
-    /// `<fmt>` files under here (see [`spark_create_table`]). One directory per `Engine` isolates
-    /// otherwise-colliding table names across files and is removed on `Drop`.
-    warehouse: PathBuf,
+    /// Per-engine managed directories: the warehouse (Spark's `CREATE TABLE … USING <fmt>` is
+    /// lowered to a real `CREATE EXTERNAL TABLE … LOCATION '<warehouse>/<name>/'` whose data
+    /// lives in actual `<fmt>` files under here — see [`spark_create_table`]) and the
+    /// DataFusion spill dir (sort/aggregate spill files, kept out of the shared OS temp root so
+    /// the watchdog can size it cheaply). One directory per `Engine` isolates
+    /// otherwise-colliding table names across files; both are removed when the LAST handle
+    /// drops — `for_session` clones share them (KAN-85).
+    dirs: Arc<ManagedDirs>,
     /// Lowercased names of the session-temporary views created so far in this engine's lifetime
     /// (`CREATE [GLOBAL] TEMP[ORARY] VIEW <name>`). Spark forbids a *persistent* `CREATE VIEW` from
     /// referencing any of these (SPARK-29628 / `INVALID_TEMP_OBJ_REFERENCE`); DataFusion has no
     /// temp/permanent distinction and would silently accept it, so we track the temp set ourselves
     /// and reject the offending persistent view to keep error-parity with Spark. A name is removed
     /// when a later persistent view re-uses it (DataFusion's single namespace would shadow it).
-    temp_views: Mutex<HashSet<String>>,
+    temp_views: Arc<Mutex<HashSet<String>>>,
     /// The external [`oxidant_catalog::CatalogProvider`]s registered via [`Engine::register_catalog`],
     /// keyed by their registered name. Held alongside the DataFusion bridge so the engine can answer
     /// `SHOW DATABASES`/`SHOW TABLES IN …` authoritatively (the bridge only exposes a best-effort,
     /// already-materialized listing). See the SHOW interception in [`Engine::sql`].
-    oxidant_catalogs: Mutex<HashMap<String, Arc<dyn oxidant_catalog::CatalogProvider>>>,
+    oxidant_catalogs: Arc<Mutex<HashMap<String, Arc<dyn oxidant_catalog::CatalogProvider>>>>,
     /// User-defined functions registered in this session (SQL `CREATE FUNCTION`, Connect sync).
     udf_registry: udf_registry::SharedUdfRegistry,
-    /// The session's current catalog + current namespace ("current database"), set by `USE` and
+    /// This handle's current catalog + current namespace ("current database"), set by `USE` and
     /// consulted for defaulting unqualified names in SHOW/DESCRIBE (see [`Engine::sql`]'s `USE`
-    /// interception and [`Engine::current_catalog_and_namespace`]). Mirrors the shape of
-    /// [`oxidant_catalog::CatalogRegistry`]'s current-catalog/-namespace pointers, but is owned
-    /// directly by the engine rather than by `oxidant-connect`'s separate Catalog-RPC registry.
-    current: Mutex<(String, Vec<String>)>,
+    /// interception and [`Engine::current_catalog_and_namespace`]). The ONLY per-handle state:
+    /// a plain `Engine::new()` handle owns a private cell (CLI/tests/direct use unchanged),
+    /// while [`Engine::for_session`] handles share everything else but point `current` at the
+    /// session's registry cell (KAN-85) — one Connect session's `USE` no longer leaks into
+    /// every other session.
+    current: SessionCurrent,
+    /// KAN-85: per-session (catalog, namespace) cells keyed by Connect session id, plus the
+    /// catalog new sessions seed from (`spark.sql.defaultCatalog`; default `spark_catalog`).
+    sessions: Arc<Mutex<SessionState>>,
     /// Metadata for tables created locally via `CREATE TABLE ... USING <fmt>` (see
     /// [`CreatedTableMeta`]), keyed by the table name as written in the `CREATE TABLE` statement.
     /// `spark_create_table`'s lowering rewrites the statement into a plain `CREATE EXTERNAL TABLE`
     /// that DataFusion's catalog cannot answer `COMMENT`/`TBLPROPERTIES` from, so this is captured
     /// separately at CREATE time. Consulted by later SHOW/DESCRIBE work via
     /// [`Engine::created_table_meta`].
-    created_tables: Mutex<HashMap<String, CreatedTableMeta>>,
+    created_tables: Arc<Mutex<HashMap<String, CreatedTableMeta>>>,
     /// Set permanently on Flight workers so losing a distributed stage's task-local snapshot
     /// scope fails rather than silently resolving a newer lakehouse snapshot.
     require_lakehouse_snapshot_pins: Arc<AtomicBool>,
@@ -2122,12 +2130,12 @@ pub struct Engine {
     /// KAN-53 auto selection rerouted a plan to sort-merge on this engine
     /// ([`Engine::plan_time_smj_reroute`] returning true). Read via
     /// [`Engine::plan_time_smj_reroute_count`].
-    plan_time_smj_reroutes: AtomicU64,
+    plan_time_smj_reroutes: Arc<AtomicU64>,
     /// How many tables were registered with driver-measured statistics on this engine
     /// ([`Engine::register_batches_with_stats`]) — the worker-side observable that the
     /// stage-input statistics path (KAN-2 A3) actually engaged. Read via
     /// [`Engine::measured_stats_registration_count`].
-    measured_stats_registrations: AtomicU64,
+    measured_stats_registrations: Arc<AtomicU64>,
     /// This engine's identity in the process-global stage plan cache
     /// ([`stage_plan_cache`], R5-4): two engines in one process never share plan templates
     /// (a template embeds its engine's base-table providers). Unique per engine, from the
@@ -2138,21 +2146,53 @@ pub struct Engine {
     /// providers. Per-task localized `shuffle_input__s*_p*` registrations are exempt
     /// (their schemas ride in the cache key instead; bumping on every task would
     /// invalidate the cache constantly). Read into [`stage_plan_cache::StagePlanKey`].
-    catalog_version: AtomicU64,
+    catalog_version: Arc<AtomicU64>,
     /// Last-activity timestamp of the engine's memory pool (grow/shrink/try_grow) — a
     /// worker-wide operator-progress signal for the stage no-progress watchdog (KAN-47).
     pool_activity: progress_pool::PoolActivity,
-    /// This engine's dedicated DataFusion spill directory (sort/aggregate spill files).
-    /// Kept out of the shared OS temp root so the watchdog can size it cheaply; removed
-    /// on `Drop` like [`Engine::warehouse`].
-    spill_dir: PathBuf,
     /// Cached `estimate_table_stats` results (bytes + catalog row-count statistic), keyed by
-    /// the lowercased table name as passed (catalog-qualified or bare). Auto-broadcast sizing
-    /// runs per query, and the uncached path issues Glue/Catalog API calls + S3 LISTs for every
-    /// table — a multi-second fixed tax per query (the SF10 per-query floor). Sizes/row counts
-    /// only steer the replicate/shard heuristic (never correctness), so a bounded TTL
-    /// (`OXIDANT_TABLE_BYTES_CACHE_TTL_MS`, default 1h, 0 disables) is safe against data growth.
-    table_bytes_cache: Mutex<HashMap<String, (TableStats, std::time::Instant)>>,
+    /// the lowercased RESOLVED (catalog, namespace, table) — bare-name estimates are scoped to
+    /// the session state that produced them (KAN-85), qualified names share one entry.
+    /// Auto-broadcast sizing runs per query, and the uncached path issues Glue/Catalog API
+    /// calls and S3 LISTs for every table — a multi-second fixed tax per query (the SF10
+    /// per-query floor). Sizes/row counts only steer the replicate/shard heuristic (never
+    /// correctness), so a bounded TTL (`OXIDANT_TABLE_BYTES_CACHE_TTL_MS`, default 1h, 0
+    /// disables) is safe against data growth.
+    table_bytes_cache: Arc<Mutex<HashMap<String, (TableStats, std::time::Instant)>>>,
+}
+
+/// The engine's managed directories (warehouse + spill). Removed when the last `Arc` handle
+/// drops — `Engine` handles produced by [`Engine::for_session`] share one `ManagedDirs`, so a
+/// session handle dropping mid-flight never deletes files another session is reading (KAN-85).
+struct ManagedDirs {
+    warehouse: PathBuf,
+    spill_dir: PathBuf,
+}
+
+impl Drop for ManagedDirs {
+    /// Tear down the managed directories: the warehouse (the `CREATE TABLE …
+    /// USING <fmt>` format-backed storage) and the DataFusion spill dir. Best-effort: a
+    /// leftover temp dir is harmless, so failures are ignored.
+    fn drop(&mut self) {
+        if self.warehouse.exists() {
+            let _ = std::fs::remove_dir_all(&self.warehouse);
+        }
+        if self.spill_dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.spill_dir);
+        }
+    }
+}
+
+/// A session's current `(catalog, namespace)` cell (KAN-85) — shared by every engine handle
+/// derived for that session via [`Engine::for_session`].
+type SessionCurrent = Arc<Mutex<(String, Vec<String>)>>;
+
+/// KAN-85 per-session state: each Connect session's (catalog, namespace) cell, plus the
+/// catalog NEW sessions seed from (`spark.sql.defaultCatalog`, default `spark_catalog`).
+/// Existing sessions keep their (possibly `USE`-adjusted) state when the default changes.
+struct SessionState {
+    default_catalog: String,
+    cells: HashMap<String, SessionCurrent>,
 }
 
 /// How much rewriting a plan tolerates before the distributed stage split, gating
@@ -2512,24 +2552,30 @@ impl Engine {
         ));
         Self {
             ctx: Arc::new(ctx),
-            warehouse,
-            temp_views: Mutex::new(HashSet::new()),
-            oxidant_catalogs: Mutex::new(HashMap::new()),
+            dirs: Arc::new(ManagedDirs {
+                warehouse,
+                spill_dir,
+            }),
+            temp_views: Arc::new(Mutex::new(HashSet::new())),
+            oxidant_catalogs: Arc::new(Mutex::new(HashMap::new())),
             udf_registry: Arc::new(Mutex::new(udf_registry::UdfRegistry::new())),
-            current: Mutex::new((
+            current: Arc::new(Mutex::new((
                 oxidant_catalog::DEFAULT_CATALOG.to_string(),
                 vec![oxidant_catalog::DEFAULT_NAMESPACE.to_string()],
-            )),
-            created_tables: Mutex::new(HashMap::new()),
+            ))),
+            sessions: Arc::new(Mutex::new(SessionState {
+                default_catalog: oxidant_catalog::DEFAULT_CATALOG.to_string(),
+                cells: HashMap::new(),
+            })),
+            created_tables: Arc::new(Mutex::new(HashMap::new())),
             require_lakehouse_snapshot_pins: Arc::new(AtomicBool::new(false)),
             memory_pool_bytes: memory_limit,
-            plan_time_smj_reroutes: AtomicU64::new(0),
-            measured_stats_registrations: AtomicU64::new(0),
+            plan_time_smj_reroutes: Arc::new(AtomicU64::new(0)),
+            measured_stats_registrations: Arc::new(AtomicU64::new(0)),
             plan_cache_id: id,
-            catalog_version: AtomicU64::new(0),
+            catalog_version: Arc::new(AtomicU64::new(0)),
             pool_activity,
-            spill_dir,
-            table_bytes_cache: Mutex::new(HashMap::new()),
+            table_bytes_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2544,7 +2590,7 @@ impl Engine {
     /// a second worker-wide progress signal (frozen under the spill-pool deadlock class).
     /// Best-effort: a missing/unreadable dir counts as 0.
     pub fn spill_dir_bytes(&self) -> u64 {
-        dir_bytes(&self.spill_dir)
+        dir_bytes(&self.dirs.spill_dir)
     }
 
     /// Import UDF definitions from JSON (distributed worker sync).
@@ -2639,7 +2685,7 @@ impl Engine {
         // DDL fails to plan/execute (exotic column types, etc.) we fall through to the normal path,
         // which reproduces the original parse error — so an unsupported CREATE stays in exactly the
         // bucket it failed in before (never a regression).
-        if let Some(low) = spark_create_table::lower_create_table_using(query, &self.warehouse)
+        if let Some(low) = spark_create_table::lower_create_table_using(query, &self.dirs.warehouse)
             .filter(|l| !self.name_targets_external_catalog(&l.name))
         {
             if self.run_create_external(&low).await.is_ok() {
@@ -2655,7 +2701,7 @@ impl Engine {
                 return Ok(vec![]);
             }
         } else if let Some(ctas) =
-            spark_create_table::lower_create_table_ctas(query, &self.warehouse)
+            spark_create_table::lower_create_table_ctas(query, &self.dirs.warehouse)
                 .filter(|c| !self.name_targets_external_catalog(&c.name))
         {
             if self.run_create_table_ctas(&ctas).await.is_ok() {
@@ -4756,8 +4802,89 @@ impl Engine {
     /// The session's current catalog + current namespace, set by `USE` (default:
     /// `spark_catalog`/`default`). Consulted by [`Engine::run_show`] (and later `DESCRIBE` work) to
     /// default unqualified catalog/namespace-relative names.
-    fn current_catalog_and_namespace(&self) -> (String, Vec<String>) {
+    pub fn current_catalog_and_namespace(&self) -> (String, Vec<String>) {
         self.current.lock().expect("current poisoned").clone()
+    }
+
+    /// A handle to this engine whose current catalog/namespace is the per-session cell for
+    /// `session_id` — created on first use, seeded from the engine's session default catalog
+    /// (`spark.sql.defaultCatalog`; `["default"]` namespace for the builtin catalog, empty for
+    /// an external one — the KAN-84 `USE CATALOG` semantics). Everything else is shared with
+    /// this handle: catalogs, registered tables, UDFs, the estimate cache, managed dirs.
+    ///
+    /// KAN-85: the Connect server holds one shared `Arc<Engine>`; per-request handles from this
+    /// method keep one session's `USE` from leaking into every other session.
+    pub fn for_session(&self, session_id: &str) -> Engine {
+        let cell = {
+            let mut state = self.sessions.lock().expect("sessions poisoned");
+            let default_catalog = state.default_catalog.clone();
+            state
+                .cells
+                .entry(session_id.to_string())
+                .or_insert_with(|| {
+                    let namespace = if default_catalog == oxidant_catalog::DEFAULT_CATALOG {
+                        vec![oxidant_catalog::DEFAULT_NAMESPACE.to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    Arc::new(Mutex::new((default_catalog, namespace)))
+                })
+                .clone()
+        };
+        Engine {
+            ctx: self.ctx.clone(),
+            dirs: self.dirs.clone(),
+            temp_views: self.temp_views.clone(),
+            oxidant_catalogs: self.oxidant_catalogs.clone(),
+            udf_registry: self.udf_registry.clone(),
+            current: cell,
+            sessions: self.sessions.clone(),
+            created_tables: self.created_tables.clone(),
+            require_lakehouse_snapshot_pins: self.require_lakehouse_snapshot_pins.clone(),
+            memory_pool_bytes: self.memory_pool_bytes,
+            plan_time_smj_reroutes: self.plan_time_smj_reroutes.clone(),
+            measured_stats_registrations: self.measured_stats_registrations.clone(),
+            plan_cache_id: self.plan_cache_id,
+            catalog_version: self.catalog_version.clone(),
+            pool_activity: self.pool_activity.clone(),
+            table_bytes_cache: self.table_bytes_cache.clone(),
+        }
+    }
+
+    /// Set the catalog NEW sessions seed from (`spark.sql.defaultCatalog`); existing sessions
+    /// keep their (possibly `USE`-adjusted) state. Errors if the catalog isn't registered.
+    pub fn set_default_catalog(&self, catalog: &str) -> Result<()> {
+        let canonical = self.canonical_catalog_name(catalog).ok_or_else(|| {
+            Error::Plan(format!(
+                "[CATALOG_NOT_FOUND] The catalog `{catalog}` not found"
+            ))
+        })?;
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .default_catalog = canonical;
+        Ok(())
+    }
+
+    /// Spark Catalog RPC `setCurrentCatalog`: identical semantics to SQL `USE CATALOG <name>`
+    /// (KAN-84 namespace reset + KAN-87 matching) over the same per-session state (KAN-85).
+    pub async fn set_current_catalog(&self, catalog: &str) -> Result<()> {
+        self.run_use(&UseStmt::Catalog {
+            catalog: catalog.to_string(),
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Spark Catalog RPC `setCurrentDatabase`: identical semantics to SQL `USE <namespace>`
+    /// (KAN-86 existence validation included) over the same per-session state (KAN-85).
+    pub async fn set_current_namespace(&self, namespace: &str) -> Result<()> {
+        self.run_use(&UseStmt::Namespace {
+            catalog: None,
+            namespace: parse_qualified_name(namespace),
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Resolve a (possibly qualified) dotted name — as returned by [`parse_qualified_name`] — to an
@@ -4869,14 +4996,17 @@ impl Engine {
     /// (`OXIDANT_TABLE_BYTES_CACHE_TTL_MS`): both estimates steer only the auto-broadcast
     /// heuristic, so bounded staleness is safe.
     ///
-    /// Cache keys are lowercased while catalog lookup (`oxidant_catalog`) is case-sensitive;
-    /// production names arrive planner-normalized, so the mismatch is latent, not live.
+    /// The cache key is the RESOLVED (catalog, namespace, table), lowercased — so a bare-name
+    /// estimate is scoped to the session catalog/namespace state that produced it (KAN-85: one
+    /// session's estimate never leaks into another's via the shared cache), while a
+    /// fully-qualified name resolves identically in every session and shares one entry. Keys
+    /// are lowercased while catalog lookup (`oxidant_catalog`) is case-sensitive; production
+    /// names arrive planner-normalized, so the mismatch is latent, not live.
     pub async fn estimate_table_stats(&self, table_name: &str) -> TableStats {
-        self.estimate_table_stats_cached(
-            table_name.to_ascii_lowercase(),
-            self.estimate_table_stats_uncached(table_name),
-        )
-        .await
+        let segments = parse_qualified_name(table_name);
+        let key = self.stats_cache_key(&segments);
+        self.estimate_table_stats_cached(key, self.estimate_table_stats_uncached(table_name))
+            .await
     }
 
     /// [`Engine::estimate_table_stats`] over a structured logical [`TableReference`] — the
@@ -4884,23 +5014,27 @@ impl Engine {
     /// `catalog()`/`schema()`/`table()` (instead of a Display/string round-trip) keeps the
     /// qualifier exact, so a `glue.db.t` scan probes Glue's `db` exactly once (KAN-81; the
     /// string entry point is only reached with bare names from `resolve_replicated_tables`).
-    ///
-    /// The cache key is the segments joined with `.`, lowercased — the same key the string
-    /// path computes for the equivalent qualified name.
     pub async fn estimate_table_stats_ref(
         &self,
         reference: &datafusion::common::TableReference,
     ) -> TableStats {
-        let key = reference
-            .catalog()
-            .into_iter()
-            .chain(reference.schema())
-            .chain([reference.table()])
-            .collect::<Vec<_>>()
-            .join(".")
-            .to_ascii_lowercase();
+        let segments = table_ref_segments(reference);
+        let key = self.stats_cache_key(&segments);
         self.estimate_table_stats_cached(key, self.estimate_table_stats_ref_uncached(reference))
             .await
+    }
+
+    /// The `table_bytes_cache` key for a name: its resolved `(catalog, namespace, table)`
+    /// triple (session-state defaults applied), joined and lowercased.
+    fn stats_cache_key(&self, segments: &[String]) -> String {
+        let (catalog, namespace, table) = self.resolve_table_ref(segments);
+        join_table_name_parts(
+            [catalog.as_str()]
+                .into_iter()
+                .chain(namespace.iter().map(String::as_str))
+                .chain([table.as_str()]),
+        )
+        .to_ascii_lowercase()
     }
 
     /// The shared per-engine TTL cache behind [`Engine::estimate_table_stats`] and
@@ -4968,13 +5102,7 @@ impl Engine {
             }
         }
 
-        let segments: Vec<String> = reference
-            .catalog()
-            .into_iter()
-            .chain(reference.schema())
-            .chain([reference.table()])
-            .map(str::to_string)
-            .collect();
+        let segments = table_ref_segments(reference);
         self.estimate_stats_resolved(&segments).await
     }
 
@@ -5756,6 +5884,19 @@ fn join_table_name_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> String
         .join(".")
 }
 
+/// The segments of a structured [`datafusion::common::TableReference`] — `[catalog?, schema?,
+/// table]` — the input shape `parse_qualified_name` produces for the string path, so both
+/// sizing-walk entries share one resolution core (KAN-81).
+fn table_ref_segments(reference: &datafusion::common::TableReference) -> Vec<String> {
+    reference
+        .catalog()
+        .into_iter()
+        .chain(reference.schema())
+        .chain([reference.table()])
+        .map(str::to_string)
+        .collect()
+}
+
 /// Split a (possibly backtick-quoted) dotted identifier like `glue.clickbench` or
 /// `` `glue`.`my db` `` into its segments, stripping the backtick quoting.
 fn parse_qualified_name(name: &str) -> Vec<String> {
@@ -6186,20 +6327,6 @@ pub(crate) async fn build_listing_table(
 impl Default for Engine {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for Engine {
-    /// Tear down this engine's managed directories: the warehouse (the `CREATE TABLE …
-    /// USING <fmt>` format-backed storage) and the DataFusion spill dir. Best-effort: a
-    /// leftover temp dir is harmless, so failures are ignored.
-    fn drop(&mut self) {
-        if self.warehouse.exists() {
-            let _ = std::fs::remove_dir_all(&self.warehouse);
-        }
-        if self.spill_dir.exists() {
-            let _ = std::fs::remove_dir_all(&self.spill_dir);
-        }
     }
 }
 
@@ -6795,6 +6922,150 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // KAN-85 — per-session catalog/namespace state: one Connect server's sessions share the
+    // engine's catalogs/tables/caches but never each other's `USE` state.
+    // ---------------------------------------------------------------------
+
+    /// A's `USE CATALOG` leaves B (and the base handle) at the default; re-deriving a session
+    /// returns the same cell.
+    #[tokio::test]
+    async fn for_session_isolates_current_catalog_and_namespace() {
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+
+        let a = engine.for_session("a");
+        let b = engine.for_session("b");
+        a.sql("USE CATALOG testcat").await.unwrap();
+
+        assert_eq!(a.current_catalog_and_namespace().0, "testcat");
+        assert!(
+            a.current_catalog_and_namespace().1.is_empty(),
+            "external catalog switch clears the namespace (KAN-84)"
+        );
+        assert_eq!(
+            b.current_catalog_and_namespace(),
+            ("spark_catalog".to_string(), vec!["default".to_string()]),
+            "session B is untouched by A's USE"
+        );
+        assert_eq!(
+            engine.current_catalog_and_namespace().0,
+            "spark_catalog",
+            "the base handle keeps its own state (CLI/tests unchanged)"
+        );
+        // Same session id → same cell.
+        assert_eq!(
+            engine.for_session("a").current_catalog_and_namespace().0,
+            "testcat"
+        );
+    }
+
+    /// Bare-name resolution follows the SESSION's catalog: A (current catalog testcat) answers
+    /// `SHOW TABLES` from testcat while B stays on the builtin catalog.
+    #[tokio::test]
+    async fn for_session_bare_name_resolution_uses_session_catalog() {
+        use arrow::array::StringArray;
+        let dir = kan81_parquet_dir("kan85-show");
+        let mut tables = HashMap::new();
+        tables.insert(
+            "db1.orders".to_string(),
+            format!("file://{}/", dir.display()),
+        );
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(tables)));
+
+        let a = engine.for_session("a");
+        a.sql("USE CATALOG testcat").await.unwrap();
+        let b = engine.for_session("b");
+
+        let batches = a.sql("SHOW TABLES").await.unwrap();
+        let names: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let col = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..batch.num_rows())
+                    .map(|i| col.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(names, vec!["orders".to_string()], "A sees testcat's tables");
+
+        // B's bare SHOW TABLES reads the builtin catalog's default schema (no orders there).
+        let batches = b.sql("SHOW TABLES").await.unwrap();
+        let names: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let col = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..batch.num_rows())
+                    .map(|i| col.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            !names.contains(&"orders".to_string()),
+            "B must not see A's catalog: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The KAN-81 sizing walk reads the SESSION's catalog state: A (current catalog testcat,
+    /// empty namespace) restricts a bare-name estimate to testcat; B (default state) takes the
+    /// legacy all-catalog search — and A's cached estimate does not leak into B (the cache key
+    /// carries the resolved catalog/namespace).
+    #[tokio::test]
+    async fn for_session_sizing_walk_uses_session_catalog_state() {
+        let dir = kan81_parquet_dir("kan85-size");
+        let mut tables = HashMap::new();
+        tables.insert(
+            "db1.orders".to_string(),
+            format!("file://{}/", dir.display()),
+        );
+        let catalog = Arc::new(RecordingCatalog::new(tables));
+        let other = Arc::new(RecordingCatalog::new(HashMap::new()));
+
+        let engine = Engine::new();
+        engine.register_catalog("testcat", catalog.clone());
+        engine.register_catalog("othercat", other.clone());
+
+        let a = engine.for_session("a");
+        a.sql("USE CATALOG testcat").await.unwrap();
+        let b = engine.for_session("b");
+
+        // A: restricted to testcat — found there, othercat never probed.
+        let (bytes, _) = a.estimate_table_stats("orders").await;
+        assert!(bytes.is_some(), "A sizes orders via testcat: {bytes:?}");
+        assert!(
+            other.list_calls().is_empty() && other.load_calls().is_empty(),
+            "A's estimate must not touch othercat: {:?} / {:?}",
+            other.list_calls(),
+            other.load_calls()
+        );
+
+        // B: same bare name under the builtin catalog → legacy all-catalog search. A cache
+        // leak would return A's entry with NO new catalog probes; the resolved-triple cache
+        // key forces B's own search instead.
+        let probes_after_a = catalog.list_calls().len();
+        let (bytes, _) = b.estimate_table_stats("orders").await;
+        assert!(
+            bytes.is_some(),
+            "B sizes orders via the legacy search: {bytes:?}"
+        );
+        assert!(
+            catalog.list_calls().len() > probes_after_a,
+            "B's estimate runs its own search (no cache leak from A): {:?}",
+            catalog.list_calls()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn use_unknown_catalog_errors() {
         let engine = Engine::new();
@@ -6885,7 +7156,10 @@ mod tests {
         for name in ["SPARK_CATALOG", "Spark_Catalog"] {
             engine.sql(&format!("USE CATALOG {name}")).await.unwrap();
             let (catalog, namespace) = engine.current_catalog_and_namespace();
-            assert_eq!(catalog, "spark_catalog", "canonical name stored for `{name}`");
+            assert_eq!(
+                catalog, "spark_catalog",
+                "canonical name stored for `{name}`"
+            );
             assert_eq!(namespace, vec!["default".to_string()]);
         }
     }
@@ -7606,7 +7880,7 @@ mod tests {
             .sql("CREATE TABLE extcat.ns.t USING parquet AS SELECT 1 AS x")
             .await;
         assert!(
-            !engine.warehouse.join("extcat_ns_t").exists(),
+            !engine.dirs.warehouse.join("extcat_ns_t").exists(),
             "must not fall back to writing the local warehouse for an external-catalog-qualified name"
         );
     }
@@ -7622,7 +7896,7 @@ mod tests {
             .sql("CREATE TABLE ExtCat.ns.t USING parquet AS SELECT 1 AS x")
             .await;
         assert!(
-            !engine.warehouse.join("ExtCat_ns_t").exists(),
+            !engine.dirs.warehouse.join("ExtCat_ns_t").exists(),
             "a differently-cased catalog reference must still route away from the local warehouse"
         );
     }

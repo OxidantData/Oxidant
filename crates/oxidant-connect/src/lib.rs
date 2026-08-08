@@ -51,6 +51,10 @@ const MAX_MSG: usize = 256 * 1024 * 1024;
 /// Rows per Arrow result chunk, so a single gRPC message never carries an oversized batch.
 const CHUNK_ROWS: usize = 8192;
 
+/// The session id the session-less REST statement/UI API shares (KAN-85): REST statements and
+/// catalog-explorer "current catalog" read one session cell, isolated from gRPC sessions.
+pub(crate) const REST_SESSION_ID: &str = "rest";
+
 /// Server configuration.
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -367,7 +371,9 @@ impl OxidantService {
             }
         }
         if let Some(def) = snapshot.get("spark.sql.defaultCatalog") {
-            let _ = self.registry.set_current_catalog(def);
+            // New sessions seed from this catalog (KAN-85); existing sessions keep their
+            // (possibly `USE`-adjusted) state.
+            let _ = self.engine.set_default_catalog(def);
         }
     }
 
@@ -459,6 +465,7 @@ impl OxidantService {
     /// its result rows come back inline as a `LocalRelation`.
     async fn run_sql_command(
         &self,
+        engine: &Engine,
         session_id: &str,
         operation_id: &str,
         sql: &str,
@@ -471,14 +478,14 @@ impl OxidantService {
                 operation_id,
                 truncate_sql(sql),
             ));
-            if let Ok(plan) = self.engine.logical_plan(sql).await {
+            if let Ok(plan) = engine.logical_plan(sql).await {
                 self.spawn_plan_explain(&tracker, plan);
             }
             emit_local_stage_started(&tracker, "command");
             let task_id = self.observability.alloc_task_id();
             tracker.task_started(0, task_id, "driver");
             let start = std::time::Instant::now();
-            let batches = match self.engine.sql(sql).await {
+            let batches = match engine.sql(sql).await {
                 Ok(b) => b,
                 Err(e) => {
                     tracker.finish_error(e.to_string());
@@ -532,6 +539,7 @@ impl OxidantService {
     /// `LocalRelation`, and the full relation surface).
     async fn resolve_plan(
         &self,
+        engine: &Engine,
         plan: &Option<sc::Plan>,
     ) -> std::result::Result<datafusion::logical_expr::LogicalPlan, Status> {
         match plan.as_ref().and_then(|p| p.op_type.as_ref()) {
@@ -539,11 +547,11 @@ impl OxidantService {
                 Some(sc::command::CommandType::SqlCommand(c)) => {
                     let sql = sql_command_text(c)
                         .ok_or_else(|| Status::invalid_argument("empty SqlCommand"))?;
-                    self.engine.logical_plan(&sql).await.map_err(err_to_status)
+                    engine.logical_plan(&sql).await.map_err(err_to_status)
                 }
                 _ => Err(Status::unimplemented("AnalyzePlan: unsupported command")),
             },
-            Some(sc::plan::OpType::Root(rel)) => translate::to_plan(self.engine.ctx(), rel).await,
+            Some(sc::plan::OpType::Root(rel)) => translate::to_plan(engine.ctx(), rel).await,
             _ => Err(Status::unimplemented("AnalyzePlan: empty plan")),
         }
     }
@@ -551,6 +559,7 @@ impl OxidantService {
     /// Resolve the result schema of a plan for `AnalyzePlan(Schema)`.
     async fn plan_schema(
         &self,
+        engine: &Engine,
         plan: &Option<sc::Plan>,
     ) -> std::result::Result<oxidant_loom::arrow::datatypes::SchemaRef, Status> {
         match plan.as_ref().and_then(|p| p.op_type.as_ref()) {
@@ -558,13 +567,13 @@ impl OxidantService {
                 Some(sc::command::CommandType::SqlCommand(c)) => {
                     let sql = sql_command_text(c)
                         .ok_or_else(|| Status::invalid_argument("empty SqlCommand"))?;
-                    self.engine.schema(&sql).await.map_err(err_to_status)
+                    engine.schema(&sql).await.map_err(err_to_status)
                 }
                 _ => Err(Status::unimplemented(
                     "AnalyzePlan(Schema): unsupported command",
                 )),
             },
-            Some(sc::plan::OpType::Root(rel)) => self.relation_schema(rel).await,
+            Some(sc::plan::OpType::Root(rel)) => self.relation_schema(engine, rel).await,
             _ => Err(Status::unimplemented("AnalyzePlan(Schema): empty plan")),
         }
     }
@@ -573,12 +582,13 @@ impl OxidantService {
     /// column, everything else via the relation translator's logical plan.
     async fn relation_schema(
         &self,
+        engine: &Engine,
         rel: &sc::Relation,
     ) -> std::result::Result<oxidant_loom::arrow::datatypes::SchemaRef, Status> {
         use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
         match rel.rel_type.as_ref() {
             Some(sc::relation::RelType::Sql(sql)) => {
-                self.engine.schema(&sql.query).await.map_err(err_to_status)
+                engine.schema(&sql.query).await.map_err(err_to_status)
             }
             Some(sc::relation::RelType::LocalRelation(lr)) => {
                 let data = lr.data.as_deref().unwrap_or_default();
@@ -598,7 +608,7 @@ impl OxidantService {
             Some(sc::relation::RelType::Catalog(cat)) => catalog::result_schema(cat)
                 .ok_or_else(|| Status::unimplemented("AnalyzePlan(Schema): catalog op")),
             _ => {
-                let plan = translate::to_plan(self.engine.ctx(), rel).await?;
+                let plan = translate::to_plan(engine.ctx(), rel).await?;
                 Ok(Arc::new(plan.schema().as_arrow().clone()))
             }
         }
@@ -609,6 +619,7 @@ impl OxidantService {
     /// [`Self::base_relation_batches`].
     async fn eval_relation(
         &self,
+        engine: &Engine,
         rel: &sc::Relation,
         operation_id: Option<&str>,
     ) -> std::result::Result<(Vec<RecordBatch>, Option<oxidant_loom::QueryStats>), Status> {
@@ -617,16 +628,18 @@ impl OxidantService {
                 .input
                 .as_deref()
                 .ok_or_else(|| Status::invalid_argument("ShowString.input missing"))?;
-            let (batches, _) = self.base_relation_batches(child, operation_id).await?;
+            let (batches, _) = self
+                .base_relation_batches(engine, child, operation_id)
+                .await?;
             let text = show_string(&batches, s.num_rows, s.truncate)?;
             return Ok((vec![show_string_batch(text)], None));
         }
         // `spark.catalog.*` operations (listTables, currentCatalog, setCurrentDatabase, …).
         if let Some(sc::relation::RelType::Catalog(cat)) = rel.rel_type.as_ref() {
-            let batches = catalog::handle_catalog(&self.engine, &self.registry, cat).await?;
+            let batches = catalog::handle_catalog(engine, &self.registry, cat).await?;
             return Ok((batches, None));
         }
-        self.base_relation_batches(rel, operation_id).await
+        self.base_relation_batches(engine, rel, operation_id).await
     }
 
     /// Evaluate a `Sql` or `LocalRelation` to record batches, with observability hooks. The second
@@ -639,13 +652,14 @@ impl OxidantService {
     /// override). Unsupported shapes fall back locally.
     async fn base_relation_batches(
         &self,
+        engine: &Engine,
         rel: &sc::Relation,
         operation_id: Option<&str>,
     ) -> std::result::Result<(Vec<RecordBatch>, Option<oxidant_loom::QueryStats>), Status> {
         match rel.rel_type.as_ref() {
             Some(sc::relation::RelType::Sql(sql)) => {
                 let workers = self.workers_from_config();
-                let udf_json = self.engine.export_udfs_json();
+                let udf_json = engine.export_udfs_json();
                 let description = truncate_sql(&sql.query);
                 let tracker = operation_id.map(|op| {
                     Arc::new(QueryTracker::begin(
@@ -659,8 +673,7 @@ impl OxidantService {
                 // explain, the auto-broadcast sizing, and the distributed planner itself.
                 // Previously the query was parsed/analyzed here and then *again* inside
                 // `try_run_distributed` — a full second planning pass per query.
-                let plan_and_pins = self
-                    .engine
+                let plan_and_pins = engine
                     .logical_plan_with_lakehouse_snapshots(&sql.query)
                     .await
                     .ok();
@@ -671,7 +684,7 @@ impl OxidantService {
                 }
                 let replicated = match &plan_and_pins {
                     Some((plan, _)) => {
-                        oxidant_execution::plan::resolve_replicated_tables(&self.engine, plan).await
+                        oxidant_execution::plan::resolve_replicated_tables(engine, plan).await
                     }
                     None => oxidant_loom::shard::replicated_tables_override_from_env(),
                 };
@@ -681,7 +694,7 @@ impl OxidantService {
                 let dist_result = match &plan_and_pins {
                     Some((plan, pins)) => {
                         distributed::try_run_distributed_plan(
-                            &self.engine,
+                            engine,
                             &workers,
                             plan,
                             &sql.query,
@@ -748,13 +761,13 @@ impl OxidantService {
                 // DataFusion can't plan; those carry no scan metrics.
                 let exec = if is_scan_query(&sql.query) {
                     // Metrics-capturing path: rows / bytes scanned / duration from the executed plan.
-                    self.engine
+                    engine
                         .sql_with_stats(&sql.query)
                         .await
                         .map(|(b, s)| (b, Some(s)))
                 } else {
                     // SHOW / DESCRIBE / DDL / CTAS / INSERT: no scan metrics — don't fabricate any.
-                    self.engine.sql(&sql.query).await.map(|b| (b, None))
+                    engine.sql(&sql.query).await.map(|b| (b, None))
                 };
                 let (mut batches, stats): (Vec<RecordBatch>, Option<oxidant_loom::QueryStats>) =
                     match exec {
@@ -770,11 +783,7 @@ impl OxidantService {
                 // table. Re-derive the schema only for queries — `engine.schema` plans via
                 // `ctx.sql`, which would re-execute a DDL statement (a query has no side effect).
                 if batches.is_empty() && is_query(&sql.query) {
-                    let schema = self
-                        .engine
-                        .schema(&sql.query)
-                        .await
-                        .map_err(err_to_status)?;
+                    let schema = engine.schema(&sql.query).await.map_err(err_to_status)?;
                     batches.push(RecordBatch::new_empty(schema));
                 }
                 let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
@@ -810,10 +819,9 @@ impl OxidantService {
             _ => {
                 // Capture the Delta/Iceberg snapshot identities the translation resolves so the
                 // distributed stages below can pin workers to the same snapshot (KAN-48).
-                let (plan, lakehouse_snapshot_pins) = self
-                    .engine
+                let (plan, lakehouse_snapshot_pins) = engine
                     .capture_lakehouse_snapshots(async {
-                        translate::to_plan(self.engine.ctx(), rel)
+                        translate::to_plan(engine.ctx(), rel)
                             .await
                             .map_err(|s| Error::Plan(format!("translate: {}", s.message())))
                     })
@@ -822,9 +830,9 @@ impl OxidantService {
                 let schema = Arc::new(plan.schema().as_arrow().clone());
                 let workers = self.workers_from_config();
                 let replicated =
-                    oxidant_execution::plan::resolve_replicated_tables(&self.engine, &plan).await;
+                    oxidant_execution::plan::resolve_replicated_tables(engine, &plan).await;
                 let replicated_refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
-                let udf_json = self.engine.export_udfs_json();
+                let udf_json = engine.export_udfs_json();
                 let tracker = operation_id.map(|op| {
                     Arc::new(QueryTracker::begin(
                         self.observability.clone(),
@@ -836,7 +844,7 @@ impl OxidantService {
                     self.spawn_plan_explain(t, plan.clone());
                 }
                 match distributed::try_run_distributed_plan(
-                    &self.engine,
+                    engine,
                     &workers,
                     &plan,
                     "DataFrame",
@@ -878,7 +886,7 @@ impl OxidantService {
                     t.task_started(0, tid, "driver");
                 }
                 let start = std::time::Instant::now();
-                let batches = match self.engine.execute_logical_plan(plan).await {
+                let batches = match engine.execute_logical_plan(plan).await {
                     Ok(b) => b,
                     Err(e) => {
                         if let Some(t) = &tracker {
@@ -925,7 +933,10 @@ impl OxidantService {
         sql: &str,
         operation_id: &str,
     ) -> std::result::Result<(Vec<RecordBatch>, Option<oxidant_loom::QueryStats>), Status> {
-        self.base_relation_batches(&sql_relation(sql), Some(operation_id))
+        // The REST statement API is session-less; all its statements share one session cell
+        // (KAN-85) instead of leaking into gRPC sessions' state.
+        let engine = self.engine.for_session(REST_SESSION_ID);
+        self.base_relation_batches(&engine, &sql_relation(sql), Some(operation_id))
             .await
     }
 
@@ -1004,6 +1015,9 @@ impl SparkConnectService for OxidantService {
         // Track the op as in-flight so `Interrupt` can cancel it (KAN-17); the guard
         // unregisters on every exit path, including the `?` early returns below.
         let _in_flight = InFlightGuard::register(self, &session_id, &operation_id);
+        // KAN-85: every engine call in this request runs against the session's own
+        // catalog/namespace state — one session's `USE` no longer leaks into the others.
+        let engine = self.engine.for_session(&session_id);
 
         let responses = match req.plan.as_ref().and_then(|p| p.op_type.as_ref()) {
             // PySpark `spark.sql(...)`: a query returns a lazy relation handle; a DDL/DML command
@@ -1012,7 +1026,7 @@ impl SparkConnectService for OxidantService {
                 Some(sc::command::CommandType::SqlCommand(c)) => {
                     let sql = sql_command_text(c)
                         .ok_or_else(|| Status::invalid_argument("empty SqlCommand"))?;
-                    self.run_sql_command(&session_id, &operation_id, &sql)
+                    self.run_sql_command(&engine, &session_id, &operation_id, &sql)
                         .await?
                 }
                 Some(sc::command::CommandType::WriteStreamOperationStart(s)) => {
@@ -1078,7 +1092,9 @@ impl SparkConnectService for OxidantService {
             },
             // A relation (Sql, LocalRelation, ShowString, …): evaluate it and stream the result.
             Some(sc::plan::OpType::Root(rel)) => {
-                let (batches, stats) = self.eval_relation(rel, Some(&operation_id)).await?;
+                let (batches, stats) = self
+                    .eval_relation(&engine, rel, Some(&operation_id))
+                    .await?;
                 self.stream_batches(&session_id, &operation_id, &batches, stats.as_ref())?
             }
             _ => return Err(Status::unimplemented("empty or unsupported plan")),
@@ -1102,6 +1118,8 @@ impl SparkConnectService for OxidantService {
         use sc::analyze_plan_response as out;
 
         let req = request.into_inner();
+        // KAN-85: schema/explain resolution reads the session's catalog state like execution does.
+        let engine = self.engine.for_session(&req.session_id);
         let result = match req.analyze {
             Some(Analyze::SparkVersion(_)) => Some(out::Result::SparkVersion(out::SparkVersion {
                 // Advertise the protocol version we vendored protos from.
@@ -1110,7 +1128,7 @@ impl SparkConnectService for OxidantService {
             // PySpark `df.schema` / `df.columns` / `printSchema()` — resolve the result schema
             // without executing and return it as a Spark struct `DataType`.
             Some(Analyze::Schema(s)) => {
-                let schema = self.plan_schema(&s.plan).await?;
+                let schema = self.plan_schema(&engine, &s.plan).await?;
                 Some(out::Result::Schema(out::Schema {
                     schema: Some(types::schema_to_spark(&schema)),
                 }))
@@ -1119,13 +1137,12 @@ impl SparkConnectService for OxidantService {
             // also include the logical plans; SIMPLE (and the unspecified default) show physical only.
             Some(Analyze::Explain(e)) => {
                 use sc::analyze_plan_request::explain::ExplainMode;
-                let plan = self.resolve_plan(&e.plan).await?;
+                let plan = self.resolve_plan(&engine, &e.plan).await?;
                 let extended = matches!(
                     ExplainMode::try_from(e.explain_mode),
                     Ok(ExplainMode::Extended | ExplainMode::Cost | ExplainMode::Formatted)
                 );
-                let text = self
-                    .engine
+                let text = engine
                     .explain(&plan, extended)
                     .await
                     .map_err(err_to_status)?;
@@ -1135,7 +1152,7 @@ impl SparkConnectService for OxidantService {
             }
             // PySpark `df.printSchema()` — the resolved schema as Spark's indented tree.
             Some(Analyze::TreeString(t)) => {
-                let schema = self.plan_schema(&t.plan).await?;
+                let schema = self.plan_schema(&engine, &t.plan).await?;
                 Some(out::Result::TreeString(out::TreeString {
                     tree_string: types::schema_tree_string(&schema),
                 }))
