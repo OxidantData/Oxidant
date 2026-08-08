@@ -60,7 +60,13 @@ jobs:
 
   build-test:
     name: clippy + test
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # 8vcpu for the NVMe, not the cores: with cache restore + clippy's separate
+    # artifact set + per-crate test binaries this job consumes ~100 GB in ~5 min
+    # (PR #34 died 3x on XMinioStorageFull with 101 GB free at job start). The
+    # 4vcpu tier's disk is too small even though its CPU is adequate. KAN-74
+    # tracks getting back to 4vcpu (single-Arrow toolchain, throwaway clippy
+    # target dir).
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     # Fail fast rather than burning an hour on a wedged runner. The suite compiles the workspace
     # twice over (see the disk-reclaim step) and then runs the distributed tests serially, so the
     # honest ceiling is well above the ~10 min this takes on `main`. 180: the line-tables-only
