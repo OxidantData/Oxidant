@@ -48,7 +48,9 @@ fn coerce_shim_batch(
             // The shim exports strings as Arrow "u" (Utf8); engines running
             // with schema_force_view_types declare Utf8View instead.
             | (DataType::Utf8, DataType::Utf8View)
-            | (DataType::Utf8, DataType::LargeUtf8) => {
+            | (DataType::Utf8, DataType::LargeUtf8)
+            // libcudf COUNT is Int32; the engine declares count(*) as Int64.
+            | (DataType::Int32, DataType::Int64) => {
                 columns[i] = cast(columns[i].as_ref(), declared_ty)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                 changed = true;
@@ -249,5 +251,27 @@ mod tests {
             .unwrap();
         assert_eq!(col.value(0), "A");
         assert_eq!(col.value(1), "R");
+    }
+
+    #[test]
+    fn int32_shim_output_coerces_to_declared_int64() {
+        use datafusion::arrow::array::{Int32Array, Int64Array};
+        let got_schema = Arc::new(Schema::new(vec![Field::new(
+            "count_order",
+            DataType::Int32,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(got_schema, vec![Arc::new(Int32Array::from(vec![5, 6]))]).unwrap();
+        let declared = Arc::new(Schema::new(vec![Field::new(
+            "count_order",
+            DataType::Int64,
+            true,
+        )]));
+        let out = coerce_shim_batch(batch, &declared).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
+        let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(col.value(0), 5);
+        assert_eq!(col.value(1), 6);
     }
 }
