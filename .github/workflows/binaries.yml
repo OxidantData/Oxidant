@@ -383,8 +383,12 @@ jobs:
           submodules: recursive
 
       # manylinux has git/gcc/cmake/perl but no Rust toolchain and no gh CLI.
+      # safe.directory: the runner-side checkout is owned by the runner uid, so
+      # in-container git (and gh, which shells out to git) refuses it as
+      # "dubious ownership" — this bit the v0.1.1 `gh release upload` step.
       - name: Set up Rust toolchain + GitHub CLI
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.cargo/bin:$PATH"
@@ -426,7 +430,8 @@ jobs:
           ls -la dist-packages/
 
       - name: Upload packages to the GitHub Release
-        run: gh release upload "${{ needs.plan.outputs.tag }}" dist-packages/* --clobber
+        # --repo: resolve via the API instead of gh shelling out to git.
+        run: gh release upload "${{ needs.plan.outputs.tag }}" dist-packages/* --clobber --repo ${{ github.repository }}
 
       # The curl|sh installer only installs the binary (cargo-dist ships no data
       # files), so the bundled sample tables need a standalone download for that
@@ -436,7 +441,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           tar -czf sample-data.tar.gz sample-data
-          gh release upload "${{ needs.plan.outputs.tag }}" sample-data.tar.gz --clobber
+          gh release upload "${{ needs.plan.outputs.tag }}" sample-data.tar.gz --clobber --repo ${{ github.repository }}
 
   announce:
     needs:
