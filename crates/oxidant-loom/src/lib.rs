@@ -3960,6 +3960,11 @@ impl Engine {
     /// - **Case**: SQL unquoted identifiers are conventionally case-insensitive, but catalog names
     ///   are registered verbatim (`register_catalog`); comparing case-sensitively would silently
     ///   misroute e.g. `CREATE TABLE Glue.db.t ...` when the catalog was registered as `glue`.
+    ///   This deliberately diverges from Spark's catalog-name matching (KAN-87 — exact keys for
+    ///   v2 plugins, case-folding only for the session catalog): the cost of a false positive
+    ///   here is a clean catalog not-found downstream, while a false negative silently writes a
+    ///   catalog-targeted table into the local warehouse — the conservative direction wins for
+    ///   DDL routing, unlike name RESOLUTION (which follows Spark exactly).
     fn name_targets_external_catalog(&self, name: &str) -> bool {
         let segments = split_name_segments(name);
         if segments.len() < 3 {
@@ -4629,13 +4634,25 @@ impl Engine {
 
     /// Whether `name` is a registered catalog — either an external [`oxidant_catalog::CatalogProvider`]
     /// (`register_catalog`) or the built-in `spark_catalog`.
+    ///
+    /// KAN-87 — matching follows Spark's `CatalogManager.catalog` exactly: ONLY the session
+    /// catalog name matches case-insensitively (`name.equalsIgnoreCase(SESSION_CATALOG_NAME)`);
+    /// v2 plugin catalog names are exact map keys. So `USE CATALOG SPARK_CATALOG` resolves, but
+    /// a case-mismatched external catalog (`Glue` for registered `glue`) is `CATALOG_NOT_FOUND`.
     fn catalog_registered(&self, name: &str) -> bool {
-        name == oxidant_catalog::DEFAULT_CATALOG
-            || self
-                .oxidant_catalogs
-                .lock()
-                .expect("oxidant_catalogs poisoned")
-                .contains_key(name)
+        self.canonical_catalog_name(name).is_some()
+    }
+
+    /// The registered casing for a catalog name: the canonical `spark_catalog` for a
+    /// case-insensitive builtin match (KAN-87 — backend callers compare the current catalog
+    /// against `DEFAULT_CATALOG` case-sensitively, so the user's casing is never stored), else
+    /// the name as given (external names are exact map keys, so it IS the registered casing).
+    /// `None` when unregistered.
+    fn canonical_catalog_name(&self, name: &str) -> Option<String> {
+        if name.eq_ignore_ascii_case(oxidant_catalog::DEFAULT_CATALOG) {
+            return Some(oxidant_catalog::DEFAULT_CATALOG.to_string());
+        }
+        self.oxidant_catalog(name).map(|_| name.to_string())
     }
 
     /// Apply a parsed `USE` statement, updating the session's current catalog/namespace.
@@ -4655,15 +4672,19 @@ impl Engine {
     async fn run_use(&self, stmt: &UseStmt) -> Result<Vec<RecordBatch>> {
         match stmt {
             UseStmt::Catalog { catalog } => {
-                if !self.catalog_registered(catalog) {
+                let Some(canonical) = self.canonical_catalog_name(catalog) else {
                     return Err(Error::Plan(format!(
                         "[CATALOG_NOT_FOUND] The catalog `{catalog}` not found"
                     )));
-                }
+                };
                 let mut current = self.current.lock().expect("current poisoned");
-                if current.0 != *catalog {
-                    current.0 = catalog.clone();
-                    current.1 = if *catalog == oxidant_catalog::DEFAULT_CATALOG {
+                // The same-catalog no-op compares CANONICAL names (KAN-87): re-`USE CATALOG`
+                // of the builtin under different casing is a no-op, not a namespace reset —
+                // Spark's raw case-sensitive comparison there reads as an implementation
+                // accident, since its `catalog()` folds the session-catalog case anyway.
+                if current.0 != canonical {
+                    current.0 = canonical.clone();
+                    current.1 = if canonical == oxidant_catalog::DEFAULT_CATALOG {
                         vec![oxidant_catalog::DEFAULT_NAMESPACE.to_string()]
                     } else {
                         Vec::new()
@@ -4672,17 +4693,18 @@ impl Engine {
             }
             UseStmt::Namespace { catalog, namespace } => {
                 if let Some(cat) = catalog {
-                    if !self.catalog_registered(cat) {
+                    let Some(canonical) = self.canonical_catalog_name(cat) else {
                         return Err(Error::Plan(format!(
                             "[CATALOG_NOT_FOUND] The catalog `{cat}` not found"
                         )));
-                    }
+                    };
+                    let mut current = self.current.lock().expect("current poisoned");
+                    current.0 = canonical;
+                    current.1 = namespace.clone();
+                } else {
+                    let mut current = self.current.lock().expect("current poisoned");
+                    current.1 = namespace.clone();
                 }
-                let mut current = self.current.lock().expect("current poisoned");
-                if let Some(cat) = catalog {
-                    current.0 = cat.clone();
-                }
-                current.1 = namespace.clone();
             }
         }
         Ok(vec![])
@@ -6741,6 +6763,38 @@ mod tests {
             vec!["db1".to_string()],
             "re-USE of the current catalog keeps the namespace (Spark no-op)"
         );
+    }
+
+    /// KAN-87: only the session catalog's name matches case-insensitively — Spark's
+    /// `CatalogManager.catalog` does `name.equalsIgnoreCase(SESSION_CATALOG_NAME)` and keeps
+    /// v2 plugin catalogs as exact map keys. The canonical lowercase name is stored, so
+    /// downstream `== spark_catalog` checks keep working.
+    #[tokio::test]
+    async fn use_catalog_builtin_matches_case_insensitively() {
+        let engine = Engine::new();
+        for name in ["SPARK_CATALOG", "Spark_Catalog"] {
+            engine.sql(&format!("USE CATALOG {name}")).await.unwrap();
+            let (catalog, namespace) = engine.current_catalog_and_namespace();
+            assert_eq!(catalog, "spark_catalog", "canonical name stored for `{name}`");
+            assert_eq!(namespace, vec!["default".to_string()]);
+        }
+    }
+
+    /// KAN-87: external catalog names are exact — a case-mismatched `USE CATALOG TESTCAT`
+    /// fails with CATALOG_NOT_FOUND rather than matching the registered `testcat` (Spark: v2
+    /// plugin catalogs are exact map keys, no case folding).
+    #[tokio::test]
+    async fn use_catalog_external_names_are_case_sensitive() {
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+        let err = engine.sql("USE CATALOG TESTCAT").await.unwrap_err();
+        match err {
+            Error::Plan(msg) => assert!(msg.contains("[CATALOG_NOT_FOUND]"), "{msg}"),
+            other => panic!("expected Plan, got {other:?}"),
+        }
+        // The exact-case form resolves.
+        engine.sql("USE CATALOG testcat").await.unwrap();
+        assert_eq!(engine.current_catalog_and_namespace().0, "testcat");
     }
 
     /// Bare `SHOW TABLES` after `USE CATALOG <external>` (no current database) lists the union
