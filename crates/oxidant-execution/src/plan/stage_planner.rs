@@ -360,11 +360,25 @@ pub async fn resolve_replicated_tables(engine: &Engine, lp: &LogicalPlan) -> Vec
         .filter(|name| seen.insert(name.to_ascii_lowercase()))
         .collect();
     // Size tables concurrently: a cache miss lists files (and, for external catalogs,
-    // probes namespaces via the catalog CLI) — serializing those multiplies the first-query
+    // calls the catalog's metadata API) — serializing those multiplies the first-query
     // latency by the table count. The per-engine estimate cache keeps repeats cheap. Row
     // counts ride the same walk (catalog table properties; no extra I/O).
-    let estimates =
-        futures::future::join_all(names.iter().map(|name| engine.estimate_table_stats(name))).await;
+    //
+    // The bare `names` stay the classification key below (sized/stamp_replicated_tables and
+    // friends key off bare names); the sizing walk itself goes through the scan's full
+    // TableReference when one owns the name (KAN-81), so a catalog-qualified `glue.db.t`
+    // probes exactly its own namespace instead of fanning out across every catalog. The
+    // string entry point is only the no-scan-owner fallback (local MemTables).
+    let estimates = futures::future::join_all(names.iter().map(|name| {
+        let reference = find_table_ref(lp, name);
+        async move {
+            match reference {
+                Some(reference) => engine.estimate_table_stats_ref(&reference).await,
+                None => engine.estimate_table_stats(name).await,
+            }
+        }
+    }))
+    .await;
     let mut sized: Vec<(String, Option<u64>)> = Vec::with_capacity(estimates.len());
     let mut rows: Vec<Option<u64>> = Vec::with_capacity(estimates.len());
     for (name, (bytes, row_count)) in names.into_iter().zip(estimates) {
@@ -4453,10 +4467,12 @@ pub(crate) fn qualified_table_sql(lp: &LogicalPlan, bare: &str) -> String {
     find_qualified_table_sql(lp, bare).unwrap_or_else(|| bare.to_string())
 }
 
-fn find_qualified_table_sql(lp: &LogicalPlan, bare: &str) -> Option<String> {
+/// Look up the full logical [`TableReference`] for a bare table name in `lp` (and expression
+/// subqueries). Returns `None` when no scan owns the name (local MemTables).
+fn find_table_ref(lp: &LogicalPlan, bare: &str) -> Option<TableReference> {
     if let LogicalPlan::TableScan(s) = lp {
         if s.table_name.table() == bare {
-            return Some(table_ref_sql(&s.table_name));
+            return Some(s.table_name.clone());
         }
     }
     for e in lp.expressions() {
@@ -4470,8 +4486,8 @@ fn find_qualified_table_sql(lp: &LogicalPlan, bare: &str) -> Option<String> {
                 _ => None,
             };
             if let Some(plan) = sub {
-                if let Some(sql) = find_qualified_table_sql(plan, bare) {
-                    found = Some(sql);
+                if let Some(reference) = find_table_ref(plan, bare) {
+                    found = Some(reference);
                     return Ok(TreeNodeRecursion::Stop);
                 }
             }
@@ -4482,11 +4498,15 @@ fn find_qualified_table_sql(lp: &LogicalPlan, bare: &str) -> Option<String> {
         }
     }
     for c in lp.inputs() {
-        if let Some(sql) = find_qualified_table_sql(c, bare) {
-            return Some(sql);
+        if let Some(reference) = find_table_ref(c, bare) {
+            return Some(reference);
         }
     }
     None
+}
+
+fn find_qualified_table_sql(lp: &LogicalPlan, bare: &str) -> Option<String> {
+    find_table_ref(lp, bare).map(|r| table_ref_sql(&r))
 }
 
 #[cfg(test)]

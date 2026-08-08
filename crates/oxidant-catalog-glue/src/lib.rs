@@ -803,8 +803,14 @@ mod tests {
 
     use aws_sdk_glue::config::{BehaviorVersion, Credentials, Region, SharedCredentialsProvider};
 
-    const DATABASES_JSON: &str = r#"{"DatabaseList":[{"Name":"db1"}]}"#;
-    const TABLES_JSON: &str = r#"{"TableList":[{"Name":"orders"}]}"#;
+    // Page 1 carries a `NextToken`; the page-2 responses only come back when the follow-up
+    // request threads the token through, so the two-page assertions double as proof the
+    // manual pagination loop works (Glue silently truncates at its 100-item page size
+    // otherwise).
+    const DATABASES_PAGE1_JSON: &str = r#"{"DatabaseList":[{"Name":"db1"}],"NextToken":"p2"}"#;
+    const DATABASES_PAGE2_JSON: &str = r#"{"DatabaseList":[{"Name":"db2"}]}"#;
+    const TABLES_PAGE1_JSON: &str = r#"{"TableList":[{"Name":"orders"}],"NextToken":"p2"}"#;
+    const TABLES_PAGE2_JSON: &str = r#"{"TableList":[{"Name":"customers"}]}"#;
     const ORDERS_JSON: &str = r#"{"Table":{"Name":"orders","StorageDescriptor":{"Location":"s3://bucket/db1/orders/","Columns":[{"Name":"id","Type":"bigint"}]},"PartitionKeys":[{"Name":"dt","Type":"string"}],"Parameters":{"classification":"parquet"}}}"#;
     const ICEBERG_JSON: &str = r#"{"Table":{"Name":"iceberg_t","StorageDescriptor":{"Location":"s3://bucket/db1/iceberg_t/","Columns":[{"Name":"id","Type":"bigint"}]},"PartitionKeys":[],"Parameters":{"table_type":"ICEBERG","metadata_location":"s3://bucket/db1/iceberg_t/metadata/00010-abc.metadata.json"}}}"#;
     const NOT_FOUND_JSON: &str =
@@ -856,11 +862,20 @@ mod tests {
                         buf.extend_from_slice(&chunk[..n]);
                     }
                     let request = String::from_utf8_lossy(&buf).to_string();
+                    let page2 = request.contains(r#""NextToken":"p2""#);
                     // NB: match `GetTables` before `GetTable` — the latter is a substring.
                     let (status, body) = if request.contains("GetDatabases") {
-                        ("200 OK", DATABASES_JSON)
+                        if page2 {
+                            ("200 OK", DATABASES_PAGE2_JSON)
+                        } else {
+                            ("200 OK", DATABASES_PAGE1_JSON)
+                        }
                     } else if request.contains("GetTables") {
-                        ("200 OK", TABLES_JSON)
+                        if page2 {
+                            ("200 OK", TABLES_PAGE2_JSON)
+                        } else {
+                            ("200 OK", TABLES_PAGE1_JSON)
+                        }
                     } else if request.contains("GetTable") {
                         if request.contains("nope") {
                             ("400 Bad Request", NOT_FOUND_JSON)
@@ -903,18 +918,28 @@ mod tests {
         let port = spawn_glue_stub().await;
         let cat = stub_catalog(port);
 
-        // GetDatabases → namespaces; a non-empty parent short-circuits without a call.
+        // GetDatabases → namespaces across BOTH pages (page 1 carries NextToken=p2; page 2 only
+        // answers when the follow-up request threads the token through). A non-empty parent
+        // short-circuits without a call.
         let namespaces = cat.list_namespaces(&[]).await.expect("databases");
-        assert_eq!(namespaces, vec![vec!["db1".to_string()]]);
+        assert_eq!(
+            namespaces,
+            vec![vec!["db1".to_string()], vec!["db2".to_string()]],
+            "both paginated pages"
+        );
         assert!(cat
             .list_namespaces(&["db1".to_string()])
             .await
             .expect("flat")
             .is_empty());
 
-        // GetTables → table names in the database.
+        // GetTables → table names in the database, again across both pages.
         let tables = cat.list_tables(&["db1".to_string()]).await.expect("tables");
-        assert_eq!(tables, vec!["orders".to_string()]);
+        assert_eq!(
+            tables,
+            vec!["orders".to_string(), "customers".to_string()],
+            "both paginated pages"
+        );
 
         // GetTable → parsed metadata: parquet format, declared schema, partition columns.
         let md = cat

@@ -4740,10 +4740,50 @@ impl Engine {
     /// Shares the [`Engine::estimate_table_bytes`] cache and TTL
     /// (`OXIDANT_TABLE_BYTES_CACHE_TTL_MS`): both estimates steer only the auto-broadcast
     /// heuristic, so bounded staleness is safe.
+    ///
+    /// Cache keys are lowercased while catalog lookup (`oxidant_catalog`) is case-sensitive;
+    /// production names arrive planner-normalized, so the mismatch is latent, not live.
     pub async fn estimate_table_stats(&self, table_name: &str) -> TableStats {
-        let key = table_name.to_ascii_lowercase();
+        self.estimate_table_stats_cached(
+            table_name.to_ascii_lowercase(),
+            self.estimate_table_stats_uncached(table_name),
+        )
+        .await
+    }
+
+    /// [`Engine::estimate_table_stats`] over a structured logical [`TableReference`] — the
+    /// shape the distributed planner actually holds. Building the segments from
+    /// `catalog()`/`schema()`/`table()` (instead of a Display/string round-trip) keeps the
+    /// qualifier exact, so a `glue.db.t` scan probes Glue's `db` exactly once (KAN-81; the
+    /// string entry point is only reached with bare names from `resolve_replicated_tables`).
+    ///
+    /// The cache key is the segments joined with `.`, lowercased — the same key the string
+    /// path computes for the equivalent qualified name.
+    pub async fn estimate_table_stats_ref(
+        &self,
+        reference: &datafusion::common::TableReference,
+    ) -> TableStats {
+        let key = reference
+            .catalog()
+            .into_iter()
+            .chain(reference.schema())
+            .chain([reference.table()])
+            .collect::<Vec<_>>()
+            .join(".")
+            .to_ascii_lowercase();
+        self.estimate_table_stats_cached(key, self.estimate_table_stats_ref_uncached(reference))
+            .await
+    }
+
+    /// The shared per-engine TTL cache behind [`Engine::estimate_table_stats`] and
+    /// [`Engine::estimate_table_stats_ref`]; `compute` is the uncached walk for the entry.
+    async fn estimate_table_stats_cached(
+        &self,
+        key: String,
+        compute: impl std::future::Future<Output = TableStats>,
+    ) -> TableStats {
         let Some(ttl) = table_bytes_cache_ttl() else {
-            return self.estimate_table_stats_uncached(table_name).await;
+            return compute.await;
         };
         let fresh = self
             .table_bytes_cache
@@ -4755,7 +4795,7 @@ impl Engine {
         if let Some(stats) = fresh {
             return stats;
         }
-        let stats = self.estimate_table_stats_uncached(table_name).await;
+        let stats = compute.await;
         self.table_bytes_cache
             .lock()
             .expect("table_bytes_cache poisoned")
@@ -4777,13 +4817,50 @@ impl Engine {
             }
         }
 
-        // Resolve the (possibly qualified) name exactly the way SHOW/DESCRIBE do, so a
-        // catalog/namespace qualifier pins *where* the table lives. Before this, the walk
-        // discarded the qualifier and brute-force searched every namespace of every external
-        // catalog — on Glue each probe is a `GetTable` call, so one `count(*)` against a
-        // fully-qualified table fanned out into O(databases) API calls per query (KAN-81).
         let segments = parse_qualified_name(table_name);
-        let (catalog, namespace, table) = self.resolve_table_ref(&segments);
+        self.estimate_stats_resolved(&segments).await
+    }
+
+    /// The uncached sizing walk behind [`Engine::estimate_table_stats_ref`]: same as the
+    /// string path, but the segments come straight from the planner's structured
+    /// [`datafusion::common::TableReference`].
+    async fn estimate_table_stats_ref_uncached(
+        &self,
+        reference: &datafusion::common::TableReference,
+    ) -> TableStats {
+        let bare = reference.table();
+
+        // Session-registered ListingTable (e.g. `register_parquet`): sized from the listing;
+        // there is no catalog metadata, so no row-count statistic.
+        if let Ok(provider) = self.ctx.table_provider(bare).await {
+            if let Some(bytes) =
+                estimate_listing_provider_bytes(&self.ctx.state(), provider.as_ref()).await
+            {
+                return (Some(bytes), None);
+            }
+        }
+
+        let segments: Vec<String> = reference
+            .catalog()
+            .into_iter()
+            .chain(reference.schema())
+            .chain([reference.table()])
+            .map(str::to_string)
+            .collect();
+        self.estimate_stats_resolved(&segments).await
+    }
+
+    /// The resolution core shared by both uncached sizing walks: `segments` is the
+    /// (possibly partial) dotted name, from either `parse_qualified_name` (string path) or a
+    /// structured [`datafusion::common::TableReference`] (planner path).
+    ///
+    /// Resolving exactly the way SHOW/DESCRIBE do means a catalog/namespace qualifier pins
+    /// *where* the table lives. Before KAN-81 the walk discarded the qualifier and brute-force
+    /// searched every namespace of every external catalog — on Glue each probe is a `GetTable`
+    /// call, so one `count(*)` against a fully-qualified table fanned out into O(databases)
+    /// API calls per query.
+    async fn estimate_stats_resolved(&self, segments: &[String]) -> TableStats {
+        let (catalog, namespace, table) = self.resolve_table_ref(segments);
 
         if let Some(provider) = self.oxidant_catalog(&catalog) {
             if !namespace.is_empty() {
@@ -4806,6 +4883,14 @@ impl Engine {
             {
                 return stats;
             }
+            return (None, None);
+        }
+
+        // A 3+-segment name whose catalog isn't registered can never resolve — sizing it via
+        // the all-catalog fan-out would burn O(databases) catalog probes on a name guaranteed
+        // to miss. (The 2-segment `db.t` form keeps the legacy fallback: its first segment is
+        // a namespace in the *current* catalog, not a catalog name.)
+        if segments.len() >= 3 {
             return (None, None);
         }
 
@@ -6249,7 +6334,9 @@ mod tests {
     }
 
     /// `USE <external-catalog>` with no current namespace restricts the bare-name search to
-    /// that catalog: a second registered catalog is never touched.
+    /// that catalog: the table lives ONLY in a second registered catalog, so the search must
+    /// miss with the second catalog never probed (deterministic — under the old all-catalog
+    /// fan-out the table resolves, regardless of HashMap iteration order).
     #[tokio::test]
     async fn estimate_stats_use_catalog_restricts_search_to_that_catalog() {
         let dir = kan81_parquet_dir("usecat");
@@ -6258,8 +6345,8 @@ mod tests {
             "db1.orders".to_string(),
             format!("file://{}/", dir.display()),
         );
-        let catalog = Arc::new(RecordingCatalog::new(tables));
-        let other = Arc::new(RecordingCatalog::new(HashMap::new()));
+        let catalog = Arc::new(RecordingCatalog::new(HashMap::new()));
+        let other = Arc::new(RecordingCatalog::new(tables));
 
         let engine = Engine::new();
         engine.register_catalog("testcat", catalog.clone());
@@ -6268,12 +6355,16 @@ mod tests {
         // external-catalog-with-empty-namespace path directly.
         *engine.current.lock().expect("current poisoned") = ("testcat".to_string(), vec![]);
 
-        let (bytes, _rows) = engine.estimate_table_stats("orders").await;
-        assert!(
-            bytes.is_some(),
-            "search of testcat must size orders: {bytes:?}"
+        let stats = engine.estimate_table_stats("orders").await;
+        assert_eq!(
+            stats,
+            (None, None),
+            "restricted to testcat, which does not have orders"
         );
-        assert!(!catalog.list_calls().is_empty());
+        assert!(
+            !catalog.list_calls().is_empty(),
+            "the current catalog is still searched"
+        );
         assert!(
             other.list_calls().is_empty() && other.load_calls().is_empty(),
             "another catalog must not be searched: {:?} / {:?}",
@@ -6281,6 +6372,25 @@ mod tests {
             other.load_calls()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 3+-segment name whose catalog isn't registered can never resolve — the walk must not
+    /// fan out across every catalog looking for it (zero probes, "unknown").
+    #[tokio::test]
+    async fn estimate_stats_unknown_qualified_catalog_never_fans_out() {
+        let catalog = Arc::new(RecordingCatalog::new(HashMap::new()));
+
+        let engine = Engine::new();
+        engine.register_catalog("testcat", catalog.clone());
+
+        let stats = engine.estimate_table_stats("glu.db1.orders").await;
+        assert_eq!(stats, (None, None));
+        assert!(
+            catalog.list_calls().is_empty() && catalog.load_calls().is_empty(),
+            "an unregistered catalog qualifier must not probe any catalog: {:?} / {:?}",
+            catalog.list_calls(),
+            catalog.load_calls()
+        );
     }
 
     // ---------------------------------------------------------------------

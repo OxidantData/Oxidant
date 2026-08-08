@@ -471,6 +471,170 @@ async fn row_multiple_without_catalog_stats_is_legacy() {
 }
 
 // ---------------------------------------------------------------------------
+// KAN-81 walk-level regression: the sizing walk must reach the catalog with the
+// scan's FULL TableReference. `resolve_replicated_tables` names tables by
+// `TableReference::table()` (bare), so without re-reading the scan's reference the
+// estimator only ever saw `orders` — and brute-force enumerated every namespace of
+// every catalog (on Glue, O(databases) GetTable calls per table per query).
+// ---------------------------------------------------------------------------
+
+/// A `StatsCatalog`-style fixture that RECORDS every `list_namespaces`/`load_table` call, so
+/// the sizing walk's call shape is asserted directly.
+struct RecordingCatalog {
+    tables: HashMap<String, String>, // "<db>.<table>" -> location
+    list_calls: Mutex<Vec<Vec<String>>>,
+    load_calls: Mutex<Vec<(Vec<String>, String)>>,
+}
+
+impl RecordingCatalog {
+    fn clear_calls(&self) {
+        self.list_calls.lock().unwrap().clear();
+        self.load_calls.lock().unwrap().clear();
+    }
+    fn list_calls(&self) -> Vec<Vec<String>> {
+        self.list_calls.lock().unwrap().clone()
+    }
+    fn load_calls(&self) -> Vec<(Vec<String>, String)> {
+        self.load_calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl oxidant_catalog::CatalogProvider for RecordingCatalog {
+    fn name(&self) -> &str {
+        "testcat"
+    }
+
+    async fn list_namespaces(
+        &self,
+        parent: &[String],
+    ) -> oxidant_catalog::Result<Vec<Vec<String>>> {
+        self.list_calls.lock().unwrap().push(parent.to_vec());
+        if parent.is_empty() {
+            Ok(vec![vec!["db1".to_string()]])
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    async fn list_tables(&self, _namespace: &[String]) -> oxidant_catalog::Result<Vec<String>> {
+        Ok(self.tables.keys().cloned().collect())
+    }
+
+    async fn load_table(
+        &self,
+        namespace: &[String],
+        table: &str,
+    ) -> oxidant_catalog::Result<oxidant_catalog::TableMetadata> {
+        self.load_calls
+            .lock()
+            .unwrap()
+            .push((namespace.to_vec(), table.to_string()));
+        let key = format!("{}.{table}", namespace.join("."));
+        let location = self
+            .tables
+            .get(&key)
+            .ok_or_else(|| oxidant_catalog::Error::Plan(format!("no such table `{key}`")))?;
+        Ok(oxidant_catalog::TableMetadata::new(
+            key,
+            location.clone(),
+            oxidant_catalog::TableFormat::Parquet,
+        ))
+    }
+}
+
+/// Through `resolve_replicated_tables` (the production driver path), a query over two
+/// three-part-named tables must cost exactly one `load_table` per table in its own namespace
+/// and ZERO `list_namespaces` — while the classification output keeps its bare-name keys.
+#[tokio::test]
+async fn sizing_walk_uses_qualified_refs_without_namespace_enumeration() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("OXIDANT_REPLICATE_MAX_ROW_MULTIPLE");
+    std::env::remove_var("OXIDANT_REPLICATED_TABLES");
+
+    let dir = tempfile::tempdir().unwrap();
+    // `orders` is the byte anchor (padded wide column); `customers` is tiny and replicates.
+    let orders = batch(
+        vec![i64f("o_custkey"), i64f("o_total"), strf("o_comment")],
+        vec![
+            i64v(&[1, 2, 3, 4]),
+            i64v(&[10, 20, 30, 40]),
+            Arc::new(StringArray::from(
+                (0..4).map(|_| "x".repeat(600)).collect::<Vec<_>>(),
+            )),
+        ],
+    );
+    let customers = batch(
+        vec![i64f("c_custkey"), strf("c_name")],
+        vec![i64v(&[1, 2]), Arc::new(StringArray::from(vec!["a", "b"]))],
+    );
+    let orders_dir = dir.path().join("orders");
+    let customers_dir = dir.path().join("customers");
+    write_parquet(&orders_dir, &orders);
+    write_parquet(&customers_dir, &customers);
+    assert!(
+        std::fs::metadata(orders_dir.join("part-0.parquet"))
+            .unwrap()
+            .len()
+            > std::fs::metadata(customers_dir.join("part-0.parquet"))
+                .unwrap()
+                .len(),
+        "orders must be the byte anchor"
+    );
+
+    let mut tables = HashMap::new();
+    tables.insert(
+        "db1.orders".to_string(),
+        orders_dir.to_str().unwrap().to_string(),
+    );
+    tables.insert(
+        "db1.customers".to_string(),
+        customers_dir.to_str().unwrap().to_string(),
+    );
+    let catalog = Arc::new(RecordingCatalog {
+        tables,
+        list_calls: Mutex::new(Vec::new()),
+        load_calls: Mutex::new(Vec::new()),
+    });
+
+    let engine = Engine::new();
+    engine.register_catalog("testcat", catalog.clone());
+    let sql = "SELECT c.c_name AS n, SUM(o.o_total) AS t \
+               FROM testcat.db1.orders o \
+               JOIN testcat.db1.customers c ON o.o_custkey = c.c_custkey \
+               GROUP BY c.c_name";
+    let lp = engine.logical_plan(sql).await.unwrap();
+    // Planning resolved each table through the bridge (one load_table per table); reset the
+    // recordings so only the sizing walk's calls are asserted.
+    catalog.clear_calls();
+
+    let replicated = resolve_replicated_tables(&engine, &lp).await;
+
+    let mut loads = catalog.load_calls();
+    loads.sort();
+    assert_eq!(
+        loads,
+        vec![
+            (vec!["db1".to_string()], "customers".to_string()),
+            (vec!["db1".to_string()], "orders".to_string()),
+        ],
+        "exactly one load_table per table, in its own namespace"
+    );
+    assert!(
+        catalog.list_calls().is_empty(),
+        "a qualified reference must never enumerate namespaces: {:?}",
+        catalog.list_calls()
+    );
+    // Classification still keys off bare names: tiny customers replicates, the byte anchor
+    // orders stays sharded.
+    assert!(
+        replicated.iter().any(|t| t == "customers"),
+        "{replicated:?}"
+    );
+    assert!(!replicated.iter().any(|t| t == "orders"), "{replicated:?}");
+}
+
+// ---------------------------------------------------------------------------
 // Planner shapes under the 2-sharded classification
 // ---------------------------------------------------------------------------
 
