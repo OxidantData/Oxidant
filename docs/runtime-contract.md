@@ -74,7 +74,7 @@ clusters should continue to run one connect-server pod plus an autoscaled worker
 - Deploy **one driver pod** + **N worker pods** from the OSS images above.
 - Expose a headless Service for workers (`clusterIP: None`) so `OXIDANT_WORKER_SERVICE` DNS resolves pod IPs.
 - HPA on worker Deployment using external metric `oxidant_pending_stage_tasks` (requires a metrics adapter), **or** proactive scale via the gateway `POST /clusters/{id}/scale` API when the driver sets `OXIDANT_AUTOSCALE=1`.
-- IRSA / S3 credentials for data paths (engine uses AWS CLI in the connect-server image for Glue catalog).
+- IRSA / S3 credentials for data paths (engine talks to the Glue catalog in-process via `aws-sdk-glue`, using the standard AWS credential chain).
 
 ## Autoscaling (parallelism-driven)
 

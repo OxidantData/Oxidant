@@ -40,10 +40,10 @@ oxidant spark server --port 50051 \
 ```
 
 Supported `type` values today: **`hive`** (Hive Metastore over Thrift), **`glue`**
-(AWS Glue Data Catalog via the AWS CLI + instance role / IRSA), and **`rest`** /
-`unity` / `iceberg` (Iceberg REST). Glue options: `region`, optional `warehouse`
-(`s3://bucket/prefix` for CTAS without `LOCATION`). The AWS CLI path is taken only
-from `OXIDANT_AWS_BIN` (never from catalog options).
+(AWS Glue Data Catalog via `aws-sdk-glue` in-process, with the standard AWS credential
+chain — env, shared config, instance role / IRSA), and **`rest`** / `unity` / `iceberg`
+(Iceberg REST). Glue options: `region`, optional `warehouse`
+(`s3://bucket/prefix` for CTAS without `LOCATION`).
 
 EC2 ASG walkthrough (create Glue DB/table, IAM, `CatalogConf`):
 [`distributed-ec2.md`](distributed-ec2.md).

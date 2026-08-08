@@ -55,7 +55,10 @@ pub fn group_catalog_options(
 
 /// Build a catalog provider from its grouped options. Dispatches on `type` (the
 /// `spark.sql.catalog.<name>.type` value). New built-in provider types are added here.
-pub fn build_provider(
+///
+/// Async because the Glue provider loads its AWS SDK config (`aws-config::load`) at build time —
+/// still cheap and non-networked: credentials resolve lazily on the first actual Glue call.
+pub async fn build_provider(
     name: &str,
     options: &HashMap<String, String>,
 ) -> Result<Arc<dyn CatalogProvider>, Status> {
@@ -74,9 +77,10 @@ pub fn build_provider(
             Ok(Arc::new(cat))
         }
         "glue" => {
-            // Credentials come from the instance role (IMDS); `region` (default us-west-2) and an
-            // optional `aws_bin` arrive as `spark.sql.catalog.<name>.{region,aws_bin}`.
-            let cat = oxidant_catalog_glue::GlueCatalog::from_config(name, options);
+            // Credentials come from the standard AWS chain (env, shared config, instance role /
+            // IRSA); `region` (default us-west-2) and an optional `warehouse` arrive as
+            // `spark.sql.catalog.<name>.{region,warehouse}`.
+            let cat = oxidant_catalog_glue::GlueCatalog::from_config(name, options).await;
             Ok(Arc::new(cat))
         }
         "rest" | "unity" | "iceberg" => {
@@ -651,8 +655,8 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
-    #[test]
-    fn config_grouping_and_provider_build() {
+    #[tokio::test]
+    async fn config_grouping_and_provider_build() {
         let mut config = HashMap::new();
         config.insert(
             "spark.sql.catalog.prod.type".to_string(),
@@ -668,14 +672,14 @@ mod tests {
         let prod = &groups["prod"];
         assert_eq!(prod["type"], "hive");
         // Builds without connecting (connection is lazy).
-        assert!(build_provider("prod", prod).is_ok());
+        assert!(build_provider("prod", prod).await.is_ok());
         // Unknown type is a clean unimplemented error.
         let mut bad = HashMap::new();
         bad.insert("type".to_string(), "mystery".to_string());
         // `.err().unwrap()` (not `.unwrap_err()`) — the Ok type `Arc<dyn CatalogProvider>` is not
         // `Debug`, which `unwrap_err`'s panic message would require.
         assert_eq!(
-            build_provider("x", &bad).err().unwrap().code(),
+            build_provider("x", &bad).await.err().unwrap().code(),
             tonic::Code::Unimplemented
         );
     }
