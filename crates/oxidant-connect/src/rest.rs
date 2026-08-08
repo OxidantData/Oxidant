@@ -113,7 +113,7 @@ impl LogVisitor {
             self.0.push_str(", ");
         }
         self.0.push_str(field.name());
-        self.0.push_str("=");
+        self.0.push('=');
         self.0.push_str(&value.to_string());
     }
 }
