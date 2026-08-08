@@ -313,7 +313,10 @@ impl OxidantService {
         Arc::clone(&self.engine)
     }
 
-    /// Borrow the catalog registry (current catalog / namespace pointers and registered providers).
+    /// Borrow the catalog registry (the registered-provider map: `catalog_names`/`contains`/
+    /// `provider`). KAN-85: the current catalog/namespace pointers on it are NOT the Connect
+    /// session state — those live on the per-session engine handles (`Engine::for_session`);
+    /// do not wire the registry pointers back into request handling.
     pub fn registry(&self) -> Arc<oxidant_catalog::CatalogRegistry> {
         Arc::clone(&self.registry)
     }
@@ -1030,7 +1033,7 @@ impl SparkConnectService for OxidantService {
                         .await?
                 }
                 Some(sc::command::CommandType::WriteStreamOperationStart(s)) => {
-                    let result = self.handle_write_stream_start(s).await?;
+                    let result = self.handle_write_stream_start(&engine, s).await?;
                     vec![self.response(
                         &session_id,
                         &operation_id,
@@ -1040,7 +1043,7 @@ impl SparkConnectService for OxidantService {
                     )]
                 }
                 Some(sc::command::CommandType::StreamingQueryCommand(c)) => {
-                    let result = self.handle_streaming_query_command(c).await?;
+                    let result = self.handle_streaming_query_command(&engine, c).await?;
                     vec![self.response(
                         &session_id,
                         &operation_id,
@@ -1504,6 +1507,9 @@ impl SparkConnectService for OxidantService {
         request: Request<sc::ReleaseSessionRequest>,
     ) -> std::result::Result<Response<sc::ReleaseSessionResponse>, Status> {
         let req = request.into_inner();
+        // Evict the session's catalog/namespace cell (KAN-85); in-flight requests hold their
+        // own `Arc` of the cell and finish unaffected.
+        self.engine.drop_session(&req.session_id);
         Ok(Response::new(sc::ReleaseSessionResponse {
             session_id: req.session_id,
             server_side_session_id: self.server_session_id.clone(),

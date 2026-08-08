@@ -289,6 +289,12 @@ impl CatalogRegistry {
     }
 
     /// The current catalog name.
+    ///
+    /// KAN-85 note: these current-pointer accessors serve the SPI type's own consumers/tests.
+    /// The Connect service's per-session catalog/namespace state lives on the engine handles
+    /// (`Engine::for_session` / `Engine::set_current_catalog`), NOT here — SQL `USE` and the
+    /// `spark.catalog.setCurrent*` RPCs share that per-session state, so don't reintroduce
+    /// reads/writes of these pointers on request paths.
     pub fn current_catalog(&self) -> String {
         self.lock().current_catalog.clone()
     }

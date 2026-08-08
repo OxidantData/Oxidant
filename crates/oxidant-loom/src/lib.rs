@@ -2077,6 +2077,11 @@ type TableStats = (Option<u64>, Option<u64>);
 
 /// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
 /// operators behind the same surface in Phase 1.
+///
+/// Cloning a handle shares ALL engine state — including the `current` catalog/namespace cell
+/// (KAN-85: use [`Engine::for_session`] for a DIFFERENT session's state). The managed
+/// directories are removed only when the last handle drops.
+#[derive(Clone)]
 pub struct Engine {
     ctx: Arc<SessionContext>,
     /// Per-engine managed directories: the warehouse (Spark's `CREATE TABLE … USING <fmt>` is
@@ -4750,37 +4755,50 @@ impl Engine {
                 // KAN-86: the namespace must exist (Spark's `setCurrentNamespace` →
                 // `SCHEMA_NOT_FOUND`) — validated BEFORE any state changes, so a failed USE
                 // leaves the session untouched.
-                self.validate_namespace(&target_catalog, namespace).await?;
+                let namespace = self.validate_namespace(&target_catalog, namespace).await?;
                 let mut current = self.current.lock().expect("current poisoned");
                 if let Some(cat) = canonical {
                     current.0 = cat;
                 }
-                current.1 = namespace.clone();
+                current.1 = namespace;
             }
         }
         Ok(vec![])
     }
 
     /// Validate a `USE` target namespace exists — Spark's `setCurrentNamespace` runs
-    /// `assertNamespaceExist` and raises `[SCHEMA_NOT_FOUND] The schema \`db\` cannot be found`
-    /// (KAN-86). The builtin catalog checks DataFusion's registered schemas; an external
-    /// catalog is walked level-by-level via `list_namespaces` (cheap in-process since KAN-82),
-    /// so a multi-part namespace on a single-level provider (Glue) fails `SCHEMA_NOT_FOUND` at
-    /// the second level. A backend failure (`Error::Io`) propagates — a namespace is never
-    /// silently accepted when validation itself fails.
-    async fn validate_namespace(&self, catalog: &str, namespace: &[String]) -> Result<()> {
+    /// `assertNamespaceExist` and raises `[SCHEMA_NOT_FOUND]` (KAN-86) — and return the
+    /// namespace to STORE: the builtin catalog matches case-insensitively and stores the
+    /// registered casing (Spark's v1 `formatDatabaseName` fold, `caseSensitive=false`
+    /// default), so `USE DEFAULT` works and lands on `["default"]`; external catalogs match
+    /// exactly (Spark's v2 `namespaceExists` is exact) and store as given.
+    ///
+    /// External validation walks level-by-level via `list_namespaces` (cheap in-process since
+    /// KAN-82), so a multi-part namespace on a single-level provider (Glue) fails
+    /// `SCHEMA_NOT_FOUND` at the second level. A backend failure (`Error::Io`) propagates — a
+    /// namespace is never silently accepted when validation itself fails.
+    async fn validate_namespace(&self, catalog: &str, namespace: &[String]) -> Result<Vec<String>> {
         if namespace.is_empty() {
-            return Ok(());
+            return Ok(namespace.to_vec());
         }
         let not_found = || {
+            let qualified = std::iter::once(catalog)
+                .chain(namespace.iter().map(String::as_str))
+                .map(|part| format!("`{part}`"))
+                .collect::<Vec<_>>()
+                .join(".");
             Error::Plan(format!(
-                "[SCHEMA_NOT_FOUND] The schema `{}` cannot be found",
-                namespace.join(".")
+                "[SCHEMA_NOT_FOUND] The schema {qualified} cannot be found"
             ))
         };
         if catalog == oxidant_catalog::DEFAULT_CATALOG {
-            if self.builtin_namespaces().contains(&namespace.join(".")) {
-                return Ok(());
+            let want = namespace.join(".");
+            if let Some(registered) = self
+                .builtin_namespaces()
+                .into_iter()
+                .find(|n| n.eq_ignore_ascii_case(&want))
+            {
+                return Ok(vec![registered]);
             }
             return Err(not_found());
         }
@@ -4796,7 +4814,7 @@ impl Engine {
                 return Err(not_found());
             }
         }
-        Ok(())
+        Ok(namespace.to_vec())
     }
 
     /// The session's current catalog + current namespace, set by `USE` (default:
@@ -4851,6 +4869,17 @@ impl Engine {
         }
     }
 
+    /// Drop the per-session state cell for `session_id` (Connect `ReleaseSession`). In-flight
+    /// requests hold their own `Arc` of the cell, so evicting mid-flight is safe — they finish
+    /// on their handle, and the next `for_session` for the id re-seeds from the default.
+    pub fn drop_session(&self, session_id: &str) {
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .cells
+            .remove(session_id);
+    }
+
     /// Set the catalog NEW sessions seed from (`spark.sql.defaultCatalog`); existing sessions
     /// keep their (possibly `USE`-adjusted) state. Errors if the catalog isn't registered.
     pub fn set_default_catalog(&self, catalog: &str) -> Result<()> {
@@ -4877,11 +4906,19 @@ impl Engine {
     }
 
     /// Spark Catalog RPC `setCurrentDatabase`: identical semantics to SQL `USE <namespace>`
-    /// (KAN-86 existence validation included) over the same per-session state (KAN-85).
+    /// (KAN-86 existence validation included) over the same per-session state (KAN-85). An
+    /// empty/blank database name is rejected (Spark errors; an empty namespace would otherwise
+    /// slip past validation and read as "no database selected").
     pub async fn set_current_namespace(&self, namespace: &str) -> Result<()> {
+        let segments = parse_qualified_name(namespace);
+        if segments.is_empty() {
+            return Err(Error::Plan(format!(
+                "[SCHEMA_NOT_FOUND] The schema `{namespace}` cannot be found"
+            )));
+        }
         self.run_use(&UseStmt::Namespace {
             catalog: None,
-            namespace: parse_qualified_name(namespace),
+            namespace: segments,
         })
         .await
         .map(|_| ())
@@ -6874,7 +6911,8 @@ mod tests {
         match err {
             Error::Plan(msg) => {
                 assert!(msg.contains("[SCHEMA_NOT_FOUND]"), "{msg}");
-                assert!(msg.contains("nosuchdb"), "{msg}");
+                // Spark's message carries the catalog-qualified name.
+                assert!(msg.contains("`spark_catalog`.`nosuchdb`"), "{msg}");
             }
             other => panic!("expected Plan, got {other:?}"),
         }
@@ -7064,6 +7102,168 @@ mod tests {
             catalog.list_calls()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KAN-86: builtin schema names fold case (Spark's v1 `formatDatabaseName`,
+    /// `caseSensitive=false` default) — `USE DEFAULT` is legal and stores the REGISTERED
+    /// casing so later schema lookups hit. External catalogs stay exact (v2 `namespaceExists`).
+    #[tokio::test]
+    async fn use_builtin_namespace_matches_case_insensitively() {
+        let engine = Engine::new();
+        engine
+            .ctx()
+            .catalog(oxidant_catalog::DEFAULT_CATALOG)
+            .unwrap()
+            .register_schema(
+                "somedb",
+                Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
+            )
+            .unwrap();
+        engine.sql("USE SOMEDB").await.unwrap();
+        assert_eq!(
+            engine.current_catalog_and_namespace().1,
+            vec!["somedb".to_string()],
+            "case-folded match stores the registered casing"
+        );
+        engine.sql("USE DEFAULT").await.unwrap();
+        assert_eq!(
+            engine.current_catalog_and_namespace().1,
+            vec!["default".to_string()]
+        );
+    }
+
+    /// KAN-87 divergence pin: re-`USE CATALOG` of the builtin under different casing is a
+    /// canonical no-op — the namespace is NOT reset. Spark's `setCurrentCatalog` compares the
+    /// raw string case-sensitively (`currentCatalog.name() != catalogName`) and WOULD reset to
+    /// `["default"]` here; we read that as an implementation accident (its `catalog()` folds
+    /// the session-catalog case anyway) and deliberately do not reproduce it.
+    #[tokio::test]
+    async fn use_catalog_builtin_case_variant_is_noop_not_reset() {
+        let engine = Engine::new();
+        engine
+            .ctx()
+            .catalog(oxidant_catalog::DEFAULT_CATALOG)
+            .unwrap()
+            .register_schema(
+                "somedb",
+                Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
+            )
+            .unwrap();
+        engine.sql("USE somedb").await.unwrap();
+        engine.sql("USE CATALOG Spark_Catalog").await.unwrap();
+        assert_eq!(
+            engine.current_catalog_and_namespace(),
+            ("spark_catalog".to_string(), vec!["somedb".to_string()]),
+            "canonical same-catalog no-op keeps the namespace"
+        );
+    }
+
+    /// KAN-86: a backend failure during external namespace validation propagates (never
+    /// silently accepted) and leaves the session state untouched.
+    #[tokio::test]
+    async fn use_external_namespace_validation_io_propagates() {
+        struct ThrottledListCatalog;
+        #[async_trait::async_trait]
+        impl oxidant_catalog::CatalogProvider for ThrottledListCatalog {
+            fn name(&self) -> &str {
+                "throttled"
+            }
+            async fn list_namespaces(
+                &self,
+                _parent: &[String],
+            ) -> oxidant_catalog::Result<Vec<Vec<String>>> {
+                Err(oxidant_catalog::Error::Io(
+                    "aws glue GetDatabases: ThrottlingException: rate exceeded".to_string(),
+                ))
+            }
+            async fn list_tables(
+                &self,
+                _namespace: &[String],
+            ) -> oxidant_catalog::Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn load_table(
+                &self,
+                _namespace: &[String],
+                _table: &str,
+            ) -> oxidant_catalog::Result<oxidant_catalog::TableMetadata> {
+                unreachable!("validation fails before any load_table")
+            }
+        }
+
+        let engine = Engine::new();
+        engine.register_catalog("throttled", Arc::new(ThrottledListCatalog));
+        let err = engine.sql("USE throttled.somedb").await.unwrap_err();
+        match err {
+            Error::Io(msg) => assert!(msg.contains("ThrottlingException"), "{msg}"),
+            other => panic!("expected Io, got {other:?}"),
+        }
+        assert_eq!(
+            engine.current_catalog_and_namespace(),
+            ("spark_catalog".to_string(), vec!["default".to_string()]),
+            "a failed USE leaves the session state untouched"
+        );
+    }
+
+    /// KAN-85: `drop_session` evicts the session's cell — the next `for_session` for the id
+    /// re-seeds from the default.
+    #[tokio::test]
+    async fn drop_session_evicts_the_session_cell() {
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+        engine
+            .for_session("ephemeral")
+            .sql("USE CATALOG testcat")
+            .await
+            .unwrap();
+        engine.drop_session("ephemeral");
+        assert_eq!(
+            engine
+                .for_session("ephemeral")
+                .current_catalog_and_namespace(),
+            ("spark_catalog".to_string(), vec!["default".to_string()]),
+            "evicted session re-seeds from the default"
+        );
+    }
+
+    /// KAN-85: `set_default_catalog` seeds only NEW sessions; an existing session's `USE`
+    /// state is not clobbered; an external default seeds the empty namespace (KAN-84).
+    #[tokio::test]
+    async fn set_default_catalog_seeds_new_sessions_only() {
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+        let existing = engine.for_session("existing");
+        engine.set_default_catalog("testcat").unwrap();
+
+        let new = engine.for_session("new");
+        assert_eq!(
+            new.current_catalog_and_namespace(),
+            ("testcat".to_string(), vec![]),
+            "new session seeds from the default catalog (external → empty namespace)"
+        );
+        assert_eq!(
+            existing.current_catalog_and_namespace(),
+            ("spark_catalog".to_string(), vec!["default".to_string()]),
+            "existing session keeps its state"
+        );
+        // An unregistered default is rejected.
+        assert!(engine.set_default_catalog("nope").is_err());
+    }
+
+    /// KAN-86/RPC: `setCurrentDatabase("")` is rejected — an empty name would otherwise parse
+    /// to an empty namespace that validation accepts unconditionally.
+    #[tokio::test]
+    async fn set_current_namespace_rejects_empty() {
+        let engine = Engine::new();
+        for blank in ["", "  ", "``"] {
+            let err = engine.set_current_namespace(blank).await.unwrap_err();
+            assert!(matches!(err, Error::Plan(_)), "{blank:?}: {err:?}");
+        }
+        assert_eq!(
+            engine.current_catalog_and_namespace().1,
+            vec!["default".to_string()],
+            "state untouched after rejected setCurrentDatabase"
+        );
     }
 
     #[tokio::test]
