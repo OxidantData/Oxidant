@@ -157,12 +157,18 @@ pub trait CatalogProvider: Send + Sync {
     async fn load_table(&self, namespace: &[String], table: &str) -> Result<TableMetadata>;
 
     /// Whether `namespace.table` exists. Default: probe [`load_table`](Self::load_table) and treat
-    /// a not-found (`Plan`/`Io`) error as `false`; providers with a cheaper existence check should
-    /// override.
+    /// a not-found ([`Error::Plan`]) error as `false`; providers with a cheaper existence check
+    /// should override.
+    ///
+    /// Only `Plan` maps to `false`: that's the provider contract's "genuine doesn't exist"
+    /// signal (e.g. Glue's `EntityNotFoundException` — see `classify_glue_failure` in
+    /// oxidant-catalog-glue). A backend failure (`Error::Io`: throttling, auth, network, ...)
+    /// must NOT be reported as "table does not exist" — callers (Spark Connect `TableExists`)
+    /// would silently mislead clients, so it propagates as `Err`.
     async fn table_exists(&self, namespace: &[String], table: &str) -> Result<bool> {
         match self.load_table(namespace, table).await {
             Ok(_) => Ok(true),
-            Err(Error::Plan(_)) | Err(Error::Io(_)) => Ok(false),
+            Err(Error::Plan(_)) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -393,6 +399,51 @@ mod tests {
             .unwrap());
         assert!(c.namespace_exists(&["ns".to_string()]).await.unwrap());
         assert!(!c.namespace_exists(&["nope".to_string()]).await.unwrap());
+    }
+
+    /// KAN-83: `table_exists` must only read a genuine not-found (`Error::Plan`) as `false` —
+    /// a backend failure (`Error::Io`: throttling, auth, network, ...) propagates as `Err`
+    /// instead of being swallowed into "table does not exist".
+    #[tokio::test]
+    async fn table_exists_only_plan_maps_to_false() {
+        // Ok → true, Plan → false (the existing fake's missing-key error is Plan).
+        let c = fake();
+        assert!(c.table_exists(&["ns".to_string()], "orders").await.unwrap());
+        assert!(!c
+            .table_exists(&["ns".to_string()], "missing")
+            .await
+            .unwrap());
+
+        // Io → Err (a Glue `ThrottlingException`/`AccessDeniedException` surfaces as Io).
+        struct ThrottledCatalog;
+        #[async_trait]
+        impl CatalogProvider for ThrottledCatalog {
+            fn name(&self) -> &str {
+                "throttled"
+            }
+            async fn list_namespaces(&self, _parent: &[String]) -> Result<Vec<Vec<String>>> {
+                Ok(vec![])
+            }
+            async fn list_tables(&self, _namespace: &[String]) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn load_table(
+                &self,
+                _namespace: &[String],
+                _table: &str,
+            ) -> Result<TableMetadata> {
+                Err(Error::Io(
+                    "aws glue GetTable: ThrottlingException: rate exceeded".to_string(),
+                ))
+            }
+        }
+        match ThrottledCatalog
+            .table_exists(&["ns".to_string()], "orders")
+            .await
+        {
+            Err(Error::Io(msg)) => assert!(msg.contains("ThrottlingException")),
+            other => panic!("expected Err(Error::Io), got {other:?}"),
+        }
     }
 
     #[test]
