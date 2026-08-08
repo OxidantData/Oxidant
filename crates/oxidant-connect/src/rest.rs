@@ -408,6 +408,12 @@ impl StatementStore {
 }
 
 /// `{"name","type"}` pairs of a result's Arrow schema (type names via `Display`, e.g. "Int64").
+/// Backtick-quote an identifier, stripping any existing backticks first so we
+/// do not double-quote. This is Spark SQL's identifier-quoting rule.
+fn quote_identifier(id: &str) -> String {
+    format!("`{}`", id.replace('`', ""))
+}
+
 fn schema_fields(batches: &[RecordBatch]) -> Option<Vec<(String, String)>> {
     batches.first().map(|b| {
         b.schema()
@@ -800,11 +806,19 @@ async fn list_columns(
 ) -> Response {
     let engine = state.service.engine();
     let namespace = q.namespace.as_deref().unwrap_or("default");
-    let qualified = if catalog == DEFAULT_CATALOG {
-        format!("{catalog}.{namespace}.{table}")
-    } else {
-        format!("{catalog}.{namespace}.{table}")
-    };
+    // Quote each identifier part to avoid SQL injection / reserved-word issues.
+    let ns_parts: Vec<&str> = namespace.split('.').collect();
+    let quoted_ns = ns_parts
+        .iter()
+        .map(|p| quote_identifier(p))
+        .collect::<Vec<_>>()
+        .join(".");
+    let qualified = format!(
+        "{}.{n}.{t}",
+        quote_identifier(&catalog),
+        n = quoted_ns,
+        t = quote_identifier(&table)
+    );
     let sql = format!("DESCRIBE TABLE {qualified}");
     match engine.sql(&sql).await {
         Ok(batches) => {

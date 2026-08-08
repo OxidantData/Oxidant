@@ -86,10 +86,6 @@ export interface CatalogInfo {
   isCurrent: boolean;
 }
 
-export interface CatalogNamespace {
-  name: string;
-}
-
 export interface CatalogTable {
   name: string;
   type: string;
@@ -115,10 +111,6 @@ export interface ClusterStatus {
     memoryTotalMb: number;
     cpuPercent: number;
   };
-}
-
-export interface LogEntry {
-  message: string;
 }
 
 const base = `/api/v1/applications/${APP_ID}`;

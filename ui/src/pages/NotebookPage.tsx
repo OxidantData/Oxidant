@@ -223,7 +223,7 @@ export default function NotebookPage() {
     <div className="flex h-full">
       <CatalogSidebar onInsert={insertName} />
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <div className="oxidant-card mx-4 mt-4 flex flex-wrap items-center gap-2">
+        <div className="oxidant-card flex flex-wrap items-center gap-2">
           <button className="oxidant-btn" onClick={() => add("sql")}>
             + SQL cell
           </button>
@@ -252,7 +252,7 @@ export default function NotebookPage() {
           />
         </div>
 
-        <div className="flex-1 space-y-4 overflow-y-auto p-4">
+        <div className="flex-1 space-y-4 overflow-y-auto">
           {!cells.length && (
             <div className="oxidant-card text-muted">
               Empty notebook. Add a cell to get started.

@@ -49,7 +49,7 @@ export default function App() {
           </NavLink>
         ))}
       </nav>
-      <main className="flex-1 overflow-auto">
+      <main className="flex-1 overflow-auto p-4">
         <Routes>
           <Route path="/" element={<JobsPage />} />
           <Route path="/stages" element={<StagesPage />} />

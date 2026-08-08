@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { StatementResult } from "@/lib/api";
 
 interface ResultTableProps {
@@ -30,6 +30,10 @@ export default function ResultTable({
 
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+
+  useEffect(() => {
+    setPage(0);
+  }, [result.rows, pageSize]);
 
   const { pageRows, pageCount } = useMemo(() => {
     if (!enablePagination) {

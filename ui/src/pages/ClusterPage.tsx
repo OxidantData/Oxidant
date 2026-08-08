@@ -15,7 +15,7 @@ export default function ClusterPage() {
   }, [logsData, autoScroll]);
 
   return (
-    <div className="flex h-full flex-col gap-4 p-4">
+    <div className="flex h-full flex-col gap-4">
       <div className="grid gap-4 lg:grid-cols-4">
         <MetricCard label="Mode" value={status?.mode ?? "—"} />
         <MetricCard
@@ -35,7 +35,7 @@ export default function ClusterPage() {
         <MetricCard
           label="Process CPU"
           value={
-            status?.process
+            status?.process && status.process.cpuPercent != null
               ? `${status.process.cpuPercent.toFixed(1)}%`
               : "—"
           }

@@ -126,7 +126,7 @@ export default function EditorPage() {
     <div className="flex h-full">
       <CatalogSidebar onInsert={insertName} />
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex flex-1 gap-4 overflow-hidden p-4">
+        <div className="flex flex-1 gap-4 overflow-hidden">
           <div className="flex min-w-0 flex-1 flex-col space-y-4 overflow-hidden">
             <div className="oxidant-card space-y-3">
               <label className="text-sm text-muted">
