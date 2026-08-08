@@ -79,10 +79,16 @@ then wire its `type` string into `oxidant-connect`'s `build_provider` factory
 
 - **Works:** three-part-qualified queries (`cat.db.tbl`) and `spark.read.table("cat.db.tbl")`
   resolve lazily; `spark.catalog.listCatalogs/listDatabases/listTables/tableExists/databaseExists`
-  and `currentCatalog`/`setCurrentCatalog`/`currentDatabase`/`setCurrentDatabase`; Hive tables in
-  Parquet, plus Delta/Iceberg when the Hive table points at a local-filesystem location.
-- **Not yet:** DDL through the catalog (read-only); remote object stores (`s3://`, `hdfs://`) for
-  **Delta/Iceberg** tables (Parquet over remote stores works once an `object_store` is registered);
+  and `currentCatalog`/`setCurrentCatalog`/`currentDatabase`/`setCurrentDatabase`; Hive/Glue tables in
+  Parquet, Delta, and Iceberg — on the local filesystem and over `s3://`. The metastore table's
+  format is auto-detected from its parameters (`table_type=ICEBERG`, `classification=delta`,
+  `spark.sql.sources.provider`, …); Delta is read via delta-kernel and Iceberg via its
+  metadata/manifest chain, both with snapshot pinning, over whatever `object_store` the table
+  location resolves to (S3 buckets are registered automatically, honoring
+  `fs.s3a.*` storage options). Validated end-to-end against AWS Glue + S3 at TPC-H SF10
+  (all 8 tables, `count(*)` + Q1/Q6 identical to the Parquet baseline).
+- **Not yet:** DDL through the catalog (read-only); `hdfs://` locations; Delta/Iceberg
+  **column-mapping** tables (refused with an explicit error rather than misread);
   `USE <catalog>` / current-database affects the `spark.catalog.*` listing context but not yet the
   resolution of *unqualified* table names in queries — use fully-qualified names with external
   catalogs for now; ORC/Avro tables.
