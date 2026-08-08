@@ -17,9 +17,9 @@ description: |
   clients connect with a one-line URL change — no JVM. Ships the `oxidant`
   binary: `oxidant spark server --port 50051` starts the engine (Spark
   Connect on 50051, Web UI + REST API on 4040).
-  No runtime dependencies. Optional: the AWS CLI is only needed if you use
-  AWS Glue Data Catalogs — install it separately (brew install awscli / apt
-  install awscli).
+  No runtime dependencies. AWS Glue Data Catalogs are read in-process via
+  aws-sdk-glue with the standard AWS credential chain (env, shared config,
+  instance role / IRSA) — no AWS CLI needed.
 homepage: https://github.com/OxidantData/Oxidant
 license: AGPL-3.0-or-later
 # No `depends:` — the binary is statically self-contained (rustls, no OpenSSL).

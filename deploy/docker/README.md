@@ -33,7 +33,8 @@ docker build -f deploy/docker/worker.Dockerfile \
   --build-arg CONNECT_IMAGE=oxidant/connect-server:$TAG \
   -t oxidant/worker:$TAG .
 
-# Confirm AWS CLI v2 is bundled (required for Glue catalog shell-outs)
+# Confirm AWS CLI v2 is bundled (operator scripts only — the engine reads Glue
+# in-process via aws-sdk-glue)
 docker run --rm --entrypoint /usr/local/aws-cli/v2/current/bin/aws \
   oxidant/connect-server:$TAG --version
 ```
@@ -49,12 +50,12 @@ BuildKit is required (the `# syntax=` directive + the per-Dockerfile
   dependency-layer caching across source edits. No `protoc` is needed — `oxidant-proto`
   compiles the vendored Spark Connect protos with pure-Rust `protox`.
 - **AWS CLI:** a dedicated `awscli` stage installs AWS CLI v2 from Amazon’s official
-  zip into `/usr/local/aws-cli`. Runtime sets
-  `OXIDANT_AWS_BIN=/usr/local/aws-cli/v2/current/bin/aws`.
+  zip into `/usr/local/aws-cli` — bundled for operator scripts only; the engine talks
+  to Glue in-process via `aws-sdk-glue`.
 - **Runtime:** `debian:bookworm-slim` (not distroless) — the AWS CLI v2 bundle needs
   shared libraries distroless omits. User/group **65532** (`nonroot`).
 - **Credentials:** none are baked into the image. In-cluster auth is IRSA / env /
-  instance role; the CLI is only the binary Glue catalog resolution shells out to.
+  instance role, via the standard AWS credential chain.
 
 ## Security posture
 

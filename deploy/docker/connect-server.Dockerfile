@@ -55,8 +55,8 @@ RUN cargo build --profile "$CARGO_PROFILE" --locked -p oxidant-cli --bin oxidant
 # in-cluster via fsGroup). /tmp already exists in the distroless base.
 RUN install -d -o 65532 -g 65532 /rootfs/var/lib/oxidant/spill
 
-# ---- awscli: the engine resolves Glue (and HMS) catalogs by shelling out to `aws`
-# (oxidant-catalog-glue). Bundle it so a *cluster* can list/read the catalog itself —
+# ---- awscli: bundled for operator scripts / in-image debugging only. The engine
+# talks to Glue in-process via aws-sdk-glue (oxidant-catalog-glue) — no CLI shell-out.
 # arch-correct via TARGETARCH (don't default it; that pinned amd64 on arm64 builds).
 FROM debian:bookworm-slim AS awscli
 ARG TARGETARCH
@@ -102,7 +102,6 @@ USER 65532:65532
 #     pod's memory limit to make aggregations spill instead of OOM-killing.
 ENV TMPDIR=/tmp \
     HOME=/tmp \
-    OXIDANT_AWS_BIN=/usr/local/aws-cli/v2/current/bin/aws \
     OXIDANT_SAMPLE_DATA_DIR=/opt/oxidant/sample-data \
     RUST_BACKTRACE=1
 
@@ -140,6 +139,6 @@ CMD ["spark", "server", "--port", "50051"]
 #
 # Credentials: NONE are baked in. In-cluster, catalog/storage auth is per-cluster
 # least-privilege IRSA (the pod's ServiceAccount role). The AWS CLI *binary* is
-# bundled (see awscli stage + OXIDANT_AWS_BIN) so Glue catalog resolution can shell
-# out to `aws glue …`; identity still comes from IRSA / the environment.
+# bundled (see awscli stage) for operator scripts only — the engine talks to Glue
+# in-process via aws-sdk-glue; identity comes from IRSA / the environment.
 ###############################################################################

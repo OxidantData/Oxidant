@@ -86,8 +86,9 @@ A free Community AMI on AWS Marketplace is in progress (listing pending) — unt
 then, use any install path above on an EC2 instance. EC2 autoscaling via
 CloudFormation is documented in [distributed-ec2.md](distributed-ec2.md).
 
-> **Glue catalog users:** install the AWS CLI separately (`brew install awscli` /
-> `apt install awscli`) — it is not bundled. See [catalogs-glue.md](catalogs-glue.md).
+> **Glue catalog users:** no AWS CLI needed — the engine uses `aws-sdk-glue` in-process with
+> the standard AWS credential chain (env vars, shared config, instance role / IRSA). See
+> [catalogs-glue.md](catalogs-glue.md).
 
 ## Run the server
 

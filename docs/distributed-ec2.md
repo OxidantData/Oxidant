@@ -104,8 +104,8 @@ policies. Bootstrap also pins `OXIDANT_SHUFFLE_PARTITIONS` to `WorkerCount` on t
 
 ## Prepare S3 + Glue Data Catalog
 
-Oxidant’s Glue provider (`oxidant-catalog-glue`) shells out to the AWS CLI
-(`OXIDANT_AWS_BIN`, default `/usr/local/bin/aws` on the AMI). Credentials come from the
+Oxidant’s Glue provider (`oxidant-catalog-glue`) uses `aws-sdk-glue` in-process with the
+standard AWS credential chain. Credentials come from the
 **instance profile** (IMDSv2). Tables must already exist in Glue and point at readable
 S3 locations (Parquet is the well-supported path for remote object stores today; see
 [`catalogs.md`](catalogs.md)).
@@ -340,7 +340,9 @@ journalctl -u oxidant-bootstrap -u oxidant-driver -e --no-pager | tail -n 80
 getent hosts "$(grep OXIDANT_WORKER_SERVICE /etc/oxidant/oxidant.env | cut -d= -f2)"
 ```
 
-Expect `/etc/oxidant/oxidant.env` on the **driver** to include roughly:
+Expect `/etc/oxidant/oxidant.env` on the **driver** to include roughly
+(`OXIDANT_AWS_BIN` is consumed only by the AMI's own operator scripts —
+`bootstrap.sh`/`shard-resolve.sh`; the engine reads Glue in-process via aws-sdk-glue):
 
 ```bash
 OXIDANT_AWS_BIN=/usr/local/bin/aws
@@ -396,9 +398,10 @@ locations when they execute. Do not rely on client-only config for multi-worker 
 ### How Glue auth works on EC2
 
 1. Instance profile (from `EnableGlueAccess` + `DataBucketArns`) provides credentials via IMDSv2.
-2. `OXIDANT_AWS_BIN=/usr/local/bin/aws` points at the AMI’s AWS CLI v2.
-3. `oxidant-catalog-glue` runs `aws glue get-databases|get-tables|get-table …`.
-4. Table `StorageDescriptor.Location` (`s3://…`) is read with the same role’s S3 permissions.
+2. `oxidant-catalog-glue` resolves them in-process via `aws-sdk-glue` / the standard AWS
+   credential chain, then calls `GetDatabases`/`GetTables`/`GetTable` directly — no AWS CLI
+   subprocess (the AMI still bundles the CLI for operator scripts).
+3. Table `StorageDescriptor.Location` (`s3://…`) is read with the same role’s S3 permissions.
 
 No static keys belong in the AMI, user-data, or `CatalogConf`.
 
@@ -554,7 +557,7 @@ worker boot's full re-sync.
 
 | Role | Env written |
 |------|-------------|
-| Driver | `OXIDANT_WORKER_SERVICE`, `OXIDANT_WORKER_PORT=50561`, `OXIDANT_WORKER_COUNT`, `OXIDANT_SHUFFLE_PARTITIONS`, `OXIDANT_AWS_BIN`, `AWS_REGION`, spill/`TMPDIR`, optional memory/shuffle thresholds, optional `OXIDANT_CATALOG_CONF` |
+| Driver | `OXIDANT_WORKER_SERVICE`, `OXIDANT_WORKER_PORT=50561`, `OXIDANT_WORKER_COUNT`, `OXIDANT_SHUFFLE_PARTITIONS`, `OXIDANT_AWS_BIN` (AMI operator scripts only, not the engine), `AWS_REGION`, spill/`TMPDIR`, optional memory/shuffle thresholds, optional `OXIDANT_CATALOG_CONF` |
 | Worker | `OXIDANT_WORKER_COUNT`, `OXIDANT_SHARD_INDEX`, same AWS/spill/catalog/memory |
 
 ---
@@ -626,4 +629,4 @@ sudo -u oxidant /usr/local/bin/aws glue get-databases --region "$AWS_REGION"
 | [`deploy/cloudformation/oxidant-cluster.yaml`](../deploy/cloudformation/oxidant-cluster.yaml) | CFN stack |
 | [`deploy/cloudformation/deploy-stack.sh`](../deploy/cloudformation/deploy-stack.sh) | Deploy wrapper |
 | [`docs/catalogs.md`](catalogs.md) | Catalog SPI + Spark `spark.sql.catalog.*` keys |
-| [`crates/oxidant-catalog-glue/`](../crates/oxidant-catalog-glue/) | Glue provider (AWS CLI shell-out) |
+| [`crates/oxidant-catalog-glue/`](../crates/oxidant-catalog-glue/) | Glue provider (aws-sdk-glue, in-process) |
