@@ -1,4 +1,4 @@
-//! REST statement-execution API + cluster status, served from the driver's UI HTTP port.
+//! REST statement-execution API + catalog + cluster status, served from the driver's UI HTTP port.
 //!
 //! Merged into the `oxidant-ui-server` router by [`crate::serve`] (via
 //! `UiServerConfig::merge_router`), so the same axum listener that hosts the monitoring UI
@@ -9,13 +9,19 @@
 //! - `GET  /api/v1/statements/{id}` — status / schema / row count / error for one statement.
 //! - `GET  /api/v1/statements/{id}/result?format=json|csv&limit=N` — result rows.
 //! - `POST /api/v1/statements/{id}/cancel` — best-effort cancellation.
-//! - `GET  /api/v1/cluster/status` — single-node / local-cluster / distributed + workers.
+//! - `GET  /api/v1/catalogs` — list catalogs.
+//! - `GET  /api/v1/catalogs/{catalog}/namespaces` — list databases/schemas.
+//! - `GET  /api/v1/catalogs/{catalog}/tables?namespace=...` — list tables.
+//! - `GET  /api/v1/catalogs/{catalog}/tables/{table}/columns?namespace=...` — list columns.
+//! - `GET  /api/v1/catalogs/autocomplete?prefix=...` — catalog/schema/table/column suggestions.
+//! - `GET  /api/v1/cluster/status` — single-node / local-cluster / distributed + workers + process metrics.
+//! - `GET /api/v1/logs` — recent process log lines (in-memory ring buffer).
 //!
 //! Statements execute through [`OxidantService::execute_sql`], i.e. the exact `Sql`-relation
 //! arm of the gRPC path: same distributed routing, same observability hooks (statements show
 //! up on the monitoring /sql page).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
@@ -24,10 +30,17 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use datafusion::arrow::json::{ArrayWriter, WriterBuilder};
+use oxidant_catalog::DEFAULT_CATALOG;
+use oxidant_loom::arrow::array::Array;
 use oxidant_loom::arrow::record_batch::RecordBatch;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sysinfo::{Pid, System};
 use tokio::sync::{watch, Notify};
+use tracing::Subscriber;
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::Layer;
 use uuid::Uuid;
 
 use crate::OxidantService;
@@ -43,6 +56,82 @@ const LIST_CAP: usize = 100;
 const DEFAULT_RESULT_LIMIT: usize = 10_000;
 /// Default `?wait=true` blocking timeout (seconds).
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 30;
+/// Max retained log lines served by `GET /api/v1/logs`.
+const MAX_LOG_LINES: usize = 1000;
+
+/// In-memory ring buffer of recent log lines shared by the tracing layer and the logs endpoint.
+#[derive(Clone)]
+pub struct LogBuffer {
+    inner: Arc<Mutex<Vec<String>>>,
+    cap: usize,
+}
+
+impl LogBuffer {
+    fn new(cap: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Vec::with_capacity(cap))),
+            cap,
+        }
+    }
+
+    fn push(&self, line: String) {
+        let mut inner = self.inner.lock().expect("log buffer poisoned");
+        if inner.len() >= self.cap {
+            inner.remove(0);
+        }
+        inner.push(line);
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.inner.lock().expect("log buffer poisoned").clone()
+    }
+}
+
+impl<S: Subscriber> Layer<S> for LogBuffer {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        self.push(format_event(event));
+    }
+}
+
+fn format_event(event: &tracing::Event<'_>) -> String {
+    let mut visitor = LogVisitor(String::new());
+    event.record(&mut visitor);
+    let meta = event.metadata();
+    if visitor.0.is_empty() {
+        format!("[{}] {}", meta.level(), meta.target())
+    } else {
+        format!("[{}] {} - {}", meta.level(), meta.target(), visitor.0)
+    }
+}
+
+struct LogVisitor(String);
+
+impl tracing::field::Visit for LogVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if !self.0.is_empty() {
+            self.0.push_str(", ");
+        }
+        self.0.push_str(field.name());
+        self.0.push_str("=");
+        self.0.push_str(&format!("{:?}", value));
+    }
+}
+
+static LOG_BUFFER: OnceLock<LogBuffer> = OnceLock::new();
+
+/// Initialize process-wide log capture into an in-memory ring buffer and a compact
+/// `tracing` fmt subscriber. Idempotent: subsequent calls are ignored.
+pub fn init_logging() {
+    let buffer = LOG_BUFFER
+        .get_or_init(|| LogBuffer::new(MAX_LOG_LINES))
+        .clone();
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::INFO)
+        .finish()
+        .with(buffer)
+        .try_init();
+}
 
 /// Statement lifecycle, serialized lowercase exactly as the API contract spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,13 +461,19 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 struct RestState {
     service: Arc<OxidantService>,
     store: StatementStore,
+    log_buffer: LogBuffer,
 }
 
 /// Build the REST statement-execution router around a shared Spark Connect service.
 pub fn router(service: Arc<OxidantService>) -> Router {
+    init_logging();
+    let log_buffer = LOG_BUFFER
+        .get_or_init(|| LogBuffer::new(MAX_LOG_LINES))
+        .clone();
     app(RestState {
         service,
         store: StatementStore::new(),
+        log_buffer,
     })
 }
 
@@ -391,7 +486,19 @@ fn app(state: RestState) -> Router {
         .route("/api/v1/statements/{id}", get(get_statement))
         .route("/api/v1/statements/{id}/result", get(get_result))
         .route("/api/v1/statements/{id}/cancel", post(cancel_statement))
+        .route("/api/v1/catalogs", get(list_catalogs))
+        .route("/api/v1/catalogs/autocomplete", get(autocomplete_catalog))
+        .route(
+            "/api/v1/catalogs/{catalog}/namespaces",
+            get(list_namespaces),
+        )
+        .route("/api/v1/catalogs/{catalog}/tables", get(list_tables))
+        .route(
+            "/api/v1/catalogs/{catalog}/tables/{table}/columns",
+            get(list_columns),
+        )
         .route("/api/v1/cluster/status", get(cluster_status))
+        .route("/api/v1/logs", get(list_logs))
         .with_state(state)
 }
 
@@ -608,6 +715,233 @@ async fn cancel_statement(State(state): State<RestState>, Path(id): Path<String>
     }
 }
 
+// ---- catalog handlers ------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct NamespaceQuery {
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutocompleteQuery {
+    prefix: String,
+}
+
+async fn list_catalogs(State(state): State<RestState>) -> Json<Value> {
+    let registry = state.service.registry();
+    let names = registry.catalog_names();
+    let current = registry.current_catalog();
+    let catalogs: Vec<Value> = names
+        .into_iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "isCurrent": name == current,
+            })
+        })
+        .collect();
+    Json(json!({ "catalogs": catalogs }))
+}
+
+async fn list_namespaces(
+    State(state): State<RestState>,
+    Path(catalog): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let engine = state.service.engine();
+    let registry = state.service.registry();
+    let namespaces = if catalog == DEFAULT_CATALOG {
+        engine.builtin_namespaces()
+    } else {
+        let provider = registry.provider(&catalog).ok_or(StatusCode::NOT_FOUND)?;
+        provider
+            .list_namespaces(&[])
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            .map(|ns| ns.join("."))
+            .collect()
+    };
+    Ok(Json(json!({ "namespaces": namespaces })))
+}
+
+async fn list_tables(
+    State(state): State<RestState>,
+    Path(catalog): Path<String>,
+    Query(q): Query<NamespaceQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let engine = state.service.engine();
+    let registry = state.service.registry();
+    let namespace = q.namespace.as_deref().unwrap_or("default");
+    let ns_parts: Vec<String> = namespace.split(',').map(|s| s.to_string()).collect();
+    let table_names = if catalog == DEFAULT_CATALOG {
+        let schema = ns_parts
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+        engine.builtin_table_names(&schema)
+    } else {
+        let provider = registry.provider(&catalog).ok_or(StatusCode::NOT_FOUND)?;
+        provider
+            .list_tables(&ns_parts)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+    let tables: Vec<Value> = table_names
+        .into_iter()
+        .map(|name| json!({ "name": name, "type": "TABLE" }))
+        .collect();
+    Ok(Json(json!({ "tables": tables })))
+}
+
+async fn list_columns(
+    State(state): State<RestState>,
+    Path((catalog, table)): Path<(String, String)>,
+    Query(q): Query<NamespaceQuery>,
+) -> Response {
+    let engine = state.service.engine();
+    let namespace = q.namespace.as_deref().unwrap_or("default");
+    let qualified = if catalog == DEFAULT_CATALOG {
+        format!("{catalog}.{namespace}.{table}")
+    } else {
+        format!("{catalog}.{namespace}.{table}")
+    };
+    let sql = format!("DESCRIBE TABLE {qualified}");
+    match engine.sql(&sql).await {
+        Ok(batches) => {
+            let mut columns = Vec::new();
+            for batch in batches {
+                let col_names = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StringArray>();
+                let data_types = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StringArray>();
+                if let (Some(names), Some(types)) = (col_names, data_types) {
+                    for i in 0..names.len() {
+                        columns.push(json!({
+                            "name": names.value(i).to_string(),
+                            "type": types.value(i).to_string(),
+                        }));
+                    }
+                }
+            }
+            Json(json!({ "columns": columns })).into_response()
+        }
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("describe table: {e}"),
+        ),
+    }
+}
+
+async fn autocomplete_catalog(
+    State(state): State<RestState>,
+    Query(q): Query<AutocompleteQuery>,
+) -> Json<Value> {
+    let engine = state.service.engine();
+    let registry = state.service.registry();
+    let prefix = q.prefix.trim();
+    let mut suggestions = Vec::new();
+
+    // Tokenize the prefix on dots (last token is the partial identifier).
+    let parts: Vec<&str> = prefix.split('.').collect();
+    let partial = parts.last().copied().unwrap_or("").to_ascii_lowercase();
+
+    // Helper to push matches.
+    let mut push = |kind: &str, name: &str, qualified: String| {
+        if partial.is_empty() || name.to_ascii_lowercase().starts_with(&partial) {
+            suggestions.push(json!({
+                "kind": kind,
+                "name": name,
+                "qualified": qualified,
+            }));
+        }
+    };
+
+    if parts.len() <= 1 {
+        // Suggest catalogs.
+        for name in registry.catalog_names() {
+            push("catalog", &name, name.clone());
+        }
+        // Suggest namespaces in the current catalog.
+        let current = registry.current_catalog();
+        let namespaces = if current == DEFAULT_CATALOG {
+            engine.builtin_namespaces()
+        } else if let Some(provider) = registry.provider(&current) {
+            provider
+                .list_namespaces(&[])
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ns| ns.join("."))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for ns in namespaces {
+            push("namespace", &ns, format!("{current}.{ns}"));
+        }
+    } else {
+        // We have a catalog (and maybe namespace) prefix. Try to resolve it.
+        let first = parts[0];
+        let (catalog, namespace_parts) = if registry.contains(first) {
+            (first.to_string(), parts[1..parts.len() - 1].to_vec())
+        } else {
+            (
+                registry.current_catalog(),
+                parts[..parts.len() - 1].to_vec(),
+            )
+        };
+        let namespace_str = namespace_parts.join(".");
+        let ns_vec: Vec<String> = namespace_parts.iter().map(|s| s.to_string()).collect();
+
+        if namespace_parts.is_empty() {
+            // Suggest namespaces for the catalog.
+            let namespaces = if catalog == DEFAULT_CATALOG {
+                engine.builtin_namespaces()
+            } else if let Some(provider) = registry.provider(&catalog) {
+                provider
+                    .list_namespaces(&[])
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|ns| ns.join("."))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for ns in namespaces {
+                push("namespace", &ns, format!("{catalog}.{ns}"));
+            }
+        }
+
+        // Suggest tables in the resolved namespace.
+        let table_names = if catalog == DEFAULT_CATALOG {
+            let schema = ns_vec
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "default".to_string());
+            engine.builtin_table_names(&schema)
+        } else if let Some(provider) = registry.provider(&catalog) {
+            provider.list_tables(&ns_vec).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for t in table_names {
+            let qualified = if namespace_str.is_empty() {
+                format!("{catalog}.{t}")
+            } else {
+                format!("{catalog}.{namespace_str}.{t}")
+            };
+            push("table", &t, qualified);
+        }
+    }
+
+    Json(json!({ "suggestions": suggestions }))
+}
+
 /// "single-node" with no workers, "local-cluster" for loopback worker endpoints, else
 /// "distributed".
 fn cluster_mode(workers: &[String]) -> &'static str {
@@ -625,11 +959,39 @@ fn cluster_mode(workers: &[String]) -> &'static str {
 
 async fn cluster_status(State(state): State<RestState>) -> Json<Value> {
     let workers = state.service.workers_from_config();
+    let (memory_mb, memory_total_mb, cpu_pct) = process_metrics();
     Json(json!({
         "mode": cluster_mode(&workers),
         "workers": workers,
         "version": env!("CARGO_PKG_VERSION"),
+        "process": {
+            "memoryUsedMb": memory_mb,
+            "memoryTotalMb": memory_total_mb,
+            "cpuPercent": cpu_pct,
+        }
     }))
+}
+
+/// Snapshot current process CPU and memory via sysinfo.
+fn process_metrics() -> (Option<u64>, Option<u64>, Option<f32>) {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    let pid = Pid::from_u32(std::process::id());
+    sys.process(pid)
+        .map(|p| {
+            let mem = p.memory();
+            let total = sys.total_memory();
+            (
+                Some(mem / 1024 / 1024),
+                Some(total / 1024 / 1024),
+                Some(p.cpu_usage()),
+            )
+        })
+        .unwrap_or((None, None, None))
+}
+
+async fn list_logs(State(state): State<RestState>) -> Json<Value> {
+    Json(json!({ "logs": state.log_buffer.lines() }))
 }
 
 #[cfg(test)]
@@ -643,6 +1005,7 @@ mod tests {
         let state = RestState {
             service: Arc::new(OxidantService::new()),
             store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
         };
         (state.clone(), app(state))
     }
@@ -827,13 +1190,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cluster_status_reports_single_node() {
+    async fn cluster_status_reports_single_node_and_process_metrics() {
         let (_state, app) = test_state();
         let (status, body) = get_json(&app, "/api/v1/cluster/status").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["mode"], "single-node");
         assert_eq!(body["workers"], json!([]));
         assert!(!body["version"].as_str().unwrap().is_empty());
+        assert!(body["process"]["memoryUsedMb"].as_u64().is_some());
+        assert!(body["process"]["memoryTotalMb"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn logs_endpoint_returns_array() {
+        let (_state, app) = test_state();
+        let (status, body) = get_json(&app, "/api/v1/logs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["logs"].is_array());
     }
 
     #[test]
@@ -929,5 +1302,81 @@ mod tests {
         assert_eq!(inner.statements.len(), MAX_STATEMENTS);
         assert!(!inner.statements.contains_key(&first_id));
         assert!(inner.statements.contains_key(&last_id));
+    }
+
+    #[tokio::test]
+    async fn catalog_list_includes_spark_catalog() {
+        let (_state, app) = test_state();
+        let (status, body) = get_json(&app, "/api/v1/catalogs").await;
+        assert_eq!(status, StatusCode::OK);
+        let catalogs = body["catalogs"].as_array().unwrap();
+        assert!(catalogs.iter().any(|c| c["name"] == "spark_catalog"));
+    }
+
+    #[tokio::test]
+    async fn catalog_namespaces_and_tables() {
+        let (_state, app) = test_state();
+        // Create a temp view so the default namespace has a table.
+        let (_, _) = post_json(
+            &app,
+            "/api/v1/statements?wait=true",
+            json!({ "sql": "CREATE OR REPLACE TEMP VIEW rest_cat_v AS SELECT 1 AS a, 'x' AS b" }),
+        )
+        .await;
+
+        let (status, body) = get_json(&app, "/api/v1/catalogs/spark_catalog/namespaces").await;
+        assert_eq!(status, StatusCode::OK);
+        let namespaces = body["namespaces"].as_array().unwrap();
+        assert!(namespaces.iter().any(|n| n == "default"));
+
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/spark_catalog/tables?namespace=default",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let tables = body["tables"].as_array().unwrap();
+        assert!(tables.iter().any(|t| t["name"] == "rest_cat_v"));
+
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/spark_catalog/tables/rest_cat_v/columns?namespace=default",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let columns = body["columns"].as_array().unwrap();
+        assert!(columns.iter().any(|c| c["name"] == "a"));
+        assert!(columns.iter().any(|c| c["name"] == "b"));
+    }
+
+    #[tokio::test]
+    async fn catalog_autocomplete_suggests_catalogs_and_tables() {
+        let (_state, app) = test_state();
+        let (_, _) = post_json(
+            &app,
+            "/api/v1/statements?wait=true",
+            json!({ "sql": "CREATE OR REPLACE TEMP VIEW acme_orders AS SELECT 1 AS id" }),
+        )
+        .await;
+
+        // Empty prefix suggests catalogs.
+        let (status, body) = get_json(&app, "/api/v1/catalogs/autocomplete?prefix=").await;
+        assert_eq!(status, StatusCode::OK);
+        let suggestions = body["suggestions"].as_array().unwrap();
+        assert!(suggestions
+            .iter()
+            .any(|s| s["kind"] == "catalog" && s["name"] == "spark_catalog"));
+
+        // Namespace-qualified prefix suggests tables.
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/autocomplete?prefix=spark_catalog.default.ac",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let suggestions = body["suggestions"].as_array().unwrap();
+        assert!(suggestions
+            .iter()
+            .any(|s| s["kind"] == "table" && s["name"] == "acme_orders"));
     }
 }

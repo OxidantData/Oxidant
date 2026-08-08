@@ -81,6 +81,46 @@ export interface StatementResult {
   truncated: boolean;
 }
 
+export interface CatalogInfo {
+  name: string;
+  isCurrent: boolean;
+}
+
+export interface CatalogNamespace {
+  name: string;
+}
+
+export interface CatalogTable {
+  name: string;
+  type: string;
+}
+
+export interface CatalogColumn {
+  name: string;
+  type: string;
+}
+
+export interface AutocompleteSuggestion {
+  kind: "catalog" | "namespace" | "table" | "column";
+  name: string;
+  qualified: string;
+}
+
+export interface ClusterStatus {
+  mode: string;
+  workers: string[];
+  version: string;
+  process: {
+    memoryUsedMb: number;
+    memoryTotalMb: number;
+    cpuPercent: number;
+  };
+}
+
+export interface LogEntry {
+  message: string;
+}
+
 const base = `/api/v1/applications/${APP_ID}`;
 
 /** Read a JSON body, surfacing the API's `{"error": "..."}` message on non-2xx. */
@@ -121,10 +161,43 @@ export const api = {
     submit: (sql: string, waitTimeoutSecs = 60) =>
       post<StatementDoc>(`/api/v1/statements?wait=true&timeout=${waitTimeoutSecs}`, { sql }),
     get: (id: string) => get<StatementDoc>(`/api/v1/statements/${id}`),
-    result: (id: string, limit = 500) =>
-      get<StatementResult>(`/api/v1/statements/${id}/result?format=json&limit=${limit}`),
+    result: (id: string, limit = 500, format: "json" | "csv" = "json") =>
+      get<StatementResult>(`/api/v1/statements/${id}/result?format=${format}&limit=${limit}`),
+    csv: (id: string, limit = 10_000) =>
+      fetch(`/api/v1/statements/${id}/result?format=csv&limit=${limit}`).then((r) => {
+        if (!r.ok) throw new Error(`${r.status} csv download`);
+        return r.text();
+      }),
+    json: (id: string, limit = 10_000) =>
+      fetch(`/api/v1/statements/${id}/result?format=json&limit=${limit}`).then((r) => {
+        if (!r.ok) throw new Error(`${r.status} json download`);
+        return r.json() as Promise<StatementResult>;
+      }),
     cancel: (id: string) =>
       post<{ statementId: string; status: string }>(`/api/v1/statements/${id}/cancel`),
+  },
+  catalogs: {
+    list: () => get<{ catalogs: CatalogInfo[] }>("/api/v1/catalogs"),
+    namespaces: (catalog: string) =>
+      get<{ namespaces: string[] }>(`/api/v1/catalogs/${catalog}/namespaces`),
+    tables: (catalog: string, namespace: string) =>
+      get<{ tables: CatalogTable[] }>(
+        `/api/v1/catalogs/${catalog}/tables?namespace=${encodeURIComponent(namespace)}`
+      ),
+    columns: (catalog: string, namespace: string, table: string) =>
+      get<{ columns: CatalogColumn[] }>(
+        `/api/v1/catalogs/${catalog}/tables/${table}/columns?namespace=${encodeURIComponent(
+          namespace
+        )}`
+      ),
+    autocomplete: (prefix: string) =>
+      get<{ suggestions: AutocompleteSuggestion[] }>(
+        `/api/v1/catalogs/autocomplete?prefix=${encodeURIComponent(prefix)}`
+      ),
+  },
+  cluster: {
+    status: () => get<ClusterStatus>("/api/v1/cluster/status"),
+    logs: () => get<{ logs: string[] }>("/api/v1/logs"),
   },
 };
 
