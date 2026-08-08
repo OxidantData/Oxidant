@@ -167,7 +167,10 @@ fn try_gpu_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<GpuScanAggExec> {
     if !file.partition_values.is_empty() {
         return None;
     }
-    let table_path = file.object_meta.location.to_string();
+    // object_store::path::Path strips the leading '/', but the shim opens the
+    // path with plain filesystem calls — restore the absolute form (our local
+    // tables are always registered with absolute LOCATIONs).
+    let table_path = format!("/{}", file.object_meta.location);
     // A predicate pushed into the scan by FilterPushdown must be extracted too —
     // silently dropping it would aggregate rows the query filters out.
     if let Some(pushed) = cfg.file_source.filter() {

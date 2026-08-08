@@ -137,6 +137,13 @@ async fn rule_fires_on_q6_shape() {
 
     let spec = gpu_spec(&plan);
     assert!(spec.table_path.ends_with("lineitem.parquet"));
+    // The shim opens the path with plain filesystem calls, so the spec must
+    // carry the absolute path, not object_store's slash-stripped form.
+    assert!(
+        spec.table_path.starts_with('/'),
+        "path: {}",
+        spec.table_path
+    );
     assert!(spec.group_by.is_empty());
     assert_eq!(spec.aggregations.len(), 1);
     assert_eq!(spec.aggregations[0].func, AggFunc::Sum);
