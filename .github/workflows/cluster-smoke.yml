@@ -100,8 +100,10 @@ jobs:
           python3 - <<'EOF'
           import json
           d = json.load(open('dist.json'))
-          # 4 returnflag groups (A/F/N/R).
-          assert d['rowCount'] == 4, d
+          # The in-image sample tpch_lineitem.parquet (60,175 rows) has 3
+          # distinct returnflags (A/N/R; no F) — verified against the file
+          # with duckdb. Full TPC-H lineitem would have 4 (A/F/N/R).
+          assert d['rowCount'] == 3, d
           print('distributed query OK:', d['rowCount'], 'groups,', d['durationMs'], 'ms')
           EOF
           # Proof it executed on the workers: every stage-task exit emits a summary
