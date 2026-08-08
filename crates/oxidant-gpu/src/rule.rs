@@ -348,7 +348,11 @@ fn literal_spec(value: &ScalarValue) -> Option<LiteralSpec> {
     if value.is_null() {
         return None;
     }
-    let ty = match value {
+    let (ty, text) = match value {
+        // arrow's Display for decimal scalars prints the raw parts
+        // ("Some(5),15,2"), not the number — format it ourselves so the shim
+        // can parse the value with std::stod.
+        ScalarValue::Decimal128(Some(v), _p, s) => (LiteralType::Decimal, decimal_string(*v, *s)),
         ScalarValue::Int8(_)
         | ScalarValue::Int16(_)
         | ScalarValue::Int32(_)
@@ -356,23 +360,33 @@ fn literal_spec(value: &ScalarValue) -> Option<LiteralSpec> {
         | ScalarValue::UInt8(_)
         | ScalarValue::UInt16(_)
         | ScalarValue::UInt32(_)
-        | ScalarValue::UInt64(_) => LiteralType::Int,
-        ScalarValue::Float32(_) | ScalarValue::Float64(_) => LiteralType::Float,
-        ScalarValue::Utf8(_) | ScalarValue::LargeUtf8(_) | ScalarValue::Utf8View(_) => {
-            LiteralType::String
+        | ScalarValue::UInt64(_) => (LiteralType::Int, value.to_string()),
+        ScalarValue::Float32(_) | ScalarValue::Float64(_) => {
+            (LiteralType::Float, value.to_string())
         }
-        ScalarValue::Date32(_) | ScalarValue::Date64(_) => LiteralType::Date,
+        ScalarValue::Utf8(_) | ScalarValue::LargeUtf8(_) | ScalarValue::Utf8View(_) => {
+            (LiteralType::String, value.to_string())
+        }
+        ScalarValue::Date32(_) | ScalarValue::Date64(_) => (LiteralType::Date, value.to_string()),
         ScalarValue::TimestampSecond(..)
         | ScalarValue::TimestampMillisecond(..)
         | ScalarValue::TimestampMicrosecond(..)
-        | ScalarValue::TimestampNanosecond(..) => LiteralType::Timestamp,
-        ScalarValue::Decimal128(..) | ScalarValue::Decimal256(..) => LiteralType::Decimal,
+        | ScalarValue::TimestampNanosecond(..) => (LiteralType::Timestamp, value.to_string()),
         _ => return None,
     };
-    Some(LiteralSpec {
-        ty,
-        value: value.to_string(),
-    })
+    Some(LiteralSpec { ty, value: text })
+}
+
+/// Render a scaled decimal integer as a plain decimal string
+/// (e.g. 5 with scale 2 → "0.05", -2400 with scale 2 → "-24.00").
+fn decimal_string(v: i128, scale: i8) -> String {
+    if scale <= 0 {
+        return format!("{}", v * 10i128.pow((-scale) as u32));
+    }
+    let neg = v < 0;
+    let digits = format!("{:0>width$}", v.abs(), width = scale as usize + 1);
+    let (int_part, frac_part) = digits.split_at(digits.len() - scale as usize);
+    format!("{}{}.{}", if neg { "-" } else { "" }, int_part, frac_part)
 }
 
 /// The shim's column dtype vocabulary; `None` → the query stays on CPU.
@@ -403,4 +417,22 @@ fn dtype_str(dt: &DataType) -> Option<String> {
         DataType::Decimal256(p, s) => format!("decimal256({p},{s})"),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decimal_literals_render_as_numbers() {
+        assert_eq!(decimal_string(5, 2), "0.05");
+        assert_eq!(decimal_string(7, 2), "0.07");
+        assert_eq!(decimal_string(2400, 2), "24.00");
+        assert_eq!(decimal_string(-2400, 2), "-24.00");
+        assert_eq!(decimal_string(123, 0), "123");
+        assert_eq!(decimal_string(12, 5), "0.00012");
+        let lit = literal_spec(&ScalarValue::Decimal128(Some(5), 15, 2)).unwrap();
+        assert!(matches!(lit.ty, LiteralType::Decimal));
+        assert_eq!(lit.value, "0.05");
+    }
 }
