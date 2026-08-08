@@ -44,7 +44,11 @@ fn coerce_shim_batch(
         }
         match (got_ty, declared_ty) {
             (DataType::Float64, DataType::Decimal128(_, _))
-            | (DataType::Float64, DataType::Decimal256(_, _)) => {
+            | (DataType::Float64, DataType::Decimal256(_, _))
+            // The shim exports strings as Arrow "u" (Utf8); engines running
+            // with schema_force_view_types declare Utf8View instead.
+            | (DataType::Utf8, DataType::Utf8View)
+            | (DataType::Utf8, DataType::LargeUtf8) => {
                 columns[i] = cast(columns[i].as_ref(), declared_ty)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                 changed = true;
@@ -216,5 +220,34 @@ mod tests {
         .unwrap();
         let out = coerce_shim_batch(batch, &schema).unwrap();
         assert_eq!(out.column(0).len(), 1);
+    }
+
+    #[test]
+    fn utf8_shim_output_coerces_to_declared_utf8view() {
+        use datafusion::arrow::array::{StringArray, StringViewArray};
+        let got_schema = Arc::new(Schema::new(vec![Field::new(
+            "l_returnflag",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            got_schema,
+            vec![Arc::new(StringArray::from(vec!["A", "R"]))],
+        )
+        .unwrap();
+        let declared = Arc::new(Schema::new(vec![Field::new(
+            "l_returnflag",
+            DataType::Utf8View,
+            true,
+        )]));
+        let out = coerce_shim_batch(batch, &declared).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Utf8View);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(col.value(0), "A");
+        assert_eq!(col.value(1), "R");
     }
 }
