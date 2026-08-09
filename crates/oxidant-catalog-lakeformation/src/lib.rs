@@ -9,14 +9,14 @@
 //!   single table resource, optionally narrowed to one principal. Each grant maps to a
 //!   [`PrincipalTablePermissions`] — including column-level grants (`TableWithColumns` resources
 //!   surface as [`ColumnSelection::Named`] / [`ColumnSelection::AllExcept`]).
-//! - [`LakeFormationAuth::data_cells_filters`] → `ListDataCellsFilter` (paginated) for a table,
-//!   mapping each filter to a [`TableDataFilter`] with its column selection and row-filter
-//!   expression — the input scan planning (KAN-103) rewrites into DataFusion predicates/projections.
+//! - [`LakeFormationAuth::data_cells_filters`] → intersects `ListDataCellsFilter` definitions with
+//!   the principal's `DataCellsFilter` grants from `ListPermissions`, returning only filters bound
+//!   to the requesting principal.
 //!
 //! This crate only *retrieves* authorization information; it grants/revokes nothing and never
 //! shells out to the `aws` CLI.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aws_sdk_lakeformation::error::ProvideErrorMetadata;
 use aws_sdk_lakeformation::types::{
@@ -28,12 +28,22 @@ use oxidant_common::{Error, Result};
 /// Which columns of a table a grant or data-cell filter covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnSelection {
-    /// The whole table (a plain table-level grant, or a filter with no column restriction).
+    /// The whole table (a plain table-level grant, or a filter whose column clause is
+    /// `ColumnWildcard` with no exclusions).
     All,
     /// An explicit allow-list of columns.
     Named(Vec<String>),
     /// All columns except the named ones (Lake Formation `ColumnWildcard.ExcludedColumnNames`).
     AllExcept(Vec<String>),
+}
+
+/// Row visibility under a data-cell filter — explicit variants only; missing SDK fields are rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowRestriction {
+    /// Every row passes (`AllRowsWildcard`).
+    AllRows,
+    /// A PartiQL-ish boolean expression over the table's columns.
+    Expression(String),
 }
 
 /// One principal's effective permissions on one table, as returned by `ListPermissions`.
@@ -51,16 +61,15 @@ pub struct PrincipalTablePermissions {
 }
 
 /// A Lake Formation data-cell filter on a table: the row predicate + column selection scan
-/// planning applies when the filter is in effect for the querying principal.
+/// planning applies when the filter is granted to the querying principal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableDataFilter {
     /// The filter's name (unique per table).
     pub name: String,
     /// The columns visible under this filter.
     pub columns: ColumnSelection,
-    /// The row-filter predicate (a PartiQL-ish boolean expression over the table's columns), or
-    /// `None` when the filter grants all rows (`AllRowsWildcard`).
-    pub row_filter: Option<String>,
+    /// Row visibility under this filter.
+    pub row_filter: RowRestriction,
 }
 
 /// A Lake Formation authorization client for one data catalog (the account-local catalog by
@@ -102,16 +111,16 @@ impl LakeFormationAuth {
         Self { client, catalog_id }
     }
 
-    /// The effective permissions on `{database}.{table}` as one entry per principal grant.
+    /// Permissions on `{database}.{table}` as one entry per principal grant.
     ///
-    /// `principal` (an IAM ARN) narrows the query server-side to that principal; `None` lists
-    /// every principal's grants on the table. An empty result means Lake Formation has no grants
-    /// for the table (or none for that principal) — i.e. access is denied, since Lake Formation
-    /// is deny-by-default. (Note: `ListPermissions` filtered by `Resource.Table` returns
-    /// grants made *directly* on this table/its columns, including any `IAM_ALLOWED_PRINCIPALS`
-    /// legacy-hybrid-mode grant, which Lake Formation surfaces as an ordinary principal entry —
-    /// but it does not merge in a broader database- or catalog-level grant that would also cover
-    /// this table. Resolving that hierarchy, plus LF-Tag-based policies, is out of scope here.)
+    /// When `principal` is `Some`, AWS `ListPermissions` returns **effective** permissions for
+    /// that principal on the table resource (including hierarchy where the service merges them).
+    /// When `principal` is `None`, the call lists every principal's grants **directly on this
+    /// table resource** — table/column grants only, not database/catalog/LF-Tag inheritance.
+    ///
+    /// An empty result means Lake Formation has no matching grants — i.e. access is denied, since
+    /// Lake Formation is deny-by-default. Callers must treat `Ok(vec![])` as no access, never as
+    /// permission to skip authorization.
     pub async fn effective_permissions(
         &self,
         database: &str,
@@ -120,14 +129,14 @@ impl LakeFormationAuth {
     ) -> Result<Vec<PrincipalTablePermissions>> {
         let mut grants = Vec::new();
         let mut next_token: Option<String> = None;
-        // `ListPermissions` paginates via NextToken; the SDK does not auto-paginate, so loop.
+        let mut prev_token: Option<String> = None;
         loop {
             let mut req = self
                 .client
                 .list_permissions()
                 .resource_type(DataLakeResourceType::Table)
                 .resource(self.table_resource_filter(database, table))
-                .set_next_token(next_token);
+                .set_next_token(next_token.clone());
             if let Some(id) = &self.catalog_id {
                 req = req.catalog_id(id);
             }
@@ -142,48 +151,126 @@ impl LakeFormationAuth {
                 .send()
                 .await
                 .map_err(|e| sdk_failure("ListPermissions", &e))?;
-            grants.extend(
-                resp.principal_resource_permissions
-                    .unwrap_or_default()
-                    .iter()
-                    .map(map_principal_permissions),
-            );
-            match resp.next_token {
-                Some(token) => next_token = Some(token),
-                None => break,
+            for prp in resp
+                .principal_resource_permissions
+                .unwrap_or_default()
+                .iter()
+            {
+                grants.push(map_principal_permissions(prp)?);
             }
+            if !advance_pagination(&mut prev_token, resp.next_token)? {
+                break;
+            }
+            next_token = prev_token.clone();
         }
         Ok(grants)
     }
 
-    /// All data-cell filters defined on `{database}.{table}` (row filters + column masks scan
-    /// planning must apply for principals the filter is granted to).
+    /// Data-cell filters **granted** to `principal` on `{database}.{table}`.
+    ///
+    /// Resolves filter definitions (`ListDataCellsFilter`) intersected with the principal's
+    /// `DataCellsFilter` grants (`ListPermissions`). `Ok(vec![])` means no cell filters are
+    /// granted to this principal — not unrestricted table access; callers must still check
+    /// [`Self::effective_permissions`] for table/column grants.
     pub async fn data_cells_filters(
+        &self,
+        database: &str,
+        table: &str,
+        principal: &str,
+    ) -> Result<Vec<TableDataFilter>> {
+        let granted_names = self
+            .list_granted_data_cells_filter_names(database, table, principal)
+            .await?;
+        if granted_names.is_empty() {
+            return Ok(vec![]);
+        }
+        let definitions = self
+            .list_data_cell_filter_definitions(database, table)
+            .await?;
+        Ok(definitions
+            .into_iter()
+            .filter(|f| granted_names.contains(&f.name))
+            .collect())
+    }
+
+    /// `ListPermissions` for `principal`, retaining `DataCellsFilter` resource names on
+    /// `{database}.{table}` that include `SELECT`.
+    async fn list_granted_data_cells_filter_names(
+        &self,
+        database: &str,
+        table: &str,
+        principal: &str,
+    ) -> Result<HashSet<String>> {
+        let mut names = HashSet::new();
+        let mut next_token: Option<String> = None;
+        let mut prev_token: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_permissions()
+                .principal(
+                    DataLakePrincipal::builder()
+                        .data_lake_principal_identifier(principal)
+                        .build(),
+                )
+                .set_next_token(next_token.clone());
+            if let Some(id) = &self.catalog_id {
+                req = req.catalog_id(id);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| sdk_failure("ListPermissions", &e))?;
+            for prp in resp
+                .principal_resource_permissions
+                .unwrap_or_default()
+                .iter()
+            {
+                if let Some(name) = data_cells_filter_grant_name(prp, database, table) {
+                    let has_select = prp
+                        .permissions
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|p| p.as_str() == "SELECT");
+                    if has_select {
+                        names.insert(name);
+                    }
+                }
+            }
+            if !advance_pagination(&mut prev_token, resp.next_token)? {
+                break;
+            }
+            next_token = prev_token.clone();
+        }
+        Ok(names)
+    }
+
+    /// All data-cell filter **definitions** on `{database}.{table}` (`ListDataCellsFilter`).
+    async fn list_data_cell_filter_definitions(
         &self,
         database: &str,
         table: &str,
     ) -> Result<Vec<TableDataFilter>> {
         let mut filters = Vec::new();
         let mut next_token: Option<String> = None;
+        let mut prev_token: Option<String> = None;
         loop {
             let resp = self
                 .client
                 .list_data_cells_filter()
                 .table(self.table_resource(database, table))
-                .set_next_token(next_token)
+                .set_next_token(next_token.clone())
                 .send()
                 .await
                 .map_err(|e| sdk_failure("ListDataCellsFilter", &e))?;
-            filters.extend(
-                resp.data_cells_filters
-                    .unwrap_or_default()
-                    .iter()
-                    .map(map_data_cells_filter),
-            );
-            match resp.next_token {
-                Some(token) => next_token = Some(token),
-                None => break,
+            for f in resp.data_cells_filters.unwrap_or_default().iter() {
+                filters.push(map_data_cells_filter(f)?);
             }
+            if !advance_pagination(&mut prev_token, resp.next_token)? {
+                break;
+            }
+            next_token = prev_token.clone();
         }
         Ok(filters)
     }
@@ -206,36 +293,105 @@ impl LakeFormationAuth {
     }
 }
 
-/// Map one `ListPermissions` entry to [`PrincipalTablePermissions`]. Pure (SDK struct in, own
-/// struct out) so it's unit-testable without an endpoint.
-fn map_principal_permissions(prp: &PrincipalResourcePermissions) -> PrincipalTablePermissions {
-    let columns = match prp
+/// Advance a manual pagination loop. Returns `true` when another page should be fetched.
+///
+/// Empty or repeating `NextToken` values are treated as errors so callers never silently accept
+/// partial results from a stuck pagination loop.
+fn advance_pagination(prev_token: &mut Option<String>, next_token: Option<String>) -> Result<bool> {
+    match next_token {
+        None => Ok(false),
+        Some(token) if token.is_empty() => Err(Error::Io(
+            "aws lakeformation pagination: empty NextToken".to_string(),
+        )),
+        Some(token) if prev_token.as_deref() == Some(token.as_str()) => Err(Error::Io(
+            "aws lakeformation pagination: repeating NextToken".to_string(),
+        )),
+        Some(token) => {
+            *prev_token = Some(token);
+            Ok(true)
+        }
+    }
+}
+
+/// Extract a granted data-cell filter name when `prp` is a `DataCellsFilter` grant on
+/// `{database}.{table}`.
+fn data_cells_filter_grant_name(
+    prp: &PrincipalResourcePermissions,
+    database: &str,
+    table: &str,
+) -> Option<String> {
+    let dcf = prp
         .resource
         .as_ref()
-        .and_then(|r| r.table_with_columns.as_ref())
-    {
-        // A column-level grant: either an explicit column list or a wildcard with exclusions.
-        Some(twc) => match &twc.column_wildcard {
+        .and_then(|r| r.data_cells_filter.as_ref())?;
+    if dcf.database_name.as_deref() != Some(database) {
+        return None;
+    }
+    if dcf.table_name.as_deref() != Some(table) {
+        return None;
+    }
+    dcf.name.clone()
+}
+
+/// Map one `ListPermissions` entry to [`PrincipalTablePermissions`]. Pure (SDK struct in, own
+/// struct out) so it's unit-testable without an endpoint.
+fn map_principal_permissions(
+    prp: &PrincipalResourcePermissions,
+) -> Result<PrincipalTablePermissions> {
+    let principal = prp
+        .principal
+        .as_ref()
+        .and_then(|p| p.data_lake_principal_identifier.clone())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            Error::Io("aws lakeformation ListPermissions: grant missing principal".to_string())
+        })?;
+
+    let permissions: Vec<String> = prp
+        .permissions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| p.as_str().to_string())
+        .collect();
+    if permissions.is_empty() {
+        return Err(Error::Io(
+            "aws lakeformation ListPermissions: grant has empty permissions".to_string(),
+        ));
+    }
+
+    let resource = prp.resource.as_ref().ok_or_else(|| {
+        Error::Io("aws lakeformation ListPermissions: grant missing resource".to_string())
+    })?;
+
+    let columns = if let Some(twc) = resource.table_with_columns.as_ref() {
+        match &twc.column_wildcard {
             Some(cw) => {
                 ColumnSelection::AllExcept(cw.excluded_column_names.clone().unwrap_or_default())
             }
-            None => ColumnSelection::Named(twc.column_names.clone().unwrap_or_default()),
-        },
-        None => ColumnSelection::All,
+            None => {
+                let names = twc.column_names.clone().unwrap_or_default();
+                if names.is_empty() {
+                    return Err(Error::Io(
+                        "aws lakeformation ListPermissions: column grant missing ColumnNames"
+                            .to_string(),
+                    ));
+                }
+                ColumnSelection::Named(names)
+            }
+        }
+    } else if resource.table.is_some() {
+        ColumnSelection::All
+    } else {
+        return Err(Error::Io(
+            "aws lakeformation ListPermissions: grant resource is not Table or TableWithColumns"
+                .to_string(),
+        ));
     };
-    PrincipalTablePermissions {
-        principal: prp
-            .principal
-            .as_ref()
-            .and_then(|p| p.data_lake_principal_identifier.clone())
-            .unwrap_or_default(),
-        permissions: prp
-            .permissions
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|p| p.as_str().to_string())
-            .collect(),
+
+    Ok(PrincipalTablePermissions {
+        principal,
+        permissions,
         grantable: prp
             .permissions_with_grant_option
             .as_deref()
@@ -244,38 +400,56 @@ fn map_principal_permissions(prp: &PrincipalResourcePermissions) -> PrincipalTab
             .map(|p| p.as_str().to_string())
             .collect(),
         columns,
-    }
+    })
 }
 
 /// Map a Lake Formation [`DataCellsFilter`] to [`TableDataFilter`]. Pure so it's unit-testable
-/// without an endpoint.
-fn map_data_cells_filter(f: &DataCellsFilter) -> TableDataFilter {
+/// without an endpoint. Missing row/column security fields fail closed (error), never widen to
+/// unrestricted access.
+fn map_data_cells_filter(f: &DataCellsFilter) -> Result<TableDataFilter> {
+    let filter_name = if f.name.is_empty() {
+        "<unnamed>"
+    } else {
+        f.name.as_str()
+    };
+
+    let row_filter = match f.row_filter.as_ref() {
+        Some(rf) if rf.filter_expression.is_some() => {
+            RowRestriction::Expression(rf.filter_expression.clone().unwrap())
+        }
+        Some(rf) if rf.all_rows_wildcard.is_some() => RowRestriction::AllRows,
+        Some(_) | None => {
+            return Err(Error::Io(format!(
+                "aws lakeformation data filter `{filter_name}`: missing RowFilter"
+            )));
+        }
+    };
+
     let columns = match (&f.column_wildcard, &f.column_names) {
         (Some(cw), _) => {
             ColumnSelection::AllExcept(cw.excluded_column_names.clone().unwrap_or_default())
         }
-        (None, Some(names)) => ColumnSelection::Named(names.clone()),
-        (None, None) => ColumnSelection::All,
+        (None, Some(names)) if !names.is_empty() => ColumnSelection::Named(names.clone()),
+        (None, Some(_)) | (None, None) => {
+            return Err(Error::Io(format!(
+                "aws lakeformation data filter `{filter_name}`: missing column selection"
+            )));
+        }
     };
-    // `AllRowsWildcard` (no `FilterExpression`) means the filter passes every row through.
-    let row_filter = f
-        .row_filter
-        .as_ref()
-        .and_then(|rf| rf.filter_expression.clone());
-    TableDataFilter {
+
+    Ok(TableDataFilter {
         name: f.name.clone(),
         columns,
         row_filter,
-    }
+    })
 }
 
 /// Classify a failed Lake Formation API call from its error code + message.
 ///
-/// `EntityNotFoundException` (unknown database/table/filter) is an expected "doesn't exist"
-/// signal, mapped to [`Error::Plan`] — the same convention the Glue catalog uses, so the catalog
-/// bridge treats it as "not found" rather than a hard error. Everything else (notably
-/// `AccessDeniedException`) maps to [`Error::Io`], with the service code kept in the message —
-/// operators grep for `AccessDeniedException` & friends.
+/// All service failures map to [`Error::Io`], including `EntityNotFoundException`. Authorization
+/// resolution must never surface a soft "not found" that callers could treat as "skip Lake
+/// Formation enforcement". Operators grep for `AccessDeniedException` and similar codes in the
+/// message text.
 ///
 /// Pure (code + message in, [`Error`] out) so the mapping is unit-testable without constructing
 /// an SDK error.
@@ -284,11 +458,7 @@ fn classify_lakeformation_failure(action: &str, code: Option<&str>, message: &st
         Some(code) => format!("{code}: {message}"),
         None => message.to_string(),
     };
-    if code == Some("EntityNotFoundException") {
-        Error::Plan(format!("aws lakeformation {action}: {detail}"))
-    } else {
-        Error::Io(format!("aws lakeformation {action}: {detail}"))
-    }
+    Error::Io(format!("aws lakeformation {action}: {detail}"))
 }
 
 /// Map a failed SDK call to [`classify_lakeformation_failure`] via the error's service code +
@@ -330,7 +500,8 @@ fn resolve_region(
 mod tests {
     use super::*;
     use aws_sdk_lakeformation::types::{
-        AllRowsWildcard, ColumnWildcard, Permission, RowFilter, TableWithColumnsResource,
+        AllRowsWildcard, ColumnWildcard, DataCellsFilterResource, Permission, RowFilter,
+        TableWithColumnsResource,
     };
 
     // ---------------------------------------------------------------------
@@ -355,6 +526,18 @@ mod tests {
             .build()
     }
 
+    fn data_cells_filter_resource(db: &str, table: &str, name: &str) -> Resource {
+        Resource::builder()
+            .data_cells_filter(
+                DataCellsFilterResource::builder()
+                    .database_name(db)
+                    .table_name(table)
+                    .name(name)
+                    .build(),
+            )
+            .build()
+    }
+
     #[test]
     fn maps_table_level_grant_to_all_columns() {
         let prp = PrincipalResourcePermissions::builder()
@@ -364,7 +547,7 @@ mod tests {
             .permissions(Permission::Describe)
             .permissions_with_grant_option(Permission::Select)
             .build();
-        let mapped = map_principal_permissions(&prp);
+        let mapped = map_principal_permissions(&prp).expect("table grant");
         assert_eq!(mapped.principal, "arn:aws:iam::123456789012:role/analyst");
         assert_eq!(mapped.permissions, vec!["SELECT", "DESCRIBE"]);
         assert_eq!(mapped.grantable, vec!["SELECT"]);
@@ -385,7 +568,7 @@ mod tests {
             .resource(Resource::builder().table_with_columns(twc).build())
             .permissions(Permission::Select)
             .build();
-        let mapped = map_principal_permissions(&prp);
+        let mapped = map_principal_permissions(&prp).expect("column grant");
         assert_eq!(
             mapped.columns,
             ColumnSelection::Named(vec!["id".to_string(), "amount".to_string()])
@@ -410,11 +593,52 @@ mod tests {
             .resource(Resource::builder().table_with_columns(twc).build())
             .permissions(Permission::Select)
             .build();
-        let mapped = map_principal_permissions(&prp);
+        let mapped = map_principal_permissions(&prp).expect("wildcard grant");
         assert_eq!(
             mapped.columns,
             ColumnSelection::AllExcept(vec!["ssn".to_string()])
         );
+    }
+
+    #[test]
+    fn grant_missing_principal_fails_closed() {
+        let prp = PrincipalResourcePermissions::builder()
+            .resource(table_resource("db1", "orders"))
+            .permissions(Permission::Select)
+            .build();
+        let err = map_principal_permissions(&prp).expect_err("missing principal");
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn grant_empty_permissions_fails_closed() {
+        let prp = PrincipalResourcePermissions::builder()
+            .principal(principal("arn:aws:iam::123456789012:role/analyst"))
+            .resource(table_resource("db1", "orders"))
+            .build();
+        let err = map_principal_permissions(&prp).expect_err("empty permissions");
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn grant_without_table_resource_fails_closed() {
+        let prp = PrincipalResourcePermissions::builder()
+            .principal(principal("arn:aws:iam::123456789012:role/analyst"))
+            .resource(
+                Resource::builder()
+                    .data_cells_filter(
+                        DataCellsFilterResource::builder()
+                            .database_name("db1")
+                            .table_name("orders")
+                            .name("f1")
+                            .build(),
+                    )
+                    .build(),
+            )
+            .permissions(Permission::Select)
+            .build();
+        let err = map_principal_permissions(&prp).expect_err("non-table resource");
+        assert!(matches!(err, Error::Io(_)));
     }
 
     #[test]
@@ -433,9 +657,12 @@ mod tests {
             .column_names("amount")
             .build()
             .expect("data cells filter");
-        let mapped = map_data_cells_filter(&f);
+        let mapped = map_data_cells_filter(&f).expect("valid filter");
         assert_eq!(mapped.name, "region_us");
-        assert_eq!(mapped.row_filter.as_deref(), Some("region = 'us'"));
+        assert_eq!(
+            mapped.row_filter,
+            RowRestriction::Expression("region = 'us'".to_string())
+        );
         assert_eq!(
             mapped.columns,
             ColumnSelection::Named(vec!["id".to_string(), "amount".to_string()])
@@ -443,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn all_rows_wildcard_maps_to_no_row_filter() {
+    fn all_rows_wildcard_maps_explicitly() {
         let f = DataCellsFilter::builder()
             .table_catalog_id("123456789012")
             .database_name("db1")
@@ -461,8 +688,8 @@ mod tests {
             )
             .build()
             .expect("data cells filter");
-        let mapped = map_data_cells_filter(&f);
-        assert_eq!(mapped.row_filter, None);
+        let mapped = map_data_cells_filter(&f).expect("valid filter");
+        assert_eq!(mapped.row_filter, RowRestriction::AllRows);
         assert_eq!(
             mapped.columns,
             ColumnSelection::AllExcept(vec!["ssn".to_string()])
@@ -470,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_without_column_spec_covers_all_columns() {
+    fn filter_missing_column_selection_fails_closed() {
         let f = DataCellsFilter::builder()
             .table_catalog_id("123456789012")
             .database_name("db1")
@@ -483,19 +710,33 @@ mod tests {
             )
             .build()
             .expect("data cells filter");
-        let mapped = map_data_cells_filter(&f);
-        assert_eq!(mapped.columns, ColumnSelection::All);
+        let err = map_data_cells_filter(&f).expect_err("missing columns");
+        assert!(matches!(err, Error::Io(_)));
     }
 
     #[test]
-    fn entity_not_found_classifies_as_not_found() {
+    fn filter_missing_row_filter_fails_closed() {
+        let f = DataCellsFilter::builder()
+            .table_catalog_id("123456789012")
+            .database_name("db1")
+            .table_name("orders")
+            .name("broken")
+            .column_names("id")
+            .build()
+            .expect("data cells filter");
+        let err = map_data_cells_filter(&f).expect_err("missing row filter");
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn entity_not_found_classifies_as_io_error() {
         match classify_lakeformation_failure(
             "ListPermissions",
             Some("EntityNotFoundException"),
             "Entity Not Found",
         ) {
-            Error::Plan(msg) => assert!(msg.contains("Entity Not Found")),
-            other => panic!("expected Error::Plan, got {other:?}"),
+            Error::Io(msg) => assert!(msg.contains("EntityNotFoundException")),
+            other => panic!("expected Error::Io, got {other:?}"),
         }
     }
 
@@ -513,11 +754,37 @@ mod tests {
 
     #[test]
     fn generic_failure_classifies_as_io_error() {
-        // Transport/connector failures carry no service error code.
         match classify_lakeformation_failure("ListDataCellsFilter", None, "connection closed") {
             Error::Io(msg) => assert!(msg.contains("connection closed")),
             other => panic!("expected Error::Io, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_next_token_fails_closed() {
+        let mut prev = None;
+        let err = advance_pagination(&mut prev, Some(String::new())).expect_err("empty token");
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn repeating_next_token_fails_closed() {
+        let mut prev = Some("stuck".to_string());
+        let err = advance_pagination(&mut prev, Some("stuck".to_string())).expect_err("repeat");
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn data_cells_filter_grant_name_matches_table() {
+        let prp = PrincipalResourcePermissions::builder()
+            .resource(data_cells_filter_resource("db1", "orders", "region_us"))
+            .permissions(Permission::Select)
+            .build();
+        assert_eq!(
+            data_cells_filter_grant_name(&prp, "db1", "orders").as_deref(),
+            Some("region_us")
+        );
+        assert!(data_cells_filter_grant_name(&prp, "other", "orders").is_none());
     }
 
     #[test]
@@ -554,16 +821,15 @@ mod tests {
         BehaviorVersion, Credentials, Region, SharedCredentialsProvider,
     };
 
-    // Page 1 carries a `NextToken`; page 2 only answers when the follow-up request threads the
-    // token through, so the two-page assertions double as proof the manual pagination loop works.
     const PERMISSIONS_PAGE1_JSON: &str = r#"{"PrincipalResourcePermissions":[{"Principal":{"DataLakePrincipalIdentifier":"arn:aws:iam::123456789012:role/analyst"},"Resource":{"Table":{"DatabaseName":"db1","Name":"orders"}},"Permissions":["SELECT","DESCRIBE"],"PermissionsWithGrantOption":["SELECT"]}],"NextToken":"p2"}"#;
     const PERMISSIONS_PAGE2_JSON: &str = r#"{"PrincipalResourcePermissions":[{"Principal":{"DataLakePrincipalIdentifier":"arn:aws:iam::123456789012:role/scientist"},"Resource":{"TableWithColumns":{"DatabaseName":"db1","Name":"orders","ColumnNames":["id","amount"]}},"Permissions":["SELECT"]}]}"#;
+    const FILTER_GRANTS_JSON: &str = r#"{"PrincipalResourcePermissions":[{"Principal":{"DataLakePrincipalIdentifier":"arn:aws:iam::123456789012:role/analyst"},"Resource":{"DataCellsFilter":{"TableCatalogId":"123456789012","DatabaseName":"db1","TableName":"orders","Name":"region_us"}},"Permissions":["SELECT"]},{"Principal":{"DataLakePrincipalIdentifier":"arn:aws:iam::123456789012:role/analyst"},"Resource":{"DataCellsFilter":{"DatabaseName":"db1","TableName":"orders","Name":"hide_pii"}},"Permissions":["SELECT"]}]}"#;
     const DATA_FILTERS_JSON: &str = r#"{"DataCellsFilters":[{"TableCatalogId":"123456789012","DatabaseName":"db1","TableName":"orders","Name":"region_us","RowFilter":{"FilterExpression":"region = 'us'"},"ColumnNames":["id","amount"]},{"DatabaseName":"db1","TableName":"orders","Name":"hide_pii","RowFilter":{"AllRowsWildcard":{}},"ColumnWildcard":{"ExcludedColumnNames":["ssn"]}}]}"#;
-    // Lake Formation's deny-by-default response for a principal with no grants at all: an empty
-    // list, not an error — `effective_permissions` must surface this as `Ok(vec![])`.
     const EMPTY_PERMISSIONS_JSON: &str = r#"{"PrincipalResourcePermissions":[]}"#;
     const ACCESS_DENIED_JSON: &str =
         r#"{"__type":"AccessDeniedException","message":"User is not authorized"}"#;
+    const INTERNAL_ERROR_BODY: &str =
+        r#"{"__type":"InternalServerError","message":"stub page 2 failure"}"#;
 
     /// Bind a stub Lake Formation endpoint on a loopback ephemeral port; each accepted connection
     /// reads one request and answers from the `x-amz-target` / body. Returns the port; the server
@@ -582,7 +848,6 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0_u8; 8192];
-                    // Read the full request: headers first, then exactly Content-Length bytes.
                     let header_end = loop {
                         let n = sock.read(&mut chunk).await.expect("read");
                         if n == 0 {
@@ -612,13 +877,22 @@ mod tests {
                     }
                     let request = String::from_utf8_lossy(&buf).to_string();
                     let page2 = request.contains(r#""NextToken":"p2""#);
+                    let table_permissions = request.contains("ListPermissions")
+                        && (request.contains("\"Table\"") || request.contains("ResourceType"));
+                    let filter_grants = request.contains("ListPermissions")
+                        && request.contains("DataLakePrincipalIdentifier")
+                        && !table_permissions;
                     let (status, body) = if request.contains("denied") {
                         ("400 Bad Request", ACCESS_DENIED_JSON)
                     } else if request.contains("ListDataCellsFilter") {
                         ("200 OK", DATA_FILTERS_JSON)
                     } else if request.contains("ListPermissions") {
-                        if request.contains("nobody") {
+                        if request.contains("nobody") || request.contains("no_filters") {
                             ("200 OK", EMPTY_PERMISSIONS_JSON)
+                        } else if request.contains("page2_fail") && page2 {
+                            ("500 Internal Server Error", INTERNAL_ERROR_BODY)
+                        } else if filter_grants {
+                            ("200 OK", FILTER_GRANTS_JSON)
                         } else if page2 {
                             ("200 OK", PERMISSIONS_PAGE2_JSON)
                         } else {
@@ -661,8 +935,6 @@ mod tests {
         let port = spawn_lakeformation_stub().await;
         let auth = stub_client(port);
 
-        // ListPermissions → one entry per principal grant across BOTH pages: a table-level
-        // grant (page 1) and a column-level grant (page 2, only reachable via NextToken).
         let grants = auth
             .effective_permissions("db1", "orders", None)
             .await
@@ -680,27 +952,27 @@ mod tests {
             ColumnSelection::Named(vec!["id".to_string(), "amount".to_string()])
         );
 
-        // ListDataCellsFilter → both filters on the table: a row filter with named columns and
-        // an all-rows column mask with exclusions.
         let filters = auth
-            .data_cells_filters("db1", "orders")
+            .data_cells_filters("db1", "orders", "arn:aws:iam::123456789012:role/analyst")
             .await
             .expect("data filters");
         assert_eq!(filters.len(), 2);
         assert_eq!(filters[0].name, "region_us");
-        assert_eq!(filters[0].row_filter.as_deref(), Some("region = 'us'"));
+        assert_eq!(
+            filters[0].row_filter,
+            RowRestriction::Expression("region = 'us'".to_string())
+        );
         assert_eq!(
             filters[0].columns,
             ColumnSelection::Named(vec!["id".to_string(), "amount".to_string()])
         );
         assert_eq!(filters[1].name, "hide_pii");
-        assert_eq!(filters[1].row_filter, None);
+        assert_eq!(filters[1].row_filter, RowRestriction::AllRows);
         assert_eq!(
             filters[1].columns,
             ColumnSelection::AllExcept(vec!["ssn".to_string()])
         );
 
-        // A 400 AccessDeniedException maps to `Error::Io` (a real error), never "not found".
         let err = auth
             .effective_permissions(
                 "db1",
@@ -711,9 +983,6 @@ mod tests {
             .expect_err("denied principal");
         assert!(matches!(err, Error::Io(_)), "{err:?}");
 
-        // No grants at all for a principal is a successful empty result, not an error — Lake
-        // Formation is deny-by-default, so the caller must treat `Ok(vec![])` as "no access"
-        // rather than special-casing an error path.
         let grants = auth
             .effective_permissions(
                 "db1",
@@ -723,5 +992,36 @@ mod tests {
             .await
             .expect("empty permissions is not an error");
         assert!(grants.is_empty(), "{grants:?}");
+    }
+
+    #[tokio::test]
+    async fn principal_with_no_filter_grants_returns_empty_not_all_definitions() {
+        let port = spawn_lakeformation_stub().await;
+        let auth = stub_client(port);
+
+        let filters = auth
+            .data_cells_filters("db1", "orders", "arn:aws:iam::123456789012:role/no_filters")
+            .await
+            .expect("no filter grants");
+        assert!(
+            filters.is_empty(),
+            "must not return unbound filter definitions: {filters:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_failure_on_second_page_returns_err_not_partial_ok() {
+        let port = spawn_lakeformation_stub().await;
+        let auth = stub_client(port);
+
+        let err = auth
+            .effective_permissions(
+                "db1",
+                "orders",
+                Some("arn:aws:iam::123456789012:role/page2_fail"),
+            )
+            .await
+            .expect_err("page 2 failure must abort");
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
     }
 }
