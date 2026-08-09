@@ -187,7 +187,7 @@ impl CorpusReport {
         format!(
             r#"<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>Oxidant ↔ Apache Spark — SQL parity</title>
+<title>Oxidant SQL parity</title>
 <style>
 body{{font:15px/1.5 system-ui,sans-serif;max-width:760px;margin:3rem auto;padding:0 1rem;color:#111}}
 h1{{font-size:1.5rem}} .big{{font-size:2.6rem;font-weight:700;margin:.2rem 0}}
@@ -197,10 +197,10 @@ h1{{font-size:1.5rem}} .big{{font-size:2.6rem;font-weight:700;margin:.2rem 0}}
 td,th{{border-bottom:1px solid #eee;padding:.35rem .5rem;text-align:left}} .num{{text-align:right;font-variant-numeric:tabular-nums}}
 code{{background:#f4f4f4;padding:.1rem .3rem;border-radius:4px}}
 </style></head><body>
-<h1>Oxidant ↔ Apache Spark — SQL parity</h1>
-<p class=sub>Measured by replaying Apache Spark {ver}'s own golden SQL tests
-(<code>sql-tests/{{inputs,results}}</code>, {blocks} queries across {files} files) through Oxidant
-and diffing against Spark's committed <code>.sql.out</code> outputs.</p>
+<h1>Oxidant SQL parity</h1>
+<p class=sub>Measured by replaying the {ver} SQL golden corpus
+(<code>inputs/</code> + <code>results/</code>, {blocks} queries across {files} files) through Oxidant
+and diffing against its recorded <code>.sql.out</code> outputs.</p>
 <div class=cards>
 <div class=card><div class=sub>Semantic parity</div><div class=big>{sem:.1}%</div>
 <div class=sub>right answer / right rejection — {semn}/{blocks}</div></div>
@@ -242,11 +242,8 @@ semantic also credits benign column-name divergence and "both engines reject thi
     /// Human triage report.
     pub fn to_markdown(&self) -> String {
         let mut s = String::new();
-        s.push_str("# Oxidant ↔ Apache Spark — SQL parity scoreboard\n\n");
-        s.push_str(&format!(
-            "Corpus: Spark {} golden SQL tests\n\n",
-            self.spark_version
-        ));
+        s.push_str("# Oxidant SQL parity scoreboard\n\n");
+        s.push_str(&format!("Corpus tag: {}\n\n", self.spark_version));
         s.push_str(&format!(
             "- **Strict parity** (byte-for-byte): **{:.1}%**  ({}/{} queries)\n",
             self.strict_pct(),

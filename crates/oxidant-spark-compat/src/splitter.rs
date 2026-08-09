@@ -15,23 +15,40 @@ use std::path::Path;
 pub enum SkipReason {
     /// Uses `udf(...)` wrappers that require a registered Python/Scala/Java UDF.
     RequiresUdf,
+    /// The input file carries an explicit `--SKIP <reason>` directive (used by the
+    /// authored Databricks corpus for statements that need machinery oxidant does not
+    /// have yet, e.g. Delta storage or a Lake Formation catalog).
+    Marked(String),
 }
 
 impl SkipReason {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             SkipReason::RequiresUdf => "requires-udf-registration",
+            SkipReason::Marked(reason) => reason,
         }
     }
 }
 
 /// Decide whether an input file is runnable by the golden-replay path today.
 pub fn skip_reason(input_sql: &str) -> Option<SkipReason> {
-    if input_sql.lines().any(|l| {
+    for l in input_sql.lines() {
         let t = l.trim_start();
-        !t.starts_with("--") && l.contains("udf(")
-    }) {
-        return Some(SkipReason::RequiresUdf);
+        if let Some(reason) = t
+            .strip_prefix("--SKIP")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            let reason = reason.trim();
+            let reason = if reason.is_empty() {
+                "marked-skip".to_string()
+            } else {
+                reason.to_string()
+            };
+            return Some(SkipReason::Marked(reason));
+        }
+        if !t.starts_with("--") && l.contains("udf(") {
+            return Some(SkipReason::RequiresUdf);
+        }
     }
     None
 }
@@ -157,5 +174,35 @@ mod tests {
     #[test]
     fn udf_in_comment_does_not_trip() {
         assert_eq!(skip_reason("-- mentions udf( in prose\nSELECT 1;"), None);
+    }
+
+    #[test]
+    fn skip_directive_records_reason() {
+        let sql = "--SKIP requires-delta-storage\nCOPY INTO t FROM 's3://b/p';";
+        assert_eq!(
+            skip_reason(sql),
+            Some(SkipReason::Marked("requires-delta-storage".into()))
+        );
+    }
+
+    #[test]
+    fn bare_skip_directive_has_default_reason() {
+        assert_eq!(
+            skip_reason("--SKIP\nSELECT 1;"),
+            Some(SkipReason::Marked("marked-skip".into()))
+        );
+    }
+
+    #[test]
+    fn skip_prefix_without_a_separator_is_not_a_directive() {
+        assert_eq!(skip_reason("--SKIPPING is only prose\nSELECT 1;"), None);
+    }
+
+    #[test]
+    fn skip_directive_in_prose_does_not_trip() {
+        assert_eq!(
+            skip_reason("-- this is not a --SKIP directive\nSELECT 1;"),
+            None
+        );
     }
 }

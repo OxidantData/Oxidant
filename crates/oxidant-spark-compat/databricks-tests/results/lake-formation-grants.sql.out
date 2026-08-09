@@ -1,0 +1,2 @@
+-- Skipped via `--SKIP requires-lake-formation-catalog` — see inputs/lake-formation-grants.sql.
+-- Lake Formation GRANT/REVOKE enforcement needs the LF-aware Glue catalog (epic KAN-88).
