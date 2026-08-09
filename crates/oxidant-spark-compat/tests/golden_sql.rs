@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use oxidant_spark_compat::runner;
+use oxidant_spark_compat::Corpus;
 
 /// The vendored corpus must be present and substantial — guards an accidental wipe.
 #[test]
@@ -22,11 +23,26 @@ fn corpus_is_vendored() {
     );
 }
 
+/// The authored Databricks corpus is independently selectable and its explicit skips remain
+/// visible in the report instead of being silently omitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn databricks_corpus_reports_explicit_skips() {
+    let report = runner::run_corpus(Corpus::Databricks, Some("copy-into")).await;
+    assert_eq!(report.files_total, 1);
+    assert_eq!(report.files_skipped, 1);
+    assert_eq!(report.blocks_total, 0);
+    assert_eq!(
+        report.files[0].skipped.as_deref(),
+        Some("requires-delta-storage")
+    );
+    assert!(report.to_markdown().contains("requires-delta-storage"));
+}
+
 /// A representative file replays end-to-end: blocks parse, run, and classify into buckets.
 /// `group-by.sql` is a good canary — temp-view setup + aggregates + analysis errors.
 #[tokio::test(flavor = "multi_thread")]
 async fn group_by_file_replays() {
-    let report = runner::run_file("group-by.sql.out").await;
+    let report = runner::run_file(Corpus::Spark, "group-by.sql.out").await;
     assert!(report.skipped.is_none(), "group-by should not be skipped");
     assert!(
         report.total > 10,
@@ -59,7 +75,7 @@ async fn full_corpus_does_not_regress() {
         serde_json::from_str(&std::fs::read_to_string(&baseline_path).expect("baseline.json"))
             .expect("parse baseline.json");
 
-    let report = runner::run_corpus(None).await;
+    let report = runner::run_corpus(Corpus::Spark, None).await;
     // Corpus size is stable for a pinned Spark tag; a big swing means the corpus changed.
     assert_eq!(
         report.blocks_total, baseline.blocks_total,

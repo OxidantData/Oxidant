@@ -1,13 +1,20 @@
 //! `oxidant-parity` — run Spark's golden SQL corpus through oxidant and emit the parity scoreboard.
 //!
 //! Usage:
-//!   oxidant-parity golden [--filter <substr>] [--out-dir <dir>]
+//!   oxidant-parity golden [--corpus spark|databricks] [--filter <substr>] [--out-dir <dir>]
 //!     Replay the corpus, write `<out-dir>/parity.json` + `parity.md`, print the headline.
-//!   oxidant-parity file <name.sql.out>
+//!   oxidant-parity ratchet [--corpus spark|databricks] [--baseline <path>] [--out-dir <dir>]
+//!     Replay the corpus and fail if parity dropped below the committed baseline.
+//!   oxidant-parity file [--corpus spark|databricks] <name.sql.out>
 //!     Replay a single golden file and print its per-block verdicts (debugging).
+//!
+//! `--corpus` defaults to `spark` (the vendored Apache Spark `sql-tests` corpus); the
+//! `databricks` corpus is the authored Databricks SQL corpus under `databricks-tests/`,
+//! scored through the same pipeline with its own baseline/artifact defaults.
 
 use oxidant_spark_compat::report::{bucket_key, CorpusReport};
 use oxidant_spark_compat::runner;
+use oxidant_spark_compat::Corpus;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -25,20 +32,32 @@ async fn main() {
     }
 }
 
+/// Extract the `--corpus` flag (default: the vendored Spark corpus).
+fn corpus(args: &[String]) -> Corpus {
+    match flag(args, "--corpus") {
+        None => Corpus::Spark,
+        Some(name) => Corpus::from_name(&name)
+            .unwrap_or_else(|| panic!("unknown --corpus {name:?} (expected spark|databricks)")),
+    }
+}
+
 async fn golden(args: &[String]) {
+    let corpus = corpus(args);
     let filter = flag(args, "--filter");
-    let out_dir = flag(args, "--out-dir").unwrap_or_else(|| "parity".to_string());
+    let out_dir = flag(args, "--out-dir").unwrap_or_else(|| corpus.default_out_dir().to_string());
 
     eprintln!(
-        "Replaying Spark golden corpus through oxidant (filter: {:?}) …",
+        "Replaying {} golden corpus through oxidant (filter: {:?}) …",
+        corpus.name(),
         filter
     );
-    let report = runner::run_corpus(filter.as_deref()).await;
+    let report = runner::run_corpus(corpus, filter.as_deref()).await;
 
     write_artifacts(&out_dir, &report);
     println!(
-        "\n=== Oxidant ↔ Spark SQL parity ({}) ===",
-        report.spark_version
+        "\n=== Oxidant ↔ Spark SQL parity ({}, {} corpus) ===",
+        report.spark_version,
+        corpus.name()
     );
     println!(
         "strict   : {:>6.1}%  ({}/{} queries)",
@@ -63,8 +82,10 @@ async fn golden(args: &[String]) {
 /// CI gate: oxidant can only get *more* Spark-compatible, never less. Improvements should be locked
 /// in by re-baselining (`oxidant-parity golden` → commit `parity/baseline.json`).
 async fn ratchet(args: &[String]) {
-    let baseline_path = flag(args, "--baseline").unwrap_or_else(|| "parity/baseline.json".into());
-    let out_dir = flag(args, "--out-dir").unwrap_or_else(|| "parity".to_string());
+    let corpus = corpus(args);
+    let baseline_path =
+        flag(args, "--baseline").unwrap_or_else(|| corpus.default_baseline().into());
+    let out_dir = flag(args, "--out-dir").unwrap_or_else(|| corpus.default_out_dir().into());
 
     #[derive(serde::Deserialize)]
     struct Baseline {
@@ -78,11 +99,12 @@ async fn ratchet(args: &[String]) {
     )
     .expect("parse baseline json");
 
-    let report = runner::run_corpus(None).await;
+    let report = runner::run_corpus(corpus, None).await;
     write_artifacts(&out_dir, &report);
 
     println!(
-        "parity: strict {} (base {}), semantic {} (base {}), blocks {} (base {})",
+        "parity ({} corpus): strict {} (base {}), semantic {} (base {}), blocks {} (base {})",
+        corpus.name(),
         report.strict_pass,
         base.strict_pass,
         report.semantic_pass,
@@ -94,7 +116,7 @@ async fn ratchet(args: &[String]) {
     let mut failed = false;
     if report.blocks_total != base.blocks_total {
         eprintln!(
-            "✗ corpus size changed ({} vs baseline {}) — re-baseline if the Spark tag moved",
+            "✗ corpus size changed ({} vs baseline {}) — re-baseline if the corpus tag moved",
             report.blocks_total, base.blocks_total
         );
         failed = true;
@@ -140,11 +162,26 @@ fn write_artifacts(out_dir: &str, report: &CorpusReport) {
 }
 
 async fn file(args: &[String]) {
-    let Some(name) = args.first() else {
-        eprintln!("usage: oxidant-parity file <name.sql.out>");
+    let corpus = corpus(args);
+    // First non-flag argument, skipping `--flag value` pairs.
+    let mut name: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--corpus" {
+            i += 2;
+            continue;
+        }
+        if !args[i].starts_with("--") {
+            name = Some(&args[i]);
+            break;
+        }
+        i += 1;
+    }
+    let Some(name) = name else {
+        eprintln!("usage: oxidant-parity file [--corpus spark|databricks] <name.sql.out>");
         std::process::exit(2);
     };
-    let report = runner::run_file(name).await;
+    let report = runner::run_file(corpus, name).await;
     if let Some(reason) = &report.skipped {
         println!("{name}: SKIPPED ({reason})");
         return;

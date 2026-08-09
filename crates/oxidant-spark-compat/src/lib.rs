@@ -45,6 +45,91 @@ pub mod splitter;
 /// Absolute path to the vendored Spark corpus root (`spark-tests/`).
 pub const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/spark-tests");
 
+/// Absolute path to the authored Databricks corpus root (`databricks-tests/`).
+pub const DATABRICKS_CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/databricks-tests");
+
+/// Which golden corpus a run replays. Both corpora share the same
+/// `inputs/*.sql` + `results/*.sql.out` layout and the same report schema, so the
+/// ratchet / scoreboard pipeline treats them identically; they differ only in root
+/// directory and the default artifact locations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Corpus {
+    /// The vendored Apache Spark `sql-tests` corpus (`spark-tests/`). The default; its
+    /// ratchet output schema and artifact paths are unchanged.
+    Spark,
+    /// The authored Databricks SQL corpus (`databricks-tests/`), drawn from the
+    /// Databricks SQL language manual categories (USING, TBLPROPERTIES, LATERAL VIEW,
+    /// PIVOT, QUALIFY, COPY INTO, MERGE INTO, Delta Lake SQL, Lake Formation, …).
+    Databricks,
+}
+
+impl Corpus {
+    /// All corpora, in stable order (Spark first).
+    pub const ALL: [Corpus; 2] = [Corpus::Spark, Corpus::Databricks];
+
+    /// Filesystem root of the corpus (`inputs/`, `results/`, `VERSION` live under it).
+    pub fn root(self) -> std::path::PathBuf {
+        match self {
+            Corpus::Spark => std::path::PathBuf::from(CORPUS_DIR),
+            Corpus::Databricks => std::path::PathBuf::from(DATABRICKS_CORPUS_DIR),
+        }
+    }
+
+    /// CLI / display name (`--corpus <name>`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Corpus::Spark => "spark",
+            Corpus::Databricks => "databricks",
+        }
+    }
+
+    /// Parse a `--corpus` flag value.
+    pub fn from_name(s: &str) -> Option<Corpus> {
+        match s {
+            "spark" => Some(Corpus::Spark),
+            "databricks" => Some(Corpus::Databricks),
+            _ => None,
+        }
+    }
+
+    /// Default `--out-dir` for `golden` / `ratchet` artifacts.
+    pub fn default_out_dir(self) -> &'static str {
+        match self {
+            Corpus::Spark => "parity",
+            Corpus::Databricks => "parity/databricks",
+        }
+    }
+
+    /// Default `--baseline` path for `ratchet`.
+    pub fn default_baseline(self) -> &'static str {
+        match self {
+            Corpus::Spark => "parity/baseline.json",
+            Corpus::Databricks => "parity/baseline-databricks.json",
+        }
+    }
+}
+
+#[cfg(test)]
+mod corpus_tests {
+    use super::*;
+
+    #[test]
+    fn corpus_names_select_the_expected_roots_and_artifacts() {
+        assert_eq!(Corpus::from_name("spark"), Some(Corpus::Spark));
+        assert_eq!(Corpus::from_name("databricks"), Some(Corpus::Databricks));
+        assert_eq!(Corpus::from_name("unknown"), None);
+
+        assert!(Corpus::Spark.root().ends_with("spark-tests"));
+        assert!(Corpus::Databricks.root().ends_with("databricks-tests"));
+        assert_eq!(Corpus::Spark.default_out_dir(), "parity");
+        assert_eq!(Corpus::Databricks.default_out_dir(), "parity/databricks");
+        assert_eq!(
+            Corpus::Databricks.default_baseline(),
+            "parity/baseline-databricks.json"
+        );
+    }
+}
+
 /// One `-- !query` / `-- !query schema` / `-- !query output` unit from a golden `.sql.out`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoldenBlock {
