@@ -744,6 +744,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-lakeformation"
+version = "1.98.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dafd0d7936af92f7c62a1922e9867876471d2df97572032daf64c10fd1b4f911"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.2",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sso"
 version = "1.93.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4217,6 +4241,16 @@ version = "0.1.2"
 dependencies = [
  "async-trait",
  "oxidant-catalog",
+ "tokio",
+]
+
+[[package]]
+name = "oxidant-catalog-lakeformation"
+version = "0.1.2"
+dependencies = [
+ "aws-config",
+ "aws-sdk-lakeformation",
+ "oxidant-common",
  "tokio",
 ]
 

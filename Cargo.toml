@@ -30,6 +30,7 @@ oxidant-catalog    = { path = "crates/oxidant-catalog" }
 oxidant-catalog-hive = { path = "crates/oxidant-catalog-hive" }
 oxidant-catalog-glue = { path = "crates/oxidant-catalog-glue" }
 oxidant-catalog-rest = { path = "crates/oxidant-catalog-rest" }
+oxidant-catalog-lakeformation = { path = "crates/oxidant-catalog-lakeformation" }
 oxidant-optimizer  = { path = "crates/oxidant-optimizer" }
 oxidant-physical   = { path = "crates/oxidant-physical" }
 oxidant-datasource = { path = "crates/oxidant-datasource" }

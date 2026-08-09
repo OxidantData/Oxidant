@@ -1,0 +1,20 @@
+[package]
+name = "oxidant-catalog-lakeformation"
+description = "AWS Lake Formation authorization client for Oxidant, built on the official AWS SDK for Rust (in-process `aws-sdk-lakeformation`; credentials via the standard AWS chain — env, shared config, instance role / IRSA). Resolves effective table permissions and data-cell filters; consumed by the Glue catalog and scan planning."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-common = { workspace = true }
+# Official AWS SDK for the Lake Formation authorization ops (ListPermissions/ListDataCellsFilter).
+# Pinned (not "1") to versions whose MSRV matches this workspace's toolchain — the same pin
+# discipline as oxidant-catalog-glue's aws-config/aws-sdk-glue and oxidant-loom's aws-sdk-sts.
+aws-config = "=1.8.13"
+aws-sdk-lakeformation = "=1.98.1"
+
+[dev-dependencies]
+# Stub-endpoint integration test: a raw TcpListener mini-HTTP server stands in for Lake Formation.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
