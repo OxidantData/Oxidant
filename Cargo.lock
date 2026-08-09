@@ -4203,8 +4203,12 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-glue",
+ "futures",
+ "object_store",
  "oxidant-catalog",
+ "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]
