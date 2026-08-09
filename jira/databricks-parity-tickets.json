@@ -1,0 +1,172 @@
+{
+  "project": "YOUR_PROJECT_KEY",
+  "epic": {
+    "summary": "Oxidant SQL parity with Databricks SQL on AWS Glue + Lake Formation",
+    "description": "Systematically validate Oxidant against the Databricks SQL language manual, close parser/dialect/function gaps, extend Glue catalog DDL, and add Lake Formation fine-grained access control. All AWS interactions use AWS SDK for Rust in-process; AWS CLI is not allowed.",
+    "issue_type": "Epic",
+    "components": ["catalogs", "sql", "databricks", "lakeformation"],
+    "labels": ["databricks", "parity", "glue", "lakeformation"]
+  },
+  "stories": [
+    {
+      "summary": "Build Databricks SQL coverage matrix",
+      "issue_type": "Story",
+      "components": ["docs", "parity"],
+      "labels": ["databricks", "coverage", "docs"],
+      "description": "Map every section of the Databricks SQL language manual to Oxidant capabilities and record baseline pass/gap/NA counts.",
+      "acceptance_criteria": "Matrix in docs/databricks-coverage.md; each manual section mapped to pass/gap/NA with baseline counts."
+    },
+    {
+      "summary": "Add Databricks-specific SQL corpus to parity harness",
+      "issue_type": "Story",
+      "components": ["oxidant-spark-compat"],
+      "labels": ["databricks", "tests", "parity"],
+      "description": "Create a new databricks-tests/ corpus (or flag Databricks-relevant Spark tests) covering USING, TBLPROPERTIES, PARTITIONED BY, CLUSTER BY, DISTRIBUTE BY, SORT BY, LATERAL VIEW, PIVOT, UNPIVOT, MATCH_RECOGNIZE, QUALIFY, COPY INTO, MERGE INTO, Delta Lake SQL, and Lake Formation GRANT/REVOKE patterns.",
+      "acceptance_criteria": "New databricks-tests/ inputs + goldens; harness runs them; skipped files recorded with reason."
+    },
+    {
+      "summary": "Implement staged oxidant-sql dialect pipeline",
+      "issue_type": "Story",
+      "components": ["oxidant-sql"],
+      "labels": ["databricks", "dialect", "parser"],
+      "description": "Stand up the staged oxidant-sql::dialect::lower pipeline: string prefilter registry, AST intercept registry, and output naming pass.",
+      "acceptance_criteria": "Registry shell + migrate strip_temporary_view + AST intercept + output naming pass."
+    },
+    {
+      "summary": "Register Wave A function aliases",
+      "issue_type": "Story",
+      "components": ["oxidant-loom", "functions"],
+      "labels": ["databricks", "functions", "aliases"],
+      "description": "Register trivial Spark-to-DataFusion function aliases that are semantically identical.",
+      "acceptance_criteria": "starts_with/ends_with, var_samp, length, approx_distinct, bool_or/bool_and, signum, pow, ucase/lcase/char aliases pass their golden blocks."
+    },
+    {
+      "summary": "Implement high-value scalar UDF backlog",
+      "issue_type": "Story",
+      "components": ["oxidant-functions"],
+      "labels": ["databricks", "functions", "udf"],
+      "description": "Implement the most-used missing scalar functions from the function-missing parity bucket.",
+      "acceptance_criteria": "split, mask, to_char/to_varchar/to_number, format_string, typeof, elt, bit_count, size/array_size, sort_array, map_contains_key, parse_url, url_encode/decode pass their golden blocks."
+    },
+    {
+      "summary": "Implement CREATE TABLE … USING <format> for Glue/local catalog",
+      "issue_type": "Story",
+      "components": ["oxidant-sql", "catalog"],
+      "labels": ["databricks", "ddl", "glue"],
+      "description": "Implement real CREATE TABLE … USING <format> support lowered to the catalog-backed create path, not a lossy rewrite.",
+      "acceptance_criteria": "CREATE TABLE … USING with LOCATION/PARTITIONED BY/CLUSTER BY/TBLPROPERTIES; CREATE TABLE LIKE; Hive STORED AS; INSERT OVERWRITE (table + DIRECTORY); LOAD DATA; golden blocks pass."
+    },
+    {
+      "summary": "Implement USE CATALOG / USE DATABASE / USE SCHEMA",
+      "issue_type": "Story",
+      "components": ["oxidant-sql"],
+      "labels": ["databricks", "ddl", "namespace"],
+      "description": "Implement USE statements via AST intercept so current catalog/namespace is set correctly.",
+      "acceptance_criteria": "AST intercept sets current catalog/namespace; handles quoting, comments, semicolons; rejects invalid catalogs as Spark does."
+    },
+    {
+      "summary": "Implement LIKE ANY / LIKE ALL",
+      "issue_type": "Story",
+      "components": ["oxidant-sql"],
+      "labels": ["databricks", "sql", "expressions"],
+      "description": "Implement Spark LIKE ANY / LIKE ALL expression syntax.",
+      "acceptance_criteria": "Rewritten to OR/AND chain at AST level; golden blocks pass."
+    },
+    {
+      "summary": "Implement PIVOT / UNPIVOT",
+      "issue_type": "Story",
+      "components": ["oxidant-sql", "plan"],
+      "labels": ["databricks", "sql", "transform"],
+      "description": "Implement PIVOT and UNPIVOT relational operators.",
+      "acceptance_criteria": "Requires child-schema resolution; emits correct LogicalPlan; golden blocks pass."
+    },
+    {
+      "summary": "Implement SHOW / DESCRIBE metadata statements",
+      "issue_type": "Story",
+      "components": ["oxidant-sql", "catalog"],
+      "labels": ["databricks", "metadata", "sql"],
+      "description": "Implement SHOW DATABASES/TABLES/COLUMNS/TBLPROPERTIES and DESCRIBE TABLE/QUERY/CREATE TABLE against catalog metadata.",
+      "acceptance_criteria": "SHOW DATABASES IN glue, SHOW TABLES IN glue.db, DESCRIBE TABLE glue.db.t, SHOW CREATE TABLE return catalog metadata directly."
+    },
+    {
+      "summary": "Spark output-name reconciliation pass",
+      "issue_type": "Story",
+      "components": ["oxidant-sql"],
+      "labels": ["databricks", "schema", "naming"],
+      "description": "Implement a plan-level output-naming pass so DataFusion result headers match Spark's Expression.sql algorithm.",
+      "acceptance_criteria": "schema-only bucket reduced by matching Spark Expression.sql headers for common expressions."
+    },
+    {
+      "summary": "Extend Glue catalog DDL: ALTER/DROP/CREATE DATABASE/REPAIR",
+      "issue_type": "Story",
+      "components": ["oxidant-catalog-glue"],
+      "labels": ["glue", "ddl", "aws-sdk"],
+      "description": "Extend oxidant-catalog-glue to support full DDL lifecycle using aws-sdk-glue in-process.",
+      "acceptance_criteria": "ALTER TABLE, DROP TABLE/DATABASE with IF EXISTS/CASCADE, CREATE DATABASE/SCHEMA, CREATE CATALOG, ALTER VIEW, COMMENT ON, TRUNCATE TABLE, REFRESH, REPAIR TABLE/MSCK REPAIR TABLE, SHOW PARTITIONS work; no AWS CLI; integration tests with stub server."
+    },
+    {
+      "summary": "Glue column statistics via ANALYZE TABLE",
+      "issue_type": "Story",
+      "components": ["oxidant-catalog-glue"],
+      "labels": ["glue", "statistics", "aws-sdk"],
+      "description": "Implement ANALYZE TABLE … COMPUTE STATISTICS for Glue tables using aws-sdk-glue.",
+      "acceptance_criteria": "ANALYZE TABLE glue.db.t COMPUTE STATISTICS persists and reads column stats via Glue SDK."
+    },
+    {
+      "summary": "Add Lake Formation authorization crate",
+      "issue_type": "Story",
+      "components": ["oxidant-catalog-lakeformation"],
+      "labels": ["lakeformation", "aws-sdk", "auth"],
+      "description": "Create a new crate that resolves Lake Formation effective permissions per table using aws-sdk-lakeformation.",
+      "acceptance_criteria": "New crate using aws-sdk-lakeformation; resolves effective permissions per table; unit tests with stub server."
+    },
+    {
+      "summary": "Apply Lake Formation row filters and column masks to scans",
+      "issue_type": "Story",
+      "components": ["oxidant-loom", "plan"],
+      "labels": ["lakeformation", "security", "plan"],
+      "description": "Apply Lake Formation row filters and column masks by rewriting table scan plans in DataFusion.",
+      "acceptance_criteria": "Plan rewrite injects filters/masks from OXIDANT-DBR-014; honors AccessDenied; integration tests pass."
+    },
+    {
+      "summary": "Lake Formation cross-account resource links",
+      "issue_type": "Story",
+      "components": ["oxidant-catalog-lakeformation"],
+      "labels": ["lakeformation", "cross-account", "glue"],
+      "description": "Support Lake Formation cross-account shared catalogs via resource links and permissions.",
+      "acceptance_criteria": "GetResourceLinks, ListPermissions support; shared Glue tables resolve through resource links."
+    },
+    {
+      "summary": "Delta Lake SQL on Glue: CONVERT/VACUUM/OPTIMIZE/RESTORE",
+      "issue_type": "Story",
+      "components": ["oxidant-datasource", "delta"],
+      "labels": ["databricks", "delta", "glue"],
+      "description": "Implement Delta Lake maintenance statements for Glue-registered Delta tables.",
+      "acceptance_criteria": "CONVERT TO DELTA, DESCRIBE HISTORY, DESCRIBE DETAIL, OPTIMIZE, VACUUM, RESTORE, CREATE TABLE … CLONE, CREATE BLOOMFILTER INDEX, GENERATE symlink manifest, FSCK REPAIR TABLE work on Glue-registered tables; stubs + S3 integration tests."
+    },
+    {
+      "summary": "Delta MERGE/UPDATE/DELETE on Glue tables",
+      "issue_type": "Story",
+      "components": ["oxidant-datasource", "delta"],
+      "labels": ["databricks", "delta", "glue", "dml"],
+      "description": "Implement Delta DML for Glue-registered Delta tables.",
+      "acceptance_criteria": "MERGE INTO, UPDATE, DELETE FROM execute and update Glue table metadata as needed."
+    },
+    {
+      "summary": "Databricks parity ratchet CI job",
+      "issue_type": "Story",
+      "components": ["ci"],
+      "labels": ["databricks", "parity", "ci"],
+      "description": "Add a CI job that runs the Databricks parity corpus and fails on regression.",
+      "acceptance_criteria": "New GitHub Actions job runs Databricks corpus and fails on regression; baseline committed."
+    },
+    {
+      "summary": "Document Glue + Lake Formation SQL support",
+      "issue_type": "Story",
+      "components": ["docs"],
+      "labels": ["databricks", "docs", "glue", "lakeformation"],
+      "description": "Document supported Databricks SQL on Glue and Lake Formation.",
+      "acceptance_criteria": "Update catalogs-glue.md, add catalogs-lakeformation.md, add Databricks parity section to README."
+    }
+  ]
+}
