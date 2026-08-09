@@ -1,17 +1,21 @@
 name: release
 
-# One-click semver release: bumps Cargo.toml workspace version, commits, tags
-# (annotated), pushes, then explicitly dispatches the two release pipelines:
-# binaries.yml (GitHub Release: tarballs, curl installer, Homebrew formula,
-# .deb/.rpm) and oxidant-image.yml (GHCR manifest ghcr.io/oxidantdata/oxidant
-# :X.Y.Z, :X.Y, :X). Tag pushes are NOT relied upon: GITHUB_TOKEN pushes don't
-# cascade to other workflows, and tag-push triggers have proven unreliable in
-# this repo — workflow_dispatch via the API always lands.
+# Semver release: bumps Cargo.toml workspace version, commits, tags (annotated),
+# pushes, then explicitly dispatches the two release pipelines: binaries.yml
+# (GitHub Release: tarballs, curl installer, Homebrew formula, .deb/.rpm) and
+# oxidant-image.yml (GHCR manifest ghcr.io/oxidantdata/oxidant :X.Y.Z, :X.Y, :X).
+# Tag pushes are NOT relied upon: GITHUB_TOKEN pushes don't cascade to other
+# workflows, and tag-push triggers have proven unreliable in this repo —
+# workflow_dispatch via the API always lands.
 #
-# Usage: Actions → release → Run workflow → choose patch / minor / major
+# How to release:
+#   1. Label the PR `patch`, `minor`, or `major` before merging to main — the
+#      merge triggers this workflow automatically. If several labels are present,
+#      precedence is major > minor > patch.
+#   2. Or: Actions → release → Run workflow → choose patch / minor / major.
 #
-# The version bump commit carries [skip ci] so only the tag event (not the
-# branch push) fires the expensive image build.
+# Ordinary merges (no release label) do NOT release. The version bump commit
+# carries [skip ci] so only the dispatched tag builds run the expensive pipelines.
 
 on:
   workflow_dispatch:
@@ -21,6 +25,9 @@ on:
         required: true
         type: choice
         options: [patch, minor, major]
+  pull_request:
+    types: [closed]
+    branches: [main]
 
 permissions:
   contents: write
@@ -28,15 +35,23 @@ permissions:
   # without it the bumper's final step 403s ("Resource not accessible by
   # integration") after the tag is already pushed (bit v0.1.1's release run).
   actions: write
+  pull-requests: read
 
 jobs:
   release:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       (contains(github.event.pull_request.labels.*.name, 'patch') ||
+        contains(github.event.pull_request.labels.*.name, 'minor') ||
+        contains(github.event.pull_request.labels.*.name, 'major')))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           # GITHUB_TOKEN with contents:write can push to main on public repos.
           token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
           fetch-depth: 0
 
       - name: Configure git identity
@@ -44,12 +59,32 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+      - name: Resolve bump kind
+        id: bump
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "kind=${{ inputs.bump }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Label precedence when multiple are present: major > minor > patch.
+          labels='${{ toJson(github.event.pull_request.labels.*.name) }}'
+          if echo "$labels" | jq -e 'index("major")' >/dev/null; then
+            echo "kind=major" >> "$GITHUB_OUTPUT"
+          elif echo "$labels" | jq -e 'index("minor")' >/dev/null; then
+            echo "kind=minor" >> "$GITHUB_OUTPUT"
+          elif echo "$labels" | jq -e 'index("patch")' >/dev/null; then
+            echo "kind=patch" >> "$GITHUB_OUTPUT"
+          else
+            echo "merged PR has no patch/minor/major label" >&2
+            exit 1
+          fi
+
       - name: Bump workspace version
         id: ver
         run: |
           CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          case "${{ inputs.bump }}" in
+          case "${{ steps.bump.outputs.kind }}" in
             major) NEW="$((MAJOR+1)).0.0" ;;
             minor) NEW="${MAJOR}.$((MINOR+1)).0" ;;
             patch) NEW="${MAJOR}.${MINOR}.$((PATCH+1))" ;;
@@ -91,6 +126,7 @@ jobs:
             echo "|---|---|"
             echo "| Previous version | \`${{ steps.ver.outputs.old }}\` |"
             echo "| New version | \`${{ steps.ver.outputs.version }}\` |"
+            echo "| Bump | \`${{ steps.bump.outputs.kind }}\` |"
             echo "| Git tag | \`${{ steps.ver.outputs.tag }}\` |"
             echo ""
             echo "Dispatched **binaries** (GitHub Release: tarballs, curl installer,"
