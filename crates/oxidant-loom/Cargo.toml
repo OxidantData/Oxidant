@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 oxidant-common = { workspace = true }
 oxidant-plan = { workspace = true }
+# The Spark-SQL dialect layer: `normalize_spark_sql` runs its Stage-1 string-prefilter registry.
+oxidant-sql = { workspace = true }
 oxidant-physical = { workspace = true }
 oxidant-datasource = { workspace = true }
 oxidant-catalog = { workspace = true }

@@ -119,19 +119,6 @@ fn env_bool(key: &str) -> Option<bool> {
     }
 }
 
-/// Adapt Spark-dialect SQL that DataFusion's planner rejects verbatim but supports once a
-/// dialect-only keyword is dropped. The rewrite only touches the leading DDL keywords and leaves
-/// the statement body byte-for-byte intact.
-///
-/// Today it handles `CREATE [OR REPLACE] [GLOBAL] TEMPORARY VIEW … ` → `CREATE [OR REPLACE]
-/// VIEW … `. Spark temporary views are *session*-scoped; a DataFusion session-catalog view is
-/// too, so dropping `TEMPORARY`/`GLOBAL` preserves the semantics within a session while letting
-/// DataFusion register the view (its `create_view` rejects `temporary` and nothing else). This is
-/// the single biggest Spark-parity unlock — almost every Spark SQL test opens with
-/// `CREATE OR REPLACE TEMPORARY VIEW testData AS …`.
-///
-/// This is a stopgap living in the engine; it will migrate into the `oxidant-sql` Spark-dialect
-/// front end when that lands.
 /// Detect `COUNT(DISTINCT col1, col2, …)` — Spark rejects this; DataFusion panics.
 fn is_multi_arg_count_distinct(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
@@ -188,14 +175,25 @@ fn split_name_segments(name: &str) -> Vec<&str> {
     segments
 }
 
+/// Adapt Spark-dialect SQL that DataFusion's planner rejects verbatim but supports once a
+/// dialect-only keyword is dropped or a literal is re-encoded.
+///
+/// The first pass is the `oxidant-sql` Stage-1 string prefilter registry
+/// ([`oxidant_sql::dialect::spark_pipeline`]) — home of the `CREATE [OR REPLACE] [GLOBAL]
+/// TEMP[ORARY] VIEW …` → `CREATE [OR REPLACE] VIEW …` rewrite. New dialect fixes belong in that
+/// staged pipeline, not in the passes below: this function is the shrinking remainder of the
+/// engine-local prefilter, kept only for the rewrites that have not been migrated yet.
 pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
-    // Passes run in order: (1) the leading-keyword DDL rewrite, (2) Spark single-quoted
+    // Passes run in order: (1) the oxidant-sql Stage-1 prefilter registry, (2) Spark single-quoted
     // string-literal unescaping, (3) the typed-literal rewrite over the result, (4) strip ANSI
     // INTERVAL leading-precision qualifiers (`day (3)`) that DataFusion rejects. Unescaping runs
     // BEFORE the typed-literal pass for two reasons: the re-emitted literals use `''` quote-doubling
     // (which the typed-literal scanner understands) instead of Spark's `\'`, and a numeric token
     // freed by a mis-delimited `\'` can therefore never be mistaken for code and wrapped in a CAST.
-    let stripped = strip_temporary_view(query);
+    let stripped = match oxidant_sql::dialect::spark_pipeline().rewrite_str(query) {
+        std::borrow::Cow::Owned(rewritten) => Some(rewritten),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
     let base = stripped.as_deref().unwrap_or(query);
     let unescaped = unescape_spark_string_literals(base);
     let base2 = unescaped.as_deref().unwrap_or(base);
@@ -794,60 +792,6 @@ fn rewrite_spark_typed_literals(sql: &str) -> Option<String> {
     }
 
     changed.then_some(out)
-}
-
-/// Read the next whitespace-delimited token from `s` starting at `*cur`, returning its byte span
-/// and advancing `*cur` past it. `None` at end of input.
-fn next_token(s: &str, cur: &mut usize) -> Option<(usize, usize)> {
-    let b = s.as_bytes();
-    while *cur < b.len() && b[*cur].is_ascii_whitespace() {
-        *cur += 1;
-    }
-    let start = *cur;
-    while *cur < b.len() && !b[*cur].is_ascii_whitespace() {
-        *cur += 1;
-    }
-    (start < *cur).then_some((start, *cur))
-}
-
-/// If `query` begins with `CREATE [OR REPLACE] [GLOBAL] TEMPORARY VIEW`, return the same
-/// statement with `GLOBAL TEMPORARY` removed; otherwise `None` (leave the query untouched).
-fn strip_temporary_view(query: &str) -> Option<String> {
-    let lead = query.len() - query.trim_start().len();
-    let (ws, rest) = query.split_at(lead);
-    let eq = |span: (usize, usize), kw: &str| rest[span.0..span.1].eq_ignore_ascii_case(kw);
-
-    let mut cur = 0;
-    if !eq(next_token(rest, &mut cur)?, "create") {
-        return None;
-    }
-    let mut or_replace = false;
-    let mut tok = next_token(rest, &mut cur)?;
-    if eq(tok, "or") {
-        if !eq(next_token(rest, &mut cur)?, "replace") {
-            return None;
-        }
-        or_replace = true;
-        tok = next_token(rest, &mut cur)?;
-    }
-    if eq(tok, "global") {
-        tok = next_token(rest, &mut cur)?;
-    }
-    // Only rewrite when the temp keyword is present (otherwise DataFusion already copes). Spark
-    // accepts both `TEMPORARY` and the `TEMP` abbreviation.
-    if !eq(tok, "temporary") && !eq(tok, "temp") {
-        return None;
-    }
-    if !eq(next_token(rest, &mut cur)?, "view") {
-        return None;
-    }
-    // The statement body (view name onward) is preserved verbatim from just after `VIEW`.
-    let head = if or_replace {
-        "CREATE OR REPLACE VIEW"
-    } else {
-        "CREATE VIEW"
-    };
-    Some(format!("{ws}{head}{}", &rest[cur..]))
 }
 
 /// Parsed shape of a `CREATE [OR REPLACE] [GLOBAL] [TEMP[ORARY]] VIEW` statement, used to enforce
