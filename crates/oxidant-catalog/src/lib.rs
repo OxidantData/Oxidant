@@ -269,6 +269,10 @@ pub trait CatalogProvider: Send + Sync {
     /// rejects a change it cannot honor (e.g. an unrepresentable column type) with
     /// [`Error::Unsupported`] and must then leave the table untouched.
     ///
+    /// KAN-100 covers properties, comment, location, and `ADD COLUMNS` only — `RENAME COLUMN` /
+    /// `CHANGE COLUMN` are deferred until Loom wires those ALTER variants into the SPI (Glue
+    /// would require a full `StorageDescriptor` column-list rewrite for each rename/type change).
+    ///
     /// Default: `Unsupported`.
     async fn alter_table(
         &self,
@@ -311,6 +315,10 @@ pub trait CatalogProvider: Send + Sync {
 }
 
 /// One `ALTER TABLE` change for [`CatalogProvider::alter_table`].
+///
+/// KAN-100 intentionally omits `RENAME COLUMN` / `CHANGE COLUMN` variants: Glue's `UpdateTable`
+/// replaces the whole table definition and those Spark ALTER forms need column-level rename/type
+/// mutation that is not yet parsed into this SPI (see the trait doc on [`CatalogProvider::alter_table`]).
 #[derive(Debug, Clone)]
 pub enum TableChange {
     /// `SET TBLPROPERTIES ('k'='v', ...)` — upsert table properties.

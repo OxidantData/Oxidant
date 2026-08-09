@@ -13,7 +13,8 @@
 //! DDL coverage (KAN-100): `create_database` → `CreateDatabase`, `drop_database` →
 //! `DeleteDatabase` (CASCADE emulated by deleting the database's tables first — Glue has no
 //! cascade flag), `drop_table` → `DeleteTable`, `alter_table` → `GetTable` + `UpdateTable`
-//! (properties / comment / location / added columns), `list_partitions` → `GetPartitions`
+//! (properties / comment / location / added columns — `RENAME COLUMN` / `CHANGE COLUMN` deferred
+//! until Loom wires those ALTER forms into the SPI), `list_partitions` → `GetPartitions`
 //! (paginated), and `repair_table` (`MSCK REPAIR TABLE`): scan the table's storage location for
 //! Hive-style `key=value/` partition directories via `object_store` and `BatchCreatePartition`
 //! the ones Glue doesn't know yet.
@@ -33,6 +34,7 @@ use aws_sdk_glue::types::{
 use oxidant_catalog::arrow::datatypes::SchemaRef;
 use oxidant_catalog::hive_types::{
     arrow_type_to_hive, columns_to_schema, format_serde, schema_to_columns, validate_identifier,
+    validate_partition_value,
 };
 use oxidant_catalog::{CatalogProvider, Error, Result, TableChange, TableFormat, TableMetadata};
 
@@ -283,9 +285,16 @@ impl CatalogProvider for GlueCatalog {
         if cascade {
             // Glue's DeleteDatabase refuses a non-empty database and has no cascade flag —
             // emulate Spark/Hive `DROP DATABASE ... CASCADE` by deleting every table first.
-            for table in self.list_tables(&[database.to_string()]).await? {
-                self.drop_table(&[database.to_string()], &table, false)
-                    .await?;
+            match self.list_tables(&[database.to_string()]).await {
+                Ok(tables) => {
+                    for table in tables {
+                        self.drop_table(&[database.to_string()], &table, false)
+                            .await?;
+                    }
+                }
+                // Missing database + IF EXISTS → no-op (same as DeleteDatabase would be).
+                Err(Error::Plan(_)) if if_exists => return Ok(()),
+                Err(e) => return Err(e),
             }
         }
         match self.client.delete_database().name(database).send().await {
@@ -431,8 +440,11 @@ impl CatalogProvider for GlueCatalog {
                 .database_name(db)
                 .table_name(table);
             for values in chunk {
+                for (key, value) in part_keys.iter().zip(values.iter()) {
+                    validate_partition_value(key, value)?;
+                }
                 let mut part_sd = sd.clone();
-                part_sd.location = Some(partition_location(&location, &part_keys, values));
+                part_sd.location = Some(partition_location(&location, &part_keys, values)?);
                 req = req.partition_input_list(
                     PartitionInput::builder()
                         .set_values(Some(values.clone()))
@@ -440,9 +452,13 @@ impl CatalogProvider for GlueCatalog {
                         .build(),
                 );
             }
-            req.send()
-                .await
-                .map_err(|e| sdk_failure("BatchCreatePartition", &e))?;
+            match req.send().await {
+                Ok(_) => {}
+                // Idempotent repair: a retry after partial success may re-send partitions Glue
+                // already registered.
+                Err(e) if e.code() == Some("AlreadyExistsException") => {}
+                Err(e) => return Err(sdk_failure("BatchCreatePartition", &e)),
+            }
         }
         Ok(missing.len())
     }
@@ -692,13 +708,18 @@ fn apply_table_changes(input: &mut TableInput, changes: &[TableChange]) -> Resul
                 input.description = comment.clone().filter(|c| !c.is_empty());
             }
             TableChange::SetLocation(location) => {
+                let loc = if location.ends_with('/') {
+                    location.clone()
+                } else {
+                    format!("{location}/")
+                };
                 let sd = input.storage_descriptor.as_mut().ok_or_else(|| {
                     Error::Plan(format!(
                         "ALTER TABLE SET LOCATION on `{}`: table has no storage descriptor",
                         input.name
                     ))
                 })?;
-                sd.location = Some(location.clone());
+                sd.location = Some(loc);
             }
             TableChange::AddColumns(fields) => {
                 let sd = input.storage_descriptor.as_mut().ok_or_else(|| {
@@ -733,14 +754,21 @@ fn apply_table_changes(input: &mut TableInput, changes: &[TableChange]) -> Resul
 
 /// The storage location of one partition under a table root: `{location}/{k1=v1}/{k2=v2}/`
 /// (the Hive layout `MSCK REPAIR TABLE` discovers and `load_table` reads back).
-fn partition_location(table_location: &str, part_keys: &[String], values: &[String]) -> String {
+fn partition_location(
+    table_location: &str,
+    part_keys: &[String],
+    values: &[String],
+) -> Result<String> {
+    for (key, value) in part_keys.iter().zip(values.iter()) {
+        validate_partition_value(key, value)?;
+    }
     let dirs = part_keys
         .iter()
         .zip(values)
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("/");
-    format!("{}/{dirs}/", table_location.trim_end_matches('/'))
+    Ok(format!("{}/{dirs}/", table_location.trim_end_matches('/')))
 }
 
 /// Parse a directory path (relative to the table root, e.g. `["dt=2024-01", "hr=05"]`) into
@@ -755,7 +783,11 @@ fn partition_values_from_dirs(dirs: &[&str], part_keys: &[String]) -> Option<Vec
         .zip(part_keys)
         .map(|(dir, key)| {
             let (k, v) = dir.split_once('=')?;
-            (k == key).then(|| v.to_string())
+            if k != key {
+                return None;
+            }
+            validate_partition_value(key, v).ok()?;
+            Some(v.to_string())
         })
         .collect()
 }
@@ -1068,6 +1100,27 @@ mod tests {
     }
 
     #[test]
+    fn apply_table_changes_set_location_normalizes_trailing_slash() {
+        let mut input = TableInput::builder()
+            .name("t")
+            .storage_descriptor(StorageDescriptor::builder().location("s3://x/old/").build())
+            .build()
+            .expect("input");
+        apply_table_changes(
+            &mut input,
+            &[TableChange::SetLocation("s3://x/new".to_string())],
+        )
+        .expect("apply");
+        assert_eq!(
+            input
+                .storage_descriptor()
+                .and_then(|sd| sd.location())
+                .map(str::to_string),
+            Some("s3://x/new/".to_string())
+        );
+    }
+
+    #[test]
     fn apply_table_changes_add_columns_without_storage_descriptor_errors() {
         let mut input = bare_table_input("t");
         let err = apply_table_changes(
@@ -1177,6 +1230,11 @@ mod tests {
             partition_values_from_dirs(&["year=2024", "01"], &keys),
             None
         );
+        // Path traversal in a value must not be treated as a partition.
+        assert_eq!(
+            partition_values_from_dirs(&["dt=../../outside"], &["dt".to_string()]),
+            None
+        );
     }
 
     #[test]
@@ -1184,14 +1242,22 @@ mod tests {
         let keys = vec!["year".to_string(), "month".to_string()];
         let values = vec!["2024".to_string(), "01".to_string()];
         assert_eq!(
-            partition_location("s3://bucket/db/t", &keys, &values),
+            partition_location("s3://bucket/db/t", &keys, &values).expect("location"),
             "s3://bucket/db/t/year=2024/month=01/"
         );
         // A trailing slash on the table location is trimmed, not doubled.
         assert_eq!(
-            partition_location("s3://bucket/db/t/", &keys, &values),
+            partition_location("s3://bucket/db/t/", &keys, &values).expect("location"),
             "s3://bucket/db/t/year=2024/month=01/"
         );
+    }
+
+    #[test]
+    fn partition_location_rejects_path_traversal_in_values() {
+        let keys = vec!["dt".to_string()];
+        let err = partition_location("s3://bucket/db/t", &keys, &["../../outside".to_string()])
+            .unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
     }
 
     // `discover_partitions` scans a real storage location for Hive-style `key=value/`
@@ -1237,6 +1303,10 @@ mod tests {
         let wrong_key = dir.path().join("year=2024");
         std::fs::create_dir_all(&wrong_key).expect("mkdir");
         std::fs::write(wrong_key.join("f.parquet"), b"x").expect("write");
+        // Path traversal in a partition value must not be registered.
+        let traversal = dir.path().join("dt=../../outside");
+        std::fs::create_dir_all(&traversal).expect("mkdir");
+        std::fs::write(traversal.join("f.parquet"), b"x").expect("write");
 
         let location = url::Url::from_directory_path(dir.path())
             .expect("file url")
@@ -1684,7 +1754,12 @@ mod tests {
                     let page2 = request.contains(r#""NextToken":"p2""#);
                     // NB: match `GetTables` before any bare `Table`/`Database` check below.
                     let (status, body) = if request.contains("GetTables") {
-                        if page2 {
+                        if request.contains(r#""DatabaseName":"missing""#) {
+                            (
+                                "400 Bad Request",
+                                r#"{"__type":"EntityNotFoundException","message":"Database not found"}"#,
+                            )
+                        } else if page2 {
                             ("200 OK", TABLES_PAGE2_JSON)
                         } else {
                             ("200 OK", TABLES_PAGE1_JSON)
@@ -1823,6 +1898,16 @@ mod tests {
         // both via `DeleteTable` before `DeleteDatabase` ran (Glue itself refuses to delete a
         // non-empty database and has no cascade flag).
         assert_eq!(delete_table_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn drop_database_if_exists_cascade_on_missing_database_is_noop() {
+        let port = spawn_ddl_stub(Arc::new(AtomicUsize::new(0))).await;
+        let cat = stub_catalog(port);
+
+        cat.drop_database("missing", true, true)
+            .await
+            .expect("if exists cascade on a missing database is a no-op");
     }
 
     #[tokio::test]
@@ -2037,6 +2122,7 @@ mod tests {
         get_table_body: String,
         get_partitions_body: &'static str,
         batch_create_calls: Arc<Mutex<Vec<String>>>,
+        batch_create_error: Option<&'static str>,
     ) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2049,6 +2135,7 @@ mod tests {
                 };
                 let get_table_body = get_table_body.clone();
                 let batch_create_calls = batch_create_calls.clone();
+                let batch_create_error = batch_create_error;
                 tokio::spawn(async move {
                     let request = read_stub_request(&mut sock).await;
                     if request.is_empty() {
@@ -2061,7 +2148,11 @@ mod tests {
                             .lock()
                             .expect("lock")
                             .push(request.clone());
-                        write_stub_response(&mut sock, "200 OK", "{}").await;
+                        if let Some(body) = batch_create_error {
+                            write_stub_response(&mut sock, "400 Bad Request", body).await;
+                        } else {
+                            write_stub_response(&mut sock, "200 OK", "{}").await;
+                        }
                     } else if request.contains("GetPartitions") {
                         write_stub_response(&mut sock, "200 OK", get_partitions_body).await;
                     } else if request.contains("GetTable") {
@@ -2100,6 +2191,7 @@ mod tests {
             get_table_body,
             PARTITIONS_SINGLE_EXISTING_JSON,
             batch_create_calls.clone(),
+            None,
         )
         .await;
         let cat = stub_catalog(port);
@@ -2138,6 +2230,7 @@ mod tests {
             UNPARTITIONED_JSON.to_string(),
             "not valid partitions JSON",
             batch_create_calls.clone(),
+            None,
         )
         .await;
         let cat = stub_catalog(port);
@@ -2148,5 +2241,36 @@ mod tests {
             .expect("repair");
         assert_eq!(added, 0);
         assert!(batch_create_calls.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn repair_table_treats_batch_create_already_exists_as_idempotent_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let part = dir.path().join("dt=2024-01-02");
+        std::fs::create_dir_all(&part).expect("mkdir");
+        std::fs::write(part.join("part-0.parquet"), b"x").expect("write");
+        let location = url::Url::from_directory_path(dir.path())
+            .expect("file url")
+            .to_string();
+        let get_table_body = format!(
+            r#"{{"Table":{{"Name":"repair_t","StorageDescriptor":{{"Location":"{location}","Columns":[{{"Name":"id","Type":"bigint"}}]}},"PartitionKeys":[{{"Name":"dt","Type":"string"}}],"Parameters":{{"classification":"parquet"}}}}}}"#
+        );
+
+        let batch_create_calls = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_repair_stub(
+            get_table_body,
+            r#"{"Partitions":[]}"#,
+            batch_create_calls.clone(),
+            Some(r#"{"__type":"AlreadyExistsException","message":"Partition already exists"}"#),
+        )
+        .await;
+        let cat = stub_catalog(port);
+
+        let added = cat
+            .repair_table(&["db1".to_string()], "repair_t")
+            .await
+            .expect("repair");
+        assert_eq!(added, 1);
+        assert_eq!(batch_create_calls.lock().expect("lock").len(), 1);
     }
 }
