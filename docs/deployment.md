@@ -47,6 +47,19 @@ notebooks, dashboards, and scheduled jobs.
    path (or attach an external catalog), `GRANT SELECT` to a group, and run a query in the SQL
    editor.
 
+## Releasing the engine (binaries + container image)
+
+Ordinary merges to `main` do **not** publish GitHub Releases or
+`ghcr.io/oxidantdata/oxidant` images. To cut a semver release:
+
+1. **Label the PR** with exactly one intent before merge: `patch`, `minor`, or `major`.
+   When the PR merges, the `release` workflow bumps `Cargo.toml`, tags `vX.Y.Z`, and
+   dispatches the `binaries` and `oxidant-image` pipelines. If multiple release labels
+   are present, **major beats minor beats patch**.
+2. **Or run manually:** Actions → **release** → Run workflow → choose patch / minor / major.
+
+Merges without a release label land on `main` with no version bump and no publish step.
+
 ## Operations
 
 - **Clusters**: create/start/stop/resize from the UI; ephemeral *job clusters* are created per
