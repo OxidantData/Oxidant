@@ -1,0 +1,3 @@
+-- Skipped via `--SKIP requires-delta-storage` — see inputs/copy-into.sql.
+-- COPY INTO needs Delta Lake target tables and cloud object storage; unskip once the
+-- engine can execute Delta DDL/DML, then author goldens here.

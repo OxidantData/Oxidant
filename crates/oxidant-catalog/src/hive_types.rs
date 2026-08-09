@@ -212,6 +212,20 @@ pub fn validate_identifier(kind: &str, value: &str) -> Result<()> {
     }
 }
 
+/// Reject partition values that could escape the table root when interpolated into Hive-style
+/// `key=value/` path segments (e.g. `dt=../../outside/` under a `file://` warehouse).
+pub fn validate_partition_value(key: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::Plan(format!("partition value for `{key}` is empty")));
+    }
+    if value.contains('/') || value.contains('\\') || value.contains("..") {
+        return Err(Error::Plan(format!(
+            "partition value `{value}` for `{key}` is not valid (must not contain path separators or `..`)"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +429,14 @@ mod tests {
             let err = validate_identifier("table", bad).unwrap_err();
             assert!(matches!(err, Error::Plan(_)), "{bad}");
         }
+    }
+
+    #[test]
+    fn validate_partition_value_rejects_path_traversal_and_separators() {
+        for bad in ["", "..", "../../outside", "a/b", r"a\b"] {
+            let err = validate_partition_value("dt", bad).unwrap_err();
+            assert!(matches!(err, Error::Plan(_)), "{bad}");
+        }
+        assert!(validate_partition_value("dt", "2024-01-01").is_ok());
     }
 }

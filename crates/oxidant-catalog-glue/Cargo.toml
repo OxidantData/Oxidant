@@ -17,7 +17,15 @@ async-trait = "0.1"
 # aws-config/aws-sdk-sts.
 aws-config = "=1.8.13"
 aws-sdk-glue = "=1.137.0"
+# REPAIR TABLE scans the table's storage for `key=value/` partition directories — object_store
+# covers `s3://` via the standard AWS chain and `file://` for local tables (same pin as
+# oxidant-datasource); `url`/`futures` are its URL parsing and stream-draining companions.
+object_store = { version = "=0.13.2", features = ["aws"] }
+url = "2"
+futures = "0.3"
 
 [dev-dependencies]
 # Stub-endpoint integration test: a raw TcpListener mini-HTTP server stands in for Glue.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+# REPAIR TABLE test: a temp directory stands in for the table's storage root.
+tempfile = "3"

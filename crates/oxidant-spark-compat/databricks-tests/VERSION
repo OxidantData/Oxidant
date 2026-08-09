@@ -1,0 +1,4 @@
+Databricks SQL golden test corpus (authored, not vendored)
+Source: Databricks SQL language manual statement categories
+Jira: epic KAN-88 (Databricks SQL parity), story KAN-90
+Tag: databricks-sql-v1

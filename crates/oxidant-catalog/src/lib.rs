@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Field, SchemaRef};
 
 /// Shared Hive/Glue type-string → Arrow schema mapping (used by the Hive and Glue providers).
 pub mod hive_types;
@@ -220,6 +220,117 @@ pub trait CatalogProvider: Send + Sync {
             self.name()
         )))
     }
+
+    /// Create a database (`CREATE DATABASE` / `CREATE SCHEMA`). `comment`/`location` are the
+    /// optional Spark `COMMENT`/`LOCATION` clauses; with no explicit `location` the provider
+    /// picks the default (e.g. under its configured warehouse). `if_not_exists` makes an
+    /// already-existing database a no-op (`Ok`); without it the provider returns an error.
+    ///
+    /// Default: `Unsupported`.
+    async fn create_database(
+        &self,
+        database: &str,
+        if_not_exists: bool,
+        comment: Option<String>,
+        location: Option<String>,
+    ) -> Result<()> {
+        let _ = (database, if_not_exists, comment, location);
+        Err(Error::Unsupported(format!(
+            "catalog `{}` does not support creating databases",
+            self.name()
+        )))
+    }
+
+    /// Drop a database (`DROP DATABASE` / `DROP SCHEMA`). `if_exists` makes a missing database a
+    /// no-op (`Ok`). `cascade` drops the tables inside first; a provider whose backend has no
+    /// native cascade emulates it by deleting the tables one by one.
+    ///
+    /// Default: `Unsupported`.
+    async fn drop_database(&self, database: &str, if_exists: bool, cascade: bool) -> Result<()> {
+        let _ = (database, if_exists, cascade);
+        Err(Error::Unsupported(format!(
+            "catalog `{}` does not support dropping databases",
+            self.name()
+        )))
+    }
+
+    /// Drop one table (`DROP TABLE`). `if_exists` makes a missing table a no-op (`Ok`).
+    ///
+    /// Default: `Unsupported`.
+    async fn drop_table(&self, namespace: &[String], table: &str, if_exists: bool) -> Result<()> {
+        let _ = (namespace, table, if_exists);
+        Err(Error::Unsupported(format!(
+            "catalog `{}` does not support dropping tables",
+            self.name()
+        )))
+    }
+
+    /// Apply `ALTER TABLE` `changes` to one table and return its post-alter metadata. A provider
+    /// rejects a change it cannot honor (e.g. an unrepresentable column type) with
+    /// [`Error::Unsupported`] and must then leave the table untouched.
+    ///
+    /// KAN-100 covers properties, comment, location, and `ADD COLUMNS` only — `RENAME COLUMN` /
+    /// `CHANGE COLUMN` are deferred until Loom wires those ALTER variants into the SPI (Glue
+    /// would require a full `StorageDescriptor` column-list rewrite for each rename/type change).
+    ///
+    /// Default: `Unsupported`.
+    async fn alter_table(
+        &self,
+        namespace: &[String],
+        table: &str,
+        changes: Vec<TableChange>,
+    ) -> Result<TableMetadata> {
+        let _ = (namespace, table, changes);
+        Err(Error::Unsupported(format!(
+            "catalog `{}` does not support altering tables",
+            self.name()
+        )))
+    }
+
+    /// List a table's partitions (`SHOW PARTITIONS`): one entry per partition, its values in
+    /// partition-key order. Empty for an unpartitioned table or one with no registered
+    /// partitions.
+    ///
+    /// Default: `Unsupported`.
+    async fn list_partitions(&self, namespace: &[String], table: &str) -> Result<Vec<Vec<String>>> {
+        let _ = (namespace, table);
+        Err(Error::Unsupported(format!(
+            "catalog `{}` does not support listing partitions",
+            self.name()
+        )))
+    }
+
+    /// `REPAIR TABLE` / `MSCK REPAIR TABLE`: scan the table's storage location for Hive-style
+    /// `key=value/` partition directories and register the ones the metastore doesn't know yet.
+    /// Returns the number of partitions added (0 for an unpartitioned table).
+    ///
+    /// Default: `Unsupported`.
+    async fn repair_table(&self, namespace: &[String], table: &str) -> Result<usize> {
+        let _ = (namespace, table);
+        Err(Error::Unsupported(format!(
+            "catalog `{}` does not support repairing tables",
+            self.name()
+        )))
+    }
+}
+
+/// One `ALTER TABLE` change for [`CatalogProvider::alter_table`].
+///
+/// KAN-100 intentionally omits `RENAME COLUMN` / `CHANGE COLUMN` variants: Glue's `UpdateTable`
+/// replaces the whole table definition and those Spark ALTER forms need column-level rename/type
+/// mutation that is not yet parsed into this SPI (see the trait doc on [`CatalogProvider::alter_table`]).
+#[derive(Debug, Clone)]
+pub enum TableChange {
+    /// `SET TBLPROPERTIES ('k'='v', ...)` — upsert table properties.
+    SetProperties(HashMap<String, String>),
+    /// `UNSET TBLPROPERTIES ('k', ...)` — remove table properties (absent keys are ignored).
+    UnsetProperties(Vec<String>),
+    /// `COMMENT '...'` — set the table comment (`None` clears it).
+    SetComment(Option<String>),
+    /// `SET LOCATION '...'` — move the table's storage root.
+    SetLocation(String),
+    /// `ADD COLUMNS (...)` — append data columns (Arrow fields) to the table schema.
+    AddColumns(Vec<Field>),
 }
 
 /// The per-session set of named catalogs plus the current catalog / namespace pointers.

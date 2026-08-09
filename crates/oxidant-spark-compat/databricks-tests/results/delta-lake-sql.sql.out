@@ -1,0 +1,2 @@
+-- Skipped via `--SKIP requires-delta-storage` — see inputs/delta-lake-sql.sql.
+-- Delta Lake time travel and maintenance commands need Delta storage/metadata.

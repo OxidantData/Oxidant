@@ -48,6 +48,7 @@ Architecture: [architecture.md](architecture.md).
 | `deploy/packer/` | Hardened AL2023 AMI for EC2 driver/workers |
 | `deploy/cloudformation/` | CFN + ASG data plane |
 | `scripts/` | CI local, repo rename helper |
+| `jira/` | Jira import artifacts for the Databricks parity epic (CSV + JSON) |
 
 ## Docs map
 

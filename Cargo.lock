@@ -4227,8 +4227,12 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-glue",
+ "futures",
+ "object_store",
  "oxidant-catalog",
+ "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -4416,6 +4420,7 @@ dependencies = [
  "oxidant-gpu",
  "oxidant-physical",
  "oxidant-plan",
+ "oxidant-sql",
  "rayon",
  "regex",
  "serde",
@@ -4497,6 +4502,7 @@ dependencies = [
 name = "oxidant-sql"
 version = "0.1.2"
 dependencies = [
+ "datafusion",
  "oxidant-common",
  "oxidant-plan",
 ]

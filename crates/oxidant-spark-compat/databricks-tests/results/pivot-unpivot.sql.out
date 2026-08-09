@@ -1,0 +1,58 @@
+-- Authored golden (Databricks SQL language manual: PIVOT / UNPIVOT).
+-- !query
+CREATE OR REPLACE TEMPORARY VIEW quarterly (region STRING, quarter STRING, amount INT) AS VALUES
+  ('west', 'Q1', 100), ('west', 'Q2', 150), ('east', 'Q1', 200), ('east', 'Q2', 50)
+-- !query schema
+struct<>
+-- !query output
+
+
+-- !query
+CREATE OR REPLACE TEMPORARY VIEW wide (region STRING, q1 INT, q2 INT) AS VALUES
+  ('west', 100, 150), ('east', 200, 50), ('south', NULL, 10)
+-- !query schema
+struct<>
+-- !query output
+
+
+-- !query
+SELECT * FROM quarterly PIVOT (SUM(amount) FOR quarter IN ('Q1', 'Q2')) ORDER BY region
+-- !query schema
+struct<region:string,Q1:bigint,Q2:bigint>
+-- !query output
+east	200	50
+west	100	150
+
+
+-- !query
+SELECT * FROM quarterly PIVOT (SUM(amount) AS total FOR quarter IN ('Q1' AS q1, 'Q2' AS q2)) ORDER BY region
+-- !query schema
+struct<region:string,q1:bigint,q2:bigint>
+-- !query output
+east	200	50
+west	100	150
+
+
+-- !query
+SELECT region, quarter, amount FROM wide UNPIVOT (amount FOR quarter IN (q1, q2)) ORDER BY region, quarter
+-- !query schema
+struct<region:string,quarter:string,amount:int>
+-- !query output
+east	q1	200
+east	q2	50
+south	q2	10
+west	q1	100
+west	q2	150
+
+
+-- !query
+SELECT * FROM wide UNPIVOT INCLUDE NULLS (amount FOR quarter IN (q1, q2)) ORDER BY region, quarter
+-- !query schema
+struct<region:string,quarter:string,amount:int>
+-- !query output
+east	q1	200
+east	q2	50
+south	q1	NULL
+south	q2	10
+west	q1	100
+west	q2	150
