@@ -50,6 +50,12 @@ pub fn is_retryable(err: &Error) -> bool {
         || s.contains("connection")
         || s.contains("reset")
         || s.contains("broken pipe")
+        // tonic::transport::Error displays only as "transport error"; with or without the
+        // source chain from `status_detail`, that string must trigger channel eviction +
+        // retry (SF100 TPC-DS Q10: 16 failed tasks, zero retries).
+        || s.contains("transport")
+        || s.contains("goaway")
+        || s.contains("incomplete message")
         || s.contains("health check failed")
         || s.contains("shuffle")
         || s.contains("empty bucket")
@@ -359,6 +365,19 @@ mod tests {
         assert!(is_retryable(&Error::Io("connect worker: refused".into())));
         assert!(is_retryable(&Error::Execution(
             "do_get: Unavailable".into()
+        )));
+        // Opaque tonic transport string (no source chain) and the enriched form.
+        assert!(is_retryable(&Error::Execution(
+            "do_get: transport error".into()
+        )));
+        assert!(is_retryable(&Error::Execution(
+            "do_get: transport error: connection reset by peer".into()
+        )));
+        assert!(is_retryable(&Error::Execution(
+            "do_get: http2 error: stream error received: goaway".into()
+        )));
+        assert!(is_retryable(&Error::Execution(
+            "do_exchange: incomplete message".into()
         )));
         assert!(!is_retryable(&Error::Plan("bad sql".into())));
     }

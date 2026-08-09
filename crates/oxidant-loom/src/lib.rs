@@ -186,10 +186,12 @@ fn split_name_segments(name: &str) -> Vec<&str> {
 pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
     // Passes run in order: (1) the oxidant-sql Stage-1 prefilter registry, (2) Spark single-quoted
     // string-literal unescaping, (3) the typed-literal rewrite over the result, (4) strip ANSI
-    // INTERVAL leading-precision qualifiers (`day (3)`) that DataFusion rejects. Unescaping runs
-    // BEFORE the typed-literal pass for two reasons: the re-emitted literals use `''` quote-doubling
-    // (which the typed-literal scanner understands) instead of Spark's `\'`, and a numeric token
-    // freed by a mis-delimited `\'` can therefore never be mistaken for code and wrapped in a CAST.
+    // INTERVAL leading-precision qualifiers (`day (3)`) that DataFusion rejects, (5) qualify
+    // INTERVAL literals that carry their unit inside the string (`interval '30 days'`).
+    // Unescaping runs BEFORE the typed-literal pass for two reasons: the re-emitted literals use
+    // `''` quote-doubling (which the typed-literal scanner understands) instead of Spark's `\'`,
+    // and a numeric token freed by a mis-delimited `\'` can therefore never be mistaken for code
+    // and wrapped in a CAST.
     // Production runs Stage 1 only via `rewrite_str`. When Stage 2 intercepts register, replace
     // this with `spark_pipeline().lower(...)` (or wire `lower()` into `Engine::sql` / `plan_spark`).
     let stripped = match oxidant_sql::dialect::spark_pipeline().rewrite_str(query) {
@@ -202,15 +204,20 @@ pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
     let typed = rewrite_spark_typed_literals(base2);
     let base3 = typed.as_deref().unwrap_or(base2);
     let interval = strip_interval_leading_precision(base3);
-    match interval {
-        Some(i) => std::borrow::Cow::Owned(i),
-        None => match typed {
-            Some(t) => std::borrow::Cow::Owned(t),
-            None => match unescaped {
-                Some(u) => std::borrow::Cow::Owned(u),
-                None => match stripped {
-                    Some(s) => std::borrow::Cow::Owned(s),
-                    None => std::borrow::Cow::Borrowed(query),
+    let base4 = interval.as_deref().unwrap_or(base3);
+    let qualified = qualify_interval_units(base4);
+    match qualified {
+        Some(q) => std::borrow::Cow::Owned(q),
+        None => match interval {
+            Some(i) => std::borrow::Cow::Owned(i),
+            None => match typed {
+                Some(t) => std::borrow::Cow::Owned(t),
+                None => match unescaped {
+                    Some(u) => std::borrow::Cow::Owned(u),
+                    None => match stripped {
+                        Some(s) => std::borrow::Cow::Owned(s),
+                        None => std::borrow::Cow::Borrowed(query),
+                    },
                 },
             },
         },
@@ -363,6 +370,256 @@ fn interval_unit_len(b: &[u8]) -> Option<usize> {
     const UNITS: &[&[u8]] = &[
         b"years", b"year", b"months", b"month", b"days", b"day", b"hours", b"hour", b"minutes",
         b"minute", b"seconds", b"second",
+    ];
+    for u in UNITS {
+        if b.len() >= u.len() && b[..u.len()].eq_ignore_ascii_case(u) {
+            let after = u.len();
+            if after < b.len() {
+                let next = b[after];
+                if next.is_ascii_alphanumeric() || next == b'_' {
+                    continue;
+                }
+            }
+            return Some(u.len());
+        }
+    }
+    None
+}
+
+/// Move the unit of a Spark `INTERVAL` literal out of the string and into the qualifier position
+/// DataFusion's parser demands: `interval '30 days'` → `interval '30' DAY`.
+///
+/// Spark accepts the unit either inside the literal or as a following token; the Databricks
+/// dialect oxidant plans on (`Dialect::require_interval_qualifier`) accepts only the latter and
+/// otherwise fails with `INTERVAL requires a unit after the literal value` before execution
+/// starts — TPC-DS Q12/Q20/Q98 (`+ interval '30 days'`) never reached the engine at SF100.
+///
+/// The same spelling also arrives from oxidant's OWN distributed stage SQL: DataFusion's
+/// `Unparser` renders interval scalars in Postgres-verbose style
+/// (`INTERVAL '0 YEARS 0 MONS 30 DAYS 0 HOURS 0 MINS 0.00 SECS'`), which each worker re-parses
+/// under the same dialect. Zero terms are dropped and multi-unit content becomes a parenthesized
+/// sum, so that form collapses to `(INTERVAL '30' DAY)`.
+///
+/// Faithful, not lossy: DataFusion re-joins value and qualifier into a single string and hands it
+/// to the same Arrow interval parser that reads Spark's spelling, so both forms yield the same
+/// `IntervalMonthDayNano`. Anything that is not a clean `<amount> <unit>` sequence is left
+/// untouched so its original parse error survives. Returns `None` when nothing changed.
+fn qualify_interval_units(sql: &str) -> Option<String> {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0;
+    let mut changed = false;
+
+    while i < n {
+        // Copy quoted regions verbatim so string content is never rewritten. An INTERVAL
+        // keyword is only recognized at a code position, so `'interval ''30 days'''` is safe.
+        if b[i] == b'\'' || b[i] == b'"' {
+            let quote = b[i];
+            let start = i;
+            i += 1;
+            while i < n {
+                if b[i] == quote {
+                    if i + 1 < n && b[i + 1] == quote {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += utf8_len(b[i]).min(n - i);
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        if let Some(m) = match_unqualified_interval(b, i) {
+            if let Some(terms) = interval_terms_to_sql(&sql[m.content_start..m.content_end]) {
+                out.push_str(&terms);
+                i = m.end;
+                changed = true;
+                continue;
+            }
+        }
+
+        let len = utf8_len(b[i]).min(n - i);
+        out.push_str(&sql[i..i + len]);
+        i += len;
+    }
+
+    changed.then_some(out)
+}
+
+/// If `sql[i..]` starts with `INTERVAL '<content>'` **not** followed by a unit token, return the
+/// content span and the index just past the closing quote. An already-qualified interval
+/// (`interval '30' day`) returns `None` so it is copied through byte-for-byte.
+fn match_unqualified_interval(b: &[u8], i: usize) -> Option<UnqualifiedInterval> {
+    if !interval_keyword_at(b, i) {
+        return None;
+    }
+    let n = b.len();
+    let mut j = i + 8; // len("interval")
+
+    while j < n && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= n || b[j] != b'\'' {
+        return None;
+    }
+    j += 1;
+    let content_start = j;
+    let content_end;
+    loop {
+        if j >= n {
+            // Unterminated literal — leave it alone so the original parse error is preserved.
+            return None;
+        }
+        if b[j] == b'\'' {
+            // A `''` escape never appears in an interval amount; bail rather than guess.
+            if j + 1 < n && b[j + 1] == b'\'' {
+                return None;
+            }
+            content_end = j;
+            j += 1;
+            break;
+        }
+        j += utf8_len(b[j]).min(n - j);
+    }
+    let end = j;
+
+    while j < n && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if temporal_unit_token_len(&b[j..]).is_some() {
+        return None;
+    }
+
+    Some(UnqualifiedInterval {
+        content_start,
+        content_end,
+        end,
+    })
+}
+
+struct UnqualifiedInterval {
+    content_start: usize,
+    content_end: usize,
+    end: usize,
+}
+
+/// Render the contents of an unqualified interval literal as qualified `INTERVAL` SQL, or `None`
+/// when `content` is not a whitespace-separated sequence of `<amount> <unit>` pairs.
+///
+/// Zero-valued terms are dropped (Postgres-verbose output is mostly zeros); an all-zero interval
+/// becomes `INTERVAL '0' SECOND`. Two or more surviving terms are summed inside parentheses so the
+/// rewrite is safe in any expression position.
+fn interval_terms_to_sql(content: &str) -> Option<String> {
+    let tokens: Vec<&str> = content.split_whitespace().collect();
+    if tokens.is_empty() || tokens.len() % 2 != 0 {
+        return None;
+    }
+    let mut terms = Vec::with_capacity(tokens.len() / 2);
+    for pair in tokens.chunks(2) {
+        let amount = pair[0];
+        if !is_interval_amount(amount) {
+            return None;
+        }
+        let unit = interval_unit_keyword(pair[1])?;
+        // A zero term contributes nothing; keeping them all would bloat every stage SQL string.
+        if amount.parse::<f64>().is_ok_and(|v| v == 0.0) {
+            continue;
+        }
+        terms.push(format!("INTERVAL '{amount}' {unit}"));
+    }
+    match terms.len() {
+        0 => Some("INTERVAL '0' SECOND".to_string()),
+        1 => Some(terms.pop().expect("one term")),
+        _ => Some(format!("({})", terms.join(" + "))),
+    }
+}
+
+/// Whether `s` is an interval amount: an optionally signed decimal number.
+fn is_interval_amount(s: &str) -> bool {
+    let digits = s.strip_prefix(['-', '+']).unwrap_or(s);
+    if digits.is_empty() {
+        return false;
+    }
+    let mut parts = digits.splitn(2, '.');
+    let int_part = parts.next().unwrap_or("");
+    let frac_part = parts.next();
+    if !int_part.bytes().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    match frac_part {
+        // `5.` and `.5` are both accepted, but at least one digit must be present overall.
+        Some(frac) => {
+            !(int_part.is_empty() && frac.is_empty()) && frac.bytes().all(|c| c.is_ascii_digit())
+        }
+        None => !int_part.is_empty(),
+    }
+}
+
+/// Map an in-literal unit spelling (Spark's and Arrow's, including the abbreviations DataFusion's
+/// Postgres-verbose unparser emits) onto the qualifier keyword sqlparser accepts.
+fn interval_unit_keyword(unit: &str) -> Option<&'static str> {
+    let u = unit.to_ascii_lowercase();
+    Some(match u.as_str() {
+        "y" | "yr" | "yrs" | "year" | "years" => "YEAR",
+        "mon" | "mons" | "month" | "months" => "MONTH",
+        "w" | "week" | "weeks" => "WEEK",
+        "d" | "day" | "days" => "DAY",
+        "h" | "hr" | "hrs" | "hour" | "hours" => "HOUR",
+        "m" | "min" | "mins" | "minute" | "minutes" => "MINUTE",
+        "s" | "sec" | "secs" | "second" | "seconds" => "SECOND",
+        "ms" | "msec" | "msecs" | "millisecond" | "milliseconds" => "MILLISECOND",
+        "us" | "usec" | "usecs" | "microsecond" | "microseconds" => "MICROSECOND",
+        "nanosecond" | "nanoseconds" => "NANOSECOND",
+        _ => return None,
+    })
+}
+
+/// Length of a temporal-unit *token* at the start of `b`, matching sqlparser's
+/// `next_token_is_temporal_unit` set. Used only to tell an already-qualified interval from one
+/// whose unit is inside the literal — deliberately wider than [`interval_unit_len`] (which drives
+/// the leading-precision pass) so no qualified spelling is ever rewritten.
+fn temporal_unit_token_len(b: &[u8]) -> Option<usize> {
+    // Longer spellings first so `years` wins over `year`.
+    const UNITS: &[&[u8]] = &[
+        b"centuries",
+        b"century",
+        b"decade",
+        b"dow",
+        b"doy",
+        b"epoch",
+        b"isodow",
+        b"isoyear",
+        b"julian",
+        b"microseconds",
+        b"microsecond",
+        b"millenium",
+        b"millennium",
+        b"milliseconds",
+        b"millisecond",
+        b"nanoseconds",
+        b"nanosecond",
+        b"quarter",
+        b"timezone_hour",
+        b"timezone_minute",
+        b"timezone",
+        b"years",
+        b"year",
+        b"months",
+        b"month",
+        b"weeks",
+        b"week",
+        b"days",
+        b"day",
+        b"hours",
+        b"hour",
+        b"minutes",
+        b"minute",
+        b"seconds",
+        b"second",
     ];
     for u in UNITS {
         if b.len() >= u.len() && b[..u.len()].eq_ignore_ascii_case(u) {
@@ -2305,13 +2562,123 @@ impl datafusion::optimizer::OptimizerRule for FoldConstantFilters {
     }
 }
 
+/// Default fraction of detected host/cgroup RAM used for the DataFusion spill pool when
+/// `OXIDANT_MEMORY_LIMIT_BYTES` is unset. Leaves headroom for OS page cache, Arrow IPC
+/// buffers outside the pool, and the shuffle bucket cache.
+const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.7;
+
+/// Resolve the engine's memory-pool budget from the environment and the host.
+///
+/// | `OXIDANT_MEMORY_LIMIT_BYTES` | Result |
+/// |---|---|
+/// | positive integer | `Some(n)` — that many bytes |
+/// | `0` | `None` — unbounded (explicit opt-out) |
+/// | unset / empty / unparseable | auto-size from cgroup v2 → cgroup v1 → host RAM, times
+///   `OXIDANT_MEMORY_POOL_FRACTION` (default [`DEFAULT_MEMORY_POOL_FRACTION`]); `None` only
+///   if every detection path fails |
+///
+/// Shared with the shuffle spill threshold ([`SpillStore::from_env`] in oxidant-execution)
+/// so an unset memory limit still engages both the FairSpillPool and the bucket cache.
+pub fn resolve_memory_pool_bytes() -> Option<usize> {
+    match std::env::var("OXIDANT_MEMORY_LIMIT_BYTES") {
+        Ok(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return auto_size_memory_pool_bytes();
+            }
+            match s.parse::<usize>() {
+                Ok(0) => None,
+                Ok(n) => Some(n),
+                Err(_) => auto_size_memory_pool_bytes(),
+            }
+        }
+        Err(_) => auto_size_memory_pool_bytes(),
+    }
+}
+
+/// Detect available RAM and apply `OXIDANT_MEMORY_POOL_FRACTION`. Returns `None` when no
+/// usable figure can be read (tests on exotic hosts stay unbounded rather than guessing).
+fn auto_size_memory_pool_bytes() -> Option<usize> {
+    let total = cgroup_memory_bytes().or_else(host_memory_bytes)?;
+    if total == 0 {
+        return None;
+    }
+    let fraction = std::env::var("OXIDANT_MEMORY_POOL_FRACTION")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|f| *f > 0.0 && *f <= 1.0)
+        .unwrap_or(DEFAULT_MEMORY_POOL_FRACTION);
+    let bytes = (total as f64 * fraction) as usize;
+    // Floor at 64 MiB so a tiny fraction or a mis-reported cgroup cannot create a
+    // unusable FairSpillPool that starves every operator on first grow.
+    Some(bytes.max(64 * 1024 * 1024))
+}
+
+/// cgroup v2 `memory.max`, then cgroup v1 `memory.limit_in_bytes`. Values that mean
+/// "unlimited" (`max`, or a limit larger than the host) are rejected so we fall through
+/// to [`host_memory_bytes`].
+fn cgroup_memory_bytes() -> Option<usize> {
+    const CGROUP_V2: &str = "/sys/fs/cgroup/memory.max";
+    const CGROUP_V1: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
+    if let Ok(raw) = std::fs::read_to_string(CGROUP_V2) {
+        let s = raw.trim();
+        if s != "max" {
+            if let Ok(n) = s.parse::<u64>() {
+                if let Some(usable) = usable_cgroup_limit(n) {
+                    return Some(usable);
+                }
+            }
+        }
+    }
+    if let Ok(raw) = std::fs::read_to_string(CGROUP_V1) {
+        if let Ok(n) = raw.trim().parse::<u64>() {
+            if let Some(usable) = usable_cgroup_limit(n) {
+                return Some(usable);
+            }
+        }
+    }
+    None
+}
+
+/// Reject cgroup "unlimited" sentinels (page-aligned `2^63`-ish values) and limits that
+/// exceed physical RAM by more than a small factor — those are not real budgets.
+fn usable_cgroup_limit(n: u64) -> Option<usize> {
+    // Linux reports "no limit" as a huge page-aligned number near 2^63.
+    if n == 0 || n >= (1u64 << 50) {
+        return None;
+    }
+    if let Some(host) = host_memory_bytes() {
+        // A cgroup larger than 4× host RAM is almost certainly the unlimited sentinel on a
+        // host whose RAM we can see; prefer the host figure.
+        if n as usize > host.saturating_mul(4) {
+            return None;
+        }
+    }
+    usize::try_from(n).ok()
+}
+
+/// Host physical RAM via sysinfo. Returns `None` when the probe reports zero.
+fn host_memory_bytes() -> Option<usize> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let total = sys.total_memory();
+    if total == 0 {
+        None
+    } else {
+        usize::try_from(total).ok()
+    }
+}
+
 impl Engine {
     /// Create a fresh engine with default session state.
     ///
-    /// If `OXIDANT_MEMORY_LIMIT_BYTES` is set, the engine runs with a bounded spill pool of
-    /// that size (DataFusion spills aggregations/sorts to disk instead of OOM-killing the
-    /// process) — important when running ClickBench on a memory-constrained box. Unset
-    /// (the default) keeps the unbounded pool, so local/test behavior is unchanged.
+    /// Memory pool sizing (see [`resolve_memory_pool_bytes`]):
+    /// - `OXIDANT_MEMORY_LIMIT_BYTES=<n>` — bounded `FairSpillPool` of `n` bytes.
+    /// - `OXIDANT_MEMORY_LIMIT_BYTES=0` — explicit unbounded pool (legacy local/test mode).
+    /// - unset — auto-size from cgroup / host RAM × `OXIDANT_MEMORY_POOL_FRACTION` (default
+    ///   0.7), so workers cannot OOM by omitting the CloudFormation `MemoryLimitBytes`
+    ///   parameter (SF100 TPC-DS Q10: unbounded pool + no shuffle spill → `do_get:
+    ///   transport error` after the worker died).
     ///
     /// Phase 1.4 margin-push knobs, each applied only when its env var is set (so the default
     /// behavior is unchanged and the values can be swept on a benchmark box without a rebuild):
@@ -2344,10 +2711,7 @@ impl Engine {
     ///   filtering only; min/max bounds still prune — and bounds carry the row-group
     ///   pruning for clustered keys like `ss_sold_date_sk`).
     pub fn new() -> Self {
-        let memory_limit = std::env::var("OXIDANT_MEMORY_LIMIT_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
-        Self::new_inner(memory_limit)
+        Self::new_inner(resolve_memory_pool_bytes())
     }
 
     /// Engine with an explicit bounded spill pool of `bytes`, independent of the process
@@ -2458,10 +2822,10 @@ impl Engine {
             };
             use datafusion::execution::runtime_env::RuntimeEnvBuilder;
             use std::sync::Arc;
-            // With `OXIDANT_MEMORY_LIMIT_BYTES` set: the bounded `FairSpillPool` (aggregations/
-            // sorts spill instead of OOM-killing); unset: the unbounded pool — DataFusion's
-            // own default. Either way the pool is wrapped so operator memory activity is
-            // timestamped for the no-progress watchdog.
+            // Bounded `FairSpillPool` when [`resolve_memory_pool_bytes`] returns `Some`
+            // (explicit limit or auto-sized from host/cgroup); `None` (`=0` opt-out) keeps
+            // DataFusion's unbounded pool. Either way the pool is wrapped so operator
+            // memory activity is timestamped for the no-progress watchdog.
             let inner: Arc<dyn MemoryPool> = match memory_limit {
                 Some(bytes) => Arc::new(FairSpillPool::new(bytes)),
                 None => Arc::new(UnboundedMemoryPool::default()),
@@ -8203,6 +8567,99 @@ mod tests {
         assert_eq!(normalize_spark_sql(inside), inside);
     }
 
+    #[test]
+    fn resolve_memory_pool_bytes_honours_env_and_autosizes() {
+        // Process-global env — keep this test short and restore afterwards.
+        let prev = std::env::var("OXIDANT_MEMORY_LIMIT_BYTES").ok();
+        let prev_frac = std::env::var("OXIDANT_MEMORY_POOL_FRACTION").ok();
+
+        std::env::set_var("OXIDANT_MEMORY_LIMIT_BYTES", "123456789");
+        assert_eq!(resolve_memory_pool_bytes(), Some(123456789));
+
+        std::env::set_var("OXIDANT_MEMORY_LIMIT_BYTES", "0");
+        assert_eq!(resolve_memory_pool_bytes(), None);
+
+        std::env::remove_var("OXIDANT_MEMORY_LIMIT_BYTES");
+        std::env::set_var("OXIDANT_MEMORY_POOL_FRACTION", "0.5");
+        let auto = resolve_memory_pool_bytes();
+        assert!(
+            auto.is_some_and(|n| n >= 64 * 1024 * 1024),
+            "unset MEMORY_LIMIT must auto-size from host/cgroup RAM: {auto:?}"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("OXIDANT_MEMORY_LIMIT_BYTES", v),
+            None => std::env::remove_var("OXIDANT_MEMORY_LIMIT_BYTES"),
+        }
+        match prev_frac {
+            Some(v) => std::env::set_var("OXIDANT_MEMORY_POOL_FRACTION", v),
+            None => std::env::remove_var("OXIDANT_MEMORY_POOL_FRACTION"),
+        }
+    }
+
+    #[test]
+    fn normalize_qualifies_interval_units_inside_the_literal() {
+        // TPC-DS Q12/Q20/Q98 spelling — the SF100 parse failure.
+        assert_eq!(
+            normalize_spark_sql("SELECT (cast('2001-01-12' as date) + interval '30 days') AS d"),
+            "SELECT (cast('2001-01-12' as date) + INTERVAL '30' DAY) AS d"
+        );
+        // Case and plural spellings, and a negative amount.
+        assert_eq!(
+            normalize_spark_sql("SELECT INTERVAL '1 YEAR', interval '-2 month'"),
+            "SELECT INTERVAL '1' YEAR, INTERVAL '-2' MONTH"
+        );
+        // Multi-unit content becomes a parenthesized sum, safe in any expression position.
+        assert_eq!(
+            normalize_spark_sql("SELECT ts + interval '1 day 2 hours'"),
+            "SELECT ts + (INTERVAL '1' DAY + INTERVAL '2' HOUR)"
+        );
+        // DataFusion's Postgres-verbose unparser output — what workers re-parse from stage SQL.
+        assert_eq!(
+            normalize_spark_sql(
+                "SELECT INTERVAL '0 YEARS 0 MONS 30 DAYS 0 HOURS 0 MINS 0.00 SECS'"
+            ),
+            "SELECT INTERVAL '30' DAY"
+        );
+        // Mixed month + day-time verbose output keeps both surviving terms.
+        assert_eq!(
+            normalize_spark_sql("SELECT INTERVAL '0 YEARS 3 MONS 0 DAYS 0 HOURS 0 MINS 1.50 SECS'"),
+            "SELECT (INTERVAL '3' MONTH + INTERVAL '1.50' SECOND)"
+        );
+        // An all-zero interval still has to be a legal literal.
+        assert_eq!(
+            normalize_spark_sql("SELECT INTERVAL '0 YEARS 0 MONS 0 DAYS'"),
+            "SELECT INTERVAL '0' SECOND"
+        );
+    }
+
+    #[test]
+    fn normalize_leaves_qualified_and_unparseable_intervals_alone() {
+        for q in [
+            // Already qualified — every spelling sqlparser accepts as a unit token.
+            "SELECT date '1998-12-01' - interval '90' day AS d",
+            "SELECT interval '90' days AS d",
+            "SELECT interval '1' week AS d",
+            "SELECT interval '5' milliseconds AS d",
+            "SELECT interval '1-2' year to month AS d",
+            // Unit missing entirely, or not a unit we recognize: the original parse error is
+            // more useful than a guess.
+            "SELECT interval '30'",
+            "SELECT interval '30 fortnights'",
+            "SELECT interval '1 day 2'",
+            "SELECT interval 'abc days'",
+            // String content that merely looks like an interval.
+            "SELECT 'interval ''30 days''' AS s",
+            // A trailing alias must not be mistaken for a unit qualifier.
+            "SELECT interval '30' day d FROM t",
+        ] {
+            assert_eq!(normalize_spark_sql(q), q, "should not rewrite: {q}");
+        }
+        // Unquoted Spark spelling already parses (the amount is a number, the unit a token).
+        let unquoted = "SELECT ts + interval 30 days";
+        assert_eq!(normalize_spark_sql(unquoted), unquoted);
+    }
+
     #[tokio::test]
     async fn tpch_interval_date_arithmetic() {
         use arrow::array::{Array, Date32Array};
@@ -8242,6 +8699,40 @@ mod tests {
             .downcast_ref::<Date32Array>()
             .unwrap();
         assert_eq!(col.value(0), 9131); // 1995-01-01
+    }
+
+    #[tokio::test]
+    async fn tpcds_spark_interval_spelling_executes() {
+        use arrow::array::{Array, Date32Array};
+        let engine = Engine::new();
+        // TPC-DS Q12's date window: the unit inside the literal must agree with the qualified
+        // spelling. 2001-01-12 + 30 days = 2001-02-11 (Date32 epoch day 11364).
+        for sql in [
+            "SELECT (cast('2001-01-12' as date) + interval '30 days') AS d",
+            "SELECT (cast('2001-01-12' as date) + interval '30' day) AS d",
+            // Postgres-verbose form, as DataFusion's unparser emits it into stage SQL.
+            "SELECT (cast('2001-01-12' as date) + interval '0 YEARS 0 MONS 30 DAYS 0 HOURS \
+             0 MINS 0.00 SECS') AS d",
+        ] {
+            let batches = engine.sql(sql).await.unwrap();
+            let col = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap();
+            assert_eq!(col.value(0), 11364, "sql={sql}");
+        }
+        // Multi-unit content sums its terms: 2001-01-12 + 1 month 2 days = 2001-02-14.
+        let multi = engine
+            .sql("SELECT (cast('2001-01-12' as date) + interval '1 month 2 days') AS d")
+            .await
+            .unwrap();
+        let col = multi[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 11367);
     }
 
     #[test]
@@ -8774,9 +9265,17 @@ mod tests {
 
     #[tokio::test]
     async fn join_guard_off_without_bounded_pool() {
+        // Explicit opt-out: unset now auto-sizes a bounded pool (SF100 default).
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        let prev = std::env::var("OXIDANT_MEMORY_LIMIT_BYTES").ok();
+        std::env::set_var("OXIDANT_MEMORY_LIMIT_BYTES", "0");
         let engine = Engine::new();
         assert_eq!(engine.memory_pool_bytes, None);
         assert_eq!(engine.hash_join_build_budget(), None);
+        match prev {
+            Some(v) => std::env::set_var("OXIDANT_MEMORY_LIMIT_BYTES", v),
+            None => std::env::remove_var("OXIDANT_MEMORY_LIMIT_BYTES"),
+        }
     }
 
     #[tokio::test]
@@ -9608,14 +10107,18 @@ mod tests {
         assert_eq!(c, 1_000);
     }
 
-    /// KAN-53 follow-up: without a bounded pool there is no budget to guard — an
-    /// unknown-estimate hash join keeps the hash plan (behavior unchanged), matching the
-    /// positive-estimate case (`auto_join_selection_small_build_keeps_hash`).
+    /// KAN-53 follow-up: with an explicit unbounded pool (`OXIDANT_MEMORY_LIMIT_BYTES=0`)
+    /// there is no budget to guard — an unknown-estimate hash join keeps the hash plan
+    /// (behavior unchanged), matching the positive-estimate case
+    /// (`auto_join_selection_small_build_keeps_hash`). Unset MEMORY_LIMIT now auto-sizes
+    /// a bounded pool, so this test opts out explicitly.
     #[tokio::test]
     async fn auto_join_selection_unknown_estimate_unbounded_keeps_hash() {
         let _env = JOIN_GUARD_ENV_LOCK.lock().await;
         std::env::remove_var("OXIDANT_PREFER_HASH_JOIN");
         std::env::remove_var("OXIDANT_SORT_MERGE_FALLBACK");
+        let prev = std::env::var("OXIDANT_MEMORY_LIMIT_BYTES").ok();
+        std::env::set_var("OXIDANT_MEMORY_LIMIT_BYTES", "0");
         let engine = Engine::new();
         register_unknown_stats_table(&engine, "u_big", join_guard_kv_batches(100_000, 100_000));
         register_unknown_stats_table(&engine, "u_small", join_guard_kv_batches(1_000, 1_000));
@@ -9636,6 +10139,10 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(c, 1_000);
+        match prev {
+            Some(v) => std::env::set_var("OXIDANT_MEMORY_LIMIT_BYTES", v),
+            None => std::env::remove_var("OXIDANT_MEMORY_LIMIT_BYTES"),
+        }
     }
 
     // ---- KAN-8: parquet footer statistics on catalog scans ----------------------

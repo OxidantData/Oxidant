@@ -606,7 +606,7 @@ aws glue delete-database --region "${AWS_REGION}" --name "${GLUE_DB}"
 | `AccessDenied` on Glue/S3 | Deployed with `--glue false` or incomplete `DataBucketArns` (need bucket **and** `/*`) |
 | Catalog works locally on driver but distributed scan fails | Workers missing `OXIDANT_CATALOG_CONF` — set stack `CatalogConf`, replace instances |
 | Spill fills root volume | Spill size `0`, or no eligible device: bootstrap picks the largest **unmounted, unpartitioned, non-root** whole disk (no fixed device names) — `lsblk -f` and the bootstrap log line `no spill block device found` tell you which disks were skipped and why (mounted / has partitions) |
-| OOM on large queries | Empty memory/shuffle thresholds — set `MemoryLimitBytes` + `ShuffleSpillBytes` |
+| OOM on large queries | Prefer setting `MemoryLimitBytes` + `ShuffleSpillBytes` for publishable SF100 numbers. Empty is no longer fatal: the engine auto-sizes the FairSpillPool and shuffle threshold from cgroup/host RAM × `OXIDANT_MEMORY_POOL_FRACTION` (default 0.7). Set `OXIDANT_MEMORY_LIMIT_BYTES=0` only when you intentionally want the unbounded pool. Opaque `do_get: transport error` after ~tens of seconds with many failed tasks usually means a worker died under an unbounded or undersized budget — check `journalctl -u oxidant-worker` / dmesg for OOM, and the enriched status source chain in the driver log. |
 | `CatalogConf` deploy error / truncated tag | Value must be ≤256 characters |
 
 ```sh

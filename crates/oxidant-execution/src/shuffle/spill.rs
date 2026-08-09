@@ -42,10 +42,15 @@ impl SpillStore {
     /// limit so several under-limit stages cannot accumulate past the budget.
     pub fn from_env() -> Option<Self> {
         let configured_root = non_empty_env("OXIDANT_SHUFFLE_SPILL_DIR").map(PathBuf::from);
+        // Explicit shuffle env wins; otherwise share the engine's resolved budget
+        // (auto-sized from cgroup/host RAM when `OXIDANT_MEMORY_LIMIT_BYTES` is unset) so
+        // SF100 workers spill shuffle buckets by default. `OXIDANT_MEMORY_LIMIT_BYTES=0`
+        // opts out of both the FairSpillPool and this threshold — only a configured spill
+        // dir (force-spill) still enables the store.
         let memory_limit_bytes = non_empty_env("OXIDANT_SHUFFLE_SPILL_BYTES")
-            .or_else(|| non_empty_env("OXIDANT_MEMORY_LIMIT_BYTES"))
             .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0);
+            .filter(|&n| n > 0)
+            .or_else(oxidant_loom::resolve_memory_pool_bytes);
         let total_limit_bytes = non_empty_env("OXIDANT_SHUFFLE_TOTAL_SPILL_BYTES")
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
