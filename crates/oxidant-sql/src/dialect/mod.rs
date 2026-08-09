@@ -1,4 +1,4 @@
-//! The Spark-SQL → DataFusion dialect shim.
+//! The Spark-SQL → DataFusion dialect layer.
 //!
 //! Oxidant executes SQL on DataFusion, whose dialect is close to but not identical to Spark SQL. This
 //! module rewrites the well-defined, safe differences so existing Spark/Databricks SQL runs
@@ -6,13 +6,55 @@
 //! test-corpus-driven**: a small set of correct rewrites beats a broad, buggy one, and the
 //! rewriter is **string-literal-aware** so it never touches the contents of a `'...'` literal.
 //!
-//! v1 rewrites:
-//! - **Backtick identifiers** — Spark's `` `my col` `` → ANSI double-quoted `"my col"` (DataFusion's
-//!   identifier quoting). The #1 source of migration friction.
+//! # The staged pipeline
 //!
-//! Function/semantic rewrites (`from_unixtime`, `date_format`, lateral-view `explode`, …) are the
-//! next entries; each lands with corpus tests. A `spark-compat` toggle (off → pass-through) gates
-//! the shim so users can opt out.
+//! [`DialectPipeline`] (see [`pipeline`]) lowers one SQL statement through three additive
+//! stages, each a registry of independent rules (design: `oxidant-spark-compat/ROADMAP.md` §2):
+//!
+//! 1. **String prefilter** ([`str_rule`], pre-parse) — verified-faithful, purely-lexical,
+//!    leading-keyword rewrites only (e.g. [`str_rule::StripTemporaryView`], migrated from
+//!    `oxidant-loom::normalize_spark_sql`).
+//! 2. **Statement intercepts** ([`intercept`], post-parse) — AST-level rules that see a
+//!    `sqlparser` `Statement` parsed with the Databricks dialect and either fully own the
+//!    statement or pass it through. Home for `USE`, `LIKE ANY/ALL`, `PIVOT`/`UNPIVOT`,
+//!    `SHOW`/`DESCRIBE` (later tickets).
+//! 3. **Output naming** ([`naming`], post-plan) — renames anonymous result columns to
+//!    Spark's `Expression.sql` names via a registry of per-expression naming rules.
+//!
+//! Rule contract (all stages): **either a rule fires and fully owns its target, or it returns
+//! `None` and the next rule sees the input unchanged.** Stage 1 hands every rule the *original*
+//! SQL text; Stage 2 parses the Stage-1-rewritten text and hands every intercept the same
+//! `Statement`; Stage 3 scans each output expression independently. Ordering is by
+//! specificity; two rules claiming the same statement or expression is a hard error in debug
+//! builds and first-wins in release, so additions stay conflict-free by construction.
+//!
+//! Production today calls [`DialectPipeline::rewrite_str`] only (Stage 1). Stages 2 and 3 are
+//! scaffolded registries — wiring [`DialectPipeline::lower`] / [`DialectPipeline::apply_output_naming`]
+//! into the engine is tracked in follow-up tickets (e.g. KAN-96 USE).
+//!
+//! Standalone rewrites (not yet pipeline stages):
+//! - **Backtick identifiers** — Spark's `` `my col` `` → ANSI double-quoted `"my col"` (DataFusion's
+//!   identifier quoting), via [`to_datafusion_sql`]. The #1 source of migration friction. This is a
+//!   whole-statement token pass rather than a leading-keyword one, so it cannot become a Stage-1
+//!   rule under the fire-and-own contract: it would claim statements an owning rule also claims
+//!   (e.g. ``CREATE TEMPORARY VIEW `v` …``). Composing non-owning lexical passes with owning ones
+//!   needs a contract extension, which is deliberately out of scope here.
+
+pub mod intercept;
+pub mod naming;
+pub mod pipeline;
+pub mod str_rule;
+
+use std::sync::OnceLock;
+
+pub use pipeline::{DialectPipeline, LowerOutcome};
+
+/// The process-wide [`DialectPipeline::spark`] instance. The pipeline is stateless across
+/// statements, so the engine builds it once and borrows it per query.
+pub fn spark_pipeline() -> &'static DialectPipeline {
+    static PIPELINE: OnceLock<DialectPipeline> = OnceLock::new();
+    PIPELINE.get_or_init(DialectPipeline::spark)
+}
 
 /// Rewrite a Spark-SQL statement into a DataFusion-compatible one. Conservative: anything not in
 /// the known-safe rewrite set is passed through verbatim.

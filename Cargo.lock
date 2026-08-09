@@ -4386,6 +4386,7 @@ dependencies = [
  "oxidant-gpu",
  "oxidant-physical",
  "oxidant-plan",
+ "oxidant-sql",
  "rayon",
  "regex",
  "serde",
@@ -4467,6 +4468,7 @@ dependencies = [
 name = "oxidant-sql"
 version = "0.1.2"
 dependencies = [
+ "datafusion",
  "oxidant-common",
  "oxidant-plan",
 ]

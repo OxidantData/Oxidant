@@ -18,6 +18,8 @@
 | [docs/deployment.md](docs/deployment.md) | Self-hosted platform deploy outline |
 | [docs/catalogs.md](docs/catalogs.md) | External catalog SPI (Hive / Glue / REST) |
 | [docs/runtime-contract.md](docs/runtime-contract.md) | Engine image env contract |
+| [docs/databricks-coverage.md](docs/databricks-coverage.md) | Databricks SQL coverage matrix (what works today + owning ticket) |
+| [docs/databricks-parity-plan.md](docs/databricks-parity-plan.md) | Databricks parity plan (Glue + Lake Formation epic) |
 
 Deployment options: the free Community AMI on AWS Marketplace (listing in progress) or
 `docker pull ghcr.io/oxidantdata/oxidant`; EC2 autoscaling via CloudFormation is

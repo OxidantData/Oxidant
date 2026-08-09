@@ -33,3 +33,5 @@ in a few minutes.
 |-----|---------|
 | [architecture.md](architecture.md) | Engine design: Loom vectorized core, HVM backend, Connect path |
 | [CODEMAP.md](CODEMAP.md) | Crate / bench / deploy ownership map |
+| [databricks-coverage.md](databricks-coverage.md) | Databricks SQL manual coverage matrix: statements / functions / types / operators, with probe evidence |
+| [databricks-parity-plan.md](databricks-parity-plan.md) | Phased plan for Databricks SQL parity on Glue + Lake Formation (epic KAN-89..KAN-108) |

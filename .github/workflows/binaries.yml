@@ -55,7 +55,6 @@ permissions:
 # If there's a prerelease-style suffix to the version, then the release(s)
 # will be marked as a prerelease.
 on:
-  pull_request:
   # Fired explicitly by release.yml after it pushes a release tag (tag-push
   # triggers are unreliable here); the dist jobs key off github.ref being a tag.
   workflow_dispatch:

@@ -1,0 +1,38 @@
+-- Authored golden (Databricks SQL language manual: LATERAL VIEW).
+-- !query
+CREATE OR REPLACE TEMPORARY VIEW items (id INT, tags ARRAY<STRING>) AS VALUES
+  (1, array('a', 'b')), (2, array('c')), (3, array())
+-- !query schema
+struct<>
+-- !query output
+
+
+-- !query
+SELECT id, tag FROM items LATERAL VIEW explode(tags) AS tag ORDER BY id, tag
+-- !query schema
+struct<id:int,tag:string>
+-- !query output
+1	a
+1	b
+2	c
+
+
+-- !query
+SELECT id, tag FROM items LATERAL VIEW OUTER explode(tags) AS tag ORDER BY id, tag
+-- !query schema
+struct<id:int,tag:string>
+-- !query output
+1	a
+1	b
+2	c
+3	NULL
+
+
+-- !query
+SELECT id, pos, tag FROM items LATERAL VIEW posexplode(tags) AS pos, tag ORDER BY id, pos
+-- !query schema
+struct<id:int,pos:int,tag:string>
+-- !query output
+1	0	a
+1	1	b
+2	0	c
