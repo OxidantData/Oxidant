@@ -10,5 +10,7 @@ rust-version.workspace = true
 [dependencies]
 oxidant-common = { workspace = true }
 oxidant-plan = { workspace = true }
-# TODO(deps): sqlparser = "0.5x" (or a Spark-dialect fork) — Sail wrote a bespoke parser
-#             that reached 94.5% on 1,373 parsing tests; revisit build-vs-reuse in Phase 0.
+# The dialect pipeline speaks DataFusion's own AST/plan types (and its vendored `sqlparser`),
+# so the version must stay pinned to the one `oxidant-loom` embeds — a second `sqlparser`
+# copy in the tree would make `Statement` a different type across the crate boundary.
+datafusion = "54"
