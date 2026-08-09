@@ -9,7 +9,7 @@ struct<>
 
 -- !query
 CREATE OR REPLACE TEMPORARY VIEW wide (region STRING, q1 INT, q2 INT) AS VALUES
-  ('west', 100, 150), ('east', 200, 50)
+  ('west', 100, 150), ('east', 200, 50), ('south', NULL, 10)
 -- !query schema
 struct<>
 -- !query output
@@ -38,10 +38,11 @@ SELECT region, quarter, amount FROM wide UNPIVOT (amount FOR quarter IN (q1, q2)
 -- !query schema
 struct<region:string,quarter:string,amount:int>
 -- !query output
-west	q1	100
-west	q2	150
 east	q1	200
 east	q2	50
+south	q2	10
+west	q1	100
+west	q2	150
 
 
 -- !query
@@ -49,7 +50,9 @@ SELECT * FROM wide UNPIVOT INCLUDE NULLS (amount FOR quarter IN (q1, q2)) ORDER 
 -- !query schema
 struct<region:string,quarter:string,amount:int>
 -- !query output
-west	q1	100
-west	q2	150
 east	q1	200
 east	q2	50
+south	q1	NULL
+south	q2	10
+west	q1	100
+west	q2	150

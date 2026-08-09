@@ -6,7 +6,7 @@ CREATE OR REPLACE TEMPORARY VIEW quarterly (region STRING, quarter STRING, amoun
   ('west', 'Q1', 100), ('west', 'Q2', 150), ('east', 'Q1', 200), ('east', 'Q2', 50);
 
 CREATE OR REPLACE TEMPORARY VIEW wide (region STRING, q1 INT, q2 INT) AS VALUES
-  ('west', 100, 150), ('east', 200, 50);
+  ('west', 100, 150), ('east', 200, 50), ('south', NULL, 10);
 
 SELECT * FROM quarterly PIVOT (SUM(amount) FOR quarter IN ('Q1', 'Q2')) ORDER BY region;
 
