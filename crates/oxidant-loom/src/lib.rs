@@ -2608,10 +2608,24 @@ fn auto_size_memory_pool_bytes() -> Option<usize> {
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|f| *f > 0.0 && *f <= 1.0)
         .unwrap_or(DEFAULT_MEMORY_POOL_FRACTION);
-    let bytes = (total as f64 * fraction) as usize;
+    let mut bytes = (total as f64 * fraction) as usize;
+    // In-process multi-worker modes (`local-cluster`, benches) create one Engine per
+    // worker that would each claim ~0.7× RAM. Divide by the colocated count when set.
+    if let Some(n) = colocated_engine_count() {
+        bytes /= n;
+    }
     // Floor at 64 MiB so a tiny fraction or a mis-reported cgroup cannot create a
     // unusable FairSpillPool that starves every operator on first grow.
     Some(bytes.max(64 * 1024 * 1024))
+}
+
+/// Number of Engines expected to share this process's RAM. Set by
+/// `oxidant spark server --mode local-cluster` (and optionally by benches).
+fn colocated_engine_count() -> Option<usize> {
+    std::env::var("OXIDANT_COLOCATED_ENGINES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 1)
 }
 
 /// Shuffle-cache threshold sibling of [`resolve_memory_pool_bytes`].
