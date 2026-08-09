@@ -43,6 +43,15 @@ pub fn is_retryable(err: &Error) -> bool {
     if s.contains("connect worker") {
         return true;
     }
+    // Transport-class failures (possibly with a "timeout"/"keepalive" source chain from
+    // `status_detail`) must retry *before* the KAN-15 timeout guard — otherwise an enriched
+    // `do_get: transport error: connection timed out` would be treated as a stage timeout
+    // and skip channel eviction + retry.
+    if s.contains("transport") || s.contains("goaway") || s.contains("incomplete message") {
+        return true;
+    }
+    // KAN-15: stage wall-clock / tonic DeadlineExceeded while the original attempt may
+    // still be running server-side — do not retry.
     if s.contains("deadline") || s.contains("timed out") || s.contains("timeout") {
         return false;
     }
@@ -359,6 +368,23 @@ mod tests {
         assert!(is_retryable(&Error::Io("connect worker: refused".into())));
         assert!(is_retryable(&Error::Execution(
             "do_get: Unavailable".into()
+        )));
+        // Opaque tonic transport string (no source chain) and the enriched form.
+        assert!(is_retryable(&Error::Execution(
+            "do_get: transport error".into()
+        )));
+        assert!(is_retryable(&Error::Execution(
+            "do_get: transport error: connection reset by peer".into()
+        )));
+        // Keepalive / connect timeout in the source chain must stay retryable.
+        assert!(is_retryable(&Error::Execution(
+            "do_get: transport error: connection timed out".into()
+        )));
+        assert!(is_retryable(&Error::Execution(
+            "do_get: http2 error: stream error received: goaway".into()
+        )));
+        assert!(is_retryable(&Error::Execution(
+            "do_exchange: incomplete message".into()
         )));
         assert!(!is_retryable(&Error::Plan("bad sql".into())));
     }

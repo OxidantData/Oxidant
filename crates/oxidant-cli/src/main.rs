@@ -202,6 +202,11 @@ fn static_workers(args: &[String]) -> oxidant_common::Result<Vec<String>> {
 }
 
 async fn start_local_cluster_workers(count: usize) -> oxidant_common::Result<Vec<String>> {
+    // N in-process workers each run `Engine::new()`; without this hint every engine
+    // auto-sizes to ~70% of host RAM and they overcommit. See `resolve_memory_pool_bytes`.
+    if count > 1 {
+        std::env::set_var("OXIDANT_COLOCATED_ENGINES", count.to_string());
+    }
     let mut endpoints = Vec::with_capacity(count);
     for idx in 0..count {
         let port = pick_ephemeral_port()?;

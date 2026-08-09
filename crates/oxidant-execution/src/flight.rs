@@ -108,13 +108,21 @@ impl Worker {
     pub fn new(engine: Arc<Engine>) -> Self {
         engine.require_lakehouse_snapshot_pins();
         let spill = SpillStore::from_env();
-        if let Some(bytes) = std::env::var("OXIDANT_MEMORY_LIMIT_BYTES")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
-            eprintln!(
-                "Oxidant worker memory budget: OXIDANT_MEMORY_LIMIT_BYTES={bytes} (DataFusion spill pool + shuffle threshold)"
-            );
+        match std::env::var("OXIDANT_MEMORY_LIMIT_BYTES") {
+            Ok(bytes) if !bytes.trim().is_empty() => {
+                eprintln!(
+                    "Oxidant worker memory budget: OXIDANT_MEMORY_LIMIT_BYTES={bytes} (DataFusion spill pool + shuffle threshold)"
+                );
+            }
+            _ => {
+                if let Some(bytes) = oxidant_loom::resolve_memory_pool_bytes() {
+                    eprintln!(
+                        "Oxidant worker memory budget: auto-sized {bytes} bytes \
+                         (cgroup/host × OXIDANT_MEMORY_POOL_FRACTION; set \
+                         OXIDANT_MEMORY_LIMIT_BYTES to override, or =0 for unbounded)"
+                    );
+                }
+            }
         }
         let slots = worker_task_slots();
         Self {
@@ -1649,7 +1657,11 @@ async fn serve_flight_worker(port: u16, worker: Worker) -> Result<()> {
     let addr = format!("0.0.0.0:{port}")
         .parse()
         .map_err(|e| Error::Io(format!("bad worker addr: {e}")))?;
+    // Keepalive matches the client in [`connect_flight`]: detect dead peers and keep
+    // long-idle pooled connections alive across stage gaps at SF100.
     tonic::transport::Server::builder()
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
         .add_service(
             FlightServiceServer::new(worker)
                 .max_decoding_message_size(MAX_MSG)
@@ -1659,6 +1671,31 @@ async fn serve_flight_worker(port: u16, worker: Worker) -> Result<()> {
         .await
         .map_err(|e| Error::Io(format!("worker serve: {e}")))?;
     Ok(())
+}
+
+/// Format a tonic [`Status`] with its `source()` chain so transport failures are diagnosable.
+///
+/// tonic's `transport::Error` displays only as `"transport error"`; the real cause
+/// (connection reset, GOAWAY, incomplete message) lives in `Status::source()`, which
+/// `Status::from_error` populates. SF100 TPC-DS Q10 failed with the opaque string alone.
+fn status_detail(status: &tonic::Status) -> String {
+    error_detail(status)
+}
+
+/// Append the `source()` chain of any [`std::error::Error`] (tonic Status, transport Error, …).
+fn error_detail(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    // Prefer Status::message() when present — Display on Status includes the code prefix.
+    if let Some(status) = err.downcast_ref::<tonic::Status>() {
+        out = status.message().to_string();
+    }
+    let mut src = err.source();
+    while let Some(e) = src {
+        out.push_str(": ");
+        out.push_str(&e.to_string());
+        src = e.source();
+    }
+    out
 }
 
 /// Connect to a worker and run one `do_get` with retries on transient errors.
@@ -1741,9 +1778,15 @@ async fn connect_flight(
     let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
         .map_err(|e| Error::Io(format!("endpoint: {e}")))?
         .connect_timeout(std::time::Duration::from_secs(2))
+        // Detect dead workers and keep long-idle pooled channels alive between stages
+        // (SF100 TPC-DS Q10: opaque `do_get: transport error` after a peer died).
+        .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+        .keep_alive_timeout(std::time::Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
         .connect()
         .await
-        .map_err(|e| Error::Io(format!("connect worker: {e}")))?;
+        .map_err(|e| Error::Io(format!("connect worker: {}", error_detail(&e))))?;
     flight_channels()
         .lock()
         .expect("flight channels poisoned")
@@ -1759,7 +1802,7 @@ async fn do_get_batches_once(endpoint: String, ticket_bytes: Vec<u8>) -> Result<
     let stream = client
         .do_get(ticket)
         .await
-        .map_err(|e| Error::Execution(format!("do_get: {}", e.message())))?
+        .map_err(|e| Error::Execution(format!("do_get: {}", status_detail(&e))))?
         .into_inner();
 
     let mut rb = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
@@ -1880,7 +1923,7 @@ async fn do_action_collect(
         .map_err(|e| {
             // Transport-class failure: drop the pooled channel so the next action dials fresh.
             evict_flight_channel(&endpoint);
-            Error::Execution(format!("do_action: {}", e.message()))
+            Error::Execution(format!("do_action: {}", status_detail(&e)))
         })?
         .into_inner();
     let mut bodies = Vec::new();
@@ -2041,7 +2084,7 @@ async fn push_bucket_once(
     let mut stream = client
         .do_exchange(futures::stream::iter(frames))
         .await
-        .map_err(|e| Error::Execution(format!("do_exchange: {}", e.message())))?
+        .map_err(|e| Error::Execution(format!("do_exchange: {}", status_detail(&e))))?
         .into_inner();
     while let Some(item) = stream.next().await {
         item.map_err(|e| Error::Execution(format!("do_exchange stream: {e}")))?;
@@ -2067,6 +2110,9 @@ fn is_pull_retryable(err: &Error) -> bool {
     let s = err.to_string().to_ascii_lowercase();
     s.contains("connect")
         || s.contains("unavailable")
+        || s.contains("transport")
+        || s.contains("goaway")
+        || s.contains("incomplete message")
         || s.contains("do_get")
         || s.contains("do_exchange")
 }
@@ -2130,6 +2176,18 @@ mod tests {
         let worker = Worker::new(Arc::new(Engine::new()));
         assert!(worker.spill_enabled());
         std::env::remove_var("OXIDANT_MEMORY_LIMIT_BYTES");
+    }
+
+    #[test]
+    fn worker_enables_shuffle_spill_from_auto_sized_budget() {
+        // Unset memory env → resolve_memory_pool_bytes auto-sizes from host RAM, and
+        // SpillStore::from_env must pick that up (SF100 default path).
+        std::env::remove_var("OXIDANT_MEMORY_LIMIT_BYTES");
+        std::env::remove_var("OXIDANT_SHUFFLE_SPILL_BYTES");
+        std::env::remove_var("OXIDANT_SHUFFLE_SPILL_DIR");
+        assert!(oxidant_loom::resolve_memory_pool_bytes().is_some());
+        let worker = Worker::new(Arc::new(Engine::new()));
+        assert!(worker.spill_enabled());
     }
 
     #[test]
@@ -2510,9 +2568,37 @@ mod tests {
                 forward_upstream_stage_ids: vec![],
                 upstream_bucket_rows: vec![],
             };
-            let out = run_stage_on_worker(endpoints[0].clone(), consume)
-                .await
-                .expect("coalesced consumer run");
+            // Retry transport/connect races the same way the producer boot loop does —
+            // under a full workspace suite the peer can flap once between produce and consume.
+            let mut out = None;
+            let mut last = None;
+            for _ in 0..50 {
+                match run_stage_on_worker(endpoints[0].clone(), consume.clone()).await {
+                    Ok(b) => {
+                        out = Some(b);
+                        break;
+                    }
+                    Err(e) => {
+                        let s = e.to_string().to_ascii_lowercase();
+                        if s.contains("connect")
+                            || s.contains("transport")
+                            || s.contains("unavailable")
+                        {
+                            last = Some(e);
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
+                        panic!("coalesced consumer run: {e}");
+                    }
+                }
+            }
+            let out = out.unwrap_or_else(|| {
+                panic!(
+                    "coalesced consumer run: {}",
+                    last.map(|e| e.to_string())
+                        .unwrap_or_else(|| "no attempts".into())
+                )
+            });
             for b in &out {
                 let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
                 seen.extend((0..k.len()).map(|i| k.value(i)));
@@ -2656,7 +2742,9 @@ mod tests {
         let mut stream = client
             .do_exchange(futures::stream::iter(frames))
             .await
-            .map_err(|e| oxidant_common::Error::Execution(format!("do_exchange: {}", e.message())))?
+            .map_err(|e| {
+                oxidant_common::Error::Execution(format!("do_exchange: {}", status_detail(&e)))
+            })?
             .into_inner();
         while let Some(item) = stream.next().await {
             item.map_err(|e| oxidant_common::Error::Execution(format!("do_exchange stream: {e}")))?;

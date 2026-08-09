@@ -42,10 +42,14 @@ impl SpillStore {
     /// limit so several under-limit stages cannot accumulate past the budget.
     pub fn from_env() -> Option<Self> {
         let configured_root = non_empty_env("OXIDANT_SHUFFLE_SPILL_DIR").map(PathBuf::from);
+        // Explicit shuffle env wins; otherwise use [`resolve_shuffle_spill_bytes`] so an
+        // auto-sized FairSpillPool and the in-memory shuffle cache do not both claim ~70%
+        // of RAM (shuffle takes ¼ of the auto-sized pool). `OXIDANT_MEMORY_LIMIT_BYTES=0`
+        // opts out of both — only a configured spill dir (force-spill) still enables the store.
         let memory_limit_bytes = non_empty_env("OXIDANT_SHUFFLE_SPILL_BYTES")
-            .or_else(|| non_empty_env("OXIDANT_MEMORY_LIMIT_BYTES"))
             .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0);
+            .filter(|&n| n > 0)
+            .or_else(oxidant_loom::resolve_shuffle_spill_bytes);
         let total_limit_bytes = non_empty_env("OXIDANT_SHUFFLE_TOTAL_SPILL_BYTES")
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
