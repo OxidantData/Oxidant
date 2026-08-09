@@ -60,10 +60,27 @@ pub fn project_spark_names(plan: LogicalPlan, rules: &[Arc<dyn NamingRule>]) -> 
         let col = Expr::Column(Column::new(qualifier.cloned(), field.name()));
         // First rule to claim the expression wins; explicit user aliases simply see no rule
         // fire (rules target anonymous-expression shapes) and keep their chosen name.
-        let out_name = rules
-            .iter()
-            .find_map(|r| r.spark_name(pe))
-            .unwrap_or_else(|| field.name().to_string());
+        let mut claimed: Option<&'static str> = None;
+        let mut out_name = field.name().to_string();
+        for rule in rules {
+            let Some(name) = rule.spark_name(pe) else {
+                continue;
+            };
+            match claimed {
+                None => {
+                    claimed = Some(rule.name());
+                    out_name = name;
+                }
+                Some(first) => debug_assert!(
+                    false,
+                    "dialect naming rules `{first}` and `{}` both claim the same expression",
+                    rule.name()
+                ),
+            }
+            if !cfg!(debug_assertions) {
+                break;
+            }
+        }
         if out_name != *field.name() {
             changed = true;
         }
@@ -109,6 +126,23 @@ mod tests {
         fn spark_name(&self, expr: &Expr) -> Option<String> {
             match expr {
                 Expr::Literal(ScalarValue::Int64(Some(v)), _) => Some(v.to_string()),
+                _ => None,
+            }
+        }
+    }
+
+    /// Toy rule that renames string literals to a fixed name (used where `FixedName`'s
+    /// claim-everything behavior would overlap another rule in debug builds).
+    struct StringFixedName;
+
+    impl NamingRule for StringFixedName {
+        fn name(&self) -> &'static str {
+            "string-fixed-name"
+        }
+
+        fn spark_name(&self, expr: &Expr) -> Option<String> {
+            match expr {
+                Expr::Literal(ScalarValue::Utf8(_), _) => Some("x".to_string()),
                 _ => None,
             }
         }
@@ -203,6 +237,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "dialect naming rules `first` and `second` both claim")]
+    fn conflicting_naming_rules_are_a_debug_hard_error() {
+        struct AlwaysName(&'static str);
+        impl NamingRule for AlwaysName {
+            fn name(&self) -> &'static str {
+                self.0
+            }
+            fn spark_name(&self, _expr: &Expr) -> Option<String> {
+                Some("x".to_string())
+            }
+        }
+        let plan = LogicalPlanBuilder::empty(false)
+            .project(vec![lit(1i64)])
+            .unwrap()
+            .build()
+            .unwrap();
+        let _ = project_spark_names(
+            plan,
+            &[rule(AlwaysName("first")), rule(AlwaysName("second"))],
+        );
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
     fn first_claiming_rule_wins() {
         let plan = LogicalPlanBuilder::empty(false)
             .project(vec![lit(7i64)])
@@ -216,13 +275,13 @@ mod tests {
     #[test]
     fn later_rule_fires_where_the_earlier_one_declines() {
         // Per-column fallthrough: `IntLiteralName` claims the integer, declines the string, and
-        // `FixedName` names the column it left behind.
+        // `StringFixedName` names the column it left behind.
         let plan = LogicalPlanBuilder::empty(false)
             .project(vec![lit(7i64), lit("s")])
             .unwrap()
             .build()
             .unwrap();
-        let out = project_spark_names(plan, &[rule(IntLiteralName), rule(FixedName)]);
+        let out = project_spark_names(plan, &[rule(IntLiteralName), rule(StringFixedName)]);
         assert_eq!(output_names(&out), ["7", "x"]);
     }
 

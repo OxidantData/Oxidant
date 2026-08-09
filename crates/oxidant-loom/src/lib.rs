@@ -190,6 +190,8 @@ pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
     // BEFORE the typed-literal pass for two reasons: the re-emitted literals use `''` quote-doubling
     // (which the typed-literal scanner understands) instead of Spark's `\'`, and a numeric token
     // freed by a mis-delimited `\'` can therefore never be mistaken for code and wrapped in a CAST.
+    // Production runs Stage 1 only via `rewrite_str`. When Stage 2 intercepts register, replace
+    // this with `spark_pipeline().lower(...)` (or wire `lower()` into `Engine::sql` / `plan_spark`).
     let stripped = match oxidant_sql::dialect::spark_pipeline().rewrite_str(query) {
         std::borrow::Cow::Owned(rewritten) => Some(rewritten),
         std::borrow::Cow::Borrowed(_) => None,

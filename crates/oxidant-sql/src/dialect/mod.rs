@@ -21,10 +21,16 @@
 //! 3. **Output naming** ([`naming`], post-plan) — renames anonymous result columns to
 //!    Spark's `Expression.sql` names via a registry of per-expression naming rules.
 //!
-//! Every rule's contract: **either it fires and fully owns the statement, or it returns
-//! `None` and the next rule sees the original input unchanged.** Ordering is by specificity;
-//! two rules claiming the same statement is a hard error in debug builds and first-wins in
-//! release, so additions stay conflict-free by construction.
+//! Rule contract (all stages): **either a rule fires and fully owns its target, or it returns
+//! `None` and the next rule sees the input unchanged.** Stage 1 hands every rule the *original*
+//! SQL text; Stage 2 parses the Stage-1-rewritten text and hands every intercept the same
+//! `Statement`; Stage 3 scans each output expression independently. Ordering is by
+//! specificity; two rules claiming the same statement or expression is a hard error in debug
+//! builds and first-wins in release, so additions stay conflict-free by construction.
+//!
+//! Production today calls [`DialectPipeline::rewrite_str`] only (Stage 1). Stages 2 and 3 are
+//! scaffolded registries — wiring [`DialectPipeline::lower`] / [`DialectPipeline::apply_output_naming`]
+//! into the engine is tracked in follow-up tickets (e.g. KAN-96 USE).
 //!
 //! Standalone rewrites (not yet pipeline stages):
 //! - **Backtick identifiers** — Spark's `` `my col` `` → ANSI double-quoted `"my col"` (DataFusion's

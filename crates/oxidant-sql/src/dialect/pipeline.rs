@@ -20,11 +20,17 @@
 //! ([`NamingRule`]s) is a separate post-plan step — [`DialectPipeline::apply_output_naming`] —
 //! because it operates on the analyzed `LogicalPlan`, not on SQL text.
 //!
-//! Rule contract (all stages): **either a rule fires and fully owns the statement, or it
-//! returns `None` and the next rule sees the original input unchanged.** No rule mutates
-//! shared state; ordering is by specificity, and a conflict — two rules claiming the same
-//! statement — is a hard error in debug builds and first-wins in release, so additions stay
-//! conflict-free by construction.
+//! Rule contract (all stages): **either a rule fires and fully owns its target, or it returns
+//! `None` and the next rule sees the input unchanged.** Stage 1 hands every rule the *original*
+//! SQL text; Stage 2 parses the Stage-1-rewritten text and hands every intercept the same
+//! `Statement`; Stage 3 scans each output expression independently. No rule mutates shared
+//! state; ordering is by specificity, and a conflict — two rules claiming the same statement
+//! or expression — is a hard error in debug builds and first-wins in release, so additions
+//! stay conflict-free by construction.
+//!
+//! Production today calls [`Self::rewrite_str`] only (Stage 1). Stages 2 and 3 are empty
+//! registries until follow-up tickets wire [`Self::lower`] / [`Self::apply_output_naming`]
+//! into the engine.
 
 use std::borrow::Cow;
 use std::sync::Arc;
