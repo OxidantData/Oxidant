@@ -2614,30 +2614,91 @@ fn auto_size_memory_pool_bytes() -> Option<usize> {
     Some(bytes.max(64 * 1024 * 1024))
 }
 
-/// cgroup v2 `memory.max`, then cgroup v1 `memory.limit_in_bytes`. Values that mean
-/// "unlimited" (`max`, or a limit larger than the host) are rejected so we fall through
-/// to [`host_memory_bytes`].
-fn cgroup_memory_bytes() -> Option<usize> {
-    const CGROUP_V2: &str = "/sys/fs/cgroup/memory.max";
-    const CGROUP_V1: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
-    if let Ok(raw) = std::fs::read_to_string(CGROUP_V2) {
-        let s = raw.trim();
-        if s != "max" {
-            if let Ok(n) = s.parse::<u64>() {
-                if let Some(usable) = usable_cgroup_limit(n) {
-                    return Some(usable);
-                }
+/// Shuffle-cache threshold sibling of [`resolve_memory_pool_bytes`].
+///
+/// - Explicit `OXIDANT_MEMORY_LIMIT_BYTES=<n>` → `Some(n)` (legacy: same number as the pool).
+/// - `OXIDANT_MEMORY_LIMIT_BYTES=0` → `None` (opt out).
+/// - unset (auto-size) → **¼ of the auto-sized pool**, so the FairSpillPool and the in-memory
+///   shuffle cache do not both claim ~70% of RAM. Floor 64 MiB.
+///
+/// Callers that set `OXIDANT_SHUFFLE_SPILL_BYTES` should prefer that and never call this.
+pub fn resolve_shuffle_spill_bytes() -> Option<usize> {
+    match std::env::var("OXIDANT_MEMORY_LIMIT_BYTES") {
+        Ok(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return auto_size_shuffle_spill_bytes();
+            }
+            match s.parse::<usize>() {
+                Ok(0) => None,
+                Ok(n) => Some(n),
+                Err(_) => auto_size_shuffle_spill_bytes(),
             }
         }
+        Err(_) => auto_size_shuffle_spill_bytes(),
     }
-    if let Ok(raw) = std::fs::read_to_string(CGROUP_V1) {
-        if let Ok(n) = raw.trim().parse::<u64>() {
-            if let Some(usable) = usable_cgroup_limit(n) {
-                return Some(usable);
-            }
+}
+
+fn auto_size_shuffle_spill_bytes() -> Option<usize> {
+    resolve_memory_pool_bytes().map(|n| (n / 4).max(64 * 1024 * 1024))
+}
+
+/// Process cgroup memory limit (v2 then v1), preferring **this process's** cgroup over the
+/// root. Root `/sys/fs/cgroup/memory.max` is often `max` even when the unit has
+/// `MemoryMax=` (systemd / EC2 workers), which would incorrectly fall through to host RAM.
+fn cgroup_memory_bytes() -> Option<usize> {
+    for path in cgroup_memory_limit_paths() {
+        if let Some(n) = read_cgroup_limit(&path) {
+            return Some(n);
         }
     }
     None
+}
+
+fn cgroup_memory_limit_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") {
+        for line in content.lines() {
+            // cgroup v2: `0::/system.slice/oxidant-worker.service`
+            if let Some(rel) = line.strip_prefix("0::") {
+                let mut base = std::path::PathBuf::from("/sys/fs/cgroup");
+                let rel = rel.trim().trim_start_matches('/');
+                if !rel.is_empty() {
+                    base.push(rel);
+                }
+                paths.push(base.join("memory.max"));
+                break;
+            }
+        }
+        for line in content.lines() {
+            // cgroup v1: `…:memory:/system.slice/oxidant-worker.service`
+            if let Some((_, path)) = line.split_once(":memory:") {
+                let mut base = std::path::PathBuf::from("/sys/fs/cgroup/memory");
+                let rel = path.trim().trim_start_matches('/');
+                if !rel.is_empty() {
+                    base.push(rel);
+                }
+                paths.push(base.join("memory.limit_in_bytes"));
+                break;
+            }
+        }
+    }
+    // Root fallbacks (bare containers / non-systemd).
+    paths.push(std::path::PathBuf::from("/sys/fs/cgroup/memory.max"));
+    paths.push(std::path::PathBuf::from(
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ));
+    paths
+}
+
+fn read_cgroup_limit(path: &std::path::Path) -> Option<usize> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let s = raw.trim();
+    if s == "max" {
+        return None;
+    }
+    let n = s.parse::<u64>().ok()?;
+    usable_cgroup_limit(n)
 }
 
 /// Reject cgroup "unlimited" sentinels (page-aligned `2^63`-ish values) and limits that
@@ -8575,9 +8636,12 @@ mod tests {
 
         std::env::set_var("OXIDANT_MEMORY_LIMIT_BYTES", "123456789");
         assert_eq!(resolve_memory_pool_bytes(), Some(123456789));
+        // Explicit pool size still seeds shuffle 1:1 (legacy).
+        assert_eq!(resolve_shuffle_spill_bytes(), Some(123456789));
 
         std::env::set_var("OXIDANT_MEMORY_LIMIT_BYTES", "0");
         assert_eq!(resolve_memory_pool_bytes(), None);
+        assert_eq!(resolve_shuffle_spill_bytes(), None);
 
         std::env::remove_var("OXIDANT_MEMORY_LIMIT_BYTES");
         std::env::set_var("OXIDANT_MEMORY_POOL_FRACTION", "0.5");
@@ -8585,6 +8649,12 @@ mod tests {
         assert!(
             auto.is_some_and(|n| n >= 64 * 1024 * 1024),
             "unset MEMORY_LIMIT must auto-size from host/cgroup RAM: {auto:?}"
+        );
+        let shuffle = resolve_shuffle_spill_bytes();
+        assert_eq!(
+            shuffle,
+            auto.map(|n| (n / 4).max(64 * 1024 * 1024)),
+            "auto-sized shuffle must be ¼ of the pool, not a second 70% claim"
         );
 
         match prev {
