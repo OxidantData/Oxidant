@@ -54,7 +54,7 @@
       "components": ["oxidant-sql", "catalog"],
       "labels": ["databricks", "ddl", "glue"],
       "description": "Implement real CREATE TABLE … USING <format> support lowered to the catalog-backed create path, not a lossy rewrite.",
-      "acceptance_criteria": "CREATE TABLE glue.db.t (…) USING parquet LOCATION 's3://…' TBLPROPERTIES (…) creates Glue table + writes Parquet files; golden blocks pass."
+      "acceptance_criteria": "CREATE TABLE … USING with LOCATION/PARTITIONED BY/CLUSTER BY/TBLPROPERTIES; CREATE TABLE LIKE; Hive STORED AS; INSERT OVERWRITE (table + DIRECTORY); LOAD DATA; golden blocks pass."
     },
     {
       "summary": "Implement USE CATALOG / USE DATABASE / USE SCHEMA",
@@ -102,7 +102,7 @@
       "components": ["oxidant-catalog-glue"],
       "labels": ["glue", "ddl", "aws-sdk"],
       "description": "Extend oxidant-catalog-glue to support full DDL lifecycle using aws-sdk-glue in-process.",
-      "acceptance_criteria": "ALTER TABLE, DROP TABLE/DATABASE with IF EXISTS/CASCADE, CREATE DATABASE/SCHEMA, REPAIR TABLE/MSCK REPAIR TABLE, SHOW PARTITIONS work; no AWS CLI; integration tests with stub server."
+      "acceptance_criteria": "ALTER TABLE, DROP TABLE/DATABASE with IF EXISTS/CASCADE, CREATE DATABASE/SCHEMA, CREATE CATALOG, ALTER VIEW, COMMENT ON, TRUNCATE TABLE, REFRESH, REPAIR TABLE/MSCK REPAIR TABLE, SHOW PARTITIONS work; no AWS CLI; integration tests with stub server."
     },
     {
       "summary": "Glue column statistics via ANALYZE TABLE",
@@ -142,7 +142,7 @@
       "components": ["oxidant-datasource", "delta"],
       "labels": ["databricks", "delta", "glue"],
       "description": "Implement Delta Lake maintenance statements for Glue-registered Delta tables.",
-      "acceptance_criteria": "CONVERT TO DELTA, DESCRIBE HISTORY, OPTIMIZE, VACUUM, RESTORE work on Glue-registered tables; stubs + S3 integration tests."
+      "acceptance_criteria": "CONVERT TO DELTA, DESCRIBE HISTORY, DESCRIBE DETAIL, OPTIMIZE, VACUUM, RESTORE, CREATE TABLE … CLONE, CREATE BLOOMFILTER INDEX, GENERATE symlink manifest, FSCK REPAIR TABLE work on Glue-registered tables; stubs + S3 integration tests."
     },
     {
       "summary": "Delta MERGE/UPDATE/DELETE on Glue tables",

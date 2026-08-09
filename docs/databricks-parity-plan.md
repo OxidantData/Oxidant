@@ -109,21 +109,27 @@ Add a new `oxidant-catalog-lakeformation` crate (or extend the Glue provider) us
 | `OXIDANT-DBR-003` | Implement staged `oxidant-sql` dialect pipeline | oxidant-sql | Registry shell + migrate `strip_temporary_view` + AST intercept + output naming pass | 2w |
 | `OXIDANT-DBR-004` | Register Wave A function aliases | oxidant-loom / functions | `starts_with`/`ends_with`, `var_samp`, `length`, `approx_distinct`, `bool_or`/`bool_and`, `signum`, `pow`, `ucase`/`lcase`/`char` aliases pass their golden blocks | 1w |
 | `OXIDANT-DBR-005` | Implement high-value scalar UDF backlog | oxidant-functions | `split`, `mask`, `to_char`/`to_varchar`/`to_number`, `format_string`, `typeof`, `elt`, `bit_count`, `size`/`array_size`, `sort_array`, `map_contains_key`, `parse_url`, `url_encode`/`decode` | 3w |
-| `OXIDANT-DBR-006` | Implement `CREATE TABLE … USING <format>` for Glue/local catalog | oxidant-sql / catalog | `CREATE TABLE glue.db.t (…) USING parquet LOCATION 's3://…' TBLPROPERTIES (…)` creates Glue table + writes Parquet files; golden blocks pass | 3w |
+| `OXIDANT-DBR-006` | Implement `CREATE TABLE … USING <format>` for Glue/local catalog | oxidant-sql / catalog | `CREATE TABLE … USING` with `LOCATION`/`PARTITIONED BY`/`CLUSTER BY`/`TBLPROPERTIES`; also `CREATE TABLE LIKE`, Hive-format `STORED AS`, `INSERT OVERWRITE` (table + `DIRECTORY`), and `LOAD DATA`; golden blocks pass | 3w |
 | `OXIDANT-DBR-007` | Implement `USE CATALOG` / `USE DATABASE` / `USE SCHEMA` | oxidant-sql | AST intercept sets current catalog/namespace; handles quoting, comments, semicolons; rejects invalid catalogs as Spark does | 1w |
 | `OXIDANT-DBR-008` | Implement `LIKE ANY` / `LIKE ALL` | oxidant-sql | Rewritten to OR/AND chain at AST level; golden blocks pass | 1w |
 | `OXIDANT-DBR-009` | Implement `PIVOT` / `UNPIVOT` | oxidant-sql / plan | Requires child-schema resolution; emits correct `LogicalPlan`; golden blocks pass | 3w |
 | `OXIDANT-DBR-010` | Implement `SHOW` / `DESCRIBE` metadata statements | oxidant-sql / catalog | `SHOW DATABASES IN glue`, `SHOW TABLES IN glue.db`, `DESCRIBE TABLE glue.db.t`, `SHOW CREATE TABLE` return catalog metadata directly | 2w |
 | `OXIDANT-DBR-011` | Spark output-name reconciliation pass | oxidant-sql | `schema-only` bucket reduced by matching Spark `Expression.sql` headers for common expressions | 3w |
-| `OXIDANT-DBR-012` | Extend Glue catalog DDL: ALTER/DROP/CREATE DATABASE/REPAIR | oxidant-catalog-glue | Uses `aws-sdk-glue`; no CLI; integration tests with stub server | 3w |
+| `OXIDANT-DBR-012` | Extend Glue catalog DDL: ALTER/DROP/CREATE DATABASE/REPAIR | oxidant-catalog-glue | `ALTER TABLE`, `DROP TABLE/DATABASE` with `IF EXISTS`/`CASCADE`, `CREATE DATABASE/SCHEMA`, `CREATE CATALOG`, `ALTER VIEW`, `COMMENT ON`, `TRUNCATE TABLE`, `REFRESH`, `REPAIR TABLE`/`MSCK REPAIR TABLE`, `SHOW PARTITIONS`; uses `aws-sdk-glue`; no CLI; stub-server integration tests | 3w |
 | `OXIDANT-DBR-013` | Glue column statistics via ANALYZE TABLE | oxidant-catalog-glue | `ANALYZE TABLE glue.db.t COMPUTE STATISTICS` persists and reads column stats via Glue SDK | 2w |
 | `OXIDANT-DBR-014` | Add Lake Formation authorization crate | oxidant-catalog-lakeformation | New crate using `aws-sdk-lakeformation`; resolves effective permissions per table; unit tests with stub server | 3w |
 | `OXIDANT-DBR-015` | Apply Lake Formation row filters and column masks to scans | oxidant-loom / plan | Plan rewrite injects filters/masks from OXIDANT-DBR-014; honors `AccessDenied`; integration tests pass | 3w |
 | `OXIDANT-DBR-016` | Lake Formation cross-account resource links | oxidant-catalog-lakeformation | `GetResourceLinks`, `ListPermissions` support; shared Glue tables resolve through resource links | 2w |
-| `OXIDANT-DBR-017` | Delta Lake SQL on Glue: CONVERT/VACUUM/OPTIMIZE/RESTORE | oxidant-datasource / delta | Delta operations work on Glue-registered tables; stubs + S3 integration tests | 3w |
+| `OXIDANT-DBR-017` | Delta Lake SQL on Glue: CONVERT/VACUUM/OPTIMIZE/RESTORE | oxidant-datasource / delta | `CONVERT TO DELTA`, `DESCRIBE HISTORY`, `DESCRIBE DETAIL`, `OPTIMIZE`, `VACUUM`, `RESTORE`, `CREATE TABLE … CLONE`, `CREATE BLOOMFILTER INDEX`, `GENERATE` symlink manifest, `FSCK REPAIR TABLE` on Glue-registered tables; stubs + S3 integration tests | 3w |
 | `OXIDANT-DBR-018` | Delta `MERGE`/`UPDATE`/`DELETE` on Glue tables | oxidant-datasource / delta | DML executes and updates Glue table metadata as needed | 3w |
 | `OXIDANT-DBR-019` | Databricks parity ratchet CI job | ci | New GitHub Actions job runs Databricks corpus and fails on regression; baseline committed | 1w |
 | `OXIDANT-DBR-020` | Document Glue + Lake Formation SQL support | docs | Update `catalogs-glue.md`, add `catalogs-lakeformation.md`, add Databricks parity section to README | 1w |
+
+Follow-on Jira tickets filed under epic KAN-88 from the KAN-89 matrix / PR #45 review (not in the
+original twenty CSV rows): **KAN-110** (SQL UDF eval bug), **KAN-111** (`TABLESAMPLE` no-op),
+**KAN-112** (`COPY INTO`), **KAN-113** (`SORT BY`/`CLUSTER BY`/`DISTRIBUTE BY`), **KAN-114**
+(`LATERAL VIEW`), **KAN-115** (`TRANSFORM … USING`), **KAN-116** (correlated/`LATERAL`/recursive
+CTE/`= ANY` planner), **KAN-117** (type-system gaps), **KAN-118** (array `[]` base).
 
 ## Dependencies and ordering
 

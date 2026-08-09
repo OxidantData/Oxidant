@@ -1,8 +1,13 @@
 # Jira import artifacts — Databricks SQL parity epic
 
-This directory contains the epic and stories from the approved plan in
-`../.kimi-code/sessions/*/agents/main/plans/kyle-rayner-miss-martian-metamorpho.md`,
-ready for import into Jira.
+This directory contains the epic and stories from the plan in
+[`../docs/databricks-parity-plan.md`](../docs/databricks-parity-plan.md), ready for import
+into Jira.
+
+> These stories have since been imported as **KAN-89..KAN-108** under epic **KAN-88**. The files
+> are kept as the record of what was imported; see
+> [`../docs/databricks-coverage.md`](../docs/databricks-coverage.md) §"Ticket map" for the
+> row-order mapping onto the real Jira keys.
 
 ## Files
 
@@ -31,7 +36,7 @@ Use `databricks-parity-tickets.json` with a script or tool like `jira-cli` / `go
 export JIRA_API_TOKEN="your-token"
 export JIRA_BASE_URL="https://your-domain.atlassian.net"
 export JIRA_PROJECT="OXIDANT"
-# Then run your importer, or ask Kimi to write one given the JSON schema.
+# Then run your importer against the JSON schema above.
 ```
 
 ### Note on the Epic key

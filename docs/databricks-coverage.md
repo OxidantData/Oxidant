@@ -7,7 +7,8 @@ actually does today, across four axes: **statements**, **functions**, **data typ
 
 This is the KAN-89 deliverable for the "Oxidant SQL parity with Databricks SQL on AWS Glue + Lake
 Formation" epic. The plan behind the epic is [`databricks-parity-plan.md`](databricks-parity-plan.md);
-every **Missing** or **Partial** row below names the ticket (KAN-89..KAN-108) that owns closing it.
+every **Missing** or **Partial** row below names the ticket that owns closing it (original epic
+stories KAN-89..KAN-108, plus follow-on tickets KAN-110..KAN-118 filed from this matrix).
 
 ## How this was measured
 
@@ -17,7 +18,7 @@ every **Missing** or **Partial** row below names the ticket (KAN-89..KAN-108) th
 | Build | `cargo build -p oxidant-cli` (dev profile) |
 | Server | `./target/debug/oxidant spark server --port 50051 --sample-data sample-data` |
 | Probe transport | `POST /api/v1/statements?wait=true` (the [REST API](api.md) that `oxidant sql` drives) |
-| Probes run | 578 statements over three passes (508 first pass, 55 follow-ups, 15 semantic checks) |
+| Probes run | 578 statements over three passes (508 first pass = 505 scored across the four axes below + 3 setup/DDL warm-ups not attributed to an axis, 55 follow-ups, 15 semantic checks). Reconstructible statement probes are listed in [`parity/databricks-probes.md`](../parity/databricks-probes.md); function-category ratios are category aggregates (see that file). |
 | Date | 2026-08-09 |
 
 Every row's Evidence column is one of two things and nothing else:
@@ -84,11 +85,12 @@ denominator for the function/dialect tickets and the wrong one for Databricks-on
 
 ## Headline
 
-197 manual sections are scored below: **73 Supported** (one of them parse-only), **28 Partial**,
-**79 Missing**, **17 N/A**. Every one of the 107 Missing/Partial rows names an owning ticket.
+200 manual sections are scored below: **75 Supported** (74 probed, one parse-only), **29 Partial**,
+**79 Missing**, **17 N/A**. Every one of the 108 Missing/Partial rows names an owning ticket.
 
 Raw first-pass probe pass rates, by axis (a probe "passes" if the statement succeeded — it does
-not assert Databricks-identical values, so these are upper bounds):
+not assert Databricks-identical values, so these are upper bounds). Denominators sum to 505; the
+other 3 first-pass statements were setup/DDL warm-ups (see methodology table).
 
 | Axis | Probes passing |
 |------|---------------:|
@@ -116,7 +118,7 @@ not assert Databricks-identical values, so these are upper bounds):
 | `CREATE TEMPORARY VIEW` | Supported | `CREATE TEMPORARY VIEW cov_tv AS SELECT id FROM cov_t` → OK; `SHOW VIEWS` reports it with `isTemporary = true`. Temp/persistent distinction is tracked in `Engine::sql` (`temp_views`, `analyze_create_view`) since DataFusion has none. | — |
 | `CREATE MATERIALIZED VIEW` | N/A | `CREATE MATERIALIZED VIEW cov_mv AS …` → `Materialized views not supported`. Databricks MVs are a DLT/serverless control-plane object. | — |
 | `CREATE STREAMING TABLE` | N/A | `CREATE STREAMING TABLE cov_st AS …` → `ParserError("Expected: an object type after CREATE, found: STREAMING")`. DLT pipeline object. | — |
-| `CREATE FUNCTION` (SQL body) | Partial | `CREATE OR REPLACE FUNCTION cov_add2(x INT) RETURNS INT RETURN x + 100` → OK, but `SELECT cov_add2(1)` → `1` and `SELECT cov_add2(5)` → `1`. The definition registers (`crates/oxidant-loom/src/udf_registry.rs` → `try_create_function`) but the body is not evaluating the argument. | KAN-91 |
+| `CREATE FUNCTION` (SQL body) | Partial | `CREATE OR REPLACE FUNCTION cov_add2(x INT) RETURNS INT RETURN x + 100` → OK, but `SELECT cov_add2(1)` → `1` and `SELECT cov_add2(5)` → `1`. The definition registers (`crates/oxidant-loom/src/udf_registry.rs` → `try_create_function`) but the body is not evaluating the argument. | KAN-110 |
 | `CREATE CATALOG` | Missing | `CREATE CATALOG IF NOT EXISTS cov_cat` → `ParserError("Expected: an object type after CREATE, found: CATALOG")` | KAN-100 |
 | `CREATE CONNECTION` | N/A | `CREATE CONNECTION cov_conn TYPE mysql …` → `ParserError("… found: CONNECTION")`. Unity Catalog Lakehouse Federation object. | — |
 | `CREATE EXTERNAL LOCATION` / `CREATE CREDENTIAL` | N/A | `CREATE EXTERNAL LOCATION cov_loc URL 's3://b/p' …` → `ParserError("Expected: TABLE, found: LOCATION")`. Unity Catalog securable. | — |
@@ -149,7 +151,7 @@ not assert Databricks-identical values, so these are upper bounds):
 | `DELETE FROM` | Missing | `DELETE FROM cov_dml WHERE a = 9` → `DELETE operation on table 'cov_dml' caused by This feature is not implemented: DELETE not supported` | KAN-106 |
 | `UPDATE` | Missing | `UPDATE cov_dml SET b = 'y' WHERE a = 1` → `UPDATE operation on table 'cov_dml' caused by This feature is not implemented: UPDATE not supported` | KAN-106 |
 | `MERGE INTO` | Missing | Full `MERGE INTO cov_dml t USING cov_t s ON t.a = s.id WHEN MATCHED … WHEN NOT MATCHED …` → `Unsupported SQL statement: MERGE INTO …` | KAN-106 |
-| `COPY INTO` | Missing | `COPY INTO cov_dml FROM '/tmp/probe/out' FILEFORMAT = PARQUET` → `ParserError("Expected: FROM or TO, found: cov_dml at Line: 1, Column: 11")` (the parser only knows PostgreSQL `COPY`) | KAN-90 |
+| `COPY INTO` | Missing | `COPY INTO cov_dml FROM '/tmp/probe/out' FILEFORMAT = PARQUET` → `ParserError("Expected: FROM or TO, found: cov_dml at Line: 1, Column: 11")` (the parser only knows PostgreSQL `COPY`) | KAN-112 |
 | `LOAD DATA` | Missing | `LOAD DATA INPATH '/tmp/probe/out' INTO TABLE cov_dml` → `ParserError("Expected: `DATA` or an extension name after `LOAD`, found: INPATH")` | KAN-94 |
 | `PUT INTO` | N/A | Not probed. Databricks volume-ingest statement, control-plane only. | — |
 
@@ -167,26 +169,26 @@ not assert Databricks-identical values, so these are upper bounds):
 | `HAVING` | Supported | `… GROUP BY name HAVING sum(amt) > 5` → OK | — |
 | `ORDER BY` (incl. `NULLS FIRST/LAST`, ordinals) | Supported | `ORDER BY id DESC`, `ORDER BY id ASC NULLS LAST`, `ORDER BY 1` → all OK | — |
 | `LIMIT` / `OFFSET` | Supported | `SELECT id FROM cov_t ORDER BY id LIMIT 2 OFFSET 1` → OK | — |
-| `SORT BY` | Missing | `SELECT id FROM cov_t SORT BY id` → `This feature is not implemented: SORT BY` | KAN-90 |
-| `CLUSTER BY` (query clause) | Missing | `SELECT id FROM cov_t CLUSTER BY id` → `This feature is not implemented: CLUSTER BY` | KAN-90 |
-| `DISTRIBUTE BY` | Missing | `SELECT id FROM cov_t DISTRIBUTE BY id` → `Physical plan does not support DistributeBy partitioning` | KAN-90 |
+| `SORT BY` | Missing | `SELECT id FROM cov_t SORT BY id` → `This feature is not implemented: SORT BY` | KAN-113 |
+| `CLUSTER BY` (query clause) | Missing | `SELECT id FROM cov_t CLUSTER BY id` → `This feature is not implemented: CLUSTER BY` | KAN-113 |
+| `DISTRIBUTE BY` | Missing | `SELECT id FROM cov_t DISTRIBUTE BY id` → `Physical plan does not support DistributeBy partitioning` | KAN-113 |
 | `JOIN` — inner/left/right/full/cross | Supported | All five probes → OK | — |
 | `JOIN` — `LEFT SEMI` / `LEFT ANTI` | Supported | `SELECT a.id FROM cov_t a LEFT SEMI JOIN cov_t b ON a.id = b.id` → OK; same for `LEFT ANTI` | — |
 | `JOIN` — `NATURAL`, `USING` | Supported | `NATURAL JOIN` and `JOIN … USING (id)` → both OK | — |
-| `LATERAL` subquery join | Missing | `SELECT t.id, s.x FROM cov_t t, LATERAL (SELECT t.id + 1 AS x) s` → `Physical plan does not support logical expression OuterReferenceColumn(…)` | KAN-97 |
+| `LATERAL` subquery join | Missing | `SELECT t.id, s.x FROM cov_t t, LATERAL (SELECT t.id + 1 AS x) s` → `Physical plan does not support logical expression OuterReferenceColumn(…)` | KAN-116 |
 | Set operators `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` | Supported | All four probes → OK | — |
 | Set operator `MINUS` | Missing | `SELECT 1 AS a MINUS SELECT 2` → `This feature is not implemented: MINUS  not implemented` | KAN-91 |
 | Common table expressions (`WITH`, column list) | Supported | `WITH c AS (SELECT 1 AS a) SELECT a FROM c` and `WITH c(a) AS (SELECT 1) SELECT a FROM c` → OK | — |
-| Recursive CTE (`WITH RECURSIVE`) | Missing | `WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 3) …` → `Schema error: No field named n. Valid fields are c."Int64(1)".`; the un-aliased variant → `Cannot project plan column 0 ('c.n + Int64(1)') to expected output field` | KAN-91 |
+| Recursive CTE (`WITH RECURSIVE`) | Missing | `WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 3) …` → `Schema error: No field named n. Valid fields are c."Int64(1)".`; the un-aliased variant → `Cannot project plan column 0 ('c.n + Int64(1)') to expected output field` | KAN-116 |
 | Subqueries — scalar, `IN`, `EXISTS` (uncorrelated) | Supported | `SELECT (SELECT max(id) FROM cov_t)`, `… WHERE id IN (SELECT …)`, `… WHERE EXISTS (SELECT 1 …)` → OK | — |
-| Correlated scalar subquery in `SELECT` | Missing | `SELECT id, (SELECT count(*) FROM cov_t u WHERE u.id <= t.id) AS c FROM cov_t t` → `Physical plan does not support logical expression ScalarSubquery(<subquery>)`. Correlated `IN` in `WHERE` does work. | KAN-91 |
+| Correlated scalar subquery in `SELECT` | Missing | `SELECT id, (SELECT count(*) FROM cov_t u WHERE u.id <= t.id) AS c FROM cov_t t` → `Physical plan does not support logical expression ScalarSubquery(<subquery>)`. Correlated `IN` in `WHERE` does work. | KAN-116 |
 | Window functions + `OVER` + frames | Supported | `row_number()/rank()/lag()/ntile()` over `ORDER BY`; `ROWS BETWEEN 1 PRECEDING AND CURRENT ROW` and `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` → all OK | — |
 | `WINDOW` clause (named windows) | Supported | `SELECT id, rank() OVER w FROM cov_t WINDOW w AS (ORDER BY id)` → OK | — |
 | `QUALIFY` | Supported | `SELECT id FROM cov_t QUALIFY row_number() OVER (ORDER BY id) = 1` → 1 row; `… <= 2` → 2 rows | — |
-| `LATERAL VIEW` (incl. `OUTER`) | Missing | `… LATERAL VIEW explode(t.arr) e AS v` → `This feature is not implemented: LATERAL VIEWS` | KAN-90 |
+| `LATERAL VIEW` (incl. `OUTER`) | Missing | `… LATERAL VIEW explode(t.arr) e AS v` → `This feature is not implemented: LATERAL VIEWS` | KAN-114 |
 | `PIVOT` | Missing | `… PIVOT (sum(amt) FOR name IN ('a','b'))` → `Unsupported ast node Pivot { … }` | KAN-97 |
 | `UNPIVOT` | Missing | `… UNPIVOT (val FOR col IN (x, y))` → `Unsupported ast node Unpivot { … }` | KAN-97 |
-| `TABLESAMPLE` | Partial | Parses but is ignored: `SELECT count(*) FROM cov_t TABLESAMPLE (1 ROWS)` → `3` on a 3-row table (Databricks returns 1). `TABLESAMPLE (50 PERCENT)` likewise returns everything. | KAN-90 |
+| `TABLESAMPLE` | Partial | Parses but is ignored: `SELECT count(*) FROM cov_t TABLESAMPLE (1 ROWS)` → `3` on a 3-row table (Databricks returns 1). `TABLESAMPLE (50 PERCENT)` likewise returns everything. | KAN-111 |
 | `VALUES` clause | Supported | `SELECT * FROM VALUES (1,'a'),(2,'b') AS t(num, letter)` → OK | — |
 | Table-valued function `range()` | Partial | `SELECT * FROM range(3)` → works but the column is `value`, not Spark's `id`; `SELECT id FROM range(5)` → `Schema error: No field named id. Valid fields are "range()".value.` | KAN-99 |
 | Table-valued functions `explode` / `inline` / `posexplode` in `FROM` | Missing | `SELECT * FROM explode(array(1,2))` → `table function 'explode' not found` (same for `inline`, `posexplode`) | KAN-93 |
@@ -194,7 +196,7 @@ not assert Databricks-identical values, so these are upper bounds):
 | Hints (`/*+ BROADCAST(t) */`, `REPARTITION`) | Partial | Both probes return correct rows, so the comment is tolerated, but nothing consumes it — no code path reads Spark hints, and join strategy is chosen by `crates/oxidant-loom/src/lib.rs` → `join_preference` from env/statistics instead. | KAN-91 |
 | Aggregate `FILTER (WHERE …)` | Supported | `SELECT count(*) FILTER (WHERE id > 1) FROM cov_t` → OK | — |
 | `WITHIN GROUP (ORDER BY …)` | Supported | `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM cov_t` → `2.0` | — |
-| `TRANSFORM … USING` (script transform) | Missing | `SELECT TRANSFORM(id) USING 'cat' AS (x) FROM cov_t` → `ParserError("Expected: end of statement, found: 'cat' at Line: 1, Column: 28")` | KAN-90 |
+| `TRANSFORM … USING` (script transform) | Missing | `SELECT TRANSFORM(id) USING 'cat' AS (x) FROM cov_t` → `ParserError("Expected: end of statement, found: 'cat' at Line: 1, Column: 28")` | KAN-115 |
 | `TABLE <name>` statement | Missing | `TABLE cov_t` → `ParserError("Expected: an SQL statement, found: TABLE at Line: 1, Column: 1")` | KAN-91 |
 | Time travel `VERSION AS OF` / `TIMESTAMP AS OF` | Partial | Works on Delta: `SELECT count(*) FROM samples.tpch_nation_delta VERSION AS OF 0` → `25`. But it is silently ignored on non-Delta tables — `SELECT count(*) FROM cov_t VERSION AS OF 99` (a Parquet table, no version 99) → `3` instead of an error. | KAN-105 |
 | `EXPLAIN` | Partial | `EXPLAIN SELECT 1 AS a` → `plan_type`/`plan` rows (DataFusion shape, not Spark's single `plan` column); `EXPLAIN FORMAT INDENT …` → OK; `EXPLAIN EXTENDED SELECT 1 AS a` → `ParserError("Expected: an SQL statement, found: EXTENDED at Line: 1, Column: 9")` | KAN-91 |
@@ -279,12 +281,12 @@ functions are the ones that actually failed.
 | Window / analytic functions | Supported | 6/6: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `nth_value` all evaluate over `OVER (ORDER BY …)` | — |
 | Array functions | Partial | 14/22. Missing: `size`, `sequence`, `shuffle`, `slice`, `array_insert`, `get`, plus `array_prepend` (arity error) and one `array_append` planning error. | KAN-93 |
 | Map functions | Partial | 6/10. Missing: `map_concat`, `map_from_arrays`, `map_from_entries`, `str_to_map`. Working: `map_keys`, `map_values`, `map_contains_key`, `map_entries`, `element_at`, `try_element_at`, `cardinality`. | KAN-93 |
-| Struct functions | Partial | 1/5. `named_struct`/`struct` construct fine and `to_json` works, but field access via a dot on a constructed struct fails (see Operators), and `schema_of_json` is missing. | KAN-91, KAN-93 |
+| Struct functions | Partial | 1/5 probes (one probe bundled `named_struct`+`struct`+`to_json` as a single pass). Those three construct/serialize fine, but field access via a dot on a constructed struct fails (see Operators), and `schema_of_json` is missing. | KAN-91, KAN-93 |
 | Lambda / higher-order functions | Missing | 0/11 — `transform`, `filter`, `exists`, `forall`, `aggregate`, `reduce`, `zip_with`, `transform_keys`, `transform_values`, `map_filter`, `map_zip_with` all → `Invalid function`. The `->` lambda operator itself is therefore also untested against a real callee. | KAN-93 |
 | String functions | Partial | 29/41. Missing: `locate`, `format_number`, `printf`, `soundex`, `base64`, `unbase64`, `sentences`, `space`, `collate`, `is_valid_utf8`, `luhn_check`. Diverging: `encode('a','utf-8')` → `There is no built-in encoding named 'utf-8'` (only `base64`/`base64pad`/`hex`); `regexp_extract_all('aab','a')` → `[INVALID_PARAMETER_VALUE.REGEX_GROUP_INDEX] … expected a group index between 0 and 0, got 1` where Databricks defaults to group 0. | KAN-92, KAN-93 |
 | Math functions | Partial | 13/20. Missing: `e`, `randn`, `bit_get`, `negative`, `width_bucket`, `hypot`. Diverging: `bround(2.5)` → `bround on non-integral input (Float64) is not supported`. Working: `abs`, `ceil`, `floor`, `round`, `exp`/`ln`/`log`/`log2`/`log10`, `pow`/`power`/`sqrt`/`cbrt`, all trig and hyperbolic, `degrees`/`radians`/`pi`, `sign`/`signum`, `greatest`/`least`, `factorial`, `conv`, `shiftleft`/`shiftright`/`shiftrightunsigned`, `bit_count`, `try_add`/`try_subtract`/`try_multiply`/`try_divide`, `isnan`, `nanvl`. | KAN-92, KAN-93 |
 | Date/time functions | Partial | 8/28 — the weakest category. Missing: `year`, `month`, `day`, `quarter`, `hour`, `minute`, `second`, `dayofweek`, `dayofmonth`, `dayofyear`, `weekofyear`, `datediff`, `date_diff`, `dateadd`, `timestampadd`, `timestampdiff`, `add_months`, `months_between`, `last_day`, `next_day`, `from_utc_timestamp`, `to_utc_timestamp`, `convert_timezone`, `current_timezone`, `make_interval`, `unix_micros`, `window`, `session_window`. Working: `current_date`, `current_timestamp`, `now`, `date_add`/`date_sub`, `date_format`, `date_trunc`, `to_date`, `to_timestamp`, `from_unixtime`, `make_date`, `make_timestamp`, `extract`/`date_part`, `unix_date`, `try_to_timestamp`, `unix_timestamp(expr, fmt)`. Diverging: `trunc(DATE, 'MM')` coerces only numerics; `to_date('01/02/2024','MM/dd/yyyy')` → `input contains invalid characters` (Java format patterns aren't understood — the strftime spelling `'%m/%d/%Y'` works); `unix_timestamp()` rejects zero arguments. | KAN-92, KAN-93 |
-| Conditional functions | Partial | 6/8. Missing: `isnull`, `isnotnull`, `equal_null`. Working: `coalesce`, `nvl`, `nvl2`, `nullif`, `ifnull`, `if`, `nullifzero`, `zeroifnull`. | KAN-92 |
+| Conditional functions | Partial | 6/8 probes (two probes each covered a pair of working functions, so eight function names appear against six passing probes). Missing: `isnull`, `isnotnull`, `equal_null`. Working: `coalesce`, `nvl`, `nvl2`, `nullif`, `ifnull`, `if`, `nullifzero`, `zeroifnull`. | KAN-92 |
 | Conversion functions | Supported | 7/7: `cast`, `try_cast`, the constructor aliases (`bigint`/`int`/`string`/`double`/`boolean`/`date`/`timestamp`/`binary`/`decimal`), and `typeof` (`crates/oxidant-loom/src/spark_functions/spark_cast_constructors.rs`) | — |
 | Predicate functions | Partial | 2/5. `regexp_like` and `rlike` work as functions; `isnull`, and the function spellings `like(x, p)` / `ilike(x, p)` are missing. | KAN-92 |
 | Hash functions | Missing | 0/3 under Spark spellings — `sha`, `sha1`, `sha2`, `crc32`, `hash`, `xxhash64` all `Invalid function`. The primitives exist under DataFusion names: `SELECT md5('a'), sha256('a')` → OK, `SELECT digest('a','sha256')` → OK. Alias work, not new implementation. | KAN-92 |
@@ -297,7 +299,7 @@ functions are the ones that actually failed.
 | Misc / system functions | Partial | 4/15. Working: `current_catalog`, `current_database`, `current_schema`, `version`, `uuid`, `assert_true`. Missing: `current_user`/`user`/`session_user`, `current_version`, `monotonically_increasing_id`, `spark_partition_id`, `input_file_name`, `raise_error`, `aes_encrypt`, `bitmap_count`, `java_method`, `reflect`, `stack`. | KAN-93 |
 | Geospatial functions (`ST_*`) | Missing | 0/3 — `st_point`, `st_area`, `st_astext` → `Invalid function`. | KAN-93 |
 | AI functions (`ai_query`, `ai_analyze_sentiment`, `vector_search`) | N/A | 0/3 — all `Invalid function`. Require Databricks Model Serving / Vector Search. | — |
-| SQL UDFs (`CREATE FUNCTION … RETURN`) | Partial | Registers, but evaluates wrong: after `CREATE OR REPLACE FUNCTION cov_add2(x INT) RETURNS INT RETURN x + 100`, both `SELECT cov_add2(1)` and `SELECT cov_add2(5)` → `1`. | KAN-91 |
+| SQL UDFs (`CREATE FUNCTION … RETURN`) | Partial | Registers, but evaluates wrong: after `CREATE OR REPLACE FUNCTION cov_add2(x INT) RETURNS INT RETURN x + 100`, both `SELECT cov_add2(1)` and `SELECT cov_add2(5)` → `1`. | KAN-110 |
 
 ## G. Data types
 
@@ -308,18 +310,18 @@ functions are the ones that actually failed.
 | `FLOAT` / `DOUBLE` | Supported | `CAST(1.5 AS FLOAT)`, `CAST(1.5 AS DOUBLE)` → OK | — |
 | `DECIMAL(p,s)` | Supported | `CAST(1.5 AS DECIMAL(10,2))` → `v:Decimal128(10, 2)` = `1.5`; decimal division follows Spark's rules (`DECIMAL(10,2) / DECIMAL(10,2)` → `Decimal128(16, 6)` = `0.333333`) | — |
 | `STRING` | Supported | `SELECT typeof(CAST('a' AS STRING))` → `string` | — |
-| `CHAR(n)` / `VARCHAR(n)` | Partial | Both parse and cast to `Utf8View`, but the length is not applied: `SELECT concat('[', CAST('ab' AS CHAR(4)), ']')` → `[ab]`, where Databricks pads to `[ab  ]`. | KAN-91 |
-| `BINARY` | Missing | `SELECT CAST('ab' AS BINARY)` → `This feature is not implemented: Unsupported SQL type BINARY` | KAN-91 |
+| `CHAR(n)` / `VARCHAR(n)` | Partial | Both parse and cast to `Utf8View`, but the length is not applied: `SELECT concat('[', CAST('ab' AS CHAR(4)), ']')` → `[ab]`, where Databricks pads to `[ab  ]`. | KAN-117 |
+| `BINARY` | Missing | `SELECT CAST('ab' AS BINARY)` → `This feature is not implemented: Unsupported SQL type BINARY` | KAN-117 |
 | `DATE` | Supported | `SELECT DATE '2024-01-02'` → OK | — |
 | `TIMESTAMP` | Supported | `SELECT TIMESTAMP '2024-01-02 03:04:05'` → OK | — |
-| `TIMESTAMP_NTZ` | Missing | `SELECT CAST('2024-01-02 03:04:05' AS TIMESTAMP_NTZ)` → `Unsupported SQL type TIMESTAMP_NTZ` | KAN-91 |
-| `INTERVAL` — year-month | Partial | Single-unit works (`INTERVAL '3' MONTH` → `Interval(MonthDayNano)` = `3 mons`); the compound form does not: `INTERVAL '1-2' YEAR TO MONTH` → `Unsupported Interval Expression with last_field Some(Month)`. Arrow also has one interval type where Spark has two distinct ones. | KAN-91 |
-| `INTERVAL` — day-time | Partial | Same split: `INTERVAL '5' DAY` → OK; `INTERVAL '1 02:03:04' DAY TO SECOND` → `Unsupported Interval Expression with last_field Some(Second)` | KAN-91 |
+| `TIMESTAMP_NTZ` | Missing | `SELECT CAST('2024-01-02 03:04:05' AS TIMESTAMP_NTZ)` → `Unsupported SQL type TIMESTAMP_NTZ` | KAN-117 |
+| `INTERVAL` — year-month | Partial | Single-unit works (`INTERVAL '3' MONTH` → `Interval(MonthDayNano)` = `3 mons`); the compound form does not: `INTERVAL '1-2' YEAR TO MONTH` → `Unsupported Interval Expression with last_field Some(Month)`. Arrow also has one interval type where Spark has two distinct ones. | KAN-117 |
+| `INTERVAL` — day-time | Partial | Same split: `INTERVAL '5' DAY` → OK; `INTERVAL '1 02:03:04' DAY TO SECOND` → `Unsupported Interval Expression with last_field Some(Second)` | KAN-117 |
 | `ARRAY<T>` | Supported | `SELECT array(1,2,3)` → `List(Int32)` = `[1, 2, 3]`; `CAST(array(1,2) AS ARRAY<BIGINT>)` → OK; `typeof(array(1))` → `array<int>` | — |
 | `MAP<K,V>` | Partial | Values are right — `SELECT map('a',1,'b',2)` → `{"a": 1, "b": 2}` — but the type name is not: `typeof(map('a',1))` → ``map(field { name: "entries", data_type: struct([…]) }, false)`` instead of Databricks' `MAP<STRING, INT>`. | KAN-99 |
 | `STRUCT<…>` | Supported | `SELECT named_struct('a',1,'b','x')` → `Struct("a": Int32, "b": Utf8)`; `struct(1 AS a, 'x' AS b)` also OK | — |
-| `VARIANT` | Missing | `SELECT CAST(NULL AS VARIANT)` → `Unsupported SQL type VARIANT`; `parse_json` → `Invalid function 'parse_json'` | KAN-91, KAN-93 |
-| `OBJECT` | Missing | `SELECT CAST(NULL AS OBJECT<a: INT>)` → `ParserError("Expected: ), found: < at Line: 1, Column: 27")` | KAN-91 |
+| `VARIANT` | Missing | `SELECT CAST(NULL AS VARIANT)` → `Unsupported SQL type VARIANT`; `parse_json` → `Invalid function 'parse_json'` | KAN-117, KAN-93 |
+| `OBJECT` | Missing | `SELECT CAST(NULL AS OBJECT<a: INT>)` → `ParserError("Expected: ), found: < at Line: 1, Column: 27")` | KAN-117 |
 | `GEOGRAPHY` / `GEOMETRY` | Missing | `st_geogfromtext` / `st_geomfromtext` → `Invalid function` | KAN-93 |
 | `VOID` / `NULL` | Supported | `SELECT NULL` → OK; `SELECT typeof(NULL)` → OK | — |
 
@@ -341,7 +343,7 @@ functions are the ones that actually failed.
 | `BETWEEN` | Supported | `SELECT 2 BETWEEN 1 AND 3` → `true` | — |
 | `IN` (list and subquery) | Supported | `SELECT 2 IN (1,2,3)` → OK; `… WHERE id IN (SELECT …)` → OK, including the correlated form | — |
 | `EXISTS` | Supported | `SELECT id FROM cov_t t WHERE EXISTS (SELECT 1 FROM cov_t u WHERE u.id = t.id)` → OK | — |
-| `= ANY (subquery)` | Missing | `SELECT 1 = ANY (SELECT id FROM cov_t)` → `Physical plan does not support logical expression Exists(…)` | KAN-91 |
+| `= ANY (subquery)` | Missing | `SELECT 1 = ANY (SELECT id FROM cov_t)` → `Physical plan does not support logical expression Exists(…)` | KAN-116 |
 | `LIKE` (incl. `ESCAPE`) | Supported | `SELECT 'abc' LIKE 'a%'` → `true`; `'a_c' LIKE 'a\_c'` → OK | — |
 | `ILIKE` | Supported | `SELECT 'ABC' ILIKE 'a%'` → `true` | — |
 | `RLIKE` / `REGEXP` (operator form) | Missing | `SELECT 'abc' RLIKE '^a'` → `Unsupported ast node in sqltorel: RLike { … }` (same for `REGEXP`). The function form works: `SELECT regexp_like('abc','^a')` → OK. | KAN-91 |
@@ -351,17 +353,19 @@ functions are the ones that actually failed.
 | Cast operator `::` | Supported | `SELECT '1'::INT` → OK | — |
 | Field access `.` on a struct column | Supported | `SELECT s.a FROM (SELECT named_struct('a',1) AS s) t` → `1` | — |
 | Field access `.` on an inline struct expression | Missing | `SELECT named_struct('a',1).a` → `Dot access not supported for non-string expr: Identifier(…)`. This is the same round-trip hazard `sanitize_generated_sql` works around in `crates/oxidant-execution/src/plan/stage_planner.rs`. | KAN-91 |
-| Subscript `[]` on arrays and maps | Supported | `SELECT array(1,2,3)[1]`, `SELECT map('a',1)['a']` → OK. Note `array(10,20,30)[0]` also succeeds, so 0-vs-1 based indexing needs its own check (see Not verified). | — |
+| Subscript `[]` on arrays and maps | Partial | Map subscript works (`SELECT map('a',1)['a']` → `1`). Array subscript is **1-based** here: `SELECT array(10,20,30)[0] AS z, array(10,20,30)[1] AS o` → `z=null, o=10`. Spark/Databricks `[]` is 0-based (expected `z=10, o=20`); `element_at` is the 1-based form. | KAN-118 |
 | Lambda `->` | Missing | `SELECT transform(array(1,2), x -> x + 1)` → `Invalid function 'transform'`. No higher-order function exists to apply a lambda to, so the operator is untestable today. | KAN-93 |
-| JSON path `:` | Missing | `SELECT '{"a":1}':a` → `Binary operator 'Colon' is not supported in the physical expr`; the VARIANT spelling fails earlier at `parse_json`. | KAN-91, KAN-93 |
+| JSON path `:` | Missing | `SELECT '{"a":1}':a` → `Binary operator 'Colon' is not supported in the physical expr`; the VARIANT spelling fails earlier at `parse_json`. | KAN-117, KAN-93 |
 
 ## Ticket map
 
-`jira/databricks-parity-tickets.csv` carries placeholder IDs; they map in order onto the Jira
-keys used above.
+[`docs/databricks-parity-plan.md`](databricks-parity-plan.md) §Stories assigns the placeholder
+IDs `OXIDANT-DBR-001..020`. They map in order onto both the Jira keys used above and the story
+rows (lines 3–22) of `jira/databricks-parity-tickets.csv`, which has no ID column of its own —
+mapping is positional by CSV row order.
 
-| CSV ID | Jira | Summary |
-|--------|------|---------|
+| Plan ID | Jira | Summary |
+|---------|------|---------|
 | OXIDANT-DBR-001 | KAN-89 | Build Databricks SQL coverage matrix (this document) |
 | OXIDANT-DBR-002 | KAN-90 | Add Databricks-specific SQL corpus to parity harness |
 | OXIDANT-DBR-003 | KAN-91 | Implement staged `oxidant-sql` dialect pipeline |
@@ -383,10 +387,29 @@ keys used above.
 | OXIDANT-DBR-019 | KAN-107 | Databricks parity ratchet CI job |
 | OXIDANT-DBR-020 | KAN-108 | Document Glue + Lake Formation SQL support |
 
-Four tickets have no **Missing**/**Partial** rows pointing at them, for different reasons:
-KAN-89 is this document; KAN-96 (`LIKE ANY`/`LIKE ALL`) is already implemented and both probes
-pass, so it looks closeable on inspection; KAN-107 and KAN-108 are process/docs tickets that gate
-the work rather than appearing as a language-surface gap.
+Follow-on tickets filed from this matrix (and its review), also under epic KAN-88:
+
+| Jira | Type | Summary | Owns matrix rows |
+|------|------|---------|------------------|
+| KAN-110 | Bug | SQL UDF body not evaluated | `CREATE FUNCTION`, SQL UDFs |
+| KAN-111 | Bug | `TABLESAMPLE` parsed then ignored | `TABLESAMPLE` |
+| KAN-112 | Story | `COPY INTO` file ingest | `COPY INTO` |
+| KAN-113 | Story | `SORT BY` / `CLUSTER BY` / `DISTRIBUTE BY` | those three query clauses |
+| KAN-114 | Story | `LATERAL VIEW` (incl. `OUTER`) | `LATERAL VIEW` |
+| KAN-115 | Story | `TRANSFORM … USING` | `TRANSFORM … USING` |
+| KAN-116 | Story | Planner: correlated / `LATERAL` / recursive CTE / `= ANY` | recursive CTE, correlated scalar, `LATERAL` join, `= ANY` |
+| KAN-117 | Story | Type system: `BINARY`, `TIMESTAMP_NTZ`, `VARIANT`/`OBJECT`, compound `INTERVAL`, `CHAR(n)` | those type rows (+ JSON `:` with KAN-93) |
+| KAN-118 | Bug | Array `[]` is 1-based; Spark/Databricks are 0-based | array/map subscript |
+
+KAN-91 keeps dialect/AST surface only (operators, `SELECT * REPLACE`, `MINUS`, session/`CACHE`/`EXPLAIN` forms, hints, `IDENTIFIER`, `TABLE`, struct-dot AST). Planner and type-system gaps that a pipeline shell cannot close were moved to KAN-116 / KAN-117.
+
+KAN-94 / KAN-100 / KAN-105 acceptance criteria in the plan and `jira/` import artifacts were broadened so the matrix rows citing them stay inside those tickets' stated scope (see plan §Stories).
+
+Five tickets have no **Missing**/**Partial** rows pointing at them, for different reasons:
+KAN-89 is this document; KAN-90 adds golden coverage but does not implement language features;
+KAN-96 (`LIKE ANY`/`LIKE ALL`) is already implemented and both probes pass, so it looks
+closeable on inspection; KAN-107 and KAN-108 are process/docs tickets that gate the work
+rather than appearing as a language-surface gap.
 
 ## Where the plan document is out of date
 
@@ -410,9 +433,6 @@ Listed rather than guessed:
 - **Constraint enforcement.** `CREATE TABLE … CONSTRAINT pk PRIMARY KEY (a)` parses, but I did not
   test whether a duplicate insert is rejected or whether the constraint is reported by
   `SHOW CREATE TABLE`. Marked Supported (parse-only) on the parse evidence alone.
-- **Array subscript base.** `array(1,2,3)[1]` and `array(10,20,30)[0]` both succeed; I did not
-  check the returned element against Spark's 1-based indexing, so the row is scored on the
-  operator parsing and evaluating, not on index semantics.
 - **Glue-backed behavior for every DDL/DML row.** All probes ran against the built-in
   `spark_catalog` on local Parquet. Rows that a Glue catalog might answer differently
   (`SHOW PARTITIONS`, `ANALYZE TABLE`, `ALTER TABLE`) were not re-run against Glue — that needs
