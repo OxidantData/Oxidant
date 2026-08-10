@@ -74,6 +74,42 @@ see [`docs/distributed-ec2.md`](docs/distributed-ec2.md).
 Local TPC-H distributed gate:
 `cargo run -p oxidant-bench -- tpch-distributed --sf 0.01 --workers 2`.
 
+### SF100 / TPC-DS memory gotchas (do not re-learn the hard way)
+
+PR #51 added **auto-size** when `OXIDANT_MEMORY_LIMIT_BYTES` is unset (cgroup/host RAM ×
+`OXIDANT_MEMORY_POOL_FRACTION`, shuffle cache = ¼ of that pool, `OXIDANT_COLOCATED_ENGINES`
+for in-process multi-worker). That fixed the *unbounded-pool* class of failures
+(opaque `do_get: transport error` after a worker OOM — classic TPC-DS **Q2** / Q5 on SF100
+before the fix).
+
+**Auto-size is not enough for SF100 honesty runs.** HashJoin build sides are **not**
+spillable (memory lands outside the FairSpillPool), and shuffle defaults to
+`OXIDANT_SHUFFLE_PARTITIONS = WorkerCount` (bootstrap / CFN when the param is empty).
+With 2 workers that means **2 shuffle buckets** → one worker can soak most of the join
+and climb to ~50+ GiB RSS while the other stays light.
+
+| Symptom | Likely cause | Required fix |
+|---------|--------------|--------------|
+| Opaque `do_get: transport error`, worker dead, dmesg OOM | Unbounded / missing pool (`MEMORY_LIMIT` unset **and** auto-size unavailable, or `=0`) | Leave unset for auto-size **or** set explicit limits; never `=0` on SF100 |
+| One worker ~50+ GiB RSS, other light; Q2 / multi-fact joins die | Shuffle partitions ≈ worker count (2-bucket skew) | `OXIDANT_SHUFFLE_PARTITIONS=32` (≈ worker vCPU) |
+| Hash joins blow cgroup despite a bounded pool | Undersized instance / pool for non-spillable build | Canonical topology below — do not "fix" with bigger auto fraction alone |
+
+**Canonical SF100 topology** (copy from [`docs/distributed-ec2.md`](docs/distributed-ec2.md)
+§ SF100 — keep in sync; do not invent a lighter stack for publishable numbers):
+
+| Knob | Value |
+|------|-------|
+| Workers | 2 × `m8g.8xlarge` (128 GiB), spill EBS 500 GiB |
+| `OXIDANT_MEMORY_LIMIT_BYTES` | `42949672960` (40 Gi) |
+| `OXIDANT_SHUFFLE_SPILL_BYTES` | `8589934592` (8 Gi) |
+| `OXIDANT_SHUFFLE_PARTITIONS` | `32` (**must** pass `--shuffle-partitions 32`; empty CFN falls back to `WorkerCount=2`) |
+| Deploy | `./deploy/cloudformation/deploy-stack.sh … --memory-limit-bytes 42949672960 --shuffle-spill-bytes 8589934592 --shuffle-partitions 32 …` |
+
+Before blaming the planner on SF100 TPC-DS Q2 (or TPC-H multi-fact joins), verify on **every**
+worker: `OXIDANT_MEMORY_LIMIT_BYTES`, `OXIDANT_SHUFFLE_SPILL_BYTES`, and on the driver
+`OXIDANT_SHUFFLE_PARTITIONS=32`. Check `journalctl -u oxidant-worker` / dmesg for OOM and
+per-worker RSS skew before changing code.
+
 ### CI gotchas (commit / push / PR)
 
 GitHub Actions gates live in `.github/workflows/ci.yml`. Before pushing, run

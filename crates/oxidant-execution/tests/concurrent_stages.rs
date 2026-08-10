@@ -16,7 +16,7 @@
 //!    before the first finish.
 //! 3. `failed_arm_skips_dependents_and_surfaces_error` — one arm's stage fails: its
 //!    dependents are never dispatched (no `TaskStarted`), the stage's own error surfaces,
-//!    and the query returns promptly instead of hanging on the surviving arm.
+//!    worker task slots are free afterward, and a follow-up query can run.
 
 // ENV_LOCK serializes process-global `OXIDANT_CONCURRENT_STAGES` across async tests.
 #![allow(clippy::await_holding_lock)]
@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
 use oxidant_execution::driver::{run_stages, run_stages_obs, Cluster, StageDef};
-use oxidant_execution::flight::serve_worker;
+use oxidant_execution::flight::{heartbeat_worker, serve_worker};
 use oxidant_execution::plan::{plan_distributed_logical, DistributedQuery};
 use oxidant_loom::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
 use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
@@ -478,4 +478,19 @@ async fn failed_arm_skips_dependents_and_surfaces_error() {
         failed_arm_finished,
         "the failing arm's task must be attributed Failed in the stream: {events:?}"
     );
+
+    // After cancel + drain, every worker must report free slots so the next query can run.
+    for ep in &cluster.workers {
+        let hb = heartbeat_worker(ep.clone())
+            .await
+            .expect("heartbeat after concurrent failure");
+        assert_eq!(
+            hb.slots_used,
+            Some(0),
+            "worker {ep} still holding slots after concurrent stage failure: {hb:?}"
+        );
+    }
+    run_stages(&cluster, &warmup)
+        .await
+        .expect("follow-up query must succeed once slots are free");
 }

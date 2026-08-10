@@ -1458,6 +1458,10 @@ async fn run_stages_concurrent(
     let np = cluster.num_partitions;
     let mut in_flight: FuturesUnordered<BoxFuture<'static, (u32, Result<()>)>> =
         FuturesUnordered::new();
+    // Stage ids currently running (pushed to `in_flight`, not yet completed). Used so a
+    // failure can cancel siblings on workers before dropping their Flight futures — otherwise
+    // slots stay held and the next query fails with `worker has no free task slots`.
+    let mut in_flight_ids: HashSet<u32> = HashSet::new();
     loop {
         // Dispatch every stage whose upstreams all completed. The task futures are cold,
         // so this sweep emits every ready stage's TaskStarted events before any task of
@@ -1500,6 +1504,7 @@ async fn run_stages_concurrent(
                         stage_rows,
                     )?
                 };
+            in_flight_ids.insert(id);
             in_flight.push(
                 async move {
                     let result = join_stage_tasks(task_futs).await;
@@ -1511,6 +1516,7 @@ async fn run_stages_concurrent(
         let Some((id, result)) = in_flight.next().await else {
             break;
         };
+        in_flight_ids.remove(&id);
         match result {
             Ok(()) => {
                 let stage = stage_map
@@ -1529,16 +1535,30 @@ async fn run_stages_concurrent(
                 dag.complete(id);
             }
             Err(e) => {
-                // Skip every transitive dependent (it can never become ready now) and
-                // surface the stage's own error immediately — waiting out in-flight
-                // siblings would let a wedged arm delay the failure to the stage timeout.
+                // Skip dependents, cancel sibling stages on workers, then briefly drain
+                // in-flight Flight futures so task slots free before the next query.
+                // Preserve `e` as the returned root cause (do not replace with cancel noise).
                 let skipped = dag.fail(id);
+                let sibling_ids: Vec<u32> = in_flight_ids.iter().copied().collect();
                 tracing::warn!(
                     target: "oxidant.driver",
                     stage_id = id,
                     ?skipped,
-                    "stage failed; skipping its dependents and surfacing the error"
+                    ?sibling_ids,
+                    "stage failed; cancelling in-flight siblings and surfacing the root error"
                 );
+                if !sibling_ids.is_empty() {
+                    cancel_stages_on_workers(&cluster.workers, sibling_ids.into_iter()).await;
+                }
+                // Bounded drain: drop remaining futures after a short wait so a wedged sibling
+                // cannot pin this query until the full stage timeout. QueryAbortGuard /
+                // OXIDANT_STAGE_TIMEOUT_MS remain the hard backstops.
+                let drain = std::time::Duration::from_secs(5);
+                let _ = tokio::time::timeout(drain, async {
+                    while in_flight.next().await.is_some() {}
+                })
+                .await;
+                in_flight_ids.clear();
                 return Err(e);
             }
         }
