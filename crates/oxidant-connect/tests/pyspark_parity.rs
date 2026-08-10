@@ -190,7 +190,7 @@ async fn sql_command_ddl_executes_eagerly() {
 /// TPC-DS Q5/Q12-class Spark spelling must plan via Connect Sql relations (not only Engine::sql).
 #[tokio::test]
 async fn sql_relation_accepts_spark_interval_unit_in_string() {
-    let mut client = boot(50593).await;
+    let mut client = boot(50604).await;
     let q = "SELECT (cast('2001-01-12' AS date) + interval '30 days') AS d";
     let resps = run(&mut client, root(sql_relation(q))).await;
     assert!(
@@ -202,7 +202,7 @@ async fn sql_relation_accepts_spark_interval_unit_in_string() {
 /// Same normalize must apply when PySpark sends SqlCommand then executes the lazy relation.
 #[tokio::test]
 async fn sql_command_accepts_spark_interval_between_window() {
-    let mut client = boot(50595).await;
+    let mut client = boot(50605).await;
     // TPC-DS-style window: BETWEEN start AND (start + interval '30 days').
     let q = "SELECT 1 AS ok \
              WHERE cast('2001-01-12' AS date) BETWEEN cast('2001-01-12' AS date) \
