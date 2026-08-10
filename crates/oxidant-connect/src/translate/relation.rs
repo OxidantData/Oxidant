@@ -43,12 +43,18 @@ async fn translate(ctx: &SessionContext, rel: &sc::Relation) -> Result<LogicalPl
         .ok_or_else(|| inval("empty relation"))?;
     match rt {
         RelType::Read(r) => read(ctx, r).await,
-        RelType::Sql(s) => ctx
-            .sql(&s.query)
-            .await
-            .map_err(|e| inval(format!("sql: {e}")))?
-            .into_unoptimized_plan()
-            .pipe(Ok),
+        // Apply the same Spark SQL front-end as `Engine::sql` / `logical_plan`. Without this,
+        // PySpark `spark.sql(...)` / ExecutePlan Sql relations hit raw SessionContext parse and
+        // reject Spark's `interval '30 days'` (TPC-DS Q5/Q12 on SF100 Connect clients) even
+        // though the loom normalize path already rewrites that form for Engine entry points.
+        RelType::Sql(s) => {
+            let query = oxidant_loom::normalize_spark_sql(&s.query);
+            ctx.sql(query.as_ref())
+                .await
+                .map_err(|e| inval(format!("sql: {e}")))?
+                .into_unoptimized_plan()
+                .pipe(Ok)
+        }
         RelType::LocalRelation(lr) => local_relation(lr),
         RelType::Range(r) => range(ctx, r).await,
         RelType::Project(p) => {

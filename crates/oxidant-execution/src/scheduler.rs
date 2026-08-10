@@ -173,9 +173,7 @@ async fn run_stage_inner_impl(
         // alternate-endpoint fallbacks still probe — skipping a genuinely full or dead
         // worker there saves the whole stage-dispatch round trip.
         if attempt > 0 && !worker_accepts_task(primary.clone()).await {
-            last_err = Some(Error::Execution(format!(
-                "worker has no free task slots: {primary}"
-            )));
+            last_err = Some(no_free_slots_error(primary.clone()).await);
             if attempt + 1 < max {
                 tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
                 continue;
@@ -211,9 +209,7 @@ async fn run_stage_inner_impl(
                 Err(e) => last_err = Some(e),
             }
         } else {
-            last_err = Some(Error::Execution(format!(
-                "worker has no free task slots: {primary}"
-            )));
+            last_err = Some(no_free_slots_error(primary.clone()).await);
         }
     }
 
@@ -351,6 +347,22 @@ async fn worker_accepts_task(endpoint: String) -> bool {
         Ok(heartbeat) => heartbeat.has_available_slot(),
         Err(e) if action_unimplemented(&e) => health_check_worker(endpoint).await.is_ok(),
         Err(_) => false,
+    }
+}
+
+/// Build a `worker has no free task slots` error, including occupancy when the heartbeat is reachable.
+async fn no_free_slots_error(endpoint: String) -> Error {
+    match heartbeat_worker(endpoint.clone()).await {
+        Ok(hb) => Error::Execution(format!(
+            "worker has no free task slots: {endpoint} (used: {}/{})",
+            hb.slots_used
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "?".into()),
+            hb.slots_total
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "?".into()),
+        )),
+        Err(_) => Error::Execution(format!("worker has no free task slots: {endpoint}")),
     }
 }
 
