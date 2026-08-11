@@ -236,10 +236,14 @@ async fn single_node(total_rows: i64, custs: i64, base_sql: &str) -> Vec<RecordB
 async fn measured_small_build_keeps_hash_join_and_matches_single_node() {
     let _guard = ENV_LOCK.lock().await;
     std::env::remove_var("OXIDANT_STAGE_INPUT_STATS");
+    // Pin fan-out to worker count: the Spark-aligned shuffle floor (200) would slice
+    // each task's measured build far below the 16 MiB budget and vacate the assertion.
+    std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "2");
     const CUSTS: i64 = 200;
     const ORDERS: i64 = 2_000;
     let expected = rows(&single_node(ORDERS, CUSTS, SINGLE_SQL).await);
     let (actual, e0, e1) = run_join(64 * 1024 * 1024, ORDERS, CUSTS, SINGLE_SQL).await;
+    std::env::remove_var("OXIDANT_SHUFFLE_PARTITIONS");
     assert_eq!(
         rows(&actual),
         expected,
@@ -268,6 +272,7 @@ async fn measured_small_build_keeps_hash_join_and_matches_single_node() {
 async fn measured_large_build_still_reroutes_and_matches_single_node() {
     let _guard = ENV_LOCK.lock().await;
     std::env::remove_var("OXIDANT_STAGE_INPUT_STATS");
+    std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "2");
     // 64 MiB pool ⇒ 16 MiB build budget (0.25 fraction). np = 2 consumer tasks, so each
     // task's build side (the smaller of its two measured shuffle inputs) is ~1.2M rows
     // × 16 B ≈ 19 MB — over budget. 2.4M distinct custkeys keep the smaller side large,
@@ -276,6 +281,7 @@ async fn measured_large_build_still_reroutes_and_matches_single_node() {
     const ORDERS: i64 = 2_400_000;
     let expected = rows4(&single_node(ORDERS, CUSTS, LARGE_SQL).await);
     let (actual, e0, e1) = run_join(64 * 1024 * 1024, ORDERS, CUSTS, LARGE_SQL).await;
+    std::env::remove_var("OXIDANT_SHUFFLE_PARTITIONS");
     assert_eq!(
         rows4(&actual),
         expected,
@@ -300,11 +306,13 @@ async fn measured_large_build_still_reroutes_and_matches_single_node() {
 async fn stage_input_stats_disabled_restores_plain_registration() {
     let _guard = ENV_LOCK.lock().await;
     std::env::set_var("OXIDANT_STAGE_INPUT_STATS", "0");
+    std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "2");
     const CUSTS: i64 = 200;
     const ORDERS: i64 = 2_000;
     let expected = rows(&single_node(ORDERS, CUSTS, SINGLE_SQL).await);
     let (actual, e0, e1) = run_join(64 * 1024 * 1024, ORDERS, CUSTS, SINGLE_SQL).await;
     std::env::remove_var("OXIDANT_STAGE_INPUT_STATS");
+    std::env::remove_var("OXIDANT_SHUFFLE_PARTITIONS");
     assert_eq!(
         rows(&actual),
         expected,

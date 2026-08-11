@@ -25,13 +25,29 @@ use oxidant_proto::spark::connect as sc;
 use sc::spark_connect_service_client::SparkConnectServiceClient;
 use tonic::transport::Channel;
 
-// Keep clear of distributed_pyspark.rs (50870–50878).
-const PORT: u16 = 50890;
-const W0: u16 = 50891;
-const W1: u16 = 50892;
-const PORT_DF: u16 = 50893;
-const W0_DF: u16 = 50894;
-const W1_DF: u16 = 50895;
+// Ports BELOW the Linux ephemeral source range (32768..=60999) so outbound
+// connections / parallel crates cannot steal the Connect listen port under CI load.
+fn port_base() -> u16 {
+    22100 + (std::process::id() as u16 % 200) * 6
+}
+fn port_driver() -> u16 {
+    port_base()
+}
+fn port_w0() -> u16 {
+    port_base() + 1
+}
+fn port_w1() -> u16 {
+    port_base() + 2
+}
+fn port_driver_df() -> u16 {
+    port_base() + 3
+}
+fn port_w0_df() -> u16 {
+    port_base() + 4
+}
+fn port_w1_df() -> u16 {
+    port_base() + 5
+}
 
 const N: i64 = 100;
 
@@ -209,7 +225,8 @@ async fn distributed_groupby_over_delta_table_matches_single_node() {
     let expected = group_rows(&single.sql(SQL).await.expect("single-node baseline"));
 
     // Two workers, each resolving `glue.ns.t` to its own disjoint shard directory.
-    for (port, dir) in [(W0, &shard0_dir), (W1, &shard1_dir)] {
+    let (w0, w1, driver_port) = (port_w0(), port_w1(), port_driver());
+    for (port, dir) in [(w0, &shard0_dir), (w1, &shard1_dir)] {
         let engine = engine_with_catalog(dir);
         tokio::spawn(async move {
             let _ = serve_worker(port, engine).await;
@@ -219,15 +236,15 @@ async fn distributed_groupby_over_delta_table_matches_single_node() {
     let driver = engine_with_catalog(&full_dir);
     let mut service = OxidantService::with_engine(driver);
     service.workers = vec![
-        format!("http://127.0.0.1:{W0}"),
-        format!("http://127.0.0.1:{W1}"),
+        format!("http://127.0.0.1:{w0}"),
+        format!("http://127.0.0.1:{w1}"),
     ];
     tokio::spawn(async move {
-        let _ = oxidant_connect::serve_instance(service, PORT).await;
+        let _ = oxidant_connect::serve_instance(service, driver_port).await;
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let mut client = connect(&format!("http://127.0.0.1:{PORT}")).await;
+    let mut client = connect(&format!("http://127.0.0.1:{driver_port}")).await;
     let batches = exec_sql(&mut client, SQL).await;
     assert_eq!(
         group_rows(&batches),
@@ -263,7 +280,8 @@ async fn distributed_dataframe_groupby_over_delta_table_matches_single_node() {
     );
     let expected = group_rows(&single.sql(SQL).await.expect("single-node baseline"));
 
-    for (port, dir) in [(W0_DF, &shard0_dir), (W1_DF, &shard1_dir)] {
+    let (w0, w1, driver_port) = (port_w0_df(), port_w1_df(), port_driver_df());
+    for (port, dir) in [(w0, &shard0_dir), (w1, &shard1_dir)] {
         let engine = engine_with_catalog(dir);
         tokio::spawn(async move {
             let _ = serve_worker(port, engine).await;
@@ -273,15 +291,15 @@ async fn distributed_dataframe_groupby_over_delta_table_matches_single_node() {
     let driver = engine_with_catalog(&full_dir);
     let mut service = OxidantService::with_engine(driver);
     service.workers = vec![
-        format!("http://127.0.0.1:{W0_DF}"),
-        format!("http://127.0.0.1:{W1_DF}"),
+        format!("http://127.0.0.1:{w0}"),
+        format!("http://127.0.0.1:{w1}"),
     ];
     tokio::spawn(async move {
-        let _ = oxidant_connect::serve_instance(service, PORT_DF).await;
+        let _ = oxidant_connect::serve_instance(service, driver_port).await;
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let mut client = connect(&format!("http://127.0.0.1:{PORT_DF}")).await;
+    let mut client = connect(&format!("http://127.0.0.1:{driver_port}")).await;
     let batches = exec_relation(&mut client, dataframe_groupby_sum("glue.ns.t")).await;
     let mut got = group_rows(&batches);
     got.sort();
@@ -390,13 +408,15 @@ async fn worker_rejects_lakehouse_scan_without_snapshot_pin() {
 }
 
 async fn connect(endpoint: &str) -> SparkConnectServiceClient<Channel> {
-    for _ in 0..50 {
-        if let Ok(c) = SparkConnectServiceClient::connect(endpoint.to_string()).await {
-            return c;
+    let mut last = String::new();
+    for _ in 0..100 {
+        match SparkConnectServiceClient::connect(endpoint.to_string()).await {
+            Ok(c) => return c,
+            Err(e) => last = e.to_string(),
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("server not ready at {endpoint}");
+    panic!("server not ready at {endpoint}: {last}");
 }
 
 async fn exec_sql(client: &mut SparkConnectServiceClient<Channel>, sql: &str) -> Vec<RecordBatch> {

@@ -509,9 +509,11 @@ async fn q11_uncorrelated_threshold_plans_one_row_broadcast() {
         "{}",
         scalar_combine.sql
     );
-    // The subquery's projection (`* 0.0001`) is re-applied over the combined value.
+    // The subquery's projection (`* (0.0001 / SF)`) is re-applied over the combined value.
+    // Committed Q11 keeps parentheses around the fraction (postprocess rewrite).
     assert!(
-        scalar_combine.sql.contains("m0 * 0.0001"),
+        scalar_combine.sql.contains("m0 * (0.0001 / 1)")
+            || scalar_combine.sql.contains("m0 * 0.0001"),
         "{}",
         scalar_combine.sql
     );

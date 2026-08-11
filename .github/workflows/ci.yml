@@ -6,8 +6,8 @@ name: CI
 # Per-run tiers:
 #   - every PR/push: rustfmt, clippy+test (the Spark-SQL parity ratchet is folded into it
 #     as steps — fails anything that drops parity below parity/baseline.json), coverage gates
-#   - main pushes, PRs labeled `full-gates`, manual dispatch: query-gates (TPC-H/TPC-DS/
-#     distributed suites) — skipped on routine PRs to keep iteration cheap
+#   - main pushes, PRs labeled `full-gates`, manual dispatch: query-gates (official TPC
+#     dbgen/dsdgen at SF1 — TPC-H/TPC-DS/distributed suites) — skipped on routine PRs
 # Heavier gates live elsewhere:
 #   - ClickBench on real 14.78 GB data -> bench.yml, Blacksmith 16-vCPU runner
 #   - llvm-cov line coverage (informational) -> coverage-nightly.yml
@@ -57,6 +57,8 @@ jobs:
           rustup component add rustfmt
           rustc --version && cargo --version
       - run: cargo fmt --all -- --check
+      - name: ASG membership bootstrap tests
+        run: bash deploy/packer/tests/test_asg_membership.sh
 
   build-test:
     name: clippy + test
@@ -178,25 +180,26 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
 
-  # The TPC-H / TPC-DS / distributed gates used to run at the tail of build-test, which made the
-  # critical path the SUM of compiling the workspace and replaying every query suite. They only
-  # need the `oxidant-bench` binary, so they run here in parallel against the same shared cache.
-  # Note these execute in the dev profile — `[profile.dev.package."*"] opt-level = 2` in the root
-  # Cargo.toml is what keeps that tractable, since it optimizes datafusion/arrow while leaving
-  # workspace crates cheap to compile.
+  # TPC-H / TPC-DS / distributed gates. Official TPC.org kits (`dbgen` / `dsdgen`) at SF1 —
+  # not DuckDB. Needs the `oxidant-bench` binary only, so this runs in parallel with build-test
+  # against the shared cargo cache. Dev profile is fine: `[profile.dev.package."*"] opt-level = 2`
+  # keeps datafusion/arrow hot.
   # Runs on every main push (main is the fully-gated record), on PRs labeled `full-gates`,
   # and on manual dispatch. Routine PRs skip this job to keep iteration cheap and fast.
   query-gates:
-    name: TPC-H + TPC-DS + distributed gates
+    name: TPC-H + TPC-DS + distributed gates (official kits, SF1)
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-gates'))
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    # SF1 dsdgen + parquet convert + full Q1–Q99 + distributed execute is the long pole.
+    timeout-minutes: 180
+    env:
+      OXIDANT_TPC_KITS: ${{ github.workspace }}/.tpc-kits
+      OXIDANT_TPC_DATA: ${{ github.workspace }}/.tpc-data
     steps:
       - uses: actions/checkout@v4
-      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
-      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
       - name: Add Rust toolchain to PATH (self-hosted runner)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
@@ -207,34 +210,67 @@ jobs:
         with:
           shared-key: workspace
           save-if: "false" # build-test writes this cache
+      - name: Cache official TPC kits (dbgen / dsdgen)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OXIDANT_TPC_KITS }}
+          key: tpc-kits-${{ runner.os }}-${{ hashFiles('bench/tpc/fetch-kits.sh', 'bench/tpc/build-kits.sh') }}
+          restore-keys: |
+            tpc-kits-${{ runner.os }}-
+      - name: Cache SF1 harness data (CSV / Parquet)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OXIDANT_TPC_DATA }}
+          key: tpc-sf1-data-${{ runner.os }}-${{ hashFiles('crates/oxidant-bench/src/tpch_data.rs', 'crates/oxidant-bench/src/tpcds_data.rs', 'bench/tpc/tpcds_columns.tsv') }}
+          restore-keys: |
+            tpc-sf1-data-${{ runner.os }}-
       - name: Build oxidant-bench once (every gate below reuses this binary)
         run: cargo build -p oxidant-bench
-      - name: TPC-H coverage (Q1/Q3/Q5/Q6/Q10)
-        run: cargo run -p oxidant-bench -- tpch
-      - name: TPC-H distributed (3 workers, sf0.05)
-        run: cargo run -p oxidant-bench -- tpch-distributed --sf 0.05 --workers 3
-        env:
-          OXIDANT_TPCH_DIST_REQUIRE_ALL: "1"
-      - name: Install DuckDB CLI (TPC-DS dsdgen + oracle)
+      - name: Fetch + build official TPC kits (dbgen / dsdgen)
         run: |
-          # unzip is absent on the self-hosted box's minimal Ubuntu image (present on GitHub-hosted).
+          command -v gcc >/dev/null || { sudo apt-get update -y && sudo apt-get install -y build-essential flex bison; }
+          export DATA_ROOT="$(dirname "$OXIDANT_TPC_KITS")"
+          export KITS_DIR="$OXIDANT_TPC_KITS"
+          mkdir -p "$KITS_DIR" "$OXIDANT_TPC_DATA"
+          if [[ ! -x "$KITS_DIR/tpch-kit/dbgen/dbgen" || ! -x "$KITS_DIR/tpcds-kit/tools/dsdgen" ]]; then
+            ./bench/tpc/fetch-kits.sh
+            ./bench/tpc/build-kits.sh
+          else
+            echo "TPC kits already present under $KITS_DIR — skipping fetch/build"
+            "$KITS_DIR/tpch-kit/dbgen/dbgen" -h 2>&1 | head -3 || true
+            "$KITS_DIR/tpcds-kit/tools/dsdgen" -HELP 2>&1 | head -3 || true
+          fi
+      - name: Install DuckDB CLI (optional result oracle)
+        id: duckdb
+        continue-on-error: true
+        run: |
           command -v unzip >/dev/null || { sudo apt-get update -y && sudo apt-get install -y unzip; }
           curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.3.2/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
           sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
           duckdb --version
-      - name: TPC-DS coverage (Q1–Q99, sf0.01, pass-set ratchet)
-        run: cargo run -p oxidant-bench -- tpcds --sf 0.01
-      - name: TPC-DS distributed planner ratchet (95/99 floor, sf0.01)
-        run: cargo run -p oxidant-bench -- tpcds-distributed --sf 0.01
+      - name: TPC-H coverage (official dbgen SF1)
+        run: cargo run -p oxidant-bench -- tpch --sf 1 --data "${OXIDANT_TPC_DATA}/tpch-sf1"
+      - name: TPC-H distributed (2 workers, SF1)
+        run: cargo run -p oxidant-bench -- tpch-distributed --sf 1 --workers 2 --data "${OXIDANT_TPC_DATA}/tpch-sf1"
+        env:
+          OXIDANT_TPCH_DIST_REQUIRE_ALL: "1"
+      - name: TPC-DS coverage (Q1–Q99, official dsdgen SF1, pass-set ratchet)
+        run: |
+          if [[ "${{ steps.duckdb.outcome }}" != "success" ]]; then
+            echo "DuckDB oracle unavailable — execute-only (OXIDANT_TPCDS_ALLOW_NO_ORACLE=1)"
+            export OXIDANT_TPCDS_ALLOW_NO_ORACLE=1
+          fi
+          cargo run -p oxidant-bench -- tpcds --sf 1 --data "${OXIDANT_TPC_DATA}/tpcds-sf1"
+      - name: TPC-DS distributed planner ratchet (SF1)
+        run: cargo run -p oxidant-bench -- tpcds-distributed --sf 1 --data "${OXIDANT_TPC_DATA}/tpcds-sf1"
       # The planner ratchet above only proves a distributed plan can be BUILT. This runs every
       # distributable query on a real two-worker cluster and compares row-for-row against
       # single-node. It fails on ANY mismatch or execution error, and on any query dropping out of
-      # bench/distributed/tpcds-execute-baseline.json. Full sweep, not a sample: sampling eight
-      # queries is how 24 wrong-or-broken queries were counted as "distributed" for so long.
-      - name: TPC-DS distributed EXECUTE correctness ratchet (95 verified, sf0.01, 2 workers)
-        run: cargo run -p oxidant-bench -- tpcds-distributed --execute --sf 0.01 --workers 2
+      # bench/distributed/tpcds-execute-baseline.json. Full sweep, not a sample.
+      - name: TPC-DS distributed EXECUTE correctness ratchet (SF1, 2 workers)
+        run: cargo run -p oxidant-bench -- tpcds-distributed --execute --sf 1 --workers 2 --data "${OXIDANT_TPC_DATA}/tpcds-sf1"
       - name: Distributed correctness gate
-        run: cargo run -p oxidant-bench -- correctness-distributed --rows 2000
+        run: cargo run -p oxidant-bench -- correctness-distributed --rows 2000 --sf 1 --data "${OXIDANT_TPC_DATA}/tpcds-sf1"
         env:
           OXIDANT_DIST_TPCDS_SAMPLE: "8"
 

@@ -37,6 +37,17 @@ use crate::shuffle::protocol::{self, ShuffleExchangeHeader, ShuffleReadTicket, S
 use crate::shuffle::spill::{enforce_total_budget, BucketCache, SpillStore};
 use crate::shuffle::{hash_partition, PUSH_SRC};
 
+/// Max concurrent remote shuffle bucket pulls per upstream on a consumer task.
+/// Override via `OXIDANT_SHUFFLE_PULL_CONCURRENCY` (default 8). Caps consume-side RSS when
+/// AQE coalesces many producer buckets onto one reader or when shuffle partitions ≫ workers.
+fn shuffle_pull_concurrency() -> usize {
+    std::env::var("OXIDANT_SHUFFLE_PULL_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(8)
+}
+
 /// Flight `do_action` type: evict all cached stage outputs on this worker.
 pub const ACTION_CLEAR_STAGES: &str = "clear_stages";
 /// Flight `do_action` type: register session UDF definitions (JSON payload).
@@ -886,15 +897,25 @@ impl Worker {
                 } else {
                     &t.upstream_endpoints[..]
                 };
+                // Bound fan-in concurrency so a coalesced reader (or 200-way shuffle) cannot
+                // materialize every remote bucket into RSS at once — Spark-style per-task
+                // working sets stay capped (SF100 consume-side OOM class).
                 let pulls: Vec<_> = read_buckets
                     .iter()
-                    .flat_map(|&bucket| {
-                        endpoints
-                            .iter()
-                            .map(move |ep| pull_bucket(ep.clone(), up_stage, bucket))
-                    })
+                    .flat_map(|&bucket| endpoints.iter().map(move |ep| (ep.clone(), bucket)))
                     .collect();
-                futures::future::join_all(pulls)
+                async move {
+                    let mut out = Vec::with_capacity(pulls.len());
+                    let mut iter =
+                        futures::stream::iter(pulls.into_iter().map(|(ep, bucket)| async move {
+                            pull_bucket(ep, up_stage, bucket).await
+                        }))
+                        .buffer_unordered(shuffle_pull_concurrency());
+                    while let Some(part) = iter.next().await {
+                        out.push(part);
+                    }
+                    out
+                }
             }))
             .await;
         for (i, results) in per_upstream.into_iter().enumerate() {

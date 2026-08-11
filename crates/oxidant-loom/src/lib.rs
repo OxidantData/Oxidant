@@ -187,7 +187,8 @@ pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
     // Passes run in order: (1) the oxidant-sql Stage-1 prefilter registry, (2) Spark single-quoted
     // string-literal unescaping, (3) the typed-literal rewrite over the result, (4) strip ANSI
     // INTERVAL leading-precision qualifiers (`day (3)`) that DataFusion rejects, (5) qualify
-    // INTERVAL literals that carry their unit inside the string (`interval '30 days'`).
+    // INTERVAL literals that carry their unit inside the string (`interval '30 days'`),
+    // (6) rewrite Postgres/TPC-DS bare forms (`date + 30 days`) to qualified INTERVAL SQL.
     // Unescaping runs BEFORE the typed-literal pass for two reasons: the re-emitted literals use
     // `''` quote-doubling (which the typed-literal scanner understands) instead of Spark's `\'`,
     // and a numeric token freed by a mis-delimited `\'` can therefore never be mistaken for code
@@ -206,22 +207,162 @@ pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
     let interval = strip_interval_leading_precision(base3);
     let base4 = interval.as_deref().unwrap_or(base3);
     let qualified = qualify_interval_units(base4);
-    match qualified {
-        Some(q) => std::borrow::Cow::Owned(q),
-        None => match interval {
-            Some(i) => std::borrow::Cow::Owned(i),
-            None => match typed {
-                Some(t) => std::borrow::Cow::Owned(t),
-                None => match unescaped {
-                    Some(u) => std::borrow::Cow::Owned(u),
-                    None => match stripped {
-                        Some(s) => std::borrow::Cow::Owned(s),
-                        None => std::borrow::Cow::Borrowed(query),
+    let base5 = qualified.as_deref().unwrap_or(base4);
+    let bare = rewrite_bare_pg_interval_literals(base5);
+    match bare {
+        Some(b) => std::borrow::Cow::Owned(b),
+        None => match qualified {
+            Some(q) => std::borrow::Cow::Owned(q),
+            None => match interval {
+                Some(i) => std::borrow::Cow::Owned(i),
+                None => match typed {
+                    Some(t) => std::borrow::Cow::Owned(t),
+                    None => match unescaped {
+                        Some(u) => std::borrow::Cow::Owned(u),
+                        None => match stripped {
+                            Some(s) => std::borrow::Cow::Owned(s),
+                            None => std::borrow::Cow::Borrowed(query),
+                        },
                     },
                 },
             },
         },
     }
+}
+
+/// Rewrite Postgres/TPC-DS bare interval arithmetic (`date + 30 days`, `date - 14 days`)
+/// into qualified `INTERVAL 'N' DAY` that DataFusion's Databricks dialect accepts.
+///
+/// Official `dsqgen` (oxidant dialect) emits this form for date windows (Q5/Q12/Q16/…).
+/// Spark/Postgres accept it; sqlparser-under-Databricks rejects with
+/// `Expected: ), found: days`. Already-qualified `INTERVAL …` forms and string literals
+/// are left untouched. Returns `None` when nothing changed.
+fn rewrite_bare_pg_interval_literals(sql: &str) -> Option<String> {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n + 16);
+    let mut i = 0;
+    let mut changed = false;
+
+    while i < n {
+        if b[i] == b'\'' || b[i] == b'"' {
+            let quote = b[i];
+            let start = i;
+            i += 1;
+            while i < n {
+                if b[i] == quote {
+                    if quote == b'\'' && i + 1 < n && b[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        if (b[i] == b'+' || b[i] == b'-') && !is_ident_byte(b, i.wrapping_sub(1)) {
+            if let Some(m) = match_bare_pg_interval(b, i) {
+                // Skip when this is already `interval N days` / `INTERVAL 'N' days`.
+                if !preceded_by_interval_keyword(b, i) {
+                    let sign = if b[i] == b'-' { "-" } else { "+" };
+                    let amount = &sql[m.amount_start..m.amount_end];
+                    let unit = interval_unit_keyword(&sql[m.unit_start..m.unit_end])
+                        .expect("match_bare_pg_interval only returns known units");
+                    out.push_str(sign);
+                    out.push_str(" INTERVAL '");
+                    out.push_str(amount);
+                    out.push_str("' ");
+                    out.push_str(unit);
+                    i = m.end;
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+
+        out.push(b[i] as char);
+        i += 1;
+    }
+
+    changed.then_some(out)
+}
+
+struct BarePgInterval {
+    amount_start: usize,
+    amount_end: usize,
+    unit_start: usize,
+    unit_end: usize,
+    end: usize,
+}
+
+/// At `+/-`, match `\s*<digits>\s*<unit>\b` where unit is a known interval spelling.
+fn match_bare_pg_interval(b: &[u8], sign_idx: usize) -> Option<BarePgInterval> {
+    let n = b.len();
+    let mut j = sign_idx + 1;
+    while j < n && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    let amount_start = j;
+    if j >= n || !b[j].is_ascii_digit() {
+        return None;
+    }
+    while j < n && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    let amount_end = j;
+    if amount_start == amount_end {
+        return None;
+    }
+    // Require whitespace between amount and unit (`30days` is not a TPC-DS form).
+    if j >= n || !b[j].is_ascii_whitespace() {
+        return None;
+    }
+    while j < n && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    let unit_start = j;
+    let unit_len = interval_unit_len(&b[j..])?;
+    let unit_end = unit_start + unit_len;
+    // Trailing identifier char would make this part of a larger token.
+    if is_ident_byte(b, unit_end) {
+        return None;
+    }
+    Some(BarePgInterval {
+        amount_start,
+        amount_end,
+        unit_start,
+        unit_end,
+        end: unit_end,
+    })
+}
+
+fn is_ident_byte(b: &[u8], i: usize) -> bool {
+    b.get(i)
+        .copied()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+/// True when `interval` (case-insensitive) is the token immediately before `sign_idx`
+/// (allowing only whitespace between).
+fn preceded_by_interval_keyword(b: &[u8], sign_idx: usize) -> bool {
+    let mut k = sign_idx;
+    while k > 0 && b[k - 1].is_ascii_whitespace() {
+        k -= 1;
+    }
+    const KW: &[u8] = b"interval";
+    if k < KW.len() {
+        return false;
+    }
+    let start = k - KW.len();
+    if !b[start..k].eq_ignore_ascii_case(KW) {
+        return false;
+    }
+    // Must be a token boundary before `interval`.
+    start == 0 || !is_ident_byte(b, start - 1)
 }
 
 /// Strip ANSI SQL-92 interval *leading precision* qualifiers that TPC-H emits
@@ -2029,7 +2170,56 @@ where
 /// merged build batch, hash-table growth, probe-side buffering) can push worker RSS far
 /// past the pool and wedge the query against the cgroup limit. The guard built on this
 /// budget re-plans such queries with spill-capable sort-merge joins.
+///
+/// Spark EMR parity: the effective budget is also capped by Spark's
+/// `canBuildLocalHashMap` rule — see [`DEFAULT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES`].
 const DEFAULT_HASH_JOIN_MAX_BUILD_FRACTION: f64 = 0.25;
+
+/// Spark `spark.sql.autoBroadcastJoinThreshold` default (10 MiB). Used with shuffle
+/// partition count as the SHJ admission gate: build bytes must be `< threshold ×
+/// partitions` (and further divided by [`HASH_JOIN_BUILD_OVERHEAD_FACTOR`] for hash-table
+/// / Arrow overhead that sits outside FairSpillPool). Override via
+/// `OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES`.
+const DEFAULT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES: usize = 10 * 1024 * 1024;
+
+/// Multiplier for untracked HashJoin RSS (hash table, merged build batch, probe buffers)
+/// relative to the row-width estimate. Without this, SF100 fact⋈fact builds can look
+/// "under budget" then cgroup-OOM before the pool-exhaustion retry (KAN-57).
+const HASH_JOIN_BUILD_OVERHEAD_FACTOR: usize = 2;
+
+/// Spark-like default shuffle partition floor when sizing the hash-join build budget
+/// (`spark.sql.shuffle.partitions` default is 200).
+const DEFAULT_SHUFFLE_PARTITIONS_FOR_JOIN_BUDGET: u32 = 200;
+
+/// Shuffle partition count used for the Spark-aligned HashJoin build cap. Prefers
+/// `OXIDANT_SHUFFLE_PARTITIONS`, then `OXIDANT_DEFAULT_PARALLELISM`, else 200.
+fn shuffle_partitions_for_join_budget() -> u32 {
+    std::env::var("OXIDANT_SHUFFLE_PARTITIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &u32| n > 0)
+        .or_else(|| {
+            std::env::var("OXIDANT_DEFAULT_PARALLELISM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n: &u32| n > 0)
+        })
+        .unwrap_or(DEFAULT_SHUFFLE_PARTITIONS_FOR_JOIN_BUDGET)
+}
+
+/// Spark `canBuildLocalHashMap` budget: `threshold × partitions / overhead`.
+fn spark_aligned_hash_join_build_cap() -> usize {
+    let threshold = std::env::var("OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(DEFAULT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES);
+    let partitions = shuffle_partitions_for_join_budget() as usize;
+    threshold
+        .saturating_mul(partitions)
+        .saturating_div(HASH_JOIN_BUILD_OVERHEAD_FACTOR)
+        .max(threshold) // never below one partition's threshold
+}
 
 /// Estimated in-memory width of one row of `schema`, in bytes. Fixed-width types use their
 /// exact size; variable-width values use a flat 48 bytes (offset + typical content). Only a
@@ -2772,6 +2962,10 @@ impl Engine {
     ///   pool, the per-join build-side budget (as a pool fraction) above which `auto` mode
     ///   re-plans a query with sort-merge joins (KAN-25/KAN-53; see
     ///   [`Engine::collect_join_guarded`]).
+    /// - `OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES` (usize, default **10 MiB** = Spark
+    ///   `autoBroadcastJoinThreshold`) — Spark `canBuildLocalHashMap` gate: effective build
+    ///   budget is also capped at `threshold × shuffle_partitions / 2` so SF100 fact⋈fact
+    ///   joins prefer spillable sort-merge on EMR-class (`m8g.4xlarge`) workers.
     ///
     /// KAN-2 R2 dynamic-filter knobs (hash-join build-side → probe-side scan filters, the
     /// star-shape fast path; the pushdown itself is pinned on session-wide):
@@ -3609,18 +3803,30 @@ impl Engine {
             .map_err(|e| Error::Execution(e.to_string()))
     }
 
-    /// The build-side budget in bytes for the KAN-25 hash-join memory guard: a fraction of
-    /// the bounded pool (`OXIDANT_HASH_JOIN_MAX_BUILD_FRACTION`, default
-    /// [`DEFAULT_HASH_JOIN_MAX_BUILD_FRACTION`]). `None` when the engine runs unbounded (no
-    /// `OXIDANT_MEMORY_LIMIT_BYTES`) — the guard is then fully off and behavior is unchanged.
+    /// The build-side budget in bytes for the KAN-25 hash-join memory guard.
+    ///
+    /// Effective budget = `min(pool × fraction, spark_shj_cap)` where:
+    /// - `fraction` is `OXIDANT_HASH_JOIN_MAX_BUILD_FRACTION` (default 0.25)
+    /// - `spark_shj_cap` is Spark's `canBuildLocalHashMap` rule:
+    ///   `(OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES × shuffle_partitions)
+    ///    / HASH_JOIN_BUILD_OVERHEAD_FACTOR`
+    ///
+    /// Matching Spark's `preferSortMergeJoin=true` default: large equi-joins take
+    /// spill-capable sort-merge; HashJoin is only admitted when the build fits a
+    /// *per-partition* working set, not when it merely fits a quarter of the whole pool
+    /// (the old rule that still OOM'd SF100 on `m8g.4xlarge`).
+    ///
+    /// `None` when the engine runs unbounded — the guard is then fully off.
     fn hash_join_build_budget(&self) -> Option<usize> {
+        let pool = self.memory_pool_bytes?;
         let fraction = std::env::var("OXIDANT_HASH_JOIN_MAX_BUILD_FRACTION")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|f| *f > 0.0 && *f <= 1.0)
             .unwrap_or(DEFAULT_HASH_JOIN_MAX_BUILD_FRACTION);
-        self.memory_pool_bytes
-            .map(|pool| (pool as f64 * fraction) as usize)
+        let pool_cap = (pool as f64 * fraction) as usize;
+        let spark_cap = spark_aligned_hash_join_build_cap();
+        Some(pool_cap.min(spark_cap))
     }
 
     /// Whether the KAN-25 sort-merge fallback is explicitly allowed (env
@@ -8744,6 +8950,24 @@ mod tests {
         assert_eq!(normalize_spark_sql(unquoted), unquoted);
     }
 
+    #[test]
+    fn normalize_rewrites_tpcds_bare_pg_interval_days() {
+        // Official dsqgen spelling — ParseError "Expected: ), found: days" on Connect without this.
+        assert_eq!(
+            normalize_spark_sql("SELECT (cast('2001-01-12' as date) + 30 days) AS d"),
+            "SELECT (cast('2001-01-12' as date) + INTERVAL '30' DAY) AS d"
+        );
+        assert_eq!(
+            normalize_spark_sql(
+                "and d_date between (cast ('1998-04-08' as date) - 30 days) and (cast ('1998-04-08' as date) + 30 days)"
+            ),
+            "and d_date between (cast ('1998-04-08' as date) - INTERVAL '30' DAY) and (cast ('1998-04-08' as date) + INTERVAL '30' DAY)"
+        );
+        // Column aliases that contain the word "days" must stay untouched.
+        let alias = r#"select 1 as "31-60 days" from t"#;
+        assert_eq!(normalize_spark_sql(alias), alias);
+    }
+
     #[tokio::test]
     async fn tpch_interval_date_arithmetic() {
         use arrow::array::{Array, Date32Array};
@@ -8792,6 +9016,8 @@ mod tests {
         // TPC-DS Q12's date window: the unit inside the literal must agree with the qualified
         // spelling. 2001-01-12 + 30 days = 2001-02-11 (Date32 epoch day 11364).
         for sql in [
+            // Official dsqgen bare form (no INTERVAL keyword).
+            "SELECT (cast('2001-01-12' as date) + 30 days) AS d",
             "SELECT (cast('2001-01-12' as date) + interval '30 days') AS d",
             "SELECT (cast('2001-01-12' as date) + interval '30' day) AS d",
             // Postgres-verbose form, as DataFusion's unparser emits it into stage SQL.
@@ -9420,6 +9646,13 @@ mod tests {
         // can deadlock under a bounded pool — enable it explicitly for this test.
         let _env = JOIN_GUARD_ENV_LOCK.lock().await;
         std::env::set_var("OXIDANT_SORT_MERGE_FALLBACK", "true");
+        // Pin the Spark SHJ cap above the pool-fraction budget so this test still exercises
+        // the fraction gate (not the EMR-parity per-partition threshold).
+        std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "200");
+        std::env::set_var(
+            "OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES",
+            (64 * 1024 * 1024).to_string(),
+        );
         let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
         const LEFT: i64 = 9_000_000;
         const RIGHT: i64 = 9_500_000;
@@ -9458,6 +9691,104 @@ mod tests {
         assert_eq!(c, LEFT);
         assert_eq!(s, LEFT * (LEFT - 1) / 2);
         std::env::remove_var("OXIDANT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("OXIDANT_SHUFFLE_PARTITIONS");
+        std::env::remove_var("OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES");
+    }
+
+    /// Spark EMR parity: the HashJoin build budget is capped by
+    /// `threshold × shuffle_partitions / overhead`, not only by pool × 0.25 — so a 40 Gi
+    /// worker pool cannot admit a multi-GiB fact build that would still fit 25% of the pool
+    /// and then cgroup-OOM on `m8g.4xlarge`.
+    #[tokio::test]
+    async fn spark_aligned_hash_join_budget_caps_below_pool_fraction() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("OXIDANT_HASH_JOIN_MAX_BUILD_FRACTION");
+        std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "200");
+        std::env::set_var(
+            "OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES",
+            (10 * 1024 * 1024).to_string(),
+        );
+        // 40 Gi pool × 0.25 = 10 Gi, but Spark SHJ cap is 10 MiB × 200 / 2 = 1000 MiB.
+        let engine = Engine::new_with_memory_limit(40 * 1024 * 1024 * 1024);
+        let budget = engine.hash_join_build_budget().unwrap();
+        assert_eq!(budget, 10 * 1024 * 1024 * 200 / 2);
+        std::env::remove_var("OXIDANT_SHUFFLE_PARTITIONS");
+        std::env::remove_var("OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES");
+    }
+
+    /// SF100-shaped fact⋈fact: ~150M join keys (orders-scale) must plan-time reroute to
+    /// SortMergeJoin under the Spark-aligned budget (not stay on non-spillable HashJoin).
+    /// Uses measured stats so we do not materialize SF100-scale batches in-process.
+    #[tokio::test]
+    async fn sf100_scale_build_estimate_reroutes_sort_merge() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("OXIDANT_PREFER_HASH_JOIN");
+        std::env::remove_var("OXIDANT_SORT_MERGE_FALLBACK");
+        std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "200");
+        std::env::set_var(
+            "OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES",
+            (10 * 1024 * 1024).to_string(),
+        );
+        // Modest pool so the test stays light; spark cap (1 Gi) is the binding constraint.
+        let engine = Engine::new_with_memory_limit(8 * 1024 * 1024 * 1024);
+        // 200M keys × 8 B ≈ 1.6 GiB estimated build > 1 GiB spark cap.
+        const N: u64 = 200_000_000;
+        engine
+            .register_batches_with_stats("orders", join_guard_kv_batches(4_000, 1_000), N)
+            .unwrap();
+        engine
+            .register_batches_with_stats("lineitem", join_guard_kv_batches(4_000, 1_000), N)
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c FROM orders o JOIN lineitem l ON o.k = l.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(contains_hash_join(plan.as_ref()));
+        let budget = engine.hash_join_build_budget().unwrap();
+        assert!(
+            hash_join_build_exceeds(plan.as_ref(), budget),
+            "SF100-scale build must exceed the Spark-aligned HashJoin budget ({budget})"
+        );
+        assert!(
+            engine.plan_time_smj_reroute(plan.as_ref()),
+            "auto selection must prefer SortMergeJoin for SF100-scale equi-joins"
+        );
+        std::env::remove_var("OXIDANT_SHUFFLE_PARTITIONS");
+        std::env::remove_var("OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES");
+    }
+
+    /// Spark SMJ match-buffer / external-sort path: duplicate-heavy equi-join under a
+    /// tight FairSpillPool must complete via sort-merge (spillable) rather than OOM.
+    #[tokio::test]
+    async fn sort_merge_duplicate_keys_spill_under_tiny_pool() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::set_var("OXIDANT_PREFER_HASH_JOIN", "false");
+        std::env::set_var("OXIDANT_TARGET_PARTITIONS", "2");
+        // Small pool: external sort must spill; duplicate keys stress SMJ buffers.
+        let engine = Engine::new_with_memory_limit(32 * 1024 * 1024);
+        std::env::remove_var("OXIDANT_TARGET_PARTITIONS");
+        // 8k rows, 50 distinct keys → moderate fanout without exploding the COUNT result.
+        const N: i64 = 8_000;
+        const KEYS: i64 = 50;
+        engine
+            .register_batches("left_t", join_guard_kv_batches(N, KEYS))
+            .unwrap();
+        engine
+            .register_batches("right_t", join_guard_kv_batches(N, KEYS))
+            .unwrap();
+        let batches = engine
+            .sql("SELECT COUNT(*) AS c FROM left_t l JOIN right_t r ON l.k = r.k")
+            .await
+            .expect("duplicate-key SMJ must complete under a tiny spillable pool");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        // Each key has N/KEYS rows on each side → (N/KEYS)^2 matches per key × KEYS.
+        let per = N / KEYS;
+        assert_eq!(c, per * per * KEYS);
+        std::env::remove_var("OXIDANT_PREFER_HASH_JOIN");
     }
 
     /// KAN-2 throughput: the pre-split optimizer's shape gate. SQL table aliases

@@ -237,13 +237,12 @@ async fn static_two_worker_cluster_still_succeeds() {
     assert!(ok, "fixed-membership 2-worker cluster must keep working");
 }
 
-/// Producers write 4 shuffle buckets on a 2-worker cluster. With `OXIDANT_AQE=1` (the
-/// observability-only suggestion path, off by default) `coalesced_partitions` would suggest
-/// shrinking to 2 — previously the driver mutated `num_partitions` mid-query and the consumer
-/// orphaned buckets 2..3 (silent row loss).
+/// Producers write 4 shuffle buckets on a 2-worker cluster. With AQE on,
+/// `coalesced_partitions` suggests shrinking to 2 — previously the driver mutated
+/// `num_partitions` mid-query and the consumer orphaned buckets 2..3 (silent row loss).
 #[tokio::test]
 async fn aqe_coalesce_suggestion_must_not_orphan_shuffle_buckets() {
-    // The suggestion path is opt-in (default off); enable it for this test's process.
+    // Pin on explicitly (AQE defaults on; keep the test hermetic against env opt-out).
     std::env::set_var("OXIDANT_AQE", "1");
     // Prove the suggestion path would fire for this shape (partitions > workers, small buckets).
     let would_coalesce =

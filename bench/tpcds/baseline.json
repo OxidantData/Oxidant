@@ -1,5 +1,5 @@
 {
-  "notes": "TPC-DS pass-set ratchet at sf=0.01. CI fails if any listed query stops passing (execute + DuckDB match: exact ints, 0.1% rel float eps). Re-baseline when the set changes.",
+  "notes": "TPC-DS pass-set ratchet at official dsdgen SCALE=1. CI fails if any listed query stops passing (execute + optional DuckDB match: exact ints, 0.1% rel float eps). Re-baseline when the set changes.",
   "scale_factor": 0.01,
   "passed": [
     "Q1",

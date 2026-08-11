@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Oxidant distributed data plane on EC2 Auto Scaling Groups (no EKS).
   One Spark Connect driver + N fixed Arrow Flight workers, discovered via
-  private Route53 multi-A DNS (OXIDANT_WORKER_SERVICE). Worker count is pinned
+  ASG private-IP membership (OXIDANT_WORKERS). Worker count is pinned
   (Min=Max=Desired) — dynamic scale-out is incompatible with file-list sharding.
 
 Metadata:
@@ -170,9 +170,10 @@ Parameters:
     Type: String
     Default: ''
     Description: >
-      Optional OXIDANT_SHUFFLE_PARTITIONS (hash-shuffle fan-out, driver-side). Empty falls
-      back to WorkerCount. For SF100 set ~= worker vCPU (e.g. 32 on m8g.8xlarge) to spread
-      the shuffle and avoid 2-bucket skew pinning all load onto one worker.
+      Optional OXIDANT_SHUFFLE_PARTITIONS (hash-shuffle fan-out, driver-side). Empty leaves
+      the env unset so the engine uses its Spark-like default max(200, worker_vcpus) —
+      never WorkerCount (a 2-worker cluster must not collapse to a 2-bucket shuffle).
+      For SF100 honesty runs leave empty or set >= 200.
 
   DataBucketArns:
     Type: CommaDelimitedList
@@ -475,7 +476,7 @@ Resources:
               - Key: oxidant:shuffle-spill-bytes
                 Value: !Ref ShuffleSpillBytes
               - Key: oxidant:shuffle-partitions
-                Value: !If [HasShufflePartitions, !Ref ShufflePartitions, !Sub '${WorkerCount}']
+                Value: !If [HasShufflePartitions, !Ref ShufflePartitions, '']
               - Key: oxidant:catalog-conf
                 Value: !If [HasCatalogConf, !Ref CatalogConf, 'none']
               - Key: oxidant:distributed-strict
@@ -556,7 +557,7 @@ Resources:
               - Key: oxidant:shuffle-spill-bytes
                 Value: !Ref ShuffleSpillBytes
               - Key: oxidant:shuffle-partitions
-                Value: !If [HasShufflePartitions, !Ref ShufflePartitions, !Sub '${WorkerCount}']
+                Value: !If [HasShufflePartitions, !Ref ShufflePartitions, '']
               - Key: oxidant:catalog-conf
                 Value: !If [HasCatalogConf, !Ref CatalogConf, 'none']
               - Key: oxidant:distributed-strict

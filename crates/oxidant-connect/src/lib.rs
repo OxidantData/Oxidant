@@ -279,7 +279,17 @@ impl OxidantService {
             .get("spark.oxidant.workers")
             .map(|s| distributed::parse_worker_list(Some(s)))
             .filter(|w| !w.is_empty());
-        cfg_workers.unwrap_or_else(|| self.workers.clone())
+        // Prefer live config, then re-resolve from env/DNS each query (EC2 workers can
+        // register in Route53 after the driver process started — a stale empty
+        // `self.workers` snapshot is what let SF100 fall through to driver-local scans).
+        cfg_workers.unwrap_or_else(|| {
+            let live = distributed::parse_worker_list(None);
+            if !live.is_empty() {
+                live
+            } else {
+                self.workers.clone()
+            }
+        })
     }
 
     /// Render the observability plan text OFF the query critical path: `Engine::explain`
@@ -742,7 +752,29 @@ impl OxidantService {
                         // Distributed execution doesn't surface DataFusion scan metrics → no stats.
                         return Ok((batches, None));
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // Workers configured (static list / OXIDANT_WORKERS /
+                        // OXIDANT_WORKER_SERVICE) but the planner declined: under strict
+                        // mode that is already an error inside try_run_distributed_plan.
+                        // Soft mode still falls through — but never when discovery env is
+                        // set and the membership set was empty (handled above). If we got
+                        // here with workers configured under strict, refuse local SF100.
+                        if distributed::distributed_strict_public()
+                            && (!workers.is_empty()
+                                || std::env::var("OXIDANT_WORKER_SERVICE")
+                                    .ok()
+                                    .is_some_and(|s| !s.trim().is_empty())
+                                || std::env::var("OXIDANT_WORKERS")
+                                    .ok()
+                                    .is_some_and(|s| !s.trim().is_empty()))
+                        {
+                            return Err(Status::failed_precondition(
+                                "OXIDANT_DISTRIBUTED_STRICT: query did not run distributed; \
+                                 refusing driver-local fallback (would OOM a small Connect \
+                                 driver on SF100)",
+                            ));
+                        }
+                    }
                     Err(e) => {
                         if let Some(t) = &tracker {
                             t.finish_error(e.to_string());
@@ -873,7 +905,22 @@ impl OxidantService {
                         }
                         return Ok((batches, None));
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if distributed::distributed_strict_public()
+                            && (!workers.is_empty()
+                                || std::env::var("OXIDANT_WORKER_SERVICE")
+                                    .ok()
+                                    .is_some_and(|s| !s.trim().is_empty())
+                                || std::env::var("OXIDANT_WORKERS")
+                                    .ok()
+                                    .is_some_and(|s| !s.trim().is_empty()))
+                        {
+                            return Err(Status::failed_precondition(
+                                "OXIDANT_DISTRIBUTED_STRICT: DataFrame plan did not run \
+                                 distributed; refusing driver-local fallback",
+                            ));
+                        }
+                    }
                     Err(e) => {
                         if let Some(t) = &tracker {
                             t.finish_error(e.to_string());

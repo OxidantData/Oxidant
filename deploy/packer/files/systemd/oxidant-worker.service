@@ -2,7 +2,7 @@
 Description=Oxidant Arrow Flight worker
 Documentation=https://github.com/OxidantData/Oxidant
 # Requires+After oxidant-bootstrap: the worker must not start before bootstrap
-# has written /etc/oxidant/oxidant.env (shard index) and upserted its Route53 A
+# has written /etc/oxidant/oxidant.env (shard index; driver discovers workers via ASG IPs)
 # record. oxidant-bootstrap never starts this unit from inside its oneshot —
 # that closes a dependency cycle and deadlocks boot (KAN-58). UserData starts
 # this unit on first boot; the multi-user.target graph does on reboots.

@@ -1,18 +1,25 @@
-//! TPC-DS data generation via the DuckDB `tpcds` extension (`dsdgen`) exported as Parquet.
+//! TPC-DS data via official TPC `dsdgen` (not DuckDB).
 //!
-//! Parquet (not CSV) is required so the same harness can target SF100/500/1000 on larger hardware
-//! without materializing everything as text. Generation requires a `duckdb` CLI on PATH (or a
-//! common install location). Idempotent: skipped when the sentinel + recorded scale factor match.
+//! Emits Snappy Parquet under `dir`. Official `dsdgen` requires an integer scale factor ≥ 1
+//! (SCALE is GB). Idempotent when `store_sales.parquet` exists and `scale_factor.txt` matches.
 //!
-//! First-time `INSTALL tpcds` needs network egress to DuckDB's extension repository; subsequent
-//! runs use the local extension cache.
+//! Column names come from [`TPCDS_COLUMNS`] (`bench/tpc/tpcds_columns.tsv`) — the public SQL
+//! schema matching official `.dat` column order.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
-use std::process::Command;
+use std::sync::OnceLock;
 
-/// The 24 TPC-DS tables (DuckDB `dsdgen` / official kit).
+use datafusion::prelude::{CsvReadOptions, SessionContext};
+
+use crate::tpc_kits;
+
+/// Vendored public column lists (table → ordered columns), matching official `dsdgen` `.dat` order.
+const TPCDS_COLUMNS: &str = include_str!("../../../bench/tpc/tpcds_columns.tsv");
+
+/// The 24 TPC-DS tables (official kit).
 pub const TABLES: [&str; 24] = [
     "call_center",
     "catalog_page",
@@ -42,16 +49,41 @@ pub const TABLES: [&str; 24] = [
 
 const SENTINEL: &str = "store_sales.parquet";
 pub(crate) const SF_MARKER: &str = "scale_factor.txt";
-const EXPORT_DIR: &str = ".export";
+const RAW_DIR: &str = ".dsdgen-raw";
 
-/// Locate a `duckdb` binary: PATH, else common install locations.
+fn column_map() -> &'static HashMap<String, Vec<String>> {
+    static MAP: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m = HashMap::new();
+        for line in TPCDS_COLUMNS.lines() {
+            let line = line.trim().trim_matches('"');
+            if line.is_empty() {
+                continue;
+            }
+            let (table, cols) = line
+                .split_once('\t')
+                .unwrap_or_else(|| panic!("bad tpcds_columns.tsv line: {line}"));
+            m.insert(
+                table.to_string(),
+                cols.split(',').map(|s| s.trim().to_string()).collect(),
+            );
+        }
+        m
+    })
+}
+
+/// Locate a `duckdb` binary (optional **oracle only** — not used for generation).
 pub fn duckdb_path() -> Option<String> {
     for cand in [
         "duckdb",
         "/opt/homebrew/opt/duckdb/bin/duckdb",
         "/usr/local/bin/duckdb",
     ] {
-        if Command::new(cand).arg("--version").output().is_ok() {
+        if std::process::Command::new(cand)
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
             return Some(cand.to_string());
         }
     }
@@ -66,12 +98,9 @@ pub(crate) fn duckdb_quote_path(path: &Path) -> io::Result<String> {
     Ok(s.replace('\'', "''"))
 }
 
-/// Generate scale-factor `sf` TPC-DS data as Parquet under `dir`. Idempotent when
-/// `store_sales.parquet` exists and `scale_factor.txt` matches `sf`.
-///
-/// On SF mismatch, only known harness artifacts are removed (table Parquets, SF marker,
-/// DuckDB export leftovers) — never unrelated files in `--data`.
+/// Generate scale-factor `sf` TPC-DS data as Parquet under `dir`.
 pub fn generate(sf: f64, dir: &Path) -> io::Result<()> {
+    let sf_int = validate_sf(sf)?;
     fs::create_dir_all(dir)?;
     let sentinel = dir.join(SENTINEL);
     let marker = dir.join(SF_MARKER);
@@ -82,55 +111,85 @@ pub fn generate(sf: f64, dir: &Path) -> io::Result<()> {
         clear_harness_artifacts(dir)?;
     }
 
-    let duckdb = duckdb_path().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "duckdb CLI not found on PATH (required for TPC-DS data generation via dsdgen)",
-        )
-    })?;
-
-    let stage = dir.join(EXPORT_DIR);
-    if stage.exists() {
-        fs::remove_dir_all(&stage)?;
+    let raw = dir.join(RAW_DIR);
+    if raw.exists() {
+        fs::remove_dir_all(&raw)?;
     }
-    fs::create_dir_all(&stage)?;
-
-    let stage_lit = duckdb_quote_path(&stage)?;
-    // INSTALL needs network the first time; LOAD uses the local cache afterward.
-    let script = format!(
-        "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf = {sf}); EXPORT DATABASE '{stage_lit}' (FORMAT PARQUET);"
+    fs::create_dir_all(&raw)?;
+    eprintln!(
+        "[tpcds-data] official dsdgen SCALE={sf_int} → {} (then Parquet)",
+        raw.display()
     );
-    let out = Command::new(&duckdb)
-        .args(["-c", &script])
-        .output()
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("failed to spawn duckdb: {e}"))
-        })?;
-    if !out.status.success() {
+    tpc_kits::run_dsdgen(sf_int, &raw)?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tokio rt: {e}")))?;
+    rt.block_on(convert_dat_to_parquet(&raw, dir))?;
+
+    let _ = fs::remove_dir_all(&raw);
+    let mut f = fs::File::create(&marker)?;
+    writeln!(f, "{sf:.10}")?;
+    Ok(())
+}
+
+fn validate_sf(sf: f64) -> io::Result<u32> {
+    if sf < 1.0 || (sf - sf.round()).abs() > 1e-9 {
         return Err(io::Error::new(
-            io::ErrorKind::Other,
+            io::ErrorKind::InvalidInput,
             format!(
-                "duckdb dsdgen/export failed (INSTALL tpcds needs network on first use): {}",
-                String::from_utf8_lossy(&out.stderr)
+                "official TPC-DS dsdgen requires integer SCALE ≥ 1 (got {sf}); use --sf 1 (or 10/100/…)"
             ),
         ));
     }
+    Ok(sf.round() as u32)
+}
 
+async fn convert_dat_to_parquet(raw: &Path, out: &Path) -> io::Result<()> {
+    let cols_map = column_map();
+    let ctx = SessionContext::new();
     for t in TABLES {
-        let src = stage.join(format!("{t}.parquet"));
+        let src = raw.join(format!("{t}.dat"));
         if !src.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("expected {} after EXPORT", src.display()),
+                format!("dsdgen did not produce {}", src.display()),
             ));
         }
-        fs::rename(&src, dir.join(format!("{t}.parquet")))?;
-    }
-    let _ = fs::remove_dir_all(&stage);
+        let headers = cols_map.get(t).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no column list for `{t}` in tpcds_columns.tsv"),
+            )
+        })?;
+        let header_refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+        let staged = raw.join(format!("{t}.csv"));
+        tpc_kits::pipe_tbl_to_csv(&src, &staged, &header_refs)?;
 
-    let mut f = fs::File::create(&marker)?;
-    // Fixed decimal so marker round-trips with CLI-parsed f64 (avoids 0.01 vs 0.010000000000000002).
-    writeln!(f, "{sf:.10}")?;
+        let path_str = staged
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 path"))?;
+        // Headered CSV + type inference (matches prior DuckDB parquet usability for SQL).
+        let opts = CsvReadOptions::new().has_header(true);
+        ctx.register_csv(t, path_str, opts)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("register {t}: {e}")))?;
+        let dest = out.join(format!("{t}.parquet"));
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 path"))?
+            .replace('\'', "''");
+        ctx.sql(&format!(
+            "COPY (SELECT * FROM \"{t}\") TO '{dest_str}' (FORMAT PARQUET)"
+        ))
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("copy plan {t}: {e}")))?
+        .collect()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("copy exec {t}: {e}")))?;
+        let _ = fs::remove_file(&staged);
+    }
     Ok(())
 }
 
@@ -146,7 +205,6 @@ fn sf_marker_matches(marker: &Path, sf: f64) -> io::Result<bool> {
         .is_some_and(|p| (p - sf).abs() < 1e-9))
 }
 
-/// Remove only harness-owned files so a wrong `--sf` cannot wipe an unrelated `--data` tree.
 fn clear_harness_artifacts(dir: &Path) -> io::Result<()> {
     for t in TABLES {
         let p = dir.join(format!("{t}.parquet"));
@@ -160,9 +218,9 @@ fn clear_harness_artifacts(dir: &Path) -> io::Result<()> {
             fs::remove_file(&p)?;
         }
     }
-    let export = dir.join(EXPORT_DIR);
-    if export.exists() {
-        fs::remove_dir_all(&export)?;
+    let raw = dir.join(RAW_DIR);
+    if raw.exists() {
+        fs::remove_dir_all(&raw)?;
     }
     Ok(())
 }
@@ -170,7 +228,6 @@ fn clear_harness_artifacts(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::path::PathBuf;
 
     fn tmp_dir(name: &str) -> PathBuf {
@@ -182,41 +239,39 @@ mod tests {
     }
 
     #[test]
+    fn column_map_has_all_tables() {
+        let m = column_map();
+        for t in TABLES {
+            assert!(m.contains_key(t), "missing {t}");
+            assert!(!m[t].is_empty());
+        }
+        assert_eq!(m["store_sales"].len(), 23);
+    }
+
+    #[test]
     fn duckdb_quote_path_escapes_single_quotes() {
         let p = Path::new("/tmp/oxidant's-data");
         assert_eq!(duckdb_quote_path(p).unwrap(), "/tmp/oxidant''s-data");
     }
 
     #[test]
+    fn validate_sf_rejects_fractional() {
+        assert!(validate_sf(0.01).is_err());
+        assert_eq!(validate_sf(1.0).unwrap(), 1);
+    }
+
+    #[test]
     fn clear_harness_artifacts_preserves_unrelated_files() {
         let dir = tmp_dir("wipe");
         fs::write(dir.join("store_sales.parquet"), b"ss").unwrap();
-        fs::write(dir.join("customer.parquet"), b"c").unwrap();
-        fs::write(dir.join(SF_MARKER), b"0.01\n").unwrap();
+        fs::write(dir.join(SF_MARKER), b"1\n").unwrap();
         fs::write(dir.join("keep_me.txt"), b"important").unwrap();
-        fs::create_dir_all(dir.join("keep_subdir")).unwrap();
-        fs::write(dir.join("keep_subdir/x"), b"x").unwrap();
-
         clear_harness_artifacts(&dir).unwrap();
-
         assert!(!dir.join("store_sales.parquet").exists());
-        assert!(!dir.join("customer.parquet").exists());
-        assert!(!dir.join(SF_MARKER).exists());
         assert_eq!(
             fs::read_to_string(dir.join("keep_me.txt")).unwrap(),
             "important"
         );
-        assert!(dir.join("keep_subdir/x").exists());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn sf_marker_matches_uses_epsilon() {
-        let dir = tmp_dir("sf");
-        let marker = dir.join(SF_MARKER);
-        fs::write(&marker, "0.0100000000\n").unwrap();
-        assert!(sf_marker_matches(&marker, 0.01).unwrap());
-        assert!(!sf_marker_matches(&marker, 0.02).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 }

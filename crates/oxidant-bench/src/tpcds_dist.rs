@@ -672,13 +672,13 @@ mod tests {
         use datafusion::logical_expr::LogicalPlan;
         use oxidant_execution::plan::plan_distributed_logical;
 
-        let dir = std::env::temp_dir().join("oxidant-tpcds-sf0.01");
-        // Data generation shells out to the duckdb CLI (dsdgen); the CI `clippy + test`
-        // job runs the workspace suite without it (the query-gates job installs it and
-        // exercises the same path through `tpcds-distributed --execute`). Skip — rather
-        // than fail — only when generation is impossible; any real generation error still
-        // panics.
-        if let Err(e) = tpcds_data::generate(0.01, &dir) {
+        let dir = std::env::temp_dir().join("oxidant-tpcds-sf1");
+        // Data generation shells out to official dsdgen (integer SCALE ≥ 1). The CI
+        // `clippy + test` job runs the workspace suite without the kits (query-gates
+        // installs them and exercises the same path via `tpcds-distributed`). Skip —
+        // rather than fail — only when generation is impossible; any real generation
+        // error still panics.
+        if let Err(e) = tpcds_data::generate(1.0, &dir) {
             if e.kind() == std::io::ErrorKind::NotFound {
                 eprintln!("[pre-split-audit] skipping: {e}");
                 return;
