@@ -1,0 +1,901 @@
+{
+  "dataset": "TPC-DS SF100 (Glue tpcds_sf100 via Athena engine v3)",
+  "machine": "athena serverless (workgroup tpcds-sf100-comparison)",
+  "run_date": "2026-08-11",
+  "failures": 10,
+  "queries": [
+    {
+      "query": "Q1",
+      "status": "SUCCEEDED",
+      "engine_ms": 6353,
+      "elapsed_s": 6.353,
+      "data_scanned_bytes": 430394758,
+      "error": null,
+      "execution_id": "b629db53-9f87-4c21-b604-de8190cbb2e2"
+    },
+    {
+      "query": "Q2",
+      "status": "SUCCEEDED",
+      "engine_ms": 11970,
+      "elapsed_s": 11.97,
+      "data_scanned_bytes": 2482697660,
+      "error": null,
+      "execution_id": "cd6673fe-1003-4f93-9c74-1ff590675a2c"
+    },
+    {
+      "query": "Q3",
+      "status": "SUCCEEDED",
+      "engine_ms": 8792,
+      "elapsed_s": 8.792,
+      "data_scanned_bytes": 3511266724,
+      "error": null,
+      "execution_id": "3162d031-bbb3-40aa-bd6d-21d0f58bb03f"
+    },
+    {
+      "query": "Q4",
+      "status": "SUCCEEDED",
+      "engine_ms": 24254,
+      "elapsed_s": 24.254,
+      "data_scanned_bytes": 16492303864,
+      "error": null,
+      "execution_id": "8ba231a6-ad3f-456c-b741-a7c971853426"
+    },
+    {
+      "query": "Q5",
+      "status": "SUCCEEDED",
+      "engine_ms": 35107,
+      "elapsed_s": 35.107,
+      "data_scanned_bytes": 6704831090,
+      "error": null,
+      "execution_id": "fae58f12-82c2-411f-aaa0-f53344a71832"
+    },
+    {
+      "query": "Q6",
+      "status": "SUCCEEDED",
+      "engine_ms": 5186,
+      "elapsed_s": 5.186,
+      "data_scanned_bytes": 2034703510,
+      "error": null,
+      "execution_id": "6bc9e30b-fc35-4461-88cb-812d8f36e34e"
+    },
+    {
+      "query": "Q7",
+      "status": "SUCCEEDED",
+      "engine_ms": 7800,
+      "elapsed_s": 7.8,
+      "data_scanned_bytes": 6122776573,
+      "error": null,
+      "execution_id": "4c9eee43-cb45-4f51-ad25-4dcc7422f893"
+    },
+    {
+      "query": "Q8",
+      "status": "SUCCEEDED",
+      "engine_ms": 10938,
+      "elapsed_s": 10.938,
+      "data_scanned_bytes": 1988410193,
+      "error": null,
+      "execution_id": "deb62b32-4560-4b8e-b146-b3edfc2ea9c6"
+    },
+    {
+      "query": "Q9",
+      "status": "SUCCEEDED",
+      "engine_ms": 7528,
+      "elapsed_s": 7.528,
+      "data_scanned_bytes": 2259364907,
+      "error": null,
+      "execution_id": "2aa4bf37-e1ee-413f-9ef7-c98cf9a9b38b"
+    },
+    {
+      "query": "Q10",
+      "status": "SUCCEEDED",
+      "engine_ms": 7033,
+      "elapsed_s": 7.033,
+      "data_scanned_bytes": 643709905,
+      "error": null,
+      "execution_id": "320e07af-b09f-4022-a3d8-1f1d9abb2a51"
+    },
+    {
+      "query": "Q11",
+      "status": "SUCCEEDED",
+      "engine_ms": 12165,
+      "elapsed_s": 12.165,
+      "data_scanned_bytes": 7188134600,
+      "error": null,
+      "execution_id": "3d77d8e9-3b2e-4d22-a847-e205293d494e"
+    },
+    {
+      "query": "Q12",
+      "status": "SUCCEEDED",
+      "engine_ms": 3962,
+      "elapsed_s": 3.962,
+      "data_scanned_bytes": 857178991,
+      "error": null,
+      "execution_id": "509715a9-609e-410a-9467-3d8235a21664"
+    },
+    {
+      "query": "Q13",
+      "status": "SUCCEEDED",
+      "engine_ms": 10383,
+      "elapsed_s": 10.383,
+      "data_scanned_bytes": 7297522156,
+      "error": null,
+      "execution_id": "5b598be0-5b54-47b1-873a-736200072405"
+    },
+    {
+      "query": "Q14",
+      "status": "SUCCEEDED",
+      "engine_ms": 21157,
+      "elapsed_s": 21.157,
+      "data_scanned_bytes": 21883658425,
+      "error": null,
+      "execution_id": "54c8d1ed-0f09-4b16-a1c3-a512dbb88506"
+    },
+    {
+      "query": "Q15",
+      "status": "SUCCEEDED",
+      "engine_ms": 5683,
+      "elapsed_s": 5.683,
+      "data_scanned_bytes": 55811170,
+      "error": null,
+      "execution_id": "2b556567-392f-4878-a838-ffd46a1773aa"
+    },
+    {
+      "query": "Q16",
+      "status": "FAILED",
+      "engine_ms": 135,
+      "elapsed_s": 0.135,
+      "data_scanned_bytes": 0,
+      "error": "TYPE_MISMATCH: line 8:14: Cannot check if date is BETWEEN varchar(10) and date",
+      "execution_id": "10a7fbd1-573b-421f-b053-b1b99c469c6c"
+    },
+    {
+      "query": "Q17",
+      "status": "SUCCEEDED",
+      "engine_ms": 9258,
+      "elapsed_s": 9.258,
+      "data_scanned_bytes": 3342658304,
+      "error": null,
+      "execution_id": "98acf2cc-eac6-46dd-a484-fcb17fed88e2"
+    },
+    {
+      "query": "Q18",
+      "status": "SUCCEEDED",
+      "engine_ms": 4863,
+      "elapsed_s": 4.863,
+      "data_scanned_bytes": 811154889,
+      "error": null,
+      "execution_id": "8f285ce8-2fa8-4af8-aebf-0177a7110c03"
+    },
+    {
+      "query": "Q19",
+      "status": "SUCCEEDED",
+      "engine_ms": 11283,
+      "elapsed_s": 11.283,
+      "data_scanned_bytes": 3976563889,
+      "error": null,
+      "execution_id": "79ef1765-d453-4c7f-ba4b-c58b20e41334"
+    },
+    {
+      "query": "Q20",
+      "status": "SUCCEEDED",
+      "engine_ms": 6333,
+      "elapsed_s": 6.333,
+      "data_scanned_bytes": 28511147,
+      "error": null,
+      "execution_id": "d6f4e172-146d-4d69-9d45-e6fbccb86f47"
+    },
+    {
+      "query": "Q21",
+      "status": "SUCCEEDED",
+      "engine_ms": 4479,
+      "elapsed_s": 4.479,
+      "data_scanned_bytes": 104429584,
+      "error": null,
+      "execution_id": "ca92de10-8fe9-4968-b33f-04bcd50bddca"
+    },
+    {
+      "query": "Q22",
+      "status": "SUCCEEDED",
+      "engine_ms": 4438,
+      "elapsed_s": 4.438,
+      "data_scanned_bytes": 590358859,
+      "error": null,
+      "execution_id": "3e466eb5-9312-466d-8b87-3220667d108b"
+    },
+    {
+      "query": "Q23",
+      "status": "SUCCEEDED",
+      "engine_ms": 21913,
+      "elapsed_s": 21.913,
+      "data_scanned_bytes": 12223965650,
+      "error": null,
+      "execution_id": "b85caeea-637e-4b61-962f-ca29a070c35b"
+    },
+    {
+      "query": "Q24",
+      "status": "SUCCEEDED",
+      "engine_ms": 9573,
+      "elapsed_s": 9.573,
+      "data_scanned_bytes": 8064017394,
+      "error": null,
+      "execution_id": "909367bf-051f-4cdd-aa35-17a0cef0d7ca"
+    },
+    {
+      "query": "Q25",
+      "status": "SUCCEEDED",
+      "engine_ms": 12014,
+      "elapsed_s": 12.014,
+      "data_scanned_bytes": 4783485050,
+      "error": null,
+      "execution_id": "c781c1b6-1fec-4320-a25b-2065e658ce80"
+    },
+    {
+      "query": "Q26",
+      "status": "SUCCEEDED",
+      "engine_ms": 7245,
+      "elapsed_s": 7.245,
+      "data_scanned_bytes": 649932694,
+      "error": null,
+      "execution_id": "8e1f8014-1601-4d87-96e6-ea755eb26d34"
+    },
+    {
+      "query": "Q27",
+      "status": "SUCCEEDED",
+      "engine_ms": 10932,
+      "elapsed_s": 10.932,
+      "data_scanned_bytes": 16747829797,
+      "error": null,
+      "execution_id": "f190eb3c-e504-40a4-9d32-97ac0b1baac1"
+    },
+    {
+      "query": "Q28",
+      "status": "SUCCEEDED",
+      "engine_ms": 16234,
+      "elapsed_s": 16.234,
+      "data_scanned_bytes": 3341694017,
+      "error": null,
+      "execution_id": "797bf176-1201-49f3-8dd5-76694b066688"
+    },
+    {
+      "query": "Q29",
+      "status": "SUCCEEDED",
+      "engine_ms": 9025,
+      "elapsed_s": 9.025,
+      "data_scanned_bytes": 3879843471,
+      "error": null,
+      "execution_id": "12cf0687-669c-4760-8cc2-bf41bce7108d"
+    },
+    {
+      "query": "Q30",
+      "status": "SUCCEEDED",
+      "engine_ms": 4177,
+      "elapsed_s": 4.177,
+      "data_scanned_bytes": 265514576,
+      "error": null,
+      "execution_id": "da6f4a83-7324-45c1-b251-d6917b08962f"
+    },
+    {
+      "query": "Q31",
+      "status": "SUCCEEDED",
+      "engine_ms": 10242,
+      "elapsed_s": 10.242,
+      "data_scanned_bytes": 7593377996,
+      "error": null,
+      "execution_id": "09cf75bc-20b3-4472-95ca-66cccd65da34"
+    },
+    {
+      "query": "Q32",
+      "status": "FAILED",
+      "engine_ms": 117,
+      "elapsed_s": 0.117,
+      "data_scanned_bytes": 0,
+      "error": "TYPE_MISMATCH: line 7:14: Cannot check if date is BETWEEN varchar(10) and date",
+      "execution_id": "ce760eae-64f3-4869-a661-ed362696bd7c"
+    },
+    {
+      "query": "Q33",
+      "status": "SUCCEEDED",
+      "engine_ms": 7507,
+      "elapsed_s": 7.507,
+      "data_scanned_bytes": 4533232032,
+      "error": null,
+      "execution_id": "727b9811-8af2-4395-a1ae-e764405d8adb"
+    },
+    {
+      "query": "Q34",
+      "status": "SUCCEEDED",
+      "engine_ms": 9917,
+      "elapsed_s": 9.917,
+      "data_scanned_bytes": 1109787428,
+      "error": null,
+      "execution_id": "69a6fd0b-09f6-4d0c-8a76-5921f3458e1f"
+    },
+    {
+      "query": "Q35",
+      "status": "SUCCEEDED",
+      "engine_ms": 6869,
+      "elapsed_s": 6.869,
+      "data_scanned_bytes": 651438587,
+      "error": null,
+      "execution_id": "6df2924d-68e6-4090-9d4a-c8380d4e9dc7"
+    },
+    {
+      "query": "Q36",
+      "status": "SUCCEEDED",
+      "engine_ms": 10452,
+      "elapsed_s": 10.452,
+      "data_scanned_bytes": 15300066015,
+      "error": null,
+      "execution_id": "54a95cdb-2a16-4dca-8e7d-fcb1e5950fc7"
+    },
+    {
+      "query": "Q37",
+      "status": "SUCCEEDED",
+      "engine_ms": 4608,
+      "elapsed_s": 4.608,
+      "data_scanned_bytes": 906339990,
+      "error": null,
+      "execution_id": "062a9dbf-b0ab-46a5-b261-36077375103c"
+    },
+    {
+      "query": "Q38",
+      "status": "SUCCEEDED",
+      "engine_ms": 8343,
+      "elapsed_s": 8.343,
+      "data_scanned_bytes": 688263980,
+      "error": null,
+      "execution_id": "f22f2376-8cc7-4962-91ea-1fab36d8f44b"
+    },
+    {
+      "query": "Q39",
+      "status": "SUCCEEDED",
+      "engine_ms": 4128,
+      "elapsed_s": 4.128,
+      "data_scanned_bytes": 93320067,
+      "error": null,
+      "execution_id": "d25fc668-c4af-4070-9071-78c97b8db4d5"
+    },
+    {
+      "query": "Q40",
+      "status": "SUCCEEDED",
+      "engine_ms": 5166,
+      "elapsed_s": 5.166,
+      "data_scanned_bytes": 252710801,
+      "error": null,
+      "execution_id": "f6475ca6-9a9c-4794-9522-cb5f61d93106"
+    },
+    {
+      "query": "Q41",
+      "status": "SUCCEEDED",
+      "engine_ms": 10084,
+      "elapsed_s": 10.084,
+      "data_scanned_bytes": 3987971,
+      "error": null,
+      "execution_id": "2edc1abc-21ed-4d39-9953-9c3ef2fac93a"
+    },
+    {
+      "query": "Q42",
+      "status": "SUCCEEDED",
+      "engine_ms": 7048,
+      "elapsed_s": 7.048,
+      "data_scanned_bytes": 3416404386,
+      "error": null,
+      "execution_id": "e47b9876-a966-4431-8b64-44ce5aaa13d9"
+    },
+    {
+      "query": "Q43",
+      "status": "SUCCEEDED",
+      "engine_ms": 9540,
+      "elapsed_s": 9.54,
+      "data_scanned_bytes": 1640941814,
+      "error": null,
+      "execution_id": "d822dcc1-e9b6-44c6-a178-56502c8ade81"
+    },
+    {
+      "query": "Q44",
+      "status": "SUCCEEDED",
+      "engine_ms": 15176,
+      "elapsed_s": 15.176,
+      "data_scanned_bytes": 8613371664,
+      "error": null,
+      "execution_id": "68b4e0c7-a413-4091-a88e-5252cc34d6da"
+    },
+    {
+      "query": "Q45",
+      "status": "SUCCEEDED",
+      "engine_ms": 3981,
+      "elapsed_s": 3.981,
+      "data_scanned_bytes": 880970992,
+      "error": null,
+      "execution_id": "0df8edae-0388-40b9-9b4a-676d8a7cd1ae"
+    },
+    {
+      "query": "Q46",
+      "status": "SUCCEEDED",
+      "engine_ms": 10390,
+      "elapsed_s": 10.39,
+      "data_scanned_bytes": 3356548204,
+      "error": null,
+      "execution_id": "b2b935ba-cf8c-4885-a3d3-dfdac3b25b64"
+    },
+    {
+      "query": "Q47",
+      "status": "SUCCEEDED",
+      "engine_ms": 10871,
+      "elapsed_s": 10.871,
+      "data_scanned_bytes": 9657549253,
+      "error": null,
+      "execution_id": "caf57325-4e42-4504-b6d8-43645ee0fe4c"
+    },
+    {
+      "query": "Q48",
+      "status": "SUCCEEDED",
+      "engine_ms": 8700,
+      "elapsed_s": 8.7,
+      "data_scanned_bytes": 3912251772,
+      "error": null,
+      "execution_id": "6666bb1a-dcd4-4736-9a34-9d284ca8065b"
+    },
+    {
+      "query": "Q49",
+      "status": "SUCCEEDED",
+      "engine_ms": 29474,
+      "elapsed_s": 29.474,
+      "data_scanned_bytes": 10487666581,
+      "error": null,
+      "execution_id": "4ea7ad83-a654-45c8-bf22-71e19ab0e4b0"
+    },
+    {
+      "query": "Q50",
+      "status": "SUCCEEDED",
+      "engine_ms": 6857,
+      "elapsed_s": 6.857,
+      "data_scanned_bytes": 2790425499,
+      "error": null,
+      "execution_id": "d998737a-7ec3-4b2f-9d86-821401cb2178"
+    },
+    {
+      "query": "Q51",
+      "status": "SUCCEEDED",
+      "engine_ms": 9888,
+      "elapsed_s": 9.888,
+      "data_scanned_bytes": 3823017263,
+      "error": null,
+      "execution_id": "ef987b48-e5ab-472f-83cf-c278a7443eb2"
+    },
+    {
+      "query": "Q52",
+      "status": "SUCCEEDED",
+      "engine_ms": 6419,
+      "elapsed_s": 6.419,
+      "data_scanned_bytes": 3425511758,
+      "error": null,
+      "execution_id": "2004bd5f-12e3-44f5-8784-0f5331d964ff"
+    },
+    {
+      "query": "Q53",
+      "status": "SUCCEEDED",
+      "engine_ms": 8889,
+      "elapsed_s": 8.889,
+      "data_scanned_bytes": 3242411494,
+      "error": null,
+      "execution_id": "83775b5b-8f28-4783-a53d-3346756a159e"
+    },
+    {
+      "query": "Q54",
+      "status": "SUCCEEDED",
+      "engine_ms": 7722,
+      "elapsed_s": 7.722,
+      "data_scanned_bytes": 3290039799,
+      "error": null,
+      "execution_id": "45e2fa28-5c5d-4598-9df1-35cece241ead"
+    },
+    {
+      "query": "Q55",
+      "status": "SUCCEEDED",
+      "engine_ms": 10943,
+      "elapsed_s": 10.943,
+      "data_scanned_bytes": 3446993510,
+      "error": null,
+      "execution_id": "a3089947-87e6-4fb3-9990-6162415b1411"
+    },
+    {
+      "query": "Q56",
+      "status": "SUCCEEDED",
+      "engine_ms": 24716,
+      "elapsed_s": 24.716,
+      "data_scanned_bytes": 4518908936,
+      "error": null,
+      "execution_id": "210e22bc-8d20-4162-91ad-00dc1aa20b75"
+    },
+    {
+      "query": "Q57",
+      "status": "SUCCEEDED",
+      "engine_ms": 7234,
+      "elapsed_s": 7.234,
+      "data_scanned_bytes": 1123163669,
+      "error": null,
+      "execution_id": "883b90f1-2381-49a3-9fbd-dabc1a261d74"
+    },
+    {
+      "query": "Q58",
+      "status": "FAILED",
+      "engine_ms": 152,
+      "elapsed_s": 0.152,
+      "data_scanned_bytes": 0,
+      "error": "TYPE_MISMATCH: line 14:27: Cannot apply operator: date = varchar(10)",
+      "execution_id": "e07f2bfc-afc4-4b50-9a01-84fde11310e7"
+    },
+    {
+      "query": "Q59",
+      "status": "SUCCEEDED",
+      "engine_ms": 18374,
+      "elapsed_s": 18.374,
+      "data_scanned_bytes": 3084077351,
+      "error": null,
+      "execution_id": "bf06dcc2-4345-45f3-a7d1-5ad002edb231"
+    },
+    {
+      "query": "Q60",
+      "status": "SUCCEEDED",
+      "engine_ms": 8606,
+      "elapsed_s": 8.606,
+      "data_scanned_bytes": 4578848868,
+      "error": null,
+      "execution_id": "e8c0ac2a-5af1-437e-9aef-6ecbafb3fbef"
+    },
+    {
+      "query": "Q61",
+      "status": "SUCCEEDED",
+      "engine_ms": 41337,
+      "elapsed_s": 41.337,
+      "data_scanned_bytes": 8362425516,
+      "error": null,
+      "execution_id": "1e072c7c-da79-4640-ae60-b03e4150f6e2"
+    },
+    {
+      "query": "Q62",
+      "status": "SUCCEEDED",
+      "engine_ms": 29964,
+      "elapsed_s": 29.964,
+      "data_scanned_bytes": 475116279,
+      "error": null,
+      "execution_id": "bfe33539-f0de-41f2-9c4d-a8b1f5a07d69"
+    },
+    {
+      "query": "Q63",
+      "status": "SUCCEEDED",
+      "engine_ms": 7346,
+      "elapsed_s": 7.346,
+      "data_scanned_bytes": 3217478104,
+      "error": null,
+      "execution_id": "0cd7bc4d-d29d-426d-a4ee-a4dd82af4c35"
+    },
+    {
+      "query": "Q64",
+      "status": "SUCCEEDED",
+      "engine_ms": 50570,
+      "elapsed_s": 50.57,
+      "data_scanned_bytes": 19231860983,
+      "error": null,
+      "execution_id": "6e8b4599-8cbd-4a32-ad5c-08e11164be12"
+    },
+    {
+      "query": "Q65",
+      "status": "SUCCEEDED",
+      "engine_ms": 12856,
+      "elapsed_s": 12.856,
+      "data_scanned_bytes": 3195642741,
+      "error": null,
+      "execution_id": "71720bc7-8c59-43ba-a7c3-13c87d314792"
+    },
+    {
+      "query": "Q66",
+      "status": "SUCCEEDED",
+      "engine_ms": 35412,
+      "elapsed_s": 35.412,
+      "data_scanned_bytes": 1453767812,
+      "error": null,
+      "execution_id": "1e437336-9fd3-4d5c-b3c1-5bc26eab643c"
+    },
+    {
+      "query": "Q67",
+      "status": "SUCCEEDED",
+      "engine_ms": 11703,
+      "elapsed_s": 11.703,
+      "data_scanned_bytes": 3530756993,
+      "error": null,
+      "execution_id": "95d860c5-67f4-40d2-b71b-6ecbd46d2882"
+    },
+    {
+      "query": "Q68",
+      "status": "SUCCEEDED",
+      "engine_ms": 10024,
+      "elapsed_s": 10.024,
+      "data_scanned_bytes": 5670750845,
+      "error": null,
+      "execution_id": "a285c3a4-9251-4913-b0d3-d962bc42badb"
+    },
+    {
+      "query": "Q69",
+      "status": "SUCCEEDED",
+      "engine_ms": 6506,
+      "elapsed_s": 6.506,
+      "data_scanned_bytes": 637992858,
+      "error": null,
+      "execution_id": "f92c2722-d1e5-42d0-af87-79fbfa90bc99"
+    },
+    {
+      "query": "Q70",
+      "status": "FAILED",
+      "engine_ms": 170,
+      "elapsed_s": 0.17,
+      "data_scanned_bytes": 0,
+      "error": "INVALID_ARGUMENTS: Invalid reference to output of SELECT clause from grouping() expression in ORDER BY",
+      "execution_id": "8a188440-8561-4bcf-9a9d-3c9ad3f9ef43"
+    },
+    {
+      "query": "Q71",
+      "status": "SUCCEEDED",
+      "engine_ms": 6514,
+      "elapsed_s": 6.514,
+      "data_scanned_bytes": 4572850155,
+      "error": null,
+      "execution_id": "8f392c97-cf5b-4b6c-89df-0eb2d5962940"
+    },
+    {
+      "query": "Q72",
+      "status": "FAILED",
+      "engine_ms": 181,
+      "elapsed_s": 0.181,
+      "data_scanned_bytes": 0,
+      "error": "TYPE_MISMATCH: line 27:29: Cannot apply operator: date + integer",
+      "execution_id": "6cc28ef5-0485-40ba-9082-7259c2e5a846"
+    },
+    {
+      "query": "Q73",
+      "status": "SUCCEEDED",
+      "engine_ms": 9440,
+      "elapsed_s": 9.44,
+      "data_scanned_bytes": 1110492656,
+      "error": null,
+      "execution_id": "0b5fa4ac-8586-42dd-bccd-21209f380e32"
+    },
+    {
+      "query": "Q74",
+      "status": "SUCCEEDED",
+      "engine_ms": 10346,
+      "elapsed_s": 10.346,
+      "data_scanned_bytes": 5180821182,
+      "error": null,
+      "execution_id": "a4744971-34f1-494c-a401-f186b19a3778"
+    },
+    {
+      "query": "Q75",
+      "status": "SUCCEEDED",
+      "engine_ms": 14070,
+      "elapsed_s": 14.07,
+      "data_scanned_bytes": 12119534938,
+      "error": null,
+      "execution_id": "2d3496b5-5702-4bd6-8de2-7c8c9a9983fc"
+    },
+    {
+      "query": "Q76",
+      "status": "SUCCEEDED",
+      "engine_ms": 8697,
+      "elapsed_s": 8.697,
+      "data_scanned_bytes": 5819208984,
+      "error": null,
+      "execution_id": "4b242634-c122-48c4-b372-95c6c0e67909"
+    },
+    {
+      "query": "Q77",
+      "status": "SUCCEEDED",
+      "engine_ms": 11742,
+      "elapsed_s": 11.742,
+      "data_scanned_bytes": 5253992820,
+      "error": null,
+      "execution_id": "8c08a735-a1e0-48d4-8711-166cac5f4a3e"
+    },
+    {
+      "query": "Q78",
+      "status": "SUCCEEDED",
+      "engine_ms": 13126,
+      "elapsed_s": 13.126,
+      "data_scanned_bytes": 9150348411,
+      "error": null,
+      "execution_id": "e7fa1a8d-50a2-4376-82a4-d8978aba6c46"
+    },
+    {
+      "query": "Q79",
+      "status": "SUCCEEDED",
+      "engine_ms": 11200,
+      "elapsed_s": 11.2,
+      "data_scanned_bytes": 3337149792,
+      "error": null,
+      "execution_id": "03d703b8-ad33-4e55-a2a4-f19045401173"
+    },
+    {
+      "query": "Q80",
+      "status": "SUCCEEDED",
+      "engine_ms": 16677,
+      "elapsed_s": 16.677,
+      "data_scanned_bytes": 8665412731,
+      "error": null,
+      "execution_id": "a4bda26a-0d0a-4478-a1b6-a25a6998dfdc"
+    },
+    {
+      "query": "Q81",
+      "status": "SUCCEEDED",
+      "engine_ms": 4394,
+      "elapsed_s": 4.394,
+      "data_scanned_bytes": 171516622,
+      "error": null,
+      "execution_id": "38c00a1f-6668-4503-8140-852e82979348"
+    },
+    {
+      "query": "Q82",
+      "status": "SUCCEEDED",
+      "engine_ms": 4630,
+      "elapsed_s": 4.63,
+      "data_scanned_bytes": 1709040173,
+      "error": null,
+      "execution_id": "51b1e4c1-c4eb-4c59-b3cd-108aaa3b4a51"
+    },
+    {
+      "query": "Q83",
+      "status": "FAILED",
+      "engine_ms": 139,
+      "elapsed_s": 0.139,
+      "data_scanned_bytes": 0,
+      "error": "TYPE_MISMATCH: line 14:31: IN value and list items must be the same type or coercible to a common type. Cannot find common type between date and varchar(10), all types (without duplicates): [date, varchar(10)]",
+      "execution_id": "71d0b187-73aa-49f5-b8b9-650a956c3260"
+    },
+    {
+      "query": "Q84",
+      "status": "SUCCEEDED",
+      "engine_ms": 2150,
+      "elapsed_s": 2.15,
+      "data_scanned_bytes": 238216551,
+      "error": null,
+      "execution_id": "2f5942d6-6019-418b-9798-7234ab7f341a"
+    },
+    {
+      "query": "Q85",
+      "status": "SUCCEEDED",
+      "engine_ms": 6061,
+      "elapsed_s": 6.061,
+      "data_scanned_bytes": 1886077192,
+      "error": null,
+      "execution_id": "1074a4c5-5396-4213-8e69-7e80083058d7"
+    },
+    {
+      "query": "Q86",
+      "status": "FAILED",
+      "engine_ms": 119,
+      "elapsed_s": 0.119,
+      "data_scanned_bytes": 0,
+      "error": "INVALID_ARGUMENTS: Invalid reference to output of SELECT clause from grouping() expression in ORDER BY",
+      "execution_id": "aae6d85a-375a-4d2e-922a-ce74156b6f16"
+    },
+    {
+      "query": "Q87",
+      "status": "SUCCEEDED",
+      "engine_ms": 10969,
+      "elapsed_s": 10.969,
+      "data_scanned_bytes": 688263980,
+      "error": null,
+      "execution_id": "6713cc93-c2d5-424a-b988-99cde504a779"
+    },
+    {
+      "query": "Q88",
+      "status": "SUCCEEDED",
+      "engine_ms": 9469,
+      "elapsed_s": 9.469,
+      "data_scanned_bytes": 651507980,
+      "error": null,
+      "execution_id": "e475dcd7-8d29-4500-8cee-f48f10573d81"
+    },
+    {
+      "query": "Q89",
+      "status": "SUCCEEDED",
+      "engine_ms": 9635,
+      "elapsed_s": 9.635,
+      "data_scanned_bytes": 3239960992,
+      "error": null,
+      "execution_id": "4891fdfb-9eef-48b0-ba06-7317b217dd6a"
+    },
+    {
+      "query": "Q90",
+      "status": "SUCCEEDED",
+      "engine_ms": 6491,
+      "elapsed_s": 6.491,
+      "data_scanned_bytes": 416137272,
+      "error": null,
+      "execution_id": "e9773356-6498-4ac3-8171-a40786c49993"
+    },
+    {
+      "query": "Q91",
+      "status": "SUCCEEDED",
+      "engine_ms": 3511,
+      "elapsed_s": 3.511,
+      "data_scanned_bytes": 91559648,
+      "error": null,
+      "execution_id": "78785db5-85d1-4c22-b301-0f00b6028fc2"
+    },
+    {
+      "query": "Q92",
+      "status": "FAILED",
+      "engine_ms": 303,
+      "elapsed_s": 0.303,
+      "data_scanned_bytes": 0,
+      "error": "TYPE_MISMATCH: line 7:14: Cannot check if date is BETWEEN varchar(10) and date",
+      "execution_id": "24d246f6-67cf-4e36-86b3-6755f11e5658"
+    },
+    {
+      "query": "Q93",
+      "status": "SUCCEEDED",
+      "engine_ms": 7602,
+      "elapsed_s": 7.602,
+      "data_scanned_bytes": 3822173907,
+      "error": null,
+      "execution_id": "aa41f73d-475d-44d3-88be-850407801d0c"
+    },
+    {
+      "query": "Q94",
+      "status": "FAILED",
+      "engine_ms": 118,
+      "elapsed_s": 0.118,
+      "data_scanned_bytes": 0,
+      "error": "TYPE_MISMATCH: line 8:14: Cannot check if date is BETWEEN varchar(10) and date",
+      "execution_id": "747b0a92-c4b6-4cad-a656-85430f46a57d"
+    },
+    {
+      "query": "Q95",
+      "status": "FAILED",
+      "engine_ms": 144,
+      "elapsed_s": 0.144,
+      "data_scanned_bytes": 0,
+      "error": "TYPE_MISMATCH: line 16:14: Cannot check if date is BETWEEN varchar(10) and date",
+      "execution_id": "05ed8c84-7feb-4276-b97a-3318c4f65afc"
+    },
+    {
+      "query": "Q96",
+      "status": "SUCCEEDED",
+      "engine_ms": 36715,
+      "elapsed_s": 36.715,
+      "data_scanned_bytes": 689567298,
+      "error": null,
+      "execution_id": "3e2f758f-dc4e-4c86-8fa8-22e9df4ee573"
+    },
+    {
+      "query": "Q97",
+      "status": "SUCCEEDED",
+      "engine_ms": 7132,
+      "elapsed_s": 7.132,
+      "data_scanned_bytes": 2267625302,
+      "error": null,
+      "execution_id": "f19d46aa-0d64-4769-8e08-4dd3440e1515"
+    },
+    {
+      "query": "Q98",
+      "status": "SUCCEEDED",
+      "engine_ms": 6367,
+      "elapsed_s": 6.367,
+      "data_scanned_bytes": 3403485336,
+      "error": null,
+      "execution_id": "261d3911-5d91-4892-b8f3-79c778beac43"
+    },
+    {
+      "query": "Q99",
+      "status": "SUCCEEDED",
+      "engine_ms": 12878,
+      "elapsed_s": 12.878,
+      "data_scanned_bytes": 111894062,
+      "error": null,
+      "execution_id": "730cc0bc-3377-4b81-8b1a-f5bec5f33388"
+    }
+  ],
+  "elapsed_total_s": 1029.334,
+  "data_scanned_total_bytes": 365556981642
+}
