@@ -648,6 +648,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// SF100 / EMR-parity: under a tiny shuffle budget the producer must keep spilling so
+    /// `memory_bytes()` stays ~0 even after many partitions are appended (KAN-32 path).
+    #[test]
+    fn streaming_append_keeps_rss_near_zero_under_tiny_spill_budget() {
+        let root = default_spill_root();
+        let store = SpillStore {
+            root: root.clone(),
+            force_spill: false,
+            memory_limit_bytes: Some(64),
+            total_limit_bytes: None,
+        };
+        std::fs::create_dir_all(&root).unwrap();
+
+        let b = batch();
+        let schema = b.schema();
+        let mut cache = BucketCache::from_memory(vec![Vec::new(); 32]);
+        for p in 0..32u32 {
+            cache
+                .append_batch(schema.clone(), 99, 0, p, b.clone(), Some(&store))
+                .expect("append");
+            assert_eq!(
+                cache.memory_bytes(),
+                0,
+                "after partition {p} the cache must be fully spilled"
+            );
+        }
+        assert!(matches!(cache, BucketCache::Spilled { .. }));
+        // Consume path must still rehydrate each bucket.
+        for p in 0..32usize {
+            let got = cache.read_partition(p).unwrap();
+            assert_eq!(
+                got.iter().map(|x| x.num_rows()).sum::<usize>(),
+                b.num_rows()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn memory_limit_policy_spills_when_threshold_reached() {
         let root = default_spill_root();

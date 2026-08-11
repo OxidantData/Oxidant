@@ -4199,6 +4199,7 @@ version = "0.1.4"
 dependencies = [
  "datafusion",
  "iceberg",
+ "oxidant-catalog-glue",
  "oxidant-connect",
  "oxidant-execution",
  "oxidant-loom",
@@ -4207,7 +4208,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tonic 0.12.3",
- "tpchgen",
 ]
 
 [[package]]
@@ -6496,12 +6496,6 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
-
-[[package]]
-name = "tpchgen"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d651db770ccf53b89dd769ed47899c0c089452e3b725c3c48fbc6a2be579638"
 
 [[package]]
 name = "tracing"

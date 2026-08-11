@@ -140,9 +140,33 @@ pub async fn try_run_distributed_plan(
     lakehouse_snapshot_pins: &str,
     caches: &DistributedCaches,
 ) -> Result<Option<Vec<RecordBatch>>> {
+    let t0 = std::time::Instant::now();
+    // Always-on journal line (eprintln, like worker "Oxidant stage summary") — RUST_LOG
+    // is often unset on EC2 AMI, so tracing::info alone is invisible during SF100 smokes.
+    eprintln!(
+        "Oxidant distributed: begin desc={} workers_cfg={} strict={}",
+        truncate_sql(description),
+        workers.len(),
+        distributed_strict()
+    );
     let membership = caches.membership(workers);
     let endpoints = membership.endpoints();
     if endpoints.is_empty() {
+        // Workers were configured (static list, OXIDANT_WORKERS, or OXIDANT_WORKER_SERVICE)
+        // but none resolved. Under OXIDANT_DISTRIBUTED_STRICT, refuse driver-local fallback —
+        // an SF100 fact scan on c6g.xlarge (8 GiB) OOMs Connect instead of failing closed.
+        eprintln!(
+            "Oxidant distributed: no endpoints (workers_cfg={}) after {}ms",
+            workers.len(),
+            t0.elapsed().as_millis()
+        );
+        if distributed_strict() && workers_configured(workers) {
+            return Err(Error::Execution(
+                "OXIDANT_DISTRIBUTED_STRICT: workers are configured but none are reachable; \
+                 refusing driver-local fallback (would OOM a small Connect driver on SF100)"
+                    .into(),
+            ));
+        }
         return Ok(None);
     }
 
@@ -152,9 +176,14 @@ pub async fn try_run_distributed_plan(
     // year (KAN-2 throughput; 6.3s → 1.5s at SF10). Fail-open: correctness never depends
     // on the rewrite (DataFusion runs these same two rules on every single-node query),
     // so an optimizer hiccup keeps the original plan.
+    let t_opt = std::time::Instant::now();
     let optimized = engine
         .optimize_logical_plan(plan.clone())
         .unwrap_or_else(|_| plan.clone());
+    eprintln!(
+        "Oxidant distributed: optimized plan in {}ms; splitting…",
+        t_opt.elapsed().as_millis()
+    );
     let mut split_result = plan_distributed_logical(&optimized, replicated);
     if split_result.is_err() {
         // The rewritten shape can fall outside the splitter's vocabulary even when the
@@ -194,6 +223,10 @@ pub async fn try_run_distributed_plan(
     let mut dq = match split_result {
         Ok(d) => d,
         Err(Error::Unsupported(reason)) => {
+            eprintln!(
+                "Oxidant distributed: split unsupported after {}ms: {reason}",
+                t0.elapsed().as_millis()
+            );
             record_distributed_fallback(tracker, &reason);
             if distributed_strict() {
                 return Err(Error::Unsupported(reason));
@@ -206,6 +239,14 @@ pub async fn try_run_distributed_plan(
         stage.lakehouse_snapshot_pins = lakehouse_snapshot_pins.to_string();
     }
     let cluster = Cluster::from_membership(membership);
+    eprintln!(
+        "Oxidant distributed: split ok stages={} finalize={} endpoints={} num_partitions={} elapsed_ms={}",
+        dq.stages.len(),
+        dq.finalize_sql.is_some(),
+        endpoints.len(),
+        cluster.num_partitions,
+        t0.elapsed().as_millis()
+    );
 
     if let Some(json) = udf_json.filter(|s| !s.is_empty() && *s != "[]") {
         // Sync in parallel, and only to endpoints that don't already hold this exact UDF
@@ -263,9 +304,27 @@ pub async fn try_run_distributed_plan(
     // the last leaf's barrier and splice the re-derived stages onto the dispatched prefix.
     let reopt = oxidant_execution::driver::reopt_join_order_enabled()
         .then_some(oxidant_execution::driver::ReoptContext { plan, replicated });
+    let t_run = std::time::Instant::now();
+    eprintln!(
+        "Oxidant distributed: dispatching {} stages to {} workers (num_partitions={})",
+        dq.stages.len(),
+        cluster.worker_count(),
+        cluster.num_partitions
+    );
     let mut batches = run_stages_obs(&cluster, &dq.stages, store, operation_id, reopt).await?;
+    eprintln!(
+        "Oxidant distributed: stages done in {}ms (batches={} rows≈{})",
+        t_run.elapsed().as_millis(),
+        batches.len(),
+        batches.iter().map(|b| b.num_rows()).sum::<usize>()
+    );
 
     if let Some(finalize) = dq.finalize_sql {
+        let t_fin = std::time::Instant::now();
+        eprintln!(
+            "Oxidant distributed: finalize begin sql={}",
+            truncate_sql(&finalize)
+        );
         engine
             .register_batches("result", batches.clone())
             .map_err(|e| Error::Execution(e.to_string()))?;
@@ -273,8 +332,18 @@ pub async fn try_run_distributed_plan(
             .sql(&finalize)
             .await
             .map_err(|e| Error::Execution(format!("finalize `{description}`: {e}")))?;
+        eprintln!(
+            "Oxidant distributed: finalize done in {}ms (rows≈{})",
+            t_fin.elapsed().as_millis(),
+            batches.iter().map(|b| b.num_rows()).sum::<usize>()
+        );
     }
 
+    eprintln!(
+        "Oxidant distributed: ok total_ms={} desc={}",
+        t0.elapsed().as_millis(),
+        truncate_sql(description)
+    );
     Ok(Some(batches))
 }
 
@@ -352,13 +421,18 @@ fn worker_bound(env_key: &str, fallback: u32) -> u32 {
 }
 
 /// Parse `spark.oxidant.workers` or `OXIDANT_WORKERS` (comma-separated `host:port` list).
+///
+/// When that list is empty but `OXIDANT_WORKER_SERVICE` is set, resolve the multi-A DNS
+/// name (EC2 Route53 / k8s headless Service) into Flight endpoints — same discovery Spark
+/// EMR uses so the driver never starts with a silent empty executor set.
 pub fn parse_worker_list(config_value: Option<&str>) -> Vec<String> {
     let env_workers = std::env::var("OXIDANT_WORKERS").ok();
     let raw = config_value
         .filter(|s| !s.is_empty())
         .or(env_workers.as_deref())
         .unwrap_or("");
-    raw.split(',')
+    let mut out: Vec<String> = raw
+        .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|ep| {
@@ -368,7 +442,47 @@ pub fn parse_worker_list(config_value: Option<&str>) -> Vec<String> {
                 format!("http://{ep}")
             }
         })
-        .collect()
+        .collect();
+    if out.is_empty() {
+        out = resolve_worker_service_dns();
+    }
+    out
+}
+
+/// Resolve `OXIDANT_WORKER_SERVICE`[:`OXIDANT_WORKER_PORT`] via DNS A/AAAA records.
+fn resolve_worker_service_dns() -> Vec<String> {
+    use std::net::ToSocketAddrs;
+    let Ok(host) = std::env::var("OXIDANT_WORKER_SERVICE") else {
+        return Vec::new();
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        return Vec::new();
+    }
+    let port: u16 = std::env::var("OXIDANT_WORKER_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50561);
+    let addr = format!("{host}:{port}");
+    match addr.to_socket_addrs() {
+        Ok(iter) => {
+            let mut eps: Vec<String> = iter
+                .map(|a| format!("http://{}:{}", a.ip(), a.port()))
+                .collect();
+            eps.sort();
+            eps.dedup();
+            eps
+        }
+        Err(e) => {
+            tracing::warn!(
+                host = %host,
+                port,
+                error = %e,
+                "OXIDANT_WORKER_SERVICE DNS resolve failed; no workers"
+            );
+            Vec::new()
+        }
+    }
 }
 
 fn truncate_sql(s: &str) -> String {
@@ -385,6 +499,25 @@ fn distributed_strict() -> bool {
     std::env::var("OXIDANT_DISTRIBUTED_STRICT")
         .ok()
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Public alias for Connect request paths that must refuse driver-local fallback.
+pub fn distributed_strict_public() -> bool {
+    distributed_strict()
+}
+
+/// True when the process was told to run distributed (static worker list or discovery env).
+fn workers_configured(workers: &[String]) -> bool {
+    if !workers.is_empty() {
+        return true;
+    }
+    env_non_empty("OXIDANT_WORKERS") || env_non_empty("OXIDANT_WORKER_SERVICE")
+}
+
+fn env_non_empty(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty())
 }
 
 fn record_distributed_fallback(tracker: Option<&QueryTracker>, reason: &str) {
@@ -443,6 +576,47 @@ mod tests {
         let w = parse_worker_list(Some("127.0.0.1:50561,127.0.0.1:50562"));
         assert_eq!(w.len(), 2);
         assert!(w[0].starts_with("http://"));
+    }
+
+    /// Bare-metal / EC2 ASG pin path: static `OXIDANT_WORKERS=ip:port,…` is authoritative.
+    /// DNS (`OXIDANT_WORKER_SERVICE`) is only a fallback when the static list is empty (k8s).
+    #[test]
+    fn parse_worker_list_prefers_static_oxidant_workers_over_dns() {
+        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        std::env::set_var("OXIDANT_WORKERS", "10.0.0.1:50561,10.0.0.2:50561");
+        // Unresolvable on purpose — must not be consulted when OXIDANT_WORKERS is set.
+        std::env::set_var("OXIDANT_WORKER_SERVICE", "workers.missing.oxidant.internal");
+        let w = parse_worker_list(None);
+        std::env::remove_var("OXIDANT_WORKERS");
+        std::env::remove_var("OXIDANT_WORKER_SERVICE");
+        assert_eq!(
+            w,
+            vec![
+                "http://10.0.0.1:50561".to_string(),
+                "http://10.0.0.2:50561".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_worker_list_reads_env_when_config_absent() {
+        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OXIDANT_WORKER_SERVICE");
+        std::env::set_var("OXIDANT_WORKERS", "192.168.1.10:50561");
+        let w = parse_worker_list(None);
+        std::env::remove_var("OXIDANT_WORKERS");
+        assert_eq!(w, vec!["http://192.168.1.10:50561".to_string()]);
+    }
+
+    /// Honesty / bare-metal: empty membership with OXIDANT_WORKERS configured must stay
+    /// "workers configured" so strict mode cannot silently go driver-local.
+    #[test]
+    fn workers_configured_true_for_static_list_env() {
+        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OXIDANT_WORKER_SERVICE");
+        std::env::set_var("OXIDANT_WORKERS", "10.1.1.1:50561,10.1.1.2:50561");
+        assert!(workers_configured(&[]));
+        std::env::remove_var("OXIDANT_WORKERS");
     }
 
     #[test]
@@ -606,6 +780,41 @@ mod tests {
             .expect("no workers means no distribute attempt");
         std::env::remove_var("OXIDANT_DISTRIBUTED_STRICT");
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn workers_configured_detects_discovery_env() {
+        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OXIDANT_WORKERS");
+        std::env::remove_var("OXIDANT_WORKER_SERVICE");
+        assert!(!workers_configured(&[]));
+        assert!(workers_configured(&["http://127.0.0.1:50561".into()]));
+        std::env::set_var("OXIDANT_WORKER_SERVICE", "workers.oxidant.internal");
+        assert!(workers_configured(&[]));
+        std::env::remove_var("OXIDANT_WORKER_SERVICE");
+        std::env::set_var("OXIDANT_WORKERS", "127.0.0.1:50561");
+        assert!(workers_configured(&[]));
+        std::env::remove_var("OXIDANT_WORKERS");
+    }
+
+    /// Discovery env set + empty membership must fail closed under strict (no local SF100).
+    #[tokio::test]
+    async fn strict_mode_errors_when_worker_service_set_but_unreachable() {
+        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        std::env::set_var("OXIDANT_DISTRIBUTED_STRICT", "1");
+        std::env::set_var("OXIDANT_WORKER_SERVICE", "workers.missing.oxidant.internal");
+        std::env::remove_var("OXIDANT_WORKERS");
+        let e = engine_with_t().await;
+        // Empty static list: membership endpoints are empty, but WORKER_SERVICE is set.
+        let result = try_run_distributed(&e, &[], "SELECT 1", &[], None, None).await;
+        std::env::remove_var("OXIDANT_DISTRIBUTED_STRICT");
+        std::env::remove_var("OXIDANT_WORKER_SERVICE");
+        let err = result.expect_err("strict mode must refuse local fallback");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("OXIDANT_DISTRIBUTED_STRICT") && msg.contains("none are reachable"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test]

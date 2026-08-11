@@ -81,14 +81,23 @@ impl ClusterMembership for StaticMembership {
 }
 
 /// Resolve cluster membership for distributed execution.
+///
+/// A non-empty static list (`OXIDANT_WORKERS` / `--workers` / ASG private-IP pin) always
+/// wins. Kubernetes headless DNS (`OXIDANT_WORKER_SERVICE`) is only used when no static
+/// endpoints were supplied — otherwise EC2 honesty deploys that still carry a leftover
+/// DNS env var would ignore the pinned Flight list and mis-count fan-out vs
+/// `OXIDANT_WORKER_COUNT`.
 pub fn resolve_membership(static_workers: &[WorkerEndpoint]) -> Arc<dyn ClusterMembership> {
+    if !static_workers.is_empty() {
+        return Arc::new(RefreshingMembership::new(StaticMembership::new(
+            static_workers.to_vec(),
+        )));
+    }
     #[cfg(feature = "k8s")]
     if let Some(k8s) = k8s::K8sMembership::from_env() {
         return Arc::new(RefreshingMembership::new(k8s));
     }
-    Arc::new(RefreshingMembership::new(StaticMembership::new(
-        static_workers.to_vec(),
-    )))
+    Arc::new(RefreshingMembership::new(StaticMembership::new(Vec::new())))
 }
 
 /// TTL-cached membership that re-resolves endpoints on each `endpoints()` call after expiry.

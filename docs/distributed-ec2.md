@@ -1,9 +1,9 @@
 # Running distributed Oxidant on EC2 (CloudFormation + ASG)
 
 This is the **EKS-free** data-plane path: one Spark Connect driver EC2 instance + N
-Arrow Flight worker instances in fixed-size Auto Scaling Groups, discovered via a
-private Route53 multi-A name. It matches the OSS runtime contract in
-[`runtime-contract.md`](runtime-contract.md).
+Arrow Flight worker instances in fixed-size Auto Scaling Groups. Worker membership is
+**private IPs from the worker ASG** (IAM `Describe*`), not Route53 and not UDP broadcast.
+It matches the OSS runtime contract in [`runtime-contract.md`](runtime-contract.md).
 
 For catalog SPI details (Hive / Glue / REST), see [`catalogs.md`](catalogs.md).
 For the future full platform (SSO, gateway operator, Terraform), see
@@ -14,21 +14,52 @@ For the future full platform (SSO, gateway operator, Terraform), see
 ```
 PySpark / oxidant-bench  -->  oxidant driver :50051  (direct IP — no LB)
                               |
-                              |  OXIDANT_WORKER_SERVICE DNS (multi-A)
+                              |  OXIDANT_WORKERS=private-ip:50561,…
+                              |  (from ASG InService + EC2 DescribeInstances)
                               v
-                         worker EC2s :50561 (Flight)
+                         worker EC2s :50561 (Flight, VPC private)
                               |
                               |  aws glue + s3 (instance role)
                               v
                          Glue Data Catalog + S3 data
 ```
 
+### Why not Route53 / broadcast?
+
+| Approach | Verdict |
+|----------|---------|
+| **ASG → private IP list** (chosen) | Same idea as EMR/YARN / Databricks control plane: cluster manager hands the driver executor addresses. Auth is IAM instance role; traffic stays on private IPs; SGs restrict Flight to driver↔workers. |
+| Route53 multi-A | Extra moving part; TTL/upsert races left the driver with an empty worker set and silent local scans. Kept only as unused legacy tags on older stacks. |
+| UDP / LAN broadcast | **Not used.** Insecure, spoofable, and does not work across AWS subnets/AZs. |
+
+### Driver vs workers (Spark EMR / Databricks parity)
+
+Treat the Connect driver like a **Spark driver / EMR master**, not like an executor:
+
+| Role | Does | Must not |
+|------|------|----------|
+| Driver (`c6g.xlarge`) | Spark Connect, planning, stage orchestration, tiny finalize | Scan SF100 facts, build large hash joins, hold worker memory limits |
+| Workers (`m8g.*`) | Parquet/Iceberg scans, shuffle, joins/aggs under FairSpillPool | Sit idle while the driver OOMs |
+
+**Never silently fall back to driver-local execution** when workers are configured.
+`OXIDANT_DISTRIBUTED_STRICT=1` (CFN `--distributed-strict true`) makes that an error.
+Bootstrap waits until the worker ASG has `WorkerCount` InService instances, resolves
+their **private** IPs, and pins `OXIDANT_WORKERS=ip:50561,…` before Connect starts
+(same gate as EMR waiting for core nodes).
+
+**How to verify distribution (do this before trusting SF100 numbers):**
+
+1. During a multi-fact query, CloudWatch **CPUUtilization** on workers must rise; driver stays comparatively light.
+2. Worker `NetworkIn` should dominate (S3 + shuffle), not the driver’s.
+3. `journalctl -u oxidant-worker` shows `Oxidant stage summary:` lines with `num_partitions` ≥ 200.
+4. If workers are ~0% CPU while the driver climbs, **stop the run** — results are not distributed.
+
 | Piece | Implementation |
 |-------|----------------|
 | AMI | Packer AL2023 image (`deploy/packer/`) with `oxidant`, AWS CLI v2, hardened `oxidant` user (uid 65532), systemd units |
 | Driver | ASG `Min=Max=Desired=1`, `oxidant spark server --port 50051` |
 | Workers | ASG `Min=Max=Desired=WorkerCount` (pinned — no scale policies) |
-| Discovery | Private hosted zone; workers UPSERT `workers.<stack>.<zone>` with all InService private IPs |
+| Discovery | Driver bootstrap: ASG InService instance IDs → EC2 private IPs → `OXIDANT_WORKERS` |
 | Sharding | Boot assigns `OXIDANT_SHARD_INDEX` = position in sorted InService instance IDs |
 | Spill | Optional second EBS volume mounted at `/var/lib/oxidant/spill` (`TMPDIR`) |
 | Auth | Instance profiles only — no credentials in the AMI |
@@ -98,7 +129,8 @@ File-list sharding uses a fixed `OXIDANT_WORKER_COUNT`
 plus a stable `OXIDANT_SHARD_INDEX` per worker. Changing N under an ASG scaling policy
 without coordinated re-assignment silently duplicates or drops shards. The template
 sets `MinSize = MaxSize = DesiredCapacity = WorkerCount` and adds **no** scaling
-policies. Bootstrap also pins `OXIDANT_SHUFFLE_PARTITIONS` to `WorkerCount` on the driver.
+policies. Leave `ShufflePartitions` empty so the engine applies its Spark-like default
+(`max(200, worker_vcpus)`); do not pin shuffle to `WorkerCount`.
 
 ---
 
@@ -265,7 +297,7 @@ Template: [`deploy/cloudformation/oxidant-cluster.yaml`](../deploy/cloudformatio
 
 What the stack creates:
 
-- IAM instance profiles (SSM + optional S3/Glue; workers also get Route53 change on the private zone)
+- IAM instance profiles (SSM + optional S3/Glue; driver/workers: ASG + EC2 Describe for membership)
 - Security groups (Connect `50051` from `ClientCidr`; Flight `50561` driver→workers and worker↔worker)
 - Private hosted zone (`HostedZoneName`, default `oxidant.internal`)
 - Driver LT + ASG (size 1) and worker LT + ASG (size `WorkerCount`)
@@ -336,8 +368,8 @@ cat /etc/oxidant/oxidant.env
 systemctl status oxidant-bootstrap oxidant-driver --no-pager
 journalctl -u oxidant-bootstrap -u oxidant-driver -e --no-pager | tail -n 80
 
-# workers should resolve via private DNS
-getent hosts "$(grep OXIDANT_WORKER_SERVICE /etc/oxidant/oxidant.env | cut -d= -f2)"
+# workers must be concrete private Flight endpoints (ASG membership)
+grep '^OXIDANT_WORKERS=' /etc/oxidant/oxidant.env
 ```
 
 Expect `/etc/oxidant/oxidant.env` on the **driver** to include roughly
@@ -347,9 +379,9 @@ Expect `/etc/oxidant/oxidant.env` on the **driver** to include roughly
 ```bash
 OXIDANT_AWS_BIN=/usr/local/bin/aws
 AWS_REGION=us-west-2
-OXIDANT_WORKER_SERVICE=workers.oxidant-demo.oxidant.internal
+OXIDANT_WORKERS=172.31.10.11:50561,172.31.20.22:50561
 OXIDANT_WORKER_COUNT=2
-OXIDANT_SHUFFLE_PARTITIONS=2
+OXIDANT_DISTRIBUTED_STRICT=1
 OXIDANT_CATALOG_CONF="spark.sql.catalog.glue.type=glue;..."
 TMPDIR=/var/lib/oxidant/spill
 ```
@@ -450,37 +482,38 @@ spark.sql("SELECT * FROM glue.oxidant_demo.orders LIMIT 10").show()
 ## SF100 topology (canonical)
 
 **Keep this table in sync with any published SF100 EC2 numbers** (KAN-14).
-Graviton **arm64** AMI required (`c6g` / `m8g`).
+Graviton **arm64** AMI required (`c6g` / `m8g`). Target matches **Spark EMR** honesty
+hardware: `c6g.xlarge` master + 2× `m8g.4xlarge` cores with 500 GiB gp3 spill.
 
 | Role | Count | Instance type | vCPU / RAM | Root EBS | Spill EBS (`/var/lib/oxidant/spill`) | ASG |
 |------|------:|---------------|------------|----------|-----------------------------------|-----|
-| Driver (Spark Connect `:50051`) | 1 | **`c6g.xlarge`** | 4 / 8 GiB | **100 GiB gp3** | 0 (optional; root is enough for driver) | Min=Max=Desired=**1** |
-| Workers (Flight `:50561`) | 2 | **`m8g.8xlarge`** | 32 / 128 GiB | 40 GiB gp3 (default) | **500 GiB gp3** each | Min=Max=Desired=**2** (pinned; no scale policies) |
+| Driver (Spark Connect `:50051`) | 1 | **`c6g.xlarge`** | 4 / 8 GiB | **100 GiB gp3** | 0 (root is enough) | Min=Max=Desired=**1** |
+| Workers (Flight `:50561`) | 2 | **`m8g.4xlarge`** | 16 / 64 GiB | 40 GiB gp3 (default) | **500 GiB gp3** each | Min=Max=Desired=**2** (pinned; no scale policies) |
 
 | Engine env (SF100) | Value | Where |
 |--------------------|-------|-------|
-| `OXIDANT_DISTRIBUTED_STRICT` | `1` | driver (`--distributed-strict true`) |
-| `OXIDANT_PREFER_HASH_JOIN` | `auto` | driver + workers (default; forced values are legacy — see `docs/runtime-contract.md`) |
-| `OXIDANT_MEMORY_LIMIT_BYTES` | `42949672960` (40 Gi) | workers (DataFusion spill pool) |
-| `OXIDANT_SHUFFLE_SPILL_BYTES` | `8589934592` (8 Gi) | workers (shuffle cache threshold) |
-| `OXIDANT_SHUFFLE_PARTITIONS` | `32` | driver (≈ worker vCPU; > worker count spreads shuffle + reduces skew) |
-| `OXIDANT_WORKER_COUNT` / shards | `2` | fixed; matches ASG size |
-| Catalog | Glue Parquet `tpch_sf100` / `tpcds_sf100` | `CatalogConf` on driver **and** workers |
-| Dataset | `s3://oxidant-artifacts-<account>/{tpch,tpcds}-sf100/` | Parquet only for publishable runs |
+| `OXIDANT_DISTRIBUTED_STRICT` | `1` | driver (`--distributed-strict true`) — refuse local fallback when workers are configured but unreachable |
+| `OXIDANT_PREFER_HASH_JOIN` | `auto` | driver + workers (Spark `preferSortMergeJoin`; large builds → SMJ) |
+| `OXIDANT_MEMORY_LIMIT_BYTES` | e.g. `28895544320` (~27 Gi) | **workers only** (bootstrap skips this on the driver — a fat pool on an 8 GiB c6g OOMs Connect) |
+| `OXIDANT_SHUFFLE_SPILL_BYTES` | `8589934592` (8 Gi) | **workers only** |
+| `OXIDANT_SHUFFLE_PARTITIONS` | unset or `200` | driver — engine default is `max(200, worker_vcpus)`; empty CFN **must not** stamp `WorkerCount` |
+| `OXIDANT_AQE` | `1` (default on) | driver + workers — coalesce toward 64 MiB advisory partitions |
+| `OXIDANT_S3_CACHE_DIR` | empty on driver; `/var/lib/oxidant/s3cache` on workers | whole-object cache; workers also set `OXIDANT_S3_CACHE_MAX_OBJECT_BYTES=2Gi` so SF100 single-file facts stay on ranged GETs |
+| `OXIDANT_STAGE_TIMEOUT_MS` | `3600000` (1 h) | driver + workers (default 10 min is too short for cold SF100) |
+| Catalog | Glue Iceberg / Parquet `tpch_sf100` / `tpcds_sf100` | `CatalogConf` on driver **and** workers |
+| Dataset | Prefer **many** Snappy Parquet files (or Iceberg) under `warehouse/` — a single ~21 GiB `lineitem.parquet` is a known foot-gun; see [`bench/tpch/SF100-EC2-NOTES.md`](../bench/tpch/SF100-EC2-NOTES.md) | Official TPC `dbgen`/`dsdgen` via `bench/tpc/prepare.sh` |
 
 Memory invariant: `memoryLimitBytes + shuffleSpillBytes + headroom
-≤ instance RAM`. On `m8g.8xlarge` (128 GiB) that is 40 Gi + 8 Gi tracked ≈ 48 Gi, leaving
-~80 Gi native headroom for Arrow / S3 / Glue CLI — do not raise both pools to the full
-limit. Worker cgroup is `MemoryMax=112G` / `MemoryHigh=96G`.
+≤ instance RAM`. On `m8g.4xlarge` (64 GiB) prefer ~27 Gi pool + 8 Gi shuffle cache, leaving
+native headroom for Arrow / S3 — do not raise both pools to the full limit.
 
-> **Why `m8g.8xlarge`, not `m8g.4xlarge` (KAN-14 rerun, 2026-07-28):** DataFusion 54's
-> `HashJoin` build side is **not spillable**, so at SF100 the big `lineitem ⋈ orders`
-> build lands mostly *outside* the `FairSpillPool`. On `m8g.4xlarge` (64 GiB, 20 Gi pool)
-> every multi-fact TPC-H join (Q2/Q3/Q4/Q5/Q7/Q8) blew past the 56 Gi worker cgroup and
-> the stage aborted — the driver reported `register `result`: no batches` while the
-> single-table scans (Q1/Q6) still passed. `m8g.8xlarge` (128 GiB, 40 Gi pool) plus
-> `OXIDANT_SHUFFLE_PARTITIONS=32` (≈ worker vCPU; removes the 2-bucket skew that pinned all
-> shuffle onto one worker) gives the join real headroom.
+> **Spark EMR parity (why this topology works now):** DataFusion's `HashJoin` build is still
+> not spillable, but `auto` join selection admits HashJoin only when the build fits Spark's
+> `canBuildLocalHashMap` budget (`10 MiB × shuffle_partitions / 2`). Large SF100 equi-joins
+> therefore plan SortMergeJoin (spillable external sort). Combined with a ≥200 shuffle
+> partition floor (never `WorkerCount=2`), EMR-class `m8g.4xlarge` workers stay under the
+> cgroup. Pre-parity (KAN-14, 2026-07-28) required `m8g.8xlarge` because HashJoin stayed on
+> the critical path with a 2-bucket shuffle.
 
 ### Deploy recipe (copy/paste)
 
@@ -502,17 +535,16 @@ MY_IP=$(curl -fsS https://checkip.amazonaws.com)/32
   --stack oxidant-sf100 \
   --region "${AWS_REGION}" \
   --driver-type c6g.xlarge \
-  --worker-type m8g.8xlarge \
+  --worker-type m8g.4xlarge \
   --workers 2 \
   --driver-root-size 100 \
   --worker-root-size 40 \
   --driver-spill-size 0 \
   --worker-spill-size 500 \
-  --memory-limit-bytes 42949672960 \
+  --memory-limit-bytes 28895544320 \
   --shuffle-spill-bytes 8589934592 \
-  --shuffle-partitions 32 \
   --distributed-strict true \
-  --prefer-hash-join false \
+  --prefer-hash-join auto \
   --data-buckets "arn:aws:s3:::${BUCKET},arn:aws:s3:::${BUCKET}/*" \
   --glue true \
   --catalog-conf "spark.sql.catalog.glue.type=glue;spark.sql.catalog.glue.region=${AWS_REGION};spark.sql.catalog.glue.warehouse=s3://${BUCKET}/warehouse" \
@@ -535,10 +567,10 @@ MY_IP=$(curl -fsS https://checkip.amazonaws.com)/32
    `/dev/nvmeX` name hints). Persists via `/etc/fstab`; safe to re-run.
 2. Reads instance tags (`oxidant:role`, `oxidant:worker-count`, `oxidant:worker-asg`,
    `oxidant:catalog-conf`, …)
-3. **Workers:** waits for InService peers, assigns `OXIDANT_SHARD_INDEX`, UPSERTs the
-   shared Route53 A RRSet from the InService peers **plus its own IP** (self may
-   not be InService yet on a cold start; dead instances are pruned on every boot)
-4. Writes `/etc/oxidant/oxidant.env` **atomically** (temp file + rename — a killed
+3. **Workers:** waits for InService peers, assigns `OXIDANT_SHARD_INDEX` (no DNS upsert)
+4. **Driver:** waits for `WorkerCount` InService workers, resolves **private IPs** via
+   EC2 `DescribeInstances`, pins `OXIDANT_WORKERS=ip:50561,…`
+5. Writes `/etc/oxidant/oxidant.env` **atomically** (temp file + rename — a killed
    bootstrap can never leave a truncated env file) and **enables** (never starts)
    `oxidant-driver` or `oxidant-worker`
 
@@ -548,16 +580,13 @@ must never `systemctl start`/`--now` a role unit from inside its own oneshot
 (that closed the cycle that deadlocked fresh instances until `TimeoutStartSec`).
 First boot: UserData runs `systemctl start oxidant-bootstrap.service`, waits for it,
 then `systemctl enable --now oxidant-<role>`. Reboots: the WantedBy/Requires/After
-graph re-runs bootstrap (idempotent) before the role unit. Shutdown / scale-in:
-`ExecStop` runs `bootstrap.sh --deregister`, which removes **only this
-instance's IP** from the RRSet — never a full re-sync (at stop time the ASG may
-still list the instance InService, which would re-add its dying IP and leave it
-stale forever). Workers that die without `ExecStop` are pruned by the next
-worker boot's full re-sync.
+graph re-runs bootstrap (idempotent) before the role unit. After replace/scale,
+re-run bootstrap on the driver (or replace the driver instance) so `OXIDANT_WORKERS`
+picks up the new private IP set.
 
 | Role | Env written |
 |------|-------------|
-| Driver | `OXIDANT_WORKER_SERVICE`, `OXIDANT_WORKER_PORT=50561`, `OXIDANT_WORKER_COUNT`, `OXIDANT_SHUFFLE_PARTITIONS`, `OXIDANT_AWS_BIN` (AMI operator scripts only, not the engine), `AWS_REGION`, spill/`TMPDIR`, optional memory/shuffle thresholds, optional `OXIDANT_CATALOG_CONF` |
+| Driver | `OXIDANT_WORKERS` (private `ip:50561` list), `OXIDANT_WORKER_COUNT`, optional `OXIDANT_SHUFFLE_PARTITIONS` / `OXIDANT_DISTRIBUTED_STRICT`, `OXIDANT_AWS_BIN` (AMI operator scripts only), `AWS_REGION`, spill/`TMPDIR`, optional catalog/memory |
 | Worker | `OXIDANT_WORKER_COUNT`, `OXIDANT_SHARD_INDEX`, same AWS/spill/catalog/memory |
 
 ---
@@ -599,9 +628,9 @@ aws glue delete-database --region "${AWS_REGION}" --name "${GLUE_DB}"
 |---------|----------------|
 | Inflated / duplicated aggregates | Missing `OXIDANT_SHARD_INDEX` / `OXIDANT_WORKER_COUNT` on workers, or the **same** `OXIDANT_SHARD_INDEX` on every worker (each then reads shard 0's file subset, so single-file tables count 2× and size-balanced multi-file tables ~1× with skew) — check `/etc/oxidant/oxidant.env` on *every* worker |
 | Fresh instance: bootstrap "starting" for 5 min, then no `/etc/oxidant/oxidant.env` and the role unit never starts | Pre-KAN-58 AMI: bootstrap started the role unit from inside its own oneshot while the role unit `Requires=`/`After=` bootstrap — a circular wait killed at `TimeoutStartSec`. Rebake from current `deploy/packer`; live fix: copy the repo `bootstrap.sh` over `/usr/local/lib/oxidant/bootstrap.sh`, then `systemctl reset-failed oxidant-bootstrap && systemctl start oxidant-bootstrap && systemctl start oxidant-<role>` |
-| Queries fail on dead worker IPs ("no free task slots") | Stale A records in `workers.<zone>` — instances killed without `ExecStop` (or pre-KAN-58 deregistration, which re-synced the full InService set and could re-add the dying IP). `sudo systemctl restart oxidant-bootstrap` on any live worker forces a full re-sync that prunes dead IPs; graceful stops now remove only the instance's own IP |
-| Driver fails membership vs count | Route53 A set size ≠ `WorkerCount` — wait for all workers InService; check worker Route53 IAM |
-| Workers never receive tasks | Driver cannot resolve `OXIDANT_WORKER_SERVICE` — private zone VPC association / SG |
+| Queries fail on dead worker IPs ("no free task slots") | Stale `OXIDANT_WORKERS` on the driver after replace — re-run `oxidant-bootstrap` on the driver (or replace driver) so ASG private IPs are re-pinned |
+| Driver fails membership vs count | ASG InService count &lt; `WorkerCount` or IAM missing `ec2:DescribeInstances` / `autoscaling:DescribeAutoScalingGroups` |
+| Workers never receive tasks | Empty/missing `OXIDANT_WORKERS` on driver, or worker SG blocking Flight 50561 from driver SG |
 | `aws glue … EntityNotFound` | Wrong database/table name or region in `CatalogConf` |
 | `AccessDenied` on Glue/S3 | Deployed with `--glue false` or incomplete `DataBucketArns` (need bucket **and** `/*`) |
 | Catalog works locally on driver but distributed scan fails | Workers missing `OXIDANT_CATALOG_CONF` — set stack `CatalogConf`, replace instances |
@@ -623,7 +652,8 @@ sudo -u oxidant /usr/local/bin/aws glue get-databases --region "$AWS_REGION"
 | Path | Role |
 |------|------|
 | [`deploy/packer/oxidant-runtime.pkr.hcl`](../deploy/packer/oxidant-runtime.pkr.hcl) | Packer AMI |
-| [`deploy/packer/files/bootstrap.sh`](../deploy/packer/files/bootstrap.sh) | Boot: spill mount + shard index + DNS upsert + atomic env (+ catalog); shutdown: self-IP DNS deregistration |
+| [`deploy/packer/files/bootstrap.sh`](../deploy/packer/files/bootstrap.sh) | Boot: spill mount + shard index + ASG private-IP `OXIDANT_WORKERS` pin + atomic env |
+| [`deploy/packer/tests/test_asg_membership.sh`](../deploy/packer/tests/test_asg_membership.sh) | Hermetic regression: mocked ASG → private IP CSV; fail-closed on incomplete membership |
 | [`deploy/packer/files/systemd/`](../deploy/packer/files/systemd/) | `oxidant-bootstrap` / `oxidant-driver` / `oxidant-worker` |
 | [`deploy/packer/build-ami.sh`](../deploy/packer/build-ami.sh) | AMI build wrapper |
 | [`deploy/cloudformation/oxidant-cluster.yaml`](../deploy/cloudformation/oxidant-cluster.yaml) | CFN stack |

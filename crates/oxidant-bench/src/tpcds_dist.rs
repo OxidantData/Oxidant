@@ -672,7 +672,7 @@ mod tests {
         use datafusion::logical_expr::LogicalPlan;
         use oxidant_execution::plan::plan_distributed_logical;
 
-        let dir = std::env::temp_dir().join("oxidant-tpcds-sf0.01");
+        let dir = std::env::temp_dir().join("oxidant-tpcds-sf1");
         // Data generation shells out to the duckdb CLI (dsdgen); the CI `clippy + test`
         // job runs the workspace suite without it (the query-gates job installs it and
         // exercises the same path through `tpcds-distributed --execute`). Skip — rather

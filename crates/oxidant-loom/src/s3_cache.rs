@@ -39,6 +39,10 @@ use tokio::sync::OnceCell;
 const DEFAULT_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// Default revalidation window: 5 minutes between S3 HEAD checks per cached object.
 const DEFAULT_TTL_MS: u64 = 300_000;
+/// Skip full-object materialization above this size (default 2 GiB). SF100 single-file
+/// `lineitem.parquet` (~21 GiB) must stay on ranged S3 GETs — materializing it pinned
+/// workers for 10+ minutes and timed out stages (2026-08-10).
+const DEFAULT_MAX_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// One materialized object in the cache index.
 struct Entry {
@@ -94,8 +98,13 @@ pub struct DiskCachingStore {
     inner: Arc<dyn ObjectStore>,
     dir: std::path::PathBuf,
     max_bytes: u64,
+    /// Objects larger than this are never materialized; callers fall back to ranged
+    /// reads on `inner`. `0` disables the cap.
+    max_object_bytes: u64,
     ttl: std::time::Duration,
     state: Arc<State>,
+    /// Paths we already know exceed [`Self::max_object_bytes`] (skip repeated HEADs).
+    oversized: Mutex<std::collections::HashSet<Path>>,
 }
 
 fn cache_err(
@@ -113,11 +122,23 @@ fn cache_err(
 
 impl DiskCachingStore {
     /// Wrap `inner` with a disk cache at `dir` (`max_bytes` LRU budget, `ttl` revalidation
-    /// window). Creates `dir` if missing.
+    /// window). Creates `dir` if missing. Objects larger than `max_object_bytes` (when >0)
+    /// are never materialized.
     pub fn new(
         inner: Arc<dyn ObjectStore>,
         dir: std::path::PathBuf,
         max_bytes: u64,
+        ttl: std::time::Duration,
+    ) -> std::io::Result<Self> {
+        Self::new_with_object_cap(inner, dir, max_bytes, DEFAULT_MAX_OBJECT_BYTES, ttl)
+    }
+
+    /// Like [`Self::new`] with an explicit per-object materialization cap.
+    pub fn new_with_object_cap(
+        inner: Arc<dyn ObjectStore>,
+        dir: std::path::PathBuf,
+        max_bytes: u64,
+        max_object_bytes: u64,
         ttl: std::time::Duration,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
@@ -125,17 +146,20 @@ impl DiskCachingStore {
             inner,
             dir,
             max_bytes,
+            max_object_bytes,
             ttl,
             state: Arc::new(State {
                 map: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
                 total_bytes: AtomicU64::new(0),
             }),
+            oversized: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
     /// Build the wrapper from `OXIDANT_S3_CACHE_DIR` (unset/empty disables caching),
-    /// `OXIDANT_S3_CACHE_MAX_BYTES` (default 20 GiB) and `OXIDANT_S3_CACHE_TTL_MS` (default 300000).
+    /// `OXIDANT_S3_CACHE_MAX_BYTES` (default 20 GiB), `OXIDANT_S3_CACHE_TTL_MS` (default 300000),
+    /// and `OXIDANT_S3_CACHE_MAX_OBJECT_BYTES` (default 2 GiB; `0` = no per-object cap).
     pub fn from_env(inner: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         let Some(dir) = std::env::var("OXIDANT_S3_CACHE_DIR")
             .ok()
@@ -147,19 +171,24 @@ impl DiskCachingStore {
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(DEFAULT_MAX_BYTES);
+        let max_object_bytes = std::env::var("OXIDANT_S3_CACHE_MAX_OBJECT_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(DEFAULT_MAX_OBJECT_BYTES);
         let ttl_ms = std::env::var("OXIDANT_S3_CACHE_TTL_MS")
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(DEFAULT_TTL_MS);
-        match Self::new(
+        match Self::new_with_object_cap(
             inner.clone(),
             std::path::PathBuf::from(dir.clone()),
             max_bytes,
+            max_object_bytes,
             std::time::Duration::from_millis(ttl_ms),
         ) {
             Ok(store) => {
                 eprintln!(
-                    "oxidant: S3 disk cache enabled at {dir} (max {max_bytes} B, ttl {ttl_ms} ms)"
+                    "oxidant: S3 disk cache enabled at {dir} (max {max_bytes} B, max_object {max_object_bytes} B, ttl {ttl_ms} ms)"
                 );
                 Arc::new(store)
             }
@@ -185,6 +214,17 @@ impl DiskCachingStore {
     /// revalidating by HEAD (size + etag) when the entry is stale. `Err` leaves no cache
     /// state; callers fall back to the inner store.
     async fn ensure_local(&self, location: &Path) -> MaterializeResult {
+        if self
+            .oversized
+            .lock()
+            .expect("s3 cache oversized poisoned")
+            .contains(location)
+        {
+            return Err(Arc::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "s3 object exceeds OXIDANT_S3_CACHE_MAX_OBJECT_BYTES; using ranged reads",
+            )));
+        }
         if let Some(file) = self.fresh_entry(location) {
             return Ok(file);
         }
@@ -246,6 +286,19 @@ impl DiskCachingStore {
                 format!("s3 head {location}: {e}"),
             )
         })?;
+        if self.max_object_bytes > 0 && meta.size > self.max_object_bytes {
+            self.oversized
+                .lock()
+                .expect("s3 cache oversized poisoned")
+                .insert(location.clone());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "s3 object {location} is {} B > OXIDANT_S3_CACHE_MAX_OBJECT_BYTES={}; using ranged reads",
+                    meta.size, self.max_object_bytes
+                ),
+            ));
+        }
         // Re-adopt a present entry (and its on-disk file) when the object is unchanged —
         // covers TTL revalidation within this process's lifetime.
         {
@@ -530,8 +583,10 @@ impl DiskCachingStore {
             inner: Arc::clone(&self.inner),
             dir: self.dir.clone(),
             max_bytes: self.max_bytes,
+            max_object_bytes: self.max_object_bytes,
             ttl: self.ttl,
             state: Arc::clone(&self.state),
+            oversized: Mutex::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -695,6 +750,42 @@ mod tests {
             gets.gets.load(Ordering::Relaxed),
             1,
             "the second read must come from disk, not the inner store"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_objects_bypass_cache_and_use_ranged_inner_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = vec![b'x'; 64];
+        let inner = Arc::new(MockStore::default().with_object("big.parquet", payload.clone()));
+        let gets = Arc::clone(&inner);
+        let store = Arc::new(
+            DiskCachingStore::new_with_object_cap(
+                inner,
+                dir.path().to_path_buf(),
+                1 << 20,
+                32, // cap below object size
+                std::time::Duration::from_millis(60_000),
+            )
+            .unwrap(),
+        );
+        let a = store
+            .get_ranges(&Path::from("big.parquet"), &[0..8, 8..16])
+            .await
+            .unwrap();
+        let b = store
+            .get_ranges(&Path::from("big.parquet"), &[0..8, 8..16])
+            .await
+            .unwrap();
+        assert_eq!(a[0].as_ref(), &payload[0..8]);
+        assert_eq!(b[0].as_ref(), &payload[0..8]);
+        assert!(
+            gets.gets.load(Ordering::Relaxed) >= 2,
+            "oversized objects must not materialize; each get_ranges hits inner"
+        );
+        assert!(
+            !dir.path().join("big.parquet").exists(),
+            "must not leave a materialized file for oversized objects"
         );
     }
 

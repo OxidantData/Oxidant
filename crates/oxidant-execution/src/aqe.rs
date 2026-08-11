@@ -9,8 +9,18 @@
 
 use oxidant_common::Result;
 
+/// Spark EMR advisory shuffle partition size (~64 MiB). When AQE is on, coalesce toward
+/// `ceil(total_rows / rows_per_advisory_partition)` rather than always collapsing to
+/// `num_workers` (which re-creates giant per-task working sets on SF100).
+const DEFAULT_AQE_ADVISORY_PARTITION_BYTES: usize = 64 * 1024 * 1024;
+
+/// Flat row-width assumption when converting the advisory byte target into a row count
+/// (matches the coarse estimator used by the hash-join build guard).
+const AQE_ADVISORY_ROW_WIDTH_BYTES: usize = 64;
+
 /// After a producer stage, suggest a reduced shuffle partition count when every bucket is
-/// below `OXIDANT_AQE_COALESCE_MAX_ROWS` (default 4096) per sampled worker.
+/// below `OXIDANT_AQE_COALESCE_MAX_ROWS` (default 4096) per sampled worker, targeting Spark's
+/// advisory partition size (`OXIDANT_AQE_ADVISORY_PARTITION_BYTES`, default 64 MiB).
 ///
 /// The return value is a **read modulus**, not a partition range: consumers must read the
 /// coalesced stage through [`coalesced_read_buckets`], never as a plain `0..new_p` range
@@ -36,11 +46,16 @@ pub fn coalesced_partitions(
     if max_bucket * 3 > total && bucket_row_counts.len() > 2 {
         return Ok(current_partitions);
     }
-    if max_bucket <= max_rows && bucket_row_counts.len() > num_workers.max(1) {
-        Ok(num_workers.max(1) as u32)
-    } else {
-        Ok(current_partitions)
+    if max_bucket > max_rows || bucket_row_counts.len() <= num_workers.max(1) {
+        return Ok(current_partitions);
     }
+
+    // Spark-like target: enough reader partitions that each holds ~advisory bytes of rows.
+    let rows_per_part = aqe_advisory_partition_rows().max(1);
+    let target = ((total + rows_per_part - 1) / rows_per_part) as u32;
+    let floor = num_workers.max(1) as u32;
+    let new_p = target.clamp(floor, current_partitions);
+    Ok(new_p)
 }
 
 /// The producer bucket ids a coalesced consumer partition reads: `partition, partition + m,
@@ -57,16 +72,21 @@ pub fn coalesced_read_buckets(np: u32, m: u32, partition: u32) -> Vec<u32> {
     (partition..np).step_by(m as usize).collect()
 }
 
-/// AQE sampling is **off by default**: it costs one `bucket_row_counts` action round trip per
-/// worker after every producer stage. Set `OXIDANT_AQE=1` to enable the sample; a coalesce
-/// decision is then recorded at the stage barrier and applied as the read modulus of the
-/// stage's downstream consumers (see [`coalesced_read_buckets`]).
+/// AQE sampling defaults **on** (Spark 3+ / EMR parity). Set `OXIDANT_AQE=0`/`false`/`off` to
+/// disable the per-producer `bucket_row_counts` round trip. When enabled, a coalesce decision
+/// is recorded at the stage barrier and applied as the read modulus of the stage's downstream
+/// consumers (see [`coalesced_read_buckets`]).
 pub fn aqe_enabled() -> bool {
     std::env::var("OXIDANT_AQE")
         .ok()
         .as_deref()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .map(|v| {
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no"))
+        })
+        .unwrap_or(true)
 }
 
 /// Whether the driver measures producer-stage row counts at the stage barrier for consumer
@@ -99,6 +119,18 @@ fn aqe_coalesce_max_rows() -> usize {
         .unwrap_or(4096)
 }
 
+fn aqe_advisory_partition_bytes() -> usize {
+    std::env::var("OXIDANT_AQE_ADVISORY_PARTITION_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(DEFAULT_AQE_ADVISORY_PARTITION_BYTES)
+}
+
+fn aqe_advisory_partition_rows() -> usize {
+    aqe_advisory_partition_bytes() / AQE_ADVISORY_ROW_WIDTH_BYTES
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,12 +140,32 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn coalesces_small_uniform_buckets() {
+    fn coalesces_small_uniform_buckets_toward_advisory_target() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("OXIDANT_AQE", "1");
+        // 8 × ~100 rows: tiny vs 64 MiB advisory → collapse toward worker floor.
         let p = coalesced_partitions(4, 8, &[100, 120, 90, 110, 80, 95, 105, 100]).unwrap();
         std::env::remove_var("OXIDANT_AQE");
         assert_eq!(p, 4);
+    }
+
+    #[test]
+    fn keeps_more_partitions_when_advisory_size_requires() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OXIDANT_AQE", "1");
+        // Force a tiny advisory so target stays above the worker floor.
+        std::env::set_var("OXIDANT_AQE_ADVISORY_PARTITION_BYTES", "1024"); // 16 rows/part
+        std::env::set_var("OXIDANT_AQE_COALESCE_MAX_ROWS", "100000");
+        // 8 buckets × 1000 rows = 8000 rows → ceil(8000/16) = 500, clamped to current=8.
+        let counts = vec![1000usize; 8];
+        let p = coalesced_partitions(2, 8, &counts).unwrap();
+        std::env::remove_var("OXIDANT_AQE");
+        std::env::remove_var("OXIDANT_AQE_ADVISORY_PARTITION_BYTES");
+        std::env::remove_var("OXIDANT_AQE_COALESCE_MAX_ROWS");
+        assert_eq!(
+            p, 8,
+            "advisory sizing must not over-collapse large shuffles"
+        );
     }
 
     #[test]
@@ -126,20 +178,21 @@ mod tests {
     }
 
     #[test]
-    fn aqe_defaults_off_and_env_opts_in() {
+    fn aqe_defaults_on_and_env_opts_out() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("OXIDANT_AQE");
         assert!(
-            !aqe_enabled(),
-            "AQE must default off — the per-stage bucket-row-count sample costs one action \
-             round trip per worker on every query"
+            aqe_enabled(),
+            "AQE must default on — Spark 3+ / EMR parity for shuffle sizing"
         );
-        // With the default off, the suggestion path is a no-op pass-through.
+        // With the default on, small uniform buckets coalesce toward the worker floor.
+        let p = coalesced_partitions(4, 8, &[100, 120, 90, 110, 80, 95, 105, 100]).unwrap();
+        assert_eq!(p, 4, "enabled AQE must coalesce tiny uniform buckets");
+
+        std::env::set_var("OXIDANT_AQE", "0");
+        assert!(!aqe_enabled());
         let p = coalesced_partitions(4, 8, &[100, 120, 90, 110, 80, 95, 105, 100]).unwrap();
         assert_eq!(p, 8, "disabled AQE must not suggest coalescing");
-
-        std::env::set_var("OXIDANT_AQE", "1");
-        assert!(aqe_enabled());
         std::env::remove_var("OXIDANT_AQE");
     }
 

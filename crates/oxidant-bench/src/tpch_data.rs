@@ -1,117 +1,149 @@
-//! Real TPC-H data generation via the pure-Rust [`tpchgen`] crate, written as CSV files that both
-//! oxidant (DataFusion) and the DuckDB oracle read. CSV (not the crate's Arrow path) keeps oxidant on its
-//! own pinned Arrow — no cross-crate Arrow-version coupling.
+//! TPC-H data via official TPC `dbgen` (not the `tpchgen` crate / DuckDB).
+//!
+//! `dbgen` emits pipe-delimited `.tbl` files; we convert them to headered CSV so the existing
+//! harness and DuckDB oracle paths keep working. Idempotent when `lineitem.csv` exists.
 
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use tpchgen::csv::{
-    CustomerCsv, LineItemCsv, NationCsv, OrderCsv, PartCsv, PartSuppCsv, RegionCsv, SupplierCsv,
-};
-use tpchgen::generators::{
-    CustomerGenerator, LineItemGenerator, NationGenerator, OrderGenerator, PartGenerator,
-    PartSuppGenerator, RegionGenerator, SupplierGenerator,
-};
+
+use crate::tpc_kits;
 
 /// The eight TPC-H table names (data files are `<name>.csv` under the data dir).
 pub const TABLES: [&str; 8] = [
     "nation", "region", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
 ];
 
-/// Generate scale-factor `sf` TPC-H data as CSV (with headers) under `dir`. Idempotent: if
-/// `lineitem.csv` already exists the generation is skipped (so reruns are cheap).
+const HEADERS: &[(&str, &[&str])] = &[
+    (
+        "nation",
+        &["n_nationkey", "n_name", "n_regionkey", "n_comment"],
+    ),
+    ("region", &["r_regionkey", "r_name", "r_comment"]),
+    (
+        "supplier",
+        &[
+            "s_suppkey",
+            "s_name",
+            "s_address",
+            "s_nationkey",
+            "s_phone",
+            "s_acctbal",
+            "s_comment",
+        ],
+    ),
+    (
+        "customer",
+        &[
+            "c_custkey",
+            "c_name",
+            "c_address",
+            "c_nationkey",
+            "c_phone",
+            "c_acctbal",
+            "c_mktsegment",
+            "c_comment",
+        ],
+    ),
+    (
+        "part",
+        &[
+            "p_partkey",
+            "p_name",
+            "p_mfgr",
+            "p_brand",
+            "p_type",
+            "p_size",
+            "p_container",
+            "p_retailprice",
+            "p_comment",
+        ],
+    ),
+    (
+        "partsupp",
+        &[
+            "ps_partkey",
+            "ps_suppkey",
+            "ps_availqty",
+            "ps_supplycost",
+            "ps_comment",
+        ],
+    ),
+    (
+        "orders",
+        &[
+            "o_orderkey",
+            "o_custkey",
+            "o_orderstatus",
+            "o_totalprice",
+            "o_orderdate",
+            "o_orderpriority",
+            "o_clerk",
+            "o_shippriority",
+            "o_comment",
+        ],
+    ),
+    (
+        "lineitem",
+        &[
+            "l_orderkey",
+            "l_partkey",
+            "l_suppkey",
+            "l_linenumber",
+            "l_quantity",
+            "l_extendedprice",
+            "l_discount",
+            "l_tax",
+            "l_returnflag",
+            "l_linestatus",
+            "l_shipdate",
+            "l_commitdate",
+            "l_receiptdate",
+            "l_shipinstruct",
+            "l_shipmode",
+            "l_comment",
+        ],
+    ),
+];
+
+/// Generate scale-factor `sf` TPC-H data as CSV (with headers) under `dir`.
 pub fn generate(sf: f64, dir: &Path) -> std::io::Result<()> {
     generate_prefixed(sf, dir, "")
 }
 
-/// Like [`generate`], but each file is named `<prefix><name>.csv` — the committed
-/// `sample-data/` tree carries the `tpch_` table-name prefix its SQL-visible tables use.
+/// Like [`generate`], but each file is named `<prefix><name>.csv`.
 pub fn generate_prefixed(sf: f64, dir: &Path, prefix: &str) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     if dir.join(format!("{prefix}lineitem.csv")).exists() {
         return Ok(());
     }
-    // Each table: write its header, then every generated row via the CSV formatter. `part=1,
-    // part_count=1` generates the whole table in one shot.
-    write_csv(dir, &format!("{prefix}nation"), NationCsv::header(), || {
-        NationGenerator::new(sf, 1, 1)
-            .into_iter()
-            .map(NationCsv::new)
-    })?;
-    write_csv(dir, &format!("{prefix}region"), RegionCsv::header(), || {
-        RegionGenerator::new(sf, 1, 1)
-            .into_iter()
-            .map(RegionCsv::new)
-    })?;
-    write_csv(
-        dir,
-        &format!("{prefix}supplier"),
-        SupplierCsv::header(),
-        || {
-            SupplierGenerator::new(sf, 1, 1)
-                .into_iter()
-                .map(SupplierCsv::new)
-        },
-    )?;
-    write_csv(
-        dir,
-        &format!("{prefix}customer"),
-        CustomerCsv::header(),
-        || {
-            CustomerGenerator::new(sf, 1, 1)
-                .into_iter()
-                .map(CustomerCsv::new)
-        },
-    )?;
-    write_csv(dir, &format!("{prefix}part"), PartCsv::header(), || {
-        PartGenerator::new(sf, 1, 1).into_iter().map(PartCsv::new)
-    })?;
-    write_csv(
-        dir,
-        &format!("{prefix}partsupp"),
-        PartSuppCsv::header(),
-        || {
-            PartSuppGenerator::new(sf, 1, 1)
-                .into_iter()
-                .map(PartSuppCsv::new)
-        },
-    )?;
-    write_csv(dir, &format!("{prefix}orders"), OrderCsv::header(), || {
-        OrderGenerator::new(sf, 1, 1).into_iter().map(OrderCsv::new)
-    })?;
-    write_csv(
-        dir,
-        &format!("{prefix}lineitem"),
-        LineItemCsv::header(),
-        || {
-            LineItemGenerator::new(sf, 1, 1)
-                .into_iter()
-                .map(LineItemCsv::new)
-        },
-    )?;
-    Ok(())
-}
 
-/// Write `<name>.csv` under `dir`: the header line, then every formatted row from `rows()`.
-fn write_csv<I, R>(
-    dir: &Path,
-    name: &str,
-    header: &str,
-    rows: impl Fn() -> I,
-) -> std::io::Result<()>
-where
-    I: Iterator<Item = R>,
-    R: std::fmt::Display,
-{
-    let mut f = BufWriter::new(File::create(dir.join(format!("{name}.csv")))?);
-    writeln!(f, "{header}")?;
-    for row in rows() {
-        writeln!(f, "{row}")?;
+    let raw = dir.join(".dbgen-raw");
+    if raw.exists() {
+        let _ = fs::remove_dir_all(&raw);
     }
-    f.flush()
+    fs::create_dir_all(&raw)?;
+    eprintln!(
+        "[tpch-data] official dbgen SF{sf} → {} (then CSV)",
+        raw.display()
+    );
+    tpc_kits::run_dbgen(sf, &raw)?;
+
+    for (name, headers) in HEADERS {
+        let tbl = raw.join(format!("{name}.tbl"));
+        if !tbl.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("dbgen did not produce {}", tbl.display()),
+            ));
+        }
+        let csv = dir.join(format!("{prefix}{name}.csv"));
+        tpc_kits::pipe_tbl_to_csv(&tbl, &csv, headers)?;
+    }
+    let _ = fs::remove_dir_all(&raw);
+    Ok(())
 }
 
 fn i64f(name: &str) -> Field {
@@ -120,8 +152,6 @@ fn i64f(name: &str) -> Field {
 fn i32f(name: &str) -> Field {
     Field::new(name, DataType::Int32, false)
 }
-/// TPC-H money/quantity columns are `DECIMAL(15,2)` — exact, so aggregates are deterministic
-/// (Q15 filters on exact equality of a summed value, which float64 makes non-deterministic).
 fn decf(name: &str) -> Field {
     Field::new(name, DataType::Decimal128(15, 2), false)
 }
@@ -132,9 +162,7 @@ fn datef(name: &str) -> Field {
     Field::new(name, DataType::Date32, false)
 }
 
-/// Explicit Arrow schema for `table` (so the CSV reader gets dates/decimals/keys right rather than
-/// inferring). Money/quantity columns are `Decimal128(15,2)` per the TPC-H spec — exact arithmetic,
-/// so equality-on-aggregate queries (Q15) are deterministic.
+/// Explicit Arrow schema for `table` (CSV reader gets dates/decimals/keys right).
 pub fn schema(table: &str) -> SchemaRef {
     let fields = match table {
         "nation" => vec![

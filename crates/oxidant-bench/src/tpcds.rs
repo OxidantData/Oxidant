@@ -1,10 +1,10 @@
-//! TPC-DS harness on **real** generated Parquet: [`tpcds_data`] invokes DuckDB `dsdgen`, oxidant
+//! TPC-DS harness on **real** Parquet from official TPC `dsdgen` ([`tpcds_data`]), oxidant
 //! registers the 24 tables and runs Q1–Q99 with ClickBench-style hot timing, then cross-checks
-//! against DuckDB over the same files. CI gates a tiny SF (`0.01`) via a pass-set ratchet in
-//! `bench/tpcds/baseline.json` so coverage can only hold or rise toward 99/99.
+//! against DuckDB over the same files when available (oracle only — not the generator).
+//! CI uses integer SCALE (`--sf 1`) because official `dsdgen` rejects fractional SF.
+//! Pass-set ratchet: `bench/tpcds/baseline.json`.
 //!
-//! DuckDB is both the data generator and the oracle (engineering harness — not an independent
-//! ground truth). Set `OXIDANT_TPCDS_ALLOW_NO_ORACLE=1` only for execute-only smoke without DuckDB.
+//! Set `OXIDANT_TPCDS_ALLOW_NO_ORACLE=1` only for execute-only smoke without DuckDB.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -26,8 +26,9 @@ const BASELINE_JSON: &str = include_str!("../../../bench/tpcds/baseline.json");
 /// without collapsing distinct integer keys the way 3-sig-fig rounding does).
 const FLOAT_REL_EPS: f64 = 1e-3;
 
-/// The 99 official TPC-DS queries (DuckDB `tpcds_queries()` fixed substitution parameters),
-/// loaded from `bench/tpcds/queries/q{N}.sql` at compile time.
+/// The 99 official TPC-DS queries (from TPC `dsqgen -QUALIFY Y`), loaded from
+/// `bench/tpcds/queries/q{N}.sql` at compile time. Regenerate with
+/// `bench/tpc/generate-queries.sh`.
 pub(crate) fn queries() -> Vec<(&'static str, &'static str)> {
     macro_rules! q {
         ($n:literal) => {

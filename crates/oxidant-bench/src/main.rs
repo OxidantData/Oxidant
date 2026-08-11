@@ -35,6 +35,7 @@ use tonic::transport::Channel;
 mod distributed_coverage;
 mod sample_data;
 mod suite;
+mod tpc_kits;
 mod tpcds;
 mod tpcds_data;
 mod tpcds_dist;
@@ -645,7 +646,7 @@ async fn run_correctness(rows: usize) {
 }
 
 /// Distributed correctness: synthetic GROUP BY + optional TPC-DS supported-subset sample.
-async fn run_correctness_distributed(_rows: usize) {
+async fn run_correctness_distributed(_rows: usize, data: Option<String>) {
     use oxidant_execution::driver::{run_stages, Cluster};
     use oxidant_execution::flight::serve_worker;
     use oxidant_execution::plan::plan_distributed;
@@ -745,8 +746,11 @@ async fn run_correctness_distributed(_rows: usize) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
     if tpcds_sample > 0 {
-        let sf: f64 = flag(&std::env::args().collect::<Vec<_>>(), "--sf").unwrap_or(0.01);
-        let dir = std::env::temp_dir().join(format!("oxidant-tpcds-dist-corr-sf{sf}"));
+        let args: Vec<String> = std::env::args().collect();
+        let sf: f64 = flag(&args, "--sf").unwrap_or(1.0);
+        let dir = data.map(std::path::PathBuf::from).unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("oxidant-tpcds-dist-corr-sf{sf}"))
+        });
         eprintln!(
             "\n[correctness-distributed] TPC-DS supported sample (n={tpcds_sample}) sf{sf} …"
         );
@@ -812,14 +816,19 @@ async fn bench_main() {
         .and_then(|i| args.get(i + 1))
         .map(Path::new);
     let with_duckdb = !args.iter().any(|a| a == "--no-duckdb");
+    let glue_database = args
+        .iter()
+        .position(|a| a == "--glue-database")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str);
 
     match args.get(1).map(String::as_str) {
         Some("clickbench") | None => run_clickbench(rows).await,
         Some("clickbench-grpc") => run_clickbench_grpc(rows, data).await,
         Some("correctness") => run_correctness(rows).await,
-        Some("correctness-distributed") => run_correctness_distributed(rows).await,
+        Some("correctness-distributed") => run_correctness_distributed(rows, data.clone()).await,
         Some(cmd @ ("tpch" | "tpch-distributed" | "tpch-bench")) => {
-            let sf: f64 = flag(&args, "--sf").unwrap_or(0.05);
+            let sf: f64 = flag(&args, "--sf").unwrap_or(1.0);
             let dir = data.clone().unwrap_or_else(|| {
                 format!("{}/oxidant-tpch-sf{sf}", std::env::temp_dir().display())
             });
@@ -831,6 +840,7 @@ async fn bench_main() {
                     tpch::run_bench(tpch::BenchOpts {
                         sf,
                         data: Path::new(&dir),
+                        glue_database,
                         duckdb_db,
                         out_json: Path::new(&out),
                         machine: &machine,
@@ -858,7 +868,8 @@ async fn bench_main() {
             sample_data::run(Path::new(&dir)).await;
         }
         Some("tpcds-distributed") => {
-            let sf: f64 = flag(&args, "--sf").unwrap_or(0.01);
+            // Official dsdgen requires integer SCALE ≥ 1.
+            let sf: f64 = flag(&args, "--sf").unwrap_or(1.0);
             let dir = data.clone().unwrap_or_else(|| {
                 format!("{}/oxidant-tpcds-sf{sf}", std::env::temp_dir().display())
             });
@@ -908,7 +919,8 @@ async fn bench_main() {
             }
         }
         Some("tpcds") => {
-            let sf: f64 = flag(&args, "--sf").unwrap_or(0.01);
+            // Official dsdgen requires integer SCALE ≥ 1.
+            let sf: f64 = flag(&args, "--sf").unwrap_or(1.0);
             let dir = data.unwrap_or_else(|| {
                 format!("{}/oxidant-tpcds-sf{sf}", std::env::temp_dir().display())
             });

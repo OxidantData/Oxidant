@@ -41,34 +41,43 @@ queries through them automatically. If `--workers` is omitted, the count falls b
 `OXIDANT_DEFAULT_PARALLELISM`, then to `2`. This mode is for development and CI — use separate
 hosts (below) for real clusters.
 
-## Multiple hosts
+## Multiple hosts / bare metal
 
-Run one driver plus a worker process on each additional machine. A worker is the same
-`oxidant` binary as the driver, started with the `worker` subcommand.
+There is **no auto-join multicast and no Route53 requirement**. Bare metal, VMs, and
+on-prem racks use the same model as Spark Standalone’s static executor list: start Flight
+workers, then tell the driver their reachable `host:port` addresses.
 
-On every worker host:
+On every worker host (use a unique shard index when you shard scans across machines):
 
 ```sh
+export OXIDANT_SHARD_INDEX=0   # 0 .. N-1, distinct per worker
+export OXIDANT_WORKER_COUNT=2
 oxidant worker --port 50561
 ```
 
-On the driver host, pass the static worker list at startup:
+On the driver host, pass the static worker list (private/LAN IPs preferred):
 
 ```sh
-oxidant spark server --port 50051 --workers host1:50561,host2:50561
+export OXIDANT_DISTRIBUTED_STRICT=1   # fail closed if workers are unreachable
+oxidant spark server --port 50051 --workers 10.0.0.11:50561,10.0.0.12:50561
 ```
 
-The startup log confirms registration (`Oxidant static workers: http://host1:50561,...`),
+The startup log confirms registration (`Oxidant static workers: http://10.0.0.11:50561,...`),
 and the status endpoint then reports `"mode":"distributed"` with the worker list.
 
 Equivalent alternatives:
 
-- Environment: `OXIDANT_WORKERS=host1:50561,host2:50561`
-- Per session, from any Spark Connect client: set the conf `spark.oxidant.workers` to the
-  same comma-separated list (overrides the startup list for that session).
+- Environment: `OXIDANT_WORKERS=10.0.0.11:50561,10.0.0.12:50561`
+- Per session: Spark conf `spark.oxidant.workers` (same comma-separated list; overrides
+  the startup list for that session)
 
-**Registration is static.** The driver takes the worker set at startup; there is no dynamic
-join/leave. To add, remove, or replace workers, restart the driver with the new list.
+**Security (bare metal):** bind Flight to a private interface; firewall **50561** so only the
+driver (and peer workers for shuffle) can connect. Prefer VPC/VPN/WireGuard addresses over
+opening Flight to the internet. Do **not** use UDP/LAN broadcast discovery.
+
+**Registration is static.** To add, remove, or replace workers, restart the driver with the
+new list (or update `spark.oxidant.workers`). EC2 ASG deployments automate that pin at boot
+via IAM `Describe*` → private IPs (see [`distributed-ec2.md`](distributed-ec2.md)).
 
 **Don't mix the two meanings of `--workers`.** In the default local mode it takes remote
 endpoints (`host:port,...`); with `--mode local-cluster` it takes an in-process worker
@@ -92,11 +101,11 @@ rootfs mounts, and build instructions: [`deploy/docker/README.md`](../deploy/doc
 
 ## Kubernetes discovery
 
-Static lists are the simple path. For Kubernetes, the driver can instead resolve live worker
-endpoints from a headless Service / EndpointSlices (`OXIDANT_WORKER_SERVICE`), which tracks
-autoscaling without driver restarts. That env contract is documented in
-[`runtime-contract.md`](runtime-contract.md); a full EC2/ASG data plane (Packer AMI +
-CloudFormation, Route53 discovery) is in [`distributed-ec2.md`](distributed-ec2.md).
+Static lists are the simple path (bare metal and most VMs). For Kubernetes, the driver can
+instead resolve live worker endpoints from a headless Service (`OXIDANT_WORKER_SERVICE`).
+That env contract is in [`runtime-contract.md`](runtime-contract.md). EC2/ASG (Packer AMI +
+CloudFormation) pins `OXIDANT_WORKERS` from ASG private IPs — see
+[`distributed-ec2.md`](distributed-ec2.md).
 
 ## Notes
 

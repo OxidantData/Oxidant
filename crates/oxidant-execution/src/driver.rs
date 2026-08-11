@@ -11,10 +11,12 @@
 //! the join key so matching keys co-locate on one worker, which then joins them locally.
 //!
 //! Intermediate stages that both consume *and* produce are supported (left-deep join chains).
-//! Shuffle partition count defaults to worker count but can be overridden via
-//! `OXIDANT_SHUFFLE_PARTITIONS` (like `spark.sql.shuffle.partitions`) or, when that is unset,
-//! `OXIDANT_DEFAULT_PARALLELISM`. Shuffle buckets spill when over the configured memory budget
-//! (see [`crate::shuffle::spill`]); push-based `do_exchange` complements pull-based shuffle reads.
+//! Shuffle partition count defaults to a Spark-like floor (`max(200, worker_vcpus)`) — never
+//! bare worker count (a 2-worker SF100 cluster with 2 buckets skews joins onto one node).
+//! Override via `OXIDANT_SHUFFLE_PARTITIONS` (like `spark.sql.shuffle.partitions`) or, when
+//! that is unset, `OXIDANT_DEFAULT_PARALLELISM`. Shuffle buckets spill when over the
+//! configured memory budget (see [`crate::shuffle::spill`]); push-based `do_exchange`
+//! complements pull-based shuffle reads.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,7 +44,18 @@ use crate::membership::{ClusterMembership, StaticMembership};
 use crate::scheduler::run_stage_with_retry;
 use crate::shuffle::protocol::StageTicket;
 
+/// Spark `spark.sql.shuffle.partitions` default — also the Oxidant floor so a 2-worker
+/// cluster never collapses to a 2-bucket shuffle (SF100 skew / OOM class).
+const DEFAULT_SHUFFLE_PARTITIONS_FLOOR: u32 = 200;
+
 /// Number of hash-shuffle partitions for the next query.
+///
+/// Resolution order:
+/// 1. `OXIDANT_SHUFFLE_PARTITIONS` (explicit)
+/// 2. `OXIDANT_DEFAULT_PARALLELISM`
+/// 3. Spark-like default: `max(200, worker_vcpus, worker_count)` where `worker_vcpus` comes
+///    from `OXIDANT_WORKER_VCPUS` (total cluster worker vCPUs) or
+///    `OXIDANT_WORKER_CORES × worker_count` when per-worker cores are tagged.
 pub fn shuffle_partitions(worker_count: usize) -> u32 {
     std::env::var("OXIDANT_SHUFFLE_PARTITIONS")
         .ok()
@@ -54,7 +67,27 @@ pub fn shuffle_partitions(worker_count: usize) -> u32 {
                 .and_then(|s| s.parse().ok())
                 .filter(|&n: &u32| n > 0)
         })
-        .unwrap_or(worker_count.max(1) as u32)
+        .unwrap_or_else(|| default_shuffle_partitions(worker_count))
+}
+
+/// Spark-aligned default when no explicit shuffle/parallelism env is set.
+pub fn default_shuffle_partitions(worker_count: usize) -> u32 {
+    let workers = worker_count.max(1) as u32;
+    let worker_vcpus = std::env::var("OXIDANT_WORKER_VCPUS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &u32| n > 0)
+        .or_else(|| {
+            std::env::var("OXIDANT_WORKER_CORES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n: &u32| n > 0)
+                .map(|cores| cores.saturating_mul(workers))
+        })
+        .unwrap_or(workers);
+    DEFAULT_SHUFFLE_PARTITIONS_FLOOR
+        .max(worker_vcpus)
+        .max(workers)
 }
 
 /// Expected worker fan-out from `OXIDANT_WORKER_COUNT` (same env workers use for file sharding).
@@ -716,6 +749,13 @@ async fn run_stages_obs_inner(
     // Freeze the planning snapshot for this query: never reshape partitions from membership.
     let planned_workers = cluster.workers.clone();
     cluster.check_shard_modulus()?;
+    eprintln!(
+        "Oxidant driver: query={query_id} stages={} workers={} num_partitions={} concurrent={}",
+        stages.len(),
+        planned_workers.len(),
+        cluster.num_partitions,
+        concurrent_stages_enabled()
+    );
     let consumed: HashSet<u32> = stages
         .iter()
         .flat_map(|s| s.upstream_stage_ids.iter().copied())
@@ -1478,6 +1518,20 @@ async fn run_stages_concurrent(
                     .await?;
             ensure_stable_membership(cluster, planned_workers)?;
             check_query_cancelled(query_id, cancel)?;
+            eprintln!(
+                "Oxidant driver: dispatch stage_id={} exchange={:?} upstreams={:?} sql={}",
+                stage.stage_id,
+                stage.exchange,
+                stage.upstream_stage_ids,
+                {
+                    let t = stage.sql.trim().replace('\n', " ");
+                    if t.chars().count() <= 100 {
+                        t
+                    } else {
+                        format!("{}…", t.chars().take(99).collect::<String>())
+                    }
+                }
+            );
             let task_futs =
                 if stage.exchange == ExchangeMode::Hash && !stage.upstream_stage_ids.is_empty() {
                     let read_mod = consumer_read_modulus(&stage, coalesced).unwrap_or(np);
@@ -1532,6 +1586,10 @@ async fn run_stages_concurrent(
                     stage_rows,
                 )
                 .await;
+                eprintln!(
+                    "Oxidant driver: stage_id={id} barrier complete (in_flight={})",
+                    in_flight_ids.len()
+                );
                 dag.complete(id);
             }
             Err(e) => {
@@ -2036,16 +2094,51 @@ fn stage_ticket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `OXIDANT_SHUFFLE_PARTITIONS` / worker-vcpu hints are process-global.
+    static SHUFFLE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn shuffle_partitions_defaults_to_spark_floor_not_worker_count() {
+        let _guard = SHUFFLE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OXIDANT_SHUFFLE_PARTITIONS");
+        std::env::remove_var("OXIDANT_DEFAULT_PARALLELISM");
+        std::env::remove_var("OXIDANT_WORKER_VCPUS");
+        std::env::remove_var("OXIDANT_WORKER_CORES");
+        assert_eq!(
+            shuffle_partitions(2),
+            200,
+            "2-worker clusters must not default to a 2-bucket shuffle"
+        );
+        // 16 cores × 2 workers = 32 vCPUs, still below the Spark floor of 200.
+        std::env::set_var("OXIDANT_WORKER_CORES", "16");
+        assert_eq!(shuffle_partitions(2), 200);
+        std::env::set_var("OXIDANT_WORKER_VCPUS", "256");
+        assert_eq!(shuffle_partitions(2), 256);
+        std::env::remove_var("OXIDANT_WORKER_VCPUS");
+        std::env::remove_var("OXIDANT_WORKER_CORES");
+        std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "16");
+        assert_eq!(shuffle_partitions(2), 16);
+        std::env::remove_var("OXIDANT_SHUFFLE_PARTITIONS");
+    }
 
     #[test]
     fn cluster_snapshots_membership_at_scheduling_time() {
+        let _guard = SHUFFLE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OXIDANT_SHUFFLE_PARTITIONS");
+        std::env::remove_var("OXIDANT_DEFAULT_PARALLELISM");
         let membership = Arc::new(StaticMembership::new(vec![
             "a:50561".into(),
             "b:50561".into(),
         ]));
         let cluster = Cluster::from_membership(membership);
         assert_eq!(cluster.worker_count(), 2);
-        assert!(cluster.num_partitions >= 2);
+        assert!(
+            cluster.num_partitions >= 200,
+            "default shuffle partitions must follow the Spark floor, got {}",
+            cluster.num_partitions
+        );
     }
 
     #[test]

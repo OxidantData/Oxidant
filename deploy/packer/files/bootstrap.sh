@@ -5,12 +5,12 @@
 #   1. Mount spill EBS (if present) at /var/lib/oxidant/spill
 #   2. Read instance tags / IMDS for role + cluster config
 #   3. Workers: assign OXIDANT_SHARD_INDEX from sorted InService ASG peers
-#   4. Workers: upsert the shared A RRSet (boot: full set incl. own IP) and
-#      remove ONLY this instance's IP on shutdown (symmetric deregistration)
+#   4. Driver: wait for WorkerCount InService peers, pin private IPs into
+#      OXIDANT_WORKERS (Spark EMR / YARN-style membership — not Route53/DNS)
 #   5. Write /etc/oxidant/oxidant.env atomically and enable (never start) the
 #      matching systemd unit — UserData / the unit graph starts it after us
 #
-# No credentials are stored — uses the instance profile only.
+# No credentials are stored — uses the instance profile only (IAM Describe*).
 set -euo pipefail
 
 ENV_FILE=/etc/oxidant/oxidant.env
@@ -20,7 +20,8 @@ IMDS_TOKEN_TTL=21600
 AWS_BIN="${OXIDANT_AWS_BIN:-/usr/local/bin/aws}"
 export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
-log() { echo "[oxidant-bootstrap] $*"; }
+# Always stderr — stdout from helpers (e.g. wait_for_worker_private_ips) is machine-parsed.
+log() { echo "[oxidant-bootstrap] $*" >&2; }
 
 imds_token() {
   curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
@@ -162,6 +163,58 @@ wait_for_workers() {
   printf '%s\n' "${ids}"
 }
 
+# Spark EMR / YARN-style membership: the control plane learns executor private IPs
+# from the cluster manager (here: ASG + EC2 DescribeInstances via instance role).
+# No Route53, no UDP broadcast (broadcast is insecure and does not cross AWS subnets).
+# Output: one private IPv4 per line, sorted unique. Fails closed if count < expected.
+# stdin: private IPv4 lines → stdout: `ip:50561,ip:50561` (sorted unique, empty → empty).
+private_ips_to_workers_csv() {
+  local port="${1:-50561}"
+  # Only accept dotted IPv4 — never let a log prefix like "[oxidant-bootstrap]" become a host.
+  sort -u | awk -v port="${port}" '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {printf sep $1":"port; sep=","}'
+}
+
+wait_for_worker_private_ips() {
+  local asg="$1"
+  local expected="$2"
+  # Tests may shrink the wait; production keeps the cold-start ASG budget.
+  local wait_secs="${OXIDANT_BOOTSTRAP_WAIT_SECS:-300}"
+  local deadline=$((SECONDS + wait_secs))
+  local ids="" id ip ips="" count=0
+  while (( SECONDS < deadline )); do
+    ids="$("${AWS_BIN}" autoscaling describe-auto-scaling-groups \
+      --region "${REGION}" \
+      --auto-scaling-group-names "${asg}" \
+      --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+      --output text 2>/dev/null | tr '\t' '\n' | sort -u)"
+    ips=""
+    while IFS= read -r id; do
+      [[ -z "${id}" ]] && continue
+      ip="$("${AWS_BIN}" ec2 describe-instances \
+        --region "${REGION}" \
+        --instance-ids "${id}" \
+        --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+        --output text 2>/dev/null || true)"
+      if [[ -n "${ip}" && "${ip}" != "None" ]]; then
+        ips+="${ip}"$'\n'
+      fi
+    done <<< "${ids}"
+    count="$(printf '%s' "${ips}" | grep -c . || true)"
+    # Exact match only — during ASG instance refresh InService can briefly exceed
+    # WorkerCount; pinning that set makes driver fan-out ≠ OXIDANT_WORKER_COUNT and
+    # fail closed ("silently drop data"). Wait for a settled membership.
+    if [[ "${count}" -eq "${expected}" ]]; then
+      log "ASG ${asg}: ${count}/${expected} worker private IPs ready"
+      printf '%s' "${ips}" | sort -u
+      return 0
+    fi
+    log "waiting for exactly ${expected} worker private IPs from ASG ${asg} (have ${count})"
+    sleep "${OXIDANT_BOOTSTRAP_POLL_SECS:-5}"
+  done
+  log "ERROR: timed out waiting for ${expected} worker private IPs from ASG ${asg} (have ${count})"
+  return 1
+}
+
 # Multi-value answer set: maintain one A RRSet with all worker IPs.
 # Boot path: rewrite the full set from the current InService peer list PLUS
 # this instance's own IP. Self must always be included — on a cold start the
@@ -291,8 +344,11 @@ write_env() {
   local role="$1"
   umask 022
   mkdir -p /etc/oxidant
-  # S3 disk cache (PR #76): on by default — the SF10 benchmark configuration. The engine
-  # treats unset/empty as disabled, so an operator can still turn it off per node.
+  # S3 disk cache (PR #76): workers only. The cache materializes *whole* S3 objects on
+  # first touch — fine for SF10 multi-file facts, lethal on the driver (and on SF100
+  # single-file 20+ GiB parquet) because Connect planning / schema reads pull the same
+  # keys and the driver then downloads tens of GiB onto an 8–16 GiB box. Empty/unset
+  # disables the cache (ranged parquet reads stay on S3).
   mkdir -p /var/lib/oxidant/s3cache
   chown oxidant:oxidant /var/lib/oxidant/s3cache
   # Atomic: render into a temp file in the same directory, then rename. A
@@ -311,7 +367,6 @@ AWS_REGION=${REGION}
 AWS_DEFAULT_REGION=${REGION}
 TMPDIR=${SPILL_MOUNT}
 HOME=/var/lib/oxidant
-OXIDANT_S3_CACHE_DIR=/var/lib/oxidant/s3cache
 EOF
     # Cluster membership vars are meaningless on a standalone single node.
     if [[ "${role}" != "standalone" ]]; then
@@ -320,11 +375,21 @@ OXIDANT_WORKER_COUNT=${WORKER_COUNT}
 OXIDANT_WORKER_PORT=50561
 EOF
     fi
-    if [[ -n "${MEMORY_LIMIT_BYTES}" && "${MEMORY_LIMIT_BYTES}" != "None" ]]; then
-      echo "OXIDANT_MEMORY_LIMIT_BYTES=${MEMORY_LIMIT_BYTES}"
-    fi
-    if [[ -n "${SHUFFLE_SPILL_BYTES}" && "${SHUFFLE_SPILL_BYTES}" != "None" ]]; then
-      echo "OXIDANT_SHUFFLE_SPILL_BYTES=${SHUFFLE_SPILL_BYTES}"
+    # Worker spill pool only. The CFN MemoryLimitBytes tag is the *worker* SF100
+    # invariant (40 Gi on m8g.8xlarge). Applying it on the driver stamps a 40 Gi
+    # FairSpillPool onto an 8–16 GiB c6g and the OOM killer reaps Connect mid-query
+    # (TPC-H Q3, 2026-08-10). Drivers auto-size from cgroup instead.
+    if [[ "${role}" == "worker" || "${role}" == "standalone" ]]; then
+      if [[ -n "${MEMORY_LIMIT_BYTES}" && "${MEMORY_LIMIT_BYTES}" != "None" ]]; then
+        echo "OXIDANT_MEMORY_LIMIT_BYTES=${MEMORY_LIMIT_BYTES}"
+      fi
+      if [[ -n "${SHUFFLE_SPILL_BYTES}" && "${SHUFFLE_SPILL_BYTES}" != "None" ]]; then
+        echo "OXIDANT_SHUFFLE_SPILL_BYTES=${SHUFFLE_SPILL_BYTES}"
+      fi
+      echo "OXIDANT_S3_CACHE_DIR=/var/lib/oxidant/s3cache"
+      # Cap single-object materialization so a 20+ GiB lineitem.parquet cannot pin the
+      # worker for 10+ minutes downloading the whole file (ranged reads still work).
+      echo "OXIDANT_S3_CACHE_MAX_OBJECT_BYTES=2147483648"
     fi
     if [[ -n "${CATALOG_CONF}" && "${CATALOG_CONF}" != "None" && "${CATALOG_CONF}" != "none" ]]; then
       # Escape embedded double-quotes for systemd EnvironmentFile quoting.
@@ -337,15 +402,33 @@ EOF
     fi
     if [[ "${role}" == "driver" ]]; then
       cat <<EOF
-OXIDANT_WORKER_SERVICE=${WORKER_DNS_NAME}
-OXIDANT_SHUFFLE_PARTITIONS=${SHUFFLE_PARTITIONS}
+OXIDANT_S3_CACHE_DIR=
+OXIDANT_STAGE_TIMEOUT_MS=3600000
+OXIDANT_AQE=1
+RUST_LOG=info,oxidant=info,oxidant_connect=info,oxidant_execution=info
 EOF
+      # Membership = private Flight endpoints from ASG (see wait_for_worker_private_ips).
+      # Do not set OXIDANT_WORKER_SERVICE for EC2 — that DNS path was Route53-coupled and
+      # raced empty at boot. Optional k8s headless DNS remains a separate deploy model.
+      if [[ -n "${DRIVER_WORKERS_CSV:-}" ]]; then
+        echo "OXIDANT_WORKERS=${DRIVER_WORKERS_CSV}"
+        log "pinned OXIDANT_WORKERS=${DRIVER_WORKERS_CSV}" >&2
+      else
+        log "ERROR: driver has empty worker IP list — refusing silent local fallback" >&2
+        return 1
+      fi
+      if [[ -n "${SHUFFLE_PARTITIONS}" && "${SHUFFLE_PARTITIONS}" != "None" ]]; then
+        echo "OXIDANT_SHUFFLE_PARTITIONS=${SHUFFLE_PARTITIONS}"
+      fi
       if [[ "${DISTRIBUTED_STRICT}" == "true" || "${DISTRIBUTED_STRICT}" == "1" ]]; then
         echo "OXIDANT_DISTRIBUTED_STRICT=1"
       fi
     elif [[ "${role}" == "worker" ]]; then
       cat <<EOF
 OXIDANT_SHARD_INDEX=${SHARD_INDEX}
+OXIDANT_STAGE_TIMEOUT_MS=3600000
+OXIDANT_AQE=1
+RUST_LOG=info,oxidant=info,oxidant_connect=info,oxidant_execution=info
 EOF
     fi
     # standalone: no cluster vars at all — the server runs single-node.
@@ -386,89 +469,110 @@ enable_role_unit() {
 
 # ---- main --------------------------------------------------------------------
 
-TOKEN="$(imds_token)"
-INSTANCE_ID="$(imds_get meta-data/instance-id)"
-REGION="$(imds_get meta-data/placement/region)"
-PRIVATE_IP="$(imds_get meta-data/local-ipv4)"
+oxidant_bootstrap_main() {
+  TOKEN="$(imds_token)"
+  INSTANCE_ID="$(imds_get meta-data/instance-id)"
+  REGION="$(imds_get meta-data/placement/region)"
+  PRIVATE_IP="$(imds_get meta-data/local-ipv4)"
 
-# Shutdown / scale-in fast path: fetch ONLY the tags deregistration needs,
-# single-shot (network may be going away; TimeoutStopSec bounds us).
-if [[ "${1:-}" == "--deregister" ]]; then
-  ROLE="$(tag_value_fast oxidant:role)"
-  HOSTED_ZONE_ID="$(tag_value_fast oxidant:hosted-zone-id)"
-  WORKER_DNS_NAME="$(tag_value_fast oxidant:worker-dns-name)"
-  ROLE="${ROLE:-worker}"
-  if [[ "${ROLE}" == "worker" && -n "${HOSTED_ZONE_ID}" && -n "${WORKER_DNS_NAME}" ]]; then
-    remove_self_dns "${HOSTED_ZONE_ID}" "${WORKER_DNS_NAME}" || true
-  fi
-  exit 0
-fi
-
-ROLE="$(tag_value oxidant:role)"
-WORKER_COUNT="$(tag_value oxidant:worker-count)"
-WORKER_ASG="$(tag_value oxidant:worker-asg)"
-HOSTED_ZONE_ID="$(tag_value oxidant:hosted-zone-id)"
-WORKER_DNS_NAME="$(tag_value oxidant:worker-dns-name)"
-MEMORY_LIMIT_BYTES="$(tag_value oxidant:memory-limit-bytes)"
-SHUFFLE_SPILL_BYTES="$(tag_value oxidant:shuffle-spill-bytes)"
-SHUFFLE_PARTITIONS="$(tag_value oxidant:shuffle-partitions)"
-CATALOG_CONF="$(tag_value oxidant:catalog-conf)"
-DISTRIBUTED_STRICT="$(tag_value oxidant:distributed-strict)"
-PREFER_HASH_JOIN="$(tag_value oxidant:prefer-hash-join)"
-
-# No role tag = Marketplace single-node AMI path: boot straight into a
-# standalone Spark Connect server (no shard index, no Route53, no ASG).
-ROLE="${ROLE:-standalone}"
-WORKER_COUNT="${WORKER_COUNT:-1}"
-SHUFFLE_PARTITIONS="${SHUFFLE_PARTITIONS:-${WORKER_COUNT}}"
-DISTRIBUTED_STRICT="${DISTRIBUTED_STRICT:-false}"
-PREFER_HASH_JOIN="${PREFER_HASH_JOIN:-auto}"
-
-mount_spill_volume
-
-SHARD_INDEX=0
-if [[ "${ROLE}" == "worker" ]]; then
-  if [[ -z "${WORKER_ASG}" || "${WORKER_ASG}" == "None" ]]; then
-    log "ERROR: oxidant:worker-asg tag missing; cannot assign shard index"
-    exit 1
-  fi
-  mapfile -t PEER_IDS < <(wait_for_workers "${WORKER_ASG}" "${WORKER_COUNT}")
-  # Ensure self is in the list even if not yet InService.
-  if ! printf '%s\n' "${PEER_IDS[@]}" | grep -qx "${INSTANCE_ID}"; then
-    PEER_IDS+=("${INSTANCE_ID}")
-  fi
-  IFS=$'\n' PEER_IDS=($(printf '%s\n' "${PEER_IDS[@]}" | sort -u))
-  # Loud-fail on an incomplete peer list: assigning a shard index from fewer than
-  # WORKER_COUNT peers silently duplicates an index on another worker (the doomed
-  # shard is then read by NOBODY — wrong query results, no error). Note this cannot
-  # cover the instance-refresh transitional case (an early replacement legitimately
-  # sees a full list that still contains a doomed old worker and takes its slot);
-  # that one self-heals via oxidant-shard-resolve.timer re-resolving against settled
-  # membership.
-  if (( ${#PEER_IDS[@]} < WORKER_COUNT )); then
-    log "ERROR: only ${#PEER_IDS[@]} of ${WORKER_COUNT} worker peers visible; refusing to assign a shard index from an incomplete list"
-    exit 1
-  fi
-  SHARD_INDEX=-1
-  for i in "${!PEER_IDS[@]}"; do
-    if [[ "${PEER_IDS[$i]}" == "${INSTANCE_ID}" ]]; then
-      SHARD_INDEX=$i
-      break
+  # Shutdown / scale-in fast path: fetch ONLY the tags deregistration needs,
+  # single-shot (network may be going away; TimeoutStopSec bounds us).
+  if [[ "${1:-}" == "--deregister" ]]; then
+    ROLE="$(tag_value_fast oxidant:role)"
+    HOSTED_ZONE_ID="$(tag_value_fast oxidant:hosted-zone-id)"
+    WORKER_DNS_NAME="$(tag_value_fast oxidant:worker-dns-name)"
+    ROLE="${ROLE:-worker}"
+    if [[ "${ROLE}" == "worker" && -n "${HOSTED_ZONE_ID}" && -n "${WORKER_DNS_NAME}" ]]; then
+      remove_self_dns "${HOSTED_ZONE_ID}" "${WORKER_DNS_NAME}" || true
     fi
-  done
-  if (( SHARD_INDEX < 0 )); then
-    log "ERROR: could not determine shard index for ${INSTANCE_ID}"
-    exit 1
+    return 0
   fi
-  log "assigned OXIDANT_SHARD_INDEX=${SHARD_INDEX} (of ${WORKER_COUNT})"
 
-  if [[ -n "${HOSTED_ZONE_ID}" && -n "${WORKER_DNS_NAME}" ]]; then
-    sync_worker_dns "${HOSTED_ZONE_ID}" "${WORKER_DNS_NAME}" "${WORKER_ASG}"
-  else
-    log "WARNING: Route53 tags missing; driver discovery will fail"
+  ROLE="$(tag_value oxidant:role)"
+  WORKER_COUNT="$(tag_value oxidant:worker-count)"
+  WORKER_ASG="$(tag_value oxidant:worker-asg)"
+  HOSTED_ZONE_ID="$(tag_value oxidant:hosted-zone-id)"
+  WORKER_DNS_NAME="$(tag_value oxidant:worker-dns-name)"
+  MEMORY_LIMIT_BYTES="$(tag_value oxidant:memory-limit-bytes)"
+  SHUFFLE_SPILL_BYTES="$(tag_value oxidant:shuffle-spill-bytes)"
+  SHUFFLE_PARTITIONS="$(tag_value oxidant:shuffle-partitions)"
+  CATALOG_CONF="$(tag_value oxidant:catalog-conf)"
+  DISTRIBUTED_STRICT="$(tag_value oxidant:distributed-strict)"
+  PREFER_HASH_JOIN="$(tag_value oxidant:prefer-hash-join)"
+
+  # No role tag = Marketplace single-node AMI path: boot straight into a
+  # standalone Spark Connect server (no shard index, no ASG membership).
+  ROLE="${ROLE:-standalone}"
+  WORKER_COUNT="${WORKER_COUNT:-1}"
+  # Leave shuffle partitions empty when the CFN tag is unset so the engine applies its
+  # Spark-like default (max(200, worker_vcpus)) — never pin to WorkerCount (2-bucket SF100 skew).
+  SHUFFLE_PARTITIONS="${SHUFFLE_PARTITIONS:-}"
+  DISTRIBUTED_STRICT="${DISTRIBUTED_STRICT:-false}"
+  PREFER_HASH_JOIN="${PREFER_HASH_JOIN:-auto}"
+
+  mount_spill_volume
+
+  SHARD_INDEX=0
+  if [[ "${ROLE}" == "worker" ]]; then
+    if [[ -z "${WORKER_ASG}" || "${WORKER_ASG}" == "None" ]]; then
+      log "ERROR: oxidant:worker-asg tag missing; cannot assign shard index"
+      return 1
+    fi
+    mapfile -t PEER_IDS < <(wait_for_workers "${WORKER_ASG}" "${WORKER_COUNT}")
+    # Ensure self is in the list even if not yet InService.
+    if ! printf '%s\n' "${PEER_IDS[@]}" | grep -qx "${INSTANCE_ID}"; then
+      PEER_IDS+=("${INSTANCE_ID}")
+    fi
+    IFS=$'\n' PEER_IDS=($(printf '%s\n' "${PEER_IDS[@]}" | sort -u))
+    # Loud-fail on an incomplete peer list: assigning a shard index from fewer than
+    # WORKER_COUNT peers silently duplicates an index on another worker (the doomed
+    # shard is then read by NOBODY — wrong query results, no error). Note this cannot
+    # cover the instance-refresh transitional case (an early replacement legitimately
+    # sees a full list that still contains a doomed old worker and takes its slot);
+    # that one self-heals via oxidant-shard-resolve.timer re-resolving against settled
+    # membership.
+    if (( ${#PEER_IDS[@]} < WORKER_COUNT )); then
+      log "ERROR: only ${#PEER_IDS[@]} of ${WORKER_COUNT} worker peers visible; refusing to assign a shard index from an incomplete list"
+      return 1
+    fi
+    SHARD_INDEX=-1
+    for i in "${!PEER_IDS[@]}"; do
+      if [[ "${PEER_IDS[$i]}" == "${INSTANCE_ID}" ]]; then
+        SHARD_INDEX=$i
+        break
+      fi
+    done
+    if (( SHARD_INDEX < 0 )); then
+      log "ERROR: could not determine shard index for ${INSTANCE_ID}"
+      return 1
+    fi
+    log "assigned OXIDANT_SHARD_INDEX=${SHARD_INDEX} (of ${WORKER_COUNT})"
   fi
+
+  # Driver: wait for full InService set, pin private IPs into OXIDANT_WORKERS (Spark
+  # "executors registered" gate — not DNS / Route53).
+  DRIVER_WORKERS_CSV=""
+  if [[ "${ROLE}" == "driver" ]]; then
+    if [[ -z "${WORKER_ASG}" || "${WORKER_ASG}" == "None" ]]; then
+      log "ERROR: oxidant:worker-asg tag missing on driver; cannot discover workers"
+      return 1
+    fi
+    local_ips=""
+    local_ips="$(wait_for_worker_private_ips "${WORKER_ASG}" "${WORKER_COUNT}")" || return 1
+    DRIVER_WORKERS_CSV="$(printf '%s\n' "${local_ips}" | private_ips_to_workers_csv 50561)"
+    if [[ -z "${DRIVER_WORKERS_CSV}" ]]; then
+      log "ERROR: ASG ${WORKER_ASG} yielded no private IPs"
+      return 1
+    fi
+    log "driver membership OXIDANT_WORKERS=${DRIVER_WORKERS_CSV}"
+  fi
+
+  write_env "${ROLE}"
+  enable_role_unit "${ROLE}"
+  log "bootstrap complete role=${ROLE} instance=${INSTANCE_ID}"
+}
+
+# Sourced by deploy/packer/tests — keep functions without running IMDS/main.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  oxidant_bootstrap_main "$@"
 fi
-
-write_env "${ROLE}"
-enable_role_unit "${ROLE}"
-log "bootstrap complete role=${ROLE} instance=${INSTANCE_ID}"
