@@ -114,10 +114,8 @@ fn item() -> RecordBatch {
             i64v(&[1, 2, 3, 4]),
             i64v(&[11, 12, 13, 14]),
             Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
-            // Q37: i_current_price BETWEEN 22 AND 52
-            i64v(&[25, 30, 40, 45]),
-            // Q37: i_manufact_id IN (678, 964, 918, 849)
-            i64v(&[678, 964, 918, 849]),
+            i64v(&[70, 80, 90, 100]),
+            i64v(&[677, 940, 694, 808]),
         ],
     )
 }
@@ -134,10 +132,9 @@ fn date_dim() -> RecordBatch {
         ])),
         vec![
             i64v(&[100, 101, 102]),
-            // Q37 window: 2001-06-02 .. +60d → Date32 11475..=11535
-            Arc::new(Date32Array::from(vec![11_475, 11_480, 11_490])),
+            Arc::new(Date32Array::from(vec![11_000, 11_001, 11_002])),
             i64v(&[7, 7, 8]),
-            i64v(&[2001, 2001, 2001]),
+            i64v(&[1999, 1999, 1999]),
         ],
     )
     .unwrap()
@@ -154,21 +151,21 @@ fn warehouse() -> RecordBatch {
     )
 }
 
-/// Simplified `customer_demographics` dim (Q72 filters `cd_marital_status = 'M'`).
+/// Simplified `customer_demographics` dim (Q72 filters `cd_marital_status = 'D'`).
 fn customer_demographics() -> RecordBatch {
     batch(
         vec![i64f("cd_demo_sk"), strf("cd_marital_status")],
-        vec![i64v(&[10, 20]), Arc::new(StringArray::from(vec!["M", "S"]))],
+        vec![i64v(&[10, 20]), Arc::new(StringArray::from(vec!["D", "S"]))],
     )
 }
 
-/// Simplified `household_demographics` dim (Q72 filters `hd_buy_potential = '1001-5000'`).
+/// Simplified `household_demographics` dim (Q72 filters `hd_buy_potential = '>10000'`).
 fn household_demographics() -> RecordBatch {
     batch(
         vec![i64f("hd_demo_sk"), strf("hd_buy_potential")],
         vec![
             i64v(&[30, 40]),
-            Arc::new(StringArray::from(vec!["1001-5000", "0-500"])),
+            Arc::new(StringArray::from(vec![">10000", "0-500"])),
         ],
     )
 }
@@ -975,7 +972,7 @@ fn q72_inventory() -> RecordBatch {
     )
 }
 
-/// Q72-tailored `date_dim`: sk 100 is the passing sold date (year 2001, week 7), 101 the
+/// Q72-tailored `date_dim`: sk 100 is the passing sold date (year 1999, week 7), 101 the
 /// wrong-year one; 200/201 the matching / week-mismatched inventory dates; 300/301 the
 /// passing / failing ship dates (`d3.d_date > d1.d_date + 5` ⇔ `> 11005`).
 fn q72_date_dim() -> RecordBatch {
@@ -992,7 +989,7 @@ fn q72_date_dim() -> RecordBatch {
                 11_000, 11_001, 10_999, 10_998, 11_010, 11_003,
             ])),
             i64v(&[7, 7, 7, 8, 10, 10]),
-            i64v(&[2001, 2000, 2001, 2001, 2001, 2001]),
+            i64v(&[1999, 1998, 1999, 1999, 1999, 1999]),
         ],
     )
     .unwrap()
@@ -1104,13 +1101,13 @@ async fn q72_shape_two_sharded_plans_distributed() {
         );
     }
     // Every WHERE conjunct is accounted for — scan filter or step residual, none dropped:
-    // cd_marital_status = 'M', hd_buy_potential = '1001-5000', d1.d_year = 2001 (folded scan
+    // cd_marital_status = 'D', hd_buy_potential = '>10000', d1.d_year = 1999 (folded scan
     // filters), the d_week_seq equality (d2's fold key), the quantity comparison and the
     // ship-date comparison (stage WHERE residuals).
     for frag in [
-        "cd_marital_status = 'M'",
-        "hd_buy_potential = '1001-5000'",
-        "d1.d_year = 2001",
+        "cd_marital_status = 'D'",
+        "hd_buy_potential = '>10000'",
+        "d1.d_year = 1999",
         "d1.d_week_seq = d2.d_week_seq",
         "r.inventory__inv_quantity_on_hand < l.catalog_sales__cs_quantity",
         "d3.d_date",
