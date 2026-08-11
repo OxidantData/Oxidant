@@ -12,7 +12,24 @@ use oxidant_loom::Engine;
 use oxidant_observability::{AppStateStore, ExecutionEvent};
 use oxidant_proto::spark::connect as sc;
 use sc::spark_connect_service_client::SparkConnectServiceClient;
+use tokio::sync::broadcast;
 use tonic::transport::Channel;
+
+/// Drain a store subscription without treating broadcast lag as end-of-stream.
+/// With the Spark-aligned shuffle floor (200), TaskStarted/Finished can outrun a
+/// small buffer; Lagged must not hide earlier StageStarted events we still care about.
+fn drain_events(rx: &mut broadcast::Receiver<ExecutionEvent>) -> Vec<ExecutionEvent> {
+    let mut out = Vec::new();
+    loop {
+        match rx.try_recv() {
+            Ok(e) => out.push(e),
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    out
+}
 
 // Keep clear of oxidant-execution distributed_* tests (50571–50634 range).
 const PORT: u16 = 50870;
@@ -161,7 +178,7 @@ async fn distributed_groupby_via_dataframe_relation_tree() {
     assert_eq!(got_rows, expected_rows);
 
     let mut worker_stage_tasks = 0i32;
-    while let Ok(event) = rx.try_recv() {
+    for event in drain_events(&mut rx) {
         if let ExecutionEvent::StageStarted {
             num_tasks,
             operation_id,

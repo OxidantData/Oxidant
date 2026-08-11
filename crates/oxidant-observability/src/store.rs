@@ -141,7 +141,7 @@ impl AppStateStore {
         event_log_dir: Option<PathBuf>,
         max_queries: usize,
     ) -> Self {
-        let (tx, _) = broadcast::channel(256);
+        let (tx, _) = broadcast::channel(8192);
         Self {
             app_id: app_id.into(),
             app_name: app_name.into(),
