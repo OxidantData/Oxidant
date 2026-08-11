@@ -126,6 +126,26 @@ def rewrite_tpch_q11(body: str) -> str:
     raise SystemExit(f"TPC-H Q11: could not rewrite SF fraction:\n{body}")
 
 
+# dsqgen QUALIFY still samples AGG_FIELD from text{SR_RETURN_AMT, SR_FEE, …}.
+# Pin the Spark SQL Perf / prior-harness column so answer sets stay stable.
+_Q1_AGG_RE = re.compile(
+    r"sum\(\s*(?:"
+    r"SR_RETURN_AMT|SR_FEE|SR_REFUNDED_CASH|SR_RETURN_AMT_INC_TAX|"
+    r"SR_REVERSED_CHARGE|SR_STORE_CREDIT|SR_RETURN_TAX"
+    r")\s*\)",
+    re.IGNORECASE,
+)
+
+
+def rewrite_tpcds_q1(body: str) -> str:
+    body2, count = _Q1_AGG_RE.subn("sum(sr_return_amt)", body, count=1)
+    if count != 1:
+        raise SystemExit(
+            f"TPC-DS Q1: expected one AGG_FIELD sum(...); got {count}:\n{body}"
+        )
+    return body2
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", choices=("tpch", "tpcds"), required=True)
@@ -144,6 +164,8 @@ def main() -> None:
         body = rewrite_tpch_q11(body)
     if args.suite == "tpch" and args.num == 15:
         body = rewrite_tpch_q15(body)
+    if args.suite == "tpcds" and args.num == 1:
+        body = rewrite_tpcds_q1(body)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     header = (
