@@ -3112,6 +3112,14 @@ impl Engine {
             let state = datafusion::execution::session_state::SessionStateBuilder::new()
                 .with_config(config)
                 .with_runtime_env(env)
+                // `SparkSubstrPlanner` MUST precede the default expr planners:
+                // `with_default_features` *extends* this list with the defaults, and the SQL
+                // planner consults expr planners in order — the default planner always claims
+                // `plan_substring`, so a substring planner appended later (e.g. via
+                // `register_expr_planner`) would never run. See `spark_functions::spark_substr`.
+                .with_expr_planners(vec![Arc::new(
+                    spark_functions::spark_substr::SparkSubstrPlanner,
+                )])
                 .with_default_features()
                 .with_physical_optimizer_rules(physical_optimizer_rules())
                 .build();
