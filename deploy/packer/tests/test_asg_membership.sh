@@ -154,6 +154,12 @@ mock_aws_over() {
 mock_aws_over
 export OXIDANT_BOOTSTRAP_WAIT_SECS=2 OXIDANT_BOOTSTRAP_POLL_SECS=1
 assert_fail "over-subscribed ASG fails closed (exact WorkerCount)" wait_for_worker_private_ips my-workers 2
+assert_fail "wait_for_workers also exact (shard index)" wait_for_workers my-workers 2
+
+mock_aws_full
+export OXIDANT_BOOTSTRAP_WAIT_SECS=30 OXIDANT_BOOTSTRAP_POLL_SECS=1
+got="$(wait_for_workers my-workers 2 | tr '\n' ' ' | sed 's/ *$//')"
+assert_eq "wait_for_workers returns exact peer ids" "${got}" "i-aaa i-bbb"
 
 # Guard: driver membership must not wait on / pin Route53 DNS.
 if grep -q 'wait_for_worker_dns' "${BOOTSTRAP}"; then

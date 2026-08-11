@@ -9651,7 +9651,7 @@ mod tests {
         std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "200");
         std::env::set_var(
             "OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES",
-            &(64 * 1024 * 1024).to_string(),
+            (64 * 1024 * 1024).to_string(),
         );
         let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
         const LEFT: i64 = 9_000_000;
@@ -9706,7 +9706,7 @@ mod tests {
         std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "200");
         std::env::set_var(
             "OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES",
-            &(10 * 1024 * 1024).to_string(),
+            (10 * 1024 * 1024).to_string(),
         );
         // 40 Gi pool × 0.25 = 10 Gi, but Spark SHJ cap is 10 MiB × 200 / 2 = 1000 MiB.
         let engine = Engine::new_with_memory_limit(40 * 1024 * 1024 * 1024);
@@ -9727,7 +9727,7 @@ mod tests {
         std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "200");
         std::env::set_var(
             "OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES",
-            &(10 * 1024 * 1024).to_string(),
+            (10 * 1024 * 1024).to_string(),
         );
         // Modest pool so the test stays light; spark cap (1 Gi) is the binding constraint.
         let engine = Engine::new_with_memory_limit(8 * 1024 * 1024 * 1024);

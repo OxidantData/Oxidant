@@ -142,25 +142,28 @@ mount_spill_volume() {
 wait_for_workers() {
   local asg="$1"
   local expected="$2"
-  local deadline=$((SECONDS + 240))
-  local ids=""
+  # Match wait_for_worker_private_ips: exact WorkerCount only. During ASG refresh
+  # InService can briefly exceed expected; assigning SHARD_INDEX from that set can
+  # yield index >= WORKER_COUNT (duplicate scans / silent under-coverage).
+  local wait_secs="${OXIDANT_BOOTSTRAP_WAIT_SECS:-240}"
+  local deadline=$((SECONDS + wait_secs))
+  local ids="" count=0
   while (( SECONDS < deadline )); do
     ids="$("${AWS_BIN}" autoscaling describe-auto-scaling-groups \
       --region "${REGION}" \
       --auto-scaling-group-names "${asg}" \
       --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
-      --output text 2>/dev/null | tr '\t' '\n' | sort)"
-    local count
+      --output text 2>/dev/null | tr '\t' '\n' | sort -u)"
     count="$(printf '%s\n' "${ids}" | grep -c . || true)"
-    if [[ "${count}" -ge "${expected}" ]]; then
+    if [[ "${count}" -eq "${expected}" ]]; then
       printf '%s\n' "${ids}"
       return 0
     fi
-    log "waiting for ${expected} InService workers in ${asg} (have ${count})"
-    sleep 5
+    log "waiting for exactly ${expected} InService workers in ${asg} (have ${count})"
+    sleep "${OXIDANT_BOOTSTRAP_POLL_SECS:-5}"
   done
-  # Best-effort: return whatever we have so the instance still starts.
-  printf '%s\n' "${ids}"
+  log "ERROR: timed out waiting for ${expected} InService workers in ${asg} (have ${count})"
+  return 1
 }
 
 # Spark EMR / YARN-style membership: the control plane learns executor private IPs
@@ -199,13 +202,13 @@ wait_for_worker_private_ips() {
         ips+="${ip}"$'\n'
       fi
     done <<< "${ids}"
-    count="$(printf '%s' "${ips}" | grep -c . || true)"
+    count="$(printf '%s\n' "${ips}" | sort -u | grep -c . || true)"
     # Exact match only — during ASG instance refresh InService can briefly exceed
     # WorkerCount; pinning that set makes driver fan-out ≠ OXIDANT_WORKER_COUNT and
     # fail closed ("silently drop data"). Wait for a settled membership.
     if [[ "${count}" -eq "${expected}" ]]; then
       log "ASG ${asg}: ${count}/${expected} worker private IPs ready"
-      printf '%s' "${ips}" | sort -u
+      printf '%s\n' "${ips}" | sort -u
       return 0
     fi
     log "waiting for exactly ${expected} worker private IPs from ASG ${asg} (have ${count})"
@@ -518,21 +521,13 @@ oxidant_bootstrap_main() {
       log "ERROR: oxidant:worker-asg tag missing; cannot assign shard index"
       return 1
     fi
-    mapfile -t PEER_IDS < <(wait_for_workers "${WORKER_ASG}" "${WORKER_COUNT}")
-    # Ensure self is in the list even if not yet InService.
-    if ! printf '%s\n' "${PEER_IDS[@]}" | grep -qx "${INSTANCE_ID}"; then
-      PEER_IDS+=("${INSTANCE_ID}")
-    fi
+    mapfile -t PEER_IDS < <(wait_for_workers "${WORKER_ASG}" "${WORKER_COUNT}") || return 1
     IFS=$'\n' PEER_IDS=($(printf '%s\n' "${PEER_IDS[@]}" | sort -u))
-    # Loud-fail on an incomplete peer list: assigning a shard index from fewer than
-    # WORKER_COUNT peers silently duplicates an index on another worker (the doomed
-    # shard is then read by NOBODY — wrong query results, no error). Note this cannot
-    # cover the instance-refresh transitional case (an early replacement legitimately
-    # sees a full list that still contains a doomed old worker and takes its slot);
-    # that one self-heals via oxidant-shard-resolve.timer re-resolving against settled
-    # membership.
-    if (( ${#PEER_IDS[@]} < WORKER_COUNT )); then
-      log "ERROR: only ${#PEER_IDS[@]} of ${WORKER_COUNT} worker peers visible; refusing to assign a shard index from an incomplete list"
+    # Exact peer set only (same contract as driver OXIDANT_WORKERS). Do not inject
+    # self when not yet InService — that overshoots WorkerCount and can assign
+    # SHARD_INDEX >= WORKER_COUNT. Cold start waits until ASG flips us InService.
+    if (( ${#PEER_IDS[@]} != WORKER_COUNT )); then
+      log "ERROR: peer list size ${#PEER_IDS[@]} != WORKER_COUNT=${WORKER_COUNT}; refusing shard assignment"
       return 1
     fi
     SHARD_INDEX=-1
@@ -543,7 +538,11 @@ oxidant_bootstrap_main() {
       fi
     done
     if (( SHARD_INDEX < 0 )); then
-      log "ERROR: could not determine shard index for ${INSTANCE_ID}"
+      log "ERROR: ${INSTANCE_ID} not in settled InService peer list; refusing shard assignment"
+      return 1
+    fi
+    if (( SHARD_INDEX >= WORKER_COUNT )); then
+      log "ERROR: SHARD_INDEX=${SHARD_INDEX} >= WORKER_COUNT=${WORKER_COUNT}"
       return 1
     fi
     log "assigned OXIDANT_SHARD_INDEX=${SHARD_INDEX} (of ${WORKER_COUNT})"

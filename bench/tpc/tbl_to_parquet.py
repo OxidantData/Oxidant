@@ -308,19 +308,38 @@ def _tpch_sources(raw: Path, name: str) -> list[Path]:
     return []
 
 
-def convert_tpch(raw: Path, out: Path, row_group: int, target_part_bytes: int) -> None:
+def convert_tpch(
+    raw: Path,
+    out: Path,
+    row_group: int,
+    target_part_bytes: int,
+    *,
+    force: bool = False,
+) -> None:
     for name, schema in TPCH_SCHEMAS.items():
         sources = _tpch_sources(raw, name)
         if not sources:
             raise SystemExit(f"missing {raw / (name + '.tbl')} (and no .tbl.N parts)")
         dest = out / name
         existing = sorted(dest.glob("part-*.parquet"))
-        if existing and all(p.stat().st_size > 0 for p in existing):
+        if existing and all(p.stat().st_size > 0 for p in existing) and not force:
             print(f"[parquet] skip {name} ({len(existing)} parts exist)")
             continue
+        if force and dest.exists():
+            import shutil
+
+            shutil.rmtree(dest)
         part = 0
+        wrote = False
         for src in sources:
+            if src.stat().st_size == 0:
+                # Parallel dbgen children can emit empty part files for sparse tables.
+                print(f"[parquet] skip empty {src.name}")
+                continue
             part = _convert_one(src, dest, schema, row_group, target_part_bytes, start_part=part)
+            wrote = True
+        if not wrote:
+            raise SystemExit(f"no non-empty sources for table {name} under {raw}")
 
 
 _TPCDS_PART_RE = re.compile(r"^(.+)_(\d+)_(\d+)\.dat$")
@@ -389,8 +408,17 @@ def convert_tpcds(
 
             shutil.rmtree(dest)
         part = 0
+        wrote = False
         for src in sources:
+            if src.stat().st_size == 0:
+                # Parallel dsdgen children can emit empty CHILD parts; aborting
+                # mid-table leaves a partial Parquet dir and breaks --force restarts.
+                print(f"[parquet] skip empty {src.name}")
+                continue
             part = _convert_one(src, dest, schema, row_group, target_part_bytes, start_part=part)
+            wrote = True
+        if not wrote:
+            raise SystemExit(f"no non-empty sources for table {name} under {raw}")
 
 
 def main() -> None:
@@ -419,7 +447,13 @@ def main() -> None:
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     if args.suite == "tpch":
-        convert_tpch(args.raw, args.out, args.row_group, args.target_part_bytes)
+        convert_tpch(
+            args.raw,
+            args.out,
+            args.row_group,
+            args.target_part_bytes,
+            force=args.force,
+        )
     else:
         only = {t.strip() for t in args.only.split(",") if t.strip()} or None
         convert_tpcds(
