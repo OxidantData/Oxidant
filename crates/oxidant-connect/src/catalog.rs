@@ -145,6 +145,16 @@ pub async fn handle_catalog(
                 table_exists(engine, registry, &t.table_name, t.db_name.as_deref()).await?;
             Ok(scalar_bool(exists))
         }
+        CatType::RefreshTable(r) => {
+            // Evict the bridge's cached provider for the table + bump the catalog version so
+            // cached stage plans rebuild. Driver-side only: worker processes converge via the
+            // catalog cache TTL (`OXIDANT_CATALOG_CACHE_TTL_MS`) — see `Engine::refresh_table`.
+            engine
+                .refresh_table(&r.table_name)
+                .await
+                .map_err(err_to_status)?;
+            Ok(empty_result())
+        }
         CatType::DatabaseExists(d) => {
             let exists = database_exists(engine, registry, &d.db_name).await?;
             Ok(scalar_bool(exists))
@@ -463,6 +473,7 @@ fn cat_op_name(ct: &sc::catalog::CatType) -> &'static str {
     match ct {
         CreateTable(_) | CreateExternalTable(_) => "createTable",
         DropTable(_) => "dropTable",
+        RefreshTable(_) => "refreshTable",
         CreateDatabase(_) => "createDatabase",
         DropDatabase(_) => "dropDatabase",
         ListColumns(_) => "listColumns",
@@ -524,10 +535,20 @@ mod tests {
     }
 
     fn parquet_dir() -> std::path::PathBuf {
+        parquet_dir_with_rows(3)
+    }
+
+    /// Write a one-column (`x: Int64`) parquet file with `n` rows into a fresh temp dir.
+    fn parquet_dir_with_rows(n: usize) -> std::path::PathBuf {
         use oxidant_loom::arrow::array::Int64Array;
+        // Tests run as threads in ONE process (same pid) and start in parallel — pid+nanos
+        // alone collided in practice (one test's cleanup removed another's dir), so a
+        // process-unique counter disambiguates.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "oxidant-conn-cat-{}-{}",
+            "oxidant-conn-cat-{}-{}-{}",
             std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -537,7 +558,7 @@ mod tests {
         let schema = Arc::new(Sch::new(vec![F::new("x", Dt::Int64, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            vec![Arc::new(Int64Array::from_iter(0..n as i64))],
         )
         .unwrap();
         let f = std::fs::File::create(dir.join("part-0.parquet")).unwrap();
@@ -647,6 +668,171 @@ mod tests {
             .value(0);
         assert_eq!(c, 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake catalog whose `sales.orders` location can be swapped between resolutions — the
+    /// `refreshTable` lever (changed metastore metadata must become visible after a refresh).
+    struct MutableFakeCat {
+        location: std::sync::Mutex<String>,
+    }
+
+    #[async_trait]
+    impl OxidantCat for MutableFakeCat {
+        fn name(&self) -> &str {
+            "prod"
+        }
+        async fn list_namespaces(&self, parent: &[String]) -> CatRes<Vec<Vec<String>>> {
+            if parent.is_empty() {
+                Ok(vec![vec!["sales".to_string()]])
+            } else {
+                Ok(vec![])
+            }
+        }
+        async fn list_tables(&self, ns: &[String]) -> CatRes<Vec<String>> {
+            if ns == ["sales"] {
+                Ok(vec!["orders".to_string()])
+            } else {
+                Ok(vec![])
+            }
+        }
+        async fn load_table(&self, ns: &[String], t: &str) -> CatRes<TableMetadata> {
+            if ns == ["sales"] && t == "orders" {
+                Ok(TableMetadata::new(
+                    "prod.sales.orders",
+                    self.location.lock().unwrap().clone(),
+                    TableFormat::Parquet,
+                ))
+            } else {
+                Err(CatErr::Plan(format!("no such table {t}")))
+            }
+        }
+    }
+
+    async fn count_orders(engine: &Engine) -> i64 {
+        let batches = engine
+            .sql("SELECT COUNT(*) AS c FROM prod.sales.orders")
+            .await
+            .unwrap();
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    /// `spark.catalog.refreshTable`: evicts the bridge's cached provider so the next query
+    /// re-resolves the table from the metastore — a changed location/schema is picked up
+    /// without an engine restart. Both the bare-name (session current catalog+namespace) and
+    /// the fully-qualified forms are exercised.
+    #[tokio::test]
+    async fn refresh_table_picks_up_changed_metadata() {
+        use sc::catalog::CatType;
+        let dir = parquet_dir_with_rows(3);
+        let dir2 = parquet_dir_with_rows(5);
+        let mutable = Arc::new(MutableFakeCat {
+            location: std::sync::Mutex::new(format!("file://{}", dir.to_string_lossy())),
+        });
+        let provider: Arc<dyn OxidantCat> = mutable.clone();
+        let engine = Engine::new();
+        let registry = CatalogRegistry::new();
+        engine.register_catalog("prod", provider.clone());
+        registry.register("prod", provider);
+        engine.set_current_catalog("prod").await.unwrap();
+        engine.set_current_namespace("sales").await.unwrap();
+
+        // First query resolves + caches the provider (3-row location).
+        assert_eq!(count_orders(&engine).await, 3);
+
+        // The metastore moves underneath (now 5 rows); the cache still serves the old provider.
+        *mutable.location.lock().unwrap() = format!("file://{}", dir2.to_string_lossy());
+        assert_eq!(
+            count_orders(&engine).await,
+            3,
+            "within the cache TTL the stale provider is served"
+        );
+
+        // refreshTable (bare table name → session's current catalog + namespace) evicts it.
+        let b = handle_catalog(
+            &engine,
+            &registry,
+            &op(CatType::RefreshTable(sc::RefreshTable {
+                table_name: "orders".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(b[0].num_rows(), 0, "refreshTable is a side-effect-only op");
+        assert_eq!(
+            count_orders(&engine).await,
+            5,
+            "post-refresh sees the new location"
+        );
+
+        // The fully-qualified form works too (swap back to the 3-row location).
+        *mutable.location.lock().unwrap() = format!("file://{}", dir.to_string_lossy());
+        handle_catalog(
+            &engine,
+            &registry,
+            &op(CatType::RefreshTable(sc::RefreshTable {
+                table_name: "prod.sales.orders".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count_orders(&engine).await, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// refreshTable edge case (KAN-84): external-catalog sessions seed an EMPTY namespace, so a
+    /// bare-name refresh has no `db` segment and no session namespace to key the bridge's schema
+    /// providers by. A naive `namespace.last()` guard would silently no-op; instead the eviction
+    /// falls back to a bare-name sweep of the current external catalog's schema providers.
+    #[tokio::test]
+    async fn refresh_table_bare_name_with_empty_session_namespace() {
+        use sc::catalog::CatType;
+        let dir = parquet_dir_with_rows(3);
+        let dir2 = parquet_dir_with_rows(5);
+        let mutable = Arc::new(MutableFakeCat {
+            location: std::sync::Mutex::new(format!("file://{}", dir.to_string_lossy())),
+        });
+        let provider: Arc<dyn OxidantCat> = mutable.clone();
+        let engine = Engine::new();
+        let registry = CatalogRegistry::new();
+        engine.register_catalog("prod", provider.clone());
+        registry.register("prod", provider);
+        // USE CATALOG prod — and nothing else: the session namespace stays EMPTY (KAN-84).
+        engine.set_current_catalog("prod").await.unwrap();
+        assert!(
+            engine.current_catalog_and_namespace().1.is_empty(),
+            "external-catalog session seeds an empty namespace"
+        );
+
+        // Resolve + cache the provider via a fully-qualified query (3-row location).
+        assert_eq!(count_orders(&engine).await, 3);
+
+        // The metastore moves; the bare-name refresh must still evict despite the empty
+        // session namespace.
+        *mutable.location.lock().unwrap() = format!("file://{}", dir2.to_string_lossy());
+        handle_catalog(
+            &engine,
+            &registry,
+            &op(CatType::RefreshTable(sc::RefreshTable {
+                table_name: "orders".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count_orders(&engine).await,
+            5,
+            "bare-name refresh evicts even with an empty session namespace"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     fn bool_at(b: &RecordBatch) -> bool {

@@ -79,7 +79,10 @@ then wire its `type` string into `oxidant-connect`'s `build_provider` factory
 
 - **Works:** three-part-qualified queries (`cat.db.tbl`) and `spark.read.table("cat.db.tbl")`
   resolve lazily; `spark.catalog.listCatalogs/listDatabases/listTables/tableExists/databaseExists`
-  and `currentCatalog`/`setCurrentCatalog`/`currentDatabase`/`setCurrentDatabase`; Hive/Glue tables in
+  and `currentCatalog`/`setCurrentCatalog`/`currentDatabase`/`setCurrentDatabase`;
+  `refreshTable` (evicts the driver-side cached table provider and invalidates cached stage
+  plans — workers converge via `OXIDANT_CATALOG_CACHE_TTL_MS`, see
+  [runtime-contract.md](runtime-contract.md)); Hive/Glue tables in
   Parquet, Delta, and Iceberg — on the local filesystem and over `s3://`. The metastore table's
   format is auto-detected from its parameters (`table_type=ICEBERG`, `classification=delta`,
   `spark.sql.sources.provider`, …); Delta is read via delta-kernel and Iceberg via its
