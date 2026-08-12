@@ -514,7 +514,7 @@ fn cse_merge_pass(stages: &mut Vec<StageDef>) -> bool {
 /// positive only forgoes the merge, while the functions DataFusion marks volatile unparse to
 /// exactly these spellings. SQL-level CSE cannot resolve UDF signatures the way the plan-level
 /// [`super::dag_splitter::plan_contains_volatile`] can, so planner-emitted SQL is the scope.
-fn sql_contains_volatile(sql: &str) -> bool {
+pub(crate) fn sql_contains_volatile(sql: &str) -> bool {
     const VOLATILE: [&str; 8] = [
         "rand(",
         "random(",

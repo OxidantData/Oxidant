@@ -27,6 +27,19 @@ EMR core nodes are half the size of Oxidant's workers (m8g.8xlarge was blocked b
 account vCPU quota on the EMR path). Oxidant's totals were achieved with **2× the
 worker hardware** — see "Performance findings".
 
+## Methodology caveat (2026-08-12, KAN-146)
+
+The Oxidant per-query numbers below are single-pass timings with **uncontrolled S3
+disk-cache state** on the workers (20 GiB/worker at `/var/lib/oxidant/s3cache`).
+KAN-146 forensics measured a ~50× cold/warm swing on fact-scan-heavy queries (e.g. Q26
+cold 56.4s vs warm 1.1s on the SAME binary), so individual Oxidant rows — both wins and
+apparent regressions — carry that much noise unless the cache state is stated. Totals
+are less distorted (a sequential 99-query pass mixes cold and warm states), but
+per-query A/B conclusions from this table alone are not reliable. The cache-controlled
+re-measurement (v0.1.8, cold + warm passes) supersedes this table once landed; the
+discipline (pre-warm both arms or hot-of-N, flags on the side that consumes them) is
+tracked in KAN-154.
+
 ## Per-query results
 
 | Query | Oxidant (s) | EMR Spark (s) | Athena (s) |

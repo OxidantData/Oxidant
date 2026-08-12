@@ -29,6 +29,18 @@
 //! ON-clause residuals. Shapes where that fold is unsafe (a `Filter` still parked above the
 //! chain, a non-INNER/LEFT trailing join, a boundary that null-extends, or a reference the
 //! stage's FROM cannot bind) keep the historical rejection instead of planning wrong.
+//!
+//! ## Semi-join runtime filters (KAN-150)
+//!
+//! A fold alone filters fact rows only AFTER the shuffle: the leaf scan stages ship every
+//! row. So an INNER equijoin to a *filtered* replicated dim additionally injects an
+//! `<key> IN (SELECT <dim key> FROM <dim> WHERE <dim filters>)` conjunct into the leaf
+//! scan's stage SQL ([`semi_join_leaf_filters`]) — a runtime/semi-join filter crossing the
+//! stage boundary as SQL. The conjunct only removes rows the INNER join itself would drop
+//! (skipped entirely when the boundary preserves the leaf's side, when the dim is
+//! unfiltered, or when its filter is volatile), and on the worker the subquery re-plans to
+//! a hash semi join whose DataFusion dynamic filter prunes the fact's parquet scan — fact
+//! reduction BEFORE the shuffle write, Trino-style.
 
 use std::collections::HashMap;
 
@@ -39,7 +51,8 @@ use oxidant_common::{Error, Result};
 use super::stage_planner::{
     base_tables, build_finalize, build_remap, collect_equijoin_keys, column_name,
     distinct_stage_sql, expr_sql, recombine_stage_sql, sanitize_generated_sql,
-    shuffle_join_two_tables, simple_table_scan, AggSpec, DistributedQuery, Peeled, SimpleScan,
+    shuffle_join_two_tables, simple_table_scan, sql_contains_volatile, AggSpec, DistributedQuery,
+    Peeled, SimpleScan,
 };
 use crate::driver::StageDef;
 
@@ -401,6 +414,130 @@ pub(crate) fn flatten_join_residual(
         .unwrap_or(e.clone())
 }
 
+/// KAN-150 semi-join runtime filters (Trino-style dynamic filtering across stage
+/// boundaries), **on by default** (`OXIDANT_SEMI_JOIN_FILTERS=0` to disable): INNER
+/// equijoins to a *filtered replicated* dimension inject an `IN (SELECT <dim key> FROM <dim>
+/// WHERE <dim filters>)` conjunct into the sharded leaf's scan-stage SQL, so the dim's key
+/// set filters fact rows BEFORE the shuffle write. Exactness: the join is INNER, so a leaf
+/// row whose key matches no (filtered) dim row can never contribute to the output — the
+/// conjunct only removes rows the join itself would drop, and the join still runs unaltered
+/// downstream (row multiplicity and dim columns are unaffected). On the worker the
+/// re-planned subquery becomes a hash semi join building on the replicated dim whose
+/// DataFusion dynamic filter reaches the fact's parquet scan (row-group / page-index
+/// pruning) — the single-node KAN-2 R2 machinery, re-materialized across the stage
+/// boundary as SQL.
+pub fn semi_join_filters_enabled() -> bool {
+    std::env::var("OXIDANT_SEMI_JOIN_FILTERS")
+        .ok()
+        .as_deref()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
+/// Semi-join filter conjuncts to splice into a chain's leaf scan stages: `leftmost` for the
+/// chain's leftmost scan, `by_step[i]` for step `i`'s (sharded) right scan.
+#[derive(Default)]
+struct SemiJoinLeafFilters {
+    leftmost: Vec<String>,
+    by_step: HashMap<usize, Vec<String>>,
+}
+
+/// Compute the semi-join leaf filters for a shuffle-join chain (KAN-150). A step
+/// contributes conjuncts only when the injection is provably exact and useful:
+///
+/// - the step is an INNER equijoin to a **replicated** dim (present in full on every
+///   worker, so the leaf stage's IN-subquery resolves there);
+/// - the dim scan is **filtered** (`filter_sql`) — an unfiltered FK→PK dim admits ~every
+///   fact key, so the subquery would be pure overhead (KAN-146: provable admission only);
+/// - the dim filter is non-volatile (the subquery evaluates it a second time in the leaf
+///   stage — a duplicated `rand()`/`now()` could disagree with the join-stage fold);
+/// - when the chain-side key resolves to a sharded step's right leaf, that boundary's join
+///   must not PRESERVE the leaf's side (INNER or LEFT — a RIGHT/FULL boundary emits dim-
+///   key-less leaf rows with NULL extension, which the filter would wrongly drop). The
+///   leftmost leaf needs no such guard: its rows traverse every downstream step linearly,
+///   and the INNER dim step drops non-matching rows whatever the intermediate join types.
+///
+/// Anything unexpected (non-column keys, keys on replicated-only relations, …) skips that
+/// step silently — injection is an optimization, never a planning failure.
+fn semi_join_leaf_filters(
+    leftmost: &SimpleScan<'_>,
+    steps: &[ChainStep<'_>],
+    sharded: &[&str],
+    replicated: &[&str],
+) -> SemiJoinLeafFilters {
+    let mut out = SemiJoinLeafFilters::default();
+    if !semi_join_filters_enabled() {
+        return out;
+    }
+    for (j, step) in steps.iter().enumerate() {
+        if step.join_type != JoinType::Inner
+            || sharded.contains(&step.right.table)
+            || !replicated.contains(&step.right.table)
+        {
+            continue;
+        }
+        let Some(dim_filter) = &step.right.filter_sql else {
+            continue;
+        };
+        if sql_contains_volatile(dim_filter) {
+            continue;
+        }
+        let dim_alias = scan_alias(&step.right);
+        for (lk, rk) in &step.keys {
+            let Ok((chain_key, dim_col)) = orient_fold_key(lk, rk, step) else {
+                continue;
+            };
+            let (Ok(rel), Ok(leaf_col)) = (relation_of(chain_key), column_name(chain_key)) else {
+                continue;
+            };
+            let conjunct = format!(
+                "{leaf_col} IN (SELECT {dim_col} FROM {} AS {dim_alias} WHERE {dim_filter})",
+                step.right.table_sql
+            );
+            // The leaf this conjunct filters: the leftmost scan, or the sharded right
+            // leaf of an earlier step whose boundary join does not preserve it.
+            let target = if rel == leftmost.table || rel == scan_alias(leftmost) {
+                Some(&mut out.leftmost)
+            } else {
+                (0..j)
+                    .find(|&i| {
+                        let s = &steps[i];
+                        sharded.contains(&s.right.table)
+                            && (rel == s.right.table || rel == scan_alias(&s.right))
+                            && matches!(s.join_type, JoinType::Inner | JoinType::Left)
+                    })
+                    .map(|i| out.by_step.entry(i).or_default())
+            };
+            if let Some(list) = target {
+                if !list.contains(&conjunct) {
+                    list.push(conjunct);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [`leaf_stage_sql`] with extra semi-join filter conjuncts ANDed into the leaf's WHERE.
+fn leaf_stage_sql_with_semis(scan: &SimpleScan<'_>, semis: &[String]) -> (String, Vec<String>) {
+    if semis.is_empty() {
+        return leaf_stage_sql(scan);
+    }
+    let extra = format!("({})", semis.join(") AND ("));
+    let filter_sql = Some(match &scan.filter_sql {
+        Some(prev) => format!("({prev}) AND {extra}"),
+        None => extra,
+    });
+    let narrowed = SimpleScan {
+        table: scan.table,
+        table_sql: scan.table_sql.clone(),
+        alias: scan.alias,
+        filter_sql,
+        schema: scan.schema.clone(),
+    };
+    leaf_stage_sql(&narrowed)
+}
+
 fn build_chain(
     p: &Peeled<'_>,
     sharded: &[&str],
@@ -424,6 +561,12 @@ fn build_chain(
     let mut left_side = LeftSide::Leaf;
     let mut left_flats: Vec<String> = Vec::new();
     let mut pending_bcast: Vec<usize> = Vec::new(); // indices into steps
+
+    // KAN-150: semi-join runtime filters — filtered replicated dims inner-joining the
+    // chain inject an IN-subquery key filter into the sharded leaf scan stages they key
+    // on, pruning fact rows before the shuffle write (worker-side, the subquery re-plans
+    // to a hash semi join whose dynamic filter prunes the fact's parquet scan).
+    let semis = semi_join_leaf_filters(&leftmost, steps, sharded, replicated);
 
     let n = steps.len();
     for i in 0..n {
@@ -460,7 +603,7 @@ fn build_chain(
         }
         let left_stage_id = match &left_side {
             LeftSide::Leaf => {
-                let (sql, flats) = leaf_stage_sql(&leftmost);
+                let (sql, flats) = leaf_stage_sql_with_semis(&leftmost, &semis.leftmost);
                 let mut key_idxs = Vec::with_capacity(left_key_metas.len());
                 for (alias, name) in &left_key_metas {
                     key_idxs.push(flat_key_index(&flats, alias, name)?);
@@ -479,7 +622,10 @@ fn build_chain(
             }
         };
 
-        let (right_sql, right_flats) = leaf_stage_sql(&step.right);
+        let (right_sql, right_flats) = leaf_stage_sql_with_semis(
+            &step.right,
+            semis.by_step.get(&i).map_or(&[], Vec::as_slice),
+        );
         let mut right_key_idxs = Vec::with_capacity(right_key_names.len());
         for name in &right_key_names {
             right_key_idxs.push(flat_key_index(&right_flats, &right_alias, name)?);
@@ -1657,5 +1803,168 @@ mod tests {
         let (lp, dq) = chain_plan(CHAIN4, &TABLES4).await;
         let rows = measured(&dq, &[("ta", 100), ("tb", 100), ("tc", 5000)]);
         assert!(replan_chain_tail(&lp, &[], &dq.stages, &rows).is_none());
+    }
+
+    // --- KAN-150: semi-join runtime filters injected into leaf scan stages ----------------
+
+    /// Serializes the tests that mutate `OXIDANT_SEMI_JOIN_FILTERS` (process-global env).
+    static SEMI_FILTER_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// [`chain_plan`] with distinct sharded / replicated sets: the sharded facts get
+    /// `(k, g)` columns, every replicated dim gets `(k, d)` so a scan filter has something
+    /// to reference. Dim filters ride a derived table (`JOIN (SELECT … WHERE …) AS …`) so
+    /// the scan's `filter_sql` is structural, not optimizer-dependent.
+    async fn chain_plan_mixed(
+        sql: &str,
+        sharded: &[&str],
+        replicated: &[&str],
+    ) -> DistributedQuery {
+        let engine = oxidant_loom::Engine::new();
+        let int = DataType::Int64;
+        for t in sharded.iter().chain(replicated.iter()) {
+            let cols: &[(&str, DataType)] = if sharded.contains(t) {
+                &[("k", int.clone()), ("g", int.clone())]
+            } else {
+                &[("k", int.clone()), ("d", int.clone())]
+            };
+            let schema = Arc::new(Schema::new(
+                cols.iter()
+                    .map(|(n, t)| Field::new(*n, t.clone(), true))
+                    .collect::<Vec<_>>(),
+            ));
+            let batch = RecordBatch::try_new(
+                schema,
+                cols.iter()
+                    .map(|_| Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>)
+                    .collect(),
+            )
+            .unwrap();
+            engine.register_batches(t, vec![batch]).unwrap();
+        }
+        let lp = engine.logical_plan(sql).await.unwrap();
+        let p = super::super::stage_planner::peel(&lp).unwrap();
+        plan_shuffle_join_chain(&p, sharded, replicated)
+            .unwrap_or_else(|e| panic!("chain planning failed for {sql}: {e}"))
+    }
+
+    /// Star chain with a filtered replicated dim on the leftmost fact: the dim's key set
+    /// must filter the fact's leaf scan BEFORE the shuffle.
+    #[tokio::test]
+    async fn semi_filter_injected_into_leftmost_leaf_for_filtered_dim() {
+        let _env = SEMI_FILTER_ENV_LOCK.lock().await;
+        let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                   JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fa.k = dimf.k \
+                   JOIN fb ON fa.k = fb.k GROUP BY fa.g";
+        let dq = chain_plan_mixed(sql, &["fa", "fb"], &["dim"]).await;
+        let leaf = leaf_sql(&dq, "fa");
+        assert!(
+            leaf.contains("k IN (SELECT k FROM dim AS dimf WHERE (dim.d > 10))"),
+            "the filtered dim must inject a semi-join filter into the fa leaf, got:\n{leaf}"
+        );
+        // The untouched sharded leaf carries no filter.
+        assert!(
+            !leaf_sql(&dq, "fb").contains(" IN (SELECT"),
+            "fb joins no dim — its leaf must stay unfiltered"
+        );
+    }
+
+    /// A dim keying on a sharded RIGHT leaf injects into that leaf — but only when the
+    /// boundary consuming the leaf does not preserve it (INNER here; LEFT equally allowed).
+    #[tokio::test]
+    async fn semi_filter_injected_into_right_leaf_when_boundary_not_preserving() {
+        let _env = SEMI_FILTER_ENV_LOCK.lock().await;
+        let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                   JOIN fb ON fa.k = fb.k \
+                   JOIN fc ON fa.k = fc.k \
+                   JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fb.k = dimf.k \
+                   GROUP BY fa.g";
+        let dq = chain_plan_mixed(sql, &["fa", "fb", "fc"], &["dim"]).await;
+        assert!(
+            leaf_sql(&dq, "fb").contains("k IN (SELECT k FROM dim AS dimf WHERE (dim.d > 10))"),
+            "fb's leaf must carry the dim's semi-join filter, got:\n{}",
+            leaf_sql(&dq, "fb")
+        );
+        assert!(
+            !leaf_sql(&dq, "fa").contains(" IN (SELECT"),
+            "fa keys no dim — its leaf must stay unfiltered"
+        );
+    }
+
+    /// Exactness guard: when the boundary consuming the leaf PRESERVES the leaf's side
+    /// (RIGHT JOIN — unmatched fb rows must null-extend into the output whatever the dim
+    /// says), no filter may attach to that leaf.
+    #[tokio::test]
+    async fn semi_filter_absent_when_boundary_preserves_leaf() {
+        let _env = SEMI_FILTER_ENV_LOCK.lock().await;
+        let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                   RIGHT JOIN fb ON fa.k = fb.k \
+                   JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fb.g = dimf.k \
+                   JOIN fc ON fa.k = fc.k \
+                   GROUP BY fa.g";
+        let dq = chain_plan_mixed(sql, &["fa", "fb", "fc"], &["dim"]).await;
+        assert!(
+            !leaf_sql(&dq, "fb").contains(" IN (SELECT"),
+            "fb is preserved by the RIGHT boundary — its leaf must stay unfiltered, got:\n{}",
+            leaf_sql(&dq, "fb")
+        );
+    }
+
+    /// Admission guards (KAN-146 — provable selectivity only): an UNFILTERED dim injects
+    /// nothing, and neither does an outer (non-INNER) dim join.
+    #[tokio::test]
+    async fn semi_filter_absent_for_unfiltered_or_outer_dim() {
+        let _env = SEMI_FILTER_ENV_LOCK.lock().await;
+        let unfiltered = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                          JOIN dim ON fa.k = dim.k \
+                          JOIN fb ON fa.k = fb.k GROUP BY fa.g";
+        let dq = chain_plan_mixed(unfiltered, &["fa", "fb"], &["dim"]).await;
+        assert!(
+            !leaf_sql(&dq, "fa").contains(" IN (SELECT"),
+            "an unfiltered dim admits ~every fact key — no injection, got:\n{}",
+            leaf_sql(&dq, "fa")
+        );
+
+        let outer = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                     LEFT JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fa.k = dimf.k \
+                     JOIN fb ON fa.k = fb.k GROUP BY fa.g";
+        let dq = chain_plan_mixed(outer, &["fa", "fb"], &["dim"]).await;
+        assert!(
+            !leaf_sql(&dq, "fa").contains(" IN (SELECT"),
+            "a LEFT dim join null-extends non-matching facts — no injection, got:\n{}",
+            leaf_sql(&dq, "fa")
+        );
+    }
+
+    /// A volatile dim filter must never be duplicated into the leaf stage (the leaf's
+    /// second evaluation could disagree with the join-stage fold's).
+    #[tokio::test]
+    async fn semi_filter_absent_for_volatile_dim_filter() {
+        let _env = SEMI_FILTER_ENV_LOCK.lock().await;
+        let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                   JOIN (SELECT k FROM dim WHERE d > rand() * 10) AS dimf ON fa.k = dimf.k \
+                   JOIN fb ON fa.k = fb.k GROUP BY fa.g";
+        let dq = chain_plan_mixed(sql, &["fa", "fb"], &["dim"]).await;
+        assert!(
+            !leaf_sql(&dq, "fa").contains(" IN (SELECT"),
+            "a volatile dim filter must not be re-evaluated in the leaf, got:\n{}",
+            leaf_sql(&dq, "fa")
+        );
+    }
+
+    /// `OXIDANT_SEMI_JOIN_FILTERS=0` disables the injection (byte-identical legacy plan).
+    #[tokio::test]
+    async fn semi_filter_env_kill_switch() {
+        let _env = SEMI_FILTER_ENV_LOCK.lock().await;
+        let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                   JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fa.k = dimf.k \
+                   JOIN fb ON fa.k = fb.k GROUP BY fa.g";
+        std::env::set_var("OXIDANT_SEMI_JOIN_FILTERS", "0");
+        let dq = chain_plan_mixed(sql, &["fa", "fb"], &["dim"]).await;
+        std::env::remove_var("OXIDANT_SEMI_JOIN_FILTERS");
+        assert!(
+            !leaf_sql(&dq, "fa").contains(" IN (SELECT"),
+            "the kill switch must restore the unfiltered leaf, got:\n{}",
+            leaf_sql(&dq, "fa")
+        );
     }
 }

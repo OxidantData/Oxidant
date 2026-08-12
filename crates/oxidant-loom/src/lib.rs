@@ -12903,6 +12903,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&fact);
     }
 
+    /// KAN-150: the distributed semi-join leaf shape — a fact leaf stage whose SQL carries
+    /// an `IN (SELECT … FROM dim WHERE …)` filter injected by the stage planner (see
+    /// `oxidant_execution::plan::join_chain`) — re-planned on the worker must turn the
+    /// subquery into a hash SEMI join building on the DIM (never the fact) and push its
+    /// dynamic filter into the fact scan's predicate for row-group pruning, with exact
+    /// results. This is the worker-side half of the cross-stage runtime filter: the filter
+    /// crosses the shuffle boundary as SQL, and DataFusion's own machinery re-materializes
+    /// it against the probe-side scan.
+    #[tokio::test]
+    async fn semi_join_leaf_sql_pushes_dynamic_filter_into_fact_scan() {
+        let _env = DYN_FILTER_ENV_LOCK.lock().await;
+        let engine = Engine::new();
+        // 100k fact rows in 10 disjoint 10k-key row groups; the dim's filtered key set
+        // covers exactly the 50_000..60_000 group (the `v >= 0` conjunct keeps the dim
+        // scan *filtered* — the shape the stage planner injects).
+        let fact = write_sorted_kv_parquet_dir(100_000, 10_000);
+        register_catalog_parquet(&engine, "fact", &fact).await;
+        register_kv_dim(&engine, "dim", 50_000, 10_000);
+        // Emitted-leaf shape: flat projection + IN-subquery semi filter.
+        let query = "SELECT fact.k AS fact__k, fact.v AS fact__v FROM fact \
+                     WHERE fact.k IN (SELECT dim.k FROM dim WHERE dim.v >= 0)";
+        let plan = engine.physical_plan(query).await.unwrap();
+        let text = plan_tree_text(plan.as_ref());
+        assert!(
+            scan_predicate_has_dynamic_filter(plan.as_ref()),
+            "the semi join's dynamic filter must reach the fact scan's predicate, got:\n{text}"
+        );
+        // Execution: exactly the 10k overlapping rows survive, and the filter's bounds
+        // prune the fact row groups outside the dim's key range.
+        let batches = engine.execute_plan(plan.clone()).await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 10_000,
+            "the semi filter must keep exactly the overlap"
+        );
+        let (pruned, matched) = pruning_metric_sums(plan.as_ref(), "row_groups_pruned_statistics");
+        assert!(
+            pruned > 0,
+            "semi-join dynamic-filter bounds must prune fact row groups \
+             (pruned={pruned}, matched={matched}), plan:\n{}",
+            plan_tree_text(plan.as_ref())
+        );
+        let _ = std::fs::remove_dir_all(&fact);
+    }
+
     // ---- KAN-2: Q62 stage-0 wedge (multi-dim comma-join arm chain) ----
 
     /// Write `batches` as one-part-per-batch parquet files in a fresh temp dir.
