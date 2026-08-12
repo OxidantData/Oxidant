@@ -3807,6 +3807,16 @@ mod tests {
     use datafusion::common::stats::Precision;
     use datafusion::common::ScalarValue;
 
+    /// Serializes these tests against EVERY test in this binary that flips
+    /// `OXIDANT_PARQUET_SCAN_STATS` / `OXIDANT_PARQUET_COLUMN_STATS` (the kill-switch test
+    /// below, the KAN-8 cache tests here, and the lib.rs join-guard tests) — they all hold
+    /// `JOIN_GUARD_ENV_LOCK` while the flag is non-default, so a stats assertion only races
+    /// if it runs lock-FREE. Every test whose assertions depend on the flags' default state
+    /// must therefore hold the lock for its whole body, not just the mutators.
+    async fn stats_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::tests::JOIN_GUARD_ENV_LOCK.lock().await
+    }
+
     /// Write `batch` as a single parquet file in a fresh, process-unique temp dir; returns
     /// (dir, file path). Distinct dir per call (same pid+sequence pattern as
     /// `write_parquet_dir` — see its comment).
@@ -3880,6 +3890,7 @@ mod tests {
     /// estimator's NDV then falls back to the min/max range — the KAN-143 win).
     #[tokio::test]
     async fn footer_column_stats_attached_when_schema_matches() {
+        let _env = stats_env_lock().await;
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Int64, true),
@@ -3930,6 +3941,7 @@ mod tests {
     // NDVs stay `Absent` (parquet-rs writes none) rather than a wrong sum.
     #[tokio::test]
     async fn footer_column_stats_aggregate_across_files() {
+        let _env = stats_env_lock().await;
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Int64, true),
@@ -3972,6 +3984,7 @@ mod tests {
     /// NULL. Column stats must be dropped (row counts kept) at every level.
     #[tokio::test]
     async fn footer_column_stats_dropped_on_declared_case_mismatch() {
+        let _env = stats_env_lock().await;
         let physical = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             physical.clone(),
@@ -4053,6 +4066,7 @@ mod tests {
     /// num_rows` is the truth and the stats stay attached.
     #[tokio::test]
     async fn footer_column_stats_genuinely_absent_column_kept() {
+        let _env = stats_env_lock().await;
         let physical = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             physical.clone(),
@@ -4086,6 +4100,7 @@ mod tests {
     /// stay exact, and nothing panics.
     #[tokio::test]
     async fn footer_column_stats_row_group_less_file_does_not_poison_aggregate() {
+        let _env = stats_env_lock().await;
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Int64, true),
@@ -4121,6 +4136,7 @@ mod tests {
     /// along (right values at the right positions), and projected-away columns must vanish.
     #[tokio::test]
     async fn footer_column_stats_follow_projection() {
+        let _env = stats_env_lock().await;
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Int64, false),
@@ -4188,7 +4204,7 @@ mod tests {
     /// still disables footer reads entirely.
     #[tokio::test]
     async fn footer_column_stats_env_kill_switches() {
-        let _env = crate::tests::JOIN_GUARD_ENV_LOCK.lock().await;
+        let _env = stats_env_lock().await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
