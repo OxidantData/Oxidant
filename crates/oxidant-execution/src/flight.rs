@@ -1540,8 +1540,12 @@ impl FlightService for Worker {
                 let stage_id: u32 = body.trim().parse().map_err(|_| {
                     Status::invalid_argument("bucket_row_counts body must be a decimal stage id")
                 })?;
-                // Sum per-partition rows across every producer scope of the stage.
+                // Sum per-partition rows across every producer scope of the stage. `bytes`
+                // (KAN-145) rides the same probe: estimated memory footprint for cached
+                // buckets, real on-disk bytes for spilled ones — an additive response field,
+                // so older drivers parsing only `counts` stay wire-compatible.
                 let mut counts: Vec<usize> = Vec::new();
+                let mut bytes: Vec<u64> = Vec::new();
                 {
                     let guard = self.stage_outputs.lock().expect("stage cache poisoned");
                     for ((sid, _), (_, cache)) in guard.iter() {
@@ -1554,9 +1558,15 @@ impl FlightService for Worker {
                             }
                             counts[p] += rows;
                         }
+                        for (p, n) in cache.partition_byte_counts().into_iter().enumerate() {
+                            if bytes.len() <= p {
+                                bytes.resize(p + 1, 0);
+                            }
+                            bytes[p] += n;
+                        }
                     }
                 }
-                let body = serde_json::json!({ "counts": counts }).to_string();
+                let body = serde_json::json!({ "counts": counts, "bytes": bytes }).to_string();
                 Ok(action_response(body.into_bytes()))
             }
             ACTION_TASK_STATUS => {
@@ -1871,9 +1881,19 @@ pub async fn cancel_stage_on_worker(endpoint: String, stage_id: u32) -> Result<(
     .await
 }
 
-/// Per-partition row counts of a worker's cached output for `stage_id` — the driver's AQE
-/// sample of shuffle sizes without transferring the buckets themselves (KAN-32).
-pub async fn bucket_row_counts(endpoint: String, stage_id: u32) -> Result<Vec<usize>> {
+/// A worker's answer to the `bucket_row_counts` probe: per-partition row counts of its
+/// cached output for a stage, plus per-partition byte counts when the worker is new
+/// enough to report them (KAN-145 — `bytes` is `None` against a mixed-version cluster
+/// whose workers predate the additive response field).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BucketSample {
+    pub rows: Vec<usize>,
+    pub bytes: Option<Vec<u64>>,
+}
+
+/// Per-partition row/byte counts of a worker's cached output for `stage_id` — the driver's
+/// AQE sample of shuffle sizes without transferring the buckets themselves (KAN-32).
+pub async fn bucket_row_counts(endpoint: String, stage_id: u32) -> Result<BucketSample> {
     let bodies = do_action_collect(
         endpoint,
         ACTION_BUCKET_ROW_COUNTS,
@@ -1894,7 +1914,14 @@ pub async fn bucket_row_counts(endpoint: String, stage_id: u32) -> Result<Vec<us
                 .collect()
         })
         .unwrap_or_default();
-    Ok(counts)
+    let bytes = value
+        .get("bytes")
+        .and_then(|b| b.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect::<Vec<u64>>());
+    Ok(BucketSample {
+        rows: counts,
+        bytes,
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

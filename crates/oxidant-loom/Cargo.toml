@@ -24,6 +24,11 @@ async-trait = "0.1"
 # Arrow IPC bytes produced here line up with whatever encodes them downstream.
 # Phase 1 carves out native operators on the ~10 heavy ClickBench queries.
 datafusion = "54"
+# Direct handle on `DFParquetMetadata` / `apply_file_schema_type_coercions` for the KAN-143
+# column-statistics trust check in `catalog_bridge` (the umbrella crate re-exports only the
+# deprecated free-function wrappers). Already in the tree as datafusion's own parquet
+# datasource at exactly this version — pinned so the lock entry is reused, no new dep tree.
+datafusion-datasource-parquet = "=54.1.0"
 # Read table data from object stores (S3) for Glue/Hive locations on `s3://`. Pinned to the same
 # 0.13 line DataFusion pulls so the `ObjectStore` trait/types unify; `aws` adds the S3 client + the
 # EC2 instance-role (IMDS) credential provider — no static keys.

@@ -38,6 +38,7 @@ use crate::autoscale::{
 use crate::dag_dispatch::StageDag;
 use crate::flight::{
     bucket_row_counts, cancel_stage_on_worker, clear_worker_stages, pull_bucket_with_retry,
+    BucketSample,
 };
 use crate::lineage::StageLineage;
 use crate::membership::{ClusterMembership, StaticMembership};
@@ -772,6 +773,10 @@ async fn run_stages_obs_inner(
     // per-task row counts to the `shuffle_input*` scans — the plan-time join guard then
     // sizes hash builds from measured data instead of unknown statistics.
     let mut stage_rows: HashMap<u32, Vec<u64>> = HashMap::new();
+    // Telemetry-only per-stage output totals (KAN-145) recorded at the same barrier —
+    // feeds StageFinished input/output rows and shuffle read/write bytes; unlike
+    // `stage_rows` it is not gated by `OXIDANT_STAGE_INPUT_STATS` and never rides tickets.
+    let mut stage_totals: HashMap<u32, StageTotals> = HashMap::new();
 
     let outputs: Vec<&StageDef> = stages
         .iter()
@@ -860,6 +865,7 @@ async fn run_stages_obs_inner(
             &operation_id,
             &mut coalesced,
             &mut stage_rows,
+            &mut stage_totals,
         )
         .await?;
     } else {
@@ -928,6 +934,7 @@ async fn run_stages_obs_inner(
                     &operation_id,
                     &mut coalesced,
                     &mut stage_rows,
+                    &mut stage_totals,
                 )
                 .await;
                 dispatched_ids.insert(current_id);
@@ -953,6 +960,7 @@ async fn run_stages_obs_inner(
                 &operation_id,
                 &mut coalesced,
                 &mut stage_rows,
+                &mut stage_totals,
             )
             .await;
             dispatched_ids.insert(current_id);
@@ -1223,14 +1231,18 @@ async fn run_stages_obs_inner(
     }
 
     if let (Some(ref s), Some(ref op)) = (&store, &operation_id) {
+        // KAN-145: the output stage's input rows / shuffle-read bytes are its upstreams'
+        // barrier-measured outputs; its own output rows are the batches just pulled.
+        let (shuffle_read_bytes, _, input_rows, _) =
+            stage_finished_counters(output, None, &stage_totals);
         s.emit(ExecutionEvent::StageFinished {
             operation_id: op.clone(),
             stage_id: output.stage_id as i32,
             status: StageStatus::Complete,
             completion_time_ms: now_ms(),
-            shuffle_read_bytes: 0,
+            shuffle_read_bytes,
             shuffle_write_bytes: 0,
-            input_rows: 0,
+            input_rows,
             output_rows: out.iter().map(|b| b.num_rows() as i64).sum(),
         });
     }
@@ -1493,6 +1505,7 @@ async fn run_stages_concurrent(
     operation_id: &Option<String>,
     coalesced: &mut HashMap<u32, u32>,
     stage_rows: &mut HashMap<u32, Vec<u64>>,
+    stage_totals: &mut HashMap<u32, StageTotals>,
 ) -> Result<()> {
     let mut dag = StageDag::new(stages, output_stage_id, scalar_stage.map(|s| s.stage_id));
     let np = cluster.num_partitions;
@@ -1584,6 +1597,7 @@ async fn run_stages_concurrent(
                     operation_id,
                     coalesced,
                     stage_rows,
+                    stage_totals,
                 )
                 .await;
                 eprintln!(
@@ -1630,6 +1644,70 @@ async fn run_stages_concurrent(
     Ok(())
 }
 
+/// Per-stage output totals measured at the stage barrier (KAN-145): exact row count and
+/// shuffle-write bytes summed over every producing worker's bucket sample. `bytes` is
+/// `None` on a mixed-version cluster whose workers predate byte reporting. Telemetry-only
+/// (StageFinished counters and downstream stages' input/read numbers) — unlike
+/// `stage_rows` this never feeds tickets, so it is not gated by
+/// `OXIDANT_STAGE_INPUT_STATS`.
+#[derive(Debug, Clone, Copy, Default)]
+struct StageTotals {
+    rows: u64,
+    bytes: Option<u64>,
+}
+
+/// The exact output totals of a stage from the barrier's per-worker bucket sample —
+/// `Some` only when every worker answered; a partial sample reports nothing rather than
+/// an undercount (telemetry must not lie).
+fn exact_stage_totals(per_worker: &HashMap<String, Option<BucketSample>>) -> Option<StageTotals> {
+    if per_worker.is_empty() || !per_worker.values().all(|c| c.is_some()) {
+        return None;
+    }
+    let mut rows = 0u64;
+    let mut bytes = 0u64;
+    let mut bytes_known = true;
+    for sample in per_worker.values().flatten() {
+        rows += sample.rows.iter().map(|&n| n as u64).sum::<u64>();
+        match &sample.bytes {
+            Some(b) => bytes += b.iter().sum::<u64>(),
+            None => bytes_known = false,
+        }
+    }
+    Some(StageTotals {
+        rows,
+        bytes: bytes_known.then_some(bytes),
+    })
+}
+
+/// Real counters for the StageFinished event (KAN-145), in event field order
+/// (`shuffle_read_bytes`, `shuffle_write_bytes`, `input_rows`, `output_rows`): this
+/// stage's output rows / shuffle-write bytes come from the barrier bucket sample, its
+/// input rows / shuffle-read bytes are the summed outputs of its upstream stages as
+/// recorded at their own barriers (a coalesced read still pulls every upstream bucket
+/// exactly once, so upstream write bytes == this stage's read bytes). Counters that
+/// cannot be measured exactly stay 0 — the pre-KAN-145 value — never an undercount.
+fn stage_finished_counters(
+    stage: &StageDef,
+    per_worker: Option<&HashMap<String, Option<BucketSample>>>,
+    stage_totals: &HashMap<u32, StageTotals>,
+) -> (i64, i64, i64, i64) {
+    let own = per_worker.and_then(exact_stage_totals);
+    let mut input_rows = 0u64;
+    let mut read_bytes = 0u64;
+    for up in &stage.upstream_stage_ids {
+        if let Some(t) = stage_totals.get(up) {
+            input_rows += t.rows;
+            read_bytes += t.bytes.unwrap_or(0);
+        }
+    }
+    (
+        read_bytes as i64,
+        own.and_then(|t| t.bytes).unwrap_or(0) as i64,
+        input_rows as i64,
+        own.map(|t| t.rows).unwrap_or(0) as i64,
+    )
+}
+
 /// Emit the StageFinished event for a producer stage and (when AQE is enabled) sample its
 /// per-partition bucket row counts, recording a coalesced read modulus in `coalesced` when
 /// every bucket is small. The planned partition count is never shrunk mid-query — producers
@@ -1637,14 +1715,20 @@ async fn run_stages_concurrent(
 /// coalesced stage through the modulus mapping (`aqe::coalesced_read_buckets`) instead of a
 /// plain `0..new_p` range (which would orphan buckets `new_p..num_partitions-1`).
 ///
-/// The same sample — one `bucket_row_counts` action round trip per worker, a local
-/// in-memory row count (KAN-32) shared by both consumers — also feeds the stage-input
-/// statistics path (`OXIDANT_STAGE_INPUT_STATS`, default on): the exact per-bucket totals
-/// (summed across every producing worker) are recorded in `stage_rows` and ride
-/// downstream tickets as [`StageTicket::upstream_bucket_rows`], so workers attach measured
-/// row counts to their `shuffle_input*` scans and the plan-time join-strategy guard sizes
-/// hash builds from data instead of unknown statistics (Spark AQE's runtime
-/// SMJ→hash/broadcast conversion).
+/// The same sample — one `bucket_row_counts` action round trip per worker, local bucket
+/// metadata (KAN-32) shared by all consumers — feeds:
+/// - the StageFinished event's real counters (KAN-145): output rows / shuffle-write bytes
+///   from this stage's sample, input rows / shuffle-read bytes from `stage_totals`;
+/// - the stage-input statistics path (`OXIDANT_STAGE_INPUT_STATS`, default on): the exact
+///   per-bucket totals (summed across every producing worker) are recorded in `stage_rows`
+///   and ride downstream tickets as [`StageTicket::upstream_bucket_rows`], so workers
+///   attach measured row counts to their `shuffle_input*` scans and the plan-time
+///   join-strategy guard sizes hash builds from data instead of unknown statistics
+///   (Spark AQE's runtime SMJ→hash/broadcast conversion).
+///
+/// With telemetry wired (`store` + `operation_id`) the sample runs even when both AQE and
+/// stage-input stats are disabled — it is cheap and is the only source of real counters.
+#[allow(clippy::too_many_arguments)]
 async fn finish_stage_barrier(
     cluster: &Cluster,
     stage: &StageDef,
@@ -1653,23 +1737,36 @@ async fn finish_stage_barrier(
     operation_id: &Option<String>,
     coalesced: &mut HashMap<u32, u32>,
     stage_rows: &mut HashMap<u32, Vec<u64>>,
+    stage_totals: &mut HashMap<u32, StageTotals>,
 ) {
+    let telemetry = store.is_some() && operation_id.is_some();
+    let per_worker = if aqe_enabled() || stage_input_stats_enabled() || telemetry {
+        Some(sample_per_worker_bucket_counts(cluster, stage.stage_id).await)
+    } else {
+        None
+    };
+    let totals = per_worker.as_ref().and_then(exact_stage_totals);
     if let (Some(ref s), Some(ref op)) = (store, operation_id) {
+        let (shuffle_read_bytes, shuffle_write_bytes, input_rows, output_rows) =
+            stage_finished_counters(stage, per_worker.as_ref(), stage_totals);
         s.emit(ExecutionEvent::StageFinished {
             operation_id: op.clone(),
             stage_id: stage.stage_id as i32,
             status: StageStatus::Complete,
             completion_time_ms: now_ms(),
-            shuffle_read_bytes: 0,
-            shuffle_write_bytes: 0,
-            input_rows: 0,
-            output_rows: 0,
+            shuffle_read_bytes,
+            shuffle_write_bytes,
+            input_rows,
+            output_rows,
         });
     }
-    if !aqe_enabled() && !stage_input_stats_enabled() {
-        return;
+    // Record this stage's totals for downstream stages' input/read counters.
+    if let Some(t) = totals {
+        stage_totals.insert(stage.stage_id, t);
     }
-    let per_worker = sample_per_worker_bucket_counts(cluster, stage.stage_id).await;
+    let Some(per_worker) = per_worker else {
+        return;
+    };
     // AQE: on a coalesce decision, remember it for the rest of this query: downstream
     // consumers dispatch `new_p` reader partitions, partition `p` pulling producer buckets
     // `p, p+new_p, …` (every `b ≡ p mod new_p`), so each of the `num_partitions` written
@@ -1707,7 +1804,7 @@ async fn finish_stage_barrier(
     if stage_input_stats_enabled() && per_worker.values().all(|c| c.is_some()) {
         let mut totals = vec![0u64; num_partitions as usize];
         for counts in per_worker.values().flatten() {
-            for (b, n) in counts.iter().enumerate() {
+            for (b, n) in counts.rows.iter().enumerate() {
                 if let Some(t) = totals.get_mut(b) {
                     *t += *n as u64;
                 }
@@ -1839,16 +1936,16 @@ fn splice_replanned_tail(
     Some(out)
 }
 
-/// Ask every worker for its cached per-partition row counts of a producer stage (the cheap
-/// KAN-32 `bucket_row_counts` action — a local in-memory count, no data movement). `None`
-/// for a worker that errored or predates the action (mixed-version cluster). The action
-/// exists because the pre-KAN-32 sampler pulled every partition's bucket over Flight just
-/// to count rows, shipping the whole stage output through the driver after every producer
-/// stage (at SF10, ~90M rows for Q18 alone).
+/// Ask every worker for its cached per-partition row/byte counts of a producer stage (the
+/// cheap KAN-32 `bucket_row_counts` action — local bucket metadata, no data movement).
+/// `None` for a worker that errored or predates the action (mixed-version cluster). The
+/// action exists because the pre-KAN-32 sampler pulled every partition's bucket over Flight
+/// just to count rows, shipping the whole stage output through the driver after every
+/// producer stage (at SF10, ~90M rows for Q18 alone).
 async fn sample_per_worker_bucket_counts(
     cluster: &Cluster,
     stage_id: u32,
-) -> HashMap<String, Option<Vec<usize>>> {
+) -> HashMap<String, Option<BucketSample>> {
     let mut per_worker = HashMap::new();
     for ep in &cluster.workers {
         let c = bucket_row_counts(ep.clone(), stage_id).await.ok();
@@ -1865,7 +1962,7 @@ async fn owner_bucket_row_counts(
     cluster: &Cluster,
     stage_id: u32,
     num_partitions: u32,
-    per_worker: &HashMap<String, Option<Vec<usize>>>,
+    per_worker: &HashMap<String, Option<BucketSample>>,
 ) -> Vec<usize> {
     let mut counts = vec![0usize; num_partitions as usize];
     for p in 0..num_partitions {
@@ -1874,7 +1971,7 @@ async fn owner_bucket_row_counts(
         };
         match per_worker.get(&ep) {
             Some(Some(c)) => {
-                if let Some(n) = c.get(p as usize) {
+                if let Some(n) = c.rows.get(p as usize) {
                     counts[p as usize] = *n;
                 }
             }
@@ -2390,6 +2487,78 @@ mod tests {
         assert!(err.contains("membership changed mid-query"));
         assert!(err.contains("expected"));
         assert!(err.contains("observed"));
+    }
+
+    #[test]
+    fn stage_finished_counters_combine_barrier_sample_and_upstream_totals() {
+        // KAN-145: a consumer stage with two measured upstreams and a complete
+        // per-worker bucket sample of its own output.
+        let stage = StageDef::new(2, "SELECT * FROM shuffle_input_0", vec![0, 1], vec![]);
+        let sample = |rows: &[usize], bytes: Option<&[u64]>| {
+            Some(BucketSample {
+                rows: rows.to_vec(),
+                bytes: bytes.map(|b| b.to_vec()),
+            })
+        };
+        let per_worker: HashMap<String, Option<BucketSample>> = HashMap::from([
+            ("a:1".into(), sample(&[10, 20], Some(&[100, 200]))),
+            ("b:1".into(), sample(&[5, 7], Some(&[50, 70]))),
+        ]);
+        let stage_totals = HashMap::from([
+            (
+                0,
+                StageTotals {
+                    rows: 40,
+                    bytes: Some(400),
+                },
+            ),
+            // Upstream 1 was measured before byte reporting (mixed-version): its rows
+            // count toward input, its bytes contribute nothing.
+            (
+                1,
+                StageTotals {
+                    rows: 60,
+                    bytes: None,
+                },
+            ),
+        ]);
+        let (read, write, input, output) =
+            stage_finished_counters(&stage, Some(&per_worker), &stage_totals);
+        assert_eq!(
+            output, 42,
+            "output rows = every worker's bucket rows summed"
+        );
+        assert_eq!(
+            write, 420,
+            "write bytes = every worker's bucket bytes summed"
+        );
+        assert_eq!(input, 100, "input rows = upstream output rows summed");
+        assert_eq!(read, 400, "read bytes = known upstream write bytes summed");
+
+        // A partial sample (one worker unreachable) must zero the stage's own counters
+        // rather than publish an undercount; upstream-derived counters still stand.
+        let mut partial = per_worker.clone();
+        partial.insert("b:1".into(), None);
+        let (read, write, input, output) =
+            stage_finished_counters(&stage, Some(&partial), &stage_totals);
+        assert_eq!((write, output), (0, 0));
+        assert_eq!((read, input), (400, 100));
+
+        // Workers that predate byte reporting: rows stay real, write bytes fall back to 0.
+        let old_workers: HashMap<String, Option<BucketSample>> = HashMap::from([
+            ("a:1".into(), sample(&[3], None)),
+            ("b:1".into(), sample(&[4], None)),
+        ]);
+        let (_, write, _, output) =
+            stage_finished_counters(&stage, Some(&old_workers), &HashMap::new());
+        assert_eq!((write, output), (0, 7));
+
+        // No sample (telemetry off and AQE/stats disabled) keeps the pre-KAN-145 zeros.
+        let leaf = StageDef::new(0, "SELECT 1", vec![], vec![0]);
+        assert_eq!(
+            stage_finished_counters(&leaf, None, &HashMap::new()),
+            (0, 0, 0, 0)
+        );
     }
 
     #[test]
