@@ -229,6 +229,23 @@ impl SpillStore {
         segs.into_iter().map(|(_, path)| path).collect()
     }
 
+    /// On-disk bytes of one spilled bucket (base file + append segments), for the driver's
+    /// barrier telemetry sample (KAN-145). A missing file counts as 0 — producers only
+    /// write files for buckets they appended to.
+    pub fn bucket_disk_bytes(&self, stage_id: u32, src: u32, partition: u32) -> u64 {
+        let mut total = 0u64;
+        let base = self.path(stage_id, src, partition);
+        if let Ok(meta) = std::fs::metadata(&base) {
+            total += meta.len();
+        }
+        for segment in self.segment_paths(stage_id, src, partition) {
+            if let Ok(meta) = std::fs::metadata(&segment) {
+                total += meta.len();
+            }
+        }
+        total
+    }
+
     /// Remove all spill files for a stage.
     pub fn clear_stage(&self, stage_id: u32) {
         self.clear_by_prefix(&format!("stage_{stage_id}_"));
@@ -465,6 +482,27 @@ impl BucketCache {
         }
     }
 
+    /// Per-partition byte counts for the driver's StageFinished telemetry (KAN-145):
+    /// estimated Arrow memory footprint while in-memory, real on-disk bytes once spilled.
+    /// Same cost class as [`partition_row_counts`] — bucket metadata only, no data read.
+    pub fn partition_byte_counts(&self) -> Vec<u64> {
+        match self {
+            Self::Memory(buckets) => buckets
+                .iter()
+                .map(|bucket| estimated_batch_bytes(bucket) as u64)
+                .collect(),
+            Self::Spilled {
+                spill,
+                stage_id,
+                src,
+                row_counts,
+                ..
+            } => (0..row_counts.len())
+                .map(|p| spill.bucket_disk_bytes(*stage_id, *src, p as u32))
+                .collect(),
+        }
+    }
+
     /// Spill an in-memory cache to disk in place (no-op when already spilled).
     pub fn spill_now(
         &mut self,
@@ -623,6 +661,47 @@ mod tests {
                     .copied()
             })
             .collect()
+    }
+
+    #[test]
+    fn partition_byte_counts_tracks_memory_estimate_and_spilled_disk_bytes() {
+        let b = batch();
+        let schema = b.schema();
+
+        // In-memory: estimated Arrow footprint per bucket, aligned with row counts.
+        let cache = BucketCache::from_memory(vec![vec![b.clone()], Vec::new(), vec![b.clone()]]);
+        let bytes = cache.partition_byte_counts();
+        assert_eq!(bytes.len(), 3);
+        assert_eq!(bytes[1], 0);
+        assert!(bytes[0] > 0 && bytes[0] == bytes[2]);
+        assert_eq!(
+            bytes[0] as usize,
+            estimated_batch_bytes(std::slice::from_ref(&b))
+        );
+
+        // Spilled: real on-disk bytes (base + segments), nonzero exactly where rows are.
+        let root = default_spill_root();
+        let store = store_at(root.clone(), true, None);
+        let mut cache = BucketCache::from_memory(vec![vec![b.clone()], Vec::new()]);
+        cache
+            .spill_now(schema.clone(), 7, 0, &store)
+            .expect("spill");
+        cache
+            .append_batch(schema, 7, 0, 1, b.clone(), Some(&store))
+            .expect("append");
+        let bytes = cache.partition_byte_counts();
+        let rows = cache.partition_row_counts();
+        assert_eq!(rows, vec![3, 3]);
+        assert_eq!(bytes.len(), 2);
+        assert!(bytes[0] > 0, "spilled bucket must report disk bytes");
+        assert!(bytes[1] > 0, "appended segment must report disk bytes");
+        assert_eq!(
+            bytes[0],
+            store.bucket_disk_bytes(7, 0, 0),
+            "cache and store must agree on bucket disk bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
