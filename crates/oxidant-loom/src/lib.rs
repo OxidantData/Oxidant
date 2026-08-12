@@ -2105,12 +2105,17 @@ fn aggregate_plan_metric(plan: &dyn datafusion::physical_plan::ExecutionPlan, na
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinPreference {
     /// `auto` — the default (also the fallback for unset/empty/unrecognized values): the
-    /// engine chooses per query instead of per deployment. A query's partitioned equijoins
-    /// run as hash joins only when every build side is positively estimated to fit the
-    /// KAN-25 budget ([`Engine::hash_join_build_budget`]); over budget OR with no usable
-    /// build-side statistics the query is re-planned with spill-capable sort-merge joins
-    /// (unknown ⇒ safe: an unaccounted hash build can OOM-kill the worker before the
-    /// runtime pool-exhaustion retry fires — SF10 TPC-H Q16/Q21, TPC-DS Q11; KAN-57).
+    /// engine chooses per query instead of per deployment. KAN-142: a query needing ANY
+    /// strategy decision is re-planned once with the per-join rule
+    /// ([`Engine::per_join_strategy_physical_plan`]) — each partitioned hash join keeps
+    /// hash only when its build side is positively estimated to fit the KAN-25 budget
+    /// ([`Engine::hash_join_build_budget`]), converts to broadcast (`CollectLeft`) when the
+    /// build is positively measured/estimated under
+    /// [`Engine::broadcast_admission_cap`], and converts to spill-capable sort-merge when
+    /// over budget OR with no usable build-side statistics (unknown ⇒ safe: an
+    /// unaccounted hash build can OOM-kill the worker before the runtime pool-exhaustion
+    /// retry fires — SF10 TPC-H Q16/Q21, TPC-DS Q11; KAN-57). A hash join the per-join
+    /// rule cannot convert still falls back to the whole-plan sort-merge re-plan.
     /// Without a bounded pool there is no budget to guard, so plans keep their hash
     /// joins. The runtime pool-exhaustion retry (and the KAN-53 stall-retry) remains the
     /// backstop for estimates that undershoot in the other direction.
@@ -2186,6 +2191,29 @@ const DEFAULT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES: usize = 10 * 1024 * 1024;
 /// relative to the row-width estimate. Without this, SF100 fact⋈fact builds can look
 /// "under budget" then cgroup-OOM before the pool-exhaustion retry (KAN-57).
 const HASH_JOIN_BUILD_OVERHEAD_FACTOR: usize = 2;
+
+/// KAN-142 broadcast (`CollectLeft`) admission threshold, mirroring Spark's
+/// `spark.sql.autoBroadcastJoinThreshold` default (10 MiB). A partitioned hash join whose
+/// build side is POSITIVELY estimated at or below this size (and within the KAN-25 budget)
+/// is converted to a broadcast hash join — the build side is coalesced once and shared by
+/// every probe partition, eliding both sides' shuffle repartitions (Spark AQE's
+/// runtime broadcast conversion; DataFusion 54's own `CollectLeft` admission stops at
+/// `hash_join_single_partition_threshold` = 1 MiB / 128K rows, far below barrier-measured
+/// shuffle inputs). Override via `OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES`; `0` disables.
+const DEFAULT_BROADCAST_JOIN_THRESHOLD_BYTES: usize = 10 * 1024 * 1024;
+
+/// The KAN-142 broadcast admission threshold from `OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES`;
+/// `None` disables broadcast conversion (`=0`). Unparseable values keep the default.
+fn broadcast_join_threshold_bytes() -> Option<usize> {
+    match std::env::var("OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES") {
+        Ok(s) => match s.parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT_BROADCAST_JOIN_THRESHOLD_BYTES),
+        },
+        Err(_) => Some(DEFAULT_BROADCAST_JOIN_THRESHOLD_BYTES),
+    }
+}
 
 /// Spark-like default shuffle partition floor when sizing the hash-join build budget
 /// (`spark.sql.shuffle.partitions` default is 200).
@@ -2331,6 +2359,171 @@ fn hash_join_build_estimate_unknown(plan: &dyn datafusion::physical_plan::Execut
         .any(|c| hash_join_build_estimate_unknown(c.as_ref()))
 }
 
+// ---- KAN-142: per-join runtime strategy conversion (Spark AQE analogue) --------------
+
+/// Whether `hj` still runs partitioned while its build side is POSITIVELY estimated at or
+/// below `cap` bytes — a KAN-142 broadcast (`CollectLeft`) candidate. Restricted to INNER
+/// joins: outer/semi/anti joins constrain which side may be broadcast, and null-aware anti
+/// joins REQUIRE `CollectLeft` already (DataFusion seats them so at physical planning).
+/// The estimate standard is the same one the KAN-25 budget guard trusts
+/// ([`hash_join_build_estimated_bytes`]) — measured (`MeasuredStatsTable`) or footer-exact
+/// row counts, never a guess: unknown estimates are NOT broadcast candidates.
+fn hash_join_broadcast_eligible(
+    hj: &datafusion::physical_plan::joins::HashJoinExec,
+    cap: usize,
+) -> bool {
+    use datafusion::physical_plan::joins::PartitionMode;
+    !matches!(hj.partition_mode(), PartitionMode::CollectLeft)
+        && !hj.null_aware
+        && *hj.join_type() == datafusion::logical_expr::JoinType::Inner
+        && hash_join_build_estimated_bytes(hj).is_some_and(|est| est <= cap)
+}
+
+/// Whether any hash join in `plan` is a KAN-142 broadcast candidate at `cap` bytes (see
+/// [`hash_join_broadcast_eligible`]).
+fn hash_join_broadcast_candidate(
+    plan: &dyn datafusion::physical_plan::ExecutionPlan,
+    cap: usize,
+) -> bool {
+    if let Some(hj) = as_hash_join(plan) {
+        if hash_join_broadcast_eligible(hj, cap) {
+            return true;
+        }
+    }
+    plan.children()
+        .iter()
+        .any(|c| hash_join_broadcast_candidate(c.as_ref(), cap))
+}
+
+/// Convert a partitioned hash join to broadcast (`CollectLeft`): the build side is
+/// coalesced to one partition and collected ONCE, shared by every probe-side partition —
+/// both sides' shuffle repartitions drop out under `EnforceDistribution`. `None` when the
+/// rebuild fails (the caller then keeps the partitioned join). The builder preserves the
+/// projection, join filter and null equality (the KAN-2 R2 dynamic filter is always
+/// `None` at this point — it attaches in the later `FilterPushdown` phase); only the
+/// partition mode changes (properties are recomputed).
+fn hash_join_as_broadcast(
+    hj: &datafusion::physical_plan::joins::HashJoinExec,
+) -> Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    use datafusion::physical_plan::joins::PartitionMode;
+    hj.builder()
+        .with_partition_mode(PartitionMode::CollectLeft)
+        .build()
+        .ok()
+        .map(|h| Arc::new(h) as Arc<dyn datafusion::physical_plan::ExecutionPlan>)
+}
+
+/// Convert a hash join to a spill-capable sort-merge join exactly as the DataFusion
+/// physical planner builds one under `prefer_hash_join=false` (same `on`, filter, join
+/// type, default sort options, null equality), so a per-join conversion is
+/// byte-equivalent to what the whole-plan KAN-25 re-plan would produce for that join.
+/// `None` when the join carries a pushed-down column projection (a `SortMergeJoinExec`
+/// cannot re-seat one — the caller falls back to the whole-plan re-plan), when the join
+/// is NULL-AWARE (see below), or when construction fails.
+///
+/// Null-aware anti joins (`NOT IN` with nullable keys) must NEVER be converted here:
+/// `SortMergeJoinExec` has no null-aware support — DataFusion's own planner comment is
+/// "Null-aware joins must use CollectLeft" (datafusion-54.1.0 physical_planner.rs) — so
+/// converting one would silently drop NOT-IN NULL semantics (a NULL in the subquery must
+/// empty the result; a plain anti join treats it as never matching). Note the pre-existing
+/// hazard this does NOT fix: the whole-plan KAN-25 re-plan (`prefer_hash_join=false`)
+/// still seats null-aware joins as sort-merge because DataFusion's planner checks
+/// `prefer_hash_join` before `null_aware` — out of scope for KAN-142, but this rule must
+/// never make it worse by newly converting one itself.
+fn hash_join_as_sort_merge(
+    hj: &datafusion::physical_plan::joins::HashJoinExec,
+) -> Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    if hj.contains_projection() || hj.null_aware {
+        return None;
+    }
+    let on = hj.on().to_vec();
+    datafusion::physical_plan::joins::SortMergeJoinExec::try_new(
+        Arc::clone(hj.left()),
+        Arc::clone(hj.right()),
+        on.clone(),
+        hj.filter().cloned(),
+        *hj.join_type(),
+        vec![arrow::compute::SortOptions::default(); on.len()],
+        hj.null_equality(),
+    )
+    .ok()
+    .map(|smj| Arc::new(smj) as Arc<dyn datafusion::physical_plan::ExecutionPlan>)
+}
+
+/// The KAN-142 physical optimizer rule: decide the join strategy PER JOIN from the
+/// build-side size statistics available at plan time (barrier-measured on shuffle inputs,
+/// footer-exact on catalog scans) instead of the all-or-nothing session re-plan:
+///
+/// - build side positively estimated at or below `broadcast_cap` (an INNER join) ⇒
+///   broadcast (`CollectLeft`) hash join — Spark AQE's runtime broadcast conversion;
+/// - build side over `budget`, or with NO usable estimate, with `smj_allowed` ⇒
+///   sort-merge join — the KAN-25/KAN-53 "unknown ⇒ safe" policy, per join;
+/// - otherwise the partitioned hash join stands (build positively fits the budget).
+///
+/// NULL-AWARE anti joins are excluded from BOTH conversions: they already require
+/// `CollectLeft`, and `SortMergeJoinExec` has no null-aware support (see
+/// [`hash_join_as_sort_merge`]).
+///
+/// Inserted after [`PreferBoundedJoinBuildSide`] and BEFORE `EnforceDistribution`, so a
+/// converted join's inputs are (re-)partitioned and sorted for the NEW strategy. The
+/// KAN-25 memory guarantee is preserved: a broadcast admission cap never exceeds the
+/// hash-join budget ([`Engine::broadcast_admission_cap`]), so no hash build is admitted
+/// by this rule that the old guard would have rerouted; over-budget or unknown builds are
+/// converted to spill-capable sort-merge, and a join the rule cannot convert (a
+/// projection-carrying hash join) still trips [`Engine::needs_smj_reroute`] on the
+/// converted plan and falls back to the whole-plan sort-merge re-plan.
+#[derive(Debug)]
+struct PerJoinJoinStrategy {
+    /// KAN-25 build-side budget in bytes; `None` disables sort-merge conversion.
+    budget: Option<usize>,
+    /// Broadcast admission cap in bytes (≤ `budget`); `None` disables broadcast conversion.
+    broadcast_cap: Option<usize>,
+    /// Whether hash → sort-merge conversion is allowed ([`Engine::smj_replan_allowed`]).
+    smj_allowed: bool,
+}
+
+impl datafusion::physical_optimizer::PhysicalOptimizerRule for PerJoinJoinStrategy {
+    fn optimize(
+        &self,
+        plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        _config: &datafusion::common::config::ConfigOptions,
+    ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+        plan.transform_up(|p| {
+            let Some(hj) = as_hash_join(p.as_ref()) else {
+                return Ok(Transformed::no(p));
+            };
+            if let Some(cap) = self.broadcast_cap {
+                if hash_join_broadcast_eligible(hj, cap) {
+                    if let Some(broadcast) = hash_join_as_broadcast(hj) {
+                        return Ok(Transformed::yes(broadcast));
+                    }
+                }
+            }
+            if self.smj_allowed
+                && !hj.null_aware
+                && self.budget.is_some_and(|budget| {
+                    hash_join_build_estimated_bytes(hj).map_or(true, |est| est > budget)
+                })
+            {
+                if let Some(smj) = hash_join_as_sort_merge(hj) {
+                    return Ok(Transformed::yes(smj));
+                }
+            }
+            Ok(Transformed::no(p))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "per_join_join_strategy"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
 // ---- KAN-2 (TPC-DS Q62 wedge): build hash joins on row-BOUNDED sides only -------------
 
 /// A provable UPPER BOUND on `plan`'s output rows: its own `Exact` row statistic, or such
@@ -2455,6 +2648,31 @@ fn physical_optimizer_rules(
     rules
 }
 
+/// [`physical_optimizer_rules`] plus the KAN-142 per-join strategy rule, inserted
+/// immediately after [`PreferBoundedJoinBuildSide`] (build-side seating must be final
+/// before per-join strategy sizing) and before `EnforceDistribution` (converted joins
+/// need their inputs re-partitioned / re-sorted for the new strategy). Used by the
+/// query-scoped KAN-142 re-plan ([`Engine::per_join_strategy_physical_plan`]); the engine's
+/// own session pipeline stays stock so plans that need no conversion never pay for one.
+/// With neither anchor present the pipeline is kept whole — a mis-positioned conversion
+/// could silently break partitioning, which is worse than no rule at all (the re-plan
+/// then degrades to the unchanged plan, and the whole-plan sort-merge fallback still
+/// guards over-budget builds).
+fn physical_optimizer_rules_with_join_strategy(
+    strategy: std::sync::Arc<PerJoinJoinStrategy>,
+) -> Vec<std::sync::Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>> {
+    let mut rules = physical_optimizer_rules();
+    let position = rules
+        .iter()
+        .position(|r| r.name() == "prefer_bounded_join_build_side")
+        .map(|i| i + 1)
+        .or_else(|| rules.iter().position(|r| r.name() == "EnforceDistribution"));
+    if let Some(i) = position {
+        rules.insert(i, strategy);
+    }
+    rules
+}
+
 /// Whether an execution error is the bounded memory pool denying a reservation.
 /// DataFusion renders `DataFusionError::ResourcesExhausted` as "Resources Exhausted: …";
 /// match textually so wrapped / contextual errors still count.
@@ -2525,9 +2743,11 @@ pub struct Engine {
     /// (unbounded pool) disables the guard entirely.
     memory_pool_bytes: Option<usize>,
     /// Test/diagnostic observability for the plan-time join-strategy guard: how often the
-    /// KAN-53 auto selection rerouted a plan to sort-merge on this engine
-    /// ([`Engine::plan_time_smj_reroute`] returning true). Read via
-    /// [`Engine::plan_time_smj_reroute_count`].
+    /// KAN-53 auto selection's sort-merge predicate fired on this engine
+    /// ([`Engine::plan_time_smj_reroute`] returning true). Since KAN-142 the firing query
+    /// is usually handled by the per-join conversion re-plan, with the whole-plan
+    /// sort-merge re-plan as the fallback, so the count reads "guard engagements", not
+    /// strictly "whole-plan reroutes". Read via [`Engine::plan_time_smj_reroute_count`].
     plan_time_smj_reroutes: Arc<AtomicU64>,
     /// How many tables were registered with driver-measured statistics on this engine
     /// ([`Engine::register_batches_with_stats`]) — the worker-side observable that the
@@ -2954,18 +3174,25 @@ impl Engine {
     ///   (the lever most likely to move the high-card `GROUP BY` queries Q32–Q34).
     /// - `OXIDANT_PREFER_HASH_JOIN` (`auto`|`true`|`false`, default `auto`, KAN-53) — `true`
     ///   forces DataFusion's in-memory hash join session-wide, `false` forces spill-capable
-    ///   sort-merge joins for partitioned equijoins; `auto` chooses per query: hash joins
-    ///   only when each build side is positively estimated to fit the KAN-25 budget below,
-    ///   sort-merge when over budget OR when no usable build-side statistics exist
-    ///   (unknown ⇒ safe; without a bounded pool, plans keep their hash joins).
+    ///   sort-merge joins for partitioned equijoins; `auto` chooses per join (KAN-142):
+    ///   hash joins only when each build side is positively estimated to fit the KAN-25
+    ///   budget below, broadcast (`CollectLeft`) when the build fits the
+    ///   `OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES` cap, sort-merge when over budget OR when
+    ///   no usable build-side statistics exist (unknown ⇒ safe; without a bounded pool,
+    ///   plans keep their hash joins).
     /// - `OXIDANT_HASH_JOIN_MAX_BUILD_FRACTION` (f64 in (0, 1], default 0.25) — with a bounded
     ///   pool, the per-join build-side budget (as a pool fraction) above which `auto` mode
-    ///   re-plans a query with sort-merge joins (KAN-25/KAN-53; see
+    ///   converts a join to sort-merge (KAN-25/KAN-53/KAN-142; see
     ///   [`Engine::collect_join_guarded`]).
     /// - `OXIDANT_HASH_JOIN_PER_PARTITION_THRESHOLD_BYTES` (usize, default **10 MiB** = Spark
     ///   `autoBroadcastJoinThreshold`) — Spark `canBuildLocalHashMap` gate: effective build
     ///   budget is also capped at `threshold × shuffle_partitions / 2` so SF100 fact⋈fact
     ///   joins prefer spillable sort-merge on EMR-class (`m8g.4xlarge`) workers.
+    /// - `OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES` (usize, default **10 MiB** = Spark
+    ///   `autoBroadcastJoinThreshold`; `0` disables, KAN-142) — `auto` mode converts a
+    ///   partitioned INNER hash join to broadcast (`CollectLeft`) when its build side is
+    ///   positively measured (stage-barrier) or estimated at or below this threshold,
+    ///   clamped to the build budget, eliding both sides' shuffle repartitions.
     ///
     /// KAN-2 R2 dynamic-filter knobs (hash-join build-side → probe-side scan filters, the
     /// star-shape fast path; the pushdown itself is pinned on session-wide):
@@ -3865,7 +4092,7 @@ impl Engine {
         Self::smj_fallback_enabled() || join_preference() == JoinPreference::Auto
     }
 
-    /// Whether the plan-time guard reroutes `plan` to a sort-merge re-plan: a bounded-pool
+    /// Whether `plan` still needs the whole-plan sort-merge reroute: a bounded-pool
     /// build-side estimate over the KAN-25 budget ([`Engine::hash_join_build_budget`]) —
     /// or NO usable estimate at all — with the re-plan allowed
     /// ([`Engine::smj_replan_allowed`]). Shared by [`Engine::collect_join_guarded`] and
@@ -3878,23 +4105,80 @@ impl Engine {
     /// positively say the build fits the budget; the runtime retry remains the backstop
     /// for estimates that undershoot in the other direction. Without a bounded pool there
     /// is no budget to fit, so the plan always keeps its hash joins (unchanged).
-    fn plan_time_smj_reroute(&self, plan: &dyn datafusion::physical_plan::ExecutionPlan) -> bool {
+    ///
+    /// KAN-142: this is ALSO the post-conversion safety check — a per-join converted plan
+    /// ([`Engine::per_join_strategy_physical_plan`]) that still trips it contains a hash
+    /// join the rule could not convert and falls back to the whole-plan sort-merge
+    /// re-plan. The counter-free core lets that check run without double-counting
+    /// reroutes (see [`Engine::plan_time_smj_reroute`]).
+    ///
+    /// Known pre-existing hazard (unchanged by KAN-142): when the only violation is a
+    /// NULL-AWARE anti join (`NOT IN` with nullable keys), this predicate still fires
+    /// and the whole-plan `prefer_hash_join=false` re-plan seats the join as sort-merge
+    /// even though `SortMergeJoinExec` has no null-aware support — DataFusion's planner
+    /// checks `prefer_hash_join` before `null_aware` (datafusion-54.1.0
+    /// physical_planner.rs). The KAN-142 rule itself never converts one
+    /// ([`hash_join_as_sort_merge`] refuses), so the per-join path never makes it worse;
+    /// fixing the whole-plan fallback for that shape is follow-up work.
+    fn needs_smj_reroute(&self, plan: &dyn datafusion::physical_plan::ExecutionPlan) -> bool {
         let Some(budget) = self.hash_join_build_budget() else {
             return false;
         };
         if !Self::smj_replan_allowed() {
             return false;
         }
-        let reroute =
-            hash_join_build_exceeds(plan, budget) || hash_join_build_estimate_unknown(plan);
+        hash_join_build_exceeds(plan, budget) || hash_join_build_estimate_unknown(plan)
+    }
+
+    /// [`Engine::needs_smj_reroute`] plus the KAN-53 observability counter (a reroute that
+    /// FIRES is counted once per call — call sites that also re-check a converted plan use
+    /// [`Engine::needs_smj_reroute`] so one query never counts twice).
+    fn plan_time_smj_reroute(&self, plan: &dyn datafusion::physical_plan::ExecutionPlan) -> bool {
+        let reroute = self.needs_smj_reroute(plan);
         if reroute {
             self.plan_time_smj_reroutes.fetch_add(1, Ordering::Relaxed);
         }
         reroute
     }
 
-    /// Test/diagnostic observability: how many times the plan-time join-strategy guard
-    /// rerouted a plan to sort-merge on this engine (KAN-53 auto selection).
+    /// The KAN-142 broadcast admission cap in bytes: the
+    /// `OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES` threshold (default
+    /// [`DEFAULT_BROADCAST_JOIN_THRESHOLD_BYTES`]) clamped to the KAN-25 build budget, so a
+    /// broadcast conversion never admits a hash build the budget guard would have rerouted
+    /// (the `CollectLeft` build is coalesced to ONE partition and collected whole — the
+    /// same bytes a partitioned build would spread, so the budget must cover all of them).
+    /// `None` — broadcast conversion disabled — when the threshold is set to `0`, when
+    /// there is no bounded pool (no budget to clamp to; the unbounded path stays
+    /// byte-for-byte unchanged), or under a forced `OXIDANT_PREFER_HASH_JOIN` (KAN-45
+    /// semantics: forced sessions are never re-planned).
+    fn broadcast_admission_cap(&self) -> Option<usize> {
+        if join_preference() != JoinPreference::Auto {
+            return None;
+        }
+        let budget = self.hash_join_build_budget()?;
+        let threshold = broadcast_join_threshold_bytes()?;
+        Some(threshold.min(budget))
+    }
+
+    /// Whether any hash join in `plan` is a KAN-142 broadcast candidate: an INNER
+    /// partitioned hash join whose build side is positively estimated at or below
+    /// [`Engine::broadcast_admission_cap`] — the runtime analog of Spark AQE's
+    /// sort-merge → broadcast conversion, driven by barrier-measured (`MeasuredStatsTable`)
+    /// or footer-exact statistics instead of a config threshold alone.
+    fn plan_time_broadcast_upgrade(
+        &self,
+        plan: &dyn datafusion::physical_plan::ExecutionPlan,
+    ) -> bool {
+        let Some(cap) = self.broadcast_admission_cap() else {
+            return false;
+        };
+        hash_join_broadcast_candidate(plan, cap)
+    }
+
+    /// Test/diagnostic observability: how many times the plan-time join-strategy guard's
+    /// sort-merge predicate fired on this engine (KAN-53 auto selection; since KAN-142 the
+    /// firing query is usually handled by the per-join conversion re-plan — see
+    /// [`Engine::per_join_strategy_physical_plan`]).
     #[doc(hidden)]
     pub fn plan_time_smj_reroute_count(&self) -> u64 {
         self.plan_time_smj_reroutes.load(Ordering::Relaxed)
@@ -3988,6 +4272,63 @@ impl Engine {
             .await
     }
 
+    /// Re-plan `logical` with the KAN-142 per-join strategy rule added to the physical
+    /// optimizer pipeline ([`PerJoinJoinStrategy`]): ONE physical plan in which each
+    /// partitioned hash join independently becomes a broadcast (`CollectLeft`) hash join
+    /// when its build side is positively measured/estimated at or below
+    /// [`Engine::broadcast_admission_cap`], a sort-merge join when its build side is over
+    /// the KAN-25 budget or un-estimable ([`Engine::smj_replan_allowed`]), or stays a
+    /// partitioned hash join when the build positively fits — the distributed engine's
+    /// per-join runtime strategy conversion, replacing the all-or-nothing session re-plan
+    /// for multi-join stage SQL.
+    ///
+    /// The query-scoped session shares this engine's catalogs/runtime/pool and keeps the
+    /// session's own `prefer_hash_join` (the rule, not the planner config, picks per
+    /// join); `sort_spill_reservation_bytes` is lowered exactly as for the whole-plan
+    /// sort-merge re-plan so converted sorters can spill through a tight pool. Callers
+    /// MUST re-check the returned plan with [`Engine::needs_smj_reroute`]: a hash join
+    /// the rule cannot convert (a projection-carrying one) keeps its over-budget build,
+    /// and only the whole-plan sort-merge re-plan covers it.
+    async fn per_join_strategy_physical_plan(
+        &self,
+        logical: datafusion::logical_expr::LogicalPlan,
+    ) -> Result<(
+        SessionContext,
+        Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    )> {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        let mut config = self.ctx.state().config().clone();
+        // Same shared-catalog guard as `physical_plan_with_join_preference`.
+        config = config.with_create_default_catalog_and_schema(false);
+        {
+            let opts = config.options_mut();
+            opts.execution.sort_spill_reservation_bytes =
+                opts.execution.sort_spill_reservation_bytes.min(1024 * 1024);
+        }
+        let strategy = std::sync::Arc::new(PerJoinJoinStrategy {
+            budget: self.hash_join_build_budget(),
+            broadcast_cap: self.broadcast_admission_cap(),
+            smj_allowed: Self::smj_replan_allowed(),
+        });
+        let state = SessionStateBuilder::new_from_existing(self.ctx.state())
+            .with_config(config)
+            .with_physical_optimizer_rules(physical_optimizer_rules_with_join_strategy(strategy))
+            .build();
+        // The returned context is load-bearing: the plan must be COLLECTED under its
+        // `task_ctx` (same shared catalog/runtime/pool, fallback config), or execution
+        // reads the original session's options.
+        let ctx = SessionContext::new_with_state(state);
+        let df = ctx
+            .execute_logical_plan(logical)
+            .await
+            .map_err(|e| Error::Plan(e.to_string()))?;
+        let plan = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        Ok((ctx, plan))
+    }
+
     /// Give the doomed first attempt's surviving partition streams a moment to release
     /// their pool reservations before the sort-merge retry claims its own. When a hash-join
     /// build errors out of `collect`, the other partitions' streams are still finishing
@@ -4043,14 +4384,66 @@ impl Engine {
                 .await
                 .map_err(|e| Error::Execution(e.to_string()));
         }
-        if self.plan_time_smj_reroute(plan.as_ref()) {
-            if let Ok((smj_ctx, smj)) = self
-                .sort_merge_physical_plan(df.logical_plan().clone())
+        let smj_reroute = self.plan_time_smj_reroute(plan.as_ref());
+        if smj_reroute || self.plan_time_broadcast_upgrade(plan.as_ref()) {
+            // KAN-142 first: ONE re-plan that decides the strategy PER JOIN from the
+            // (barrier-measured or footer-exact) build-side sizes — broadcast for
+            // measured-small builds, hash for builds that fit, sort-merge only for the
+            // joins whose build is over budget or un-estimable — instead of the
+            // all-or-nothing session re-plan below.
+            if let Ok((pj_ctx, pj)) = self
+                .per_join_strategy_physical_plan(df.logical_plan().clone())
                 .await
             {
-                return datafusion::physical_plan::collect(smj, smj_ctx.task_ctx())
+                if !self.needs_smj_reroute(pj.as_ref()) {
+                    // Runtime pool exhaustion under a per-join plan's remaining hash
+                    // joins (estimates can undershoot, e.g. wide strings) keeps the same
+                    // backstop as the unconverted path below: one whole-plan sort-merge
+                    // retry.
+                    match datafusion::physical_plan::collect(pj.clone(), pj_ctx.task_ctx()).await {
+                        Ok(batches) => return Ok(batches),
+                        Err(e) => {
+                            let had_hash_join = contains_hash_join(pj.as_ref());
+                            drop(pj);
+                            if is_pool_exhausted(&e) && had_hash_join && Self::smj_replan_allowed()
+                            {
+                                self.wait_for_pool_drain().await;
+                                let (smj_ctx, smj) = self
+                                    .sort_merge_physical_plan(df.logical_plan().clone())
+                                    .await?;
+                                return datafusion::physical_plan::collect(smj, smj_ctx.task_ctx())
+                                    .await
+                                    .map_err(|retry| {
+                                        Error::Execution(format!(
+                                            "query exhausted the OXIDANT_MEMORY_LIMIT_BYTES pool \
+                                             under a non-spillable hash join and the sort-merge \
+                                             retry failed: {retry}"
+                                        ))
+                                    });
+                            }
+                            if smj_reroute {
+                                return Err(Error::Execution(e.to_string()));
+                            }
+                            // Broadcast-only trigger: the original hash plan was already
+                            // validated safe by the guard — a non-pool error from the
+                            // per-join plan falls back to it (below) rather than failing
+                            // a query that pre-KAN-142 simply executed.
+                        }
+                    }
+                }
+                // An over-budget / un-estimable hash build the per-join rule could not
+                // convert (a projection-carrying join, e.g.): the whole-plan sort-merge
+                // re-plan remains the fallback.
+            }
+            if smj_reroute {
+                if let Ok((smj_ctx, smj)) = self
+                    .sort_merge_physical_plan(df.logical_plan().clone())
                     .await
-                    .map_err(|e| Error::Execution(e.to_string()));
+                {
+                    return datafusion::physical_plan::collect(smj, smj_ctx.task_ctx())
+                        .await
+                        .map_err(|e| Error::Execution(e.to_string()));
+                }
             }
             // Re-planning failed (a join shape sort-merge cannot take, e.g.): fall through
             // to the hash plan — the runtime guard below still bounds the blast radius.
@@ -4160,21 +4553,58 @@ impl Engine {
                 .create_physical_plan()
                 .await
                 .map_err(|e| Error::Execution(e.to_string()))?;
-            if self.plan_time_smj_reroute(plan.as_ref()) {
-                if let Ok((smj_ctx, smj)) = self
-                    .sort_merge_physical_plan(df.logical_plan().clone())
+            let smj_reroute = self.plan_time_smj_reroute(plan.as_ref());
+            if smj_reroute || self.plan_time_broadcast_upgrade(plan.as_ref()) {
+                // KAN-142 first: ONE re-plan deciding the strategy PER JOIN from this
+                // task's barrier-measured shuffle-input sizes (broadcast for measured-
+                // small builds, hash for builds that fit, sort-merge only for over-budget
+                // / un-estimable builds) instead of the all-or-nothing session re-plan.
+                if let Ok((pj_ctx, pj)) = self
+                    .per_join_strategy_physical_plan(df.logical_plan().clone())
                     .await
                 {
-                    // Merge the sort-merge plan's partitions into one stream (stage output
-                    // is unordered by contract — ORDER BY/LIMIT live in the driver finalize).
-                    let merged: Arc<dyn datafusion::physical_plan::ExecutionPlan> = Arc::new(
-                        datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
-                            smj,
-                        ),
-                    );
-                    return merged
-                        .execute(0, smj_ctx.task_ctx())
-                        .map_err(|e| Error::Execution(e.to_string()));
+                    if !self.needs_smj_reroute(pj.as_ref()) {
+                        // Merge partitions into one stream (stage output is unordered by
+                        // contract — ORDER BY/LIMIT live in the driver finalize).
+                        let merged: Arc<dyn datafusion::physical_plan::ExecutionPlan> = Arc::new(
+                            datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+                                pj,
+                            ),
+                        );
+                        match merged.execute(0, pj_ctx.task_ctx()) {
+                            Ok(stream) => return Ok(stream),
+                            Err(e) => {
+                                if smj_reroute {
+                                    return Err(Error::Execution(e.to_string()));
+                                }
+                                // Broadcast-only trigger: the original hash plan was
+                                // already validated safe by the guard — fall back to it
+                                // (below) rather than failing a task that pre-KAN-142
+                                // simply executed. Stream-time errors keep the existing
+                                // contract (caller discards partial output and retries
+                                // through `Engine::sql`).
+                            }
+                        }
+                    }
+                    // An over-budget / un-estimable hash build the per-join rule could not
+                    // convert: the whole-plan sort-merge re-plan remains the fallback.
+                }
+                if smj_reroute {
+                    if let Ok((smj_ctx, smj)) = self
+                        .sort_merge_physical_plan(df.logical_plan().clone())
+                        .await
+                    {
+                        // Merge the sort-merge plan's partitions into one stream (stage output
+                        // is unordered by contract — ORDER BY/LIMIT live in the driver finalize).
+                        let merged: Arc<dyn datafusion::physical_plan::ExecutionPlan> = Arc::new(
+                            datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+                                smj,
+                            ),
+                        );
+                        return merged
+                            .execute(0, smj_ctx.task_ctx())
+                            .map_err(|e| Error::Execution(e.to_string()));
+                    }
                 }
                 // Re-planning failed (a join shape sort-merge cannot take, e.g.): fall
                 // through to the hash plan — a runtime pool exhaustion then surfaces as a
@@ -11197,8 +11627,8 @@ mod tests {
             "an Inexact num_rows must read as a usable estimate"
         );
         // The guard-facing consequence (KAN-2): the chain output sits on the top join's
-        // PROBE side (its phantom 100-row estimate must never seat a build), and the
-        // dim BUILD side is exactly sized — the propagation the Q37/Q82 fix relies on.
+        // PROBE side (its estimate must never seat a build), and the dim BUILD side is
+        // exactly sized — the propagation the Q37/Q82 fix relies on.
         assert!(
             contains_hash_join(top.right().as_ref()),
             "the fixture must probe the top join with the lower join's output"
@@ -11312,6 +11742,500 @@ mod tests {
             .value(0);
         assert_eq!(c, ROWS);
         assert_eq!(s, ROWS * (ROWS - 1) / 2);
+    }
+
+    // ---- KAN-142: per-join runtime strategy conversion --------------------------------
+
+    /// How many sort-merge joins a plan tree contains (KAN-142 shape assertions).
+    fn sort_merge_join_count(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> usize {
+        let here = usize::from(
+            (plan as &dyn std::any::Any)
+                .is::<datafusion::physical_plan::joins::SortMergeJoinExec>(),
+        );
+        here + plan
+            .children()
+            .iter()
+            .map(|c| sort_merge_join_count(c.as_ref()))
+            .sum::<usize>()
+    }
+
+    /// How many repartition (shuffle) nodes a plan tree contains (KAN-142 broadcast
+    /// elision assertions — `CollectLeft` uses a `CoalescePartitionsExec` instead).
+    fn repartition_count(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> usize {
+        let here = usize::from(
+            (plan as &dyn std::any::Any)
+                .is::<datafusion::physical_plan::repartition::RepartitionExec>(),
+        );
+        here + plan
+            .children()
+            .iter()
+            .map(|c| repartition_count(c.as_ref()))
+            .sum::<usize>()
+    }
+
+    /// The partition mode of every hash join in a plan tree (KAN-142 shape assertions).
+    fn hash_join_modes(
+        plan: &dyn datafusion::physical_plan::ExecutionPlan,
+    ) -> Vec<datafusion::physical_plan::joins::PartitionMode> {
+        let mut modes = Vec::new();
+        if let Some(hj) = as_hash_join(plan) {
+            modes.push(*hj.partition_mode());
+        }
+        for child in plan.children() {
+            modes.extend(hash_join_modes(child.as_ref()));
+        }
+        modes
+    }
+
+    /// Indent-render a plan for assertion messages (KAN-142).
+    fn plan_display(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> String {
+        datafusion::physical_plan::displayable(plan)
+            .indent(false)
+            .to_string()
+    }
+
+    /// KAN-142: a multi-join stage no longer picks ONE strategy for all joins — the
+    /// per-join re-plan converts the over-budget build to sort-merge while the
+    /// measured-small dim build keeps a hash join, in ONE physical plan (before
+    /// KAN-142 the whole stage went sort-merge). The plan also passes the
+    /// whole-plan-fallback safety check, and the mixed plan returns the right rows.
+    #[tokio::test]
+    async fn per_join_strategy_converts_each_join_on_its_own_build_size() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("OXIDANT_PREFER_HASH_JOIN");
+        std::env::remove_var("OXIDANT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES");
+        std::env::set_var("OXIDANT_TARGET_PARTITIONS", "2");
+        let engine = Engine::new_with_memory_limit(64 * 1024 * 1024);
+        std::env::remove_var("OXIDANT_TARGET_PARTITIONS");
+        // fact/fact2: 1.5M (k, v) Int64 rows ≈ 24 MB estimated build (the SUMs keep `v`
+        // in the scan projection) — over the 16 MiB budget (64 MiB pool × 0.25). dim:
+        // 1_000 rows ≈ 16 KB — fits with room.
+        const ROWS: i64 = 1_500_000;
+        engine
+            .register_batches_with_stats("fact", join_guard_kv_batches(ROWS, ROWS), ROWS as u64)
+            .unwrap();
+        engine
+            .register_batches_with_stats("fact2", join_guard_kv_batches(ROWS, ROWS), ROWS as u64)
+            .unwrap();
+        engine
+            .register_batches_with_stats("dim", join_guard_kv_batches(1_000, 1_000), 1_000)
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c, SUM(f.v) AS sf, SUM(d.v) AS sd, SUM(f2.v) AS s2 \
+                     FROM fact f JOIN dim d ON f.k = d.k \
+                     JOIN fact2 f2 ON f.k = f2.k";
+        // The guard still reads the DEFAULT (all-hash) plan: the fact2 build trips it.
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert_eq!(sort_merge_join_count(plan.as_ref()), 0);
+        assert!(
+            engine.plan_time_smj_reroute(plan.as_ref()),
+            "the 24 MB fact2 build must trip the budget guard"
+        );
+        // The KAN-142 re-plan converts PER JOIN: sort-merge ONLY for the fact2 build,
+        // the dim join keeps a hash join — one mixed plan, not an all-sort-merge stage.
+        let df = engine.plan_spark(query).await.unwrap();
+        let (_ctx, pj) = engine
+            .per_join_strategy_physical_plan(df.logical_plan().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            sort_merge_join_count(pj.as_ref()),
+            1,
+            "only the over-budget fact2 build converts to sort-merge:\n{}",
+            plan_display(pj.as_ref())
+        );
+        assert_eq!(
+            hash_join_modes(pj.as_ref()).len(),
+            1,
+            "the measured-small dim build keeps a hash join:\n{}",
+            plan_display(pj.as_ref())
+        );
+        assert!(
+            !engine.needs_smj_reroute(pj.as_ref()),
+            "no over-budget / un-estimable hash build may remain — the whole-plan \
+             sort-merge fallback must not fire"
+        );
+        // The mixed plan returns the right rows: f ⋈ d is 1_000 rows (dim keys are a
+        // unique subset), each joining exactly one fact2 row; every SUM is 0+…+999.
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("the per-join mixed plan must complete under the bounded pool");
+        use arrow::array::Int64Array;
+        let col = |i: usize| {
+            batches[0]
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(col(0), 1_000);
+        assert_eq!(col(1), 999 * 1_000 / 2);
+        assert_eq!(col(2), 999 * 1_000 / 2);
+        assert_eq!(col(3), 999 * 1_000 / 2);
+    }
+
+    /// KAN-142 broadcast: a measured build ABOVE DataFusion's own `CollectLeft`
+    /// admission (1 MiB / 128K rows — the stock pipeline keeps a partitioned hash join
+    /// with both sides shuffled) but at or below the
+    /// `OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES` cap converts to a broadcast hash join,
+    /// eliding both sides' shuffle repartitions (Spark AQE's runtime broadcast
+    /// conversion). Results are unchanged.
+    #[tokio::test]
+    async fn per_join_broadcast_converts_measured_small_build() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("OXIDANT_PREFER_HASH_JOIN");
+        std::env::remove_var("OXIDANT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES");
+        std::env::set_var("OXIDANT_TARGET_PARTITIONS", "2");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        std::env::remove_var("OXIDANT_TARGET_PARTITIONS");
+        // dim: 300_000 rows ≈ 4.8 MB — over DataFusion's 1 MiB/128K-row CollectLeft
+        // admission (stock stays partitioned), under the 10 MiB KAN-142 broadcast cap.
+        const DIM: i64 = 300_000;
+        engine
+            .register_batches_with_stats(
+                "fact",
+                join_guard_kv_batches(2_000_000, 2_000_000),
+                2_000_000,
+            )
+            .unwrap();
+        engine
+            .register_batches_with_stats("dim", join_guard_kv_batches(DIM, DIM), DIM as u64)
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c FROM fact f JOIN dim d ON f.k = d.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert_eq!(
+            hash_join_modes(plan.as_ref()),
+            vec![datafusion::physical_plan::joins::PartitionMode::Partitioned],
+            "DataFusion's own admission must keep the 4.8 MB build partitioned:\n{}",
+            plan_display(plan.as_ref())
+        );
+        assert!(engine.plan_time_broadcast_upgrade(plan.as_ref()));
+        assert!(
+            !engine.plan_time_smj_reroute(plan.as_ref()),
+            "both builds fit the 64 MiB budget — no sort-merge reroute"
+        );
+        let df = engine.plan_spark(query).await.unwrap();
+        let (_ctx, pj) = engine
+            .per_join_strategy_physical_plan(df.logical_plan().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            hash_join_modes(pj.as_ref()),
+            vec![datafusion::physical_plan::joins::PartitionMode::CollectLeft],
+            "the measured-small build converts to broadcast:\n{}",
+            plan_display(pj.as_ref())
+        );
+        assert!(
+            repartition_count(pj.as_ref()) < repartition_count(plan.as_ref()),
+            "broadcast must elide shuffle repartitions ({} ≥ {}):\n{}",
+            repartition_count(pj.as_ref()),
+            repartition_count(plan.as_ref()),
+            plan_display(pj.as_ref())
+        );
+        assert!(!engine.needs_smj_reroute(pj.as_ref()));
+        // dim keys are a unique subset of fact keys → one match per dim row.
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("the broadcast plan must complete");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, DIM);
+    }
+
+    /// KAN-142 broadcast admission is clamped by the KAN-25 budget, disabled by
+    /// `OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES=0`, and off under a forced
+    /// `OXIDANT_PREFER_HASH_JOIN` (KAN-45 semantics: forced sessions never re-plan) — a
+    /// broadcast conversion must never admit a hash build the budget guard would have
+    /// rerouted.
+    #[tokio::test]
+    async fn per_join_broadcast_admission_cap_respects_env_and_budget() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("OXIDANT_PREFER_HASH_JOIN");
+        std::env::remove_var("OXIDANT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        engine
+            .register_batches_with_stats(
+                "fact",
+                join_guard_kv_batches(2_000_000, 2_000_000),
+                2_000_000,
+            )
+            .unwrap();
+        // dim: 600_000 rows ≈ 4.8 MB estimated build (COUNT(*) projects the scan to the
+        // 8-byte join key) — under the default 10 MiB broadcast cap, over the 4 MiB cap
+        // of a 16 MiB pool.
+        engine
+            .register_batches_with_stats("dim", join_guard_kv_batches(600_000, 600_000), 600_000)
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c FROM fact f JOIN dim d ON f.k = d.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        // Default: cap = min(10 MiB threshold, 64 MiB budget) = 10 MiB → 4.8 MB build is
+        // a broadcast candidate.
+        assert_eq!(engine.broadcast_admission_cap(), Some(10 * 1024 * 1024));
+        assert!(engine.plan_time_broadcast_upgrade(plan.as_ref()));
+        // `=0` disables broadcast conversion entirely.
+        std::env::set_var("OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES", "0");
+        assert_eq!(engine.broadcast_admission_cap(), None);
+        assert!(!engine.plan_time_broadcast_upgrade(plan.as_ref()));
+        std::env::remove_var("OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES");
+        // The cap clamps to the build budget: with a 16 MiB pool the budget is 4 MiB, so
+        // the 4.8 MB build is NOT broadcast — it keeps the partitioned hash join the
+        // budget guard admits.
+        let tight = Engine::new_with_memory_limit(16 * 1024 * 1024);
+        assert_eq!(
+            tight.broadcast_admission_cap(),
+            Some(4 * 1024 * 1024),
+            "cap must clamp to the 16 MiB pool × 0.25 budget"
+        );
+        assert!(!tight.plan_time_broadcast_upgrade(plan.as_ref()));
+        // A forced strategy never re-plans (KAN-45), so broadcast stays off.
+        std::env::set_var("OXIDANT_PREFER_HASH_JOIN", "true");
+        assert_eq!(engine.broadcast_admission_cap(), None);
+        std::env::set_var("OXIDANT_PREFER_HASH_JOIN", "false");
+        assert_eq!(engine.broadcast_admission_cap(), None);
+        std::env::remove_var("OXIDANT_PREFER_HASH_JOIN");
+        // No bounded pool ⇒ no budget to clamp to ⇒ no broadcast conversion.
+        std::env::set_var("OXIDANT_MEMORY_LIMIT_BYTES", "0");
+        let unbounded = Engine::new();
+        std::env::remove_var("OXIDANT_MEMORY_LIMIT_BYTES");
+        assert_eq!(unbounded.broadcast_admission_cap(), None);
+    }
+
+    /// KAN-142 keeps the "unknown ⇒ safe" policy PER JOIN: a build side with no usable
+    /// statistics converts to sort-merge in the per-join re-plan (where it used to drag
+    /// the whole stage along), the converted plan passes the fallback safety check, and
+    /// the query completes under the bounded pool.
+    #[tokio::test]
+    async fn per_join_unknown_build_converts_to_sort_merge() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("OXIDANT_PREFER_HASH_JOIN");
+        std::env::remove_var("OXIDANT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES");
+        std::env::set_var("OXIDANT_TARGET_PARTITIONS", "2");
+        let engine = Engine::new_with_memory_limit(64 * 1024 * 1024);
+        std::env::remove_var("OXIDANT_TARGET_PARTITIONS");
+        const ROWS: i64 = 1_500_000;
+        register_unknown_stats_table(&engine, "m", join_guard_kv_batches(ROWS, ROWS));
+        register_unknown_stats_table(&engine, "m2", join_guard_kv_batches(ROWS, ROWS));
+        let query = "SELECT COUNT(*) AS c FROM m JOIN m2 ON m.k = m2.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(
+            engine.plan_time_smj_reroute(plan.as_ref()),
+            "an un-estimable build must still trip the guard (unknown ⇒ safe)"
+        );
+        let df = engine.plan_spark(query).await.unwrap();
+        let (_ctx, pj) = engine
+            .per_join_strategy_physical_plan(df.logical_plan().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            sort_merge_join_count(pj.as_ref()),
+            1,
+            "the unknown build converts to sort-merge:\n{}",
+            plan_display(pj.as_ref())
+        );
+        assert!(
+            !engine.needs_smj_reroute(pj.as_ref()),
+            "no un-estimable hash build may remain after the conversion"
+        );
+        let batches = engine
+            .sql(query)
+            .await
+            .expect("unknown-build join completes via the per-join sort-merge conversion");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, ROWS);
+    }
+
+    /// (k, v) batches with a NULLABLE key column: every `null_every`-th key is NULL
+    /// (`null_every <= 0` ⇒ no NULLs) — the `NOT IN` null-aware anti-join fixture.
+    fn nullable_kv_batches(rows: i64, key_mod: i64, null_every: i64) -> Vec<RecordBatch> {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let per = rows / 4;
+        (0..4)
+            .map(|p| {
+                let start = p * per;
+                let ks: Vec<Option<i64>> = (start..start + per)
+                    .map(|i| (null_every <= 0 || i % null_every != 0).then_some(i % key_mod))
+                    .collect();
+                let vs: Vec<i64> = (start..start + per).collect();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(ks)),
+                        Arc::new(Int64Array::from(vs)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// Whether any hash join in `plan` is NULL-AWARE (KAN-142 null-aware guard assertion).
+    fn contains_null_aware_hash_join(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> bool {
+        if let Some(hj) = as_hash_join(plan) {
+            if hj.null_aware {
+                return true;
+            }
+        }
+        plan.children()
+            .iter()
+            .any(|c| contains_null_aware_hash_join(c.as_ref()))
+    }
+
+    /// KAN-142 review regression: the per-join rule must NEVER seat a NULL-AWARE anti
+    /// join (`NOT IN` with nullable keys) as sort-merge — `SortMergeJoinExec` has no
+    /// null-aware support, so converting would drop NOT-IN NULL semantics (a NULL in the
+    /// subquery must empty the result). The fixture drives the per-join path with a
+    /// broadcast-only trigger (a partitioned INNER join over a measured-small dim), so
+    /// the null-aware anti join rides the same re-plan; it must come out the other side
+    /// still a null-aware HASH join, with no sort-merge join in the plan — and the query
+    /// must return null-correct counts.
+    #[tokio::test]
+    async fn per_join_never_converts_null_aware_anti_join_to_sort_merge() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("OXIDANT_PREFER_HASH_JOIN");
+        std::env::remove_var("OXIDANT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES");
+        std::env::set_var("OXIDANT_TARGET_PARTITIONS", "2");
+        let engine = Engine::new_with_memory_limit(64 * 1024 * 1024);
+        std::env::remove_var("OXIDANT_TARGET_PARTITIONS");
+        // fact: 2M rows, nullable k = i with every 4th NULL. dim: 200_000 rows ≈ 1.6 MB
+        // k-only build — over DataFusion's own CollectLeft admission (partitioned in the
+        // stock plan), under the 10 MiB KAN-142 broadcast cap.
+        const FACT: i64 = 2_000_000;
+        engine
+            .register_batches_with_stats("fact", nullable_kv_batches(FACT, FACT, 4), FACT as u64)
+            .unwrap();
+        engine
+            .register_batches_with_stats("dim", join_guard_kv_batches(200_000, 200_000), 200_000)
+            .unwrap();
+        engine
+            .register_batches_with_stats("blocklist", nullable_kv_batches(1_000, 1_000, 0), 1_000)
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c FROM fact f JOIN dim d ON f.k = d.k \
+                     WHERE f.k NOT IN (SELECT k FROM blocklist)";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(
+            contains_null_aware_hash_join(plan.as_ref()),
+            "the NOT IN over a nullable subquery key must plan as a null-aware anti join:\n{}",
+            plan_display(plan.as_ref())
+        );
+        assert!(
+            !engine.plan_time_smj_reroute(plan.as_ref()),
+            "every build is positively sized and under budget — the trigger is broadcast-only"
+        );
+        assert!(engine.plan_time_broadcast_upgrade(plan.as_ref()));
+        // The per-join re-plan must leave the null-aware anti join a HASH join (the SMJ
+        // branch's !null_aware guard) while converting the dim join.
+        let df = engine.plan_spark(query).await.unwrap();
+        let (_ctx, pj) = engine
+            .per_join_strategy_physical_plan(df.logical_plan().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            sort_merge_join_count(pj.as_ref()),
+            0,
+            "the null-aware anti join must never convert to sort-merge:\n{}",
+            plan_display(pj.as_ref())
+        );
+        assert!(
+            contains_null_aware_hash_join(pj.as_ref()),
+            "the null-aware anti join must survive the per-join re-plan as a hash join:\n{}",
+            plan_display(pj.as_ref())
+        );
+        assert!(!engine.needs_smj_reroute(pj.as_ref()));
+        // Null-correct results through the per-join path: blocklist = [0, 1000) without
+        // NULLs → non-null fact keys in [1000, 200000) qualify: 199_000 values less the
+        // 49_750 multiples of 4 (NULL keys).
+        let engine_ref = &engine;
+        let count = |q: &'static str| async move {
+            use arrow::array::Int64Array;
+            engine_ref.sql(q).await.unwrap()[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(count(query).await, 149_250);
+        // A NULL in the subquery must EMPTY the result (null-aware semantics) — a
+        // wrongly non-null-aware conversion would return 149_250 here instead.
+        engine
+            .register_batches_with_stats("blocklist", nullable_kv_batches(1_000, 1_000, 2), 1_000)
+            .unwrap();
+        assert_eq!(count(query).await, 0);
+    }
+
+    /// KAN-142 review regression, guard-pinning shape: a null-aware anti join whose build
+    /// side is UN-ESTIMABLE is exactly the join the SMJ branch would convert without the
+    /// `!null_aware` guard — the per-join re-plan must keep it a hash join, so the
+    /// converted plan still trips [`Engine::needs_smj_reroute`] and the query takes the
+    /// (documented, pre-existing) whole-plan fallback instead of a per-join plan with
+    /// null semantics silently dropped.
+    #[tokio::test]
+    async fn per_join_null_aware_unknown_build_stays_hash_for_fallback() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("OXIDANT_PREFER_HASH_JOIN");
+        std::env::remove_var("OXIDANT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES");
+        std::env::set_var("OXIDANT_TARGET_PARTITIONS", "2");
+        let engine = Engine::new_with_memory_limit(64 * 1024 * 1024);
+        std::env::remove_var("OXIDANT_TARGET_PARTITIONS");
+        register_unknown_stats_table(&engine, "mystery", nullable_kv_batches(4_000, 4_000, 4));
+        engine
+            .register_batches_with_stats("blocklist", nullable_kv_batches(1_000, 1_000, 0), 1_000)
+            .unwrap();
+        let query = "SELECT COUNT(*) AS c FROM mystery m \
+                     WHERE m.k NOT IN (SELECT k FROM blocklist)";
+        let plan = engine.physical_plan(query).await.unwrap();
+        assert!(
+            contains_null_aware_hash_join(plan.as_ref()),
+            "the NOT IN over nullable keys must plan as a null-aware anti join:\n{}",
+            plan_display(plan.as_ref())
+        );
+        assert!(
+            engine.plan_time_smj_reroute(plan.as_ref()),
+            "the un-estimable null-aware build must trip the guard (unknown ⇒ safe)"
+        );
+        let df = engine.plan_spark(query).await.unwrap();
+        let (_ctx, pj) = engine
+            .per_join_strategy_physical_plan(df.logical_plan().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            sort_merge_join_count(pj.as_ref()),
+            0,
+            "the guard must keep the null-aware anti join a hash join even when its \
+             build is un-estimable:\n{}",
+            plan_display(pj.as_ref())
+        );
+        assert!(contains_null_aware_hash_join(pj.as_ref()));
+        assert!(
+            engine.needs_smj_reroute(pj.as_ref()),
+            "the unconvertible null-aware build must still trip the post-conversion \
+             safety check, engaging the whole-plan fallback"
+        );
     }
 
     #[tokio::test]
