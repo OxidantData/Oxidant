@@ -169,11 +169,13 @@ Parameters:
   ShufflePartitions:
     Type: String
     Default: ''
+    AllowedPattern: '^[0-9]*$'
     Description: >
       Optional OXIDANT_SHUFFLE_PARTITIONS (hash-shuffle fan-out, driver-side). Empty leaves
       the env unset so the engine uses its Spark-like default max(200, worker_vcpus) —
       never WorkerCount (a 2-worker cluster must not collapse to a 2-bucket shuffle).
-      For SF100 honesty runs leave empty or set >= 200.
+      For SF100 honesty runs leave empty or set >= 200. Digits only; a non-empty value
+      below the engine floor stamps anyway but logs a loud boot warning (KAN-139).
 
   DataBucketArns:
     Type: CommaDelimitedList
