@@ -2361,13 +2361,27 @@ fn hash_join_build_estimate_unknown(plan: &dyn datafusion::physical_plan::Execut
 
 // ---- KAN-142: per-join runtime strategy conversion (Spark AQE analogue) --------------
 
-/// Whether `hj` still runs partitioned while its build side is POSITIVELY estimated at or
-/// below `cap` bytes — a KAN-142 broadcast (`CollectLeft`) candidate. Restricted to INNER
-/// joins: outer/semi/anti joins constrain which side may be broadcast, and null-aware anti
-/// joins REQUIRE `CollectLeft` already (DataFusion seats them so at physical planning).
-/// The estimate standard is the same one the KAN-25 budget guard trusts
-/// ([`hash_join_build_estimated_bytes`]) — measured (`MeasuredStatsTable`) or footer-exact
-/// row counts, never a guess: unknown estimates are NOT broadcast candidates.
+/// Whether `hj` still runs partitioned while its build side is PROVABLY at or below `cap`
+/// bytes — a KAN-142 broadcast (`CollectLeft`) candidate. Restricted to INNER joins:
+/// outer/semi/anti joins constrain which side may be broadcast, and null-aware anti joins
+/// REQUIRE `CollectLeft` already (DataFusion seats them so at physical planning).
+///
+/// KAN-146: the sizing standard is a provable row UPPER BOUND ([`provable_row_bound`] —
+/// `Exact` statistics seen through row-preserving/non-increasing wrappers), NOT the
+/// KAN-25 budget guard's estimate ([`hash_join_build_estimated_bytes`], which accepts
+/// `Inexact`). An `Inexact` estimate is a guess, not a bound: DataFusion estimates a
+/// column-stats-less join output as `Inexact(min(left, right))` — orders of magnitude
+/// under the real fact-sized result for an FK star join (see [`PreferBoundedJoinBuildSide`])
+/// — and a filtered scan's post-selectivity estimate undershoots the same way when the
+/// filter's column statistics are absent or stale. A broadcast conversion on such a
+/// phantom-small "estimate" coalesces the real build to ONE partition and single-thread
+/// hash-builds it on every consuming task — the exact wedge the KAN-2 rule exists to
+/// prevent — while eliding the probe-side repartition that kept the join parallel. The
+/// guard can afford `Inexact` (its error direction is a safe sort-merge reroute);
+/// broadcast admission cannot (its error direction is a serialized coalesce), so unknown
+/// OR inexact builds are NOT broadcast candidates. Honest admissions keep working:
+/// footer-exact parquet scans and barrier-measured (`MeasuredStatsTable`) shuffle inputs
+/// report `Exact` rows.
 fn hash_join_broadcast_eligible(
     hj: &datafusion::physical_plan::joins::HashJoinExec,
     cap: usize,
@@ -2376,7 +2390,9 @@ fn hash_join_broadcast_eligible(
     !matches!(hj.partition_mode(), PartitionMode::CollectLeft)
         && !hj.null_aware
         && *hj.join_type() == datafusion::logical_expr::JoinType::Inner
-        && hash_join_build_estimated_bytes(hj).is_some_and(|est| est <= cap)
+        && provable_row_bound(hj.left().as_ref()).is_some_and(|rows| {
+            rows.saturating_mul(estimated_row_width(&hj.left().schema())) <= cap
+        })
 }
 
 /// Whether any hash join in `plan` is a KAN-142 broadcast candidate at `cap` bytes (see
@@ -2454,8 +2470,10 @@ fn hash_join_as_sort_merge(
 /// build-side size statistics available at plan time (barrier-measured on shuffle inputs,
 /// footer-exact on catalog scans) instead of the all-or-nothing session re-plan:
 ///
-/// - build side positively estimated at or below `broadcast_cap` (an INNER join) ⇒
-///   broadcast (`CollectLeft`) hash join — Spark AQE's runtime broadcast conversion;
+/// - build side PROVABLY at or below `broadcast_cap` (an INNER join, KAN-146: a
+///   `Exact`-statistic row upper bound through row-preserving wrappers, never an
+///   `Inexact` estimate — see [`hash_join_broadcast_eligible`]) ⇒ broadcast
+///   (`CollectLeft`) hash join — Spark AQE's runtime broadcast conversion;
 /// - build side over `budget`, or with NO usable estimate, with `smj_allowed` ⇒
 ///   sort-merge join — the KAN-25/KAN-53 "unknown ⇒ safe" policy, per join;
 /// - otherwise the partitioned hash join stands (build positively fits the budget).
@@ -3191,8 +3209,10 @@ impl Engine {
     /// - `OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES` (usize, default **10 MiB** = Spark
     ///   `autoBroadcastJoinThreshold`; `0` disables, KAN-142) — `auto` mode converts a
     ///   partitioned INNER hash join to broadcast (`CollectLeft`) when its build side is
-    ///   positively measured (stage-barrier) or estimated at or below this threshold,
-    ///   clamped to the build budget, eliding both sides' shuffle repartitions.
+    ///   PROVABLY at or below this threshold (KAN-146: an `Exact` row upper bound through
+    ///   row-preserving wrappers — barrier-measured or footer-exact statistics, never an
+    ///   `Inexact` estimate), clamped to the build budget, eliding both sides' shuffle
+    ///   repartitions.
     ///
     /// KAN-2 R2 dynamic-filter knobs (hash-join build-side → probe-side scan filters, the
     /// star-shape fast path; the pushdown itself is pinned on session-wide):
@@ -11976,6 +11996,120 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(c, DIM);
+    }
+
+    /// KAN-146: broadcast admission must NOT trust an `Inexact` estimate. When both sides
+    /// of a join are lower-join outputs, `PreferBoundedJoinBuildSide` has no provably
+    /// bounded side to seat, and DataFusion's `Inexact(min(left, right))` join-output
+    /// estimate makes a fact-wide intermediate look dimension-small (the KAN-2 Q62 wedge:
+    /// `Inexact(min)` ≈ the dim for what is really the full fact-sized output). The old
+    /// standard ([`hash_join_build_estimated_bytes`], `Precision::get_value` accepts
+    /// `Inexact`) admitted that phantom-small build — coalescing an ever-wider
+    /// intermediate to ONE partition and single-thread hash-building it on every
+    /// consuming task. The provable-bound standard must refuse it.
+    #[tokio::test]
+    async fn per_join_broadcast_rejects_inexact_chain_build_estimate() {
+        let _env = JOIN_GUARD_ENV_LOCK.lock().await;
+        std::env::remove_var("OXIDANT_PREFER_HASH_JOIN");
+        std::env::remove_var("OXIDANT_SORT_MERGE_FALLBACK");
+        std::env::remove_var("OXIDANT_BROADCAST_JOIN_THRESHOLD_BYTES");
+        std::env::set_var("OXIDANT_TARGET_PARTITIONS", "2");
+        let engine = Engine::new_with_memory_limit(256 * 1024 * 1024);
+        std::env::remove_var("OXIDANT_TARGET_PARTITIONS");
+        // f1/f2: 2M rows with keys inside the 300K-key dim domain (FK star shape: every
+        // fact row matches exactly one dim row, so each lower-join output is really 2M
+        // rows wide) — but DataFusion estimates each as `Inexact(min(2M, 300K)) = 300K`
+        // and the top join's build as ~2.4 MB, UNDER the 10 MiB cap (the old admission
+        // standard fires) and over DataFusion's own 1 MiB/128K-row admission (the stock
+        // plan stays partitioned, so only KAN-142 could convert it).
+        for name in ["f1", "f2"] {
+            engine
+                .register_batches_with_stats(
+                    name,
+                    join_guard_kv_batches(2_000_000, 300_000),
+                    2_000_000,
+                )
+                .unwrap();
+        }
+        for name in ["d1", "d2"] {
+            engine
+                .register_batches_with_stats(name, join_guard_kv_batches(300_000, 300_000), 300_000)
+                .unwrap();
+        }
+        let query = "SELECT COUNT(*) AS c \
+                     FROM (SELECT f1.k AS k FROM f1 JOIN d1 ON f1.k = d1.k) a \
+                     JOIN (SELECT f2.k AS k FROM f2 JOIN d2 ON f2.k = d2.k) b ON a.k = b.k";
+        let plan = engine.physical_plan(query).await.unwrap();
+        // Fixture check: some hash join carries a build whose estimate undershoots the cap
+        // while lacking a provable row bound — exactly what the old standard admitted.
+        fn phantom_build(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> Option<usize> {
+            if let Some(hj) = as_hash_join(plan) {
+                if provable_row_bound(hj.left().as_ref()).is_none() {
+                    if let Some(est) = hash_join_build_estimated_bytes(hj) {
+                        if est <= 10 * 1024 * 1024 {
+                            return Some(est);
+                        }
+                    }
+                }
+            }
+            plan.children()
+                .iter()
+                .find_map(|c| phantom_build(c.as_ref()))
+        }
+        assert!(
+            phantom_build(plan.as_ref()).is_some(),
+            "the fixture must contain an Inexact phantom-small build (old standard would \
+             admit):\n{}",
+            plan_display(plan.as_ref())
+        );
+        // The honest dim builds ARE broadcast candidates (the guard fires for them)…
+        assert!(
+            engine.plan_time_broadcast_upgrade(plan.as_ref()),
+            "the Exact dim builds below the cap must stay admissible"
+        );
+        // …but the per-join re-plan must convert ONLY those: no broadcast may seat a build
+        // without a provable row bound (the phantom chain intermediate stays partitioned).
+        let df = engine.plan_spark(query).await.unwrap();
+        let (_ctx, pj) = engine
+            .per_join_strategy_physical_plan(df.logical_plan().clone())
+            .await
+            .unwrap();
+        fn unbounded_broadcast_build(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> bool {
+            if let Some(hj) = as_hash_join(plan) {
+                if matches!(
+                    hj.partition_mode(),
+                    datafusion::physical_plan::joins::PartitionMode::CollectLeft
+                ) && provable_row_bound(hj.left().as_ref()).is_none()
+                {
+                    return true;
+                }
+            }
+            plan.children()
+                .iter()
+                .any(|c| unbounded_broadcast_build(c.as_ref()))
+        }
+        assert!(
+            !unbounded_broadcast_build(pj.as_ref()),
+            "no CollectLeft build may lack a provable row bound:\n{}",
+            plan_display(pj.as_ref())
+        );
+        assert!(
+            hash_join_modes(pj.as_ref())
+                .contains(&datafusion::physical_plan::joins::PartitionMode::CollectLeft),
+            "the honest dim builds must still convert to broadcast:\n{}",
+            plan_display(pj.as_ref())
+        );
+        // The query itself still completes: a and b are each 2M rows wide; per key the
+        // counts multiply (200K keys × 7×7 + 100K keys × 6×6).
+        let batches = engine.sql(query).await.expect("chain-of-chains join");
+        use arrow::array::Int64Array;
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, 200_000 * 7 * 7 + 100_000 * 6 * 6);
     }
 
     /// KAN-142 broadcast admission is clamped by the KAN-25 budget, disabled by
