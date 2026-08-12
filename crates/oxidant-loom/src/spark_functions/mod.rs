@@ -47,6 +47,10 @@ mod spark_misc;
 pub(crate) mod spark_nonzero_divisor;
 mod spark_regex_misc;
 mod spark_strings;
+// `pub(crate)` (like `spark_divide`): `Engine::new_inner` in `lib.rs` embeds the
+// `SparkSubstrPlanner` directly — SQL `substr`/`substring` is planned through
+// `ExprPlanner::plan_substring`, never the function registry (see the submodule docs).
+pub(crate) mod spark_substr;
 mod try_arithmetic;
 
 /// Register all Spark-only scalar functions into `ctx`.
@@ -74,6 +78,7 @@ pub fn register(ctx: &SessionContext) {
     spark_aggregates::register(ctx);
     spark_aggregates2::register(ctx);
     spark_bitshift::register(ctx);
+    ctx.register_udf(spark_substr::udf());
 }
 
 /// `typeof(expr)` — Spark returns the *type name* of the argument (e.g. `int`, `string`,

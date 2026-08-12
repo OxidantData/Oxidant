@@ -686,10 +686,23 @@ impl OxidantService {
                 // explain, the auto-broadcast sizing, and the distributed planner itself.
                 // Previously the query was parsed/analyzed here and then *again* inside
                 // `try_run_distributed` — a full second planning pass per query.
-                let plan_and_pins = engine
+                // A plan-build failure is NOT silent: under OXIDANT_DISTRIBUTED_STRICT the
+                // refusal below would otherwise mask the real error as "did not run
+                // distributed", misreading a client/query defect as a splitter coverage gap
+                // (SF100 TPC-DS Q31/Q49/Q51/Q91 — the driver could not even parse the
+                // submitted SQL, but reported a strict-mode splitter refusal).
+                let mut plan_build_error: Option<Error> = None;
+                let plan_and_pins = match engine
                     .logical_plan_with_lakehouse_snapshots(&sql.query)
                     .await
-                    .ok();
+                {
+                    Ok(pp) => Some(pp),
+                    Err(e) => {
+                        eprintln!("Oxidant distributed: driver plan build failed: {e}");
+                        plan_build_error = Some(e);
+                        None
+                    }
+                };
                 // The observability explain is itself a full optimize + physical-plan
                 // pass — run it detached (see `spawn_plan_explain`).
                 if let (Some(t), Some((plan, _))) = (&tracker, &plan_and_pins) {
@@ -768,11 +781,9 @@ impl OxidantService {
                                     .ok()
                                     .is_some_and(|s| !s.trim().is_empty()))
                         {
-                            return Err(Status::failed_precondition(
-                                "OXIDANT_DISTRIBUTED_STRICT: query did not run distributed; \
-                                 refusing driver-local fallback (would OOM a small Connect \
-                                 driver on SF100)",
-                            ));
+                            return Err(Status::failed_precondition(strict_refusal_message(
+                                plan_build_error.as_ref(),
+                            )));
                         }
                     }
                     Err(e) => {
@@ -1989,6 +2000,24 @@ fn err_to_status(e: Error) -> Status {
     }
 }
 
+/// The OXIDANT_DISTRIBUTED_STRICT refusal for a query that never ran distributed.
+///
+/// When the distributed attempt was skipped because the driver-side plan build itself failed,
+/// the refusal names that root cause — otherwise a bad query reads as a splitter coverage gap
+/// (SF100 TPC-DS Q31/Q49/Q51/Q91: the submitted SQL was unparseable, but the client saw only
+/// "did not run distributed").
+fn strict_refusal_message(plan_build_error: Option<&Error>) -> String {
+    let cause = match plan_build_error {
+        Some(e) => format!("; driver plan build failed: {e}"),
+        None => String::new(),
+    };
+    format!(
+        "OXIDANT_DISTRIBUTED_STRICT: query did not run distributed; \
+         refusing driver-local fallback (would OOM a small Connect \
+         driver on SF100){cause}"
+    )
+}
+
 /// Start the Spark Connect server and serve until the process is killed.
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let port = config.port;
@@ -2086,6 +2115,30 @@ mod scan_query_tests {
         assert!(!is_scan_query(""));
         // Leading '(' is treated as a delimiter, so parenthesized SELECT is not a scan query.
         assert!(!is_scan_query("(SELECT 1)"));
+    }
+}
+
+#[cfg(test)]
+mod strict_refusal_tests {
+    use super::strict_refusal_message;
+    use oxidant_common::Error;
+
+    #[test]
+    fn refusal_without_plan_error_keeps_legacy_message() {
+        assert_eq!(
+            strict_refusal_message(None),
+            "OXIDANT_DISTRIBUTED_STRICT: query did not run distributed; \
+             refusing driver-local fallback (would OOM a small Connect driver on SF100)"
+        );
+    }
+
+    #[test]
+    fn refusal_names_driver_plan_build_failure() {
+        let err = Error::Plan("SQL error: ParserError: Expected: end of statement".to_string());
+        let msg = strict_refusal_message(Some(&err));
+        assert!(msg.starts_with("OXIDANT_DISTRIBUTED_STRICT: query did not run distributed"));
+        assert!(msg.contains("driver plan build failed"), "got: {msg}");
+        assert!(msg.contains("ParserError"), "got: {msg}");
     }
 }
 

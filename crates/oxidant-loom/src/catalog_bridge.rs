@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -111,9 +111,13 @@ pub struct OxidantCatalogProvider {
     catalog: Arc<dyn OxidantCatalog>,
     ctx: Arc<SessionContext>,
     require_lakehouse_snapshot_pins: Arc<AtomicBool>,
+    /// Shared catalog-version counter (the engine's stage-plan-cache staleness guard), bumped
+    /// when a TTL revalidation or an eviction detects/removes a changed table — see
+    /// [`OxidantSchemaProvider::table`].
+    catalog_version: Arc<AtomicU64>,
     /// Lazily-created per-namespace schema providers (cheap wrappers; cached so repeated
     /// references to the same namespace share a table cache).
-    schemas: Mutex<HashMap<String, Arc<dyn SchemaProvider>>>,
+    schemas: Mutex<HashMap<String, Arc<OxidantSchemaProvider>>>,
 }
 
 impl OxidantCatalogProvider {
@@ -122,13 +126,41 @@ impl OxidantCatalogProvider {
         catalog: Arc<dyn OxidantCatalog>,
         ctx: Arc<SessionContext>,
         require_lakehouse_snapshot_pins: Arc<AtomicBool>,
+        catalog_version: Arc<AtomicU64>,
     ) -> Self {
         Self {
             catalog,
             ctx,
             require_lakehouse_snapshot_pins,
+            catalog_version,
             schemas: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Evict every cached variant of `table` in `namespace` (`spark.catalog.refreshTable`), so
+    /// the next `table()` re-resolves it from the metastore. Returns whether anything was
+    /// cached. The caller bumps the shared catalog version (the eviction itself does not, so a
+    /// no-op eviction of a never-resolved table doesn't invalidate plan caches for nothing).
+    pub fn evict_table(&self, namespace: &str, table: &str) -> bool {
+        self.schemas
+            .lock()
+            .expect("schemas poisoned")
+            .get(namespace)
+            .is_some_and(|schema| schema.evict_table(table))
+    }
+
+    /// Evict every cached variant of `table` across ALL materialized schema providers, by bare
+    /// name. Used by `spark.catalog.refreshTable` when the session has no current namespace to
+    /// key on (external-catalog sessions seed an empty one — KAN-84): a bare-name refresh must
+    /// still evict wherever the table was resolved. Returns whether anything was evicted.
+    pub fn evict_table_anywhere(&self, table: &str) -> bool {
+        self.schemas
+            .lock()
+            .expect("schemas poisoned")
+            .values()
+            .fold(false, |evicted, schema| {
+                schema.evict_table(table) || evicted
+            })
     }
 }
 
@@ -163,9 +195,10 @@ impl CatalogProvider for OxidantCatalogProvider {
                 vec![name.to_string()],
                 self.ctx.clone(),
                 self.require_lakehouse_snapshot_pins.clone(),
+                self.catalog_version.clone(),
             ))
         });
-        Some(provider.clone())
+        Some(provider.clone() as Arc<dyn SchemaProvider>)
     }
 }
 
@@ -175,6 +208,8 @@ struct OxidantSchemaProvider {
     namespace: Vec<String>,
     ctx: Arc<SessionContext>,
     require_lakehouse_snapshot_pins: Arc<AtomicBool>,
+    /// Shared catalog-version counter (see [`OxidantCatalogProvider::catalog_version`]).
+    catalog_version: Arc<AtomicU64>,
     /// Resolved tables, cached so a table referenced repeatedly in a query is loaded once.
     ///
     /// Keyed by `(name, replicated)` where `replicated` is the shard/replicate decision the
@@ -186,6 +221,10 @@ struct OxidantSchemaProvider {
     /// every worker where the plan assumed shards (rows × worker count), or first resolved as
     /// sharded and later served as only a shard where the plan assumed a full copy (rows
     /// dropped) — KAN-35. Both variants fit in the cache, so a role flip costs one re-list.
+    ///
+    /// Non-lakehouse entries are revalidated against the metastore once their TTL
+    /// ([`catalog_cache_ttl`]) expires — a cached provider is NOT immortal: a Glue table whose
+    /// schema/location changed out-of-band must be picked up without an engine restart.
     tables: Mutex<HashMap<(String, bool), CachedTable>>,
 }
 
@@ -193,6 +232,12 @@ struct CachedTable {
     provider: Arc<dyn TableProvider>,
     snapshot_key: Option<String>,
     snapshot: Option<SnapshotIdentity>,
+    /// When this entry was resolved (TTL bookkeeping; non-lakehouse entries only).
+    resolved_at: std::time::Instant,
+    /// [`metadata_fingerprint`] of the metadata the provider was built from. `None` for entries
+    /// that never went through `load_table` (CTAS `register_table`) — a TTL revalidation then
+    /// always re-resolves, which is the correct conservative direction.
+    fingerprint: Option<String>,
 }
 
 impl OxidantSchemaProvider {
@@ -201,15 +246,64 @@ impl OxidantSchemaProvider {
         namespace: Vec<String>,
         ctx: Arc<SessionContext>,
         require_lakehouse_snapshot_pins: Arc<AtomicBool>,
+        catalog_version: Arc<AtomicU64>,
     ) -> Self {
         Self {
             catalog,
             namespace,
             ctx,
             require_lakehouse_snapshot_pins,
+            catalog_version,
             tables: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Drop all cached variants (`(name, replicated)` and `(name, sharded)`) of `name` so the
+    /// next `table()` re-resolves from the metastore. Returns whether anything was evicted.
+    fn evict_table(&self, name: &str) -> bool {
+        let mut tables = self.tables.lock().expect("tables poisoned");
+        let before = tables.len();
+        tables.retain(|(n, _), _| n != name);
+        tables.len() != before
+    }
+}
+
+/// The non-lakehouse table-cache TTL: `OXIDANT_CATALOG_CACHE_TTL_MS` (default 60000 ms; `0`
+/// revalidates against the metastore on every `table()` call; unparseable falls back to the
+/// default). Read per call — like `OXIDANT_STAGE_PLAN_CACHE_ENTRIES` — so tests and operators
+/// can toggle it without a restart.
+fn catalog_cache_ttl() -> std::time::Duration {
+    const DEFAULT_TTL_MS: u64 = 60_000;
+    match std::env::var("OXIDANT_CATALOG_CACHE_TTL_MS") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_millis(DEFAULT_TTL_MS)),
+        Err(_) => std::time::Duration::from_millis(DEFAULT_TTL_MS),
+    }
+}
+
+/// A cheap fingerprint of the metadata a provider was built from — location, format, declared
+/// schema fields (name + type + nullability), and partition columns — so a TTL revalidation can tell
+/// "metastore unchanged" apart from "re-typed / moved" without diffing providers.
+fn metadata_fingerprint(md: &TableMetadata) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    md.location.hash(&mut h);
+    format!("{:?}", md.format).hash(&mut h);
+    match &md.schema {
+        Some(schema) => {
+            for field in schema.fields() {
+                field.name().hash(&mut h);
+                format!("{:?}", field.data_type()).hash(&mut h);
+                field.is_nullable().hash(&mut h);
+            }
+        }
+        None => "inferred".hash(&mut h),
+    }
+    md.partition_columns.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 impl fmt::Debug for OxidantSchemaProvider {
@@ -240,9 +334,14 @@ impl SchemaProvider for OxidantSchemaProvider {
         // The shard/replicate decision is baked into a cached provider at resolution time;
         // resolve (or reuse) the variant matching this query's classification (KAN-35).
         let replicated = crate::shard::is_replicated_table(name);
+        let key = (name.to_string(), replicated);
+        // Set to `(fingerprint, provider)` when a non-lakehouse cache entry is past its TTL and
+        // must be revalidated against the metastore. The revalidation happens outside the lock —
+        // `load_table` is async and must not hold it.
+        let mut revalidate = None;
         {
             let tables = self.tables.lock().expect("tables poisoned");
-            if let Some(cached) = tables.get(&(name.to_string(), replicated)) {
+            if let Some(cached) = tables.get(&key) {
                 if let (Some(snapshot_key), Some(snapshot)) =
                     (&cached.snapshot_key, &cached.snapshot)
                 {
@@ -272,7 +371,71 @@ impl SchemaProvider for OxidantSchemaProvider {
                         }
                     }
                 } else {
-                    return Ok(Some(cached.provider.clone()));
+                    // Non-lakehouse entry: serve the cached provider within the TTL; past it,
+                    // revalidate below. A cached provider is NOT immortal — an out-of-band
+                    // metastore change (re-typed Glue schema, new location) must be picked up
+                    // without an engine restart.
+                    let ttl = catalog_cache_ttl();
+                    if !ttl.is_zero() && cached.resolved_at.elapsed() < ttl {
+                        return Ok(Some(cached.provider.clone()));
+                    }
+                    revalidate = Some((cached.fingerprint.clone(), cached.provider.clone()));
+                }
+            }
+        }
+        if let Some((cached_fingerprint, cached_provider)) = revalidate {
+            match self.catalog.load_table(&self.namespace, name).await {
+                Ok(metadata) => {
+                    let fingerprint = metadata_fingerprint(&metadata);
+                    if Some(&fingerprint) == cached_fingerprint.as_ref() {
+                        // Unchanged: keep the provider, just restart the TTL window.
+                        if let Some(entry) =
+                            self.tables.lock().expect("tables poisoned").get_mut(&key)
+                        {
+                            entry.resolved_at = std::time::Instant::now();
+                        }
+                        return Ok(Some(cached_provider));
+                    }
+                    // The metastore metadata moved (re-typed schema, new location, …): rebuild
+                    // the provider and bump the shared catalog version so cached distributed
+                    // stage plans (keyed on it) miss and rebuild too.
+                    let resolved = metadata_to_provider(
+                        &self.ctx.state(),
+                        &metadata,
+                        name,
+                        self.require_lakehouse_snapshot_pins.load(Ordering::Relaxed),
+                    )
+                    .await?;
+                    self.tables.lock().expect("tables poisoned").insert(
+                        key,
+                        CachedTable {
+                            provider: resolved.provider.clone(),
+                            snapshot_key: resolved.snapshot_key,
+                            snapshot: resolved.snapshot,
+                            resolved_at: std::time::Instant::now(),
+                            fingerprint: Some(fingerprint),
+                        },
+                    );
+                    self.catalog_version.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(resolved.provider));
+                }
+                // The table vanished from the metastore: drop the stale entry and take
+                // DataFusion's standard not-found path.
+                Err(Error::Plan(_)) => {
+                    self.tables.lock().expect("tables poisoned").remove(&key);
+                    self.catalog_version.fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
+                // A revalidation failure (Glue throttling, transient network, …) must not fail
+                // the query: serve the cached provider and try again after the next TTL window
+                // (restart the window here — otherwise every `table()` call under sustained
+                // throttling re-hits the metastore).
+                Err(_) => {
+                    if let Some(entry) = self.tables.lock().expect("tables poisoned").get_mut(&key)
+                    {
+                        entry.resolved_at = std::time::Instant::now();
+                    }
+                    return Ok(Some(cached_provider));
                 }
             }
         }
@@ -283,6 +446,7 @@ impl SchemaProvider for OxidantSchemaProvider {
             // A storage / connection / unsupported failure is a real error — surface it.
             Err(e) => return Err(oxidant_to_df(e)),
         };
+        let fingerprint = metadata_fingerprint(&metadata);
         let resolved = metadata_to_provider(
             &self.ctx.state(),
             &metadata,
@@ -291,11 +455,13 @@ impl SchemaProvider for OxidantSchemaProvider {
         )
         .await?;
         self.tables.lock().expect("tables poisoned").insert(
-            (name.to_string(), replicated),
+            key,
             CachedTable {
                 provider: resolved.provider.clone(),
                 snapshot_key: resolved.snapshot_key,
                 snapshot: resolved.snapshot,
+                resolved_at: std::time::Instant::now(),
+                fingerprint: Some(fingerprint),
             },
         );
         Ok(Some(resolved.provider))
@@ -342,6 +508,10 @@ impl SchemaProvider for OxidantSchemaProvider {
                 provider: provider.clone(),
                 snapshot_key: None,
                 snapshot: None,
+                resolved_at: std::time::Instant::now(),
+                // CTAS never went through `load_table`, so there is no metadata fingerprint to
+                // compare — a TTL revalidation conservatively re-resolves this entry.
+                fingerprint: None,
             },
         );
         Ok(Some(provider))
@@ -3080,6 +3250,360 @@ mod tests {
         assert!(hinted_second.1 > 0);
 
         std::env::remove_var("OXIDANT_PARQUET_SCAN_STATS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- catalog cache TTL revalidation + eviction --------------------------
+
+    /// Serializes the TTL tests: `OXIDANT_CATALOG_CACHE_TTL_MS` is process-global and each
+    /// test's assertions depend on the value it set. An async mutex so the guard can be held
+    /// across the tests' `.await` points (clippy `await_holding_lock`).
+    static TTL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A fake catalog whose single table `ns.orders` can be re-pointed at a new location (or
+    /// re-declared with a new schema) between resolutions, counting `load_table` calls — the
+    /// levers for the TTL-revalidation tests.
+    struct MutableCatalog {
+        state: Mutex<MutableCatalogState>,
+    }
+
+    struct MutableCatalogState {
+        location: String,
+        schema: Option<SchemaRef>,
+        loads: usize,
+        /// When set, the next `load_table` fails with a transient (non-`Plan`) error — the
+        /// Glue-throttling lever for the fail-open revalidation test.
+        fail_next: bool,
+        /// When set, the table has vanished from the metastore (`load_table` answers
+        /// `Error::Plan`) — the lever for the table-vanished revalidation test.
+        dropped: bool,
+    }
+
+    impl MutableCatalog {
+        fn new(location: String) -> Self {
+            Self {
+                state: Mutex::new(MutableCatalogState {
+                    location,
+                    schema: None,
+                    loads: 0,
+                    fail_next: false,
+                    dropped: false,
+                }),
+            }
+        }
+        fn set_location(&self, location: String) {
+            self.state.lock().unwrap().location = location;
+        }
+        fn set_fail_next(&self) {
+            self.state.lock().unwrap().fail_next = true;
+        }
+        fn set_dropped(&self, dropped: bool) {
+            self.state.lock().unwrap().dropped = dropped;
+        }
+        fn loads(&self) -> usize {
+            self.state.lock().unwrap().loads
+        }
+    }
+
+    #[async_trait]
+    impl OxidantCatalog for MutableCatalog {
+        fn name(&self) -> &str {
+            "mutable"
+        }
+        async fn list_namespaces(&self, _parent: &[String]) -> CatResult<Vec<Vec<String>>> {
+            Ok(vec![vec!["ns".to_string()]])
+        }
+        async fn list_tables(&self, _ns: &[String]) -> CatResult<Vec<String>> {
+            Ok(vec!["orders".to_string()])
+        }
+        async fn load_table(&self, ns: &[String], table: &str) -> CatResult<TableMetadata> {
+            if ns == ["ns"] && table == "orders" {
+                let mut state = self.state.lock().unwrap();
+                state.loads += 1;
+                if state.dropped {
+                    return Err(Error::Plan("no such table: ns.orders".to_string()));
+                }
+                if state.fail_next {
+                    state.fail_next = false;
+                    return Err(Error::Io("simulated Glue throttling".to_string()));
+                }
+                let md = TableMetadata::new(
+                    "mutable.ns.orders",
+                    state.location.clone(),
+                    TableFormat::Parquet,
+                );
+                Ok(match &state.schema {
+                    Some(s) => md.with_schema(s.clone()),
+                    None => md,
+                })
+            } else {
+                Err(Error::Plan(format!(
+                    "no such table: {}.{table}",
+                    ns.join(".")
+                )))
+            }
+        }
+    }
+
+    /// Build a schema provider over `catalog` with a private catalog-version counter.
+    fn ttl_test_provider(catalog: Arc<MutableCatalog>) -> (OxidantSchemaProvider, Arc<AtomicU64>) {
+        let version = Arc::new(AtomicU64::new(0));
+        let provider = OxidantSchemaProvider::new(
+            catalog,
+            vec!["ns".to_string()],
+            Arc::new(SessionContext::new()),
+            Arc::new(AtomicBool::new(false)),
+            version.clone(),
+        );
+        (provider, version)
+    }
+
+    /// (a) Within the TTL a cache hit serves the cached provider — the metastore is not
+    /// re-read even if the table moved underneath.
+    #[tokio::test]
+    async fn within_ttl_serves_cached_provider_without_reload() {
+        let _guard = TTL_ENV_LOCK.lock().await;
+        std::env::set_var("OXIDANT_CATALOG_CACHE_TTL_MS", "3600000");
+        let dir = write_parquet_dir();
+        let catalog = Arc::new(MutableCatalog::new(format!(
+            "file://{}",
+            dir.to_string_lossy()
+        )));
+        let (provider, _version) = ttl_test_provider(catalog.clone());
+
+        let first = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(catalog.loads(), 1);
+
+        let dir2 = write_parquet_dir();
+        catalog.set_location(format!("file://{}", dir2.to_string_lossy()));
+        let second = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(
+            catalog.loads(),
+            1,
+            "within the TTL the metastore is not re-read"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cached provider is served as-is"
+        );
+
+        std::env::remove_var("OXIDANT_CATALOG_CACHE_TTL_MS");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// (b) Past the TTL with unchanged metadata, the cached provider is kept (no rebuild) and
+    /// `resolved_at` restarts the TTL window — proven by an immediate third call NOT
+    /// revalidating (a stale `resolved_at` would revalidate again).
+    #[tokio::test]
+    async fn past_ttl_unchanged_metadata_keeps_provider_and_refreshes_window() {
+        let _guard = TTL_ENV_LOCK.lock().await;
+        std::env::set_var("OXIDANT_CATALOG_CACHE_TTL_MS", "1000");
+        let dir = write_parquet_dir();
+        let catalog = Arc::new(MutableCatalog::new(format!(
+            "file://{}",
+            dir.to_string_lossy()
+        )));
+        let (provider, version) = ttl_test_provider(catalog.clone());
+
+        let first = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(catalog.loads(), 1);
+
+        // Expire the TTL window, then resolve again: revalidation happens, the fingerprint is
+        // unchanged, so the SAME provider is returned and no version bump occurs.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let second = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(catalog.loads(), 2, "past the TTL the metastore is re-read");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged metadata keeps the cached provider"
+        );
+        assert_eq!(
+            version.load(Ordering::Relaxed),
+            0,
+            "no change, no version bump"
+        );
+
+        // Immediately after: the refreshed window means no second revalidation.
+        let third = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(
+            catalog.loads(),
+            2,
+            "resolved_at refreshed — an immediate re-resolve stays cached"
+        );
+        assert!(Arc::ptr_eq(&first, &third));
+
+        std::env::remove_var("OXIDANT_CATALOG_CACHE_TTL_MS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (c) Past the TTL with CHANGED metadata (new location), the provider is rebuilt from the
+    /// fresh metadata and the shared catalog version is bumped (so cached stage plans miss).
+    #[tokio::test]
+    async fn past_ttl_changed_metadata_re_resolves_and_bumps_version() {
+        let _guard = TTL_ENV_LOCK.lock().await;
+        std::env::set_var("OXIDANT_CATALOG_CACHE_TTL_MS", "0");
+        let dir = write_parquet_dir();
+        let dir2 = write_parquet_dir();
+        let catalog = Arc::new(MutableCatalog::new(format!(
+            "file://{}",
+            dir.to_string_lossy()
+        )));
+        let (provider, version) = ttl_test_provider(catalog.clone());
+
+        let first = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(catalog.loads(), 1);
+        assert_eq!(version.load(Ordering::Relaxed), 0);
+
+        catalog.set_location(format!("file://{}", dir2.to_string_lossy()));
+        let second = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(
+            catalog.loads(),
+            2,
+            "TTL=0 revalidates on every table() call"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "changed metadata rebuilds the provider"
+        );
+        assert_eq!(
+            version.load(Ordering::Relaxed),
+            1,
+            "a detected change bumps the catalog version"
+        );
+
+        // Steady state again: the new fingerprint is cached, so the next revalidation keeps it.
+        let third = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(catalog.loads(), 3);
+        assert!(Arc::ptr_eq(&second, &third));
+        assert_eq!(version.load(Ordering::Relaxed), 1);
+
+        std::env::remove_var("OXIDANT_CATALOG_CACHE_TTL_MS");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// (d) `evict_table` drops the cached entry outright (even inside the TTL window), so the
+    /// next `table()` re-resolves from the metastore.
+    #[tokio::test]
+    async fn evict_table_forces_re_resolution() {
+        let _guard = TTL_ENV_LOCK.lock().await;
+        // A huge TTL proves eviction, not TTL expiry, drives the re-resolution.
+        std::env::set_var("OXIDANT_CATALOG_CACHE_TTL_MS", "3600000");
+        let dir = write_parquet_dir();
+        let dir2 = write_parquet_dir();
+        let catalog = Arc::new(MutableCatalog::new(format!(
+            "file://{}",
+            dir.to_string_lossy()
+        )));
+        let (provider, _version) = ttl_test_provider(catalog.clone());
+
+        let first = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(catalog.loads(), 1);
+
+        assert!(provider.evict_table("orders"), "cached entry evicted");
+        assert!(!provider.evict_table("orders"), "nothing left to evict");
+
+        catalog.set_location(format!("file://{}", dir2.to_string_lossy()));
+        let second = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(catalog.loads(), 2, "eviction forces a fresh metastore read");
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        std::env::remove_var("OXIDANT_CATALOG_CACHE_TTL_MS");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// (e) Fail-open: past the TTL, a TRANSIENT revalidation failure (Glue throttling — a
+    /// non-`Plan` error) serves the cached provider instead of failing the query, does NOT bump
+    /// the version, and restarts the TTL window (an immediate follow-up call must not re-hit
+    /// the metastore — that would amplify throttling into a per-query retry storm).
+    #[tokio::test]
+    async fn past_ttl_revalidation_error_serves_cached_and_defers_retry() {
+        let _guard = TTL_ENV_LOCK.lock().await;
+        std::env::set_var("OXIDANT_CATALOG_CACHE_TTL_MS", "1000");
+        let dir = write_parquet_dir();
+        let catalog = Arc::new(MutableCatalog::new(format!(
+            "file://{}",
+            dir.to_string_lossy()
+        )));
+        let (provider, version) = ttl_test_provider(catalog.clone());
+
+        let first = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(catalog.loads(), 1);
+
+        // Expire the TTL window, then make the revalidation fail transiently: the cached
+        // provider is served and no version bump occurs.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        catalog.set_fail_next();
+        let second = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(catalog.loads(), 2, "past the TTL the metastore is re-read");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a transient revalidation failure serves the cached provider"
+        );
+        assert_eq!(
+            version.load(Ordering::Relaxed),
+            0,
+            "a failed revalidation is not a detected change"
+        );
+
+        // The fail-open arm restarts the TTL window: an immediate follow-up stays cached
+        // instead of re-hitting the (throttling) metastore.
+        let third = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(
+            catalog.loads(),
+            2,
+            "fail-open refreshes resolved_at — no immediate retry amplification"
+        );
+        assert!(Arc::ptr_eq(&first, &third));
+
+        std::env::remove_var("OXIDANT_CATALOG_CACHE_TTL_MS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (f) Table vanished: past the TTL, a `Plan` ("no such table") revalidation result drops
+    /// the stale entry, bumps the catalog version (cached stage plans must not reference a
+    /// dropped table), and resolves to DataFusion's standard not-found path (`Ok(None)`). A
+    /// later re-creation resolves fresh.
+    #[tokio::test]
+    async fn past_ttl_vanished_table_evicts_and_bumps_version() {
+        let _guard = TTL_ENV_LOCK.lock().await;
+        std::env::set_var("OXIDANT_CATALOG_CACHE_TTL_MS", "0");
+        let dir = write_parquet_dir();
+        let catalog = Arc::new(MutableCatalog::new(format!(
+            "file://{}",
+            dir.to_string_lossy()
+        )));
+        let (provider, version) = ttl_test_provider(catalog.clone());
+
+        let first = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(catalog.loads(), 1);
+        assert_eq!(version.load(Ordering::Relaxed), 0);
+
+        catalog.set_dropped(true);
+        let gone = provider.table("orders").await.unwrap();
+        assert_eq!(
+            catalog.loads(),
+            2,
+            "TTL=0 revalidates on every table() call"
+        );
+        assert!(gone.is_none(), "a vanished table resolves to not-found");
+        assert_eq!(
+            version.load(Ordering::Relaxed),
+            1,
+            "dropping the stale entry bumps the catalog version"
+        );
+
+        // Re-created in the metastore: the next call re-resolves from scratch (fresh load —
+        // no version bump on the initial-load path).
+        catalog.set_dropped(false);
+        let recreated = provider.table("orders").await.unwrap().unwrap();
+        assert_eq!(catalog.loads(), 3);
+        assert!(!Arc::ptr_eq(&first, &recreated));
+        assert_eq!(version.load(Ordering::Relaxed), 1);
+
+        std::env::remove_var("OXIDANT_CATALOG_CACHE_TTL_MS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

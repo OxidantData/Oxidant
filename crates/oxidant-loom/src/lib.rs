@@ -3112,6 +3112,14 @@ impl Engine {
             let state = datafusion::execution::session_state::SessionStateBuilder::new()
                 .with_config(config)
                 .with_runtime_env(env)
+                // `SparkSubstrPlanner` MUST precede the default expr planners:
+                // `with_default_features` *extends* this list with the defaults, and the SQL
+                // planner consults expr planners in order — the default planner always claims
+                // `plan_substring`, so a substring planner appended later (e.g. via
+                // `register_expr_planner`) would never run. See `spark_functions::spark_substr`.
+                .with_expr_planners(vec![Arc::new(
+                    spark_functions::spark_substr::SparkSubstrPlanner,
+                )])
                 .with_default_features()
                 .with_physical_optimizer_rules(physical_optimizer_rules())
                 .build();
@@ -4580,9 +4588,95 @@ impl Engine {
             provider,
             self.ctx.clone(),
             self.require_lakehouse_snapshot_pins.clone(),
+            self.catalog_version.clone(),
         ));
         self.ctx.register_catalog(name, bridge);
         self.note_catalog_change(name);
+    }
+
+    /// `spark.catalog.refreshTable`: drop the table's cached provider from the external catalog
+    /// bridge, so the next reference re-resolves it from the metastore (a re-typed schema / new
+    /// location is picked up without a restart). When an entry was actually evicted, the stage
+    /// plan cache's catalog version is bumped so cached distributed plans rebuild; a refresh
+    /// that evicted nothing (never-resolved table, local non-external-catalog table) is a
+    /// no-op — like Spark, which skips cache invalidation when nothing was cached. Accepts
+    /// `catalog.db.table`, `db.table`, or a bare `table` — resolved against this handle's
+    /// current catalog + namespace (the same session state SQL `USE` and the Connect Catalog
+    /// RPCs drive).
+    ///
+    /// Edge case: external-catalog sessions seed an EMPTY namespace (KAN-84, see
+    /// [`Engine::for_session`]/`run_use`), so a bare-name refresh has no namespace to key the
+    /// bridge's schema providers by. Rather than no-op, the eviction then falls back to a
+    /// bare-name sweep of the resolved catalog's schema providers (or of every registered
+    /// external catalog when the current catalog isn't external).
+    ///
+    /// NOTE: this RPC only reaches the process it lands on (the driver). Worker processes are
+    /// not reachable from here — they converge on metastore changes via the non-lakehouse
+    /// catalog cache TTL (`OXIDANT_CATALOG_CACHE_TTL_MS`, see `catalog_bridge`).
+    pub async fn refresh_table(&self, table_name: &str) -> Result<()> {
+        let parts = oxidant_catalog::split_ident(table_name);
+        let Some((table, qualifier)) = parts.split_last() else {
+            return Err(Error::Plan(format!(
+                "refreshTable: empty table name `{table_name}`"
+            )));
+        };
+        let (current_catalog, current_namespace) = self.current_catalog_and_namespace();
+        let (catalog, namespace, external, external_names) = {
+            let catalogs = self
+                .oxidant_catalogs
+                .lock()
+                .expect("oxidant_catalogs poisoned");
+            // A leading segment that names a registered external catalog is the catalog (the
+            // rest is the namespace); otherwise the whole qualifier is a namespace in the
+            // current catalog.
+            let (catalog, namespace) = match qualifier.split_first() {
+                Some((first, rest)) if catalogs.contains_key(first.as_str()) => {
+                    (first.clone(), rest.to_vec())
+                }
+                _ if !qualifier.is_empty() => (current_catalog.clone(), qualifier.to_vec()),
+                _ => (current_catalog.clone(), current_namespace),
+            };
+            let external = catalogs.contains_key(&catalog);
+            let external_names: Vec<String> = catalogs.keys().cloned().collect();
+            (catalog, namespace, external, external_names)
+        };
+
+        // The bridge is registered under the same name in DataFusion's catalog list; downcast
+        // via the `Any` supertrait (`CatalogProvider` has no dedicated `as_any`). The
+        // `provider` Arc is bound in each scope so the downcast reference stays valid.
+        let mut evicted = false;
+        if external {
+            if let Some(provider) = self.ctx.catalog(&catalog) {
+                let any: &dyn std::any::Any = provider.as_ref();
+                if let Some(bridge) = any.downcast_ref::<catalog_bridge::OxidantCatalogProvider>() {
+                    evicted = match namespace.last() {
+                        // The bridge's schema providers are single-part namespaces (see
+                        // `catalog_bridge` module docs) — the last segment is the key.
+                        Some(ns) => bridge.evict_table(ns, table),
+                        // Empty session namespace (KAN-84): no schema key — evict by bare name
+                        // across every schema provider the bridge materialized.
+                        None => bridge.evict_table_anywhere(table),
+                    };
+                }
+            }
+        } else if namespace.is_empty() {
+            // Bare name, no current namespace, and the current catalog isn't external: sweep
+            // every registered external catalog — evict by bare name wherever it is cached.
+            for name in &external_names {
+                if let Some(provider) = self.ctx.catalog(name) {
+                    let any: &dyn std::any::Any = provider.as_ref();
+                    if let Some(bridge) =
+                        any.downcast_ref::<catalog_bridge::OxidantCatalogProvider>()
+                    {
+                        evicted = bridge.evict_table_anywhere(table) || evicted;
+                    }
+                }
+            }
+        }
+        if evicted {
+            self.catalog_version.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Whether `name` is qualified with a registered external catalog (`catalog.db.table`, or

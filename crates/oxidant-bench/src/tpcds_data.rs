@@ -12,12 +12,18 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::OnceLock;
 
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::{CsvReadOptions, SessionContext};
 
 use crate::tpc_kits;
 
 /// Vendored public column lists (table → ordered columns), matching official `dsdgen` `.dat` order.
 const TPCDS_COLUMNS: &str = include_str!("../../../bench/tpc/tpcds_columns.tsv");
+
+/// Canonical TPC-DS types (table → `name:type` per official `tpcds.sql`) — string zips,
+/// decimal money, int32 keys. CSV inference mis-types these (Int64 zips, Float64 money)
+/// and breaks the SF1 gate (Q8/Q15/Q19/Q45 substr-over-int, Q67 float-sum ties).
+const TPCDS_TYPES: &str = include_str!("../../../bench/tpc/tpcds_types.tsv");
 
 /// The 24 TPC-DS tables (official kit).
 pub const TABLES: [&str; 24] = [
@@ -67,6 +73,46 @@ fn column_map() -> &'static HashMap<String, Vec<String>> {
                 table.to_string(),
                 cols.split(',').map(|s| s.trim().to_string()).collect(),
             );
+        }
+        m
+    })
+}
+
+fn schema_map() -> &'static HashMap<String, Schema> {
+    static MAP: OnceLock<HashMap<String, Schema>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m = HashMap::new();
+        for line in TPCDS_TYPES.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (table, cols) = line
+                .split_once('\t')
+                .unwrap_or_else(|| panic!("bad tpcds_types.tsv line: {line}"));
+            let mut fields = Vec::new();
+            for col in cols.split('|') {
+                let (name, typ) = col
+                    .rsplit_once(':')
+                    .unwrap_or_else(|| panic!("bad tpcds_types.tsv column: {col}"));
+                let t = typ.trim().to_ascii_lowercase();
+                let dt = if t == "integer" {
+                    DataType::Int32
+                } else if t == "date" {
+                    DataType::Date32
+                } else if let Some(ps) =
+                    t.strip_prefix("decimal(").and_then(|s| s.strip_suffix(')'))
+                {
+                    let (p, s) = ps.split_once(',').expect("decimal(p,s)");
+                    DataType::Decimal128(p.trim().parse().unwrap(), s.trim().parse().unwrap())
+                } else if t.starts_with("char") || t.starts_with("varchar") || t == "time" {
+                    DataType::Utf8
+                } else {
+                    panic!("unhandled tpcds type {t}");
+                };
+                fields.push(Field::new(name, dt, true));
+            }
+            m.insert(table.to_string(), Schema::new(fields));
         }
         m
     })
@@ -122,11 +168,24 @@ pub fn generate(sf: f64, dir: &Path) -> io::Result<()> {
     );
     tpc_kits::run_dsdgen(sf_int, &raw)?;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tokio rt: {e}")))?;
-    rt.block_on(convert_dat_to_parquet(&raw, dir))?;
+    // Convert on a dedicated thread with its own current-thread runtime. bench_main already
+    // runs inside tokio (nested block_on panics), block_in_place requires a multi-thread
+    // runtime (#[tokio::test] is current-thread), so a plain spawned thread is the only
+    // shape that works from every caller. 32 MiB stack matches main.rs (parser recursion).
+    let raw_t = raw.clone();
+    let dir_t = dir.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tokio rt: {e}")))?;
+            rt.block_on(convert_dat_to_parquet(&raw_t, &dir_t))
+        })
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn convert: {e}")))?
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "convert thread panicked"))??;
 
     let _ = fs::remove_dir_all(&raw);
     let mut f = fs::File::create(&marker)?;
@@ -170,24 +229,36 @@ async fn convert_dat_to_parquet(raw: &Path, out: &Path) -> io::Result<()> {
         let path_str = staged
             .to_str()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 path"))?;
-        // Headered CSV + type inference (matches prior DuckDB parquet usability for SQL).
-        let opts = CsvReadOptions::new().has_header(true);
+        // Explicit canonical schema (no inference): string zips, decimal money, int32 keys —
+        // see TPCDS_TYPES. Empty fields parse as null for non-string columns.
+        let schema = schema_map().get(t).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no schema for `{t}` in tpcds_types.tsv"),
+            )
+        })?;
+        let opts = CsvReadOptions::new().has_header(true).schema(schema);
         ctx.register_csv(t, path_str, opts)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("register {t}: {e}")))?;
         let dest = out.join(format!("{t}.parquet"));
         let dest_str = dest
             .to_str()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 path"))?
-            .replace('\'', "''");
-        ctx.sql(&format!(
-            "COPY (SELECT * FROM \"{t}\") TO '{dest_str}' (FORMAT PARQUET)"
-        ))
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("copy plan {t}: {e}")))?
-        .collect()
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("copy exec {t}: {e}")))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 path"))?;
+        // DataFrame API: the SQL `COPY (SELECT …) TO … (FORMAT PARQUET)` form is not
+        // accepted by the DataFusion 54 parser (fails at the options list).
+        let mut parquet_opts = datafusion::config::TableParquetOptions::default();
+        parquet_opts.global.compression = Some("snappy".into());
+        ctx.table(t)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("read {t}: {e}")))?
+            .write_parquet(
+                dest_str,
+                datafusion::dataframe::DataFrameWriteOptions::new().with_single_file_output(true),
+                Some(parquet_opts),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("write {t}: {e}")))?;
         let _ = fs::remove_file(&staged);
     }
     Ok(())

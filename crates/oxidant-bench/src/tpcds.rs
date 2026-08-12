@@ -26,6 +26,19 @@ const BASELINE_JSON: &str = include_str!("../../../bench/tpcds/baseline.json");
 /// without collapsing distinct integer keys the way 3-sig-fig rounding does).
 const FLOAT_REL_EPS: f64 = 1e-3;
 
+/// Tolerance for Decimal columns in the ordered execute-gate comparator
+/// ([`batches_equal_ordered`]; much tighter than [`FLOAT_REL_EPS`]). Decimal ADDITION is exact,
+/// so pure `SUM(...)` columns stay byte-identical across the distributed partial/final split —
+/// but a decimal DIVISION rounds at the division result scale, and the split shifts where that
+/// rounding happens: single-node divides fully-combined per-group sums, while the partial stages
+/// divide per-worker partial sums and the final stage recombines those rounded ratios (TPC-DS
+/// Q66's `sum(jan_sales / w_warehouse_sq_ft)`; measured max divergence 1e-6 abs = 1 ulp at
+/// division scale 6, bounded by the number of recombined terms × 0.5 ulp). 1e-5 abs / 1e-6 rel
+/// covers that rounding-point shift with margin while staying far below any real data
+/// difference (the `ordered_decimal_stays_exact` test's 1% case still fails).
+const DECIMAL_ABS_EPS: f64 = 1e-5;
+const DECIMAL_REL_EPS: f64 = 1e-6;
+
 /// The 99 official TPC-DS queries (from TPC `dsqgen -QUALIFY Y`), loaded from
 /// `bench/tpcds/queries/q{N}.sql` at compile time. Regenerate with
 /// `bench/tpc/generate-queries.sh`.
@@ -369,9 +382,12 @@ pub(crate) fn normalize_batches(batches: &[RecordBatch]) -> Vec<Vec<String>> {
 /// Ordered row-for-row equality for the distributed execute gate.
 ///
 /// Float32/Float64 columns compare with [`FLOAT_REL_EPS`] relative tolerance (partial-aggregate
-/// recombination is not bit-identical to single-node). Decimals, integers, dates, and strings
-/// stay byte-exact via Arrow's default formatter. Row order is significant — unlike
-/// [`rows_equal`], which is a multiset comparator for the single-node DuckDB oracle.
+/// recombination is not bit-identical to single-node). Decimal columns compare with the much
+/// tighter [`DECIMAL_ABS_EPS`]/[`DECIMAL_REL_EPS`] band: decimal sums recombine exactly, but a
+/// decimal division's rounding point moves across the partial/final split (see the constants'
+/// doc). Integers, dates, and strings stay byte-exact via Arrow's default formatter. Row order
+/// is significant — unlike [`rows_equal`], which is a multiset comparator for the single-node
+/// DuckDB oracle.
 pub(crate) fn batches_equal_ordered(a: &[RecordBatch], b: &[RecordBatch]) -> bool {
     let schema_a = match a.first() {
         Some(batch) => batch.schema(),
@@ -385,14 +401,20 @@ pub(crate) fn batches_equal_ordered(a: &[RecordBatch], b: &[RecordBatch]) -> boo
         return false;
     }
 
-    let float_cols: Vec<bool> = schema_a
+    let col_cmp: Vec<CellCmp> = schema_a
         .fields()
         .iter()
         .zip(schema_b.fields())
         .map(|(fa, fb)| {
-            // Only treat a column as float-tolerant when *both* sides are Float32/Float64.
+            // Only tolerate rounding noise when *both* sides share the fractional type class.
             // A Decimal↔Float mismatch must stay an exact string compare (and fail).
-            is_float_type(fa.data_type()) && is_float_type(fb.data_type())
+            if is_float_type(fa.data_type()) && is_float_type(fb.data_type()) {
+                CellCmp::Float
+            } else if is_decimal_type(fa.data_type()) && is_decimal_type(fb.data_type()) {
+                CellCmp::Decimal
+            } else {
+                CellCmp::Exact
+            }
         })
         .collect();
 
@@ -402,24 +424,39 @@ pub(crate) fn batches_equal_ordered(a: &[RecordBatch], b: &[RecordBatch]) -> boo
         return false;
     }
     rows_a.iter().zip(rows_b.iter()).all(|(ra, rb)| {
-        if ra.len() != rb.len() || ra.len() != float_cols.len() {
+        if ra.len() != rb.len() || ra.len() != col_cmp.len() {
             return false;
         }
         ra.iter()
             .zip(rb.iter())
-            .zip(float_cols.iter())
-            .all(|((ca, cb), &is_float)| {
-                if is_float {
-                    float_cells_close(ca, cb)
-                } else {
-                    ca == cb
-                }
+            .zip(col_cmp.iter())
+            .all(|((ca, cb), cmp)| match cmp {
+                CellCmp::Float => float_cells_close(ca, cb),
+                CellCmp::Decimal => decimal_cells_close(ca, cb),
+                CellCmp::Exact => ca == cb,
             })
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellCmp {
+    Exact,
+    Float,
+    Decimal,
+}
+
 fn is_float_type(dt: &DataType) -> bool {
     matches!(dt, DataType::Float32 | DataType::Float64)
+}
+
+fn is_decimal_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
 }
 
 fn float_cells_close(a: &str, b: &str) -> bool {
@@ -431,6 +468,24 @@ fn float_cells_close(a: &str, b: &str) -> bool {
     }
     match (a.parse::<f64>(), b.parse::<f64>()) {
         (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => floats_close(x, y),
+        _ => false,
+    }
+}
+
+/// Decimal cells formatted by Arrow (`1234.5678` at the column's scale). Tolerance is the
+/// tighter of the division-ulp band, NOT [`floats_close`]'s loose relative band: decimal
+/// recombination is exact except across a division rounding-point shift.
+fn decimal_cells_close(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if a == "NULL" || b == "NULL" {
+        return false;
+    }
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => {
+            (x - y).abs() <= DECIMAL_ABS_EPS.max(DECIMAL_REL_EPS * x.abs().max(y.abs()))
+        }
         _ => false,
     }
 }
@@ -631,9 +686,61 @@ mod tests {
             );
             RecordBatch::try_new(schema.clone(), vec![arr]).unwrap()
         };
-        // 1.00 vs 1.01 as decimal — must NOT match under float eps.
+        // 1.00 vs 1.01 as decimal — must NOT match even under the decimal band (1% ≫ 1e-6).
         assert!(!batches_equal_ordered(&[mk(100)], &[mk(101)]));
         assert!(batches_equal_ordered(&[mk(100)], &[mk(100)]));
+    }
+
+    #[test]
+    fn ordered_decimal_division_ulp_matches() {
+        use datafusion::arrow::array::{ArrayRef, Decimal128Array};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        // Q66's `*_sales_per_sq_foot` columns: division result scale 6. The distributed
+        // partial/final split rounds the division at a different operand granularity than
+        // single-node, so cells differ by ~1 ulp (1e-6); that must compare equal.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ratio",
+            DataType::Decimal128(38, 6),
+            false,
+        )]));
+        let mk = |v: i128| {
+            let arr: ArrayRef = Arc::new(
+                Decimal128Array::from(vec![v])
+                    .with_precision_and_scale(38, 6)
+                    .unwrap(),
+            );
+            RecordBatch::try_new(schema.clone(), vec![arr]).unwrap()
+        };
+        // 15.303015 vs 15.303014 (the measured Q66 divergence): 1 ulp at scale 6.
+        assert!(batches_equal_ordered(&[mk(15303015)], &[mk(15303014)]));
+        // 100 ulps is beyond recombination noise — must stay a mismatch.
+        assert!(!batches_equal_ordered(&[mk(15303015)], &[mk(15302915)]));
+    }
+
+    #[test]
+    fn ordered_decimal_scale_zero_stays_exact() {
+        use datafusion::arrow::array::{ArrayRef, Decimal128Array};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        // Scale-0 decimals step in whole units, so any real difference ≫ DECIMAL_ABS_EPS.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "n",
+            DataType::Decimal128(38, 0),
+            false,
+        )]));
+        let mk = |v: i128| {
+            let arr: ArrayRef = Arc::new(
+                Decimal128Array::from(vec![v])
+                    .with_precision_and_scale(38, 0)
+                    .unwrap(),
+            );
+            RecordBatch::try_new(schema.clone(), vec![arr]).unwrap()
+        };
+        assert!(!batches_equal_ordered(&[mk(1000)], &[mk(1001)]));
+        assert!(batches_equal_ordered(&[mk(1000)], &[mk(1000)]));
     }
 
     #[test]
