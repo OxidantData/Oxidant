@@ -11130,6 +11130,8 @@ mod tests {
     /// behavior change: before footer-stat attachment every catalog parquet scan reported
     /// `Statistics::new_unknown`, so the unknown-estimate reroute sent every such join to
     /// sort-merge. `OXIDANT_PARQUET_SCAN_STATS=0` restores the old shape (the escape hatch).
+    /// KAN-143: column-level min/max/null counts ride along when the declared schema matches
+    /// the file's physical columns (see `column_stats_trusted` in catalog_bridge).
     #[tokio::test]
     async fn catalog_parquet_scan_attaches_footer_row_counts() {
         let _env = JOIN_GUARD_ENV_LOCK.lock().await;
@@ -11180,10 +11182,11 @@ mod tests {
             "footer row counts must sum to an exact table row count, got {:?}",
             stats.num_rows
         );
-        // Per-file counts keep the original file order (part-0 = 4 rows), and column-level
-        // statistics must be STRIPPED: computed against the declared schema they would
-        // misdescribe case/type-mismatched file columns, and the parquet opener reads
-        // per-file min==max / all-null stats as constant-column proofs (the
+        // Per-file counts keep the original file order (part-0 = 4 rows). KAN-143: with a
+        // schema that matches the file's physical columns (inferred here, so names/types
+        // line up exactly), column-level statistics are ATTACHED — min/max/null counts from
+        // the footer. They are dropped only for case/type-mismatched files, which the
+        // parquet opener would otherwise read as constant-column proofs (the
         // `declared_schema_matches_columns_case_insensitively` regression).
         let part0 = scan.partition_statistics(Some(0)).unwrap();
         assert!(
@@ -11194,15 +11197,36 @@ mod tests {
             "partition 0 must be part-0.parquet's footer count, got {:?}",
             part0.num_rows
         );
+        let part0_x = &part0.column_statistics[0];
         assert!(
-            part0
-                .column_statistics
-                .iter()
-                .all(|c| c.min_value.get_value().is_none()
-                    && c.max_value.get_value().is_none()
-                    && c.null_count.get_value().is_none()),
-            "per-file column statistics must be stripped, got {:?}",
+            matches!(
+                part0_x.min_value.get_value(),
+                Some(datafusion::common::ScalarValue::Int64(Some(0)))
+            ) && matches!(
+                part0_x.max_value.get_value(),
+                Some(datafusion::common::ScalarValue::Int64(Some(3)))
+            ) && matches!(
+                part0_x.null_count,
+                datafusion::common::stats::Precision::Exact(0)
+            ),
+            "part-0 (x in 0..4) must carry footer column statistics, got {:?}",
             part0.column_statistics
+        );
+        // The table-wide aggregate folds both files: min 0, max 5, exact null count.
+        let agg_x = &stats.column_statistics[0];
+        assert!(
+            matches!(
+                agg_x.min_value.get_value(),
+                Some(datafusion::common::ScalarValue::Int64(Some(0)))
+            ) && matches!(
+                agg_x.max_value.get_value(),
+                Some(datafusion::common::ScalarValue::Int64(Some(5)))
+            ) && matches!(
+                agg_x.null_count,
+                datafusion::common::stats::Precision::Exact(0)
+            ),
+            "the table aggregate must span both files' column statistics, got {:?}",
+            stats.column_statistics
         );
         // The escape hatch: statistics disabled → the pre-KAN-8 unknown shape.
         std::env::set_var("OXIDANT_PARQUET_SCAN_STATS", "0");
@@ -11578,18 +11602,19 @@ mod tests {
         }
     }
 
-    /// Assumption check behind the Q37/Q82 guard, directly against DataFusion 54.1.0:
-    /// with exact scan row counts but NO column statistics (footer attachment strips
-    /// them, see [`catalog_parquet_scan_attaches_footer_row_counts`]), a join chain's
-    /// OUTPUT statistics report `num_rows = Inexact(min(l, r))` —
-    /// `estimate_inner_join_cardinality` derives the join selectivity from
-    /// row-count-bounded max-distinct estimates when NDVs are absent
-    /// (datafusion-physical-plan-54.1.0 `joins/utils.rs`), and
-    /// `Precision::Inexact::get_value()` is `Some`, so the KAN-25 guard's
-    /// [`hash_join_build_estimated_bytes`] treats a join-output side as
-    /// estimable instead of rerouting it to sort-merge. (KAN-2: that estimate is a
-    /// phantom for foreign-key chains — the chain output is the PROBE side now; the
-    /// guard sizes the exact dim builds it is placed on.)
+    /// Assumption check behind the Q37/Q82 guard, directly against DataFusion 54.1.0: with
+    /// exact scan row counts AND footer column statistics (KAN-143 — pre-KAN-143 the footer
+    /// attachment stripped them, see [`catalog_parquet_scan_attaches_footer_row_counts`]), a
+    /// foreign-key join chain's OUTPUT statistics report `num_rows = Inexact(fact_rows)` —
+    /// `estimate_inner_join_cardinality` derives the join selectivity from max-distinct
+    /// estimates, which the join keys' min/max ranges pin to the dimension key domains
+    /// rather than the fact row count (datafusion-physical-plan-54.1.0 `joins/utils.rs`),
+    /// and `Precision::Inexact::get_value()` is `Some`, so the KAN-25 guard's
+    /// [`hash_join_build_estimated_bytes`] treats a join-output side as estimable instead
+    /// of rerouting it to sort-merge. (KAN-2/KAN-143: pre-KAN-143 this estimate was
+    /// `Inexact(min(l, r))` — a phantom orders of magnitude under the real fact-sized
+    /// output; the chain output is the PROBE side now, and the guard sizes the exact dim
+    /// builds it is placed on.)
     #[tokio::test]
     async fn join_chain_output_statistics_report_usable_inexact_num_rows() {
         let _env = JOIN_GUARD_ENV_LOCK.lock().await;
@@ -11609,17 +11634,19 @@ mod tests {
             )
             .await
             .unwrap();
-        // The upper of the two hash joins carries the CHAIN's output statistics:
-        // min(fact ⋈ dim1) = 100 inexact rows in, min(100, 1_000) = 100 out.
+        // The upper of the two hash joins carries the CHAIN's output statistics. With
+        // footer min/max on the join keys the NDV estimates are the dim key domains
+        // (100 and 1_000), so fact ⋈ dim1 estimates fact-sized 100_000 in, and
+        // 100_000 ⋈ dim2 estimates 100_000 out (pre-KAN-143: min(l, r) = 100 both times).
         let top = top_hash_join(plan.as_ref()).expect("a 2-join chain");
         let stats =
             datafusion::physical_plan::ExecutionPlan::partition_statistics(top, None).unwrap();
         assert!(
             matches!(
                 stats.num_rows,
-                datafusion::common::stats::Precision::Inexact(100)
+                datafusion::common::stats::Precision::Inexact(100_000)
             ),
-            "join-chain output must be Inexact(min(l, r)) rows, got {:?}",
+            "join-chain output must estimate fact-sized rows (not Inexact(min(l, r))), got {:?}",
             stats.num_rows
         );
         assert!(

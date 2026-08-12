@@ -1570,7 +1570,24 @@ impl TableProvider for LakehouseTableProvider {
 /// unknown-statistics scans — the escape hatch if footer reads misbehave against some
 /// object store. `OXIDANT_PREFER_HASH_JOIN` remains the per-session join-strategy override.
 fn parquet_scan_stats_enabled() -> bool {
-    std::env::var("OXIDANT_PARQUET_SCAN_STATS")
+    parquet_stats_env_flag("OXIDANT_PARQUET_SCAN_STATS")
+}
+
+/// Whether the footer statistics also carry COLUMN statistics (min/max, null counts,
+/// distinct counts) in addition to row/byte counts (env `OXIDANT_PARQUET_COLUMN_STATS`,
+/// default **true**). Column stats feed DataFusion's join cardinality estimation — an FK
+/// star join's output is otherwise estimated as `Inexact(min(left, right))`, orders of
+/// magnitude under the real fact-sized result (see `provable_row_bound` in lib.rs). Setting
+/// `0`/`false`/`off`/`no` restores the row-counts-only shape (the pre-KAN-143 behavior)
+/// while keeping the footer prefetch itself. `OXIDANT_PARQUET_SCAN_STATS=0` still disables
+/// footer reads entirely.
+fn parquet_column_stats_enabled() -> bool {
+    parquet_stats_env_flag("OXIDANT_PARQUET_COLUMN_STATS")
+}
+
+/// Shared `0`/`false`/`off`/`no` parsing for the scan-statistics env gates; unset means ON.
+fn parquet_stats_env_flag(var: &str) -> bool {
+    std::env::var(var)
         .ok()
         .as_deref()
         .map(|v| {
@@ -1594,11 +1611,11 @@ fn parquet_scan_stats_enabled() -> bool {
 /// KAN-45/KAN-53 runtime pool-exhaustion retry already backstops. Footer reads NEVER fail
 /// the scan itself.
 ///
-/// Only row counts and byte sizes are attached — column-level min/max/null counts are
-/// deliberately DROPPED: they are computed against the declared file schema, but the
-/// physical file columns may differ in name case or type (the gap
-/// [`crate::schema_adapt::CaseInsensitiveExprAdapterFactory`] exists to bridge), and the
-/// parquet opener consumes per-file column statistics as constant-column
+/// Column-level min/max/null counts are attached only when [`column_stats_trusted`] proves
+/// they describe the file's ACTUAL physical columns: they are computed against the declared
+/// file schema, whose column names, case and types can differ from the physical file columns
+/// (the gap [`crate::schema_adapt::CaseInsensitiveExprAdapterFactory`] bridges at read
+/// time), and the parquet opener consumes per-file column statistics as constant-column
 /// (`min == max` / all-null) proofs that rewrite projections to literals before the
 /// expression adapter runs. Row counts are schema-independent, so they stay exact.
 async fn parquet_footer_file_groups(
@@ -1611,9 +1628,7 @@ async fn parquet_footer_file_groups(
     Option<datafusion::common::Statistics>,
 ) {
     use datafusion::common::stats::Precision;
-    use datafusion::common::Statistics;
-    use datafusion::datasource::file_format::parquet::ParquetFormat;
-    use datafusion::datasource::file_format::FileFormat;
+    use datafusion::common::{ColumnStatistics, Statistics};
     use datafusion::datasource::physical_plan::FileGroup;
     use futures::StreamExt;
 
@@ -1637,14 +1652,14 @@ async fn parquet_footer_file_groups(
             return (plain_groups(), None);
         }
     };
+    let attach_columns = parquet_column_stats_enabled();
     let file_schema = table_schema.file_schema().clone();
     let mut per_file = futures::stream::iter(files.iter().cloned().enumerate().map(|(i, file)| {
         let store = Arc::clone(&store);
         let schema = file_schema.clone();
         async move {
-            let stats = ParquetFormat::default()
-                .infer_stats(state, &store, schema, &file.object_meta)
-                .await;
+            let stats =
+                parquet_file_footer_statistics(state, &store, &schema, &file.object_meta).await;
             (i, file, stats)
         }
     }))
@@ -1660,28 +1675,82 @@ async fn parquet_footer_file_groups(
     let mut total_byte_size = Precision::Exact(0_usize);
     let mut read = 0_usize;
     let mut missed = 0_usize;
+    // Table-wide column aggregates, built only while EVERY successfully read file
+    // contributes trusted column stats; a missed file or one untrusted file poisons the
+    // whole aggregate (a partial min/max/null-count across files would be silently wrong).
+    // `None` until the first trusted file seeds it — folding into `Absent` would never
+    // produce a value (`Precision::min`/`max` propagate `Absent`).
+    let mut column_aggs: Option<Vec<ColumnStatistics>> = None;
+    let mut column_aggs_poisoned = !attach_columns;
+    let mut ndv_summed_files = 0_usize;
     for (_, file, stats) in per_file {
         match stats {
-            Ok(stats) => {
+            Ok(footer) => {
                 read += 1;
-                num_rows = num_rows.add(&stats.num_rows);
-                total_byte_size = total_byte_size.add(&stats.total_byte_size);
-                // Keep ONLY row/byte counts per file — drop the column statistics. They
-                // were computed against the DECLARED file schema, whose column names,
-                // case and types can differ from the physical file columns (exactly the
-                // gap `CaseInsensitiveExprAdapterFactory` bridges at read time): a
-                // case-mismatched column comes back `null_count == num_rows`, and the
+                num_rows = num_rows.add(&footer.stats.num_rows);
+                total_byte_size = total_byte_size.add(&footer.stats.total_byte_size);
+                let attach_file_columns = attach_columns && footer.column_stats_trusted;
+                // Keep ONLY row/byte counts when column stats are disabled or untrusted for
+                // this file: DataFusion computes them against the DECLARED file schema, whose
+                // column names, case and types can differ from the physical file columns
+                // (exactly the gap `CaseInsensitiveExprAdapterFactory` bridges at read time):
+                // a case-mismatched column comes back `null_count == num_rows`, and the
                 // parquet opener treats that (or `min == max`) as proof of a constant
                 // column — literal-replacing or file-pruning real data away.
-                let file_stats = Statistics::new_unknown(table_schema.file_schema())
-                    .with_num_rows(stats.num_rows)
-                    .with_total_byte_size(stats.total_byte_size);
+                let file_stats = if attach_file_columns {
+                    footer.stats.clone()
+                } else {
+                    Statistics::new_unknown(table_schema.file_schema())
+                        .with_num_rows(footer.stats.num_rows)
+                        .with_total_byte_size(footer.stats.total_byte_size)
+                };
                 // Group-level statistics (what `partition_statistics(Some(p))` reads) cover
                 // the full table schema — file columns + partition columns — per
                 // `FileGroup::file_statistics`'s contract.
-                let group_stats = Statistics::new_unknown(table_schema.table_schema())
-                    .with_num_rows(stats.num_rows)
-                    .with_total_byte_size(stats.total_byte_size);
+                let mut group_stats = Statistics::new_unknown(table_schema.table_schema())
+                    .with_num_rows(footer.stats.num_rows)
+                    .with_total_byte_size(footer.stats.total_byte_size);
+                if attach_file_columns {
+                    group_stats.column_statistics = table_wide_column_stats(
+                        footer.stats.column_statistics.clone(),
+                        table_schema,
+                    );
+                }
+                // A 0-row file contributes nothing to the column aggregates — folding its
+                // `Absent` min/max in would poison the whole table's statistics.
+                if footer.stats.num_rows == Precision::Exact(0) {
+                    groups.push(
+                        FileGroup::new(vec![file.with_statistics(Arc::new(file_stats))])
+                            .with_statistics(Arc::new(group_stats)),
+                    );
+                    continue;
+                }
+                match (
+                    column_aggs_poisoned,
+                    attach_file_columns,
+                    column_aggs.as_mut(),
+                ) {
+                    (false, true, Some(aggs)) => {
+                        ndv_summed_files += 1;
+                        for (agg, file_column) in
+                            aggs.iter_mut().zip(footer.stats.column_statistics.iter())
+                        {
+                            agg.null_count = agg.null_count.add(&file_column.null_count);
+                            agg.min_value = agg.min_value.min(&file_column.min_value);
+                            agg.max_value = agg.max_value.max(&file_column.max_value);
+                            agg.distinct_count =
+                                agg.distinct_count.add(&file_column.distinct_count);
+                            agg.byte_size = agg.byte_size.add(&file_column.byte_size);
+                        }
+                    }
+                    (false, true, None) => {
+                        ndv_summed_files = 1;
+                        column_aggs = Some(footer.stats.column_statistics.clone());
+                    }
+                    // This file's column stats are unusable — no honest aggregate remains.
+                    (false, false, _) => column_aggs_poisoned = true,
+                    _ => {}
+                }
                 groups.push(
                     FileGroup::new(vec![file.with_statistics(Arc::new(file_stats))])
                         .with_statistics(Arc::new(group_stats)),
@@ -1689,6 +1758,7 @@ async fn parquet_footer_file_groups(
             }
             Err(e) => {
                 missed += 1;
+                column_aggs_poisoned = true;
                 eprintln!(
                     "warn: could not read parquet footer statistics for `{}`: {e}",
                     file.object_meta.location
@@ -1704,10 +1774,128 @@ async fn parquet_footer_file_groups(
         num_rows = num_rows.to_inexact();
         total_byte_size = total_byte_size.to_inexact();
     }
-    let statistics = Statistics::new_unknown(table_schema.table_schema())
+    let mut statistics = Statistics::new_unknown(table_schema.table_schema())
         .with_num_rows(num_rows)
         .with_total_byte_size(total_byte_size);
+    if let Some(mut aggs) = column_aggs.filter(|_| !column_aggs_poisoned) {
+        // NDVs do not compose across files: the per-file exact counts SUM to an upper
+        // bound (the same value Spark's catalog statistics use), never an exact count.
+        if ndv_summed_files > 1 {
+            for agg in &mut aggs {
+                agg.distinct_count = agg.distinct_count.to_inexact();
+            }
+        }
+        statistics.column_statistics = table_wide_column_stats(aggs, table_schema);
+    }
     (groups, Some(statistics))
+}
+
+/// A file's footer statistics plus whether the COLUMN-level part is safe to use.
+struct FileFooterStatistics {
+    /// Full statistics against the declared file schema, exactly as DataFusion computes
+    /// them (`DFParquetMetadata::statistics_from_parquet_metadata`): exact row count,
+    /// per-column min/max, null counts, distinct counts and byte sizes where the footer
+    /// carries them.
+    stats: datafusion::common::Statistics,
+    /// `false` when the declared file schema does not line up with the file's physical
+    /// columns (see [`column_stats_trusted`]) — consumers must then keep only the row/byte
+    /// counts, which are schema-independent and stay exact.
+    column_stats_trusted: bool,
+}
+
+/// Read one file's footer (through the runtime's shared metadata cache, same entry the
+/// scan's `CachedParquetFileReaderFactory` later reuses) and compute its statistics. This
+/// is exactly `ParquetFormat::infer_stats` — `DFParquetMetadata::fetch_metadata` +
+/// `statistics_from_parquet_metadata`, same cache, same size hint, same page-index policy —
+/// except the metadata stays around for the [`column_stats_trusted`] check instead of being
+/// dropped inside `fetch_statistics`.
+async fn parquet_file_footer_statistics(
+    state: &dyn datafusion::catalog::Session,
+    store: &Arc<dyn object_store::ObjectStore>,
+    file_schema: &SchemaRef,
+    object_meta: &object_store::ObjectMeta,
+) -> DfResult<FileFooterStatistics> {
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion_datasource_parquet::metadata::DFParquetMetadata;
+
+    let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
+    let metadata = DFParquetMetadata::new(store.as_ref(), object_meta)
+        .with_metadata_size_hint(ParquetFormat::default().metadata_size_hint())
+        .with_file_metadata_cache(Some(metadata_cache))
+        .fetch_metadata()
+        .await?;
+    let stats = DFParquetMetadata::statistics_from_parquet_metadata(&metadata, file_schema)?;
+    Ok(FileFooterStatistics {
+        column_stats_trusted: column_stats_trusted(&metadata, file_schema),
+        stats,
+    })
+}
+
+/// Whether the column statistics DataFusion derives for `file_schema` describe the file's
+/// ACTUAL physical columns — and are therefore safe to hand to the parquet opener, which
+/// turns `min == max` / all-null column stats into constant-column literal rewrites of the
+/// projection and predicate (`constant_columns_from_stats`, datafusion-datasource-parquet
+/// 54 opener).
+///
+/// DataFusion looks each declared column up BY NAME in the physical schema
+/// (`StatisticsConverter::try_new`); when the lookup fails it stamps
+/// `null_count = Exact(num_rows)` — stats that "prove" an all-null column. That is correct
+/// for a genuinely absent column (schema evolution: the reader yields nulls too), but wrong
+/// when the column exists under a different name case: the
+/// `CaseInsensitiveExprAdapterFactory` then decodes real data while the stats claim all
+/// null, and the opener literal-replaces the column away. Attach column stats only when
+/// every declared column that exists in the file case-INSENSITIVELY also resolves by its
+/// exact name.
+fn column_stats_trusted(
+    metadata: &datafusion::parquet::file::metadata::ParquetMetaData,
+    file_schema: &SchemaRef,
+) -> bool {
+    use datafusion::parquet::arrow::arrow_reader::statistics::StatisticsConverter;
+    use datafusion::parquet::arrow::parquet_to_arrow_schema;
+
+    let file_metadata = metadata.file_metadata();
+    // Mirror `statistics_from_parquet_metadata`'s own physical-schema derivation —
+    // including its binary/string type coercions — so the check passes exactly when its
+    // converter lookups succeeded.
+    let mut physical_schema = match parquet_to_arrow_schema(
+        file_metadata.schema_descr(),
+        file_metadata.key_value_metadata(),
+    ) {
+        Ok(schema) => schema,
+        Err(_) => return false,
+    };
+    if let Some(merged) = datafusion_datasource_parquet::apply_file_schema_type_coercions(
+        file_schema,
+        &physical_schema,
+    ) {
+        physical_schema = merged;
+    }
+    file_schema.fields().iter().all(|field| {
+        StatisticsConverter::try_new(field.name(), &physical_schema, file_metadata.schema_descr())
+            .is_ok()
+            || !physical_schema
+                .fields()
+                .iter()
+                .any(|physical| physical.name().eq_ignore_ascii_case(field.name()))
+    })
+}
+
+/// Widen file-schema-shaped column statistics to the full table schema by appending unknown
+/// entries for the partition columns (which footers never describe).
+fn table_wide_column_stats(
+    mut file_columns: Vec<datafusion::common::ColumnStatistics>,
+    table_schema: &datafusion::datasource::table_schema::TableSchema,
+) -> Vec<datafusion::common::ColumnStatistics> {
+    let partition_columns = table_schema
+        .table_schema()
+        .fields()
+        .len()
+        .saturating_sub(file_columns.len());
+    file_columns.extend(
+        std::iter::repeat_with(datafusion::common::ColumnStatistics::new_unknown)
+            .take(partition_columns),
+    );
+    file_columns
 }
 
 async fn infer_listed_parquet_schema(
@@ -3604,6 +3792,435 @@ mod tests {
         assert_eq!(version.load(Ordering::Relaxed), 1);
 
         std::env::remove_var("OXIDANT_CATALOG_CACHE_TTL_MS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- KAN-143: parquet footer COLUMN statistics --------------------------
+    //
+    // `parquet_footer_file_groups` attaches per-column min/max, null counts and distinct
+    // counts (where the footer carries them) on top of row/byte counts, gated by
+    // `OXIDANT_PARQUET_COLUMN_STATS` (default ON) and per-file by `column_stats_trusted`.
+    // The aggregate feeds DataFusion's join cardinality estimation; the per-file copy feeds
+    // the parquet opener's constant-column proofs, which is exactly why mismatched-schema
+    // files must be excluded.
+
+    use datafusion::common::stats::Precision;
+    use datafusion::common::ScalarValue;
+
+    /// Write `batch` as a single parquet file in a fresh, process-unique temp dir; returns
+    /// (dir, file path). Distinct dir per call (same pid+sequence pattern as
+    /// `write_parquet_dir` — see its comment).
+    fn write_single_parquet(
+        name: &str,
+        batch: &RecordBatch,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "oxidant-colstats-{}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+        w.write(batch).unwrap();
+        w.close().unwrap();
+        (dir, path)
+    }
+
+    /// Run `parquet_footer_file_groups` over `paths` with a catalog-declared `file_schema`
+    /// (no partition columns), against a plain local-filesystem session.
+    async fn footer_stats_for(
+        paths: &[&std::path::Path],
+        file_schema: SchemaRef,
+    ) -> (
+        Vec<datafusion::datasource::physical_plan::FileGroup>,
+        Option<datafusion::common::Statistics>,
+    ) {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let store_url =
+            datafusion::execution::object_store::ObjectStoreUrl::parse("file://").unwrap();
+        let table_schema =
+            datafusion::datasource::table_schema::TableSchema::new(file_schema, vec![]);
+        let files = paths
+            .iter()
+            .map(|path| {
+                let meta = std::fs::metadata(path).unwrap();
+                datafusion::datasource::listing::PartitionedFile::new_from_meta(
+                    object_store::ObjectMeta {
+                        location: object_store::path::Path::from_filesystem_path(path).unwrap(),
+                        last_modified: meta.modified().map(chrono::DateTime::from).unwrap(),
+                        size: meta.len(),
+                        e_tag: None,
+                        version: None,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        parquet_footer_file_groups(&state, &store_url, &table_schema, &files).await
+    }
+
+    fn int64_batch(schema: &SchemaRef, a: Vec<i64>, b: Vec<Option<i64>>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(a)), Arc::new(Int64Array::from(b))],
+        )
+        .unwrap()
+    }
+
+    /// Matching schemas: full column stats are attached at all three levels (per-file,
+    /// per-group, table aggregate) and parquet-rs's unwritten NDVs stay `Absent` (the join
+    /// estimator's NDV then falls back to the min/max range — the KAN-143 win).
+    #[tokio::test]
+    async fn footer_column_stats_attached_when_schema_matches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let batch = int64_batch(
+            &schema,
+            vec![1, 2, 3, 8],
+            vec![Some(10), None, Some(30), Some(20)],
+        );
+        let (dir, path) = write_single_parquet("part-0.parquet", &batch);
+
+        let (groups, statistics) = footer_stats_for(&[&path], schema).await;
+        let statistics = statistics.expect("statistics attached");
+        assert_eq!(statistics.num_rows, Precision::Exact(4));
+        assert_eq!(statistics.column_statistics.len(), 2);
+        let a = &statistics.column_statistics[0];
+        assert_eq!(a.min_value, Precision::Exact(ScalarValue::Int64(Some(1))));
+        assert_eq!(a.max_value, Precision::Exact(ScalarValue::Int64(Some(8))));
+        assert_eq!(a.null_count, Precision::Exact(0));
+        // parquet-rs never writes distinct counts; they must stay Absent, never invented.
+        assert_eq!(a.distinct_count, Precision::Absent);
+        let b = &statistics.column_statistics[1];
+        assert_eq!(b.null_count, Precision::Exact(1));
+        assert_eq!(b.min_value, Precision::Exact(ScalarValue::Int64(Some(10))));
+        assert_eq!(b.max_value, Precision::Exact(ScalarValue::Int64(Some(30))));
+
+        // Per-file statistics (what the parquet opener's constant-column proofs read) carry
+        // the same column stats in the file-schema shape.
+        let file_stats = groups[0]
+            .file_statistics(Some(0))
+            .expect("per-file statistics");
+        assert_eq!(file_stats.num_rows, Precision::Exact(4));
+        assert_eq!(
+            file_stats.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(8)))
+        );
+        // Group-level statistics (what `partition_statistics(Some(p))` reads) too.
+        let group_stats = groups[0].file_statistics(None).expect("group statistics");
+        assert_eq!(group_stats.column_statistics.len(), 2);
+        assert_eq!(
+            group_stats.column_statistics[1].null_count,
+            Precision::Exact(1)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two files: the table aggregate MIN/MAX spans both files, null counts SUM exactly, and
+    // NDVs stay `Absent` (parquet-rs writes none) rather than a wrong sum.
+    #[tokio::test]
+    async fn footer_column_stats_aggregate_across_files() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let batch1 = int64_batch(
+            &schema,
+            vec![1, 2, 3, 8],
+            vec![Some(10), None, None, Some(20)],
+        );
+        let batch2 = int64_batch(
+            &schema,
+            vec![5, 6, 7, 40],
+            vec![None, Some(5), Some(15), Some(25)],
+        );
+        let (dir, path1) = write_single_parquet("part-0.parquet", &batch1);
+        let path2 = dir.join("part-1.parquet");
+        let f = std::fs::File::create(&path2).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema.clone(), None).unwrap();
+        w.write(&batch2).unwrap();
+        w.close().unwrap();
+
+        let (_, statistics) = footer_stats_for(&[&path1, &path2], schema).await;
+        let statistics = statistics.expect("statistics attached");
+        assert_eq!(statistics.num_rows, Precision::Exact(8));
+        let a = &statistics.column_statistics[0];
+        assert_eq!(a.min_value, Precision::Exact(ScalarValue::Int64(Some(1))));
+        assert_eq!(a.max_value, Precision::Exact(ScalarValue::Int64(Some(40))));
+        assert_eq!(a.distinct_count, Precision::Absent);
+        let b = &statistics.column_statistics[1];
+        assert_eq!(b.null_count, Precision::Exact(3));
+        assert_eq!(b.min_value, Precision::Exact(ScalarValue::Int64(Some(5))));
+        assert_eq!(b.max_value, Precision::Exact(ScalarValue::Int64(Some(25))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The KAN-143 guard: the declared schema's column case differs from the file's — the
+    /// gap `CaseInsensitiveExprAdapterFactory` bridges at READ time. DataFusion's stats
+    /// converter resolves columns by exact name and stamps `null_count == num_rows` for the
+    /// "missing" column; attaching that would let the opener literal-replace real data with
+    /// NULL. Column stats must be dropped (row counts kept) at every level.
+    #[tokio::test]
+    async fn footer_column_stats_dropped_on_declared_case_mismatch() {
+        let physical = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            physical.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))],
+        )
+        .unwrap();
+        let (dir, path) = write_single_parquet("part-0.parquet", &batch);
+        let declared = Arc::new(Schema::new(vec![Field::new("X", DataType::Int64, false)]));
+
+        let (groups, statistics) = footer_stats_for(&[&path], declared).await;
+        let statistics = statistics.expect("row counts still attached");
+        assert_eq!(statistics.num_rows, Precision::Exact(4));
+        assert_eq!(statistics.column_statistics.len(), 1);
+        assert_eq!(
+            statistics.column_statistics[0].null_count,
+            Precision::Absent
+        );
+        assert_eq!(statistics.column_statistics[0].min_value, Precision::Absent);
+        let file_stats = groups[0]
+            .file_statistics(Some(0))
+            .expect("per-file statistics");
+        assert_eq!(file_stats.num_rows, Precision::Exact(4));
+        assert_eq!(file_stats.column_statistics[0].max_value, Precision::Absent);
+        assert_eq!(
+            groups[0].file_statistics(None).unwrap().column_statistics[0].min_value,
+            Precision::Absent
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end proof the guard protects the read path: with column stats enabled, the
+    /// mixed-case declared-schema query still decodes REAL values — no all-null literal
+    /// rewrite. (The pre-KAN-143 unconditional drop made this trivially true; the guard
+    /// keeps it true now that stats are attached.)
+    #[tokio::test]
+    async fn footer_column_stats_case_mismatch_still_reads_real_data() {
+        let dir = write_mixedcase_int_parquet_dir(); // files: `VendorID`, 1+2+3 and 10+20
+        let location = format!("file://{}", dir.to_string_lossy());
+        let declared = Arc::new(Schema::new(vec![Field::new(
+            "vendorid",
+            DataType::Int64,
+            true,
+        )]));
+
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "fake",
+            Arc::new(SchemaCatalog {
+                location,
+                schema: Some(declared),
+            }),
+        );
+        let batches = engine
+            .sql("SELECT COUNT(vendorid) AS c, SUM(vendorid) AS s FROM fake.ns.mixed")
+            .await
+            .expect("case-insensitive declared-schema query should succeed");
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let s = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(
+            (c, s),
+            (5, 36),
+            "real data must survive statistics attachment"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A declared column genuinely ABSENT from the file (schema evolution) is NOT a
+    /// mismatch: the reader fills it with NULLs, so the footer-derived `null_count ==
+    /// num_rows` is the truth and the stats stay attached.
+    #[tokio::test]
+    async fn footer_column_stats_genuinely_absent_column_kept() {
+        let physical = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            physical.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))],
+        )
+        .unwrap();
+        let (dir, path) = write_single_parquet("part-0.parquet", &batch);
+        let declared = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("y", DataType::Int64, true),
+        ]));
+
+        let (_, statistics) = footer_stats_for(&[&path], declared).await;
+        let statistics = statistics.expect("statistics attached");
+        let x = &statistics.column_statistics[0];
+        assert_eq!(x.min_value, Precision::Exact(ScalarValue::Int64(Some(1))));
+        assert_eq!(x.max_value, Precision::Exact(ScalarValue::Int64(Some(4))));
+        let y = &statistics.column_statistics[1];
+        assert_eq!(y.null_count, Precision::Exact(4));
+        // DataFusion surfaces the missing column's min/max as Exact NULL scalars (its
+        // "all-null" representation), never a concrete value.
+        assert!(matches!(
+            y.min_value.get_value(),
+            Some(value) if value.is_null()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 0-row file has no row groups and no column statistics in its footer. It must not
+    /// poison the table aggregate: min/max still come from the non-empty file, row counts
+    /// stay exact, and nothing panics.
+    #[tokio::test]
+    async fn footer_column_stats_row_group_less_file_does_not_poison_aggregate() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let (dir, empty_path) =
+            write_single_parquet("part-0.parquet", &int64_batch(&schema, vec![], vec![]));
+        let full_batch = int64_batch(
+            &schema,
+            vec![1, 2, 3, 8],
+            vec![Some(10), None, Some(30), Some(20)],
+        );
+        let full_path = dir.join("part-1.parquet");
+        let f = std::fs::File::create(&full_path).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema.clone(), None).unwrap();
+        w.write(&full_batch).unwrap();
+        w.close().unwrap();
+
+        let (_, statistics) = footer_stats_for(&[&empty_path, &full_path], schema).await;
+        let statistics = statistics.expect("statistics attached");
+        assert_eq!(statistics.num_rows, Precision::Exact(4));
+        let a = &statistics.column_statistics[0];
+        assert_eq!(a.min_value, Precision::Exact(ScalarValue::Int64(Some(1))));
+        assert_eq!(a.max_value, Precision::Exact(ScalarValue::Int64(Some(8))));
+        assert_eq!(
+            statistics.column_statistics[1].null_count,
+            Precision::Exact(1)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scan-level statistics DataFusion's join estimation actually consumes are the
+    /// PROJECTED ones: projecting a subset of columns must project the column statistics
+    /// along (right values at the right positions), and projected-away columns must vanish.
+    #[tokio::test]
+    async fn footer_column_stats_follow_projection() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Int64Array::from(vec![7, 9])),
+            ],
+        )
+        .unwrap();
+        let (dir, _path) = write_single_parquet("part-0.parquet", &batch);
+        let location =
+            crate::shard::ensure_collection_url(&format!("file://{}", dir.to_string_lossy()));
+        let md = TableMetadata::new("fake.ns.mixed", location.clone(), TableFormat::Parquet)
+            .with_schema(schema);
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let root = datafusion::datasource::listing::ListingTableUrl::parse(&location).unwrap();
+        let provider =
+            parquet_metadata_provider_with_assignment(&state, &md, "mixed", vec![root], None)
+                .await
+                .unwrap();
+
+        // Project ONLY `c` (table index 2): the projected scan statistics must carry c's
+        // min/max at position 0 and nothing else.
+        let plan = provider
+            .scan(&state, Some(&vec![2]), &[], None)
+            .await
+            .unwrap();
+        fn find_scan(
+            plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        ) -> Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            if plan.name() == "DataSourceExec" {
+                return Some(Arc::clone(plan));
+            }
+            for child in plan.children() {
+                if let Some(found) = find_scan(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let scan = find_scan(&plan).expect("a DataSourceExec in the scan plan");
+        let stats = scan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(2));
+        assert_eq!(stats.column_statistics.len(), 1);
+        assert_eq!(
+            stats.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Int64(Some(7)))
+        );
+        assert_eq!(
+            stats.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(9)))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kill switches: `OXIDANT_PARQUET_COLUMN_STATS=0` restores the row-counts-only shape
+    /// (the pre-KAN-143 behavior) while keeping footer counts; `OXIDANT_PARQUET_SCAN_STATS=0`
+    /// still disables footer reads entirely.
+    #[tokio::test]
+    async fn footer_column_stats_env_kill_switches() {
+        let _env = crate::tests::JOIN_GUARD_ENV_LOCK.lock().await;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))],
+        )
+        .unwrap();
+        let (dir, path) = write_single_parquet("part-0.parquet", &batch);
+
+        std::env::set_var("OXIDANT_PARQUET_COLUMN_STATS", "0");
+        let (groups, statistics) = footer_stats_for(&[&path], schema.clone()).await;
+        let statistics = statistics.expect("row counts still attached");
+        assert_eq!(statistics.num_rows, Precision::Exact(4));
+        assert_eq!(statistics.column_statistics[0].min_value, Precision::Absent);
+        assert_eq!(
+            groups[0]
+                .file_statistics(Some(0))
+                .unwrap()
+                .column_statistics[0]
+                .max_value,
+            Precision::Absent
+        );
+
+        std::env::set_var("OXIDANT_PARQUET_SCAN_STATS", "0");
+        let (groups, statistics) = footer_stats_for(&[&path], schema).await;
+        assert!(
+            statistics.is_none(),
+            "scan-stats off: no aggregate statistics"
+        );
+        assert!(groups[0].file_statistics(Some(0)).is_none());
+
+        std::env::remove_var("OXIDANT_PARQUET_COLUMN_STATS");
+        std::env::remove_var("OXIDANT_PARQUET_SCAN_STATS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

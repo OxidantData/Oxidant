@@ -4409,6 +4409,7 @@ dependencies = [
  "bytes",
  "chrono",
  "datafusion",
+ "datafusion-datasource-parquet",
  "delta_kernel",
  "delta_kernel_default_engine",
  "futures",
