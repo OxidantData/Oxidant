@@ -2496,17 +2496,12 @@ fn split_union_finish(
     let replicated_id = sharded_output_id + 1;
     let mut replicated_stage =
         StageDef::new(replicated_id, replicated_partial, vec![], hash_key_cols);
-    match replicated_slice_tables(replicated_input) {
-        Some(slice_tables) => {
+    match sliced_replicate_stamp(replicated_input, replicated) {
+        Some(stamp) => {
             // Sliced placement: dispatch to every worker (default worker-indexed exchange) and
             // drop the sliced tables from this stage's replicate stamp so their scans shard.
             // `stamp_replicated_tables` preserves a non-empty stamp.
-            let kept: Vec<&str> = replicated
-                .iter()
-                .filter(|t| !slice_tables.iter().any(|s| s.eq_ignore_ascii_case(t)))
-                .copied()
-                .collect();
-            replicated_stage.replicated_tables = kept.join(",");
+            replicated_stage.replicated_tables = stamp;
         }
         None => replicated_stage.exchange = ExchangeMode::Forward,
     }
@@ -2572,7 +2567,7 @@ fn split_union_finish(
 /// KAN-54 trap shifted to the replicated side). The outer aggregate's own partials already
 /// recombine exactly, or [`partial_and_combine_lists`] would have rejected the query before
 /// this split was chosen.
-fn replicated_slice_tables(replicated_input: &LogicalPlan) -> Option<Vec<String>> {
+pub(crate) fn replicated_slice_tables(replicated_input: &LogicalPlan) -> Option<Vec<String>> {
     if crate::driver::expected_worker_count_from_env().unwrap_or(1) <= 1 {
         return None;
     }
@@ -2594,6 +2589,32 @@ fn replicated_slice_tables(replicated_input: &LogicalPlan) -> Option<Vec<String>
         picked.push(anchor?);
     }
     Some(picked)
+}
+
+/// The reduced replicate stamp for a stage whose replicated-only scan region fans out across
+/// workers — `replicated` minus the anchor tables [`replicated_slice_tables`] chose to slice —
+/// or `None` to keep the single-[`ExchangeMode::Forward`] placement (single/unknown worker
+/// count, no safe anchor, or an anchor force-included by `OXIDANT_REPLICATED_TABLES`). Setting
+/// the returned non-empty stamp on a stage makes `stamp_replicated_tables` leave it alone, so
+/// the workers' file sharder slices exactly those tables' scans for that stage only; every
+/// other replicated table is still scanned in full, keeping the region's joins co-located
+/// within each worker's disjoint slice.
+///
+/// `None` when the kept stamp would be EMPTY: an empty stamp reads as "unset" and
+/// `stamp_replicated_tables` would refill it with the full replicate list, silently un-slicing
+/// the anchors and multiplying the stage's rows by the worker count. `Forward` is the safe
+/// placement for that (degenerate — every replicated table sliced) case.
+pub(crate) fn sliced_replicate_stamp(plan: &LogicalPlan, replicated: &[&str]) -> Option<String> {
+    let slice_tables = replicated_slice_tables(plan)?;
+    let kept: Vec<&str> = replicated
+        .iter()
+        .filter(|t| !slice_tables.iter().any(|s| s.eq_ignore_ascii_case(t)))
+        .copied()
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    Some(kept.join(","))
 }
 
 /// The replicated side's leaf union arms for slice analysis, or `None` when any node outside

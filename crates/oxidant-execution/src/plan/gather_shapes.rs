@@ -20,7 +20,9 @@
 //! - [`try_union_over_derived_ctes`] — Q23 at the SF10 classification: `UNION ALL` of
 //!   per-channel arms whose only sharded inputs are shared derived CTEs; each distinct CTE is
 //!   planned once (fingerprint dedup) and gathers, and each arm runs exactly once as a
-//!   `Forward` stage pulling the CTEs' bucket 0.
+//!   `Forward` stage pulling the CTEs' bucket 0 — or, on a multi-worker cluster, as a
+//!   fanned-out export/semi/partial/recombine pipeline with the CTEs re-keyed to the arms'
+//!   join columns (KAN-156).
 //! - [`try_cross_scalar_threshold`] (used by the Q23 shape) — a grouped aggregate that
 //!   cross-joins a single-row derived scalar (`best_ss_customer ⋈ max_store_sales`): the
 //!   scalar's own grouped input distributes, a KAN-27 one-row broadcast computes the value,
@@ -47,8 +49,9 @@ use super::stage_planner::{
     collect_equijoin_keys, count_table_scans, expr_sql, extract_from_tail, final_group_by_sql,
     finalize_expr_sql, flatten_union_all, flattened_group_exprs, is_grouping_set, output_name,
     partial_and_combine_lists, partial_combine_sql, peel, plan_distributed_logical,
-    qualified_table_sql, reject_unsafe_broadcast_shapes, sanitize_generated_sql, strip_alias,
-    unqualify, wrap_output, AggSpec, DistributedQuery, Peeled,
+    qualified_table_sql, reject_unsafe_broadcast_shapes, replicated_slice_tables,
+    sanitize_generated_sql, sliced_replicate_stamp, strip_alias, unqualify, wrap_output, AggSpec,
+    DistributedQuery, Peeled,
 };
 use crate::driver::{scalar_literal_supported, ExchangeMode, StageDef, SCALAR_TOKEN};
 
@@ -1073,6 +1076,12 @@ pub(crate) fn try_derived_having_scalar_threshold(
 ///    the arm's grouped aggregate exact — a Hash exchange would instead re-run the whole
 ///    arm once per shuffle partition, with partitions 1..n-1 guaranteed empty (correct
 ///    but ~partitions× the work; see the note at the emission site).
+///
+///    KAN-156: on a multi-worker cluster, [`try_q23_fanned_arms`] first attempts to replace
+///    these single-task arms with fanned-out pipelines (sliced scan export → hash-co-located
+///    semi per CTE → partial aggregate → per-arm recombine), re-keying the CTE terminal
+///    stages from the gather to the arms' join columns. It is all-or-nothing and strictly
+///    admitted; any decline keeps the Forward arms here byte-identical.
 /// 3. The arms concatenate in one final `UNION ALL` stage; the query's `ORDER BY`/`LIMIT`
 ///    rides the usual driver-side finalize.
 ///
@@ -1182,51 +1191,70 @@ pub(crate) fn try_union_over_derived_ctes(
 
     // Each arm: replace its CTE references with `shuffle_input` placeholders (numbered locally
     // per arm, matching that stage's upstream list) and emit the arm as one gathered stage.
-    let mut arm_stage_ids = Vec::with_capacity(arm_leaves.len());
-    let mut base = 0usize;
-    for (arm, leaves) in u.inputs.iter().zip(&arm_leaves) {
-        let branch_by_node: HashMap<usize, usize> = leaves
-            .iter()
-            .enumerate()
-            .map(|(j, l)| (super::dag_splitter::node_id(l), j))
-            .collect();
-        let (rewritten, changed) =
-            super::dag_splitter::replace_branches(arm, &branch_by_node, leaves.len())?;
-        if !changed {
-            decline!("q23");
+    //
+    // KAN-156: first try to fan the replicated channel arms out across workers (sliced scan
+    // exports + hash-co-located CTE joins + partial/recombine) — all-or-nothing, since the CTE
+    // terminal stages are re-keyed from the partition-0 gather to the arms' join keys. `None`
+    // keeps the original per-arm `Forward` stages below.
+    let arm_stage_ids = match try_q23_fanned_arms(
+        &u.inputs,
+        &arm_leaves,
+        &rep_of,
+        &rep_output,
+        replicated,
+        &mut next_id,
+        &mut stages,
+    ) {
+        Some(ids) => ids,
+        None => {
+            let mut arm_stage_ids = Vec::with_capacity(arm_leaves.len());
+            let mut base = 0usize;
+            for (arm, leaves) in u.inputs.iter().zip(&arm_leaves) {
+                let branch_by_node: HashMap<usize, usize> = leaves
+                    .iter()
+                    .enumerate()
+                    .map(|(j, l)| (super::dag_splitter::node_id(l), j))
+                    .collect();
+                let (rewritten, changed) =
+                    super::dag_splitter::replace_branches(arm, &branch_by_node, leaves.len())?;
+                if !changed {
+                    decline!("q23");
+                }
+                // No sharded scan may remain in the arm skeleton (a scan left behind would read only
+                // partition 0's local shard of the fact).
+                let mut remaining = base_tables(&rewritten);
+                collect_subquery_tables(&rewritten, &mut remaining);
+                if remaining.iter().any(|t| {
+                    t != "shuffle_input"
+                        && !t.starts_with("shuffle_input_")
+                        && !replicated.contains(&t.as_str())
+                }) {
+                    decline!("q23");
+                }
+                let sql = plan_sql(&rewritten, "union arm")?;
+                let upstreams: Vec<u32> = (0..leaves.len())
+                    .map(|j| rep_output[&rep_of[base + j]])
+                    .collect();
+                // Run the arm exactly once (`ExchangeMode::Forward` → one task on worker 0), not
+                // once per shuffle partition: every worker holds the full replicated channel/dim
+                // tables, and each CTE gather leaves its whole output in bucket 0 of every
+                // endpoint, so a single task pulling bucket 0 from every endpoint computes the
+                // exact arm. A Hash exchange here is correct-but-slow — the empty hash key makes
+                // partitions 1..n-1 emit zero rows while every partition re-runs the full
+                // replicated scan + join (Q23 at SF10: 169s vs Spark's 5.8s, 71.6 GB of spill
+                // from the duplicated work). Per-worker partials over the replicated fact would
+                // instead multiply the arm's rows by the worker count (KAN-54), so Forward
+                // (compute once) is the only correct fast placement.
+                let mut arm = StageDef::new(next_id, sql, upstreams, vec![]);
+                arm.exchange = ExchangeMode::Forward;
+                stages.push(arm);
+                arm_stage_ids.push(next_id);
+                next_id += 1;
+                base += leaves.len();
+            }
+            arm_stage_ids
         }
-        // No sharded scan may remain in the arm skeleton (a scan left behind would read only
-        // partition 0's local shard of the fact).
-        let mut remaining = base_tables(&rewritten);
-        collect_subquery_tables(&rewritten, &mut remaining);
-        if remaining.iter().any(|t| {
-            t != "shuffle_input"
-                && !t.starts_with("shuffle_input_")
-                && !replicated.contains(&t.as_str())
-        }) {
-            decline!("q23");
-        }
-        let sql = plan_sql(&rewritten, "union arm")?;
-        let upstreams: Vec<u32> = (0..leaves.len())
-            .map(|j| rep_output[&rep_of[base + j]])
-            .collect();
-        // Run the arm exactly once (`ExchangeMode::Forward` → one task on worker 0), not
-        // once per shuffle partition: every worker holds the full replicated channel/dim
-        // tables, and each CTE gather leaves its whole output in bucket 0 of every
-        // endpoint, so a single task pulling bucket 0 from every endpoint computes the
-        // exact arm. A Hash exchange here is correct-but-slow — the empty hash key makes
-        // partitions 1..n-1 emit zero rows while every partition re-runs the full
-        // replicated scan + join (Q23 at SF10: 169s vs Spark's 5.8s, 71.6 GB of spill
-        // from the duplicated work). Per-worker partials over the replicated fact would
-        // instead multiply the arm's rows by the worker count (KAN-54), so Forward
-        // (compute once) is the only correct fast placement.
-        let mut arm = StageDef::new(next_id, sql, upstreams, vec![]);
-        arm.exchange = ExchangeMode::Forward;
-        stages.push(arm);
-        arm_stage_ids.push(next_id);
-        next_id += 1;
-        base += leaves.len();
-    }
+    };
 
     // Final stage: the UNION ALL of the arms under the original output projection/alias.
     let arm_map: HashMap<usize, usize> = u
@@ -1249,6 +1277,568 @@ pub(crate) fn try_union_over_derived_ctes(
         stages,
         finalize_sql: build_outer_finalize(sort, limit)?,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// KAN-156: fanned-out Q23 channel arms.
+//
+// The original composition runs each replicated channel arm as ONE `Forward` stage (one task,
+// always on worker 0) scanning the full replicated channel fact — SF100 profile: 170 s + 110 s
+// of single-task work for the catalog/web arms. The fanned-out form replaces each arm with a
+// short pipeline whose every stage is parallel:
+//
+// 1. **Export** (leaf producer, one task per worker): the arm's scan region — the replicated
+//    channel fact + dimensions with the arm's non-CTE conjuncts — projecting the group columns
+//    (`gc{j}`), aggregate arguments (`aa{i}`), and per-CTE join keys (`j{m}_{k}`). The region's
+//    anchor table (the channel fact) is sliced across workers via the stage's reduced replicate
+//    stamp, so each worker exports a disjoint 1/W file slice; hash-shuffled by the first CTE's
+//    join key.
+// 2. **One semi stage per CTE**: an inner equijoin against the CTE's terminal output, which is
+//    re-keyed from the partition-0 gather to the arm's join columns, so equal keys co-locate
+//    and the per-partition join is the exact single-node join (multiplicity preserved; NULL
+//    keys never match on either side). Intermediate semis passthrough and re-shuffle by the
+//    next CTE's key; the last folds in the partial aggregate (`sum`/`count`/`min`/`max` over
+//    the exported `aa{i}`), hash-shuffled by the group key.
+// 3. **Recombine** per arm: the associative combine over the co-located per-slice partials,
+//    re-applying the arm's output projection via the ordinary remap machinery. Arms recombine
+//    SEPARATELY and the final `UNION ALL` stage concatenates them — equal group keys across
+//    arms must not merge (single-node concatenates arm outputs too).
+//
+// Exactness: the export is row-level over the region, so the disjoint per-slice union equals
+// the full region output; inner equijoins distribute over hash co-location; the partial
+// aggregates re-add associatively once equal groups co-locate. The result is
+// semantics-identical to the single-`Forward` arm.
+//
+// Admission is deliberately narrow (anything else keeps the `Forward` arms): every arm must be
+// a plain grouped aggregate (no sort/limit/having/alias-projection/grouping-set/DISTINCT, only
+// sum/count/min/max) over a strip-able scan region whose CTE references are all plain-column
+// equi keys, every CTE occurrence must be key-joined (never cross-joined), the re-key target
+// per CTE must agree across arms, and every arm's region must offer a safe slice anchor
+// (multi-worker cluster — single-worker keeps `Forward` byte-identical).
+// ---------------------------------------------------------------------------
+
+/// One arm's join against one CTE occurrence in the Q23 fan-out.
+struct Q23CteJoin {
+    /// The deduplicated representative this occurrence plans from.
+    rep: usize,
+    /// CTE output key column positions (the terminal stage's re-key target).
+    key_idx: Vec<u32>,
+    /// CTE output key column names, aligned with `key_idx`.
+    key_cols: Vec<String>,
+    /// Arm-side key expression SQL over the scan-region columns, aligned with `key_cols`.
+    arm_key_sql: Vec<String>,
+}
+
+/// One arm's fanned-out analysis (see the module comment above).
+struct Q23ArmFanout<'a> {
+    /// The arm's peeled projection + aggregate.
+    p: Peeled<'a>,
+    /// Classified arm aggregates (all non-DISTINCT sum/count/min/max).
+    aggs: Vec<AggSpec>,
+    /// Group column SQL (flattened).
+    group_sql: Vec<String>,
+    /// The arm's scan region: `agg.input` with every CTE leaf removed (join keys recorded).
+    region: LogicalPlan,
+    /// Per-CTE-occurrence joins, in leaf order.
+    joins: Vec<Q23CteJoin>,
+    /// The export stage's reduced replicate stamp (sliced anchors dropped).
+    stamp: String,
+}
+
+/// State for [`q23_strip_cte`]: the CTE leaf identity/alias maps plus the equi keys recorded
+/// while stripping them out of an arm's scan region.
+struct Q23StripCtx {
+    leaf_ids: HashSet<usize>,
+    alias_of: HashMap<usize, String>,
+    occ_of: HashMap<usize, usize>,
+    /// Recorded equi keys per leaf node id: (CTE-side column name, arm-side expression).
+    keys: HashMap<usize, Vec<(String, Expr)>>,
+    /// Unqualified names of every CTE output column (ambiguity guard).
+    leaf_fields: HashSet<String>,
+}
+
+impl Q23StripCtx {
+    /// The CTE leaf a column belongs to, by its relation qualifier matching the leaf's alias.
+    fn leaf_of(&self, c: &Column) -> Option<usize> {
+        let relation = c.relation.as_ref()?;
+        self.alias_of
+            .iter()
+            .find(|(_, alias)| alias.as_str() == relation.table())
+            .map(|(id, _)| *id)
+    }
+}
+
+/// The distinct CTE leaves `e` references. Err on anything the analysis cannot rule out: an
+/// unqualified column whose name collides with a CTE output column, or columns of two
+/// different leaves in one expression.
+fn q23_leaf_refs(e: &Expr, ctx: &Q23StripCtx) -> std::result::Result<Vec<usize>, ()> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut refs: Vec<usize> = Vec::new();
+    let mut bad = false;
+    let _ = e.apply(|node| {
+        if let Expr::Column(c) = node {
+            match ctx.leaf_of(c) {
+                Some(id) => {
+                    if !refs.contains(&id) {
+                        refs.push(id);
+                    }
+                }
+                None if c.relation.is_none() && ctx.leaf_fields.contains(&c.name) => {
+                    bad = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                None => {}
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    if bad || refs.len() > 1 {
+        return Err(());
+    }
+    Ok(refs)
+}
+
+/// Rebuild an arm's scan region with every CTE leaf removed, recording the equi keys that
+/// connected it. `None` for any structure outside the admitted shape (a removed CTE leaf
+/// bubbles up through the join cases, so a `None` return at the top level means "decline the
+/// fan-out", never "the whole region was a leaf" — the arm itself is never a bare CTE).
+fn q23_strip_cte(node: &LogicalPlan, ctx: &mut Q23StripCtx) -> Option<LogicalPlan> {
+    if ctx.leaf_ids.contains(&node_id(node)) {
+        return None;
+    }
+    match node {
+        LogicalPlan::TableScan(_) => Some(node.clone()),
+        LogicalPlan::Filter(f) => {
+            let input = q23_strip_cte(&f.input, ctx)?;
+            let mut conjuncts = Vec::new();
+            flatten_conjuncts(&f.predicate, &mut conjuncts);
+            let mut kept: Vec<Expr> = Vec::new();
+            for c in conjuncts {
+                let refs = q23_leaf_refs(c, ctx).ok()?;
+                if refs.is_empty() {
+                    kept.push(c.clone());
+                    continue;
+                }
+                // A CTE-referencing conjunct is admitted only as a plain equi key:
+                // `<cte>.<col> = <arm expr>` in either operand order.
+                let Expr::BinaryExpr(be) = c else { return None };
+                if be.op != Operator::Eq {
+                    return None;
+                }
+                let leaf_id = refs[0];
+                let no_refs = |e: &Expr| q23_leaf_refs(e, ctx).map(|r| r.is_empty()) == Ok(true);
+                let (key_col, arm_expr) = match (be.left.as_ref(), be.right.as_ref()) {
+                    (Expr::Column(col), other)
+                        if ctx.leaf_of(col) == Some(leaf_id) && no_refs(other) =>
+                    {
+                        (col, other)
+                    }
+                    (other, Expr::Column(col))
+                        if ctx.leaf_of(col) == Some(leaf_id) && no_refs(other) =>
+                    {
+                        (col, other)
+                    }
+                    _ => return None,
+                };
+                if expr_contains_subquery(arm_expr) {
+                    return None;
+                }
+                ctx.keys
+                    .entry(leaf_id)
+                    .or_default()
+                    .push((key_col.name.clone(), arm_expr.clone()));
+            }
+            if kept.is_empty() {
+                return Some(input);
+            }
+            let predicate = kept.into_iter().reduce(|a, b| a.and(b))?;
+            Some(LogicalPlan::Filter(
+                Filter::try_new(predicate, Arc::new(input)).ok()?,
+            ))
+        }
+        LogicalPlan::Join(j) if j.join_type == JoinType::Inner => {
+            let left_leaf = ctx.leaf_ids.contains(&node_id(&j.left));
+            let right_leaf = ctx.leaf_ids.contains(&node_id(&j.right));
+            match (left_leaf, right_leaf) {
+                (true, true) => None,
+                (false, false) => {
+                    // No CTE on either side: the ON keys / residual must stay leaf-free.
+                    let no_refs =
+                        |e: &Expr| q23_leaf_refs(e, ctx).map(|r| r.is_empty()) == Ok(true);
+                    for (le, re) in &j.on {
+                        if !no_refs(le) || !no_refs(re) {
+                            return None;
+                        }
+                    }
+                    if let Some(f) = &j.filter {
+                        if !no_refs(f) {
+                            return None;
+                        }
+                    }
+                    let nl = q23_strip_cte(&j.left, ctx)?;
+                    let nr = q23_strip_cte(&j.right, ctx)?;
+                    Some(LogicalPlan::Join(datafusion::logical_expr::Join {
+                        left: Arc::new(nl),
+                        right: Arc::new(nr),
+                        ..j.clone()
+                    }))
+                }
+                (left_is_leaf, _) => {
+                    // The CTE sits directly on one side of the join: record the ON keys
+                    // (a key-less cross join records nothing here — the comma-join form's
+                    // conjuncts above contribute them instead — and the per-leaf key check
+                    // at the end declines a genuinely un-keyed CTE).
+                    let (leaf_id, other_side) = if left_is_leaf {
+                        (node_id(&j.left), &j.right)
+                    } else {
+                        (node_id(&j.right), &j.left)
+                    };
+                    if j.filter.is_some() {
+                        return None;
+                    }
+                    for (le, re) in &j.on {
+                        let (key_expr, arm_expr) = if left_is_leaf { (le, re) } else { (re, le) };
+                        let Expr::Column(col) = key_expr else {
+                            return None;
+                        };
+                        if ctx.leaf_of(col) != Some(leaf_id)
+                            || q23_leaf_refs(arm_expr, ctx).map(|r| r.is_empty()) != Ok(true)
+                            || expr_contains_subquery(arm_expr)
+                        {
+                            return None;
+                        }
+                        ctx.keys
+                            .entry(leaf_id)
+                            .or_default()
+                            .push((col.name.clone(), arm_expr.clone()));
+                    }
+                    q23_strip_cte(other_side, ctx)
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Analyze one Q23 channel arm for the fan-out pipeline (see the KAN-156 module comment).
+fn q23_arm_fanout<'a>(
+    arm: &'a LogicalPlan,
+    leaves: &[&'a LogicalPlan],
+    base: usize,
+    rep_of: &[usize],
+    replicated: &[&str],
+) -> Option<Q23ArmFanout<'a>> {
+    let up = Unparser::default();
+    let p = peel(arm).ok()?;
+    if p.sort.is_some()
+        || p.limit.is_some()
+        || !p.having.is_empty()
+        || !p.alias_projections.is_empty()
+    {
+        return None;
+    }
+    if p.agg.group_expr.is_empty() || is_grouping_set(&p.agg.group_expr) {
+        return None;
+    }
+    let aggs = p
+        .agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()
+        .ok()?;
+    if aggs
+        .iter()
+        .any(|a| a.distinct || !matches!(a.func.as_str(), "sum" | "count" | "min" | "max"))
+    {
+        return None;
+    }
+
+    let mut ctx = Q23StripCtx {
+        leaf_ids: HashSet::new(),
+        alias_of: HashMap::new(),
+        occ_of: HashMap::new(),
+        keys: HashMap::new(),
+        leaf_fields: HashSet::new(),
+    };
+    for (j, leaf) in leaves.iter().enumerate() {
+        // The leaf must carry its CTE alias: the join conjuncts address it by relation.
+        let LogicalPlan::SubqueryAlias(s) = leaf else {
+            return None;
+        };
+        let id = node_id(leaf);
+        ctx.leaf_ids.insert(id);
+        ctx.alias_of.insert(id, s.alias.table().to_string());
+        ctx.occ_of.insert(id, base + j);
+        ctx.leaf_fields
+            .extend(leaf.schema().fields().iter().map(|f| f.name().clone()));
+    }
+
+    // Group keys and aggregate arguments are computed in the export, before any CTE join —
+    // they must read region columns only.
+    for e in p.agg.group_expr.iter().chain(p.agg.aggr_expr.iter()) {
+        if !q23_leaf_refs(e, &ctx).ok()?.is_empty() || expr_contains_subquery(e) {
+            return None;
+        }
+    }
+
+    let region = q23_strip_cte(p.agg.input.as_ref(), &mut ctx)?;
+    if base_tables(&region)
+        .iter()
+        .any(|t| !replicated.contains(&t.as_str()))
+    {
+        return None;
+    }
+    let stamp = sliced_replicate_stamp(&region, replicated)?;
+    let group_sql: Vec<String> = flattened_group_exprs(&p.agg.group_expr)
+        .into_iter()
+        .map(|g| expr_sql(&up, g))
+        .collect::<Result<_>>()
+        .ok()?;
+
+    let mut joins = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        let id = node_id(leaf);
+        let keys = ctx.keys.get(&id).filter(|k| !k.is_empty())?;
+        let field_names: Vec<&str> = leaf
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        // The semi+partial stage groups by the unqualified exported `gc{j}` aliases; a CTE
+        // output column literally named `gc<N>` would make that GROUP BY ambiguous.
+        if field_names.iter().any(|n| {
+            let b = n.as_bytes();
+            b.len() > 2 && b[0] == b'g' && b[1] == b'c' && b[2..].iter().all(u8::is_ascii_digit)
+        }) {
+            return None;
+        }
+        let mut key_idx = Vec::with_capacity(keys.len());
+        let mut key_cols = Vec::with_capacity(keys.len());
+        let mut arm_key_sql = Vec::with_capacity(keys.len());
+        for (col, expr) in keys {
+            // The key column must address the CTE output schema as a plain identifier (it is
+            // spliced into the semi stage's ON clause).
+            if !col.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return None;
+            }
+            key_idx.push(field_names.iter().position(|n| n == col)? as u32);
+            key_cols.push(col.clone());
+            arm_key_sql.push(expr_sql(&up, expr).ok()?);
+        }
+        let occ = ctx.occ_of[&id];
+        joins.push(Q23CteJoin {
+            rep: rep_of[occ],
+            key_idx,
+            key_cols,
+            arm_key_sql,
+        });
+    }
+    Some(Q23ArmFanout {
+        p,
+        aggs,
+        group_sql,
+        region,
+        joins,
+        stamp,
+    })
+}
+
+/// The partial-aggregate select item over the exported `aa{i}` (semi+partial stage).
+fn q23_fanout_partial(func: &str, i: usize) -> Option<String> {
+    Some(match func {
+        "sum" => format!("sum(semi_s.aa{i}) AS c{i}"),
+        "count" => format!("count(semi_s.aa{i}) AS c{i}"),
+        "min" => format!("min(semi_s.aa{i}) AS c{i}"),
+        "max" => format!("max(semi_s.aa{i}) AS c{i}"),
+        _ => return None,
+    })
+}
+
+/// The recombine select item over the `c{i}` partials (counts re-add by summing).
+fn q23_fanout_combine(func: &str, i: usize) -> Option<String> {
+    Some(match func {
+        "sum" | "count" => format!("sum(c{i}) AS r{i}"),
+        "min" => format!("min(c{i}) AS r{i}"),
+        "max" => format!("max(c{i}) AS r{i}"),
+        _ => return None,
+    })
+}
+
+/// Build one arm's pipeline stages with ids allocated from `next_id` (nothing is pushed to the
+/// plan's stage list until every arm built successfully — the caller commits atomically).
+/// Returns the built stages and the recombine (arm output) stage id.
+fn build_q23_fanned_arm(
+    fan: &Q23ArmFanout,
+    rep_output: &HashMap<usize, u32>,
+    next_id: &mut u32,
+) -> Option<(Vec<StageDef>, u32)> {
+    let n_group = fan.group_sql.len();
+    let first_join = fan.joins.first()?;
+
+    // Export: group cols, aggregate args, then per-join key columns.
+    let mut export_cols: Vec<String> = Vec::new();
+    for (j, g) in fan.group_sql.iter().enumerate() {
+        export_cols.push(format!("{g} AS gc{j}"));
+    }
+    for (i, spec) in fan.aggs.iter().enumerate() {
+        export_cols.push(format!("{} AS aa{i}", spec.arg_sql));
+    }
+    // (join position, key position) -> export column index; passthrough semis preserve these.
+    let mut j_col: HashMap<(usize, usize), u32> = HashMap::new();
+    for (m, join) in fan.joins.iter().enumerate() {
+        for (k, sql) in join.arm_key_sql.iter().enumerate() {
+            j_col.insert((m, k), export_cols.len() as u32);
+            export_cols.push(format!("{sql} AS j{m}_{k}"));
+        }
+    }
+    let region_sql = Unparser::default()
+        .plan_to_sql(&fan.region)
+        .map_err(|e| unsupported(format!("unparse q23 arm region: {e}")))
+        .ok()?
+        .to_string();
+    let tail = sanitize_generated_sql(&extract_from_tail(&region_sql).ok()?);
+    let export_sql = sanitize_generated_sql(&format!("SELECT {} {tail}", export_cols.join(", ")));
+    let first_keys: Vec<u32> = (0..first_join.key_idx.len())
+        .map(|k| j_col[&(0, k)])
+        .collect();
+    let export_id = *next_id;
+    *next_id += 1;
+    let mut export_stage = StageDef::new(export_id, export_sql, vec![], first_keys);
+    export_stage.replicated_tables = fan.stamp.clone();
+
+    let mut stages = vec![export_stage];
+    let mut prev_id = export_id;
+
+    // One semi stage per CTE; the last folds in the partial aggregate.
+    for (m, join) in fan.joins.iter().enumerate() {
+        let cte_stage = rep_output[&join.rep];
+        let cond = join
+            .key_cols
+            .iter()
+            .enumerate()
+            .map(|(k, col)| format!("semi_s.j{m}_{k} = semi_k.{col}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let upstreams = vec![prev_id, cte_stage];
+        let id = *next_id;
+        *next_id += 1;
+        if m + 1 < fan.joins.len() {
+            let next_keys: Vec<u32> = (0..fan.joins[m + 1].key_idx.len())
+                .map(|k| j_col[&(m + 1, k)])
+                .collect();
+            let sql = sanitize_generated_sql(&format!(
+                "SELECT semi_s.* FROM (SELECT * FROM shuffle_input_0) AS semi_s \
+                 INNER JOIN (SELECT * FROM shuffle_input_1) AS semi_k ON {cond}"
+            ));
+            stages.push(StageDef::new(id, sql, upstreams, next_keys));
+        } else {
+            let mut sel: Vec<String> = (0..n_group)
+                .map(|j| format!("semi_s.gc{j} AS gc{j}"))
+                .collect();
+            for (i, spec) in fan.aggs.iter().enumerate() {
+                sel.push(q23_fanout_partial(&spec.func, i)?);
+            }
+            let group_by = (0..n_group)
+                .map(|j| format!("gc{j}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = sanitize_generated_sql(&format!(
+                "SELECT {} FROM (SELECT * FROM shuffle_input_0) AS semi_s \
+                 INNER JOIN (SELECT * FROM shuffle_input_1) AS semi_k ON {cond} GROUP BY {group_by}",
+                sel.join(", ")
+            ));
+            let hash: Vec<u32> = (0..n_group as u32).collect();
+            stages.push(StageDef::new(id, sql, upstreams, hash));
+        }
+        prev_id = id;
+    }
+
+    // Recombine the co-located per-slice partials; re-apply the arm's output projection.
+    let mut sel: Vec<String> = (0..n_group).map(|j| format!("gc{j} AS g{j}")).collect();
+    for (i, spec) in fan.aggs.iter().enumerate() {
+        sel.push(q23_fanout_combine(&spec.func, i)?);
+    }
+    let group_by = (0..n_group)
+        .map(|j| format!("gc{j}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let inner = format!(
+        "SELECT {} FROM shuffle_input GROUP BY {group_by}",
+        sel.join(", ")
+    );
+    let remap = build_remap(&fan.p);
+    let sql = wrap_output(&fan.p, &inner, &remap).ok()?;
+    let id = *next_id;
+    *next_id += 1;
+    stages.push(StageDef::new(
+        id,
+        sanitize_generated_sql(&sql),
+        vec![prev_id],
+        vec![],
+    ));
+    Some((stages, id))
+}
+
+/// Try to replace the per-arm `Forward` stages of [`try_union_over_derived_ctes`] with the
+/// fanned-out pipelines (see the KAN-156 module comment). All-or-nothing: on success the CTE
+/// terminal stages are re-keyed from the partition-0 gather to the arms' join keys and every
+/// arm reads them hash-co-located; on any decline nothing is mutated and the caller emits the
+/// original `Forward` arms against the gathered CTEs.
+#[allow(clippy::too_many_arguments)]
+fn try_q23_fanned_arms(
+    union_inputs: &[Arc<LogicalPlan>],
+    arm_leaves: &[Vec<&LogicalPlan>],
+    rep_of: &[usize],
+    rep_output: &HashMap<usize, u32>,
+    replicated: &[&str],
+    next_id: &mut u32,
+    stages: &mut Vec<StageDef>,
+) -> Option<Vec<u32>> {
+    // Analyze every arm first — the re-keying below is not reversible per arm, so nothing may
+    // fail after it starts.
+    let mut fanouts = Vec::with_capacity(union_inputs.len());
+    let mut base = 0usize;
+    for (arm, leaves) in union_inputs.iter().zip(arm_leaves) {
+        fanouts.push(q23_arm_fanout(arm, leaves, base, rep_of, replicated)?);
+        base += leaves.len();
+    }
+    // One re-key target per CTE representative, identical across every arm that joins it (a
+    // stage has exactly one output hash key).
+    let mut rep_keys: HashMap<usize, Vec<u32>> = HashMap::new();
+    for fan in &fanouts {
+        for join in &fan.joins {
+            match rep_keys.get(&join.rep) {
+                Some(prev) if *prev != join.key_idx => return None,
+                Some(_) => {}
+                None => {
+                    rep_keys.insert(join.rep, join.key_idx.clone());
+                }
+            }
+        }
+    }
+    // Build every arm's stages with a scratch id cursor (pure — no plan mutation yet).
+    let mut scratch = *next_id;
+    let mut built: Vec<(Vec<StageDef>, u32)> = Vec::with_capacity(fanouts.len());
+    for fan in &fanouts {
+        built.push(build_q23_fanned_arm(fan, rep_output, &mut scratch)?);
+    }
+
+    // Commit: re-key the CTE terminal stages (equal keys now co-locate with the arm exports),
+    // then append the arm pipelines.
+    for (rep, key_idx) in &rep_keys {
+        let terminal = rep_output[rep];
+        let stage = stages.iter_mut().find(|s| s.stage_id == terminal)?;
+        stage.hash_key_cols = key_idx.clone();
+    }
+    let mut ids = Vec::with_capacity(built.len());
+    for (arm_stages, out_id) in built {
+        stages.extend(arm_stages);
+        ids.push(out_id);
+    }
+    *next_id = scratch;
+    Some(ids)
 }
 
 /// Plan one derived CTE for [`try_union_over_derived_ctes`]: the single-row-scalar cross-join
@@ -2637,18 +3227,24 @@ fn plan_ranked_arm(
 ///
 /// 1. **cross_items** — the INTERSECT chain's raw arms run as leaf producers hash-shuffled on
 ///    the full (brand, class, category) triple (the sharded channel's arm per worker, the
-///    replicated channels' arms once via `ExchangeMode::Forward`), so equal triples co-locate
+///    replicated channels' arms once via `ExchangeMode::Forward` — or, on a multi-worker
+///    cluster, fanned out per worker over disjoint file slices of the arm's anchor table;
+///    KAN-156. Equal triples still co-locate, so the per-partition INTERSECT — dedup
+///    included — stays exact), so equal triples co-locate
 ///    and the per-partition `INTERSECT` is exact. The `item` join-back is a per-partition
 ///    broadcast join against the co-located triple stream; its one-column `ss_item_sk` output
 ///    hash-shuffles on the key, becoming the co-located IN key stream for every channel arm.
 /// 2. **avg_sales** — per-worker `sum`/`count` partials over the sharded channel's arm plus one
-///    `Forward` partial over the replicated arms combine into the one-row global AVG, gathered
+///    `Forward` partial over the replicated arms (multi-worker: per-worker partials over
+///    disjoint slices of the replicated anchors — the one-row-per-task global partials re-add
+///    in the unchanged combine) combine into the one-row global AVG, gathered
 ///    to partition 0 (the Q24 threshold decomposition). The arms consume it as a **co-located
 ///    stream** (`SELECT m0 FROM shuffle_input_N`, the Q44 pattern) rather than a `SCALAR_TOKEN`
 ///    literal: the driver substitutes at most one such token per plan, and the literal would
 ///    also force the scalar stage to stay unconsumed.
 /// 3. **Each channel arm** (the Q70 `agg_pipeline_with_in_producer` pattern) — a scan export of
-///    the group columns, aggregate arguments, and `xx_item_sk`, hash-shuffled by that key; a
+///    the group columns, aggregate arguments, and `xx_item_sk`, hash-shuffled by that key
+///    (replicated-only arms: one `Forward` task, or multi-worker fanned-out slices as above); a
 ///    per-partition semi join against the key stream feeding the partial aggregate (co-location
 ///    makes the `IN` globally exact, three-valued logic included: a NULL key never matches on
 ///    either side, and an unmatched non-NULL key is FALSE-or-NULL — filtered either way); then a
@@ -2869,9 +3465,12 @@ fn build_rollup_union_derived(lp: &LogicalPlan, replicated: &[&str]) -> Option<D
         next_id += 1;
         let mut export_stage = StageDef::new(export_id, export_sql, vec![], vec![j0_idx]);
         if !a.sharded {
-            // A replicated-only arm is identical on every worker: produce it once (the driver's
-            // Forward rule) instead of multiplying it by the worker count.
-            export_stage.exchange = ExchangeMode::Forward;
+            // A replicated-only arm is identical on every worker: fan the scan out when a safe
+            // slice anchor exists (KAN-156 — each worker exports a disjoint file slice and the
+            // hash shuffle on j0 still co-locates equal IN keys, so the co-located semi below
+            // stays exact); otherwise produce it once (the driver's Forward rule) instead of
+            // multiplying it by the worker count.
+            place_replicated_stage(&mut export_stage, &[a.body], replicated);
         }
         stages.push(export_stage);
 
@@ -3115,6 +3714,43 @@ fn q14_raw_row_source(lp: &LogicalPlan) -> bool {
     }
 }
 
+/// KAN-156: choose the placement for a stage computing a replicated-only row source or partial.
+/// On a multi-worker cluster with a safe slice anchor per arm, the stage keeps the default
+/// worker-indexed exchange and runs on EVERY worker, each scanning a disjoint 1/W file slice of
+/// the anchor tables (the reduced replicate stamp makes the workers' file sharder treat them as
+/// sharded for this stage only); otherwise the stage computes exactly once
+/// (`ExchangeMode::Forward` — one task on worker 0). Slicing is all-or-nothing across `arms`:
+/// an arm without a safe anchor would be scanned in full on every worker and its contribution
+/// would multiply by the worker count. Exactness for the sliced placement is the caller's
+/// argument, and it is always the same shape: the stage's output is a row-level stream or a
+/// recombine-safe partial (INTERSECT legs dedup after hash co-location, AVG legs combine
+/// sum/count, arm GROUP BYs are partial aggregates), so the disjoint per-slice outputs merge
+/// associatively downstream — byte-identical semantics to the single-task `Forward` version.
+fn place_replicated_stage(stage: &mut StageDef, arms: &[&LogicalPlan], replicated: &[&str]) {
+    let mut anchors: Vec<String> = Vec::new();
+    for arm in arms {
+        match replicated_slice_tables(arm) {
+            Some(mut a) => anchors.append(&mut a),
+            None => {
+                stage.exchange = ExchangeMode::Forward;
+                return;
+            }
+        }
+    }
+    let kept: Vec<&str> = replicated
+        .iter()
+        .filter(|t| !anchors.iter().any(|s| s.eq_ignore_ascii_case(t)))
+        .copied()
+        .collect();
+    // An empty stamp reads as "unset" and would be refilled with the full replicate list,
+    // silently un-slicing the anchors — keep `Forward` for that degenerate case.
+    if kept.is_empty() {
+        stage.exchange = ExchangeMode::Forward;
+        return;
+    }
+    stage.replicated_tables = kept.join(",");
+}
+
 /// Plan the `cross_items` key set: the INTERSECT chain as full-row key-shuffles plus the `item`
 /// join-back, emitting the one-column key stream hash-shuffled on that key. Returns the key
 /// stream's terminal stage id and its key column name.
@@ -3214,8 +3850,11 @@ fn plan_q14_intersect_key_set(
         let sql = plan_sql(arm, "q14 intersect arm").ok()?;
         let mut stage = StageDef::new(*next_id, sql, vec![], hash_key.clone());
         if scans == 0 {
-            // Replicated arm: produce once (Forward) instead of once per worker.
-            stage.exchange = ExchangeMode::Forward;
+            // Replicated arm: fan the scan out across workers when a safe slice anchor exists
+            // (each worker scans a disjoint file slice and hash-shuffles by the full row, so
+            // duplicates still co-locate and the per-partition INTERSECT stays exact);
+            // otherwise produce once (Forward) instead of once per worker.
+            place_replicated_stage(&mut stage, &[arm], replicated);
         }
         arm_stage_ids.push(*next_id);
         *next_id += 1;
@@ -3399,6 +4038,7 @@ fn plan_q14_global_scalar(
 
     let mut sharded_sql: Option<String> = None;
     let mut repl_sqls: Vec<String> = Vec::new();
+    let mut repl_arms: Vec<&LogicalPlan> = Vec::new();
     for arm in &scalar_arms {
         if !q14_raw_row_source(arm) {
             return None;
@@ -3421,6 +4061,7 @@ fn plan_q14_global_scalar(
             sharded_sql = Some(sql);
         } else {
             repl_sqls.push(sql);
+            repl_arms.push(arm.as_ref());
         }
     }
     let sharded_sql = sharded_sql?;
@@ -3430,7 +4071,11 @@ fn plan_q14_global_scalar(
 
     // Per-worker partial over the sharded arm (global partial: exactly one row per worker, even
     // over an empty shard — so the combine's one row is the exact single-node value, NULLs and
-    // empty-input included), gathered; one Forward partial over the replicated arms.
+    // empty-input included), gathered; one Forward partial over the replicated arms — or, when
+    // every replicated arm has a safe slice anchor, a per-worker partial over disjoint file
+    // slices of the anchors (KAN-156): each task still emits its one global-partial row (empty
+    // slices included), and the per-slice partials re-add in the unchanged combine exactly like
+    // the sharded side's per-worker partials.
     let psel = partial_sels.join(", ");
     let sharded_id = *next_id;
     *next_id += 1;
@@ -3449,7 +4094,7 @@ fn plan_q14_global_scalar(
         vec![],
         vec![],
     );
-    repl_stage.exchange = ExchangeMode::Forward;
+    place_replicated_stage(&mut repl_stage, &repl_arms, replicated);
     stages.push(repl_stage);
     let comb_id = *next_id;
     *next_id += 1;
