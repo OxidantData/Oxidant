@@ -425,7 +425,7 @@ async fn q16_not_in_plans_shuffle_join_anti() {
     assert!(
         producer
             .sql
-            .contains("SELECT supplier.s_suppkey AS k0 FROM supplier WHERE"),
+            .contains("SELECT DISTINCT supplier.s_suppkey AS k0 FROM supplier WHERE"),
         "{}",
         producer.sql
     );

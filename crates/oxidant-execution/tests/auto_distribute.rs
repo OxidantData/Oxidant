@@ -1138,7 +1138,9 @@ async fn subquery_over_sharded_table_plans_semi_shuffle() {
     );
     assert_eq!(dq.stages[0].hash_key_cols, vec![0]);
     assert!(
-        dq.stages[0].sql.contains("SELECT t.k AS k0 FROM t WHERE"),
+        dq.stages[0]
+            .sql
+            .contains("SELECT DISTINCT t.k AS k0 FROM t WHERE"),
         "{}",
         dq.stages[0].sql
     );
