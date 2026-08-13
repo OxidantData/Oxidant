@@ -328,6 +328,114 @@ pub(crate) fn flat_key_index(flats: &[String], alias: &str, col: &str) -> Result
         })
 }
 
+/// Union-find over the chain's INNER equijoin keys, keyed by `(alias, column)`.
+///
+/// KAN-162 (TPC-DS q17/q25/q29 at the all-facts-sharded classification): a sharded
+/// boundary's left key can reference a replicated dim that folds into the stage and
+/// never becomes a shuffle input — `sr_customer_sk = cs_bill_customer_sk` when
+/// `store_returns` is replicated. Conjunctive inner-join equality is transitive, so the
+/// key substitutes with an equivalent column the co-located shuffle stream carries
+/// (`ss_customer_sk` via the chain's own `ss_customer_sk = sr_customer_sk`); the stage's
+/// join result and hash co-location are unchanged. Only INNER steps feed the web and
+/// only INNER boundaries substitute: outer / semi / anti keys decide null-extension /
+/// presence and keep the historical rejection when the key is not carried.
+struct ChainKeyWeb {
+    parent: HashMap<(String, String), (String, String)>,
+    /// Every linked key, in chain order — the leftmost leaf's keys link first, so the
+    /// first carried peer in insertion order is the chain root's when one exists.
+    members: Vec<(String, String)>,
+}
+
+impl ChainKeyWeb {
+    fn build(aliases: &HashMap<String, String>, steps: &[ChainStep<'_>]) -> Self {
+        let mut web = ChainKeyWeb {
+            parent: HashMap::new(),
+            members: Vec::new(),
+        };
+        for step in steps {
+            if step.join_type != JoinType::Inner {
+                continue;
+            }
+            for (l, r) in &step.keys {
+                let (Ok(l_rel), Ok(l_name)) = (relation_of(l), column_name(l)) else {
+                    continue;
+                };
+                let (Ok(r_rel), Ok(r_name)) = (relation_of(r), column_name(r)) else {
+                    continue;
+                };
+                let la = aliases.get(&l_rel).cloned().unwrap_or(l_rel);
+                let ra = aliases.get(&r_rel).cloned().unwrap_or(r_rel);
+                web.link((la, l_name), (ra, r_name));
+            }
+        }
+        web
+    }
+
+    fn find(&self, key: &(String, String)) -> (String, String) {
+        let mut root = key.clone();
+        while let Some(p) = self.parent.get(&root) {
+            root = p.clone();
+        }
+        root
+    }
+
+    fn link(&mut self, a: (String, String), b: (String, String)) {
+        for k in [&a, &b] {
+            if !self.members.contains(k) {
+                self.members.push(k.clone());
+            }
+        }
+        let (ra, rb) = (self.find(&a), self.find(&b));
+        if ra != rb {
+            self.parent.insert(rb, ra);
+        }
+    }
+
+    /// An equality-web peer of `key` carried by the shuffle stream (`carried` holds the
+    /// leftmost alias plus the aliases of the sharded steps placed so far).
+    fn carried_peer(&self, key: &(String, String), carried: &[String]) -> Option<(String, String)> {
+        let root = self.find(key);
+        self.members
+            .iter()
+            .find(|k| self.find(k) == root && carried.contains(&k.0))
+            .cloned()
+    }
+}
+
+/// The aliases whose columns the left shuffle stream carries at chain step `i`: the
+/// leftmost leaf plus every sharded right leaf placed before it.
+fn carried_aliases(
+    left_alias: &str,
+    steps: &[ChainStep<'_>],
+    sharded: &[&str],
+    i: usize,
+) -> Vec<String> {
+    let mut carried = vec![left_alias.to_string()];
+    for s in &steps[..i] {
+        if sharded.contains(&s.right.table) {
+            carried.push(scan_alias(&s.right).to_string());
+        }
+    }
+    carried
+}
+
+/// Substitute an INNER boundary's left key when it references a folded replicated dim
+/// (never a shuffle input): the carried equality-web peer is equal by transitivity, so
+/// the shuffle hash and ON clause bind it instead. Uncarried keys with no peer pass
+/// through unchanged — the historical "missing from shuffle projection" rejection.
+fn substitute_carried_key(
+    join_type: JoinType,
+    meta: &mut (String, String),
+    key_web: &ChainKeyWeb,
+    carried: &[String],
+) {
+    if join_type == JoinType::Inner && !carried.contains(&meta.0) {
+        if let Some(peer) = key_web.carried_peer(meta, carried) {
+            *meta = peer;
+        }
+    }
+}
+
 fn relation_of(e: &Expr) -> Result<String> {
     match e {
         Expr::Column(c) => c
@@ -602,6 +710,18 @@ fn build_chain(
     // to a hash semi join whose dynamic filter prunes the fact's parquet scan).
     let semis = semi_join_leaf_filters(&leftmost, steps, sharded, replicated);
 
+    // KAN-162: the chain-wide inner-join equality web (plus the full relation→alias map
+    // it keys on) for folded-dim left-key substitution — see [`ChainKeyWeb`].
+    let mut web_aliases: HashMap<String, String> = HashMap::new();
+    web_aliases.insert(leftmost.table.to_string(), left_alias.clone());
+    web_aliases.insert(left_alias.clone(), left_alias.clone());
+    for s in steps {
+        let a = scan_alias(&s.right).to_string();
+        web_aliases.insert(s.right.table.to_string(), a.clone());
+        web_aliases.insert(a.clone(), a);
+    }
+    let key_web = ChainKeyWeb::build(&web_aliases, steps);
+
     let n = steps.len();
     for i in 0..n {
         let step = &steps[i];
@@ -634,6 +754,13 @@ fn build_chain(
                 .unwrap_or(left_key_rel);
             left_key_metas.push((left_key_alias, left_key_name));
             right_key_names.push(column_name(right_key)?);
+        }
+        // KAN-162: a left key referencing a folded replicated dim (q17/q25/q29's
+        // `sr_customer_sk = cs_bill_customer_sk` with store_returns replicated) is not on
+        // the shuffle stream — substitute the carried equality-web peer.
+        let carried = carried_aliases(&left_alias, steps, sharded, i);
+        for meta in &mut left_key_metas {
+            substitute_carried_key(step.join_type, meta, &key_web, &carried);
         }
         let left_stage_id = match &left_side {
             LeftSide::Leaf => {
@@ -930,8 +1057,15 @@ fn build_chain(
             }
         }
         // LeftSemi/LeftAnti: left columns only (right side is not in the join output schema).
-        let hash_keys = next_sharded_left_keys(steps, i + 1, sharded, &alias_by_relation)
-            .unwrap_or_else(|| left_key_metas.clone());
+        let hash_keys = next_sharded_left_keys(
+            steps,
+            i + 1,
+            sharded,
+            &alias_by_relation,
+            &key_web,
+            &carried_aliases(&left_alias, steps, sharded, i + 1),
+        )
+        .unwrap_or_else(|| left_key_metas.clone());
         let mut hash_idxs = Vec::with_capacity(hash_keys.len());
         for (hash_alias, hash_col) in &hash_keys {
             hash_idxs.push(flat_key_index(&new_flats, hash_alias, hash_col)?);
@@ -1112,6 +1246,8 @@ fn next_sharded_left_keys(
     from: usize,
     sharded: &[&str],
     alias_by_relation: &HashMap<String, String>,
+    key_web: &ChainKeyWeb,
+    carried: &[String],
 ) -> Option<Vec<(String, String)>> {
     for step in steps.iter().skip(from) {
         if !sharded.contains(&step.right.table) {
@@ -1122,7 +1258,11 @@ fn next_sharded_left_keys(
             let col = column_name(left_key).ok()?;
             let rel = relation_of(left_key).ok()?;
             let alias = alias_by_relation.get(&rel).cloned().unwrap_or(rel);
-            out.push((alias, col));
+            // KAN-162: the same folded-dim left-key substitution build_chain applies at
+            // the boundary — the intermediate stage must hash on the carried peer.
+            let mut meta = (alias, col);
+            substitute_carried_key(step.join_type, &mut meta, key_web, carried);
+            out.push(meta);
         }
         return Some(out);
     }
