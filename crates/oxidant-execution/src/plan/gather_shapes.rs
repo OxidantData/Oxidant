@@ -1119,7 +1119,7 @@ pub(crate) fn try_union_over_derived_ctes(
     let mut arm_leaves: Vec<Vec<&LogicalPlan>> = Vec::with_capacity(u.inputs.len());
     for arm in &u.inputs {
         let mut leaves = Vec::new();
-        let Some(()) = collect_arm_leaves(arm, replicated, &mut leaves) else {
+        let Some(()) = collect_arm_leaves(arm, replicated, &mut leaves, true, None) else {
             decline!("q23");
         };
         if leaves.is_empty() || leaves.iter().any(|l| std::ptr::eq(*l, arm.as_ref())) {
@@ -1583,13 +1583,30 @@ fn q23_arm_fanout<'a>(
     }
 
     let region = q23_strip_cte(p.agg.input.as_ref(), &mut ctx)?;
-    if base_tables(&region)
+    // The region must evaluate per worker with exact per-slice output: either all-replicated
+    // (sliced across workers via a safe anchor, KAN-156) or — KAN-161 — exactly one sharded
+    // anchor scanned once in a broadcast-safe join tree, which each worker already holds as
+    // its disjoint local shard (no slicing; the stamp keeps the full replicated list). Two
+    // sharded tables in one region would join local shards only — WRONG; keep rejecting that.
+    let region_tables = base_tables(&region);
+    let mut region_sharded: Vec<&str> = region_tables
         .iter()
-        .any(|t| !replicated.contains(&t.as_str()))
-    {
-        return None;
-    }
-    let stamp = sliced_replicate_stamp(&region, replicated)?;
+        .map(String::as_str)
+        .filter(|t| !replicated.contains(t))
+        .collect();
+    region_sharded.sort_unstable();
+    region_sharded.dedup();
+    let stamp = match region_sharded.as_slice() {
+        [] => sliced_replicate_stamp(&region, replicated)?,
+        [t] => {
+            if count_table_scans(&region, t) != 1 {
+                return None;
+            }
+            reject_unsafe_broadcast_shapes(&region, t).ok()?;
+            replicated.join(",")
+        }
+        _ => return None,
+    };
     let group_sql: Vec<String> = flattened_group_exprs(&p.agg.group_expr)
         .into_iter()
         .map(|g| expr_sql(&up, g))
@@ -1852,11 +1869,32 @@ fn plan_derived_cte(leaf: &LogicalPlan, replicated: &[&str]) -> Result<Option<Di
 }
 
 /// Collect an arm's derived sharded CTEs (occurrence level), or `None` when the arm's shape is
-/// outside the [`try_union_over_derived_ctes`] composition.
+/// outside the [`try_union_over_derived_ctes`] composition. `at_root` is set only for the arm
+/// node itself (KAN-161): with the channel facts sharded, the arm's own scan region reads one
+/// sharded fact — the root then stays the skeleton instead of classifying as a CTE leaf.
+/// `anchor` carries that decision down the recursion: the descent must not re-classify the
+/// root's own aggregate as a CTE leaf once it reaches it (a bare `Aggregate` leaf is unplannable
+/// here — `q23_arm_fanout` needs `SubqueryAlias` leaves, and the skeleton above it still
+/// references the aggregate's original output names), and below that aggregate the region's
+/// scans of the single sharded anchor table are legitimate per-worker local-shard reads.
+#[derive(Clone)]
+struct RootAnchor<'a> {
+    /// The arm root's own aggregate, kept as the skeleton.
+    agg: &'a Aggregate,
+    /// The one sharded table its scan region reads (verified scanned exactly once in a
+    /// broadcast-safe join tree at the root).
+    table: String,
+    /// Flips once the recursion crosses `agg`: only below it is `table` tolerated in the
+    /// replicated-only skeleton check.
+    inside: bool,
+}
+
 fn collect_arm_leaves<'a>(
     node: &'a LogicalPlan,
     replicated: &[&str],
     out: &mut Vec<&'a LogicalPlan>,
+    at_root: bool,
+    mut anchor: Option<RootAnchor<'a>>,
 ) -> Option<()> {
     // A peel-able grouped aggregate whose own body directly scans a sharded base table is a
     // materialized derived CTE (frequent_ss_items / best_ss_customer). The arm's own aggregate
@@ -1867,30 +1905,77 @@ fn collect_arm_leaves<'a>(
             let mut region = Vec::new();
             skeleton_region_tables(p.agg.input.as_ref(), &mut region);
             if region.iter().any(|t| !replicated.contains(&t.as_str())) {
-                out.push(node);
-                return Some(());
+                // KAN-161: at the arm root the region may scan the arm's own channel fact
+                // (catalog_sales / web_sales now shard). Keep the root as the skeleton when the
+                // region holds exactly one sharded table, scanned once, in a broadcast-safe
+                // join tree — the fanned-out arm pipeline then evaluates it per worker over
+                // the local shard (exact: row-level export + hash co-location downstream).
+                // Deeper nodes keep leaf semantics: they are the materialized derived CTEs,
+                // and a sharded region there must still classify as a leaf.
+                let mut region_sharded: Vec<&str> = region
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|t| !replicated.contains(t))
+                    .collect();
+                region_sharded.sort_unstable();
+                region_sharded.dedup();
+                let root_anchor = at_root
+                    && matches!(
+                        region_sharded.as_slice(),
+                        [t] if count_table_scans(p.agg.input.as_ref(), t) == 1
+                            && reject_unsafe_broadcast_shapes(p.agg.input.as_ref(), t).is_ok()
+                    );
+                if root_anchor {
+                    anchor = Some(RootAnchor {
+                        agg: p.agg,
+                        table: region_sharded[0].to_string(),
+                        inside: false,
+                    });
+                } else if anchor
+                    .as_ref()
+                    .map_or(true, |a| !std::ptr::eq(a.agg, p.agg))
+                {
+                    out.push(node);
+                    return Some(());
+                }
             }
         }
     }
     // A skeleton node: its own region may read replicated tables only, including tables inside
-    // expression subqueries.
+    // expression subqueries. (The arm root admitted above is an Aggregate/Projection node, so
+    // `skeleton_region_tables` does not descend past its aggregate boundary into the region —
+    // the sharded anchor is not re-rejected here. Below the anchored aggregate the region's
+    // scans of the anchor table itself are the admitted per-worker local-shard reads.)
+    let anchor_table = anchor
+        .as_ref()
+        .filter(|a| a.inside)
+        .map(|a| a.table.as_str());
     let mut region = Vec::new();
     skeleton_region_tables(node, &mut region);
     collect_subquery_tables(node, &mut region);
-    if region.iter().any(|t| !replicated.contains(&t.as_str())) {
+    if region
+        .iter()
+        .any(|t| !replicated.contains(&t.as_str()) && Some(t.as_str()) != anchor_table)
+    {
         return None;
     }
     match node {
         LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) | LogicalPlan::Filter(_) => {
             for i in node.inputs() {
-                collect_arm_leaves(i, replicated, out)?;
+                collect_arm_leaves(i, replicated, out, false, anchor.clone())?;
             }
             Some(())
         }
         LogicalPlan::Aggregate(a) if !a.group_expr.is_empty() => {
             let before = out.len();
+            let mut child_anchor = anchor.clone();
+            if let Some(an) = child_anchor.as_mut() {
+                if std::ptr::eq(an.agg, a) {
+                    an.inside = true;
+                }
+            }
             for i in node.inputs() {
-                collect_arm_leaves(i, replicated, out)?;
+                collect_arm_leaves(i, replicated, out, false, child_anchor.clone())?;
             }
             // A replicated-only aggregate in the arm skeleton is declined conservatively
             // (the arm must read at least one gathered CTE to belong in this composition);
@@ -1903,7 +1988,7 @@ fn collect_arm_leaves<'a>(
         }
         LogicalPlan::Join(j) if j.join_type == JoinType::Inner => {
             for i in node.inputs() {
-                collect_arm_leaves(i, replicated, out)?;
+                collect_arm_leaves(i, replicated, out, false, anchor.clone())?;
             }
             Some(())
         }
@@ -3362,7 +3447,12 @@ fn build_rollup_union_derived(lp: &LogicalPlan, replicated: &[&str]) -> Option<D
         outer_arg_pos.push(union_pos(n)?);
     }
 
-    // --- Exactly one sharded base table across the whole plan ----------------
+    // --- At least one sharded base table across the whole plan ---------------
+    // KAN-161: several facts may be sharded at once (catalog_sales/web_sales above the
+    // auto-broadcast threshold). Admission is per arm below: each arm of the key set /
+    // scalar / channel union may scan at most ONE sharded table, exactly once, in a
+    // broadcast-safe tree — the per-stage exactness arguments (full-row hash co-location,
+    // associative partials) do not depend on which channel is sharded.
     let mut all_tables = base_tables(lp);
     collect_subquery_tables(lp, &mut all_tables);
     let mut sharded: Vec<&str> = all_tables
@@ -3372,9 +3462,9 @@ fn build_rollup_union_derived(lp: &LogicalPlan, replicated: &[&str]) -> Option<D
         .collect();
     sharded.sort_unstable();
     sharded.dedup();
-    let [fact] = sharded.as_slice() else {
+    if sharded.is_empty() {
         return None;
-    };
+    }
 
     // --- Per-arm shape -------------------------------------------------------
     let mut arms: Vec<Q14ChannelArm> = Vec::with_capacity(arm_plans.len());
@@ -3408,16 +3498,10 @@ fn build_rollup_union_derived(lp: &LogicalPlan, replicated: &[&str]) -> Option<D
     // --- Stages: the two derived tables first (topological order) ------------
     let mut stages: Vec<StageDef> = Vec::new();
     let mut next_id = 0u32;
-    let (key_stage, key_name) = plan_q14_intersect_key_set(
-        arms[0].in_subquery,
-        fact,
-        replicated,
-        &mut stages,
-        &mut next_id,
-    )?;
+    let (key_stage, key_name) =
+        plan_q14_intersect_key_set(arms[0].in_subquery, replicated, &mut stages, &mut next_id)?;
     let scalar_stage = plan_q14_global_scalar(
         arms[0].having_subquery,
-        fact,
         replicated,
         &mut stages,
         &mut next_id,
@@ -3756,7 +3840,6 @@ fn place_replicated_stage(stage: &mut StageDef, arms: &[&LogicalPlan], replicate
 /// stream's terminal stage id and its key column name.
 fn plan_q14_intersect_key_set(
     sub: &LogicalPlan,
-    fact: &str,
     replicated: &[&str],
     stages: &mut Vec<StageDef>,
     next_id: &mut u32,
@@ -3836,17 +3919,30 @@ fn plan_q14_intersect_key_set(
         if !q14_raw_row_source(arm) || arm.schema().fields().len() != n_cols {
             return None;
         }
-        let scans = count_table_scans(arm, fact);
-        let other_sharded = base_tables(arm)
+        // KAN-161: each arm may scan at most one sharded table, exactly once (per-channel
+        // facts shard independently — the full-row hash co-location makes the per-partition
+        // INTERSECT exact no matter which arms are sharded).
+        let arm_tables = base_tables(arm);
+        let mut arm_sharded: Vec<&str> = arm_tables
             .iter()
-            .any(|t| t != fact && !replicated.contains(&t.as_str()));
-        if other_sharded || scans > 1 {
-            return None;
-        }
-        if scans == 1 {
-            sharded_arms += 1;
-            reject_unsafe_broadcast_shapes(arm, fact).ok()?;
-        }
+            .map(String::as_str)
+            .filter(|t| !replicated.contains(t))
+            .collect();
+        arm_sharded.sort_unstable();
+        arm_sharded.dedup();
+        let scans = match arm_sharded.as_slice() {
+            [] => 0,
+            [t] => {
+                let n = count_table_scans(arm, t);
+                if n != 1 {
+                    return None;
+                }
+                reject_unsafe_broadcast_shapes(arm, t).ok()?;
+                sharded_arms += 1;
+                n
+            }
+            _ => return None,
+        };
         let sql = plan_sql(arm, "q14 intersect arm").ok()?;
         let mut stage = StageDef::new(*next_id, sql, vec![], hash_key.clone());
         if scans == 0 {
@@ -3860,7 +3956,7 @@ fn plan_q14_intersect_key_set(
         *next_id += 1;
         stages.push(stage);
     }
-    if sharded_arms != 1 {
+    if sharded_arms == 0 {
         return None;
     }
 
@@ -3948,14 +4044,14 @@ fn q14_semi_keys_cover_full_row(j: &datafusion::logical_expr::Join) -> bool {
 }
 
 /// Plan the HAVING scalar (Q14's `avg_sales`): one global non-DISTINCT min/max/sum/count/avg
-/// over a raw UNION ALL of channel projections, exactly one scanning the sharded fact. The
-/// mixed-sharding global decomposes as per-worker partials over the sharded arm plus one
-/// `Forward` partial over the replicated arms, then a one-row combine gathered to partition 0.
+/// over a raw UNION ALL of channel projections, each scanning at most one sharded table
+/// (exactly once), with at least one sharded arm overall. The mixed-sharding global decomposes
+/// as one per-worker partial per sharded arm plus one partial over the replicated arms (when
+/// any), then a one-row combine gathered to partition 0.
 /// Returns the combine stage id; consumers read it as `(SELECT m0 FROM shuffle_input_N)` where
 /// their own main input also gathers (partition-0 co-location).
 fn plan_q14_global_scalar(
     sub: &LogicalPlan,
-    fact: &str,
     replicated: &[&str],
     stages: &mut Vec<StageDef>,
     next_id: &mut u32,
@@ -4036,79 +4132,94 @@ fn plan_q14_global_scalar(
         _ => return None,
     };
 
-    let mut sharded_sql: Option<String> = None;
+    let mut sharded_sqls: Vec<String> = Vec::new();
     let mut repl_sqls: Vec<String> = Vec::new();
     let mut repl_arms: Vec<&LogicalPlan> = Vec::new();
     for arm in &scalar_arms {
         if !q14_raw_row_source(arm) {
             return None;
         }
-        let scans = count_table_scans(arm, fact);
-        let other_sharded = base_tables(arm)
+        // KAN-161: per arm at most one sharded table, scanned exactly once.
+        let arm_tables = base_tables(arm);
+        let mut arm_sharded: Vec<&str> = arm_tables
             .iter()
-            .any(|t| t != fact && !replicated.contains(&t.as_str()));
-        if other_sharded || scans > 1 {
-            return None;
-        }
-        if scans == 1 {
-            reject_unsafe_broadcast_shapes(arm, fact).ok()?;
-        }
-        let sql = plan_sql(arm, "q14 scalar arm").ok()?;
-        if scans == 1 {
-            if sharded_sql.is_some() {
-                return None;
+            .map(String::as_str)
+            .filter(|t| !replicated.contains(t))
+            .collect();
+        arm_sharded.sort_unstable();
+        arm_sharded.dedup();
+        let sharded_arm = match arm_sharded.as_slice() {
+            [] => false,
+            [t] => {
+                if count_table_scans(arm, t) != 1 {
+                    return None;
+                }
+                reject_unsafe_broadcast_shapes(arm, t).ok()?;
+                true
             }
-            sharded_sql = Some(sql);
+            _ => return None,
+        };
+        let sql = plan_sql(arm, "q14 scalar arm").ok()?;
+        if sharded_arm {
+            sharded_sqls.push(sql);
         } else {
             repl_sqls.push(sql);
             repl_arms.push(arm.as_ref());
         }
     }
-    let sharded_sql = sharded_sql?;
-    if repl_sqls.is_empty() {
+    if sharded_sqls.is_empty() {
         return None;
     }
 
-    // Per-worker partial over the sharded arm (global partial: exactly one row per worker, even
-    // over an empty shard — so the combine's one row is the exact single-node value, NULLs and
-    // empty-input included), gathered; one Forward partial over the replicated arms — or, when
-    // every replicated arm has a safe slice anchor, a per-worker partial over disjoint file
-    // slices of the anchors (KAN-156): each task still emits its one global-partial row (empty
-    // slices included), and the per-slice partials re-add in the unchanged combine exactly like
-    // the sharded side's per-worker partials.
+    // Per-worker partial over each sharded arm (global partial: exactly one row per worker,
+    // even over an empty shard — so the combine's one row is the exact single-node value,
+    // NULLs and empty-input included), gathered; when replicated arms exist, one Forward
+    // partial over them — or, when every replicated arm has a safe slice anchor, a per-worker
+    // partial over disjoint file slices of the anchors (KAN-156): each task still emits its
+    // one global-partial row (empty slices included), and the per-slice partials re-add in the
+    // unchanged combine exactly like the sharded side's per-worker partials.
     let psel = partial_sels.join(", ");
-    let sharded_id = *next_id;
-    *next_id += 1;
-    stages.push(StageDef::new(
-        sharded_id,
-        sanitize_generated_sql(&format!("SELECT {psel} FROM ({sharded_sql}) AS sq2")),
-        vec![],
-        vec![],
-    ));
-    let repl_union = repl_sqls.join(" UNION ALL ");
-    let repl_id = *next_id;
-    *next_id += 1;
-    let mut repl_stage = StageDef::new(
-        repl_id,
-        sanitize_generated_sql(&format!("SELECT {psel} FROM ({repl_union}) AS sq2")),
-        vec![],
-        vec![],
-    );
-    place_replicated_stage(&mut repl_stage, &repl_arms, replicated);
-    stages.push(repl_stage);
+    let mut partial_ids: Vec<u32> = Vec::with_capacity(sharded_sqls.len() + 1);
+    for sql in &sharded_sqls {
+        let id = *next_id;
+        *next_id += 1;
+        stages.push(StageDef::new(
+            id,
+            sanitize_generated_sql(&format!("SELECT {psel} FROM ({sql}) AS sq2")),
+            vec![],
+            vec![],
+        ));
+        partial_ids.push(id);
+    }
+    if !repl_sqls.is_empty() {
+        let repl_union = repl_sqls.join(" UNION ALL ");
+        let repl_id = *next_id;
+        *next_id += 1;
+        let mut repl_stage = StageDef::new(
+            repl_id,
+            sanitize_generated_sql(&format!("SELECT {psel} FROM ({repl_union}) AS sq2")),
+            vec![],
+            vec![],
+        );
+        place_replicated_stage(&mut repl_stage, &repl_arms, replicated);
+        stages.push(repl_stage);
+        partial_ids.push(repl_id);
+    }
     let comb_id = *next_id;
     *next_id += 1;
     // `HAVING COUNT(*) > 0`: the empty partitions (gathered inputs land on partition 0 only)
     // would still emit the global aggregate's identity row; partition 0's input always carries
     // the per-worker / Forward partial rows, so its one row survives.
+    let comb_inputs = (0..partial_ids.len())
+        .map(|i| format!("SELECT * FROM shuffle_input_{i}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
     stages.push(StageDef::new(
         comb_id,
         sanitize_generated_sql(&format!(
-            "SELECT {comb_expr} AS m0 FROM \
-             (SELECT * FROM shuffle_input_0 UNION ALL SELECT * FROM shuffle_input_1) AS avg_in \
-             HAVING COUNT(*) > 0"
+            "SELECT {comb_expr} AS m0 FROM ({comb_inputs}) AS avg_in HAVING COUNT(*) > 0"
         )),
-        vec![sharded_id, repl_id],
+        partial_ids,
         vec![],
     ));
     Some(comb_id)

@@ -22,9 +22,13 @@ use futures::TryStreamExt;
 use object_store::ObjectMeta;
 use oxidant_common::{Error, Result};
 
-/// Default auto-broadcast byte cap (32 GiB). Tables at/above this stay sharded even when
-/// smaller than the query's largest table.
-pub const DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// Default auto-broadcast byte cap (4 GiB). Tables at/above this stay sharded even when
+/// smaller than the query's largest table. Sized so the SF100 TPC-DS mid facts
+/// (`catalog_sales` ~14.5 GB, `web_sales` ~7.2 GB) classify sharded — they were being
+/// replicated under the old 32 GiB cap, forcing the whole 3-fact chain into one 2-task
+/// stage re-scanning ~17 GB of replicated facts (KAN-161: TPC-DS Q25/Q17) — while the
+/// returns tables and dims stay replicated.
+pub const DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 tokio::task_local! {
     /// Driver-classified replicate set for the current stage (lowercase names).
@@ -255,7 +259,7 @@ where
     SHARD_ASSIGNMENT_CONTEXT.scope(assignment, future).await
 }
 
-/// Byte cap for auto-broadcast (`OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES`). Default 32 GiB.
+/// Byte cap for auto-broadcast (`OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES`). Default 4 GiB.
 /// `0` disables size-based auto-replication (env override only).
 pub fn auto_broadcast_threshold_bytes() -> u64 {
     match std::env::var("OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES") {
@@ -774,6 +778,43 @@ mod tests {
 
         let disabled = classify_replicated_tables(&sized, &["nation"], 0);
         assert_eq!(disabled, vec!["nation".to_string()]);
+    }
+
+    /// KAN-161: the default auto-broadcast cap is 4 GiB so the SF100 TPC-DS mid facts
+    /// (`catalog_sales` ~14.5 GB, `web_sales` ~7.2 GB) classify sharded while the returns
+    /// tables and dims stay replicated. Under the old 32 GiB cap both mid facts replicated,
+    /// collapsing the 3-fact chain into one 2-task stage re-scanning ~17 GB of replicated
+    /// facts (TPC-DS Q25 +298s, Q17 +204s).
+    #[test]
+    fn default_threshold_keeps_sf100_mid_facts_sharded() {
+        assert_eq!(
+            DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES,
+            4 * 1024 * 1024 * 1024
+        );
+
+        let g = 1024 * 1024 * 1024;
+        let sized = vec![
+            ("catalog_sales".into(), Some(15 * g)), // largest → byte anchor, always sharded
+            ("web_sales".into(), Some(8 * g)),
+            ("store_sales".into(), Some(6 * g)),
+            ("catalog_returns".into(), Some(2 * g)),
+            ("web_returns".into(), Some(g)),
+            ("store_returns".into(), Some(g / 2)),
+            ("item".into(), Some(50_000_000)),
+        ];
+        let got = classify_replicated_tables(&sized, &[], DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES);
+        for sharded in ["catalog_sales", "web_sales", "store_sales"] {
+            assert!(
+                !got.iter().any(|t| t == sharded),
+                "{sharded} must stay sharded at the 4 GiB default"
+            );
+        }
+        for replicated in ["catalog_returns", "web_returns", "store_returns", "item"] {
+            assert!(
+                got.contains(&replicated.to_string()),
+                "{replicated} must replicate at the 4 GiB default"
+            );
+        }
     }
 
     /// TPC-DS SF10 shape: `catalog_sales` is the byte anchor (~1+ GB, 14.4M rows) while

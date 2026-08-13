@@ -1110,3 +1110,248 @@ fn q78_fanned_distributed_matches_single_node() {
         .await;
     });
 }
+
+// ---------------------------------------------------------------------------
+// KAN-161 — every channel fact sharded (auto-broadcast threshold dropped below
+// catalog_sales/web_sales): the Q14/Q23/Q78 shapes must still admit, with each
+// arm/branch scanning its own sharded fact per worker.
+// ---------------------------------------------------------------------------
+
+/// KAN-161 classification for Q14: all three channel facts sharded; dims/returns replicate.
+const REPL_Q14_ALL_SHARDED: [&str; 6] = [
+    "date_dim",
+    "item",
+    "customer",
+    "store_returns",
+    "catalog_returns",
+    "web_returns",
+];
+/// KAN-161 classification for Q23: the channel facts and store_sales sharded.
+const REPL_Q23_ALL_SHARDED: [&str; 3] = ["customer", "date_dim", "item"];
+/// KAN-161 classification for Q78: all three channel facts sharded; date_dim/returns replicate.
+const REPL_Q78_ALL_SHARDED: [&str; 4] = [
+    "date_dim",
+    "web_returns",
+    "catalog_returns",
+    "store_returns",
+];
+
+/// W=1 admission pin: with every channel fact sharded the Q14 shape still plans — one
+/// INTERSECT leg, one arm export, and one avg partial per sharded channel. Nothing is
+/// replicated-only, so no `Forward` stage exists.
+#[tokio::test]
+async fn q14_kan161_all_facts_sharded_plans() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_env();
+    let dir = tempfile::tempdir().unwrap();
+    let tables = q14_tables();
+    let engine = catalog_engine(write_fixtures(dir.path(), &tables)).await;
+    let lp = engine.logical_plan(&qualify(Q14)).await.unwrap();
+    let dq = plan_distributed_logical(&lp, &REPL_Q14_ALL_SHARDED)
+        .expect("Q14 plans with all channel facts sharded");
+    assert!(
+        dq.stages.iter().any(|s| s.sql.contains("INTERSECT")),
+        "cross_items distributes as key-shuffled INTERSECT arms: {dq:?}"
+    );
+    assert!(
+        dq.stages.iter().any(|s| s.sql.contains("ROLLUP")),
+        "the combine stage rebuilds the grouping sets: {dq:?}"
+    );
+    assert!(
+        !dq.stages
+            .iter()
+            .any(|s| s.exchange == ExchangeMode::Forward),
+        "no replicated-only stage remains: {dq:?}"
+    );
+    for fact in ["store_sales", "catalog_sales", "web_sales"] {
+        let scans = dq
+            .stages
+            .iter()
+            .filter(|s| s.upstream_stage_ids.is_empty() && s.sql.contains(fact))
+            .count();
+        assert_eq!(
+            scans, 3,
+            "INTERSECT leg + arm export + avg partial each scan `{fact}`: {dq:?}"
+        );
+    }
+}
+
+#[test]
+fn q14_kan161_all_facts_sharded_matches_single_node() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(32 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("e2e runtime");
+    rt.block_on(async {
+        assert_fanned_matches_single_node(
+            "Q14/sharded",
+            Q14,
+            &REPL_Q14_ALL_SHARDED,
+            &q14_tables(),
+            |dq| {
+                assert!(
+                    !dq.stages
+                        .iter()
+                        .any(|s| s.exchange == ExchangeMode::Forward),
+                    "all-sharded plan has no Forward stage: {dq:?}"
+                );
+            },
+        )
+        .await;
+    });
+}
+
+/// W=1 admission pin: with the channel facts sharded, both Q23 arms fan out over their sharded
+/// anchors — the `Forward` arm fallback would read one worker's shard only and must NOT be
+/// chosen (it declines on the remaining sharded scan).
+#[tokio::test]
+async fn q23_kan161_all_facts_sharded_plans() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_env();
+    let dir = tempfile::tempdir().unwrap();
+    let tables = q23_tables();
+    let engine = catalog_engine(write_fixtures(dir.path(), &tables)).await;
+    let lp = engine.logical_plan(&qualify(Q23)).await.unwrap();
+    let dq = plan_distributed_logical(&lp, &REPL_Q23_ALL_SHARDED)
+        .expect("Q23 plans with the channel facts sharded");
+    assert!(
+        !dq.stages
+            .iter()
+            .any(|s| s.exchange == ExchangeMode::Forward),
+        "both arms fan out; no Forward arm: {dq:?}"
+    );
+    let exports = q23_export_stages(&dq);
+    assert_eq!(exports.len(), 2, "one export per channel arm: {dq:?}");
+    for s in &exports {
+        for dim in ["customer", "date_dim", "item"] {
+            assert!(
+                s.replicated_tables.split(',').any(|x| x == dim),
+                "dim `{dim}` stays replicated in the export: {s:?}"
+            );
+        }
+        for fact in ["catalog_sales", "web_sales", "store_sales"] {
+            assert!(
+                !s.replicated_tables.split(',').any(|x| x == fact),
+                "fact `{fact}` is sharded, never stamped replicated: {s:?}"
+            );
+        }
+    }
+    // The CTE terminal stages re-key to the arms' join columns exactly as in the KAN-156
+    // fan-out (frequent_ss_items by item_sk = output col 1, best_ss_customer by c_customer_sk
+    // = output col 0).
+    let frequent = dq
+        .stages
+        .iter()
+        .find(|s| s.sql.contains("\"item_sk\"") && s.sql.contains("\"cnt\""))
+        .expect("frequent_ss_items terminal stage");
+    assert_eq!(frequent.hash_key_cols, vec![1], "{frequent:?}");
+    let best = dq
+        .stages
+        .iter()
+        .find(|s| s.sql.contains("\"ssales\""))
+        .expect("best_ss_customer terminal stage");
+    assert_eq!(best.hash_key_cols, vec![0], "{best:?}");
+}
+
+#[test]
+fn q23_kan161_all_facts_sharded_matches_single_node() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(32 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("e2e runtime");
+    rt.block_on(async {
+        assert_fanned_matches_single_node(
+            "Q23/sharded",
+            Q23,
+            &REPL_Q23_ALL_SHARDED,
+            &q23_tables(),
+            |dq| {
+                assert!(
+                    !dq.stages
+                        .iter()
+                        .any(|s| s.exchange == ExchangeMode::Forward),
+                    "all-sharded plan has no Forward stage: {dq:?}"
+                );
+            },
+        )
+        .await;
+    });
+}
+
+/// W=1 admission pin: with web_sales/catalog_sales sharded, all three Q78 branches classify
+/// `BranchKind::Sharded` and plan through the ordinary sharded-fact machinery (per-worker
+/// partial + recombine), keyed for the outer skeleton — no `mergeable_branch` change needed
+/// (each branch tail still scans exactly one sharded table).
+#[tokio::test]
+async fn q78_kan161_all_facts_sharded_plans() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_env();
+    let dir = tempfile::tempdir().unwrap();
+    let tables = q78_tables();
+    let engine = catalog_engine(write_fixtures(dir.path(), &tables)).await;
+    let lp = engine.logical_plan(&qualify(Q78)).await.unwrap();
+    let dq = plan_distributed_logical(&lp, &REPL_Q78_ALL_SHARDED)
+        .expect("Q78 plans with all channel facts sharded");
+    assert!(
+        !dq.stages
+            .iter()
+            .any(|s| s.exchange == ExchangeMode::Forward),
+        "no branch materializes as Forward: {dq:?}"
+    );
+    for fact in ["store_sales", "web_sales", "catalog_sales"] {
+        let partial = dq
+            .stages
+            .iter()
+            .find(|s| s.upstream_stage_ids.is_empty() && s.sql.contains(fact))
+            .unwrap_or_else(|| panic!("a sharded branch partial scans {fact}: {dq:?}"));
+        assert!(
+            partial.sql.contains("GROUP BY"),
+            "branch partial over the local shard: {partial:?}"
+        );
+        assert!(
+            !partial.replicated_tables.split(',').any(|x| x == fact),
+            "`{fact}` is sharded, never stamped replicated: {partial:?}"
+        );
+    }
+    let outer = dq.stages.last().unwrap();
+    assert_eq!(outer.upstream_stage_ids.len(), 3, "ss/ws/cs: {dq:?}");
+    for &id in &outer.upstream_stage_ids {
+        assert_eq!(
+            stage_by_id(&dq, id).hash_key_cols,
+            vec![0, 1, 2],
+            "branch output keyed for the skeleton: {dq:?}"
+        );
+    }
+    assert!(dq.finalize_sql.is_some(), "two-phase TopK finalize: {dq:?}");
+}
+
+#[test]
+fn q78_kan161_all_facts_sharded_matches_single_node() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(32 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("e2e runtime");
+    rt.block_on(async {
+        assert_fanned_matches_single_node(
+            "Q78/sharded",
+            Q78,
+            &REPL_Q78_ALL_SHARDED,
+            &q78_tables(),
+            |dq| {
+                assert!(
+                    !dq.stages
+                        .iter()
+                        .any(|s| s.exchange == ExchangeMode::Forward),
+                    "all-sharded plan has no Forward stage: {dq:?}"
+                );
+            },
+        )
+        .await;
+    });
+}
