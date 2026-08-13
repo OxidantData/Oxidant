@@ -50,8 +50,8 @@ use super::stage_planner::{
     finalize_expr_sql, flatten_union_all, flattened_group_exprs, is_grouping_set, output_name,
     partial_and_combine_lists, partial_combine_sql, peel, plan_distributed_logical,
     qualified_table_sql, reject_unsafe_broadcast_shapes, replicated_slice_tables,
-    sanitize_generated_sql, sliced_replicate_stamp, strip_alias, unqualify, wrap_output, AggSpec,
-    DistributedQuery, Peeled,
+    sanitize_generated_sql, sliced_replicate_stamp, strip_alias, unqualify, wrap_output,
+    wrap_output_recombine, AggSpec, DistributedQuery, Peeled,
 };
 use crate::driver::{scalar_literal_supported, ExchangeMode, StageDef, SCALAR_TOKEN};
 
@@ -3648,7 +3648,8 @@ fn build_rollup_union_derived(lp: &LogicalPlan, replicated: &[&str]) -> Option<D
          HAVING COUNT(*) > 0 OR EXISTS (SELECT * FROM shuffle_input_{gate_pos})",
         combine.join(", ")
     );
-    let final_sql = sanitize_generated_sql(&wrap_output(&p, &inner, &build_remap(&p)).ok()?);
+    let final_sql =
+        sanitize_generated_sql(&wrap_output_recombine(&p, &inner, &build_remap(&p)).ok()?);
     let mut upstreams = arm_out_ids.clone();
     upstreams.push(scalar_stage);
     stages.push(StageDef::new(next_id, final_sql, upstreams, vec![]));
