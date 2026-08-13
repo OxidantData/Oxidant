@@ -10,7 +10,7 @@ name: CI
 #     dbgen/dsdgen at SF1 — TPC-H/TPC-DS/distributed suites) — skipped on routine PRs
 # Heavier gates live elsewhere:
 #   - ClickBench on real 14.78 GB data -> bench.yml, Blacksmith 16-vCPU runner
-#   - llvm-cov line coverage (informational) -> coverage-nightly.yml
+#   - llvm-cov line coverage also runs nightly for trending -> coverage-nightly.yml
 #
 # BUILD TIME: every compiling job restores ONE cargo cache via `shared-key: workspace` below.
 # Keyed per job (the rust-cache default) the workspace got compiled from scratch four times
@@ -178,6 +178,76 @@ jobs:
             parity/parity.html
             parity/scoreboard.json
           retention-days: 30
+          if-no-files-found: ignore
+
+  # Informational llvm-cov line-coverage report on every PR and main push. Mirrors the
+  # nightly job in coverage-nightly.yml so coverage deltas are visible on the PR itself.
+  # NON-BLOCKING by design (continue-on-error: true): it must never gate a merge — do not
+  # add it to required status checks. Gotchas (AGENTS.md): separate target dir
+  # target/llvm-cov-target, build oxidant-cli into it first, `--html` without
+  # `--output-path`, artifact lives at target/llvm-cov/html.
+  line-coverage:
+    name: line coverage (informational, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: llvm-cov # instrumented artifacts must not pollute the shared CI cache
+      # Prebuilt binary. `cargo install cargo-llvm-cov --locked` compiled it from source
+      # on every run, which cost more than the coverage pass itself.
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Build oxidant CLI (integration tests spawn the binary under llvm-cov target dir)
+        run: cargo build -p oxidant-cli --target-dir target/llvm-cov-target
+      - name: Generate HTML coverage report
+        run: cargo llvm-cov --workspace --html
+      # `cargo llvm-cov report` reuses the data collected by the run above — do NOT run
+      # `cargo llvm-cov --summary-only` here, that flag only pairs with --json/--lcov and
+      # re-executes the whole instrumented suite a second time.
+      - name: Publish coverage summary to job summary
+        if: always()
+        run: |
+          cargo llvm-cov report --summary-only --json --output-path /tmp/cov-summary.json || true
+          if [[ -s /tmp/cov-summary.json ]]; then
+            {
+              echo "## Line coverage (informational)"
+              echo ""
+              echo "| Crate | Covered | Coverable | % |"
+              echo "|-------|---------|-----------|---|"
+              python3 - <<'EOF'
+          import json
+          data = json.load(open("/tmp/cov-summary.json"))
+          crates = {}
+          for f in data["data"][0]["files"]:
+              parts = f["filename"].split("/")
+              name = "/".join(parts[1:3]) if parts[0] == "crates" and len(parts) > 2 else "(other)"
+              s = f["summary"]["lines"]
+              c = crates.setdefault(name, [0, 0])
+              c[0] += s["covered"]
+              c[1] += s["count"]
+          tot = data["data"][0]["totals"]["lines"]
+          for name in sorted(crates):
+              cov, cnt = crates[name]
+              pct = (100.0 * cov / cnt) if cnt else 0.0
+              print(f"| {name} | {cov} | {cnt} | {pct:.2f}% |")
+          pct = (100.0 * tot["covered"] / tot["count"]) if tot["count"] else 0.0
+          print(f"| **TOTAL** | **{tot['covered']}** | **{tot['count']}** | **{pct:.2f}%** |")
+          EOF
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload coverage HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-cov-html
+          path: target/llvm-cov/html
+          retention-days: 14
           if-no-files-found: ignore
 
   # TPC-H / TPC-DS / distributed gates. Official TPC.org kits (`dbgen` / `dsdgen`) at SF1 —
