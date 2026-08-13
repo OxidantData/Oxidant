@@ -684,6 +684,14 @@ pub(crate) fn aggregation_stages_for(
         if peels_to_inner_aggregate(&agg.input) {
             return aggregate_over_aggregate_stages(p, replicated);
         }
+        // KAN-162: a UNION ALL whose arms each scan at most one sharded table (exactly once,
+        // in a broadcast-safe tree) splits into one partial producer per sharded table plus an
+        // associative recombine — the two-producer `try_split_broadcast_union` shape generalized
+        // to N sharded arms. Pure admission gate: when the predicate doesn't hold the shuffle
+        // join chain below keeps its current decline behavior.
+        if let Some(dq) = try_split_multi_sharded_union(p, replicated)? {
+            return Ok(dq);
+        }
         return crate::plan::join_chain::plan_shuffle_join_chain(p, &sharded, replicated);
     }
 
@@ -2544,6 +2552,287 @@ fn split_union_finish(
         stages,
         finalize_sql: build_finalize(p)?,
     })
+}
+
+/// KAN-162: aggregate over a `UNION ALL` whose arms collectively scan two or more sharded
+/// tables — e.g. TPC-DS Q2's `web_sales`+`catalog_sales` union or Q33/Q56/Q60/Q76's
+/// per-channel unions at the all-facts-sharded SF100 classification (KAN-161's 4 GiB
+/// auto-broadcast threshold shards every sales fact, so these no longer fit
+/// [`try_split_broadcast_union`]'s exactly-one-sharded-arm shape, and the shuffle join chain
+/// has no UNION vocabulary).
+///
+/// Admission (per union arm, reusing KAN-161's predicate): the arm scans **at most one**
+/// sharded table, **exactly once**, in a broadcast-safe tree
+/// (`count_table_scans(arm, t) == 1 && reject_unsafe_broadcast_shapes(arm, t).is_ok()`).
+/// Arms are bucketed by that table; arms scanning only replicated tables form one optional
+/// replicated bucket. The plan generalizes the two-producer union split to N sharded arms:
+///
+/// 1. **one partial-aggregate producer per bucket**: the bucket's (rebuilt) arm slice —
+///    arm-local sharded scan + broadcast dims — partially aggregated by the group key,
+///    hash-shuffled by that key. The replicated bucket keeps the single-sharded path's
+///    placement (sliced per-worker partials when sliceable, else one `Forward` worker).
+/// 2. **one associative recombine**: `UNION ALL` of every producer stream, re-aggregated by
+///    the group key — exact because union arms partition the input rows and hash co-location
+///    puts every partial for a group key on one partition.
+///
+/// Every check failure returns `Ok(None)` — this is a pure admission gate layered in front of
+/// the shuffle join chain, so a shape it declines keeps the chain's existing refusal.
+fn try_split_multi_sharded_union(
+    p: &Peeled<'_>,
+    replicated: &[&str],
+) -> Result<Option<DistributedQuery>> {
+    let agg = p.agg;
+    let aggs = agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()?;
+    if aggs.iter().any(|a| a.distinct) {
+        return Ok(None);
+    }
+    let Some(groups) = split_union_by_sharding_multi(&agg.input, replicated)? else {
+        return Ok(None);
+    };
+    // This composition only exists for the multi-sharded union; a single sharded bucket (or
+    // none) belongs to `try_split_broadcast_union` / the flat broadcast path below.
+    if groups.iter().filter(|(key, _)| key.is_some()).count() < 2 {
+        return Ok(None);
+    }
+
+    // Validate each rebuilt producer the way the single-sharded path validates its narrowed
+    // side: the ancestor chain above the union (broadcast dim joins, projections, filters) is
+    // now folded into the bucket's plan, so re-derive the bucket's sharded set and re-run the
+    // broadcast-safe tree check on the result. A join above the union that pulls in a second
+    // sharded table, or an unsafe preserved-side outer join up there, declines the whole shape.
+    for (key, plan) in &groups {
+        match key {
+            Some(t) => {
+                let plan_tables = base_tables(plan);
+                let mut plan_sharded: Vec<&str> = plan_tables
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|tb| !replicated.contains(tb))
+                    .collect();
+                plan_sharded.sort_unstable();
+                plan_sharded.dedup();
+                if plan_sharded != [t.as_str()] {
+                    return Ok(None);
+                }
+                if reject_unsafe_broadcast_shapes(plan, t).is_err() {
+                    return Ok(None);
+                }
+                // KAN-49d's reroute (a replicated aggregate joined into the arm above the arm's
+                // own aggregate) is specific to the two-producer shape; decline it here rather
+                // than risk the double-count it guards against.
+                if find_replicated_agg_join(plan, t).is_some() {
+                    return Ok(None);
+                }
+            }
+            None => {
+                if base_tables(plan)
+                    .iter()
+                    .any(|tb| !replicated.contains(&tb.as_str()))
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        // KAN-54's additive constraint, per producer: an inner aggregate recomputes per worker,
+        // so it (and the outer aggregate over it) must re-associatively recombine — inner
+        // SUM/COUNT only, leaf-level, no grouping sets; outer SUM only.
+        let mut inner_aggs = Vec::new();
+        collect_aggregates(plan, &mut inner_aggs);
+        if !inner_aggs.is_empty() {
+            let inner_ok = inner_aggs.iter().all(|a| {
+                let mut nested = Vec::new();
+                collect_aggregates(&a.input, &mut nested);
+                nested.is_empty()
+                    && !is_grouping_set(&a.group_expr)
+                    && a.aggr_expr.iter().all(|e| {
+                        AggSpec::classify(e)
+                            .map(|s| !s.distinct && matches!(s.func.as_str(), "sum" | "count"))
+                            .unwrap_or(false)
+                    })
+            });
+            let outer_ok = agg.aggr_expr.iter().all(|e| {
+                AggSpec::classify(e)
+                    .map(|s| !s.distinct && s.func == "sum")
+                    .unwrap_or(false)
+            });
+            if !inner_ok || !outer_ok {
+                return Ok(None);
+            }
+        }
+    }
+
+    let up = Unparser::default();
+    let group_sql: Vec<String> = flattened_group_exprs(&agg.group_expr)
+        .into_iter()
+        .map(|g| expr_sql(&up, g))
+        .collect::<Result<_>>()?;
+    let remap = build_remap(p);
+    let (psel, combine) = partial_and_combine_lists(&group_sql, &aggs)?;
+    let group_by = group_sql.join(", ");
+
+    // Grouping sets gather everything to partition 0, same as `split_union_finish`.
+    let grouping_set = is_grouping_set(&agg.group_expr);
+    let hash_key_cols: Vec<u32> = if grouping_set {
+        vec![]
+    } else {
+        (0..group_sql.len() as u32).collect()
+    };
+
+    let mut stages: Vec<StageDef> = Vec::with_capacity(groups.len() + 1);
+    for (key, plan) in &groups {
+        let tail = union_split_tail(plan)?;
+        let partial = sanitize_generated_sql(&format!(
+            "SELECT {} {tail} GROUP BY {group_by}",
+            psel.join(", ")
+        ));
+        let mut stage = StageDef::new(stages.len() as u32, partial, vec![], hash_key_cols.clone());
+        if key.is_none() {
+            // The replicated bucket is identical on every worker: slice it across workers when
+            // the anchor tables allow, else compute it once and forward (see
+            // `split_union_finish`).
+            match sliced_replicate_stamp(plan, replicated) {
+                Some(stamp) => stage.replicated_tables = stamp,
+                None => stage.exchange = ExchangeMode::Forward,
+            }
+        }
+        stages.push(stage);
+    }
+
+    let final_group_by = final_group_by_sql(&agg.group_expr, group_sql.len())?;
+    let reject_empty_partition = if grouping_set {
+        " HAVING COUNT(*) > 0"
+    } else {
+        ""
+    };
+    let arm_reads: Vec<String> = (0..stages.len())
+        .map(|i| format!("SELECT * FROM shuffle_input_{i}"))
+        .collect();
+    let inner = format!(
+        "SELECT {} FROM ({}) AS merged_arms GROUP BY {final_group_by}{reject_empty_partition}",
+        combine.join(", "),
+        arm_reads.join(" UNION ALL ")
+    );
+    let final_sql = wrap_output(p, &inner, &remap)?;
+    let combine_id = stages.len() as u32;
+    stages.push(StageDef::new(
+        combine_id,
+        final_sql,
+        (0..combine_id).collect(),
+        vec![],
+    ));
+
+    Ok(Some(DistributedQuery {
+        stages,
+        finalize_sql: build_finalize(p)?,
+    }))
+}
+
+/// Split a `Union` reachable from `lp` into one rebuilt plan per sharded table its arms scan
+/// (plus one plan for the arms scanning only replicated tables), or `Ok(None)` when the shape
+/// isn't the multi-sharded union split's: no `Union`, an arm scanning two or more sharded
+/// tables, an arm scanning its sharded table more than once, or an arm failing the
+/// broadcast-safe tree check (KAN-161's admission predicate, applied per arm).
+///
+/// One bucket of the multi-sharded union split: the bucket's single sharded table (`None` =
+/// the replicated-only bucket) paired with its rebuilt arm-slice plan.
+type ShardedUnionBucket = (Option<String>, LogicalPlan);
+
+/// The descent/rebuild mirrors [`split_union_by_sharding`]: single-child nodes recurse and
+/// rebuild via [`with_new_child`]; a multi-child node (a broadcast join above the union —
+/// TPC-DS Q71's `item`/`time_dim` wrapper) is descended on the one child containing the
+/// `Union`, with the other children cloned unchanged into every rebuilt plan.
+fn split_union_by_sharding_multi(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<Option<Vec<ShardedUnionBucket>>> {
+    if let LogicalPlan::Union(u) = lp {
+        // Flatten nested unions before bucketing (TPC-DS keeps three-way set ops nested), same
+        // as `split_union_by_sharding`.
+        let mut arms = Vec::new();
+        for input in &u.inputs {
+            flatten_union_all(input, &mut arms);
+        }
+        let mut groups: Vec<(Option<String>, Vec<Arc<LogicalPlan>>)> = Vec::new();
+        for arm in &arms {
+            let mut sharded: Vec<String> = base_tables(arm)
+                .into_iter()
+                .filter(|t| !replicated.contains(&t.as_str()))
+                .collect();
+            sharded.sort_unstable();
+            sharded.dedup();
+            let key = match sharded.as_slice() {
+                [] => None,
+                [t] => {
+                    if count_table_scans(arm, t) != 1
+                        || reject_unsafe_broadcast_shapes(arm, t).is_err()
+                    {
+                        return Ok(None);
+                    }
+                    Some(t.clone())
+                }
+                _ => return Ok(None),
+            };
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, bucket)) => bucket.push(Arc::clone(arm)),
+                None => groups.push((key, vec![Arc::clone(arm)])),
+            }
+        }
+        // Rebuild each bucket. A rebuild failure (arm type coercion the strict `Union`
+        // validator rejects even loosely) declines the shape rather than guessing.
+        let mut out = Vec::with_capacity(groups.len());
+        for (key, bucket) in groups {
+            match union_of_arms(bucket) {
+                Ok(plan) => out.push((key, plan)),
+                Err(_) => return Ok(None),
+            }
+        }
+        return Ok(Some(out));
+    }
+
+    let children = lp.inputs();
+    if children.is_empty() {
+        return Ok(None);
+    }
+    if children.len() == 1 {
+        return match split_union_by_sharding_multi(children[0], replicated)? {
+            Some(groups) => groups
+                .into_iter()
+                .map(|(key, child)| with_new_child(lp, child).map(|plan| (key, plan)))
+                .collect::<Result<Vec<_>>>()
+                .map(Some),
+            None => Ok(None),
+        };
+    }
+    // Multi-child node: the Union must live under exactly one child; the rest are cloned
+    // unchanged into every rebuilt plan.
+    let mut found: Option<(usize, Vec<ShardedUnionBucket>)> = None;
+    for (idx, child) in children.iter().enumerate() {
+        if let Some(groups) = split_union_by_sharding_multi(child, replicated)? {
+            if found.is_some() {
+                return Ok(None); // ambiguous: more than one child has a splittable Union
+            }
+            found = Some((idx, groups));
+        }
+    }
+    let Some((idx, groups)) = found else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(groups.len());
+    for (key, new_child) in groups {
+        let mut new_children: Vec<LogicalPlan> = children.iter().map(|c| (*c).clone()).collect();
+        new_children[idx] = new_child;
+        let rebuilt = lp
+            .with_new_exprs(lp.expressions(), new_children)
+            .map_err(|e| {
+                Error::Unsupported(format!("auto-distribute: rebuild union-split join: {e}"))
+            })?;
+        out.push((key, rebuilt));
+    }
+    Ok(Some(out))
 }
 
 /// One sliced anchor table per replicated arm for the replicated-slice producer placement, or
