@@ -4301,3 +4301,429 @@ fn q14_arm_agg_index(e: &Expr, agg: &Aggregate, remap: &HashMap<String, String>)
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxidant_loom::arrow::array::{Int64Array, StringArray};
+    use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
+    use oxidant_loom::arrow::record_batch::RecordBatch;
+    use oxidant_loom::Engine;
+
+    const Q38: &str = include_str!("../../../../bench/tpcds/queries/q38.sql");
+    const Q87: &str = include_str!("../../../../bench/tpcds/queries/q87.sql");
+    const Q97: &str = include_str!("../../../../bench/tpcds/queries/q97.sql");
+    const Q24: &str = include_str!("../../../../bench/tpcds/queries/q24.sql");
+
+    fn i64f(name: &str) -> Field {
+        Field::new(name, DataType::Int64, false)
+    }
+
+    fn strf(name: &str) -> Field {
+        Field::new(name, DataType::Utf8, false)
+    }
+
+    /// An all-Int64 single-row table (plan-shape tests never read the rows, but the tables
+    /// must exist for `logical_plan`).
+    fn i64_table(cols: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(
+            cols.iter().map(|c| i64f(c)).collect::<Vec<_>>(),
+        ));
+        let arrays: Vec<oxidant_loom::arrow::array::ArrayRef> = (0..cols.len())
+            .map(|_| Arc::new(Int64Array::from(vec![1i64])) as oxidant_loom::arrow::array::ArrayRef)
+            .collect();
+        RecordBatch::try_new(schema, arrays).unwrap()
+    }
+
+    /// Miniature TPC-DS schema covering Q24/Q38/Q87/Q97 (one row per table).
+    async fn tpcds_engine() -> Engine {
+        let engine = Engine::new();
+        engine
+            .register_batches(
+                "store_sales",
+                vec![i64_table(&[
+                    "ss_customer_sk",
+                    "ss_sold_date_sk",
+                    "ss_item_sk",
+                    "ss_ticket_number",
+                    "ss_store_sk",
+                    "ss_net_paid",
+                ])],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "catalog_sales",
+                vec![i64_table(&[
+                    "cs_bill_customer_sk",
+                    "cs_sold_date_sk",
+                    "cs_item_sk",
+                ])],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "web_sales",
+                vec![i64_table(&[
+                    "ws_bill_customer_sk",
+                    "ws_sold_date_sk",
+                    "ws_item_sk",
+                ])],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "store_returns",
+                vec![i64_table(&["sr_ticket_number", "sr_item_sk"])],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "store",
+                vec![i64_table(&[
+                    "s_store_sk",
+                    "s_store_name",
+                    "s_state",
+                    "s_zip",
+                    "s_market_id",
+                ])],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "item",
+                vec![i64_table(&[
+                    "i_item_sk",
+                    "i_color",
+                    "i_current_price",
+                    "i_manager_id",
+                    "i_units",
+                    "i_size",
+                ])],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "customer",
+                vec![RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        i64f("c_customer_sk"),
+                        strf("c_last_name"),
+                        strf("c_first_name"),
+                        i64f("c_current_addr_sk"),
+                        strf("c_birth_country"),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(vec![1i64])),
+                        Arc::new(StringArray::from(vec!["smith"])),
+                        Arc::new(StringArray::from(vec!["ann"])),
+                        Arc::new(Int64Array::from(vec![1i64])),
+                        Arc::new(StringArray::from(vec!["US"])),
+                    ],
+                )
+                .unwrap()],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "customer_address",
+                vec![RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        i64f("ca_address_sk"),
+                        strf("ca_state"),
+                        strf("ca_country"),
+                        strf("ca_zip"),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(vec![1i64])),
+                        Arc::new(StringArray::from(vec!["CA"])),
+                        Arc::new(StringArray::from(vec!["US"])),
+                        Arc::new(StringArray::from(vec!["94000"])),
+                    ],
+                )
+                .unwrap()],
+            )
+            .unwrap();
+        engine
+            .register_batches(
+                "date_dim",
+                vec![i64_table(&["d_date_sk", "d_month_seq", "d_date"])],
+            )
+            .unwrap();
+        engine
+    }
+
+    async fn plan(sql: &str) -> LogicalPlan {
+        tpcds_engine().await.logical_plan(sql).await.unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // Q38 / Q87: global count(*) over an INTERSECT / EXCEPT chain.
+    // ------------------------------------------------------------------
+
+    /// The SF10 post-classification configuration for the set-op shapes: `store_sales` is the
+    /// sharded fact; the other two channels and the dims replicate.
+    const REPL_SET_OP: [&str; 4] = ["date_dim", "customer", "catalog_sales", "web_sales"];
+
+    #[tokio::test]
+    async fn q38_global_count_over_intersect_plans_distributed() {
+        let lp = plan(Q38).await;
+        let dq = try_global_count_over_set_op(&lp, &REPL_SET_OP)
+            .unwrap()
+            .expect("Q38 must admit the set-op shape");
+        // Three branch exports (hash-shuffled on the full 3-column row) + per-partition
+        // INTERSECT + global recombine.
+        assert_eq!(dq.stages.len(), 5, "{dq:?}");
+        for (i, stage) in dq.stages[..3].iter().enumerate() {
+            assert_eq!(stage.stage_id, i as u32);
+            assert_eq!(
+                stage.hash_key_cols,
+                vec![0, 1, 2],
+                "branch exports shuffle on the full row: {stage:?}"
+            );
+            assert!(stage.upstream_stage_ids.is_empty());
+        }
+        assert!(dq.stages[0].sql.contains("store_sales"), "{dq:?}");
+        let chain = &dq.stages[3];
+        assert_eq!(chain.upstream_stage_ids, vec![0, 1, 2]);
+        assert!(
+            chain.sql.contains("INTERSECT") && chain.sql.contains("count(*)"),
+            "per-partition set-op stage: {}",
+            chain.sql
+        );
+        let global = &dq.stages[4];
+        assert_eq!(global.upstream_stage_ids, vec![3]);
+        assert!(
+            global.sql.contains("sum(a0)"),
+            "global recombine sums per-partition counts: {}",
+            global.sql
+        );
+    }
+
+    #[tokio::test]
+    async fn q87_global_count_over_except_plans_distributed() {
+        let lp = plan(Q87).await;
+        let dq = try_global_count_over_set_op(&lp, &REPL_SET_OP)
+            .unwrap()
+            .expect("Q87 must admit the set-op shape");
+        assert_eq!(dq.stages.len(), 5, "{dq:?}");
+        assert!(
+            dq.stages[3].sql.contains("EXCEPT"),
+            "per-partition EXCEPT stage: {}",
+            dq.stages[3].sql
+        );
+    }
+
+    #[tokio::test]
+    async fn set_op_shape_declines_without_set_op() {
+        let lp = plan("SELECT count(*) FROM store_sales").await;
+        assert!(
+            try_global_count_over_set_op(&lp, &REPL_SET_OP)
+                .unwrap()
+                .is_none(),
+            "a plain scan aggregate has no semi/anti chain to distribute"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_op_shape_declines_on_distinct_count() {
+        let lp = plan(&Q38.replace("count(*)", "count(DISTINCT c_last_name)")).await;
+        assert!(
+            try_global_count_over_set_op(&lp, &REPL_SET_OP)
+                .unwrap()
+                .is_none(),
+            "count(DISTINCT …) is not recombinable by summing per-partition counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_op_shape_declines_on_non_count_aggregate() {
+        let lp = plan(&Q38.replace("count(*)", "sum(1)")).await;
+        assert!(
+            try_global_count_over_set_op(&lp, &REPL_SET_OP)
+                .unwrap()
+                .is_none(),
+            "only count recombines exactly over a set-op chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_op_shape_declines_on_grouped_aggregate() {
+        let lp = plan(
+            "SELECT k, count(*) FROM (\
+                 SELECT DISTINCT ss_customer_sk AS k FROM store_sales INTERSECT \
+                 SELECT DISTINCT cs_bill_customer_sk AS k FROM catalog_sales) x \
+             GROUP BY k",
+        )
+        .await;
+        assert!(
+            try_global_count_over_set_op(&lp, &REPL_SET_OP)
+                .unwrap()
+                .is_none(),
+            "grouped aggregates belong to the ordinary aggregation shapes, not this one"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_op_shape_declines_on_two_sharded_tables_in_one_leaf() {
+        // One branch scanning two sharded facts cannot be evaluated per-worker.
+        let lp = plan(
+            "SELECT count(*) FROM (\
+                 SELECT DISTINCT ss_customer_sk FROM store_sales \
+                 JOIN web_sales ON ss_sold_date_sk = ws_sold_date_sk INTERSECT \
+                 SELECT DISTINCT cs_bill_customer_sk FROM catalog_sales) x",
+        )
+        .await;
+        assert!(
+            try_global_count_over_set_op(&lp, &["catalog_sales"])
+                .unwrap()
+                .is_none(),
+            "a leaf with two sharded scans is not shard-local-computable"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Q97: global aggregates over a FULL OUTER JOIN of distinct-key aggregates.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn q97_full_outer_global_agg_both_sides_sharded() {
+        let lp = plan(Q97).await;
+        let dq = try_full_outer_join_global_agg(&lp, &["date_dim"])
+            .unwrap()
+            .expect("Q97 must admit the full-outer shape");
+        // Left partial/combine + right partial/combine + per-partition FULL OUTER JOIN +
+        // global recombine.
+        assert_eq!(dq.stages.len(), 6, "{dq:?}");
+        let join = &dq.stages[4];
+        assert_eq!(join.upstream_stage_ids, vec![1, 3], "{dq:?}");
+        assert!(
+            join.sql.contains("FULL OUTER JOIN"),
+            "per-partition join stage: {}",
+            join.sql
+        );
+        let global = &dq.stages[5];
+        assert_eq!(global.upstream_stage_ids, vec![4]);
+        assert!(
+            global.sql.contains("HAVING COUNT(*) > 0"),
+            "the empty-input guard must gate the global aggregate: {}",
+            global.sql
+        );
+    }
+
+    #[tokio::test]
+    async fn q97_full_outer_global_agg_replicated_side_is_forwarded() {
+        // With `catalog_sales` replicated, the right side's distinct keys are computed once
+        // (Forward — per-worker evaluation would multiply the key set) and hash-shuffled to
+        // co-locate with the sharded side.
+        let lp = plan(Q97).await;
+        let dq = try_full_outer_join_global_agg(&lp, &["date_dim", "catalog_sales"])
+            .unwrap()
+            .expect("Q97 with a replicated side must still admit");
+        assert_eq!(dq.stages.len(), 5, "{dq:?}");
+        let forwards = dq
+            .stages
+            .iter()
+            .filter(|s| s.exchange == ExchangeMode::Forward)
+            .count();
+        assert_eq!(
+            forwards, 1,
+            "exactly the fully-replicated side is a Forward stage: {dq:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn q97_shape_declines_on_inner_join() {
+        let lp = plan(&Q97.replace("FULL OUTER JOIN", "JOIN")).await;
+        assert!(
+            try_full_outer_join_global_agg(&lp, &["date_dim"])
+                .unwrap()
+                .is_none(),
+            "an inner join of the two sides is the broadcast/shuffle-join planner's shape"
+        );
+    }
+
+    #[tokio::test]
+    async fn q97_shape_declines_on_distinct_aggregate() {
+        let lp = plan(
+            "SELECT count(DISTINCT ssci.customer_sk) FROM \
+             (SELECT ss_customer_sk customer_sk, ss_item_sk item_sk FROM store_sales \
+              GROUP BY ss_customer_sk, ss_item_sk) ssci \
+             FULL OUTER JOIN \
+             (SELECT cs_bill_customer_sk customer_sk, cs_item_sk item_sk FROM catalog_sales \
+              GROUP BY cs_bill_customer_sk, cs_item_sk) csci \
+             ON (ssci.customer_sk = csci.customer_sk AND ssci.item_sk = csci.item_sk)",
+        )
+        .await;
+        assert!(
+            try_full_outer_join_global_agg(&lp, &["date_dim"])
+                .unwrap()
+                .is_none(),
+            "count(DISTINCT …) over a full outer join does not recombine per-partition"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Q24: HAVING scalar threshold over a shared derived per-key aggregate.
+    // ------------------------------------------------------------------
+
+    /// The SF10 classification for Q24: `store_sales` sharded, the returns table and every
+    /// dim replicated.
+    const REPL_Q24: [&str; 5] = [
+        "store_returns",
+        "store",
+        "item",
+        "customer",
+        "customer_address",
+    ];
+
+    #[tokio::test]
+    async fn q24_derived_having_scalar_threshold_plans_distributed() {
+        let lp = plan(Q24).await;
+        let dq = try_derived_having_scalar_threshold(&lp, &REPL_Q24)
+            .unwrap()
+            .expect("Q24 must admit the scalar-threshold shape");
+        // The derived aggregate (partial + combine), the scalar partial + one-row combine,
+        // and the outer partial + combine.
+        assert_eq!(dq.stages.len(), 6, "{dq:?}");
+        let quoted = format!("'{SCALAR_TOKEN}'");
+        let token_stages = dq.stages.iter().filter(|s| s.sql.contains(&quoted)).count();
+        assert_eq!(
+            token_stages, 1,
+            "the scalar placeholder must survive in exactly the outer combine: {dq:?}"
+        );
+        // The scalar combine produces the global threshold off the derived combine's output.
+        assert!(
+            dq.stages.iter().any(|s| s.sql.contains(" AS m0 FROM")),
+            "one-row scalar combine stage missing: {dq:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn q24_shape_declines_when_scalar_reads_a_different_table() {
+        // The threshold must be over the SAME derived table the outer aggregate reads —
+        // a scalar over the raw fact cannot reuse the distributed derived stages.
+        let lp = plan(&Q24.replace("FROM ssales)", "FROM store_sales)")).await;
+        assert!(
+            try_derived_having_scalar_threshold(&lp, &REPL_Q24)
+                .unwrap()
+                .is_none(),
+            "a threshold over a different input than the outer aggregate must decline"
+        );
+    }
+
+    #[tokio::test]
+    async fn q24_shape_declines_without_having() {
+        let lp = plan(
+            "SELECT ss_store_sk, sum(ss_net_paid) FROM store_sales \
+             GROUP BY ss_store_sk",
+        )
+        .await;
+        assert!(
+            try_derived_having_scalar_threshold(&lp, &REPL_Q24)
+                .unwrap()
+                .is_none(),
+            "no HAVING scalar threshold — nothing for this shape to do"
+        );
+    }
+}

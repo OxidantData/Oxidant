@@ -1325,4 +1325,110 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// `OXIDANT_WORKER_COUNT` must parse and exceed 1 — a single worker (or a garbage count)
+    /// is unsharded regardless of any index env.
+    #[test]
+    fn from_env_requires_worker_count_above_one() {
+        let _env = ShardEnvWriteGuard::take();
+        std::env::remove_var("OXIDANT_SHARD_INDEX");
+        std::env::remove_var("OXIDANT_POD_NAME");
+        std::env::set_var("OXIDANT_WORKER_COUNT", "1");
+        assert_eq!(
+            ShardAssignment::from_env(),
+            None,
+            "a one-worker cluster reads every file"
+        );
+        std::env::set_var("OXIDANT_WORKER_COUNT", "not-a-number");
+        assert_eq!(ShardAssignment::from_env(), None);
+        std::env::remove_var("OXIDANT_WORKER_COUNT");
+    }
+
+    /// An index at/above the worker count disables sharding (with a warning) instead of
+    /// silently owning no files.
+    #[test]
+    fn from_env_rejects_out_of_range_index() {
+        let _env = ShardEnvWriteGuard::take();
+        std::env::set_var("OXIDANT_WORKER_COUNT", "2");
+        std::env::set_var("OXIDANT_SHARD_INDEX", "2");
+        assert_eq!(
+            ShardAssignment::from_env(),
+            None,
+            "index == count is invalid"
+        );
+        std::env::set_var("OXIDANT_SHARD_INDEX", "1");
+        assert_eq!(
+            ShardAssignment::from_env(),
+            Some(ShardAssignment { index: 1, count: 2 })
+        );
+        std::env::remove_var("OXIDANT_WORKER_COUNT");
+        std::env::remove_var("OXIDANT_SHARD_INDEX");
+    }
+
+    /// StatefulSet fallback: `OXIDANT_POD_NAME`'s trailing ordinal names the shard when
+    /// `OXIDANT_SHARD_INDEX` is unset; a pod name without a numeric suffix is unsharded.
+    #[test]
+    fn from_env_falls_back_to_statefulset_pod_name() {
+        let _env = ShardEnvWriteGuard::take();
+        std::env::set_var("OXIDANT_WORKER_COUNT", "3");
+        std::env::remove_var("OXIDANT_SHARD_INDEX");
+        std::env::set_var("OXIDANT_POD_NAME", "oxidant-prod-worker-2");
+        assert_eq!(
+            ShardAssignment::from_env(),
+            Some(ShardAssignment { index: 2, count: 3 })
+        );
+        std::env::set_var("OXIDANT_POD_NAME", "oxidant-prod-worker");
+        assert_eq!(ShardAssignment::from_env(), None);
+        std::env::remove_var("OXIDANT_WORKER_COUNT");
+        std::env::remove_var("OXIDANT_POD_NAME");
+    }
+
+    /// `OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES`: absent/unparseable → the 4 GiB default;
+    /// `0` disables size-based auto-replication; surrounding whitespace is tolerated.
+    #[test]
+    fn auto_broadcast_threshold_env_parsing() {
+        std::env::remove_var("OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES");
+        assert_eq!(
+            auto_broadcast_threshold_bytes(),
+            DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES
+        );
+        std::env::set_var("OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES", "0");
+        assert_eq!(auto_broadcast_threshold_bytes(), 0);
+        std::env::set_var("OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES", " 1073741824 ");
+        assert_eq!(auto_broadcast_threshold_bytes(), 1 << 30);
+        std::env::set_var("OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES", "junk");
+        assert_eq!(
+            auto_broadcast_threshold_bytes(),
+            DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES
+        );
+        std::env::remove_var("OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES");
+    }
+
+    #[test]
+    fn replicated_csv_drops_empty_tokens_and_lowercases() {
+        assert_eq!(
+            parse_replicated_tables_csv(" , Nation, ,REGION ,"),
+            vec!["nation".to_string(), "region".to_string()]
+        );
+        assert!(parse_replicated_tables_csv("").is_empty());
+        assert!(parse_replicated_tables_csv(" , ,").is_empty());
+    }
+
+    /// The single-file heuristic: a dotted final segment (`v1.2`, `part-0.parquet`) is left
+    /// slash-less; a dot-prefixed segment (`.hidden`) is a directory and gets the slash.
+    #[test]
+    fn collection_url_single_file_heuristic_boundaries() {
+        assert_eq!(ensure_collection_url(""), "");
+        assert_eq!(ensure_collection_url("  "), "");
+        assert_eq!(
+            ensure_collection_url("s3://bucket/data/v1.2"),
+            "s3://bucket/data/v1.2",
+            "a dotted final segment looks like one file"
+        );
+        assert_eq!(
+            ensure_collection_url("s3://bucket/dir/.hidden"),
+            "s3://bucket/dir/.hidden/",
+            "a dot-prefixed final segment is a directory"
+        );
+    }
 }
