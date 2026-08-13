@@ -1228,12 +1228,22 @@ async fn parquet_metadata_provider_with_assignment(
             None => groups.push((store_url, vec![file])),
         }
     }
+    let logical_statistics = lakehouse_logical_statistics(
+        state,
+        &datafusion::datasource::table_schema::TableSchema::new(
+            file_schema.clone(),
+            partition_fields.clone(),
+        ),
+        &groups,
+    )
+    .await;
     let provider: Arc<dyn TableProvider> = Arc::new(LakehouseTableProvider {
         schema: table_schema,
         file_schema,
         partition_fields,
         groups,
         case_insensitive_schema_adapter: md.schema.is_some(),
+        statistics: logical_statistics,
     });
     match dim_cache_fingerprint {
         Some((fingerprint, source_bytes)) => {
@@ -1439,12 +1449,22 @@ async fn resolve_lakehouse_provider(
         }
     }
 
+    let logical_statistics = lakehouse_logical_statistics(
+        state,
+        &datafusion::datasource::table_schema::TableSchema::new(
+            file_schema.clone(),
+            partition_fields.clone(),
+        ),
+        &groups,
+    )
+    .await;
     let provider: Arc<dyn TableProvider> = Arc::new(LakehouseTableProvider {
         schema: table_schema,
         file_schema,
         partition_fields,
         groups,
         case_insensitive_schema_adapter: md.schema.is_some(),
+        statistics: logical_statistics,
     });
     let provider = match dim_source_bytes {
         Some(source_bytes) => {
@@ -1476,6 +1496,13 @@ struct LakehouseTableProvider {
         Vec<datafusion::datasource::listing::PartitionedFile>,
     )>,
     case_insensitive_schema_adapter: bool,
+    /// Table-wide parquet-footer statistics computed ONCE at provider construction (KAN-160,
+    /// via [`lakehouse_logical_statistics`]) — the same KAN-143 aggregate the physical scan
+    /// attaches per file group — so LOGICAL-plan consumers (join ordering, the
+    /// oxidant-execution semi-join filter admission gate) see the table's real row count
+    /// instead of DataFusion's `Statistics::new_unknown` default. `None` keeps the unknown
+    /// shape (statistics disabled or no footer readable).
+    statistics: Option<datafusion::common::Statistics>,
 }
 
 #[async_trait]
@@ -1486,6 +1513,10 @@ impl TableProvider for LakehouseTableProvider {
 
     fn table_type(&self) -> datafusion::logical_expr::TableType {
         datafusion::logical_expr::TableType::Base
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.statistics.clone()
     }
 
     async fn scan(
@@ -1788,6 +1819,62 @@ async fn parquet_footer_file_groups(
         statistics.column_statistics = table_wide_column_stats(aggs, table_schema);
     }
     (groups, Some(statistics))
+}
+
+/// Table-wide statistics for [`LakehouseTableProvider::statistics`] (KAN-160): merge the
+/// per-object-store-group aggregates of [`parquet_footer_file_groups`] — the very same
+/// KAN-143 footer statistics the physical scan attaches — so the logical plan sees the
+/// table's real row count. Computing here (provider construction, an async context) is what
+/// lets the sync `TableProvider::statistics()` stay cheap: the footer reads go through the
+/// runtime's shared metadata cache, so the later physical scan reuses them instead of
+/// fetching twice. The per-file trust gate is inherited unchanged (a case/type-mismatched
+/// file contributes row/byte counts only; a missed file degrades the group to `Inexact`).
+///
+/// `None` when statistics are disabled or NO group produced an aggregate (the pre-KAN-160
+/// unknown-statistics shape — consumers then fail open). A group whose footers are all
+/// unreadable is SKIPPED rather than collapsing the table to `Absent`: the remaining groups
+/// still merge, with the merged row/byte counts degraded to `Inexact` so consumers treat the
+/// partial total conservatively. Multiple object-store groups for
+/// one table are rare; column min/max do not compose honestly across independent
+/// aggregates, so a multi-group table keeps merged row/byte counts only (single-group
+/// tables keep the group's full column statistics).
+async fn lakehouse_logical_statistics(
+    state: &dyn datafusion::catalog::Session,
+    table_schema: &datafusion::datasource::table_schema::TableSchema,
+    groups: &[(
+        datafusion::execution::object_store::ObjectStoreUrl,
+        Vec<datafusion::datasource::listing::PartitionedFile>,
+    )],
+) -> Option<datafusion::common::Statistics> {
+    use datafusion::common::Statistics;
+
+    let mut merged: Option<Statistics> = None;
+    let mut skipped_group = false;
+    for (store_url, files) in groups {
+        let (_, group_stats) =
+            parquet_footer_file_groups(state, store_url, table_schema, files).await;
+        // A group with no readable footer contributes nothing — skip it rather than collapse
+        // the WHOLE table to `Absent` (which would fail the KAN-160 semi-join gate open for a
+        // partially-readable table). The merged counts are then a partial total, so they are
+        // marked `Inexact` below: conservative, and the gate stays usable on the exact path.
+        let Some(group_stats) = group_stats else {
+            skipped_group = true;
+            continue;
+        };
+        merged = Some(match merged {
+            None => group_stats,
+            Some(prev) => Statistics::new_unknown(table_schema.table_schema())
+                .with_num_rows(prev.num_rows.add(&group_stats.num_rows))
+                .with_total_byte_size(prev.total_byte_size.add(&group_stats.total_byte_size)),
+        });
+    }
+    if skipped_group {
+        if let Some(stats) = &mut merged {
+            stats.num_rows = stats.num_rows.to_inexact();
+            stats.total_byte_size = stats.total_byte_size.to_inexact();
+        }
+    }
+    merged
 }
 
 /// A file's footer statistics plus whether the COLUMN-level part is safe to use.
