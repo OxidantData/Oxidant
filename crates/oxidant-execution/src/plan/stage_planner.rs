@@ -4373,7 +4373,7 @@ fn substitute_co_located_join_inputs(
                     };
                     if let Some(rep) = replacement {
                         out.extend_from_slice(ident.as_bytes());
-                        out.extend_from_slice(&tail[i..tstart].as_bytes());
+                        out.extend_from_slice(&tail.as_bytes()[i..tstart]);
                         out.extend_from_slice(rep.as_bytes());
                         i = tend;
                         continue;
