@@ -3319,10 +3319,11 @@ fn plan_ranked_arm(
 ///    and the per-partition `INTERSECT` is exact. The `item` join-back is a per-partition
 ///    broadcast join against the co-located triple stream; its one-column `ss_item_sk` output
 ///    hash-shuffles on the key, becoming the co-located IN key stream for every channel arm.
-/// 2. **avg_sales** — per-worker `sum`/`count` partials over the sharded channel's arm plus one
-///    `Forward` partial over the replicated arms (multi-worker: per-worker partials over
-///    disjoint slices of the replicated anchors — the one-row-per-task global partials re-add
-///    in the unchanged combine) combine into the one-row global AVG, gathered
+/// 2. **avg_sales** — one per-worker `sum`/`count` partial stage per sharded arm plus one
+///    optional partial over the replicated arms (KAN-161: any subset of channel arms may be
+///    sharded, each scanning at most one sharded table exactly once; multi-worker: per-worker
+///    partials over disjoint slices of the replicated anchors — the one-row-per-task global
+///    partials re-add in the unchanged combine) combine into the one-row global AVG, gathered
 ///    to partition 0 (the Q24 threshold decomposition). The arms consume it as a **co-located
 ///    stream** (`SELECT m0 FROM shuffle_input_N`, the Q44 pattern) rather than a `SCALAR_TOKEN`
 ///    literal: the driver substitutes at most one such token per plan, and the literal would
@@ -3345,8 +3346,9 @@ fn plan_ranked_arm(
 ///
 /// Declines (`Ok(None)`) for anything outside this exact family: a non-grouping-set top, arms
 /// without exactly one plain-column `IN` plus one scalar-compare HAVING, fingerprint or
-/// volatility mismatches between the inlined subquery copies, more than one sharded base table
-/// across the whole plan (subqueries included), a second sharded scan in any component, non-raw
+/// volatility mismatches between the inlined subquery copies, any component scanning more than
+/// one sharded base table or scanning its sharded table more than once (subqueries included;
+/// KAN-161 admits arms/legs with at most one sharded table each), non-raw
 /// INTERSECT arms, a semi join whose keys are not the full-row match of the DISTINCT-INTERSECT
 /// lowering, or a scalar that is not a single global min/max/sum/count/avg over a raw UNION ALL.
 pub(crate) fn try_rollup_union_derived_subqueries(
