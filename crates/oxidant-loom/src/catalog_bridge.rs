@@ -1830,8 +1830,11 @@ async fn parquet_footer_file_groups(
 /// fetching twice. The per-file trust gate is inherited unchanged (a case/type-mismatched
 /// file contributes row/byte counts only; a missed file degrades the group to `Inexact`).
 ///
-/// `None` when statistics are disabled or no group produced an aggregate (the pre-KAN-160
-/// unknown-statistics shape — consumers then fail open). Multiple object-store groups for
+/// `None` when statistics are disabled or NO group produced an aggregate (the pre-KAN-160
+/// unknown-statistics shape — consumers then fail open). A group whose footers are all
+/// unreadable is SKIPPED rather than collapsing the table to `Absent`: the remaining groups
+/// still merge, with the merged row/byte counts degraded to `Inexact` so consumers treat the
+/// partial total conservatively. Multiple object-store groups for
 /// one table are rare; column min/max do not compose honestly across independent
 /// aggregates, so a multi-group table keeps merged row/byte counts only (single-group
 /// tables keep the group's full column statistics).
@@ -1846,16 +1849,30 @@ async fn lakehouse_logical_statistics(
     use datafusion::common::Statistics;
 
     let mut merged: Option<Statistics> = None;
+    let mut skipped_group = false;
     for (store_url, files) in groups {
         let (_, group_stats) =
             parquet_footer_file_groups(state, store_url, table_schema, files).await;
-        let group_stats = group_stats?;
+        // A group with no readable footer contributes nothing — skip it rather than collapse
+        // the WHOLE table to `Absent` (which would fail the KAN-160 semi-join gate open for a
+        // partially-readable table). The merged counts are then a partial total, so they are
+        // marked `Inexact` below: conservative, and the gate stays usable on the exact path.
+        let Some(group_stats) = group_stats else {
+            skipped_group = true;
+            continue;
+        };
         merged = Some(match merged {
             None => group_stats,
             Some(prev) => Statistics::new_unknown(table_schema.table_schema())
                 .with_num_rows(prev.num_rows.add(&group_stats.num_rows))
                 .with_total_byte_size(prev.total_byte_size.add(&group_stats.total_byte_size)),
         });
+    }
+    if skipped_group {
+        if let Some(stats) = &mut merged {
+            stats.num_rows = stats.num_rows.to_inexact();
+            stats.total_byte_size = stats.total_byte_size.to_inexact();
+        }
     }
     merged
 }

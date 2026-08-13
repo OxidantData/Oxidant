@@ -5,7 +5,9 @@
 //! parquet is re-read from object storage and re-decoded on every stage of a query and on every
 //! query of a benchmark suite. This module memoizes the decoded Arrow [`RecordBatch`]es behind a
 //! process-global, byte-capped LRU so a replicated table is read + decoded **once per worker per
-//! data version**, then served from memory as a [`MemTable`].
+//! data version**, then served from memory as a [`MemTable`] carrying the exact decoded row
+//! count / byte size in its `statistics()` (KAN-160: stats-gated consumers must see the real
+//! cardinality of cache-served dims, not `Absent`).
 //!
 //! # Correctness contract
 //!
@@ -40,12 +42,17 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::stats::Precision;
+use datafusion::common::Statistics;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::SessionState;
+use datafusion::logical_expr::{Expr, TableType};
+use datafusion::physical_plan::ExecutionPlan;
 
 /// Default cache budget: 2 GiB of decoded Arrow data per worker process.
 const DEFAULT_DIM_CACHE_BYTES: u64 = 2 << 30;
@@ -270,11 +277,18 @@ pub fn fingerprint_snapshot(snapshot: &oxidant_datasource::SnapshotIdentity) -> 
 /// `source_bytes` its on-disk byte total — a cheap preflight: a table whose compressed bytes
 /// already exceed the cap cannot fit decoded, so it is served uncached without a wasted scan.
 ///
-/// - **hit**: returns a [`MemTable`] over the cached batches; `provider` is dropped unread.
+/// - **hit**: returns a stats-carrying [`MemTable`] ([`StatsMemTable`]) over the cached
+///   batches; `provider` is dropped unread.
 /// - **miss**: fully scans `provider` (all columns, no pushdown — a replicated table is read in
-///   full by every worker anyway), caches the decoded batches, and returns a [`MemTable`] over
-///   the *same* buffers, so even the populating query reads the files exactly once.
+///   full by every worker anyway), caches the decoded batches, and returns a stats-carrying
+///   [`MemTable`] over the *same* buffers, so even the populating query reads the files
+///   exactly once.
 /// - **disabled / too large**: returns `provider` unchanged.
+///
+/// Both memtable paths report the EXACT decoded row count and byte size through
+/// `TableProvider::statistics()` ([`StatsMemTable`]) so stats-gated consumers (the KAN-160
+/// semi-join filter admission gate) engage on the default dim-cache path instead of failing
+/// open on `Absent`.
 ///
 /// A failed population scan propagates the error (the query would have failed on the same
 /// files at execution time) and caches nothing.
@@ -330,15 +344,64 @@ async fn memoize_with(
     mem_table(&key, schema, batches)
 }
 
+/// A [`MemTable`] wrapper whose `statistics()` reports the EXACT decoded row count and
+/// byte size of the cached batches (KAN-160). A plain `MemTable` does not override
+/// `statistics()`, so consumers read `Precision::Absent` and stats-gated admission checks
+/// — notably the oxidant-execution semi-join filter gate — fail OPEN on the very tables
+/// they exist to bound: with the dim cache on (the default), nearly every replicated dim
+/// would be admitted unmeasured. The counts are known exactly at decode time (the cache
+/// holds the full materialized table), so the wrapper reports them as `Exact`; schema,
+/// table type, and scan delegate to the inner `MemTable` unchanged.
+#[derive(Debug)]
+struct StatsMemTable {
+    inner: MemTable,
+    statistics: Statistics,
+}
+
+#[async_trait]
+impl TableProvider for StatsMemTable {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        self.inner.scan(state, projection, filters, limit).await
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        Some(self.statistics.clone())
+    }
+}
+
 fn mem_table(
     key: &DimCacheKey,
     schema: SchemaRef,
     batches: Arc<Vec<RecordBatch>>,
 ) -> DfResult<Arc<dyn TableProvider>> {
-    let table = MemTable::try_new(schema, vec![(*batches).clone()]).map_err(|e| {
+    let table = MemTable::try_new(schema.clone(), vec![(*batches).clone()]).map_err(|e| {
         DataFusionError::Execution(format!("dim cache mem table `{}`: {e}", key.table))
     })?;
-    Ok(Arc::new(table))
+    let statistics = Statistics::new_unknown(&schema)
+        .with_num_rows(Precision::Exact(
+            batches.iter().map(RecordBatch::num_rows).sum(),
+        ))
+        .with_total_byte_size(Precision::Exact(
+            batches.iter().map(RecordBatch::get_array_memory_size).sum(),
+        ));
+    Ok(Arc::new(StatsMemTable {
+        inner: table,
+        statistics,
+    }))
 }
 
 #[cfg(test)]
@@ -617,6 +680,51 @@ mod tests {
                 batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
                 3,
                 "both the populating and the cached provider must serve all rows"
+            );
+        }
+    }
+
+    /// KAN-160: both the populating (miss) and the served (hit) provider must report the
+    /// EXACT decoded row count through `statistics()` — a plain `MemTable` reports `Absent`,
+    /// which fails stats-gated admission checks open on the default dim-cache path.
+    #[tokio::test]
+    async fn memoize_provider_reports_exact_decoded_stats() {
+        let cache = DimCache::with_cap(1 << 20);
+        let ctx = datafusion::prelude::SessionContext::new();
+        let state = ctx.state();
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(schema(), vec![vec![batch(vec![1, 2]), batch(vec![3])]]).unwrap(),
+        );
+        let expected_bytes: usize = [batch(vec![1, 2]), batch(vec![3])]
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum();
+        let miss = memoize_with(&cache, &state, "db.t", "v1".to_string(), 1, provider)
+            .await
+            .unwrap();
+        let hit = memoize_with(
+            &cache,
+            &state,
+            "db.t",
+            "v1".to_string(),
+            1,
+            Arc::new(MemTable::try_new(schema(), vec![vec![]]).unwrap()),
+        )
+        .await
+        .unwrap();
+        for provider in [miss, hit] {
+            let stats = provider
+                .statistics()
+                .expect("cached dims must carry statistics");
+            assert_eq!(
+                stats.num_rows,
+                Precision::Exact(3),
+                "the exact decoded row count must reach logical-plan consumers"
+            );
+            assert_eq!(
+                stats.total_byte_size,
+                Precision::Exact(expected_bytes),
+                "the exact decoded byte size must reach logical-plan consumers"
             );
         }
     }

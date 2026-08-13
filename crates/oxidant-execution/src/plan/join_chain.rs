@@ -491,6 +491,9 @@ fn semi_join_leaf_filters(
     if !semi_join_filters_enabled() {
         return out;
     }
+    // KAN-160: read the admission cap ONCE per call — per-step env reads would be
+    // inconsistent with the kill-switch pattern above and could observe a mid-plan change.
+    let max_dim_rows = semi_join_filter_max_dim_rows();
     for (j, step) in steps.iter().enumerate() {
         if step.join_type != JoinType::Inner
             || sharded.contains(&step.right.table)
@@ -508,7 +511,7 @@ fn semi_join_leaf_filters(
         // bounds the filtered key set the leaf stages hash-build).
         use datafusion::common::stats::Precision;
         match step.right.stats_num_rows {
-            Precision::Exact(n) if n <= semi_join_filter_max_dim_rows() => {}
+            Precision::Exact(n) if n <= max_dim_rows => {}
             Precision::Exact(_) | Precision::Inexact(_) => continue,
             Precision::Absent => {}
         }
@@ -2035,14 +2038,14 @@ mod tests {
         }
     }
 
-    /// [`chain_plan_mixed`] with the dim registered through [`StatsMemTable`] carrying an
-    /// EXACT `num_rows` of `dim_rows` (`None` = absent statistics). Sharded tables stay on
+    /// [`chain_plan_mixed`] with the dim registered through [`StatsMemTable`] carrying the
+    /// given `num_rows` precision (`Absent` = no statistics override). Sharded tables stay on
     /// plain `MemTable` (statistics `Absent`).
     async fn chain_plan_dim_stats(
         sql: &str,
         sharded: &[&str],
         dim: &str,
-        dim_rows: Option<usize>,
+        dim_rows: datafusion::common::stats::Precision<usize>,
     ) -> DistributedQuery {
         let engine = oxidant_loom::Engine::new();
         let int = DataType::Int64;
@@ -2076,10 +2079,12 @@ mod tests {
         let mem =
             datafusion::datasource::MemTable::try_new(dim_schema.clone(), vec![vec![dim_batch]])
                 .unwrap();
-        let stats = dim_rows.map(|n| {
-            datafusion::common::Statistics::new_unknown(&dim_schema)
-                .with_num_rows(datafusion::common::stats::Precision::Exact(n))
-        });
+        let stats = match dim_rows {
+            datafusion::common::stats::Precision::Absent => None,
+            num_rows => Some(
+                datafusion::common::Statistics::new_unknown(&dim_schema).with_num_rows(num_rows),
+            ),
+        };
         let table: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(StatsMemTable {
             inner: Arc::new(mem),
             stats,
@@ -2100,7 +2105,13 @@ mod tests {
         let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
                    JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fa.k = dimf.k \
                    JOIN fb ON fa.k = fb.k GROUP BY fa.g";
-        let dq = chain_plan_dim_stats(sql, &["fa", "fb"], "dim", Some(2_000_000)).await;
+        let dq = chain_plan_dim_stats(
+            sql,
+            &["fa", "fb"],
+            "dim",
+            datafusion::common::stats::Precision::Exact(2_000_000),
+        )
+        .await;
         assert!(
             !leaf_sql(&dq, "fa").contains(" IN (SELECT"),
             "a 2M-row dim exceeds the 1M admission cap — no injection, got:\n{}",
@@ -2115,7 +2126,13 @@ mod tests {
         let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
                    JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fa.k = dimf.k \
                    JOIN fb ON fa.k = fb.k GROUP BY fa.g";
-        let dq = chain_plan_dim_stats(sql, &["fa", "fb"], "dim", Some(1_000_000)).await;
+        let dq = chain_plan_dim_stats(
+            sql,
+            &["fa", "fb"],
+            "dim",
+            datafusion::common::stats::Precision::Exact(1_000_000),
+        )
+        .await;
         assert!(
             leaf_sql(&dq, "fa").contains("k IN (SELECT k FROM dim AS dimf WHERE (dim.d > 10))"),
             "a dim exactly at the 1M cap must still inject, got:\n{}",
@@ -2131,10 +2148,63 @@ mod tests {
         let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
                    JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fa.k = dimf.k \
                    JOIN fb ON fa.k = fb.k GROUP BY fa.g";
-        let dq = chain_plan_dim_stats(sql, &["fa", "fb"], "dim", None).await;
+        let dq = chain_plan_dim_stats(
+            sql,
+            &["fa", "fb"],
+            "dim",
+            datafusion::common::stats::Precision::Absent,
+        )
+        .await;
         assert!(
             leaf_sql(&dq, "fa").contains("k IN (SELECT k FROM dim AS dimf WHERE (dim.d > 10))"),
             "absent dim statistics must fail open and inject, got:\n{}",
+            leaf_sql(&dq, "fa")
+        );
+    }
+
+    /// An INEXACT statistics row count is rejected outright, even within the cap — the
+    /// KAN-146 provable-admission discipline admits only exact counts (or absent-statistics
+    /// fail-open).
+    #[tokio::test]
+    async fn semi_filter_rejected_when_dim_stats_inexact() {
+        let _env = SEMI_FILTER_ENV_LOCK.lock().await;
+        let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                   JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fa.k = dimf.k \
+                   JOIN fb ON fa.k = fb.k GROUP BY fa.g";
+        let dq = chain_plan_dim_stats(
+            sql,
+            &["fa", "fb"],
+            "dim",
+            datafusion::common::stats::Precision::Inexact(100),
+        )
+        .await;
+        assert!(
+            !leaf_sql(&dq, "fa").contains(" IN (SELECT"),
+            "an inexact dim row count must reject the injection even within the cap, got:\n{}",
+            leaf_sql(&dq, "fa")
+        );
+    }
+
+    /// `OXIDANT_SEMI_JOIN_FILTER_MAX_DIM_ROWS` overrides the 1M default cap: a dim whose
+    /// EXACT count exceeds the default but fits the override must inject.
+    #[tokio::test]
+    async fn semi_filter_env_cap_override_honored() {
+        let _env = SEMI_FILTER_ENV_LOCK.lock().await;
+        let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                   JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fa.k = dimf.k \
+                   JOIN fb ON fa.k = fb.k GROUP BY fa.g";
+        std::env::set_var("OXIDANT_SEMI_JOIN_FILTER_MAX_DIM_ROWS", "4000000");
+        let dq = chain_plan_dim_stats(
+            sql,
+            &["fa", "fb"],
+            "dim",
+            datafusion::common::stats::Precision::Exact(2_000_000),
+        )
+        .await;
+        std::env::remove_var("OXIDANT_SEMI_JOIN_FILTER_MAX_DIM_ROWS");
+        assert!(
+            leaf_sql(&dq, "fa").contains("k IN (SELECT k FROM dim AS dimf WHERE (dim.d > 10))"),
+            "a 2M-row dim fits the 4M override cap — the injection must be admitted, got:\n{}",
             leaf_sql(&dq, "fa")
         );
     }
