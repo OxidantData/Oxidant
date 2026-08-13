@@ -700,3 +700,109 @@ fn q51_window_over_full_join_of_windowed_aggregates_plans_and_matches() {
         assert_distributed_matches_single_node(Q51, &REPL_STORE_SALES, "store_sales").await;
     });
 }
+
+// --- KAN-162: Q51 with BOTH join sides sharded (the all-facts-sharded SF100 classification) ---
+
+/// Both facts sharded: only the shared dims replicate.
+const REPL_NEITHER_FACT: [&str; 3] = ["date_dim", "store", "item"];
+
+/// Every table held in full on each worker except the named facts, row-sharded into contiguous
+/// halves — both windowed branches' partials genuinely recombine across workers.
+async fn two_workers_two_sharded(facts: &[&str]) -> Cluster {
+    let fact_full = |name: &str| match name {
+        "store_sales" => store_sales(),
+        "web_sales" => web_sales(),
+        other => panic!("unknown fact {other}"),
+    };
+    let (p0, p1) = (unique_worker_port(), unique_worker_port());
+    for (i, port) in [p0, p1].into_iter().enumerate() {
+        let e = Arc::new(Engine::new());
+        for (name, batch) in all_tables() {
+            if facts.contains(&name) {
+                register(&e, name, shard_rows(&fact_full(name), i));
+            } else {
+                register(&e, name, vec![batch]);
+            }
+        }
+        tokio::spawn(async move {
+            let _ = serve_worker(port, e).await;
+        });
+    }
+    Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ])
+}
+
+#[test]
+fn q51_both_sharded_window_join_plans_and_matches() {
+    run_e2e(async move {
+        std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "16");
+        let planner = tpcds_engine().await;
+        let dq = strict_plan(&planner, Q51, &REPL_NEITHER_FACT).await;
+        assert_no_fact_gather(&dq);
+        assert!(
+            dq.stages.iter().any(|s| s.sql.contains("FULL JOIN")),
+            "the two windowed branches full-join on the co-located key: {dq:?}"
+        );
+        for fact in ["store_sales", "web_sales"] {
+            assert!(
+                dq.stages
+                    .iter()
+                    .any(|s| s.upstream_stage_ids.is_empty() && s.sql.contains(fact)),
+                "each sharded windowed-aggregate branch runs its own sharded pipeline: {dq:?}"
+            );
+        }
+        let expected = planner.sql(Q51).await.expect("single-node");
+        assert!(
+            expected.iter().map(RecordBatch::num_rows).sum::<usize>() > 0,
+            "single-node result must be non-empty (otherwise the comparison is vacuous)"
+        );
+        let cluster = two_workers_two_sharded(&["store_sales", "web_sales"]).await;
+        let actual = run_distributed(&cluster, &planner, Q51, &REPL_NEITHER_FACT).await;
+        assert_eq!(
+            rows_sorted(&actual),
+            rows_sorted(&expected),
+            "both-sharded window join must equal single-node"
+        );
+    });
+}
+
+/// Decline pin: the both-sharded relaxation keeps the per-side requirements — a sharded side
+/// that is not a windowed aggregate branch must still refuse (strict mode).
+const BOTH_SHARDED_PLAIN_SIDE: &str = "
+SELECT a.d_year AS y, a.s_amt AS store_amt, b.s_amt AS web_amt,
+       SUM(COALESCE(a.s_amt, 0)) OVER (PARTITION BY a.d_year) AS cum
+FROM (
+  SELECT d_year, i_item_sk, SUM(ss_ext_sales_price) AS s_amt,
+         ROW_NUMBER() OVER (PARTITION BY d_year ORDER BY SUM(ss_ext_sales_price)) AS rn
+  FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk
+  JOIN item ON ss_item_sk = i_item_sk
+  GROUP BY d_year, i_item_sk
+) a
+FULL OUTER JOIN (
+  SELECT d_year, ws_item_sk, SUM(ws_net_paid) AS s_amt
+  FROM web_sales JOIN date_dim ON ws_sold_date_sk = d_date_sk
+  GROUP BY d_year, ws_item_sk
+) b ON a.d_year = b.d_year AND a.i_item_sk = b.ws_item_sk
+";
+
+#[test]
+fn both_sharded_window_join_with_plain_side_still_refuses() {
+    run_e2e(async move {
+        let planner = tpcds_engine().await;
+        let lp = planner
+            .logical_plan(BOTH_SHARDED_PLAIN_SIDE)
+            .await
+            .expect("logical plan");
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OXIDANT_DISTRIBUTED_STRICT", "1");
+        let planned = plan_distributed_logical(&lp, &REPL_NEITHER_FACT);
+        std::env::remove_var("OXIDANT_DISTRIBUTED_STRICT");
+        assert!(
+            planned.is_err(),
+            "a both-sharded window join whose sharded side is not a windowed aggregate must \
+             keep refusing in strict mode, got {planned:?}"
+        );
+    });
+}

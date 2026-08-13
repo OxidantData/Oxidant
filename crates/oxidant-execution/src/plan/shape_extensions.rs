@@ -1623,7 +1623,8 @@ fn window_over_distinct_union_stages_for(
 /// worker. Both sides shuffle by the equijoin key for an exact co-located full join (rows with
 /// equal keys co-locate; preserved-side rows can never straddle partitions), the CASE/renaming
 /// projection over the join re-applies in the join stage, and the outer framed windows compute
-/// after a final partition-keyed shuffle.
+/// after a final partition-keyed shuffle. KAN-162 admits BOTH sides sharded — each side's exact
+/// output rows hash by the same join key, so the co-location argument is unchanged.
 fn window_over_join_stages_for(
     p: &WindowPeeled<'_>,
     window: &Window,
@@ -1677,8 +1678,17 @@ fn window_over_join_stages_for(
         return Err(unsupported("no equijoin keys"));
     }
 
-    // Classify the sides: exactly one may scan sharded tables (planned through the shape
-    // planners); the other must be all-replicated (computed once on a Forward worker).
+    // Classify the sides: a side scanning any sharded table is planned through the shape
+    // planners; an all-replicated side is computed once on a Forward worker. Both sides may be
+    // sharded (KAN-162, TPC-DS Q51 at the all-facts-sharded classification): each sharded side
+    // runs the exact partial → combine → partition-shuffle window pipeline in the loop below
+    // and its terminal rows hash by the same join key, so equal keys co-locate and the FULL
+    // OUTER JOIN matches key-locally (a preserved-side row hashes to exactly one partition).
+    // The KAN-49b both-sharded refusal was an artifact of the single-sharded classification,
+    // not an exactness guard — the per-side requirements enforced in the planning loop below
+    // (a windowed-aggregate branch, join keys resolvable against the side's output columns,
+    // the outer PARTITION BY expressible over the join output) are the real admission and
+    // still refuse every other shape.
     let side_is_sharded = |side: &LogicalPlan| {
         let mut tables = base_tables(side);
         collect_subquery_tables(side, &mut tables);
@@ -1686,9 +1696,6 @@ fn window_over_join_stages_for(
     };
     let left_sharded = side_is_sharded(join.left.as_ref());
     let right_sharded = side_is_sharded(join.right.as_ref());
-    if left_sharded && right_sharded {
-        return Err(unsupported("both join sides scan sharded tables"));
-    }
 
     let mut stages: Vec<StageDef> = Vec::new();
     let mut side_terminals: Vec<u32> = Vec::new();
