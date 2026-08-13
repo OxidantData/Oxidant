@@ -335,7 +335,7 @@ fn stamp_replicated_tables(dq: &mut DistributedQuery, replicated: &[&str]) {
 /// Infer replicate/broadcast tables from file sizes + optional `OXIDANT_REPLICATED_TABLES` override.
 ///
 /// See [`oxidant_loom::shard::classify_replicated_tables`]: the largest known table in the plan stays
-/// sharded; smaller tables under `OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES` (default 32 GiB) replicate.
+/// sharded; smaller tables under `OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES` (default 4 GiB) replicate.
 /// With catalog row counts available, the row-aware rule (`OXIDANT_REPLICATE_MAX_ROW_MULTIPLE`, on
 /// by default at 4.0) keeps a byte-eligible candidate sharded when it has more than multiple ×
 /// the largest table's rows — see [`oxidant_loom::shard::classify_replicated_tables_with_rows`].
