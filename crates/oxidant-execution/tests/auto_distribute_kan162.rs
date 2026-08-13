@@ -573,3 +573,272 @@ async fn arm_with_repeated_sharded_scan_declines_safely() {
         "arm with a repeated sharded scan must keep declining in strict mode, got {planned:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// (d) Q77-like N-arm join-deferral: a sharded arm that joins a REPLICATED
+//     per-key aggregate into its own per-key aggregate (KAN-49d's shape) gets
+//     one stage-A–D deferral chain per bucket, recombined with the rest.
+// ---------------------------------------------------------------------------
+
+/// Two sharded arms, each `Projection over Join(Aggregate(sharded …), Aggregate(replicated
+/// store_returns …))` — the KAN-49d two-producer shape once per sharded fact.
+const AGG_JOIN_ARMS: &str = "
+SELECT channel, id, SUM(sales) AS total_sales, SUM(returns_) AS total_returns
+FROM (
+  SELECT 'store' AS channel, s.id AS id, s.sales AS sales, r.returns_ AS returns_
+  FROM (
+    SELECT ss_store_sk AS id, SUM(ss_ext_sales_price) AS sales
+    FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE d_year = 2001
+    GROUP BY ss_store_sk
+  ) s
+  LEFT JOIN (
+    SELECT sr_store_sk AS id, SUM(sr_return_amt) AS returns_
+    FROM store_returns
+    GROUP BY sr_store_sk
+  ) r ON s.id = r.id
+  UNION ALL
+  SELECT 'web' AS channel, s.id AS id, s.sales AS sales, r.returns_ AS returns_
+  FROM (
+    SELECT ws_web_page_sk AS id, SUM(ws_ext_sales_price) AS sales
+    FROM web_sales
+    GROUP BY ws_web_page_sk
+  ) s
+  LEFT JOIN (
+    SELECT sr_store_sk AS id, SUM(sr_return_amt) AS returns_
+    FROM store_returns
+    GROUP BY sr_store_sk
+  ) r ON s.id = r.id
+) x
+GROUP BY channel, id
+ORDER BY channel, id
+";
+
+#[tokio::test]
+async fn n_arm_agg_join_deferral_matches_single_node() {
+    assert_matches_single_node(
+        "agg-join-arms",
+        AGG_JOIN_ARMS,
+        &REPL_ALL_BUT_SALES,
+        &["store_sales", "web_sales"],
+        |dq| {
+            // 2×4 deferral stages + recombine, minus one: the two buckets' stage-B replicated
+            // aggregates are byte-identical (same store_returns subquery), so the stage-level
+            // CSE merges them — the second chain's stage C reads stage 1 directly.
+            assert_eq!(
+                dq.stages.len(),
+                8,
+                "two stage-A–D deferral chains (stage B CSE-merged) + recombine: {dq:?}"
+            );
+            let deferred = dq
+                .stages
+                .iter()
+                .filter(|s| s.sql.contains("LEFT JOIN (SELECT * FROM shuffle_input_1)"))
+                .count();
+            assert_eq!(deferred, 2, "one deferred join per sharded bucket: {dq:?}");
+            let replicated_producers = dq
+                .stages
+                .iter()
+                .filter(|s| s.exchange == ExchangeMode::Forward && s.sql.contains("store_returns"))
+                .count();
+            assert_eq!(
+                replicated_producers, 1,
+                "the identical replicated aggregates CSE to one once-computed stage: {dq:?}"
+            );
+            let combine = dq.stages.last().expect("combine stage");
+            assert_eq!(
+                combine.upstream_stage_ids,
+                vec![3, 7],
+                "the recombine reads exactly the two stage-D terminals: {dq:?}"
+            );
+            for id in [3u32, 7] {
+                let d = dq
+                    .stages
+                    .iter()
+                    .find(|s| s.stage_id == id)
+                    .expect("stage-D terminal");
+                assert_eq!(
+                    d.hash_key_cols,
+                    vec![0, 1],
+                    "stage D hash-shuffles by the outer (channel, id) key: {d:?}"
+                );
+            }
+        },
+    )
+    .await;
+}
+
+/// One deferred agg-join arm (store) plus one flat pre-aggregated arm (web): the recombine's
+/// producer indexing must skip the deferral chain's interior stages.
+const AGG_JOIN_MIXED: &str = "
+SELECT channel, id, SUM(sales) AS total_sales, SUM(returns_) AS total_returns
+FROM (
+  SELECT 'store' AS channel, s.id AS id, s.sales AS sales, r.returns_ AS returns_
+  FROM (
+    SELECT ss_store_sk AS id, SUM(ss_ext_sales_price) AS sales
+    FROM store_sales
+    GROUP BY ss_store_sk
+  ) s
+  LEFT JOIN (
+    SELECT sr_store_sk AS id, SUM(sr_return_amt) AS returns_
+    FROM store_returns
+    GROUP BY sr_store_sk
+  ) r ON s.id = r.id
+  UNION ALL
+  SELECT 'web' AS channel, ws_web_page_sk AS id,
+         SUM(ws_ext_sales_price) AS sales, SUM(ws_net_profit) AS returns_
+  FROM web_sales
+  GROUP BY ws_web_page_sk
+) x
+GROUP BY channel, id
+ORDER BY channel, id
+";
+
+#[tokio::test]
+async fn mixed_deferral_and_flat_arms_match_single_node() {
+    assert_matches_single_node(
+        "agg-join-mixed",
+        AGG_JOIN_MIXED,
+        &REPL_ALL_BUT_SALES,
+        &["store_sales", "web_sales"],
+        |dq| {
+            assert_eq!(
+                dq.stages.len(),
+                6,
+                "one deferral chain (0-3) + one flat producer (4) + recombine (5): {dq:?}"
+            );
+            let combine = dq.stages.last().expect("combine stage");
+            assert_eq!(
+                combine.upstream_stage_ids,
+                vec![3, 4],
+                "the recombine reads the stage-D terminal and the flat producer: {dq:?}"
+            );
+            assert!(
+                combine.sql.contains("shuffle_input_1"),
+                "both producer streams merge: {combine:?}"
+            );
+        },
+    )
+    .await;
+}
+
+/// Decline pin: the arm join carrying a non-equality residual (`s.sales > r.returns_`) is not
+/// the deferral shape — the whole union must keep declining in strict mode.
+const AGG_JOIN_RESIDUAL: &str = "
+SELECT channel, id, SUM(sales) AS total_sales
+FROM (
+  SELECT 'store' AS channel, s.id AS id, s.sales AS sales
+  FROM (
+    SELECT ss_store_sk AS id, SUM(ss_ext_sales_price) AS sales
+    FROM store_sales
+    GROUP BY ss_store_sk
+  ) s
+  LEFT JOIN (
+    SELECT sr_store_sk AS id, SUM(sr_return_amt) AS returns_
+    FROM store_returns
+    GROUP BY sr_store_sk
+  ) r ON s.id = r.id AND s.sales > r.returns_
+  UNION ALL
+  SELECT 'web' AS channel, ws_web_page_sk AS id, SUM(ws_ext_sales_price) AS sales
+  FROM web_sales
+  GROUP BY ws_web_page_sk
+) x
+GROUP BY channel, id
+";
+
+#[tokio::test]
+async fn agg_join_arm_with_residual_declines_safely() {
+    let planner = planner_engine();
+    let lp = planner
+        .logical_plan(AGG_JOIN_RESIDUAL)
+        .await
+        .expect("logical plan");
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("OXIDANT_DISTRIBUTED_STRICT", "1");
+    let planned = plan_distributed_logical(&lp, &REPL_ALL_BUT_SALES);
+    std::env::remove_var("OXIDANT_DISTRIBUTED_STRICT");
+    assert!(
+        planned.is_err(),
+        "an agg-join arm with a non-equality residual must keep declining in strict mode, \
+         got {planned:?}"
+    );
+}
+
+/// Q77's catalog arm spelling: `FROM cs, cr` — a genuine CROSS PRODUCT of two per-key
+/// aggregates (no join predicate). DataFusion 54 plans it as `Join{Inner, on: [], filter:
+/// None}` (Display prints "Cross Join:"). The deferral routes it with BOTH producers gathered
+/// whole to partition 0, where stage C computes the full cross product against the recombined
+/// left aggregate — exact because laq holds exactly one row per key before the cross. The web
+/// arm is a flat pre-aggregated producer, mirroring the mixed test above.
+const AGG_JOIN_CROSS: &str = "
+SELECT channel, id, SUM(sales) AS total_sales, SUM(returns_) AS total_returns
+FROM (
+  SELECT 'catalog' AS channel, s.id AS id, s.sales AS sales, r.returns_ AS returns_
+  FROM (
+    SELECT cs_call_center_sk AS id, SUM(cs_ext_sales_price) AS sales
+    FROM catalog_sales
+    GROUP BY cs_call_center_sk
+  ) s,
+  (
+    SELECT sr_store_sk AS id, SUM(sr_return_amt) AS returns_
+    FROM store_returns
+    GROUP BY sr_store_sk
+  ) r
+  UNION ALL
+  SELECT 'store' AS channel, ss_store_sk AS id,
+         SUM(ss_ext_sales_price) AS sales, SUM(ss_net_profit) AS returns_
+  FROM store_sales
+  GROUP BY ss_store_sk
+) x
+GROUP BY channel, id
+ORDER BY channel, id
+";
+
+#[tokio::test]
+async fn cross_join_agg_arm_deferral_matches_single_node() {
+    assert_matches_single_node(
+        "agg-join-cross",
+        AGG_JOIN_CROSS,
+        &REPL_ALL_BUT_SALES,
+        &["catalog_sales", "store_sales"],
+        |dq| {
+            assert_eq!(
+                dq.stages.len(),
+                6,
+                "one cross-join deferral chain (0-3) + one flat producer (4) + recombine (5): \
+                 {dq:?}"
+            );
+            let stage_c = &dq.stages[2];
+            assert!(
+                stage_c
+                    .sql
+                    .contains("CROSS JOIN (SELECT * FROM shuffle_input_1) AS raq"),
+                "stage C is the cross product against the recombined left aggregate: {stage_c:?}"
+            );
+            let stage_a = &dq.stages[0];
+            assert!(
+                stage_a.hash_key_cols.is_empty(),
+                "no co-location key exists for a cross join: the left partials gather whole \
+                 to partition 0: {stage_a:?}"
+            );
+            let stage_b = &dq.stages[1];
+            assert!(
+                stage_b.exchange == ExchangeMode::Forward && stage_b.hash_key_cols.is_empty(),
+                "the replicated aggregate computes once and gathers whole to partition 0: \
+                 {stage_b:?}"
+            );
+            let combine = dq.stages.last().expect("combine stage");
+            assert_eq!(
+                combine.upstream_stage_ids,
+                vec![3, 4],
+                "the recombine reads the stage-D terminal and the flat producer: {dq:?}"
+            );
+            assert_eq!(
+                dq.stages[3].hash_key_cols,
+                vec![0, 1],
+                "stage D hash-shuffles by the outer (channel, id) key: {dq:?}"
+            );
+        },
+    )
+    .await;
+}

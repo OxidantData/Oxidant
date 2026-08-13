@@ -58,11 +58,13 @@
 //! one-row broadcast — scalar partial/combine stages plus driver-side literal injection into the
 //! outer stages ([`super::shape_extensions::try_uncorrelated_scalar_threshold`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use datafusion::common::TableReference;
-use datafusion::logical_expr::{Aggregate, Expr, GroupingSet, JoinType, LogicalPlan, Union};
+use datafusion::common::{Column, TableReference};
+use datafusion::logical_expr::{
+    Aggregate, Expr, GroupingSet, JoinType, LogicalPlan, Projection, Union,
+};
 use datafusion::sql::unparser::Unparser;
 use oxidant_common::{Error, Result};
 use oxidant_loom::Engine;
@@ -2441,7 +2443,10 @@ fn try_split_broadcast_union(
 
     // KAN-49d (TPC-DS Q77): a replicated aggregate joined into the sharded arm above the arm's
     // own aggregate would silently double under the naive path — route it to the join-deferral
-    // composition (or refuse) before anything else runs.
+    // composition (or refuse) before anything else runs. The CROSS JOIN spelling (Q77's catalog
+    // arm, `FROM cs, cr`) routes the same way: DataFusion 54 has no `LogicalPlan::CrossJoin` —
+    // a cross join is a `LogicalPlan::Join` with `join_type: Inner`, empty `on`, and no filter
+    // (its Display prints "Cross Join:"), so this finder already matches it.
     if find_replicated_agg_join(&sharded_input, sharded_name).is_some() {
         return try_split_union_agg_join(
             p,
@@ -2657,6 +2662,12 @@ fn split_union_finish(
 ///    arm-local sharded scan + broadcast dims — partially aggregated by the group key,
 ///    hash-shuffled by that key. The replicated bucket keeps the single-sharded path's
 ///    placement (sliced per-worker partials when sliceable, else one `Forward` worker).
+///    A bucket whose arm joins a REPLICATED aggregate into the sharded arm's own aggregate
+///    (KAN-49d's Q77 shape) cannot use the flat partial — its per-key totals would attach
+///    once per worker partial — so it gets the join-deferral stage chain of
+///    [`union_agg_join_bucket_stages`] (per-bucket sharded partial + once-computed replicated
+///    aggregate co-located by the join key, recombined per key BEFORE the join), whose stage-D
+///    terminal is the bucket's producer.
 /// 2. **one associative recombine**: `UNION ALL` of every producer stream, re-aggregated by
 ///    the group key — exact because union arms partition the input rows and hash co-location
 ///    puts every partial for a group key on one partition.
@@ -2690,7 +2701,9 @@ fn try_split_multi_sharded_union(
     // now folded into the bucket's plan, so re-derive the bucket's sharded set and re-run the
     // broadcast-safe tree check on the result. A join above the union that pulls in a second
     // sharded table, or an unsafe preserved-side outer join up there, declines the whole shape.
+    let mut agg_join_bucket: Vec<bool> = Vec::with_capacity(groups.len());
     for (key, plan) in &groups {
+        let mut is_agg_join = false;
         match key {
             Some(t) => {
                 let plan_tables = base_tables(plan);
@@ -2707,12 +2720,17 @@ fn try_split_multi_sharded_union(
                 if reject_unsafe_broadcast_shapes(plan, t).is_err() {
                     return Ok(None);
                 }
-                // KAN-49d's reroute (a replicated aggregate joined into the arm above the arm's
-                // own aggregate) is specific to the two-producer shape; decline it here rather
-                // than risk the double-count it guards against.
-                if find_replicated_agg_join(plan, t).is_some() {
-                    return Ok(None);
-                }
+                // KAN-162: KAN-49d's reroute (a replicated aggregate joined into the arm above
+                // the arm's own aggregate — TPC-DS Q77's `ss LEFT JOIN sr`) generalizes to the
+                // N-producer shape: each such bucket gets its own join-deferral stage chain
+                // (stage A–D per bucket, built and re-validated by
+                // [`union_agg_join_bucket_stages`], which declines the whole shape on a shape
+                // mismatch) instead of the flat partial below. The KAN-54 additive guard does
+                // not apply to it — the deferral is exact by the per-key-recombine-first
+                // argument, not by per-worker additivity. The CROSS JOIN spelling (Q77's
+                // catalog arm) is a `LogicalPlan::Join` in DataFusion 54 (Inner, empty `on`,
+                // no filter), so the one finder covers both spellings.
+                is_agg_join = find_replicated_agg_join(plan, t).is_some();
             }
             None => {
                 if base_tables(plan)
@@ -2723,6 +2741,11 @@ fn try_split_multi_sharded_union(
                 }
             }
         }
+        if is_agg_join {
+            agg_join_bucket.push(true);
+            continue;
+        }
+        agg_join_bucket.push(false);
         // KAN-54's additive constraint, per producer: an inner aggregate recomputes per worker,
         // so it (and the outer aggregate over it) must re-associatively recombine — inner
         // SUM/COUNT only, leaf-level, no grouping sets; outer SUM only.
@@ -2769,7 +2792,23 @@ fn try_split_multi_sharded_union(
     };
 
     let mut stages: Vec<StageDef> = Vec::with_capacity(groups.len() + 1);
-    for (key, plan) in &groups {
+    let mut producers: Vec<u32> = Vec::with_capacity(groups.len());
+    for ((key, plan), is_agg_join) in groups.iter().zip(&agg_join_bucket) {
+        if *is_agg_join {
+            // KAN-162: one stage-A–D join-deferral chain per agg-join bucket; the terminal
+            // (stage D) is the bucket's producer into the shared recombine and takes the same
+            // group-key hash (or partition-0 gather for grouping sets) as the flat producers.
+            let t = key.as_deref().expect("an agg-join bucket is sharded");
+            let Some(mut bucket) = union_agg_join_bucket_stages(p, plan, t, stages.len() as u32)?
+            else {
+                return Ok(None);
+            };
+            let terminal = bucket.last_mut().expect("join-deferral bucket stages");
+            terminal.hash_key_cols = hash_key_cols.clone();
+            producers.push(terminal.stage_id);
+            stages.extend(bucket);
+            continue;
+        }
         let tail = union_split_tail(plan)?;
         let partial = sanitize_generated_sql(&format!(
             "SELECT {} {tail} GROUP BY {group_by}",
@@ -2785,6 +2824,7 @@ fn try_split_multi_sharded_union(
                 None => stage.exchange = ExchangeMode::Forward,
             }
         }
+        producers.push(stage.stage_id);
         stages.push(stage);
     }
 
@@ -2794,7 +2834,7 @@ fn try_split_multi_sharded_union(
     } else {
         ""
     };
-    let arm_reads: Vec<String> = (0..stages.len())
+    let arm_reads: Vec<String> = (0..producers.len())
         .map(|i| format!("SELECT * FROM shuffle_input_{i}"))
         .collect();
     let inner = format!(
@@ -2804,12 +2844,7 @@ fn try_split_multi_sharded_union(
     );
     let final_sql = wrap_output_recombine(p, &inner, &remap)?;
     let combine_id = stages.len() as u32;
-    stages.push(StageDef::new(
-        combine_id,
-        final_sql,
-        (0..combine_id).collect(),
-        vec![],
-    ));
+    stages.push(StageDef::new(combine_id, final_sql, producers, vec![]));
 
     Ok(Some(DistributedQuery {
         stages,
@@ -2842,9 +2877,17 @@ fn split_union_by_sharding_multi(
         for input in &u.inputs {
             flatten_union_all(input, &mut arms);
         }
+        // Arms are admitted FIFO. An arm that fails the direct per-arm admission may still
+        // split: a nested MIXED union inside the arm (TPC-DS Q5's per-channel
+        // `Aggregate over Join(Union(sales, returns) ⋈ dims)`) distributes exactly over the
+        // enclosing chain — see [`distribute_over_nested_union`]. Each distributed branch is
+        // pushed back onto the queue and re-admitted, so a branch that itself fails (or
+        // contains a deeper nested union) recurses; every distribution removes one `Union`
+        // node from the arm, so the queue drains.
+        let mut pending: VecDeque<Arc<LogicalPlan>> = arms.into_iter().collect();
         let mut groups: Vec<(Option<String>, Vec<Arc<LogicalPlan>>)> = Vec::new();
-        for arm in &arms {
-            let mut sharded: Vec<String> = base_tables(arm)
+        while let Some(arm) = pending.pop_front() {
+            let mut sharded: Vec<String> = base_tables(&arm)
                 .into_iter()
                 .filter(|t| !replicated.contains(&t.as_str()))
                 .collect();
@@ -2852,19 +2895,30 @@ fn split_union_by_sharding_multi(
             sharded.dedup();
             let key = match sharded.as_slice() {
                 [] => None,
-                [t] => {
-                    if count_table_scans(arm, t) != 1
-                        || reject_unsafe_broadcast_shapes(arm, t).is_err()
-                    {
-                        return Ok(None);
-                    }
+                [t] if count_table_scans(&arm, t) == 1
+                    && reject_unsafe_broadcast_shapes(&arm, t).is_ok() =>
+                {
                     Some(t.clone())
                 }
-                _ => return Ok(None),
+                _ => {
+                    match distribute_over_nested_union(&arm, replicated)? {
+                        Some(branches) => {
+                            // Re-admit each branch in place (order preserved) so the
+                            // sales-side branches bucket by their sharded table and the
+                            // all-replicated returns-side branches land in the replicated
+                            // bucket.
+                            for branch in branches.into_iter().rev() {
+                                pending.push_front(branch);
+                            }
+                            continue;
+                        }
+                        None => return Ok(None),
+                    }
+                }
             };
             match groups.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, bucket)) => bucket.push(Arc::clone(arm)),
-                None => groups.push((key, vec![Arc::clone(arm)])),
+                Some((_, bucket)) => bucket.push(Arc::clone(&arm)),
+                None => groups.push((key, vec![Arc::clone(&arm)])),
             }
         }
         // Rebuild each bucket. A rebuild failure (arm type coercion the strict `Union`
@@ -2919,6 +2973,137 @@ fn split_union_by_sharding_multi(
         out.push((key, rebuilt));
     }
     Ok(Some(out))
+}
+
+/// KAN-162 (TPC-DS Q5): distribute a plan node's ancestor chain over a nested `Union`
+/// reachable inside it, returning one rebuilt plan per union branch — or `Ok(None)` when the
+/// shape has no splittable nested union, keeping the caller's decline exactly.
+///
+/// The nested mixed union: a `Union` whose branches sit under a chain of
+///
+/// - **single-child nodes** (`Projection` / `Aggregate` / `Filter` / `SubqueryAlias`) — each
+///   distributes over `UNION ALL` exactly (bag semantics) except `Aggregate`, see below; and
+/// - **`Inner` joins** whose other children scan only replicated tables — an inner join
+///   distributes over a disjoint union on any one side exactly. A non-inner join in the
+///   chain, a sharded table in any other join child, a `Union` reachable under more than one
+///   child of the same join, or any other node type (`Window`, `Limit`, `Sort`, `Distinct`,
+///   …) is not distributable and returns `Ok(None)`.
+///
+/// Exactness: `UNION ALL` distributes over inner join / filter / projection verbatim, so
+/// each rebuilt branch covers exactly its share of the arm's rows; the top-level split then
+/// partitions input rows by bucket exactly as it does for undistributed arms, and
+/// replicated-bucket placement (sliced stamp or `Forward`) is the existing, already-correct
+/// mechanism. An `Aggregate` in the chain does NOT distribute over a union in isolation
+/// (`Agg(X ∪ Y)` ≠ `Agg(X) ∪ Agg(Y)` when a group spans both) — it is admitted here only
+/// because the split's recombine re-aggregates every producer's partials by the group key:
+/// the per-branch inner aggregates feed the outer aggregate's SUM recombine, which is exact
+/// under precisely the KAN-54 additive guard (inner leaf-level SUM/COUNT, no grouping sets;
+/// outer all-SUM) that `try_split_multi_sharded_union` re-runs on every rebuilt bucket plan.
+/// The chain — including the arm's own inner aggregate — is rebuilt UNCHANGED around each
+/// branch, so per-channel aggregates are neither merged nor reordered across channels.
+fn distribute_over_nested_union(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<Option<Vec<Arc<LogicalPlan>>>> {
+    match lp {
+        LogicalPlan::Union(u) => {
+            let mut arms = Vec::new();
+            for input in &u.inputs {
+                flatten_union_all(input, &mut arms);
+            }
+            // Re-alias each branch positionally to the UNION's output names: the union schema
+            // takes the first branch's field names, so once the union is gone the enclosing
+            // chain's references (e.g. `salesreturns.return_amt`) only resolve on a branch
+            // whose own projection used different names if the columns are renamed. A branch
+            // whose columns can't be re-aliased cleanly (duplicate qualified names) declines.
+            let names: Vec<&str> = u
+                .schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
+            let mut out = Vec::with_capacity(arms.len());
+            for arm in arms {
+                let fields = arm.schema().fields();
+                if fields.len() != names.len() {
+                    return Ok(None);
+                }
+                let exprs: Vec<Expr> = fields
+                    .iter()
+                    .zip(&names)
+                    .map(|(f, name)| {
+                        // Unqualified reference to the branch's own output column: a branch
+                        // whose names are ambiguous fails `Projection::try_new` → decline.
+                        Expr::Column(Column::new_unqualified(f.name())).alias(*name)
+                    })
+                    .collect();
+                match Projection::try_new(exprs, Arc::clone(&arm)) {
+                    Ok(p) => out.push(Arc::new(LogicalPlan::Projection(p))),
+                    Err(_) => return Ok(None),
+                }
+            }
+            Ok(Some(out))
+        }
+        LogicalPlan::Projection(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::SubqueryAlias(_) => {
+            let child = lp.inputs()[0];
+            match distribute_over_nested_union(child, replicated)? {
+                Some(branches) => branches
+                    .into_iter()
+                    .map(|branch| with_new_child(lp, (*branch).clone()).map(Arc::new))
+                    .collect::<Result<Vec<_>>>()
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
+        LogicalPlan::Join(j) => {
+            if j.join_type != JoinType::Inner {
+                return Ok(None);
+            }
+            let children = lp.inputs();
+            let mut found: Option<(usize, Vec<Arc<LogicalPlan>>)> = None;
+            for (idx, child) in children.iter().enumerate() {
+                if let Some(branches) = distribute_over_nested_union(child, replicated)? {
+                    if found.is_some() {
+                        return Ok(None); // ambiguous: unions under two join children
+                    }
+                    found = Some((idx, branches));
+                }
+            }
+            let Some((idx, branches)) = found else {
+                return Ok(None);
+            };
+            // Every other join child must be fully replicated: a sharded table there would
+            // belong to the distributed branches' bucketing, not ride along cloned.
+            for (i, child) in children.iter().enumerate() {
+                if i != idx
+                    && base_tables(child)
+                        .iter()
+                        .any(|t| !replicated.contains(&t.as_str()))
+                {
+                    return Ok(None);
+                }
+            }
+            let mut out = Vec::with_capacity(branches.len());
+            for branch in branches {
+                let mut new_children: Vec<LogicalPlan> =
+                    children.iter().map(|c| (*c).clone()).collect();
+                new_children[idx] = (*branch).clone();
+                let rebuilt = lp
+                    .with_new_exprs(lp.expressions(), new_children)
+                    .map_err(|e| {
+                        Error::Unsupported(format!(
+                            "auto-distribute: rebuild nested-union distribution join: {e}"
+                        ))
+                    })?;
+                out.push(Arc::new(rebuilt));
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// One sliced anchor table per replicated arm for the replicated-slice producer placement, or
@@ -3368,24 +3553,11 @@ fn join_side_agg(side: &LogicalPlan) -> Option<JoinSide<'_>> {
 /// TPC-DS Q77's sharded arm: `Projection over Join(Aggregate(sharded …), Aggregate(replicated …))`
 /// — sales per key `LEFT JOIN` returns per key, both pre-aggregated. The arm must not run per
 /// worker (the replicated side's per-key totals would attach once per worker partial — see
-/// [`find_replicated_agg_join`]). Instead:
+/// [`find_replicated_agg_join`]). The join-deferral composition is built by
+/// [`union_agg_join_bucket_stages`]; this entry point closes it with the replicated-side partial
+/// producer + recombine via [`split_union_finish`] (the exactly-one-sharded-arm case).
 ///
-/// 1. **stage A**: the sharded aggregate's ordinary per-worker partial, hash-shuffled by its
-///    group key;
-/// 2. **stage B**: the replicated aggregate evaluated in full exactly once
-///    ([`ExchangeMode::Forward`]), hash-shuffled by the join key so equal keys co-locate;
-/// 3. **stage C**: recombine the left partials **per key first** (`GROUP BY g{j}` over the
-///    co-located partials), then run the join against the replicated side and apply the arm's
-///    projection — the join sees exactly one left row per key, so the replicated totals attach
-///    exactly once. Output gathers to partition 0 (empty hash key).
-///
-/// Stage C emits the arm rows named as the union's output columns; a [`union_split_outer_partial`]
-/// adapter regroups them into the outer partial schema, and [`split_union_finish`] closes with
-/// the replicated-arms partial + recombine as usual.
-///
-/// `Ok(None)` — a safe refusal — when the arm is not exactly this shape: non-equi/full-key join,
-/// a join filter, a non-LEFT/INNER join type, a sharded side that is not a single-scan aggregate
-/// over raw rows, or outer group/aggregate expressions that are not plain union columns.
+/// `Ok(None)` — a safe refusal — when the arm is not exactly the composition's shape.
 fn try_split_union_agg_join(
     p: &Peeled<'_>,
     sharded_input: &LogicalPlan,
@@ -3393,8 +3565,72 @@ fn try_split_union_agg_join(
     replicated_input: &LogicalPlan,
     replicated: &[&str],
 ) -> Result<Option<DistributedQuery>> {
+    let Some(stages) = union_agg_join_bucket_stages(p, sharded_input, sharded_name, 0)? else {
+        return Ok(None);
+    };
     let up = Unparser::default();
-    // Arm shape: (SubqueryAlias)* → Projection → (SubqueryAlias)* → Join.
+    let aggs = p
+        .agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()?;
+    let group_sql: Vec<String> = flattened_group_exprs(&p.agg.group_expr)
+        .into_iter()
+        .map(|g| expr_sql(&up, g))
+        .collect::<Result<_>>()?;
+    let remap = build_remap(p);
+    split_union_finish(
+        p,
+        &group_sql,
+        &aggs,
+        &remap,
+        stages,
+        replicated_input,
+        replicated,
+    )
+    .map(Some)
+}
+
+/// Stages A–D of the join-deferral composition for ONE sharded union bucket whose arm is
+/// `Projection over Join(Aggregate(sharded …), Aggregate(replicated …))` — or, for TPC-DS
+/// Q77's catalog arm (`FROM cs, cr`), the same shape with a `CrossJoin` of the two per-key
+/// aggregates:
+///
+/// 1. **stage A**: the sharded aggregate's ordinary per-worker partial, hash-shuffled by its
+///    group key (equijoin arm) or gathered whole to partition 0 (cross join — no co-location
+///    key exists);
+/// 2. **stage B**: the replicated aggregate evaluated in full exactly once
+///    ([`ExchangeMode::Forward`]), hash-shuffled by the join key so equal keys co-locate
+///    (equijoin) or gathered whole to partition 0 (cross join);
+/// 3. **stage C**: recombine the left partials **per key first** (`GROUP BY g{j}` over the
+///    co-located partials), then run the join against the replicated side and apply the arm's
+///    projection — the join sees exactly one left row per key, so the replicated totals attach
+///    exactly once. For the cross join, partition 0 holds laq (the whole recombined left
+///    aggregate) and raq (the whole replicated aggregate) and computes the full cross product;
+///    every other partition sees two empty inputs and emits nothing. Output gathers to
+///    partition 0 (empty hash key).
+/// 4. **stage D**: a [`union_split_outer_partial`] adapter regrouping the arm rows into the
+///    outer partial schema.
+///
+/// Stage D is the last stage returned and emits the `g{j}`/`a{i}` partial schema with an empty
+/// hash key; the caller assigns its shuffle (the single-sharded path lets
+/// [`split_union_finish`] set the group-key hash; the KAN-162 multi-sharded path assigns the
+/// shared group-key hash itself). Stage ids are consecutive starting at `first_id`; stage C's
+/// `shuffle_input_0`/`shuffle_input_1` are its two positional upstreams (A, B).
+///
+/// `Ok(None)` — a safe refusal — when the arm is not exactly this shape: non-equi/full-key join,
+/// a join filter, a non-LEFT/INNER join type, a sharded side that is not a single-scan aggregate
+/// over raw rows (either join spelling), or outer group/aggregate expressions that are not plain
+/// union columns.
+fn union_agg_join_bucket_stages(
+    p: &Peeled<'_>,
+    sharded_input: &LogicalPlan,
+    sharded_name: &str,
+    first_id: u32,
+) -> Result<Option<Vec<StageDef>>> {
+    let up = Unparser::default();
+    // Arm shape: (SubqueryAlias)* → Projection → (SubqueryAlias)* → Join | CrossJoin.
     let mut node = sharded_input;
     while let LogicalPlan::SubqueryAlias(s) = node {
         node = s.input.as_ref();
@@ -3406,24 +3642,46 @@ fn try_split_union_agg_join(
     while let LogicalPlan::SubqueryAlias(s) = jnode {
         jnode = s.input.as_ref();
     }
-    let LogicalPlan::Join(join) = jnode else {
-        return Ok(None);
+    // The sharded side must be the LEFT input as written; the flipped spelling declines.
+    // `equi` is the equijoin node, or `None` for a genuine cross product of the two per-key
+    // aggregates (Q77's catalog arm, `FROM cs, cr`). The cross product is exact by the same
+    // recombine-left-first argument — laq holds exactly one row per key before the cross — but
+    // with no equijoin key there is no co-location to exploit: BOTH producers gather to
+    // partition 0 (empty hash keys) and stage C's partition-0 task computes the whole cross
+    // product; every other partition sees two empty inputs and emits nothing (laq's GROUP BY
+    // over an empty input yields zero rows because the left aggregate is keyed — the
+    // `group_expr.is_empty()` refusal below is what keeps that true).
+    //
+    // DataFusion 54 has no `LogicalPlan::CrossJoin`: a cross join is a `Join` with
+    // `join_type: Inner`, empty `on`, and no filter (its Display prints "Cross Join:"). An
+    // Inner join whose equality conjuncts sit in `filter` (DataFusion parks CTE-arm join
+    // conditions there) is NOT a cross product — it takes the equijoin path.
+    let (left_plan, right_plan, equi) = match jnode {
+        LogicalPlan::Join(join)
+            if join.join_type == JoinType::Inner && join.on.is_empty() && join.filter.is_none() =>
+        {
+            (join.left.as_ref(), join.right.as_ref(), None)
+        }
+        LogicalPlan::Join(join) => {
+            if !matches!(join.join_type, JoinType::Left | JoinType::Inner) {
+                return Ok(None);
+            }
+            (join.left.as_ref(), join.right.as_ref(), Some(join))
+        }
+        _ => return Ok(None),
     };
-    if !matches!(join.join_type, JoinType::Left | JoinType::Inner) {
-        return Ok(None);
-    }
     // Sides: (SubqueryAlias)? → (renaming Projection)? → Aggregate; left scans the sharded table
     // exactly once, right zero (fully replicated).
-    let Some(left) = join_side_agg(&join.left) else {
+    let Some(left) = join_side_agg(left_plan) else {
         return Ok(None);
     };
-    let Some(right) = join_side_agg(&join.right) else {
+    let Some(right) = join_side_agg(right_plan) else {
         return Ok(None);
     };
     let left_agg = left.agg;
     let right_agg = right.agg;
-    if count_table_scans(&join.right, sharded_name) != 0
-        || count_table_scans(&join.left, sharded_name) != 1
+    if count_table_scans(right_plan, sharded_name) != 0
+        || count_table_scans(left_plan, sharded_name) != 1
     {
         return Ok(None);
     }
@@ -3445,63 +3703,66 @@ fn try_split_union_agg_join(
     if left_aggs.iter().any(|a| a.distinct) {
         return Ok(None);
     }
-    // Equijoin keys: from `ON` plus equality conjuncts parked in `join.filter` (DataFusion keeps
-    // CTE-arm join conditions there). Any non-equality residual declines — it belongs to a
-    // different shape.
-    let Ok((keys, residual)) = collect_equijoin_keys(&join.on, join.filter.as_ref()) else {
-        return Ok(None);
-    };
-    if residual.is_some() || keys.len() != left_agg.group_expr.len() {
-        return Ok(None);
-    }
-    // Orient each pair (left side first) and require plain columns both sides. One pair per left
-    // group column, and every right group column equated — otherwise a left row can match several
-    // right rows and the outer SUM fans out.
-    let col_name = |e: &Expr| -> Option<String> {
-        match e {
-            Expr::Column(c) => Some(c.name.clone()),
-            _ => None,
-        }
-    };
-    let side_has = |side: &JoinSide, e: &Expr| -> bool {
-        match e {
-            Expr::Column(c) => match &c.relation {
-                Some(r) => Some(r.to_string()) == side.alias,
-                None => side.out_names.iter().any(|n| n == &c.name),
-            },
-            _ => false,
-        }
-    };
+    // Equijoin keys (the `Join` arm only): from `ON` plus equality conjuncts parked in
+    // `join.filter` (DataFusion keeps CTE-arm join conditions there). Any non-equality
+    // residual declines — it belongs to a different shape. A cross join has no keys to
+    // validate; its stage C fans out by construction (see the `equi` comment above).
     let mut left_key_names = Vec::new();
     let mut right_key_names = Vec::new();
-    for (a, b) in &keys {
-        let (Some(an), Some(bn)) = (col_name(a), col_name(b)) else {
+    if let Some(join) = equi {
+        let Ok((keys, residual)) = collect_equijoin_keys(&join.on, join.filter.as_ref()) else {
             return Ok(None);
         };
-        let (a_l, a_r) = (side_has(&left, a), side_has(&right, a));
-        let (b_l, b_r) = (side_has(&left, b), side_has(&right, b));
-        if a_l && b_r && !(a_r && b_l) {
-            left_key_names.push(an);
-            right_key_names.push(bn);
-        } else if b_l && a_r && !(b_r && a_l) {
-            left_key_names.push(bn);
-            right_key_names.push(an);
-        } else {
+        if residual.is_some() || keys.len() != left_agg.group_expr.len() {
             return Ok(None);
         }
-    }
-    let mut left_group_out: Vec<String> = left.out_names[..left_agg.group_expr.len()].to_vec();
-    let mut left_keys_sorted = left_key_names.clone();
-    left_group_out.sort();
-    left_keys_sorted.sort();
-    if left_group_out != left_keys_sorted {
-        return Ok(None);
-    }
-    let right_group_out = &right.out_names[..right_agg.group_expr.len()];
-    if right_agg.group_expr.is_empty()
-        || !right_group_out.iter().all(|n| right_key_names.contains(n))
-    {
-        return Ok(None);
+        // Orient each pair (left side first) and require plain columns both sides. One pair per
+        // left group column, and every right group column equated — otherwise a left row can
+        // match several right rows and the outer SUM fans out.
+        let col_name = |e: &Expr| -> Option<String> {
+            match e {
+                Expr::Column(c) => Some(c.name.clone()),
+                _ => None,
+            }
+        };
+        let side_has = |side: &JoinSide, e: &Expr| -> bool {
+            match e {
+                Expr::Column(c) => match &c.relation {
+                    Some(r) => Some(r.to_string()) == side.alias,
+                    None => side.out_names.iter().any(|n| n == &c.name),
+                },
+                _ => false,
+            }
+        };
+        for (a, b) in &keys {
+            let (Some(an), Some(bn)) = (col_name(a), col_name(b)) else {
+                return Ok(None);
+            };
+            let (a_l, a_r) = (side_has(&left, a), side_has(&right, a));
+            let (b_l, b_r) = (side_has(&left, b), side_has(&right, b));
+            if a_l && b_r && !(a_r && b_l) {
+                left_key_names.push(an);
+                right_key_names.push(bn);
+            } else if b_l && a_r && !(b_r && a_l) {
+                left_key_names.push(bn);
+                right_key_names.push(an);
+            } else {
+                return Ok(None);
+            }
+        }
+        let mut left_group_out: Vec<String> = left.out_names[..left_agg.group_expr.len()].to_vec();
+        let mut left_keys_sorted = left_key_names.clone();
+        left_group_out.sort();
+        left_keys_sorted.sort();
+        if left_group_out != left_keys_sorted {
+            return Ok(None);
+        }
+        let right_group_out = &right.out_names[..right_agg.group_expr.len()];
+        if right_agg.group_expr.is_empty()
+            || !right_group_out.iter().all(|n| right_key_names.contains(n))
+        {
+            return Ok(None);
+        }
     }
     // The outer aggregate must read plain union columns that the arm projection emits.
     let arm_out_names: Vec<String> = proj.expr.iter().map(output_name).collect();
@@ -3509,7 +3770,9 @@ fn try_split_union_agg_join(
         return Ok(None);
     }
 
-    // Stage A: left partial per worker, hash-shuffled by the left group key.
+    // Stage A: left partial per worker, hash-shuffled by the left group key — or, for a cross
+    // join, gathered whole to partition 0 (no co-location key exists; the cross product runs on
+    // the one partition holding the fully recombined left aggregate).
     let left_group_sql: Vec<String> = left_agg
         .group_expr
         .iter()
@@ -3522,16 +3785,17 @@ fn try_split_union_agg_join(
         left_psel.join(", "),
         left_group_sql.join(", ")
     ));
-    let stage_a = StageDef::new(
-        0,
-        stage_a_sql,
-        vec![],
-        (0..left_group_sql.len() as u32).collect(),
-    );
+    let stage_a_keys: Vec<u32> = if equi.is_some() {
+        (0..left_group_sql.len() as u32).collect()
+    } else {
+        vec![]
+    };
+    let stage_a = StageDef::new(first_id, stage_a_sql, vec![], stage_a_keys);
 
-    // Stage B: the replicated aggregate in full, once, hash-co-located by the right join key.
+    // Stage B: the replicated aggregate in full, once, hash-co-located by the right join key —
+    // or, for a cross join, gathered whole to partition 0 alongside the left partials.
     let right_sql = sanitize_generated_sql(
-        &up.plan_to_sql(&join.right)
+        &up.plan_to_sql(right_plan)
             .map_err(|e| {
                 Error::Unsupported(format!(
                     "auto-distribute: unparse union-arm replicated aggregate: {e}"
@@ -3539,21 +3803,26 @@ fn try_split_union_agg_join(
             })?
             .to_string(),
     );
-    let right_key_pos: Option<Vec<u32>> = right_key_names
-        .iter()
-        .map(|n| {
-            join.right
-                .schema()
-                .fields()
-                .iter()
-                .position(|f| f.name() == n)
-                .map(|i| i as u32)
-        })
-        .collect();
-    let Some(right_key_pos) = right_key_pos else {
-        return Ok(None);
+    let right_key_pos: Vec<u32> = if equi.is_some() {
+        let pos: Option<Vec<u32>> = right_key_names
+            .iter()
+            .map(|n| {
+                right_plan
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == n)
+                    .map(|i| i as u32)
+            })
+            .collect();
+        let Some(pos) = pos else {
+            return Ok(None);
+        };
+        pos
+    } else {
+        vec![]
     };
-    let mut stage_b = StageDef::new(1, right_sql, vec![], right_key_pos);
+    let mut stage_b = StageDef::new(first_id + 1, right_sql, vec![], right_key_pos);
     stage_b.exchange = ExchangeMode::Forward;
 
     // Stage C: recombine left partials per key, then join, then the arm's projection.
@@ -3611,11 +3880,22 @@ fn try_split_union_agg_join(
         };
         on_parts.push(format!("{ls} = {rs}"));
     }
-    let on_sql = on_parts.join(" AND ");
-    let join_kw = if join.join_type == JoinType::Left {
-        "LEFT JOIN"
-    } else {
-        "JOIN"
+    // Equijoin arm: `… laq JOIN|LEFT JOIN raq ON <keys>`. CrossJoin arm: `… laq CROSS JOIN raq`
+    // (no ON) — exact because laq is the whole recombined left aggregate on this partition (or
+    // empty off partition 0).
+    let join_clause = match equi {
+        Some(join) => {
+            let join_kw = if join.join_type == JoinType::Left {
+                "LEFT JOIN"
+            } else {
+                "JOIN"
+            };
+            format!(
+                "{join_kw} (SELECT * FROM shuffle_input_1) AS raq ON {}",
+                on_parts.join(" AND ")
+            )
+        }
+        None => "CROSS JOIN (SELECT * FROM shuffle_input_1) AS raq".to_string(),
     };
     let select = proj
         .expr
@@ -3628,11 +3908,17 @@ fn try_split_union_agg_join(
         .collect::<Result<Vec<_>>>()?
         .join(", ");
     let stage_c_sql = sanitize_generated_sql(&format!(
-        "SELECT {select} FROM ({laq}) AS laq {join_kw} (SELECT * FROM shuffle_input_1) AS raq ON {on_sql}"
+        "SELECT {select} FROM ({laq}) AS laq {join_clause}"
     ));
-    let stage_c = StageDef::new(2, stage_c_sql, vec![0, 1], vec![]);
+    let stage_c = StageDef::new(
+        first_id + 2,
+        stage_c_sql,
+        vec![first_id, first_id + 1],
+        vec![],
+    );
 
-    // Stage D: regroup the exact arm rows into the outer partial schema.
+    // Stage D: regroup the exact arm rows into the outer partial schema. Its shuffle key is the
+    // caller's to assign (see the doc comment above).
     let aggs = p
         .agg
         .aggr_expr
@@ -3640,23 +3926,9 @@ fn try_split_union_agg_join(
         .map(AggSpec::classify)
         .collect::<Result<Vec<_>>>()?;
     let stage_d_sql = union_split_outer_partial(&up, p.agg, &aggs)?;
-    let stage_d = StageDef::new(3, stage_d_sql, vec![2], vec![]);
+    let stage_d = StageDef::new(first_id + 3, stage_d_sql, vec![first_id + 2], vec![]);
 
-    let group_sql: Vec<String> = flattened_group_exprs(&p.agg.group_expr)
-        .into_iter()
-        .map(|g| expr_sql(&up, g))
-        .collect::<Result<_>>()?;
-    let remap = build_remap(p);
-    split_union_finish(
-        p,
-        &group_sql,
-        &aggs,
-        &remap,
-        vec![stage_a, stage_b, stage_c, stage_d],
-        replicated_input,
-        replicated,
-    )
-    .map(Some)
+    Ok(Some(vec![stage_a, stage_b, stage_c, stage_d]))
 }
 
 /// TPC-DS Q5's sharded arm: an aggregate over *another* mixed union nested inside it

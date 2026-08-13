@@ -1623,7 +1623,8 @@ fn window_over_distinct_union_stages_for(
 /// worker. Both sides shuffle by the equijoin key for an exact co-located full join (rows with
 /// equal keys co-locate; preserved-side rows can never straddle partitions), the CASE/renaming
 /// projection over the join re-applies in the join stage, and the outer framed windows compute
-/// after a final partition-keyed shuffle.
+/// after a final partition-keyed shuffle. KAN-162 admits BOTH sides sharded — each side's exact
+/// output rows hash by the same join key, so the co-location argument is unchanged.
 fn window_over_join_stages_for(
     p: &WindowPeeled<'_>,
     window: &Window,
@@ -1677,8 +1678,17 @@ fn window_over_join_stages_for(
         return Err(unsupported("no equijoin keys"));
     }
 
-    // Classify the sides: exactly one may scan sharded tables (planned through the shape
-    // planners); the other must be all-replicated (computed once on a Forward worker).
+    // Classify the sides: a side scanning any sharded table is planned through the shape
+    // planners; an all-replicated side is computed once on a Forward worker. Both sides may be
+    // sharded (KAN-162, TPC-DS Q51 at the all-facts-sharded classification): each sharded side
+    // runs the exact partial → combine → partition-shuffle window pipeline in the loop below
+    // and its terminal rows hash by the same join key, so equal keys co-locate and the FULL
+    // OUTER JOIN matches key-locally (a preserved-side row hashes to exactly one partition).
+    // The KAN-49b both-sharded refusal was an artifact of the single-sharded classification,
+    // not an exactness guard — the per-side requirements enforced in the planning loop below
+    // (a windowed-aggregate branch, join keys resolvable against the side's output columns,
+    // the outer PARTITION BY expressible over the join output) are the real admission and
+    // still refuse every other shape.
     let side_is_sharded = |side: &LogicalPlan| {
         let mut tables = base_tables(side);
         collect_subquery_tables(side, &mut tables);
@@ -1686,9 +1696,6 @@ fn window_over_join_stages_for(
     };
     let left_sharded = side_is_sharded(join.left.as_ref());
     let right_sharded = side_is_sharded(join.right.as_ref());
-    if left_sharded && right_sharded {
-        return Err(unsupported("both join sides scan sharded tables"));
-    }
 
     let mut stages: Vec<StageDef> = Vec::new();
     let mut side_terminals: Vec<u32> = Vec::new();
@@ -3528,8 +3535,12 @@ pub(crate) fn try_in_agg_semi_join(
 /// paths): a distributable aggregate on top (non-empty plain GROUP BY, no grouping sets,
 /// subquery-free HAVING; DISTINCT aggregates take the exact shuffle-by-group-key path); every
 /// subquery predicate is a top-level WHERE conjunct; all of them correlate on the **same** outer
-/// key expressions; each subquery scans the same single sharded fact exactly once and every
-/// other table anywhere is replicated; the outer body scans at most one sharded table (exactly
+/// key expressions; each subquery scans its own single sharded fact exactly once (KAN-157:
+/// distinct conjuncts may touch distinct sharded facts — the Q10/Q35/Q69 all-facts-sharded
+/// classification) and every other table anywhere is replicated; a top-level `OR` of non-negated
+/// `EXISTS` arms counts as one conjunct whose producers are re-OR'd (parenthesized) in the semi
+/// stage, while negated or mixed `OR`s decline; the outer body scans at most one sharded table
+/// (exactly
 /// once) — or, TPC-H Q16, is a single sharded–sharded inner equijoin planned as two flattened
 /// leaf scans plus a co-located join stage that re-exports the same `ok{j}` / `oe{n}` / `oc{n}`
 /// contract; `IN` subqueries are uncorrelated with either a plain scan body or a `GROUP BY
@@ -3662,6 +3673,13 @@ pub(crate) fn try_semi_anti_subqueries(
             outer: &'a Expr,
             subquery: &'a LogicalPlan,
         },
+        /// A top-level `OR` of non-negated `EXISTS` arms (KAN-157, TPC-DS Q10/Q35's
+        /// `EXISTS (web_sales…) OR EXISTS (catalog_sales…)` at the all-facts-sharded
+        /// classification): every disjunct builds its own co-located key stream and the semi
+        /// condition re-joins the per-disjunct predicates with `OR`. Negated disjuncts
+        /// decline — an anti arm holds on every partition but its key's own, so it cannot
+        /// gate a replicated-outer row onto exactly one partition.
+        ExistsOr { disjuncts: Vec<&'a LogicalPlan> },
     }
 
     /// A residual (non-equality) correlation predicate, re-emitted against the co-located
@@ -3712,6 +3730,27 @@ pub(crate) fn try_semi_anti_subqueries(
                 outer: iq.expr.as_ref(),
                 subquery: iq.subquery.subquery.as_ref(),
             }),
+            Expr::BinaryExpr(b) if b.op == Operator::Or && expr_contains_subquery(c) => {
+                // KAN-157: a top-level `OR` of non-negated `EXISTS` arms (TPC-DS Q10/Q35's
+                // `EXISTS (web…) OR EXISTS (catalog…)`) whose legs scan sharded facts. Each
+                // disjunct becomes its own key-stream producer below; anything else in an
+                // `OR` (a negated arm, a non-EXISTS leaf) declines.
+                let mut leaves = Vec::new();
+                flatten_disjuncts(c, &mut leaves);
+                let mut disjuncts = Vec::with_capacity(leaves.len());
+                for leaf in leaves {
+                    match leaf {
+                        Expr::Exists(ex) if !ex.negated => {
+                            disjuncts.push(ex.subquery.subquery.as_ref());
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                if disjuncts.len() < 2 {
+                    return Ok(None);
+                }
+                sub_preds.push(SubPred::ExistsOr { disjuncts });
+            }
             other => {
                 if expr_contains_subquery(other) {
                     // One uncorrelated scalar-aggregate compare (TPC-H Q22) rides along as a
@@ -3741,13 +3780,13 @@ pub(crate) fn try_semi_anti_subqueries(
         }
     }
 
-    // Table safety for one subquery's inner body: it must scan the same single sharded fact
-    // exactly once; every other table inside the subquery must be replicated.
-    fn check_fact(
-        inner_body: &LogicalPlan,
-        replicated: &[&str],
-        fact: &mut Option<String>,
-    ) -> bool {
+    // Table safety for one subquery's inner body: it must scan exactly one sharded fact
+    // exactly once; every other table inside the subquery must be replicated. KAN-157 lifted
+    // the historical "the same sharded fact across every subquery" rule: distinct predicates
+    // may scan distinct sharded facts (TPC-DS Q10/Q35/Q69 at the all-facts-sharded
+    // classification) — each gets its own key stream hash-shuffled by the shared correlation
+    // key, so the streams co-locate per key regardless of the source fact.
+    fn check_fact(inner_body: &LogicalPlan, replicated: &[&str]) -> bool {
         let tables = base_tables(inner_body);
         let mut sharded: Vec<&str> = tables
             .iter()
@@ -3759,20 +3798,10 @@ pub(crate) fn try_semi_anti_subqueries(
         let [f] = sharded.as_slice() else {
             return false;
         };
-        if count_table_scans(inner_body, f) != 1 {
-            return false;
-        }
-        match fact {
-            Some(existing) => existing == f,
-            None => {
-                *fact = Some(f.to_string());
-                true
-            }
-        }
+        count_table_scans(inner_body, f) == 1
     }
 
     let mut producers: Vec<Producer> = Vec::new();
-    let mut fact: Option<String> = None;
     let mut next_id: u32 = 0;
     // A scalar-broadcast conjunct takes the leading stage ids so its combine has completed by
     // the time any token-bearing stage is dispatched (the driver pulls it positionally).
@@ -3794,15 +3823,21 @@ pub(crate) fn try_semi_anti_subqueries(
             vec![],
         ));
     }
-    for pred in &sub_preds {
-        let (anti, in_outer, subquery) = match pred {
-            SubPred::Exists { anti, subquery } => (*anti, None, *subquery),
-            SubPred::In {
-                anti,
-                outer,
-                subquery,
-            } => (*anti, Some(*outer), *subquery),
-        };
+    // Semi-stage condition composition: one entry per top-level subquery conjunct — a single
+    // producer's predicate, or the KAN-157 parenthesized `OR` of a disjunct group's
+    // predicates (indices into `producers`).
+    enum CondGroup {
+        Single(usize),
+        Or(Vec<usize>),
+    }
+
+    // Build the key-stream producer for one subquery predicate (`Ok(None)` = the shape
+    // declines). Shared by plain semi/anti conjuncts and by every disjunct of an `OR` group.
+    let build_producer = |anti: bool,
+                          in_outer: Option<&Expr>,
+                          subquery: &LogicalPlan,
+                          next_id: &mut u32|
+     -> Result<Option<Producer>> {
         let is_in = in_outer.is_some();
 
         // Strip aliases; EXISTS ignores its SELECT list (strip every projection), while IN's
@@ -3891,7 +3926,7 @@ pub(crate) fn try_semi_anti_subqueries(
             if !in_scope_cols.iter().all(|c| scope.contains(c)) {
                 return Ok(None);
             }
-            if !check_fact(scan_body, replicated, &mut fact) {
+            if !check_fact(scan_body, replicated) {
                 return Ok(None);
             }
             let outer = strip_outer_refs(in_outer.expect("IN predicate carries its outer expr"));
@@ -3962,10 +3997,10 @@ pub(crate) fn try_semi_anti_subqueries(
                     having_sql.join(" AND ")
                 )
             };
-            let pid = next_id;
-            let cid = next_id + 1;
-            next_id += 2;
-            producers.push(Producer {
+            let pid = *next_id;
+            let cid = *next_id + 1;
+            *next_id += 2;
+            return Ok(Some(Producer {
                 anti,
                 is_in,
                 outer_keys: vec![outer],
@@ -3975,8 +4010,7 @@ pub(crate) fn try_semi_anti_subqueries(
                 ],
                 ic_aliases: HashMap::new(),
                 residuals: Vec::new(),
-            });
-            continue;
+            }));
         }
 
         // Plain inner body (EXISTS, or an uncorrelated IN over a scan): split its WHERE
@@ -4066,7 +4100,7 @@ pub(crate) fn try_semi_anti_subqueries(
                 outer_cols: outer_cs,
             });
         }
-        if !check_fact(inner_body, replicated, &mut fact) {
+        if !check_fact(inner_body, replicated) {
             return Ok(None);
         }
 
@@ -4136,18 +4170,60 @@ pub(crate) fn try_semi_anti_subqueries(
                 .to_string(),
         )?);
         let where_sql = where_clause(&up, &inner_preds)?;
-        let sql = sanitize_generated_sql(&format!("SELECT {} {tail}{where_sql}", sels.join(", ")));
+        // KAN-157: the semi stage only tests membership of the exported `(k{j}, ic{n})` tuples
+        // against the co-located stream, so the producer emits each distinct tuple once —
+        // one materialized key set per query instead of one row per fact-row through the
+        // shuffle (the Q10/Q35/Q69 EXISTS legs at the all-facts-sharded classification).
+        let sql = sanitize_generated_sql(&format!(
+            "SELECT DISTINCT {} {tail}{where_sql}",
+            sels.join(", ")
+        ));
         let n_keys = inner_key_sql.len() as u32;
-        let id = next_id;
-        next_id += 1;
-        producers.push(Producer {
+        let id = *next_id;
+        *next_id += 1;
+        Ok(Some(Producer {
             anti,
             is_in,
             outer_keys,
             stages: vec![StageDef::new(id, sql, vec![], (0..n_keys).collect())],
             ic_aliases,
             residuals,
-        });
+        }))
+    };
+
+    let mut cond_groups: Vec<CondGroup> = Vec::new();
+    for pred in &sub_preds {
+        match pred {
+            SubPred::Exists { anti, subquery } => {
+                let Some(pr) = build_producer(*anti, None, subquery, &mut next_id)? else {
+                    return Ok(None);
+                };
+                cond_groups.push(CondGroup::Single(producers.len()));
+                producers.push(pr);
+            }
+            SubPred::In {
+                anti,
+                outer,
+                subquery,
+            } => {
+                let Some(pr) = build_producer(*anti, Some(outer), subquery, &mut next_id)? else {
+                    return Ok(None);
+                };
+                cond_groups.push(CondGroup::Single(producers.len()));
+                producers.push(pr);
+            }
+            SubPred::ExistsOr { disjuncts } => {
+                let mut group = Vec::with_capacity(disjuncts.len());
+                for disjunct in disjuncts {
+                    let Some(pr) = build_producer(false, None, disjunct, &mut next_id)? else {
+                        return Ok(None);
+                    };
+                    group.push(producers.len());
+                    producers.push(pr);
+                }
+                cond_groups.push(CondGroup::Or(group));
+            }
+        }
     }
 
     // Co-location requires every subquery predicate to correlate on the same outer keys.
@@ -4466,9 +4542,11 @@ pub(crate) fn try_semi_anti_subqueries(
         return Ok(None);
     }
 
-    // Semi/anti conditions against the co-located key streams.
+    // Semi/anti conditions against the co-located key streams: one condition per producer,
+    // then composed per `cond_groups` — a plain conjunct passes through, a KAN-157 disjunct
+    // group becomes the parenthesized `OR` of its producers' predicates.
     let total_upstreams = producer_out_ids.len() + usize::from(scan_id.is_some());
-    let mut conds: Vec<String> = Vec::new();
+    let mut producer_conds: Vec<String> = Vec::new();
     for (i, pr) in producers.iter().enumerate() {
         let input = input_name(i + usize::from(scan_id.is_some()), total_upstreams);
         let outer_ref = |j: usize| {
@@ -4480,7 +4558,7 @@ pub(crate) fn try_semi_anti_subqueries(
         };
         if pr.is_in {
             let kw = if pr.anti { "NOT IN" } else { "IN" };
-            conds.push(format!("{} {kw} (SELECT k0 FROM {input})", outer_ref(0)));
+            producer_conds.push(format!("{} {kw} (SELECT k0 FROM {input})", outer_ref(0)));
             continue;
         }
         let mut on: Vec<String> = (0..n_keys)
@@ -4505,11 +4583,24 @@ pub(crate) fn try_semi_anti_subqueries(
             ));
         }
         let kw = if pr.anti { "NOT EXISTS" } else { "EXISTS" };
-        conds.push(format!(
+        producer_conds.push(format!(
             "{kw} (SELECT 1 FROM {input} AS k WHERE {})",
             on.join(" AND ")
         ));
     }
+    let conds: Vec<String> = cond_groups
+        .iter()
+        .map(|g| match g {
+            CondGroup::Single(i) => producer_conds[*i].clone(),
+            CondGroup::Or(idxs) => format!(
+                "({})",
+                idxs.iter()
+                    .map(|i| producer_conds[*i].as_str())
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            ),
+        })
+        .collect();
 
     // The semi/anti filter feeds the ordinary partial/combine aggregation stages.
     let (tail, group_sql, stage_aggs) = if scan_id.is_some() {
@@ -6190,6 +6281,17 @@ pub(crate) fn flatten_conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         Expr::BinaryExpr(b) if b.op == Operator::And => {
             flatten_conjuncts(&b.left, out);
             flatten_conjuncts(&b.right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Split `a OR b OR …` into its top-level disjuncts (references, no cloning).
+fn flatten_disjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::BinaryExpr(b) if b.op == Operator::Or => {
+            flatten_disjuncts(&b.left, out);
+            flatten_disjuncts(&b.right, out);
         }
         other => out.push(other),
     }
