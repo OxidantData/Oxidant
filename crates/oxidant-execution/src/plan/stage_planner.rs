@@ -58,11 +58,13 @@
 //! one-row broadcast — scalar partial/combine stages plus driver-side literal injection into the
 //! outer stages ([`super::shape_extensions::try_uncorrelated_scalar_threshold`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use datafusion::common::TableReference;
-use datafusion::logical_expr::{Aggregate, Expr, GroupingSet, JoinType, LogicalPlan, Union};
+use datafusion::common::{Column, TableReference};
+use datafusion::logical_expr::{
+    Aggregate, Expr, GroupingSet, JoinType, LogicalPlan, Projection, Union,
+};
 use datafusion::sql::unparser::Unparser;
 use oxidant_common::{Error, Result};
 use oxidant_loom::Engine;
@@ -2789,9 +2791,17 @@ fn split_union_by_sharding_multi(
         for input in &u.inputs {
             flatten_union_all(input, &mut arms);
         }
+        // Arms are admitted FIFO. An arm that fails the direct per-arm admission may still
+        // split: a nested MIXED union inside the arm (TPC-DS Q5's per-channel
+        // `Aggregate over Join(Union(sales, returns) ⋈ dims)`) distributes exactly over the
+        // enclosing chain — see [`distribute_over_nested_union`]. Each distributed branch is
+        // pushed back onto the queue and re-admitted, so a branch that itself fails (or
+        // contains a deeper nested union) recurses; every distribution removes one `Union`
+        // node from the arm, so the queue drains.
+        let mut pending: VecDeque<Arc<LogicalPlan>> = arms.into_iter().collect();
         let mut groups: Vec<(Option<String>, Vec<Arc<LogicalPlan>>)> = Vec::new();
-        for arm in &arms {
-            let mut sharded: Vec<String> = base_tables(arm)
+        while let Some(arm) = pending.pop_front() {
+            let mut sharded: Vec<String> = base_tables(&arm)
                 .into_iter()
                 .filter(|t| !replicated.contains(&t.as_str()))
                 .collect();
@@ -2799,19 +2809,30 @@ fn split_union_by_sharding_multi(
             sharded.dedup();
             let key = match sharded.as_slice() {
                 [] => None,
-                [t] => {
-                    if count_table_scans(arm, t) != 1
-                        || reject_unsafe_broadcast_shapes(arm, t).is_err()
-                    {
-                        return Ok(None);
-                    }
+                [t] if count_table_scans(&arm, t) == 1
+                    && reject_unsafe_broadcast_shapes(&arm, t).is_ok() =>
+                {
                     Some(t.clone())
                 }
-                _ => return Ok(None),
+                _ => {
+                    match distribute_over_nested_union(&arm, replicated)? {
+                        Some(branches) => {
+                            // Re-admit each branch in place (order preserved) so the
+                            // sales-side branches bucket by their sharded table and the
+                            // all-replicated returns-side branches land in the replicated
+                            // bucket.
+                            for branch in branches.into_iter().rev() {
+                                pending.push_front(branch);
+                            }
+                            continue;
+                        }
+                        None => return Ok(None),
+                    }
+                }
             };
             match groups.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, bucket)) => bucket.push(Arc::clone(arm)),
-                None => groups.push((key, vec![Arc::clone(arm)])),
+                Some((_, bucket)) => bucket.push(Arc::clone(&arm)),
+                None => groups.push((key, vec![Arc::clone(&arm)])),
             }
         }
         // Rebuild each bucket. A rebuild failure (arm type coercion the strict `Union`
@@ -2866,6 +2887,137 @@ fn split_union_by_sharding_multi(
         out.push((key, rebuilt));
     }
     Ok(Some(out))
+}
+
+/// KAN-162 (TPC-DS Q5): distribute a plan node's ancestor chain over a nested `Union`
+/// reachable inside it, returning one rebuilt plan per union branch — or `Ok(None)` when the
+/// shape has no splittable nested union, keeping the caller's decline exactly.
+///
+/// The nested mixed union: a `Union` whose branches sit under a chain of
+///
+/// - **single-child nodes** (`Projection` / `Aggregate` / `Filter` / `SubqueryAlias`) — each
+///   distributes over `UNION ALL` exactly (bag semantics) except `Aggregate`, see below; and
+/// - **`Inner` joins** whose other children scan only replicated tables — an inner join
+///   distributes over a disjoint union on any one side exactly. A non-inner join in the
+///   chain, a sharded table in any other join child, a `Union` reachable under more than one
+///   child of the same join, or any other node type (`Window`, `Limit`, `Sort`, `Distinct`,
+///   …) is not distributable and returns `Ok(None)`.
+///
+/// Exactness: `UNION ALL` distributes over inner join / filter / projection verbatim, so
+/// each rebuilt branch covers exactly its share of the arm's rows; the top-level split then
+/// partitions input rows by bucket exactly as it does for undistributed arms, and
+/// replicated-bucket placement (sliced stamp or `Forward`) is the existing, already-correct
+/// mechanism. An `Aggregate` in the chain does NOT distribute over a union in isolation
+/// (`Agg(X ∪ Y)` ≠ `Agg(X) ∪ Agg(Y)` when a group spans both) — it is admitted here only
+/// because the split's recombine re-aggregates every producer's partials by the group key:
+/// the per-branch inner aggregates feed the outer aggregate's SUM recombine, which is exact
+/// under precisely the KAN-54 additive guard (inner leaf-level SUM/COUNT, no grouping sets;
+/// outer all-SUM) that `try_split_multi_sharded_union` re-runs on every rebuilt bucket plan.
+/// The chain — including the arm's own inner aggregate — is rebuilt UNCHANGED around each
+/// branch, so per-channel aggregates are neither merged nor reordered across channels.
+fn distribute_over_nested_union(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<Option<Vec<Arc<LogicalPlan>>>> {
+    match lp {
+        LogicalPlan::Union(u) => {
+            let mut arms = Vec::new();
+            for input in &u.inputs {
+                flatten_union_all(input, &mut arms);
+            }
+            // Re-alias each branch positionally to the UNION's output names: the union schema
+            // takes the first branch's field names, so once the union is gone the enclosing
+            // chain's references (e.g. `salesreturns.return_amt`) only resolve on a branch
+            // whose own projection used different names if the columns are renamed. A branch
+            // whose columns can't be re-aliased cleanly (duplicate qualified names) declines.
+            let names: Vec<&str> = u
+                .schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
+            let mut out = Vec::with_capacity(arms.len());
+            for arm in arms {
+                let fields = arm.schema().fields();
+                if fields.len() != names.len() {
+                    return Ok(None);
+                }
+                let exprs: Vec<Expr> = fields
+                    .iter()
+                    .zip(&names)
+                    .map(|(f, name)| {
+                        // Unqualified reference to the branch's own output column: a branch
+                        // whose names are ambiguous fails `Projection::try_new` → decline.
+                        Expr::Column(Column::new_unqualified(f.name())).alias(*name)
+                    })
+                    .collect();
+                match Projection::try_new(exprs, Arc::clone(&arm)) {
+                    Ok(p) => out.push(Arc::new(LogicalPlan::Projection(p))),
+                    Err(_) => return Ok(None),
+                }
+            }
+            Ok(Some(out))
+        }
+        LogicalPlan::Projection(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::SubqueryAlias(_) => {
+            let child = lp.inputs()[0];
+            match distribute_over_nested_union(child, replicated)? {
+                Some(branches) => branches
+                    .into_iter()
+                    .map(|branch| with_new_child(lp, (*branch).clone()).map(Arc::new))
+                    .collect::<Result<Vec<_>>>()
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
+        LogicalPlan::Join(j) => {
+            if j.join_type != JoinType::Inner {
+                return Ok(None);
+            }
+            let children = lp.inputs();
+            let mut found: Option<(usize, Vec<Arc<LogicalPlan>>)> = None;
+            for (idx, child) in children.iter().enumerate() {
+                if let Some(branches) = distribute_over_nested_union(child, replicated)? {
+                    if found.is_some() {
+                        return Ok(None); // ambiguous: unions under two join children
+                    }
+                    found = Some((idx, branches));
+                }
+            }
+            let Some((idx, branches)) = found else {
+                return Ok(None);
+            };
+            // Every other join child must be fully replicated: a sharded table there would
+            // belong to the distributed branches' bucketing, not ride along cloned.
+            for (i, child) in children.iter().enumerate() {
+                if i != idx
+                    && base_tables(child)
+                        .iter()
+                        .any(|t| !replicated.contains(&t.as_str()))
+                {
+                    return Ok(None);
+                }
+            }
+            let mut out = Vec::with_capacity(branches.len());
+            for branch in branches {
+                let mut new_children: Vec<LogicalPlan> =
+                    children.iter().map(|c| (*c).clone()).collect();
+                new_children[idx] = (*branch).clone();
+                let rebuilt = lp
+                    .with_new_exprs(lp.expressions(), new_children)
+                    .map_err(|e| {
+                        Error::Unsupported(format!(
+                            "auto-distribute: rebuild nested-union distribution join: {e}"
+                        ))
+                    })?;
+                out.push(Arc::new(rebuilt));
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// One sliced anchor table per replicated arm for the replicated-slice producer placement, or
