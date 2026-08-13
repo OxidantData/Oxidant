@@ -3,7 +3,7 @@ q1	fail	fail
 q2	ok(4)	ok(4)
 q3	ok(2)	ok(2)
 q4	ok(9)	ok(13)
-q5	ok(6)	fail
+q5	ok(6)	ok(8)
 q6	ok(2)	ok(2)
 q7	ok(2)	ok(2)
 q8	ok(2)	ok(2)

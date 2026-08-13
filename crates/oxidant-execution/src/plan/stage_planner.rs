@@ -2702,8 +2702,10 @@ fn try_split_multi_sharded_union(
     // broadcast-safe tree check on the result. A join above the union that pulls in a second
     // sharded table, or an unsafe preserved-side outer join up there, declines the whole shape.
     let mut agg_join_bucket: Vec<bool> = Vec::with_capacity(groups.len());
+    let mut left_join_bucket: Vec<bool> = Vec::with_capacity(groups.len());
     for (key, plan) in &groups {
         let mut is_agg_join = false;
+        let mut is_left_join = false;
         match key {
             Some(t) => {
                 let plan_tables = base_tables(plan);
@@ -2717,20 +2719,29 @@ fn try_split_multi_sharded_union(
                 if plan_sharded != [t.as_str()] {
                     return Ok(None);
                 }
-                if reject_unsafe_broadcast_shapes(plan, t).is_err() {
-                    return Ok(None);
+                // KAN-162 (TPC-DS Q5's web leg): a bucket chaining over a co-locatable LEFT
+                // JOIN (see [`find_co_locatable_left_join`]) skips the broadcast-safe tree
+                // check — [`union_left_join_branch_stages`]'s own gates replace it. The
+                // `plan_sharded == [t]` re-derivation above and the KAN-54 additive check
+                // below still run for it.
+                if find_co_locatable_left_join(plan, t).is_some() {
+                    is_left_join = true;
+                } else {
+                    if reject_unsafe_broadcast_shapes(plan, t).is_err() {
+                        return Ok(None);
+                    }
+                    // KAN-162: KAN-49d's reroute (a replicated aggregate joined into the arm above
+                    // the arm's own aggregate — TPC-DS Q77's `ss LEFT JOIN sr`) generalizes to the
+                    // N-producer shape: each such bucket gets its own join-deferral stage chain
+                    // (stage A–D per bucket, built and re-validated by
+                    // [`union_agg_join_bucket_stages`], which declines the whole shape on a shape
+                    // mismatch) instead of the flat partial below. The KAN-54 additive guard does
+                    // not apply to it — the deferral is exact by the per-key-recombine-first
+                    // argument, not by per-worker additivity. The CROSS JOIN spelling (Q77's
+                    // catalog arm) is a `LogicalPlan::Join` in DataFusion 54 (Inner, empty `on`,
+                    // no filter), so the one finder covers both spellings.
+                    is_agg_join = find_replicated_agg_join(plan, t).is_some();
                 }
-                // KAN-162: KAN-49d's reroute (a replicated aggregate joined into the arm above
-                // the arm's own aggregate — TPC-DS Q77's `ss LEFT JOIN sr`) generalizes to the
-                // N-producer shape: each such bucket gets its own join-deferral stage chain
-                // (stage A–D per bucket, built and re-validated by
-                // [`union_agg_join_bucket_stages`], which declines the whole shape on a shape
-                // mismatch) instead of the flat partial below. The KAN-54 additive guard does
-                // not apply to it — the deferral is exact by the per-key-recombine-first
-                // argument, not by per-worker additivity. The CROSS JOIN spelling (Q77's
-                // catalog arm) is a `LogicalPlan::Join` in DataFusion 54 (Inner, empty `on`,
-                // no filter), so the one finder covers both spellings.
-                is_agg_join = find_replicated_agg_join(plan, t).is_some();
             }
             None => {
                 if base_tables(plan)
@@ -2743,9 +2754,11 @@ fn try_split_multi_sharded_union(
         }
         if is_agg_join {
             agg_join_bucket.push(true);
+            left_join_bucket.push(false);
             continue;
         }
         agg_join_bucket.push(false);
+        left_join_bucket.push(is_left_join);
         // KAN-54's additive constraint, per producer: an inner aggregate recomputes per worker,
         // so it (and the outer aggregate over it) must re-associatively recombine — inner
         // SUM/COUNT only, leaf-level, no grouping sets; outer SUM only.
@@ -2793,7 +2806,27 @@ fn try_split_multi_sharded_union(
 
     let mut stages: Vec<StageDef> = Vec::with_capacity(groups.len() + 1);
     let mut producers: Vec<u32> = Vec::with_capacity(groups.len());
-    for ((key, plan), is_agg_join) in groups.iter().zip(&agg_join_bucket) {
+    for (((key, plan), is_agg_join), is_left_join) in
+        groups.iter().zip(&agg_join_bucket).zip(&left_join_bucket)
+    {
+        if *is_left_join {
+            // KAN-162: one co-located LEFT JOIN chain (R1 key-shuffle + R2 Forward shuffle +
+            // R3 per-partition join producer) per such bucket; the terminal (R3) is the
+            // bucket's producer into the shared recombine and takes the same group-key hash
+            // (or partition-0 gather for grouping sets) as the flat producers.
+            let t = key
+                .as_deref()
+                .expect("a co-located LEFT JOIN bucket is sharded");
+            let Some(mut bucket) = union_left_join_branch_stages(p, plan, t, stages.len() as u32)?
+            else {
+                return Ok(None);
+            };
+            let terminal = bucket.last_mut().expect("co-located join bucket stages");
+            terminal.hash_key_cols = hash_key_cols.clone();
+            producers.push(terminal.stage_id);
+            stages.extend(bucket);
+            continue;
+        }
         if *is_agg_join {
             // KAN-162: one stage-A–D join-deferral chain per agg-join bucket; the terminal
             // (stage D) is the bucket's producer into the shared recombine and takes the same
@@ -2899,6 +2932,19 @@ fn split_union_by_sharding_multi(
                     && reject_unsafe_broadcast_shapes(&arm, t).is_ok() =>
                 {
                     Some(t.clone())
+                }
+                // KAN-162 (TPC-DS Q5's web leg): an arm chaining over
+                // `LeftJoin(replicated preserved, sharded null-extended)` fails the
+                // broadcast-safe check above for exactly one reason — the co-locatable LEFT
+                // JOIN. Admit it as its own bucket kind: push a SINGLETON group, bypassing
+                // the same-key merge below, so it never folds into the flat `web_sales`
+                // bucket (the flat producer would unparse the LEFT JOIN verbatim — the
+                // inexact per-worker shape). `union_of_arms` collapses the singleton.
+                [t] if count_table_scans(&arm, t) == 1
+                    && find_co_locatable_left_join(&arm, t).is_some() =>
+                {
+                    groups.push((Some(t.clone()), vec![Arc::clone(&arm)]));
+                    continue;
                 }
                 _ => {
                     match distribute_over_nested_union(&arm, replicated)? {
@@ -3423,6 +3469,37 @@ fn find_replicated_agg_join<'a>(
         .find_map(|c| find_replicated_agg_join(c, sharded_name))
 }
 
+/// KAN-162 (TPC-DS Q5's web leg): find a `LEFT JOIN` whose PRESERVED side scans the sharded
+/// table zero times (fully replicated in the bucket context — the bucket's only sharded table
+/// is `sharded_name`) and whose NULL-EXTENDED side scans it — the shape
+/// [`reject_unsafe_broadcast_shapes`] correctly refuses to run per worker: every worker holds
+/// every preserved row but only a slice of the null-extended side, so an unmatched preserved
+/// row would null-extend once per worker. The bucket instead runs the co-located composition
+/// built by [`union_left_join_branch_stages`]: both sides are hash-shuffled by the join key
+/// and the LEFT JOIN runs per partition, each preserved row landing in exactly one bucket.
+///
+/// The caller guarantees the bucket plan's only sharded table is `sharded_name`, scanned
+/// exactly once overall — so the preserved side is necessarily all-replicated and the
+/// null-extended side holds that single scan. Only `JoinType::Left` qualifies: Right/Full
+/// spellings are a different shape (and q80's `fact LEFT JOIN returns`, sharded side
+/// preserved, is already broadcast-safe and never reaches here).
+fn find_co_locatable_left_join<'a>(
+    lp: &'a LogicalPlan,
+    sharded_name: &str,
+) -> Option<&'a datafusion::logical_expr::Join> {
+    if let LogicalPlan::Join(j) = lp {
+        if j.join_type == JoinType::Left
+            && count_table_scans(&j.left, sharded_name) == 0
+            && count_table_scans(&j.right, sharded_name) == 1
+        {
+            return Some(j);
+        }
+    }
+    lp.inputs()
+        .iter()
+        .find_map(|c| find_co_locatable_left_join(c, sharded_name))
+}
+
 /// Column-remap scope for [`try_split_union_agg_join`]'s stage C: left-aggregate output columns
 /// resolve to the recombined `laq.g{j}` / `laq.r{i}`, the replicated aggregate's output columns
 /// to `raq.<name>`. Qualified references disambiguate by the two sides' subquery aliases; a bare
@@ -3929,6 +4006,392 @@ fn union_agg_join_bucket_stages(
     let stage_d = StageDef::new(first_id + 3, stage_d_sql, vec![first_id + 2], vec![]);
 
     Ok(Some(vec![stage_a, stage_b, stage_c, stage_d]))
+}
+
+/// Which side of a co-located LEFT JOIN a column reference resolves to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LjSide {
+    Left,
+    Right,
+    Neither,
+    Ambiguous,
+}
+
+/// Stages R1–R3 of the co-located LEFT JOIN composition for ONE sharded union bucket whose
+/// arm chains over `LeftJoin(replicated preserved, sharded null-extended)` — TPC-DS Q5's web
+/// leg (`web_returns LEFT JOIN web_sales`, the join existing only to recover
+/// `ws_web_site_sk` for return rows). See [`find_co_locatable_left_join`] for why the bucket
+/// cannot run per worker. The composition (q77's stage-A/B pattern at row level):
+///
+/// 1. **R1**: a narrow key-shuffle of the null-extended side — join keys first (so
+///    `hash_key_cols = 0..k`), then exactly the right-side columns referenced above the
+///    join. An ordinary sliced sharded leaf stage: a per-partition bucket holds ALL the
+///    side's rows for its key slice.
+/// 2. **R2**: the preserved side unparsed verbatim (q77's stage-B recipe), computed once
+///    ([`ExchangeMode::Forward`]) and hash-shuffled by the left key positions — each
+///    preserved row routed to exactly one bucket, NULL keys included (NULLs hash to one
+///    deterministic bucket and null-extend there exactly once).
+/// 3. **R3 (the bucket's producer)**: the flat producer's own construction — the outer
+///    partial SELECT over [`union_split_tail`] — with the tail's two FROM items
+///    token-substituted to the positional shuffle inputs (see
+///    [`substitute_co_located_join_inputs`]). Replicated dims in the chain scan locally (the
+///    KAN-55 consumer-stage precedent). R3's shuffle key is the caller's to assign (the
+///    shared group-key hash, or the partition-0 gather for grouping sets).
+///
+/// Exactness: equal keys co-locate, so partition p reproduces `preserved_p LEFT JOIN
+/// null_ext_p` over exactly the rows hashing to p — matched rows expand exactly once
+/// (arbitrary fanout; no uniqueness assumption), unmatched and NULL-keyed preserved rows
+/// null-extend exactly once. The sharded fact's measures stay with the separate flat
+/// producer (the union's sales branch), so nothing double-counts.
+///
+/// `Ok(None)` — a safe refusal — when the shape is not exactly this one: either join input
+/// not a bare scan, no equijoin key or a residual (non-equality) join filter, a key that is
+/// not a plain column, a non-INNER join above the LEFT JOIN in the bucket's chain, a
+/// right-side reference above the join that does not resolve unambiguously, or a tail
+/// whose FROM items do not substitute exactly once each.
+fn union_left_join_branch_stages(
+    p: &Peeled<'_>,
+    plan: &LogicalPlan,
+    sharded_name: &str,
+    first_id: u32,
+) -> Result<Option<Vec<StageDef>>> {
+    let up = Unparser::default();
+    let Some(join) = find_co_locatable_left_join(plan, sharded_name) else {
+        return Ok(None);
+    };
+    // Both join inputs must be bare scans: R1/R2 are built straight from the scan, and the
+    // tail substitution rewrites exactly one bare FROM item per side.
+    let LogicalPlan::TableScan(left_scan) = join.left.as_ref() else {
+        return Ok(None);
+    };
+    let LogicalPlan::TableScan(right_scan) = join.right.as_ref() else {
+        return Ok(None);
+    };
+    let preserved = left_scan.table_name.to_string();
+    let null_ext = right_scan.table_name.to_string();
+    if null_ext != sharded_name {
+        return Ok(None);
+    }
+    // Every other join in the bucket's chain must be INNER (DataFusion's CrossJoin spelling
+    // included — the KAN-26 normalization converts those before the cascade, but admit
+    // either): an outer join above the LEFT JOIN is a different composition. Its other
+    // children are replicated — the caller's `plan_sharded == [t]` re-derivation has run.
+    if !other_joins_inner(plan, join) {
+        return Ok(None);
+    }
+
+    let left_fields: Vec<&str> = join
+        .left
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    let right_fields: Vec<&str> = join
+        .right
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    let side_of = |c: &Column| -> LjSide {
+        match &c.relation {
+            Some(r) => {
+                let rel = r.to_string();
+                if rel == preserved {
+                    LjSide::Left
+                } else if rel == null_ext {
+                    LjSide::Right
+                } else {
+                    LjSide::Neither
+                }
+            }
+            None => {
+                match (
+                    left_fields.contains(&c.name.as_str()),
+                    right_fields.contains(&c.name.as_str()),
+                ) {
+                    (true, false) => LjSide::Left,
+                    (false, true) => LjSide::Right,
+                    (true, true) => LjSide::Ambiguous,
+                    (false, false) => LjSide::Neither,
+                }
+            }
+        }
+    };
+
+    // Equijoin keys: ON plus equality conjuncts parked in `filter` (DataFusion keeps the
+    // analyzed plan's join conditions there). Any non-equality residual declines.
+    let Ok((keys, residual)) = collect_equijoin_keys(&join.on, join.filter.as_ref()) else {
+        return Ok(None);
+    };
+    if residual.is_some() {
+        return Ok(None);
+    }
+    // Orient each pair (preserved side first) and require plain columns both sides.
+    let mut left_key_names: Vec<String> = Vec::new();
+    let mut right_key_names: Vec<String> = Vec::new();
+    for (a, b) in &keys {
+        let (Expr::Column(ca), Expr::Column(cb)) = (a, b) else {
+            return Ok(None);
+        };
+        match (side_of(ca), side_of(cb)) {
+            (LjSide::Left, LjSide::Right) => {
+                left_key_names.push(ca.name.clone());
+                right_key_names.push(cb.name.clone());
+            }
+            (LjSide::Right, LjSide::Left) => {
+                left_key_names.push(cb.name.clone());
+                right_key_names.push(ca.name.clone());
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    // The right-side columns referenced anywhere above the join (the join's payload — Q5's
+    // `ws_web_site_sk`). Column references inside the null-extended subtree itself are
+    // excluded; a bare name resolving to BOTH sides is ambiguous and declines.
+    let mut referenced: Vec<String> = Vec::new();
+    {
+        let mut cols: Vec<Column> = Vec::new();
+        collect_columns_outside(plan, join.right.as_ref(), &mut cols);
+        for c in &cols {
+            match side_of(c) {
+                LjSide::Right => {
+                    if !referenced.contains(&c.name) {
+                        referenced.push(c.name.clone());
+                    }
+                }
+                LjSide::Ambiguous => return Ok(None),
+                LjSide::Left | LjSide::Neither => {}
+            }
+        }
+    }
+
+    // R1: narrow key-shuffle of the null-extended side (join keys first).
+    let mut extra: Vec<String> = referenced
+        .iter()
+        .filter(|c| !right_key_names.contains(c))
+        .cloned()
+        .collect();
+    extra.sort();
+    for name in right_key_names.iter().chain(&extra) {
+        if !right_fields.contains(&name.as_str()) {
+            return Ok(None);
+        }
+    }
+    let r1_cols: Vec<String> = right_key_names
+        .iter()
+        .chain(&extra)
+        .map(|c| format!("{null_ext}.{c}"))
+        .collect();
+    let r1_sql = sanitize_generated_sql(&format!("SELECT {} FROM {null_ext}", r1_cols.join(", ")));
+    let stage_r1 = StageDef::new(
+        first_id,
+        r1_sql,
+        vec![],
+        (0..right_key_names.len() as u32).collect(),
+    );
+
+    // R2: the preserved side in full, once, hash-co-located by the left join key.
+    let r2_sql = sanitize_generated_sql(
+        &up.plan_to_sql(join.left.as_ref())
+            .map_err(|e| {
+                Error::Unsupported(format!(
+                    "auto-distribute: unparse co-located LEFT JOIN preserved side: {e}"
+                ))
+            })?
+            .to_string(),
+    );
+    let left_key_pos: Option<Vec<u32>> = left_key_names
+        .iter()
+        .map(|n| {
+            join.left
+                .schema()
+                .fields()
+                .iter()
+                .position(|f| f.name() == n)
+                .map(|i| i as u32)
+        })
+        .collect();
+    let Some(left_key_pos) = left_key_pos else {
+        return Ok(None);
+    };
+    let mut stage_r2 = StageDef::new(first_id + 1, r2_sql, vec![], left_key_pos);
+    stage_r2.exchange = ExchangeMode::Forward;
+
+    // R3: the bucket's producer — the flat producer's construction over the substituted
+    // tail. upstreams = [R1, R2], so `shuffle_input_0` is the null-extended side and
+    // `shuffle_input_1` the preserved side. The shuffle key is the caller's to assign.
+    let tail = union_split_tail(plan)?;
+    let Some(tail) = substitute_co_located_join_inputs(&tail, &preserved, &null_ext) else {
+        return Ok(None);
+    };
+    let aggs = p
+        .agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()?;
+    let group_sql: Vec<String> = flattened_group_exprs(&p.agg.group_expr)
+        .into_iter()
+        .map(|g| expr_sql(&up, g))
+        .collect::<Result<_>>()?;
+    let (psel, _) = partial_and_combine_lists(&group_sql, &aggs)?;
+    let r3_sql = sanitize_generated_sql(&format!(
+        "SELECT {} {tail} GROUP BY {}",
+        psel.join(", "),
+        group_sql.join(", ")
+    ));
+    let stage_r3 = StageDef::new(first_id + 2, r3_sql, vec![first_id, first_id + 1], vec![]);
+
+    Ok(Some(vec![stage_r1, stage_r2, stage_r3]))
+}
+
+/// Every `Join` node in `lp`'s subtree other than the co-located LEFT JOIN `lj` (identified
+/// by pointer — it is borrowed out of the same plan tree) is an INNER join.
+fn other_joins_inner(lp: &LogicalPlan, lj: &datafusion::logical_expr::Join) -> bool {
+    let here_ok = match lp {
+        LogicalPlan::Join(j) => std::ptr::eq(j, lj) || j.join_type == JoinType::Inner,
+        _ => true,
+    };
+    here_ok && lp.inputs().iter().all(|c| other_joins_inner(c, lj))
+}
+
+/// All expression columns in `lp`'s subtree except those under `skip` (pointer-identified —
+/// the co-located LEFT JOIN's null-extended input, whose own columns the join keys already
+/// cover).
+fn collect_columns_outside(lp: &LogicalPlan, skip: &LogicalPlan, out: &mut Vec<Column>) {
+    if std::ptr::eq(lp, skip) {
+        return;
+    }
+    for e in lp.expressions() {
+        collect_expr_columns(&e, out);
+    }
+    for c in lp.inputs() {
+        collect_columns_outside(c, skip, out);
+    }
+}
+
+/// Token-aware rewrite of a co-located LEFT JOIN bucket's FROM tail: the preserved side's
+/// FROM item becomes `(SELECT * FROM shuffle_input_1) AS <preserved>` (R2) and the
+/// null-extended side's JOIN item becomes `(SELECT * FROM shuffle_input_0) AS <null_ext>`
+/// (R1). `None` unless each substitutes exactly once — the bucket's count==1 scan
+/// guarantees each table token appears exactly once as a FROM/JOIN item, so anything else
+/// means the shape was not the expected one.
+///
+/// Whole-identifier, keyword-anchored: only an identifier immediately following a `FROM` or
+/// `JOIN` keyword qualifies, so qualified column references (`web_sales.ws_item_sk` in the
+/// ON clause) and table mentions inside string literals / quoted identifiers / comments are
+/// never rewritten (the `localize_shuffle_input_sql` discipline).
+fn substitute_co_located_join_inputs(
+    tail: &str,
+    preserved: &str,
+    null_ext: &str,
+) -> Option<String> {
+    let bytes = tail.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(tail.len() + 64);
+    let mut n_preserved = 0usize;
+    let mut n_null_ext = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Quoted spans: 'string' / "identifier" / `identifier`, each self-escaped by doubling.
+        if c == b'\'' || c == b'"' || c == b'`' {
+            let quote = c;
+            out.push(c);
+            i += 1;
+            while i < bytes.len() {
+                out.push(bytes[i]);
+                if bytes[i] == quote {
+                    if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                        out.push(bytes[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Line comment: copy through end-of-line verbatim.
+        if c == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment: copy through the closing marker verbatim.
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            out.extend_from_slice(b"/*");
+            i += 2;
+            while i < bytes.len() {
+                out.push(bytes[i]);
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    out.push(b'/');
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'_' || c.is_ascii_alphabetic() {
+            let start = i;
+            while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            let ident = &tail[start..i];
+            let is_from = ident.eq_ignore_ascii_case("from");
+            let is_join = ident.eq_ignore_ascii_case("join");
+            if is_from || is_join {
+                // The FROM/JOIN item: the next identifier after whitespace, if any.
+                let mut j = i;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b'_' || bytes[j].is_ascii_alphabetic()) {
+                    let tstart = j;
+                    let mut tend = j;
+                    while tend < bytes.len()
+                        && (bytes[tend] == b'_' || bytes[tend].is_ascii_alphanumeric())
+                    {
+                        tend += 1;
+                    }
+                    let target = &tail[tstart..tend];
+                    let replacement = if is_from && target == preserved {
+                        n_preserved += 1;
+                        Some(format!("(SELECT * FROM shuffle_input_1) AS {preserved}"))
+                    } else if is_join && target == null_ext {
+                        n_null_ext += 1;
+                        Some(format!("(SELECT * FROM shuffle_input_0) AS {null_ext}"))
+                    } else {
+                        None
+                    };
+                    if let Some(rep) = replacement {
+                        out.extend_from_slice(ident.as_bytes());
+                        out.extend_from_slice(&tail.as_bytes()[i..tstart]);
+                        out.extend_from_slice(rep.as_bytes());
+                        i = tend;
+                        continue;
+                    }
+                }
+            }
+            out.extend_from_slice(ident.as_bytes());
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    if n_preserved == 1 && n_null_ext == 1 {
+        // Input was valid UTF-8; all inserted text is ASCII and quoted spans are copied whole.
+        Some(String::from_utf8(out).unwrap_or_else(|_| tail.to_string()))
+    } else {
+        None
+    }
 }
 
 /// TPC-DS Q5's sharded arm: an aggregate over *another* mixed union nested inside it
