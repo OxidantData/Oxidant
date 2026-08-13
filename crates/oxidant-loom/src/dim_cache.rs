@@ -728,4 +728,53 @@ mod tests {
             );
         }
     }
+
+    /// Re-inserting a live key (a re-cache after an eviction race) replaces the entry: the
+    /// old bytes leave the footprint, the new batches are served, and no entry duplicates.
+    #[test]
+    fn reinsert_same_key_replaces_without_double_counting() {
+        let cache = DimCache::with_cap(1 << 20);
+        cache.insert(
+            key("db.t", "v1"),
+            schema(),
+            Arc::new(vec![batch(vec![1, 2, 3])]),
+        );
+        let replacement = Arc::new(vec![batch(vec![4])]);
+        let replacement_bytes = replacement
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum::<usize>() as u64;
+        cache.insert(key("db.t", "v1"), schema(), replacement);
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1, "the key must not duplicate");
+        assert_eq!(
+            stats.cached_bytes, replacement_bytes,
+            "the replaced entry's bytes must leave the footprint"
+        );
+        assert_eq!(stats.inserts, 2);
+        let (_, batches) = cache.get(&key("db.t", "v1")).unwrap();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1,
+            "the cache serves the replacement's rows"
+        );
+    }
+
+    /// A provider whose scan decodes zero batches (an empty replicated table) still caches:
+    /// the schema falls back to the provider's and the stats report Exact(0) rows.
+    #[tokio::test]
+    async fn memoize_empty_scan_falls_back_to_provider_schema() {
+        let cache = DimCache::with_cap(1 << 20);
+        let ctx = datafusion::prelude::SessionContext::new();
+        let state = ctx.state();
+        let provider: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(schema(), vec![vec![]]).unwrap());
+        let out = memoize_with(&cache, &state, "db.t", "v1".to_string(), 1, provider)
+            .await
+            .unwrap();
+        assert_eq!(out.schema().fields().len(), 1);
+        let stats = out.statistics().expect("cached dims must carry statistics");
+        assert_eq!(stats.num_rows, Precision::Exact(0));
+        assert_eq!(cache.stats().inserts, 1);
+    }
 }
