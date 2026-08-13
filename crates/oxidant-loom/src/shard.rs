@@ -22,13 +22,14 @@ use futures::TryStreamExt;
 use object_store::ObjectMeta;
 use oxidant_common::{Error, Result};
 
-/// Default auto-broadcast byte cap (4 GiB). Tables at/above this stay sharded even when
-/// smaller than the query's largest table. Sized so the SF100 TPC-DS mid facts
-/// (`catalog_sales` ~14.5 GB, `web_sales` ~7.2 GB) classify sharded — they were being
-/// replicated under the old 32 GiB cap, forcing the whole 3-fact chain into one 2-task
-/// stage re-scanning ~17 GB of replicated facts (KAN-161: TPC-DS Q25/Q17) — while the
-/// returns tables and dims stay replicated.
-pub const DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Default auto-broadcast byte cap (32 GiB). Tables at/above this stay sharded even when
+/// smaller than the query's largest table. NOTE: KAN-161 briefly lowered this to 4 GiB
+/// (v0.1.11) to shard the SF100 mid facts, but the planner did not yet support the
+/// resulting multi-sharded shapes — 20/99 TPC-DS queries regressed to STRICT refusals
+/// (union-of-sharded-facts, subquery-over-sharded, shuffle-projection key retention,
+/// both-sharded window joins). Reverted in v0.1.12; the threshold re-flips only when the
+/// multi-sharded shape support (KAN-162) lands with the 99-query classification guard.
+pub const DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 tokio::task_local! {
     /// Driver-classified replicate set for the current stage (lowercase names).
@@ -259,7 +260,7 @@ where
     SHARD_ASSIGNMENT_CONTEXT.scope(assignment, future).await
 }
 
-/// Byte cap for auto-broadcast (`OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES`). Default 4 GiB.
+/// Byte cap for auto-broadcast (`OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES`). Default 32 GiB.
 /// `0` disables size-based auto-replication (env override only).
 pub fn auto_broadcast_threshold_bytes() -> u64 {
     match std::env::var("OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES") {
@@ -780,16 +781,16 @@ mod tests {
         assert_eq!(disabled, vec!["nation".to_string()]);
     }
 
-    /// KAN-161: the default auto-broadcast cap is 4 GiB so the SF100 TPC-DS mid facts
-    /// (`catalog_sales` ~14.5 GB, `web_sales` ~7.2 GB) classify sharded while the returns
-    /// tables and dims stay replicated. Under the old 32 GiB cap both mid facts replicated,
-    /// collapsing the 3-fact chain into one 2-task stage re-scanning ~17 GB of replicated
-    /// facts (TPC-DS Q25 +298s, Q17 +204s).
+    /// KAN-161 revert: the default auto-broadcast cap is back at 32 GiB. The 4 GiB default
+    /// (v0.1.11) classified the SF100 mid facts sharded, but the planner lacked the
+    /// multi-sharded shape support — 20/99 TPC-DS queries regressed to STRICT refusals.
+    /// The 4 GiB re-flip lands with KAN-162 (multi-sharded union split + classification
+    /// guard); until then the mid facts replicate and Q14/Q23 keep their v0.1.10 plans.
     #[test]
-    fn default_threshold_keeps_sf100_mid_facts_sharded() {
+    fn default_threshold_reverts_to_32_gib_pending_kan162() {
         assert_eq!(
             DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES,
-            4 * 1024 * 1024 * 1024
+            32 * 1024 * 1024 * 1024
         );
 
         let g = 1024 * 1024 * 1024;
@@ -803,16 +804,23 @@ mod tests {
             ("item".into(), Some(50_000_000)),
         ];
         let got = classify_replicated_tables(&sized, &[], DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES);
-        for sharded in ["catalog_sales", "web_sales", "store_sales"] {
+        for sharded in ["catalog_sales"] {
             assert!(
                 !got.iter().any(|t| t == sharded),
-                "{sharded} must stay sharded at the 4 GiB default"
+                "{sharded} must stay sharded (byte anchor)"
             );
         }
-        for replicated in ["catalog_returns", "web_returns", "store_returns", "item"] {
+        for replicated in [
+            "web_sales",
+            "store_sales",
+            "catalog_returns",
+            "web_returns",
+            "store_returns",
+            "item",
+        ] {
             assert!(
                 got.contains(&replicated.to_string()),
-                "{replicated} must replicate at the 4 GiB default"
+                "{replicated} must replicate at the reverted 32 GiB default"
             );
         }
     }
