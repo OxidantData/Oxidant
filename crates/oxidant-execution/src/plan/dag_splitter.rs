@@ -15,7 +15,11 @@
 //!   replicated-fact scan + aggregate was recomputed `OXIDANT_SHUFFLE_PARTITIONS` times (16× at
 //!   SF10) with only partition 0's copy ever used. Such a branch now becomes a single
 //!   `Forward` stage: computed exactly once on one worker (every worker holds the replicated
-//!   inputs), its exact output gathered to partition 0 like any sharded branch's.
+//!   inputs), its exact output gathered to partition 0 like any sharded branch's. On a
+//!   multi-worker cluster the branch instead fans out (KAN-156): a per-worker partial
+//!   aggregate over a disjoint 1/W file slice of the branch's anchor table, hash-shuffled by
+//!   the group key, plus the ordinary recombine — same exactness argument as a sharded fact's
+//!   partial, since the anchor's slice alone partitions the branch's joined rows.
 //! - **Identical branches are planned once.** A CTE self-joined N times (Q11's `year_total` ×4)
 //!   inlines as N structurally identical subtrees; deduplicating by plan fingerprint (volatile
 //!   expressions excluded — they must re-evaluate per reference) leaves one sub-DAG whose
@@ -67,10 +71,11 @@ use oxidant_common::{Error, Result};
 
 use super::shape_extensions::{build_outer_finalize, ensure_subquery_tables_replicated};
 use super::stage_planner::{
-    base_tables, count_table_scans, expr_sql, extract_from_tail, flatten_and_conjuncts,
-    partial_combine_sql, peel, plan_contains_distinct, plan_distributed_logical,
-    recombine_partial_state_sql, reject_unsafe_broadcast_shapes, sanitize_generated_sql,
-    strip_alias, AggSpec, DistributedQuery,
+    base_tables, build_remap, count_table_scans, expr_sql, extract_from_tail,
+    flatten_and_conjuncts, flattened_group_exprs, is_grouping_set, partial_combine_sql, peel,
+    plan_contains_distinct, plan_distributed_logical, recombine_partial_state_sql,
+    recombine_stage_sql, reject_unsafe_broadcast_shapes, sanitize_generated_sql,
+    sliced_replicate_stamp, strip_alias, AggSpec, DistributedQuery,
 };
 use crate::driver::{ExchangeMode, StageDef};
 
@@ -194,8 +199,11 @@ pub(crate) fn try_branch_dag(
             // (16× at SF10) while only partition 0's copy is ever used. Materialize it as one
             // `Forward` stage instead — computed exactly once (the driver's Forward producers
             // run on a single worker), its already-exact output gathered to partition 0 like
-            // any other branch output.
-            BranchKind::ReplicatedAggregate => forward_branch_query(branch.node, r)?,
+            // any other branch output. KAN-156: on a multi-worker cluster the branch instead
+            // fans out — per-worker partials over disjoint file slices of the branch's anchor
+            // table plus the ordinary recombine — when the shape allows (see
+            // [`sliced_branch_query`]).
+            BranchKind::ReplicatedAggregate => replicated_branch_query(branch.node, replicated, r)?,
         };
         rep_queries.insert(r, dq);
     }
@@ -290,7 +298,9 @@ enum BranchKind {
     /// Scans at least one sharded table; planned through the shape planners into a sub-DAG.
     Sharded,
     /// An aggregate branch over only replicated tables; materialized as a single `Forward`
-    /// stage so its full replicated-fact scan runs once, not once per shuffle partition.
+    /// stage so its full replicated-fact scan runs once, not once per shuffle partition — or,
+    /// on a multi-worker cluster, as a sliced per-worker partial + recombine (KAN-156, see
+    /// [`sliced_branch_query`]).
     ReplicatedAggregate,
 }
 
@@ -318,6 +328,82 @@ fn forward_branch_query(branch: &LogicalPlan, branch_i: usize) -> Result<Distrib
         }],
         finalize_sql: None,
     })
+}
+
+/// KAN-156: fan a replicated-only aggregate branch out across workers when the shape allows,
+/// falling back to the single-`Forward` materialization otherwise.
+fn replicated_branch_query(
+    branch: &LogicalPlan,
+    replicated: &[&str],
+    branch_i: usize,
+) -> Result<DistributedQuery> {
+    if let Some(dq) = sliced_branch_query(branch, replicated) {
+        return Ok(dq);
+    }
+    forward_branch_query(branch, branch_i)
+}
+
+/// The fanned-out form of a replicated-only aggregate branch (TPC-DS Q78's `ws`/`cs` arms,
+/// Q58's per-channel item arms — SF100 profile: 292 s of single-`Forward`-task work on the cs
+/// arm alone): a per-worker **partial** aggregate over a disjoint 1/W file slice of the
+/// branch's anchor table, hash-shuffled by the group key, then the ordinary recombine — the
+/// same stage pair [`recombine_stage_sql`] builds for a sharded fact. The anchor's slice alone
+/// partitions the branch's joined rows (every other replicated table stays whole on each
+/// worker, so the arm's joins — including a `LEFT ANTI` whose preserved side is the anchor —
+/// stay co-located within the slice), and the per-slice partials recombine associatively, so
+/// the output is byte-identical in semantics to the single-`Forward` branch.
+///
+/// `None` — the caller keeps `Forward` — for anything the two-stage form cannot reproduce
+/// exactly: not a peel-able plain grouped aggregate, a `DISTINCT` aggregate, grouping sets
+/// (their gather/two-phase variants are not composed here), an `ORDER BY`/`LIMIT` on the
+/// branch, an intervening alias projection, no safe slice anchor, or a degenerate all-sliced
+/// stamp (see [`sliced_replicate_stamp`]). The branch's combine stage is the sub-DAG output:
+/// [`outer_keying`] may still re-target its hash key at the skeleton's equijoin columns, and
+/// its gather default matches the `Forward` placement it replaces.
+fn sliced_branch_query(branch: &LogicalPlan, replicated: &[&str]) -> Option<DistributedQuery> {
+    fn build(branch: &LogicalPlan, replicated: &[&str]) -> Result<DistributedQuery> {
+        let p = peel(branch)?;
+        if p.sort.is_some() || p.limit.is_some() || !p.alias_projections.is_empty() {
+            return Err(Error::Unsupported("branch top not plain".into()));
+        }
+        let agg = p.agg;
+        if agg.group_expr.is_empty() || is_grouping_set(&agg.group_expr) {
+            return Err(Error::Unsupported(
+                "branch aggregate not a plain group-by".into(),
+            ));
+        }
+        let aggs = agg
+            .aggr_expr
+            .iter()
+            .map(AggSpec::classify)
+            .collect::<Result<Vec<_>>>()?;
+        if aggs.iter().any(|a| a.distinct) {
+            return Err(Error::Unsupported("DISTINCT aggregate".into()));
+        }
+        let stamp = sliced_replicate_stamp(&agg.input, replicated)
+            .ok_or_else(|| Error::Unsupported("no safe slice anchor".into()))?;
+        let up = Unparser::default();
+        let group_sql: Vec<String> = flattened_group_exprs(&agg.group_expr)
+            .into_iter()
+            .map(|g| expr_sql(&up, g))
+            .collect::<Result<_>>()?;
+        let input_sql = up
+            .plan_to_sql(&agg.input)
+            .map_err(|e| Error::Unsupported(format!("unparse branch input: {e}")))?
+            .to_string();
+        let tail = sanitize_generated_sql(&extract_from_tail(&input_sql)?);
+        let remap = build_remap(&p);
+        let (partial_sql, final_sql) = recombine_stage_sql(&p, &group_sql, &aggs, &tail, &remap)?;
+        let hash_key_cols: Vec<u32> = (0..group_sql.len() as u32).collect();
+        let mut partial = StageDef::new(0, partial_sql, vec![], hash_key_cols);
+        partial.replicated_tables = stamp;
+        let combine = StageDef::new(1, final_sql, vec![0], vec![]);
+        Ok(DistributedQuery {
+            stages: vec![partial, combine],
+            finalize_sql: None,
+        })
+    }
+    build(branch, replicated).ok()
 }
 
 /// One branch representative eligible for shared-scan merging: a bare global aggregate (through
@@ -1834,7 +1920,11 @@ fn append_branch(
             exchange: stage.exchange,
             plan_fragment: stage.plan_fragment,
             lakehouse_snapshot_pins: stage.lakehouse_snapshot_pins,
-            replicated_tables: String::new(),
+            // Preserve a deliberate per-stage replicate stamp (a sliced replicated producer's
+            // reduced stamp drops its anchor tables so the workers' file sharder slices those
+            // scans for this stage only); an empty stamp is filled by the outer
+            // `stamp_replicated_tables` as before.
+            replicated_tables: stage.replicated_tables,
         });
         output_id = Some(new_id);
         *next_id = (*next_id).max(new_id.checked_add(1).ok_or_else(|| {
