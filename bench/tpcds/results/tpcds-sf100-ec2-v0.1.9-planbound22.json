@@ -1,0 +1,713 @@
+{
+  "dataset": "TPC-DS SF100 (Glue tpcds_sf100 via EC2 Connect)",
+  "machine": "oxidant-sf100-v0.1.9-semifilters",
+  "run_date": "2026-08-12",
+  "endpoint": "sc://44.228.131.152:50051",
+  "tries": 1,
+  "failures": 0,
+  "queries": [
+    {
+      "query": "Q1",
+      "tries": [
+        17.582041025161743
+      ],
+      "elapsed_s": 17.582041025161743,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q2",
+      "tries": [
+        111.29159593582153
+      ],
+      "elapsed_s": 111.29159593582153,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q3",
+      "tries": [
+        74.31257796287537
+      ],
+      "elapsed_s": 74.31257796287537,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q4",
+      "tries": [
+        159.44613695144653
+      ],
+      "elapsed_s": 159.44613695144653,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q5",
+      "tries": [
+        289.80833196640015
+      ],
+      "elapsed_s": 289.80833196640015,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q6",
+      "tries": [
+        5.019506216049194
+      ],
+      "elapsed_s": 5.019506216049194,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q7",
+      "tries": [
+        2.5735418796539307
+      ],
+      "elapsed_s": 2.5735418796539307,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q8",
+      "tries": [
+        1.5434527397155762
+      ],
+      "elapsed_s": 1.5434527397155762,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q9",
+      "tries": [
+        2.1123929023742676
+      ],
+      "elapsed_s": 2.1123929023742676,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q10",
+      "tries": [
+        228.35283303260803
+      ],
+      "elapsed_s": 228.35283303260803,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q11",
+      "tries": [
+        106.33722925186157
+      ],
+      "elapsed_s": 106.33722925186157,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q12",
+      "tries": [
+        1.4397881031036377
+      ],
+      "elapsed_s": 1.4397881031036377,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q13",
+      "tries": [
+        2.37166428565979
+      ],
+      "elapsed_s": 2.37166428565979,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q14",
+      "tries": [
+        1281.480504989624
+      ],
+      "elapsed_s": 1281.480504989624,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q15",
+      "tries": [
+        53.67014479637146
+      ],
+      "elapsed_s": 53.67014479637146,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q16",
+      "tries": [
+        231.75475811958313
+      ],
+      "elapsed_s": 231.75475811958313,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q17",
+      "tries": [
+        301.64358615875244
+      ],
+      "elapsed_s": 301.64358615875244,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q18",
+      "tries": [
+        40.32589793205261
+      ],
+      "elapsed_s": 40.32589793205261,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q19",
+      "tries": [
+        1.7093241214752197
+      ],
+      "elapsed_s": 1.7093241214752197,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q20",
+      "tries": [
+        0.7438321113586426
+      ],
+      "elapsed_s": 0.7438321113586426,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q21",
+      "tries": [
+        12.20777678489685
+      ],
+      "elapsed_s": 12.20777678489685,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q22",
+      "tries": [
+        1.1264190673828125
+      ],
+      "elapsed_s": 1.1264190673828125,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q23",
+      "tries": [
+        743.3232271671295
+      ],
+      "elapsed_s": 743.3232271671295,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q24",
+      "tries": [
+        94.60510325431824
+      ],
+      "elapsed_s": 94.60510325431824,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q25",
+      "tries": [
+        405.30797505378723
+      ],
+      "elapsed_s": 405.30797505378723,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q26",
+      "tries": [
+        41.160884857177734
+      ],
+      "elapsed_s": 41.160884857177734,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q27",
+      "tries": [
+        2.858557939529419
+      ],
+      "elapsed_s": 2.858557939529419,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q28",
+      "tries": [
+        2.402301788330078
+      ],
+      "elapsed_s": 2.402301788330078,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q29",
+      "tries": [
+        410.2068769931793
+      ],
+      "elapsed_s": 410.2068769931793,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q30",
+      "tries": [
+        4.430417060852051
+      ],
+      "elapsed_s": 4.430417060852051,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q31",
+      "tries": [
+        57.137113094329834
+      ],
+      "elapsed_s": 57.137113094329834,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q32",
+      "tries": [
+        55.77715992927551
+      ],
+      "elapsed_s": 55.77715992927551,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q33",
+      "tries": [
+        170.18268299102783
+      ],
+      "elapsed_s": 170.18268299102783,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q34",
+      "tries": [
+        74.99094486236572
+      ],
+      "elapsed_s": 74.99094486236572,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q35",
+      "tries": [
+        341.5151171684265
+      ],
+      "elapsed_s": 341.5151171684265,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q36",
+      "tries": [
+        75.66130995750427
+      ],
+      "elapsed_s": 75.66130995750427,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q37",
+      "tries": [
+        73.62189197540283
+      ],
+      "elapsed_s": 73.62189197540283,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q38",
+      "tries": [
+        119.18362808227539
+      ],
+      "elapsed_s": 119.18362808227539,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q39",
+      "tries": [
+        21.470568895339966
+      ],
+      "elapsed_s": 21.470568895339966,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q40",
+      "tries": [
+        14.674993991851807
+      ],
+      "elapsed_s": 14.674993991851807,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q41",
+      "tries": [
+        0.9403531551361084
+      ],
+      "elapsed_s": 0.9403531551361084,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q42",
+      "tries": [
+        1.3302409648895264
+      ],
+      "elapsed_s": 1.3302409648895264,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q43",
+      "tries": [
+        1.7684149742126465
+      ],
+      "elapsed_s": 1.7684149742126465,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q44",
+      "tries": [
+        1.2946019172668457
+      ],
+      "elapsed_s": 1.2946019172668457,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q45",
+      "tries": [
+        27.960963010787964
+      ],
+      "elapsed_s": 27.960963010787964,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q46",
+      "tries": [
+        1.6457719802856445
+      ],
+      "elapsed_s": 1.6457719802856445,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q47",
+      "tries": [
+        3.1929919719696045
+      ],
+      "elapsed_s": 3.1929919719696045,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q48",
+      "tries": [
+        2.0118021965026855
+      ],
+      "elapsed_s": 2.0118021965026855,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q49",
+      "tries": [
+        196.19777393341064
+      ],
+      "elapsed_s": 196.19777393341064,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q50",
+      "tries": [
+        94.13477301597595
+      ],
+      "elapsed_s": 94.13477301597595,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q51",
+      "tries": [
+        88.64252495765686
+      ],
+      "elapsed_s": 88.64252495765686,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q52",
+      "tries": [
+        1.3279969692230225
+      ],
+      "elapsed_s": 1.3279969692230225,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q53",
+      "tries": [
+        1.2236642837524414
+      ],
+      "elapsed_s": 1.2236642837524414,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q54",
+      "tries": [
+        301.0529398918152
+      ],
+      "elapsed_s": 301.0529398918152,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q55",
+      "tries": [
+        1.4284889698028564
+      ],
+      "elapsed_s": 1.4284889698028564,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q56",
+      "tries": [
+        162.71392583847046
+      ],
+      "elapsed_s": 162.71392583847046,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q57",
+      "tries": [
+        55.69420003890991
+      ],
+      "elapsed_s": 55.69420003890991,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q58",
+      "tries": [
+        198.88592720031738
+      ],
+      "elapsed_s": 198.88592720031738,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q59",
+      "tries": [
+        2.698762893676758
+      ],
+      "elapsed_s": 2.698762893676758,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q60",
+      "tries": [
+        167.95998096466064
+      ],
+      "elapsed_s": 167.95998096466064,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q61",
+      "tries": [
+        75.87349510192871
+      ],
+      "elapsed_s": 75.87349510192871,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q62",
+      "tries": [
+        16.27974224090576
+      ],
+      "elapsed_s": 16.27974224090576,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q63",
+      "tries": [
+        1.4307091236114502
+      ],
+      "elapsed_s": 1.4307091236114502,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q64",
+      "tries": [
+        204.0957591533661
+      ],
+      "elapsed_s": 204.0957591533661,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q65",
+      "tries": [
+        39.43416094779968
+      ],
+      "elapsed_s": 39.43416094779968,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q66",
+      "tries": [
+        111.50365710258484
+      ],
+      "elapsed_s": 111.50365710258484,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q67",
+      "tries": [
+        100.34356498718262
+      ],
+      "elapsed_s": 100.34356498718262,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q68",
+      "tries": [
+        2.30330491065979
+      ],
+      "elapsed_s": 2.30330491065979,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q69",
+      "tries": [
+        275.1762156486511
+      ],
+      "elapsed_s": 275.1762156486511,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q70",
+      "tries": [
+        79.25121784210205
+      ],
+      "elapsed_s": 79.25121784210205,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q71",
+      "tries": [
+        54.89936399459839
+      ],
+      "elapsed_s": 54.89936399459839,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q72",
+      "tries": [
+        63.69753098487854
+      ],
+      "elapsed_s": 63.69753098487854,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q73",
+      "tries": [
+        74.41863894462585
+      ],
+      "elapsed_s": 74.41863894462585,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q74",
+      "tries": [
+        61.029747009277344
+      ],
+      "elapsed_s": 61.029747009277344,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q75",
+      "tries": [
+        184.1097650527954
+      ],
+      "elapsed_s": 184.1097650527954,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q76",
+      "tries": [
+        74.85265111923218
+      ],
+      "elapsed_s": 74.85265111923218,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q77",
+      "tries": [
+        297.7821218967438
+      ],
+      "elapsed_s": 297.7821218967438,
+      "hot_s": null,
+      "error": null
+    },
+    {
+      "query": "Q78",
+      "tries": [
+        290.9764029979706
+      ],
+      "elapsed_s": 290.9764029979706,
+      "hot_s": null,
+      "error": null
+    }
+  ],
+  "elapsed_total_s": 8954.92823958397
+}

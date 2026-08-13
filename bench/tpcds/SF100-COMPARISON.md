@@ -1,9 +1,46 @@
 # TPC-DS SF100 three-engine comparison: Oxidant vs EMR Spark vs Athena
 
-Date: 2026-08-11. Dataset: TPC-DS SF100 (~100 GB scale factor 100) in Glue
+## Current standing (2026-08-13, hardware-parity track)
+
+Composed best per-query numbers on the parity cluster (2× m8g.4xlarge workers,
+`OXIDANT_DISTRIBUTED_STRICT=1`, shuffle 200) across the v0.1.8→v0.1.10 engine releases,
+measured under the KAN-146 cache-controlled discipline:
+
+| | Oxidant (composed v0.1.8–v0.1.10) | EMR Spark (2× m8g.4xlarge) | ratio |
+|--|----------------------------------:|---------------------------:|------:|
+| **Total (99 queries)** | **9604 s** | **5753 s** | **1.67×** |
+| Hard 25 (plan-bound 22 + Q14/Q23/Q78) | 5738 s | 1517 s | 3.78× |
+| **Other 74 queries** | **3865 s** | **4235 s** | **0.91× — Oxidant faster** |
+
+Oxidant beats EMR outright on **44/99** queries. The entire remaining gap (4221 s of
+3851 s) sits in the 25-query hard set; worst ratios: Q93 39× (20.6 s vs 0.5 s — trivial
+absolute), Q35 8.2×, Q82 7.3×, Q69 7.1×, Q54 6.5×, Q10 6.2×, Q14 5.1×, Q23 4.8×.
+
+Release progression on the hard set (single-pass timings, same cluster):
+- **v0.1.8** (KAN-146 broadcast-admission fix): plan-bound 22 = 3871 s; Q14 1067 s, Q23 665 s, Q78 414 s.
+- **v0.1.9** (KAN-150 cross-stage semi-join runtime filters): plan-bound 22 = 3694 s (−5%).
+  Wins: Q6 73.5→5.0 (−93%), Q42 74.1→1.3 (−98%), Q98 75.5→1.8 (−98%) — all three now beat
+  EMR — Q33 −47%, Q17/Q38/Q87/Q99 −19…−25%. Measured injection overhead on the EXISTS
+  family (knob-off A/B): Q77 ~80 s, Q35 ~55 s, Q69 ~27 s, Q10 ~17 s → admission-tightening
+  follow-up KAN-160.
+- **v0.1.10** (KAN-156 fan-out of replicated-only/Forward stages): driver journal shows
+  **zero `Forward` stages** on Q14/Q23/Q78 (was 5/2/2 single-task legs). Q14 1281→1034 s
+  (−19%), Q23 743→650 s (−13%), Q78 291→245 s (−16%). Below the profile's estimates
+  (~450/~430/~200) — the sliced legs now run W=2 tasks and the binding constraint has moved
+  to cold-scan throughput (profile fix #2) and the classification side (Q25/Q17, KAN-156
+  follow-up).
+
+Mechanism evidence: `bench/tpcds/SF100-OPERATOR-PROFILE.md` (KAN-153). Next leverage in
+order: cold-scan throughput + cache sizing (KAN-153), Q25/Q17 classification reclassify,
+Q10/Q35/Q69/Q77 replicated-EXISTS materialization (KAN-157), repeated-scan CSE (KAN-158),
+semi-filter admission (KAN-160).
+
+## Original baseline (2026-08-11)
+
+Dataset: TPC-DS SF100 (~100 GB scale factor 100) in Glue
 `tpcds_sf100` (canonical typed Parquet, `s3://weft-artifacts-810738286322/tpcds-sf100-typed/`),
 us-west-2. Same dsqgen query texts (`bench/tpcds/queries/q1..q99.sql`) for all three
-engines, single cold run per query (`tries=1`), `.collect()` timing.
+engines, single cold run per query (`tries=1`), `.collect()` timing. (Date: 2026-08-11.)
 
 ## Headline
 
