@@ -360,7 +360,7 @@ async fn q4_exists_plans_semi_shuffle_replicated_outer() {
     assert!(
         producer
             .sql
-            .contains("SELECT lineitem.l_orderkey AS k0 FROM lineitem WHERE"),
+            .contains("SELECT DISTINCT lineitem.l_orderkey AS k0 FROM lineitem WHERE"),
         "{}",
         producer.sql
     );
