@@ -1352,6 +1352,12 @@ pub(crate) struct SimpleScan<'a> {
     pub(crate) alias: Option<&'a str>,
     pub(crate) filter_sql: Option<String>,
     pub(crate) schema: datafusion::common::DFSchemaRef,
+    /// The scan's logical-plan row-count statistic (KAN-160), from the table provider's
+    /// `TableProvider::statistics()` — exact parquet-footer counts for lakehouse tables,
+    /// `Absent` for providers without statistics (e.g. `MemTable`). Read by the semi-join
+    /// filter admission gate in `join_chain`; plan consumers must treat it as the
+    /// UNFILTERED table cardinality (an upper bound once `filter_sql` applies).
+    pub(crate) stats_num_rows: datafusion::common::stats::Precision<usize>,
 }
 
 fn find_inner_equijoin(lp: &LogicalPlan) -> Result<&datafusion::logical_expr::Join> {
@@ -1387,6 +1393,11 @@ pub(crate) fn simple_table_scan(lp: &LogicalPlan) -> Result<SimpleScan<'_>> {
             alias: None,
             filter_sql: None,
             schema: s.projected_schema.clone(),
+            stats_num_rows: datafusion::datasource::source_as_provider(&s.source)
+                .ok()
+                .and_then(|p| p.statistics())
+                .map(|stats| stats.num_rows)
+                .unwrap_or(datafusion::common::stats::Precision::Absent),
         }),
         LogicalPlan::SubqueryAlias(sa) => {
             let mut inner = simple_table_scan(sa.input.as_ref())?;

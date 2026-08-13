@@ -434,6 +434,25 @@ pub fn semi_join_filters_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Maximum dim-table row count for semi-join filter admission (KAN-160; env
+/// `OXIDANT_SEMI_JOIN_FILTER_MAX_DIM_ROWS`, default **1_000_000**): a filtered replicated
+/// dim only injects its `IN (SELECT …)` conjunct when the dim's `TableProvider::statistics()`
+/// reports an EXACT row count at or below this cap. The subquery's build side (the filtered
+/// dim key set, materialized as a hash semi join in every leaf-stage task) is bounded by the
+/// dim's cardinality, so an unbounded admit could shuffle-filter a fact leaf against a
+/// near-fact-sized dim — pure overhead plus a real memory risk. `Inexact` counts are
+/// rejected outright (KAN-146 discipline: provable admission only); `Absent` fails OPEN
+/// (providers without statistics, e.g. `MemTable`, keep the KAN-150 behavior). The compared
+/// count is the dim's UNFILTERED table cardinality — the conservative bound, since the
+/// `filter_sql` conjuncts can only shrink the key set.
+pub fn semi_join_filter_max_dim_rows() -> usize {
+    std::env::var("OXIDANT_SEMI_JOIN_FILTER_MAX_DIM_ROWS")
+        .ok()
+        .as_deref()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000)
+}
+
 /// Semi-join filter conjuncts to splice into a chain's leaf scan stages: `leftmost` for the
 /// chain's leftmost scan, `by_step[i]` for step `i`'s (sharded) right scan.
 #[derive(Default)]
@@ -451,6 +470,9 @@ struct SemiJoinLeafFilters {
 ///   fact key, so the subquery would be pure overhead (KAN-146: provable admission only);
 /// - the dim filter is non-volatile (the subquery evaluates it a second time in the leaf
 ///   stage — a duplicated `rand()`/`now()` could disagree with the join-stage fold);
+/// - the dim's `TableProvider::statistics()` row count passes the KAN-160 size gate:
+///   `Exact(n)` admits iff `n <= semi_join_filter_max_dim_rows()`, `Inexact` rejects
+///   (KAN-146 discipline), `Absent` fails open (see [`semi_join_filter_max_dim_rows`]);
 /// - when the chain-side key resolves to a sharded step's right leaf, that boundary's join
 ///   must not PRESERVE the leaf's side (INNER or LEFT — a RIGHT/FULL boundary emits dim-
 ///   key-less leaf rows with NULL extension, which the filter would wrongly drop). The
@@ -481,6 +503,14 @@ fn semi_join_leaf_filters(
         };
         if sql_contains_volatile(dim_filter) {
             continue;
+        }
+        // KAN-160 size gate: admit only a provably small dim (the unfiltered cardinality
+        // bounds the filtered key set the leaf stages hash-build).
+        use datafusion::common::stats::Precision;
+        match step.right.stats_num_rows {
+            Precision::Exact(n) if n <= semi_join_filter_max_dim_rows() => {}
+            Precision::Exact(_) | Precision::Inexact(_) => continue,
+            Precision::Absent => {}
         }
         let dim_alias = scan_alias(&step.right);
         for (lk, rk) in &step.keys {
@@ -534,6 +564,7 @@ fn leaf_stage_sql_with_semis(scan: &SimpleScan<'_>, semis: &[String]) -> (String
         alias: scan.alias,
         filter_sql,
         schema: scan.schema.clone(),
+        stats_num_rows: scan.stats_num_rows,
     };
     leaf_stage_sql(&narrowed)
 }
@@ -1964,6 +1995,146 @@ mod tests {
         assert!(
             !leaf_sql(&dq, "fa").contains(" IN (SELECT"),
             "the kill switch must restore the unfiltered leaf, got:\n{}",
+            leaf_sql(&dq, "fa")
+        );
+    }
+
+    // --- KAN-160: stats-gated semi-join filter admission --------------------------------
+
+    /// A `MemTable` wrapper whose logical-plan statistics are overridden, so the KAN-160
+    /// admission gate can be exercised without parquet footers. `None` keeps the provider's
+    /// default unknown-statistics shape.
+    #[derive(Debug)]
+    struct StatsMemTable {
+        inner: Arc<datafusion::datasource::MemTable>,
+        stats: Option<datafusion::common::Statistics>,
+    }
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for StatsMemTable {
+        fn schema(&self) -> oxidant_loom::arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::logical_expr::TableType {
+            datafusion::logical_expr::TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        fn statistics(&self) -> Option<datafusion::common::Statistics> {
+            self.stats.clone()
+        }
+    }
+
+    /// [`chain_plan_mixed`] with the dim registered through [`StatsMemTable`] carrying an
+    /// EXACT `num_rows` of `dim_rows` (`None` = absent statistics). Sharded tables stay on
+    /// plain `MemTable` (statistics `Absent`).
+    async fn chain_plan_dim_stats(
+        sql: &str,
+        sharded: &[&str],
+        dim: &str,
+        dim_rows: Option<usize>,
+    ) -> DistributedQuery {
+        let engine = oxidant_loom::Engine::new();
+        let int = DataType::Int64;
+        for t in sharded {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", int.clone(), true),
+                Field::new("g", int.clone(), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+                    Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+                ],
+            )
+            .unwrap();
+            engine.register_batches(t, vec![batch]).unwrap();
+        }
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("k", int.clone(), true),
+            Field::new("d", int.clone(), true),
+        ]));
+        let dim_batch = RecordBatch::try_new(
+            dim_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap();
+        let mem =
+            datafusion::datasource::MemTable::try_new(dim_schema.clone(), vec![vec![dim_batch]])
+                .unwrap();
+        let stats = dim_rows.map(|n| {
+            datafusion::common::Statistics::new_unknown(&dim_schema)
+                .with_num_rows(datafusion::common::stats::Precision::Exact(n))
+        });
+        let table: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(StatsMemTable {
+            inner: Arc::new(mem),
+            stats,
+        });
+        engine.ctx().register_table(dim, table).unwrap();
+        let lp = engine.logical_plan(sql).await.unwrap();
+        let p = super::super::stage_planner::peel(&lp).unwrap();
+        plan_shuffle_join_chain(&p, sharded, &[dim])
+            .unwrap_or_else(|e| panic!("chain planning failed for {sql}: {e}"))
+    }
+
+    /// A dim whose EXACT statistics row count exceeds
+    /// `OXIDANT_SEMI_JOIN_FILTER_MAX_DIM_ROWS` (default 1M) must NOT inject — the leaf
+    /// stages would hash-build a near-fact-sized key set for no proven selectivity.
+    #[tokio::test]
+    async fn semi_filter_rejected_when_dim_exact_rows_exceed_cap() {
+        let _env = SEMI_FILTER_ENV_LOCK.lock().await;
+        let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                   JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fa.k = dimf.k \
+                   JOIN fb ON fa.k = fb.k GROUP BY fa.g";
+        let dq = chain_plan_dim_stats(sql, &["fa", "fb"], "dim", Some(2_000_000)).await;
+        assert!(
+            !leaf_sql(&dq, "fa").contains(" IN (SELECT"),
+            "a 2M-row dim exceeds the 1M admission cap — no injection, got:\n{}",
+            leaf_sql(&dq, "fa")
+        );
+    }
+
+    /// A dim whose EXACT statistics row count is within the cap injects as before.
+    #[tokio::test]
+    async fn semi_filter_injected_when_dim_exact_rows_within_cap() {
+        let _env = SEMI_FILTER_ENV_LOCK.lock().await;
+        let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                   JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fa.k = dimf.k \
+                   JOIN fb ON fa.k = fb.k GROUP BY fa.g";
+        let dq = chain_plan_dim_stats(sql, &["fa", "fb"], "dim", Some(1_000_000)).await;
+        assert!(
+            leaf_sql(&dq, "fa").contains("k IN (SELECT k FROM dim AS dimf WHERE (dim.d > 10))"),
+            "a dim exactly at the 1M cap must still inject, got:\n{}",
+            leaf_sql(&dq, "fa")
+        );
+    }
+
+    /// A dim with ABSENT statistics fails open: providers without statistics keep the
+    /// KAN-150 injection (the `MemTable`-backed plans stay byte-identical).
+    #[tokio::test]
+    async fn semi_filter_injected_when_dim_stats_absent() {
+        let _env = SEMI_FILTER_ENV_LOCK.lock().await;
+        let sql = "SELECT fa.g, COUNT(*) AS c FROM fa \
+                   JOIN (SELECT k FROM dim WHERE d > 10) AS dimf ON fa.k = dimf.k \
+                   JOIN fb ON fa.k = fb.k GROUP BY fa.g";
+        let dq = chain_plan_dim_stats(sql, &["fa", "fb"], "dim", None).await;
+        assert!(
+            leaf_sql(&dq, "fa").contains("k IN (SELECT k FROM dim AS dimf WHERE (dim.d > 10))"),
+            "absent dim statistics must fail open and inject, got:\n{}",
             leaf_sql(&dq, "fa")
         );
     }
