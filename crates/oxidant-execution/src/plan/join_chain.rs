@@ -42,7 +42,7 @@
 //! a hash semi join whose DataFusion dynamic filter prunes the fact's parquet scan — fact
 //! reduction BEFORE the shuffle write, Trino-style.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan};
 use datafusion::sql::unparser::Unparser;
@@ -50,11 +50,11 @@ use oxidant_common::{Error, Result};
 
 use super::stage_planner::{
     base_tables, build_finalize, build_remap, collect_equijoin_keys, column_name,
-    distinct_stage_sql, expr_sql, recombine_stage_sql, sanitize_generated_sql,
-    shuffle_join_two_tables, simple_table_scan, sql_contains_volatile, AggSpec, DistributedQuery,
-    Peeled, SimpleScan,
+    distinct_stage_sql, expr_sql, plan_distributed_logical, recombine_stage_sql,
+    sanitize_generated_sql, shuffle_join_two_tables, simple_table_scan, sql_contains_volatile,
+    AggSpec, DistributedQuery, Peeled, SimpleScan,
 };
-use crate::driver::StageDef;
+use crate::driver::{ExchangeMode, StageDef};
 
 /// Plan a left-deep shuffle-join chain (+ grouped aggregation) over `sharded.len() >= 2` tables.
 pub(crate) fn plan_shuffle_join_chain(
@@ -62,7 +62,7 @@ pub(crate) fn plan_shuffle_join_chain(
     sharded: &[&str],
     replicated: &[&str],
 ) -> Result<DistributedQuery> {
-    let (leftmost, steps, crossed_filter) = extract_equijoin_chain(&p.agg.input)?;
+    let (leftmost, steps, crossed_filter) = extract_equijoin_chain(&p.agg.input, replicated)?;
     if steps.is_empty() {
         return Err(Error::Unsupported(
             "auto-distribute: expected at least one equijoin between sharded tables".into(),
@@ -75,24 +75,39 @@ pub(crate) fn plan_shuffle_join_chain(
         && steps[0].join_type == JoinType::Inner
         && sharded.len() == 2
         && base_tables(&p.agg.input).len() == 2
-        && sharded.contains(&leftmost.table)
-        && sharded.contains(&steps[0].right.table)
+        && leftmost.table().is_some_and(|t| sharded.contains(&t))
+        && steps[0].right.table().is_some_and(|t| sharded.contains(&t))
     {
         return shuffle_join_two_tables(p, sharded);
     }
 
     for step in &steps {
-        let t = step.right.table;
-        if !sharded.contains(&t) && !replicated.contains(&t) {
-            return Err(Error::Unsupported(format!(
-                "auto-distribute: join chain table `{t}` is neither sharded nor replicated"
-            )));
+        match &step.right {
+            ChainSide::Scan(scan) => {
+                let t = scan.table;
+                if !sharded.contains(&t) && !replicated.contains(&t) {
+                    return Err(Error::Unsupported(format!(
+                        "auto-distribute: join chain table `{t}` is neither sharded nor replicated"
+                    )));
+                }
+            }
+            // A derived leg shuffles only ever as an INNER equijoin side (the comma-join
+            // shapes it exists for); outer / semi / anti boundaries keep the rejection.
+            ChainSide::Derived(_) if step.join_type != JoinType::Inner => {
+                return Err(Error::Unsupported(
+                    "auto-distribute: derived shuffle join side is only supported on INNER joins"
+                        .into(),
+                ));
+            }
+            ChainSide::Derived(_) => {}
         }
     }
-    if !sharded.contains(&leftmost.table) {
-        return Err(Error::Unsupported(
-            "auto-distribute: left-deep shuffle chain requires a sharded leftmost table".into(),
-        ));
+    if let ChainSide::Scan(scan) = &leftmost {
+        if !sharded.contains(&scan.table) {
+            return Err(Error::Unsupported(
+                "auto-distribute: left-deep shuffle chain requires a sharded leftmost table".into(),
+            ));
+        }
     }
 
     ensure_semi_anti_aggs_ok(p, &steps)?;
@@ -101,11 +116,109 @@ pub(crate) fn plan_shuffle_join_chain(
 }
 
 struct ChainStep<'a> {
-    right: SimpleScan<'a>,
+    right: ChainSide<'a>,
     /// Equijoin key pairs `(left, right)` — one or more for composite keys (KAN-10).
     keys: Vec<(Expr, Expr)>,
     residual_filter: Option<Expr>,
     join_type: JoinType,
+}
+
+/// One side of a shuffle-chain boundary: either a plain leaf scan, or a KAN-162 **opaque
+/// derived leg** (TPC-DS q54's `my_customers` / q64's `cs_ui` at the all-facts-sharded
+/// classification) — a `SubqueryAlias`-wrapped derived subplan scanning at least one sharded
+/// table. The derived leg plans recursively via [`plan_distributed_logical`] and materializes
+/// as its own sub-DAG, whose output an export stage re-flattens (`alias__col`) and re-hashes
+/// by the boundary join key, exactly like a leaf scan's shuffle stage — the pairwise join
+/// machinery downstream is unchanged.
+enum ChainSide<'a> {
+    Scan(SimpleScan<'a>),
+    Derived(DerivedLeg<'a>),
+}
+
+struct DerivedLeg<'a> {
+    /// The `SubqueryAlias` name the chain's keys / projections qualify the leg's columns by.
+    alias: &'a str,
+    /// The whole chain-side plan (`Filter`-wrapped `SubqueryAlias` included): single-leaf
+    /// conjuncts pushed by the comma connector re-apply inside the leg's own subplan.
+    plan: &'a LogicalPlan,
+    /// The leg's output schema as the chain sees it (alias-qualified).
+    schema: datafusion::common::DFSchemaRef,
+}
+
+impl<'a> ChainSide<'a> {
+    fn alias(&self) -> &'a str {
+        match self {
+            ChainSide::Scan(s) => scan_alias(s),
+            ChainSide::Derived(d) => d.alias,
+        }
+    }
+
+    /// The base table a scan side reads; a derived leg has no single table.
+    fn table(&self) -> Option<&'a str> {
+        match self {
+            ChainSide::Scan(s) => Some(s.table),
+            ChainSide::Derived(_) => None,
+        }
+    }
+
+    fn as_scan(&self) -> Option<&SimpleScan<'a>> {
+        match self {
+            ChainSide::Scan(s) => Some(s),
+            ChainSide::Derived(_) => None,
+        }
+    }
+
+    /// Whether this side becomes a shuffled stream (a scan of a sharded table, or a derived
+    /// leg — extraction admitted it only because it scans sharded tables).
+    fn is_sharded(&self, sharded: &[&str]) -> bool {
+        match self {
+            ChainSide::Scan(s) => sharded.contains(&s.table),
+            ChainSide::Derived(_) => true,
+        }
+    }
+}
+
+/// Admit a non-scan chain side as an opaque derived leg: `Filter` wrappers (the comma
+/// connector's pushed single-leaf conjuncts) see through to exactly one `SubqueryAlias` over
+/// a derived subplan. `None` for plain scans and for anything without a single alias — the
+/// caller then keeps the original `simple_table_scan` rejection.
+fn derived_chain_leg(side: &LogicalPlan) -> Option<DerivedLeg<'_>> {
+    let mut node = side;
+    while let LogicalPlan::Filter(f) = node {
+        node = f.input.as_ref();
+    }
+    let LogicalPlan::SubqueryAlias(a) = node else {
+        return None;
+    };
+    if matches!(a.input.as_ref(), LogicalPlan::TableScan(_)) {
+        return None;
+    }
+    Some(DerivedLeg {
+        alias: a.alias.table(),
+        plan: side,
+        schema: side.schema().clone(),
+    })
+}
+
+/// Classify one chain side: a plain leaf scan, an opaque derived leg (only when it scans at
+/// least one sharded table — replicated-only derived tables keep the original rejection: the
+/// broadcast / gather paths own them), or the original [`simple_table_scan`] error unchanged.
+fn chain_side<'a>(side: &'a LogicalPlan, replicated: &[&str]) -> Result<ChainSide<'a>> {
+    match simple_table_scan(side) {
+        Ok(scan) => Ok(ChainSide::Scan(scan)),
+        Err(scan_err) => {
+            let Some(leg) = derived_chain_leg(side) else {
+                return Err(scan_err);
+            };
+            if !base_tables(leg.plan)
+                .iter()
+                .any(|t| !replicated.contains(&t.as_str()))
+            {
+                return Err(scan_err);
+            }
+            Ok(ChainSide::Derived(leg))
+        }
+    }
 }
 
 fn supported_shuffle_join_type(jt: JoinType) -> Result<()> {
@@ -161,9 +274,11 @@ fn ensure_semi_anti_aggs_ok(p: &Peeled<'_>, steps: &[ChainStep<'_>]) -> Result<(
     let mut dropped_relations = Vec::new();
     for step in steps {
         if matches!(step.join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
-            dropped_relations.push(step.right.table.to_string());
-            if let Some(a) = step.right.alias {
-                dropped_relations.push(a.to_string());
+            if let Some(scan) = step.right.as_scan() {
+                dropped_relations.push(scan.table.to_string());
+                if let Some(a) = scan.alias {
+                    dropped_relations.push(a.to_string());
+                }
             }
         }
     }
@@ -208,34 +323,39 @@ fn collect_column_relations(e: &Expr, out: &mut Vec<String>) {
     });
 }
 
-/// Flatten the left-deep equijoin chain under `lp` into its leftmost scan + one step per
+/// Flatten the left-deep equijoin chain under `lp` into its leftmost side + one step per
 /// join. Also reports whether the walk crossed any `Filter` on the spine above/between the
 /// joins: such a predicate is NOT captured in the chain (the steps carry only their own ON /
 /// residual filters), so it would be silently dropped from the plan — callers folding
 /// trailing joins into the final stage must refuse rather than ship an unfiltered plan
 /// ([`super::join_order::distribute_chain_filter`] normally lands those conjuncts on scans
-/// and step residuals first).
-fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<ChainStep<'_>>, bool)> {
+/// and step residuals first). A side that is not a plain scan may still be admitted as an
+/// opaque derived leg ([`chain_side`], KAN-162); anything else keeps the original rejection.
+fn extract_equijoin_chain<'a>(
+    lp: &'a LogicalPlan,
+    replicated: &[&str],
+) -> Result<(ChainSide<'a>, Vec<ChainStep<'a>>, bool)> {
     fn walk<'a>(
         lp: &'a LogicalPlan,
+        replicated: &[&str],
         crossed_filter: &mut bool,
-    ) -> Result<(SimpleScan<'a>, Vec<ChainStep<'a>>)> {
+    ) -> Result<(ChainSide<'a>, Vec<ChainStep<'a>>)> {
         match lp {
-            LogicalPlan::Projection(p) => walk(p.input.as_ref(), crossed_filter),
+            LogicalPlan::Projection(p) => walk(p.input.as_ref(), replicated, crossed_filter),
             LogicalPlan::Filter(f) => {
                 *crossed_filter = true;
-                walk(f.input.as_ref(), crossed_filter)
+                walk(f.input.as_ref(), replicated, crossed_filter)
             }
             // KAN-11: CTE / subquery aliases wrap otherwise left-deep equijoin trees.
-            LogicalPlan::SubqueryAlias(s) => walk(s.input.as_ref(), crossed_filter),
-            LogicalPlan::Sort(s) => walk(s.input.as_ref(), crossed_filter),
-            LogicalPlan::Limit(l) => walk(l.input.as_ref(), crossed_filter),
-            LogicalPlan::Distinct(d) => walk(d.input().as_ref(), crossed_filter),
+            LogicalPlan::SubqueryAlias(s) => walk(s.input.as_ref(), replicated, crossed_filter),
+            LogicalPlan::Sort(s) => walk(s.input.as_ref(), replicated, crossed_filter),
+            LogicalPlan::Limit(l) => walk(l.input.as_ref(), replicated, crossed_filter),
+            LogicalPlan::Distinct(d) => walk(d.input().as_ref(), replicated, crossed_filter),
             LogicalPlan::Join(j) => {
                 supported_shuffle_join_type(j.join_type)?;
                 let (keys, residual_filter) = equijoin_keys(j)?;
-                let right = simple_table_scan(j.right.as_ref())?;
-                match simple_table_scan(j.left.as_ref()) {
+                let right = chain_side(j.right.as_ref(), replicated)?;
+                match chain_side(j.left.as_ref(), replicated) {
                     Ok(leftmost) => Ok((
                         leftmost,
                         vec![ChainStep {
@@ -246,7 +366,8 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
                         }],
                     )),
                     Err(_) => {
-                        let (leftmost, mut steps) = walk(j.left.as_ref(), crossed_filter)?;
+                        let (leftmost, mut steps) =
+                            walk(j.left.as_ref(), replicated, crossed_filter)?;
                         steps.push(ChainStep {
                             right,
                             keys,
@@ -264,7 +385,7 @@ fn extract_equijoin_chain(lp: &LogicalPlan) -> Result<(SimpleScan<'_>, Vec<Chain
         }
     }
     let mut crossed_filter = false;
-    let (leftmost, steps) = walk(lp, &mut crossed_filter)?;
+    let (leftmost, steps) = walk(lp, replicated, &mut crossed_filter)?;
     Ok((leftmost, steps, crossed_filter))
 }
 
@@ -403,7 +524,7 @@ impl ChainKeyWeb {
 }
 
 /// The aliases whose columns the left shuffle stream carries at chain step `i`: the
-/// leftmost leaf plus every sharded right leaf placed before it.
+/// leftmost leaf plus every sharded right side placed before it.
 fn carried_aliases(
     left_alias: &str,
     steps: &[ChainStep<'_>],
@@ -412,8 +533,8 @@ fn carried_aliases(
 ) -> Vec<String> {
     let mut carried = vec![left_alias.to_string()];
     for s in &steps[..i] {
-        if sharded.contains(&s.right.table) {
-            carried.push(scan_alias(&s.right).to_string());
+        if s.right.is_sharded(sharded) {
+            carried.push(s.right.alias().to_string());
         }
     }
     carried
@@ -590,7 +711,7 @@ struct SemiJoinLeafFilters {
 /// Anything unexpected (non-column keys, keys on replicated-only relations, …) skips that
 /// step silently — injection is an optimization, never a planning failure.
 fn semi_join_leaf_filters(
-    leftmost: &SimpleScan<'_>,
+    leftmost: &ChainSide<'_>,
     steps: &[ChainStep<'_>],
     sharded: &[&str],
     replicated: &[&str],
@@ -599,17 +720,24 @@ fn semi_join_leaf_filters(
     if !semi_join_filters_enabled() {
         return out;
     }
+    // Injection targets plain scan leaves only: a derived leg's sub-DAG plans on its own.
+    let ChainSide::Scan(leftmost) = leftmost else {
+        return out;
+    };
     // KAN-160: read the admission cap ONCE per call — per-step env reads would be
     // inconsistent with the kill-switch pattern above and could observe a mid-plan change.
     let max_dim_rows = semi_join_filter_max_dim_rows();
     for (j, step) in steps.iter().enumerate() {
+        let Some(scan) = step.right.as_scan() else {
+            continue;
+        };
         if step.join_type != JoinType::Inner
-            || sharded.contains(&step.right.table)
-            || !replicated.contains(&step.right.table)
+            || sharded.contains(&scan.table)
+            || !replicated.contains(&scan.table)
         {
             continue;
         }
-        let Some(dim_filter) = &step.right.filter_sql else {
+        let Some(dim_filter) = &scan.filter_sql else {
             continue;
         };
         if sql_contains_volatile(dim_filter) {
@@ -618,12 +746,12 @@ fn semi_join_leaf_filters(
         // KAN-160 size gate: admit only a provably small dim (the unfiltered cardinality
         // bounds the filtered key set the leaf stages hash-build).
         use datafusion::common::stats::Precision;
-        match step.right.stats_num_rows {
+        match scan.stats_num_rows {
             Precision::Exact(n) if n <= max_dim_rows => {}
             Precision::Exact(_) | Precision::Inexact(_) => continue,
             Precision::Absent => {}
         }
-        let dim_alias = scan_alias(&step.right);
+        let dim_alias = scan_alias(scan);
         for (lk, rk) in &step.keys {
             let Ok((chain_key, dim_col)) = orient_fold_key(lk, rk, step) else {
                 continue;
@@ -633,7 +761,7 @@ fn semi_join_leaf_filters(
             };
             let conjunct = format!(
                 "{leaf_col} IN (SELECT {dim_col} FROM {} AS {dim_alias} WHERE {dim_filter})",
-                step.right.table_sql
+                scan.table_sql
             );
             // The leaf this conjunct filters: the leftmost scan, or the sharded right
             // leaf of an earlier step whose boundary join does not preserve it.
@@ -642,10 +770,12 @@ fn semi_join_leaf_filters(
             } else {
                 (0..j)
                     .find(|&i| {
-                        let s = &steps[i];
-                        sharded.contains(&s.right.table)
-                            && (rel == s.right.table || rel == scan_alias(&s.right))
-                            && matches!(s.join_type, JoinType::Inner | JoinType::Left)
+                        let Some(s_scan) = steps[i].right.as_scan() else {
+                            return false;
+                        };
+                        sharded.contains(&s_scan.table)
+                            && (rel == s_scan.table || rel == scan_alias(s_scan))
+                            && matches!(steps[i].join_type, JoinType::Inner | JoinType::Left)
                     })
                     .map(|i| out.by_step.entry(i).or_default())
             };
@@ -684,23 +814,29 @@ fn build_chain(
     p: &Peeled<'_>,
     sharded: &[&str],
     replicated: &[&str],
-    leftmost: SimpleScan<'_>,
+    leftmost: ChainSide<'_>,
     steps: &[ChainStep<'_>],
     crossed_filter: bool,
 ) -> Result<DistributedQuery> {
     let mut alias_by_relation: HashMap<String, String> = HashMap::new();
-    let left_alias = scan_alias(&leftmost).to_string();
-    alias_by_relation.insert(leftmost.table.to_string(), left_alias.clone());
+    let left_alias = leftmost.alias().to_string();
+    if let Some(t) = leftmost.table() {
+        alias_by_relation.insert(t.to_string(), left_alias.clone());
+    }
     alias_by_relation.insert(left_alias.clone(), left_alias.clone());
 
     let mut stages: Vec<StageDef> = Vec::new();
     let mut next_id: u32 = 0;
 
-    enum LeftSide {
-        Leaf,
+    enum LeftSide<'s, 'a> {
+        Leaf(&'s SimpleScan<'a>),
+        Derived(&'s DerivedLeg<'a>),
         Stage { id: u32 },
     }
-    let mut left_side = LeftSide::Leaf;
+    let mut left_side = match &leftmost {
+        ChainSide::Scan(s) => LeftSide::Leaf(s),
+        ChainSide::Derived(d) => LeftSide::Derived(d),
+    };
     let mut left_flats: Vec<String> = Vec::new();
     let mut pending_bcast: Vec<usize> = Vec::new(); // indices into steps
 
@@ -713,11 +849,15 @@ fn build_chain(
     // KAN-162: the chain-wide inner-join equality web (plus the full relation→alias map
     // it keys on) for folded-dim left-key substitution — see [`ChainKeyWeb`].
     let mut web_aliases: HashMap<String, String> = HashMap::new();
-    web_aliases.insert(leftmost.table.to_string(), left_alias.clone());
+    if let Some(t) = leftmost.table() {
+        web_aliases.insert(t.to_string(), left_alias.clone());
+    }
     web_aliases.insert(left_alias.clone(), left_alias.clone());
     for s in steps {
-        let a = scan_alias(&s.right).to_string();
-        web_aliases.insert(s.right.table.to_string(), a.clone());
+        let a = s.right.alias().to_string();
+        if let Some(t) = s.right.table() {
+            web_aliases.insert(t.to_string(), a.clone());
+        }
         web_aliases.insert(a.clone(), a);
     }
     let key_web = ChainKeyWeb::build(&web_aliases, steps);
@@ -725,17 +865,25 @@ fn build_chain(
     let n = steps.len();
     for i in 0..n {
         let step = &steps[i];
-        let right_alias = scan_alias(&step.right).to_string();
-        alias_by_relation.insert(step.right.table.to_string(), right_alias.clone());
+        let right_alias = step.right.alias().to_string();
+        if let Some(t) = step.right.table() {
+            alias_by_relation.insert(t.to_string(), right_alias.clone());
+        }
         alias_by_relation.insert(right_alias.clone(), right_alias.clone());
 
-        let right_is_sharded = sharded.contains(&step.right.table);
+        let right_is_sharded = step.right.is_sharded(sharded);
 
         if !right_is_sharded {
-            if !replicated.contains(&step.right.table) {
+            // A non-sharded side is always a plain scan (a derived leg `is_sharded`).
+            let Some(scan) = step.right.as_scan() else {
+                return Err(Error::Unsupported(
+                    "auto-distribute: internal: non-sharded chain side is not a leaf scan".into(),
+                ));
+            };
+            if !replicated.contains(&scan.table) {
                 return Err(Error::Unsupported(format!(
                     "auto-distribute: `{}` must be listed in replicated",
-                    step.right.table
+                    scan.table
                 )));
             }
             pending_bcast.push(i);
@@ -763,8 +911,8 @@ fn build_chain(
             substitute_carried_key(step.join_type, meta, &key_web, &carried);
         }
         let left_stage_id = match &left_side {
-            LeftSide::Leaf => {
-                let (sql, flats) = leaf_stage_sql_with_semis(&leftmost, &semis.leftmost);
+            LeftSide::Leaf(scan) => {
+                let (sql, flats) = leaf_stage_sql_with_semis(scan, &semis.leftmost);
                 let mut key_idxs = Vec::with_capacity(left_key_metas.len());
                 for (alias, name) in &left_key_metas {
                     key_idxs.push(flat_key_index(&flats, alias, name)?);
@@ -772,6 +920,23 @@ fn build_chain(
                 let id = next_id;
                 next_id += 1;
                 stages.push(StageDef::new(id, sql, vec![], key_idxs));
+                left_flats = flats;
+                id
+            }
+            LeftSide::Derived(leg) => {
+                // The opaque leg's sub-DAG + export stage stand in for the leaf scan's
+                // shuffle stage; the export re-hashes by this boundary's left key(s).
+                let key_names: Vec<String> = left_key_metas
+                    .iter()
+                    .map(|(_, name)| name.clone())
+                    .collect();
+                let (id, flats) = materialize_derived_leg(
+                    leg,
+                    replicated,
+                    &key_names,
+                    &mut stages,
+                    &mut next_id,
+                )?;
                 left_flats = flats;
                 id
             }
@@ -783,21 +948,36 @@ fn build_chain(
             }
         };
 
-        let (right_sql, right_flats) = leaf_stage_sql_with_semis(
-            &step.right,
-            semis.by_step.get(&i).map_or(&[], Vec::as_slice),
-        );
-        let mut right_key_idxs = Vec::with_capacity(right_key_names.len());
-        for name in &right_key_names {
-            right_key_idxs.push(flat_key_index(&right_flats, &right_alias, name)?);
-        }
-        let right_id = next_id;
-        next_id += 1;
-        stages.push(StageDef::new(right_id, right_sql, vec![], right_key_idxs));
+        let (right_id, right_flats) = match &step.right {
+            ChainSide::Scan(scan) => {
+                let (right_sql, right_flats) = leaf_stage_sql_with_semis(
+                    scan,
+                    semis.by_step.get(&i).map_or(&[], Vec::as_slice),
+                );
+                let mut right_key_idxs = Vec::with_capacity(right_key_names.len());
+                for name in &right_key_names {
+                    right_key_idxs.push(flat_key_index(&right_flats, &right_alias, name)?);
+                }
+                let right_id = next_id;
+                next_id += 1;
+                stages.push(StageDef::new(right_id, right_sql, vec![], right_key_idxs));
+                (right_id, right_flats)
+            }
+            // A derived leg materializes as its own sub-DAG + export stage, hash-keyed on
+            // this boundary's right key(s) — the join stage consumes it exactly like a
+            // leaf scan's shuffle stage.
+            ChainSide::Derived(leg) => materialize_derived_leg(
+                leg,
+                replicated,
+                &right_key_names,
+                &mut stages,
+                &mut next_id,
+            )?,
+        };
 
         let replicated_aliases: Vec<String> = pending_bcast
             .iter()
-            .map(|&bi| scan_alias(&steps[bi].right).to_string())
+            .map(|&bi| steps[bi].right.alias().to_string())
             .collect();
         let up = Unparser::default();
         let mut on_sql = left_key_metas
@@ -878,7 +1058,7 @@ fn build_chain(
         pending_bcast.clear();
 
         let trailing = &steps[i + 1..];
-        let last_sharded = !trailing.iter().any(|s| sharded.contains(&s.right.table));
+        let last_sharded = !trailing.iter().any(|s| s.right.is_sharded(sharded));
         let mut replicated_final = replicated_aliases.clone();
         if last_sharded {
             // Trailing replicated-only joins after the last sharded shuffle boundary fold
@@ -916,21 +1096,26 @@ fn build_chain(
                 let null_extended: Vec<String> = steps[..i]
                     .iter()
                     .filter(|s| s.join_type == JoinType::Left)
-                    .map(|s| scan_alias(&s.right).to_string())
+                    .map(|s| s.right.alias().to_string())
                     .collect();
                 // Aliases the co-located shuffle inputs carry: the leftmost leaf and every
                 // sharded step up to the boundary.
                 let mut stream_aliases: Vec<String> = vec![left_alias.clone()];
                 for s in &steps[..=i] {
-                    if sharded.contains(&s.right.table) {
-                        stream_aliases.push(scan_alias(&s.right).to_string());
+                    if s.right.is_sharded(sharded) {
+                        stream_aliases.push(s.right.alias().to_string());
                     }
                 }
                 for t in trailing {
-                    if !replicated.contains(&t.right.table) {
+                    // `last_sharded` means every trailing side is a non-shuffled plain scan
+                    // (a derived leg `is_sharded`, so it can never appear here).
+                    let Some(t_scan) = t.right.as_scan() else {
+                        return Err(unsafe_rejection());
+                    };
+                    if !replicated.contains(&t_scan.table) {
                         return Err(Error::Unsupported(format!(
                             "auto-distribute: `{}` must be listed in replicated",
-                            t.right.table
+                            t_scan.table
                         )));
                     }
                     // Only INNER / LEFT folds are provably key-local against a complete
@@ -943,7 +1128,7 @@ fn build_chain(
                     // bound in this stage's FROM: a shuffle input, an earlier fold, or (for
                     // the residual) the step's own right side. Key pairs are oriented first —
                     // the chain-side reference is the one that must resolve.
-                    let t_alias = scan_alias(&t.right).to_string();
+                    let t_alias = scan_alias(t_scan).to_string();
                     let mut refs: Vec<String> = Vec::new();
                     for (lk, rk) in &t.keys {
                         let Ok((chain_key, _)) = orient_fold_key(lk, rk, t) else {
@@ -1087,6 +1272,131 @@ fn build_chain(
     ))
 }
 
+/// Materialize an opaque derived leg (KAN-162: TPC-DS q54's `my_customers` / q64's `cs_ui`
+/// at the all-facts-sharded classification). The leg's `SubqueryAlias`-wrapped subplan plans
+/// recursively as its own sub-DAG via [`plan_distributed_logical`]; its stages splice into
+/// the chain's stage list ([`super::dag_splitter::append_branch`]); then one export stage
+/// re-flattens the leg's output columns to the same `<alias>__<col>` names a leaf scan's
+/// shuffle stage emits, hash-partitioned by the boundary join key(s) (`key_names`, the
+/// leg-side column names of the step's equijoin pairs). The export re-partitions whatever
+/// layout the sub-DAG produced, so both bucket layouts of the leg's own shuffles are
+/// correct, and the pairwise join machinery downstream is unchanged.
+///
+/// Stage outputs carry the logical plan's field names (the
+/// [`super::dag_splitter::placeholder_plan`] invariant: a sub-DAG's output stage re-aliases
+/// every column to its schema field name), so the export SELECTs by field name.
+///
+/// Declines — never a wrong plan — when the leg plans to a `Forward`-exchange output stage
+/// (its sharded input must flow through hash-shuffled stages, not a single-worker forward;
+/// the same invariant the CrossJoin splitter enforces on its branches), when the leg's
+/// output schema has duplicate field names (the flat export could not name them apart), or
+/// when a field name is not a plain identifier (the chain's hand-built `l.<flat>` /
+/// `r.<flat>` stage SQL does not quote, so e.g. an un-aliased `sum(...)` output column
+/// cannot be referenced).
+///
+/// A `DISTINCT` in the leg's subplan is rewritten to its exact group-by equivalent first
+/// ([`rewrite_leg_distincts`]) — the recursive planner has no `Distinct` vocabulary.
+fn materialize_derived_leg(
+    leg: &DerivedLeg<'_>,
+    replicated: &[&str],
+    key_names: &[String],
+    stages: &mut Vec<StageDef>,
+    next_id: &mut u32,
+) -> Result<(u32, Vec<String>)> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut flats = Vec::new();
+    let mut sels = Vec::new();
+    for f in leg.schema.fields() {
+        let name = f.name();
+        if !seen.insert(name.as_str()) {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: derived shuffle join side `{}` outputs duplicate column \
+                 `{name}` — cannot name its shuffle flats apart",
+                leg.alias
+            )));
+        }
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || name.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            return Err(Error::Unsupported(format!(
+                "auto-distribute: derived shuffle join side `{}` outputs non-identifier column \
+                 `{name}` — alias the derived table's columns to plain names",
+                leg.alias
+            )));
+        }
+        let flat = flat_col(leg.alias, name);
+        sels.push(format!("{name} AS {flat}"));
+        flats.push(flat);
+    }
+    let leg_plan = rewrite_leg_distincts(leg.plan)?;
+    let dq = plan_distributed_logical(&leg_plan, replicated).map_err(|e| {
+        Error::Unsupported(format!(
+            "auto-distribute: derived shuffle join side `{}` is not distributable: {e}",
+            leg.alias
+        ))
+    })?;
+    if dq
+        .stages
+        .last()
+        .is_some_and(|s| s.exchange == ExchangeMode::Forward)
+    {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: derived shuffle join side `{}` scans a sharded table but outputs \
+             via Forward exchange; its sharded input must flow through hash-shuffled stages, \
+             not a single-worker forward",
+            leg.alias
+        )));
+    }
+    let output_id = super::dag_splitter::append_branch(stages, next_id, dq, 0)?;
+    let mut key_idxs = Vec::with_capacity(key_names.len());
+    for name in key_names {
+        key_idxs.push(flat_key_index(&flats, leg.alias, name)?);
+    }
+    let id = *next_id;
+    *next_id += 1;
+    stages.push(StageDef::new(
+        id,
+        sanitize_generated_sql(&format!("SELECT {} FROM shuffle_input", sels.join(", "))),
+        vec![output_id],
+        key_idxs,
+    ));
+    Ok((id, flats))
+}
+
+/// Rewrite every `DISTINCT` (`Distinct::All`) in a derived leg's subplan as its exact logical
+/// equivalent — an aggregate grouping by every input column — before the recursive
+/// [`plan_distributed_logical`] call: the distributed planner has no `Distinct` vocabulary
+/// (q54's `my_customers` is a distinct over the union of the two sharded sales facts, which
+/// the KAN-162 multi-sharded-union split plans once the distinct reads as a group-by).
+/// `Distinct::On` keeps the recursive planner's explicit rejection.
+fn rewrite_leg_distincts(plan: &LogicalPlan) -> Result<LogicalPlan> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    plan.clone()
+        .transform(|node| {
+            let LogicalPlan::Distinct(distinct) = &node else {
+                return Ok(Transformed::no(node));
+            };
+            let datafusion::logical_expr::Distinct::All(input) = distinct else {
+                return Ok(Transformed::no(node));
+            };
+            let group_expr = input
+                .schema()
+                .columns()
+                .into_iter()
+                .map(Expr::Column)
+                .collect();
+            let agg =
+                datafusion::logical_expr::Aggregate::try_new(input.clone(), group_expr, vec![])?;
+            Ok(Transformed::yes(LogicalPlan::Aggregate(agg)))
+        })
+        .map(|t| t.data)
+        .map_err(|e| {
+            Error::Plan(format!(
+                "auto-distribute: derived-leg DISTINCT rewrite: {e}"
+            ))
+        })
+}
+
 /// The stage-SQL text a folded join's left-key column binds to: the boundary's left shuffle
 /// input (`l.<flat>`), its right shuffle input (`r.<flat>` — TPC-DS Q72's `warehouse` and
 /// `date_dim d2` folds key on the `inventory` side of the `catalog_sales ⋈ inventory`
@@ -1120,12 +1430,17 @@ fn orient_fold_key<'e>(
     right: &'e Expr,
     step: &ChainStep<'_>,
 ) -> Result<(&'e Expr, String)> {
-    let alias = scan_alias(&step.right);
+    let Some(scan) = step.right.as_scan() else {
+        return Err(Error::Unsupported(
+            "auto-distribute: a derived chain side cannot fold into a stage".into(),
+        ));
+    };
+    let alias = scan_alias(scan);
     let refs_right = |e: &Expr| match e {
         Expr::Column(c) => c
             .relation
             .as_ref()
-            .is_some_and(|r| r.table() == alias || r.table() == step.right.table),
+            .is_some_and(|r| r.table() == alias || r.table() == scan.table),
         _ => false,
     };
     match (refs_right(left), refs_right(right)) {
@@ -1133,7 +1448,7 @@ fn orient_fold_key<'e>(
         (true, false) => Ok((right, column_name(left)?)),
         _ => Err(Error::Unsupported(format!(
             "auto-distribute: join key ({left}, {right}) does not connect `{}` to the chain",
-            step.right.table
+            scan.table
         ))),
     }
 }
@@ -1156,7 +1471,12 @@ fn emit_dim_fold(
     where_residuals: &mut Vec<Expr>,
     up: &Unparser,
 ) -> Result<()> {
-    let b_alias = scan_alias(&step.right).to_string();
+    let Some(scan) = step.right.as_scan() else {
+        return Err(Error::Unsupported(
+            "auto-distribute: a derived chain side cannot fold into a stage".into(),
+        ));
+    };
+    let b_alias = scan_alias(scan).to_string();
     let mut on_parts = Vec::with_capacity(step.keys.len());
     for (b_left, b_right) in &step.keys {
         let (chain_key, dim_col) = orient_fold_key(b_left, b_right, step)?;
@@ -1167,10 +1487,10 @@ fn emit_dim_fold(
     }
     join_from.push_str(&format!(
         " {join_kw} {} AS {b_alias} ON {}",
-        step.right.table,
+        scan.table,
         on_parts.join(" AND ")
     ));
-    alias_by_relation.insert(step.right.table.to_string(), b_alias.clone());
+    alias_by_relation.insert(scan.table.to_string(), b_alias.clone());
     alias_by_relation.insert(b_alias.clone(), b_alias.clone());
     folded_aliases.push(b_alias);
     if let Some(residual) = &step.residual_filter {
@@ -1184,7 +1504,7 @@ fn emit_dim_fold(
             join_from.push_str(&format!(" AND ({})", expr_sql(up, &flattened)?));
         }
     }
-    if let Some(pred) = &step.right.filter_sql {
+    if let Some(pred) = &scan.filter_sql {
         join_from.push_str(&format!(" AND ({pred})"));
     }
     Ok(())
@@ -1250,7 +1570,7 @@ fn next_sharded_left_keys(
     carried: &[String],
 ) -> Option<Vec<(String, String)>> {
     for step in steps.iter().skip(from) {
-        if !sharded.contains(&step.right.table) {
+        if !step.right.is_sharded(sharded) {
             continue;
         }
         let mut out = Vec::with_capacity(step.keys.len());
@@ -1369,7 +1689,7 @@ pub(crate) fn replan_chain_tail(
     let plan = reordered.as_ref().unwrap_or(plan);
 
     let p = super::stage_planner::peel(plan).ok()?;
-    let (leftmost, steps, _) = extract_equijoin_chain(&p.agg.input).ok()?;
+    let (leftmost, steps, _) = extract_equijoin_chain(&p.agg.input, replicated).ok()?;
     // Three joins are the smallest chain with a permutable two-step tail.
     if steps.len() < 3 || steps.iter().any(|s| s.join_type != JoinType::Inner) {
         return None;
@@ -1380,11 +1700,24 @@ pub(crate) fn replan_chain_tail(
         .filter(|t| !replicated.contains(&t.as_str()))
         .map(|t| t.as_str())
         .collect();
-    // Every join must be a sharded–sharded shuffle: a replicated dim folds into its join
-    // stage and has no leaf stage to measure.
-    if !sharded.contains(&leftmost.table) || steps.iter().any(|s| !sharded.contains(&s.right.table))
-    {
+    // Every join must be a sharded–sharded shuffle between plain scans: a replicated dim
+    // folds into its join stage and has no leaf stage to measure, and an opaque derived leg
+    // (KAN-162) materializes as a sub-DAG whose spliced stages this re-plan cannot re-derive
+    // byte-for-byte — keep the original plan for both.
+    let ChainSide::Scan(leftmost_scan) = &leftmost else {
         return None;
+    };
+    let mut leaf_scans: Vec<&SimpleScan<'_>> = Vec::with_capacity(steps.len() + 1);
+    if !sharded.contains(&leftmost_scan.table) {
+        return None;
+    }
+    leaf_scans.push(leftmost_scan);
+    for s in &steps {
+        let scan = s.right.as_scan()?;
+        if !sharded.contains(&scan.table) {
+            return None;
+        }
+        leaf_scans.push(scan);
     }
 
     // Measure every leaf through its dispatched stage: leaf SQL is order-invariant, so
@@ -1392,15 +1725,17 @@ pub(crate) fn replan_chain_tail(
     // without a match or without a complete barrier sample bails (an undercounted leaf
     // would steer the order on bad data — the safe direction is no re-optimization).
     let mut leaf_rows: Vec<u64> = Vec::with_capacity(steps.len() + 1);
-    for scan in std::iter::once(&leftmost).chain(steps.iter().map(|s| &s.right)) {
+    for scan in &leaf_scans {
         let (sql, _) = leaf_stage_sql(scan);
         let stage = stages
             .iter()
             .find(|s| s.upstream_stage_ids.is_empty() && s.sql == sql)?;
         leaf_rows.push(stage_rows.get(&stage.stage_id)?.iter().sum());
     }
-    let mut leaf_names: Vec<String> = vec![scan_alias(&leftmost).to_string()];
-    leaf_names.extend(steps.iter().map(|s| scan_alias(&s.right).to_string()));
+    let leaf_names: Vec<String> = leaf_scans
+        .iter()
+        .map(|s| scan_alias(s).to_string())
+        .collect();
 
     // Placement dependencies (ported from join_order's reorder): the leaves — other than a
     // step's own right leaf — its ON / residual exprs reference. A step may only be placed
@@ -1416,7 +1751,7 @@ pub(crate) fn replan_chain_tail(
         for expr in exprs {
             for col in expr.column_refs() {
                 let rel = col.relation.as_ref()?.table();
-                let i = chain_leaf_index(rel, &leftmost, &steps)?;
+                let i = chain_leaf_index(rel, &leaf_scans)?;
                 if i != own_leaf && !step_deps.contains(&i) {
                     step_deps.push(i);
                 }
@@ -1499,16 +1834,9 @@ pub(crate) fn replan_chain_tail(
 /// The chain leaf (0 = leftmost, i+1 = `steps[i].right`) a qualified relation resolves to,
 /// or `None` when zero or several leaves match — ambiguity bails the rewrite rather than
 /// guessing, as in `join_order`.
-fn chain_leaf_index(
-    rel: &str,
-    leftmost: &SimpleScan<'_>,
-    steps: &[ChainStep<'_>],
-) -> Option<usize> {
+fn chain_leaf_index(rel: &str, leaves: &[&SimpleScan<'_>]) -> Option<usize> {
     let mut found = None;
-    for (idx, scan) in std::iter::once(leftmost)
-        .chain(steps.iter().map(|s| &s.right))
-        .enumerate()
-    {
+    for (idx, scan) in leaves.iter().enumerate() {
         if scan.table == rel || scan.alias == Some(rel) {
             if found.is_some() {
                 return None;
@@ -1810,6 +2138,50 @@ mod tests {
         assert!(
             msg.contains("lineitem__l_orderkey") && msg.contains("missing"),
             "got: {msg}"
+        );
+    }
+
+    /// A derived leg whose recursive plan outputs via a `Forward` exchange must refuse: a
+    /// single-worker forward would read only one worker's local shard, so the leg's input
+    /// must flow through hash-shuffled stages. No SQL-reachable chain shape reaches this
+    /// guard (a derived leg is admitted only when it scans a sharded table, and every such
+    /// subplan needs a shuffle), so it is pinned here with a hand-built leg: `SELECT k
+    /// FROM t WHERE k > 0` over a replicated MemTable plans as a lone Forward stage
+    /// (`try_non_aggregate`).
+    #[tokio::test]
+    async fn derived_leg_with_forward_output_declines() {
+        let engine = oxidant_loom::Engine::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap();
+        engine.register_batches("t", vec![batch]).unwrap();
+        let lp = engine
+            .logical_plan("SELECT k FROM t WHERE k > 0")
+            .await
+            .unwrap();
+        let leg = DerivedLeg {
+            alias: "t",
+            plan: &lp,
+            schema: lp.schema().clone(),
+        };
+        let mut stages = Vec::new();
+        let mut next_id = 0;
+        let err =
+            materialize_derived_leg(&leg, &["t"], &["k".to_string()], &mut stages, &mut next_id)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Forward exchange"),
+            "the refusal names the Forward-exchange cause: {msg}"
         );
     }
 

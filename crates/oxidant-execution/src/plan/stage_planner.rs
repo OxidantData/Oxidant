@@ -58,7 +58,7 @@
 //! one-row broadcast — scalar partial/combine stages plus driver-side literal injection into the
 //! outer stages ([`super::shape_extensions::try_uncorrelated_scalar_threshold`]).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use datafusion::common::{Column, TableReference};
@@ -2004,11 +2004,36 @@ pub(crate) fn build_agg_remap(agg: &Aggregate) -> HashMap<String, String> {
 
 /// [`build_agg_remap`] extended with [`Peeled::alias_projections`], so a `HAVING` written against
 /// an intervening subquery's aliases (TPC-DS Q21's `inv_before`) still resolves to `r{i}` / `g{j}`.
+///
+/// KAN-162 q64: a post-aggregate `Filter` can also sit ABOVE the output projection (the
+/// branch-aware CrossJoin splitter pushes `cs1.syear = …` onto a branch whose SELECT-list
+/// projection introduced `syear`), in which case the peel makes that projection the output
+/// projection and the predicate can only resolve through its aliases. Fold those in too —
+/// insert-if-absent, so every mapping a below-the-projection `HAVING` can legitimately resolve
+/// keeps winning exactly as before (only previously-declining references gain a mapping).
 pub(crate) fn build_remap(p: &Peeled<'_>) -> HashMap<String, String> {
     let mut remap = build_agg_remap(p.agg);
     for proj in &p.alias_projections {
         for e in proj.iter() {
             let Expr::Alias(a) = e else { continue };
+            let mapped = match a.expr.as_ref() {
+                Expr::Column(c) => remap
+                    .get(&c.flat_name())
+                    .or_else(|| remap.get(&c.name))
+                    .cloned(),
+                other => remap.get(&other.schema_name().to_string()).cloned(),
+            };
+            if let Some(mapped) = mapped {
+                remap.insert(a.name.clone(), mapped);
+            }
+        }
+    }
+    if let Some(exprs) = p.projection {
+        for e in exprs.iter() {
+            let Expr::Alias(a) = e else { continue };
+            if remap.contains_key(&a.name) {
+                continue;
+            }
             let mapped = match a.expr.as_ref() {
                 Expr::Column(c) => remap
                     .get(&c.flat_name())
@@ -2100,6 +2125,30 @@ pub(crate) fn wrap_output(
     inner: &str,
     remap: &HashMap<String, String>,
 ) -> Result<String> {
+    wrap_output_impl(p, inner, remap, false)
+}
+
+/// `wrap_output` for the union-split recombine stages (the `merged_arms` combine): identical,
+/// except that when no output projection sits above the aggregate the internal `g{j}` / `r{i}`
+/// columns are re-aliased back to the aggregate's schema field names (see [`agg_output_select`])
+/// instead of `SELECT *`. Scoped to these call sites because the sub-DAG output invariant
+/// ([`super::dag_splitter::placeholder_plan`]) is what a name-based consumer — the derived-leg
+/// export stage — binds by; every other `wrap_output` consumer either applies an explicit
+/// projection or reads the internal names (e.g. a stacked window stage references `g{j}`).
+pub(crate) fn wrap_output_recombine(
+    p: &Peeled<'_>,
+    inner: &str,
+    remap: &HashMap<String, String>,
+) -> Result<String> {
+    wrap_output_impl(p, inner, remap, true)
+}
+
+fn wrap_output_impl(
+    p: &Peeled<'_>,
+    inner: &str,
+    remap: &HashMap<String, String>,
+    realias_none: bool,
+) -> Result<String> {
     let up = Unparser::default();
     let substs = build_expr_substs(p, remap);
     // Apply HAVING against remapped `g{j}`/`r{i}` columns *before* the output projection aliases
@@ -2126,9 +2175,46 @@ pub(crate) fn wrap_output(
             })
             .collect::<Result<Vec<_>>>()?
             .join(", "),
+        None if realias_none => agg_output_select(p).unwrap_or_else(|| "*".to_string()),
         None => "*".to_string(),
     };
     Ok(format!("SELECT {select} FROM {from_sql}"))
+}
+
+/// The `wrap_output` select list when no output projection sits above the aggregate (e.g. a
+/// derived leg's `DISTINCT` rewritten to its group-by equivalent): the plan's output columns
+/// are the aggregate's own schema fields, so re-alias the internal `g{j}` / `r{i}` columns
+/// back to those field names. Stage outputs must carry the logical plan's field names — a
+/// name-based consumer (the derived-leg export stage) binds by them, and emitting the raw
+/// `g{j}` names only ever worked for positional consumers.
+///
+/// Returns `None` — caller keeps the historical `SELECT *` — when the field names can't be
+/// re-aliased safely: an unexpected field count, or duplicate field names (DataFusion permits
+/// duplicate unqualified names under different qualifiers; re-aliasing would collide).
+fn agg_output_select(p: &Peeled<'_>) -> Option<String> {
+    let n_group = flattened_group_exprs(&p.agg.group_expr).len();
+    let offset = n_group + usize::from(is_grouping_set(&p.agg.group_expr));
+    let fields = p.agg.schema.fields();
+    if fields.len() != offset + p.agg.aggr_expr.len() {
+        return None;
+    }
+    let names: Vec<&str> = fields
+        .iter()
+        .take(n_group)
+        .chain(fields.iter().skip(offset))
+        .map(|f| f.name().as_str())
+        .collect();
+    if names.iter().collect::<HashSet<_>>().len() != names.len() {
+        return None;
+    }
+    let mut items = Vec::with_capacity(names.len());
+    for (j, name) in names.iter().take(n_group).enumerate() {
+        items.push(format!("g{j} AS \"{name}\""));
+    }
+    for (i, name) in names.iter().skip(n_group).enumerate() {
+        items.push(format!("r{i} AS \"{name}\""));
+    }
+    Some(items.join(", "))
 }
 
 pub(crate) fn output_name(e: &Expr) -> String {
@@ -2756,7 +2842,7 @@ fn try_split_multi_sharded_union(
         combine.join(", "),
         arm_reads.join(" UNION ALL ")
     );
-    let final_sql = wrap_output(p, &inner, &remap)?;
+    let final_sql = wrap_output_recombine(p, &inner, &remap)?;
     let combine_id = stages.len() as u32;
     stages.push(StageDef::new(combine_id, final_sql, producers, vec![]));
 

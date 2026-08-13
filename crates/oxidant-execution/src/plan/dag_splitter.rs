@@ -1885,7 +1885,11 @@ pub(crate) fn placeholder_plan(
     }
 }
 
-fn append_branch(
+/// Splice a branch's sub-DAG into the outer stage list (ids re-based past `next_id`,
+/// a `finalize_sql` appended as one more `shuffle_input` stage), returning the branch
+/// output's stage id. Used by the branch-aware CrossJoin splitter and by
+/// [`super::join_chain`]'s opaque derived legs (KAN-162 q54/q64).
+pub(crate) fn append_branch(
     stages: &mut Vec<StageDef>,
     next_id: &mut u32,
     dq: DistributedQuery,

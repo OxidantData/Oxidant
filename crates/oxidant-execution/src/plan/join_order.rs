@@ -90,14 +90,55 @@ fn is_simple_leaf(plan: &LogicalPlan) -> bool {
     }
 }
 
+/// KAN-162 (TPC-DS q54/q64 at the all-facts-sharded classification): a chain leaf the comma
+/// connector may place **opaquely** — a `SubqueryAlias` over a derived subplan (not a plain
+/// scan) that scans at least one sharded table (q54's `my_customers` distinct-over-union, q64's
+/// `cs_ui` derived aggregate). The rewrite never looks inside: conjunct columns attribute via
+/// the leaf's alias-qualified output schema ([`leaf_of`]), and the connected chain's keyed
+/// joins reference exactly those output columns, so reassociation stays semantics-preserving
+/// whatever the subplan is. The sharded-scan requirement keeps every chain whose derived
+/// leaves are all-replicated (the single-sharded broadcast path already owns those) declining
+/// byte-for-byte as before. The chain planner materializes such a leg as its own sub-DAG
+/// (see `join_chain::plan_shuffle_join_chain`).
+fn is_opaque_derived_leaf(plan: &LogicalPlan, replicated: &[&str]) -> bool {
+    let LogicalPlan::SubqueryAlias(a) = plan else {
+        return false;
+    };
+    if matches!(a.input.as_ref(), LogicalPlan::TableScan(_)) {
+        return false;
+    }
+    contains_sharded_scan(&a.input, replicated)
+}
+
+/// Whether the subtree scans a table not listed in `replicated`. Like
+/// [`super::stage_planner::base_tables`], this descends plan inputs only (expression
+/// subqueries excluded): missing one only ever makes the rewrite decline.
+fn contains_sharded_scan(plan: &LogicalPlan, replicated: &[&str]) -> bool {
+    match plan {
+        LogicalPlan::TableScan(s) => !replicated.contains(&s.table_name.table()),
+        other => other
+            .inputs()
+            .iter()
+            .any(|i| contains_sharded_scan(i, replicated)),
+    }
+}
+
 /// Flatten a left-deep inner-join chain into its leftmost leaf + one [`Step`] per join,
 /// preserving the original step order. `None` when the chain contains anything but inner joins
-/// over simple leaves.
-fn flatten_chain(node: &LogicalPlan, steps: &mut Vec<Step>) -> Option<Arc<LogicalPlan>> {
+/// over simple leaves — or, when `opaque_derived` carries the replicated-table list, over
+/// opaque derived leaves ([`is_opaque_derived_leaf`], the comma connector only).
+fn flatten_chain(
+    node: &LogicalPlan,
+    steps: &mut Vec<Step>,
+    opaque_derived: Option<&[&str]>,
+) -> Option<Arc<LogicalPlan>> {
+    let leaf_ok = |leaf: &LogicalPlan| {
+        is_simple_leaf(leaf) || opaque_derived.is_some_and(|r| is_opaque_derived_leaf(leaf, r))
+    };
     match node {
         LogicalPlan::Join(j) if j.join_type == JoinType::Inner => {
-            let leftmost = flatten_chain(&j.left, steps)?;
-            if !is_simple_leaf(&j.right) {
+            let leftmost = flatten_chain(&j.left, steps, opaque_derived)?;
+            if !leaf_ok(&j.right) {
                 return None;
             }
             steps.push(Step {
@@ -110,7 +151,7 @@ fn flatten_chain(node: &LogicalPlan, steps: &mut Vec<Step>) -> Option<Arc<Logica
             });
             Some(leftmost)
         }
-        leaf if is_simple_leaf(leaf) => Some(Arc::new(node.clone())),
+        leaf if leaf_ok(leaf) => Some(Arc::new(node.clone())),
         _ => None,
     }
 }
@@ -163,7 +204,7 @@ fn reorder_under_filter(filter: &Filter) -> Option<LogicalPlan> {
     };
 
     let mut steps: Vec<Step> = Vec::new();
-    let leftmost = flatten_chain(chain_root, &mut steps)?;
+    let leftmost = flatten_chain(chain_root, &mut steps, None)?;
     // Fewer than two joins leaves nothing to permute.
     if steps.len() < 2 {
         return None;
@@ -343,7 +384,10 @@ fn reapply_caps(chain: Arc<LogicalPlan>, caps: Vec<Cap>) -> Option<LogicalPlan> 
 /// conjunctive predicate evaluates over the same row set either way.
 ///
 /// Returns `None` for anything outside the narrow shape — a chain with a keyed step or a
-/// non-simple leaf (the KAN-49a branch-DAG cross joins above aggregates keep their shape), an
+/// non-simple leaf that is not an opaque sharded derived table (a `SubqueryAlias` over a
+/// derived subplan scanning at least one sharded table, admitted by
+/// [`is_opaque_derived_leaf`] — KAN-162 q54/q64; the KAN-49a branch-DAG cross joins above
+/// aggregates and all-replicated derived leaves keep their shape), an
 /// ambiguously-resolving column, no usable equality edge, a join graph not connected from the
 /// leftmost leaf (a genuine cross product, left exactly as written), or a subquery-bearing
 /// conjunct the dedicated subquery paths own (a conjunct correlated across several leaves, or
@@ -446,7 +490,7 @@ fn visit_subquery_plans(e: &Expr, f: &mut impl FnMut(&LogicalPlan)) {
 fn connect_under_filter(filter: &Filter, replicated: &[&str]) -> Option<LogicalPlan> {
     // The chain root must be the filter's direct input — no caps, keeping the shape narrow.
     let mut steps: Vec<Step> = Vec::new();
-    let leftmost = flatten_chain(&filter.input, &mut steps)?;
+    let leftmost = flatten_chain(&filter.input, &mut steps, Some(replicated))?;
     // Only pure comma chains: every step key-less (a keyed step is a different normalization —
     // `rewrite_comma_join_filters` / the ordinary keyed-chain paths own those).
     if steps.is_empty() || steps.iter().any(|s| !s.on.is_empty() || s.filter.is_some()) {
@@ -454,6 +498,21 @@ fn connect_under_filter(filter: &Filter, replicated: &[&str]) -> Option<LogicalP
     }
     let mut leaves: Vec<Arc<LogicalPlan>> = vec![leftmost];
     leaves.extend(steps.iter().map(|s| s.right.clone()));
+
+    // More than one opaque derived leaf is the KAN-41 branch-dedup family (TPC-DS Q11's
+    // self-joined `year_total` CTE): the branch splitter owns that shape and plans ONE
+    // shared branch sub-DAG — but only from the un-converged comma shape, so converging
+    // here would steal it into the strictly worse per-leg materialization. The derived-leaf
+    // admission targets exactly one derived leg among plain scans (q54's `my_customers`,
+    // q64's `cs_ui`).
+    if leaves
+        .iter()
+        .filter(|l| is_opaque_derived_leaf(l, replicated))
+        .count()
+        > 1
+    {
+        return None;
+    }
 
     let mut conjuncts = Vec::new();
     flatten_and_conjuncts(&filter.predicate, &mut conjuncts);
