@@ -399,23 +399,34 @@ impl StageDef {
 /// see the token.
 pub(crate) const SCALAR_TOKEN: &str = "__OXIDANT_SCALAR_STAGE__";
 
-/// Replace the scalar token in `stage`'s SQL (if any) with the literal computed from the scalar
-/// stage's one-row output (pulled from the workers on first use). The scalar stage must precede
-/// `stage` in the topologically-ordered stage list, i.e. it has already completed by the time
-/// `stage` is dispatched.
+/// Indexed scalar-column token for multi-column one-row broadcasts (KAN-144: TPC-DS Q54's
+/// two `BETWEEN` DISTINCT bounds share one Forward stage with columns `s0`, `s1`, …).
+/// Column 0 also accepts the legacy [`SCALAR_TOKEN`] for single-column plans (TPC-H Q11).
+pub(crate) fn scalar_column_token(i: usize) -> String {
+    format!("__OXIDANT_SCALAR_STAGE_{i}__")
+}
+
+fn stage_sql_has_scalar_token(sql: &str) -> bool {
+    sql.contains(SCALAR_TOKEN) || sql.contains("__OXIDANT_SCALAR_STAGE_")
+}
+
+/// Replace scalar token(s) in `stage`'s SQL with literal(s) from the scalar stage's one-row
+/// output (pulled from the workers on first use). The scalar stage must precede `stage` in the
+/// topologically-ordered stage list. A multi-column scalar row substitutes
+/// `'__OXIDANT_SCALAR_STAGE_{i}__'` for column `i`; the legacy [`SCALAR_TOKEN`] maps to column 0.
 async fn substitute_scalar_tokens(
     cluster: &Cluster,
     stage: &StageDef,
     stages: &[StageDef],
     scalar_stage: Option<&StageDef>,
-    literal: &mut Option<String>,
+    literals: &mut Option<Vec<String>>,
 ) -> Result<StageDef> {
-    if !stage.sql.contains(SCALAR_TOKEN) {
+    if !stage_sql_has_scalar_token(&stage.sql) {
         return Ok(stage.clone());
     }
     let Some(scalar) = scalar_stage else {
         return Err(Error::Plan(format!(
-            "stage {} references {SCALAR_TOKEN} but the plan has no scalar stage",
+            "stage {} references a scalar token but the plan has no scalar stage",
             stage.stage_id
         )));
     };
@@ -438,43 +449,72 @@ async fn substitute_scalar_tokens(
             scalar.stage_id, stage.stage_id
         )));
     }
-    let lit = match literal {
+    let mut lits = match literals {
         Some(l) => l.clone(),
         None => {
-            let l = pull_scalar_literal(cluster, scalar.stage_id).await?;
-            *literal = Some(l.clone());
+            let l = pull_scalar_row(cluster, scalar.stage_id).await?;
+            *literals = Some(l.clone());
             l
         }
     };
-    let sql = stage.sql.replace(&format!("'{SCALAR_TOKEN}'"), &lit);
+    // Empty scalar (0 rows) returns a single NULL from pull; pad to the number of tokens this
+    // stage references so multi-column BETWEEN bounds all become NULL.
+    let needed = (0..64)
+        .filter(|i| sql_has_quoted_token(&stage.sql, &scalar_column_token(*i)))
+        .count()
+        .max(usize::from(sql_has_quoted_token(&stage.sql, SCALAR_TOKEN)));
+    if lits.len() < needed {
+        lits.resize(needed, "NULL".to_string());
+    }
+    let mut sql = stage.sql.clone();
+    // Indexed tokens first so a bare `__OXIDANT_SCALAR_STAGE__` prefix does not steal `_0`.
+    for (i, lit) in lits.iter().enumerate().rev() {
+        let tok = scalar_column_token(i);
+        sql = sql.replace(&format!("'{tok}'"), lit);
+    }
+    if let Some(lit0) = lits.first() {
+        sql = sql.replace(&format!("'{SCALAR_TOKEN}'"), lit0);
+    }
     Ok(StageDef {
         sql,
         ..stage.clone()
     })
 }
 
-/// Pull a scalar stage's complete (single-row, single-column) output from the workers and render
-/// it as a SQL literal. Zero rows — a global aggregate over an empty input, suppressed by the
-/// combine stage's `HAVING COUNT(a0) > 0` — render as `NULL`.
-async fn pull_scalar_literal(cluster: &Cluster, stage_id: u32) -> Result<String> {
-    let mut values: Vec<ScalarValue> = Vec::new();
+fn sql_has_quoted_token(sql: &str, tok: &str) -> bool {
+    sql.contains(&format!("'{tok}'"))
+}
+
+/// Pull a scalar stage's complete one-row output (one or more columns) from the workers and
+/// render each cell as a SQL literal. Zero rows — empty DISTINCT / aggregate over an empty
+/// input — render as a single `NULL` (column 0) so a lone threshold becomes NULL; multi-column
+/// empty rows render as `NULL` per expected column only when the planner emitted tokens for
+/// them (callers that need N NULLs pass a known width via the stage schema — here we return
+/// one NULL so single-column plans stay byte-compatible). Multi-row output is a hard error
+/// (SQL scalar subquery cardinality).
+async fn pull_scalar_row(cluster: &Cluster, stage_id: u32) -> Result<Vec<String>> {
+    let mut rows: Vec<Vec<ScalarValue>> = Vec::new();
     for ep in &cluster.workers {
         for p in 0..cluster.num_partitions {
             for b in pull_bucket_with_retry(ep.clone(), stage_id, p).await? {
                 for row in 0..b.num_rows() {
-                    values.push(ScalarValue::try_from_array(b.column(0), row).map_err(|e| {
-                        Error::Execution(format!("scalar stage {stage_id}: extract value: {e}"))
-                    })?);
+                    let mut cols = Vec::with_capacity(b.num_columns());
+                    for c in 0..b.num_columns() {
+                        cols.push(ScalarValue::try_from_array(b.column(c), row).map_err(|e| {
+                            Error::Execution(format!("scalar stage {stage_id}: extract value: {e}"))
+                        })?);
+                    }
+                    rows.push(cols);
                 }
             }
         }
     }
-    match values.as_slice() {
-        [] => Ok("NULL".to_string()),
-        [v] => scalar_literal_sql(v),
+    match rows.as_slice() {
+        [] => Ok(vec!["NULL".to_string()]),
+        [cols] => cols.iter().map(scalar_literal_sql).collect(),
         _ => Err(Error::Execution(format!(
             "scalar stage {stage_id} produced {} rows (expected at most one)",
-            values.len()
+            rows.len()
         ))),
     }
 }
@@ -786,7 +826,7 @@ async fn run_stages_obs_inner(
     // the driver consumes directly (literal injection) instead of a downstream worker stage. It
     // is matched positionally (so callers may rebase stage ids); the output stage is the last
     // stage of the topologically-ordered list.
-    let token_present = stages.iter().any(|s| s.sql.contains(SCALAR_TOKEN));
+    let token_present = stages.iter().any(|s| stage_sql_has_scalar_token(&s.sql));
     // Owned: a re-optimized tail swap rebuilds the stage vec, and the driver re-reads the
     // (re-derived) output stage from it afterwards.
     let (mut output, scalar_stage): (StageDef, Option<StageDef>) = match outputs.as_slice() {
@@ -837,7 +877,7 @@ async fn run_stages_obs_inner(
     // upstream endpoint for this stage id (`stage_ticket`'s shared `upstream_endpoints`), but
     // workers that never produced it simply have no cache entry and `read_shuffle` serves them
     // an empty bucket rather than erroring — so a single real producer is sufficient.
-    let mut scalar_literal: Option<String> = None;
+    let mut scalar_literal: Option<Vec<String>> = None;
     // OXIDANT_REOPT_JOIN_ORDER: when the gate is on (and the plan is re-optimizable — a
     // scalar-token plan's positional literal pipeline must keep its dispatch order),
     // stable-partition the worklist so zero-upstream leaf producers dispatch before the
@@ -1496,7 +1536,7 @@ async fn run_stages_concurrent(
     stage_map: &HashMap<u32, StageDef>,
     output_stage_id: u32,
     scalar_stage: Option<&StageDef>,
-    scalar_literal: &mut Option<String>,
+    scalar_literal: &mut Option<Vec<String>>,
     planned_workers: &[String],
     query_id: &str,
     cancel: &AtomicBool,

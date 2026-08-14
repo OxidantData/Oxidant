@@ -21,6 +21,11 @@
 //!   (SELECT sum(…) * frac FROM fact, …)`, TPC-H Q11) get a one-row broadcast: scalar
 //!   partial/combine stages, then the driver inlines the single computed value into the outer
 //!   stages' SQL before dispatch (literal injection).
+//! - **Uncorrelated scalar DISTINCT over replicated tables** in WHERE / BETWEEN (TPC-DS Q54's
+//!   `d_month_seq BETWEEN (SELECT DISTINCT d_month_seq+1 …) AND (SELECT DISTINCT …+3 …)`) get
+//!   the same one-row broadcast: a Forward `GROUP BY` (exact DISTINCT) per bound, cross-joined
+//!   into one multi-column scalar row, then literal injection (KAN-144). Multi-row DISTINCT is
+//!   a hard error at pull time — matching SQL scalar-subquery cardinality.
 //! - **UNION ALL** / **UNION** (distinct) / **INTERSECT** / **EXCEPT** of distributable arms
 //!   (branch stages + hash-shuffle co-location, then local set / dedup).
 //! - **Narrow windows**: aggregate `OVER (PARTITION BY …)` over one sharded table (shuffle by
@@ -52,7 +57,9 @@ use super::stage_planner::{
     reject_unsafe_broadcast_shapes, resolve_grouping_specs, sanitize_generated_sql,
     simple_table_scan, unqualify, wrap_output, AggSpec, DistributedQuery, Peeled,
 };
-use crate::driver::{scalar_literal_supported, ExchangeMode, StageDef, SCALAR_TOKEN};
+use crate::driver::{
+    scalar_column_token, scalar_literal_supported, ExchangeMode, StageDef, SCALAR_TOKEN,
+};
 
 /// If `lp` is a distributable aggregate window over one sharded table, lower it; otherwise
 /// `Ok(None)` so the caller falls through (unsupported window shapes return `Err`).
@@ -5899,6 +5906,280 @@ pub(crate) fn try_derived_scalar_equality(
         return Ok(None);
     }
     Ok(Some(dq))
+}
+
+/// KAN-144: uncorrelated scalar `SELECT DISTINCT <expr>` over **replicated** tables in WHERE
+/// (including `BETWEEN` bounds) — TPC-DS Q54's
+/// `d_month_seq BETWEEN (SELECT DISTINCT d_month_seq+1 FROM date_dim WHERE …) AND
+/// (SELECT DISTINCT d_month_seq+3 FROM date_dim WHERE …)`.
+///
+/// # Exactness
+///
+/// A SQL scalar subquery admits 0 or 1 row (multi-row is an error). `SELECT DISTINCT e …` as a
+/// scalar is therefore exactly `SELECT e … GROUP BY e` with the same cardinality check:
+///
+/// 1. **Forward stage** (stage 0): every Distinct scalar body is fully replicated, so one worker
+///    computes `SELECT <expr> AS s{i} … GROUP BY <expr>` per body. Multiple bodies cross-join
+///    into a single row `(s0, s1, …)` — the product of per-body cardinalities equals 1 iff each
+///    body alone would, and equals 0 iff any body is empty (BETWEEN with a NULL bound filters
+///    nothing in, matching scalar-NULL semantics).
+/// 2. **Literal injection**: the driver pulls the one-row multi-column output and replaces
+///    `'__OXIDANT_SCALAR_STAGE_{i}__'` in downstream stage SQL before dispatch. Multi-row pull
+///    is a hard error (same as single-node scalar cardinality).
+///
+/// Correlated Distinct scalars, Distinct over a sharded table, and multi-expression Distinct
+/// projections are declined (`Ok(None)`) — classical per-key decorrelation does not apply to
+/// Q54/Q82's SQL (see `scratchpad/KAN-144-DECORRELATION.md`).
+pub(crate) fn try_uncorrelated_distinct_scalars(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<Option<DistributedQuery>> {
+    let mut bodies: Vec<DistinctScalarBody> = Vec::new();
+    collect_distinct_scalar_bodies(lp, replicated, &mut bodies)?;
+    if bodies.is_empty() {
+        return Ok(None);
+    }
+    for b in &bodies {
+        if !scalar_literal_supported(&b.data_type) {
+            return Ok(None);
+        }
+    }
+
+    let mut replace_idx = 0usize;
+    let rewritten = replace_distinct_scalar_exprs(lp, replicated, bodies.len(), &mut replace_idx)?;
+    if replace_idx != bodies.len() {
+        return Ok(None);
+    }
+
+    // Recurse: the rewritten plan has no matching Distinct scalars, so this path is a no-op
+    // on the inner call and the ordinary shapes plan the subquery-free query.
+    let Ok(mut dq) = plan_distributed_logical(&rewritten, replicated) else {
+        return Ok(None);
+    };
+
+    let up = Unparser::default();
+    let mut arm_sqls: Vec<String> = Vec::with_capacity(bodies.len());
+    for (i, body) in bodies.iter().enumerate() {
+        let expr = expr_sql(&up, &body.expr)?;
+        let inner_sql = up
+            .plan_to_sql(body.inner_body.as_ref())
+            .map_err(|e| {
+                Error::Unsupported(format!(
+                    "auto-distribute: unparse distinct-scalar body: {e}"
+                ))
+            })?
+            .to_string();
+        let inner_tail = sanitize_generated_sql(&extract_from_tail(&inner_sql)?);
+        let preds: Vec<&Expr> = body.inner_preds.iter().collect();
+        let inner_where = where_clause(&up, &preds)?;
+        arm_sqls.push(sanitize_generated_sql(&format!(
+            "SELECT {expr} AS s{i} {inner_tail}{inner_where} GROUP BY {expr}"
+        )));
+    }
+
+    let scalar_sql = if arm_sqls.len() == 1 {
+        arm_sqls.remove(0)
+    } else {
+        // Cross-join one-row-or-empty arms: product cardinality matches independent scalar
+        // evaluation (0 if any empty; 1 if all singletons; >1 is a pull-time error).
+        let selects: Vec<String> = (0..arm_sqls.len()).map(|i| format!("t{i}.s{i}")).collect();
+        let mut from = format!("({}) AS t0", arm_sqls[0]);
+        for (i, arm) in arm_sqls.iter().enumerate().skip(1) {
+            from.push_str(&format!(", ({arm}) AS t{i}"));
+        }
+        format!("SELECT {} FROM {from}", selects.join(", "))
+    };
+
+    for s in &mut dq.stages {
+        s.stage_id += 1;
+        for u in &mut s.upstream_stage_ids {
+            *u += 1;
+        }
+    }
+    let mut forward = StageDef::new(0, sanitize_generated_sql(&scalar_sql), vec![], vec![]);
+    forward.exchange = ExchangeMode::Forward;
+    let mut stages = vec![forward];
+    stages.append(&mut dq.stages);
+    dq.stages = stages;
+
+    // Every token must survive as a quoted literal in some stage SQL.
+    for i in 0..bodies.len() {
+        let tok = scalar_column_token(i);
+        let quoted = format!("'{tok}'");
+        if !dq.stages.iter().any(|s| s.sql.contains(&quoted)) {
+            return Ok(None);
+        }
+    }
+    if dq
+        .finalize_sql
+        .as_ref()
+        .is_some_and(|f| f.contains("__OXIDANT_SCALAR_STAGE_"))
+    {
+        return Ok(None);
+    }
+    Ok(Some(dq))
+}
+
+/// One validated uncorrelated Distinct-scalar body over replicated tables only.
+struct DistinctScalarBody {
+    expr: Expr,
+    inner_body: Arc<LogicalPlan>,
+    inner_preds: Vec<Expr>,
+    data_type: datafusion::arrow::datatypes::DataType,
+}
+
+/// Walk `lp`'s expression subqueries (preorder) and push every matching Distinct scalar body.
+fn collect_distinct_scalar_bodies(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+    out: &mut Vec<DistinctScalarBody>,
+) -> Result<()> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    for e in lp.expressions() {
+        let mut err: Option<Error> = None;
+        let _ = e.apply(|node| {
+            if let Expr::ScalarSubquery(sq) = node {
+                match match_replicated_distinct_scalar(sq.subquery.as_ref(), replicated) {
+                    Ok(Some(body)) => out.push(body),
+                    Ok(None) => {}
+                    Err(e) => {
+                        err = Some(e);
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+    }
+    for input in lp.inputs() {
+        collect_distinct_scalar_bodies(input, replicated, out)?;
+    }
+    Ok(())
+}
+
+/// `Distinct(Projection([e], Filter*|Scan))` (or Projection-over-Distinct of a single column)
+/// over only replicated tables, uncorrelated, no nested subqueries.
+fn match_replicated_distinct_scalar(
+    sub: &LogicalPlan,
+    replicated: &[&str],
+) -> Result<Option<DistinctScalarBody>> {
+    let mut sp = sub;
+    while let LogicalPlan::SubqueryAlias(s) = sp {
+        sp = s.input.as_ref();
+    }
+    if plan_contains_outer_reference(sp) {
+        return Ok(None);
+    }
+
+    let (expr, mut body) = match sp {
+        LogicalPlan::Distinct(d) => {
+            let inp = d.input().as_ref();
+            match inp {
+                LogicalPlan::Projection(p) if p.expr.len() == 1 => {
+                    (strip_alias(&p.expr[0]).clone(), p.input.clone())
+                }
+                _ => return Ok(None),
+            }
+        }
+        LogicalPlan::Projection(p) if p.expr.len() == 1 => {
+            let e = strip_alias(&p.expr[0]).clone();
+            match p.input.as_ref() {
+                LogicalPlan::Distinct(d) => {
+                    // Projection over DISTINCT *: only a plain column of the distinct output.
+                    if !matches!(e, Expr::Column(_)) {
+                        return Ok(None);
+                    }
+                    (e, d.input().clone())
+                }
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+
+    let mut inner_preds: Vec<Expr> = Vec::new();
+    while let LogicalPlan::Filter(f) = body.as_ref() {
+        let mut conj: Vec<&Expr> = Vec::new();
+        flatten_conjuncts(&f.predicate, &mut conj);
+        for c in conj {
+            if expr_contains_subquery(c) {
+                return Ok(None);
+            }
+            inner_preds.push(c.clone());
+        }
+        body = f.input.clone();
+    }
+    if plan_has_filter_or_subquery_expr(body.as_ref()) || plan_contains_aggregate(body.as_ref()) {
+        return Ok(None);
+    }
+    let tables = base_tables(body.as_ref());
+    if tables.is_empty() || tables.iter().any(|t| !replicated.contains(&t.as_str())) {
+        return Ok(None);
+    }
+    if expr_contains_subquery(&expr) {
+        return Ok(None);
+    }
+    let data_type = match sp.schema().fields().first() {
+        Some(f) => f.data_type().clone(),
+        None => return Ok(None),
+    };
+    Ok(Some(DistinctScalarBody {
+        expr,
+        inner_body: body,
+        inner_preds,
+        data_type,
+    }))
+}
+
+/// Replace the i-th matching Distinct scalar subquery (same visit order as collect) with the
+/// indexed placeholder literal `'__OXIDANT_SCALAR_STAGE_{i}__'`.
+fn replace_distinct_scalar_exprs(
+    lp: &LogicalPlan,
+    replicated: &[&str],
+    n: usize,
+    idx: &mut usize,
+) -> Result<LogicalPlan> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    let rewrite_expr = |e: Expr, idx: &mut usize| -> Result<Expr> {
+        e.transform(|node| {
+            if let Expr::ScalarSubquery(sq) = &node {
+                if *idx < n {
+                    match match_replicated_distinct_scalar(sq.subquery.as_ref(), replicated) {
+                        Ok(Some(_)) => {
+                            let tok = scalar_column_token(*idx);
+                            *idx += 1;
+                            return Ok(Transformed::yes(Expr::Literal(
+                                ScalarValue::Utf8(Some(tok)),
+                                None,
+                            )));
+                        }
+                        Ok(None) => {}
+                        Err(_) => {}
+                    }
+                }
+            }
+            Ok(Transformed::no(node))
+        })
+        .map(|t| t.data)
+        .map_err(|e| Error::Unsupported(format!("auto-distribute: rewrite distinct scalar: {e}")))
+    };
+
+    let mut new_exprs = Vec::with_capacity(lp.expressions().len());
+    for e in lp.expressions() {
+        new_exprs.push(rewrite_expr(e, idx)?);
+    }
+    let mut new_inputs = Vec::with_capacity(lp.inputs().len());
+    for input in lp.inputs() {
+        new_inputs.push(replace_distinct_scalar_exprs(input, replicated, n, idx)?);
+    }
+    lp.with_new_exprs(new_exprs, new_inputs).map_err(|e| {
+        Error::Unsupported(format!(
+            "auto-distribute: rebuild after distinct scalar rewrite: {e}"
+        ))
+    })
 }
 
 /// Decorrelate an **uncorrelated** scalar min/max/sum/count subquery used as a comparison

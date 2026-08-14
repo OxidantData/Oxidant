@@ -14,9 +14,10 @@
 //!
 //! - the generated stage SQL contains **no `CROSS JOIN`** — every join carries its equijoin
 //!   keys in an `ON` clause;
-//! - the generated stage-0 SQL planned through the in-process engine (exactly what a worker
-//!   runs) yields a physical plan with **no `CrossJoinExec`** (and no `NestedLoopJoinExec`) —
-//!   every join is a hash/sort-merge equijoin;
+//! - the fact-scan stage SQL (not always stage 0 after KAN-144's scalar-first layout) planned
+//!   through the in-process engine (exactly what a worker runs after token substitution) yields
+//!   a physical plan with **no `CrossJoinExec`** (and no `NestedLoopJoinExec`) — every join is
+//!   a hash/sort-merge equijoin;
 //! - the distributed plan still matches single-node end-to-end under
 //!   `OXIDANT_DISTRIBUTED_STRICT=1` (no whole-fact gather substitution).
 
@@ -258,10 +259,15 @@ fn rows_sorted(batches: &[RecordBatch]) -> Vec<Vec<String>> {
 }
 
 /// The structural pin: Q6's generated stage SQL contains no `CROSS JOIN` (every join carries
-/// its equijoin keys in `ON`), and the stage-0 SQL — planned through the in-process engine
-/// exactly as a worker plans it — yields a physical plan with no `CrossJoinExec` and no
-/// `NestedLoopJoinExec`. This is the property whose absence OOM'd the SF10 worker; it is
+/// its equijoin keys in `ON`), and the fact-scan stage SQL — planned through the in-process
+/// engine exactly as a worker plans it — yields a physical plan with no `CrossJoinExec` and
+/// no `NestedLoopJoinExec`. This is the property whose absence OOM'd the SF10 worker; it is
 /// checkable at any scale because it is structural, not statistics-dependent.
+///
+/// KAN-144: the uncorrelated `SELECT DISTINCT d_month_seq` bound is a legitimate one-row
+/// broadcast, so stage 0 is now the Forward scalar (`GROUP BY d_month_seq`) and the fact
+/// scan (four equijoins + correlated price threshold + `'__OXIDANT_SCALAR_STAGE_0__'`) is a
+/// later stage. Locate the fact-scan stage by content, not by index 0.
 #[tokio::test]
 async fn q6_stage_sql_has_no_cross_join_anywhere() {
     std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "16");
@@ -277,13 +283,20 @@ async fn q6_stage_sql_has_no_cross_join_anywhere() {
             s.sql
         );
     }
-    let stage0 = &dq.stages[0].sql;
-    // The four fact/dim equijoins are now syntactic ON clauses (the correlated price
-    // threshold and the uncorrelated month_seq scalar stay spliced in WHERE).
-    assert!(stage0.contains("JOIN customer AS c ON"), "{stage0}");
-    assert!(stage0.contains("JOIN store_sales AS s ON"), "{stage0}");
-    assert!(stage0.contains("JOIN date_dim AS d ON"), "{stage0}");
-    assert!(stage0.contains("JOIN item AS i ON"), "{stage0}");
+    // Scalar-stage-first (KAN-144): find the fact-scan stage that carries the four ON equijoins.
+    let fact_sql = dq
+        .stages
+        .iter()
+        .map(|s| s.sql.as_str())
+        .find(|sql| sql.contains("JOIN store_sales AS s ON") && sql.contains("JOIN item AS i ON"))
+        .expect("q6 plan must include a fact-scan stage with the four equijoins");
+    // The four fact/dim equijoins are syntactic ON clauses; the correlated price threshold
+    // stays spliced in WHERE; the uncorrelated month_seq bound is a scalar token (substituted
+    // at dispatch from the Forward stage-0 DISTINCT/GROUP BY).
+    assert!(fact_sql.contains("JOIN customer AS c ON"), "{fact_sql}");
+    assert!(fact_sql.contains("JOIN store_sales AS s ON"), "{fact_sql}");
+    assert!(fact_sql.contains("JOIN date_dim AS d ON"), "{fact_sql}");
+    assert!(fact_sql.contains("JOIN item AS i ON"), "{fact_sql}");
     for key in [
         "a.ca_address_sk = c.c_current_addr_sk",
         "c.c_customer_sk = s.ss_customer_sk",
@@ -291,29 +304,44 @@ async fn q6_stage_sql_has_no_cross_join_anywhere() {
         "s.ss_item_sk = i.i_item_sk",
     ] {
         assert!(
-            stage0.contains(key),
-            "equijoin key must be an ON clause: {stage0}"
+            fact_sql.contains(key),
+            "equijoin key must be an ON clause: {fact_sql}"
         );
     }
-    assert!(stage0.contains("SELECT avg(j.i_current_price)"), "{stage0}");
+    assert!(
+        fact_sql.contains("SELECT avg(j.i_current_price)"),
+        "{fact_sql}"
+    );
+    assert!(
+        fact_sql.contains("__OXIDANT_SCALAR_STAGE_0__"),
+        "month_seq bound must be the indexed scalar token: {fact_sql}"
+    );
+    assert!(
+        dq.stages[0].sql.contains("GROUP BY") && dq.stages[0].sql.contains("d_month_seq"),
+        "stage 0 must be the Forward month_seq scalar: {}",
+        dq.stages[0].sql
+    );
 
-    // Plan stage-0 through a worker-equivalent engine: no non-equijoin operator anywhere.
+    // Plan the fact-scan stage through a worker-equivalent engine: no non-equijoin operator.
+    // Substitute the scalar token with a fixture literal so the physical plan is parseable
+    // (the real driver does this before dispatch).
+    let fact_for_phys = fact_sql.replace("'__OXIDANT_SCALAR_STAGE_0__'", "120");
     let worker = Engine::new();
     register_all(&worker);
     let plan = worker
-        .physical_plan(stage0)
+        .physical_plan(&fact_for_phys)
         .await
-        .expect("worker physical plan of stage-0 SQL");
+        .expect("worker physical plan of fact-scan SQL");
     let display = datafusion::physical_plan::displayable(plan.as_ref()).indent(false);
     assert_eq!(
         count_exec::<datafusion::physical_plan::joins::CrossJoinExec>(&plan),
         0,
-        "stage-0 physical plan must contain no CrossJoinExec:\n{display}"
+        "fact-scan physical plan must contain no CrossJoinExec:\n{display}"
     );
     assert_eq!(
         count_exec::<datafusion::physical_plan::joins::NestedLoopJoinExec>(&plan),
         0,
-        "stage-0 physical plan must contain no NestedLoopJoinExec:\n{display}"
+        "fact-scan physical plan must contain no NestedLoopJoinExec:\n{display}"
     );
     assert!(
         count_exec::<datafusion::physical_plan::joins::HashJoinExec>(&plan) >= 4,
