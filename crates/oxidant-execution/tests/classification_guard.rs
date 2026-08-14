@@ -1,5 +1,8 @@
 //! Classification guard: baseline-pinned plan/decline matrix for all 99 TPC-DS
-//! queries under two simulated SF100 auto-broadcast classifications.
+//! queries under two simulated SF100 auto-broadcast classifications — each run
+//! once against bare MemTable scans and once against catalog-style wrapped fact
+//! scans (`SubqueryAlias → passthrough Projection → TableScan` with a qualified
+//! `glue.tpcds_sf100.*` scan name).
 //!
 //! This test ports the scratch q2diag harness (which predicted the v0.1.11
 //! auto-broadcast regression blast radius 20/20) into the repo as a permanent
@@ -13,9 +16,13 @@
 //!   * `bcast_4gib`: v0.1.11-equivalent — all three sales facts exceed 4 GiB,
 //!     so all stay sharded; everything else is replicated.
 //!
-//! The expected outcome per (query, classification) — `ok(<stage count>)` or
-//! `fail` — is pinned in `fixtures/classification_guard_baseline.tsv`. The
-//! test FAILS when any query's plan/decline status (or stage count) changes
+//! The bare-MemTable matrix missed Glue/Hive view expansion: real catalog scans
+//! arrive wrapped, and TPC-DS q5's co-located LEFT JOIN admission previously
+//! required a bare `TableScan`. The wrapped columns exercise that shape.
+//!
+//! The expected outcome per (query, classification, scan mode) — `ok(<stage
+//! count>)` or `fail` — is pinned in `fixtures/classification_guard_baseline.tsv`.
+//! The test FAILS when any cell's plan/decline status (or stage count) changes
 //! vs the baseline. Intentional behavior changes must update the baseline in
 //! the same PR: regenerate with
 //!
@@ -33,13 +40,29 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{Column, TableReference};
 use datafusion::datasource::MemTable;
+use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
+use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
 use oxidant_execution::plan::plan_distributed_logical;
 use oxidant_loom::Engine;
 
 // SF100 byte order among the sales facts (see shard.rs KAN-161 comment):
 // store_sales (~29 GB) > catalog_sales (~14.5 GB) > web_sales (~7.2 GB).
 const SALES: [&str; 3] = ["store_sales", "catalog_sales", "web_sales"];
+
+/// Fact tables Glue/Hive expand as `SubqueryAlias → Projection → TableScan`
+/// with a catalog-qualified scan name. Wrapping these (and not dims) is what
+/// exposed the q5 bare-scan admission gap.
+const FACTS: [&str; 6] = [
+    "store_sales",
+    "catalog_sales",
+    "web_sales",
+    "store_returns",
+    "catalog_returns",
+    "web_returns",
+];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -118,21 +141,80 @@ fn replicated_32gib(all: &[String], sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// Rewrite fact `TableScan`s into the Glue/Hive view-expansion shape:
+/// `SubqueryAlias(bare) → passthrough Projection → TableScan(glue.tpcds_sf100.bare)`.
+/// Planning-only — the qualified scan uses a `LogicalTableSource` so stage SQL is
+/// never executed against it.
+fn wrap_fact_scans_catalog_style(lp: LogicalPlan) -> LogicalPlan {
+    lp.transform(|node| {
+        let LogicalPlan::TableScan(scan) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        let bare = scan.table_name.table().to_string();
+        if !FACTS.contains(&bare.as_str()) {
+            return Ok(Transformed::no(node));
+        }
+        // Already catalog-qualified (or previously wrapped): leave alone.
+        if !matches!(scan.table_name, TableReference::Bare { .. }) {
+            return Ok(Transformed::no(node));
+        }
+        let source = Arc::new(LogicalTableSource::new(Arc::clone(
+            scan.projected_schema.inner(),
+        )));
+        let scan_plan = LogicalPlanBuilder::scan(
+            TableReference::full("glue", "tpcds_sf100", bare.as_str()),
+            source,
+            None,
+        )
+        .expect("catalog-style fact scan")
+        .build()
+        .expect("catalog-style fact scan build");
+        let exprs: Vec<Expr> = scan_plan
+            .schema()
+            .iter()
+            .map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name())))
+            .collect();
+        let wrapped = LogicalPlanBuilder::from(scan_plan)
+            .project(exprs)
+            .expect("passthrough projection")
+            .alias(bare.as_str())
+            .expect("subquery alias")
+            .build()
+            .expect("wrapped fact build");
+        Ok(Transformed::yes(wrapped))
+    })
+    .expect("wrap fact scans")
+    .data
+}
+
 /// Mirror the driver's optimized-then-original split retry: plan the optimized
 /// plan; on failure, if optimization changed the plan, retry the original.
+/// When `wrap_facts` is set, both attempts see catalog-style wrapped fact scans.
 async fn plan_stage_count(
     engine: &Engine,
     sql: &str,
     replicated: &[String],
+    wrap_facts: bool,
 ) -> Result<usize, String> {
     let refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
     let lp = engine
         .logical_plan(sql)
         .await
         .map_err(|e| format!("logical_plan: {}", first_line(&e.to_string())))?;
+    let lp = if wrap_facts {
+        wrap_fact_scans_catalog_style(lp)
+    } else {
+        lp
+    };
     let optimized = engine
         .optimize_logical_plan(lp.clone())
         .unwrap_or_else(|_| lp.clone());
+    let optimized = if wrap_facts {
+        // Optimization can re-introduce bare scans from view folding; re-wrap.
+        wrap_fact_scans_catalog_style(optimized)
+    } else {
+        optimized
+    };
     match plan_distributed_logical(&optimized, &refs) {
         Ok(dq) => Ok(dq.stages.len()),
         Err(e) => {
@@ -208,22 +290,40 @@ async fn classification_guard_baseline() {
         engine.ctx().register_table(name, Arc::new(table)).unwrap();
     }
 
-    // header + one row per statement: `name<TAB>bcast_32gib<TAB>bcast_4gib`
+    // header + one row per statement:
+    // `name<TAB>bcast_32gib<TAB>bcast_4gib<TAB>wrapped_32gib<TAB>wrapped_4gib`
     let mut rows: Vec<String> = Vec::new();
     let mut errors: Vec<(String, String, String)> = Vec::new();
     for (name, sql) in all_statements() {
-        let old = plan_stage_count(&engine, &sql, &replicated_32gib(&all, &sql)).await;
-        let new = plan_stage_count(&engine, &sql, &replicated_4gib(&all)).await;
-        if let Err(e) = &old {
-            errors.push((name.clone(), "bcast_32gib".into(), e.clone()));
+        let repl_32 = replicated_32gib(&all, &sql);
+        let repl_4 = replicated_4gib(&all);
+        let bare_32 = plan_stage_count(&engine, &sql, &repl_32, false).await;
+        let bare_4 = plan_stage_count(&engine, &sql, &repl_4, false).await;
+        let wrap_32 = plan_stage_count(&engine, &sql, &repl_32, true).await;
+        let wrap_4 = plan_stage_count(&engine, &sql, &repl_4, true).await;
+        for (label, r) in [
+            ("bcast_32gib", &bare_32),
+            ("bcast_4gib", &bare_4),
+            ("wrapped_32gib", &wrap_32),
+            ("wrapped_4gib", &wrap_4),
+        ] {
+            if let Err(e) = r {
+                errors.push((name.clone(), label.into(), e.clone()));
+            }
         }
-        if let Err(e) = &new {
-            errors.push((name.clone(), "bcast_4gib".into(), e.clone()));
-        }
-        rows.push(format!("{name}\t{}\t{}", outcome_s(&old), outcome_s(&new)));
+        rows.push(format!(
+            "{name}\t{}\t{}\t{}\t{}",
+            outcome_s(&bare_32),
+            outcome_s(&bare_4),
+            outcome_s(&wrap_32),
+            outcome_s(&wrap_4)
+        ));
     }
 
-    let actual = format!("# query\tbcast_32gib\tbcast_4gib\n{}\n", rows.join("\n"));
+    let actual = format!(
+        "# query\tbcast_32gib\tbcast_4gib\twrapped_32gib\twrapped_4gib\n{}\n",
+        rows.join("\n")
+    );
 
     let path = baseline_path();
     if std::env::var("OXIDANT_CLASSIFICATION_GUARD_BLESS").is_ok() {
@@ -278,8 +378,19 @@ async fn classification_guard_baseline() {
             }
         })
         .collect();
+    let fail_w4: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| {
+            let mut c = r.split('\t');
+            match (c.next(), c.nth(3)) {
+                (Some(n), Some("fail")) => Some(n),
+                _ => None,
+            }
+        })
+        .collect();
     println!("bcast_32gib declines: {fail_32:?}");
     println!("bcast_4gib declines: {fail_4:?}");
+    println!("wrapped_4gib declines: {fail_w4:?}");
     for (name, cls, err) in &errors {
         println!("{name}\t{cls}\t{err}");
     }

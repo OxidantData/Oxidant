@@ -43,7 +43,12 @@
 //!   60.00 by null-extending matched preserved rows on the non-matching worker).
 //! - **(g) Web-leg decline pins**: residual `>` join filter; non-plain-column key; the
 //!   `RIGHT JOIN` flipped spelling; preserved side scanning the fact twice / a DIFFERENT
-//!   sharded table; null-extended side a UNION.
+//!   sharded table; null-extended side a UNION; a non-passthrough (expression) Projection
+//!   on a LEFT JOIN input (catalog wrappers must stay pure rename/reorder).
+//!
+//! Q5 STRICT e2e paths wrap fact scans as `SubqueryAlias → passthrough Projection →
+//! TableScan` (the Glue/Hive catalog shape) before planning so the co-located LEFT JOIN
+//! peel is exercised end-to-end, not only against bare MemTable scans.
 
 // ENV_LOCK serializes process-global `OXIDANT_DISTRIBUTED_STRICT` across async tests.
 #![allow(clippy::await_holding_lock)]
@@ -51,6 +56,9 @@
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::Column;
+use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
 use oxidant_execution::driver::{run_stages, Cluster, ExchangeMode};
 use oxidant_execution::flight::serve_worker;
 use oxidant_execution::plan::{plan_distributed_logical, DistributedQuery};
@@ -75,7 +83,47 @@ const REPL: [&str; 7] = [
 ];
 const SHARDED: [&str; 3] = ["store_sales", "catalog_sales", "web_sales"];
 
+/// Sales + returns facts — the tables Glue/Hive expand through catalog wrappers.
+const FACTS: [&str; 6] = [
+    "store_sales",
+    "catalog_sales",
+    "web_sales",
+    "store_returns",
+    "catalog_returns",
+    "web_returns",
+];
+
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Wrap fact `TableScan`s as `SubqueryAlias → passthrough Projection → TableScan` while
+/// keeping the bare scan name (workers still resolve MemTables). Models the catalog
+/// wrapper peel without requiring a qualified catalog on the e2e workers.
+fn wrap_fact_scans_catalog_style(lp: LogicalPlan) -> LogicalPlan {
+    lp.transform(|node| {
+        let LogicalPlan::TableScan(scan) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        let bare = scan.table_name.table().to_string();
+        if !FACTS.contains(&bare.as_str()) {
+            return Ok(Transformed::no(node));
+        }
+        let exprs: Vec<Expr> = node
+            .schema()
+            .iter()
+            .map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name())))
+            .collect();
+        let wrapped = LogicalPlanBuilder::from(node.clone())
+            .project(exprs)
+            .expect("passthrough projection")
+            .alias(bare.as_str())
+            .expect("subquery alias")
+            .build()
+            .expect("wrapped fact build");
+        Ok(Transformed::yes(wrapped))
+    })
+    .expect("wrap fact scans")
+    .data
+}
 
 static PORT: std::sync::OnceLock<AtomicU16> = std::sync::OnceLock::new();
 
@@ -359,13 +407,16 @@ fn plan_strict(
 }
 
 /// Plan strict, run on the two-worker cluster, require row-for-row equality with
-/// single-node. `check_plan` pins the stage shape.
+/// single-node. `check_plan` pins the stage shape. When `wrap_facts` is set, fact
+/// scans are rewritten to the catalog `SubqueryAlias → Projection → TableScan`
+/// shape before planning (the q5 e2e paths).
 async fn assert_matches(
     tag: &str,
     sql: &str,
     replicated: &[&str],
     planner: Engine,
     cluster: Cluster,
+    wrap_facts: bool,
     check_plan: impl Fn(&DistributedQuery),
 ) {
     let expected = planner.sql(sql).await.expect("single-node");
@@ -375,6 +426,11 @@ async fn assert_matches(
     );
 
     let lp = planner.logical_plan(sql).await.expect("logical plan");
+    let lp = if wrap_facts {
+        wrap_fact_scans_catalog_style(lp)
+    } else {
+        lp
+    };
     let dq = plan_strict(&lp, replicated, tag);
     check_plan(&dq);
 
@@ -408,9 +464,23 @@ async fn assert_matches(
 }
 
 /// The reduced-shape classification (REPL) and fixtures.
-async fn assert_matches_single_node(tag: &str, sql: &str, check_plan: impl Fn(&DistributedQuery)) {
+async fn assert_matches_single_node(
+    tag: &str,
+    sql: &str,
+    wrap_facts: bool,
+    check_plan: impl Fn(&DistributedQuery),
+) {
     let cluster = two_workers().await;
-    assert_matches(tag, sql, &REPL, planner_engine(), cluster, check_plan).await;
+    assert_matches(
+        tag,
+        sql,
+        &REPL,
+        planner_engine(),
+        cluster,
+        wrap_facts,
+        check_plan,
+    )
+    .await;
 }
 
 /// Leaf-stage count scanning `table`.
@@ -503,7 +573,7 @@ ORDER BY channel, id
 
 #[tokio::test]
 async fn nested_mixed_union_three_channels_matches_single_node() {
-    assert_matches_single_node("nested-mixed", NESTED_MIXED, |dq| {
+    assert_matches_single_node("nested-mixed", NESTED_MIXED, false, |dq| {
         // One partial producer per sales fact, hash-shuffled by (channel, id).
         for fact in SHARDED {
             let leaves = leaf_stages_scanning(dq, fact);
@@ -602,7 +672,7 @@ ORDER BY channel, id
 
 #[tokio::test]
 async fn rollup_over_nested_mixed_union_matches_single_node() {
-    assert_matches_single_node("nested-mixed-rollup", NESTED_MIXED_ROLLUP, |dq| {
+    assert_matches_single_node("nested-mixed-rollup", NESTED_MIXED_ROLLUP, false, |dq| {
         let combine = dq.stages.last().expect("recombine stage");
         assert_eq!(
             combine.upstream_stage_ids.len(),
@@ -782,7 +852,7 @@ GROUP BY channel, id
 
 #[tokio::test]
 async fn q5_web_leg_left_join_over_sharded_fact_matches_single_node() {
-    assert_matches_single_node("q5-web-leg", Q5_WEB_LEG, |dq| {
+    assert_matches_single_node("q5-web-leg", Q5_WEB_LEG, true, |dq| {
         // Seven stages: the flat `web_sales` producer (the nested union's sales branch),
         // the R1–R3 co-located LEFT JOIN chain (the returns branch's singleton bucket),
         // the flat `catalog_sales` producer, the replicated `catalog_returns` bucket, and
@@ -1103,6 +1173,7 @@ async fn q5_real_query_all_facts_sharded_matches_single_node() {
         &REPL,
         q5_planner_engine(),
         cluster,
+        true,
         |dq| {
             assert_eq!(
             dq.stages.len(),
@@ -1208,6 +1279,7 @@ async fn q5_web_leg_no_dim_join_row_class_sums_match() {
         &REPL,
         planner,
         cluster,
+        true,
         |dq| {
             assert!(
                 dq.stages.iter().any(|s| s
@@ -1320,6 +1392,17 @@ LEFT JOIN (
 ) web_sales ON web_returns.wr_item_sk = web_sales.ws_item_sk
            AND web_returns.wr_order_number = web_sales.ws_order_number";
 
+/// A non-passthrough Projection on the null-extended side (expression in the select list):
+/// catalog wrappers must be pure column rename/reorder, so this keeps declining.
+const WEB_LEG_BRANCH_EXPR_PROJ: &str = "\
+SELECT web_sales.ws_web_site_sk, web_returns.wr_returned_date_sk, CAST(0 AS DOUBLE)
+FROM web_returns
+LEFT JOIN (
+  SELECT ws_item_sk, ws_order_number, ws_web_site_sk, ws_item_sk + 1 AS extra
+  FROM web_sales
+) web_sales ON web_returns.wr_item_sk = web_sales.ws_item_sk
+           AND web_returns.wr_order_number = web_sales.ws_order_number";
+
 /// Sanity: the template itself (authentic branch) still PLANS, so a pin failure is the
 /// mutation's doing, not the harness's.
 #[tokio::test]
@@ -1384,6 +1467,15 @@ async fn q5_web_leg_union_right_side_declines_safely() {
     assert_declines(
         "q5-web-leg-union-right-side",
         &web_leg_branch_sql(WEB_LEG_BRANCH_UNION_RIGHT),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn q5_web_leg_non_passthrough_projection_declines_safely() {
+    assert_declines(
+        "q5-web-leg-non-passthrough-projection",
+        &web_leg_branch_sql(WEB_LEG_BRANCH_EXPR_PROJ),
     )
     .await;
 }
