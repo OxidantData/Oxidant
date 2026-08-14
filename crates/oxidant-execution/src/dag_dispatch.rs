@@ -68,8 +68,11 @@ impl StageDag {
                 .filter(|u| dispatch.contains(u))
                 .collect();
             // KAN-27: the token carrier reads the scalar stage's output via literal
-            // injection, an edge the plan expresses only positionally.
-            if s.sql.contains(SCALAR_TOKEN) && scalar_stage_id != Some(s.stage_id) {
+            // injection, an edge the plan expresses only positionally. Indexed tokens
+            // (`__OXIDANT_SCALAR_STAGE_{i}__`, KAN-144) share the same edge.
+            if (s.sql.contains(SCALAR_TOKEN) || s.sql.contains("__OXIDANT_SCALAR_STAGE_"))
+                && scalar_stage_id != Some(s.stage_id)
+            {
                 if let Some(scalar) = scalar_stage_id.filter(|id| dispatch.contains(id)) {
                     deps.insert(scalar);
                 }

@@ -75,7 +75,8 @@ use super::shape_extensions::{
     try_decorrelate_scalar_subquery, try_derived_scalar_equality, try_in_agg_semi_join,
     try_materialize_complex_fact, try_materialize_subquery_fact, try_nested_in_semi,
     try_non_aggregate, try_scalar_subquery_projection, try_semi_anti_subqueries,
-    try_uncorrelated_scalar_threshold, try_union_all, try_window,
+    try_uncorrelated_distinct_scalars, try_uncorrelated_scalar_threshold, try_union_all,
+    try_window,
 };
 use crate::driver::{ExchangeMode, StageDef};
 
@@ -137,6 +138,13 @@ pub fn plan_distributed_logical(lp: &LogicalPlan, replicated: &[&str]) -> Result
     let distributed = super::join_order::distribute_chain_filter(lp, replicated);
     let lp = distributed.as_ref().unwrap_or(lp);
     let primary: Result<DistributedQuery> = (|| {
+        // KAN-144: uncorrelated scalar DISTINCT over replicated tables (TPC-DS Q54's BETWEEN
+        // bounds) → one-row Forward broadcast + literal injection, then re-plan the
+        // subquery-free remainder. Runs before correlated decorrelation so the cleaned
+        // plan can match ordinary shapes.
+        if let Some(dq) = try_uncorrelated_distinct_scalars(lp, replicated)? {
+            return Ok(dq);
+        }
         // Correlated scalar min/max/sum/count subqueries (TPC-H Q2) get a real shuffle-join
         // plan here instead of the whole-fact gather they'd otherwise fall into below.
         if let Some(dq) = try_decorrelate_scalar_subquery(lp, replicated)? {
