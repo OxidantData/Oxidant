@@ -20,6 +20,8 @@
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
+use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider};
+use datafusion::datasource::MemTable;
 use oxidant_execution::driver::{run_stages, Cluster};
 use oxidant_execution::flight::serve_worker;
 use oxidant_execution::plan::plan_distributed_logical;
@@ -350,6 +352,95 @@ async fn q17_plans_with_substituted_boundary_keys() {
             "JOIN store_returns AS store_returns ON l.store_sales__ss_customer_sk = store_returns.sr_customer_sk"
         ),
         "the replicated returns table folds into the boundary stage: {plan}"
+    );
+}
+
+/// Register `batches` as `glue.tpcds_sf100.<name>` (MemoryCatalog) — models Glue view
+/// expansion's fully-qualified TableScan without AWS.
+fn register_glue_qualified(engine: &Engine, name: &str, batches: Vec<RecordBatch>) {
+    let schema = batches[0].schema();
+    let table = MemTable::try_new(schema, vec![batches]).expect("MemTable");
+    if engine.ctx().catalog("glue").is_none() {
+        engine
+            .ctx()
+            .register_catalog("glue", Arc::new(MemoryCatalogProvider::new()));
+    }
+    let catalog = engine.ctx().catalog("glue").expect("glue catalog");
+    if catalog.schema("tpcds_sf100").is_none() {
+        catalog
+            .register_schema("tpcds_sf100", Arc::new(MemorySchemaProvider::new()))
+            .unwrap();
+    }
+    catalog
+        .schema("tpcds_sf100")
+        .unwrap()
+        .register_table(name.to_string(), Arc::new(table))
+        .unwrap();
+}
+
+/// Glue SF100 shape: views expand to `TableScan: glue.tpcds_sf100.*`. Dim folds and leaf
+/// stages must emit that qualification — bare `date_dim` resolves to
+/// `spark_catalog.default.date_dim` on workers (SF100 Q17 runtime failure).
+async fn tpcds_engine_catalog_qualified() -> Engine {
+    let e = Engine::new();
+    for (name, batch) in [
+        ("date_dim", date_dim()),
+        ("store", store()),
+        ("item", item()),
+        ("store_returns", store_returns()),
+        ("store_sales", store_sales()),
+        ("catalog_sales", catalog_sales()),
+    ] {
+        register_glue_qualified(&e, name, vec![batch]);
+        e.sql(&format!(
+            "CREATE OR REPLACE VIEW {name} AS SELECT * FROM glue.tpcds_sf100.{name}"
+        ))
+        .await
+        .unwrap_or_else(|err| panic!("alias {name}: {err}"));
+    }
+    e
+}
+
+#[tokio::test]
+async fn q17_catalog_qualified_scans_preserve_qualification_in_stage_sql() {
+    let planner = tpcds_engine_catalog_qualified().await;
+    let plan = plan_strict(&planner, Q17).await;
+    assert!(
+        !plan.starts_with("DECLINE"),
+        "catalog-qualified q17 must plan: {plan}"
+    );
+    assert!(
+        !plan.contains("spark_catalog.default"),
+        "stage SQL must never emit spark_catalog.default: {plan}"
+    );
+    // Leaf scans + semi-filter subqueries + dim folds all carry the scan's TableReference.
+    for relation in [
+        "glue.tpcds_sf100.store_sales",
+        "glue.tpcds_sf100.catalog_sales",
+        "glue.tpcds_sf100.store_returns",
+        "glue.tpcds_sf100.date_dim",
+        "glue.tpcds_sf100.store",
+        "glue.tpcds_sf100.item",
+    ] {
+        assert!(
+            plan.contains(relation),
+            "stage SQL must reference qualified `{relation}`: {plan}"
+        );
+    }
+    // Dim-fold emission site (the SF100 failure): bare JOIN date_dim must not appear.
+    assert!(
+        plan.contains("JOIN glue.tpcds_sf100.date_dim AS")
+            && plan.contains("JOIN glue.tpcds_sf100.store_returns AS")
+            && plan.contains("JOIN glue.tpcds_sf100.store AS")
+            && plan.contains("JOIN glue.tpcds_sf100.item AS"),
+        "emit_dim_fold must use table_sql, not bare table: {plan}"
+    );
+    assert!(
+        !plan.contains("JOIN date_dim AS")
+            && !plan.contains("JOIN store_returns AS")
+            && !plan.contains("JOIN store AS")
+            && !plan.contains("JOIN item AS"),
+        "bare dim-fold JOINs regress catalog qualification: {plan}"
     );
 }
 
