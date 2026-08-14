@@ -1485,9 +1485,12 @@ fn emit_dim_fold(
             fold_key_sql(chain_key, alias_by_relation, right_alias, folded_aliases)?
         ));
     }
+    // Use catalog-qualified `table_sql` (not bare `table`): workers resolve bare names to
+    // `spark_catalog.default.*`, so Glue SF100 folds must emit `glue.<db>.<table>` (KAN-162).
+    // MemTable scans keep `table_sql == table`, so local e2e stays identical.
     join_from.push_str(&format!(
         " {join_kw} {} AS {b_alias} ON {}",
-        scan.table,
+        scan.table_sql,
         on_parts.join(" AND ")
     ));
     alias_by_relation.insert(scan.table.to_string(), b_alias.clone());
