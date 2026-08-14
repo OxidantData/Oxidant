@@ -599,7 +599,8 @@ async fn watch_stage_progress(
 
 /// Render the per-stage observability summary emitted at every stage-task exit (KAN-47):
 /// identity, shape, progress counters, and — when the watchdog fired — how stale the last
-/// progress signal was.
+/// progress signal was. KAN-153 appends the S3-wait / decode split when `io` is provided.
+#[allow(clippy::too_many_arguments)] // log-line formatter; args are independent fields
 fn stage_summary_line(
     stage_id: u32,
     partition_id: u32,
@@ -608,6 +609,7 @@ fn stage_summary_line(
     spill_bytes: u64,
     duration: std::time::Duration,
     status: &str,
+    io: Option<&oxidant_loom::s3_io::ScanIoStats>,
 ) -> String {
     let mut line = format!(
         "Oxidant stage summary: stage_id={stage_id} partition_id={partition_id} \
@@ -618,6 +620,12 @@ fn stage_summary_line(
     );
     if let Some(age) = progress.no_progress_age() {
         line.push_str(&format!(" last_progress_age_ms={}", age.as_millis()));
+    }
+    if let Some(stats) = io {
+        line.push(' ');
+        line.push_str(&oxidant_loom::s3_io::format_stage_io_fields(
+            stats, duration,
+        ));
     }
     line
 }
@@ -1387,6 +1395,7 @@ impl FlightService for Worker {
                 let num_partitions = t.num_partitions;
                 let cancel = self.register_stage_cancel(stage_id);
                 let progress = Arc::new(StageProgress::default());
+                let io_stats = Arc::new(oxidant_loom::s3_io::ScanIoStats::new());
                 let start = std::time::Instant::now();
                 let retry_ticket = t.clone();
                 // KAN-31/KAN-46: reap this producer task's spill scope when the task exits
@@ -1402,10 +1411,16 @@ impl FlightService for Worker {
                     src: partition_id,
                     armed: t.produce,
                 };
-                let run = async {
-                    test_stage_delay().await;
-                    test_stage_stall_once().await;
-                    self.run_stage(t, &progress).await
+                let run = {
+                    let io_stats = io_stats.clone();
+                    async {
+                        test_stage_delay().await;
+                        test_stage_stall_once().await;
+                        oxidant_loom::s3_io::with_task_io_stats(io_stats, async {
+                            self.run_stage(t, &progress).await
+                        })
+                        .await
+                    }
                 };
                 let watchdog = self.stage_watchdog(stage_id, progress.clone());
                 let result = run_stage_bounded(run, stage_timeout(), &cancel, watchdog).await;
@@ -1430,13 +1445,19 @@ impl FlightService for Worker {
                             spill.clear_scoped_stage(stage_id, partition_id);
                         }
                         let retry_watchdog = self.stage_watchdog(stage_id, progress.clone());
-                        let retry = async {
-                            test_stage_delay().await;
-                            test_stage_stall_once().await;
-                            oxidant_loom::with_join_strategy_flipped(
-                                self.run_stage(retry_ticket, &progress),
-                            )
-                            .await
+                        let retry = {
+                            let io_stats = io_stats.clone();
+                            async {
+                                test_stage_delay().await;
+                                test_stage_stall_once().await;
+                                oxidant_loom::s3_io::with_task_io_stats(io_stats, async {
+                                    oxidant_loom::with_join_strategy_flipped(
+                                        self.run_stage(retry_ticket, &progress),
+                                    )
+                                    .await
+                                })
+                                .await
+                            }
                         };
                         run_stage_bounded(retry, stage_timeout(), &cancel, retry_watchdog).await
                     }
@@ -1448,7 +1469,7 @@ impl FlightService for Worker {
                     spill_reaper.disarm();
                 }
                 self.unregister_stage_cancel(stage_id, &cancel);
-                // Per-stage observability summary (KAN-47): one line per stage-task exit.
+                // Per-stage observability summary (KAN-47 + KAN-153 IO split).
                 eprintln!(
                     "{}",
                     stage_summary_line(
@@ -1459,6 +1480,7 @@ impl FlightService for Worker {
                         total_spill_bytes(&self.engine, self.spill.as_ref()),
                         start.elapsed(),
                         if result.is_ok() { "ok" } else { "error" },
+                        Some(io_stats.as_ref()),
                     )
                 );
                 result?
@@ -3039,6 +3061,7 @@ mod tests {
             1024,
             std::time::Duration::from_millis(1234),
             "error",
+            None,
         );
         for needle in [
             "stage_id=4",
@@ -3064,7 +3087,32 @@ mod tests {
             0,
             std::time::Duration::from_millis(5),
             "ok",
+            None,
         );
         assert!(!clean.contains("last_progress_age_ms"), "{clean}");
+    }
+
+    #[test]
+    fn stage_summary_line_includes_kan153_io_split() {
+        let io = oxidant_loom::s3_io::ScanIoStats::new();
+        io.note_cache_bypass_too_large();
+        let line = stage_summary_line(
+            0,
+            0,
+            2,
+            &StageProgress::default(),
+            0,
+            std::time::Duration::from_millis(1000),
+            "ok",
+            Some(&io),
+        );
+        for needle in [
+            "s3_wait_ms=0",
+            "decode_ms=1000",
+            "s3_bytes=0",
+            "cache_bypass=1",
+        ] {
+            assert!(line.contains(needle), "missing {needle}: {line}");
+        }
     }
 }

@@ -35,6 +35,9 @@ pub mod dim_cache;
 
 /// Disk-caching object_store wrapper for remote analytical reads (`OXIDANT_S3_CACHE_DIR`).
 pub mod s3_cache;
+
+/// S3 / object-store scan I/O counters + range-read concurrency (KAN-153).
+pub mod s3_io;
 /// Worker-side stage plan cache (R5-4 / KAN-2): a distributed stage is planned once per
 /// worker, not once per task. See [`stage_plan_cache`].
 pub mod stage_plan_cache;
@@ -3282,6 +3285,14 @@ impl Engine {
             opts.execution.parquet.reorder_filters = true;
             opts.execution.parquet.binary_as_string = true;
             opts.execution.parquet.schema_force_view_types = true;
+            // KAN-153: bounded parquet readahead — how many decoded batches the scan
+            // keeps in flight while waiting on downstream. Higher values issue more
+            // concurrent row-group ranged GETs (pairs with OXIDANT_S3_RANGE_CONCURRENCY).
+            // Default 4 (DataFusion stock is 2); cap via env; `1` disables readahead.
+            opts.execution
+                .parquet
+                .maximum_buffered_record_batches_per_stream =
+                env_usize("OXIDANT_PARQUET_PREFETCH_BATCHES").unwrap_or(4);
             // KAN-2 R2: hash-join dynamic filters — the build side publishes a runtime
             // bounds+membership filter over the probe-side join keys, and the
             // probe-side parquet scan absorbs it for row-group/page-index/bloom

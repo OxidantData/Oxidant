@@ -220,12 +220,14 @@ impl DiskCachingStore {
             .expect("s3 cache oversized poisoned")
             .contains(location)
         {
+            crate::s3_io::note_cache_bypass_too_large();
             return Err(Arc::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "s3 object exceeds OXIDANT_S3_CACHE_MAX_OBJECT_BYTES; using ranged reads",
             )));
         }
         if let Some(file) = self.fresh_entry(location) {
+            crate::s3_io::note_cache_hit();
             return Ok(file);
         }
         // Single-flight: one cell per path; `get_or_try_init` coalesces concurrent
@@ -291,6 +293,7 @@ impl DiskCachingStore {
                 .lock()
                 .expect("s3 cache oversized poisoned")
                 .insert(location.clone());
+            crate::s3_io::note_cache_bypass_too_large();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -307,6 +310,7 @@ impl DiskCachingStore {
                 if entry.size == meta.size && entry.e_tag == meta.e_tag && entry.file.exists() {
                     entry.last_used = std::time::Instant::now();
                     entry.last_validated = std::time::Instant::now();
+                    crate::s3_io::note_cache_hit();
                     return Ok(entry.file.clone());
                 }
                 let stale = entry.file.clone();
@@ -342,8 +346,10 @@ impl DiskCachingStore {
                     },
                 );
             self.evict_if_needed();
+            crate::s3_io::note_cache_hit();
             return Ok(file);
         }
+        crate::s3_io::note_cache_miss();
         let tmp = file.with_extension(format!("part{}", std::process::id()));
         let mut stream = self
             .inner
