@@ -1796,11 +1796,9 @@ pub(crate) fn replan_chain_tail(
         .collect();
     let dq = build_chain(&p, &sharded, replicated, leftmost, &permuted, false).ok()?;
     // A scalar-token plan's positional literal-substitution pipeline must not be re-planned.
-    if dq
-        .stages
-        .iter()
-        .any(|s| s.sql.contains(crate::driver::SCALAR_TOKEN))
-    {
+    if dq.stages.iter().any(|s| {
+        s.sql.contains(crate::driver::SCALAR_TOKEN) || s.sql.contains("__OXIDANT_SCALAR_STAGE_")
+    }) {
         return None;
     }
 
