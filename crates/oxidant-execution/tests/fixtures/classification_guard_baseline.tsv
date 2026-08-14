@@ -62,7 +62,7 @@ q60	ok(3)	ok(4)	ok(3)	ok(4)
 q61	ok(5)	ok(5)	ok(5)	ok(5)
 q62	ok(2)	ok(2)	ok(2)	ok(2)
 q63	ok(3)	ok(3)	ok(3)	ok(3)
-q64	ok(3)	ok(7)	ok(3)	fail
+q64	ok(3)	ok(7)	ok(3)	ok(7)
 q65	ok(5)	ok(5)	ok(5)	ok(5)
 q66	ok(3)	ok(3)	ok(3)	ok(3)
 q67	ok(4)	ok(4)	ok(4)	ok(4)

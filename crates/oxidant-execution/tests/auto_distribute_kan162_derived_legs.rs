@@ -529,3 +529,224 @@ async fn all_replicated_derived_leaf_keeps_prior_rejection() {
         "an all-replicated derived leaf keeps the prior rejection: {plan}"
     );
 }
+
+// --- Glue view-expansion wrapping: the same q64 chain with catalog-wrapped fact leaves -----
+
+/// Glue/Hive expand a catalog table into `SubqueryAlias(bare) → Projection(1:1) →
+/// TableScan(<physical>)`, so on a real cluster every fact leaf arrives one `Projection` deeper
+/// than the bare `SubqueryAlias → TableScan` the comma connector used to require. A temp view
+/// over a `base_*` table reproduces exactly that shape through ordinary SQL.
+///
+/// Before KAN-162's `is_scan_passthrough`, the wrapped `store_sales` leaf failed
+/// `is_simple_leaf` *and* satisfied `is_opaque_derived_leaf`, so q64's derived-leaf count hit 2
+/// (with `cs_ui`) and the connector declined — leaving a 17-deep cross join the branch planner
+/// rejected for want of an equijoin key. Real SF100 q64 declined for this reason alone.
+const Q64_WRAPPED: &str = "
+WITH cs_ui AS (
+  SELECT cs_item_sk,
+         sum(cs_ext_list_price) AS sale,
+         sum(cr_refunded_cash) AS refund
+  FROM catalog_sales, catalog_returns
+  WHERE cs_item_sk = cr_item_sk
+    AND cs_order_number = cr_order_number
+  GROUP BY cs_item_sk
+  HAVING sum(cs_ext_list_price) > 2*sum(cr_refunded_cash)
+)
+SELECT i_item_sk, s_store_name, count(*) AS cnt, sum(ss_list_price) AS s2
+FROM store_sales, store_returns, cs_ui, item, store, customer
+WHERE ss_store_sk = s_store_sk
+  AND ss_customer_sk = c_customer_sk
+  AND ss_item_sk = i_item_sk
+  AND ss_item_sk = sr_item_sk
+  AND ss_ticket_number = sr_ticket_number
+  AND ss_item_sk = cs_ui.cs_item_sk
+GROUP BY i_item_sk, s_store_name
+";
+
+/// Physical (`base_*`) names, which is what stage SQL references once the view is folded —
+/// so the replicated / sharded lists and the worker registrations all key off these.
+const REPL_Q64_WRAPPED: [&str; 3] = ["base_item", "base_store", "base_customer"];
+const Q64_WRAPPED_SHARDED: [&str; 4] = [
+    "base_store_sales",
+    "base_store_returns",
+    "base_catalog_sales",
+    "base_catalog_returns",
+];
+
+/// Planner engine whose every table is reachable only through a Glue-style passthrough view.
+async fn wrapped_planner_engine() -> Engine {
+    let e = Engine::new();
+    for (name, full) in all_tables() {
+        register(&e, &format!("base_{name}"), vec![full]);
+        e.sql(&format!(
+            "CREATE TEMP VIEW {name} AS SELECT * FROM base_{name}"
+        ))
+        .await
+        .unwrap_or_else(|err| panic!("create view {name}: {err}"));
+    }
+    e
+}
+
+/// Workers hold the *physical* tables; the view exists only on the driver, exactly as a Glue
+/// catalog view does.
+async fn two_workers_wrapped(sharded: &[&str]) -> Cluster {
+    let (p0, p1) = (unique_worker_port(), unique_worker_port());
+    for (i, port) in [p0, p1].into_iter().enumerate() {
+        let e = Arc::new(Engine::new());
+        for (name, full) in all_tables() {
+            let physical = format!("base_{name}");
+            if sharded.contains(&physical.as_str()) {
+                register(&e, &physical, shard_rows(&full, i));
+            } else {
+                register(&e, &physical, vec![full]);
+            }
+        }
+        tokio::spawn(async move {
+            let _ = serve_worker(port, e).await;
+        });
+    }
+    Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ])
+}
+
+#[tokio::test]
+async fn q64_glue_wrapped_leaves_plan_distributed() {
+    let planner = wrapped_planner_engine().await;
+    let plan = plan_strict(&planner, Q64_WRAPPED, &REPL_Q64_WRAPPED).await;
+    assert!(
+        !plan.starts_with("DECLINE"),
+        "Glue-wrapped fact leaves must not make the comma connector decline: {plan}"
+    );
+    assert!(
+        plan.contains("cs_item_sk AS cs_ui__cs_item_sk")
+            || plan.contains("cs_ui__cs_item_sk AS cs_ui__cs_item_sk"),
+        "cs_ui is still the one opaque derived leg once the wrappers are seen through: {plan}"
+    );
+}
+
+#[tokio::test]
+async fn q64_glue_wrapped_distributed_matches_single_node() {
+    std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "16");
+    let planner = wrapped_planner_engine().await;
+    let expected = planner.sql(Q64_WRAPPED).await.expect("single-node");
+    assert!(
+        expected.iter().map(|b| b.num_rows()).sum::<usize>() > 0,
+        "fixture must produce a non-empty result or the comparison is vacuous"
+    );
+    let cluster = two_workers_wrapped(&Q64_WRAPPED_SHARDED).await;
+    let actual = run_distributed(&cluster, &planner, Q64_WRAPPED, &REPL_Q64_WRAPPED).await;
+    assert_eq!(
+        rows_sorted(&actual),
+        rows_sorted(&expected),
+        "distributed must equal single-node through Glue-style view expansion"
+    );
+}
+
+/// The peel is limited to 1:1 column passthroughs, and a *computed* view column must survive
+/// into the stage SQL rather than being silently dropped.
+///
+/// `simple_table_scan` descends past a `Projection` by discarding its expressions and reading
+/// the base table directly — sound for Glue's passthrough expansion, but before this fix a view
+/// defined as `ss_list_price * 2 AS ss_list_price` planned as a bare `SELECT ss_list_price FROM
+/// base_store_sales`, so the distributed run summed the raw column and silently disagreed with
+/// single-node. The computed leaf now stays opaque and materializes as its own leg.
+#[tokio::test]
+async fn computed_projection_leaf_keeps_its_computation() {
+    std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "16");
+    let e = computed_view_engine().await;
+    let plan = plan_strict(&e, Q64_WRAPPED, &REPL_Q64_WRAPPED).await;
+    assert!(
+        !plan.starts_with("DECLINE"),
+        "the computed leaf materializes as its own leg: {plan}"
+    );
+    assert!(
+        plan.contains("ss_list_price * CAST(2 AS DOUBLE)") || plan.contains("ss_list_price * 2"),
+        "the view's computed column must survive into stage SQL, not read the raw base column: \
+         {plan}"
+    );
+
+    let expected = e.sql(Q64_WRAPPED).await.expect("single-node");
+    assert!(
+        expected.iter().map(|b| b.num_rows()).sum::<usize>() > 0,
+        "fixture must produce a non-empty result or the comparison is vacuous"
+    );
+    let cluster = two_workers_wrapped(&Q64_WRAPPED_SHARDED).await;
+    let actual = run_distributed(&cluster, &e, Q64_WRAPPED, &REPL_Q64_WRAPPED).await;
+    assert_eq!(
+        rows_sorted(&actual),
+        rows_sorted(&expected),
+        "distributed must equal single-node through a computed view column"
+    );
+}
+
+/// Like [`wrapped_planner_engine`], but `store_sales`'s view *computes* `ss_list_price`.
+async fn computed_view_engine() -> Engine {
+    let e = Engine::new();
+    for (name, full) in all_tables() {
+        register(&e, &format!("base_{name}"), vec![full]);
+        let body = if name == "store_sales" {
+            format!(
+                "SELECT ss_item_sk, ss_ticket_number, ss_store_sk, ss_customer_sk, \
+                 ss_list_price * 2 AS ss_list_price FROM base_{name}"
+            )
+        } else {
+            format!("SELECT * FROM base_{name}")
+        };
+        e.sql(&format!("CREATE TEMP VIEW {name} AS {body}"))
+            .await
+            .unwrap_or_else(|err| panic!("create view {name}: {err}"));
+    }
+    e
+}
+
+/// An *aliased* Glue table nests **two** `SubqueryAlias`es —
+/// `SubqueryAlias(d1) → SubqueryAlias(date_dim) → Projection → TableScan` — because the view
+/// contributes one and the SQL alias another. Verified against the live Glue catalog: q64
+/// aliases ten of its dims (d1/d2/d3, cd1/cd2, hd1/hd2, ad1/ad2, ib1/ib2), so a
+/// [`is_scan_passthrough`]-equivalent that peeled only the `Projection` left real-catalog q64
+/// declining exactly as before, even though the single-alias classification guard read green.
+const Q64_WRAPPED_ALIASED: &str = "
+WITH cs_ui AS (
+  SELECT cs_item_sk,
+         sum(cs_ext_list_price) AS sale,
+         sum(cr_refunded_cash) AS refund
+  FROM catalog_sales, catalog_returns
+  WHERE cs_item_sk = cr_item_sk
+    AND cs_order_number = cr_order_number
+  GROUP BY cs_item_sk
+  HAVING sum(cs_ext_list_price) > 2*sum(cr_refunded_cash)
+)
+SELECT i1.i_item_sk, s1.s_store_name, count(*) AS cnt, sum(ss1.ss_list_price) AS s2
+FROM store_sales ss1, store_returns sr1, cs_ui, item i1, store s1, customer c1
+WHERE ss1.ss_store_sk = s1.s_store_sk
+  AND ss1.ss_customer_sk = c1.c_customer_sk
+  AND ss1.ss_item_sk = i1.i_item_sk
+  AND ss1.ss_item_sk = sr1.sr_item_sk
+  AND ss1.ss_ticket_number = sr1.sr_ticket_number
+  AND ss1.ss_item_sk = cs_ui.cs_item_sk
+GROUP BY i1.i_item_sk, s1.s_store_name
+";
+
+/// Result-equality through the doubly-nested shape. The *decline* pin for this mechanism lives
+/// in the classification guard (which now wraps every table, so aliased dims nest two
+/// `SubqueryAlias`es): a reduced query like this one is planned by a fallback path even when the
+/// comma connector declines, so it cannot pin the connector's admission on its own.
+#[tokio::test]
+async fn q64_doubly_nested_alias_distributed_matches_single_node() {
+    std::env::set_var("OXIDANT_SHUFFLE_PARTITIONS", "16");
+    let planner = wrapped_planner_engine().await;
+    let expected = planner.sql(Q64_WRAPPED_ALIASED).await.expect("single-node");
+    assert!(
+        expected.iter().map(|b| b.num_rows()).sum::<usize>() > 0,
+        "fixture must produce a non-empty result or the comparison is vacuous"
+    );
+    let cluster = two_workers_wrapped(&Q64_WRAPPED_SHARDED).await;
+    let actual = run_distributed(&cluster, &planner, Q64_WRAPPED_ALIASED, &REPL_Q64_WRAPPED).await;
+    assert_eq!(
+        rows_sorted(&actual),
+        rows_sorted(&expected),
+        "distributed must equal single-node through doubly-nested alias wrapping"
+    );
+}

@@ -1432,12 +1432,30 @@ pub(crate) fn simple_table_scan(lp: &LogicalPlan) -> Result<SimpleScan<'_>> {
             });
             Ok(inner)
         }
-        LogicalPlan::Projection(p) => simple_table_scan(p.input.as_ref()),
+        // Descending past a projection *discards its expressions*: the scan this returns is
+        // emitted as `SELECT <outer cols> FROM <base table>`, reading the base table directly.
+        // That is only sound when the projection computes nothing — Glue/Hive view expansion
+        // (`SubqueryAlias → Projection → TableScan`, KAN-162) and column pruning qualify, since
+        // every surviving column keeps its own name and value. A projection that *computes* or
+        // *renames* a column would silently vanish from the stage SQL (a view defined as
+        // `ss_list_price * 2 AS ss_list_price` summed the raw column instead), so those decline.
+        LogicalPlan::Projection(p) if projection_is_scan_passthrough(p) => {
+            simple_table_scan(p.input.as_ref())
+        }
         other => Err(Error::Unsupported(format!(
             "auto-distribute: shuffle join side must be a table scan, found `{}`",
             other.display().to_string().lines().next().unwrap_or("")
         ))),
     }
+}
+
+/// Whether every output column of `p` is a plain input column under its own name, so dropping
+/// the projection and reading its input directly preserves both names and values.
+pub(crate) fn projection_is_scan_passthrough(p: &datafusion::logical_expr::Projection) -> bool {
+    p.expr
+        .iter()
+        .zip(p.schema.fields())
+        .all(|(e, out)| matches!(e, Expr::Column(c) if c.name == *out.name()))
 }
 
 pub(crate) fn flatten_and_conjuncts(expr: &Expr, out: &mut Vec<Expr>) {
