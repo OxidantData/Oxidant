@@ -1115,19 +1115,31 @@ async fn list_logs(State(state): State<RestState>) -> Json<Value> {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)] // env_lock() serializes process-global env across async tests
 mod tests {
+    use std::sync::MutexGuard;
+
     use super::*;
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn test_state() -> (RestState, Router) {
+    /// Build the test router, holding the process-global env lock for the caller's test.
+    ///
+    /// These tests execute real SQL, and the engine reads `OXIDANT_DISTRIBUTED_STRICT` /
+    /// `OXIDANT_WORKERS` / `OXIDANT_WORKER_SERVICE` at query time. `distributed::tests`
+    /// mutates exactly those vars, and cargo runs both modules as threads in ONE process,
+    /// so without this lock a sibling's in-flight mutation intermittently made these
+    /// queries fail with a strict-mode refusal. Callers must bind the guard for the whole
+    /// test body (`let (_env, _state, app) = test_state();`).
+    fn test_state() -> (MutexGuard<'static, ()>, RestState, Router) {
+        let guard = crate::distributed::env_lock();
         let state = RestState {
             service: Arc::new(OxidantService::new()),
             store: StatementStore::new(),
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
         };
-        (state.clone(), app(state))
+        (guard, state.clone(), app(state))
     }
 
     async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -1199,7 +1211,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_wait_and_fetch_json_result() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let (status, body) = post_json(
             &app,
             "/api/v1/statements?wait=true",
@@ -1227,7 +1239,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_without_wait_returns_202_pending() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let (status, body) = post_json(
             &app,
             "/api/v1/statements",
@@ -1241,7 +1253,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_sql_fails_and_result_conflicts() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let (status, body) = post_json(
             &app,
             "/api/v1/statements?wait=true",
@@ -1259,7 +1271,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_statement_id_returns_404() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let id = Uuid::new_v4();
         let (status, _) = get_json(&app, &format!("/api/v1/statements/{id}")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1271,7 +1283,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_pending_statement_then_conflict_on_second_cancel() {
-        let (state, app) = test_state();
+        let (_env, state, app) = test_state();
         // Insert WITHOUT spawning an execution task: the statement stays pending, so the
         // cancel route is exercised deterministically (no submit/cancel race).
         let (id, _cancel_rx) = state.store.insert("SELECT 1 AS never_ran");
@@ -1296,7 +1308,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_terminal_statement_conflicts() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let (_, body) = post_json(
             &app,
             "/api/v1/statements?wait=true",
@@ -1311,7 +1323,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_status_reports_single_node_and_process_metrics() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let (status, body) = get_json(&app, "/api/v1/cluster/status").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["mode"], "single-node");
@@ -1323,7 +1335,7 @@ mod tests {
 
     #[tokio::test]
     async fn logs_endpoint_returns_array() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let (status, body) = get_json(&app, "/api/v1/logs").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["logs"].is_array());
@@ -1345,7 +1357,7 @@ mod tests {
 
     #[tokio::test]
     async fn csv_result_includes_header_row() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let (_, body) = post_json(
             &app,
             "/api/v1/statements?wait=true",
@@ -1368,7 +1380,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_statements_newest_first() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let mut ids = Vec::new();
         for n in [1, 2] {
             let (_, body) = post_json(
@@ -1392,7 +1404,7 @@ mod tests {
 
     #[tokio::test]
     async fn result_limit_truncates() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let (_, body) = post_json(
             &app,
             "/api/v1/statements?wait=true",
@@ -1426,7 +1438,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_list_includes_spark_catalog() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let (status, body) = get_json(&app, "/api/v1/catalogs").await;
         assert_eq!(status, StatusCode::OK);
         let catalogs = body["catalogs"].as_array().unwrap();
@@ -1435,7 +1447,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_namespaces_and_tables() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         // Create a temp view so the default namespace has a table.
         let (_, _) = post_json(
             &app,
@@ -1471,7 +1483,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_autocomplete_suggests_catalogs_and_tables() {
-        let (_state, app) = test_state();
+        let (_env, _state, app) = test_state();
         let (_, _) = post_json(
             &app,
             "/api/v1/statements?wait=true",

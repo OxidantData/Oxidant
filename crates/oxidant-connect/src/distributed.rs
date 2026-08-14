@@ -533,19 +533,34 @@ fn record_distributed_fallback(tracker: Option<&QueryTracker>, reason: &str) {
     }
 }
 
+/// Serializes every test that reads or writes the process-global worker/strict env
+/// (`OXIDANT_DISTRIBUTED_STRICT`, `OXIDANT_WORKERS`, `OXIDANT_WORKER_SERVICE`).
+///
+/// Cargo runs a crate's tests as threads in ONE process, so a test that sets these vars is
+/// visible to every other test while it holds them. That raced `rest::tests`, whose engine
+/// reads the same vars at query time: it intermittently saw `strict=true` plus the
+/// deliberately-unresolvable `OXIDANT_WORKER_SERVICE` from a sibling and failed the query.
+/// Anything touching that env — mutator or reader — must hold this lock.
 #[cfg(test)]
-#[allow(clippy::await_holding_lock)] // STRICT_ENV_LOCK serializes process-global env across async tests
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lock [`ENV_LOCK`], ignoring poisoning: a panic in one test must not cascade into every
+/// other test that shares the guard.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+#[allow(clippy::await_holding_lock)] // ENV_LOCK serializes process-global env across async tests
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use super::*;
     use oxidant_loom::arrow::array::Int64Array;
     use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
     use oxidant_loom::arrow::record_batch::RecordBatch;
     use oxidant_observability::AppStateStore;
-
-    /// `OXIDANT_DISTRIBUTED_STRICT` is process-global; serialize tests that mutate it.
-    static STRICT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -582,7 +597,7 @@ mod tests {
     /// DNS (`OXIDANT_WORKER_SERVICE`) is only a fallback when the static list is empty (k8s).
     #[test]
     fn parse_worker_list_prefers_static_oxidant_workers_over_dns() {
-        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        let _guard = super::env_lock();
         std::env::set_var("OXIDANT_WORKERS", "10.0.0.1:50561,10.0.0.2:50561");
         // Unresolvable on purpose — must not be consulted when OXIDANT_WORKERS is set.
         std::env::set_var("OXIDANT_WORKER_SERVICE", "workers.missing.oxidant.internal");
@@ -600,7 +615,7 @@ mod tests {
 
     #[test]
     fn parse_worker_list_reads_env_when_config_absent() {
-        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        let _guard = super::env_lock();
         std::env::remove_var("OXIDANT_WORKER_SERVICE");
         std::env::set_var("OXIDANT_WORKERS", "192.168.1.10:50561");
         let w = parse_worker_list(None);
@@ -612,7 +627,7 @@ mod tests {
     /// "workers configured" so strict mode cannot silently go driver-local.
     #[test]
     fn workers_configured_true_for_static_list_env() {
-        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        let _guard = super::env_lock();
         std::env::remove_var("OXIDANT_WORKER_SERVICE");
         std::env::set_var("OXIDANT_WORKERS", "10.1.1.1:50561,10.1.1.2:50561");
         assert!(workers_configured(&[]));
@@ -621,7 +636,7 @@ mod tests {
 
     #[test]
     fn membership_cached_until_worker_list_changes() {
-        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        let _guard = super::env_lock();
         // Hermetic: force the static-list path even if a k8s env leaks into the test process.
         std::env::remove_var("OXIDANT_WORKER_SERVICE");
         let caches = DistributedCaches::default();
@@ -710,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn soft_fallback_returns_none_and_local_still_runs() {
-        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        let _guard = super::env_lock();
         std::env::remove_var("OXIDANT_DISTRIBUTED_STRICT");
         let e = engine_with_t().await;
         let workers: Vec<String> = WORKERS.iter().map(|s| (*s).to_string()).collect();
@@ -724,7 +739,7 @@ mod tests {
 
     #[tokio::test]
     async fn strict_mode_returns_unsupported_reason() {
-        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        let _guard = super::env_lock();
         std::env::set_var("OXIDANT_DISTRIBUTED_STRICT", "1");
         let e = engine_with_t().await;
         let workers: Vec<String> = WORKERS.iter().map(|s| (*s).to_string()).collect();
@@ -747,7 +762,7 @@ mod tests {
     /// driver-local collect.
     #[tokio::test]
     async fn strict_mode_rejects_correlated_subquery_over_sharded_table() {
-        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        let _guard = super::env_lock();
         std::env::set_var("OXIDANT_DISTRIBUTED_STRICT", "1");
         let e = engine_with_t().await;
         e.register_batches("u", vec![test_batch()]).unwrap();
@@ -772,7 +787,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_workers_skips_strict_and_fallback() {
-        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        let _guard = super::env_lock();
         std::env::set_var("OXIDANT_DISTRIBUTED_STRICT", "1");
         let e = engine_with_t().await;
         let out = try_run_distributed(&e, &[], UNSUPPORTED_SQL, &[], None, None)
@@ -784,7 +799,7 @@ mod tests {
 
     #[test]
     fn workers_configured_detects_discovery_env() {
-        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        let _guard = super::env_lock();
         std::env::remove_var("OXIDANT_WORKERS");
         std::env::remove_var("OXIDANT_WORKER_SERVICE");
         assert!(!workers_configured(&[]));
@@ -800,7 +815,7 @@ mod tests {
     /// Discovery env set + empty membership must fail closed under strict (no local SF100).
     #[tokio::test]
     async fn strict_mode_errors_when_worker_service_set_but_unreachable() {
-        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        let _guard = super::env_lock();
         std::env::set_var("OXIDANT_DISTRIBUTED_STRICT", "1");
         std::env::set_var("OXIDANT_WORKER_SERVICE", "workers.missing.oxidant.internal");
         std::env::remove_var("OXIDANT_WORKERS");
@@ -819,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_event_emitted_when_tracker_present() {
-        let _guard = STRICT_ENV_LOCK.lock().unwrap();
+        let _guard = super::env_lock();
         std::env::remove_var("OXIDANT_DISTRIBUTED_STRICT");
         let store = Arc::new(AppStateStore::new());
         let mut rx = store.subscribe();

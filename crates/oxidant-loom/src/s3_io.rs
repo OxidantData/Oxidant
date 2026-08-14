@@ -148,7 +148,12 @@ fn monotonic_ns() -> u64 {
     // Instant is opaque; convert via a process-start epoch for exclusive-wait math.
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    start.elapsed().as_nanos() as u64
+    // `+ 1` keeps this strictly positive. `wait_started_ns` uses 0 as its "no wait in
+    // flight" sentinel, and the very first call initializes START and reads it back
+    // immediately — on a coarse timebase (Apple Silicon ticks ~41.67ns) those two reads
+    // land in the same tick and `elapsed()` is genuinely 0, which `end_wait` would then
+    // read as "never started" and silently drop the first S3 wait of the process.
+    start.elapsed().as_nanos() as u64 + 1
 }
 
 tokio::task_local! {
@@ -628,8 +633,37 @@ mod tests {
         let snap = stats.snapshot();
         assert!(snap.s3_range_calls >= 1, "{snap:?}");
         assert_eq!(snap.s3_bytes, 48);
-        // Exclusive wait should be non-zero after a real await.
-        assert!(snap.s3_wait_ms > 0 || stats.s3_wait_ns.load(Ordering::Relaxed) > 0);
+        // NOTE: deliberately no `s3_wait_ns > 0` assertion here. This store is `InMemory`,
+        // so the "fetch" is a memcpy that can complete inside one timebase tick — an
+        // exclusive wait of 0 is CORRECT, not a bug. Asserting otherwise made this test
+        // fail intermittently under full-workspace load. Wait accounting is pinned
+        // deterministically by `exclusive_wait_records_a_real_await` below.
+    }
+
+    /// `s3_wait_ns` must accumulate across a genuine await. Driven directly through
+    /// begin/end so the elapsed interval is a real 5ms, not whatever an in-memory
+    /// object store happens to take.
+    #[tokio::test]
+    async fn exclusive_wait_records_a_real_await() {
+        let stats = ScanIoStats::new();
+        stats.begin_wait();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        stats.end_wait(Duration::from_millis(5), 128);
+
+        assert!(
+            stats.s3_wait_ns.load(Ordering::Relaxed) > 0,
+            "exclusive wait must be recorded across a real await"
+        );
+        assert_eq!(stats.snapshot().s3_bytes, 128);
+    }
+
+    /// Regression: `wait_started_ns` uses 0 as its "nothing in flight" sentinel, so a
+    /// timestamp of 0 would make `end_wait` discard the interval. The first call in a
+    /// process initializes the epoch and reads it back within the same timebase tick,
+    /// which is exactly when a raw `elapsed()` returns 0.
+    #[test]
+    fn monotonic_ns_is_never_zero() {
+        assert!(monotonic_ns() > 0);
     }
 
     #[tokio::test]
