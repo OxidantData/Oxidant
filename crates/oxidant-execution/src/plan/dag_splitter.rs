@@ -614,10 +614,7 @@ fn mergeable_branch(branch: &LogicalPlan, replicated: &[&str]) -> Option<Mergeab
 /// (AND-able, in tree order). `None` when a node refuses to rebuild — the caller simply
 /// declines the merge. The conjuncts are only sound to reapply as a post-join row predicate
 /// when every join below is INNER; [`mergeable_branch`] checks that on the stripped tail.
-///
-/// KAN-158 (`gather_shapes` Q23 shared-scan CSE) also uses this to compare an unrestricted
-/// outer aggregate body against a filter-restricted sibling (sq2) without re-planning either.
-pub(crate) fn strip_filters(lp: &LogicalPlan) -> Option<(LogicalPlan, Vec<Expr>)> {
+fn strip_filters(lp: &LogicalPlan) -> Option<(LogicalPlan, Vec<Expr>)> {
     if let LogicalPlan::Filter(f) = lp {
         let (input, mut conjuncts) = strip_filters(&f.input)?;
         let mut mine = Vec::new();
@@ -641,7 +638,7 @@ pub(crate) fn strip_filters(lp: &LogicalPlan) -> Option<(LogicalPlan, Vec<Expr>)
 }
 
 /// Every join in `lp` is INNER, so a stripped row predicate commutes past it unchanged.
-pub(crate) fn only_inner_joins(lp: &LogicalPlan) -> bool {
+fn only_inner_joins(lp: &LogicalPlan) -> bool {
     let local = match lp {
         LogicalPlan::Join(join) => join.join_type == JoinType::Inner,
         _ => true,

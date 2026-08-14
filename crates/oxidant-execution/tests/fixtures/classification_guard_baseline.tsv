@@ -21,7 +21,7 @@ q19	ok(2)	ok(2)	ok(2)	ok(2)
 q20	ok(3)	ok(3)	ok(3)	ok(3)
 q21	fail	fail	fail	fail
 q22	fail	fail	fail	fail
-q23	ok(12)	ok(18)	ok(12)	ok(16)
+q23	ok(11)	ok(17)	ok(11)	ok(16)
 q24	ok(6)	ok(6)	ok(3)	ok(3)
 q25	ok(2)	ok(4)	ok(2)	ok(4)
 q26	ok(2)	ok(2)	ok(2)	ok(2)
