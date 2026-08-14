@@ -1014,9 +1014,9 @@ fn ensure_remote_store(
     }
     match builder.build() {
         Ok(store) => {
-            // KAN-2 throughput: serve repeat parquet reads from local NVMe when
-            // `OXIDANT_S3_CACHE_DIR` is set (S3 re-reads were the Q39-class residual).
-            let store = crate::s3_cache::DiskCachingStore::from_env(Arc::new(store));
+            // KAN-153: concurrent ranged GETs + per-task s3_wait/decode counters, then
+            // KAN-2 whole-object disk cache (oversized facts still bypass to ranged GETs).
+            let store = crate::s3_io::wrap_remote_store(Arc::new(store));
             state
                 .runtime_env()
                 .register_object_store(os_url.as_ref(), store);

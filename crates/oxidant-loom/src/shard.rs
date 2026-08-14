@@ -804,12 +804,10 @@ mod tests {
             ("item".into(), Some(50_000_000)),
         ];
         let got = classify_replicated_tables(&sized, &[], DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES);
-        for sharded in ["catalog_sales"] {
-            assert!(
-                !got.iter().any(|t| t == sharded),
-                "{sharded} must stay sharded (byte anchor)"
-            );
-        }
+        assert!(
+            !got.iter().any(|t| t == "catalog_sales"),
+            "catalog_sales must stay sharded (byte anchor)"
+        );
         for replicated in [
             "web_sales",
             "store_sales",
