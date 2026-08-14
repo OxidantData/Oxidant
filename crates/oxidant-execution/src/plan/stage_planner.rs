@@ -4017,6 +4017,72 @@ enum LjSide {
     Ambiguous,
 }
 
+/// A LEFT JOIN input peeled through catalog-style wrappers down to its [`TableScan`].
+///
+/// Glue/Hive view expansion yields `SubqueryAlias → Projection → TableScan` with a
+/// catalog-qualified scan name (`glue.tpcds_sf100.web_sales`). [`alias`] is the FROM-item
+/// name the Unparser emits for that side (the outermost `SubqueryAlias`, else the bare
+/// table name) — R1/R2 SQL and R3's FROM-item substitution must keep it so column
+/// resolution in the bucket still lines up.
+struct PeeledJoinScan<'a> {
+    scan: &'a datafusion::logical_expr::TableScan,
+    alias: String,
+}
+
+/// True when every projection expr is a column (optionally aliased) — pure rename/reorder,
+/// no computed expressions. Anything else is not a catalog passthrough wrapper.
+fn is_passthrough_column_projection(p: &Projection) -> bool {
+    p.expr
+        .iter()
+        .all(|e| matches!(strip_alias(e), Expr::Column(_)))
+}
+
+/// Peel `SubqueryAlias` and passthrough `Projection` wrappers on a LEFT JOIN input down to
+/// the underlying [`TableScan`]. Declines (`None`) on any other node or a non-passthrough
+/// projection (expression in the select list).
+fn peel_join_input_scan(lp: &LogicalPlan) -> Option<PeeledJoinScan<'_>> {
+    let mut node = lp;
+    let mut alias: Option<String> = None;
+    loop {
+        match node {
+            LogicalPlan::SubqueryAlias(s) => {
+                if alias.is_none() {
+                    alias = Some(s.alias.table().to_string());
+                }
+                node = s.input.as_ref();
+            }
+            LogicalPlan::Projection(p) if is_passthrough_column_projection(p) => {
+                node = p.input.as_ref();
+            }
+            LogicalPlan::TableScan(s) => {
+                let alias = alias.unwrap_or_else(|| s.table_name.table().to_string());
+                return Some(PeeledJoinScan { scan: s, alias });
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// FROM-item SQL for a peeled join scan: bare alias when that is the whole table reference,
+/// otherwise `qualified AS alias` so workers resolve the catalog table while R3 keeps the
+/// Unparser's relation name.
+fn peeled_scan_from_sql(peeled: &PeeledJoinScan<'_>) -> String {
+    let table_sql = table_ref_sql(&peeled.scan.table_name);
+    if table_sql == peeled.alias {
+        peeled.alias.clone()
+    } else {
+        format!("{table_sql} AS {}", peeled.alias)
+    }
+}
+
+/// Relation qualifier matching for a peeled join side: Unparser alias, bare table name, or
+/// the fully-qualified scan string (catalog plans may emit any of the three).
+fn peeled_relation_matches(rel: &str, peeled: &PeeledJoinScan<'_>) -> bool {
+    rel == peeled.alias
+        || rel == peeled.scan.table_name.table()
+        || rel == peeled.scan.table_name.to_string()
+}
+
 /// Stages R1–R3 of the co-located LEFT JOIN composition for ONE sharded union bucket whose
 /// arm chains over `LeftJoin(replicated preserved, sharded null-extended)` — TPC-DS Q5's web
 /// leg (`web_returns LEFT JOIN web_sales`, the join existing only to recover
@@ -4027,10 +4093,11 @@ enum LjSide {
 ///    `hash_key_cols = 0..k`), then exactly the right-side columns referenced above the
 ///    join. An ordinary sliced sharded leaf stage: a per-partition bucket holds ALL the
 ///    side's rows for its key slice.
-/// 2. **R2**: the preserved side unparsed verbatim (q77's stage-B recipe), computed once
-///    ([`ExchangeMode::Forward`]) and hash-shuffled by the left key positions — each
-///    preserved row routed to exactly one bucket, NULL keys included (NULLs hash to one
-///    deterministic bucket and null-extend there exactly once).
+/// 2. **R2**: the preserved side projected in join-schema order from the peeled scan
+///    (q77's stage-B recipe), computed once ([`ExchangeMode::Forward`]) and hash-shuffled
+///    by the left key positions — each preserved row routed to exactly one bucket, NULL
+///    keys included (NULLs hash to one deterministic bucket and null-extend there exactly
+///    once).
 /// 3. **R3 (the bucket's producer)**: the flat producer's own construction — the outer
 ///    partial SELECT over [`union_split_tail`] — with the tail's two FROM items
 ///    token-substituted to the positional shuffle inputs (see
@@ -4044,11 +4111,15 @@ enum LjSide {
 /// null-extend exactly once. The sharded fact's measures stay with the separate flat
 /// producer (the union's sales branch), so nothing double-counts.
 ///
-/// `Ok(None)` — a safe refusal — when the shape is not exactly this one: either join input
-/// not a bare scan, no equijoin key or a residual (non-equality) join filter, a key that is
-/// not a plain column, a non-INNER join above the LEFT JOIN in the bucket's chain, a
-/// right-side reference above the join that does not resolve unambiguously, or a tail
-/// whose FROM items do not substitute exactly once each.
+/// Join inputs may be bare [`LogicalPlan::TableScan`]s or catalog wrappers
+/// (`SubqueryAlias` / passthrough `Projection` over a — possibly catalog-qualified —
+/// scan). Comparison against `sharded_name` uses the bare [`TableReference::table`]
+/// component. `Ok(None)` — a safe refusal — when either input does not peel to a scan, the
+/// null-extended bare name is not `sharded_name`, no equijoin key or a residual
+/// (non-equality) join filter, a key that is not a plain column, a non-INNER join above
+/// the LEFT JOIN in the bucket's chain, a right-side reference above the join that does
+/// not resolve unambiguously, or a tail whose FROM items do not substitute exactly once
+/// each.
 fn union_left_join_branch_stages(
     p: &Peeled<'_>,
     plan: &LogicalPlan,
@@ -4059,17 +4130,18 @@ fn union_left_join_branch_stages(
     let Some(join) = find_co_locatable_left_join(plan, sharded_name) else {
         return Ok(None);
     };
-    // Both join inputs must be bare scans: R1/R2 are built straight from the scan, and the
-    // tail substitution rewrites exactly one bare FROM item per side.
-    let LogicalPlan::TableScan(left_scan) = join.left.as_ref() else {
+    // Peel catalog wrappers (SubqueryAlias / passthrough Projection) down to the scan.
+    // R1/R2 SQL and the R3 FROM-item substitution use the Unparser alias, not the
+    // fully-qualified scan string.
+    let Some(left) = peel_join_input_scan(join.left.as_ref()) else {
         return Ok(None);
     };
-    let LogicalPlan::TableScan(right_scan) = join.right.as_ref() else {
+    let Some(right) = peel_join_input_scan(join.right.as_ref()) else {
         return Ok(None);
     };
-    let preserved = left_scan.table_name.to_string();
-    let null_ext = right_scan.table_name.to_string();
-    if null_ext != sharded_name {
+    let preserved = left.alias.clone();
+    let null_ext = right.alias.clone();
+    if right.scan.table_name.table() != sharded_name {
         return Ok(None);
     }
     // Every other join in the bucket's chain must be INNER (DataFusion's CrossJoin spelling
@@ -4098,9 +4170,9 @@ fn union_left_join_branch_stages(
         match &c.relation {
             Some(r) => {
                 let rel = r.to_string();
-                if rel == preserved {
+                if peeled_relation_matches(&rel, &left) {
                     LjSide::Left
-                } else if rel == null_ext {
+                } else if peeled_relation_matches(&rel, &right) {
                     LjSide::Right
                 } else {
                     LjSide::Neither
@@ -4180,12 +4252,14 @@ fn union_left_join_branch_stages(
             return Ok(None);
         }
     }
+    let right_from = peeled_scan_from_sql(&right);
     let r1_cols: Vec<String> = right_key_names
         .iter()
         .chain(&extra)
         .map(|c| format!("{null_ext}.{c}"))
         .collect();
-    let r1_sql = sanitize_generated_sql(&format!("SELECT {} FROM {null_ext}", r1_cols.join(", ")));
+    let r1_sql =
+        sanitize_generated_sql(&format!("SELECT {} FROM {right_from}", r1_cols.join(", ")));
     let stage_r1 = StageDef::new(
         first_id,
         r1_sql,
@@ -4193,16 +4267,15 @@ fn union_left_join_branch_stages(
         (0..right_key_names.len() as u32).collect(),
     );
 
-    // R2: the preserved side in full, once, hash-co-located by the left join key.
-    let r2_sql = sanitize_generated_sql(
-        &up.plan_to_sql(join.left.as_ref())
-            .map_err(|e| {
-                Error::Unsupported(format!(
-                    "auto-distribute: unparse co-located LEFT JOIN preserved side: {e}"
-                ))
-            })?
-            .to_string(),
-    );
+    // R2: the preserved side in full (join-schema column order), once, hash-co-located by
+    // the left join key. Explicit columns keep left_key_pos aligned when a passthrough
+    // Projection reorders the scan.
+    let left_from = peeled_scan_from_sql(&left);
+    let r2_cols: Vec<String> = left_fields
+        .iter()
+        .map(|c| format!("{preserved}.{c}"))
+        .collect();
+    let r2_sql = sanitize_generated_sql(&format!("SELECT {} FROM {left_from}", r2_cols.join(", ")));
     let left_key_pos: Option<Vec<u32>> = left_key_names
         .iter()
         .map(|n| {
@@ -4223,6 +4296,7 @@ fn union_left_join_branch_stages(
     // R3: the bucket's producer — the flat producer's construction over the substituted
     // tail. upstreams = [R1, R2], so `shuffle_input_0` is the null-extended side and
     // `shuffle_input_1` the preserved side. The shuffle key is the caller's to assign.
+    // Substitution keys are the Unparser aliases (not the qualified scan strings).
     let tail = union_split_tail(plan)?;
     let Some(tail) = substitute_co_located_join_inputs(&tail, &preserved, &null_ext) else {
         return Ok(None);
@@ -4280,10 +4354,12 @@ fn collect_columns_outside(lp: &LogicalPlan, skip: &LogicalPlan, out: &mut Vec<C
 /// guarantees each table token appears exactly once as a FROM/JOIN item, so anything else
 /// means the shape was not the expected one.
 ///
-/// Whole-identifier, keyword-anchored: only an identifier immediately following a `FROM` or
-/// `JOIN` keyword qualifies, so qualified column references (`web_sales.ws_item_sk` in the
-/// ON clause) and table mentions inside string literals / quoted identifiers / comments are
-/// never rewritten (the `localize_shuffle_input_sql` discipline).
+/// Whole-identifier, keyword-anchored: only a FROM/JOIN item qualifies. Bare MemTable scans
+/// unparse as `FROM web_returns` / `JOIN web_sales`; Glue/Hive view expansion unparses as
+/// `(SELECT … FROM glue.tpcds_sf100.web_returns) AS web_returns` — both forms are matched by
+/// the relation alias (never by rewriting qualified column references in the ON clause, or
+/// table mentions inside string literals / quoted identifiers / comments — the
+/// `localize_shuffle_input_sql` discipline).
 fn substitute_co_located_join_inputs(
     tail: &str,
     preserved: &str,
@@ -4294,6 +4370,79 @@ fn substitute_co_located_join_inputs(
     let mut n_preserved = 0usize;
     let mut n_null_ext = 0usize;
     let mut i = 0;
+
+    // Skip ASCII whitespace; return the new index.
+    let skip_ws = |mut j: usize| -> usize {
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        j
+    };
+    // Read a bare identifier starting at `j`; return `(ident, end)`.
+    let read_ident = |j: usize| -> Option<(&str, usize)> {
+        if j >= bytes.len() || !(bytes[j] == b'_' || bytes[j].is_ascii_alphabetic()) {
+            return None;
+        }
+        let mut end = j + 1;
+        while end < bytes.len() && (bytes[end] == b'_' || bytes[end].is_ascii_alphanumeric()) {
+            end += 1;
+        }
+        Some((&tail[j..end], end))
+    };
+    // Skip a balanced `(…)` span starting at `j` (which must be `(`); return the index
+    // past the closing `)`, respecting quotes/comments inside.
+    let skip_balanced_paren = |mut j: usize| -> Option<usize> {
+        if j >= bytes.len() || bytes[j] != b'(' {
+            return None;
+        }
+        let mut depth = 0usize;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if c == b'\'' || c == b'"' || c == b'`' {
+                let quote = c;
+                j += 1;
+                while j < bytes.len() {
+                    if bytes[j] == quote {
+                        if j + 1 < bytes.len() && bytes[j + 1] == quote {
+                            j += 2;
+                            continue;
+                        }
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                continue;
+            }
+            if c == b'-' && j + 1 < bytes.len() && bytes[j + 1] == b'-' {
+                while j < bytes.len() && bytes[j] != b'\n' {
+                    j += 1;
+                }
+                continue;
+            }
+            if c == b'/' && j + 1 < bytes.len() && bytes[j + 1] == b'*' {
+                j += 2;
+                while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                    j += 1;
+                }
+                j = j.saturating_add(2);
+                continue;
+            }
+            if c == b'(' {
+                depth += 1;
+            } else if c == b')' {
+                depth -= 1;
+                j += 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+                continue;
+            }
+            j += 1;
+        }
+        None
+    };
+
     while i < bytes.len() {
         let c = bytes[i];
         // Quoted spans: 'string' / "identifier" / `identifier`, each self-escaped by doubling.
@@ -4348,24 +4497,65 @@ fn substitute_co_located_join_inputs(
             let is_from = ident.eq_ignore_ascii_case("from");
             let is_join = ident.eq_ignore_ascii_case("join");
             if is_from || is_join {
-                // The FROM/JOIN item: the next identifier after whitespace, if any.
-                let mut j = i;
-                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                if j < bytes.len() && (bytes[j] == b'_' || bytes[j].is_ascii_alphabetic()) {
-                    let tstart = j;
-                    let mut tend = j;
-                    while tend < bytes.len()
-                        && (bytes[tend] == b'_' || bytes[tend].is_ascii_alphanumeric())
-                    {
-                        tend += 1;
+                let item_start = skip_ws(i);
+                // Catalog wrappers unparse as `(SELECT …) AS <alias>`; bare scans as `<alias>`.
+                let parsed = if item_start < bytes.len() && bytes[item_start] == b'(' {
+                    (|| {
+                        let after_paren = skip_balanced_paren(item_start)?;
+                        let mut j = skip_ws(after_paren);
+                        // Optional AS keyword.
+                        if let Some((as_kw, after_as)) = read_ident(j) {
+                            if as_kw.eq_ignore_ascii_case("as") {
+                                j = skip_ws(after_as);
+                            }
+                        }
+                        let (alias, end) = read_ident(j)?;
+                        Some((alias, end))
+                    })()
+                } else if let Some((alias, end)) = read_ident(item_start) {
+                    // Bare identifier, optionally renamed: `web_returns` or
+                    // `glue.tpcds_sf100.web_returns AS web_returns`. Do NOT treat the
+                    // trailing component of an unqualified multi-part name as the alias —
+                    // that would also match the scan inside `(SELECT … FROM glue.….t) AS t`
+                    // and double-count.
+                    let mut end = end;
+                    let mut alias = alias;
+                    let mut j = end;
+                    while j < bytes.len() && bytes[j] == b'.' {
+                        if let Some((_, next_end)) = read_ident(j + 1) {
+                            j = next_end;
+                            end = next_end;
+                        } else {
+                            break;
+                        }
                     }
-                    let target = &tail[tstart..tend];
-                    let replacement = if is_from && target == preserved {
+                    // Multi-part without AS is not a relation alias match.
+                    let is_multipart = end != item_start + alias.len();
+                    let mut j = skip_ws(end);
+                    let mut has_as = false;
+                    if let Some((as_kw, after_as)) = read_ident(j) {
+                        if as_kw.eq_ignore_ascii_case("as") {
+                            j = skip_ws(after_as);
+                            if let Some((renamed, renamed_end)) = read_ident(j) {
+                                alias = renamed;
+                                end = renamed_end;
+                                has_as = true;
+                            }
+                        }
+                    }
+                    if is_multipart && !has_as {
+                        None
+                    } else {
+                        Some((alias, end))
+                    }
+                } else {
+                    None
+                };
+                if let Some((alias, item_end)) = parsed {
+                    let replacement = if is_from && alias == preserved {
                         n_preserved += 1;
                         Some(format!("(SELECT * FROM shuffle_input_1) AS {preserved}"))
-                    } else if is_join && target == null_ext {
+                    } else if is_join && alias == null_ext {
                         n_null_ext += 1;
                         Some(format!("(SELECT * FROM shuffle_input_0) AS {null_ext}"))
                     } else {
@@ -4373,9 +4563,9 @@ fn substitute_co_located_join_inputs(
                     };
                     if let Some(rep) = replacement {
                         out.extend_from_slice(ident.as_bytes());
-                        out.extend_from_slice(&tail.as_bytes()[i..tstart]);
+                        out.extend_from_slice(&tail.as_bytes()[i..item_start]);
                         out.extend_from_slice(rep.as_bytes());
-                        i = tend;
+                        i = item_end;
                         continue;
                     }
                 }
@@ -5655,13 +5845,77 @@ fn find_qualified_table_sql(lp: &LogicalPlan, bare: &str) -> Option<String> {
 mod guard_tests {
     use super::{
         find_qualified_table_sql, qualified_table_sql, reject_out_of_scope_join_alias_refs,
-        rewrite_out_of_scope_join_alias_refs, table_ref_sql,
+        rewrite_out_of_scope_join_alias_refs, substitute_co_located_join_inputs, table_ref_sql,
     };
     use datafusion::common::TableReference;
     use datafusion::logical_expr::LogicalPlanBuilder;
     use datafusion::prelude::lit;
     use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    #[test]
+    fn substitute_co_located_joins_accepts_catalog_subquery_aliases() {
+        // Glue/Hive view expansion unparses SubqueryAlias→Projection→TableScan as
+        // `(SELECT … FROM glue.….t) AS t` rather than a bare FROM item.
+        let tail = "FROM (SELECT wr_item_sk FROM glue.tpcds_sf100.web_returns) AS web_returns LEFT OUTER JOIN (SELECT ws_item_sk FROM glue.tpcds_sf100.web_sales) AS web_sales ON web_returns.wr_item_sk = web_sales.ws_item_sk";
+        let out = substitute_co_located_join_inputs(tail, "web_returns", "web_sales")
+            .expect("catalog subquery FROM items must substitute");
+        assert!(
+            out.contains("(SELECT * FROM shuffle_input_1) AS web_returns"),
+            "{out}"
+        );
+        assert!(
+            out.contains("(SELECT * FROM shuffle_input_0) AS web_sales"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("glue.tpcds_sf100"),
+            "qualified scans must be fully replaced: {out}"
+        );
+    }
+
+    #[test]
+    fn substitute_co_located_joins_finds_nested_catalog_join_under_outer_from() {
+        // After distribute_over_nested_union rebuilds the arm, union_split_tail unparses
+        // the whole chain — the co-located LEFT JOIN sits inside outer `FROM (… ) AS x`.
+        let tail = "FROM (SELECT 'web' AS channel FROM (SELECT ws_web_site_sk FROM (SELECT wr_item_sk FROM glue.tpcds_sf100.web_returns) AS web_returns LEFT OUTER JOIN (SELECT ws_item_sk FROM glue.tpcds_sf100.web_sales) AS web_sales ON web_returns.wr_item_sk = web_sales.ws_item_sk) AS salesreturns) AS x";
+        let out = substitute_co_located_join_inputs(tail, "web_returns", "web_sales")
+            .expect("nested catalog LEFT JOIN must still substitute once");
+        assert!(
+            out.contains("(SELECT * FROM shuffle_input_1) AS web_returns"),
+            "{out}"
+        );
+        assert!(
+            out.contains("(SELECT * FROM shuffle_input_0) AS web_sales"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn substitute_real_q5_tail_fragment() {
+        let tail = r#"FROM (SELECT 'web' AS "channel", wsr.web_site_id AS id, wsr.sales FROM (SELECT web_site.web_site_id, sum(salesreturns.sales_price) AS sales FROM (SELECT ws_web_site_sk AS k, wr_returned_date_sk AS dsk, sales_price AS sales_price FROM (SELECT web_sales.ws_web_site_sk, web_returns.wr_returned_date_sk, CAST(0 AS DOUBLE) AS sales_price FROM (SELECT web_returns.wr_returned_date_sk, web_returns.wr_web_site_sk, web_returns.wr_item_sk, web_returns.wr_order_number, web_returns.wr_return_amt, web_returns.wr_net_loss FROM glue.tpcds_sf100.web_returns) AS web_returns LEFT OUTER JOIN (SELECT web_sales.ws_sold_date_sk, web_sales.ws_web_site_sk, web_sales.ws_item_sk, web_sales.ws_order_number, web_sales.ws_ext_sales_price, web_sales.ws_net_profit FROM glue.tpcds_sf100.web_sales) AS web_sales ON ((web_returns.wr_item_sk = web_sales.ws_item_sk) AND (web_returns.wr_order_number = web_sales.ws_order_number)))) AS salesreturns INNER JOIN date_dim ON salesreturns.dsk = date_dim.d_date_sk INNER JOIN web_site ON salesreturns.k = web_site.web_site_sk WHERE (date_dim.d_year = 2001) GROUP BY web_site.web_site_id) AS wsr) AS x"#;
+        let out = substitute_co_located_join_inputs(tail, "web_returns", "web_sales");
+        assert!(out.is_some(), "expected Some, got None");
+        let out = out.unwrap();
+        assert!(
+            out.contains("shuffle_input_1") && out.contains("shuffle_input_0"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn substitute_co_located_joins_still_accepts_bare_idents() {
+        let tail = "FROM web_returns LEFT OUTER JOIN web_sales ON web_returns.wr_item_sk = web_sales.ws_item_sk";
+        let out = substitute_co_located_join_inputs(tail, "web_returns", "web_sales").unwrap();
+        assert!(
+            out.contains("(SELECT * FROM shuffle_input_1) AS web_returns"),
+            "{out}"
+        );
+        assert!(
+            out.contains("(SELECT * FROM shuffle_input_0) AS web_sales"),
+            "{out}"
+        );
+    }
 
     #[test]
     fn table_ref_sql_preserves_qualification() {
