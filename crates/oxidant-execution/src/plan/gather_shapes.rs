@@ -27,10 +27,6 @@
 //!   cross-joins a single-row derived scalar (`best_ss_customer ⋈ max_store_sales`): the
 //!   scalar's own grouped input distributes, a KAN-27 one-row broadcast computes the value,
 //!   and the outer combine's HAVING compares against the injected literal.
-//!   KAN-158: when the scalar's per-key input (sq2) is a filter-restriction of the outer
-//!   per-key aggregate (same group keys + measure; sq2 adds only INNER joins to replicated
-//!   dims and filters on those dims — Q23's `date_dim` year window), both share **one** raw
-//!   fact-scan export; two consumer partials derive the restricted and unrestricted aggs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -42,9 +38,7 @@ use datafusion::logical_expr::{
 use datafusion::sql::unparser::Unparser;
 use oxidant_common::{Error, Result};
 
-use super::dag_splitter::{
-    node_id, only_inner_joins, plan_contains_volatile, replace_branches, strip_filters,
-};
+use super::dag_splitter::{node_id, plan_contains_volatile, replace_branches};
 use super::shape_extensions::{
     build_outer_finalize, collect_subquery_tables, expr_columns, expr_contains_subquery,
     flatten_conjuncts, peek_sort_limit, per_key_agg_parts, plan_contains_outer_reference,
@@ -2061,11 +2055,6 @@ fn collect_cross_leaves<'a>(node: &'a LogicalPlan, out: &mut Vec<&'a LogicalPlan
 ///    from its FROM and the wrapped references replaced by the driver's literal placeholder
 ///    ([`SCALAR_TOKEN`]), so its combine applies the HAVING against the *global* value.
 ///
-/// KAN-158: when sq2 is a **filter-restriction** of the outer per-key aggregate (same group
-/// keys and measure; sq2 only adds INNER joins to replicated dims + filters on those dims),
-/// step 1+3 share one raw fact-scan export via [`try_kan158_share_restricted_agg`] instead of
-/// scanning the fact twice (SF100 profile: stages 2≡6 at ~46 s each before CSE).
-///
 /// Restricted to: exactly one single-row derived leaf (a global aggregate over a peel-able
 /// grouped aggregate, one non-DISTINCT min/max/sum/count/avg over a plain column); every
 /// reference to it is a single-argument min/max/sum/avg aggregate in the outer aggregate list
@@ -2306,47 +2295,6 @@ fn try_cross_scalar_threshold(
             .and_then(|b| b.build())
             .map_err(|e| unsupported(format!("rebuild outer projection: {e}")))?;
     }
-
-    // Scalar partial / one-row combine projection SQL (KAN-27), shared by both paths below.
-    let up = Unparser::default();
-    let (scalar_sels, scalar_comb) = per_key_agg_parts(&m_spec.func, &m_arg_col.name, 0)?;
-    let guard_col = if m_spec.func == "avg" { "a0c" } else { "a0" };
-    let proj_sql = match m_proj {
-        Some(exprs) => {
-            let mut s0v_remap = HashMap::new();
-            s0v_remap.insert(
-                m_agg.aggr_expr[0].schema_name().to_string(),
-                "s0v".to_string(),
-            );
-            if let Some(f) = m_agg.schema.fields().first() {
-                s0v_remap.insert(f.name().clone(), "s0v".to_string());
-            }
-            let mapped = remap_expr_columns(strip_alias(&exprs[0]), &s0v_remap);
-            let mut cols = Vec::new();
-            expr_columns(&mapped, &mut cols);
-            if !cols.iter().all(|c| c.relation.is_none() && c.name == "s0v") {
-                decline!("q23-scalar");
-            }
-            expr_sql(&up, &mapped)?
-        }
-        None => "s0v".to_string(),
-    };
-
-    // KAN-158: try one shared raw scan feeding both the restricted (sq2) and unrestricted
-    // (outer) per-key aggregates before falling back to two independent fact scans.
-    if let Some(dq) = try_kan158_share_restricted_agg(
-        &sq2_p,
-        &plan,
-        replicated,
-        &scalar_sels,
-        &scalar_comb,
-        guard_col,
-        &proj_sql,
-        &token,
-    )? {
-        return Ok(Some(dq));
-    }
-
     let dq = match plan_distributed_logical(&plan, replicated) {
         Ok(dq) => dq,
         Err(_) => return Ok(None),
@@ -2384,6 +2332,31 @@ fn try_cross_scalar_threshold(
         decline!("q23-scalar");
     }
 
+    // Scalar partial / one-row combine (KAN-27 one-row broadcast), mirroring Q24's stages.
+    let up = Unparser::default();
+    let (scalar_sels, scalar_comb) = per_key_agg_parts(&m_spec.func, &m_arg_col.name, 0)?;
+    let guard_col = if m_spec.func == "avg" { "a0c" } else { "a0" };
+    let proj_sql = match m_proj {
+        Some(exprs) => {
+            let mut s0v_remap = HashMap::new();
+            s0v_remap.insert(
+                m_agg.aggr_expr[0].schema_name().to_string(),
+                "s0v".to_string(),
+            );
+            if let Some(f) = m_agg.schema.fields().first() {
+                s0v_remap.insert(f.name().clone(), "s0v".to_string());
+            }
+            let mapped = remap_expr_columns(strip_alias(&exprs[0]), &s0v_remap);
+            let mut cols = Vec::new();
+            expr_columns(&mapped, &mut cols);
+            if !cols.iter().all(|c| c.relation.is_none() && c.name == "s0v") {
+                decline!("q23-scalar");
+            }
+            expr_sql(&up, &mapped)?
+        }
+        None => "s0v".to_string(),
+    };
+
     let mut stages = sq2_dq.stages;
     let sq2_last = stages.last().map(|s| s.stage_id).unwrap_or(0);
     let scalar_partial_id = sq2_last + 1;
@@ -2412,520 +2385,6 @@ fn try_cross_scalar_threshold(
         stages,
         finalize_sql: None,
     }))
-}
-
-/// KAN-158: share one raw fact-scan export between a **filter-restricted** per-key aggregate
-/// (`sq2_p`, the scalar's input) and an **unrestricted** sibling (`outer_plan`, the rebuilt
-/// best-customer aggregate).
-///
-/// Admission (all required — anything weaker is not provably exact):
-///
-/// 1. Both peels have the same group-key count and identical group-expr SQL, one non-DISTINCT
-///    `sum`/`count`/`min`/`max`/`avg` each, and identical argument SQL.
-/// 2. Stripping filters, the outer tail's base tables are a **proper subset** of sq2's; every
-///    extra table is replicated; every join below both tails is INNER (so filters commute).
-/// 3. The extra tables contribute a single equijoin key from the outer tail's schema onto a
-///    column of the extra dim (Q23: `ss_sold_date_sk = d_date_sk`); sq2's residual filters
-///    mention only columns of the extra dims (the year window).
-/// 4. The outer body is broadcast-safe over exactly one sharded fact.
-///
-/// Plan shape when admitted:
-///
-/// ```text
-/// shared leaf  — export (g0.., dsk, amt) from the outer body, hash by group keys
-/// dated partial ← shared — join extra dims + sq2 filters, partial agg (feeds the scalar)
-/// dated combine → scalar partial/combine (KAN-27 one-row broadcast)
-/// wide partial  ← shared — unrestricted partial agg
-/// wide combine  — HAVING against the scalar token (outer output)
-/// ```
-///
-/// Declines (returns `Ok(None)`) when any check fails — the caller keeps the two-scan path.
-#[allow(clippy::too_many_arguments)] // scalar partial/combine fragments + token travel with the plan peels
-fn try_kan158_share_restricted_agg(
-    sq2_p: &Peeled<'_>,
-    outer_plan: &LogicalPlan,
-    replicated: &[&str],
-    scalar_sels: &[String],
-    scalar_comb: &str,
-    guard_col: &str,
-    proj_sql: &str,
-    token: &str,
-) -> Result<Option<DistributedQuery>> {
-    let dbg = std::env::var("OXIDANT_TPCDS_DEBUG").is_ok();
-    macro_rules! decline158 {
-        ($($arg:tt)*) => {{
-            if dbg {
-                eprintln!("[kan158] decline: {}", format!($($arg)*));
-            }
-            return Ok(None);
-        }};
-    }
-    let Ok(outer_p) = peel(strip_aliases(outer_plan)) else {
-        decline158!("outer peel failed");
-    };
-    if outer_p.agg.group_expr.len() != sq2_p.agg.group_expr.len()
-        || outer_p.agg.aggr_expr.len() != 1
-        || sq2_p.agg.aggr_expr.len() != 1
-        || !sq2_p.having.is_empty()
-        || outer_p.sort.is_some()
-        || sq2_p.sort.is_some()
-        || plan_contains_volatile(outer_plan)
-        || plan_contains_volatile(sq2_p.agg.input.as_ref())
-    {
-        decline158!(
-            "shape mismatch groups={}vs{} aggs={}vs{} sq2_having={} volatile",
-            outer_p.agg.group_expr.len(),
-            sq2_p.agg.group_expr.len(),
-            outer_p.agg.aggr_expr.len(),
-            sq2_p.agg.aggr_expr.len(),
-            sq2_p.having.len()
-        );
-    }
-    let up = Unparser::default();
-    for (a, b) in outer_p.agg.group_expr.iter().zip(&sq2_p.agg.group_expr) {
-        let (asql, bsql) = (expr_sql(&up, a)?, expr_sql(&up, b)?);
-        if asql != bsql {
-            decline158!("group expr mismatch {asql} vs {bsql}");
-        }
-    }
-    let outer_agg = AggSpec::classify(&outer_p.agg.aggr_expr[0])?;
-    let sq2_agg = AggSpec::classify(&sq2_p.agg.aggr_expr[0])?;
-    if outer_agg.distinct
-        || sq2_agg.distinct
-        || outer_agg.func != sq2_agg.func
-        || outer_agg.arg_sql != sq2_agg.arg_sql
-        || !matches!(
-            outer_agg.func.as_str(),
-            "sum" | "count" | "min" | "max" | "avg"
-        )
-    {
-        decline158!(
-            "agg mismatch {}/{} vs {}/{}",
-            outer_agg.func,
-            outer_agg.arg_sql,
-            sq2_agg.func,
-            sq2_agg.arg_sql
-        );
-    }
-
-    let (outer_tail, outer_filters) = match strip_filters(outer_p.agg.input.as_ref()) {
-        Some(v) => v,
-        None => decline158!("strip_filters outer failed"),
-    };
-    let (sq2_tail, sq2_filters) = match strip_filters(sq2_p.agg.input.as_ref()) {
-        Some(v) => v,
-        None => decline158!("strip_filters sq2 failed"),
-    };
-    // The unrestricted body may carry residual filters (DataFusion often leaves equijoin
-    // predicates as Filter-over-CrossJoin); they ride the shared leaf's WHERE. Sq2 must carry
-    // at least one *additional* filter (the year window) that becomes the dated consumer's
-    // restriction.
-    if sq2_filters.is_empty() {
-        decline158!("sq2 has no residual filters");
-    }
-    if !only_inner_joins(&outer_tail) || !only_inner_joins(&sq2_tail) {
-        decline158!("non-inner joins");
-    }
-
-    let outer_tables = base_tables(&outer_tail);
-    let sq2_tables = base_tables(&sq2_tail);
-    let outer_set: HashSet<&str> = outer_tables.iter().map(String::as_str).collect();
-    let mut extra: Vec<&str> = sq2_tables
-        .iter()
-        .map(String::as_str)
-        .filter(|t| !outer_set.contains(t))
-        .collect();
-    extra.sort_unstable();
-    extra.dedup();
-    if extra.is_empty() || extra.iter().any(|t| !replicated.contains(t)) {
-        decline158!("extra={extra:?} replicated check");
-    }
-    // Every outer table must appear in sq2 (sq2 is a restriction, not a rewrite).
-    if outer_tables
-        .iter()
-        .any(|t| !sq2_tables.iter().any(|s| s == t))
-    {
-        decline158!("outer tables not subset of sq2: {outer_tables:?} vs {sq2_tables:?}");
-    }
-
-    let mut outer_sharded: Vec<&str> = outer_tables
-        .iter()
-        .map(String::as_str)
-        .filter(|t| !replicated.contains(t))
-        .collect();
-    outer_sharded.sort_unstable();
-    outer_sharded.dedup();
-    let [fact] = outer_sharded.as_slice() else {
-        decline158!("outer_sharded={outer_sharded:?}");
-    };
-    if count_table_scans(&outer_tail, fact) != 1
-        || reject_unsafe_broadcast_shapes(&outer_tail, fact).is_err()
-    {
-        decline158!("broadcast-unsafe or multi-scan fact={fact}");
-    }
-
-    // Exactly one extra replicated dim (Q23: date_dim). Multi-dim restrictions need per-dim
-    // join keys and are declined until a caller needs them.
-    if extra.len() != 1 {
-        decline158!("extra len {} {:?}", extra.len(), extra);
-    }
-    let extra_table = extra[0];
-
-    // The equijoin key from the outer body onto the extra dim — required so the dated
-    // consumer can re-attach with `INNER JOIN dim ON dsk = dim.<key>` without inventing
-    // join conditions. Q23: `ss_sold_date_sk = d_date_sk`.
-    let Some((dsk_sql, dim_key)) = fact_side_join_key_to_extra(&sq2_tail, &outer_tail, extra_table)
-    else {
-        decline158!("no join key to extra={extra_table}");
-    };
-    // Sq2 residual filters may only touch the extra dim. A filter on the fact/customer
-    // columns would not be a pure restriction of the shared leaf's row set.
-    for f in &sq2_filters {
-        let mut cols = Vec::new();
-        expr_columns(f, &mut cols);
-        if cols
-            .iter()
-            .any(|c| match c.relation.as_ref().map(|r| r.table()) {
-                Some(t) => t != extra_table,
-                None => !table_has_column(&sq2_tail, extra_table, &c.name),
-            })
-        {
-            decline158!("sq2 filter touches non-extra cols");
-        }
-    }
-
-    let n_group = outer_p.agg.group_expr.len();
-    let mut export_cols: Vec<String> = Vec::with_capacity(n_group + 2);
-    for (j, g) in outer_p.agg.group_expr.iter().enumerate() {
-        export_cols.push(format!("{} AS g{j}", expr_sql(&up, g)?));
-    }
-    export_cols.push(format!("{dsk_sql} AS dsk"));
-    export_cols.push(format!("{} AS amt", outer_agg.arg_sql));
-    let outer_sql = Unparser::default()
-        .plan_to_sql(&outer_tail)
-        .map_err(|e| unsupported(format!("kan158 unparse outer tail: {e}")))?
-        .to_string();
-    let tail = sanitize_generated_sql(&extract_from_tail(&outer_sql)?);
-    let shared_where = if outer_filters.is_empty() {
-        String::new()
-    } else {
-        let parts: Result<Vec<_>> = outer_filters.iter().map(|f| expr_sql(&up, f)).collect();
-        format!(" WHERE {}", parts?.join(" AND "))
-    };
-    let shared_sql = sanitize_generated_sql(&format!(
-        "SELECT {} {tail}{shared_where}",
-        export_cols.join(", ")
-    ));
-    let hash_keys: Vec<u32> = (0..n_group as u32).collect();
-
-    // Dated restriction = sq2 filters that are not already on the shared leaf. Prefer the
-    // full sq2_filters list when outer had no filters; otherwise require every sq2 filter to
-    // mention only the extra dim (outer's join-eq filters live on outer tables and must not
-    // be re-applied after the dim join).
-    let dated_filters: Vec<&Expr> = if outer_filters.is_empty() {
-        sq2_filters.iter().collect()
-    } else {
-        sq2_filters
-            .iter()
-            .filter(|f| {
-                let mut cols = Vec::new();
-                expr_columns(f, &mut cols);
-                cols.iter().any(|c| {
-                    c.relation
-                        .as_ref()
-                        .is_some_and(|r| r.table() == extra_table)
-                        || table_has_column(&sq2_tail, extra_table, &c.name)
-                })
-            })
-            .collect()
-    };
-    if dated_filters.is_empty() {
-        decline158!("no dated restriction filters after subtracting outer");
-    }
-    let filter_sql = {
-        let parts: Result<Vec<_>> = dated_filters.iter().map(|f| expr_sql(&up, f)).collect();
-        parts?.join(" AND ")
-    };
-    let join_extra = {
-        let dim_sql = qualified_table_sql(&sq2_tail, extra_table);
-        // Alias the dim back to its bare name so residual filter SQL (which names
-        // `date_dim.d_year` via the plan's Column relation) still resolves after the
-        // shared-leaf projection dropped the original scan.
-        if dim_sql == extra_table {
-            format!("INNER JOIN {dim_sql} ON dsk = {extra_table}.{dim_key}")
-        } else {
-            format!("INNER JOIN {dim_sql} AS {extra_table} ON dsk = {extra_table}.{dim_key}")
-        }
-    };
-    let group_by = (0..n_group)
-        .map(|j| format!("g{j}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let (partial_sels, _) = partial_combine_sql(&outer_agg.func, 0, "amt")?;
-    let dated_sql = sanitize_generated_sql(&format!(
-        "SELECT {group_by}, {} FROM shuffle_input {join_extra} WHERE {filter_sql} GROUP BY {group_by}",
-        partial_sels.join(", ")
-    ));
-    let wide_sql = sanitize_generated_sql(&format!(
-        "SELECT {group_by}, {} FROM shuffle_input GROUP BY {group_by}",
-        partial_sels.join(", ")
-    ));
-
-    // Plan the outer through the ordinary machinery only to reuse its combine/HAVING SQL and
-    // output projection — then discard its leaf (replaced by the shared-scan wide partial).
-    let outer_dq = match plan_distributed_logical(outer_plan, replicated) {
-        Ok(dq) => dq,
-        Err(_) => return Ok(None),
-    };
-    if outer_dq.finalize_sql.is_some() || outer_dq.stages.len() < 2 {
-        return Ok(None);
-    }
-    let quoted = format!("'{token}'");
-    if outer_dq
-        .stages
-        .iter()
-        .filter(|s| s.sql.contains(&quoted))
-        .count()
-        != 1
-    {
-        return Ok(None);
-    }
-    // The outer leaf must be the only empty-upstream stage; its combine (and any projection
-    // stages) follow. We keep everything after the leaf.
-    let outer_leaf = &outer_dq.stages[0];
-    if !outer_leaf.upstream_stage_ids.is_empty() {
-        return Ok(None);
-    }
-    let outer_rest = &outer_dq.stages[1..];
-
-    // Likewise plan sq2 for its combine SQL (output names `c_customer_sk` / `csales`).
-    let sq2_plan = {
-        // Rebuild sq2 as a bare aggregate (no HAVING) matching sq2_p.
-        let agg = Aggregate::try_new(
-            Arc::new(sq2_p.agg.input.as_ref().clone()),
-            sq2_p.agg.group_expr.to_vec(),
-            sq2_p.agg.aggr_expr.to_vec(),
-        )
-        .map_err(|e| unsupported(format!("kan158 rebuild sq2: {e}")))?;
-        let mut plan = LogicalPlan::Aggregate(agg);
-        if let Some(proj) = sq2_p.projection {
-            plan = LogicalPlanBuilder::from(plan)
-                .project(proj.to_vec())
-                .and_then(|b| b.build())
-                .map_err(|e| unsupported(format!("kan158 sq2 projection: {e}")))?;
-        }
-        plan
-    };
-    let sq2_dq = match plan_distributed_logical(&sq2_plan, replicated) {
-        Ok(dq) => dq,
-        Err(_) => return Ok(None),
-    };
-    if sq2_dq.finalize_sql.is_some()
-        || sq2_dq.stages.len() < 2
-        || !sq2_dq.stages[0].upstream_stage_ids.is_empty()
-        || sq2_dq
-            .stages
-            .last()
-            .map_or(true, |s| !s.hash_key_cols.is_empty())
-    {
-        return Ok(None);
-    }
-    let sq2_rest = &sq2_dq.stages[1..];
-
-    // Assemble: shared → dated partial → sq2 combines → scalar → wide partial → outer rest.
-    let mut stages = Vec::new();
-    let shared_id = 0u32;
-    stages.push(StageDef::new(
-        shared_id,
-        shared_sql,
-        vec![],
-        hash_keys.clone(),
-    ));
-    let dated_partial_id = 1u32;
-    stages.push(StageDef::new(
-        dated_partial_id,
-        dated_sql,
-        vec![shared_id],
-        hash_keys.clone(),
-    ));
-    // Shift sq2's post-leaf stages to follow the dated partial (their upstream 0 → dated).
-    let mut next_id = dated_partial_id + 1;
-    let id_shift = next_id; // old id 0 (leaf) maps conceptually to dated_partial; old 1 → next_id
-    let mut sq2_last = dated_partial_id;
-    for s in sq2_rest {
-        let new_id = s.stage_id + id_shift - 1; // leaf was 0; first rest was 1 → id_shift
-        let mut upstreams: Vec<u32> = s
-            .upstream_stage_ids
-            .iter()
-            .map(|&u| {
-                if u == 0 {
-                    dated_partial_id
-                } else {
-                    u + id_shift - 1
-                }
-            })
-            .collect();
-        if upstreams.is_empty() {
-            upstreams.push(dated_partial_id);
-        }
-        stages.push(StageDef {
-            stage_id: new_id,
-            sql: s.sql.clone(),
-            upstream_stage_ids: upstreams,
-            hash_key_cols: s.hash_key_cols.clone(),
-            exchange: s.exchange,
-            plan_fragment: s.plan_fragment.clone(),
-            lakehouse_snapshot_pins: s.lakehouse_snapshot_pins.clone(),
-            replicated_tables: String::new(),
-        });
-        sq2_last = new_id;
-        next_id = new_id + 1;
-    }
-
-    let scalar_partial_id = next_id;
-    stages.push(StageDef::new(
-        scalar_partial_id,
-        sanitize_generated_sql(&format!(
-            "SELECT {} FROM shuffle_input",
-            scalar_sels.join(", ")
-        )),
-        vec![sq2_last],
-        vec![],
-    ));
-    let scalar_combine_id = scalar_partial_id + 1;
-    stages.push(StageDef::new(
-        scalar_combine_id,
-        sanitize_generated_sql(&format!(
-            "SELECT {proj_sql} AS m0 FROM \
-             (SELECT {scalar_comb} AS s0v FROM shuffle_input HAVING COUNT({guard_col}) > 0) AS cs"
-        )),
-        vec![scalar_partial_id],
-        vec![],
-    ));
-    next_id = scalar_combine_id + 1;
-
-    let wide_partial_id = next_id;
-    stages.push(StageDef::new(
-        wide_partial_id,
-        wide_sql,
-        vec![shared_id],
-        hash_keys,
-    ));
-    next_id = wide_partial_id + 1;
-    // Shift outer's post-leaf stages; their upstream 0 → wide_partial.
-    let outer_shift = next_id;
-    for s in outer_rest {
-        let new_id = s.stage_id + outer_shift - 1;
-        let mut upstreams: Vec<u32> = s
-            .upstream_stage_ids
-            .iter()
-            .map(|&u| {
-                if u == 0 {
-                    wide_partial_id
-                } else {
-                    u + outer_shift - 1
-                }
-            })
-            .collect();
-        if upstreams.is_empty() {
-            upstreams.push(wide_partial_id);
-        }
-        stages.push(StageDef {
-            stage_id: new_id,
-            sql: s.sql.clone(),
-            upstream_stage_ids: upstreams,
-            hash_key_cols: s.hash_key_cols.clone(),
-            exchange: s.exchange,
-            plan_fragment: s.plan_fragment.clone(),
-            lakehouse_snapshot_pins: s.lakehouse_snapshot_pins.clone(),
-            replicated_tables: String::new(),
-        });
-    }
-
-    Ok(Some(DistributedQuery {
-        stages,
-        finalize_sql: None,
-    }))
-}
-
-/// True when a scan of `table` under `lp` exposes `column` in its schema.
-fn table_has_column(lp: &LogicalPlan, table: &str, column: &str) -> bool {
-    match lp {
-        LogicalPlan::TableScan(s) if s.table_name.table() == table => {
-            s.projected_schema
-                .fields()
-                .iter()
-                .any(|f| f.name() == column)
-                || s.source
-                    .schema()
-                    .fields()
-                    .iter()
-                    .any(|f| f.name() == column)
-        }
-        _ => lp
-            .inputs()
-            .iter()
-            .any(|i| table_has_column(i, table, column)),
-    }
-}
-
-/// Fact-side column SQL + dim-side key name for the equijoin onto `extra` in `sq2_tail`.
-///
-/// Walks `sq2_tail`'s INNER join tree for an equijoin between a column belonging to
-/// `outer_tail`'s tables and a column belonging to `extra`. Returns
-/// `(fact_side_sql, dim_key_name)` so the shared leaf can export the fact-side column as
-/// `dsk` and the dated consumer can write `INNER JOIN extra ON dsk = extra.dim_key`.
-fn fact_side_join_key_to_extra(
-    sq2_tail: &LogicalPlan,
-    outer_tail: &LogicalPlan,
-    extra: &str,
-) -> Option<(String, String)> {
-    let outer_table_set: HashSet<String> = base_tables(outer_tail).into_iter().collect();
-    let mut found: Option<(String, String)> = None;
-    let mut stack = vec![sq2_tail];
-    while let Some(node) = stack.pop() {
-        if let LogicalPlan::Join(j) = node {
-            if j.join_type == JoinType::Inner {
-                for (l, r) in &j.on {
-                    let (Expr::Column(lc), Expr::Column(rc)) = (l, r) else {
-                        continue;
-                    };
-                    let l_extra = lc.relation.as_ref().is_some_and(|rel| rel.table() == extra);
-                    let r_extra = rc.relation.as_ref().is_some_and(|rel| rel.table() == extra);
-                    let l_outer = lc
-                        .relation
-                        .as_ref()
-                        .is_some_and(|rel| outer_table_set.contains(rel.table()));
-                    let r_outer = rc
-                        .relation
-                        .as_ref()
-                        .is_some_and(|rel| outer_table_set.contains(rel.table()));
-                    let candidate = match (l_outer && r_extra, r_outer && l_extra) {
-                        (true, false) => Some((l, rc.name.clone())),
-                        (false, true) => Some((r, lc.name.clone())),
-                        _ => None,
-                    };
-                    if let Some((fact_side, dim_key)) = candidate {
-                        let sql = expr_sql(&Unparser::default(), fact_side).ok()?;
-                        if found
-                            .as_ref()
-                            .is_some_and(|(prev, prev_k)| prev != &sql || prev_k != &dim_key)
-                        {
-                            return None; // ambiguous / conflicting keys
-                        }
-                        found = Some((sql, dim_key));
-                    }
-                }
-            }
-            stack.push(j.left.as_ref());
-            stack.push(j.right.as_ref());
-            continue;
-        }
-        for i in node.inputs() {
-            stack.push(i);
-        }
-    }
-    found
 }
 
 /// Conjunctive AND of `exprs` (`None` for an empty list).
