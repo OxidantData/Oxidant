@@ -1,8 +1,10 @@
 //! Classification guard: baseline-pinned plan/decline matrix for all 99 TPC-DS
 //! queries under two simulated SF100 auto-broadcast classifications — each run
-//! once against bare MemTable scans and once against catalog-style wrapped fact
+//! once against bare MemTable scans and once against catalog-style wrapped
 //! scans (`SubqueryAlias → passthrough Projection → TableScan` with a qualified
-//! `glue.tpcds_sf100.*` scan name).
+//! `glue.tpcds_sf100.*` scan name). Every table is wrapped, matching a real Glue
+//! catalog, so a SQL-aliased table nests two `SubqueryAlias`es exactly as it does
+//! on the cluster.
 //!
 //! This test ports the scratch q2diag harness (which predicted the v0.1.11
 //! auto-broadcast regression blast radius 20/20) into the repo as a permanent
@@ -52,17 +54,13 @@ use oxidant_loom::Engine;
 // store_sales (~29 GB) > catalog_sales (~14.5 GB) > web_sales (~7.2 GB).
 const SALES: [&str; 3] = ["store_sales", "catalog_sales", "web_sales"];
 
-/// Fact tables Glue/Hive expand as `SubqueryAlias → Projection → TableScan`
-/// with a catalog-qualified scan name. Wrapping these (and not dims) is what
-/// exposed the q5 bare-scan admission gap.
-const FACTS: [&str; 6] = [
-    "store_sales",
-    "catalog_sales",
-    "web_sales",
-    "store_returns",
-    "catalog_returns",
-    "web_returns",
-];
+// Historical note: this used to wrap only the six fact tables, which is what exposed the q5
+// bare-scan admission gap. It now wraps EVERY table, because a real Glue/Hive catalog expands
+// all of them — and an *aliased* table then nests two `SubqueryAlias`es
+// (`SubqueryAlias(d1) → SubqueryAlias(date_dim) → Projection → TableScan`), which facts-only
+// wrapping never produced. Verified against the live catalog: real q64 declined on exactly that
+// shape while the facts-only matrix read green, so KAN-162's first fix looked complete and was
+// not. Wrapping everything reproduces the decline in CI.
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -151,9 +149,6 @@ fn wrap_fact_scans_catalog_style(lp: LogicalPlan) -> LogicalPlan {
             return Ok(Transformed::no(node));
         };
         let bare = scan.table_name.table().to_string();
-        if !FACTS.contains(&bare.as_str()) {
-            return Ok(Transformed::no(node));
-        }
         // Already catalog-qualified (or previously wrapped): leave alone.
         if !matches!(scan.table_name, TableReference::Bare { .. }) {
             return Ok(Transformed::no(node));

@@ -79,13 +79,48 @@ enum Cap {
 }
 
 /// A chain leaf the reorder knows how to place: a plain table scan, optionally under an alias
-/// (self-joins like Q72's `date_dim d1/d2/d3` are distinct leaves through their aliases).
+/// (self-joins like Q72's `date_dim d1/d2/d3` are distinct leaves through their aliases) and
+/// optionally under Glue's column-passthrough view expansion ([`is_scan_passthrough`]).
 /// Anything else (a subquery, an aggregation, a join of a different type) makes the chain
 /// opaque and the rewrite bails — it never guesses at plan shapes it cannot reassemble.
 fn is_simple_leaf(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::TableScan(_) => true,
-        LogicalPlan::SubqueryAlias(a) => matches!(a.input.as_ref(), LogicalPlan::TableScan(_)),
+        LogicalPlan::SubqueryAlias(a) => is_scan_passthrough(a.input.as_ref()),
+        _ => false,
+    }
+}
+
+/// Whether `plan` is a single `TableScan` wearing only renaming wrappers — column-passthrough
+/// `Projection`s and `SubqueryAlias`es.
+///
+/// KAN-162: Glue/Hive expand a catalog table into `SubqueryAlias(bare) → Projection(1:1 columns)
+/// → TableScan(glue.<db>.<bare>)`, so on a real cluster every leaf arrives deeper than the bare
+/// `SubqueryAlias → TableScan` this used to require. That cost q64: its wrapped `store_sales`
+/// leaf failed [`is_simple_leaf`] *and* satisfied [`is_opaque_derived_leaf`], pushing the comma
+/// connector's derived-leaf count to 2 (with `cs_ui`) and declining the whole rewrite — the
+/// chain then stayed a 17-deep cross join and the branch planner rejected it for want of an
+/// equijoin key.
+///
+/// Verified against the live Glue catalog: an *aliased* table nests **two** `SubqueryAlias`es
+/// (`SubqueryAlias(ad1) → SubqueryAlias(customer_address) → Projection → TableScan`), which is
+/// why this recurses through aliases rather than accepting a fixed depth. q64 aliases ten of its
+/// dims (d1/d2/d3, cd1/cd2, hd1/hd2, ad1/ad2, ib1/ib2), so peeling only the projection left it
+/// declining exactly as before.
+///
+/// Only 1:1 column projections are peeled: a projection that computes, drops, or duplicates
+/// columns is a genuine derived leg and must keep its opaque treatment. Aliases are always safe —
+/// they rename the qualifier without touching column count or values, and `leaf_of` attributes
+/// conjunct columns through the *outermost* alias's schema either way.
+fn is_scan_passthrough(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::TableScan(_) => true,
+        LogicalPlan::SubqueryAlias(a) => is_scan_passthrough(a.input.as_ref()),
+        LogicalPlan::Projection(p) => {
+            p.expr.iter().all(|e| matches!(e, Expr::Column(_)))
+                && p.expr.len() == p.input.schema().fields().len()
+                && is_scan_passthrough(p.input.as_ref())
+        }
         _ => false,
     }
 }
@@ -104,7 +139,9 @@ fn is_opaque_derived_leaf(plan: &LogicalPlan, replicated: &[&str]) -> bool {
     let LogicalPlan::SubqueryAlias(a) = plan else {
         return false;
     };
-    if matches!(a.input.as_ref(), LogicalPlan::TableScan(_)) {
+    // A plain scan — bare, or under Glue's column-passthrough view expansion
+    // ([`is_scan_passthrough`]) — is a simple leaf, not a derived leg, however it is wrapped.
+    if is_scan_passthrough(a.input.as_ref()) {
         return false;
     }
     contains_sharded_scan(&a.input, replicated)
