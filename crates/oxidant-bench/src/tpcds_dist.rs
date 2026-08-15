@@ -76,6 +76,9 @@ pub struct ExecuteBaseline {
 pub struct ExecuteReport {
     pub verified: Vec<String>,
     pub mismatched: Vec<String>,
+    /// The subset of `mismatched` whose row *multiset* matched single-node exactly — only the
+    /// sequence differed, which an `ORDER BY` with ties across the `LIMIT` boundary permits.
+    pub order_only: Vec<String>,
     pub errored: Vec<String>,
 }
 
@@ -281,6 +284,7 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
     let mut report = ExecuteReport {
         verified: Vec::new(),
         mismatched: Vec::new(),
+        order_only: Vec::new(),
         errored: Vec::new(),
     };
     let debug = std::env::var("OXIDANT_TPCDS_DEBUG").is_ok();
@@ -392,10 +396,30 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
             eprintln!("{name:<4} distributed ok [{mode}] ({})", dq.stages.len());
         } else {
             report.mismatched.push(name.to_string());
-            eprintln!("{name:<4} distributed MISMATCH [{mode}]");
+            // Distinguish "returned different data" from "returned the same rows in a different
+            // order". A query whose ORDER BY keys tie across the LIMIT boundary has no single
+            // correct row order, so distributed and single-node can disagree on sequence while
+            // both are right — TPC-DS Q18 and Q65 do exactly this at sf10. Both still fail the
+            // gate (an order-only difference can also be a real ordering bug), but labelling them
+            // apart keeps a genuine wrong-answer from being dismissed as "just the tie thing".
+            let exp_rows = normalize_batches(&expected);
+            let got_rows = normalize_batches(&result);
+            let (mut se, mut sg) = (exp_rows.clone(), got_rows.clone());
+            se.sort();
+            sg.sort();
+            if se == sg {
+                report.order_only.push(name.to_string());
+                eprintln!(
+                    "{name:<4} distributed MISMATCH [{mode}] — ORDER ONLY: identical {} row \
+                     multiset, different sequence (ORDER BY ties)",
+                    se.len()
+                );
+            } else {
+                eprintln!("{name:<4} distributed MISMATCH [{mode}] — DIFFERENT ROWS");
+            }
             if debug {
-                let exp = normalize_batches(&expected);
-                let got = normalize_batches(&result);
+                let exp = exp_rows;
+                let got = got_rows;
                 eprintln!(
                     "  expected {} rows / got {} rows\n  first expected: {:?}\n  first got:      {:?}",
                     exp.len(),
@@ -452,6 +476,13 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
         report.mismatched.len(),
         report.errored.len()
     );
+    if !report.order_only.is_empty() {
+        eprintln!(
+            "  of those, {} were ORDER-ONLY (identical row multiset, ORDER BY ties): {}",
+            report.order_only.len(),
+            report.order_only.join(", ")
+        );
+    }
     eprintln!(
         "verified_json={}",
         serde_json::to_string(&report.verified).unwrap_or_default()
@@ -473,11 +504,31 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
 /// answer regardless of how many of them there are.
 fn check_execute_ratchet(report: &ExecuteReport, baseline: Option<&Path>) -> bool {
     let mut ok = true;
-    if !report.mismatched.is_empty() {
+    let different_rows: Vec<&String> = report
+        .mismatched
+        .iter()
+        .filter(|q| !report.order_only.contains(q))
+        .collect();
+    if !different_rows.is_empty() {
         eprintln!(
             "[tpcds-execute] WRONG ANSWERS: {} — a distributed plan must never return a result \
              that differs from single-node; make the planner decline the shape instead",
-            report.mismatched.join(", ")
+            different_rows
+                .iter()
+                .map(|q| q.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        ok = false;
+    }
+    if !report.order_only.is_empty() {
+        // Still a gate failure — an order-only difference can be a genuine ordering bug — but it
+        // is a materially different finding from returning different data, so say which it is.
+        eprintln!(
+            "[tpcds-execute] ORDER-ONLY MISMATCH: {} — row multiset matches single-node exactly, \
+             only the sequence differs (ORDER BY keys tie across the LIMIT). Not a wrong answer, \
+             but the distributed plan must still reproduce single-node's order",
+            report.order_only.join(", ")
         );
         ok = false;
     }
@@ -805,8 +856,24 @@ mod tests {
         ExecuteReport {
             verified: own(verified),
             mismatched: own(mismatched),
+            // These fixtures assert the ratchet's wrong-answer path, so treat every mismatch as a
+            // genuine data difference; `order_only` is covered by its own case below.
+            order_only: Vec::new(),
             errored: own(errored),
         }
+    }
+
+    /// A mismatch whose row multiset matched single-node still fails the gate — an order-only
+    /// difference can be a real ordering bug — but it must be reported as ORDER-ONLY rather than
+    /// as a wrong answer, or a genuine wrong answer gets dismissed as "just the tie thing".
+    #[test]
+    fn order_only_mismatch_fails_the_gate_but_is_not_a_wrong_answer() {
+        let mut r = report(&["Q1"], &["Q18"], &[]);
+        r.order_only = vec!["Q18".to_string()];
+        assert!(
+            !check_execute_ratchet(&r, None),
+            "an order-only mismatch must still fail the execute gate"
+        );
     }
 
     /// Write a throwaway baseline under a caller-supplied name, so tests running in parallel
