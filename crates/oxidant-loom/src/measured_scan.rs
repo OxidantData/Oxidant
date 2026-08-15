@@ -115,7 +115,7 @@ impl ExecutionPlan for MeasuredStatsExec {
 /// per-column null-count walk over every batch — at plan time.
 #[derive(Debug)]
 pub struct MeasuredStatsTable {
-    inner: datafusion::datasource::MemTable,
+    inner: Arc<dyn datafusion::catalog::TableProvider>,
     num_rows: usize,
     total_byte_size: usize,
 }
@@ -141,12 +141,33 @@ impl MeasuredStatsTable {
                     .sum::<usize>()
             })
             .sum();
-        let inner = datafusion::datasource::MemTable::try_new(schema, vec![batches])?;
+        let inner = Arc::new(datafusion::datasource::MemTable::try_new(
+            schema,
+            vec![batches],
+        )?);
         Ok(Self {
             inner,
             num_rows,
             total_byte_size,
         })
+    }
+
+    /// Attach the driver's measured statistics to an arbitrary provider.
+    ///
+    /// Exists so a shuffle input that was streamed to disk instead of held in a `MemTable`
+    /// still reports the barrier-measured row count to the join-strategy guard. Without this
+    /// the spill-backed path would silently fall back to DataFusion's file-derived estimates
+    /// and plan joins differently from the in-memory path — the same input, two plans.
+    pub fn from_provider(
+        inner: Arc<dyn datafusion::catalog::TableProvider>,
+        num_rows: usize,
+        total_byte_size: usize,
+    ) -> Self {
+        Self {
+            inner,
+            num_rows,
+            total_byte_size,
+        }
     }
 }
 
@@ -193,6 +214,58 @@ mod tests {
             ],
         )
         .unwrap()]
+    }
+
+    /// The spill-backed shuffle input must actually be readable and report the measured
+    /// stats. SpillStore writes IPC *stream* format (`StreamWriter`) while DataFusion's
+    /// `ArrowFormat` leads with `FileReader`; this proves the fallback path really works for
+    /// the files we produce, rather than trusting that it does.
+    #[tokio::test]
+    async fn arrow_ipc_shuffle_input_streams_from_disk_with_measured_stats() {
+        use datafusion::arrow::ipc::writer::StreamWriter;
+
+        let dir =
+            std::env::temp_dir().join(format!("ox-ipc-probe-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let batches = kv_batches(40);
+        let schema = batches[0].schema();
+        {
+            let f = std::fs::File::create(dir.join("part_0.arrow")).unwrap();
+            let mut w = StreamWriter::try_new(f, &schema).unwrap();
+            for b in &batches {
+                w.write(b).unwrap();
+            }
+            w.finish().unwrap();
+        }
+
+        let engine = crate::Engine::new();
+        engine
+            .register_arrow_ipc_shuffle_input("spilled", &dir, schema, 40, 1234)
+            .unwrap();
+        let rows = engine
+            .sql("SELECT count(*) AS n FROM spilled")
+            .await
+            .unwrap();
+        let n: i64 = rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 40, "spill-backed shuffle input must read back every row");
+
+        let provider = engine.ctx.table_provider("spilled").await.unwrap();
+        let scan = provider
+            .scan(&engine.ctx.state(), None, &[], None)
+            .await
+            .unwrap();
+        let stats = scan.partition_statistics(None).unwrap();
+        assert!(
+            matches!(stats.num_rows, Precision::Exact(40)),
+            "measured stats must survive the spill path, got {:?}",
+            stats.num_rows
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

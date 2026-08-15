@@ -397,13 +397,73 @@ pub async fn resolve_replicated_tables(engine: &Engine, lp: &LogicalPlan) -> Vec
     }
     let override_names = replicated_tables_override_from_env();
     let override_refs: Vec<&str> = override_names.iter().map(String::as_str).collect();
-    classify_replicated_tables_with_rows(
-        &sized,
-        &rows,
-        &override_refs,
-        auto_broadcast_threshold_bytes(),
-        replicate_max_row_multiple(),
-    )
+    let multiple = replicate_max_row_multiple();
+    let shipped = auto_broadcast_threshold_bytes();
+    let widest =
+        classify_replicated_tables_with_rows(&sized, &rows, &override_refs, shipped, multiple);
+    if !replicate_ladder_enabled() {
+        return widest;
+    }
+    // Ladder (opt-in, `OXIDANT_REPLICATE_LADDER=1`): prefer the *tightest* replicated set that
+    // still produces a distributed plan, falling back rung by rung to today's set.
+    //
+    // The shipped 32 GiB threshold replicates any table smaller than the largest one, which at
+    // SF100 means fact tables: TPC-DS Q17 broadcasts `catalog_sales` (144M rows) and
+    // `store_returns` (28.8M) onto every worker instead of shuffle-joining them. Spark's
+    // comparable knob defaults to 10 MB. Measured locally: with only true dimensions replicated
+    // 89/99 TPC-DS queries still plan — including Q17/Q25/Q29/Q54 — but 10 decline, so the tight
+    // set cannot simply become the default. Probing per query keeps those 10 on the wide set.
+    //
+    // The probe mirrors `try_run_distributed_plan`: split the optimized plan, and on failure
+    // retry the original, because the optimizer can move a plan outside the splitter's
+    // vocabulary. Anything that plans today still plans — the last rung is `widest`.
+    let optimized = engine.optimize_logical_plan(lp.clone()).ok();
+    for rung in ladder_thresholds(shipped) {
+        let candidate =
+            classify_replicated_tables_with_rows(&sized, &rows, &override_refs, rung, multiple);
+        if candidate.len() >= widest.len() {
+            continue; // no tighter than what we already have
+        }
+        let refs: Vec<&str> = candidate.iter().map(String::as_str).collect();
+        let splits = optimized
+            .as_ref()
+            .map(|o| plan_distributed_logical(o, &refs).is_ok())
+            .unwrap_or(false)
+            || plan_distributed_logical(lp, &refs).is_ok();
+        if splits {
+            tracing::info!(
+                target: "oxidant.replicate",
+                threshold_bytes = rung,
+                replicated = ?candidate,
+                "replicate ladder: using tighter replicated set (shuffle-join instead of broadcast)"
+            );
+            return candidate;
+        }
+    }
+    widest
+}
+
+/// Opt-in per-query search for the tightest workable replicated set. Off by default: it changes
+/// broadcast joins into shuffle joins, which is the right call at SF100 scale but cannot be
+/// proven from a small local run, so it ships as an A/B switch rather than a new default.
+fn replicate_ladder_enabled() -> bool {
+    std::env::var("OXIDANT_REPLICATE_LADDER")
+        .ok()
+        .as_deref()
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
+        .unwrap_or(false)
+}
+
+/// Candidate broadcast thresholds, tightest first, ending just below `shipped`.
+///
+/// - 10 MiB — Spark's `spark.sql.autoBroadcastJoinThreshold` default: dimensions only.
+/// - 4 GiB  — replicates a small fact (SF100 `store_returns` ~1.4 GB) but not a large one
+///   (`catalog_sales` ~9.8 GB), which is the useful middle ground for the 3-fact queries.
+fn ladder_thresholds(shipped: u64) -> Vec<u64> {
+    [10 * 1024 * 1024, 4 * 1024 * 1024 * 1024]
+        .into_iter()
+        .filter(|t| *t < shipped)
+        .collect()
 }
 
 /// Last-line check on the SQL every stage will hand to a worker.
@@ -1440,7 +1500,22 @@ pub(crate) fn simple_table_scan(lp: &LogicalPlan) -> Result<SimpleScan<'_>> {
         // *renames* a column would silently vanish from the stage SQL (a view defined as
         // `ss_list_price * 2 AS ss_list_price` summed the raw column instead), so those decline.
         LogicalPlan::Projection(p) if projection_is_scan_passthrough(p) => {
-            simple_table_scan(p.input.as_ref())
+            let mut inner = simple_table_scan(p.input.as_ref())?;
+            // KEEP the projection's narrower schema. Descending past it and taking the scan's
+            // own `projected_schema` re-widens the leaf back to every column of the table —
+            // which is exactly what a column-pruning projection was there to prevent.
+            //
+            // The cost is not academic: TPC-DS q37 references ONE column of `catalog_sales`
+            // (`cs_item_sk`) and the leaf stage shipped all ~34 through the shuffle, so the
+            // producer buffered whole fact shards and the worker was OOM-killed. Names and
+            // values are unchanged (that is what `projection_is_scan_passthrough` guarantees),
+            // so this narrows what is shuffled without altering any result.
+            //
+            // Filters are unaffected: `filter_sql` is emitted as the leaf's `WHERE`, and SQL
+            // lets `WHERE` reference columns the `SELECT` list omits. A join key that somehow
+            // is not carried fails loudly in `flat_key_index` rather than silently.
+            inner.schema = p.schema.clone();
+            Ok(inner)
         }
         other => Err(Error::Unsupported(format!(
             "auto-distribute: shuffle join side must be a table scan, found `{}`",
@@ -6912,5 +6987,45 @@ mod driver_side_optimization_tests {
                 st.sql
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod replicate_ladder_tests {
+    use super::*;
+
+    /// Off by default: the ladder converts broadcast joins into shuffle joins, which is a large
+    /// behavioural change that only a cluster run can price. It must stay opt-in until then.
+    #[test]
+    fn ladder_defaults_off_and_env_opts_in() {
+        std::env::remove_var("OXIDANT_REPLICATE_LADDER");
+        assert!(!replicate_ladder_enabled(), "ladder must default OFF");
+        for v in ["1", "true", "on", "yes"] {
+            std::env::set_var("OXIDANT_REPLICATE_LADDER", v);
+            assert!(replicate_ladder_enabled(), "OXIDANT_REPLICATE_LADDER={v}");
+        }
+        for v in ["0", "false", "off"] {
+            std::env::set_var("OXIDANT_REPLICATE_LADDER", v);
+            assert!(!replicate_ladder_enabled(), "OXIDANT_REPLICATE_LADDER={v}");
+        }
+        std::env::remove_var("OXIDANT_REPLICATE_LADDER");
+    }
+
+    /// Rungs are tightest-first and strictly below the shipped threshold — the caller falls back
+    /// to the shipped set last, which is what guarantees nothing that plans today stops planning.
+    #[test]
+    fn ladder_rungs_are_ascending_and_below_shipped() {
+        let shipped = 32 * 1024 * 1024 * 1024u64;
+        let rungs = ladder_thresholds(shipped);
+        assert_eq!(rungs, vec![10 * 1024 * 1024, 4 * 1024 * 1024 * 1024]);
+        assert!(rungs.windows(2).all(|w| w[0] < w[1]), "tightest first");
+        assert!(rungs.iter().all(|t| *t < shipped), "all below shipped");
+
+        // An operator who already tightened the threshold gets no rung above their own setting.
+        assert!(ladder_thresholds(1024).is_empty());
+        assert_eq!(
+            ladder_thresholds(1024 * 1024 * 1024),
+            vec![10 * 1024 * 1024]
+        );
     }
 }

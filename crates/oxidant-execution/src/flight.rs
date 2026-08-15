@@ -29,6 +29,7 @@ use arrow_flight::{
 use futures::{StreamExt, TryStreamExt};
 use oxidant_common::{Error, Result};
 use oxidant_loom::arrow::datatypes::{Schema, SchemaRef};
+use oxidant_loom::arrow::ipc as arrow_ipc;
 use oxidant_loom::arrow::record_batch::RecordBatch;
 use oxidant_loom::Engine;
 use tonic::{Request, Response, Status, Streaming};
@@ -40,6 +41,143 @@ use crate::shuffle::{hash_partition, PUSH_SRC};
 /// Max concurrent remote shuffle bucket pulls per upstream on a consumer task.
 /// Override via `OXIDANT_SHUFFLE_PULL_CONCURRENCY` (default 8). Caps consume-side RSS when
 /// AQE coalesces many producer buckets onto one reader or when shuffle partitions ≫ workers.
+/// Charge consumer-side shuffle-pull bytes to the DataFusion memory pool (env:
+/// `OXIDANT_SHUFFLE_PULL_ACCOUNTING`, default **off**).
+///
+/// A consumer materializes every bucket of its modulus class in memory for the whole stage
+/// (`run_stage_inner`) and nothing can spill it. Those bytes are invisible to the pool, so a
+/// worker can run far past its configured budget and be killed by the cgroup with no
+/// `ResourcesExhausted` to act on — measured at ~1.3 GiB/s and 6x a 1 GiB pool on a
+/// two-sharded-fact join (TPC-DS q37, q50).
+///
+/// Turning this on makes the pool see them, which converts that kernel kill into an actionable
+/// error. It is **off by default** because the pool is DataFusion's *operator* budget, and
+/// charging non-operator memory to it competes with operators that were sized against it:
+/// with it on, the KAN-25 join guard's sort-merge fallback no longer fits its budget
+/// (`tests/worker_join_memory_guard.rs`), and TPC-DS q67 — which legitimately pulls ~3.3 GB
+/// into one reader and ran fine in a 6 GiB container against a 3 GiB pool — starts failing.
+///
+/// The real fix is to make shuffle-pull data spillable so it never needs to fit at all; until
+/// then this is a diagnostic and a safety valve for operators who would rather lose a query
+/// than have the cgroup kill the worker and take every concurrent query with it.
+fn shuffle_pull_accounting() -> bool {
+    std::env::var("OXIDANT_SHUFFLE_PULL_ACCOUNTING")
+        .ok()
+        .as_deref()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+}
+
+/// Rough bytes-per-row used to turn the driver's measured row count into a size estimate for
+/// the spill decision. Matches the AQE advisory estimator's assumption; it only has to be right
+/// to an order of magnitude, because the decision is "does this plausibly not fit".
+const SHUFFLE_ROW_WIDTH_ESTIMATE_BYTES: u64 = 64;
+
+/// Above how many estimated bytes a consumer streams its shuffle input from disk instead of
+/// holding it in a `MemTable` (env: `OXIDANT_SHUFFLE_PULL_SPILL_BYTES`; unset = never spill).
+///
+/// A consumer task materializing its whole modulus class in memory for the life of the stage is
+/// the allocation that neither the DataFusion pool nor the shuffle budget bounds: the worker
+/// grows until the cgroup kills it, with no `ResourcesExhausted` to act on. Streaming from Arrow
+/// IPC removes the requirement to fit rather than trying to budget for it.
+///
+/// Unset by default while this is proven out; the decision is made from the driver's measured
+/// row counts BEFORE the pull, since deciding afterwards is too late to save anything.
+fn shuffle_pull_spill_bytes() -> Option<usize> {
+    std::env::var("OXIDANT_SHUFFLE_PULL_SPILL_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// One upstream's pull result: the batches (empty when spilled), the pool reservation to hold
+/// for the stage, and the spill directory + schema when the input went to disk.
+struct PullOutcome {
+    parts: Vec<Result<Vec<RecordBatch>>>,
+    reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
+    spilled: Option<(std::path::PathBuf, SchemaRef, usize)>,
+}
+
+impl PullOutcome {
+    fn err(e: Error) -> Self {
+        Self {
+            parts: vec![Err(e)],
+            reservation: None,
+            spilled: None,
+        }
+    }
+}
+
+/// Writes pulled shuffle buckets straight to Arrow IPC files so the batches can be dropped
+/// immediately, keeping a consumer task's working set to one bucket.
+struct ShuffleSpillWriter {
+    dir: std::path::PathBuf,
+    seq: usize,
+    schema: Option<SchemaRef>,
+    rows: usize,
+}
+
+impl ShuffleSpillWriter {
+    fn create(dir: &std::path::Path) -> Result<Self> {
+        // A stale directory from a previous attempt at the same (stage, partition, upstream)
+        // would be scanned as extra rows, so start clean.
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Error::Io(format!("shuffle pull spill dir {}: {e}", dir.display())))?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            seq: 0,
+            schema: None,
+            rows: 0,
+        })
+    }
+
+    fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        // Drop only SCHEMA-LESS placeholder buckets (a Forward upstream served by a worker that
+        // never ran it) — mirroring the in-memory path's
+        // `retain(|b| !b.schema().fields().is_empty())`.
+        //
+        // Zero-ROW batches must be kept: they carry the real schema, and in spill mode the
+        // originals are dropped after writing, so discarding them loses the only record of what
+        // the input looks like. A LEFT OUTER join whose right side is empty for this partition
+        // then has no schema to scan and the query fails
+        // (`auto_distribute::two_sharded_tables_left_outer_shuffle_join` caught exactly this).
+        let batches: Vec<&RecordBatch> = batches
+            .iter()
+            .filter(|b| !b.schema().fields().is_empty())
+            .collect();
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let schema = self
+            .schema
+            .get_or_insert_with(|| batches[0].schema())
+            .clone();
+        let path = self.dir.join(format!("part_{:06}.arrow", self.seq));
+        self.seq += 1;
+        let file = std::fs::File::create(&path)
+            .map_err(|e| Error::Io(format!("shuffle pull spill create {}: {e}", path.display())))?;
+        let mut w = arrow_ipc::writer::StreamWriter::try_new(file, &schema)
+            .map_err(|e| Error::Io(format!("shuffle pull spill writer: {e}")))?;
+        for b in batches {
+            // Erase benign nullability/metadata drift between endpoints exactly as the
+            // in-memory path does, or the IPC writer rejects the batch outright.
+            let b = align_batch_schema(b, &schema).unwrap_or_else(|| (*b).clone());
+            self.rows += b.num_rows();
+            w.write(&b)
+                .map_err(|e| Error::Io(format!("shuffle pull spill write: {e}")))?;
+        }
+        w.finish()
+            .map_err(|e| Error::Io(format!("shuffle pull spill finish: {e}")))?;
+        Ok(())
+    }
+
+    /// `None` when nothing was written — the caller then registers an empty in-memory input,
+    /// because a directory with no files has no schema to scan.
+    fn finish(self) -> Option<(std::path::PathBuf, SchemaRef, usize)> {
+        self.schema.map(|s| (self.dir, s, self.rows))
+    }
+}
+
 fn shuffle_pull_concurrency() -> usize {
     std::env::var("OXIDANT_SHUFFLE_PULL_CONCURRENCY")
         .ok()
@@ -361,6 +499,10 @@ impl Drop for TaskSlotGuard {
 struct ShuffleInputGuard {
     engine: Arc<Engine>,
     names: Vec<String>,
+    /// Pool reservations covering the batches behind `names`. Held here so every exit path
+    /// releases them with the registration itself — an early `?` between reserving and
+    /// deregistering would otherwise leak the bytes for the worker's lifetime.
+    reservations: Vec<datafusion::execution::memory_pool::MemoryReservation>,
 }
 
 impl Drop for ShuffleInputGuard {
@@ -368,6 +510,7 @@ impl Drop for ShuffleInputGuard {
         for name in &self.names {
             self.engine.deregister_table(name);
         }
+        // Reservations drop with `self`, after the tables they cover are gone.
     }
 }
 
@@ -874,6 +1017,7 @@ impl Worker {
         let mut shuffle_inputs = ShuffleInputGuard {
             engine: self.engine.clone(),
             names: Vec::new(),
+            reservations: Vec::new(),
         };
         // R5-4: this task's registered shuffle-input providers (upstream order), handed to
         // the stage plan cache so a template hit rebinds scans to THIS task's data (and its
@@ -895,8 +1039,27 @@ impl Worker {
         // take no server-side task slot, so this cannot starve stage tasks), then
         // concatenate per upstream in the legacy nested-loop order — bucket-major, then
         // endpoint — which ordered consumers rely on; the first error in that order wins.
-        let per_upstream =
-            futures::future::join_all(t.upstream_stage_ids.iter().map(|&up_stage| {
+        //
+        // Read the accounting flag once here rather than inside the concurrent block below.
+        // `std::env::var` takes a process-global lock, so keeping it off the per-pull path is
+        // the right shape — though measurement says it was NOT costing anything detectable
+        // (hoisting it moved the SF10 99 from 68.3/67.9 s to 66.1/68.7 s, i.e. not at all).
+        let account_pulls = shuffle_pull_accounting();
+        // Decide UP FRONT, from the driver's barrier-measured row counts, whether each
+        // upstream is too big to hold. Deciding after the pull is useless: by then the memory
+        // is already spent. `None` (no measurement on the ticket) keeps the in-memory path.
+        let pull_spill_bytes = shuffle_pull_spill_bytes();
+        let spill_upstream: Vec<bool> = (0..t.upstream_stage_ids.len())
+            .map(|i| {
+                pull_spill_bytes.is_some_and(|limit| {
+                    measured_upstream_rows(&t, &read_buckets, i).is_some_and(|rows| {
+                        rows.saturating_mul(SHUFFLE_ROW_WIDTH_ESTIMATE_BYTES) as usize > limit
+                    })
+                })
+            })
+            .collect();
+        let per_upstream = futures::future::join_all(t.upstream_stage_ids.iter().enumerate().map(
+            |(up_idx, &up_stage)| {
                 // A `Forward`-mode upstream ran exactly once, on the first endpoint (the driver
                 // dispatches it there); the other endpoints would only serve schema-less
                 // placeholder buckets, so don't round-trip them at all.
@@ -912,7 +1075,40 @@ impl Worker {
                     .iter()
                     .flat_map(|&bucket| endpoints.iter().map(move |ep| (ep.clone(), bucket)))
                     .collect();
+                let engine = self.engine.clone();
+                let spill_this = spill_upstream[up_idx];
+                let spill_dir =
+                    engine.shuffle_pull_spill_dir(t.stage_id, t.partition_id, up_idx as u32);
                 async move {
+                    // Account each bucket AS IT ARRIVES when enabled. Reserving once after the
+                    // pull completes is too late: the accumulation below IS the allocation that
+                    // exhausts the box, so the reservation would be taken on bytes the worker
+                    // had already died holding. A coalesced reader (`read_buckets` = its whole
+                    // modulus class, pulled from every endpoint) can be assigned a large
+                    // fraction of the entire shuffle, which is why this grows without bound on
+                    // a two-sharded-fact join. Off by default — see `shuffle_pull_accounting`.
+                    let mut reservation = if account_pulls {
+                        match engine.reserve_external_bytes(&format!("ShufflePull[{up_stage}]"), 0)
+                        {
+                            Ok(r) => Some(r),
+                            Err(e) => return PullOutcome::err(e),
+                        }
+                    } else {
+                        None
+                    };
+                    // Spill mode: write each bucket to an Arrow IPC file and DROP it, so the
+                    // task's working set is one bucket rather than its whole modulus class.
+                    // The consumer later scans the directory as a streaming table, which is
+                    // what removes the "must fit in RAM" requirement instead of budgeting for
+                    // it. Only taken when the driver's measured rows say the input is large.
+                    let mut spilled: Option<ShuffleSpillWriter> = if spill_this {
+                        match ShuffleSpillWriter::create(&spill_dir) {
+                            Ok(w) => Some(w),
+                            Err(e) => return PullOutcome::err(e),
+                        }
+                    } else {
+                        None
+                    };
                     let mut out = Vec::with_capacity(pulls.len());
                     let mut iter =
                         futures::stream::iter(pulls.into_iter().map(|(ep, bucket)| async move {
@@ -920,16 +1116,85 @@ impl Worker {
                         }))
                         .buffer_unordered(shuffle_pull_concurrency());
                     while let Some(part) = iter.next().await {
-                        out.push(part);
+                        if let (Some(r), Ok(batches)) = (reservation.as_mut(), part.as_ref()) {
+                            let bytes = crate::shuffle::estimated_batch_bytes(batches);
+                            if let Err(e) = r.try_grow(bytes) {
+                                out.push(Err(Error::Execution(format!(
+                                    "shuffle pull for stage {up_stage} exceeded the worker \
+                                     memory pool after {} buckets: {e} — this data is held in \
+                                     memory for the whole stage and cannot be spilled. Raise \
+                                     the worker memory limit, replicate one side of the join, \
+                                     or unset OXIDANT_SHUFFLE_PULL_ACCOUNTING.",
+                                    out.len(),
+                                ))));
+                                break;
+                            }
+                        }
+                        match (spilled.as_mut(), part) {
+                            (Some(w), Ok(batches)) => {
+                                if let Err(e) = w.write(&batches) {
+                                    out.push(Err(e));
+                                    break;
+                                }
+                                // `batches` dropped here — that is the whole point.
+                            }
+                            (Some(_), Err(e)) => {
+                                out.push(Err(e));
+                                break;
+                            }
+                            (None, part) => out.push(part),
+                        }
                     }
-                    out
+                    PullOutcome {
+                        parts: out,
+                        reservation,
+                        spilled: spilled.and_then(|w| w.finish()),
+                    }
                 }
-            }))
-            .await;
-        for (i, results) in per_upstream.into_iter().enumerate() {
+            },
+        ))
+        .await;
+        for (i, outcome) in per_upstream.into_iter().enumerate() {
+            let PullOutcome {
+                parts: results,
+                reservation: pull_reservation,
+                spilled,
+            } = outcome;
+            // Carry the pull's reservation into the guard: these are the same bytes the
+            // MemTable below will hold, so they stay reserved for the stage's lifetime rather
+            // than being released and re-taken (which would open a window where the pool
+            // believes the memory is free).
+            if let Some(r) = pull_reservation {
+                shuffle_inputs.reservations.push(r);
+            }
             let mut input = Vec::new();
             for part in results {
-                input.extend(part.map_err(|e| Status::internal(e.to_string()))?);
+                input.extend(part.map_err(|e| Status::resource_exhausted(e.to_string()))?);
+            }
+            let name = if single {
+                crate::shuffle::localized_shuffle_input_name(t.stage_id, t.partition_id, None)
+            } else {
+                crate::shuffle::localized_shuffle_input_name(t.stage_id, t.partition_id, Some(i))
+            };
+            // Spilled: the batches were written to Arrow IPC and dropped, so register a
+            // streaming scan over the directory instead of a MemTable. The placeholder
+            // filtering and schema alignment the in-memory path does below were applied
+            // per-bucket by `ShuffleSpillWriter::write`.
+            if let Some((dir, schema, rows)) = spilled {
+                let measured = measured_upstream_rows(&t, &read_buckets, i).unwrap_or(rows as u64);
+                let provider = self
+                    .engine
+                    .register_arrow_ipc_shuffle_input(
+                        &name,
+                        &dir,
+                        schema,
+                        measured,
+                        rows.saturating_mul(SHUFFLE_ROW_WIDTH_ESTIMATE_BYTES as usize),
+                    )
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                shuffle_providers.push(provider);
+                shuffle_inputs.names.push(name);
+                continue;
             }
             // A `Forward`-mode upstream (a replicated-only UNION/aggregation arm — see
             // `stage_planner::try_split_broadcast_union`) runs on exactly one worker; unless
@@ -955,16 +1220,14 @@ impl Worker {
                     .map(|b| align_batch_schema(&b, &declared).unwrap_or(b))
                     .collect();
             }
-            let name = if single {
-                crate::shuffle::localized_shuffle_input_name(t.stage_id, t.partition_id, None)
-            } else {
-                crate::shuffle::localized_shuffle_input_name(t.stage_id, t.partition_id, Some(i))
-            };
             // KAN-2 A3: when the ticket carries the driver's barrier-measured bucket
             // totals, register the input with that exact row count attached — the
             // plan-time join-strategy guard then sizes hash builds from measured data.
             // Otherwise the plain MemTable registration applies (DataFusion's own
             // batch-derived statistics).
+            // No second reservation here: the pull above already reserved exactly these bytes
+            // and that reservation is now held by `shuffle_inputs`. Reserving again would
+            // double-count the MemTable and halve the usable pool.
             let provider = match measured_upstream_rows(&t, &read_buckets, i) {
                 Some(rows) => self.engine.register_batches_with_stats(&name, input, rows),
                 None => self.engine.register_batches(&name, input),
@@ -2192,6 +2455,28 @@ mod tests {
     use super::*;
     use oxidant_loom::arrow::array::{Int32Array, Int64Array};
     use oxidant_loom::arrow::datatypes::{DataType, Field};
+
+    // Charging shuffle-pull bytes to the DataFusion pool must stay OFF unless asked for: the
+    // pool is the operator budget, and competing with it breaks operators sized against it
+    // (the KAN-25 sort-merge fallback in tests/worker_join_memory_guard.rs stops fitting) and
+    // fails queries that legitimately pull more than the pool into one reader (TPC-DS q67,
+    // ~3.3 GB against a 3 GiB pool, in a 6 GiB container).
+    #[test]
+    fn shuffle_pull_accounting_is_opt_in() {
+        let prev = std::env::var("OXIDANT_SHUFFLE_PULL_ACCOUNTING").ok();
+        std::env::remove_var("OXIDANT_SHUFFLE_PULL_ACCOUNTING");
+        assert!(!shuffle_pull_accounting(), "must default OFF");
+        for on in ["1", "true", "on", "ON"] {
+            std::env::set_var("OXIDANT_SHUFFLE_PULL_ACCOUNTING", on);
+            assert!(shuffle_pull_accounting(), "`{on}` must enable it");
+        }
+        std::env::set_var("OXIDANT_SHUFFLE_PULL_ACCOUNTING", "0");
+        assert!(!shuffle_pull_accounting());
+        match prev {
+            Some(v) => std::env::set_var("OXIDANT_SHUFFLE_PULL_ACCOUNTING", v),
+            None => std::env::remove_var("OXIDANT_SHUFFLE_PULL_ACCOUNTING"),
+        }
+    }
 
     #[test]
     fn align_batch_schema_erases_nullability_drift() {

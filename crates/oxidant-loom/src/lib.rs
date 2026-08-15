@@ -3455,6 +3455,46 @@ impl Engine {
         dir_bytes(&self.dirs.spill_dir)
     }
 
+    /// Reserve `bytes` against this engine's DataFusion memory pool for Arrow data the caller
+    /// holds OUTSIDE any DataFusion operator, returning the reservation to hold for its
+    /// lifetime (dropping it releases the bytes).
+    ///
+    /// The worker's shuffle-input `MemTable`s are the motivating case: a consumer task pulls
+    /// every bucket it was assigned into RSS and registers it, and until this existed those
+    /// bytes were invisible to the pool. The consequence was not a slow query — it was that
+    /// the pool believed it had headroom it did not have, so downstream operators never
+    /// spilled and the kernel killed the worker outright (no `ResourcesExhausted`, nothing to
+    /// act on). Two sharded facts joined together reached 6x the configured pool in ~5 s.
+    ///
+    /// Registered with `can_spill = false` deliberately: the caller cannot hand these bytes
+    /// back on demand, so under a `FairSpillPool` they must count against the non-spillable
+    /// share and squeeze the spillable operators rather than the reverse.
+    ///
+    /// With no bounded pool (`OXIDANT_MEMORY_LIMIT_BYTES=0`) this is a no-op reservation that
+    /// always succeeds, matching the unbounded pool's contract.
+    pub fn reserve_external_bytes(
+        &self,
+        label: &str,
+        bytes: usize,
+    ) -> Result<datafusion::execution::memory_pool::MemoryReservation> {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let pool = self.ctx.task_ctx().runtime_env().memory_pool.clone();
+        let reservation = MemoryConsumer::new(label)
+            .with_can_spill(false)
+            .register(&pool);
+        reservation.try_grow(bytes).map_err(|e| {
+            Error::Execution(format!(
+                "reserve {bytes} bytes for `{label}`: {e} (pool {}; this is shuffle-input data \
+                 that cannot be spilled — lower OXIDANT_WORKER_TASK_SLOTS, raise the worker \
+                 memory limit, or replicate one side of the join)",
+                self.memory_pool_bytes
+                    .map_or_else(|| "unbounded".to_string(), |b| format!("{b} bytes")),
+            ))
+        })?;
+        Ok(reservation)
+    }
+
     /// Import UDF definitions from JSON (distributed worker sync).
     pub fn register_udfs_json(&self, json: &str) -> Result<()> {
         let mut reg = self.udf_registry.lock().unwrap();
@@ -3903,6 +3943,19 @@ impl Engine {
                 PreSplitRewrite::Standard => vec![
                     Arc::new(ExtractEquijoinPredicate::new()),
                     Arc::new(PushDownFilter::new()),
+                    // NOT here: `OptimizeProjections`. Column pruning is badly wanted — without
+                    // it `TableScan.projection` is never set, `projected_schema` stays the FULL
+                    // table schema, and every leaf shuffle stage ships every column of a sharded
+                    // fact (TPC-DS q37 references ONE column of `catalog_sales` and shuffles all
+                    // ~34, which is what makes the producer buffer whole fact shards and get the
+                    // worker OOM-killed). But adding the rule here makes the splitter DECLINE
+                    // q37's two-sharded shape entirely and fall back to a single Forward stage —
+                    // `tests/auto_broadcast_row_multiple::q37_shape_two_sharded_no_forward_fallback`
+                    // catches it, and a non-distributed fallback is strictly worse than a wide
+                    // shuffle. Pruning has to be taught to the splitter (or applied at the leaf
+                    // in `join_chain::leaf_stage_sql` from the chain's own column usage) before
+                    // the rule can go in. Measured, not assumed: that was the only failure in the
+                    // whole oxidant-execution suite.
                 ],
                 PreSplitRewrite::UnionExtended => vec![
                     // Same pushdown pair first — outer predicates reach the union arms…
@@ -4892,6 +4945,75 @@ impl Engine {
         self.ctx
             .register_table(name, table.clone())
             .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
+        self.measured_stats_registrations
+            .fetch_add(1, Ordering::Relaxed);
+        self.note_catalog_change(name);
+        Ok(table)
+    }
+
+    /// Directory this worker uses for one consumer task's spilled shuffle input.
+    ///
+    /// Nested under the engine's own DataFusion spill root so `Drop` reclaims it with
+    /// everything else, and keyed by (stage, partition, upstream) so sibling tasks on the same
+    /// worker never scan each other's files.
+    pub fn shuffle_pull_spill_dir(
+        &self,
+        stage_id: u32,
+        partition_id: u32,
+        upstream_idx: u32,
+    ) -> std::path::PathBuf {
+        self.dirs
+            .spill_dir
+            .join(format!("pull_{stage_id}_{partition_id}_{upstream_idx}"))
+    }
+
+    /// Register a shuffle input that lives on DISK as Arrow IPC files, rather than in a
+    /// `MemTable`, so scanning it streams instead of requiring the whole input to fit in RAM.
+    ///
+    /// This is the spill-backed twin of [`Engine::register_batches_with_stats`]. A consumer
+    /// task materializing its whole modulus class in memory for the life of the stage is the
+    /// one allocation that neither the DataFusion pool nor the shuffle budget bounds — the
+    /// worker simply grows until the cgroup kills it. Streaming from IPC removes the
+    /// requirement instead of trying to budget for it.
+    ///
+    /// `measured_rows` is the driver's barrier count and is attached exactly as the in-memory
+    /// path attaches it, so the join-strategy guard sees the same statistics either way.
+    pub fn register_arrow_ipc_shuffle_input(
+        &self,
+        name: &str,
+        dir: &std::path::Path,
+        schema: datafusion::arrow::datatypes::SchemaRef,
+        measured_rows: u64,
+        measured_bytes: usize,
+    ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        use datafusion::datasource::file_format::arrow::ArrowFormat;
+        use datafusion::datasource::listing::{
+            ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+        };
+
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.display()))
+            .map_err(|e| Error::Execution(format!("spill dir url for `{name}`: {e}")))?;
+        let options = ListingOptions::new(Arc::new(ArrowFormat)).with_file_extension(".arrow");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(options)
+            .with_schema(schema);
+        let listing = Arc::new(
+            ListingTable::try_new(config)
+                .map_err(|e| Error::Execution(format!("spill listing `{name}`: {e}")))?,
+        );
+        let table: Arc<dyn datafusion::catalog::TableProvider> =
+            Arc::new(measured_scan::MeasuredStatsTable::from_provider(
+                listing,
+                measured_rows as usize,
+                measured_bytes,
+            ));
+        let _ = self.ctx.deregister_table(name);
+        self.ctx
+            .register_table(name, table.clone())
+            .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
+        // This IS a measured-stats registration — count it like the in-memory path, or the
+        // spill route silently reads as "no measured statistics" to the observability that
+        // `tests/stage_input_stats.rs` asserts on.
         self.measured_stats_registrations
             .fetch_add(1, Ordering::Relaxed);
         self.note_catalog_change(name);
@@ -9585,6 +9707,54 @@ mod tests {
         // Precision must not be stripped from string content that merely looks similar.
         let inside = "SELECT 'interval ''90'' day (3)' AS s";
         assert_eq!(normalize_spark_sql(inside), inside);
+    }
+
+    // Shuffle-input data lives in a MemTable for the whole stage and cannot be spilled. Before
+    // `reserve_external_bytes` the pool never saw it, so it reported headroom that did not
+    // exist, downstream operators declined to spill, and the worker was kernel-killed with no
+    // `ResourcesExhausted` to act on — measured at 6x the configured pool in ~5 s.
+    #[test]
+    fn external_reservation_is_visible_to_the_pool_and_released_on_drop() {
+        let engine = Engine::new_with_memory_limit(8 * 1024 * 1024);
+        let pool = engine.ctx().task_ctx().runtime_env().memory_pool.clone();
+        assert_eq!(pool.reserved(), 0);
+
+        let reservation = engine
+            .reserve_external_bytes("ShuffleInput[t]", 4 * 1024 * 1024)
+            .expect("fits in an 8 MiB pool");
+        assert_eq!(
+            pool.reserved(),
+            4 * 1024 * 1024,
+            "the pool must SEE shuffle-input bytes, not just tolerate them"
+        );
+
+        drop(reservation);
+        assert_eq!(pool.reserved(), 0, "dropping the guard releases the bytes");
+    }
+
+    #[test]
+    fn external_reservation_past_the_pool_fails_loudly_instead_of_growing_rss() {
+        let engine = Engine::new_with_memory_limit(4 * 1024 * 1024);
+        let err = engine
+            .reserve_external_bytes("ShuffleInput[t]", 64 * 1024 * 1024)
+            .expect_err("64 MiB must not fit a 4 MiB pool");
+        let msg = err.to_string();
+        // The message has to tell an operator what to actually do about it.
+        assert!(msg.contains("ShuffleInput[t]"), "names the input: {msg}");
+        assert!(
+            msg.contains("OXIDANT_WORKER_TASK_SLOTS") && msg.contains("replicate"),
+            "offers the remedies: {msg}"
+        );
+    }
+
+    #[test]
+    fn external_reservation_is_a_noop_without_a_bounded_pool() {
+        // `OXIDANT_MEMORY_LIMIT_BYTES=0` opts out of bounding; reserving must not start
+        // failing queries that previously ran.
+        let engine = Engine::new_inner(None);
+        engine
+            .reserve_external_bytes("ShuffleInput[t]", usize::MAX / 2)
+            .expect("unbounded pool accepts any reservation");
     }
 
     #[test]
