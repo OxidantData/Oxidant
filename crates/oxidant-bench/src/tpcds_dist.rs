@@ -187,6 +187,41 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
         })
         .collect();
 
+    // Ad-hoc SQL against the fully-registered single-node engine. Lets a generated stage SQL (or a
+    // hand-reduced variant of one) be checked against an external oracle without a distributed run.
+    if let Ok(path) = std::env::var("OXIDANT_TPCDS_SQL_FILE") {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        for (i, stmt) in text
+            .split(";\n")
+            .filter(|s| !s.trim().is_empty())
+            .enumerate()
+        {
+            match single.sql(stmt.trim()).await {
+                Ok(b) => {
+                    let rows = normalize_batches(&b);
+                    let last: Vec<i128> = rows
+                        .iter()
+                        .filter_map(|r| r.last())
+                        .filter_map(|v| v.parse::<i128>().ok())
+                        .collect();
+                    eprintln!(
+                        "[sql-file {i}] n={} last_col_max={:?} last_col_sum={}",
+                        rows.len(),
+                        last.iter().max(),
+                        last.iter().sum::<i128>()
+                    );
+                    if rows.len() <= 4 {
+                        for r in &rows {
+                            eprintln!("[sql-file {i}] {}", r.join(" | "));
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[sql-file {i}] FAILED: {e}"),
+            }
+        }
+        return;
+    }
+
     // Plan pass: collect supported queries + sharded fact.
     let mut supported: Vec<(String, String, String)> = Vec::new(); // name, sql, fact
     for (name, raw) in &qs_filtered {
@@ -372,6 +407,37 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
                     for (i, (e, g)) in exp.iter().zip(got.iter()).enumerate() {
                         let mark = if e == g { "==" } else { "!=" };
                         eprintln!("    [{i}] {mark} exp={e:?}\n           got={g:?}");
+                    }
+                }
+                // Re-run each leaf stage's generated SQL on the single-node engine (which has
+                // every table registered unsharded). A leaf whose result differs from what the
+                // same SQL means elsewhere localizes the defect to planning that generated text,
+                // rather than to sharding, placement, or the exchange.
+                if std::env::var("OXIDANT_TPCDS_RUN_LEAF_SQL").is_ok() {
+                    for st in dq.stages.iter().filter(|s| s.upstream_stage_ids.is_empty()) {
+                        match single.sql(&st.sql).await {
+                            Ok(b) => {
+                                let rows = normalize_batches(&b);
+                                // Fingerprint the last column (the count partial) so the result
+                                // can be matched against an independent oracle's numbers.
+                                let last: Vec<i128> = rows
+                                    .iter()
+                                    .filter_map(|r| r.last())
+                                    .filter_map(|v| v.parse::<i128>().ok())
+                                    .collect();
+                                eprintln!(
+                                    "  [leaf-sql] stage {} -> {} rows; last_col n={} max={:?} sum={}",
+                                    st.stage_id,
+                                    rows.len(),
+                                    last.len(),
+                                    last.iter().max(),
+                                    last.iter().sum::<i128>()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("  [leaf-sql] stage {} FAILED: {e}", st.stage_id)
+                            }
+                        }
                     }
                 }
             }

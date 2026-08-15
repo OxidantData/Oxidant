@@ -2623,6 +2623,18 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for PreferBoundedJoin
             if *hj.join_type() != datafusion::logical_expr::JoinType::Inner || hj.null_aware {
                 return Ok(Transformed::no(p));
             }
+            // Never re-seat a join that carries a non-equi filter. The filter is evaluated
+            // against its own intermediate schema via side-tagged column indices; re-seating
+            // here (after `JoinSelection`, before `EnforceDistribution`) leaves that mapping
+            // resolving from the opposite inputs, which silently evaluates the predicate with
+            // its operands exchanged rather than failing. TPC-DS Q72 at SF10 hit exactly this:
+            // `inv_quantity_on_hand < cs_quantity` ran as `cs_quantity < inv_quantity_on_hand`
+            // and inflated `count(*)` ~19x (786,559 groups vs the correct 42,226) with no error.
+            // The rule is a build-side performance heuristic, so declining these joins costs at
+            // most the re-seat; returning wrong answers is not an acceptable trade.
+            if hj.filter().is_some() {
+                return Ok(Transformed::no(p));
+            }
             if provable_row_bound(hj.left().as_ref()).is_some()
                 || provable_row_bound(hj.right().as_ref()).is_none()
             {
@@ -7516,6 +7528,178 @@ impl Default for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KAN-2 regression: [`PreferBoundedJoinBuildSide`] must not re-seat a hash join that carries
+    /// a non-equi filter.
+    ///
+    /// A join filter is evaluated against its own intermediate schema through *side-tagged* column
+    /// indices. Re-seating the build side moves the inputs but not that mapping, so the predicate
+    /// silently runs with its operands exchanged — no error, just a wrong answer. TPC-DS Q72 at
+    /// SF10 hit exactly this: `inv_quantity_on_hand < cs_quantity` executed reversed and inflated
+    /// `count(*)` ~19x (786,559 groups vs the correct 42,226).
+    ///
+    /// The join is built directly rather than via SQL because the firing conditions (unbounded
+    /// build, bounded probe, Partitioned mode) are what the planner's own join selection keeps
+    /// arranging *away*; a SQL fixture ends up with the bounded side already on the left and never
+    /// exercises the rule. The no-filter case is asserted too, so this fails if the fixture ever
+    /// stops meeting the conditions rather than passing vacuously.
+    #[tokio::test]
+    async fn filtered_join_is_not_re_seated() {
+        use datafusion::common::config::ConfigOptions;
+        use datafusion::common::{JoinSide, NullEquality};
+        use datafusion::logical_expr::{JoinType, Operator};
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column};
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+        use datafusion::physical_plan::ExecutionPlan;
+
+        fn kv(rows: impl Iterator<Item = (i64, i64)>, kn: &str, vn: &str) -> Vec<RecordBatch> {
+            let (ks, vs): (Vec<i64>, Vec<i64>) = rows.unzip();
+            let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                datafusion::arrow::datatypes::Field::new(
+                    kn,
+                    datafusion::arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+                datafusion::arrow::datatypes::Field::new(
+                    vn,
+                    datafusion::arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+            ]));
+            vec![RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(datafusion::arrow::array::Int64Array::from(ks)),
+                    Arc::new(datafusion::arrow::array::Int64Array::from(vs)),
+                ],
+            )
+            .unwrap()]
+        }
+
+        let engine = Engine::new();
+        engine
+            .register_batches_with_stats(
+                "f1",
+                kv((0..3_000).map(|i| (i % 10, i)), "fk", "fv"),
+                3_000,
+            )
+            .unwrap();
+        engine
+            .register_batches_with_stats("d1", kv((0..10).map(|k| (k, 0)), "dk", "dv"), 10)
+            .unwrap();
+        engine
+            .register_batches_with_stats("dsmall", kv((0..10).map(|k| (k, 50)), "sk", "sv"), 10)
+            .unwrap();
+
+        // Build side: a join intermediate, whose row count is Inexact -> no provable bound.
+        let left = engine
+            .physical_plan("SELECT f1.fk AS ak, f1.fv AS av FROM f1 JOIN d1 ON f1.fk = d1.dk")
+            .await
+            .unwrap();
+        // Probe side: a plain scan carrying an Exact row count -> bounded.
+        let right = engine
+            .physical_plan("SELECT sk, sv FROM dsmall")
+            .await
+            .unwrap();
+        assert!(
+            provable_row_bound(left.as_ref()).is_none(),
+            "fixture: the build side must have no provable row bound"
+        );
+        assert!(
+            provable_row_bound(right.as_ref()).is_some(),
+            "fixture: the probe side must be bounded"
+        );
+
+        let on = vec![(
+            Arc::new(Column::new("ak", 0)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            Arc::new(Column::new("sk", 0)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        )];
+        // `sv < av`, i.e. right.v < left.v, over the intermediate schema [av, sv].
+        let filter_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "av",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+            datafusion::arrow::datatypes::Field::new(
+                "sv",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+        ]));
+        let filter = JoinFilter::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("sv", 1)),
+                Operator::Lt,
+                Arc::new(Column::new("av", 0)),
+            )),
+            vec![
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Right,
+                },
+            ],
+            filter_schema,
+        );
+
+        let build = |f: Option<JoinFilter>| {
+            Arc::new(
+                HashJoinExec::try_new(
+                    Arc::clone(&left),
+                    Arc::clone(&right),
+                    on.clone(),
+                    f,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::Partitioned,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .unwrap(),
+            ) as Arc<dyn ExecutionPlan>
+        };
+        // A re-seat wraps the join in a ProjectionExec to restore column order, so find the join.
+        fn first_join_build_col(plan: &dyn ExecutionPlan) -> Option<String> {
+            if let Some(hj) = as_hash_join(plan) {
+                return Some(hj.left().schema().field(0).name().clone());
+            }
+            plan.children()
+                .iter()
+                .find_map(|c| first_join_build_col(c.as_ref()))
+        }
+        let build_side_name = |p: &Arc<dyn ExecutionPlan>| {
+            first_join_build_col(p.as_ref()).expect("a hash join in the result")
+        };
+
+        let cfg = ConfigOptions::default();
+        // Without a filter the rule fires: the bounded `dsmall` becomes the build side. This is
+        // the fixture's proof that the (unbounded build, bounded probe) conditions really hold.
+        let swapped = PreferBoundedJoinBuildSide
+            .optimize(build(None), &cfg)
+            .unwrap();
+        assert_eq!(
+            build_side_name(&swapped),
+            "sk",
+            "fixture: an unfiltered join in this shape must be re-seated onto the bounded side"
+        );
+
+        // With a filter the rule must decline, leaving the original build side in place.
+        let kept = PreferBoundedJoinBuildSide
+            .optimize(build(Some(filter)), &cfg)
+            .unwrap();
+        assert_eq!(
+            build_side_name(&kept),
+            "ak",
+            "a join carrying a non-equi filter was re-seated: the filter's side-tagged column \
+             indices now resolve from the opposite inputs, silently reversing the predicate"
+        );
+    }
 
     #[tokio::test]
     async fn select_one() {
