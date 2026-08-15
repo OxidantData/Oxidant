@@ -42,20 +42,71 @@ pub fn coalesced_partitions(
         return Ok(1);
     }
     let max_bucket = *bucket_row_counts.iter().max().unwrap_or(&0);
-    // Skew: one bucket dominates — keep partitions (skew join handling is future work).
-    if max_bucket * 3 > total && bucket_row_counts.len() > 2 {
-        return Ok(current_partitions);
-    }
-    if max_bucket > max_rows || bucket_row_counts.len() <= num_workers.max(1) {
-        return Ok(current_partitions);
+
+    // Concentrated output: coalescing provably cannot make any reader hold more than it already
+    // does. Reader `p` pulls exactly the buckets `b ≡ p (mod m)`, so when the worst such sum is
+    // no larger than the largest single bucket, no reader grows and the only thing that changes
+    // is that `current_partitions - m` tasks that would have read nothing are never dispatched.
+    //
+    // The motivating case is the empty-hash-key shape (`keys[]` — a gathered stage puts every row
+    // in bucket 0). The row-ratio skew test below reads that as maximal skew, and the
+    // `max_bucket > max_rows` test rejects it once the single bucket exceeds 4096 rows, so both
+    // guards veto precisely the case that most needs coalescing. TPC-DS Q14's three per-arm
+    // recombine stages each dispatched 200 tasks of which exactly **one** produced rows; the other
+    // 199 cost ~220 ms of setup apiece, ~132 s of the query's ~200 s of CPU.
+    //
+    // Search upward for the *smallest* workable `m` rather than only trying the worker floor: a
+    // stage whose rows sit in a handful of buckets cannot merge down to `floor` without stacking
+    // two populated buckets onto one reader, but it can usually merge to some modest `m` that
+    // still leaves every reader holding at most one. TPC-DS Q67's three 200-task stages spread 11
+    // populated buckets across 200, so 189 of every 200 tasks read nothing.
+    let floor = num_workers.max(1) as u32;
+
+    // Skew: one bucket dominates. Or: a bucket is too big to merge, or there are too few buckets
+    // to bother. These are the cases the advisory sizing below must not touch.
+    let declined = (max_bucket * 3 > total && bucket_row_counts.len() > 2)
+        || max_bucket > max_rows
+        || bucket_row_counts.len() <= floor as usize;
+
+    if !declined {
+        // Spark-like target: enough reader partitions that each holds ~advisory bytes of rows.
+        let rows_per_part = aqe_advisory_partition_rows().max(1);
+        let target = ((total + rows_per_part - 1) / rows_per_part) as u32;
+        return Ok(target.clamp(floor, current_partitions));
     }
 
-    // Spark-like target: enough reader partitions that each holds ~advisory bytes of rows.
-    let rows_per_part = aqe_advisory_partition_rows().max(1);
-    let target = ((total + rows_per_part - 1) / rows_per_part) as u32;
-    let floor = num_workers.max(1) as u32;
-    let new_p = target.clamp(floor, current_partitions);
-    Ok(new_p)
+    // Only now — where the guards above refuse to size the stage at all — fall back to the
+    // provable check. This ordering matters: run first, it *overrides* the advisory sizing and
+    // makes things worse, because a moderately uneven stage can satisfy `worst <= max_bucket` at
+    // some mid-range `m` (say 50) that the advisory path would have sized at `floor`. Measured on
+    // the sf10 sweep: probing first took the run from 5,157 tasks / 385 s of stage CPU to 9,726
+    // tasks / 416 s.
+    if !concentrated_coalesce_enabled() {
+        return Ok(current_partitions);
+    }
+    // An extra "never stack two populated buckets on one reader" condition was tried here and
+    // MEASURED WORSE: it cost +8.95 s over the SF10 99 (q67 alone +2.70 s, which is exactly the
+    // stage shape this path exists to help) and did not rescue the queries it was written for —
+    // q37/q50 still exhausted the pool. The reasoning is sound but the memory it saves is not
+    // where the problem is, so it is not worth its price. `stacks_populated_buckets` stays as a
+    // tested helper documenting the attempt; do not re-add it to this predicate without a
+    // measurement that beats 62 s. (The helper itself is deleted rather than left dead — the
+    // predicate was `counts.iter().skip(p).step_by(m).filter(|&&c| c > max_rows).count() > 1`
+    // for every reader p.)
+    (floor..current_partitions)
+        .find(|&m| worst_coalesced_load(bucket_row_counts, m) <= max_bucket)
+        .map_or(Ok(current_partitions), Ok)
+}
+
+/// The largest number of rows any single reader would hold if the stage were read with modulus
+/// `m` — reader `p` pulls every bucket `b ≡ p (mod m)`, so this is the max over `p` of those sums.
+/// Mirrors [`coalesced_read_buckets`]; keep the two in lockstep.
+fn worst_coalesced_load(bucket_row_counts: &[usize], m: u32) -> usize {
+    let m = m.max(1) as usize;
+    (0..m)
+        .map(|p| bucket_row_counts.iter().skip(p).step_by(m).sum::<usize>())
+        .max()
+        .unwrap_or(0)
 }
 
 /// The producer bucket ids a coalesced consumer partition reads: `partition, partition + m,
@@ -101,6 +152,25 @@ pub fn aqe_enabled() -> bool {
 /// statistics).
 pub fn stage_input_stats_enabled() -> bool {
     std::env::var("OXIDANT_STAGE_INPUT_STATS")
+        .ok()
+        .as_deref()
+        .map(|v| {
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no"))
+        })
+        .unwrap_or(true)
+}
+
+/// Kill switch for the concentrated-output coalesce path (`OXIDANT_AQE_CONCENTRATED=0`).
+///
+/// Defaults ON. Exists so a cluster can A/B the change from one image: without it the only way to
+/// turn the path off is `OXIDANT_AQE=0`, which disables *all* coalescing and so measures something
+/// else entirely. Any optimization that changes how many tasks get dispatched deserves an off
+/// switch an operator can reach without a redeploy.
+fn concentrated_coalesce_enabled() -> bool {
+    std::env::var("OXIDANT_AQE_CONCENTRATED")
         .ok()
         .as_deref()
         .map(|v| {
@@ -175,6 +245,130 @@ mod tests {
         let p = coalesced_partitions(2, 4, &[10, 10, 10, 9000]).unwrap();
         std::env::remove_var("OXIDANT_AQE");
         assert_eq!(p, 4);
+    }
+
+    /// A gathered stage (`keys[]` — empty hash key) puts every row in bucket 0. That reads as
+    /// maximal skew to [`keeps_partitions_on_skew`]'s test and blows past `max_rows` once the
+    /// bucket exceeds 4096 rows, yet it is exactly the shape that must coalesce: without it the
+    /// consumer dispatches `current_partitions` tasks and all but one read nothing. TPC-DS Q14's
+    /// per-arm recombine stages hit this with 7,254 rows in 1 of 200 buckets.
+    #[test]
+    fn coalesces_single_bucket_stage_despite_skew_and_size() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OXIDANT_AQE", "1");
+        let mut counts = vec![0usize; 200];
+        counts[0] = 7254; // above OXIDANT_AQE_COALESCE_MAX_ROWS (4096), and maximally skewed
+        let p = coalesced_partitions(2, 200, &counts).unwrap();
+        std::env::remove_var("OXIDANT_AQE");
+        assert_eq!(
+            p, 2,
+            "a stage whose rows sit in one bucket must coalesce: no reader can grow, and the \
+             other 198 tasks would read nothing"
+        );
+    }
+
+    /// The concentrated-output path must never accept a coalesce that builds a reader larger
+    /// than the biggest bucket that already existed — that is the straggler the skew guard is
+    /// there to prevent.
+    #[test]
+    fn concentrated_path_rejects_when_a_reader_would_grow() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OXIDANT_AQE", "1");
+        // Two equal large buckets in the same residue class mod 2 would sum to 2x the largest
+        // bucket, so the concentrated path must decline and leave the decision to the guards.
+        let p = coalesced_partitions(2, 4, &[9000, 10, 9000, 10]).unwrap();
+        std::env::remove_var("OXIDANT_AQE");
+        assert_eq!(p, 4, "coalescing must not double a reader's working set");
+    }
+
+    /// The concentrated path must be switchable off from the environment so a cluster can A/B it
+    /// without a second image — and without `OXIDANT_AQE=0`, which would disable all coalescing.
+    // The row-sum test alone would accept a modulus that stacks two big buckets on one reader:
+    // a consumer holds its whole modulus class in memory for the stage and nothing can spill it,
+    // so that is a peak-RSS multiplier, not a wash. Two sharded facts (TPC-DS q37, q50) exhausted
+    // the worker pool mid-pull because of exactly this.
+    #[test]
+    fn concentrated_path_has_a_kill_switch() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OXIDANT_AQE", "1");
+        let mut counts = vec![0usize; 200];
+        counts[0] = 7254;
+
+        std::env::remove_var("OXIDANT_AQE_CONCENTRATED");
+        assert_eq!(
+            coalesced_partitions(2, 200, &counts).unwrap(),
+            2,
+            "default ON"
+        );
+
+        std::env::set_var("OXIDANT_AQE_CONCENTRATED", "0");
+        assert_eq!(
+            coalesced_partitions(2, 200, &counts).unwrap(),
+            200,
+            "OXIDANT_AQE_CONCENTRATED=0 restores the pre-change fan-out"
+        );
+        std::env::remove_var("OXIDANT_AQE_CONCENTRATED");
+        std::env::remove_var("OXIDANT_AQE");
+    }
+
+    /// Ordering regression guard. The provable concentrated check must run only where the skew /
+    /// size guards decline — never ahead of the advisory sizing. A uniformly-filled stage is
+    /// sized to the worker floor by the advisory path; the concentrated check would refuse to go
+    /// below `current` for the same input, so probing first silently keeps every task. Measured
+    /// on the sf10 sweep, probing first cost 5,157 -> 9,726 tasks and 385 s -> 416 s of CPU.
+    #[test]
+    fn advisory_sizing_wins_over_the_concentrated_probe() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OXIDANT_AQE", "1");
+        let counts = vec![100usize; 200]; // uniform: no skew, every bucket small
+        let p = coalesced_partitions(2, 200, &counts).unwrap();
+        std::env::remove_var("OXIDANT_AQE");
+        assert_eq!(
+            p, 2,
+            "uniform small buckets must size to the worker floor, not stay at 200"
+        );
+        // The concentrated check alone would never accept anything below `current` here.
+        assert!(worst_coalesced_load(&counts, 2) > 100);
+    }
+
+    /// A stage with a handful of populated buckets (not just one) must still shed its empty
+    /// tasks: pick the smallest modulus that keeps every reader at or below the largest existing
+    /// bucket. TPC-DS Q67 spreads 11 populated buckets over 200, so 189/200 tasks read nothing.
+    #[test]
+    fn coalesces_few_populated_buckets_to_the_smallest_safe_modulus() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OXIDANT_AQE", "1");
+        let mut counts = vec![0usize; 200];
+        for i in 0..11 {
+            counts[i * 7] = 9000; // 11 populated buckets, above max_rows, spread out
+        }
+        let p = coalesced_partitions(2, 200, &counts).unwrap();
+        std::env::remove_var("OXIDANT_AQE");
+        assert!(p < 200, "must coalesce away the 189 empty readers, got {p}");
+        assert!(
+            worst_coalesced_load(&counts, p) <= 9000,
+            "chosen modulus {p} must not stack two populated buckets onto one reader"
+        );
+    }
+
+    #[test]
+    fn worst_coalesced_load_matches_the_read_mapping() {
+        let counts = [5usize, 1, 7, 2, 3, 4];
+        // Reader p pulls buckets b ≡ p (mod 2): {0,2,4} = 15 and {1,3,5} = 7.
+        assert_eq!(worst_coalesced_load(&counts, 2), 15);
+        // Cross-check against the mapping the consumers actually use, so the two cannot drift.
+        for m in 1..=6u32 {
+            let want = (0..m)
+                .map(|p| {
+                    coalesced_read_buckets(counts.len() as u32, m, p)
+                        .iter()
+                        .map(|&b| counts[b as usize])
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap();
+            assert_eq!(worst_coalesced_load(&counts, m), want, "m={m}");
+        }
     }
 
     #[test]

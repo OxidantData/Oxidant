@@ -1815,6 +1815,18 @@ async fn finish_stage_barrier(
     if aqe_enabled() {
         let counts =
             owner_bucket_row_counts(cluster, stage.stage_id, num_partitions, &per_worker).await;
+        if std::env::var("OXIDANT_AQE_DEBUG").is_ok() {
+            let total: usize = counts.iter().sum();
+            let max_bucket = counts.iter().copied().max().unwrap_or(0);
+            let nonempty = counts.iter().filter(|&&c| c > 0).count();
+            let decision = coalesced_partitions(cluster.worker_count(), num_partitions, &counts);
+            eprintln!(
+                "[aqe] stage_id={} np={num_partitions} total_rows={total} max_bucket={max_bucket} \
+                 nonempty_buckets={nonempty}/{} -> {decision:?}",
+                stage.stage_id,
+                counts.len()
+            );
+        }
         if let Ok(new_p) = coalesced_partitions(cluster.worker_count(), num_partitions, &counts) {
             if new_p < num_partitions {
                 coalesced.insert(stage.stage_id, new_p);

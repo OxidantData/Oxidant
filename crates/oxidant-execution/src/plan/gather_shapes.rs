@@ -3516,13 +3516,36 @@ fn build_rollup_union_derived(lp: &LogicalPlan, replicated: &[&str]) -> Option<D
         let arm_remap = build_agg_remap(ap.agg);
         let n_group = ap.agg.group_expr.len();
 
-        // Scan export: group columns, aggregate arguments, and the IN key — hashed by the key.
+        // Scan export: group columns, aggregate *partials*, and the IN key — hashed by the key.
+        //
+        // The export pre-aggregates by `(gc0..gcN, j0)` rather than shipping raw fact rows. This
+        // is exact for any decomposable aggregate (the matcher above admits only non-DISTINCT
+        // sum/count/min/max), and the semi filter downstream is a predicate on `j0` *alone* —
+        // which is part of this group key — so every row of a group shares one filter verdict and
+        // filtering after the pre-aggregate is equivalent to filtering before it.
+        //
+        // It cannot ship more rows than the raw form (grouping only ever reduces), so the shuffle
+        // and the semi+aggregate downstream are never worse; the cost is one local hash aggregate
+        // over rows that were about to be hash-partitioned on `j0` anyway. The win is large
+        // whenever the group is coarse, which is the shape's normal case: the arm groups by
+        // dimension attributes that the IN key functionally determines. TPC-DS Q14 at SF10 exports
+        // 878,106 -> 51,000 rows for the store arm (17.2x), 9.1x for catalog, 4.6x for web, and
+        // the ratio grows with scale factor because the group is bounded by `item` while the fact
+        // row count is not.
         let mut export_cols: Vec<String> = Vec::new();
         for (j, g) in ap.agg.group_expr.iter().enumerate() {
             export_cols.push(format!("{} AS gc{j}", expr_sql(&up, g).ok()?));
         }
+        let preshuffle_reduce = q14_preshuffle_reduce_enabled();
         for (i, spec) in a.aggs.iter().enumerate() {
-            export_cols.push(format!("{} AS aa{i}", spec.arg_sql));
+            if preshuffle_reduce {
+                export_cols.push(format!(
+                    "{} AS aa{i}",
+                    q14_export_partial(&spec.func, &spec.arg_sql)?
+                ));
+            } else {
+                export_cols.push(format!("{} AS aa{i}", spec.arg_sql));
+            }
         }
         export_cols.push(format!("{} AS j0", expr_sql(&up, a.in_outer).ok()?));
         let j0_idx = (export_cols.len() - 1) as u32;
@@ -3543,8 +3566,18 @@ fn build_rollup_union_derived(lp: &LogicalPlan, replicated: &[&str]) -> Option<D
                 .ok()?;
             format!(" WHERE {}", parts.join(" AND "))
         };
+        let export_group_by = if preshuffle_reduce {
+            let cols = (0..n_group)
+                .map(|j| format!("gc{j}"))
+                .chain(std::iter::once("j0".to_string()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" GROUP BY {cols}")
+        } else {
+            String::new()
+        };
         let export_sql = sanitize_generated_sql(&format!(
-            "SELECT {} {tail}{where_sql}",
+            "SELECT {} {tail}{where_sql}{export_group_by}",
             export_cols.join(", ")
         ));
         let export_id = next_id;
@@ -3561,10 +3594,18 @@ fn build_rollup_union_derived(lp: &LogicalPlan, replicated: &[&str]) -> Option<D
         stages.push(export_stage);
 
         // Co-located semi + partial aggregate (gathers: the recombine must see the one-row
-        // scalar, which lands on partition 0 only).
+        // scalar, which lands on partition 0 only). The export already partial-aggregated, so this
+        // stage *merges* those partials (counts re-add by summing) instead of aggregating raw args.
         let mut psel: Vec<String> = (0..n_group).map(|j| format!("gc{j} AS b{j}")).collect();
         for (i, spec) in a.aggs.iter().enumerate() {
-            psel.push(q14_partial(&spec.func, i)?);
+            if preshuffle_reduce {
+                psel.push(format!(
+                    "{} AS c{i}",
+                    q14_merge(&spec.func, &format!("aa{i}"))?
+                ));
+            } else {
+                psel.push(q14_partial(&spec.func, i)?);
+            }
         }
         let group_by = (0..n_group)
             .map(|j| format!("gc{j}"))
@@ -3946,7 +3987,21 @@ fn plan_q14_intersect_key_set(
             }
             _ => return None,
         };
-        let sql = plan_sql(arm, "q14 intersect arm").ok()?;
+        // Dedup each arm *before* the shuffle. `q14_intersect_arms` only accepts DataFusion's
+        // DISTINCT-INTERSECT lowering, so the set op below already discards duplicates:
+        // `A INTERSECT B` == `distinct(A) INTERSECT distinct(B)`. Producing them here turns the
+        // exchange from one row per qualifying fact row into one row per distinct tuple, which for
+        // this shape is a dimension-attribute tuple and therefore tiny and scale-independent.
+        // TPC-DS Q14 at SF10: 16,496,728 -> 11,676 rows for the store arm (1,413x), 734x for
+        // catalog, 370x for web — 29.4M shuffled rows down to 35,028.
+        let arm_sql = plan_sql(arm, "q14 intersect arm").ok()?;
+        let sql = if q14_preshuffle_reduce_enabled() {
+            sanitize_generated_sql(&format!(
+                "SELECT DISTINCT * FROM ({arm_sql}) AS q14_set_arm"
+            ))
+        } else {
+            arm_sql
+        };
         let mut stage = StageDef::new(*next_id, sql, vec![], hash_key.clone());
         if scans == 0 {
             // Replicated arm: fan the scan out across workers when a safe slice anchor exists
@@ -4228,13 +4283,56 @@ fn plan_q14_global_scalar(
     Some(comb_id)
 }
 
-/// The arm-aggregate partial in the Q14 semi+partial stage (`c{i}` over the exported `aa{i}`).
+/// Kill switch (`OXIDANT_Q14_PRESHUFFLE_REDUCE=0`) for the two pre-shuffle reductions in this
+/// shape: the channel-arm export pre-aggregate and the INTERSECT arm dedup. Defaults ON.
+///
+/// Both change what crosses the exchange, so a cluster A/B needs to flip them together and
+/// without a second build. They share one switch because they are the same optimization applied
+/// at two points, and measuring them apart is not useful.
+fn q14_preshuffle_reduce_enabled() -> bool {
+    std::env::var("OXIDANT_Q14_PRESHUFFLE_REDUCE")
+        .ok()
+        .as_deref()
+        .map(|v| {
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no"))
+        })
+        .unwrap_or(true)
+}
+
+/// The pre-change arm-aggregate partial in the Q14 semi stage (`c{i}` over a raw exported
+/// `aa{i}`). Only reachable with the pre-shuffle reduction switched off.
 fn q14_partial(func: &str, i: usize) -> Option<String> {
     Some(match func {
         "sum" => format!("sum(aa{i}) AS c{i}"),
         "count" => format!("count(aa{i}) AS c{i}"),
         "min" => format!("min(aa{i}) AS c{i}"),
         "max" => format!("max(aa{i}) AS c{i}"),
+        _ => return None,
+    })
+}
+
+/// The arm-aggregate partial computed in the Q14 *export* stage, over the raw argument SQL.
+/// Pre-aggregating here by `(gc.., j0)` is what keeps raw fact rows off the shuffle.
+fn q14_export_partial(func: &str, arg_sql: &str) -> Option<String> {
+    Some(match func {
+        "sum" => format!("sum({arg_sql})"),
+        "count" => format!("count({arg_sql})"),
+        "min" => format!("min({arg_sql})"),
+        "max" => format!("max({arg_sql})"),
+        _ => return None,
+    })
+}
+
+/// Merge already-partial values in the Q14 semi stage. `count` re-adds by summing its partials;
+/// the rest are their own merge. Keep in lockstep with [`q14_export_partial`].
+fn q14_merge(func: &str, src: &str) -> Option<String> {
+    Some(match func {
+        "sum" | "count" => format!("sum({src})"),
+        "min" => format!("min({src})"),
+        "max" => format!("max({src})"),
         _ => return None,
     })
 }
