@@ -418,9 +418,18 @@ pub async fn resolve_replicated_tables(engine: &Engine, lp: &LogicalPlan) -> Vec
     // retry the original, because the optimizer can move a plan outside the splitter's
     // vocabulary. Anything that plans today still plans — the last rung is `widest`.
     let optimized = engine.optimize_logical_plan(lp.clone()).ok();
+    // Tables that must stay replicated no matter how tight the rung is — see
+    // [`tables_behind_collapsing_join_input`]. Un-replicating one of these does not trade a
+    // broadcast for a shuffle of the same data; it forces a shuffle of the *driving fact*.
+    let pinned = tables_behind_collapsing_join_input(lp);
     for rung in ladder_thresholds(shipped) {
-        let candidate =
+        let mut candidate =
             classify_replicated_tables_with_rows(&sized, &rows, &override_refs, rung, multiple);
+        for t in &widest {
+            if pinned.contains(&t.to_ascii_lowercase()) && !candidate.contains(t) {
+                candidate.push(t.clone());
+            }
+        }
         if candidate.len() >= widest.len() {
             continue; // no tighter than what we already have
         }
@@ -454,16 +463,112 @@ fn replicate_ladder_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Candidate broadcast thresholds, tightest first, ending just below `shipped`.
+/// Candidate broadcast thresholds, strictly below `shipped`.
 ///
-/// - 10 MiB — Spark's `spark.sql.autoBroadcastJoinThreshold` default: dimensions only.
-/// - 4 GiB  — replicates a small fact (SF100 `store_returns` ~1.4 GB) but not a large one
-///   (`catalog_sales` ~9.8 GB), which is the useful middle ground for the 3-fact queries.
+/// **One rung, 4 GiB**: replicates a small fact (SF100 `store_returns` ~1.4 GB) but not a large
+/// one (`catalog_sales` ~9.8 GB), while keeping every *dimension* replicated. Dropping a large
+/// fact from the replicate set is the entire point of the ladder; dropping a dimension is a
+/// different trade, and a losing one.
+///
+/// A 10 MiB rung (Spark's `spark.sql.autoBroadcastJoinThreshold` default) was tried and
+/// **removed** — twice, because the first fix was not enough:
+///
+/// 1. Rungs were ordered tightest-first, so 10 MiB won every tightening: a tighter set shards
+///    strictly more tables, so it still "splits" whenever a looser one does.
+/// 2. Reordering to loosest-first was *still* not enough. The caller skips a rung whose set is
+///    no smaller than `widest` (`candidate.len() >= widest.len()`), and for a query touching no
+///    table over 4 GiB the 4 GiB set IS `widest` — so it was skipped and control fell through to
+///    10 MiB anyway. The harmful rung was reached exactly when the useful one had nothing to
+///    offer. Measured: 8 of 10 tightenings still chose 10 MiB.
+///
+/// Since 10 MiB's only marginal effect over 4 GiB is to stop replicating true dimensions
+/// (SF100 `customer` is ~2M rows), and every measurement of that was a large regression, the
+/// rung has no case left. Measured at SF100 (2026-08-16), same cluster, same binary:
+///
+/// ```text
+/// 10 MiB   q4 170.4s -> 1615.1s   q6 4.8s -> 78.5s (16x)   first 6 queries 4.07x WORSE
+/// 4 GiB    q10 138.0s -> 1.2s     q17 429.3s -> 48.1s      q14 58.1s -> 3.7s
+///          first 20 queries 1.86x faster than shipped, and 0.61x of Trino
+/// ```
+///
+/// The caller falls back to the shipped set last, which is what guarantees nothing that plans
+/// today stops planning — e.g. q5 (`union` of sharded facts) declines under a *flat* 4 GiB
+/// (`expected left-deep equijoin chain, found Union`) but completes here on the shipped rung.
+///
+/// If a future workload wants to shed a mid-size fact while keeping dimensions, the rung to add
+/// is somewhere near 512 MiB (above the largest dimension, below the smallest fact) — not 10 MiB.
+/// There is no measurement for that yet, so it is not here.
 fn ladder_thresholds(shipped: u64) -> Vec<u64> {
-    [10 * 1024 * 1024, 4 * 1024 * 1024 * 1024]
+    [4 * 1024 * 1024 * 1024]
         .into_iter()
         .filter(|t| *t < shipped)
         .collect()
+}
+
+/// Base tables sitting beneath a row-collapsing node (`Aggregate` / `Distinct`) that is itself a
+/// **join input**. These must stay replicated however tight the rung gets.
+///
+/// The ladder's usual trade is sound: un-replicate a fact, and instead of every worker re-reading
+/// it whole, each worker shuffles its own shard. Both sides of the join move a comparable amount
+/// of data, and the shuffle is over pruned columns, so tightening wins (SF100 q17 429.3s ->
+/// 47.6s).
+///
+/// That trade inverts when a collapsing node sits between the table and the join. TPC-DS q54:
+///
+/// ```text
+/// my_customers = DISTINCT(catalog_sales UNION ALL web_sales  JOIN item/date_dim/customer)
+/// ... my_customers JOIN store_sales ...
+/// ```
+///
+/// With `catalog_sales`/`web_sales` replicated, every worker computes `my_customers` locally —
+/// the `DISTINCT` collapses it to a handful of rows — and then joins its **own `store_sales`
+/// shard in place**. The whole query is 3 stages and the 288M-row driving fact never moves.
+///
+/// Un-replicate them and `my_customers` becomes a shuffled subtree, so the join with
+/// `store_sales` now needs both sides co-partitioned on `c_customer_sk` — which means shuffling
+/// all of `store_sales` across the network to meet a relation that collapsed to *one row*. The
+/// plan goes to 8 stages and SF100 q54 went **277.3s -> 2,178.2s (+1,900.8s)**, with both workers
+/// ~93% idle: not CPU, not OOM, just a 12 GB fact on the wire. That single query was the whole
+/// difference between beating Trino and not.
+///
+/// So the signal is not table size — it is whether a collapsing node stands between the scan and
+/// the join. Pinning only join-input collapses (rather than any `Aggregate`) is what keeps this
+/// from pinning everything: q17's `GROUP BY` is the query's final aggregate sitting *above* the
+/// whole join tree, not an input to it, so q17 still tightens.
+fn tables_behind_collapsing_join_input(lp: &LogicalPlan) -> HashSet<String> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+
+    fn scans_into(p: &LogicalPlan, out: &mut HashSet<String>) {
+        let _ = p.apply(|n| {
+            if let LogicalPlan::TableScan(ts) = n {
+                out.insert(ts.table_name.table().to_ascii_lowercase());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+    }
+
+    // Descend tracking whether a join sits above us. A collapse *under* a join is the q54
+    // shape; a collapse with no join above it is the query's final aggregate (q17) and pins
+    // nothing.
+    //
+    // Only the scans BENEATH the collapse are pinned, never its siblings — in q54 the plan is a
+    // comma-join whose inputs are `my_customers` (SubqueryAlias -> Distinct -> cs/ws/...) and
+    // `TableScan: store_sales` side by side. Pinning the whole join input would sweep up
+    // `store_sales` and disable sharding altogether, which an earlier version of this did.
+    fn walk(p: &LogicalPlan, under_join: bool, out: &mut HashSet<String>) {
+        if under_join && matches!(p, LogicalPlan::Aggregate(_) | LogicalPlan::Distinct(_)) {
+            scans_into(p, out);
+            return;
+        }
+        let is_join = matches!(p, LogicalPlan::Join(_));
+        for child in p.inputs() {
+            walk(child, under_join || is_join, out);
+        }
+    }
+
+    let mut out = HashSet::new();
+    walk(lp, false, &mut out);
+    out
 }
 
 /// Last-line check on the SQL every stage will hand to a worker.
@@ -6993,6 +7098,8 @@ mod driver_side_optimization_tests {
 #[cfg(test)]
 mod replicate_ladder_tests {
     use super::*;
+    use datafusion::arrow::array::{Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
     /// Off by default: the ladder converts broadcast joins into shuffle joins, which is a large
     /// behavioural change that only a cluster run can price. It must stay opt-in until then.
@@ -7011,21 +7118,249 @@ mod replicate_ladder_tests {
         std::env::remove_var("OXIDANT_REPLICATE_LADDER");
     }
 
-    /// Rungs are tightest-first and strictly below the shipped threshold — the caller falls back
-    /// to the shipped set last, which is what guarantees nothing that plans today stops planning.
+    /// The ladder offers exactly one rung, 4 GiB, strictly below the shipped threshold — the
+    /// caller falls back to the shipped set last, which is what guarantees nothing that plans
+    /// today stops planning.
+    ///
+    /// This is a regression guard, not a style assertion. A 10 MiB rung un-replicates true
+    /// dimensions and measured **4.07x worse** over the first 6 SF100 queries (q4 170.4s ->
+    /// 1615.1s, q6 16x), while 4 GiB measured 1.86x faster over the first 20. Re-adding a rung
+    /// below 4 GiB reintroduces that, because the caller skips a rung whose set is no smaller
+    /// than `widest` and would fall through to the tighter one exactly when 4 GiB has nothing to
+    /// offer.
     #[test]
-    fn ladder_rungs_are_ascending_and_below_shipped() {
+    fn ladder_offers_only_the_dimension_preserving_rung() {
         let shipped = 32 * 1024 * 1024 * 1024u64;
         let rungs = ladder_thresholds(shipped);
-        assert_eq!(rungs, vec![10 * 1024 * 1024, 4 * 1024 * 1024 * 1024]);
-        assert!(rungs.windows(2).all(|w| w[0] < w[1]), "tightest first");
+        assert_eq!(rungs, vec![4 * 1024 * 1024 * 1024]);
         assert!(rungs.iter().all(|t| *t < shipped), "all below shipped");
+
+        // No rung may sit below 4 GiB: that is the dimension-shedding regime.
+        assert!(
+            rungs.iter().all(|t| *t >= 4 * 1024 * 1024 * 1024),
+            "a sub-4-GiB rung re-creates the q4/q6 regression"
+        );
 
         // An operator who already tightened the threshold gets no rung above their own setting.
         assert!(ladder_thresholds(1024).is_empty());
-        assert_eq!(
-            ladder_thresholds(1024 * 1024 * 1024),
-            vec![10 * 1024 * 1024]
+        assert!(ladder_thresholds(1024 * 1024 * 1024).is_empty());
+    }
+
+    fn one_col(name: &str) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(name, DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// q54's shape: two facts collapse through a `DISTINCT` that is then a **join input**. Both
+    /// must be pinned replicated, or the join co-partitions and the driving fact goes on the wire
+    /// (SF100 q54 277.3s -> 2,178.2s).
+    #[tokio::test]
+    async fn collapsing_join_input_pins_the_tables_behind_it() {
+        let engine = Engine::new();
+        engine.register_batches("cs", vec![one_col("k")]).unwrap();
+        engine.register_batches("ws", vec![one_col("k")]).unwrap();
+        engine.register_batches("ss", vec![one_col("k")]).unwrap();
+
+        let sql = "SELECT sum(ss.v) FROM ss JOIN \
+                   (SELECT DISTINCT k FROM (SELECT k FROM cs UNION ALL SELECT k FROM ws) u) d \
+                   ON ss.k = d.k";
+        let lp = engine.logical_plan(sql).await.unwrap();
+        let pinned = tables_behind_collapsing_join_input(&lp);
+
+        assert!(pinned.contains("cs"), "cs must be pinned: {pinned:?}");
+        assert!(pinned.contains("ws"), "ws must be pinned: {pinned:?}");
+        // The driving fact is NOT behind the collapse — pinning it would defeat sharding.
+        assert!(!pinned.contains("ss"), "ss must stay shardable: {pinned:?}");
+    }
+
+    fn empty_table(engine: &Engine, name: &str, cols: &[(&str, DataType)]) {
+        let schema = Arc::new(Schema::new(
+            cols.iter()
+                .map(|(c, t)| Field::new(*c, t.clone(), true))
+                .collect::<Vec<_>>(),
+        ));
+        engine
+            .register_batches(name, vec![RecordBatch::new_empty(schema)])
+            .unwrap();
+    }
+
+    /// The real TPC-DS q54 text, not a hand-built lookalike.
+    ///
+    /// The toy test above proves the walk works on a plan *I* shaped. This one proves it survives
+    /// what DataFusion's optimizer actually does to q54 — `DISTINCT` becomes an `Aggregate`,
+    /// subqueries get flattened, `BETWEEN` scalar subqueries get rewritten. If any of that moved
+    /// the collapse out from under the join, the guard would silently stop firing and q54 would
+    /// go back to shuffling `store_sales`.
+    #[tokio::test]
+    async fn real_q54_pins_catalog_sales_and_web_sales() {
+        use DataType::{Float64, Int64, Utf8};
+        let engine = Engine::new();
+        empty_table(
+            &engine,
+            "catalog_sales",
+            &[
+                ("cs_sold_date_sk", Int64),
+                ("cs_bill_customer_sk", Int64),
+                ("cs_item_sk", Int64),
+            ],
+        );
+        empty_table(
+            &engine,
+            "web_sales",
+            &[
+                ("ws_sold_date_sk", Int64),
+                ("ws_bill_customer_sk", Int64),
+                ("ws_item_sk", Int64),
+            ],
+        );
+        empty_table(
+            &engine,
+            "store_sales",
+            &[
+                ("ss_sold_date_sk", Int64),
+                ("ss_customer_sk", Int64),
+                ("ss_ext_sales_price", Float64),
+            ],
+        );
+        empty_table(
+            &engine,
+            "item",
+            &[
+                ("i_item_sk", Int64),
+                ("i_category", Utf8),
+                ("i_class", Utf8),
+            ],
+        );
+        empty_table(
+            &engine,
+            "date_dim",
+            &[
+                ("d_date_sk", Int64),
+                ("d_moy", Int64),
+                ("d_year", Int64),
+                ("d_month_seq", Int64),
+            ],
+        );
+        empty_table(
+            &engine,
+            "customer",
+            &[("c_customer_sk", Int64), ("c_current_addr_sk", Int64)],
+        );
+        empty_table(
+            &engine,
+            "customer_address",
+            &[
+                ("ca_address_sk", Int64),
+                ("ca_county", Utf8),
+                ("ca_state", Utf8),
+            ],
+        );
+        empty_table(
+            &engine,
+            "store",
+            &[("s_store_sk", Int64), ("s_county", Utf8), ("s_state", Utf8)],
+        );
+
+        let sql = include_str!("../../../../bench/tpcds/queries/q54.sql");
+        let lp = engine
+            .logical_plan(sql.trim_end().trim_end_matches(';'))
+            .await
+            .expect("q54 should plan");
+        let optimized = engine
+            .optimize_logical_plan(lp)
+            .expect("q54 should optimize");
+        let pinned = tables_behind_collapsing_join_input(&optimized);
+
+        assert!(
+            pinned.contains("catalog_sales") && pinned.contains("web_sales"),
+            "q54's UNION-then-DISTINCT feeds a join; both facts must stay replicated or the \
+             288M-row store_sales goes on the wire (SF100: 277.3s -> 2178.2s). pinned={pinned:?}"
+        );
+        assert!(
+            !pinned.contains("store_sales"),
+            "store_sales is the driving fact and must remain shardable: {pinned:?}"
+        );
+
+        // The payoff: pinning must actually change the plan. Measured on the local 2-worker
+        // cluster, the tight set makes q54 an 8-stage plan with `store_sales` shuffled by
+        // customer_sk; with cs/ws replicated it collapses to 3 stages and the fact stays put.
+        let dims = ["item", "date_dim", "customer", "customer_address", "store"];
+        let tight: Vec<&str> = dims.to_vec();
+        let guarded: Vec<&str> = dims
+            .iter()
+            .copied()
+            .chain(["catalog_sales", "web_sales"])
+            .collect();
+
+        let tight_plan = plan_distributed_logical(&optimized, &tight).expect("tight should split");
+        let guarded_plan =
+            plan_distributed_logical(&optimized, &guarded).expect("guarded should split");
+
+        // What matters is not whether a stage *mentions* `store_sales` — the good plan scans it
+        // too — but whether the raw fact crosses the network. A leaf stage that hashes
+        // `store_sales` with no aggregation ships every pruned row; the collapsed plan scans it
+        // locally and shuffles only the `GROUP BY c_customer_sk` output, which is tiny.
+        let shuffles_store_sales = |dq: &DistributedQuery| {
+            dq.stages.iter().any(|s| {
+                let sql = s.sql.to_ascii_lowercase();
+                s.upstream_stage_ids.is_empty()
+                    && s.exchange == ExchangeMode::Hash
+                    && sql.contains("store_sales")
+                    && !sql.contains("group by")
+            })
+        };
+
+        assert!(
+            shuffles_store_sales(&tight_plan),
+            "baseline check: the tight set is supposed to shuffle store_sales, else this test \
+             proves nothing. stages={:?}",
+            tight_plan.stages.iter().map(|s| &s.sql).collect::<Vec<_>>()
+        );
+        assert!(
+            !shuffles_store_sales(&guarded_plan),
+            "pinning cs/ws must keep store_sales out of a shuffle leaf; that is the entire \
+             +1,900.8s. stages={:?}",
+            guarded_plan
+                .stages
+                .iter()
+                .map(|s| &s.sql)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            guarded_plan.stages.len() < tight_plan.stages.len(),
+            "guarded={} tight={} stages",
+            guarded_plan.stages.len(),
+            tight_plan.stages.len()
+        );
+    }
+
+    /// q17's shape: facts join directly and the only aggregate is the query's final `GROUP BY`,
+    /// which sits *above* the whole join tree rather than being an input to it. Nothing may be
+    /// pinned, or the ladder stops tightening the queries it was built for (q17 429.3s -> 47.6s).
+    #[tokio::test]
+    async fn a_final_group_by_above_the_join_tree_pins_nothing() {
+        let engine = Engine::new();
+        engine.register_batches("ss", vec![one_col("k")]).unwrap();
+        engine.register_batches("cs", vec![one_col("k")]).unwrap();
+
+        let sql = "SELECT ss.k, sum(cs.v) FROM ss JOIN cs ON ss.k = cs.k GROUP BY ss.k";
+        let lp = engine.logical_plan(sql).await.unwrap();
+        let pinned = tables_behind_collapsing_join_input(&lp);
+
+        assert!(
+            pinned.is_empty(),
+            "a top-level GROUP BY is not a join input; pinning here would disable the ladder \
+             on exactly the queries it wins on: {pinned:?}"
         );
     }
 }
