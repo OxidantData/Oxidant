@@ -810,6 +810,167 @@ fn leaf_stage_sql_with_semis(scan: &SimpleScan<'_>, semis: &[String]) -> (String
     leaf_stage_sql(&narrowed)
 }
 
+/// Kill switch (`OXIDANT_LEAF_PRUNE=0`) for leaf-stage column pruning. Defaults ON.
+fn leaf_prune_enabled() -> bool {
+    std::env::var("OXIDANT_LEAF_PRUNE")
+        .ok()
+        .as_deref()
+        .map(|v| {
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no"))
+        })
+        .unwrap_or(true)
+}
+
+/// Every leaf column the chain actually references, keyed by leaf alias.
+///
+/// Without this, [`leaf_stage_sql`] exports **every** field of `SimpleScan::schema`, so a leaf
+/// stage ships the whole width of a sharded fact across the exchange. TPC-DS Q37 reads exactly
+/// one `catalog_sales` column (`cs_item_sk`, for `cs_item_sk = i_item_sk`) and shuffles all ~34.
+///
+/// This must be a **pure function of the chain**, not accumulated during
+/// [`build_chain`]'s loop: [`replan_chain_tail`] re-derives the leaf SQL independently and
+/// matches dispatched stages by exact SQL equality, so both callers have to compute the same
+/// closure from the same inputs or adaptive re-optimization silently stops finding its stages.
+///
+/// Deliberately NOT included, because they cannot constrain it: `scan.filter_sql` and the
+/// KAN-150 semi-join filters. Leaf SQL is `SELECT <cols> FROM <table> WHERE <pred>`, and the
+/// `WHERE` is evaluated against the table, so a predicate may reference columns the `SELECT`
+/// list omits.
+///
+/// Fails **closed** in both directions. Too few columns is a DataFusion "column not found" at
+/// worker planning time, never silent wrong data — the flattening helpers ([`flatten_expr`],
+/// [`flatten_join_residual`]) rewrite `col` to `alias__col` with no existence check. Too many
+/// only forfeits the optimization.
+fn referenced_leaf_columns(
+    p: &Peeled<'_>,
+    leftmost: &ChainSide<'_>,
+    steps: &[ChainStep<'_>],
+) -> HashMap<String, HashSet<String>> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+
+    // Relation name (and alias) -> alias, for the whole chain up front.
+    let mut alias_of: HashMap<String, String> = HashMap::new();
+    let mut register = |side: &ChainSide<'_>| {
+        let a = side.alias().to_string();
+        if let Some(t) = side.table() {
+            alias_of.insert(t.to_string(), a.clone());
+        }
+        alias_of.insert(a.clone(), a);
+    };
+    register(leftmost);
+    for s in steps {
+        register(&s.right);
+    }
+
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+    // A column with no relation qualifier cannot be attributed to one leaf. Tail expressions
+    // name aggregate outputs rather than leaf columns, but rather than assume that, record the
+    // bare name for EVERY alias — the conservative direction, which only forfeits pruning.
+    let mut unqualified: HashSet<String> = HashSet::new();
+
+    let mut note = |e: &Expr| {
+        let _ = e.apply(|node| {
+            if let Expr::Column(c) = node {
+                match &c.relation {
+                    Some(rel) => {
+                        let alias = alias_of
+                            .get(rel.table())
+                            .cloned()
+                            .unwrap_or_else(|| rel.table().to_string());
+                        out.entry(alias).or_default().insert(c.name.clone());
+                    }
+                    None => {
+                        unqualified.insert(c.name.clone());
+                    }
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+    };
+
+    for s in steps {
+        for (l, r) in &s.keys {
+            note(l);
+            note(r);
+        }
+        if let Some(f) = &s.residual_filter {
+            note(f);
+        }
+    }
+    for e in &p.agg.group_expr {
+        note(e);
+    }
+    for e in &p.agg.aggr_expr {
+        note(e);
+    }
+    for e in &p.having {
+        note(e);
+    }
+    if let Some(pr) = p.projection {
+        for e in pr {
+            note(e);
+        }
+    }
+    if let Some(sorts) = p.sort {
+        for s in sorts {
+            note(&s.expr);
+        }
+    }
+    for ap in &p.alias_projections {
+        for e in *ap {
+            note(e);
+        }
+    }
+
+    if !unqualified.is_empty() {
+        for alias in alias_of.values() {
+            out.entry(alias.clone())
+                .or_default()
+                .extend(unqualified.iter().cloned());
+        }
+    }
+    out
+}
+
+/// [`SimpleScan`] restricted to `wanted`, preserving schema field order.
+///
+/// Returns the scan unchanged when pruning is disabled, when nothing would be dropped, or when
+/// the subset would be empty — an empty `SELECT` list is not valid SQL, and a leaf that truly
+/// references nothing is not worth a special case.
+fn narrow_scan<'a>(scan: &SimpleScan<'a>, wanted: Option<&HashSet<String>>) -> SimpleScan<'a> {
+    let full = SimpleScan {
+        table: scan.table,
+        table_sql: scan.table_sql.clone(),
+        alias: scan.alias,
+        filter_sql: scan.filter_sql.clone(),
+        schema: scan.schema.clone(),
+        stats_num_rows: scan.stats_num_rows,
+    };
+    if !leaf_prune_enabled() {
+        return full;
+    }
+    let Some(wanted) = wanted else { return full };
+    let kept: Vec<(Option<datafusion::common::TableReference>, _)> = scan
+        .schema
+        .iter()
+        .filter(|(_, f)| wanted.contains(f.name()))
+        .map(|(q, f)| (q.cloned(), f.clone()))
+        .collect();
+    if kept.is_empty() || kept.len() == scan.schema.fields().len() {
+        return full;
+    }
+    match datafusion::common::DFSchema::new_with_metadata(kept, scan.schema.metadata().clone()) {
+        Ok(schema) => SimpleScan {
+            schema: std::sync::Arc::new(schema),
+            ..full
+        },
+        Err(_) => full,
+    }
+}
+
 fn build_chain(
     p: &Peeled<'_>,
     sharded: &[&str],
@@ -862,6 +1023,11 @@ fn build_chain(
     }
     let key_web = ChainKeyWeb::build(&web_aliases, steps);
 
+    // Leaf column pruning: computed once, up front, from the whole chain. It cannot be
+    // accumulated during the loop below — a leaf's SQL is emitted the first time its side is
+    // used, before later steps' residuals and the final aggregate are known.
+    let leaf_cols = referenced_leaf_columns(p, &leftmost, steps);
+
     let n = steps.len();
     for i in 0..n {
         let step = &steps[i];
@@ -912,7 +1078,8 @@ fn build_chain(
         }
         let left_stage_id = match &left_side {
             LeftSide::Leaf(scan) => {
-                let (sql, flats) = leaf_stage_sql_with_semis(scan, &semis.leftmost);
+                let pruned = narrow_scan(scan, leaf_cols.get(scan_alias(scan)));
+                let (sql, flats) = leaf_stage_sql_with_semis(&pruned, &semis.leftmost);
                 let mut key_idxs = Vec::with_capacity(left_key_metas.len());
                 for (alias, name) in &left_key_metas {
                     key_idxs.push(flat_key_index(&flats, alias, name)?);
@@ -950,8 +1117,9 @@ fn build_chain(
 
         let (right_id, right_flats) = match &step.right {
             ChainSide::Scan(scan) => {
+                let pruned = narrow_scan(scan, leaf_cols.get(scan_alias(scan)));
                 let (right_sql, right_flats) = leaf_stage_sql_with_semis(
-                    scan,
+                    &pruned,
                     semis.by_step.get(&i).map_or(&[], Vec::as_slice),
                 );
                 let mut right_key_idxs = Vec::with_capacity(right_key_names.len());
@@ -1727,9 +1895,13 @@ pub(crate) fn replan_chain_tail(
     // exact SQL equality finds the stage whose barrier counted its output rows. Any leaf
     // without a match or without a complete barrier sample bails (an undercounted leaf
     // would steer the order on bad data — the safe direction is no re-optimization).
+    // Same closure `build_chain` used, recomputed from the same inputs — the leaf SQL below
+    // must match the dispatched stage byte-for-byte, so it has to be pruned identically.
+    let leaf_cols = referenced_leaf_columns(&p, &leftmost, &steps);
     let mut leaf_rows: Vec<u64> = Vec::with_capacity(steps.len() + 1);
     for scan in &leaf_scans {
-        let (sql, _) = leaf_stage_sql(scan);
+        let pruned = narrow_scan(scan, leaf_cols.get(scan_alias(scan)));
+        let (sql, _) = leaf_stage_sql(&pruned);
         let stage = stages
             .iter()
             .find(|s| s.upstream_stage_ids.is_empty() && s.sql == sql)?;
