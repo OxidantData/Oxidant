@@ -135,11 +135,27 @@ impl StreamQueryConfig {
                 .unwrap_or(true),
             iceberg_table_suffix: writer_options
                 .get("icebergTableSuffix")
-                .cloned()
-                .unwrap_or_else(|| DEFAULT_ICEBERG_SUFFIX.into()),
+                .map(|s| s.trim())
+                // An empty suffix would name the Iceberg entry exactly what the Delta entry is
+                // called, so the two would be the same catalog row — the Delta table would end up
+                // carrying an Iceberg `metadata_location`. Fall back rather than let a stray
+                // `icebergTableSuffix=` collapse the pair.
+                .filter(|s| !s.is_empty())
+                .map_or_else(|| DEFAULT_ICEBERG_SUFFIX.to_string(), str::to_string),
             checkpoint_interval: writer_options
                 .get("checkpointInterval")
-                .and_then(|s| s.parse().ok())
+                .map(|raw| {
+                    raw.trim().parse().unwrap_or_else(|_| {
+                        // Silently defaulting a value the user explicitly set means their
+                        // configured cadence never takes effect and nothing says so.
+                        eprintln!(
+                            "[oxidant] streaming: checkpointInterval `{raw}` is not a number — \
+                             using the default of {}",
+                            oxidant_datasource::delta_write::DEFAULT_CHECKPOINT_INTERVAL
+                        );
+                        oxidant_datasource::delta_write::DEFAULT_CHECKPOINT_INTERVAL
+                    })
+                })
                 .unwrap_or(oxidant_datasource::delta_write::DEFAULT_CHECKPOINT_INTERVAL),
         }
     }
@@ -248,5 +264,74 @@ mod tests {
             vec![],
         );
         assert_eq!(cfg.sink_path.as_deref(), Some("/out"));
+    }
+    /// An empty suffix would name the Iceberg entry exactly what the Delta entry is called, so the
+    /// pair would collapse into one catalog row and the Delta table would carry an Iceberg
+    /// `metadata_location`.
+    #[test]
+    fn an_empty_iceberg_suffix_falls_back_rather_than_colliding_with_the_delta_table() {
+        for value in ["", "   "] {
+            let cfg = StreamQueryConfig::from_spark(
+                "kafka",
+                &HashMap::new(),
+                "delta",
+                SinkDestination::None,
+                &[("icebergTableSuffix".to_string(), value.to_string())]
+                    .into_iter()
+                    .collect(),
+                vec![],
+            );
+            assert_eq!(
+                cfg.iceberg_table_suffix, DEFAULT_ICEBERG_SUFFIX,
+                "`icebergTableSuffix={value:?}` must not collapse the two catalog entries"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custom_iceberg_suffix_is_honoured() {
+        let cfg = StreamQueryConfig::from_spark(
+            "kafka",
+            &HashMap::new(),
+            "delta",
+            SinkDestination::None,
+            &[("icebergTableSuffix".to_string(), "_ice".to_string())]
+                .into_iter()
+                .collect(),
+            vec![],
+        );
+        assert_eq!(cfg.iceberg_table_suffix, "_ice");
+    }
+
+    /// A `checkpointInterval` that does not parse must not silently become the default with the
+    /// user believing their value took effect.
+    #[test]
+    fn a_checkpoint_interval_is_parsed_and_a_bad_one_falls_back() {
+        let good = StreamQueryConfig::from_spark(
+            "kafka",
+            &HashMap::new(),
+            "delta",
+            SinkDestination::None,
+            &[("checkpointInterval".to_string(), " 3 ".to_string())]
+                .into_iter()
+                .collect(),
+            vec![],
+        );
+        assert_eq!(good.checkpoint_interval, 3, "a padded number still parses");
+
+        let bad = StreamQueryConfig::from_spark(
+            "kafka",
+            &HashMap::new(),
+            "delta",
+            SinkDestination::None,
+            &[("checkpointInterval".to_string(), "often".to_string())]
+                .into_iter()
+                .collect(),
+            vec![],
+        );
+        assert_eq!(
+            bad.checkpoint_interval,
+            oxidant_datasource::delta_write::DEFAULT_CHECKPOINT_INTERVAL
+        );
     }
 }

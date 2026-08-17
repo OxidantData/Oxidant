@@ -562,8 +562,21 @@ impl KafkaSource {
             let assigned: u64 = shares.values().sum();
             remaining = budget.saturating_sub(assigned);
         }
-        for tp in partitions.iter().cycle().take(remaining as usize) {
-            *shares.get_mut(tp).expect("seeded above") += 1;
+        // Spread whatever is left evenly, computed rather than counted out one record at a time.
+        // After the proportional pass `remaining` is only the integer-division dust, but when
+        // there is no lag at all — every partition caught up, which is the steady state for a
+        // healthy stream — the proportional pass is skipped and `remaining` is the *entire*
+        // budget. Handing it out in a loop would cost one map lookup per permitted record on
+        // every trigger, so a large `maxOffsetsPerTrigger` would quietly burn CPU precisely when
+        // the pipeline has nothing to do.
+        let each = remaining / n;
+        let extra = remaining % n;
+        let start = self.round_robin % partitions.len();
+        for (i, tp) in partitions.iter().enumerate() {
+            // Rotate which partitions get the odd record left over, so the same ones are not
+            // favoured on every batch.
+            let rotated = ((i + partitions.len() - start) % partitions.len()) as u64;
+            *shares.get_mut(tp).expect("seeded above") += each + u64::from(rotated < extra);
         }
         shares
     }
@@ -910,6 +923,73 @@ mod tests {
         let budgets = src.partition_budgets(&partitions_of(&src));
         assert_eq!(budgets.values().sum::<u64>(), 400);
         assert!(budgets.values().all(|s| *s == 100), "{budgets:?}");
+    }
+
+    /// A caught-up topic is the steady state, and it is the case with *no* lag to apportion by —
+    /// so the whole budget falls through to the even-split path. Computing that split must not
+    /// cost one operation per permitted record: with a large `maxOffsetsPerTrigger` this test
+    /// would take minutes handing out records one at a time, on every single trigger, precisely
+    /// when the pipeline has nothing to do.
+    #[test]
+    fn a_caught_up_topic_splits_a_huge_budget_without_counting_it_out() {
+        let mut src = source_with_lag(Some(200_000_000), &[]);
+        for partition in 0..4 {
+            let tp = TopicPartition {
+                topic: "t".into(),
+                partition,
+            };
+            // Consumed right up to the high watermark: zero lag everywhere.
+            src.offsets.insert(tp.clone(), 500);
+            src.high_watermarks.insert(tp, 500);
+        }
+        let started = std::time::Instant::now();
+        let budgets = src.partition_budgets(&partitions_of(&src));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "budget split took {:?} — it is counting out records one at a time",
+            started.elapsed()
+        );
+        assert_eq!(budgets.values().sum::<u64>(), 200_000_000);
+        assert!(
+            budgets.values().all(|s| *s == 50_000_000),
+            "a caught-up topic must split evenly: {budgets:?}"
+        );
+    }
+
+    /// The dust left by integer division still has to be handed out, and to a different partition
+    /// each batch — otherwise partition 0 is permanently one record richer than partition 3.
+    #[test]
+    fn the_remainder_rotates_across_batches() {
+        let mut src = source_with_lag(Some(10), &[]);
+        for partition in 0..4 {
+            let tp = TopicPartition {
+                topic: "t".into(),
+                partition,
+            };
+            src.offsets.insert(tp.clone(), 0);
+            src.high_watermarks.insert(tp, 0);
+        }
+        let partitions = partitions_of(&src);
+
+        let mut totals: BTreeMap<TopicPartition, u64> = BTreeMap::new();
+        for _ in 0..4 {
+            let budgets = src.partition_budgets(&partitions);
+            assert_eq!(
+                budgets.values().sum::<u64>(),
+                10,
+                "the budget is never exceeded"
+            );
+            for (tp, share) in budgets {
+                *totals.entry(tp).or_default() += share;
+            }
+            src.round_robin = src.round_robin.wrapping_add(1);
+        }
+        // 10 across 4 partitions is 2 each with 2 left over; over four batches every partition
+        // must have collected the same total.
+        assert!(
+            totals.values().all(|t| *t == 10),
+            "the remainder favoured some partitions: {totals:?}"
+        );
     }
 
     #[test]

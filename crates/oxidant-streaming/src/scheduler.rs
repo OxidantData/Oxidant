@@ -651,7 +651,10 @@ fn apply_watermark(
             }
             DataType::Date32 => {
                 let d = arr.as_primitive::<oxidant_loom::arrow::datatypes::Date32Type>();
-                let wm_days = (watermark_micros / 86_400_000_000) as i32;
+                // `div_euclid`, not `/`: plain integer division truncates toward zero, so a
+                // watermark before the epoch would round *up* to the next day and drop rows it
+                // should keep. Identical for positive watermarks.
+                let wm_days = watermark_micros.div_euclid(86_400_000_000) as i32;
                 for (row, slot) in keep.iter_mut().enumerate() {
                     if !arr.is_null(row) && d.value(row) < wm_days {
                         *slot = false;

@@ -41,6 +41,15 @@ const MIN_WRITER_VERSION: i32 = 2;
 const COMMIT_ATTEMPTS: usize = 8;
 /// Commits between checkpoints. Delta's own convention, and what Spark uses.
 pub const DEFAULT_CHECKPOINT_INTERVAL: u64 = 10;
+
+/// Consecutive checkpoint failures tolerated before checkpointing is abandoned for this writer.
+///
+/// More than one, because the object store is allowed an occasional 5xx and the whole point of
+/// checkpointing is to bound log growth for a query that runs for weeks — giving up on the first
+/// blip trades a transient error for permanent unbounded growth. Not unlimited, because a
+/// *persistent* failure (no permission to write the checkpoint) should not be retried every
+/// interval forever.
+const CHECKPOINT_FAILURE_LIMIT: u32 = 3;
 /// Hive's sentinel for a null partition value, which Delta inherits.
 const NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
@@ -134,6 +143,8 @@ pub struct DeltaTableWriter {
     /// Highest `txn.version` already committed under our `app_id`.
     committed_txn: Option<i64>,
     file_counter: u64,
+    /// Consecutive checkpoint write failures. Reset by any success.
+    checkpoint_failures: u32,
 }
 
 impl DeltaTableWriter {
@@ -156,6 +167,7 @@ impl DeltaTableWriter {
             committed_txn: state.committed_txn,
             config,
             file_counter: 0,
+            checkpoint_failures: 0,
         })
     }
 
@@ -270,11 +282,25 @@ impl DeltaTableWriter {
             && self.live_files.is_some()
         {
             // A failed checkpoint must not fail the append: the data is committed and the log is
-            // correct without it, only slower to replay. Give up on checkpointing rather than
-            // retrying the same failure every interval for the life of the query.
-            if let Err(e) = self.write_checkpoint(version).await {
-                eprintln!("[oxidant] delta checkpoint at version {version} failed: {e}");
-                self.config.checkpoint_interval = 0;
+            // correct without it, only slower to replay.
+            match self.write_checkpoint(version).await {
+                Ok(()) => self.checkpoint_failures = 0,
+                Err(e) => {
+                    self.checkpoint_failures += 1;
+                    eprintln!(
+                        "[oxidant] delta checkpoint at version {version} failed \
+                         ({}/{CHECKPOINT_FAILURE_LIMIT}): {e}",
+                        self.checkpoint_failures
+                    );
+                    if self.checkpoint_failures >= CHECKPOINT_FAILURE_LIMIT {
+                        eprintln!(
+                            "[oxidant] giving up on checkpointing `{}` — its transaction log will \
+                             grow unbounded until the query restarts",
+                            self.config.table_id
+                        );
+                        self.config.checkpoint_interval = 0;
+                    }
+                }
             }
         }
         Ok(DeltaCommit {
@@ -2034,5 +2060,45 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(next_version(&store, &root).await.unwrap(), 2);
+    }
+    /// A checkpoint that fails once must not disable checkpointing for the life of the query.
+    /// Unbounded log growth is the thing checkpointing exists to prevent, so trading a transient
+    /// object-store error for it permanently is the wrong bargain.
+    #[tokio::test]
+    async fn a_transient_checkpoint_failure_does_not_disable_checkpointing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let mut writer = DeltaTableWriter::open(
+            store,
+            ObjectPath::from("tbl"),
+            schema.clone(),
+            DeltaWriterConfig {
+                table_id: "t".into(),
+                checkpoint_interval: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // One failure short of the limit leaves checkpointing enabled.
+        writer.checkpoint_failures = CHECKPOINT_FAILURE_LIMIT - 1;
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64]))])
+                .unwrap();
+        writer
+            .append(std::slice::from_ref(&batch), "p", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.checkpoint_failures, 0,
+            "a successful checkpoint must clear the failure streak"
+        );
+        assert_eq!(
+            writer.config.checkpoint_interval, 1,
+            "checkpointing must still be enabled"
+        );
     }
 }

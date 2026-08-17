@@ -186,7 +186,6 @@ pub struct LakeSink {
     catalog: Option<Arc<dyn CatalogProvider>>,
     /// Namespace and name of the sibling Iceberg catalog entry, when one was registered.
     iceberg_entry: Option<(Vec<String>, String)>,
-    batch_counter: u64,
     location: String,
 }
 
@@ -331,7 +330,6 @@ impl LakeSink {
             uniform,
             catalog: catalog_handle,
             iceberg_entry: None,
-            batch_counter: 0,
             location,
         })
     }
@@ -381,10 +379,11 @@ impl LakeSink {
             .map(|(ns, table)| format!("{}.{table}", ns.join(".")))
     }
 
-    /// A per-batch file-name fragment. The uuid keeps files from colliding across query restarts
-    /// that reset the counter.
-    fn next_file_prefix(&mut self) -> String {
-        self.batch_counter += 1;
+    /// A per-batch file-name fragment.
+    ///
+    /// A uuid rather than a counter: a restarted query starts counting from zero again, and a
+    /// name it had already used would overwrite live data rather than add to it.
+    fn next_file_prefix(&self) -> String {
         uuid::Uuid::new_v4().to_string()
     }
 
