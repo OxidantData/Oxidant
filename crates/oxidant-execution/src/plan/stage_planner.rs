@@ -735,7 +735,12 @@ pub async fn plan_distributed(
     sql: &str,
     replicated: &[&str],
 ) -> Result<DistributedQuery> {
-    let (lp, lakehouse_snapshot_pins) = engine.logical_plan_with_lakehouse_snapshots(sql).await?;
+    // Capture, alongside the snapshot pins, whether planning resolved any Lake Formation-governed
+    // table. Stamped onto every stage below so a worker that cannot enforce refuses the read
+    // instead of silently returning its shard unfiltered.
+    let ((lp, lakehouse_snapshot_pins), lakeformation_required, lakeformation_principal) = engine
+        .capture_lakeformation_enforcement(engine.logical_plan_with_lakehouse_snapshots(sql))
+        .await?;
     // Optimize before splitting: stage SQL is unparsed from this plan, and no pushdown can
     // cross a stage boundary once the plan is cut. The stock optimizer moves outer filters
     // into the scans/group-bys below (TPC-DS Q78's year predicate, KAN-2 throughput).
@@ -749,6 +754,8 @@ pub async fn plan_distributed(
     }?;
     for stage in &mut query.stages {
         stage.lakehouse_snapshot_pins = lakehouse_snapshot_pins.clone();
+        stage.lakeformation_required = lakeformation_required;
+        stage.lakeformation_principal = lakeformation_principal.clone();
         if stage.replicated_tables.is_empty() {
             stage.replicated_tables = replicated.join(",");
         }

@@ -309,6 +309,8 @@ async fn recompute_upstream_producers(
                 produce: true,
                 lakehouse_snapshot_pins: stage_def.lakehouse_snapshot_pins.clone(),
                 replicated_tables: stage_def.replicated_tables.clone(),
+                lakeformation_required: stage_def.lakeformation_required,
+                lakeformation_principal: stage_def.lakeformation_principal.clone(),
                 // A re-run producer keeps the legacy one-bucket read of its own upstreams.
                 coalesce_read_modulus: 0,
                 // …but still skips placeholder endpoints of any Forward upstreams it has.
@@ -450,6 +452,8 @@ mod tests {
             coalesce_read_modulus: 0,
             forward_upstream_stage_ids: vec![],
             upstream_bucket_rows: vec![],
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         }
     }
 

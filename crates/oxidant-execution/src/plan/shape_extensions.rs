@@ -126,6 +126,8 @@ pub(crate) fn try_non_aggregate(
             plan_fragment: None,
             lakehouse_snapshot_pins: String::new(),
             replicated_tables: String::new(),
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         }
     } else {
         StageDef::new(0, worker_sql, vec![], vec![])
@@ -7814,6 +7816,8 @@ fn plan_union(
                 plan_fragment: s.plan_fragment,
                 lakehouse_snapshot_pins: s.lakehouse_snapshot_pins,
                 replicated_tables: String::new(),
+                lakeformation_required: false,
+                lakeformation_principal: String::new(),
             });
             next_id = next_id.max(new_id + 1);
         }
@@ -7941,6 +7945,8 @@ fn plan_semi_anti_set_op(
                 plan_fragment: s.plan_fragment,
                 lakehouse_snapshot_pins: s.lakehouse_snapshot_pins,
                 replicated_tables: String::new(),
+                lakeformation_required: false,
+                lakeformation_principal: String::new(),
             });
             next_id = next_id.max(new_id + 1);
         }

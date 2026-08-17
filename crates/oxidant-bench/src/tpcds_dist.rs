@@ -362,6 +362,8 @@ pub async fn run_execute(opts: ExecuteOpts<'_>) {
                 plan_fragment: s.plan_fragment.clone(),
                 lakehouse_snapshot_pins: s.lakehouse_snapshot_pins.clone(),
                 replicated_tables: s.replicated_tables.clone(),
+                lakeformation_required: false,
+                lakeformation_principal: String::new(),
             })
             .collect();
 
