@@ -81,7 +81,10 @@ pub async fn build_provider(
             // IRSA); `region` (default us-west-2) and an optional `warehouse` arrive as
             // `spark.sql.catalog.<name>.{region,warehouse}`.
             let cat = oxidant_catalog_glue::GlueCatalog::from_config(name, options).await;
-            Ok(Arc::new(cat))
+            match build_lakeformation_authorizer(name, options).await? {
+                Some(authorizer) => Ok(Arc::new(cat.with_authorizer(authorizer))),
+                None => Ok(Arc::new(cat)),
+            }
         }
         "rest" | "unity" | "iceberg" => {
             let cat = oxidant_catalog_rest::RestCatalog::from_config(name, options)
@@ -92,6 +95,107 @@ pub async fn build_provider(
             "catalog type `{other}` is not supported yet (have: hive, glue, rest/unity/iceberg)"
         ))),
     }
+}
+
+/// Parse a boolean catalog option (`true`/`1`/`yes`/`on`, case-insensitive). Anything else that is
+/// non-empty is an error rather than a silent `false` — a typo in a security switch must not
+/// quietly leave enforcement off.
+fn parse_bool_option(catalog: &str, key: &str, raw: &str) -> Result<bool, Status> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(false),
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        other => Err(Status::invalid_argument(format!(
+            "spark.sql.catalog.{catalog}.{key} must be a boolean (got `{other}`)"
+        ))),
+    }
+}
+
+/// Build the Lake Formation authorizer for a `glue` catalog, when the operator enabled it.
+///
+/// Options, all under `spark.sql.catalog.<name>.`:
+///
+/// | Key | Meaning |
+/// |---|---|
+/// | `lakeformation` | `true` turns fine-grained access control on |
+/// | `lakeformation.identity` | `hybrid` (default), `user`, or `machine` |
+/// | `lakeformation.runtime_role_arn` | IAM role representing the querying user, assumed via STS |
+/// | `lakeformation.authorized_caller` | Value of the `LakeFormationAuthorizedCaller` session tag |
+/// | `lakeformation.catalog_id` | Glue catalog (account) ID; defaults to the caller's account |
+/// | `lakeformation.vend_credentials` | `true` (default) reads data with Lake Formation-vended credentials |
+///
+/// Construction resolves the principal eagerly — including assuming the runtime role — so a
+/// misconfiguration fails loudly here rather than surfacing later as a confusing per-table denial.
+/// Notably it does **not** degrade to an unenforced catalog on error: silently continuing without
+/// the authorization layer the operator asked for is the one outcome a security switch must never
+/// produce.
+async fn build_lakeformation_authorizer(
+    name: &str,
+    options: &HashMap<String, String>,
+) -> Result<Option<Arc<dyn oxidant_catalog::TableAuthorizer>>, Status> {
+    use oxidant_catalog_lakeformation::enforcement::{
+        AuthorizerConfig, IdentityMode, LakeFormationAuthorizer,
+    };
+
+    let enabled = options
+        .get("lakeformation")
+        .map(|v| parse_bool_option(name, "lakeformation", v))
+        .transpose()?
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(None);
+    }
+
+    let identity = match options.get("lakeformation.identity") {
+        Some(raw) => IdentityMode::parse(raw).map_err(err_to_status)?,
+        None => IdentityMode::default(),
+    };
+    // Defaults ON, matching Athena and EMR: governed data is read with credentials Lake Formation
+    // scoped to the table, not with the engine's own identity. Turning it off leaves the column/row
+    // policy applied but makes enforcement advisory — anyone with direct S3 access to the prefix
+    // bypasses it — so it is an escape hatch, not a tuning knob.
+    let vend_credentials = options
+        .get("lakeformation.vend_credentials")
+        .map(|v| parse_bool_option(name, "lakeformation.vend_credentials", v))
+        .transpose()?
+        .unwrap_or(true);
+
+    let config = AuthorizerConfig {
+        region: crate::catalog::resolve_catalog_region(options),
+        catalog_id: options.get("lakeformation.catalog_id").cloned(),
+        identity,
+        runtime_role_arn: options
+            .get("lakeformation.runtime_role_arn")
+            .cloned()
+            .filter(|s| !s.trim().is_empty()),
+        authorized_caller: options
+            .get("lakeformation.authorized_caller")
+            .cloned()
+            .filter(|s| !s.trim().is_empty()),
+        vend_credentials,
+    };
+
+    let authorizer = LakeFormationAuthorizer::new(config)
+        .await
+        .map_err(err_to_status)?;
+    Ok(Some(Arc::new(authorizer)))
+}
+
+/// Region for a catalog's AWS clients: option → `AWS_REGION` → `AWS_DEFAULT_REGION` → `us-west-2`.
+/// Mirrors the Glue and Lake Formation providers' own precedence so one catalog's clients never
+/// disagree about which region they are talking to.
+fn resolve_catalog_region(options: &HashMap<String, String>) -> String {
+    options
+        .get("region")
+        .cloned()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("AWS_REGION").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("AWS_DEFAULT_REGION")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "us-west-2".to_string())
 }
 
 /// Serve a Spark `Catalog` relation, returning the result rows as Arrow batches.
@@ -962,5 +1066,75 @@ mod tests {
             build_provider("x", &bad).await.err().unwrap().code(),
             tonic::Code::Unimplemented
         );
+    }
+
+    // ---- Lake Formation config parsing -------------------------------------
+    //
+    // These cover the option parsing only. Actually constructing the authorizer calls
+    // `sts:GetCallerIdentity`, so it belongs in the AWS-backed suite, not in unit tests.
+
+    #[test]
+    fn lakeformation_enable_flag_accepts_the_usual_boolean_spellings() {
+        for on in ["true", "TRUE", "1", "yes", "on", " true "] {
+            assert!(
+                parse_bool_option("glue", "lakeformation", on).expect("valid"),
+                "{on}"
+            );
+        }
+        for off in ["false", "0", "no", "off", ""] {
+            assert!(
+                !parse_bool_option("glue", "lakeformation", off).expect("valid"),
+                "{off}"
+            );
+        }
+    }
+
+    /// A typo in a security switch must be an error, never a silent `false` that leaves
+    /// enforcement off while the operator believes it is on.
+    #[test]
+    fn misspelled_lakeformation_flag_is_an_error_not_a_silent_false() {
+        let err = parse_bool_option("glue", "lakeformation", "ture").expect_err("typo");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("lakeformation"), "{err}");
+    }
+
+    #[test]
+    fn identity_mode_parsing_rejects_unknown_modes() {
+        use oxidant_catalog_lakeformation::enforcement::IdentityMode;
+        assert_eq!(IdentityMode::parse("hybrid").unwrap(), IdentityMode::Hybrid);
+        assert_eq!(IdentityMode::parse("user").unwrap(), IdentityMode::User);
+        assert_eq!(
+            IdentityMode::parse("machine").unwrap(),
+            IdentityMode::Machine
+        );
+        assert!(IdentityMode::parse("root").is_err());
+    }
+
+    /// A catalog without the flag must not build an authorizer — the whole feature is opt-in, and
+    /// this is the assertion that keeps it that way.
+    #[tokio::test]
+    async fn lakeformation_is_off_unless_explicitly_enabled() {
+        let mut opts = HashMap::new();
+        opts.insert("region".to_string(), "us-west-2".to_string());
+        assert!(build_lakeformation_authorizer("glue", &opts)
+            .await
+            .expect("no LF options")
+            .is_none());
+
+        opts.insert("lakeformation".to_string(), "false".to_string());
+        assert!(build_lakeformation_authorizer("glue", &opts)
+            .await
+            .expect("explicitly disabled")
+            .is_none());
+    }
+
+    #[test]
+    fn catalog_region_precedence_prefers_the_explicit_option() {
+        let mut opts = HashMap::new();
+        opts.insert("region".to_string(), "eu-west-1".to_string());
+        assert_eq!(resolve_catalog_region(&opts), "eu-west-1");
+        // Blank is treated as unset rather than as a region named "".
+        opts.insert("region".to_string(), "  ".to_string());
+        assert!(!resolve_catalog_region(&opts).trim().is_empty());
     }
 }

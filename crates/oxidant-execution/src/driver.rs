@@ -353,6 +353,11 @@ pub struct StageDef {
     /// Comma-separated tables the driver classified as fully replicated (auto-broadcast /
     /// `OXIDANT_REPLICATED_TABLES` override). Empty keeps older tickets wire-compatible.
     pub replicated_tables: String,
+    /// Whether the driver resolved any Lake Formation-governed table for this query. Propagated
+    /// to workers so one without the Lake Formation config refuses rather than reads unfiltered.
+    pub lakeformation_required: bool,
+    /// The principal the driver resolved that policy as; workers refuse on mismatch.
+    pub lakeformation_principal: String,
 }
 
 impl Default for StageDef {
@@ -366,6 +371,8 @@ impl Default for StageDef {
             plan_fragment: None,
             lakehouse_snapshot_pins: String::new(),
             replicated_tables: String::new(),
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         }
     }
 }
@@ -2234,6 +2241,8 @@ fn stage_ticket(
         produce,
         lakehouse_snapshot_pins: stage.lakehouse_snapshot_pins.clone(),
         replicated_tables: stage.replicated_tables.clone(),
+        lakeformation_required: stage.lakeformation_required,
+        lakeformation_principal: stage.lakeformation_principal.clone(),
         coalesce_read_modulus,
         forward_upstream_stage_ids: forward_upstreams(stage, stages),
         upstream_bucket_rows: measured_upstream_bucket_rows(stage, num_partitions, stage_rows),

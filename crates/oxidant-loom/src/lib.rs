@@ -23,6 +23,10 @@ use datafusion::prelude::SessionContext;
 use oxidant_common::{Error, Result};
 
 pub mod catalog_bridge;
+/// Applies a catalog authorizer's column/row access decision to a table's scans.
+pub mod lakeformation_provider;
+/// Reads governed tables with Lake Formation's vended, per-table credentials.
+pub mod lakeformation_store;
 pub mod shard;
 
 /// Shuffle-input scans carrying driver-measured row counts (runtime join-strategy
@@ -4063,6 +4067,43 @@ impl Engine {
     pub fn require_lakehouse_snapshot_pins(&self) {
         self.require_lakehouse_snapshot_pins
             .store(true, Ordering::Relaxed);
+    }
+
+    /// Run `future` recording whether it resolved any Lake Formation-governed table, so the driver
+    /// can stamp that requirement onto the stage tickets it dispatches.
+    pub async fn capture_lakeformation_enforcement<F, T>(
+        &self,
+        future: F,
+    ) -> Result<(T, bool, String)>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        catalog_bridge::capture_lakeformation_enforcement(future).await
+    }
+
+    /// The Lake Formation principal this engine enforces as, if any catalog is configured with an
+    /// authorizer. Used to scope paths that carry no driver context of their own.
+    pub fn lakeformation_principal(&self) -> Option<String> {
+        self.oxidant_catalogs
+            .lock()
+            .expect("oxidant_catalogs poisoned")
+            .values()
+            .find_map(|c| c.authorizer().map(|a| a.principal().to_string()))
+    }
+
+    /// Execute `future` under the driver's Lake Formation requirement (worker side). When
+    /// `required` is set, resolving a table through a catalog with no authorizer is an error
+    /// rather than an unfiltered read.
+    pub async fn with_lakeformation_required<F, T>(
+        &self,
+        required: bool,
+        principal: String,
+        future: F,
+    ) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        catalog_bridge::with_lakeformation_required(required, principal, future).await
     }
 
     /// Render a Spark-style `EXPLAIN` string for a logical plan, for Spark Connect

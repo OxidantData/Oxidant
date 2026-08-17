@@ -22,7 +22,7 @@ Architecture: [architecture.md](architecture.md).
 | `crates/oxidant-catalog-hive/` | Hive Metastore provider | `src/lib.rs` |
 | `crates/oxidant-catalog-glue/` | AWS Glue provider | `src/lib.rs` |
 | `crates/oxidant-catalog-rest/` | Iceberg REST / Unity-compatible | `src/lib.rs` |
-| `crates/oxidant-catalog-lakeformation/` | Lake Formation authorization (permissions, data-cell filters) | `src/lib.rs` |
+| `crates/oxidant-catalog-lakeformation/` | Lake Formation authorization: scan enforcement via `GetUnfilteredTableMetadata` + credential vending (`src/enforcement.rs`); grant introspection (`src/lib.rs`) | `src/enforcement.rs` |
 | `crates/oxidant-proto/` | Vendored Spark Connect protos (protox) | `src/lib.rs` |
 | `crates/oxidant-common/` | Shared errors, config, session identity | `src/lib.rs` |
 | `crates/oxidant-streaming/` | Structured Streaming: Kafka source, micro-batch pipeline, Delta/Glue sink | `src/lib.rs` |

@@ -4,7 +4,9 @@ Oxidant reads the AWS Glue Data Catalog through its external-catalog SPI: tables
 registered in Glue resolve as three-part names `glue.<database>.<table>`, loaded lazily on
 first reference. For Hive Metastore and Iceberg REST/Unity catalogs, see
 [`catalogs.md`](catalogs.md); for the full EC2/ASG walkthrough (IAM stack parameters, S3
-setup), see [`distributed-ec2.md`](distributed-ec2.md).
+setup), see [`distributed-ec2.md`](distributed-ec2.md). For AWS Lake Formation column-level and
+row-level security on these tables, see
+[`catalogs-lakeformation.md`](catalogs-lakeformation.md).
 
 > **Glue is optional.** Without any `--catalog-conf`, the engine serves its built-in local
 > catalog (`spark_catalog`, current database `default`) — an in-memory catalog where

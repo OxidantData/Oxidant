@@ -375,12 +375,46 @@ impl OxidantService {
     async fn sync_catalogs(&self) {
         let snapshot = self.config.lock().expect("config poisoned").clone();
         for (name, opts) in catalog::group_catalog_options(&snapshot) {
-            if self.registry.contains(&name) {
-                continue;
+            // A catalog already registered is normally left alone — but NOT when its access-control
+            // config has since appeared. Spark clients set config one key per RPC, so
+            // `spark.sql.catalog.glue.type=glue` can register the catalog before
+            // `...lakeformation=true` arrives; skipping unconditionally would leave it without an
+            // authorizer for the process lifetime while the operator believes enforcement is on.
+            // Rebuilding is safe: `register_catalog` replaces, and this only fires when the
+            // security-relevant options changed.
+            let wants_lakeformation = opts.keys().any(|k| k.starts_with("lakeformation"));
+            let already = self.registry.contains(&name);
+            if already {
+                let enforcing = self
+                    .registry
+                    .provider(&name)
+                    .is_some_and(|p| p.authorizer().is_some());
+                if !wants_lakeformation || enforcing {
+                    continue;
+                }
+                tracing::info!(
+                    catalog = %name,
+                    "Lake Formation config appeared after the catalog was registered; rebuilding \
+                     it so enforcement takes effect"
+                );
             }
-            if let Ok(provider) = catalog::build_provider(&name, &opts).await {
-                self.engine.register_catalog(&name, provider.clone());
-                self.registry.register(&name, provider);
+            match catalog::build_provider(&name, &opts).await {
+                Ok(provider) => {
+                    self.engine.register_catalog(&name, provider.clone());
+                    self.registry.register(&name, provider);
+                }
+                // Never swallow a failure to build a catalog the operator asked to enforce: a
+                // dropped error here surfaces later as "catalog not found", which reads like a
+                // typo rather than "your access-control layer did not start".
+                Err(e) if wants_lakeformation => {
+                    tracing::error!(
+                        catalog = %name,
+                        error = %e,
+                        "Lake Formation-enabled catalog failed to build; it is NOT registered and \
+                         queries against it will fail rather than read unfiltered"
+                    );
+                }
+                Err(_) => {}
             }
         }
         if let Some(def) = snapshot.get("spark.sql.defaultCatalog") {
@@ -708,11 +742,19 @@ impl OxidantService {
                 // (SF100 TPC-DS Q31/Q49/Q51/Q91 — the driver could not even parse the
                 // submitted SQL, but reported a strict-mode splitter refusal).
                 let mut plan_build_error: Option<Error> = None;
+                let mut lakeformation_required = false;
+                let mut lakeformation_principal = String::new();
                 let plan_and_pins = match engine
-                    .logical_plan_with_lakehouse_snapshots(&sql.query)
+                    .capture_lakeformation_enforcement(
+                        engine.logical_plan_with_lakehouse_snapshots(&sql.query),
+                    )
                     .await
                 {
-                    Ok(pp) => Some(pp),
+                    Ok((pp, required, principal)) => {
+                        lakeformation_required = required;
+                        lakeformation_principal = principal;
+                        Some(pp)
+                    }
                     Err(e) => {
                         eprintln!("Oxidant distributed: driver plan build failed: {e}");
                         plan_build_error = Some(e);
@@ -744,6 +786,8 @@ impl OxidantService {
                             Some(&udf_json),
                             tracker.as_deref(),
                             pins,
+                            lakeformation_required,
+                            &lakeformation_principal,
                             &self.distributed_caches,
                         )
                         .await
@@ -881,12 +925,16 @@ impl OxidantService {
             _ => {
                 // Capture the Delta/Iceberg snapshot identities the translation resolves so the
                 // distributed stages below can pin workers to the same snapshot (KAN-48).
-                let (plan, lakehouse_snapshot_pins) = engine
-                    .capture_lakehouse_snapshots(async {
+                let (
+                    (plan, lakehouse_snapshot_pins),
+                    lakeformation_required,
+                    lakeformation_principal,
+                ) = engine
+                    .capture_lakeformation_enforcement(engine.capture_lakehouse_snapshots(async {
                         translate::to_plan(engine.ctx(), rel)
                             .await
                             .map_err(|s| Error::Plan(format!("translate: {}", s.message())))
-                    })
+                    }))
                     .await
                     .map_err(err_to_status)?;
                 let schema = Arc::new(plan.schema().as_arrow().clone());
@@ -914,6 +962,8 @@ impl OxidantService {
                     Some(&udf_json),
                     tracker.as_deref(),
                     &lakehouse_snapshot_pins,
+                    lakeformation_required,
+                    &lakeformation_principal,
                     &self.distributed_caches,
                 )
                 .await

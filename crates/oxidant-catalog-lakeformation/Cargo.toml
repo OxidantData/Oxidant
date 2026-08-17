@@ -9,14 +9,21 @@ rust-version.workspace = true
 
 [dependencies]
 oxidant-common = { workspace = true }
-# For the shared ambient-region resolver, so this client, the Glue catalog, and the S3 store all
-# agree on where "no region configured" points.
+# Also carries the shared ambient-region resolver, so this client, the Glue catalog, and the S3
+# store all agree on where "no region configured" points.
 oxidant-catalog = { workspace = true }
+async-trait = "0.1"
 # Official AWS SDK for the Lake Formation authorization ops (ListPermissions/ListDataCellsFilter).
 # Pinned (not "1") to versions whose MSRV matches this workspace's toolchain — the same pin
 # discipline as oxidant-catalog-glue's aws-config/aws-sdk-glue and oxidant-loom's aws-sdk-sts.
 aws-config = "=1.8.13"
 aws-sdk-lakeformation = "=1.98.1"
+# `GetUnfilteredTableMetadata` — the third-party-engine authorization op — lives in the *Glue* API,
+# not the Lake Formation one. Same pin as oxidant-catalog-glue so the workspace resolves one copy.
+aws-sdk-glue = "=1.137.0"
+# `GetCallerIdentity`, to resolve the engine's own principal when no runtime role is assumed.
+# Same pin as oxidant-loom.
+aws-sdk-sts = "=1.97.0"
 
 [dev-dependencies]
 # Stub-endpoint integration test: a raw TcpListener mini-HTTP server stands in for Lake Formation.

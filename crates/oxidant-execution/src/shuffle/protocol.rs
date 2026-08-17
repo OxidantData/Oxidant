@@ -127,6 +127,26 @@ pub struct StageTicket {
     /// (workers fall back to the MemTable's own DataFusion statistics).
     #[prost(uint64, repeated, tag = "14")]
     pub upstream_bucket_rows: Vec<u64>,
+    /// Whether this stage touches Lake Formation-governed tables, as the driver resolved them.
+    ///
+    /// Enforcement is per-process: a worker resolves tables through its own catalog, so one
+    /// started without the Lake Formation config has no authorizer and would read its shard
+    /// unfiltered — and could not detect that on its own, because without an authorizer it has no
+    /// way to know the table is governed. The driver did resolve the policy, so it stamps the
+    /// requirement here and the worker refuses any table its catalog cannot enforce. `false`
+    /// keeps older tickets wire-compatible and is correct for queries touching no governed data.
+    #[prost(bool, tag = "15")]
+    pub lakeformation_required: bool,
+    /// The Lake Formation principal the DRIVER resolved this query's policy as.
+    ///
+    /// Driver and workers are separate processes given their catalog config independently, so a
+    /// worker could be configured with a different `identity` / `runtime_role_arn` and would then
+    /// enforce its *own*, potentially far broader, policy on its shard — silently returning more
+    /// rows and columns than the user is entitled to, with no error anywhere. The worker compares
+    /// this against its own resolved principal and refuses on mismatch. Empty keeps older tickets
+    /// wire-compatible and skips the check.
+    #[prost(string, tag = "16")]
+    pub lakeformation_principal: String,
 }
 
 /// A pull request for one hash bucket of an already-produced stage output.
@@ -216,6 +236,8 @@ mod tests {
             coalesce_read_modulus: 2,
             forward_upstream_stage_ids: vec![0],
             upstream_bucket_rows: vec![41, 59],
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         };
         let bytes = t.to_ticket_bytes();
         match decode_ticket(&bytes).unwrap() {

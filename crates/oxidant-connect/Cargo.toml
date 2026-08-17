@@ -19,6 +19,9 @@ oxidant-execution = { workspace = true, features = ["k8s"] }
 oxidant-catalog = { workspace = true }
 oxidant-catalog-hive = { workspace = true }
 oxidant-catalog-glue = { workspace = true }
+# Lake Formation fine-grained access control, attached to the Glue catalog when configured. Lives
+# here rather than in oxidant-catalog-glue so the Glue provider keeps a Glue-only dependency tree.
+oxidant-catalog-lakeformation = { workspace = true }
 oxidant-catalog-rest = { workspace = true }
 oxidant-loom = { workspace = true }
 oxidant-streaming = { workspace = true }

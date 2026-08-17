@@ -325,6 +325,8 @@ fn forward_branch_query(branch: &LogicalPlan, branch_i: usize) -> Result<Distrib
             plan_fragment: None,
             lakehouse_snapshot_pins: String::new(),
             replicated_tables: String::new(),
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         }],
         finalize_sql: None,
     })
@@ -1929,6 +1931,8 @@ pub(crate) fn append_branch(
             // scans for this stage only); an empty stamp is filled by the outer
             // `stamp_replicated_tables` as before.
             replicated_tables: stage.replicated_tables,
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         });
         output_id = Some(new_id);
         *next_id = (*next_id).max(new_id.checked_add(1).ok_or_else(|| {

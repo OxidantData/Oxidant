@@ -15,6 +15,25 @@
 //!
 //! This crate only *retrieves* authorization information; it grants/revokes nothing and never
 //! shells out to the `aws` CLI.
+//!
+//! # Which surface to use
+//!
+//! The two paths in this crate are for different jobs and are not interchangeable:
+//!
+//! - **This module** ([`LakeFormationAuth`]) wraps Lake Formation's *administrative* operations.
+//!   They enumerate the grants held on a resource, which is what an introspection command like
+//!   `SHOW GRANTS` needs. They do **not** compute an effective decision for a caller.
+//! - **[`enforcement`]** is what the query engine authorizes scans with. It calls Glue's
+//!   `GetUnfilteredTableMetadata`, the documented third-party-engine path (the one Athena and EMR
+//!   Spark use), which returns the effective decision — authorized columns, row filter, and
+//!   whether Lake Formation governs the table at all — in a single call, plus Lake Formation's
+//!   scoped credential vending.
+//!
+//! Authorizing a scan from the administrative operations would mean re-deriving, approximately, a
+//! decision AWS already computes exactly. Use [`enforcement`] for anything on the query path.
+
+/// The scan-authorization path: [`enforcement::LakeFormationAuthorizer`].
+pub mod enforcement;
 
 use std::collections::{HashMap, HashSet};
 

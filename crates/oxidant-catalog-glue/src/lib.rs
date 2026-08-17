@@ -36,7 +36,9 @@ use oxidant_catalog::hive_types::{
     arrow_type_to_hive, columns_to_schema, format_serde, schema_to_columns, validate_identifier,
     validate_partition_value,
 };
-use oxidant_catalog::{CatalogProvider, Error, Result, TableChange, TableFormat, TableMetadata};
+use oxidant_catalog::{
+    CatalogProvider, Error, Result, TableAuthorizer, TableChange, TableFormat, TableMetadata,
+};
 
 /// A Glue catalog connection, addressed by its registered `name`; metadata ops run through the
 /// in-process AWS SDK client.
@@ -47,6 +49,14 @@ pub struct GlueCatalog {
     /// `CREATE TABLE ... AS SELECT` doesn't specify an explicit `LOCATION`. `None` means CTAS
     /// against this catalog must supply an explicit location (see `create_table`).
     warehouse: Option<String>,
+    /// Fine-grained access control for this catalog's tables (AWS Lake Formation), when the
+    /// operator configured it. `None` — the default — means no authorization layer.
+    ///
+    /// Held as the SPI trait object rather than a concrete Lake Formation type on purpose: this
+    /// crate depends only on `oxidant-catalog`, so the AWS Lake Formation SDK stays out of the
+    /// Glue provider's dependency tree. `oxidant-connect` constructs the concrete authorizer and
+    /// attaches it here.
+    authorizer: Option<Arc<dyn TableAuthorizer>>,
 }
 
 impl GlueCatalog {
@@ -92,7 +102,15 @@ impl GlueCatalog {
             name: name.into(),
             client,
             warehouse,
+            authorizer: None,
         }
+    }
+
+    /// Attach a fine-grained access-control authorizer. Every table this catalog resolves is then
+    /// run through it before the engine will scan it.
+    pub fn with_authorizer(mut self, authorizer: Arc<dyn TableAuthorizer>) -> Self {
+        self.authorizer = Some(authorizer);
+        self
     }
 }
 
@@ -140,6 +158,10 @@ where
 impl CatalogProvider for GlueCatalog {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn authorizer(&self) -> Option<Arc<dyn TableAuthorizer>> {
+        self.authorizer.clone()
     }
 
     async fn list_namespaces(&self, parent: &[String]) -> Result<Vec<Vec<String>>> {

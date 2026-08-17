@@ -12,6 +12,7 @@
 | [docs/mcp.md](docs/mcp.md) | `oxidant mcp` MCP server setup/tools |
 | [docs/workers.md](docs/workers.md) | Adding workers (local-cluster / multi-host) |
 | [docs/catalogs-glue.md](docs/catalogs-glue.md) | Glue catalog end-to-end |
+| [docs/catalogs-lakeformation.md](docs/catalogs-lakeformation.md) | Lake Formation column/row security on Glue tables |
 | [docs/streaming.md](docs/streaming.md) | Structured Streaming: Kafka → live Delta tables in Glue, readable as Iceberg |
 | [docs/CODEMAP.md](docs/CODEMAP.md) | Crate / bench / site ownership |
 | [docs/architecture.md](docs/architecture.md) | Engine design (Loom / Connect) |

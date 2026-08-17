@@ -128,6 +128,8 @@ async fn shuffle_input_deregistered_after_stage_exit() {
         coalesce_read_modulus: 0,
         forward_upstream_stage_ids: vec![],
         upstream_bucket_rows: vec![],
+        lakeformation_required: false,
+        lakeformation_principal: String::new(),
     };
     run_stage_on_worker(endpoint.clone(), producer)
         .await
@@ -148,6 +150,8 @@ async fn shuffle_input_deregistered_after_stage_exit() {
         coalesce_read_modulus: 0,
         forward_upstream_stage_ids: vec![],
         upstream_bucket_rows: vec![],
+        lakeformation_required: false,
+        lakeformation_principal: String::new(),
     };
 
     // Success path: the table is dropped when the stage task returns.
