@@ -99,7 +99,11 @@ pub async fn try_run_distributed(
     // Capture the exact Delta/Iceberg snapshot identities this query resolves so every
     // worker stage scans the SAME pinned snapshot (KAN-48) — workers reject unpinned
     // lakehouse scans.
-    let (lp, lakehouse_snapshot_pins) = engine.logical_plan_with_lakehouse_snapshots(sql).await?;
+    // Capture, alongside the pins, whether this query resolved any Lake Formation-governed
+    // table; stamped onto every stage so an unenforcing worker refuses rather than leaks.
+    let ((lp, lakehouse_snapshot_pins), lakeformation_required, lakeformation_principal) = engine
+        .capture_lakeformation_enforcement(engine.logical_plan_with_lakehouse_snapshots(sql))
+        .await?;
     // Test-only path: a fresh cache per call (no cross-query reuse to assert on here —
     // `DistributedCaches` itself is unit-tested below).
     let caches = DistributedCaches::default();
@@ -112,6 +116,8 @@ pub async fn try_run_distributed(
         udf_json,
         tracker,
         &lakehouse_snapshot_pins,
+        lakeformation_required,
+        &lakeformation_principal,
         &caches,
     )
     .await
@@ -127,6 +133,11 @@ const STAGE_EXPLOSION_GUARD: usize = 40;
 /// `lakehouse_snapshot_pins` is the driver's captured table→snapshot JSON map
 /// ([`Engine::capture_lakehouse_snapshots`]), stamped onto every stage so workers resolve
 /// lakehouse tables at the same pinned snapshot; empty when the plan scans no lakehouse tables.
+/// `lakeformation_principal` is the principal the driver resolved that policy as; a worker
+/// enforcing as somebody else refuses rather than applying its own, possibly broader, policy.
+/// `lakeformation_required` says the driver resolved at least one Lake Formation-governed table,
+/// and is stamped onto every stage so a worker whose catalog cannot enforce refuses the read
+/// rather than returning its shard unfiltered.
 /// `caches` carries the per-service membership / UDF-sync caches (see [`DistributedCaches`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn try_run_distributed_plan(
@@ -138,6 +149,8 @@ pub async fn try_run_distributed_plan(
     udf_json: Option<&str>,
     tracker: Option<&QueryTracker>,
     lakehouse_snapshot_pins: &str,
+    lakeformation_required: bool,
+    lakeformation_principal: &str,
     caches: &DistributedCaches,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let t0 = std::time::Instant::now();
@@ -237,6 +250,12 @@ pub async fn try_run_distributed_plan(
     };
     for stage in &mut dq.stages {
         stage.lakehouse_snapshot_pins = lakehouse_snapshot_pins.to_string();
+        // `|=` not `=`: the splitter may already have marked a stage, and a requirement must
+        // only ever be added, never cleared.
+        stage.lakeformation_required |= lakeformation_required;
+        if stage.lakeformation_principal.is_empty() && !lakeformation_principal.is_empty() {
+            stage.lakeformation_principal = lakeformation_principal.to_string();
+        }
     }
     let cluster = Cluster::from_membership(membership);
     eprintln!(

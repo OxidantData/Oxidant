@@ -4248,8 +4248,12 @@ dependencies = [
 name = "oxidant-catalog-lakeformation"
 version = "0.1.27"
 dependencies = [
+ "async-trait",
  "aws-config",
+ "aws-sdk-glue",
  "aws-sdk-lakeformation",
+ "aws-sdk-sts",
+ "oxidant-catalog",
  "oxidant-common",
  "tokio",
 ]
@@ -4301,6 +4305,7 @@ dependencies = [
  "oxidant-catalog",
  "oxidant-catalog-glue",
  "oxidant-catalog-hive",
+ "oxidant-catalog-lakeformation",
  "oxidant-catalog-rest",
  "oxidant-common",
  "oxidant-execution",

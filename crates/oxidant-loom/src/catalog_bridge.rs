@@ -39,6 +39,93 @@ struct LakehouseSnapshotContext {
 
 tokio::task_local! {
     static LAKEHOUSE_SNAPSHOT_CONTEXT: Arc<LakehouseSnapshotContext>;
+    /// Set while executing a stage the driver marked as touching Lake Formation-governed data.
+    ///
+    /// Enforcement is per-process: a worker resolves tables through its own catalog, so a worker
+    /// started without the Lake Formation config has no authorizer and would happily read its
+    /// shard unfiltered. The worker cannot detect that on its own — without an authorizer it has
+    /// no way to know the table is governed. So the *driver*, which did resolve the policy, stamps
+    /// the requirement on the stage ticket and the worker refuses any table whose catalog cannot
+    /// enforce. Same shape as `require_lakehouse_snapshot_pins`.
+    static LAKEFORMATION_REQUIRED: bool;
+    /// The principal the driver resolved this query's policy as; empty when unknown.
+    static LAKEFORMATION_PRINCIPAL: String;
+}
+
+/// Whether the driver observed Lake Formation-governed tables while resolving this query.
+///
+/// `Arc<AtomicBool>` rather than a plain flag because resolution happens across the task tree
+/// under [`capture_lakeformation_enforcement`].
+#[derive(Default)]
+struct LakeFormationObservation {
+    required: std::sync::atomic::AtomicBool,
+    /// The principal the governed tables were resolved as, stamped on the stage tickets so a
+    /// worker enforcing as a *different* principal is caught rather than silently applying its
+    /// own, possibly broader, policy.
+    principal: Mutex<String>,
+}
+
+tokio::task_local! {
+    static LAKEFORMATION_OBSERVED: Arc<LakeFormationObservation>;
+}
+
+/// Run `future` recording whether any table it resolved was Lake Formation-governed. The driver
+/// stamps the result on every stage ticket of the query.
+pub async fn capture_lakeformation_enforcement<F, T>(
+    future: F,
+) -> oxidant_common::Result<(T, bool, String)>
+where
+    F: Future<Output = oxidant_common::Result<T>>,
+{
+    let observation = Arc::new(LakeFormationObservation::default());
+    let value = LAKEFORMATION_OBSERVED
+        .scope(observation.clone(), future)
+        .await?;
+    let principal = observation
+        .principal
+        .lock()
+        .expect("lakeformation observation poisoned")
+        .clone();
+    Ok((
+        value,
+        observation.required.load(Ordering::Relaxed),
+        principal,
+    ))
+}
+
+/// Execute `future` under the driver's enforcement requirement (worker side).
+pub async fn with_lakeformation_required<F, T>(required: bool, principal: String, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    LAKEFORMATION_PRINCIPAL
+        .scope(principal, LAKEFORMATION_REQUIRED.scope(required, future))
+        .await
+}
+
+fn note_lakeformation_enforced(principal: &str) {
+    let _ = LAKEFORMATION_OBSERVED.try_with(|o| {
+        o.required.store(true, Ordering::Relaxed);
+        let mut held = o
+            .principal
+            .lock()
+            .expect("lakeformation observation poisoned");
+        if held.is_empty() {
+            *held = principal.to_string();
+        }
+    });
+}
+
+/// The principal the driver stamped on this stage's ticket, when it stamped one.
+fn required_lakeformation_principal() -> Option<String> {
+    LAKEFORMATION_PRINCIPAL
+        .try_with(|p| p.clone())
+        .ok()
+        .filter(|p| !p.is_empty())
+}
+
+fn lakeformation_required() -> bool {
+    LAKEFORMATION_REQUIRED.try_with(|r| *r).unwrap_or(false)
 }
 
 pub(crate) async fn capture_lakehouse_snapshots<F, T>(
@@ -225,8 +312,16 @@ struct OxidantSchemaProvider {
     /// Non-lakehouse entries are revalidated against the metastore once their TTL
     /// ([`catalog_cache_ttl`]) expires — a cached provider is NOT immortal: a Glue table whose
     /// schema/location changed out-of-band must be picked up without an engine restart.
-    tables: Mutex<HashMap<(String, bool), CachedTable>>,
+    ///
+    /// The third key component is the **authorizing principal** (empty when the catalog has no
+    /// authorizer). A provider embeds its access decision the same way it embeds the shard
+    /// decision, so two principals must never share one entry — that would serve one user's
+    /// authorized column set and row filter to another.
+    tables: Mutex<HashMap<TableCacheKey, CachedTable>>,
 }
+
+/// `(table name, replicated, principal)` — see [`OxidantSchemaProvider::tables`].
+type TableCacheKey = (String, bool, String);
 
 struct CachedTable {
     provider: Arc<dyn TableProvider>,
@@ -238,6 +333,24 @@ struct CachedTable {
     /// that never went through `load_table` (CTAS `register_table`) — a TTL revalidation then
     /// always re-resolves, which is the correct conservative direction.
     fingerprint: Option<String>,
+    /// Whether the authorizer reported this table as Lake Formation-governed when the provider was
+    /// built.
+    ///
+    /// Recorded because a cache *hit* returns without re-authorizing, and the driver has to stamp
+    /// the enforcement requirement on its stage tickets from what it observed while planning. Miss
+    /// it and the second query on a table — anything inside the catalog TTL — would ship tickets
+    /// saying "not governed", and every worker would stop enforcing. Fail-open in the common case.
+    lakeformation_enforced: bool,
+}
+
+impl CachedTable {
+    /// Re-record that this table is Lake Formation-governed when it is served from cache.
+    /// See [`CachedTable::lakeformation_enforced`].
+    fn note_enforcement(&self, principal: &str) {
+        if self.lakeformation_enforced {
+            note_lakeformation_enforced(principal);
+        }
+    }
 }
 
 impl OxidantSchemaProvider {
@@ -258,13 +371,161 @@ impl OxidantSchemaProvider {
         }
     }
 
-    /// Drop all cached variants (`(name, replicated)` and `(name, sharded)`) of `name` so the
-    /// next `table()` re-resolves from the metastore. Returns whether anything was evicted.
+    /// Drop all cached variants (replicated/sharded × principal) of `name` so the next `table()`
+    /// re-resolves from the metastore. Returns whether anything was evicted.
     fn evict_table(&self, name: &str) -> bool {
         let mut tables = self.tables.lock().expect("tables poisoned");
         let before = tables.len();
-        tables.retain(|(n, _), _| n != name);
+        tables.retain(|(n, _, _), _| n != name);
         tables.len() != before
+    }
+
+    /// The principal this catalog's authorizer resolves decisions for, or `""` when the catalog
+    /// has no authorizer configured (the default — no access control layer).
+    fn principal(&self) -> String {
+        self.catalog
+            .authorizer()
+            .map(|a| a.principal().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Resolve the catalog authorizer's access decision for `name`, before any provider is built.
+    ///
+    /// `None` when the catalog has no authorizer — the default, no access-control layer. Any
+    /// failure to *resolve* a decision propagates: an authorizer that cannot answer must fail the
+    /// query rather than let it read unfiltered data.
+    ///
+    /// Resolving before the provider exists is what lets vended credentials be installed for the
+    /// table's storage prefix *first*, so the very first byte read already goes through Lake
+    /// Formation's credentials rather than the engine's own.
+    async fn resolve_access(&self, name: &str) -> DfResult<Option<oxidant_catalog::TableAccess>> {
+        let Some(authorizer) = self.catalog.authorizer() else {
+            return Ok(None);
+        };
+        let access = authorizer
+            .authorize_scan(&self.namespace, name)
+            .await
+            .map_err(oxidant_to_df)?;
+        if access.enforced {
+            note_lakeformation_enforced(authorizer.principal());
+        }
+        Ok(Some(access))
+    }
+
+    /// Point this table's storage prefix at its Lake Formation-vended credentials.
+    ///
+    /// No-op unless the decision carried credentials (vending is opt-in) and the table lives on S3.
+    /// Registers a [`RoutingObjectStore`] for the bucket the first time a governed table appears in
+    /// it, so governed and ungoverned tables can share a bucket and two governed tables can hold
+    /// different credentials — neither of which DataFusion's per-bucket store registry can express
+    /// on its own.
+    fn install_vended_credentials(
+        &self,
+        state: &SessionState,
+        md: &TableMetadata,
+        name: &str,
+        access: &oxidant_catalog::TableAccess,
+    ) -> DfResult<()> {
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        let Some(creds) = access.credentials.as_ref() else {
+            return Ok(());
+        };
+        let Some(authorizer) = self.catalog.authorizer() else {
+            return Ok(());
+        };
+        let loc = crate::shard::ensure_collection_url(&md.location);
+        let url = ListingTableUrl::parse(&loc).map_err(loc_err(md))?;
+        if url.scheme() != "s3" {
+            // Credential vending is an S3 mechanism; a governed table elsewhere still gets its
+            // column/row policy applied, just not scoped credentials.
+            return Ok(());
+        }
+        // Make sure the ambient store exists first — it becomes the routing store's fallback, and
+        // is what every ungoverned path in this bucket keeps using.
+        ensure_remote_store(state, &url, Some(&md.storage_options))?;
+        let os_url = url.object_store();
+        let base = state.runtime_env().object_store(&os_url)?;
+        // Key by runtime env AS WELL as bucket. The map is process-global but DataFusion's
+        // object-store registry is per-`RuntimeEnv`, and several engines share a process (every
+        // in-process multi-worker harness, and the test suite). Keyed by bucket alone, the second
+        // engine would be told the routing store already existed, skip registering it in its own
+        // registry, and quietly read governed data through its plain store.
+        let env_key = format!("{:p}|{}", Arc::as_ptr(state.runtime_env()), os_url.as_str());
+        let (routing, created) = crate::lakeformation_store::routing_store_or_insert(
+            &env_key,
+            state.runtime_env(),
+            &base,
+        );
+        if created {
+            state
+                .runtime_env()
+                .register_object_store(os_url.as_ref(), routing.clone());
+        }
+
+        let bucket = os_url
+            .as_str()
+            .strip_prefix("s3://")
+            .and_then(|r| r.split('/').next())
+            .unwrap_or_default()
+            .to_string();
+        let region = md
+            .storage_options
+            .get("s3.region")
+            .or_else(|| md.storage_options.get("fs.s3a.endpoint.region"))
+            .cloned()
+            .unwrap_or_else(|| {
+                std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string())
+            });
+        let credential_provider = Arc::new(
+            crate::lakeformation_store::LakeFormationCredentialProvider::new(
+                authorizer,
+                self.namespace.clone(),
+                name.to_string(),
+                creds,
+            ),
+        );
+        // Apply the SAME storage-option normalization the ambient store gets. Without it the
+        // credentialed store ignores a configured endpoint or addressing style and talks to real
+        // AWS — leaving a governed table as the only broken thing in a bucket whose other tables
+        // read fine, with an opaque error.
+        let table_store = apply_s3_storage_options(
+            object_store::aws::AmazonS3Builder::from_env()
+                .with_bucket_name(&bucket)
+                .with_region(region),
+            &md.storage_options,
+        )
+        .with_credentials(credential_provider)
+        .build()
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "build lake formation credentialed store for `{name}`: {e}"
+            ))
+        })?;
+        routing.add_route(url.prefix().clone(), Arc::new(table_store));
+        Ok(())
+    }
+
+    /// Wrap `provider` so its scans honor `access`. Returns it untouched when the decision
+    /// restricts nothing (an ungoverned table, or a principal granted everything).
+    fn enforce(
+        &self,
+        state: &SessionState,
+        name: &str,
+        provider: Arc<dyn TableProvider>,
+        access: Option<&oxidant_catalog::TableAccess>,
+    ) -> DfResult<Arc<dyn TableProvider>> {
+        let Some(access) = access else {
+            return Ok(provider);
+        };
+        if crate::lakeformation_provider::LakeFormationTableProvider::is_noop(access) {
+            return Ok(provider);
+        }
+        Ok(Arc::new(
+            crate::lakeformation_provider::LakeFormationTableProvider::try_new(
+                state, provider, access, name,
+            )?,
+        ))
     }
 }
 
@@ -284,10 +545,45 @@ fn catalog_cache_ttl() -> std::time::Duration {
     }
 }
 
+/// Apply a table's `storage_options` to an S3 builder, mapping the Iceberg/Hadoop-AWS key spellings
+/// onto `object_store`'s config keys.
+///
+/// Shared by the ambient store and the Lake Formation-credentialed per-table store so the two
+/// cannot disagree about endpoint, region, or addressing style.
+fn apply_s3_storage_options(
+    mut builder: object_store::aws::AmazonS3Builder,
+    options: &HashMap<String, String>,
+) -> object_store::aws::AmazonS3Builder {
+    for (key, value) in options {
+        let normalized = match key.as_str() {
+            "s3.access-key-id" | "fs.s3a.access.key" => "access_key_id",
+            "s3.secret-access-key" | "fs.s3a.secret.key" => "secret_access_key",
+            "s3.session-token" | "fs.s3a.session.token" => "session_token",
+            "s3.endpoint" | "fs.s3a.endpoint" => "endpoint",
+            "s3.region" | "fs.s3a.endpoint.region" => "region",
+            "s3.allow-http" => "allow_http",
+            "s3.virtual-hosted-style-request" => "virtual_hosted_style_request",
+            other => other.strip_prefix("s3.").unwrap_or(other),
+        };
+        if let Ok(config_key) = normalized.parse::<object_store::aws::AmazonS3ConfigKey>() {
+            builder = builder.with_config(config_key, value);
+        }
+    }
+    builder
+}
+
 /// A cheap fingerprint of the metadata a provider was built from — location, format, declared
 /// schema fields (name + type + nullability), and partition columns — so a TTL revalidation can tell
 /// "metastore unchanged" apart from "re-typed / moved" without diffing providers.
-fn metadata_fingerprint(md: &TableMetadata) -> String {
+///
+/// `access` folds in the authorizer's decision when the catalog has one. Metadata alone is not
+/// enough: revoking a column grant or tightening a row filter leaves the Glue table byte-identical,
+/// so without this a revoked permission would keep being served from cache until the process
+/// restarted. With it, the change is picked up on the next TTL revalidation.
+fn metadata_fingerprint(
+    md: &TableMetadata,
+    access: Option<&oxidant_catalog::TableAccess>,
+) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     md.location.hash(&mut h);
@@ -303,6 +599,11 @@ fn metadata_fingerprint(md: &TableMetadata) -> String {
         None => "inferred".hash(&mut h),
     }
     md.partition_columns.hash(&mut h);
+    if let Some(access) = access {
+        access.enforced.hash(&mut h);
+        access.authorized_columns.hash(&mut h);
+        access.row_filter.hash(&mut h);
+    }
     format!("{:016x}", h.finish())
 }
 
@@ -324,7 +625,7 @@ impl SchemaProvider for OxidantSchemaProvider {
             .lock()
             .expect("tables poisoned")
             .keys()
-            .map(|(name, _)| name.clone())
+            .map(|(name, _, _)| name.clone())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect()
@@ -333,8 +634,50 @@ impl SchemaProvider for OxidantSchemaProvider {
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
         // The shard/replicate decision is baked into a cached provider at resolution time;
         // resolve (or reuse) the variant matching this query's classification (KAN-35).
+        // Checked BEFORE the cache, not on the resolution path: a table this process already
+        // resolved for some earlier, ungoverned query is sitting in the cache unwrapped, and a
+        // miss-only check would hand that cached provider straight to a query the driver marked
+        // governed. This is the distributed fail-open hole — a worker started without the Lake
+        // Formation config cannot detect it on its own, because with no authorizer it has no way
+        // to know the table is governed, so the driver stamps the requirement on the ticket.
+        if lakeformation_required() {
+            match self.catalog.authorizer() {
+                None => {
+                    return Err(DataFusionError::Plan(format!(
+                        "this query reads Lake Formation-governed data, but catalog `{}` in this \
+                         process has no Lake Formation authorizer configured — refusing to read \
+                         `{}.{name}` unfiltered. Pass the same \
+                         `spark.sql.catalog.*.lakeformation*` config to every worker as to the \
+                         driver.",
+                        self.catalog.name(),
+                        self.namespace.join("."),
+                    )));
+                }
+                // Configured, but as somebody else. Driver and workers are given their catalog
+                // config independently, so a worker set to a different `identity` /
+                // `runtime_role_arn` would enforce its OWN policy on its shard — silently
+                // returning more rows and columns than the user is entitled to, with no error
+                // anywhere. Refuse instead of quietly widening the result.
+                Some(authorizer) => {
+                    if let Some(expected) = required_lakeformation_principal() {
+                        if authorizer.principal() != expected {
+                            return Err(DataFusionError::Plan(format!(
+                                "Lake Formation principal mismatch reading `{}.{name}`: the \
+                                 driver resolved this query's policy as `{expected}`, but catalog \
+                                 `{}` in this process enforces as `{}`. Every worker must be \
+                                 configured with the same `lakeformation.identity` and \
+                                 `lakeformation.runtime_role_arn` as the driver.",
+                                self.namespace.join("."),
+                                self.catalog.name(),
+                                authorizer.principal(),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         let replicated = crate::shard::is_replicated_table(name);
-        let key = (name.to_string(), replicated);
+        let key = (name.to_string(), replicated, self.principal());
         // Set to `(fingerprint, provider)` when a non-lakehouse cache entry is past its TTL and
         // must be revalidated against the metastore. The revalidation happens outside the lock —
         // `load_table` is async and must not hold it.
@@ -357,6 +700,7 @@ impl SchemaProvider for OxidantSchemaProvider {
                         Some(requested) if requested != *snapshot => {}
                         Some(_) => {
                             record_lakehouse_snapshot(snapshot_key, snapshot);
+                            cached.note_enforcement(&self.principal());
                             return Ok(Some(cached.provider.clone()));
                         }
                         None if self.require_lakehouse_snapshot_pins.load(Ordering::Relaxed) => {
@@ -367,6 +711,7 @@ impl SchemaProvider for OxidantSchemaProvider {
                         }
                         None => {
                             record_lakehouse_snapshot(snapshot_key, snapshot);
+                            cached.note_enforcement(&self.principal());
                             return Ok(Some(cached.provider.clone()));
                         }
                     }
@@ -377,16 +722,21 @@ impl SchemaProvider for OxidantSchemaProvider {
                     // without an engine restart.
                     let ttl = catalog_cache_ttl();
                     if !ttl.is_zero() && cached.resolved_at.elapsed() < ttl {
+                        cached.note_enforcement(&self.principal());
                         return Ok(Some(cached.provider.clone()));
                     }
                     revalidate = Some((cached.fingerprint.clone(), cached.provider.clone()));
                 }
             }
         }
+        let self_principal = self.principal();
         if let Some((cached_fingerprint, cached_provider)) = revalidate {
             match self.catalog.load_table(&self.namespace, name).await {
                 Ok(metadata) => {
-                    let fingerprint = metadata_fingerprint(&metadata);
+                    // Re-resolve the access decision alongside the metadata: a grant revoked
+                    // out-of-band changes the fingerprint even when the table itself did not.
+                    let revalidated_access = self.resolve_access(name).await?;
+                    let fingerprint = metadata_fingerprint(&metadata, revalidated_access.as_ref());
                     if Some(&fingerprint) == cached_fingerprint.as_ref() {
                         // Unchanged: keep the provider, just restart the TTL window.
                         if let Some(entry) =
@@ -399,25 +749,34 @@ impl SchemaProvider for OxidantSchemaProvider {
                     // The metastore metadata moved (re-typed schema, new location, …): rebuild
                     // the provider and bump the shared catalog version so cached distributed
                     // stage plans (keyed on it) miss and rebuild too.
+                    let state = self.ctx.state();
+                    if let Some(access) = revalidated_access.as_ref() {
+                        self.install_vended_credentials(&state, &metadata, name, access)?;
+                    }
                     let resolved = metadata_to_provider(
-                        &self.ctx.state(),
+                        &state,
                         &metadata,
                         name,
                         self.require_lakehouse_snapshot_pins.load(Ordering::Relaxed),
                     )
                     .await?;
+                    let provider =
+                        self.enforce(&state, name, resolved.provider, revalidated_access.as_ref())?;
                     self.tables.lock().expect("tables poisoned").insert(
                         key,
                         CachedTable {
-                            provider: resolved.provider.clone(),
+                            provider: provider.clone(),
                             snapshot_key: resolved.snapshot_key,
                             snapshot: resolved.snapshot,
                             resolved_at: std::time::Instant::now(),
                             fingerprint: Some(fingerprint),
+                            lakeformation_enforced: revalidated_access
+                                .as_ref()
+                                .is_some_and(|a| a.enforced),
                         },
                     );
                     self.catalog_version.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Some(resolved.provider));
+                    return Ok(Some(provider));
                 }
                 // The table vanished from the metastore: drop the stale entry and take
                 // DataFusion's standard not-found path.
@@ -430,10 +789,13 @@ impl SchemaProvider for OxidantSchemaProvider {
                 // the query: serve the cached provider and try again after the next TTL window
                 // (restart the window here — otherwise every `table()` call under sustained
                 // throttling re-hits the metastore).
+                // A revalidation failure must not clear the enforcement requirement: we are serving
+                // a cached provider built under a policy we could not re-check.
                 Err(_) => {
                     if let Some(entry) = self.tables.lock().expect("tables poisoned").get_mut(&key)
                     {
                         entry.resolved_at = std::time::Instant::now();
+                        entry.note_enforcement(&self_principal);
                     }
                     return Ok(Some(cached_provider));
                 }
@@ -446,25 +808,36 @@ impl SchemaProvider for OxidantSchemaProvider {
             // A storage / connection / unsupported failure is a real error — surface it.
             Err(e) => return Err(oxidant_to_df(e)),
         };
-        let fingerprint = metadata_fingerprint(&metadata);
+        let state = self.ctx.state();
+        // Authorize BEFORE the provider is built: the decision may carry Lake Formation-vended
+        // credentials, which have to be installed for this table's prefix before anything reads a
+        // byte. Caching the enforcing provider (rather than wrapping later) also means no later
+        // reader can obtain the unrestricted one.
+        let access = self.resolve_access(name).await?;
+        if let Some(access) = access.as_ref() {
+            self.install_vended_credentials(&state, &metadata, name, access)?;
+        }
         let resolved = metadata_to_provider(
-            &self.ctx.state(),
+            &state,
             &metadata,
             name,
             self.require_lakehouse_snapshot_pins.load(Ordering::Relaxed),
         )
         .await?;
+        let provider = self.enforce(&state, name, resolved.provider, access.as_ref())?;
+        let fingerprint = metadata_fingerprint(&metadata, access.as_ref());
         self.tables.lock().expect("tables poisoned").insert(
             key,
             CachedTable {
-                provider: resolved.provider.clone(),
+                provider: provider.clone(),
                 snapshot_key: resolved.snapshot_key,
                 snapshot: resolved.snapshot,
                 resolved_at: std::time::Instant::now(),
                 fingerprint: Some(fingerprint),
+                lakeformation_enforced: access.as_ref().is_some_and(|a| a.enforced),
             },
         );
-        Ok(Some(resolved.provider))
+        Ok(Some(provider))
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -472,7 +845,7 @@ impl SchemaProvider for OxidantSchemaProvider {
             .lock()
             .expect("tables poisoned")
             .keys()
-            .any(|(n, _)| n == name)
+            .any(|(n, _, _)| n == name)
     }
 
     fn register_table(
@@ -503,7 +876,11 @@ impl SchemaProvider for OxidantSchemaProvider {
         })??;
 
         self.tables.lock().expect("tables poisoned").insert(
-            (name.clone(), crate::shard::is_replicated_table(&name)),
+            (
+                name.clone(),
+                crate::shard::is_replicated_table(&name),
+                self.principal(),
+            ),
             CachedTable {
                 provider: provider.clone(),
                 snapshot_key: None,
@@ -512,6 +889,8 @@ impl SchemaProvider for OxidantSchemaProvider {
                 // CTAS never went through `load_table`, so there is no metadata fingerprint to
                 // compare — a TTL revalidation conservatively re-resolves this entry.
                 fingerprint: None,
+                // A freshly written table has not been authorized; the next resolution will.
+                lakeformation_enforced: false,
             },
         );
         Ok(Some(provider))
@@ -983,21 +1362,7 @@ fn ensure_remote_store(
         .with_bucket_name(&bucket)
         .with_region(region.clone());
     if let Some(options) = storage_options {
-        for (key, value) in options {
-            let normalized = match key.as_str() {
-                "s3.access-key-id" | "fs.s3a.access.key" => "access_key_id",
-                "s3.secret-access-key" | "fs.s3a.secret.key" => "secret_access_key",
-                "s3.session-token" | "fs.s3a.session.token" => "session_token",
-                "s3.endpoint" | "fs.s3a.endpoint" => "endpoint",
-                "s3.region" | "fs.s3a.endpoint.region" => "region",
-                "s3.allow-http" => "allow_http",
-                "s3.virtual-hosted-style-request" => "virtual_hosted_style_request",
-                other => other.strip_prefix("s3.").unwrap_or(other),
-            };
-            if let Ok(config_key) = normalized.parse::<object_store::aws::AmazonS3ConfigKey>() {
-                builder = builder.with_config(config_key, value);
-            }
-        }
+        builder = apply_s3_storage_options(builder, options);
     }
     if let Some(role_arn) = &requested_role {
         let session_name = storage_options
@@ -4324,6 +4689,583 @@ mod tests {
 
         std::env::remove_var("OXIDANT_PARQUET_COLUMN_STATS");
         std::env::remove_var("OXIDANT_PARQUET_SCAN_STATS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------
+    // Fine-grained access control end to end: a catalog carrying a
+    // `TableAuthorizer` must have its decision applied to real SQL, through
+    // the bridge, against a real Parquet table.
+    //
+    // The fixture lives in its own namespace (`oxidant_lf_secure`) so no other
+    // test in this file resolves through the authorizer path.
+    // ---------------------------------------------------------------------
+
+    /// Fixture table `(id, region, amount, ssn)`. `ssn` is the column-security subject; `region`
+    /// the row-filter subject. 4 rows, 2 of them `region = 'us'`.
+    fn write_lf_fixture() -> std::path::PathBuf {
+        use datafusion::arrow::array::StringArray;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "oxidant-lf-{}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("ssn", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["us", "eu", "us", "eu"])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+                Arc::new(StringArray::from(vec!["aaa", "bbb", "ccc", "ddd"])),
+            ],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.join("part-0.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        dir
+    }
+
+    /// A catalog serving the fixture under `oxidant_lf_secure.lf_protected_customers`, with an
+    /// authorizer whose decision the test controls.
+    struct SecuredCatalog {
+        location: String,
+        authorizer: Arc<dyn oxidant_catalog::TableAuthorizer>,
+    }
+
+    #[async_trait]
+    impl OxidantCatalog for SecuredCatalog {
+        fn name(&self) -> &str {
+            "lf"
+        }
+        fn authorizer(&self) -> Option<Arc<dyn oxidant_catalog::TableAuthorizer>> {
+            Some(self.authorizer.clone())
+        }
+        async fn list_namespaces(&self, _parent: &[String]) -> CatResult<Vec<Vec<String>>> {
+            Ok(vec![vec!["oxidant_lf_secure".to_string()]])
+        }
+        async fn list_tables(&self, _ns: &[String]) -> CatResult<Vec<String>> {
+            Ok(vec!["lf_protected_customers".to_string()])
+        }
+        async fn load_table(&self, ns: &[String], table: &str) -> CatResult<TableMetadata> {
+            if ns == ["oxidant_lf_secure"] && table == "lf_protected_customers" {
+                Ok(TableMetadata::new(
+                    "lf.oxidant_lf_secure.lf_protected_customers",
+                    self.location.clone(),
+                    TableFormat::Parquet,
+                ))
+            } else {
+                Err(Error::Plan(format!(
+                    "no such table: {}.{table}",
+                    ns.join(".")
+                )))
+            }
+        }
+    }
+
+    /// An authorizer returning a fixed decision, or a fixed failure.
+    struct StaticAuthorizer {
+        access: Option<oxidant_catalog::TableAccess>,
+        principal: String,
+    }
+
+    #[async_trait]
+    impl oxidant_catalog::TableAuthorizer for StaticAuthorizer {
+        async fn authorize_scan(
+            &self,
+            _namespace: &[String],
+            table: &str,
+        ) -> CatResult<oxidant_catalog::TableAccess> {
+            self.access.clone().ok_or_else(|| {
+                Error::Io(format!(
+                    "lake formation unreachable while authorizing {table}"
+                ))
+            })
+        }
+        fn principal(&self) -> &str {
+            &self.principal
+        }
+    }
+
+    fn secured_engine(
+        access: Option<oxidant_catalog::TableAccess>,
+    ) -> (crate::Engine, std::path::PathBuf) {
+        let dir = write_lf_fixture();
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "lf",
+            Arc::new(SecuredCatalog {
+                location: format!("file://{}", dir.to_string_lossy()),
+                authorizer: Arc::new(StaticAuthorizer {
+                    access,
+                    principal: "arn:aws:iam::123456789012:role/analyst".to_string(),
+                }),
+            }),
+        );
+        (engine, dir)
+    }
+
+    fn granted(columns: Option<&[&str]>, row_filter: Option<&str>) -> oxidant_catalog::TableAccess {
+        oxidant_catalog::TableAccess {
+            authorized_columns: columns.map(|c| c.iter().map(|s| s.to_string()).collect()),
+            row_filter: row_filter.map(|s| s.to_string()),
+            credentials: None,
+            enforced: true,
+        }
+    }
+
+    const LF_TABLE: &str = "lf.oxidant_lf_secure.lf_protected_customers";
+
+    #[tokio::test]
+    async fn secured_table_hides_denied_column_and_filters_rows_through_real_sql() {
+        let (engine, dir) = secured_engine(Some(granted(
+            Some(&["id", "region", "amount"]),
+            Some("region = 'us'"),
+        )));
+
+        let batches = engine
+            .sql(&format!("SELECT * FROM {LF_TABLE} ORDER BY id"))
+            .await
+            .expect("select star");
+        let schema = batches[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "region", "amount"], "ssn must be absent");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "only region='us' of the 4 fixture rows");
+
+        // The denied column is not merely unselectable — it is not in the schema.
+        let err = engine
+            .sql(&format!("SELECT ssn FROM {LF_TABLE}"))
+            .await
+            .expect_err("ssn is denied");
+        assert!(format!("{err}").contains("ssn"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn secured_table_count_reflects_the_row_filter() {
+        let (engine, dir) = secured_engine(Some(granted(None, Some("region = 'us'"))));
+        let batches = engine
+            .sql(&format!("SELECT COUNT(*) AS c FROM {LF_TABLE}"))
+            .await
+            .expect("count");
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64")
+            .value(0);
+        assert_eq!(c, 2, "the raw Parquet table has 4 rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreachable authorizer must fail the query. Falling back to an unfiltered scan would
+    /// silently disable the control at exactly the moment it cannot be verified.
+    #[tokio::test]
+    async fn authorizer_failure_fails_the_query_instead_of_scanning_unfiltered() {
+        let (engine, dir) = secured_engine(None);
+        let err = engine
+            .sql(&format!("SELECT * FROM {LF_TABLE}"))
+            .await
+            .expect_err("authorizer failure must not fall open");
+        assert!(format!("{err}").contains("lake formation"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A table Lake Formation does not govern reads exactly as it would with no authorizer — this
+    /// is what lets enforcement be switched on for a catalog without changing behavior for the
+    /// tables that are not registered with it.
+    #[tokio::test]
+    async fn ungoverned_table_reads_unrestricted() {
+        let (engine, dir) = secured_engine(Some(oxidant_catalog::TableAccess::unenforced()));
+        let batches = engine
+            .sql(&format!("SELECT * FROM {LF_TABLE}"))
+            .await
+            .expect("unenforced");
+        let schema = batches[0].schema();
+        assert_eq!(schema.fields().len(), 4, "all columns including ssn");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 4, "all rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `DESCRIBE` must not name a column the principal cannot read — EMR's rule that DDL/EXPLAIN
+    /// paths do not expose restricted information.
+    #[tokio::test]
+    async fn describe_does_not_expose_a_denied_column() {
+        let (engine, dir) = secured_engine(Some(granted(Some(&["id", "region", "amount"]), None)));
+        let batches = engine
+            .sql(&format!("DESCRIBE {LF_TABLE}"))
+            .await
+            .expect("describe");
+        let rendered = format!("{batches:?}");
+        assert!(!rendered.contains("ssn"), "DESCRIBE leaked a denied column");
+        assert!(rendered.contains("amount"), "{rendered}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same for `EXPLAIN`: the plan text must not name a denied column.
+    #[tokio::test]
+    async fn explain_does_not_expose_a_denied_column() {
+        let (engine, dir) = secured_engine(Some(granted(Some(&["id", "region", "amount"]), None)));
+        let batches = engine
+            .sql(&format!("EXPLAIN SELECT * FROM {LF_TABLE}"))
+            .await
+            .expect("explain");
+        let rendered = format!("{batches:?}");
+        assert!(!rendered.contains("ssn"), "EXPLAIN leaked a denied column");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two principals must never share a cached provider — the cache key carries the principal
+    /// precisely so one user's authorized column set is not served to another.
+    #[tokio::test]
+    async fn different_principals_do_not_share_a_cached_provider() {
+        let dir = write_lf_fixture();
+        let location = format!("file://{}", dir.to_string_lossy());
+
+        let narrow = crate::Engine::new();
+        narrow.register_catalog(
+            "lf",
+            Arc::new(SecuredCatalog {
+                location: location.clone(),
+                authorizer: Arc::new(StaticAuthorizer {
+                    access: Some(granted(Some(&["id"]), None)),
+                    principal: "arn:aws:iam::123456789012:role/narrow".to_string(),
+                }),
+            }),
+        );
+        let wide = crate::Engine::new();
+        wide.register_catalog(
+            "lf",
+            Arc::new(SecuredCatalog {
+                location,
+                authorizer: Arc::new(StaticAuthorizer {
+                    access: Some(granted(Some(&["id", "region", "amount", "ssn"]), None)),
+                    principal: "arn:aws:iam::123456789012:role/wide".to_string(),
+                }),
+            }),
+        );
+
+        let n = narrow
+            .sql(&format!("SELECT * FROM {LF_TABLE}"))
+            .await
+            .expect("narrow");
+        assert_eq!(n[0].schema().fields().len(), 1);
+        let w = wide
+            .sql(&format!("SELECT * FROM {LF_TABLE}"))
+            .await
+            .expect("wide");
+        assert_eq!(w[0].schema().fields().len(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The distributed fail-open hole, closed: a worker whose catalog has no Lake Formation
+    /// authorizer must refuse a governed table rather than read its shard unfiltered and hand the
+    /// rows back to the driver. The worker cannot detect this itself — with no authorizer it has
+    /// no way to know the table is governed — so the driver stamps the requirement on the ticket.
+    #[tokio::test]
+    async fn worker_without_an_authorizer_refuses_a_query_the_driver_marked_governed() {
+        let dir = write_lf_fixture();
+        // A catalog with NO authorizer: exactly what a worker started without the Lake Formation
+        // config looks like.
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "lf",
+            Arc::new(FakeCatalog {
+                location: format!("file://{}", dir.to_string_lossy()),
+            }),
+        );
+
+        // Without the driver's requirement this reads happily — today's behavior for an
+        // ungoverned catalog, which must not change.
+        let ok = engine.sql("SELECT * FROM lf.ns.orders").await;
+        assert!(ok.is_ok(), "ungoverned read must still work: {ok:?}");
+
+        // Under the requirement, the same read is refused.
+        let err = with_lakeformation_required(
+            true,
+            String::new(),
+            engine.sql("SELECT * FROM lf.ns.orders"),
+        )
+        .await
+        .expect_err("a worker that cannot enforce must refuse, not read unfiltered");
+        let msg = format!("{err}");
+        assert!(msg.contains("no Lake Formation authorizer"), "{msg}");
+        assert!(msg.contains("every worker"), "{msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The driver-side half: resolving a governed table must be *observed*, so the flag it stamps
+    /// on the stage tickets is set. Without this the guard above would never engage.
+    #[tokio::test]
+    async fn resolving_a_governed_table_is_observed_for_the_stage_ticket() {
+        let (engine, dir) = secured_engine(Some(granted(Some(&["id", "region"]), None)));
+        let (_, required, _) = capture_lakeformation_enforcement(async {
+            engine
+                .sql(&format!("SELECT id FROM {LF_TABLE}"))
+                .await
+                .map(|_| ())
+        })
+        .await
+        .expect("query");
+        assert!(
+            required,
+            "a governed table must mark the query as requiring enforcement"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The routing store is unit-tested on its own; this covers the *wiring* — that resolving a
+    /// governed S3 table actually installs its vended credentials against that table's prefix, and
+    /// that the bucket's registered store is the router rather than the plain one. Without this,
+    /// every read would silently fall through to the engine's ambient identity.
+    #[tokio::test]
+    async fn vended_credentials_are_installed_against_the_tables_prefix() {
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        let access = oxidant_catalog::TableAccess {
+            authorized_columns: Some(vec!["id".to_string()]),
+            row_filter: None,
+            credentials: Some(oxidant_catalog::VendedCredentials {
+                access_key_id: "ASIAEXAMPLE".to_string(),
+                secret_access_key: "secret".to_string(),
+                session_token: Some("token".to_string()),
+                expires_at: Some(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                ),
+            }),
+            enforced: true,
+        };
+
+        let engine = crate::Engine::new();
+        let provider = OxidantSchemaProvider::new(
+            Arc::new(SecuredCatalog {
+                location: "s3://lf-test-bucket/secure/customers/".to_string(),
+                authorizer: Arc::new(StaticAuthorizer {
+                    access: Some(access.clone()),
+                    principal: "arn:aws:iam::123456789012:role/analyst".to_string(),
+                }),
+            }),
+            vec!["oxidant_lf_secure".to_string()],
+            Arc::new(engine.ctx().clone()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        let md = TableMetadata::new(
+            "lf.oxidant_lf_secure.lf_protected_customers",
+            "s3://lf-test-bucket/secure/customers/",
+            TableFormat::Parquet,
+        );
+        let state = engine.ctx().state();
+        provider
+            .install_vended_credentials(&state, &md, "lf_protected_customers", &access)
+            .expect("install vended credentials");
+
+        // The bucket's registered store must now be the router, carrying exactly this table's
+        // prefix. `Display` reports the governed-prefix count.
+        let url = ListingTableUrl::parse("s3://lf-test-bucket/secure/customers/").expect("url");
+        let registered = state
+            .runtime_env()
+            .object_store(url.object_store())
+            .expect("store registered for the bucket");
+        let rendered = format!("{registered}");
+        assert!(
+            rendered.contains("LakeFormationRoutingObjectStore"),
+            "the bucket must resolve to the router, not the plain store: {rendered}"
+        );
+        assert!(
+            rendered.contains("1 governed prefixes"),
+            "the table's prefix must be routed: {rendered}"
+        );
+    }
+
+    /// Vending is opt-in: a decision without credentials must leave the bucket on its ambient
+    /// store, so enabling Lake Formation does not disturb how ungoverned data is read.
+    #[tokio::test]
+    async fn no_credentials_means_no_routing_store_is_installed() {
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        let access = oxidant_catalog::TableAccess {
+            authorized_columns: Some(vec!["id".to_string()]),
+            row_filter: None,
+            credentials: None,
+            enforced: true,
+        };
+        let engine = crate::Engine::new();
+        let provider = OxidantSchemaProvider::new(
+            Arc::new(SecuredCatalog {
+                location: "s3://lf-plain-bucket/secure/customers/".to_string(),
+                authorizer: Arc::new(StaticAuthorizer {
+                    access: Some(access.clone()),
+                    principal: "arn:aws:iam::123456789012:role/analyst".to_string(),
+                }),
+            }),
+            vec!["oxidant_lf_secure".to_string()],
+            Arc::new(engine.ctx().clone()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let md = TableMetadata::new(
+            "t",
+            "s3://lf-plain-bucket/secure/customers/",
+            TableFormat::Parquet,
+        );
+        let state = engine.ctx().state();
+        provider
+            .install_vended_credentials(&state, &md, "t", &access)
+            .expect("no-op without credentials");
+
+        let url = ListingTableUrl::parse("s3://lf-plain-bucket/secure/customers/").expect("url");
+        if let Ok(registered) = state.runtime_env().object_store(url.object_store()) {
+            assert!(
+                !format!("{registered}").contains("LakeFormationRoutingObjectStore"),
+                "no credentials must mean no router"
+            );
+        }
+    }
+
+    /// The fail-open this guards: a cache *hit* returns without re-authorizing, so unless the
+    /// cached entry re-records that the table is governed, the SECOND query on it — anything
+    /// inside the catalog TTL, i.e. the common case — would ship stage tickets saying "not
+    /// governed" and every worker would stop enforcing.
+    #[tokio::test]
+    async fn a_cached_governed_table_still_demands_worker_enforcement() {
+        let (engine, dir) = secured_engine(Some(granted(Some(&["id", "region"]), None)));
+
+        // First query resolves and caches.
+        let (_, first, _) = capture_lakeformation_enforcement(async {
+            engine
+                .sql(&format!("SELECT id FROM {LF_TABLE}"))
+                .await
+                .map(|_| ())
+        })
+        .await
+        .expect("first query");
+        assert!(first);
+
+        // Second query is served from the cache — and must still demand enforcement.
+        let (_, second, _) = capture_lakeformation_enforcement(async {
+            engine
+                .sql(&format!("SELECT id FROM {LF_TABLE}"))
+                .await
+                .map(|_| ())
+        })
+        .await
+        .expect("second query");
+        assert!(
+            second,
+            "a cache hit must not silently downgrade the query to `not governed`"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// …and an ungoverned table must NOT set it, or every query in a mixed catalog would start
+    /// demanding enforcement from workers that legitimately have none.
+    #[tokio::test]
+    async fn resolving_an_ungoverned_table_does_not_demand_enforcement() {
+        let (engine, dir) = secured_engine(Some(oxidant_catalog::TableAccess::unenforced()));
+        let (_, required, _) = capture_lakeformation_enforcement(async {
+            engine
+                .sql(&format!("SELECT * FROM {LF_TABLE}"))
+                .await
+                .map(|_| ())
+        })
+        .await
+        .expect("query");
+        assert!(
+            !required,
+            "an ungoverned table must not demand worker enforcement"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A decision is part of the cache fingerprint, so revoking a grant takes effect on the next
+    /// TTL revalidation rather than surviving until the process restarts.
+    #[tokio::test]
+    async fn revoked_grant_is_picked_up_within_the_catalog_ttl() {
+        struct MutableAuthorizer {
+            access: std::sync::Mutex<oxidant_catalog::TableAccess>,
+        }
+        #[async_trait]
+        impl oxidant_catalog::TableAuthorizer for MutableAuthorizer {
+            async fn authorize_scan(
+                &self,
+                _ns: &[String],
+                _table: &str,
+            ) -> CatResult<oxidant_catalog::TableAccess> {
+                Ok(self.access.lock().expect("access poisoned").clone())
+            }
+            fn principal(&self) -> &str {
+                "arn:aws:iam::123456789012:role/analyst"
+            }
+        }
+
+        let dir = write_lf_fixture();
+        let authorizer = Arc::new(MutableAuthorizer {
+            access: std::sync::Mutex::new(granted(Some(&["id", "region", "amount", "ssn"]), None)),
+        });
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "lf",
+            Arc::new(SecuredCatalog {
+                location: format!("file://{}", dir.to_string_lossy()),
+                authorizer: authorizer.clone(),
+            }),
+        );
+
+        // TTL 0 revalidates on every resolution, which is the behavior under test without a sleep.
+        // `OXIDANT_CATALOG_CACHE_TTL_MS` is process-global, so take the same lock the other TTL
+        // tests use — otherwise this test's window leaks into theirs and they miscount reloads.
+        let _guard = TTL_ENV_LOCK.lock().await;
+        std::env::set_var("OXIDANT_CATALOG_CACHE_TTL_MS", "0");
+
+        let before = engine
+            .sql(&format!("SELECT * FROM {LF_TABLE}"))
+            .await
+            .expect("before revoke");
+        assert_eq!(before[0].schema().fields().len(), 4);
+
+        // Revoke `ssn` out of band, as a Lake Formation admin would.
+        *authorizer.access.lock().expect("access poisoned") =
+            granted(Some(&["id", "region", "amount"]), None);
+
+        let after = engine
+            .sql(&format!("SELECT * FROM {LF_TABLE}"))
+            .await
+            .expect("after revoke");
+        let names: Vec<String> = after[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["id", "region", "amount"],
+            "the revoked column must stop being served"
+        );
+
+        std::env::remove_var("OXIDANT_CATALOG_CACHE_TTL_MS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

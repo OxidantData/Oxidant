@@ -250,6 +250,8 @@ fn shift_stages(stages: &[StageDef], offset: u32) -> (Vec<StageDef>, u32) {
             plan_fragment: s.plan_fragment.clone(),
             lakehouse_snapshot_pins: s.lakehouse_snapshot_pins.clone(),
             replicated_tables: String::new(),
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         });
         last = new_id;
     }

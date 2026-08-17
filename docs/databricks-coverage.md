@@ -251,15 +251,21 @@ Spark's rather than DataFusion's.
 
 Databricks expresses privileges through Unity Catalog. The in-scope analogue for Oxidant is AWS
 Lake Formation, which the epic tackles as a plan-rewrite/authorization layer (KAN-102..KAN-104)
-rather than as SQL `GRANT` statements. There is no Lake Formation code in the tree today:
-`rg -c lakeformation` across `*.rs`/`*.toml` returns no matches.
+rather than as SQL `GRANT` statements.
+
+> **Updated.** This section previously read "There is no Lake Formation code in the tree today".
+> That is no longer true. `crates/oxidant-catalog-lakeformation` resolves Lake Formation
+> authorization, and column/row enforcement is applied to scans via
+> `oxidant-loom/src/lakeformation_provider.rs` — see
+> [`catalogs-lakeformation.md`](catalogs-lakeformation.md). The SQL `GRANT`/`REVOKE`/`DENY`
+> statements below are still unimplemented; enforcement is configured, not expressed in SQL.
 
 | Manual section | Status | Evidence | Ticket |
 |---|---|---|---|
 | `GRANT` | Missing | ``GRANT SELECT ON TABLE cov_t TO `u@example.com` `` → `Unsupported SQL statement: GRANT SELECT ON cov_t TO …` | KAN-102 |
 | `REVOKE` | Missing | ``REVOKE SELECT ON TABLE cov_t FROM `u@example.com` `` → `Unsupported SQL statement: REVOKE SELECT ON cov_t FROM …` | KAN-102 |
 | `DENY` | Missing | ``DENY SELECT ON TABLE cov_t TO `u@example.com` `` → `Unsupported SQL statement: DENY SELECT ON cov_t TO …` | KAN-102 |
-| Row filters / column masks | Missing | No probe possible — nothing to grant against. No `aws-sdk-lakeformation` dependency and no filter/mask plan rewrite exists in `crates/oxidant-loom`. | KAN-103 |
+| Row filters / column masks | **Supported** (not via SQL) | Enforced from Lake Formation, not granted in SQL: `glue:GetUnfilteredTableMetadata` resolves the caller's authorized columns + row filter and `LakeFormationTableProvider` applies them to every scan. Denied columns are absent from the schema; row filters are `AND`-ed into the scan. Opt in with `spark.sql.catalog.<n>.lakeformation=true`. | KAN-103 |
 | Cross-account shared catalogs (resource links) | Missing | Same: no Lake Formation client in the tree. | KAN-104 |
 | `CREATE GROUP` / `ALTER GROUP` / `DROP GROUP` | N/A | `CREATE GROUP cov_grp` → `ParserError("Expected: an object type after CREATE, found: GROUP")`. Workspace identity management. | — |
 | `SHOW GRANTS ON SHARE` / `TO RECIPIENT`, `GRANT SHARE` | N/A | Delta Sharing control plane. | — |
@@ -437,9 +443,11 @@ Listed rather than guessed:
   `spark_catalog` on local Parquet. Rows that a Glue catalog might answer differently
   (`SHOW PARTITIONS`, `ANALYZE TABLE`, `ALTER TABLE`) were not re-run against Glue — that needs
   AWS credentials this environment does not have.
-- **Lake Formation rows.** Unprobeable without an AWS account; scored Missing from the absence of
-  any `aws-sdk-lakeformation` dependency or filter/mask plan rewrite in the tree, which is a code
-  path, not a probe.
+- **Lake Formation rows.** Originally scored Missing from the absence of any `aws-sdk-lakeformation`
+  dependency or filter/mask plan rewrite in the tree — a code path, not a probe. Both now exist and
+  are covered by tests against a stub Lake Formation/Glue endpoint plus end-to-end SQL over a real
+  Parquet table, so the row-filter/column-mask row above is scored from tests rather than from a
+  live AWS probe.
 - **`PUT INTO`.** Not probed; marked N/A from the manual's description as a Unity Catalog volume
   operation.
 - **Value-level Databricks equivalence.** A probe "passing" means the statement executed and

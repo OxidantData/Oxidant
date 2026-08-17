@@ -971,19 +971,29 @@ impl Worker {
         t: StageTicket,
         progress: &StageProgress,
     ) -> std::result::Result<Vec<RecordBatch>, Status> {
-        // In-process workers (tests / local harnesses) carry an explicit shard assignment:
-        // scope it around the whole stage so every file-listing resolution — producer and
-        // output paths, including their collect fallbacks — sees this worker's shard.
-        match self.shard_assignment {
-            Some(assignment) => {
-                oxidant_loom::shard::with_shard_assignment(
-                    assignment,
-                    self.run_stage_inner(t, progress),
-                )
-                .await
+        // Scope the driver's Lake Formation requirement around the WHOLE stage, for the same
+        // reason the shard assignment is scoped here: every table resolution on every path —
+        // producer, output, and their collect fallbacks — must see it. A worker whose catalog has
+        // no authorizer then refuses a governed table instead of reading its shard unfiltered,
+        // which is the only defence against a worker that was started without the Lake Formation
+        // config (it cannot detect that on its own — with no authorizer it has no way to know the
+        // table is governed).
+        let required = t.lakeformation_required;
+        let principal = t.lakeformation_principal.clone();
+        let assignment = self.shard_assignment;
+        oxidant_loom::catalog_bridge::with_lakeformation_required(required, principal, async move {
+            match assignment {
+                Some(assignment) => {
+                    oxidant_loom::shard::with_shard_assignment(
+                        assignment,
+                        self.run_stage_inner(t, progress),
+                    )
+                    .await
+                }
+                None => self.run_stage_inner(t, progress).await,
             }
-            None => self.run_stage_inner(t, progress).await,
-        }
+        })
+        .await
     }
 
     async fn run_stage_inner(
@@ -1645,11 +1655,28 @@ impl FlightService for Worker {
         let ticket = protocol::decode_ticket(&bytes)
             .map_err(|e| Status::invalid_argument(format!("decode ticket: {e}")))?;
         let batches = match ticket {
-            protocol::Ticket::Sql(sql) => self
-                .engine
-                .sql(&sql)
+            // A raw-SQL ticket is the decode *fallback* for bytes that are not a `StageTicket`;
+            // nothing in the tree sends one. It carries no driver context, so there is no
+            // requirement to inherit — scope it with this process's own Lake Formation principal
+            // when one is configured, which makes any catalog here that CANNOT enforce refuse
+            // rather than serve governed data through this path.
+            //
+            // It cannot close the case of a worker with no Lake Formation config at all: with no
+            // authorizer there is nothing to detect governance with, and no driver stamped a
+            // requirement. That is a property of the Flight plane, which is unauthenticated and
+            // trusted — anyone who can reach this port can already read whatever the worker's own
+            // credentials can reach. See docs/catalogs-lakeformation.md.
+            protocol::Ticket::Sql(sql) => {
+                let principal = self.engine.lakeformation_principal();
+                let engine = self.engine.clone();
+                oxidant_loom::catalog_bridge::with_lakeformation_required(
+                    principal.is_some(),
+                    principal.unwrap_or_default(),
+                    async move { engine.sql(&sql).await },
+                )
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?,
+                .map_err(|e| Status::internal(e.to_string()))?
+            }
             protocol::Ticket::Stage(t) => {
                 let _slot = self.acquire_task_slot().await?;
                 crate::fault_inject::maybe_fault_exit(&t);
@@ -2628,6 +2655,8 @@ mod tests {
             coalesce_read_modulus: 0,
             forward_upstream_stage_ids: vec![],
             upstream_bucket_rows: vec![],
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         };
         let mut out = None;
         for _ in 0..50 {
@@ -2673,6 +2702,8 @@ mod tests {
             coalesce_read_modulus: 0,
             forward_upstream_stage_ids: vec![],
             upstream_bucket_rows: vec![],
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         };
         for _ in 0..50 {
             if run_stage_on_worker(endpoint.clone(), ticket.clone())
@@ -2718,6 +2749,8 @@ mod tests {
             coalesce_read_modulus: 0,
             forward_upstream_stage_ids: vec![],
             upstream_bucket_rows: vec![],
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         };
         worker
             .run_stage(ticket(910), &StageProgress::default())
@@ -2774,6 +2807,8 @@ mod tests {
             coalesce_read_modulus: 0,
             forward_upstream_stage_ids: vec![],
             upstream_bucket_rows: vec![],
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         };
         for _ in 0..50 {
             if run_stage_on_worker(endpoint.clone(), ticket.clone())
@@ -2820,6 +2855,8 @@ mod tests {
             coalesce_read_modulus: 0,
             forward_upstream_stage_ids: vec![],
             upstream_bucket_rows: vec![],
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         };
         let mut out = None;
         for _ in 0..50 {
@@ -2890,6 +2927,8 @@ mod tests {
             coalesce_read_modulus: 0,
             forward_upstream_stage_ids: vec![],
             upstream_bucket_rows: vec![],
+            lakeformation_required: false,
+            lakeformation_principal: String::new(),
         };
         for (i, ep) in endpoints.iter().enumerate() {
             for _ in 0..50 {
@@ -2922,6 +2961,8 @@ mod tests {
                 coalesce_read_modulus: 2,
                 forward_upstream_stage_ids: vec![],
                 upstream_bucket_rows: vec![],
+                lakeformation_required: false,
+                lakeformation_principal: String::new(),
             };
             // Retry transport/connect races the same way the producer boot loop does —
             // under a full workspace suite the peer can flap once between produce and consume.

@@ -28,6 +28,8 @@ fn stalled_stage_ticket(stage_id: u32) -> StageTicket {
         coalesce_read_modulus: 0,
         forward_upstream_stage_ids: vec![],
         upstream_bucket_rows: vec![],
+        lakeformation_required: false,
+        lakeformation_principal: String::new(),
     }
 }
 

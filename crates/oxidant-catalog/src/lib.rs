@@ -136,6 +136,100 @@ impl TableMetadata {
     }
 }
 
+/// Short-lived storage credentials an authorizer vended for one table.
+///
+/// AWS Lake Formation's `GetTemporaryGlueTableCredentials` is the motivating case: the engine
+/// reads the table's files with these scoped credentials rather than with its own (much broader)
+/// ambient identity, so a table the principal was not granted is unreadable even if the engine's
+/// own role could reach the bytes. Kept AWS-shaped but AWS-type-free so this crate stays
+/// provider-agnostic.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VendedCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+    /// Absolute expiry. The credential provider re-vends before this passes; a long query must not
+    /// die halfway through on an expired token.
+    pub expires_at: Option<std::time::SystemTime>,
+}
+
+// Manual `Debug`: the derived one would print the secret and session token into any log line or
+// panic message that formats a `TableAccess`.
+impl std::fmt::Debug for VendedCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VendedCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// One principal's effective access to one table, as an external authorizer computed it.
+///
+/// This is a *decision*, not a set of grants: the authorizer has already merged whatever hierarchy,
+/// tags, and cell filters its backend supports. Callers apply it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableAccess {
+    /// Columns the principal may read. `None` means every column.
+    ///
+    /// A column absent from this list is absent from the table's schema — `SELECT *` narrows and
+    /// naming the column directly is an unknown-column error. That is what Athena and EMR do, and
+    /// it means an existing `SELECT *` keeps working instead of failing outright.
+    pub authorized_columns: Option<Vec<String>>,
+    /// A boolean SQL expression over the table's columns, `AND`-ed into every scan. `None` means
+    /// all rows. May reference columns absent from `authorized_columns` — the engine reads them to
+    /// evaluate the predicate and projects them away before anything else sees them.
+    pub row_filter: Option<String>,
+    /// Credentials to read this table's files with. `None` = use the engine's ambient credentials.
+    pub credentials: Option<VendedCredentials>,
+    /// Whether the backend actually governs this table.
+    ///
+    /// `false` means "not registered with the authorizer" — the table is read exactly as it would
+    /// be with no authorizer configured. Lake Formation works this way (permissions apply only to
+    /// registered locations), and it is what lets an operator switch enforcement on for a catalog
+    /// without changing behavior for the tables that are not governed.
+    pub enforced: bool,
+}
+
+impl TableAccess {
+    /// Unrestricted, ungoverned access — the decision for a table the authorizer does not manage.
+    pub fn unenforced() -> Self {
+        Self {
+            authorized_columns: None,
+            row_filter: None,
+            credentials: None,
+            enforced: false,
+        }
+    }
+
+    /// Whether this decision changes what a scan returns. An enforced table with all columns
+    /// authorized and no row filter still needs no decorator.
+    pub fn restricts_scan(&self) -> bool {
+        self.authorized_columns.is_some() || self.row_filter.is_some()
+    }
+}
+
+/// Resolves what one principal may read from one table.
+///
+/// Implementations talk to an external policy service (AWS Lake Formation today) and are expected
+/// to **fail closed**: an unreachable backend, an unparseable policy, or a restriction the engine
+/// cannot express must return `Err`, never a permissive [`TableAccess`]. Returning wide-open access
+/// on error would silently disable the security control it exists to enforce.
+#[async_trait]
+pub trait TableAuthorizer: Send + Sync {
+    /// The effective access decision for the configured principal on `namespace.table`.
+    async fn authorize_scan(&self, namespace: &[String], table: &str) -> Result<TableAccess>;
+
+    /// The principal decisions are resolved for. Used in error messages and as part of the
+    /// engine's per-table cache key, so two principals never share a cached table provider.
+    fn principal(&self) -> &str;
+}
+
 /// A pluggable catalog. **Implement this to bring your own metastore.**
 ///
 /// Namespaces are multi-part (`["sales"]`, or `["a", "b"]` for nested namespaces) so the trait
@@ -145,6 +239,17 @@ impl TableMetadata {
 pub trait CatalogProvider: Send + Sync {
     /// The catalog's registered name (the `<name>` in `spark.sql.catalog.<name>`).
     fn name(&self) -> &str;
+
+    /// The fine-grained access-control authorizer for this catalog's tables, when one is
+    /// configured. `None` (the default) means no authorization layer: tables resolve with every
+    /// column and every row visible, exactly as before this hook existed.
+    ///
+    /// Defaulted so existing and third-party providers keep compiling. A provider that returns
+    /// `Some` has every table it resolves run through [`TableAuthorizer::authorize_scan`] before
+    /// the engine will scan it.
+    fn authorizer(&self) -> Option<Arc<dyn TableAuthorizer>> {
+        None
+    }
 
     /// List the child namespaces under `parent` (empty `parent` = top level).
     async fn list_namespaces(&self, parent: &[String]) -> Result<Vec<Vec<String>>>;

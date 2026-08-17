@@ -30,6 +30,8 @@ fn consumer_ticket(partition_id: u32, endpoints: Vec<String>, forward: Vec<u32>)
         coalesce_read_modulus: 0,
         forward_upstream_stage_ids: forward,
         upstream_bucket_rows: vec![],
+        lakeformation_required: false,
+        lakeformation_principal: String::new(),
     }
 }
 
@@ -81,6 +83,8 @@ async fn forward_upstream_pulls_only_from_producer_endpoint() {
         coalesce_read_modulus: 0,
         forward_upstream_stage_ids: vec![],
         upstream_bucket_rows: vec![],
+        lakeformation_required: false,
+        lakeformation_principal: String::new(),
     };
     run_stage_on_worker(live.clone(), producer)
         .await
