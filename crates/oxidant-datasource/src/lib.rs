@@ -5,6 +5,7 @@
 //! resolver does not couple the engine to another DataFusion version.
 
 pub mod delta_write;
+pub mod uniform;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

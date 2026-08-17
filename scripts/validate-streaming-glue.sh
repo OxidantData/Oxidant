@@ -113,4 +113,14 @@ location="$(aws glue get-table --region "$AWS_REGION" \
 log "Confirming the Delta transaction log exists at ${location}"
 aws s3 ls "${location%/}/_delta_log/" --region "$AWS_REGION"
 
-log "PASS — streamed rows are queryable as glue.${GLUE_DATABASE}.${TABLE}"
+log "Confirming the Iceberg metadata published over the same files"
+aws s3 ls "${location%/}/metadata/" --region "$AWS_REGION"
+
+log "Confirming the sibling Iceberg table is registered in Glue"
+aws glue get-table --region "$AWS_REGION" \
+  --database-name "$GLUE_DATABASE" --name "${TABLE}_iceberg" \
+  --query 'Table.{TableType:Parameters.table_type,MetadataLocation:Parameters.metadata_location}' \
+  --output json
+
+log "PASS — streamed rows are queryable as glue.${GLUE_DATABASE}.${TABLE} (Delta)"
+log "       and as glue.${GLUE_DATABASE}.${TABLE}_iceberg (Iceberg, same data files)"

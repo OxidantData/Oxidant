@@ -19,6 +19,16 @@ pub struct StreamQueryConfig {
     pub output_mode: String,
     /// Optional dedup key columns (comma-separated `dedupColumns` option).
     pub dedup_columns: Vec<String>,
+    /// `writeStream.partitionBy(...)` — Hive-style partition columns for the sink table.
+    pub partition_columns: Vec<String>,
+    /// Publish Iceberg metadata over the Delta table so Iceberg engines can read it. On by
+    /// default: a live table is worth more when every engine in the building can query it, and
+    /// the metadata costs one small Avro pair per publish, not a second copy of the data.
+    pub publish_iceberg: bool,
+    /// Suffix for the sibling Iceberg catalog entry (`orders` → `orders_iceberg`).
+    pub iceberg_table_suffix: String,
+    /// Commits between Delta checkpoints and Iceberg publishes.
+    pub checkpoint_interval: u64,
 }
 
 impl Default for StreamQueryConfig {
@@ -31,9 +41,16 @@ impl Default for StreamQueryConfig {
             sink_path: None,
             output_mode: "append".into(),
             dedup_columns: vec![],
+            partition_columns: vec![],
+            publish_iceberg: true,
+            iceberg_table_suffix: DEFAULT_ICEBERG_SUFFIX.into(),
+            checkpoint_interval: oxidant_datasource::delta_write::DEFAULT_CHECKPOINT_INTERVAL,
         }
     }
 }
+
+/// Default suffix for the Iceberg catalog entry that mirrors a Delta streaming table.
+pub const DEFAULT_ICEBERG_SUFFIX: &str = "_iceberg";
 
 /// Where a `WriteStreamOperationStart` sends its output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +76,7 @@ impl StreamQueryConfig {
         sink_format: &str,
         destination: SinkDestination,
         writer_options: &HashMap<String, String>,
+        partition_columns: Vec<String>,
     ) -> Self {
         // `toTable(...)` still honours an explicit `path` option — that is how Spark lets a
         // managed-looking write land at a location the catalog's warehouse convention would not
@@ -104,6 +122,25 @@ impl StreamQueryConfig {
                         .collect()
                 })
                 .unwrap_or_default(),
+            partition_columns,
+            publish_iceberg: writer_options
+                .get("icebergCompat")
+                .or_else(|| writer_options.get("uniform"))
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "false" | "0" | "off"
+                    )
+                })
+                .unwrap_or(true),
+            iceberg_table_suffix: writer_options
+                .get("icebergTableSuffix")
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_ICEBERG_SUFFIX.into()),
+            checkpoint_interval: writer_options
+                .get("checkpointInterval")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(oxidant_datasource::delta_write::DEFAULT_CHECKPOINT_INTERVAL),
         }
     }
 }
@@ -127,6 +164,7 @@ mod tests {
             "delta",
             SinkDestination::Table("glue.live.events".into()),
             &map(&[]),
+            vec![],
         );
         assert_eq!(cfg.source_format, "kafka");
         assert_eq!(cfg.sink_format, "delta");
@@ -143,6 +181,7 @@ mod tests {
             "delta",
             SinkDestination::Table("glue.live.events".into()),
             &map(&[("path", "s3://bucket/custom/events")]),
+            vec![],
         );
         assert_eq!(cfg.sink_table.as_deref(), Some("glue.live.events"));
         assert_eq!(cfg.sink_path.as_deref(), Some("s3://bucket/custom/events"));
@@ -156,8 +195,46 @@ mod tests {
             "",
             SinkDestination::Table("glue.live.events".into()),
             &map(&[]),
+            vec![],
         );
         assert_eq!(cfg.sink_format, "delta");
+    }
+
+    #[test]
+    fn iceberg_publishing_is_on_by_default_and_can_be_turned_off() {
+        let on = StreamQueryConfig::from_spark(
+            "kafka",
+            &map(&[]),
+            "delta",
+            SinkDestination::Table("glue.live.events".into()),
+            &map(&[]),
+            vec![],
+        );
+        assert!(on.publish_iceberg, "interoperability is the default");
+        assert_eq!(on.iceberg_table_suffix, "_iceberg");
+
+        let off = StreamQueryConfig::from_spark(
+            "kafka",
+            &map(&[]),
+            "delta",
+            SinkDestination::Table("glue.live.events".into()),
+            &map(&[("icebergCompat", "false")]),
+            vec![],
+        );
+        assert!(!off.publish_iceberg);
+    }
+
+    #[test]
+    fn partition_columns_come_from_partition_by_not_an_option() {
+        let cfg = StreamQueryConfig::from_spark(
+            "kafka",
+            &map(&[]),
+            "delta",
+            SinkDestination::Table("glue.live.events".into()),
+            &map(&[]),
+            vec!["event_date".into()],
+        );
+        assert_eq!(cfg.partition_columns, vec!["event_date".to_string()]);
     }
 
     #[test]
@@ -168,6 +245,7 @@ mod tests {
             "parquet",
             SinkDestination::None,
             &map(&[("path", "/out")]),
+            vec![],
         );
         assert_eq!(cfg.sink_path.as_deref(), Some("/out"));
     }

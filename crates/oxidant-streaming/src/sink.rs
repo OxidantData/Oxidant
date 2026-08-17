@@ -9,9 +9,22 @@ use oxidant_loom::arrow::record_batch::RecordBatch;
 ///
 /// Async because the sinks that matter commit to object storage and a catalog; the in-memory and
 /// local-file sinks below just don't await anything.
+///
+/// `batch_id` is the query's monotonic micro-batch number. A transactional sink stamps it into
+/// the commit so a batch replayed after a crash is recognized and dropped instead of counted
+/// twice; sinks with no transaction log ignore it.
 #[async_trait::async_trait]
 pub trait Sink: Send + Sync {
-    async fn write_batch(&mut self, batches: &[RecordBatch]) -> oxidant_common::Result<u64>;
+    async fn write_batch(
+        &mut self,
+        batches: &[RecordBatch],
+        batch_id: u64,
+    ) -> oxidant_common::Result<u64>;
+
+    /// Spark-shaped sink description for `lastProgress`, e.g. `DeltaSink[glue.live.orders]`.
+    fn description(&self) -> String {
+        "Sink".to_string()
+    }
 }
 
 /// Append micro-batches to a file directory as Parquet.
@@ -34,7 +47,11 @@ impl FileSink {
 
 #[async_trait::async_trait]
 impl Sink for FileSink {
-    async fn write_batch(&mut self, batches: &[RecordBatch]) -> oxidant_common::Result<u64> {
+    async fn write_batch(
+        &mut self,
+        batches: &[RecordBatch],
+        _batch_id: u64,
+    ) -> oxidant_common::Result<u64> {
         let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         if rows == 0 {
             return Ok(0);
@@ -80,6 +97,10 @@ impl Sink for FileSink {
         }
         Ok(rows)
     }
+
+    fn description(&self) -> String {
+        format!("FileSink[{}]", self.path.display())
+    }
 }
 
 fn format_cell(arr: &oxidant_loom::arrow::array::ArrayRef, row: usize) -> String {
@@ -119,7 +140,11 @@ impl Default for MemorySink {
 
 #[async_trait::async_trait]
 impl Sink for MemorySink {
-    async fn write_batch(&mut self, batches: &[RecordBatch]) -> oxidant_common::Result<u64> {
+    async fn write_batch(
+        &mut self,
+        batches: &[RecordBatch],
+        _batch_id: u64,
+    ) -> oxidant_common::Result<u64> {
         let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let mut guard = self
             .batches
@@ -127,6 +152,10 @@ impl Sink for MemorySink {
             .map_err(|e| oxidant_common::Error::Execution(e.to_string()))?;
         guard.extend_from_slice(batches);
         Ok(rows)
+    }
+
+    fn description(&self) -> String {
+        "MemorySink".to_string()
     }
 }
 
@@ -147,7 +176,7 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))])
                 .unwrap();
         let mut sink = FileSink::new(dir.path(), "parquet");
-        let rows = sink.write_batch(&[batch]).await.unwrap();
+        let rows = sink.write_batch(&[batch], 1).await.unwrap();
         assert_eq!(rows, 3);
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()

@@ -21,7 +21,7 @@ import sys
 import time
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json
+from pyspark.sql.functions import col, from_json, from_unixtime, to_date
 from pyspark.sql.types import LongType, StringType, StructField, StructType
 
 # The producer's JSON payload. Declared rather than inferred: a streaming query has no sample to
@@ -63,9 +63,15 @@ def main() -> int:
         .load()
     )
 
-    orders = raw.select(
-        from_json(col("value").cast("string"), PAYLOAD).alias("payload")
-    ).select("payload.*")
+    orders = (
+        raw.select(from_json(col("value").cast("string"), PAYLOAD).alias("payload"))
+        .select("payload.*")
+        # A partition column a dashboard filters on. Partitioning is the single biggest lever on
+        # query cost for a live table: without it every dashboard query scans every file the
+        # stream has ever written. Low cardinality on purpose — never partition on a raw
+        # timestamp or an id.
+        .withColumn("event_date", to_date(from_unixtime(col("event_ts"))))
+    )
 
     target = f"glue.{database}.{table}"
     print(f"[stream] {env('KAFKA_TOPIC')} -> {target} (checkpoint {checkpoint})")
@@ -73,7 +79,11 @@ def main() -> int:
     query = (
         orders.writeStream.format("delta")
         .outputMode("append")
+        .partitionBy("event_date")
         .option("checkpointLocation", checkpoint)
+        # Iceberg metadata is published over the same Parquet files, so Athena, Trino, and
+        # DuckDB can read this table too. On by default; shown here because it is the point.
+        .option("icebergCompat", "true")
         # `availableNow` drains what is on the topic and stops, which is what a validation run
         # wants. A production pipeline uses `.trigger(processingTime="30 seconds")` instead.
         .trigger(availableNow=True)
@@ -100,6 +110,23 @@ def main() -> int:
         f"SELECT customer, count(*) AS orders, sum(amount) AS revenue "
         f"FROM {target} GROUP BY customer ORDER BY customer"
     ).show()
+
+    # The same rows, resolved through Iceberg metadata instead of the Delta log. One copy of the
+    # data; whichever engine a team already runs can read it.
+    iceberg_target = f"{target}_iceberg"
+    try:
+        iceberg_total = reader.sql(
+            f"SELECT count(*) AS n FROM {iceberg_target}"
+        ).collect()[0]["n"]
+        print(f"[verify] {iceberg_target} (Iceberg view) has {iceberg_total} rows")
+        if iceberg_total != total:
+            print(
+                f"[verify] FAIL: Delta sees {total} rows, Iceberg sees {iceberg_total}",
+                file=sys.stderr,
+            )
+            return 1
+    except Exception as exc:  # noqa: BLE001 - the Delta table is still the primary result
+        print(f"[verify] WARN: Iceberg view unreadable: {exc}", file=sys.stderr)
 
     if total == 0:
         print("[verify] FAIL: the table is empty", file=sys.stderr)

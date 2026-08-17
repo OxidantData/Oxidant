@@ -23,13 +23,31 @@ use std::sync::Arc;
 
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
-use oxidant_catalog::TableFormat;
+use oxidant_catalog::{CatalogProvider, TableChange, TableFormat};
 use oxidant_common::{Error, Result};
+use oxidant_datasource::delta_write::{DeltaTableWriter, DeltaWriterConfig};
+use oxidant_datasource::uniform::UniformTable;
 use oxidant_loom::arrow::datatypes::SchemaRef;
 use oxidant_loom::arrow::record_batch::RecordBatch;
 use oxidant_loom::Engine;
 
 use crate::sink::Sink;
+
+/// Everything about a sink that is not the table's identity.
+#[derive(Debug, Clone, Default)]
+pub struct LakeSinkOptions {
+    /// Delta `txn.appId` for idempotent commits — the streaming query id, which survives a
+    /// restart. `None` writes no `txn` action and gives up replay deduplication.
+    pub app_id: Option<String>,
+    /// `writeStream.partitionBy(...)`: columns written as directories rather than into the file.
+    pub partition_columns: Vec<String>,
+    /// Publish Iceberg metadata over the Delta table so Iceberg engines can read it too.
+    pub publish_iceberg: bool,
+    /// Name of the sibling Iceberg catalog entry, when one is registered.
+    pub iceberg_table_suffix: String,
+    /// Commits between Delta checkpoints (and Iceberg publishes). `0` disables both.
+    pub checkpoint_interval: u64,
+}
 
 /// Where a streaming query materializes its output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,11 +133,14 @@ impl LakeTarget {
 pub fn writable_format(format: &str) -> Result<TableFormat> {
     match TableFormat::from_provider(format) {
         Some(f @ (TableFormat::Delta | TableFormat::Parquet)) => Ok(f),
+        // Not a gap so much as a redirect: a Delta sink already publishes Iceberg metadata over
+        // the same data files, so `format("delta")` gives Iceberg readers the table anyway —
+        // without a second copy, and with a transaction log that commits atomically per batch.
         Some(TableFormat::Iceberg) => Err(Error::Unsupported(
-            "writeStream.format(\"iceberg\") is not supported yet — an Iceberg sink needs a \
-             snapshot commit that updates the catalog's `metadata_location`. Use \
-             format(\"delta\"), which commits atomically and is readable by Spark, Athena, and \
-             Trino."
+            "writeStream.format(\"iceberg\") is not a sink format — use format(\"delta\"), which \
+             publishes Iceberg metadata over the same Parquet files. The table is then readable \
+             by Spark and Athena as Delta and by Trino, Athena, and DuckDB as Iceberg. Turn the \
+             Iceberg side off with .option(\"icebergCompat\", \"false\")."
                 .into(),
         )),
         Some(other) => Err(Error::Unsupported(format!(
@@ -142,6 +163,14 @@ fn format_name(f: TableFormat) -> &'static str {
     }
 }
 
+/// The format-specific half of a sink.
+enum Writer {
+    /// Delta: one transaction per batch, with checkpoints, stats, and `txn` idempotency.
+    Delta(Box<DeltaTableWriter>),
+    /// Bare Parquet: one file per batch, no commit protocol.
+    Parquet,
+}
+
 /// A sink resolved against its catalog and object store, ready to accept batches.
 pub struct LakeSink {
     target: LakeTarget,
@@ -149,8 +178,14 @@ pub struct LakeSink {
     store: Arc<dyn ObjectStore>,
     /// Table root as an object-store prefix (bucket-relative for `s3://`).
     root: ObjectPath,
-    /// Stable identity written into the Delta `metaData` action.
-    table_id: String,
+    writer: Writer,
+    options: LakeSinkOptions,
+    /// The Iceberg view of this table, when interoperability is on.
+    uniform: Option<UniformTable>,
+    /// Catalog handle kept so each Iceberg publish can refresh `metadata_location`.
+    catalog: Option<Arc<dyn CatalogProvider>>,
+    /// Namespace and name of the sibling Iceberg catalog entry, when one was registered.
+    iceberg_entry: Option<(Vec<String>, String)>,
     batch_counter: u64,
     location: String,
 }
@@ -163,14 +198,27 @@ impl LakeSink {
     /// catalog, no permission to create the database, unwritable bucket) fails the
     /// `writeStream.start()` call — not silently, minutes later, on whichever batch first
     /// carried data.
-    pub async fn open(engine: &Engine, target: LakeTarget, schema: SchemaRef) -> Result<Self> {
+    pub async fn open(
+        engine: &Engine,
+        target: LakeTarget,
+        schema: SchemaRef,
+        options: LakeSinkOptions,
+    ) -> Result<Self> {
         if !matches!(target.format, TableFormat::Delta | TableFormat::Parquet) {
             return Err(Error::Unsupported(format!(
                 "streaming sink format {:?} is not writable",
                 target.format
             )));
         }
+        for column in &options.partition_columns {
+            if schema.field_with_name(column).is_err() {
+                return Err(Error::Plan(format!(
+                    "writeStream.partitionBy(`{column}`): the query does not produce that column"
+                )));
+            }
+        }
 
+        let mut catalog_handle = None;
         let (location, storage_options) = match &target.catalog {
             Some(catalog_name) => {
                 let catalog = engine.external_catalog(catalog_name).ok_or_else(|| {
@@ -223,10 +271,11 @@ impl LakeSink {
                             schema.clone(),
                             target.format,
                             target.location.clone(),
-                            &[],
+                            &options.partition_columns,
                         )
                         .await?
                 };
+                catalog_handle = Some(catalog);
                 (md.location, md.storage_options)
             }
             None => {
@@ -242,22 +291,172 @@ impl LakeSink {
 
         let store = engine.object_store_for(&location, &storage_options)?;
         let root = table_root_prefix(&location)?;
+        // Deterministic from the table identity, so a restarted query that re-declares version 0
+        // of a wiped table does not invent a second table uuid.
+        let table_id = stable_table_id(&location);
+
+        // Iceberg interoperability is only meaningful for Delta: a bare Parquet directory has no
+        // authoritative file list to mirror.
+        let publish_iceberg = options.publish_iceberg && target.format == TableFormat::Delta;
+        let uniform = publish_iceberg
+            .then(|| UniformTable::new(&location, &schema, &options.partition_columns, &table_id))
+            .transpose()?;
+
+        let writer = match target.format {
+            TableFormat::Delta => Writer::Delta(Box::new(
+                DeltaTableWriter::open(
+                    store.clone(),
+                    root.clone(),
+                    schema.clone(),
+                    DeltaWriterConfig {
+                        table_id,
+                        partition_columns: options.partition_columns.clone(),
+                        app_id: options.app_id.clone(),
+                        checkpoint_interval: options.checkpoint_interval,
+                        ..Default::default()
+                    },
+                )
+                .await?,
+            )),
+            _ => Writer::Parquet,
+        };
 
         Ok(Self {
             target,
             schema,
             store,
             root,
-            // Deterministic from the table identity, so a restarted query that re-declares
-            // version 0 of a wiped table does not invent a second table uuid.
-            table_id: stable_table_id(&location),
+            writer,
+            options,
+            uniform,
+            catalog: catalog_handle,
+            iceberg_entry: None,
             batch_counter: 0,
             location,
         })
     }
 
+    /// Register the sibling Iceberg catalog entry that Iceberg-only engines query.
+    ///
+    /// One metastore entry cannot be both formats — Athena decides how to read a table from its
+    /// `table_type`, and Delta and Iceberg readers want different answers. So the Delta table
+    /// stays the primary entry and a second one, pointing at the *same* location and the same
+    /// data files, is registered for Iceberg readers.
+    ///
+    /// Registered on the first publish rather than at query start, because an Iceberg entry with
+    /// no `metadata_location` yet is not merely empty — it is an error to every reader that opens
+    /// it. Better no table than a broken one.
+    async fn register_iceberg_entry(&mut self) -> Result<()> {
+        if self.iceberg_entry.is_some() || self.uniform.is_none() {
+            return Ok(());
+        }
+        let (Some(catalog), true) = (&self.catalog, !self.target.table.is_empty()) else {
+            return Ok(());
+        };
+        let name = format!("{}{}", self.target.table, self.options.iceberg_table_suffix);
+        if !catalog.table_exists(&self.target.namespace, &name).await? {
+            catalog
+                .create_table(
+                    &self.target.namespace,
+                    &name,
+                    self.schema.clone(),
+                    TableFormat::Iceberg,
+                    Some(self.location.clone()),
+                    &self.options.partition_columns,
+                )
+                .await?;
+        }
+        self.iceberg_entry = Some((self.target.namespace.clone(), name));
+        Ok(())
+    }
+
+    pub fn location(&self) -> &str {
+        &self.location
+    }
+
+    /// The Iceberg catalog entry mirroring this table, if one was registered.
+    pub fn iceberg_table_name(&self) -> Option<String> {
+        self.iceberg_entry
+            .as_ref()
+            .map(|(ns, table)| format!("{}.{table}", ns.join(".")))
+    }
+
+    /// A per-batch file-name fragment. The uuid keeps files from colliding across query restarts
+    /// that reset the counter.
+    fn next_file_prefix(&mut self) -> String {
+        self.batch_counter += 1;
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// Publish Iceberg metadata for the table as of `version`, and point the catalog at it.
+    ///
+    /// Best-effort by design: the Delta commit already succeeded and is the source of truth, so a
+    /// failure here leaves Iceberg readers on the previous snapshot rather than failing the
+    /// stream.
+    async fn publish_iceberg(&mut self, version: u64) {
+        let (Some(uniform), Writer::Delta(writer)) = (&self.uniform, &self.writer) else {
+            return;
+        };
+        let Some(files) = writer.live_files() else {
+            return;
+        };
+        let metadata_location = match uniform
+            .publish(self.store.as_ref(), &self.root, files, version)
+            .await
+        {
+            Ok(location) => location,
+            Err(e) => {
+                eprintln!(
+                    "[oxidant] iceberg publish for `{}` at version {version} failed: {e}",
+                    self.target.display_name()
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = self.register_iceberg_entry().await {
+            eprintln!(
+                "[oxidant] registering the Iceberg entry for `{}`: {e}",
+                self.target.display_name()
+            );
+            return;
+        }
+
+        // The pointer every Iceberg catalog reader resolves first.
+        let Some(catalog) = &self.catalog else {
+            return;
+        };
+        let change = vec![TableChange::SetProperties(
+            [("metadata_location".to_string(), metadata_location)]
+                .into_iter()
+                .collect(),
+        )];
+        let targets = self
+            .iceberg_entry
+            .iter()
+            .map(|(ns, table)| (ns.clone(), table.clone()))
+            .chain(std::iter::once((
+                self.target.namespace.clone(),
+                self.target.table.clone(),
+            )));
+        for (namespace, table) in targets {
+            if table.is_empty() {
+                continue;
+            }
+            if let Err(e) = catalog
+                .alter_table(&namespace, &table, change.clone())
+                .await
+            {
+                eprintln!("[oxidant] iceberg metadata_location for `{table}`: {e}");
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Sink for LakeSink {
     /// Where this sink writes, for progress reporting.
-    pub fn description(&self) -> String {
+    fn description(&self) -> String {
         format!(
             "{}Sink[{}]",
             format_name(self.target.format),
@@ -265,22 +464,7 @@ impl LakeSink {
         )
     }
 
-    pub fn location(&self) -> &str {
-        &self.location
-    }
-
-    fn next_file_name(&mut self) -> String {
-        let n = self.batch_counter;
-        self.batch_counter += 1;
-        // Spark's naming shape (`part-<n>-<uuid>-c000.<fmt>.parquet`), which keeps files from
-        // colliding across query restarts that reset the batch counter.
-        format!("part-{n:05}-{}-c000.parquet", uuid::Uuid::new_v4())
-    }
-}
-
-#[async_trait::async_trait]
-impl Sink for LakeSink {
-    async fn write_batch(&mut self, batches: &[RecordBatch]) -> Result<u64> {
+    async fn write_batch(&mut self, batches: &[RecordBatch], batch_id: u64) -> Result<u64> {
         let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         // An empty micro-batch must not produce an empty data file or an empty commit: Delta
         // readers would replay a growing log of no-ops, and a dashboard would see the table's
@@ -299,33 +483,35 @@ impl Sink for LakeSink {
             }
         }
 
-        let file_name = self.next_file_name();
-        match self.target.format {
-            TableFormat::Delta => {
-                oxidant_datasource::delta_write::append(
-                    self.store.as_ref(),
-                    &self.root,
-                    &self.schema,
-                    batches,
-                    &file_name,
-                    &self.table_id,
-                    &[],
-                )
-                .await?;
+        let prefix = self.next_file_prefix();
+        let published_at = match &mut self.writer {
+            Writer::Delta(writer) => {
+                let commit = writer
+                    .append(batches, &prefix, Some(batch_id as i64))
+                    .await?;
+                if commit.deduplicated {
+                    // A replay of a batch the log already carries. Reporting zero rows is the
+                    // truth: nothing was added to the table.
+                    return Ok(0);
+                }
+                let interval = self.options.checkpoint_interval;
+                (interval > 0 && (commit.version + 1) % interval == 0).then_some(commit.version)
             }
-            TableFormat::Parquet => {
+            Writer::Parquet => {
                 let bytes = encode_parquet(&self.schema, batches)?;
-                let path = self.root.clone().join(file_name.as_str());
+                let path = self
+                    .root
+                    .clone()
+                    .join(format!("part-{prefix}-c000.snappy.parquet").as_str());
                 self.store
                     .put(&path, bytes.into())
                     .await
                     .map_err(|e| Error::Io(format!("write `{path}`: {e}")))?;
+                None
             }
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "streaming sink format {other:?} is not writable"
-                )))
-            }
+        };
+        if let Some(version) = published_at {
+            self.publish_iceberg(version).await;
         }
         Ok(rows)
     }
@@ -333,9 +519,16 @@ impl Sink for LakeSink {
 
 fn encode_parquet(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
     use datafusion::parquet::arrow::ArrowWriter;
+    use datafusion::parquet::basic::Compression;
+    use datafusion::parquet::file::properties::WriterProperties;
 
+    // parquet-rs defaults to UNCOMPRESSED. Spark writes snappy, and so should a sink whose files
+    // are uploaded to object storage and then scanned by every dashboard query.
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
     let mut buf = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None)
+    let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))
         .map_err(|e| Error::Io(format!("parquet writer: {e}")))?;
     for b in batches {
         writer
@@ -414,6 +607,15 @@ mod tests {
 
     fn batch(vals: Vec<i64>) -> RecordBatch {
         RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vals))]).unwrap()
+    }
+
+    /// Sink options with the catalog-dependent features off, for path-only tests.
+    fn options() -> LakeSinkOptions {
+        LakeSinkOptions {
+            app_id: Some("test-query".into()),
+            checkpoint_interval: 10,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -538,14 +740,18 @@ mod tests {
             &engine,
             LakeTarget::location_only(table_dir.to_str().unwrap(), TableFormat::Delta),
             schema(),
+            options(),
         )
         .await
         .unwrap();
 
-        assert_eq!(sink.write_batch(&[batch(vec![1, 2, 3])]).await.unwrap(), 3);
-        assert_eq!(sink.write_batch(&[batch(vec![4, 5])]).await.unwrap(), 2);
+        assert_eq!(
+            sink.write_batch(&[batch(vec![1, 2, 3])], 1).await.unwrap(),
+            3
+        );
+        assert_eq!(sink.write_batch(&[batch(vec![4, 5])], 2).await.unwrap(), 2);
         // An empty batch is a no-op, not an empty commit.
-        assert_eq!(sink.write_batch(&[]).await.unwrap(), 0);
+        assert_eq!(sink.write_batch(&[], 3).await.unwrap(), 0);
 
         let log = table_dir.join("_delta_log");
         let commits: Vec<_> = std::fs::read_dir(&log)
@@ -571,6 +777,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_table_written_as_delta_is_readable_as_iceberg() {
+        // The whole point of publishing Iceberg metadata: *the same Parquet files*, resolved
+        // through two different metadata trees, give two different engines the same rows. If
+        // this passes, a Trino or Athena user querying the Iceberg side sees what a Spark user
+        // querying the Delta side sees, with no second copy of the data.
+        let dir = tempfile::TempDir::new().unwrap();
+        let table_dir = dir.path().join("events");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let engine = Engine::new();
+
+        let mut sink = LakeSink::open(
+            &engine,
+            LakeTarget::location_only(table_dir.to_str().unwrap(), TableFormat::Delta),
+            schema(),
+            LakeSinkOptions {
+                app_id: Some("q".into()),
+                publish_iceberg: true,
+                // Publish on every second commit so the test does not need ten batches.
+                checkpoint_interval: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        sink.write_batch(&[batch(vec![1, 2, 3])], 1).await.unwrap();
+        sink.write_batch(&[batch(vec![4, 5])], 2).await.unwrap();
+
+        // Delta's view.
+        engine
+            .register_delta("as_delta", table_dir.to_str().unwrap())
+            .await
+            .unwrap();
+        let delta = engine
+            .sql("SELECT sum(n) AS s, count(*) AS c FROM as_delta")
+            .await
+            .unwrap();
+
+        // Iceberg's view of the very same directory.
+        engine
+            .register_iceberg("as_iceberg", table_dir.to_str().unwrap())
+            .await
+            .unwrap();
+        let iceberg = engine
+            .sql("SELECT sum(n) AS s, count(*) AS c FROM as_iceberg")
+            .await
+            .unwrap();
+
+        let value = |rows: &[RecordBatch], col: usize| {
+            rows[0]
+                .column(col)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(value(&delta, 1), 5, "Delta sees five rows");
+        assert_eq!(
+            (value(&iceberg, 0), value(&iceberg, 1)),
+            (value(&delta, 0), value(&delta, 1)),
+            "the Iceberg and Delta views of one table must agree"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_batch_id_does_not_write_the_rows_twice() {
+        // A crash between the sink write and the offset checkpoint replays the batch. Without
+        // the `txn` stamp a dashboard's `count(*)` would climb every time the query restarted.
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Engine::new();
+        let open = || {
+            LakeSink::open(
+                &engine,
+                LakeTarget::location_only(dir.path().to_str().unwrap(), TableFormat::Delta),
+                schema(),
+                options(),
+            )
+        };
+
+        let mut sink = open().await.unwrap();
+        assert_eq!(sink.write_batch(&[batch(vec![1, 2])], 1).await.unwrap(), 2);
+
+        let mut restarted = open().await.unwrap();
+        assert_eq!(
+            restarted
+                .write_batch(&[batch(vec![1, 2])], 1)
+                .await
+                .unwrap(),
+            0,
+            "batch 1 was already committed"
+        );
+        assert_eq!(
+            restarted.write_batch(&[batch(vec![3])], 2).await.unwrap(),
+            1,
+            "but the next batch still lands"
+        );
+
+        engine
+            .register_delta("replayed", dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let rows = engine
+            .sql("SELECT count(*) AS c FROM replayed")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            3,
+            "three rows, not five"
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_by_writes_hive_directories_a_dashboard_can_prune() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Engine::new();
+        let partitioned: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("day", DataType::Utf8, false),
+        ]));
+        let rows = RecordBatch::try_new(
+            partitioned.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+                Arc::new(oxidant_loom::arrow::array::StringArray::from(vec![
+                    "2026-08-16",
+                    "2026-08-17",
+                    "2026-08-17",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let mut sink = LakeSink::open(
+            &engine,
+            LakeTarget::location_only(dir.path().to_str().unwrap(), TableFormat::Delta),
+            partitioned,
+            LakeSinkOptions {
+                partition_columns: vec!["day".into()],
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(sink.write_batch(&[rows], 1).await.unwrap(), 3);
+
+        assert!(dir.path().join("day=2026-08-16").is_dir());
+        assert!(dir.path().join("day=2026-08-17").is_dir());
+
+        // The partition column is reconstructed from the path, so readers still see it.
+        engine
+            .register_delta("by_day", dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let counted = engine
+            .sql("SELECT count(*) AS c FROM by_day WHERE day = '2026-08-17'")
+            .await
+            .unwrap();
+        assert_eq!(
+            counted[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn partitioning_on_a_column_the_query_does_not_produce_fails_at_start() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Engine::new();
+        let Err(err) = LakeSink::open(
+            &engine,
+            LakeTarget::location_only(dir.path().to_str().unwrap(), TableFormat::Delta),
+            schema(),
+            LakeSinkOptions {
+                partition_columns: vec!["nope".into()],
+                ..options()
+            },
+        )
+        .await
+        else {
+            panic!("partitioning on a missing column must fail at start");
+        };
+        assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[tokio::test]
     async fn a_batch_whose_schema_drifted_is_rejected_before_it_is_written() {
         let dir = tempfile::TempDir::new().unwrap();
         let engine = Engine::new();
@@ -578,6 +979,7 @@ mod tests {
             &engine,
             LakeTarget::location_only(dir.path().to_str().unwrap(), TableFormat::Delta),
             schema(),
+            options(),
         )
         .await
         .unwrap();
@@ -585,7 +987,7 @@ mod tests {
         let other: SchemaRef = Arc::new(Schema::new(vec![Field::new("m", DataType::Int64, false)]));
         let wrong =
             RecordBatch::try_new(other, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
-        let err = sink.write_batch(&[wrong]).await.unwrap_err();
+        let err = sink.write_batch(&[wrong], 1).await.unwrap_err();
         assert!(err.to_string().contains("does not match"), "{err}");
         assert!(
             !dir.path().join("_delta_log").exists(),

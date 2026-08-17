@@ -79,6 +79,7 @@ impl OxidantService {
             &start.format,
             destination,
             &start.options,
+            start.partitioning_column_names.clone(),
         );
 
         // Translate the DataFrame transformation once; the query manager re-executes it per
@@ -133,11 +134,20 @@ impl OxidantService {
         match trigger {
             Trigger::ProcessingTime(interval) => {
                 tokio::spawn(async move {
+                    // A fixed-rate schedule, not sleep-after-work. Sleeping the full interval
+                    // *after* each batch makes the real period `interval + batch duration`, so a
+                    // stream under load silently halves its own trigger rate. `tokio::interval`
+                    // with `Delay` missed-tick behaviour fires immediately when a batch overran
+                    // and otherwise keeps to the requested cadence.
+                    let mut ticker = tokio::time::interval(interval);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
+                        ticker.tick().await;
                         if let Err(e) = mgr.run_batch(&qid, &eng).await {
-                            // A failed batch stops the query rather than spinning on the same
-                            // error every interval — and leaves the message on the status, which
-                            // is where `query.status()` and `awaitTermination()` look.
+                            // A batch that fails even after its retries stops the query rather
+                            // than spinning on the same error every interval — and leaves the
+                            // message on the status, which is where `query.status()` and
+                            // `awaitTermination()` look.
                             mgr.fail(&qid, &e.to_string()).await;
                             break;
                         }
@@ -145,7 +155,6 @@ impl OxidantService {
                         if !active {
                             break;
                         }
-                        tokio::time::sleep(interval).await;
                     }
                 });
             }

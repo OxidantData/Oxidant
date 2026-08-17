@@ -238,6 +238,146 @@ async fn kafka_micro_batches_land_in_a_queryable_delta_table() {
     assert_eq!(delta_scalar_i64(&table_path, "max(`offset`)").await, 4);
 }
 
+/// Read the same table back through the *Iceberg* resolver instead of the Delta one.
+async fn iceberg_scalar_i64(table_path: &std::path::Path, sql_expr: &str) -> i64 {
+    use oxidant_loom::arrow::array::{Array, Int64Array};
+
+    let engine = oxidant_loom::Engine::new();
+    engine
+        .register_iceberg("streamed_iceberg", &table_path.to_string_lossy())
+        .await
+        .expect("register iceberg view of the delta table");
+    let batches = engine
+        .sql(&format!("SELECT {sql_expr} FROM streamed_iceberg"))
+        .await
+        .expect("query iceberg view");
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap_or_else(|| panic!("expected i64, got schema {:?}", batches[0].schema()));
+    assert!(!col.is_null(0));
+    col.value(0)
+}
+
+#[tokio::test]
+async fn a_streamed_delta_table_is_also_readable_as_iceberg() {
+    // Interoperability, end to end and through the real service: one stream, one copy of the
+    // Parquet, and both a Delta reader and an Iceberg reader see the same rows. This is what lets
+    // a team point Athena, Trino, or DuckDB at a live table without standing up a second pipeline
+    // to maintain a second copy.
+    let spool = tempfile::TempDir::new().expect("spool dir");
+    let out = tempfile::TempDir::new().expect("out dir");
+    let checkpoint = tempfile::TempDir::new().expect("checkpoint dir");
+    std::fs::write(
+        spool.path().join("batch-0.json"),
+        "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n",
+    )
+    .expect("write batch 0");
+
+    let mut client = boot(pick_port()).await;
+
+    let source_options: HashMap<String, String> = [
+        ("subscribe".to_string(), "events".to_string()),
+        (
+            "oxidant.spool.dir".to_string(),
+            spool.path().to_string_lossy().into_owned(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let projected = sc::Relation {
+        rel_type: Some(sc::relation::RelType::Project(Box::new(sc::Project {
+            input: Some(Box::new(kafka_read(source_options))),
+            expressions: vec![attr("value"), attr("topic"), attr("offset")],
+        }))),
+        ..Default::default()
+    };
+
+    let table_path = out.path().join("events_uniform");
+    let writer_options: HashMap<String, String> = [
+        (
+            "checkpointLocation".to_string(),
+            checkpoint.path().to_string_lossy().into_owned(),
+        ),
+        // Publish the Iceberg tree on every commit so one micro-batch is enough to assert on;
+        // the default of 10 amortizes the metadata write over more batches.
+        ("checkpointInterval".to_string(), "1".to_string()),
+    ]
+    .into_iter()
+    .collect();
+
+    let responses = run_command(
+        &mut client,
+        sc::command::CommandType::WriteStreamOperationStart(sc::WriteStreamOperationStart {
+            input: Some(projected),
+            format: "delta".into(),
+            options: writer_options,
+            trigger: Some(sc::write_stream_operation_start::Trigger::Once(true)),
+            output_mode: "append".into(),
+            query_name: "kafka_to_uniform".into(),
+            sink_destination: Some(sc::write_stream_operation_start::SinkDestination::Path(
+                table_path.to_string_lossy().into_owned(),
+            )),
+            ..Default::default()
+        }),
+    )
+    .await;
+
+    let query_id = responses
+        .iter()
+        .find_map(|r| match &r.response_type {
+            Some(sc::execute_plan_response::ResponseType::WriteStreamOperationStartResult(res)) => {
+                res.query_id.clone()
+            }
+            _ => None,
+        })
+        .expect("WriteStreamOperationStartResult");
+
+    run_command(
+        &mut client,
+        sc::command::CommandType::StreamingQueryCommand(sc::StreamingQueryCommand {
+            query_id: Some(query_id),
+            command: Some(sc::streaming_query_command::Command::ProcessAllAvailable(
+                true,
+            )),
+        }),
+    )
+    .await;
+
+    // Both metadata trees exist over one set of data files.
+    assert!(table_path.join("_delta_log").is_dir(), "no Delta log");
+    let metadata = table_path.join("metadata");
+    assert!(metadata.is_dir(), "no Iceberg metadata directory");
+    assert!(
+        metadata.join("version-hint.text").exists(),
+        "catalog-less Iceberg readers need version-hint.text"
+    );
+
+    // The name mapping is the detail that makes field-id-less Parquet readable as Iceberg —
+    // without it the query below returns rows of nulls rather than failing, so assert on it.
+    let current: String = std::fs::read_to_string(metadata.join("version-hint.text"))
+        .expect("version hint")
+        .trim()
+        .to_string();
+    let table_metadata =
+        std::fs::read_to_string(metadata.join(format!("v{current}.metadata.json")))
+            .expect("iceberg metadata json");
+    assert!(
+        table_metadata.contains("schema.name-mapping.default"),
+        "published Iceberg metadata must carry a name mapping"
+    );
+
+    assert_eq!(delta_scalar_i64(&table_path, "count(*)").await, 3);
+    assert_eq!(
+        iceberg_scalar_i64(&table_path, "count(*)").await,
+        3,
+        "the Iceberg view of the table must see the same rows as the Delta view"
+    );
+    assert_eq!(iceberg_scalar_i64(&table_path, "max(`offset`)").await, 2);
+}
+
 #[tokio::test]
 async fn a_kafka_stream_with_no_broker_and_no_spool_fails_the_start_call() {
     let mut client = boot(pick_port()).await;

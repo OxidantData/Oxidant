@@ -48,10 +48,17 @@ pub struct QueryProgress {
     pub name: String,
     pub batch_id: u64,
     pub num_input_rows: u64,
+    /// Rows read per second of wall clock. This used to carry the raw row *count*, so anything
+    /// scraping the documented key charted a number that was not a rate.
+    pub input_rows_per_second: f64,
+    /// Rows written per second of wall clock.
     pub processed_rows_per_second: f64,
+    /// How long the batch took end to end — poll, transform, and commit.
+    pub duration_ms: u64,
     /// One entry per streaming source. Oxidant runs one source per query, so this always has
     /// exactly one element — but it is an array because Spark's is.
     pub sources: Vec<SourceProgress>,
+    pub sink: SinkProgress,
 }
 
 /// Per-source progress inside a [`QueryProgress`].
@@ -61,6 +68,16 @@ pub struct SourceProgress {
     /// Spark's source description — e.g. `KafkaV2[Subscribe[events]]`.
     pub description: String,
     pub num_input_rows: u64,
+    pub input_rows_per_second: f64,
+}
+
+/// Where a batch landed, as `lastProgress.sink`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SinkProgress {
+    /// e.g. `deltaSink[glue.streaming_live.orders]`.
+    pub description: String,
+    pub num_output_rows: u64,
 }
 
 /// A registered streaming query with its configuration.
@@ -113,11 +130,18 @@ mod tests {
             name: "orders".into(),
             batch_id: 4,
             num_input_rows: 120,
+            input_rows_per_second: 60.0,
             processed_rows_per_second: 60.0,
+            duration_ms: 2_000,
             sources: vec![SourceProgress {
                 description: "KafkaV2[Subscribe[orders]]".into(),
                 num_input_rows: 120,
+                input_rows_per_second: 60.0,
             }],
+            sink: SinkProgress {
+                description: "deltaSink[glue.live.orders]".into(),
+                num_output_rows: 120,
+            },
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&progress).unwrap()).unwrap();
@@ -130,6 +154,8 @@ mod tests {
             "KafkaV2[Subscribe[orders]]"
         );
         assert_eq!(json["sources"][0]["numInputRows"], 120);
+        assert_eq!(json["durationMs"], 2_000);
+        assert_eq!(json["sink"]["numOutputRows"], 120);
         assert!(json.get("batch_id").is_none(), "no snake_case leakage");
     }
 }

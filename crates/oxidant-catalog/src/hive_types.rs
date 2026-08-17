@@ -175,7 +175,10 @@ pub struct HiveSerde {
 /// produce, so declaring one here would register a table nothing can read.
 pub fn format_serde(format: TableFormat) -> Result<HiveSerde> {
     match format {
-        TableFormat::Parquet | TableFormat::Delta => Ok(HiveSerde {
+        // Iceberg's metastore entry carries the same Parquet SerDe as any other Parquet table —
+        // what makes it Iceberg is the `table_type` / `metadata_location` parameters the catalog
+        // adds, not the SerDe. This is the shape Athena and Glue themselves register.
+        TableFormat::Parquet | TableFormat::Delta | TableFormat::Iceberg => Ok(HiveSerde {
             input_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
             output_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
             serde_lib: "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
@@ -193,10 +196,6 @@ pub fn format_serde(format: TableFormat) -> Result<HiveSerde> {
             serde_lib: "org.apache.hive.hcatalog.data.JsonSerDe",
             serde_params: &[],
         }),
-        TableFormat::Iceberg => Err(Error::Unsupported(format!(
-            "{format:?} is not a supported write target yet (its metastore entry needs a \
-             `metadata_location` from a real snapshot commit, not a plain SerDe declaration)"
-        ))),
     }
 }
 
@@ -410,22 +409,26 @@ mod tests {
     }
 
     #[test]
-    fn format_serde_covers_write_targets_and_still_rejects_iceberg() {
+    fn every_table_format_declares_a_serde() {
         for format in [
             TableFormat::Parquet,
             TableFormat::Csv,
             TableFormat::Json,
             TableFormat::Delta,
+            TableFormat::Iceberg,
         ] {
             assert!(format_serde(format).is_ok(), "{format:?}");
         }
-        assert!(
-            matches!(
-                format_serde(TableFormat::Iceberg),
-                Err(Error::Unsupported(_))
-            ),
-            "Iceberg needs a metadata_location from a real snapshot commit"
-        );
+    }
+
+    #[test]
+    fn iceberg_declares_the_parquet_serde_too() {
+        // A metastore entry is Iceberg because of its `table_type` parameter, not its SerDe —
+        // Athena and Glue register Iceberg tables with the ordinary Parquet SerDe.
+        let iceberg = format_serde(TableFormat::Iceberg).unwrap();
+        let parquet = format_serde(TableFormat::Parquet).unwrap();
+        assert_eq!(iceberg.serde_lib, parquet.serde_lib);
+        assert_eq!(iceberg.input_format, parquet.input_format);
     }
 
     #[test]

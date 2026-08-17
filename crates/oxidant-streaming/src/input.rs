@@ -29,22 +29,47 @@ use oxidant_common::{Error, Result};
 use oxidant_loom::arrow::datatypes::SchemaRef;
 use oxidant_loom::arrow::record_batch::RecordBatch;
 
+/// Rows per record batch handed to the plan.
+///
+/// A Kafka fetch arrives as one array per micro-batch, and feeding a single 500k-row batch into
+/// the plan defeats every operator's pipelining and makes peak memory the whole batch at every
+/// stage. This is DataFusion's own default batch size, so the streaming path behaves like the
+/// batch path.
+const ROWS_PER_BATCH: usize = 8192;
+
 /// A table whose rows are the current micro-batch.
 pub struct MicroBatchInput {
     name: String,
     schema: SchemaRef,
     table: Arc<MemTable>,
+    /// How many partitions the micro-batch is spread across — the plan's unit of parallelism.
+    partitions: usize,
 }
 
 impl MicroBatchInput {
-    /// Build an empty input with a fixed schema.
+    /// Build an empty input with a fixed schema, spread across the machine's cores.
     pub fn new(name: impl Into<String>, schema: SchemaRef) -> Result<Self> {
-        let table = MemTable::try_new(schema.clone(), vec![vec![]])
+        Self::with_partitions(name, schema, default_partitions())
+    }
+
+    /// Build an input with an explicit partition count.
+    ///
+    /// The count is the parallelism the per-batch transformation gets. With one partition the
+    /// whole micro-batch — every `from_json` parse, every filter — runs on a single core, no
+    /// matter how many the machine has.
+    pub fn with_partitions(
+        name: impl Into<String>,
+        schema: SchemaRef,
+        partitions: usize,
+    ) -> Result<Self> {
+        let partitions = partitions.max(1);
+        let table = MemTable::try_new(schema.clone(), vec![vec![]; partitions])
             .map_err(|e| Error::Execution(format!("streaming input table: {e}")))?;
         Ok(Self {
             name: name.into(),
             schema,
             table: Arc::new(table),
+            partitions,
         })
     }
 
@@ -60,7 +85,7 @@ impl MicroBatchInput {
         self.table.clone()
     }
 
-    /// Replace the input's rows with this micro-batch.
+    /// Replace the input's rows with this micro-batch, sliced and spread across its partitions.
     ///
     /// Batches whose schema does not match the declared one are rejected: a plan built against
     /// the declared schema would either error deep in execution or, worse, read the wrong column
@@ -76,14 +101,32 @@ impl MicroBatchInput {
                 )));
             }
         }
-        let partition = self
-            .table
-            .batches
-            .first()
-            .ok_or_else(|| Error::Execution("streaming input has no partition".into()))?;
-        *partition.write().await = batches;
+
+        // Slices are zero-copy views over the same buffers, so spreading a micro-batch across
+        // partitions costs nothing but gives the plan something to parallelize over.
+        let mut buckets: Vec<Vec<RecordBatch>> = vec![Vec::new(); self.partitions];
+        let mut next = 0usize;
+        for batch in &batches {
+            let rows = batch.num_rows();
+            let mut offset = 0;
+            while offset < rows {
+                let len = ROWS_PER_BATCH.min(rows - offset);
+                buckets[next % self.partitions].push(batch.slice(offset, len));
+                next += 1;
+                offset += len;
+            }
+        }
+
+        for (slot, rows) in self.table.batches.iter().zip(buckets) {
+            *slot.write().await = rows;
+        }
         Ok(())
     }
+}
+
+/// One partition per core, which is what DataFusion's own `target_partitions` defaults to.
+fn default_partitions() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 tokio::task_local! {
@@ -210,6 +253,34 @@ mod tests {
         let held = input.table.batches[0].read().await;
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].num_rows(), 1, "batch 1 must not still be present");
+    }
+
+    #[tokio::test]
+    async fn a_micro_batch_is_sliced_and_spread_so_the_plan_can_use_more_than_one_core() {
+        // A Kafka fetch arrives as one array. Left whole and in one partition, every operator in
+        // the query runs single-threaded over it and holds the entire batch at once.
+        let input = MicroBatchInput::with_partitions("t", schema(), 4).unwrap();
+        let rows: Vec<i64> = (0..ROWS_PER_BATCH as i64 * 3 + 100).collect();
+        let total = rows.len();
+        input.set_batches(vec![batch(rows)]).await.unwrap();
+
+        let mut seen = 0;
+        let mut non_empty = 0;
+        for partition in input.table.batches.iter() {
+            let held = partition.read().await;
+            if !held.is_empty() {
+                non_empty += 1;
+            }
+            for b in held.iter() {
+                assert!(
+                    b.num_rows() <= ROWS_PER_BATCH,
+                    "chunks respect the batch size"
+                );
+                seen += b.num_rows();
+            }
+        }
+        assert_eq!(seen, total, "no rows lost in the split");
+        assert_eq!(non_empty, 4, "every partition got work");
     }
 
     #[tokio::test]

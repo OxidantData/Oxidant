@@ -5044,6 +5044,26 @@ impl Engine {
             .await
     }
 
+    /// A Delta table's declared schema and partition columns, when its log can be read.
+    ///
+    /// Best effort: anything unreadable (no log yet, an unmappable type, a permissions error)
+    /// falls back to the inference path rather than failing the registration.
+    async fn delta_table_metadata(
+        &self,
+        table_path: &str,
+    ) -> Option<oxidant_datasource::delta_write::DeltaTableMetadata> {
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        let store = self
+            .object_store_for(table_path, &std::collections::HashMap::new())
+            .ok()?;
+        let root = ListingTableUrl::parse(table_path).ok()?.prefix().clone();
+        oxidant_datasource::delta_write::current_metadata(store.as_ref(), &root)
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// Register an Iceberg table directory under `name`.
     pub async fn register_iceberg(&self, name: &str, table_path: &str) -> Result<()> {
         self.register_lakehouse(name, table_path, oxidant_catalog::TableFormat::Iceberg)
@@ -5056,7 +5076,20 @@ impl Engine {
         table_path: &str,
         format: oxidant_catalog::TableFormat,
     ) -> Result<()> {
-        let metadata = oxidant_catalog::TableMetadata::new(name, table_path, format);
+        let mut metadata = oxidant_catalog::TableMetadata::new(name, table_path, format);
+        // A *partitioned* Delta table keeps its partition columns in the path, not in the data
+        // files, so a reader given only a directory sees a table missing exactly the columns a
+        // dashboard filters on. The log's `metaData` action names them; a catalog like Glue
+        // supplies the same thing from its partition keys, which is why this only matters for the
+        // bare-path form. Unpartitioned tables keep inferring their schema, as before.
+        if format == oxidant_catalog::TableFormat::Delta {
+            if let Some(declared) = self.delta_table_metadata(table_path).await {
+                if !declared.partition_columns.is_empty() {
+                    metadata.partition_columns = declared.partition_columns;
+                    metadata.schema = Some(declared.schema);
+                }
+            }
+        }
         let table = catalog_bridge::metadata_to_provider(&self.ctx.state(), &metadata, name, false)
             .await
             .map_err(|e| Error::Execution(e.to_string()))?

@@ -17,7 +17,7 @@ Architecture: [architecture.md](architecture.md).
 | `crates/oxidant-analyzer/` | Name/type resolve vs catalog | `src/lib.rs` |
 | `crates/oxidant-optimizer/` | Heddle logical opts (single Loom backend) | `src/lib.rs` |
 | `crates/oxidant-physical/` | Physical plan / `ExecutionPlan` | `src/lib.rs` |
-| `crates/oxidant-datasource/` | Parquet/CSV/JSON + Delta/Iceberg resolvers | `src/lib.rs` |
+| `crates/oxidant-datasource/` | Parquet/CSV/JSON + Delta/Iceberg resolvers; Delta writer + Iceberg (uniform) publishing | `src/lib.rs`, `src/delta_write.rs`, `src/uniform.rs` |
 | `crates/oxidant-catalog/` | Catalog SPI + registry | `src/lib.rs` |
 | `crates/oxidant-catalog-hive/` | Hive Metastore provider | `src/lib.rs` |
 | `crates/oxidant-catalog-glue/` | AWS Glue provider | `src/lib.rs` |
@@ -63,7 +63,7 @@ Architecture: [architecture.md](architecture.md).
 | `mcp.md` | `oxidant mcp` MCP server setup/tools |
 | `workers.md` | Adding workers (local-cluster / multi-host / Docker) |
 | `catalogs-glue.md` | Glue catalog end-to-end |
-| `streaming.md` | Structured Streaming: Kafka source, Delta sink, Glue live tables |
+| `streaming.md` | Structured Streaming: Kafka source, Delta sink, Glue live tables, Delta/Iceberg interoperability |
 | `architecture.md` | Canonical engine design |
 | `HVM_VERDICT.md` | HVM2/Bend backend verdict + removal record |
 | `CODEMAP.md` | This file |

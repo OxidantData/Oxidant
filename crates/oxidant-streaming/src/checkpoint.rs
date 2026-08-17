@@ -52,12 +52,21 @@ impl CheckpointStore {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
+    /// Write the checkpoint atomically: to a temporary file, then rename over the real one.
+    ///
+    /// A plain write is not safe here. A crash partway through leaves truncated JSON, `load`
+    /// then fails to parse it, and every caller's `unwrap_or_default()` quietly turns that into
+    /// "no committed offsets" — which with `startingOffsets=latest` silently skips everything
+    /// produced since. A rename is atomic on every filesystem this runs on, so the file is
+    /// either the old checkpoint or the new one.
     pub fn save(&self, state: &CheckpointState) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.root)?;
         std::fs::create_dir_all(self.root.join(METADATA_FILE))?;
         let text = serde_json::to_string_pretty(state)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(self.root.join(OFFSETS_FILE), text)
+        let staged = self.root.join(format!("{OFFSETS_FILE}.tmp"));
+        std::fs::write(&staged, text)?;
+        std::fs::rename(staged, self.root.join(OFFSETS_FILE))
     }
 
     /// Stamp a new *run* onto this checkpoint.
@@ -82,6 +91,26 @@ impl CheckpointStore {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_torn_write_can_never_be_observed() {
+        // The failure this rules out: a half-written `offsets.json` parses as nothing, every
+        // caller defaults it, and the query silently restarts from `startingOffsets`.
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let mut state = CheckpointState {
+            batch_id: 7,
+            committed_batch_id: 7,
+            ..Default::default()
+        };
+        store.save(&state).unwrap();
+        state.batch_id = 8;
+        store.save(&state).unwrap();
+
+        // No staging file survives a completed save, and the visible file always parses.
+        assert!(!dir.path().join("offsets.json.tmp").exists());
+        assert_eq!(store.load().unwrap().batch_id, 8);
+    }
 
     #[test]
     fn checkpoint_round_trip() {

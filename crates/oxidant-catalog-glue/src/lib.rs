@@ -638,6 +638,12 @@ fn build_table_input(
         // listing the directory. `detect_format` reads it back on the way in.
         input = input.parameters("spark.sql.sources.provider", "delta");
     }
+    if format == TableFormat::Iceberg {
+        // The authoritative Iceberg signal, and the one Athena, Trino, and Glue all key off.
+        // `metadata_location` is written separately, by whatever commits a snapshot — for a
+        // streaming table that is the Iceberg metadata published alongside the Delta log.
+        input = input.parameters("table_type", "ICEBERG");
+    }
     input
         .build()
         .map_err(|e| Error::Io(format!("build Glue TableInput: {e}")))
@@ -997,13 +1003,19 @@ mod tests {
     }
 
     #[test]
-    fn build_table_input_still_rejects_iceberg() {
-        // Iceberg's metastore entry needs a `metadata_location` that only a real snapshot commit
-        // can produce; declaring one from a SerDe alone would register an unreadable table.
+    fn build_table_input_labels_iceberg_with_the_table_type_athena_reads() {
+        // An Iceberg entry is Iceberg because of `table_type`, not its SerDe. `metadata_location`
+        // is added separately by whatever commits a snapshot — for a streaming table, the Iceberg
+        // metadata published alongside the Delta log.
         let schema = sample_schema();
-        let err = build_table_input("t", "s3://bucket/t/", &schema, TableFormat::Iceberg, &[])
-            .unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        let input =
+            build_table_input("t", "s3://bucket/t/", &schema, TableFormat::Iceberg, &[]).unwrap();
+        let params = input.parameters().expect("parameters");
+        assert_eq!(
+            params.get("table_type").map(String::as_str),
+            Some("ICEBERG")
+        );
+        assert_eq!(detect_format(params), TableFormat::Iceberg);
     }
 
     #[test]

@@ -101,13 +101,29 @@ over unchanged:
 | `maxOffsetsPerTrigger` | unlimited | Records per micro-batch, across all partitions |
 | `kafka.fetch.max.wait.ms` | `500` | Broker-side wait before returning an empty fetch |
 | `kafka.max.partition.fetch.bytes` | `1048576` | Fetch ceiling per partition per batch |
+| `kafka.metadata.max.age.ms` | `30000` | How often the partition assignment is re-resolved |
+
+**Partitions are fetched concurrently**, so a batch costs one round trip's latency rather than one
+per partition. On a mostly-idle topic that is the difference between a trigger that fires on time
+and one that spends `partitions x fetch.max.wait.ms` waiting.
+
+**`maxOffsetsPerTrigger` is divided across partitions**, not spent in partition order: every
+partition gets a floor of one record and the remainder is split in proportion to each partition's
+lag. Spending the budget in order would let one busy partition consume it every batch and leave
+the rest of the topic permanently unread.
+
+**New partitions are picked up automatically.** The assignment is re-resolved every
+`kafka.metadata.max.age.ms`; a partition added after the query started is read from `earliest`,
+because every record in it postdates the query.
 
 **No consumer groups.** Like Spark, Oxidant assigns partitions directly and keeps offsets in the
 query's own `checkpointLocation`. That is what makes a query replayable: the checkpoint, not the
 broker, is the source of truth for where you are — list your topics with `subscribe`.
 
-**Offsets are committed after the sink write, never before.** A crash between the two replays the
-last micro-batch (at-least-once). A crash never skips one.
+**Offsets are committed after the sink write, never before**, and the Delta sink stamps each
+micro-batch id into its commit as a `txn` action. So a crash between the two replays the batch,
+the log recognizes the replay, and the rows are *not* written twice — exactly-once into the table,
+not merely at-least-once. A crash never skips a batch either.
 
 Not supported yet: `subscribePattern`, `assign`, `includeHeaders`, `kafka.group.id`, per-record
 `timestampType` discrimination, and Kafka as a *sink*. `subscribePattern` and `assign` are
@@ -124,8 +140,8 @@ offline. It is not a broker substitute — it has one partition and replays whol
 
 | `writeStream.format(...)` | Behaviour |
 |---------------------------|-----------|
-| `delta` (default for `toTable`) | One Parquet file + one `_delta_log` commit per batch. Atomic; readable by Spark, Athena, Trino. |
-| `parquet` | One Parquet file per batch in the table directory (Hive-style). No commit protocol — a reader listing mid-write can see a partial file. |
+| `delta` (default for `toTable`) | One snappy Parquet file + one `_delta_log` commit per batch, with per-column statistics and periodic checkpoints. Atomic; readable by Spark, Athena, Trino — and, via the Iceberg metadata published alongside it, by Iceberg engines too. |
+| `parquet` | One snappy Parquet file per batch in the table directory (Hive-style). No commit protocol — a reader listing mid-write can see a partial file. |
 | `json` / `csv` | Local file directory. Development only. |
 | `memory` | In-process. Tests only. |
 
@@ -133,10 +149,22 @@ Both `toTable("catalog.database.table")` and `start("s3://bucket/path")` work; o
 declares the table in the catalog. `s3://` and local paths behave identically — writes go through
 the same object store, credentials, and assumed role that a `SELECT` from the table would use.
 
-**Iceberg is not a supported streaming sink yet.** An Iceberg commit has to write Avro manifests
-and update the catalog's `metadata_location` atomically; until that exists, `format("iceberg")`
-returns a clear error pointing at Delta rather than writing a table nothing can read. Oxidant
-*reads* Iceberg tables fine — this is a write-side gap only.
+`format("iceberg")` is not a sink format — but you almost certainly do not need it to, because a
+Delta sink publishes Iceberg metadata over the same files. See
+[Reading one table from any engine](#reading-one-table-from-any-engine) below.
+
+### Partitioning
+
+`writeStream.partitionBy("event_date")` writes Hive-style directories
+(`event_date=2026-08-17/part-….parquet`) and records the values in the Delta `add` action, the way
+Spark does. The partition columns live in the path, not in the data files.
+
+Partitioning is the single biggest lever on dashboard query cost: without it every query scans
+every file the stream has ever written. Partition on something a dashboard filters on and that
+does not explode in cardinality — a date, a region, a tenant — never on a timestamp or an id.
+
+Every data file also carries per-column `stats` (min/max/null counts) in its `add` action, so
+readers can skip files within a partition too.
 
 ### The table Oxidant registers in Glue
 
@@ -149,6 +177,57 @@ Schema is declared once, at query start, from the *transformed* plan's output �
 source's seven Kafka columns. Once created, a batch whose schema drifts from the table's is
 rejected before anything is written; schema evolution is not automatic.
 
+## Reading one table from any engine
+
+A live table is worth more when everything in the building can query it. Delta and Iceberg are
+both *metadata over Parquet* — the data files are identical, and only the description of which
+files are live differs — so Oxidant writes one copy of the data and publishes **both** metadata
+trees over it:
+
+```
+              part-00000-….parquet   part-00001-….parquet     <- written once
+                     |                       |
+   _delta_log/*.json + checkpoints           metadata/*.avro + vN.metadata.json
+   (Spark, Databricks, Athena, Oxidant)      (Trino, Athena, DuckDB, Snowflake, Oxidant)
+```
+
+This is on by default for Delta sinks. Turn it off with `.option("icebergCompat", "false")`.
+
+- In a catalog, the Delta table keeps its name and a **sibling Iceberg entry** is registered
+  alongside it: `orders` and `orders_iceberg`. One metastore entry cannot be both, because Athena
+  decides how to read a table from its `table_type`. Change the suffix with
+  `.option("icebergTableSuffix", "_ice")`.
+- Without a catalog, `metadata/version-hint.text` is written, which is how Trino's hadoop catalog
+  and DuckDB's Iceberg extension find the current snapshot.
+- The published metadata sets `schema.name-mapping.default`. Parquet written for Delta carries no
+  Iceberg field ids, and without a name mapping an Iceberg reader opens the table and returns
+  every column as null. This is the detail that makes the whole thing work.
+
+**Iceberg readers trail Delta readers.** The Iceberg tree is republished every
+`checkpointInterval` commits (10 by default), not on every micro-batch — rewriting a manifest per
+batch would cost more than the data write. Delta readers always see the newest batch; Iceberg
+readers see the table as of the last publish. Lower `checkpointInterval` to shorten the lag, at
+the cost of more metadata writes.
+
+```python
+query = (
+    orders.writeStream
+    .format("delta")
+    .partitionBy("event_date")
+    .option("checkpointLocation", "s3://my-bucket/checkpoints/orders_live")
+    .option("checkpointInterval", "10")     # Delta checkpoints + Iceberg publishes
+    .trigger(processingTime="30 seconds")
+    .toTable("glue.streaming_live.orders")
+)
+```
+
+```sql
+-- Delta readers
+SELECT count(*) FROM glue.streaming_live.orders;
+-- Iceberg readers, same files
+SELECT count(*) FROM glue.streaming_live.orders_iceberg;
+```
+
 ## Triggers
 
 | `trigger(...)` | Behaviour |
@@ -158,15 +237,22 @@ rejected before anything is written; schema evolution is not automatic.
 | `availableNow=True` | Same, then idle. |
 | *(omitted)* | Every 1 second. |
 
-A batch that fails terminates the query with the error on its status, rather than retrying the
-same failure every interval — check `query.status()` / `query.lastProgress`.
+Triggers fire on a **fixed schedule**: a batch that overruns its interval is followed immediately
+by the next one, rather than the interval being added on top of the batch's own duration.
+
+Transient I/O failures — an S3 5xx, a broker leader election, a throttled catalog call — are
+retried with exponential backoff (4 attempts). A batch that fails anyway, or that fails for a
+reason retrying cannot fix (a schema error, an offset aged out of retention), terminates the query
+with the error on its status rather than spinning on it every interval. Check `query.status()` /
+`query.lastProgress`.
 
 ## Checkpoints
 
 `checkpointLocation` holds `offsets.json`: the committed batch id, the source's replay position,
-and the event-time watermark. Point a restarted query at the same location and it resumes; the
-query `id` survives the restart while `run_id` is new, exactly as in Spark. Delete the directory
-to start over.
+and the event-time watermark. It is written atomically (staged, then renamed), so a crash mid-write
+can never leave a half-parsed checkpoint that silently resets the query's position. Point a
+restarted query at the same location and it resumes; the query `id` survives the restart while
+`run_id` is new, exactly as in Spark. Delete the directory to start over.
 
 Today the checkpoint is written through the local filesystem, so a driver that moves hosts needs
 that path on shared storage (EFS/NFS) — object-store checkpoints are not implemented yet.
@@ -189,6 +275,22 @@ The CI suite covers everything above the broker socket
 (`crates/oxidant-connect/tests/streaming_kafka_lakehouse.rs`); this script is what covers the AWS
 leg, which needs credentials CI does not have.
 
+## Throughput
+
+What the pipeline does per micro-batch, and what bounds it:
+
+| Stage | Behaviour |
+|-------|-----------|
+| Fetch | All partitions concurrently, capped at `kafka.max.partition.fetch.bytes` each |
+| Transform | The batch is sliced into 8192-row chunks across one partition per core |
+| Write | One snappy Parquet file per partition value, one Delta commit |
+| Commit | The next version is remembered, so the log is not listed per commit |
+
+Two ceilings are worth knowing. The default `kafka.max.partition.fetch.bytes` of 1 MiB caps a
+batch at roughly `partitions x 1 MiB`, so raise it (or add partitions) before raising the trigger
+rate. And micro-batches run **on the driver** — the streaming path does not use the Flight worker
+cluster — so a single process bounds throughput.
+
 ## Limits worth knowing before you deploy
 
 - **Micro-batches run on the driver.** The streaming path does not use the Flight worker cluster,
@@ -198,7 +300,13 @@ leg, which needs credentials CI does not have.
   deduplicates within a bounded window, but streaming joins and windowed aggregations that need
   cross-batch state are not implemented.
 - **One writer per table.** Concurrent Delta writers are detected (the commit is
-  create-if-not-exists and retries at the next free version), but the sink is designed for a
-  single streaming query per table.
-- **No compaction.** One file per micro-batch means a fast trigger produces many small files. Run
-  a periodic compaction job, or use a slower trigger.
+  create-if-not-exists and retries at the next free version), and the `txn` stamp is per query, so
+  the sink is designed for a single streaming query per table.
+- **No compaction.** One file per micro-batch means a fast trigger produces many small files.
+  Checkpoints keep the *log* bounded, but the file count still grows — run a periodic compaction
+  job, or use a slower trigger. If another writer compacts the table, Oxidant notices the `remove`
+  actions and stops checkpointing rather than writing a checkpoint from a stale file list.
+- **Iceberg metadata is a snapshot, not a mirror.** It is republished every `checkpointInterval`
+  commits, so Iceberg readers lag Delta readers by up to that many batches.
+- **The Iceberg side is append-only.** Deletes or updates applied to the Delta table by another
+  writer are not reflected in the published Iceberg metadata.

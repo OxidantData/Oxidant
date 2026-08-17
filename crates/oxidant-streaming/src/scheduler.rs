@@ -15,12 +15,57 @@ use crate::checkpoint::CheckpointStore;
 use crate::config::StreamQueryConfig;
 use crate::input::MicroBatchInput;
 use crate::kafka::KafkaSource;
-use crate::lake_sink::{LakeSink, LakeTarget};
-use crate::query::{QueryProgress, QueryStatus, SourceProgress, StreamingQuery, StreamingQueryId};
+use crate::lake_sink::{LakeSink, LakeSinkOptions, LakeTarget};
+use crate::query::{
+    QueryProgress, QueryStatus, SinkProgress, SourceProgress, StreamingQuery, StreamingQueryId,
+};
 use crate::sink::{FileSink, MemorySink, Sink};
 use crate::source::{FileSource, MemoryRateSource, Source};
 use crate::state::DedupState;
 use crate::watermark::WatermarkConfig;
+
+/// Attempts a transient I/O failure gets before the query gives up on it.
+const RETRY_ATTEMPTS: u32 = 4;
+
+/// Whether an error is worth trying again.
+///
+/// Under load, transient failures are routine — an S3 5xx, a partition leader election during a
+/// broker restart, a throttled catalog call. Terminating the query on the first one means a
+/// stream cannot survive an ordinary Tuesday. A planning or schema error, by contrast, will fail
+/// identically forever, so retrying it just delays the message.
+fn is_retryable(e: &Error) -> bool {
+    matches!(e, Error::Io(_))
+}
+
+fn retry_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(200u64 << attempt.min(5))
+}
+
+/// Run an I/O operation, retrying transient failures with exponential backoff.
+///
+/// Retrying a *sink write* is only safe because the sink stamps the batch id into its commit: a
+/// second attempt after a lost acknowledgement is recognized as a replay and dropped, rather than
+/// appending the rows twice.
+macro_rules! with_retry {
+    ($what:expr, $op:expr) => {{
+        let mut attempt: u32 = 0;
+        loop {
+            match $op.await {
+                Ok(value) => break Ok(value),
+                Err(e) if is_retryable(&e) && attempt + 1 < RETRY_ATTEMPTS => {
+                    attempt += 1;
+                    eprintln!(
+                        "[oxidant] streaming {}: {e} — retry {attempt}/{}",
+                        $what,
+                        RETRY_ATTEMPTS - 1
+                    );
+                    tokio::time::sleep(retry_backoff(attempt)).await;
+                }
+                Err(e) => break Err(e),
+            }
+        }
+    }};
+}
 
 /// Trigger mode for micro-batch execution.
 #[derive(Debug, Clone)]
@@ -143,7 +188,14 @@ impl StreamingQueryManager {
             Some(p) => Arc::new(p.plan.schema().as_arrow().clone()),
             None => source.schema(),
         };
-        let sink = build_sink(engine, &config, &options, sink_schema).await?;
+        // The *persisted* query id is the sink's `appId`: it survives restarts, which is what
+        // makes a replayed batch recognizable as one. A fresh uuid per run would not.
+        let app_id = if restored.query_id.is_empty() {
+            id.id.clone()
+        } else {
+            restored.query_id.clone()
+        };
+        let sink = build_sink(engine, &config, &options, sink_schema, app_id).await?;
 
         let _ = checkpoint.init_for_query(&id);
         let watermark = WatermarkConfig::from_options(
@@ -153,6 +205,10 @@ impl StreamingQueryManager {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         );
+        // Batch ids continue where the last run stopped: they are the sink's idempotency
+        // versions, so restarting at zero would make every replayed id look already-committed.
+        let mut q = q;
+        q.batch_id = restored.committed_batch_id;
         let managed = ManagedQuery {
             runtime: tokio::sync::Mutex::new(QueryRuntime {
                 source,
@@ -238,8 +294,9 @@ impl StreamingQueryManager {
         // Held for the whole batch — a Kafka fetch plus an object-store write. Status readers
         // take `state` instead, so they are never blocked by it.
         let mut rt = q.runtime.lock().await;
+        let started = std::time::Instant::now();
 
-        let source_batches = rt.source.poll_batch(engine).await?;
+        let source_batches = with_retry!("source poll", rt.source.poll_batch(engine))?;
         let input_rows: u64 = source_batches.iter().map(|b| b.num_rows() as u64).sum();
         if input_rows == 0 {
             // Nothing arrived. Do not run the plan, do not touch the sink, do not advance the
@@ -278,36 +335,62 @@ impl StreamingQueryManager {
             batches = dedup.dedup_batches(&batches, &keys);
         }
 
-        let rows = rt.sink.write_batch(&batches).await?;
-        let source_description = rt.source.description();
-        let committed_offsets = rt.source.committed_offsets();
-
+        // The batch id is what the sink stamps into its commit, so it has to be settled before
+        // the write, not after: a replayed batch is only recognizable if it carries the same id
+        // the first attempt did.
         let batch_id = {
             let mut state = q.state.write().await;
             state.batch_id += 1;
+            state.batch_id
+        };
+        let rows = with_retry!("sink write", rt.sink.write_batch(&batches, batch_id))?;
+        let source_description = rt.source.description();
+        let sink_description = rt.sink.description();
+        let committed_offsets = rt.source.committed_offsets();
+
+        let elapsed = started.elapsed();
+        let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+        {
+            let mut state = q.state.write().await;
             state.status.is_data_available = true;
             state.last_progress = Some(QueryProgress {
                 id: state.query_id.id.clone(),
                 run_id: state.query_id.run_id.clone(),
                 name: state.name.clone(),
-                batch_id: state.batch_id,
+                batch_id,
                 num_input_rows: input_rows,
-                processed_rows_per_second: rows as f64,
+                // Rows the batch actually got through, per second of wall clock — not the row
+                // count, which is what this field used to report to anything watching it.
+                input_rows_per_second: input_rows as f64 / seconds,
+                processed_rows_per_second: rows as f64 / seconds,
+                duration_ms: elapsed.as_millis() as u64,
                 sources: vec![SourceProgress {
                     description: source_description,
                     num_input_rows: input_rows,
+                    input_rows_per_second: input_rows as f64 / seconds,
                 }],
+                sink: SinkProgress {
+                    description: sink_description,
+                    num_output_rows: rows,
+                },
             });
-            state.batch_id
-        };
+        }
 
         // Exactly-once-into-the-sink: the source position is committed only after the sink write
-        // returns. A crash between the two replays the batch — at-least-once, never data loss.
+        // returns. A crash between the two replays the batch, and the sink's `txn` stamp makes
+        // that replay a no-op instead of a duplicate.
         let mut checkpoint = q.checkpoint.load().unwrap_or_default();
         checkpoint.batch_id = batch_id;
         checkpoint.committed_batch_id = batch_id;
         checkpoint.source_offsets = committed_offsets;
-        let _ = q.checkpoint.save(&checkpoint);
+        // A checkpoint that cannot be written is not cosmetic: without it a restart re-reads from
+        // wherever the last successful save left off, so the failure has to reach the user.
+        q.checkpoint.save(&checkpoint).map_err(|e| {
+            Error::Io(format!(
+                "streaming checkpoint `{}`: {e}",
+                q.checkpoint.path().display()
+            ))
+        })?;
         Ok(input_rows)
     }
 
@@ -386,7 +469,16 @@ async fn build_sink(
     config: &StreamQueryConfig,
     options: &StartOptions,
     schema: SchemaRef,
+    app_id: String,
 ) -> Result<Box<dyn Sink>> {
+    let sink_options = LakeSinkOptions {
+        app_id: Some(app_id),
+        partition_columns: config.partition_columns.clone(),
+        publish_iceberg: config.publish_iceberg,
+        iceberg_table_suffix: config.iceberg_table_suffix.clone(),
+        checkpoint_interval: config.checkpoint_interval,
+    };
+
     // `toTable(...)`: a catalog table, always through the lake sink.
     if let Some(identifier) = &config.sink_table {
         let format = crate::lake_sink::writable_format(&config.sink_format)?;
@@ -397,7 +489,9 @@ async fn build_sink(
             format,
             config.sink_path.clone(),
         )?;
-        return Ok(Box::new(LakeSink::open(engine, target, schema).await?));
+        return Ok(Box::new(
+            LakeSink::open(engine, target, schema, sink_options).await?,
+        ));
     }
 
     // `start(path)`: Delta and Parquet go through the lake sink so `s3://` works and Delta gets a
@@ -409,6 +503,7 @@ async fn build_sink(
                     engine,
                     LakeTarget::location_only(path, TableFormat::Delta),
                     schema,
+                    sink_options,
                 )
                 .await?,
             ),
@@ -417,6 +512,7 @@ async fn build_sink(
                     engine,
                     LakeTarget::location_only(path, TableFormat::Parquet),
                     schema,
+                    sink_options,
                 )
                 .await?,
             ),
@@ -444,7 +540,7 @@ fn apply_watermark(
 ) -> Vec<oxidant_loom::arrow::record_batch::RecordBatch> {
     use oxidant_loom::arrow::array::{Array, AsArray, BooleanArray};
     use oxidant_loom::arrow::compute::filter_record_batch;
-    use oxidant_loom::arrow::datatypes::DataType;
+    use oxidant_loom::arrow::datatypes::{DataType, TimeUnit};
 
     let mut out = Vec::new();
     for batch in batches {
@@ -455,11 +551,34 @@ fn apply_watermark(
         let arr = batch.column(col_idx);
         let mut keep = vec![true; batch.num_rows()];
         match arr.data_type() {
-            DataType::Timestamp(_, _) => {
-                let ts =
-                    arr.as_primitive::<oxidant_loom::arrow::datatypes::TimestampMicrosecondType>();
+            // Each Arrow timestamp unit is a distinct concrete array type. Reading them all as
+            // microseconds panics on anything else — and Kafka's own `timestamp` column is
+            // milliseconds, so the obvious `withWatermark("timestamp", …)` was a crash.
+            DataType::Timestamp(unit, _) => {
+                use oxidant_loom::arrow::datatypes::{
+                    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+                    TimestampSecondType,
+                };
+                let micros_at: Box<dyn Fn(usize) -> i64> = match unit {
+                    TimeUnit::Second => {
+                        let a = arr.as_primitive::<TimestampSecondType>().clone();
+                        Box::new(move |row| a.value(row).saturating_mul(1_000_000))
+                    }
+                    TimeUnit::Millisecond => {
+                        let a = arr.as_primitive::<TimestampMillisecondType>().clone();
+                        Box::new(move |row| a.value(row).saturating_mul(1_000))
+                    }
+                    TimeUnit::Microsecond => {
+                        let a = arr.as_primitive::<TimestampMicrosecondType>().clone();
+                        Box::new(move |row| a.value(row))
+                    }
+                    TimeUnit::Nanosecond => {
+                        let a = arr.as_primitive::<TimestampNanosecondType>().clone();
+                        Box::new(move |row| a.value(row) / 1_000)
+                    }
+                };
                 for (row, slot) in keep.iter_mut().enumerate() {
-                    if !arr.is_null(row) && ts.value(row) < watermark_micros {
+                    if !arr.is_null(row) && micros_at(row) < watermark_micros {
                         *slot = false;
                     }
                 }
@@ -555,6 +674,7 @@ mod tests {
                 "memory",
                 SinkDestination::None,
                 &HashMap::new(),
+                vec![],
             )
         };
 
@@ -619,6 +739,7 @@ mod tests {
         async fn write_batch(
             &mut self,
             batches: &[oxidant_loom::arrow::record_batch::RecordBatch],
+            _batch_id: u64,
         ) -> Result<u64> {
             self.entered.notify_one();
             self.release.notified().await;

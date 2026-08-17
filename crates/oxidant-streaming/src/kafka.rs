@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use oxidant_common::{Error, Result};
 use oxidant_loom::arrow::array::{
@@ -38,8 +39,15 @@ const TIMESTAMP_TYPE_CREATE_TIME: i32 = 0;
 /// `max.partition.fetch.bytes` default (1 MiB).
 const DEFAULT_MAX_PARTITION_FETCH_BYTES: i32 = 1024 * 1024;
 /// Default `fetch.max.wait.ms`. Short, because a micro-batch trigger should not block on an idle
-/// topic — an empty batch is a legitimate outcome.
+/// topic — an empty batch is a legitimate outcome. Partitions are fetched concurrently, so this
+/// is the cost of an idle *batch*, not an idle partition.
 const DEFAULT_FETCH_MAX_WAIT_MS: i32 = 500;
+/// How long a partition assignment is trusted before the broker is asked again.
+///
+/// Kafka's own `metadata.max.age.ms` default is five minutes, which is far too long for a stream:
+/// a topic expanded from 12 to 24 partitions — the ordinary response to load — would go on
+/// reading only the original twelve until the query restarted, silently.
+const DEFAULT_METADATA_MAX_AGE_MS: u64 = 30_000;
 
 /// The exact Arrow schema Spark's Kafka source produces.
 ///
@@ -97,6 +105,8 @@ pub struct KafkaOptions {
     pub max_offsets_per_trigger: Option<u64>,
     pub fetch_max_wait_ms: i32,
     pub max_partition_fetch_bytes: i32,
+    /// How stale a partition assignment may get before it is re-resolved against the broker.
+    pub metadata_max_age: Duration,
     /// Offline replacement for a broker — see the module docs.
     pub spool_dir: Option<PathBuf>,
 }
@@ -180,6 +190,11 @@ impl KafkaOptions {
             max_partition_fetch_bytes: get("kafka.max.partition.fetch.bytes")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_MAX_PARTITION_FETCH_BYTES),
+            metadata_max_age: Duration::from_millis(
+                get("kafka.metadata.max.age.ms")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_METADATA_MAX_AGE_MS),
+            ),
             spool_dir,
         })
     }
@@ -270,6 +285,14 @@ pub struct KafkaSource {
     assigned: bool,
     client: Option<Arc<rskafka::client::Client>>,
     partition_clients: BTreeMap<TopicPartition, Arc<rskafka::client::partition::PartitionClient>>,
+    /// Last high watermark each partition reported, which is how the next batch estimates lag
+    /// without spending a round trip per partition asking for it.
+    high_watermarks: BTreeMap<TopicPartition, i64>,
+    /// When the partition assignment was last resolved against the broker.
+    assigned_at: Option<Instant>,
+    /// Rotates which partition is served first when the budget cannot cover them all, so a
+    /// budget smaller than the partition count still drains every partition over time.
+    round_robin: usize,
     /// Spool mode only: index of the next spool file to read.
     spool_cursor: u64,
 }
@@ -282,6 +305,9 @@ impl KafkaSource {
             assigned: false,
             client: None,
             partition_clients: BTreeMap::new(),
+            high_watermarks: BTreeMap::new(),
+            assigned_at: None,
+            round_robin: 0,
             spool_cursor: 0,
         }
     }
@@ -315,11 +341,20 @@ impl KafkaSource {
         Ok(client)
     }
 
-    /// Resolve the partition set and seed each partition's starting offset. Idempotent.
+    /// Resolve the partition set and seed each partition's starting offset.
+    ///
+    /// Re-run on an interval rather than once: partitions get *added* to busy topics, and a
+    /// source that resolved its assignment once would never read them. Existing partitions keep
+    /// their offsets; a partition that appears later starts at `earliest`, because every record
+    /// in it postdates the query and skipping to `latest` would drop data the query should see.
     async fn assign(&mut self) -> Result<()> {
-        if self.assigned {
+        let fresh = self
+            .assigned_at
+            .is_some_and(|at| at.elapsed() < self.options.metadata_max_age);
+        if self.assigned && fresh {
             return Ok(());
         }
+        let first_assignment = !self.assigned;
         let client = self.client().await?;
         let topics = client
             .list_topics()
@@ -338,6 +373,9 @@ impl KafkaSource {
                     topic: want.clone(),
                     partition: *partition,
                 };
+                if self.partition_clients.contains_key(&tp) {
+                    continue;
+                }
                 let pc = client
                     .partition_client(
                         want.clone(),
@@ -351,13 +389,16 @@ impl KafkaSource {
                 // A checkpoint-restored offset always wins over `startingOffsets`: that is what
                 // makes a restarted query resume rather than replay (or skip) data.
                 if !self.offsets.contains_key(&tp) {
-                    let start = self.resolve_start_offset(&tp, &pc).await?;
+                    let start = self
+                        .resolve_start_offset(&tp, &pc, first_assignment)
+                        .await?;
                     self.offsets.insert(tp.clone(), start);
                 }
                 self.partition_clients.insert(tp, pc);
             }
         }
         self.assigned = true;
+        self.assigned_at = Some(Instant::now());
         Ok(())
     }
 
@@ -365,9 +406,18 @@ impl KafkaSource {
         &self,
         tp: &TopicPartition,
         pc: &rskafka::client::partition::PartitionClient,
+        first_assignment: bool,
     ) -> Result<i64> {
         use rskafka::client::partition::OffsetAt;
 
+        // A partition that appeared *after* the query started holds only records the query has
+        // not seen, so it is read from the beginning whatever `startingOffsets` said.
+        if !first_assignment {
+            return pc
+                .get_offset(OffsetAt::Earliest)
+                .await
+                .map_err(|e| Error::Io(format!("kafka: offset for new partition `{tp}`: {e}")));
+        }
         let at = match &self.options.starting_offsets {
             StartingOffsets::Earliest => OffsetAt::Earliest,
             StartingOffsets::Latest => OffsetAt::Latest,
@@ -383,31 +433,47 @@ impl KafkaSource {
             .map_err(|e| Error::Io(format!("kafka: offset for `{tp}`: {e}")))
     }
 
-    /// Fetch one micro-batch worth of records across all assigned partitions.
+    /// Fetch one micro-batch worth of records across all assigned partitions, concurrently.
+    ///
+    /// Every partition is fetched at once. Fetching them one at a time makes a batch cost the
+    /// *sum* of the partitions' latencies, and since a partition with nothing to send holds the
+    /// request open for `fetch.max.wait.ms`, a mostly-idle 24-partition topic spent twelve
+    /// seconds per trigger doing nothing.
     async fn fetch(&mut self) -> Result<Vec<KafkaRecord>> {
         self.assign().await?;
 
-        let budget = self.options.max_offsets_per_trigger.unwrap_or(u64::MAX);
-        let mut taken = 0u64;
-        let mut out = Vec::new();
-
-        // Round-robin over partitions in a stable order so a rate-limited batch does not
-        // starve high-numbered partitions run after run.
         let partitions: Vec<TopicPartition> = self.partition_clients.keys().cloned().collect();
-        for tp in partitions {
-            if taken >= budget {
-                break;
+        if partitions.is_empty() {
+            return Ok(vec![]);
+        }
+        let budgets = self.partition_budgets(&partitions);
+
+        let fetches = partitions.iter().filter_map(|tp| {
+            let cap = *budgets.get(tp)?;
+            if cap == 0 {
+                return None;
             }
+            let pc = self.partition_clients[tp].clone();
+            let tp = tp.clone();
             let from = *self.offsets.get(&tp).unwrap_or(&0);
-            let pc = self.partition_clients[&tp].clone();
-            let fetched = pc
-                .fetch_records(
-                    from,
-                    1..self.options.max_partition_fetch_bytes,
-                    self.options.fetch_max_wait_ms,
-                )
-                .await;
-            let (records, _high_watermark) = match fetched {
+            let bytes = 1..self.options.max_partition_fetch_bytes;
+            let wait = self.options.fetch_max_wait_ms;
+            Some(async move {
+                let result = pc.fetch_records(from, bytes, wait).await;
+                (tp, from, cap, result)
+            })
+        });
+        let fetched = futures::future::join_all(fetches).await;
+
+        // Offsets and watermarks are staged and only committed once every partition has been
+        // read. Advancing them as each partition lands would mean a failure on partition 5
+        // discards the records already taken from partitions 0-4 *and* keeps their advanced
+        // offsets, so the retry would resume past records that were never delivered anywhere.
+        let mut out = Vec::new();
+        let mut advanced: Vec<(TopicPartition, i64)> = Vec::new();
+        let mut watermarks: Vec<(TopicPartition, i64)> = Vec::new();
+        for (tp, from, cap, result) in fetched {
+            let (records, high_watermark) = match result {
                 Ok(v) => v,
                 // An out-of-range offset means the broker aged past our checkpoint (retention)
                 // or the topic was recreated. Spark's `failOnDataLoss=true` default is to fail
@@ -418,26 +484,88 @@ impl KafkaSource {
                     )))
                 }
             };
+            watermarks.push((tp.clone(), high_watermark));
 
-            for r in records {
-                if taken >= budget {
-                    break;
-                }
+            for r in records.into_iter().take(cap as usize) {
+                let offset = r.offset;
                 out.push(KafkaRecord {
                     key: r.record.key,
                     value: r.record.value,
                     topic: tp.topic.clone(),
                     partition: tp.partition,
-                    offset: r.offset,
+                    offset,
                     timestamp_ms: r.record.timestamp.timestamp_millis(),
                 });
                 // The next batch resumes after the record we just took, even if the budget cuts
                 // this partition short mid-fetch.
-                self.offsets.insert(tp.clone(), r.offset + 1);
-                taken += 1;
+                advanced.push((tp.clone(), offset + 1));
             }
         }
+        self.offsets.extend(advanced);
+        self.high_watermarks.extend(watermarks);
+        self.round_robin = self.round_robin.wrapping_add(1);
         Ok(out)
+    }
+
+    /// Divide `maxOffsetsPerTrigger` across the assigned partitions.
+    ///
+    /// This is the whole reason the option is safe to use. Spending the budget on partitions in
+    /// order — taking as much as the first will give, then the second, and stopping when the
+    /// budget runs out — means a busy partition 0 consumes the entire allowance on every batch
+    /// and the rest of the topic is *never read again*: no error, no warning, just unbounded and
+    /// invisible lag on every partition but one.
+    ///
+    /// So each partition gets a floor of one record, and the remainder is split in proportion to
+    /// the lag each partition reported last time. When the budget cannot even cover the floor,
+    /// the starting partition rotates per batch, so every partition is still drained over time.
+    fn partition_budgets(&self, partitions: &[TopicPartition]) -> BTreeMap<TopicPartition, u64> {
+        let Some(budget) = self.options.max_offsets_per_trigger else {
+            return partitions.iter().map(|tp| (tp.clone(), u64::MAX)).collect();
+        };
+        let n = partitions.len() as u64;
+        if n == 0 {
+            return BTreeMap::new();
+        }
+
+        // Fewer records allowed than partitions: serve a rotating window of one each.
+        if budget < n {
+            let start = self.round_robin % partitions.len();
+            return partitions
+                .iter()
+                .enumerate()
+                .map(|(i, tp)| {
+                    let offset = (i + partitions.len() - start) % partitions.len();
+                    (tp.clone(), u64::from((offset as u64) < budget))
+                })
+                .collect();
+        }
+
+        // Lag from the previous batch's high watermarks. Unknown on the first batch, where an
+        // equal split is the only fair guess.
+        let lag = |tp: &TopicPartition| -> u64 {
+            match (self.high_watermarks.get(tp), self.offsets.get(tp)) {
+                (Some(hw), Some(next)) => (hw - next).max(0) as u64,
+                _ => 1,
+            }
+        };
+        let total_lag: u128 = partitions.iter().map(|tp| lag(tp) as u128).sum();
+
+        let mut shares: BTreeMap<TopicPartition, u64> =
+            partitions.iter().map(|tp| (tp.clone(), 1)).collect();
+        let mut remaining = budget - n;
+        if total_lag > 0 {
+            for tp in partitions {
+                let share = (remaining as u128 * lag(tp) as u128 / total_lag) as u64;
+                *shares.get_mut(tp).expect("seeded above") += share;
+            }
+            // Integer division leaves a few records unassigned; hand them to the hungriest.
+            let assigned: u64 = shares.values().sum();
+            remaining = budget.saturating_sub(assigned);
+        }
+        for tp in partitions.iter().cycle().take(remaining as usize) {
+            *shares.get_mut(tp).expect("seeded above") += 1;
+        }
+        shares
     }
 
     /// Offline mode: treat each file in the spool directory as one micro-batch of newline-
@@ -690,6 +818,7 @@ mod tests {
             max_offsets_per_trigger: None,
             fetch_max_wait_ms: 1,
             max_partition_fetch_bytes: 1024,
+            metadata_max_age: Duration::from_secs(30),
             spool_dir: None,
         });
         let saved = SourceOffsets {
@@ -708,6 +837,107 @@ mod tests {
         assert_eq!(src.committed_offsets().unwrap(), saved);
     }
 
+    /// A source with `partitions` assigned, at the given offsets and high watermarks.
+    fn source_with_lag(budget: Option<u64>, lags: &[(i32, i64)]) -> KafkaSource {
+        let mut src = KafkaSource::new(KafkaOptions {
+            brokers: vec!["b:9092".into()],
+            topics: vec!["t".into()],
+            starting_offsets: StartingOffsets::Latest,
+            max_offsets_per_trigger: budget,
+            fetch_max_wait_ms: 1,
+            max_partition_fetch_bytes: 1024,
+            metadata_max_age: Duration::from_secs(30),
+            spool_dir: None,
+        });
+        for (partition, lag) in lags {
+            let tp = TopicPartition {
+                topic: "t".into(),
+                partition: *partition,
+            };
+            src.offsets.insert(tp.clone(), 0);
+            src.high_watermarks.insert(tp, *lag);
+        }
+        src
+    }
+
+    fn partitions_of(src: &KafkaSource) -> Vec<TopicPartition> {
+        let mut p: Vec<TopicPartition> = src.offsets.keys().cloned().collect();
+        p.sort();
+        p
+    }
+
+    #[test]
+    fn a_rate_limited_batch_never_starves_a_partition() {
+        // The regression this guards is severe and silent: spending `maxOffsetsPerTrigger` on
+        // partitions in order lets a busy partition 0 take the entire allowance every batch, so
+        // partitions 1..N are never read again and their lag grows without bound or complaint.
+        let src = source_with_lag(Some(1_000), &[(0, 10_000_000), (1, 5), (2, 5), (3, 5)]);
+        let budgets = src.partition_budgets(&partitions_of(&src));
+
+        assert_eq!(
+            budgets.values().sum::<u64>(),
+            1_000,
+            "the whole budget is used"
+        );
+        for (tp, share) in &budgets {
+            assert!(*share > 0, "`{tp}` was starved with {share}");
+        }
+        // The backlogged partition still gets the lion's share — this is a fair split, not an
+        // equal one.
+        let hot = budgets[&TopicPartition {
+            topic: "t".into(),
+            partition: 0,
+        }];
+        assert!(
+            hot > 900,
+            "the lagging partition should dominate, got {hot}"
+        );
+    }
+
+    #[test]
+    fn with_no_lag_information_the_budget_splits_evenly() {
+        // The first batch of a query has no high watermarks yet.
+        let mut src = source_with_lag(Some(400), &[]);
+        for partition in 0..4 {
+            src.offsets.insert(
+                TopicPartition {
+                    topic: "t".into(),
+                    partition,
+                },
+                0,
+            );
+        }
+        let budgets = src.partition_budgets(&partitions_of(&src));
+        assert_eq!(budgets.values().sum::<u64>(), 400);
+        assert!(budgets.values().all(|s| *s == 100), "{budgets:?}");
+    }
+
+    #[test]
+    fn a_budget_smaller_than_the_partition_count_rotates_instead_of_starving() {
+        let mut src = source_with_lag(Some(2), &[(0, 100), (1, 100), (2, 100), (3, 100)]);
+        let partitions = partitions_of(&src);
+
+        // Over four batches every partition must be served, even though only two fit per batch.
+        let mut served: BTreeMap<TopicPartition, u64> = BTreeMap::new();
+        for _ in 0..4 {
+            for (tp, share) in src.partition_budgets(&partitions) {
+                *served.entry(tp).or_default() += share;
+            }
+            src.round_robin += 1;
+        }
+        assert_eq!(served.len(), 4);
+        for (tp, total) in &served {
+            assert!(*total >= 1, "`{tp}` never got a turn");
+        }
+    }
+
+    #[test]
+    fn an_unlimited_budget_puts_no_ceiling_on_any_partition() {
+        let src = source_with_lag(None, &[(0, 10), (1, 10)]);
+        let budgets = src.partition_budgets(&partitions_of(&src));
+        assert!(budgets.values().all(|s| *s == u64::MAX));
+    }
+
     #[test]
     fn offsets_from_another_source_type_are_ignored() {
         let mut src = KafkaSource::new(KafkaOptions {
@@ -717,6 +947,7 @@ mod tests {
             max_offsets_per_trigger: None,
             fetch_max_wait_ms: 1,
             max_partition_fetch_bytes: 1024,
+            metadata_max_age: Duration::from_secs(30),
             spool_dir: None,
         });
         src.restore_offsets(&SourceOffsets {
