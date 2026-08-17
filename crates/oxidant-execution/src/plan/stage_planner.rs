@@ -455,6 +455,25 @@ pub async fn resolve_replicated_tables(engine: &Engine, lp: &LogicalPlan) -> Vec
 /// Opt-in per-query search for the tightest workable replicated set. Off by default: it changes
 /// broadcast joins into shuffle joins, which is the right call at SF100 scale but cannot be
 /// proven from a small local run, so it ships as an A/B switch rather than a new default.
+///
+/// **It stays opt-in because two SF100 runs of the identical binary and env did not agree.**
+/// Both completed 99/99 with byte-identical row counts, and 98 of 99 queries reproduced within
+/// cluster noise — but q23 did not, and q23 alone is the entire spread:
+///
+/// ```text
+/// run 1   4,732.4s   q23   111.4s     0.854x trino  -- the anomaly
+/// run 2   5,493.9s   q23   819.3s     0.991x trino  -- representative
+/// (rest of the field, for scale: shipped 632.4s, leaf-prune 663.9s, flat 4 GiB 693.8s)
+/// ```
+///
+/// Excluding q23 the two runs differ by +53.6s (~1.2%), which is this cluster's known
+/// reproducibility. So the honest reading is that run 1's q23 was the outlier, not run 2's:
+/// every other measurement of q23 in every configuration lands in a 632-820s band. The ladder's
+/// own decision is *not* the unstable part — it logged the same tightened set
+/// (`["customer", "date_dim", "item"]`) and the same five 200->2 AQE coalesces on repeat probes.
+/// What that means is that turning the ladder on buys ~1.68x over the shipped threshold but
+/// leaves q23 capped by a downstream coalesce, and the margin over Trino is ~1%, not the ~17%
+/// a single run suggested. Defaulting this on would ship that variance to every user.
 fn replicate_ladder_enabled() -> bool {
     std::env::var("OXIDANT_REPLICATE_LADDER")
         .ok()
