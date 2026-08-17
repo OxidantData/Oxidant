@@ -11,7 +11,7 @@
 #   export KAFKA_TOPIC=oxidant_validation
 #   export GLUE_DATABASE=streaming_live
 #   export S3_WAREHOUSE=s3://my-bucket/streaming
-#   export AWS_REGION=us-east-1
+#   export AWS_REGION=us-west-2      # optional; defaults to the active profile's region
 #   ./scripts/validate-streaming-glue.sh
 set -euo pipefail
 
@@ -21,7 +21,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${KAFKA_TOPIC:=oxidant_validation}"
 : "${GLUE_DATABASE:=streaming_live}"
 : "${S3_WAREHOUSE:?set S3_WAREHOUSE to an s3:// prefix Oxidant may write under}"
-: "${AWS_REGION:=us-east-1}"
+# Fall back to the active profile's region rather than a hardcoded one. This script pins the
+# catalog's region explicitly (`--catalog-conf ...glue.region`), so a hardcoded default here does
+# not merely pick a region — it *overrides* the profile the engine would otherwise resolve, and
+# quietly builds the whole pipeline in a region the operator never named.
+: "${AWS_REGION:=$(aws configure get region 2>/dev/null || true)}"
+: "${AWS_REGION:?set AWS_REGION, or configure a region on the active AWS profile}"
 : "${OXIDANT_PORT:=50251}"
 : "${RECORDS:=200}"
 
