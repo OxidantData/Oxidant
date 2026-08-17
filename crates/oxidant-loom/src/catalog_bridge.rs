@@ -477,8 +477,9 @@ impl OxidantSchemaProvider {
             .unwrap_or_else(|| {
                 // The same ambient chain the ambient store uses, so a governed table cannot end up
                 // in a different region than its ungoverned neighbours in the same bucket.
-                oxidant_catalog::aws_region::ambient_region()
-                    .unwrap_or_else(|| oxidant_catalog::aws_region::LEGACY_FALLBACK_REGION.to_string())
+                oxidant_catalog::aws_region::ambient_region().unwrap_or_else(|| {
+                    oxidant_catalog::aws_region::LEGACY_FALLBACK_REGION.to_string()
+                })
             });
         let credential_provider = Arc::new(
             crate::lakeformation_store::LakeFormationCredentialProvider::new(
