@@ -285,17 +285,16 @@ The CI suite covers everything above the broker socket
 (`crates/oxidant-connect/tests/streaming_kafka_lakehouse.rs`); this script is what covers the AWS
 leg, which needs credentials CI does not have.
 
-**S3 credentials come from the environment.** The engine builds its S3 client with
-`AmazonS3Builder::from_env()`, which reads `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
-`AWS_SESSION_TOKEN` — the variables IRSA and EC2 instance roles set. It does **not** read
-`~/.aws/credentials`, so a laptop authenticated with a named profile falls through to the instance
-metadata endpoint and fails there after a long retry (`Error performing PUT
-http://169.254.169.254/...`). The validation script exports the active profile's credentials for
-you; if you run the server by hand, do the same:
+**S3 credentials resolve through the AWS default chain**, in the same order the AWS CLI uses:
+environment variables, then web identity (IRSA), then the shared profile in `~/.aws/credentials`
+and `~/.aws/config` (including SSO and `credential_process`), then the ECS container endpoint, then
+EC2 instance metadata. So `AWS_PROFILE=myprofile` works on a laptop and an instance role works on
+EC2, with no extra setup for either.
 
-```sh
-eval "$(aws configure export-credentials --format env)"
-```
+A table can still pin its own identity, and doing so outranks the chain entirely: static keys in
+`storage_options` (`s3.access-key-id` / `fs.s3a.access.key` and friends), `fs.s3a.assumed.role.arn`
+to assume a second role on top of the ambient one, or `s3.skip-signature` to read a public bucket
+unsigned.
 
 ## Throughput
 

@@ -50,15 +50,6 @@ python3 -c 'import pyspark' 2>/dev/null || {
   exit 1
 }
 
-# The engine resolves S3 credentials from the *environment* (`AmazonS3Builder::from_env`), which is
-# what IRSA and EC2 instance roles provide. A laptop authenticated with a shared-config profile has
-# none of those set, and the S3 client falls through to the instance-metadata endpoint and fails
-# there after a long retry. Export the resolved credentials so a profile works the same as a role.
-if [ -z "${AWS_ACCESS_KEY_ID:-}" ] && aws configure export-credentials --format env >/dev/null 2>&1; then
-  log "Exporting credentials from the active AWS profile"
-  eval "$(aws configure export-credentials --format env)"
-fi
-
 log "Building the engine"
 cargo build -p oxidant-cli --release
 
