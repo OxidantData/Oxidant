@@ -930,7 +930,7 @@ static REGISTERED_BUCKET_ROLES: std::sync::Mutex<Option<HashMap<String, Option<S
 /// guarantee that the session's registered store for this bucket matches `storage_options`, not
 /// just "some store exists for this bucket." See `REGISTERED_BUCKET_ROLES`'s doc comment for why
 /// that guarantee needs an explicit check instead of being automatic.
-fn ensure_remote_store(
+pub(crate) fn ensure_remote_store(
     state: &SessionState,
     url: &datafusion::datasource::listing::ListingTableUrl,
     storage_options: Option<&HashMap<String, String>>,

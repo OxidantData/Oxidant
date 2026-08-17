@@ -627,11 +627,18 @@ fn build_table_input(
         .output_format(serde.output_format)
         .serde_info(serde_info)
         .build();
-    TableInput::builder()
+    let mut input = TableInput::builder()
         .name(table)
         .storage_descriptor(storage)
         .set_partition_keys(Some(to_columns(&part_cols)?))
-        .parameters("classification", classification_for(format))
+        .parameters("classification", classification_for(format));
+    if format == TableFormat::Delta {
+        // A Delta table's SerDe is indistinguishable from a plain Parquet table's, so this
+        // parameter is what tells Spark, EMR, and Athena to read `_delta_log/` instead of
+        // listing the directory. `detect_format` reads it back on the way in.
+        input = input.parameters("spark.sql.sources.provider", "delta");
+    }
+    input
         .build()
         .map_err(|e| Error::Io(format!("build Glue TableInput: {e}")))
 }
@@ -990,12 +997,53 @@ mod tests {
     }
 
     #[test]
-    fn build_table_input_rejects_lakehouse_write_formats() {
+    fn build_table_input_still_rejects_iceberg() {
+        // Iceberg's metastore entry needs a `metadata_location` that only a real snapshot commit
+        // can produce; declaring one from a SerDe alone would register an unreadable table.
         let schema = sample_schema();
-        for format in [TableFormat::Delta, TableFormat::Iceberg] {
-            let err = build_table_input("t", "s3://bucket/t/", &schema, format, &[]).unwrap_err();
-            assert!(matches!(err, Error::Unsupported(_)), "{format:?}");
-        }
+        let err = build_table_input("t", "s3://bucket/t/", &schema, TableFormat::Iceberg, &[])
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn build_table_input_labels_delta_so_spark_and_athena_read_the_transaction_log() {
+        let schema = sample_schema();
+        let input =
+            build_table_input("t", "s3://bucket/t/", &schema, TableFormat::Delta, &[]).unwrap();
+        let params = input.parameters().expect("parameters");
+        // A Delta table's SerDe is identical to a plain Parquet table's — this parameter is the
+        // only thing that tells a reader to consult `_delta_log/` instead of listing the
+        // directory. `detect_format` reads it back on the way in.
+        assert_eq!(
+            params.get("spark.sql.sources.provider").map(String::as_str),
+            Some("delta")
+        );
+        assert_eq!(
+            params.get("classification").map(String::as_str),
+            Some("delta")
+        );
+        assert_eq!(
+            input
+                .storage_descriptor()
+                .and_then(|sd| sd.serde_info())
+                .and_then(|s| s.serialization_library()),
+            Some("org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe")
+        );
+    }
+
+    #[test]
+    fn a_delta_table_written_by_build_table_input_round_trips_through_detect_format() {
+        let schema = sample_schema();
+        let input =
+            build_table_input("t", "s3://bucket/t/", &schema, TableFormat::Delta, &[]).unwrap();
+        let params: HashMap<String, String> = input
+            .parameters()
+            .expect("parameters")
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(detect_format(&params), TableFormat::Delta);
     }
 
     // `apply_table_changes` backs `alter_table`'s in-memory mutation of the fetched

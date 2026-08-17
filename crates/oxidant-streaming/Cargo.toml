@@ -9,13 +9,33 @@ rust-version.workspace = true
 
 [dependencies]
 oxidant-common = { workspace = true }
+oxidant-catalog = { workspace = true }
+oxidant-datasource = { workspace = true }
 oxidant-loom = { workspace = true }
 datafusion = "54"
+# Kafka client. Deliberately NOT `rdkafka`: that binds librdkafka, a large external system
+# library that has to be installed (or vendored and built with cmake) on the aarch64 AMI, the CI
+# image, and every contributor's machine. rskafka is pure Rust, and its narrow API — fetch a
+# partition from an offset — is exactly what Structured Streaming needs, since Spark's Kafka
+# source assigns partitions and keeps offsets in the query checkpoint instead of using consumer
+# groups.
+#
+# The compression features cover the four codecs a Kafka producer can choose; a batch written
+# with a codec we did not enable is unreadable, so all four are on. `compression-lz4` and
+# `compression-zstd` bind vendored C (lz4-sys / zstd-sys) built by `cc` — already required by the
+# tree, which links zstd-sys for Parquet.
+rskafka = { version = "0.6", default-features = false, features = [
+  "compression-gzip",
+  "compression-lz4",
+  "compression-snappy",
+  "compression-zstd",
+] }
+object_store = { version = "=0.13.2", features = ["aws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 async-trait = "0.1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]

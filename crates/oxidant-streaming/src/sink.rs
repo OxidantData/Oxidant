@@ -6,8 +6,12 @@ use std::sync::Mutex;
 use oxidant_loom::arrow::record_batch::RecordBatch;
 
 /// A streaming sink that accepts micro-batches.
+///
+/// Async because the sinks that matter commit to object storage and a catalog; the in-memory and
+/// local-file sinks below just don't await anything.
+#[async_trait::async_trait]
 pub trait Sink: Send + Sync {
-    fn write_batch(&mut self, batches: &[RecordBatch]) -> oxidant_common::Result<u64>;
+    async fn write_batch(&mut self, batches: &[RecordBatch]) -> oxidant_common::Result<u64>;
 }
 
 /// Append micro-batches to a file directory as Parquet.
@@ -28,8 +32,9 @@ impl FileSink {
     }
 }
 
+#[async_trait::async_trait]
 impl Sink for FileSink {
-    fn write_batch(&mut self, batches: &[RecordBatch]) -> oxidant_common::Result<u64> {
+    async fn write_batch(&mut self, batches: &[RecordBatch]) -> oxidant_common::Result<u64> {
         let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         if rows == 0 {
             return Ok(0);
@@ -112,8 +117,9 @@ impl Default for MemorySink {
     }
 }
 
+#[async_trait::async_trait]
 impl Sink for MemorySink {
-    fn write_batch(&mut self, batches: &[RecordBatch]) -> oxidant_common::Result<u64> {
+    async fn write_batch(&mut self, batches: &[RecordBatch]) -> oxidant_common::Result<u64> {
         let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let mut guard = self
             .batches
@@ -133,15 +139,15 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    #[test]
-    fn file_sink_writes_parquet() {
+    #[tokio::test]
+    async fn file_sink_writes_parquet() {
         let dir = TempDir::new().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))])
                 .unwrap();
         let mut sink = FileSink::new(dir.path(), "parquet");
-        let rows = sink.write_batch(&[batch]).unwrap();
+        let rows = sink.write_batch(&[batch]).await.unwrap();
         assert_eq!(rows, 3);
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()

@@ -42,6 +42,7 @@ sysinfo = "0.33"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tempfile = "3"
 async-trait = "0.1"
 tokio-stream = "0.1"
 tonic = "0.12"

@@ -168,7 +168,9 @@ fn rel_name(rt: &sc::relation::RelType) -> &'static str {
 }
 
 async fn read(ctx: &SessionContext, r: &sc::Read) -> Result<LogicalPlan, Status> {
-    let _is_streaming = r.is_streaming;
+    if r.is_streaming {
+        return streaming_read(ctx, r).await;
+    }
     match r.read_type.as_ref().ok_or_else(|| inval("empty read"))? {
         sc::read::ReadType::NamedTable(t) => ctx
             .table(&t.unparsed_identifier)
@@ -1012,33 +1014,93 @@ fn plan_err(e: datafusion::error::DataFusionError) -> Status {
     Status::invalid_argument(format!("plan: {e}"))
 }
 
+/// The `(format, options)` of a streaming `Read` — `readStream.format(f).option(k, v)`.
+pub type StreamingReadSpec = (String, std::collections::BTreeMap<String, String>);
+
+/// Extract the streaming read's format and options from a `Read` node.
+pub fn streaming_read_spec(r: &sc::Read) -> Result<StreamingReadSpec, Status> {
+    let Some(sc::read::ReadType::DataSource(d)) = r.read_type.as_ref() else {
+        return Err(Status::unimplemented(
+            "readStream only supports `.format(...).load()`, not `.table(...)`",
+        ));
+    };
+    let format = d.format.clone().unwrap_or_default();
+    let mut options: std::collections::BTreeMap<String, String> = d
+        .options
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    // `readStream.format("json").load(path)` puts the path outside the option map; the sources
+    // read it from the options, so fold it in rather than losing it.
+    if let Some(path) = d.paths.first() {
+        options.entry("path".to_string()).or_insert(path.clone());
+    }
+    Ok((format, options))
+}
+
+/// Lower a streaming `Read` to a scan of its micro-batch input table.
+///
+/// A Structured Streaming DataFrame is planned once and re-executed per batch, so the leaf has to
+/// be a table whose *contents* the query manager can swap without rebuilding the plan — see
+/// `oxidant_streaming::input`. The input is keyed by the read's format and options so this
+/// translator and the `WriteStreamOperationStart` handler independently land on the same one.
+async fn streaming_read(ctx: &SessionContext, r: &sc::Read) -> Result<LogicalPlan, Status> {
+    let (format, options) = streaming_read_spec(r)?;
+    let schema = oxidant_streaming::source_schema(&oxidant_streaming::StreamQueryConfig {
+        source_format: format.clone(),
+        source_options: options.clone(),
+        ..Default::default()
+    })
+    .map_err(|e| inval(format!("readStream.format(`{format}`): {e}")))?;
+
+    let input = oxidant_streaming::stream_input(&format, &options, schema)
+        .map_err(|e| inval(format!("streaming input: {e}")))?;
+    if !ctx.table_exist(input.name()).unwrap_or(false) {
+        ctx.register_table(input.name(), input.provider())
+            .map_err(|e| inval(format!("register streaming input: {e}")))?;
+    }
+
+    ctx.table(input.name())
+        .await
+        .map_err(|e| inval(format!("streaming input `{}`: {e}", input.name())))?
+        .into_unoptimized_plan()
+        .pipe(Ok)
+}
+
 /// Returns true when the relation tree contains a streaming read.
 pub fn relation_is_streaming(rel: &sc::Relation) -> bool {
+    find_streaming_read(rel).is_some()
+}
+
+/// Find the streaming `Read` at the bottom of a relation tree.
+///
+/// The writer side of a streaming query (`WriteStreamOperationStart`) carries the *sink's* format
+/// and options, not the source's — the source is only described here, at the leaf. This is what
+/// lets the query manager build the right source for a
+/// `readStream.format("kafka")…writeStream.format("delta")` pipeline.
+pub fn find_streaming_read(rel: &sc::Relation) -> Option<&sc::Read> {
     use sc::relation::RelType;
-    let Some(rt) = rel.rel_type.as_ref() else {
-        return false;
-    };
+    let rt = rel.rel_type.as_ref()?;
+    fn first(a: &Option<Box<sc::Relation>>) -> Option<&sc::Read> {
+        a.as_deref().and_then(find_streaming_read)
+    }
     match rt {
-        RelType::Read(r) => r.is_streaming,
-        RelType::Project(p) => p.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        RelType::Filter(f) => f.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        RelType::Aggregate(a) => a.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        RelType::Join(j) => {
-            j.left.as_ref().is_some_and(|l| relation_is_streaming(l))
-                || j.right.as_ref().is_some_and(|r| relation_is_streaming(r))
-        }
-        RelType::Sort(s) => s.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        RelType::Limit(l) => l.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        RelType::SetOp(u) => {
-            u.left_input
-                .as_ref()
-                .is_some_and(|l| relation_is_streaming(l))
-                || u.right_input
-                    .as_ref()
-                    .is_some_and(|r| relation_is_streaming(r))
-        }
-        RelType::SubqueryAlias(s) => s.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        _ => false,
+        RelType::Read(r) => r.is_streaming.then_some(r),
+        RelType::Project(p) => first(&p.input),
+        RelType::Filter(f) => first(&f.input),
+        RelType::Aggregate(a) => first(&a.input),
+        RelType::Join(j) => first(&j.left).or_else(|| first(&j.right)),
+        RelType::Sort(s) => first(&s.input),
+        RelType::Limit(l) => first(&l.input),
+        RelType::SetOp(u) => first(&u.left_input).or_else(|| first(&u.right_input)),
+        RelType::SubqueryAlias(s) => first(&s.input),
+        RelType::WithColumns(w) => first(&w.input),
+        RelType::WithColumnsRenamed(w) => first(&w.input),
+        RelType::Drop(d) => first(&d.input),
+        RelType::Deduplicate(d) => first(&d.input),
+        RelType::ToDf(t) => first(&t.input),
+        RelType::Repartition(r) => first(&r.input),
+        _ => None,
     }
 }
 

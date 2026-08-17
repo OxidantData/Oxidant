@@ -12,6 +12,7 @@
 | [docs/mcp.md](docs/mcp.md) | `oxidant mcp` MCP server setup/tools |
 | [docs/workers.md](docs/workers.md) | Adding workers (local-cluster / multi-host) |
 | [docs/catalogs-glue.md](docs/catalogs-glue.md) | Glue catalog end-to-end |
+| [docs/streaming.md](docs/streaming.md) | Structured Streaming: Kafka → live Delta tables in Glue |
 | [docs/CODEMAP.md](docs/CODEMAP.md) | Crate / bench / site ownership |
 | [docs/architecture.md](docs/architecture.md) | Engine design (Loom / Connect) |
 | [docs/distributed-ec2.md](docs/distributed-ec2.md) | EC2 ASG data plane (Packer + CFN) |

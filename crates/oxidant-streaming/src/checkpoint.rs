@@ -15,7 +15,10 @@ pub struct CheckpointState {
     pub query_id: String,
     pub run_id: String,
     pub batch_id: u64,
-    pub source_offsets: Vec<String>,
+    /// The source's replay position as of `committed_batch_id`. Written only after the sink
+    /// commit succeeds, so a crash mid-batch replays that batch rather than skipping it.
+    #[serde(default)]
+    pub source_offsets: Option<crate::source::SourceOffsets>,
     /// Last batch id successfully committed to the sink (exactly-once semantics).
     pub committed_batch_id: u64,
     /// Event-time watermark in microseconds (for late-data dropping).
@@ -57,15 +60,20 @@ impl CheckpointStore {
         std::fs::write(self.root.join(OFFSETS_FILE), text)
     }
 
+    /// Stamp a new *run* onto this checkpoint.
+    ///
+    /// Progress is deliberately preserved: a restart is a new `run_id` over the same committed
+    /// batch id, offsets, and watermark — that is the whole point of pointing a query at an
+    /// existing `checkpointLocation`. Wiping them here would silently re-ingest (or, with
+    /// `startingOffsets=latest`, silently skip) everything the previous run had already
+    /// committed. The `query_id` from the existing checkpoint wins for the same reason Spark
+    /// persists it: the query's identity outlives any one run.
     pub fn init_for_query(&self, id: &StreamingQueryId) -> std::io::Result<()> {
-        let state = CheckpointState {
-            query_id: id.id.clone(),
-            run_id: id.run_id.clone(),
-            batch_id: 0,
-            source_offsets: vec![],
-            committed_batch_id: 0,
-            watermark_micros: 0,
-        };
+        let mut state = self.load().unwrap_or_default();
+        if state.query_id.is_empty() {
+            state.query_id = id.id.clone();
+        }
+        state.run_id = id.run_id.clone();
         self.save(&state)
     }
 }
@@ -83,10 +91,13 @@ mod tests {
         store.init_for_query(&id).unwrap();
         let mut state = store.load().unwrap();
         state.batch_id = 3;
-        state.source_offsets = vec!["file1.parquet".into()];
+        state.source_offsets = Some(crate::source::SourceOffsets {
+            source: "kafka".into(),
+            entries: [("events-0".to_string(), 42i64)].into_iter().collect(),
+        });
         store.save(&state).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded.batch_id, 3);
-        assert_eq!(loaded.source_offsets, vec!["file1.parquet"]);
+        assert_eq!(loaded.source_offsets, state.source_offsets);
     }
 }

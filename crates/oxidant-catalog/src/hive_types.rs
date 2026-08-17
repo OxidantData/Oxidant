@@ -164,12 +164,18 @@ pub struct HiveSerde {
     pub serde_params: &'static [(&'static str, &'static str)],
 }
 
-/// Look up the [`HiveSerde`] for a CTAS write target format. Only `Parquet`/`Csv`/`Json` are
-/// supported write targets today — `Delta`/`Iceberg` need a real commit protocol (transaction log
-/// / manifest+snapshot) rather than a plain SerDe declaration, so they return `Unsupported`.
+/// Look up the [`HiveSerde`] for a write target format.
+///
+/// `Delta` declares the same Parquet SerDe as a plain Parquet table — that is the Athena/EMR
+/// convention for a Delta table in Glue, where the metastore entry is a pointer and the
+/// transaction log under `_delta_log/` is the authority on which files are live. The commit
+/// protocol is implemented in `oxidant_datasource::delta_write`; this function only describes
+/// how the metastore should label the table. `Iceberg` still returns `Unsupported`: its
+/// metastore entry has to carry a `metadata_location` that only a real snapshot commit can
+/// produce, so declaring one here would register a table nothing can read.
 pub fn format_serde(format: TableFormat) -> Result<HiveSerde> {
     match format {
-        TableFormat::Parquet => Ok(HiveSerde {
+        TableFormat::Parquet | TableFormat::Delta => Ok(HiveSerde {
             input_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
             output_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
             serde_lib: "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
@@ -187,9 +193,9 @@ pub fn format_serde(format: TableFormat) -> Result<HiveSerde> {
             serde_lib: "org.apache.hive.hcatalog.data.JsonSerDe",
             serde_params: &[],
         }),
-        TableFormat::Delta | TableFormat::Iceberg => Err(Error::Unsupported(format!(
-            "{format:?} is not a supported CTAS write target yet (needs a real commit protocol, \
-             not a plain SerDe declaration)"
+        TableFormat::Iceberg => Err(Error::Unsupported(format!(
+            "{format:?} is not a supported write target yet (its metastore entry needs a \
+             `metadata_location` from a real snapshot commit, not a plain SerDe declaration)"
         ))),
     }
 }
@@ -404,16 +410,33 @@ mod tests {
     }
 
     #[test]
-    fn format_serde_covers_write_targets_and_rejects_lakehouse_formats() {
-        for format in [TableFormat::Parquet, TableFormat::Csv, TableFormat::Json] {
+    fn format_serde_covers_write_targets_and_still_rejects_iceberg() {
+        for format in [
+            TableFormat::Parquet,
+            TableFormat::Csv,
+            TableFormat::Json,
+            TableFormat::Delta,
+        ] {
             assert!(format_serde(format).is_ok(), "{format:?}");
         }
-        for format in [TableFormat::Delta, TableFormat::Iceberg] {
-            assert!(
-                matches!(format_serde(format), Err(Error::Unsupported(_))),
-                "{format:?}"
-            );
-        }
+        assert!(
+            matches!(
+                format_serde(TableFormat::Iceberg),
+                Err(Error::Unsupported(_))
+            ),
+            "Iceberg needs a metadata_location from a real snapshot commit"
+        );
+    }
+
+    #[test]
+    fn delta_declares_the_parquet_serde() {
+        // The Athena/EMR convention: a Delta table in the metastore is labelled as Parquet and
+        // the transaction log decides which files are live.
+        let delta = format_serde(TableFormat::Delta).unwrap();
+        let parquet = format_serde(TableFormat::Parquet).unwrap();
+        assert_eq!(delta.serde_lib, parquet.serde_lib);
+        assert_eq!(delta.input_format, parquet.input_format);
+        assert_eq!(delta.output_format, parquet.output_format);
     }
 
     #[test]

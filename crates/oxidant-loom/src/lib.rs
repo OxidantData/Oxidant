@@ -6289,6 +6289,43 @@ impl Engine {
         self.ctx.as_ref()
     }
 
+    /// Look up a registered external catalog by name (case-sensitive, as registered).
+    ///
+    /// The streaming lake sink needs the raw [`oxidant_catalog::CatalogProvider`], not the
+    /// DataFusion bridge over it: it creates the target database and table through the SPI
+    /// (`create_database` / `create_table`) before any reader has ever resolved them.
+    pub fn external_catalog(
+        &self,
+        name: &str,
+    ) -> Option<Arc<dyn oxidant_catalog::CatalogProvider>> {
+        self.oxidant_catalog(name)
+    }
+
+    /// Resolve an [`ObjectStore`](object_store::ObjectStore) for a table location, registering an
+    /// S3 client for the bucket first when the location is `s3://` (local and `file://` paths
+    /// resolve through DataFusion's default registry with no registration).
+    ///
+    /// This is the write-side counterpart of the read path's store resolution, and it deliberately
+    /// shares `ensure_remote_store` so a streaming write to a Glue table uses exactly the same
+    /// credentials, endpoint, and assumed role that a `SELECT` from it would.
+    pub fn object_store_for(
+        &self,
+        location: &str,
+        storage_options: &std::collections::HashMap<String, String>,
+    ) -> Result<Arc<dyn object_store::ObjectStore>> {
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        let url = ListingTableUrl::parse(location)
+            .map_err(|e| Error::Plan(format!("bad table location `{location}`: {e}")))?;
+        let state = self.ctx.state();
+        catalog_bridge::ensure_remote_store(&state, &url, Some(storage_options))
+            .map_err(|e| Error::Io(format!("object store for `{location}`: {e}")))?;
+        state
+            .runtime_env()
+            .object_store(&url)
+            .map_err(|e| Error::Io(format!("object store for `{location}`: {e}")))
+    }
+
     /// Estimate total file bytes for a scanned table (Glue/Parquet/Delta/Iceberg listing).
     /// Returns `None` for MemTables, missing tables, or listing failures — callers treat that as
     /// "unknown" for auto-broadcast (not auto-replicated unless overridden).

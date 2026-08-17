@@ -4,6 +4,8 @@
 //! sizes, schema mappings, and row-delete metadata. DataFusion remains the data reader, so the
 //! resolver does not couple the engine to another DataFusion version.
 
+pub mod delta_write;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -175,42 +177,6 @@ pub fn write_parquet(path: &str, batches: &[arrow::record_batch::RecordBatch]) -
     writer
         .close()
         .map_err(|e| Error::Io(format!("parquet close: {e}")))?;
-    Ok(())
-}
-
-/// Append a new Parquet data file to a Delta table by writing a JSON add action to `_delta_log`.
-pub fn delta_append(
-    table_path: &str,
-    relative_path: &str,
-    batches: &[arrow::record_batch::RecordBatch],
-) -> Result<()> {
-    use std::path::Path;
-
-    let base = Path::new(table_path);
-    let data_path = base.join(relative_path);
-    if let Some(parent) = data_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::Io(format!("mkdir {}: {e}", parent.display())))?;
-    }
-    write_parquet(data_path.to_str().unwrap(), batches)?;
-
-    let log_dir = base.join("_delta_log");
-    std::fs::create_dir_all(&log_dir)
-        .map_err(|e| Error::Io(format!("mkdir {}: {e}", log_dir.display())))?;
-    let version = std::fs::read_dir(&log_dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).count())
-        .unwrap_or(0);
-    let commit = log_dir.join(format!("{version:020}.json"));
-    let action = serde_json::json!({
-        "add": {
-            "path": relative_path.replace('\\', "/"),
-            "size": std::fs::metadata(base.join(relative_path)).map(|m| m.len()).unwrap_or(0),
-            "modificationTime": chrono::Utc::now().timestamp_millis(),
-            "dataChange": true
-        }
-    });
-    std::fs::write(&commit, format!("{action}\n"))
-        .map_err(|e| Error::Io(format!("write {}: {e}", commit.display())))?;
     Ok(())
 }
 
