@@ -956,6 +956,66 @@ mod tests {
         );
     }
 
+    /// What the shipped defaults actually decide for TPC-DS Q17 at SF100. Documents (and pins)
+    /// the fact that a 32 GiB broadcast threshold replicates *fact* tables: `catalog_sales`
+    /// (144M rows, ~9.8 GB) is under both `max` and the threshold, and 144M <= 4 x 288M passes
+    /// the row-multiple guard, so every worker re-reads it in full. Spark's comparable knob
+    /// (`spark.sql.autoBroadcastJoinThreshold`) defaults to 10 MB.
+    ///
+    /// Change this test deliberately: if the default threshold moves, these queries change plan
+    /// shape from broadcast to shuffle-join, which is a large behavioural change either way.
+    #[test]
+    fn sf100_q17_facts_are_replicated_under_shipped_defaults() {
+        // Measured SF10 parquet sizes x10, and official SF100 row counts.
+        let sized = vec![
+            ("store_sales".to_string(), Some(12_000_000_000u64)),
+            ("catalog_sales".to_string(), Some(9_830_000_000)),
+            ("store_returns".to_string(), Some(1_380_000_000)),
+            ("item".to_string(), Some(30_000_000)),
+            ("date_dim".to_string(), Some(2_000_000)),
+            ("store".to_string(), Some(200_000)),
+        ];
+        let rows = vec![
+            Some(288_000_000u64),
+            Some(144_000_000),
+            Some(28_800_000),
+            Some(204_000),
+            Some(73_049),
+            Some(402),
+        ];
+        let out = classify_replicated_tables_with_rows(
+            &sized,
+            &rows,
+            &[],
+            DEFAULT_AUTO_BROADCAST_THRESHOLD_BYTES,
+            Some(4.0),
+        );
+        assert!(
+            out.iter().any(|t| t == "catalog_sales"),
+            "144M-row catalog_sales is replicated to every worker under the shipped 32 GiB \
+             threshold — this is the Q17/Q25/Q29 broadcast cost, not a planner decline: {out:?}"
+        );
+        assert!(out.iter().any(|t| t == "store_returns"), "{out:?}");
+        assert!(
+            !out.iter().any(|t| t == "store_sales"),
+            "the largest table always stays sharded: {out:?}"
+        );
+
+        // A Spark-like 10 MB threshold keeps both facts sharded, leaving only true dimensions
+        // replicated — the shuffle-join path (`plan_shuffle_join_chain`) would own the join.
+        let spark_like =
+            classify_replicated_tables_with_rows(&sized, &rows, &[], 10 * 1024 * 1024, Some(4.0));
+        assert!(
+            !spark_like.iter().any(|t| t == "catalog_sales"),
+            "{spark_like:?}"
+        );
+        assert!(
+            !spark_like.iter().any(|t| t == "store_returns"),
+            "{spark_like:?}"
+        );
+        assert!(spark_like.iter().any(|t| t == "date_dim"), "{spark_like:?}");
+    }
+
     /// `OXIDANT_REPLICATE_MAX_ROW_MULTIPLE`: unset defaults ON (4.0); `0` / negative /
     /// unparseable disable the rule; another positive value overrides the default.
     #[test]

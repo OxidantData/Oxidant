@@ -74,6 +74,22 @@ pub async fn try_plan_with_facts(
         .logical_plan(sql)
         .await
         .map_err(|e| bucket_reason(&e.to_string()))?;
+    // `OXIDANT_TPCDS_REPLICATED=<t1,t2,…>` pins the replicated set instead of sweeping one
+    // sharded fact at a time. The sweep mirrors the *harness* policy (everything but one fact is
+    // replicated), which is not what production does — there, `resolve_replicated_tables` picks by
+    // size against `OXIDANT_AUTO_BROADCAST_THRESHOLD_BYTES`. Pinning the set is how to ask "would
+    // these queries still plan if the big facts stayed sharded?" without a cluster.
+    if let Ok(list) = std::env::var("OXIDANT_TPCDS_REPLICATED") {
+        let names: Vec<String> = list
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let replicated: Vec<&str> = names.iter().map(String::as_str).collect();
+        return plan_distributed_logical(&lp, &replicated)
+            .map(|dq| (dq, "<pinned>".to_string()))
+            .map_err(|e| bucket_reason(&e.to_string()));
+    }
     let mut errors = Vec::new();
     for fact in fact_tables {
         let replicated: Vec<&str> = all_tables.iter().copied().filter(|t| *t != *fact).collect();

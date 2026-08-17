@@ -752,6 +752,52 @@ async fn q37_shape_two_sharded_no_forward_fallback() {
     );
 }
 
+/// Leaf stages must export only the columns the chain references, not the whole table.
+///
+/// Q37 reads exactly ONE `catalog_sales` column — `cs_item_sk`, for `cs_item_sk = i_item_sk`
+/// — but the leaf used to project all ~34, shipping the full width of a sharded fact across
+/// the exchange. That is what OOM-kills workers on two-sharded-fact joins, and it is a large
+/// pure-performance cost on every sharded-fact query besides.
+///
+/// Pinned as a COUNT rather than exact SQL so the test survives harmless alias/format churn
+/// but still fails if pruning silently stops firing (`OXIDANT_LEAF_PRUNE=0`, or a refactor
+/// that drops the `narrow_scan` call). The earlier attempt — enabling DataFusion's
+/// `OptimizeProjections` before the split — is NOT equivalent: it made this shape stop
+/// distributing altogether, which `q37_shape_two_sharded_no_forward_fallback` above catches.
+#[tokio::test]
+async fn q37_leaf_stages_project_only_referenced_columns() {
+    let engine = tpcds_engine().await;
+    let replicated = ["item", "date_dim"];
+    let dq = plan_distributed(&engine, Q37, &replicated)
+        .await
+        .expect("must produce a plan");
+
+    let cs_leaf = dq
+        .stages
+        .iter()
+        .find(|s| s.upstream_stage_ids.is_empty() && s.sql.contains("FROM catalog_sales"))
+        .unwrap_or_else(|| panic!("a catalog_sales leaf stage: {dq:?}"));
+
+    // Every exported column is `<name> AS catalog_sales__<name>`; count the aliases.
+    let exported = cs_leaf.sql.matches("AS catalog_sales__").count();
+    assert!(
+        exported > 0,
+        "leaf must still export its join key: {}",
+        cs_leaf.sql
+    );
+    assert!(
+        exported <= 4,
+        "q37 references one catalog_sales column; the leaf exported {exported}, which means \
+         leaf pruning is not firing and the full fact width is crossing the exchange: {}",
+        cs_leaf.sql
+    );
+    assert!(
+        cs_leaf.sql.contains("AS catalog_sales__cs_item_sk"),
+        "the join key must survive pruning: {}",
+        cs_leaf.sql
+    );
+}
+
 /// Q82 is Q37's twin (`FROM item, inventory, date_dim, store_sales`): the same dim-leftmost
 /// comma chain re-roots to `inventory` and plans distributed at the 2-sharded classification.
 #[tokio::test]

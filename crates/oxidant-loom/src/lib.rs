@@ -2623,6 +2623,18 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for PreferBoundedJoin
             if *hj.join_type() != datafusion::logical_expr::JoinType::Inner || hj.null_aware {
                 return Ok(Transformed::no(p));
             }
+            // Never re-seat a join that carries a non-equi filter. The filter is evaluated
+            // against its own intermediate schema via side-tagged column indices; re-seating
+            // here (after `JoinSelection`, before `EnforceDistribution`) leaves that mapping
+            // resolving from the opposite inputs, which silently evaluates the predicate with
+            // its operands exchanged rather than failing. TPC-DS Q72 at SF10 hit exactly this:
+            // `inv_quantity_on_hand < cs_quantity` ran as `cs_quantity < inv_quantity_on_hand`
+            // and inflated `count(*)` ~19x (786,559 groups vs the correct 42,226) with no error.
+            // The rule is a build-side performance heuristic, so declining these joins costs at
+            // most the re-seat; returning wrong answers is not an acceptable trade.
+            if hj.filter().is_some() {
+                return Ok(Transformed::no(p));
+            }
             if provable_row_bound(hj.left().as_ref()).is_some()
                 || provable_row_bound(hj.right().as_ref()).is_none()
             {
@@ -3443,6 +3455,46 @@ impl Engine {
         dir_bytes(&self.dirs.spill_dir)
     }
 
+    /// Reserve `bytes` against this engine's DataFusion memory pool for Arrow data the caller
+    /// holds OUTSIDE any DataFusion operator, returning the reservation to hold for its
+    /// lifetime (dropping it releases the bytes).
+    ///
+    /// The worker's shuffle-input `MemTable`s are the motivating case: a consumer task pulls
+    /// every bucket it was assigned into RSS and registers it, and until this existed those
+    /// bytes were invisible to the pool. The consequence was not a slow query — it was that
+    /// the pool believed it had headroom it did not have, so downstream operators never
+    /// spilled and the kernel killed the worker outright (no `ResourcesExhausted`, nothing to
+    /// act on). Two sharded facts joined together reached 6x the configured pool in ~5 s.
+    ///
+    /// Registered with `can_spill = false` deliberately: the caller cannot hand these bytes
+    /// back on demand, so under a `FairSpillPool` they must count against the non-spillable
+    /// share and squeeze the spillable operators rather than the reverse.
+    ///
+    /// With no bounded pool (`OXIDANT_MEMORY_LIMIT_BYTES=0`) this is a no-op reservation that
+    /// always succeeds, matching the unbounded pool's contract.
+    pub fn reserve_external_bytes(
+        &self,
+        label: &str,
+        bytes: usize,
+    ) -> Result<datafusion::execution::memory_pool::MemoryReservation> {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let pool = self.ctx.task_ctx().runtime_env().memory_pool.clone();
+        let reservation = MemoryConsumer::new(label)
+            .with_can_spill(false)
+            .register(&pool);
+        reservation.try_grow(bytes).map_err(|e| {
+            Error::Execution(format!(
+                "reserve {bytes} bytes for `{label}`: {e} (pool {}; this is shuffle-input data \
+                 that cannot be spilled — lower OXIDANT_WORKER_TASK_SLOTS, raise the worker \
+                 memory limit, or replicate one side of the join)",
+                self.memory_pool_bytes
+                    .map_or_else(|| "unbounded".to_string(), |b| format!("{b} bytes")),
+            ))
+        })?;
+        Ok(reservation)
+    }
+
     /// Import UDF definitions from JSON (distributed worker sync).
     pub fn register_udfs_json(&self, json: &str) -> Result<()> {
         let mut reg = self.udf_registry.lock().unwrap();
@@ -3891,6 +3943,19 @@ impl Engine {
                 PreSplitRewrite::Standard => vec![
                     Arc::new(ExtractEquijoinPredicate::new()),
                     Arc::new(PushDownFilter::new()),
+                    // NOT here: `OptimizeProjections`. Column pruning is badly wanted — without
+                    // it `TableScan.projection` is never set, `projected_schema` stays the FULL
+                    // table schema, and every leaf shuffle stage ships every column of a sharded
+                    // fact (TPC-DS q37 references ONE column of `catalog_sales` and shuffles all
+                    // ~34, which is what makes the producer buffer whole fact shards and get the
+                    // worker OOM-killed). But adding the rule here makes the splitter DECLINE
+                    // q37's two-sharded shape entirely and fall back to a single Forward stage —
+                    // `tests/auto_broadcast_row_multiple::q37_shape_two_sharded_no_forward_fallback`
+                    // catches it, and a non-distributed fallback is strictly worse than a wide
+                    // shuffle. Pruning has to be taught to the splitter (or applied at the leaf
+                    // in `join_chain::leaf_stage_sql` from the chain's own column usage) before
+                    // the rule can go in. Measured, not assumed: that was the only failure in the
+                    // whole oxidant-execution suite.
                 ],
                 PreSplitRewrite::UnionExtended => vec![
                     // Same pushdown pair first — outer predicates reach the union arms…
@@ -4880,6 +4945,75 @@ impl Engine {
         self.ctx
             .register_table(name, table.clone())
             .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
+        self.measured_stats_registrations
+            .fetch_add(1, Ordering::Relaxed);
+        self.note_catalog_change(name);
+        Ok(table)
+    }
+
+    /// Directory this worker uses for one consumer task's spilled shuffle input.
+    ///
+    /// Nested under the engine's own DataFusion spill root so `Drop` reclaims it with
+    /// everything else, and keyed by (stage, partition, upstream) so sibling tasks on the same
+    /// worker never scan each other's files.
+    pub fn shuffle_pull_spill_dir(
+        &self,
+        stage_id: u32,
+        partition_id: u32,
+        upstream_idx: u32,
+    ) -> std::path::PathBuf {
+        self.dirs
+            .spill_dir
+            .join(format!("pull_{stage_id}_{partition_id}_{upstream_idx}"))
+    }
+
+    /// Register a shuffle input that lives on DISK as Arrow IPC files, rather than in a
+    /// `MemTable`, so scanning it streams instead of requiring the whole input to fit in RAM.
+    ///
+    /// This is the spill-backed twin of [`Engine::register_batches_with_stats`]. A consumer
+    /// task materializing its whole modulus class in memory for the life of the stage is the
+    /// one allocation that neither the DataFusion pool nor the shuffle budget bounds — the
+    /// worker simply grows until the cgroup kills it. Streaming from IPC removes the
+    /// requirement instead of trying to budget for it.
+    ///
+    /// `measured_rows` is the driver's barrier count and is attached exactly as the in-memory
+    /// path attaches it, so the join-strategy guard sees the same statistics either way.
+    pub fn register_arrow_ipc_shuffle_input(
+        &self,
+        name: &str,
+        dir: &std::path::Path,
+        schema: datafusion::arrow::datatypes::SchemaRef,
+        measured_rows: u64,
+        measured_bytes: usize,
+    ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        use datafusion::datasource::file_format::arrow::ArrowFormat;
+        use datafusion::datasource::listing::{
+            ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+        };
+
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.display()))
+            .map_err(|e| Error::Execution(format!("spill dir url for `{name}`: {e}")))?;
+        let options = ListingOptions::new(Arc::new(ArrowFormat)).with_file_extension(".arrow");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(options)
+            .with_schema(schema);
+        let listing = Arc::new(
+            ListingTable::try_new(config)
+                .map_err(|e| Error::Execution(format!("spill listing `{name}`: {e}")))?,
+        );
+        let table: Arc<dyn datafusion::catalog::TableProvider> =
+            Arc::new(measured_scan::MeasuredStatsTable::from_provider(
+                listing,
+                measured_rows as usize,
+                measured_bytes,
+            ));
+        let _ = self.ctx.deregister_table(name);
+        self.ctx
+            .register_table(name, table.clone())
+            .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
+        // This IS a measured-stats registration — count it like the in-memory path, or the
+        // spill route silently reads as "no measured statistics" to the observability that
+        // `tests/stage_input_stats.rs` asserts on.
         self.measured_stats_registrations
             .fetch_add(1, Ordering::Relaxed);
         self.note_catalog_change(name);
@@ -7517,6 +7651,178 @@ impl Default for Engine {
 mod tests {
     use super::*;
 
+    /// KAN-2 regression: [`PreferBoundedJoinBuildSide`] must not re-seat a hash join that carries
+    /// a non-equi filter.
+    ///
+    /// A join filter is evaluated against its own intermediate schema through *side-tagged* column
+    /// indices. Re-seating the build side moves the inputs but not that mapping, so the predicate
+    /// silently runs with its operands exchanged — no error, just a wrong answer. TPC-DS Q72 at
+    /// SF10 hit exactly this: `inv_quantity_on_hand < cs_quantity` executed reversed and inflated
+    /// `count(*)` ~19x (786,559 groups vs the correct 42,226).
+    ///
+    /// The join is built directly rather than via SQL because the firing conditions (unbounded
+    /// build, bounded probe, Partitioned mode) are what the planner's own join selection keeps
+    /// arranging *away*; a SQL fixture ends up with the bounded side already on the left and never
+    /// exercises the rule. The no-filter case is asserted too, so this fails if the fixture ever
+    /// stops meeting the conditions rather than passing vacuously.
+    #[tokio::test]
+    async fn filtered_join_is_not_re_seated() {
+        use datafusion::common::config::ConfigOptions;
+        use datafusion::common::{JoinSide, NullEquality};
+        use datafusion::logical_expr::{JoinType, Operator};
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column};
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+        use datafusion::physical_plan::ExecutionPlan;
+
+        fn kv(rows: impl Iterator<Item = (i64, i64)>, kn: &str, vn: &str) -> Vec<RecordBatch> {
+            let (ks, vs): (Vec<i64>, Vec<i64>) = rows.unzip();
+            let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                datafusion::arrow::datatypes::Field::new(
+                    kn,
+                    datafusion::arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+                datafusion::arrow::datatypes::Field::new(
+                    vn,
+                    datafusion::arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+            ]));
+            vec![RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(datafusion::arrow::array::Int64Array::from(ks)),
+                    Arc::new(datafusion::arrow::array::Int64Array::from(vs)),
+                ],
+            )
+            .unwrap()]
+        }
+
+        let engine = Engine::new();
+        engine
+            .register_batches_with_stats(
+                "f1",
+                kv((0..3_000).map(|i| (i % 10, i)), "fk", "fv"),
+                3_000,
+            )
+            .unwrap();
+        engine
+            .register_batches_with_stats("d1", kv((0..10).map(|k| (k, 0)), "dk", "dv"), 10)
+            .unwrap();
+        engine
+            .register_batches_with_stats("dsmall", kv((0..10).map(|k| (k, 50)), "sk", "sv"), 10)
+            .unwrap();
+
+        // Build side: a join intermediate, whose row count is Inexact -> no provable bound.
+        let left = engine
+            .physical_plan("SELECT f1.fk AS ak, f1.fv AS av FROM f1 JOIN d1 ON f1.fk = d1.dk")
+            .await
+            .unwrap();
+        // Probe side: a plain scan carrying an Exact row count -> bounded.
+        let right = engine
+            .physical_plan("SELECT sk, sv FROM dsmall")
+            .await
+            .unwrap();
+        assert!(
+            provable_row_bound(left.as_ref()).is_none(),
+            "fixture: the build side must have no provable row bound"
+        );
+        assert!(
+            provable_row_bound(right.as_ref()).is_some(),
+            "fixture: the probe side must be bounded"
+        );
+
+        let on = vec![(
+            Arc::new(Column::new("ak", 0)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            Arc::new(Column::new("sk", 0)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        )];
+        // `sv < av`, i.e. right.v < left.v, over the intermediate schema [av, sv].
+        let filter_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "av",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+            datafusion::arrow::datatypes::Field::new(
+                "sv",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+        ]));
+        let filter = JoinFilter::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("sv", 1)),
+                Operator::Lt,
+                Arc::new(Column::new("av", 0)),
+            )),
+            vec![
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Right,
+                },
+            ],
+            filter_schema,
+        );
+
+        let build = |f: Option<JoinFilter>| {
+            Arc::new(
+                HashJoinExec::try_new(
+                    Arc::clone(&left),
+                    Arc::clone(&right),
+                    on.clone(),
+                    f,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::Partitioned,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .unwrap(),
+            ) as Arc<dyn ExecutionPlan>
+        };
+        // A re-seat wraps the join in a ProjectionExec to restore column order, so find the join.
+        fn first_join_build_col(plan: &dyn ExecutionPlan) -> Option<String> {
+            if let Some(hj) = as_hash_join(plan) {
+                return Some(hj.left().schema().field(0).name().clone());
+            }
+            plan.children()
+                .iter()
+                .find_map(|c| first_join_build_col(c.as_ref()))
+        }
+        let build_side_name = |p: &Arc<dyn ExecutionPlan>| {
+            first_join_build_col(p.as_ref()).expect("a hash join in the result")
+        };
+
+        let cfg = ConfigOptions::default();
+        // Without a filter the rule fires: the bounded `dsmall` becomes the build side. This is
+        // the fixture's proof that the (unbounded build, bounded probe) conditions really hold.
+        let swapped = PreferBoundedJoinBuildSide
+            .optimize(build(None), &cfg)
+            .unwrap();
+        assert_eq!(
+            build_side_name(&swapped),
+            "sk",
+            "fixture: an unfiltered join in this shape must be re-seated onto the bounded side"
+        );
+
+        // With a filter the rule must decline, leaving the original build side in place.
+        let kept = PreferBoundedJoinBuildSide
+            .optimize(build(Some(filter)), &cfg)
+            .unwrap();
+        assert_eq!(
+            build_side_name(&kept),
+            "ak",
+            "a join carrying a non-equi filter was re-seated: the filter's side-tagged column \
+             indices now resolve from the opposite inputs, silently reversing the predicate"
+        );
+    }
+
     #[tokio::test]
     async fn select_one() {
         let engine = Engine::new();
@@ -9401,6 +9707,54 @@ mod tests {
         // Precision must not be stripped from string content that merely looks similar.
         let inside = "SELECT 'interval ''90'' day (3)' AS s";
         assert_eq!(normalize_spark_sql(inside), inside);
+    }
+
+    // Shuffle-input data lives in a MemTable for the whole stage and cannot be spilled. Before
+    // `reserve_external_bytes` the pool never saw it, so it reported headroom that did not
+    // exist, downstream operators declined to spill, and the worker was kernel-killed with no
+    // `ResourcesExhausted` to act on — measured at 6x the configured pool in ~5 s.
+    #[test]
+    fn external_reservation_is_visible_to_the_pool_and_released_on_drop() {
+        let engine = Engine::new_with_memory_limit(8 * 1024 * 1024);
+        let pool = engine.ctx().task_ctx().runtime_env().memory_pool.clone();
+        assert_eq!(pool.reserved(), 0);
+
+        let reservation = engine
+            .reserve_external_bytes("ShuffleInput[t]", 4 * 1024 * 1024)
+            .expect("fits in an 8 MiB pool");
+        assert_eq!(
+            pool.reserved(),
+            4 * 1024 * 1024,
+            "the pool must SEE shuffle-input bytes, not just tolerate them"
+        );
+
+        drop(reservation);
+        assert_eq!(pool.reserved(), 0, "dropping the guard releases the bytes");
+    }
+
+    #[test]
+    fn external_reservation_past_the_pool_fails_loudly_instead_of_growing_rss() {
+        let engine = Engine::new_with_memory_limit(4 * 1024 * 1024);
+        let err = engine
+            .reserve_external_bytes("ShuffleInput[t]", 64 * 1024 * 1024)
+            .expect_err("64 MiB must not fit a 4 MiB pool");
+        let msg = err.to_string();
+        // The message has to tell an operator what to actually do about it.
+        assert!(msg.contains("ShuffleInput[t]"), "names the input: {msg}");
+        assert!(
+            msg.contains("OXIDANT_WORKER_TASK_SLOTS") && msg.contains("replicate"),
+            "offers the remedies: {msg}"
+        );
+    }
+
+    #[test]
+    fn external_reservation_is_a_noop_without_a_bounded_pool() {
+        // `OXIDANT_MEMORY_LIMIT_BYTES=0` opts out of bounding; reserving must not start
+        // failing queries that previously ran.
+        let engine = Engine::new_inner(None);
+        engine
+            .reserve_external_bytes("ShuffleInput[t]", usize::MAX / 2)
+            .expect("unbounded pool accepts any reservation");
     }
 
     #[test]
