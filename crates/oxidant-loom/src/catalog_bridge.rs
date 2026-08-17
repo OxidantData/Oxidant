@@ -1049,7 +1049,12 @@ pub(crate) fn ensure_remote_store(
         };
     }
 
-    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
+    // `AWS_REGION`, then `AWS_DEFAULT_REGION`, then the shared profile, then IMDS — the order the
+    // AWS CLI uses. This used to read `AWS_REGION` alone and hardcode `us-west-2` otherwise, which
+    // also meant it *overwrote* whatever `from_env` had resolved above. A table's own `s3.region`
+    // still wins: it is applied to the builder after this.
+    let region = oxidant_catalog::aws_region::ambient_region()
+        .unwrap_or_else(|| oxidant_catalog::aws_region::LEGACY_FALLBACK_REGION.to_string());
     let mut builder = object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(&bucket)
         .with_region(region.clone());

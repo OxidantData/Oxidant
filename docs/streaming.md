@@ -296,6 +296,10 @@ A table can still pin its own identity, and doing so outranks the chain entirely
 to assume a second role on top of the ambient one, or `s3.skip-signature` to read a public bucket
 unsigned.
 
+**The region resolves the same way** — `AWS_REGION` → `AWS_DEFAULT_REGION` → the profile's `region`
+→ instance metadata — so a profile that sets a region needs no `AWS_REGION` alongside it. A table's
+own `s3.region` outranks all of it.
+
 ## Throughput
 
 What the pipeline does per micro-batch, and what bounds it:

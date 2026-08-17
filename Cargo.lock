@@ -4249,8 +4249,10 @@ name = "oxidant-catalog"
 version = "0.1.27"
 dependencies = [
  "async-trait",
+ "aws-config",
  "datafusion",
  "oxidant-common",
+ "tempfile",
  "tokio",
 ]
 
@@ -4284,6 +4286,7 @@ version = "0.1.27"
 dependencies = [
  "aws-config",
  "aws-sdk-lakeformation",
+ "oxidant-catalog",
  "oxidant-common",
  "tokio",
 ]
