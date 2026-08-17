@@ -20,7 +20,7 @@ use crate::query::{
     QueryProgress, QueryStatus, SinkProgress, SourceProgress, StreamingQuery, StreamingQueryId,
 };
 use crate::sink::{FileSink, MemorySink, Sink};
-use crate::source::{FileSource, MemoryRateSource, Source};
+use crate::source::{FileSource, MemoryRateSource, Source, SourceOffsets};
 use crate::state::DedupState;
 use crate::watermark::WatermarkConfig;
 
@@ -172,12 +172,12 @@ impl StreamingQueryManager {
     ) -> Result<StreamingQueryId> {
         let q = StreamingQuery::new(name.clone(), checkpoint_location.clone());
         let id = q.query_id.clone();
-        let checkpoint = CheckpointStore::new(&checkpoint_location);
+        let checkpoint = checkpoint_store(engine, &checkpoint_location)?;
 
         let mut source = build_source(&config)?;
         // Resume before the first poll: a restarted query must continue from the last committed
         // batch, not replay from `startingOffsets`.
-        let restored = checkpoint.load().unwrap_or_default();
+        let restored = checkpoint.load().await.unwrap_or_default();
         if let Some(offsets) = &restored.source_offsets {
             source.restore_offsets(offsets);
         }
@@ -197,7 +197,15 @@ impl StreamingQueryManager {
         };
         let sink = build_sink(engine, &config, &options, sink_schema, app_id).await?;
 
-        let _ = checkpoint.init_for_query(&id);
+        // A checkpoint location that cannot be written is a misconfiguration the user has to see
+        // at `writeStream.start()`. Discovering it later means the query has already ingested data
+        // it cannot record having ingested.
+        checkpoint.init_for_query(&id).await.map_err(|e| {
+            Error::Io(format!(
+                "streaming checkpoint `{}` is not writable: {e}",
+                checkpoint.location()
+            ))
+        })?;
         let watermark = WatermarkConfig::from_options(
             &config
                 .source_options
@@ -296,6 +304,8 @@ impl StreamingQueryManager {
         let mut rt = q.runtime.lock().await;
         let started = std::time::Instant::now();
 
+        // Where this batch starts, captured before the poll moves the source forward.
+        let start_offset = offsets_json(rt.source.committed_offsets().as_ref());
         let source_batches = with_retry!("source poll", rt.source.poll_batch(engine))?;
         let input_rows: u64 = source_batches.iter().map(|b| b.num_rows() as u64).sum();
         if input_rows == 0 {
@@ -322,9 +332,9 @@ impl StreamingQueryManager {
             let now = chrono::Utc::now().timestamp_micros();
             let watermark = wm.watermark_micros(now);
             batches = apply_watermark(batches, &wm.event_time_column, watermark);
-            let mut state = q.checkpoint.load().unwrap_or_default();
+            let mut state = q.checkpoint.load().await.unwrap_or_default();
             state.watermark_micros = watermark;
-            let _ = q.checkpoint.save(&state);
+            let _ = q.checkpoint.save(&state).await;
         }
         if rt.dedup.is_some() {
             if rt.dedup_key_cols.is_empty() && !batches.is_empty() {
@@ -347,6 +357,7 @@ impl StreamingQueryManager {
         let source_description = rt.source.description();
         let sink_description = rt.sink.description();
         let committed_offsets = rt.source.committed_offsets();
+        let end_offset = offsets_json(committed_offsets.as_ref());
 
         let elapsed = started.elapsed();
         let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
@@ -357,17 +368,25 @@ impl StreamingQueryManager {
                 id: state.query_id.id.clone(),
                 run_id: state.query_id.run_id.clone(),
                 name: state.name.clone(),
+                timestamp: now_iso8601(),
                 batch_id,
+                batch_duration: elapsed.as_millis() as u64,
                 num_input_rows: input_rows,
                 // Rows the batch actually got through, per second of wall clock — not the row
                 // count, which is what this field used to report to anything watching it.
                 input_rows_per_second: input_rows as f64 / seconds,
                 processed_rows_per_second: rows as f64 / seconds,
-                duration_ms: elapsed.as_millis() as u64,
+                state_operators: Vec::new(),
                 sources: vec![SourceProgress {
                     description: source_description,
+                    start_offset: start_offset.clone(),
+                    // This source reads everything it polled, so where the batch ended is also the
+                    // furthest position known.
+                    end_offset: end_offset.clone(),
+                    latest_offset: end_offset,
                     num_input_rows: input_rows,
                     input_rows_per_second: input_rows as f64 / seconds,
+                    processed_rows_per_second: rows as f64 / seconds,
                 }],
                 sink: SinkProgress {
                     description: sink_description,
@@ -379,16 +398,16 @@ impl StreamingQueryManager {
         // Exactly-once-into-the-sink: the source position is committed only after the sink write
         // returns. A crash between the two replays the batch, and the sink's `txn` stamp makes
         // that replay a no-op instead of a duplicate.
-        let mut checkpoint = q.checkpoint.load().unwrap_or_default();
+        let mut checkpoint = q.checkpoint.load().await.unwrap_or_default();
         checkpoint.batch_id = batch_id;
         checkpoint.committed_batch_id = batch_id;
         checkpoint.source_offsets = committed_offsets;
         // A checkpoint that cannot be written is not cosmetic: without it a restart re-reads from
         // wherever the last successful save left off, so the failure has to reach the user.
-        q.checkpoint.save(&checkpoint).map_err(|e| {
+        q.checkpoint.save(&checkpoint).await.map_err(|e| {
             Error::Io(format!(
                 "streaming checkpoint `{}`: {e}",
-                q.checkpoint.path().display()
+                q.checkpoint.location()
             ))
         })?;
         Ok(input_rows)
@@ -424,6 +443,53 @@ impl Default for StreamingQueryManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Resolve `checkpointLocation` to a store and a prefix within it.
+///
+/// Goes through the engine's own resolver, so a checkpoint on S3 uses exactly the credentials,
+/// endpoint, and assumed role the table write uses — one auth path, not two. A bare filesystem
+/// path is normalized to a `file://` URL first; without that, `s3://bucket/x` and `/tmp/x` are
+/// indistinguishable to the URL parser and the object store, and the S3 one silently lands in a
+/// local directory named `s3:`.
+fn checkpoint_store(engine: &Engine, location: &str) -> Result<CheckpointStore> {
+    let url = if location.contains("://") {
+        location.to_string()
+    } else {
+        let absolute = std::path::Path::new(location);
+        let absolute = if absolute.is_absolute() {
+            absolute.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| Error::Io(format!("resolving `{location}`: {e}")))?
+                .join(absolute)
+        };
+        // The directory has to exist before it can be addressed as a store prefix.
+        std::fs::create_dir_all(&absolute)
+            .map_err(|e| Error::Io(format!("creating checkpoint `{}`: {e}", absolute.display())))?;
+        format!("file://{}", absolute.display())
+    };
+
+    let store = engine.object_store_for(&url, &HashMap::new())?;
+    let parsed = url::Url::parse(&url)
+        .map_err(|e| Error::Plan(format!("bad checkpointLocation `{location}`: {e}")))?;
+    let root = object_store::path::Path::from(parsed.path().trim_start_matches('/'));
+    Ok(CheckpointStore::new(store, root, location))
+}
+
+/// A source position as the JSON string Spark's progress carries. `{}` when the source has no
+/// replayable position, which is what Spark reports for a source with no offsets.
+fn offsets_json(offsets: Option<&SourceOffsets>) -> String {
+    offsets
+        .and_then(|o| serde_json::to_string(&o.entries).ok())
+        .unwrap_or_else(|| "{}".to_string())
+}
+
+/// The current instant in Spark's progress timestamp format (ISO-8601, UTC, milliseconds).
+fn now_iso8601() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 /// Build the source for a `readStream.format(...)`.
@@ -650,6 +716,27 @@ mod tests {
         assert_eq!(mgr.last_progress(&id.id).await.unwrap().batch_id, 1);
     }
 
+    /// A `checkpointLocation` with a URI scheme must be addressed as an object store, never as a
+    /// relative filesystem path. Writing `s3://bucket/ckpt` through `std::fs` does not fail — it
+    /// creates a directory literally named `s3:` under the working directory, the query runs
+    /// green, and the restart-resume guarantee it advertises is silently untrue.
+    #[test]
+    fn a_uri_checkpoint_location_is_never_written_to_the_local_filesystem() {
+        let engine = Engine::new();
+        let cwd = std::env::current_dir().unwrap();
+
+        // Resolution alone must not create anything locally; the store is remote.
+        let resolved = checkpoint_store(&engine, "s3://oxidant-test-bucket/ckpt/orders");
+        assert!(
+            !cwd.join("s3:").exists(),
+            "an s3:// checkpoint created a local `s3:` directory"
+        );
+        // Either it resolved to a real S3 store, or it refused — never a silent local write.
+        if let Ok(store) = resolved {
+            assert_eq!(store.location(), "s3://oxidant-test-bucket/ckpt/orders");
+        }
+    }
+
     #[tokio::test]
     async fn kafka_offsets_survive_a_restart_of_the_same_checkpoint() {
         let spool = tempfile::TempDir::new().unwrap();
@@ -693,7 +780,11 @@ mod tests {
             .unwrap();
         assert_eq!(mgr.process_all_available(&id.id, &engine).await.unwrap(), 2);
 
-        let state = CheckpointStore::new(checkpoint.path()).load().unwrap();
+        let state = checkpoint_store(&engine, &checkpoint.path().to_string_lossy())
+            .unwrap()
+            .load()
+            .await
+            .unwrap();
         let offsets = state.source_offsets.expect("offsets committed");
         assert_eq!(offsets.source, "kafka");
         assert_eq!(offsets.entries.get("events-0"), Some(&2));
@@ -711,7 +802,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let state2 = CheckpointStore::new(checkpoint.path()).load().unwrap();
+        let state2 = checkpoint_store(&engine, &checkpoint.path().to_string_lossy())
+            .unwrap()
+            .load()
+            .await
+            .unwrap();
         assert_eq!(
             state2
                 .source_offsets

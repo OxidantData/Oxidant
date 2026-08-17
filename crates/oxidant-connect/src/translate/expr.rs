@@ -46,7 +46,16 @@ pub fn to_expr(
         ExprType::Cast(c) => cast(ctx, c, ids),
         ExprType::Window(w) => window(ctx, w, ids),
         ExprType::SortOrder(o) => Ok(sort_order(ctx, o, ids)?.expr),
-        ExprType::UnresolvedStar(_) => Ok(wildcard()),
+        // A bare `*` is a wildcard the projection builder expands. A *targeted* star (`payload.*`)
+        // needs the input schema to expand, which only the projection builder has — reaching here
+        // means it appeared somewhere that cannot expand it, and silently widening it to `*` would
+        // return the wrong columns rather than say so.
+        ExprType::UnresolvedStar(s) => match s.unparsed_target.as_deref() {
+            None => Ok(wildcard()),
+            Some(t) => Err(inval(format!(
+                "`{t}` is only supported directly in a projection"
+            ))),
+        },
         ExprType::ExpressionString(s) => ctx
             .parse_sql_expr(&s.expression, &datafusion::common::DFSchema::empty())
             .map_err(|e| inval(format!("parse expr `{}`: {e}", s.expression))),
@@ -74,12 +83,25 @@ pub fn wildcard() -> Expr {
     }
 }
 
-/// Is this expression a `*` wildcard?
+/// Is this expression a bare `*` wildcard (no `t.*` / `payload.*` target)?
 pub fn is_wildcard(e: &sc::Expression) -> bool {
-    matches!(
-        e.expr_type.as_ref(),
-        Some(sc::expression::ExprType::UnresolvedStar(_))
-    )
+    matches!(star_target(e), Some(None))
+}
+
+/// If `e` is a star, its target: `None` for a bare `*`, `Some("payload")` for `payload.*`.
+///
+/// Spark sends the target verbatim including the trailing `.*`; strip it so callers see the name
+/// the user wrote.
+pub fn star_target(e: &sc::Expression) -> Option<Option<&str>> {
+    match e.expr_type.as_ref() {
+        Some(sc::expression::ExprType::UnresolvedStar(s)) => Some(
+            s.unparsed_target
+                .as_deref()
+                .map(|t| t.strip_suffix(".*").unwrap_or(t))
+                .filter(|t| !t.is_empty()),
+        ),
+        _ => None,
+    }
 }
 
 /// Does this expression tree reference any column by `plan_id`? (vs. by qualified name). Joins use

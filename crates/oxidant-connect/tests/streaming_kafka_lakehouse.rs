@@ -104,6 +104,19 @@ async fn run_command(
     while let Some(msg) = stream.next().await {
         out.push(msg.expect("response"));
     }
+    // Every operation must end with `ResultComplete`. A PySpark 3.5+ client treats an
+    // `ExecutePlan` stream as reattachable and keeps reattaching until it arrives, so a command
+    // that omits it hangs the client on a call the server already finished. Asserting it here
+    // covers every command these tests issue, because a stream that ends without it looks
+    // perfectly healthy from inside the server.
+    assert!(
+        matches!(
+            out.last().and_then(|r| r.response_type.as_ref()),
+            Some(sc::execute_plan_response::ResponseType::ResultComplete(_))
+        ),
+        "the response stream must end with ResultComplete, got {:?}",
+        out.last().and_then(|r| r.response_type.as_ref())
+    );
     out
 }
 
@@ -426,4 +439,117 @@ async fn a_kafka_stream_with_no_broker_and_no_spool_fails_the_start_call() {
         "unhelpful error: {}",
         err.message()
     );
+}
+
+#[tokio::test]
+async fn an_available_now_query_terminates_once_it_has_drained_the_source() {
+    // `Trigger.AvailableNow` means "process what is there, then stop" — a batch job spelled as a
+    // stream. `awaitTermination()` and the `while query.isActive` loop every such job is built
+    // around only return when the query goes inactive *by itself*; a query left active after it
+    // drained hangs the job forever on work that is already finished. The other tests here drive
+    // `ProcessAllAvailable` by hand, which masks this entirely.
+    let spool = tempfile::TempDir::new().expect("spool dir");
+    let out = tempfile::TempDir::new().expect("out dir");
+    let checkpoint = tempfile::TempDir::new().expect("checkpoint dir");
+    std::fs::write(
+        spool.path().join("batch-0.json"),
+        "{\"id\":1}\n{\"id\":2}\n",
+    )
+    .expect("write batch 0");
+
+    let mut client = boot(pick_port()).await;
+
+    let source_options: HashMap<String, String> = [
+        ("subscribe".to_string(), "events".to_string()),
+        (
+            "oxidant.spool.dir".to_string(),
+            spool.path().to_string_lossy().into_owned(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let projected = sc::Relation {
+        rel_type: Some(sc::relation::RelType::Project(Box::new(sc::Project {
+            input: Some(Box::new(kafka_read(source_options))),
+            expressions: vec![attr("value"), attr("offset")],
+        }))),
+        ..Default::default()
+    };
+
+    let table_path = out.path().join("events_available_now");
+    let writer_options: HashMap<String, String> = [(
+        "checkpointLocation".to_string(),
+        checkpoint.path().to_string_lossy().into_owned(),
+    )]
+    .into_iter()
+    .collect();
+
+    let responses = run_command(
+        &mut client,
+        sc::command::CommandType::WriteStreamOperationStart(sc::WriteStreamOperationStart {
+            input: Some(projected),
+            format: "delta".into(),
+            options: writer_options,
+            trigger: Some(sc::write_stream_operation_start::Trigger::AvailableNow(
+                true,
+            )),
+            output_mode: "append".into(),
+            query_name: "available_now".into(),
+            sink_destination: Some(sc::write_stream_operation_start::SinkDestination::Path(
+                table_path.to_string_lossy().into_owned(),
+            )),
+            ..Default::default()
+        }),
+    )
+    .await;
+
+    let query_id = responses
+        .iter()
+        .find_map(|r| match &r.response_type {
+            Some(sc::execute_plan_response::ResponseType::WriteStreamOperationStartResult(res)) => {
+                res.query_id.clone()
+            }
+            _ => None,
+        })
+        .expect("WriteStreamOperationStartResult");
+
+    // Poll the way a client does. Deliberately no `ProcessAllAvailable`: the trigger has to drain
+    // and terminate on its own.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut active = true;
+    while active && std::time::Instant::now() < deadline {
+        let responses = run_command(
+            &mut client,
+            sc::command::CommandType::StreamingQueryCommand(sc::StreamingQueryCommand {
+                query_id: Some(query_id.clone()),
+                command: Some(sc::streaming_query_command::Command::Status(true)),
+            }),
+        )
+        .await;
+        active = responses
+            .iter()
+            .find_map(|r| match &r.response_type {
+                Some(sc::execute_plan_response::ResponseType::StreamingQueryCommandResult(res)) => {
+                    match &res.result_type {
+                        Some(sc::streaming_query_command_result::ResultType::Status(s)) => {
+                            Some(s.is_active)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("a status result");
+        if active {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    assert!(
+        !active,
+        "an availableNow query is still active after draining its source"
+    );
+    // Terminated because the work is done, not because it gave up before writing.
+    assert_eq!(delta_scalar_i64(&table_path, "count(*)").await, 2);
 }

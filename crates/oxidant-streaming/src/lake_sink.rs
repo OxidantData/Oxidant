@@ -495,7 +495,14 @@ impl Sink for LakeSink {
                     return Ok(0);
                 }
                 let interval = self.options.checkpoint_interval;
-                (interval > 0 && (commit.version + 1) % interval == 0).then_some(commit.version)
+                // Publish on the very first commit, then every `interval` after it. Without the
+                // first-commit case a table is not Iceberg-readable *at all* until its tenth
+                // micro-batch — the sibling catalog entry does not even exist — so a low-volume
+                // table would quietly never gain the interoperability this sink advertises.
+                // Later publishes stay on the interval: rewriting the manifest set costs more
+                // than writing the data, so it is deliberately amortized.
+                let due = interval > 0 && (commit.version + 1) % interval == 0;
+                (commit.version == 0 || due).then_some(commit.version)
             }
             Writer::Parquet => {
                 let bytes = encode_parquet(&self.schema, batches)?;

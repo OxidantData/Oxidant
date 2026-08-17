@@ -162,7 +162,14 @@ impl OxidantService {
                 tokio::spawn(async move {
                     if let Err(e) = mgr.process_all_available(&qid, &eng).await {
                         mgr.fail(&qid, &e.to_string()).await;
+                        return;
                     }
+                    // `Once` and `AvailableNow` terminate once the data that was there is
+                    // processed — that is the whole difference from a processing-time trigger.
+                    // Leaving the query active instead makes `awaitTermination()` never return and
+                    // `isActive` never go false, so a batch job written against these triggers
+                    // hangs forever on a query that already finished its work.
+                    mgr.stop(&qid).await;
                 });
             }
         }

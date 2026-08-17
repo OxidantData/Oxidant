@@ -466,6 +466,22 @@ impl OxidantService {
         Ok(responses)
     }
 
+    /// The terminal response that ends an operation.
+    ///
+    /// Every `ExecutePlan` response stream has to end with one. A PySpark 3.5+ client uses
+    /// reattachable execution: it treats the stream as resumable and keeps reattaching until it
+    /// sees this message, so a command that omits it leaves the client spinning on a call that
+    /// already succeeded server-side.
+    fn result_complete(&self, session_id: &str, operation_id: &str) -> sc::ExecutePlanResponse {
+        self.response(
+            session_id,
+            operation_id,
+            sc::execute_plan_response::ResponseType::ResultComplete(
+                sc::execute_plan_response::ResultComplete {},
+            ),
+        )
+    }
+
     fn buffer_operation(&self, operation_id: &str, responses: Arc<Vec<sc::ExecutePlanResponse>>) {
         let mut store = self.completed_ops.lock().expect("completed_ops poisoned");
         store.evict_expired(self.completed_ops_ttl);
@@ -1092,23 +1108,29 @@ impl SparkConnectService for OxidantService {
                 }
                 Some(sc::command::CommandType::WriteStreamOperationStart(s)) => {
                     let result = self.handle_write_stream_start(&engine, s).await?;
-                    vec![self.response(
-                        &session_id,
-                        &operation_id,
-                        sc::execute_plan_response::ResponseType::WriteStreamOperationStartResult(
-                            result,
+                    vec![
+                        self.response(
+                            &session_id,
+                            &operation_id,
+                            sc::execute_plan_response::ResponseType::WriteStreamOperationStartResult(
+                                result,
+                            ),
                         ),
-                    )]
+                        self.result_complete(&session_id, &operation_id),
+                    ]
                 }
                 Some(sc::command::CommandType::StreamingQueryCommand(c)) => {
                     let result = self.handle_streaming_query_command(&engine, c).await?;
-                    vec![self.response(
-                        &session_id,
-                        &operation_id,
-                        sc::execute_plan_response::ResponseType::StreamingQueryCommandResult(
-                            result,
+                    vec![
+                        self.response(
+                            &session_id,
+                            &operation_id,
+                            sc::execute_plan_response::ResponseType::StreamingQueryCommandResult(
+                                result,
+                            ),
                         ),
-                    )]
+                        self.result_complete(&session_id, &operation_id),
+                    ]
                 }
                 Some(sc::command::CommandType::RegisterFunction(rf)) => {
                     // Register in DataFusion's UDF registry so SQL cells can call the UDF.

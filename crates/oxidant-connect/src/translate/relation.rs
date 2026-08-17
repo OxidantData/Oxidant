@@ -4,15 +4,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder, SortExpr};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::unparser::Unparser;
 use oxidant_proto::spark::connect as sc;
 use tonic::Status;
 
-use super::expr::{is_wildcard, to_expr};
+use super::expr::{star_target, to_expr};
 use super::inval;
 
 type PlanFuture<'a> = Pin<Box<dyn Future<Output = Result<LogicalPlan, Status>> + Send + 'a>>;
@@ -246,13 +248,76 @@ fn project_exprs(
 ) -> Result<Vec<Expr>, Status> {
     let mut out = Vec::with_capacity(exprs.len());
     for e in exprs {
-        if is_wildcard(e) {
-            out.extend(input.schema().columns().into_iter().map(Expr::Column));
-        } else {
-            out.push(to_expr(ctx, e, None)?);
+        match star_target(e) {
+            Some(None) => out.extend(input.schema().columns().into_iter().map(Expr::Column)),
+            Some(Some(target)) => out.extend(expand_star_target(input, target)?),
+            None => out.push(to_expr(ctx, e, None)?),
         }
     }
     Ok(out)
+}
+
+/// Expand a targeted star — `t.*` or `payload.*` — against the input schema.
+///
+/// Spark overloads one syntax for two expansions, and which one applies depends on what the name
+/// resolves to: a relation qualifier gives that relation's columns, while a struct column gives
+/// that struct's fields as top-level columns. `df.select("payload.*")` after a `from_json` is the
+/// second, and it is the ordinary way to flatten a parsed payload.
+fn expand_star_target(input: &LogicalPlan, target: &str) -> Result<Vec<Expr>, Status> {
+    let schema = input.schema();
+
+    // A relation qualifier first: `t.*` must keep meaning "every column of t" even if some other
+    // column happens to be a struct named `t`.
+    let qualified: Vec<Expr> = schema
+        .columns()
+        .into_iter()
+        .filter(|c| c.relation.as_ref().is_some_and(|r| r.table() == target))
+        .map(Expr::Column)
+        .collect();
+    if !qualified.is_empty() {
+        return Ok(qualified);
+    }
+
+    // Otherwise a struct column, possibly nested (`a.b.*`). Walk the dotted path so each step is
+    // either a column name or a field of the struct reached so far.
+    let mut parts = target.split('.');
+    let head = parts.next().unwrap_or(target);
+    let column = schema
+        .columns()
+        .into_iter()
+        .find(|c| c.name() == head)
+        .ok_or_else(|| inval(format!("`{target}.*`: no column named `{head}`")))?;
+    let idx = schema
+        .index_of_column(&column)
+        .map_err(|e| inval(format!("`{target}.*`: {e}")))?;
+    let mut dt = schema.field(idx).data_type().clone();
+    let mut base = Expr::Column(column);
+    for part in parts {
+        let DataType::Struct(fields) = &dt else {
+            return Err(inval(format!(
+                "`{target}.*`: `{part}` is not a field — the value it is read from is {dt}, not a struct"
+            )));
+        };
+        let field = fields
+            .iter()
+            .find(|f| f.name() == part)
+            .ok_or_else(|| inval(format!("`{target}.*`: no field named `{part}`")))?
+            .clone();
+        base = get_field(base, part);
+        dt = field.data_type().clone();
+    }
+
+    let DataType::Struct(fields) = &dt else {
+        return Err(inval(format!(
+            "`{target}.*`: `{target}` is {dt}, not a struct — `.*` only expands a struct or a relation"
+        )));
+    };
+    // Alias each field to its bare name, which is what Spark's expansion produces: the point of
+    // `payload.*` is that the fields stop being nested.
+    Ok(fields
+        .iter()
+        .map(|f| get_field(base.clone(), f.name()).alias(f.name()))
+        .collect())
 }
 
 async fn aggregate(ctx: &SessionContext, a: &sc::Aggregate) -> Result<LogicalPlan, Status> {

@@ -203,11 +203,15 @@ This is on by default for Delta sinks. Turn it off with `.option("icebergCompat"
   Iceberg field ids, and without a name mapping an Iceberg reader opens the table and returns
   every column as null. This is the detail that makes the whole thing work.
 
-**Iceberg readers trail Delta readers.** The Iceberg tree is republished every
-`checkpointInterval` commits (10 by default), not on every micro-batch — rewriting a manifest per
-batch would cost more than the data write. Delta readers always see the newest batch; Iceberg
+**Iceberg readers trail Delta readers.** The Iceberg tree is published on the first commit — so
+the table is readable as Iceberg from its first micro-batch, rather than only once it has written
+ten — and republished every `checkpointInterval` commits (10 by default) after that. Republishing
+per batch would cost more than the data write. Delta readers always see the newest batch; Iceberg
 readers see the table as of the last publish. Lower `checkpointInterval` to shorten the lag, at
 the cost of more metadata writes.
+
+This is verified against Amazon Athena, not just against Oxidant's own Iceberg reader: a streamed
+table's `GROUP BY customer` aggregation in Athena matches Oxidant's row for row.
 
 ```python
 query = (
@@ -234,7 +238,7 @@ SELECT count(*) FROM glue.streaming_live.orders_iceberg;
 |----------------|-----------|
 | `processingTime="30 seconds"` | Fire every interval. Accepts `ms`/`seconds`/`minutes`/`hours`. |
 | `once=True` | Drain everything available, then stop. |
-| `availableNow=True` | Same, then idle. |
+| `availableNow=True` | Same. The query goes inactive once drained, so `awaitTermination()` returns and a `while query.isActive` loop exits. |
 | *(omitted)* | Every 1 second. |
 
 Triggers fire on a **fixed schedule**: a batch that overruns its interval is followed immediately
@@ -249,13 +253,19 @@ with the error on its status rather than spinning on it every interval. Check `q
 ## Checkpoints
 
 `checkpointLocation` holds `offsets.json`: the committed batch id, the source's replay position,
-and the event-time watermark. It is written atomically (staged, then renamed), so a crash mid-write
+and the event-time watermark. It is written as a single atomic object write, so a crash mid-write
 can never leave a half-parsed checkpoint that silently resets the query's position. Point a
 restarted query at the same location and it resumes; the query `id` survives the restart while
 `run_id` is new, exactly as in Spark. Delete the directory to start over.
 
-Today the checkpoint is written through the local filesystem, so a driver that moves hosts needs
-that path on shared storage (EFS/NFS) — object-store checkpoints are not implemented yet.
+The checkpoint is written through the same object store as the table, so `s3://` works and a
+driver that restarts on another host resumes from where the last one committed. A bare filesystem
+path still works and is fine for a single-host deployment.
+
+The single write is the atomicity story: an object-store `PUT` is atomic, so a reader sees either
+the whole previous checkpoint or the whole new one, never a truncated one that would parse as "no
+committed offsets" and silently replay (or, with `startingOffsets=latest`, skip) a run's worth of
+data.
 
 ## Validating against real Glue
 
@@ -274,6 +284,18 @@ export AWS_REGION=us-east-1
 The CI suite covers everything above the broker socket
 (`crates/oxidant-connect/tests/streaming_kafka_lakehouse.rs`); this script is what covers the AWS
 leg, which needs credentials CI does not have.
+
+**S3 credentials come from the environment.** The engine builds its S3 client with
+`AmazonS3Builder::from_env()`, which reads `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+`AWS_SESSION_TOKEN` — the variables IRSA and EC2 instance roles set. It does **not** read
+`~/.aws/credentials`, so a laptop authenticated with a named profile falls through to the instance
+metadata endpoint and fails there after a long retry (`Error performing PUT
+http://169.254.169.254/...`). The validation script exports the active profile's credentials for
+you; if you run the server by hand, do the same:
+
+```sh
+eval "$(aws configure export-credentials --format env)"
+```
 
 ## Throughput
 

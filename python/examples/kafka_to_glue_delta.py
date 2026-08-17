@@ -119,12 +119,23 @@ def main() -> int:
             f"SELECT count(*) AS n FROM {iceberg_target}"
         ).collect()[0]["n"]
         print(f"[verify] {iceberg_target} (Iceberg view) has {iceberg_total} rows")
-        if iceberg_total != total:
+        # Iceberg metadata is republished every `checkpointInterval` commits, not every batch, so
+        # an Iceberg reader sees a consistent *prefix* of the commits a Delta reader sees. The
+        # invariant is therefore "a non-empty snapshot, no more than Delta has" — not equality.
+        # Asserting equality would report a failure for the documented, intended behaviour every
+        # time this runs against a table that has committed since the last publish.
+        if not 0 < iceberg_total <= total:
             print(
-                f"[verify] FAIL: Delta sees {total} rows, Iceberg sees {iceberg_total}",
+                f"[verify] FAIL: Delta sees {total} rows, Iceberg sees {iceberg_total} "
+                f"(expected a non-empty snapshot no larger than Delta's)",
                 file=sys.stderr,
             )
             return 1
+        if iceberg_total < total:
+            print(
+                f"[verify] note: the Iceberg snapshot trails by {total - iceberg_total} rows; "
+                f"it is republished every checkpointInterval commits"
+            )
     except Exception as exc:  # noqa: BLE001 - the Delta table is still the primary result
         print(f"[verify] WARN: Iceberg view unreadable: {exc}", file=sys.stderr)
 

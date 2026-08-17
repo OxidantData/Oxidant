@@ -1,13 +1,14 @@
 //! Checkpoint metadata persistence (offsets, batch id, sink commits).
 
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use serde::{Deserialize, Serialize};
 
 use crate::query::StreamingQueryId;
 
 const OFFSETS_FILE: &str = "offsets.json";
-const METADATA_FILE: &str = "metadata";
 
 /// Persisted checkpoint state for a streaming query.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -25,48 +26,66 @@ pub struct CheckpointState {
     pub watermark_micros: i64,
 }
 
-/// Filesystem-backed checkpoint store.
+/// Object-store-backed checkpoint store.
+///
+/// Backed by an [`ObjectStore`] rather than `std::fs` because `checkpointLocation` is an
+/// **object-store URL** in every deployment this targets. Writing it through the filesystem does
+/// not fail on an `s3://` location — it creates a local directory literally named `s3:/bucket/...`
+/// under the process's working directory. The query then runs perfectly, and its restart-resume
+/// story is quietly fiction: a driver that restarts anywhere else finds no checkpoint, replays
+/// from `startingOffsets`, and duplicates (or with `latest`, skips) everything.
 #[derive(Debug, Clone)]
 pub struct CheckpointStore {
-    root: PathBuf,
+    store: Arc<dyn ObjectStore>,
+    root: ObjectPath,
+    /// The location as the user wrote it, for error messages.
+    location: String,
 }
 
 impl CheckpointStore {
-    pub fn new(root: impl AsRef<Path>) -> Self {
+    pub fn new(store: Arc<dyn ObjectStore>, root: ObjectPath, location: impl Into<String>) -> Self {
         Self {
-            root: root.as_ref().to_path_buf(),
+            store,
+            root,
+            location: location.into(),
         }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.root
+    /// The location as configured, for display.
+    pub fn location(&self) -> &str {
+        &self.location
     }
 
-    pub fn load(&self) -> std::io::Result<CheckpointState> {
-        let p = self.root.join(OFFSETS_FILE);
-        if !p.exists() {
-            return Ok(CheckpointState::default());
-        }
-        let text = std::fs::read_to_string(p)?;
-        serde_json::from_str(&text)
+    fn offsets_path(&self) -> ObjectPath {
+        self.root.clone().join(OFFSETS_FILE)
+    }
+
+    pub async fn load(&self) -> std::io::Result<CheckpointState> {
+        let path = self.offsets_path();
+        let bytes = match self.store.get(&path).await {
+            Ok(result) => result.bytes().await.map_err(io_err)?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(CheckpointState::default()),
+            Err(e) => return Err(io_err(e)),
+        };
+        serde_json::from_slice(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// Write the checkpoint atomically: to a temporary file, then rename over the real one.
+    /// Write the checkpoint so a reader never observes a partial one.
     ///
-    /// A plain write is not safe here. A crash partway through leaves truncated JSON, `load`
-    /// then fails to parse it, and every caller's `unwrap_or_default()` quietly turns that into
-    /// "no committed offsets" — which with `startingOffsets=latest` silently skips everything
-    /// produced since. A rename is atomic on every filesystem this runs on, so the file is
-    /// either the old checkpoint or the new one.
-    pub fn save(&self, state: &CheckpointState) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.root)?;
-        std::fs::create_dir_all(self.root.join(METADATA_FILE))?;
-        let text = serde_json::to_string_pretty(state)
+    /// A truncated checkpoint is worse than a missing one: `load` fails to parse it, every
+    /// caller's `unwrap_or_default()` quietly turns that into "no committed offsets", and with
+    /// `startingOffsets=latest` the query silently skips everything produced since. Object stores
+    /// make a `PUT` atomic — a reader sees either the whole old object or the whole new one — so
+    /// unlike the filesystem this needs no staged temporary file.
+    pub async fn save(&self, state: &CheckpointState) -> std::io::Result<()> {
+        let text = serde_json::to_vec_pretty(state)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let staged = self.root.join(format!("{OFFSETS_FILE}.tmp"));
-        std::fs::write(&staged, text)?;
-        std::fs::rename(staged, self.root.join(OFFSETS_FILE))
+        self.store
+            .put(&self.offsets_path(), text.into())
+            .await
+            .map_err(io_err)?;
+        Ok(())
     }
 
     /// Stamp a new *run* onto this checkpoint.
@@ -77,14 +96,19 @@ impl CheckpointStore {
     /// `startingOffsets=latest`, silently skip) everything the previous run had already
     /// committed. The `query_id` from the existing checkpoint wins for the same reason Spark
     /// persists it: the query's identity outlives any one run.
-    pub fn init_for_query(&self, id: &StreamingQueryId) -> std::io::Result<()> {
-        let mut state = self.load().unwrap_or_default();
+    pub async fn init_for_query(&self, id: &StreamingQueryId) -> std::io::Result<()> {
+        let mut state = self.load().await.unwrap_or_default();
         if state.query_id.is_empty() {
             state.query_id = id.id.clone();
         }
         state.run_id = id.run_id.clone();
-        self.save(&state)
+        self.save(&state).await
     }
+}
+
+fn io_err(e: object_store::Error) -> std::io::Error {
+    // Not `Error::other`, which is stable since 1.74 and this crate's MSRV is 1.72.
+    std::io::Error::new(std::io::ErrorKind::Other, e)
 }
 
 #[cfg(test)]
@@ -92,41 +116,58 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn a_torn_write_can_never_be_observed() {
+    fn local_store(dir: &TempDir) -> CheckpointStore {
+        let store = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        CheckpointStore::new(
+            Arc::new(store),
+            ObjectPath::from(""),
+            dir.path().to_string_lossy().into_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_partial_write_can_never_be_observed() {
         // The failure this rules out: a half-written `offsets.json` parses as nothing, every
         // caller defaults it, and the query silently restarts from `startingOffsets`.
         let dir = TempDir::new().unwrap();
-        let store = CheckpointStore::new(dir.path());
+        let store = local_store(&dir);
         let mut state = CheckpointState {
             batch_id: 7,
             committed_batch_id: 7,
             ..Default::default()
         };
-        store.save(&state).unwrap();
+        store.save(&state).await.unwrap();
         state.batch_id = 8;
-        store.save(&state).unwrap();
+        store.save(&state).await.unwrap();
 
-        // No staging file survives a completed save, and the visible file always parses.
+        // The visible checkpoint always parses, and no staging artifact is left behind.
+        assert_eq!(store.load().await.unwrap().batch_id, 8);
         assert!(!dir.path().join("offsets.json.tmp").exists());
-        assert_eq!(store.load().unwrap().batch_id, 8);
     }
 
-    #[test]
-    fn checkpoint_round_trip() {
+    #[tokio::test]
+    async fn checkpoint_round_trip() {
         let dir = TempDir::new().unwrap();
-        let store = CheckpointStore::new(dir.path());
+        let store = local_store(&dir);
         let id = StreamingQueryId::new();
-        store.init_for_query(&id).unwrap();
-        let mut state = store.load().unwrap();
+        store.init_for_query(&id).await.unwrap();
+        let mut state = store.load().await.unwrap();
         state.batch_id = 3;
         state.source_offsets = Some(crate::source::SourceOffsets {
             source: "kafka".into(),
             entries: [("events-0".to_string(), 42i64)].into_iter().collect(),
         });
-        store.save(&state).unwrap();
-        let loaded = store.load().unwrap();
+        store.save(&state).await.unwrap();
+        let loaded = store.load().await.unwrap();
         assert_eq!(loaded.batch_id, 3);
         assert_eq!(loaded.source_offsets, state.source_offsets);
+    }
+
+    #[tokio::test]
+    async fn a_missing_checkpoint_reads_as_a_fresh_query() {
+        let dir = TempDir::new().unwrap();
+        let state = local_store(&dir).load().await.unwrap();
+        assert_eq!(state.batch_id, 0);
+        assert!(state.query_id.is_empty());
     }
 }
