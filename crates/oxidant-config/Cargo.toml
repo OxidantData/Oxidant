@@ -1,0 +1,19 @@
+[package]
+name = "oxidant-config"
+description = "Declarative YAML configuration for the Oxidant binary: catalogs, engine tuning, and pipeline definitions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-common = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `serde_yaml` is archived upstream; `serde_norway` is the maintained fork and keeps the
+# same API. Pinned to a minor range so a surprise 0.10 cannot land in a `cargo update`.
+serde_norway = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

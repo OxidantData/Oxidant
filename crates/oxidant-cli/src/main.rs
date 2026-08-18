@@ -9,7 +9,11 @@
 //!   --partial-sql "SELECT k, COUNT(*) c, SUM(v) s FROM t GROUP BY k" \
 //!   --final-sql   "SELECT k, SUM(c) c, SUM(s) s FROM shuffle_input GROUP BY k" \
 //!   --hash-keys 0
-//! oxidant sql -e "SELECT 1"                 # run SQL via the REST statement API (UI port)
+//! oxidant pipeline run -c oxidant.yaml      # build the declarative table DAG (Kafka -> lake)
+//! oxidant pipeline validate -c oxidant.yaml  # parse + plan + topo-sort, run nothing
+//! oxidant sql -e "SELECT 1"                 # run SQL in-process (no server needed)
+//! oxidant sql -c oxidant.yaml -e "SELECT count(*) FROM local.live.orders"
+//! oxidant sql --url http://driver:4040 -e "SELECT 1"   # ... or via a server's REST API
 //! oxidant mcp                               # stdio MCP server over the same API
 //! ```
 
@@ -21,7 +25,9 @@ use oxidant_execution::flight::serve_worker;
 use oxidant_loom::Engine;
 
 mod client;
+mod embedded;
 mod mcp;
+mod pipeline;
 #[cfg(test)]
 mod testutil;
 
@@ -31,27 +37,46 @@ mod testutil;
 // workers). Give every runtime thread a generous stack — production driver, worker, and server
 // all enter through here.
 fn main() {
+    // `engine:` is lowered to `OXIDANT_*` variables with `std::env::set_var`, which is only sound
+    // while the process is still single-threaded — `setenv` races any concurrent `getenv` from
+    // another thread, which is exactly why Rust 2024 made `set_var` unsafe. So the config is
+    // resolved and applied HERE, before the Tokio runtime and its worker threads exist, and the
+    // loaded config is handed to the subcommands rather than each of them re-reading it.
+    let args: Vec<String> = std::env::args().collect();
+    let config = match oxidant_config::OxidantConfig::resolve(config_flag(&args).as_deref()) {
+        Ok(config) => {
+            if let Some(config) = &config {
+                config.apply_engine_env();
+            }
+            config
+        }
+        Err(e) => {
+            eprintln!("oxidant: {e}");
+            std::process::exit(1);
+        }
+    };
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(32 * 1024 * 1024)
         .build()
         .expect("tokio runtime")
-        .block_on(async_main())
+        .block_on(async_main(args, config))
 }
 
-async fn async_main() {
+async fn async_main(args: Vec<String>, config: Option<oxidant_config::OxidantConfig>) {
     // TODO(issue #1): replace this hand-rolled arg handling with clap.
-    let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str);
 
     let result = match cmd {
-        Some("worker") => run_worker(&args).await,
+        Some("worker") => run_worker(&args, config).await,
         Some("driver") => run_driver(&args).await,
         Some("history-server") => run_history_server(&args).await,
-        Some("sql") => run_sql(&args).await,
+        Some("pipeline") => run_pipeline(&args, config).await,
+        Some("sql") => run_sql(&args, config).await,
         Some("mcp") => run_mcp(&args).await,
         // `oxidant spark server ...` (and the bare `server` alias) keep the Spark Connect path.
-        _ if args.iter().any(|a| a == "server") => run_server(&args).await,
+        _ if args.iter().any(|a| a == "server") => run_server(&args, config).await,
         _ => {
             usage();
             return;
@@ -75,15 +100,27 @@ fn usage() {
         "  oxidant driver --workers <h:p,h:p> --partial-sql <SQL> --final-sql <SQL> --hash-keys <c,c>"
     );
     eprintln!(
-        "  oxidant sql (-e <SQL> | -f <FILE> | stdin) [--format table|csv|json] [--url <URL>] [--timeout <SECS>]"
+        "  oxidant sql (-e <SQL> | -f <FILE> | stdin) [--format table|csv|json] [--config <FILE>] [--url <URL>] [--timeout <SECS>]"
     );
     eprintln!("  oxidant mcp [--url <URL>]");
     eprintln!(
-        "  sql/mcp talk to the REST statement API on the UI port (default $OXIDANT_URL or http://localhost:4040)"
+        "  oxidant pipeline (run|validate|show) [--config <FILE>] [--table <NAME>]... [--once]"
     );
+    eprintln!();
+    eprintln!(
+        "  `oxidant sql` runs the statement IN-PROCESS by default — no server needed. Catalogs"
+    );
+    eprintln!(
+        "  come from --config <FILE> (or $OXIDANT_CONFIG, or ./oxidant.yaml). Pass --url (or set"
+    );
+    eprintln!("  $OXIDANT_URL) to run it against a running server's REST API instead.");
+    eprintln!("  `oxidant mcp` always talks to the REST statement API on the UI port.");
 }
 
-async fn run_server(args: &[String]) -> oxidant_common::Result<()> {
+async fn run_server(
+    args: &[String],
+    config: Option<oxidant_config::OxidantConfig>,
+) -> oxidant_common::Result<()> {
     let mode = server_mode(args)?;
     let port = flag(args, "--port")
         .and_then(|s| s.parse().ok())
@@ -98,7 +135,16 @@ async fn run_server(args: &[String]) -> oxidant_common::Result<()> {
         )
     };
     let ui_bind = ui_bind_addr(args);
-    let catalogs = catalog_conf(args);
+    // The config file is the base layer; `--catalog-conf` / `OXIDANT_CATALOG_CONF` are applied
+    // on top, so an explicit flag always beats the file — the same direction every other
+    // override in this CLI runs.
+    // `engine:` was already applied in `main`, before the runtime started — see the comment
+    // there on why `set_var` cannot happen from inside a multi-threaded runtime.
+    let mut catalogs: std::collections::HashMap<String, String> = config
+        .as_ref()
+        .map(|c| c.catalog_conf().into_iter().collect())
+        .unwrap_or_default();
+    catalogs.extend(catalog_conf(args));
     if !catalogs.is_empty() {
         eprintln!("Declared {} catalog config entrie(s)", catalogs.len());
     }
@@ -329,12 +375,23 @@ fn resolve_sample_data_dir(exe_dir: &std::path::Path) -> Option<std::path::PathB
     .find(|dir| dir.join("parquet").is_dir())
 }
 
-async fn run_worker(args: &[String]) -> oxidant_common::Result<()> {
+async fn run_worker(
+    args: &[String],
+    config: Option<oxidant_config::OxidantConfig>,
+) -> oxidant_common::Result<()> {
     let port: u16 = flag(args, "--port")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| oxidant_common::Error::Io("worker requires --port".into()))?;
     // Same catalog bootstrap as `oxidant spark server` so Glue/Hive tables resolve on workers.
-    let catalogs = catalog_conf(args);
+    // Workers must see the same catalogs as the driver, or a distributed stage cannot resolve
+    // the tables its plan references. Same precedence as the server: file first, flags on top.
+    // `engine:` was already applied in `main`, before the runtime started — see the comment
+    // there on why `set_var` cannot happen from inside a multi-threaded runtime.
+    let mut catalogs: std::collections::HashMap<String, String> = config
+        .as_ref()
+        .map(|c| c.catalog_conf().into_iter().collect())
+        .unwrap_or_default();
+    catalogs.extend(catalog_conf(args));
     if !catalogs.is_empty() {
         eprintln!(
             "Worker declared {} catalog config entrie(s)",
@@ -445,6 +502,19 @@ struct SqlOptions {
     format: OutputFormat,
     url: String,
     timeout_secs: u64,
+    /// Whether a server was *asked for* (`--url` or `OXIDANT_URL`), as opposed to the default
+    /// URL being filled in.
+    ///
+    /// This is what selects between the two execution paths, and it has to be a separate
+    /// signal: `url` is always populated, so "is it non-empty" cannot distinguish "point at
+    /// this driver" from "nobody said anything". Running against `localhost:4040` because the
+    /// user did not mention a server would fail with a connection error on a machine that has
+    /// no server, which is precisely the case this whole path exists to serve.
+    server_requested: bool,
+    /// `--config <PATH>`, resolved for the embedded path.
+    config: Option<String>,
+    /// `--sample-data <DIR>` override for the embedded path.
+    sample_data: Option<String>,
 }
 
 fn sql_options(args: &[String]) -> oxidant_common::Result<SqlOptions> {
@@ -470,23 +540,102 @@ fn sql_options(args: &[String]) -> oxidant_common::Result<SqlOptions> {
         })?,
         None => client::DEFAULT_STATEMENT_TIMEOUT.as_secs(),
     };
+    let url_flag = flag(args, "--url");
+    let server_requested = url_flag.as_deref().is_some_and(|u| !u.trim().is_empty())
+        || std::env::var("OXIDANT_URL")
+            .ok()
+            .is_some_and(|u| !u.trim().is_empty());
     Ok(SqlOptions {
         source,
         format,
-        url: client::resolve_url(flag(args, "--url")),
+        url: client::resolve_url(url_flag),
         timeout_secs,
+        server_requested,
+        config: config_flag(args),
+        sample_data: flag(args, "--sample-data"),
     })
 }
 
-/// `oxidant sql ...` — run one statement to completion via the REST API and print the result.
-/// Failed/canceled statements exit non-zero with the server error on stderr (via `main`).
-async fn run_sql(args: &[String]) -> oxidant_common::Result<()> {
+/// `--config <PATH>` / `-c <PATH>`, shared by every subcommand.
+fn config_flag(args: &[String]) -> Option<String> {
+    flag(args, "--config")
+        .or_else(|| flag(args, "-c"))
+        .filter(|p| !p.trim().is_empty())
+}
+
+/// `oxidant pipeline ...` — build the declarative table DAG from the config file.
+async fn run_pipeline(
+    args: &[String],
+    config: Option<oxidant_config::OxidantConfig>,
+) -> oxidant_common::Result<()> {
+    let command = pipeline::parse_command(args)?;
+    pipeline::run(config, command).await
+}
+
+/// `oxidant sql ...` — run one statement and print the result.
+///
+/// Two paths. With `--url` or `OXIDANT_URL` set, the statement goes to that server's REST API,
+/// exactly as it always has. Otherwise it runs **in-process**: the config file's catalogs are
+/// bridged into a local engine and the query executes here, so the CLI is useful with no
+/// server running at all.
+///
+/// Failed statements exit non-zero with the error on stderr (via `main`).
+async fn run_sql(
+    args: &[String],
+    config: Option<oxidant_config::OxidantConfig>,
+) -> oxidant_common::Result<()> {
     let opts = sql_options(args)?;
     let sql = read_sql(&opts.source).await?;
+    if opts.server_requested {
+        run_sql_remote(&opts, &sql).await
+    } else {
+        run_sql_embedded(args, config, &opts, &sql).await
+    }
+}
+
+/// Run a statement in-process against a locally-built engine.
+async fn run_sql_embedded(
+    args: &[String],
+    config: Option<oxidant_config::OxidantConfig>,
+    opts: &SqlOptions,
+    sql: &str,
+) -> oxidant_common::Result<()> {
+    let sample_data = match &opts.sample_data {
+        Some(dir) => sample_data_dir_from(Some(dir.clone()), None),
+        None => sample_data_dir(args),
+    };
+    let engine = embedded::build_engine(config.as_ref(), sample_data).await?;
+    let batches = embedded::run_sql(&engine, sql).await?;
+    match opts.format {
+        OutputFormat::Csv => {
+            print!("{}", embedded::result_csv(&batches, EMBEDDED_ROW_LIMIT)?);
+        }
+        OutputFormat::Json => {
+            let doc = embedded::result_doc(&batches, EMBEDDED_ROW_LIMIT)?;
+            let pretty = serde_json::to_string_pretty(&doc)
+                .map_err(|e| oxidant_common::Error::Io(format!("encode result json: {e}")))?;
+            println!("{pretty}");
+        }
+        OutputFormat::Table => {
+            let doc = embedded::result_doc(&batches, EMBEDDED_ROW_LIMIT)?;
+            print!("{}", render_table(&doc));
+        }
+    }
+    Ok(())
+}
+
+/// Rows the embedded path will materialize for display.
+///
+/// A cap, not a silent one: past it the rendered footer says `[truncated]`. Without a limit a
+/// `SELECT *` over a large table would try to format the whole thing into memory as JSON.
+const EMBEDDED_ROW_LIMIT: usize = 10_000;
+
+/// Run a statement against a running server's REST API.
+async fn run_sql_remote(opts: &SqlOptions, sql: &str) -> oxidant_common::Result<()> {
     let client = client::StatementClient::new(&opts.url)?;
     let terminal = client::run_to_completion(
         &client,
-        &sql,
+        sql,
         std::time::Duration::from_secs(opts.timeout_secs),
     )
     .await?;

@@ -42,6 +42,25 @@ const COMMIT_ATTEMPTS: usize = 8;
 /// Commits between checkpoints. Delta's own convention, and what Spark uses.
 pub const DEFAULT_CHECKPOINT_INTERVAL: u64 = 10;
 
+/// A UUID derived from the table location, used as the Delta `metaData` id.
+///
+/// Derived rather than random so that re-opening — or re-declaring — a table produces the same
+/// table identity every time. A fresh random id on each open would make a reader that caches by
+/// table id treat one table as a succession of unrelated ones.
+pub fn stable_table_id(location: &str) -> String {
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, location.as_bytes()).to_string()
+}
+
+/// A fresh file-name prefix for one commit's data files.
+///
+/// Data-file names have to be unique across every writer of a table — two processes committing at
+/// the same instant, and a writer that reopened the table (whose own per-writer counter restarts
+/// at zero and would otherwise re-emit `part-00000-…`). A random UUID is what Spark's own Delta
+/// writer uses, for exactly this reason.
+pub fn new_file_prefix() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// Consecutive checkpoint failures tolerated before checkpointing is abandoned for this writer.
 ///
 /// More than one, because the object store is allowed an occasional 5xx and the whole point of
@@ -172,6 +191,15 @@ impl DeltaTableWriter {
     }
 
     /// The version the next commit will attempt.
+    /// The highest `txn` version already committed under this writer's `appId`.
+    ///
+    /// Exposed so a caller issuing its own idempotency versions can start above whatever the log
+    /// already carries: a version at or below this one is recognized as a replay and silently
+    /// discarded, which for a full-replace write means the table quietly stops updating.
+    pub fn committed_txn_version(&self) -> i64 {
+        self.committed_txn.unwrap_or(0)
+    }
+
     pub fn next_version(&self) -> u64 {
         self.next_version
     }
@@ -234,32 +262,7 @@ impl DeltaTableWriter {
 
         // One data file per partition-value combination. Unpartitioned tables take the fast path
         // with a single group and no projection.
-        let groups = split_by_partition(batches, &self.config.partition_columns)?;
-        let mut files = Vec::with_capacity(groups.len());
-        for (index, (partition_values, group)) in groups.into_iter().enumerate() {
-            let n = self.file_counter;
-            let file_name = format!("part-{n:05}-{file_prefix}-{index}-c000.snappy.parquet");
-            let relative = partition_dir(&partition_values, &self.config.partition_columns)
-                .map_or_else(|| file_name.clone(), |dir| format!("{dir}/{file_name}"));
-
-            let bytes = encode_parquet(&self.data_schema, &group, self.config.compression)?;
-            let size = bytes.len() as u64;
-            let num_records: u64 = group.iter().map(|b| b.num_rows() as u64).sum();
-            let path = object_path_join(&self.root, &relative);
-            self.store
-                .put(&path, bytes.into())
-                .await
-                .map_err(|e| Error::Io(format!("write `{path}`: {e}")))?;
-
-            files.push(DeltaAddFile {
-                path: relative,
-                size,
-                num_records,
-                partition_values,
-                stats: Some(file_stats(&self.data_schema, &group, num_records)),
-            });
-        }
-        self.file_counter += 1;
+        let files = self.write_data_files(batches, file_prefix).await?;
 
         let txn = txn_version.and_then(|version| {
             self.config.app_id.as_ref().map(|app_id| DeltaTxn {
@@ -277,32 +280,7 @@ impl DeltaTableWriter {
         if let Some(live) = &mut self.live_files {
             live.extend(files.iter().cloned());
         }
-        if self.config.checkpoint_interval > 0
-            && (version + 1) % self.config.checkpoint_interval == 0
-            && self.live_files.is_some()
-        {
-            // A failed checkpoint must not fail the append: the data is committed and the log is
-            // correct without it, only slower to replay.
-            match self.write_checkpoint(version).await {
-                Ok(()) => self.checkpoint_failures = 0,
-                Err(e) => {
-                    self.checkpoint_failures += 1;
-                    eprintln!(
-                        "[oxidant] delta checkpoint at version {version} failed \
-                         ({}/{CHECKPOINT_FAILURE_LIMIT}): {e}",
-                        self.checkpoint_failures
-                    );
-                    if self.checkpoint_failures >= CHECKPOINT_FAILURE_LIMIT {
-                        eprintln!(
-                            "[oxidant] giving up on checkpointing `{}` — its transaction log will \
-                             grow unbounded until the query restarts",
-                            self.config.table_id
-                        );
-                        self.config.checkpoint_interval = 0;
-                    }
-                }
-            }
-        }
+        self.maybe_checkpoint(version).await;
         Ok(DeltaCommit {
             version,
             rows,
@@ -311,14 +289,79 @@ impl DeltaTableWriter {
         })
     }
 
+    /// Checkpoint at `version` if the interval says to and our file view is trustworthy.
+    ///
+    /// A failed checkpoint must never fail the write that preceded it: the data is committed and
+    /// the log is correct without one, only slower to replay.
+    async fn maybe_checkpoint(&mut self, version: u64) {
+        if self.config.checkpoint_interval == 0
+            || (version + 1) % self.config.checkpoint_interval != 0
+            || self.live_files.is_none()
+        {
+            return;
+        }
+        match self.write_checkpoint(version).await {
+            Ok(()) => self.checkpoint_failures = 0,
+            Err(e) => {
+                self.checkpoint_failures += 1;
+                eprintln!(
+                    "[oxidant] delta checkpoint at version {version} failed \
+                     ({}/{CHECKPOINT_FAILURE_LIMIT}): {e}",
+                    self.checkpoint_failures
+                );
+                if self.checkpoint_failures >= CHECKPOINT_FAILURE_LIMIT {
+                    eprintln!(
+                        "[oxidant] giving up on checkpointing `{}` — its transaction log will \
+                         grow unbounded until the query restarts",
+                        self.config.table_id
+                    );
+                    self.config.checkpoint_interval = 0;
+                }
+            }
+        }
+    }
+
     /// Write the commit, retrying at the next free version if another writer took ours.
     async fn commit(&mut self, files: &[DeltaAddFile], txn: Option<&DeltaTxn>) -> Result<u64> {
+        self.commit_inner(files, txn, false).await
+    }
+
+    /// Commit `files`, optionally retiring every file currently live.
+    ///
+    /// `retire_live` is recomputed on every attempt rather than captured up front: when a
+    /// version race sends us back to re-read the log, the live set has changed, and committing
+    /// the *stale* remove list would leave the winner's files live alongside ours — an
+    /// overwrite that silently kept the old rows.
+    async fn commit_inner(
+        &mut self,
+        files: &[DeltaAddFile],
+        txn: Option<&DeltaTxn>,
+        retire_live: bool,
+    ) -> Result<u64> {
         for attempt in 0..COMMIT_ATTEMPTS {
             let version = self.next_version;
-            let body = render_commit(
+            let removes: Vec<DeltaAddFile> = if retire_live {
+                match &self.live_files {
+                    Some(live) => live.clone(),
+                    // Refusing is the only safe answer: without an authoritative live set we
+                    // would commit adds without the matching removes, and the table would end
+                    // up holding both the old and the new rows.
+                    None => {
+                        return Err(Error::Execution(format!(
+                            "cannot overwrite `{}`: another writer has compacted or vacuumed it, \
+                             so Oxidant's view of which files are live is not authoritative",
+                            self.root
+                        )))
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let body = render_commit_with_removes(
                 version,
                 &self.schema,
                 files,
+                &removes,
                 &self.config.table_id,
                 &self.config.partition_columns,
                 txn,
@@ -351,6 +394,113 @@ impl DeltaTableWriter {
              appending to this table concurrently",
             self.root
         )))
+    }
+
+    /// Replace the table's contents with `batches`, in one atomic commit.
+    ///
+    /// This is `INSERT OVERWRITE` / a materialized view's recompute: the commit retires every
+    /// file that was live and adds the new ones together, so a concurrent reader sees either
+    /// the whole old table or the whole new one and never a mixture of both.
+    ///
+    /// Unlike [`append`](Self::append), an empty `batches` is **not** a no-op — it truncates the
+    /// table. `INSERT OVERWRITE ... SELECT` that matches no rows is a request to empty the
+    /// table, and quietly leaving the old rows in place would be the wrong answer.
+    pub async fn replace(
+        &mut self,
+        batches: &[RecordBatch],
+        file_prefix: &str,
+        txn_version: Option<i64>,
+    ) -> Result<DeltaCommit> {
+        // Idempotency works the same as for an append: a replay of a batch this `appId` already
+        // committed must not run again.
+        if let (Some(v), Some(committed)) = (txn_version, self.committed_txn) {
+            if v <= committed {
+                return Ok(DeltaCommit {
+                    version: self.next_version,
+                    rows: 0,
+                    files: vec![],
+                    deduplicated: true,
+                });
+            }
+        }
+        if self.live_files.is_none() {
+            return Err(Error::Execution(format!(
+                "cannot overwrite `{}`: another writer has compacted or vacuumed it, so \
+                 Oxidant's view of which files are live is not authoritative",
+                self.root
+            )));
+        }
+
+        let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let files = self.write_data_files(batches, file_prefix).await?;
+        let txn = txn_version.and_then(|version| {
+            self.config.app_id.as_ref().map(|app_id| DeltaTxn {
+                app_id: app_id.clone(),
+                version,
+            })
+        });
+
+        let version = self.commit_inner(&files, txn.as_ref(), true).await?;
+        self.next_version = version + 1;
+        if let Some(txn) = &txn {
+            self.committed_txn = Some(txn.version);
+        }
+        // The new file set *is* the live set — everything before it was retired in the same
+        // commit.
+        self.live_files = Some(files.clone());
+        self.maybe_checkpoint(version).await;
+
+        Ok(DeltaCommit {
+            version,
+            rows,
+            files,
+            deduplicated: false,
+        })
+    }
+
+    /// Write `batches` as Parquet under the table root, one file per partition-value group.
+    ///
+    /// Shared by [`append`](Self::append) and [`replace`](Self::replace): both need identical
+    /// file naming, partition layout, statistics, and compression, and the two drifting apart
+    /// would give a table two different physical shapes depending on how it was written.
+    async fn write_data_files(
+        &mut self,
+        batches: &[RecordBatch],
+        file_prefix: &str,
+    ) -> Result<Vec<DeltaAddFile>> {
+        let groups = split_by_partition(batches, &self.config.partition_columns)?;
+        let mut files = Vec::with_capacity(groups.len());
+        for (index, (partition_values, group)) in groups.into_iter().enumerate() {
+            let num_records: u64 = group.iter().map(|b| b.num_rows() as u64).sum();
+            // An unpartitioned split always yields one group, even for no batches at all, so an
+            // empty overwrite would otherwise commit a zero-row Parquet file. Readers must then
+            // open it to learn it holds nothing — pure cost, on every scan, forever.
+            if num_records == 0 {
+                continue;
+            }
+            let n = self.file_counter;
+            let file_name = format!("part-{n:05}-{file_prefix}-{index}-c000.snappy.parquet");
+            let relative = partition_dir(&partition_values, &self.config.partition_columns)
+                .map_or_else(|| file_name.clone(), |dir| format!("{dir}/{file_name}"));
+
+            let bytes = encode_parquet(&self.data_schema, &group, self.config.compression)?;
+            let size = bytes.len() as u64;
+            let path = object_path_join(&self.root, &relative);
+            self.store
+                .put(&path, bytes.into())
+                .await
+                .map_err(|e| Error::Io(format!("write `{path}`: {e}")))?;
+
+            files.push(DeltaAddFile {
+                path: relative,
+                size,
+                num_records,
+                partition_values,
+                stats: Some(file_stats(&self.data_schema, &group, num_records)),
+            });
+        }
+        self.file_counter += 1;
+        Ok(files)
     }
 
     /// Write `_delta_log/{version}.checkpoint.parquet` and update `_last_checkpoint`.
@@ -480,12 +630,28 @@ impl LogState {
                         trustworthy = false;
                     }
                 } else if let Some(remove) = action.get("remove") {
-                    // We never write removes. One in the log means another writer is compacting
-                    // or vacuuming this table, so our view of the live set is not authoritative.
-                    if let Some(p) = remove.get("path").and_then(|p| p.as_str()) {
-                        removed.push(p.to_string());
+                    // Apply the remove against the live set we have built so far. Removes are
+                    // written by `replace` (INSERT OVERWRITE) and by any other writer that
+                    // compacts or vacuums the table.
+                    //
+                    // A remove for a file we have seen added is fully accounted for and leaves
+                    // our view authoritative. A remove for a path we never saw added is the
+                    // real danger signal: it means our picture of the table is incomplete, so
+                    // a checkpoint written from it would drop files that are still live.
+                    match remove.get("path").and_then(|p| p.as_str()) {
+                        Some(path) => {
+                            let known = live.iter().any(|f| f.path == path);
+                            if known {
+                                live.retain(|f| f.path != path);
+                            } else {
+                                removed.push(path.to_string());
+                                trustworthy = false;
+                            }
+                        }
+                        // A remove we cannot even read the path of tells us nothing except that
+                        // something left the table.
+                        None => trustworthy = false,
                     }
-                    trustworthy = false;
                 } else if let Some(meta) = action.get("metaData") {
                     metadata = metadata_from_json(meta).or(metadata);
                 } else if let Some(txn) = action.get("txn") {
@@ -507,9 +673,11 @@ impl LogState {
         Ok(Self {
             next_version: version,
             live_files: if trustworthy {
-                live.retain(|f| !removed.contains(&f.path));
                 Some(live)
             } else {
+                // `removed` holds the paths we could not account for; they are dropped along
+                // with the whole live set, because an incomplete set is worse than none.
+                let _ = &removed;
                 None
             },
             committed_txn,
@@ -1280,6 +1448,30 @@ pub fn render_commit(
     partition_columns: &[String],
     txn: Option<&DeltaTxn>,
 ) -> Result<String> {
+    render_commit_with_removes(
+        version,
+        schema,
+        files,
+        &[],
+        table_id,
+        partition_columns,
+        txn,
+    )
+}
+
+/// Render a commit that also retires files: the `remove` actions come first, then the `add`s.
+///
+/// This is what makes an overwrite atomic. A reader either sees the commit or does not; there is
+/// no moment at which the old files are gone and the new ones are not yet listed.
+pub fn render_commit_with_removes(
+    version: u64,
+    schema: &SchemaRef,
+    files: &[DeltaAddFile],
+    removes: &[DeltaAddFile],
+    table_id: &str,
+    partition_columns: &[String],
+    txn: Option<&DeltaTxn>,
+) -> Result<String> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut lines = Vec::new();
 
@@ -1307,6 +1499,28 @@ pub fn render_commit(
                     "appId": txn.app_id,
                     "version": txn.version,
                     "lastUpdated": now_ms,
+                }
+            })
+            .to_string(),
+        );
+    }
+
+    // Removes precede adds so a reader replaying the actions in order never holds both the old
+    // and the new file set at once.
+    for f in removes {
+        lines.push(
+            serde_json::json!({
+                "remove": {
+                    "path": f.path,
+                    "deletionTimestamp": now_ms,
+                    // `dataChange` is what tells a streaming reader these rows left the table,
+                    // as opposed to a compaction that merely reorganized the same rows.
+                    "dataChange": true,
+                    "partitionValues": f.partition_values,
+                    "size": f.size,
+                    // Delta requires the path to stay resolvable for time travel; the file is
+                    // not deleted from storage here, only retired from the live set.
+                    "extendedFileMetadata": true,
                 }
             })
             .to_string(),
@@ -2061,6 +2275,162 @@ mod tests {
         }
         assert_eq!(next_version(&store, &root).await.unwrap(), 2);
     }
+    #[tokio::test]
+    async fn replace_retires_the_previous_files_and_leaves_only_the_new_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut w = writer(dir.path(), config()).await;
+        w.append(&[batch()], "a", None).await.expect("append");
+        w.append(&[batch()], "b", None).await.expect("append");
+        let before: Vec<String> = w
+            .live_files()
+            .expect("trustworthy")
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        assert_eq!(before.len(), 2);
+
+        let commit = w.replace(&[batch()], "c", None).await.expect("replace");
+        assert_eq!(commit.files.len(), 1);
+
+        // The writer's own view: only the new file is live.
+        let after: Vec<String> = w
+            .live_files()
+            .expect("trustworthy")
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        assert_eq!(after.len(), 1);
+        assert!(
+            before.iter().all(|old| !after.contains(old)),
+            "every pre-overwrite file must have been retired: before={before:?} after={after:?}"
+        );
+
+        // And a *fresh* reader of the log agrees — which is the claim that actually matters.
+        let reopened = writer(dir.path(), config()).await;
+        let live: Vec<String> = reopened
+            .live_files()
+            .expect("a reader must be able to resolve the live set after an overwrite")
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        assert_eq!(
+            live, after,
+            "the log must describe the same live set the writer believes in"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_overwrite_commit_carries_remove_actions_for_exactly_the_old_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut w = writer(dir.path(), config()).await;
+        w.append(&[batch()], "a", None).await.expect("append");
+        let retired = w.live_files().expect("trustworthy")[0].path.clone();
+        let commit = w.replace(&[batch()], "b", None).await.expect("replace");
+
+        let body = std::fs::read_to_string(
+            dir.path()
+                .join(format!("tbl/_delta_log/{:020}.json", commit.version)),
+        )
+        .expect("read commit");
+        let removes: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("remove").is_some())
+            .collect();
+        assert_eq!(removes.len(), 1, "one remove for the one previous file");
+        assert_eq!(removes[0]["remove"]["path"], retired);
+        assert_eq!(
+            removes[0]["remove"]["dataChange"], true,
+            "a streaming reader has to be told these rows left the table"
+        );
+        // Removes must precede adds so replaying the actions in order never holds both sets.
+        let remove_at = body.lines().position(|l| l.contains("\"remove\""));
+        let add_at = body.lines().position(|l| l.contains("\"add\""));
+        assert!(
+            remove_at < add_at,
+            "removes must be rendered before adds (remove at {remove_at:?}, add at {add_at:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_with_no_rows_truncates_rather_than_doing_nothing() {
+        // `INSERT OVERWRITE ... SELECT` matching no rows is a request to empty the table.
+        // Leaving the old rows in place would answer a different question.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut w = writer(dir.path(), config()).await;
+        w.append(&[batch()], "a", None).await.expect("append");
+        assert_eq!(w.live_files().expect("trustworthy").len(), 1);
+
+        w.replace(&[], "b", None).await.expect("replace with none");
+        assert!(
+            w.live_files().expect("trustworthy").is_empty(),
+            "an empty overwrite must leave the table empty"
+        );
+        let reopened = writer(dir.path(), config()).await;
+        assert!(reopened.live_files().expect("trustworthy").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_replayed_overwrite_is_deduplicated_by_its_txn_stamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = config();
+        cfg.app_id = Some("app".into());
+        let mut w = writer(dir.path(), cfg).await;
+        w.replace(&[batch()], "a", Some(1)).await.expect("first");
+        let replay = w.replace(&[batch()], "a", Some(1)).await.expect("replay");
+        assert!(
+            replay.deduplicated,
+            "re-committing the same batch id must be recognized as a replay"
+        );
+        assert_eq!(replay.rows, 0);
+    }
+
+    #[tokio::test]
+    async fn an_overwrite_refuses_when_the_live_set_is_not_authoritative() {
+        // Committing adds without the matching removes would leave the table holding both the
+        // old and the new rows — silently wrong, so refuse instead.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut w = writer(dir.path(), config()).await;
+        w.append(&[batch()], "a", None).await.expect("append");
+
+        // A foreign remove for a file this writer never saw added: our view is now incomplete.
+        let foreign = "{\"remove\":{\"path\":\"part-99999-someone-else.parquet\",\
+                       \"deletionTimestamp\":1,\"dataChange\":true}}\n";
+        std::fs::write(
+            dir.path().join("tbl/_delta_log/00000000000000000001.json"),
+            foreign,
+        )
+        .expect("write foreign commit");
+
+        let mut reopened = writer(dir.path(), config()).await;
+        assert!(
+            reopened.live_files().is_none(),
+            "a remove for an unknown file must make the view untrustworthy"
+        );
+        let err = reopened
+            .replace(&[batch()], "b", None)
+            .await
+            .expect_err("overwrite must refuse");
+        assert!(err.to_string().contains("not authoritative"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_remove_for_a_file_we_added_keeps_the_view_trustworthy() {
+        // The precision that makes `replace` usable more than once: our own removes must not
+        // poison the live set, or the second overwrite of any table would refuse.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut w = writer(dir.path(), config()).await;
+        w.append(&[batch()], "a", None).await.expect("append");
+        w.replace(&[batch()], "b", None).await.expect("first");
+        w.replace(&[batch()], "c", None).await.expect("second");
+        let reopened = writer(dir.path(), config()).await;
+        assert_eq!(
+            reopened.live_files().map(<[_]>::len),
+            Some(1),
+            "repeated overwrites must keep a readable, single-file live set"
+        );
+    }
+
     /// A checkpoint that fails once must not disable checkpointing for the life of the query.
     /// Unbounded log growth is the thing checkpointing exists to prevent, so trading a transient
     /// object-store error for it permanently is the wrong bargain.

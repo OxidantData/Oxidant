@@ -120,21 +120,80 @@ because every record in it postdates the query.
 query's own `checkpointLocation`. That is what makes a query replayable: the checkpoint, not the
 broker, is the source of truth for where you are — list your topics with `subscribe`.
 
-**Offsets are committed after the sink write, never before**, and the Delta sink stamps each
-micro-batch id into its commit as a `txn` action. So a crash between the two replays the batch,
-the log recognizes the replay, and the rows are *not* written twice — exactly-once into the table,
-not merely at-least-once. A crash never skips a batch either.
+### Exactly-once, and what makes it true
+
+Three durable writes bracket every micro-batch, and the order is the whole guarantee:
+
+1. **The offset log** — `offsets/<batchId>` in the checkpoint records what the batch will read,
+   *before* it reads any of it.
+2. **The sink** — one Delta transaction stamped with the batch id as a `txn` action.
+3. **The commit log** — `commits/<batchId>`, then the fast-resume record in `offsets.json`.
+
+The `txn` stamp is what stops a replay writing rows twice. The offset log is what makes that
+stamp *sound*: idempotency keyed on a batch id is only correct if a replay of batch 7 covers the
+records batch 7 covered. Recording the range first turns "read the next batch" into "read batch
+7", a question that has the same answer tomorrow. Without it, a batch replayed after a crash
+reads whatever has arrived by then, the sink recognizes the id and discards the whole wider
+batch, and everything that arrived in between is lost — silently, with no error and a row count
+that merely looks like a quiet day.
+
+So a crash is recoverable wherever it lands, because the surviving prefix says which batch was in
+flight and what it covered:
+
+| Crash point | On restart |
+|---|---|
+| before the offset log | nothing was planned; plan again |
+| after the offset log, before the sink | replay the recorded range and write it |
+| after the sink, before the commit log | replay the recorded range; the `txn` stamp drops it as already written |
+| after the commit log, before the resume record | the commit entry carries the resume position; carry on from it |
+
+**A failed batch keeps its records and its id.** An attempt that never committed leaves its range
+in the log, so the retry reads the same records under the same batch id. Retrying under a *fresh*
+id would stop the sink recognizing a replay of a batch it had in fact committed — an
+acknowledgement lost on the way back — and write the rows a second time.
+
+Both logs are pruned as batches are superseded, so a fast trigger does not leave one object per
+micro-batch in the checkpoint forever.
 
 Not supported yet: `subscribePattern`, `assign`, `includeHeaders`, `kafka.group.id`, per-record
 `timestampType` discrimination, and Kafka as a *sink*. `subscribePattern` and `assign` are
 rejected rather than silently reinterpreted.
 
+### Watermarks and `dropDuplicates`
+
+A watermark is a claim about **event time**: "no record older than this is expected any more". Set
+`eventTimeColumn` (and optionally `delayMs`) on the source:
+
+```
+.option("eventTimeColumn", "event_time").option("delayMs", "60000")
+```
+
+It is computed from the data — the greatest event time seen so far, less the allowed lateness —
+and it only moves forward, resuming from the checkpoint across restarts.
+
+**It does not filter anything.** In an append-only query a late record is still a record: Spark
+drops late data only where it would feed a stateful operator, and this engine has no stateful
+aggregation across batches at all. Records behind the watermark are counted and logged, not
+deleted. (This used to be `now - delay` off the processing clock, applied as an output filter,
+which meant replaying a topic from `earliest` silently discarded the entire backfill.)
+
+What the watermark is *for* is bounding state. `dedupColumns` — `dropDuplicates` — has to remember
+every key it has seen, and the watermark is the only thing that can say when one is safe to
+forget. So **a watermark is required whenever `dedupColumns` is set**, and a config without one is
+rejected at load. The key set is part of the checkpoint, so a restart resumes with the keys it had
+rather than re-admitting every duplicate.
+
+The state is written whole with each batch, which bounds how large a key set is practical — this
+is not a RocksDB-backed state store. Keep the lateness window to what you actually need.
+
 ### Running without a broker
 
 Setting `OXIDANT_KAFKA_SPOOL` (or the `oxidant.spool.dir` option) to a directory of
-newline-delimited files makes the source read `batch-0`, `batch-1`, … from disk instead of a
-broker, one file per micro-batch. This exists so tests and demos can exercise the whole pipeline
-offline. It is not a broker substitute — it has one partition and replays whole files on restart.
+newline-delimited files makes the source read `batch-0.json`, `batch-1.json`, … from disk instead
+of a broker, one file per micro-batch. This exists so tests and demos can exercise the whole pipeline
+offline. It is not a broker substitute — one partition, no retention, no concurrent producer — but
+it does resume: the file it reached is part of the checkpoint, so a restart continues rather than
+replaying.
 
 ## The sink
 
@@ -329,8 +388,9 @@ cluster — so a single process bounds throughput.
   the sink is designed for a single streaming query per table.
 - **No compaction.** One file per micro-batch means a fast trigger produces many small files.
   Checkpoints keep the *log* bounded, but the file count still grows — run a periodic compaction
-  job, or use a slower trigger. If another writer compacts the table, Oxidant notices the `remove`
-  actions and stops checkpointing rather than writing a checkpoint from a stale file list.
+  job, or use a slower trigger. Oxidant tracks another writer's `remove` actions against its own
+  view of the live files; a `remove` for a file it never saw added means its picture of the table
+  is incomplete, and it then stops checkpointing rather than writing one from a stale file list.
 - **Iceberg metadata is a snapshot, not a mirror.** It is republished every `checkpointInterval`
   commits, so Iceberg readers lag Delta readers by up to that many batches.
 - **The Iceberg side is append-only.** Deletes or updates applied to the Delta table by another

@@ -3,6 +3,27 @@
 use std::collections::{BTreeMap, HashMap};
 
 /// How a streaming query is wired: where rows come from, and where they land.
+/// What a violated expectation does to the micro-batch that violated it.
+///
+/// `Drop` is deliberately absent: it is a predicate on the query and never needs a count, so it
+/// is composed into the SQL before the batch is ever built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectationAction {
+    /// Log the violation count and write the batch anyway.
+    Warn,
+    /// Abort the batch, leaving the table at its last good version.
+    Fail,
+}
+
+/// One counted check against a micro-batch.
+#[derive(Debug, Clone)]
+pub struct StreamExpectation {
+    pub label: String,
+    pub action: ExpectationAction,
+    /// A boolean SQL expression over the batch's own columns.
+    pub check: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamQueryConfig {
     /// `readStream.format(...)` — `kafka`, `parquet`, `json`, `csv`, `rate`, or `memory`.
@@ -19,6 +40,11 @@ pub struct StreamQueryConfig {
     pub output_mode: String,
     /// Optional dedup key columns (comma-separated `dedupColumns` option).
     pub dedup_columns: Vec<String>,
+    /// Counted data-quality checks evaluated against each micro-batch.
+    ///
+    /// Only `warn` and `fail` live here. A `drop` needs no count — it composes into the query as
+    /// a predicate — so it is applied upstream, where it costs nothing extra.
+    pub expectations: Vec<StreamExpectation>,
     /// `writeStream.partitionBy(...)` — Hive-style partition columns for the sink table.
     pub partition_columns: Vec<String>,
     /// Publish Iceberg metadata over the Delta table so Iceberg engines can read it. On by
@@ -41,6 +67,7 @@ impl Default for StreamQueryConfig {
             sink_path: None,
             output_mode: "append".into(),
             dedup_columns: vec![],
+            expectations: vec![],
             partition_columns: vec![],
             publish_iceberg: true,
             iceberg_table_suffix: DEFAULT_ICEBERG_SUFFIX.into(),
@@ -64,6 +91,47 @@ pub enum SinkDestination {
 }
 
 impl StreamQueryConfig {
+    /// Build the config for a declarative pipeline table.
+    ///
+    /// The sibling of [`from_spark`](Self::from_spark): a streaming query started from a config
+    /// file needs the same `StreamQueryConfig` a PySpark client's `writeStream` produces, just
+    /// assembled from YAML instead of from a protobuf. Keeping them as two constructors over one
+    /// struct is what lets the entire micro-batch engine below this point stay unaware of which
+    /// front end asked for the query.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_pipeline(
+        source_format: &str,
+        source_options: BTreeMap<String, String>,
+        sink_format: &str,
+        sink_table: String,
+        sink_path: Option<String>,
+        partition_columns: Vec<String>,
+        dedup_columns: Vec<String>,
+        publish_iceberg: bool,
+        iceberg_table_suffix: Option<String>,
+        checkpoint_interval: Option<u64>,
+    ) -> Self {
+        let defaults = Self::default();
+        Self {
+            source_format: source_format.to_string(),
+            source_options,
+            sink_format: sink_format.to_string(),
+            sink_table: Some(sink_table),
+            sink_path,
+            output_mode: "append".into(),
+            dedup_columns,
+            expectations: vec![],
+            partition_columns,
+            publish_iceberg,
+            iceberg_table_suffix: iceberg_table_suffix
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(defaults.iceberg_table_suffix),
+            checkpoint_interval: checkpoint_interval
+                .filter(|n| *n > 0)
+                .unwrap_or(defaults.checkpoint_interval),
+        }
+    }
+
     /// Build the config from what Spark Connect's `WriteStreamOperationStart` carries.
     ///
     /// `source_format`/`source_options` come from the streaming `Read` at the bottom of the
@@ -113,6 +181,7 @@ impl StreamQueryConfig {
                 .get("outputMode")
                 .cloned()
                 .unwrap_or_else(|| "append".into()),
+            expectations: vec![],
             dedup_columns: writer_options
                 .get("dedupColumns")
                 .map(|s| {

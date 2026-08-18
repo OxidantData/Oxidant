@@ -40,3 +40,6 @@ scratchpad/
 # Local agent code-intelligence indexes (regenerate locally; never commit)
 .codegraph/
 .gitnexus/
+
+# Local output from the runnable example (examples/README.md)
+examples/warehouse/

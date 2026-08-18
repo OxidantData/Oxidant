@@ -7,7 +7,7 @@ Architecture: [architecture.md](architecture.md).
 
 | Path | Purpose | Entrypoint |
 |------|---------|------------|
-| `crates/oxidant-cli/` | `oxidant` binary: spark server, worker, driver | `src/main.rs` |
+| `crates/oxidant-cli/` | `oxidant` binary: spark server, worker, driver, embedded `sql`, `pipeline` | `src/main.rs` |
 | `crates/oxidant-connect/` | Spark Connect gRPC + DataFrame translate | `src/lib.rs` |
 | `crates/oxidant-loom/` | Vectorized CPU engine (DataFusion 54) | `src/lib.rs` |
 | `crates/oxidant-gpu/` | GPU offload spike (KAN-70): plan rule + C FFI shim (mock by default; env-gated via `OXIDANT_GPU_OFFLOAD`) | `src/lib.rs` |
@@ -25,6 +25,8 @@ Architecture: [architecture.md](architecture.md).
 | `crates/oxidant-catalog-lakeformation/` | Lake Formation authorization: scan enforcement via `GetUnfilteredTableMetadata` + credential vending (`src/enforcement.rs`); grant introspection (`src/lib.rs`) | `src/enforcement.rs` |
 | `crates/oxidant-proto/` | Vendored Spark Connect protos (protox) | `src/lib.rs` |
 | `crates/oxidant-common/` | Shared errors, config, session identity | `src/lib.rs` |
+| `crates/oxidant-config/` | `oxidant.yaml` parsing + validation; lowers to the `spark.sql.catalog.*` and `OXIDANT_*` contracts | `src/lib.rs` |
+| `crates/oxidant-catalog-local/` | Filesystem / object-store catalog: config-declared + discovered tables, versioned JSON manifest, real write DDL | `src/lib.rs` |
 | `crates/oxidant-streaming/` | Structured Streaming: Kafka source, micro-batch pipeline, Delta/Glue sink | `src/lib.rs` |
 | `crates/oxidant-observability/` | Events, Spark REST DTOs, app state | `src/lib.rs` |
 | `crates/oxidant-ui-server/` | Spark-compat `/api/v1` + embedded UI | `src/lib.rs` |
@@ -59,6 +61,8 @@ Architecture: [architecture.md](architecture.md).
 | `getting-started.md` | Install/run + first query (UI, `oxidant sql`, PySpark) |
 | `web-ui.md` | Monitoring UI, SQL editor, notebooks |
 | `api.md` | REST statement API reference |
+| `config.md` | `oxidant.yaml` reference |
+| `pipelines.md` | Declarative table DAG (`oxidant pipeline`) |
 | `cli.md` | `oxidant sql` CLI reference |
 | `mcp.md` | `oxidant mcp` MCP server setup/tools |
 | `workers.md` | Adding workers (local-cluster / multi-host / Docker) |

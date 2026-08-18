@@ -1,0 +1,155 @@
+# Oxidant configuration — a complete, runnable example.
+#
+# This file drives the whole binary. With it you can:
+#
+#   oxidant sql -c examples/oxidant.yaml -e "SELECT count(*) FROM local.samples.nation_delta"
+#   oxidant pipeline validate -c examples/oxidant.yaml
+#   oxidant spark server -c examples/oxidant.yaml --port 50051
+#
+# The catalog section needs no broker, no metastore, and no AWS: it points at the
+# `sample-data/` tree committed in this repo. Reference: docs/config.md.
+
+# ---------------------------------------------------------------------------
+# Engine tuning.
+#
+# These are lowered to the `OXIDANT_*` environment variables the engine reads at
+# construction, so they take effect in a process this CLI starts. They cannot retune a
+# server that is already running.
+# ---------------------------------------------------------------------------
+engine:
+  # Leave `memory_limit_bytes` unset to auto-size from cgroup/host RAM. Never set it to 0.
+  # memory_limit_bytes: 28895544320
+  shuffle_partitions: 200
+  # Anything without a typed field above goes here, spelled exactly as the engine reads it.
+  env: {}
+
+# ---------------------------------------------------------------------------
+# Catalogs.
+# ---------------------------------------------------------------------------
+catalogs:
+  # A catalog over directories on disk. `warehouse` is where tables *created* by a pipeline
+  # or by CREATE TABLE are written; `tables` and `discover` point at data that already
+  # exists and that this catalog does not own.
+  local:
+    type: local
+    warehouse: ${CONFIG_DIR}/warehouse
+
+    # Explicitly declared tables, keyed by `namespace.table`. All five readable formats.
+    # Every local path must be ABSOLUTE. `${CONFIG_DIR}` is the directory holding this file,
+    # which is what keeps a committed example portable without hard-coding anyone's home
+    # directory. Note the quotes in the `discover:` entries below: inside a YAML flow mapping
+    # `{ ... }`, `{` and `}` are structural, so a `${...}` value there has to be quoted.
+    tables:
+      samples.nation_parquet:
+        format: parquet
+        location: ${CONFIG_DIR}/../sample-data/parquet/tpch_nation.parquet
+      samples.nation_csv:
+        format: csv
+        location: ${CONFIG_DIR}/../sample-data/csv/tpch_nation.csv
+        options:
+          header: "true"
+      samples.nation_delta:
+        format: delta
+        location: ${CONFIG_DIR}/../sample-data/delta/tpch_nation
+      samples.nation_iceberg:
+        format: iceberg
+        location: ${CONFIG_DIR}/../sample-data/iceberg/tpch_nation
+
+    # Scan a tree and register whatever is recognizable. Two layouts are understood:
+    # a directory of table directories (Delta/Iceberg), and a directory of data files
+    # (one table per file, named after the file stem).
+    discover:
+      - { namespace: bronze, path: "${CONFIG_DIR}/../sample-data/parquet" }
+      - { namespace: lake, path: "${CONFIG_DIR}/../sample-data/delta" }
+
+  # An AWS Glue catalog. Credentials resolve through the standard AWS chain (environment,
+  # web identity/IRSA, shared profile including SSO, container endpoint, instance role) —
+  # so `AWS_PROFILE=x` works on a laptop and an instance role works on EC2, with no extra
+  # configuration for either. Commented out so this file runs with no AWS account.
+  #
+  # glue:
+  #   type: glue
+  #   region: us-east-1
+  #   warehouse: s3://my-bucket/warehouse
+
+# The catalog an unqualified table name resolves against.
+default_catalog: local
+
+# ---------------------------------------------------------------------------
+# The pipeline: a declarative bronze -> silver -> gold DAG.
+#
+# `oxidant pipeline run -c examples/oxidant.yaml` starts every streaming table, then
+# recomputes each derived table in dependency order on each trigger.
+#
+# The source below reads from a *spool directory* rather than a broker: setting
+# `oxidant.spool.dir` makes the Kafka source read newline-delimited JSON files
+# (`batch-0`, `batch-1`, ...) one per micro-batch. That exists so the whole pipeline can be
+# exercised offline. It is not a broker substitute — one partition, and whole files are
+# replayed on restart. For a real deployment, replace the `options` below with:
+#
+#     kafka.bootstrap.servers: b-1.msk.example:9092
+#     subscribe: orders
+#     startingOffsets: earliest
+#     maxOffsetsPerTrigger: 50000
+# ---------------------------------------------------------------------------
+pipeline:
+  name: sales
+  catalog: local          # must be a catalog that can create databases and tables
+  schema: live            # created if missing
+  storage: ${CONFIG_DIR}/warehouse/live
+  checkpoints: ${CONFIG_DIR}/warehouse/_checkpoints
+  trigger: 30 seconds     # or: once | available_now | 500ms | 5 minutes
+  format: delta           # Delta is the only sink that commits atomically
+  iceberg_compat: true    # publish Iceberg metadata over the same Parquet files
+
+tables:
+  # A streaming table: it has a `source`, so it appends each micro-batch.
+  # The source is in scope as `stream`, with Spark's exact Kafka schema
+  # (key, value, topic, partition, offset, timestamp, timestampType).
+  - name: orders_bronze
+    source:
+      format: kafka
+      options:
+        # `subscribe` is required even in spool mode: the spool replaces the broker, not the
+        # topic name, and the topic is what the source stamps onto every record.
+        subscribe: orders
+        oxidant.spool.dir: ${CONFIG_DIR}/spool/orders
+        startingOffsets: earliest
+    sql: |
+      SELECT
+        CAST(get_json_object(CAST(value AS STRING), '$.order_id') AS BIGINT) AS order_id,
+        get_json_object(CAST(value AS STRING), '$.customer')                 AS customer,
+        CAST(get_json_object(CAST(value AS STRING), '$.amount') AS BIGINT)   AS amount,
+        -- From the payload's own event time, NOT the Kafka record timestamp. A column named
+        -- `event_date` that actually holds the ingestion date silently partitions by when the
+        -- data arrived, which is a different question from when the event happened, and the two
+        -- diverge exactly when it matters — a backfill, or a consumer catching up after a stall.
+        to_date(from_unixtime(
+          CAST(get_json_object(CAST(value AS STRING), '$.event_ts') AS BIGINT)
+        ))                                                                   AS event_date
+      FROM stream
+    # Partitioning is the single biggest lever on read cost: without it every query scans
+    # every file the stream has ever written. Low cardinality on purpose — never a raw
+    # timestamp or an id.
+    partition_by: [event_date]
+
+  # A derived table: defined purely by SQL over another declared table, and materialized by
+  # full recompute on each update.
+  - name: orders_silver
+    sql: SELECT * FROM orders_bronze WHERE amount > 0
+    expect:
+      # `drop` filters failing rows out; `warn` (the default) counts and logs them;
+      # `fail` aborts the update and leaves the table at its last good version.
+      amount_positive:
+        check: amount > 0
+        action: drop
+
+  - name: revenue_gold
+    sql: |
+      SELECT event_date, customer, sum(amount) AS revenue, count(*) AS orders
+      FROM orders_silver
+      GROUP BY event_date, customer
+    expect:
+      revenue_present:
+        check: revenue IS NOT NULL
+        action: fail

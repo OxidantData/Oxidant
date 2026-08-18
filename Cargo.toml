@@ -22,6 +22,7 @@ rust-version = "1.72"
 # expressed once and inherited via `{ workspace = true }` in each crate.
 [workspace.dependencies]
 oxidant-common     = { path = "crates/oxidant-common" }
+oxidant-config     = { path = "crates/oxidant-config" }
 oxidant-proto      = { path = "crates/oxidant-proto" }
 oxidant-plan       = { path = "crates/oxidant-plan" }
 oxidant-sql        = { path = "crates/oxidant-sql" }
@@ -31,6 +32,7 @@ oxidant-catalog-hive = { path = "crates/oxidant-catalog-hive" }
 oxidant-catalog-glue = { path = "crates/oxidant-catalog-glue" }
 oxidant-catalog-rest = { path = "crates/oxidant-catalog-rest" }
 oxidant-catalog-lakeformation = { path = "crates/oxidant-catalog-lakeformation" }
+oxidant-catalog-local = { path = "crates/oxidant-catalog-local" }
 oxidant-optimizer  = { path = "crates/oxidant-optimizer" }
 oxidant-physical   = { path = "crates/oxidant-physical" }
 oxidant-datasource = { path = "crates/oxidant-datasource" }

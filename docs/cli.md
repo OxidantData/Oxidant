@@ -1,17 +1,43 @@
 # `oxidant sql` — command-line SQL client
 
-`oxidant sql` runs SQL against a running server's [REST API](api.md) — a lightweight
-alternative to the [Web UI editor](web-ui.md) and to a full PySpark client.
+`oxidant sql` runs SQL two ways: **in-process by default**, and against a running server's
+[REST API](api.md) when you point it at one.
 
 ```text
-oxidant sql [--url http://localhost:4040] (-e "<sql>" | -f <file.sql> | stdin)
+oxidant sql [-c <config.yaml>] [--url http://host:4040] (-e "<sql>" | -f <file.sql> | stdin)
             [--format table|csv|json] [--timeout <secs>]
 ```
 
-The server URL comes from `--url`, or from the `OXIDANT_URL` environment variable; the default
-is `http://localhost:4040`. Long-running statements are polled until they finish; `--timeout`
-caps the total wait (default 300 seconds, after which the command exits non-zero while the
-statement keeps running server-side — cancel it via the API or Web UI).
+## Embedded (the default)
+
+With no `--url` and no `OXIDANT_URL`, the statement runs **in this process**. No server is
+started and no port is bound: the catalogs declared in [`oxidant.yaml`](config.md) are bridged
+into a local engine and the query executes there.
+
+```sh
+# Query a directory of Parquet/Delta/Iceberg/CSV/JSON files, with nothing running
+oxidant sql -c oxidant.yaml -e "SELECT count(*) FROM local.live.orders"
+
+# Zero config at all still works
+oxidant sql -e "SELECT 1 AS hello"
+```
+
+The config file is found by `--config` / `-c`, then `$OXIDANT_CONFIG`, then `./oxidant.yaml`.
+An explicit `--config` path that does not exist is an error rather than a silent fallback — a
+typo must not quietly run your statement against different catalogs.
+
+## Against a running server
+
+Passing `--url`, or setting `OXIDANT_URL`, sends the statement to that server's REST API
+instead. Long-running statements are polled until they finish; `--timeout` caps the total wait
+(default 300 seconds, after which the command exits non-zero while the statement keeps running
+server-side — cancel it via the API or Web UI).
+
+```sh
+oxidant sql --url http://driver.internal:4040 -e "SELECT count(*) FROM glue.oxidant_demo.orders"
+```
+
+`--timeout` applies only to this path; an embedded statement runs to completion locally.
 
 ## SQL input
 
@@ -46,7 +72,8 @@ oxidant sql -e "SELECT 1 AS hello" --format json | jq .
 ```sh
 oxidant sql --url http://driver.internal:4040 -e "SELECT count(*) FROM glue.oxidant_demo.orders"
 
-# or persist it for the shell session
+# or persist it for the shell session — note this switches every later `oxidant sql`
+# in the shell to the remote path, embedded execution included
 export OXIDANT_URL=http://driver.internal:4040
 oxidant sql -e "SELECT 1 AS hello"
 ```

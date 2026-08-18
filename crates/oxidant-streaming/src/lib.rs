@@ -23,17 +23,23 @@ mod state;
 mod watermark;
 
 pub use checkpoint::{CheckpointState, CheckpointStore};
-pub use config::{SinkDestination, StreamQueryConfig};
+pub use config::{
+    ExpectationAction, SinkDestination, StreamExpectation, StreamQueryConfig,
+    DEFAULT_ICEBERG_SUFFIX,
+};
 pub use input::{
     capture as capture_stream_inputs, stream_input, stream_input_name, MicroBatchInput,
 };
 pub use kafka::{kafka_schema, KafkaOptions, KafkaSource, StartingOffsets};
-pub use lake_sink::{writable_format, LakeSink, LakeTarget};
+pub use lake_sink::{writable_format, LakeSink, LakeSinkOptions, LakeTarget};
 pub use query::{QueryProgress, QueryStatus, SourceProgress, StreamingQuery, StreamingQueryId};
 pub use scheduler::{
     build_source, source_schema, MicroBatchPipeline, StartOptions, StreamingQueryManager, Trigger,
 };
 pub use sink::{FileSink, MemorySink, Sink};
-pub use source::{FileSource, MemoryRateSource, Source, SourceOffsets};
+pub use source::{BatchRange, FileSource, MemoryRateSource, Source, SourceOffsets};
 pub use state::DedupState;
+// Re-exported so a caller configuring a sink does not need its own dependency on the
+// datasource crate just to name the default.
+pub use oxidant_datasource::delta_write::DEFAULT_CHECKPOINT_INTERVAL;
 pub use watermark::WatermarkConfig;
