@@ -20,11 +20,72 @@ pub struct SourceOffsets {
     pub entries: BTreeMap<String, i64>,
 }
 
+/// The exact span of source positions one micro-batch will read, decided *before* it reads
+/// anything and written to the checkpoint's offset log.
+///
+/// This is what makes a replay sound. Sink-side idempotency stamps the batch id into the commit
+/// and drops a batch the log already carries — which is only correct if the replay covers the
+/// same records the first attempt did. Without a recorded range, a batch replayed after a crash
+/// reads *whatever is available now*, the sink recognizes the id and discards the whole thing,
+/// and every record that arrived in between is lost with it. Recording the range first turns
+/// "read the next batch" into "read batch 7", which is answerable identically at any later time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchRange {
+    /// The implementation that planned this range, so a range written by one source is never
+    /// interpreted by another — the same guard [`SourceOffsets`] carries.
+    pub source: String,
+    /// Where each key begins, inclusive.
+    pub start: BTreeMap<String, i64>,
+    /// Where each key ends, exclusive.
+    pub end: BTreeMap<String, i64>,
+    /// Discrete items the batch covers, for a source whose position is a set rather than a span
+    /// — the file source's paths. Empty for offset-based sources.
+    #[serde(default)]
+    pub items: Vec<String>,
+}
+
+impl BatchRange {
+    /// True when the range names no records, which is what an idle trigger produces.
+    ///
+    /// An empty range is never written to the log and never advances the batch id: an idle
+    /// trigger has to leave the table, and its version history, completely alone.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+            && self
+                .end
+                .iter()
+                .all(|(key, end)| *end <= self.start.get(key).copied().unwrap_or(0))
+    }
+}
+
 /// A micro-batch data source.
+///
+/// Reading is split in two on purpose. [`Source::plan_batch`] decides what the batch covers and
+/// commits nothing; [`Source::poll_range`] reads exactly that and is required to be
+/// **deterministic** — called twice with the same range it must produce the same records. The
+/// scheduler writes the range to the offset log between the two calls, so a batch interrupted
+/// anywhere after that point is replayed from the record of what it was reading rather than from
+/// whatever the source happens to hold now.
 #[async_trait::async_trait]
 pub trait Source: Send + Sync {
-    /// Read the next micro-batch. Returns empty when no new data is available.
-    async fn poll_batch(&mut self, engine: &Engine) -> oxidant_common::Result<Vec<RecordBatch>>;
+    /// Decide what the next micro-batch will read, without reading it.
+    ///
+    /// Returns an empty range when no new data is available. Must not advance any position the
+    /// source would report as committed: a planned batch that is never written has to be
+    /// re-plannable, and a plan that consumed something would lose it.
+    async fn plan_batch(&mut self, engine: &Engine) -> oxidant_common::Result<BatchRange>;
+
+    /// Read exactly the records `range` names.
+    ///
+    /// **Deterministic**: the same range must yield the same records however many times it is
+    /// read, and whichever process reads it. This is the property the offset log converts into
+    /// exactly-once — a replay that returned a wider batch would be discarded whole by the
+    /// sink's idempotency stamp, taking the extra records with it.
+    async fn poll_range(
+        &mut self,
+        engine: &Engine,
+        range: &BatchRange,
+    ) -> oxidant_common::Result<Vec<RecordBatch>>;
 
     /// The schema this source emits, known before the first batch arrives.
     ///
@@ -44,12 +105,29 @@ pub trait Source: Send + Sync {
 
     /// Resume from a checkpointed position. Called once, before the first poll.
     fn restore_offsets(&mut self, _offsets: &SourceOffsets) {}
+
+    /// The furthest position available *right now*, ignoring any per-batch budget.
+    ///
+    /// This is what bounds an `availableNow` / `once` drain. It is deliberately not the planned
+    /// range's end: with `maxOffsetsPerTrigger` set, one batch covers a slice of what is
+    /// available, so stopping at it would drain a single batch and call the topic exhausted.
+    ///
+    /// `None` means the source cannot state an end — a directory of files can always gain
+    /// another — and the drain falls back to stopping when a batch comes back empty.
+    async fn available_end(
+        &mut self,
+        _engine: &Engine,
+    ) -> oxidant_common::Result<Option<BTreeMap<String, i64>>> {
+        Ok(None)
+    }
 }
 
 /// File-directory source: reads new Parquet/JSON/CSV files not yet in the offset set.
 pub struct FileSource {
     path: PathBuf,
     format: String,
+    /// Paths already covered by a committed batch. A planned-but-uncommitted batch is *not*
+    /// recorded here — the offset log names its files, and that is what a replay reads.
     seen: HashSet<String>,
     schema: SchemaRef,
 }
@@ -90,24 +168,43 @@ impl Source for FileSource {
         format!("FileStreamSource[{}]", self.path.display())
     }
 
-    async fn poll_batch(&mut self, engine: &Engine) -> oxidant_common::Result<Vec<RecordBatch>> {
+    /// The batch is the set of files not yet consumed, named explicitly.
+    ///
+    /// A directory listing is not a stable position the way an offset is — a file can appear at
+    /// any moment — so the plan records the paths themselves. A replay then reads exactly those,
+    /// even though the directory has moved on.
+    async fn plan_batch(&mut self, _engine: &Engine) -> oxidant_common::Result<BatchRange> {
+        Ok(BatchRange {
+            source: "file".into(),
+            items: self
+                .new_files()
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    async fn poll_range(
+        &mut self,
+        engine: &Engine,
+        range: &BatchRange,
+    ) -> oxidant_common::Result<Vec<RecordBatch>> {
         use datafusion::prelude::{CsvReadOptions, JsonReadOptions, ParquetReadOptions};
 
-        let new_files = self.new_files();
-        if new_files.is_empty() {
+        if range.source != "file" || range.items.is_empty() {
             return Ok(vec![]);
         }
-        // Read each file through DataFusion's readers rather than a SQL string. `parquet_scan()`
-        // and friends are DuckDB table functions that this engine has never registered, so the
-        // SQL form this used to build could not resolve for any format.
+        // Read through DataFusion's readers rather than a SQL string. `parquet_scan()` and
+        // friends are DuckDB table functions that this engine has never registered, so the SQL
+        // form this used to build could not resolve for any format.
         let ctx = engine.ctx();
         let mut all = Vec::new();
-        for f in &new_files {
-            let path = f.to_string_lossy().into_owned();
+        for path in &range.items {
             let df = match self.format.as_str() {
-                "parquet" => ctx.read_parquet(&path, ParquetReadOptions::default()).await,
-                "json" => ctx.read_json(&path, JsonReadOptions::default()).await,
-                "csv" => ctx.read_csv(&path, CsvReadOptions::default()).await,
+                "parquet" => ctx.read_parquet(path, ParquetReadOptions::default()).await,
+                "json" => ctx.read_json(path, JsonReadOptions::default()).await,
+                "csv" => ctx.read_csv(path, CsvReadOptions::default()).await,
                 other => {
                     return Err(oxidant_common::Error::Unsupported(format!(
                         "readStream.format(`{other}`) is not a file source"
@@ -123,8 +220,11 @@ impl Source for FileSource {
                 self.schema = b.schema();
             }
             all.extend(batches);
-            self.seen.insert(path);
         }
+        // Marked consumed only once every file in the range has been read. Marking them one at a
+        // time would strand the rows already collected when a later file fails: the error
+        // discards them, and the files they came from would stay consumed.
+        self.seen.extend(range.items.iter().cloned());
         Ok(all)
     }
 
@@ -172,22 +272,77 @@ impl Source for MemoryRateSource {
         format!("RateStreamSource[rowsPerBatch={}]", self.rows_per_batch)
     }
 
-    async fn poll_batch(&mut self, engine: &Engine) -> oxidant_common::Result<Vec<RecordBatch>> {
+    async fn plan_batch(&mut self, _engine: &Engine) -> oxidant_common::Result<BatchRange> {
         if self.batch_count >= self.max_batches {
+            return Ok(BatchRange::default());
+        }
+        // The position is the batch counter: batch N is always the same generated rows, so the
+        // range is a one-wide span and a replay of it reproduces them exactly.
+        Ok(BatchRange {
+            source: "rate".into(),
+            start: [("batch".to_string(), self.batch_count as i64)].into(),
+            end: [("batch".to_string(), self.batch_count as i64 + 1)].into(),
+            items: vec![],
+        })
+    }
+
+    async fn poll_range(
+        &mut self,
+        engine: &Engine,
+        range: &BatchRange,
+    ) -> oxidant_common::Result<Vec<RecordBatch>> {
+        if range.source != "rate" || range.is_empty() {
             return Ok(vec![]);
         }
-        self.batch_count += 1;
+        self.batch_count = range.end.get("batch").copied().unwrap_or(0) as u64;
         let sql = format!(
             "SELECT id FROM range(0, {}, 1) AS t(id)",
             self.rows_per_batch
         );
         engine.sql(&sql).await
     }
+
+    fn committed_offsets(&self) -> Option<SourceOffsets> {
+        Some(SourceOffsets {
+            source: "rate".into(),
+            entries: [("batch".to_string(), self.batch_count as i64)].into(),
+        })
+    }
+
+    fn restore_offsets(&mut self, offsets: &SourceOffsets) {
+        if offsets.source != "rate" {
+            return;
+        }
+        self.batch_count = offsets.entries.get("batch").copied().unwrap_or(0) as u64;
+    }
+
+    async fn available_end(
+        &mut self,
+        _engine: &Engine,
+    ) -> oxidant_common::Result<Option<BTreeMap<String, i64>>> {
+        Ok(Some(
+            [(
+                "batch".to_string(),
+                self.max_batches.min(i64::MAX as u64) as i64,
+            )]
+            .into(),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn drain(src: &mut FileSource, engine: &Engine) -> usize {
+        let range = src.plan_batch(engine).await.unwrap();
+        src.poll_range(engine, &range)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum()
+    }
 
     #[tokio::test]
     async fn a_file_source_reads_new_files_and_skips_ones_it_has_seen() {
@@ -196,17 +351,86 @@ mod tests {
         let engine = Engine::new();
         let mut src = FileSource::new(dir.path(), "json");
 
-        let first = src.poll_batch(&engine).await.unwrap();
-        let rows: usize = first.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(rows, 2);
+        assert_eq!(drain(&mut src, &engine).await, 2);
         assert_eq!(src.schema().fields().len(), 1);
 
         // Already consumed.
-        assert!(src.poll_batch(&engine).await.unwrap().is_empty());
+        assert_eq!(drain(&mut src, &engine).await, 0);
 
         std::fs::write(dir.path().join("b.json"), "{\"n\":3}\n").unwrap();
-        let second = src.poll_batch(&engine).await.unwrap();
-        assert_eq!(second.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(drain(&mut src, &engine).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_range_reads_the_same_files_however_often_it_is_replayed() {
+        // The property the offset log converts into exactly-once. A batch that failed keeps its
+        // recorded range, and re-reading that range must produce what the first attempt saw —
+        // not "whatever has landed in the directory since".
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.json"), "{\"n\":1}\n{\"n\":2}\n").unwrap();
+        let engine = Engine::new();
+        let mut src = FileSource::new(dir.path(), "json");
+
+        let range = src.plan_batch(&engine).await.unwrap();
+        assert_eq!(range.items.len(), 1);
+
+        let first: usize = src
+            .poll_range(&engine, &range)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(first, 2);
+
+        // A file lands between the two attempts. The replay must not pick it up: the sink would
+        // recognize the batch id, discard the whole thing, and `b.json` would be lost with it.
+        std::fs::write(dir.path().join("b.json"), "{\"n\":3}\n").unwrap();
+        let replay: usize = src
+            .poll_range(&engine, &range)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(replay, 2, "the replay covers exactly the recorded range");
+
+        // And the newcomer is still there for the next batch.
+        assert_eq!(drain(&mut src, &engine).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_planned_batch_that_is_never_read_can_be_planned_again() {
+        // `plan_batch` must consume nothing: a plan that advanced the position would lose the
+        // batch whenever recording it failed.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.json"), "{\"n\":1}\n").unwrap();
+        let engine = Engine::new();
+        let mut src = FileSource::new(dir.path(), "json");
+
+        let first = src.plan_batch(&engine).await.unwrap();
+        let second = src.plan_batch(&engine).await.unwrap();
+        assert_eq!(first, second, "planning twice describes the same batch");
+        assert_eq!(drain(&mut src, &engine).await, 1);
+    }
+
+    #[test]
+    fn an_empty_range_is_what_an_idle_trigger_produces() {
+        assert!(BatchRange::default().is_empty());
+        assert!(BatchRange {
+            source: "kafka".into(),
+            start: [("t-0".to_string(), 7)].into(),
+            end: [("t-0".to_string(), 7)].into(),
+            items: vec![],
+        }
+        .is_empty());
+        assert!(!BatchRange {
+            source: "kafka".into(),
+            start: [("t-0".to_string(), 7)].into(),
+            end: [("t-0".to_string(), 8)].into(),
+            items: vec![],
+        }
+        .is_empty());
     }
 
     #[test]

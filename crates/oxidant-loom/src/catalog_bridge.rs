@@ -205,6 +205,8 @@ pub struct OxidantCatalogProvider {
     /// Lazily-created per-namespace schema providers (cheap wrappers; cached so repeated
     /// references to the same namespace share a table cache).
     schemas: Mutex<HashMap<String, Arc<OxidantSchemaProvider>>>,
+    /// Storage attributes staged for a CTAS in flight. See [`CtasAttributes`].
+    pending_ctas: PendingCtas,
 }
 
 impl OxidantCatalogProvider {
@@ -221,7 +223,32 @@ impl OxidantCatalogProvider {
             require_lakehouse_snapshot_pins,
             catalog_version,
             schemas: Mutex::new(HashMap::new()),
+            pending_ctas: PendingCtas::default(),
         }
+    }
+
+    /// Stage the storage attributes for a `CREATE TABLE … USING <fmt> … AS SELECT …` about to run
+    /// against this catalog. See [`CtasAttributes`].
+    pub(crate) fn set_pending_ctas_attributes(
+        &self,
+        namespace: &[String],
+        table: &str,
+        attributes: CtasAttributes,
+    ) {
+        self.pending_ctas
+            .lock()
+            .expect("pending CTAS attributes poisoned")
+            .insert(ctas_attributes_key(namespace, table), attributes);
+    }
+
+    /// Drop a staged entry whose statement never reached `register_table` (a planning or execution
+    /// failure). Without this, a failed `USING delta` CTAS would leave its format behind for the
+    /// next plain CTAS of the same name to pick up.
+    pub(crate) fn clear_pending_ctas_attributes(&self, namespace: &[String], table: &str) {
+        self.pending_ctas
+            .lock()
+            .expect("pending CTAS attributes poisoned")
+            .remove(&ctas_attributes_key(namespace, table));
     }
 
     /// Evict every cached variant of `table` in `namespace` (`spark.catalog.refreshTable`), so
@@ -283,6 +310,7 @@ impl CatalogProvider for OxidantCatalogProvider {
                 self.ctx.clone(),
                 self.require_lakehouse_snapshot_pins.clone(),
                 self.catalog_version.clone(),
+                self.pending_ctas.clone(),
             ))
         });
         Some(provider.clone() as Arc<dyn SchemaProvider>)
@@ -297,6 +325,8 @@ struct OxidantSchemaProvider {
     require_lakehouse_snapshot_pins: Arc<AtomicBool>,
     /// Shared catalog-version counter (see [`OxidantCatalogProvider::catalog_version`]).
     catalog_version: Arc<AtomicU64>,
+    /// Storage attributes staged for a CTAS in flight, shared with the owning catalog provider.
+    pending_ctas: PendingCtas,
     /// Resolved tables, cached so a table referenced repeatedly in a query is loaded once.
     ///
     /// Keyed by `(name, replicated)` where `replicated` is the shard/replicate decision the
@@ -360,6 +390,7 @@ impl OxidantSchemaProvider {
         ctx: Arc<SessionContext>,
         require_lakehouse_snapshot_pins: Arc<AtomicBool>,
         catalog_version: Arc<AtomicU64>,
+        pending_ctas: PendingCtas,
     ) -> Self {
         Self {
             catalog,
@@ -367,6 +398,7 @@ impl OxidantSchemaProvider {
             ctx,
             require_lakehouse_snapshot_pins,
             catalog_version,
+            pending_ctas,
             tables: Mutex::new(HashMap::new()),
         }
     }
@@ -852,6 +884,15 @@ impl SchemaProvider for OxidantSchemaProvider {
         let namespace = self.namespace.clone();
         let ctx = self.ctx.clone();
         let name_for_worker = name.clone();
+        // Read here, on the caller's thread, rather than inside the write worker: the staged entry
+        // belongs to this provider and this statement, and taking it now means a write that fails
+        // cannot leave it behind for the next CTAS of the same name.
+        let attributes = self
+            .pending_ctas
+            .lock()
+            .expect("pending CTAS attributes poisoned")
+            .remove(&ctas_attributes_key(&self.namespace, &name))
+            .unwrap_or_default();
 
         // `register_table` is a sync fn (DataFusion's trait), but the write path is all async
         // (Glue CLI / Hive Thrift / object-store puts). `Handle::current().block_on(...)` would
@@ -867,6 +908,7 @@ impl SchemaProvider for OxidantSchemaProvider {
                 namespace,
                 name_for_worker,
                 table,
+                attributes,
             ))
         })??;
 
@@ -890,6 +932,41 @@ impl SchemaProvider for OxidantSchemaProvider {
         );
         Ok(Some(provider))
     }
+}
+
+/// The storage attributes of a `CREATE TABLE … USING <fmt> [LOCATION …] [PARTITIONED BY (…)]
+/// AS SELECT …` that DataFusion's own CTAS planning cannot carry.
+///
+/// DataFusion plans `CREATE TABLE … AS SELECT` into a `MemTable` and then calls
+/// `SchemaProvider::register_table` with nothing but a name and that table — there is no seam for
+/// a storage format, an explicit `LOCATION`, or partition columns, and sqlparser does not accept
+/// Spark's `USING` clause in a `CREATE TABLE` at all. `Engine::sql` therefore parses that tail off
+/// itself ([`crate::spark_create_table::lower_external_ctas`]), stages the attributes on the
+/// target catalog's provider, and runs the stripped statement; [`register_table_async`] picks them
+/// up on its way to `CatalogProvider::create_table`. Absent an entry the behavior is exactly what
+/// it was before this existed — Parquet, at the catalog's default location, unpartitioned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CtasAttributes {
+    pub format: Option<TableFormat>,
+    pub location: Option<String>,
+    pub partition_columns: Vec<String>,
+}
+
+/// Attributes staged for CTASes in flight, keyed by `namespace.table` (lowercased).
+///
+/// Held per catalog provider — which is per session — rather than process-wide, so two sessions,
+/// or two catalogs, running a CTAS for the same `namespace.table` cannot take each other's
+/// attributes. Within one session the same name is the same table, and the entry is removed as
+/// soon as it is read.
+type PendingCtas = Arc<Mutex<HashMap<String, CtasAttributes>>>;
+
+fn ctas_attributes_key(namespace: &[String], table: &str) -> String {
+    let mut key = namespace.join(".");
+    if !key.is_empty() {
+        key.push('.');
+    }
+    key.push_str(table);
+    key.to_ascii_lowercase()
 }
 
 /// A single persistent background thread (created lazily, once, for the process lifetime) with
@@ -963,17 +1040,21 @@ async fn register_table_async(
     namespace: Vec<String>,
     name: String,
     table: Arc<dyn TableProvider>,
+    // `USING <fmt>` / `LOCATION` / `PARTITIONED BY` from the original Spark DDL, which DataFusion's
+    // CTAS planning cannot carry (see `CtasAttributes`). Default → the historical behavior.
+    attributes: CtasAttributes,
 ) -> DfResult<Arc<dyn TableProvider>> {
     let (schema, batches) = extract_mem_table_data(&table).await?;
+    let format = attributes.format.unwrap_or(TableFormat::Parquet);
 
     let metadata = catalog
         .create_table(
             &namespace,
             &name,
             schema.clone(),
-            TableFormat::Parquet,
-            None,
-            &[],
+            format,
+            attributes.location,
+            &attributes.partition_columns,
         )
         .await
         .map_err(oxidant_to_df)?;
@@ -986,6 +1067,7 @@ async fn register_table_async(
         &schema,
         batches,
         &metadata.storage_options,
+        &metadata.partition_columns,
     )
     .await?;
 
@@ -1479,14 +1561,16 @@ pub(crate) fn ensure_remote_store(
     }
 }
 
-/// Write `batches` as a single file at `location` in `format` (Parquet/Csv/Json — the only CTAS
-/// write targets; any other format is a bug upstream since `hive_types::format_serde` already
-/// rejects Delta/Iceberg before a catalog's `create_table` is ever called). Serializes in memory
-/// then `put`s through the session's `object_store` for `location`'s scheme, so this works for
-/// `s3://` (registered via [`ensure_remote_store`]) exactly like `file://`/bare local paths
-/// (DataFusion's default object-store registry resolves those to `LocalFileSystem` with no
-/// explicit registration needed) — unlike the local-only `ArrowWriter`-to-`std::fs::File` CTAS
-/// writer used by the (unrelated) local-warehouse `CREATE TABLE ... USING <fmt>` path.
+/// Write `batches` to the table at `location`.
+///
+/// Parquet/CSV/JSON serialize in memory and `put` a single file; Delta goes through
+/// [`write_delta_batches`], which writes data files **and** commits them to the transaction log so
+/// the result is a real Delta table rather than a directory of Parquet. Everything goes through the
+/// session's `object_store` for `location`'s scheme, so `s3://` (registered via
+/// [`ensure_remote_store`]) works exactly like `file://`/bare local paths (DataFusion's default
+/// registry resolves those to `LocalFileSystem` with no explicit registration) — unlike the
+/// local-only `ArrowWriter`-to-`std::fs::File` writer used by the (unrelated) local-warehouse
+/// `CREATE TABLE ... USING <fmt>` path.
 async fn write_batches_to_location(
     state: &SessionState,
     location: &str,
@@ -1494,6 +1578,7 @@ async fn write_batches_to_location(
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
     storage_options: &HashMap<String, String>,
+    partition_columns: &[String],
 ) -> DfResult<()> {
     use datafusion::datasource::listing::ListingTableUrl;
     use object_store::ObjectStoreExt;
@@ -1503,15 +1588,39 @@ async fn write_batches_to_location(
     ensure_remote_store(state, &url, Some(storage_options))?;
     let store = state.runtime_env().object_store(&url)?;
 
+    if format == TableFormat::Delta {
+        write_delta_batches(
+            store,
+            url.prefix().clone(),
+            location,
+            schema,
+            &batches,
+            partition_columns,
+            WriteMode::Append,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Only Delta partitions on write here. For the flat formats the catalog would record
+    // partition columns the data layout does not have — a table unreadable through its own
+    // metadata, because the reader expects those columns in the directory path and they are
+    // instead sitting inside a single file at the root.
+    if !partition_columns.is_empty() {
+        return Err(DataFusionError::NotImplemented(format!(
+            "`PARTITIONED BY` is not supported for a {format:?} table: this writer emits one \
+             flat file, so the partition columns ({}) would never reach the directory path the \
+             reader looks in. Use `USING delta`, which partitions on write.",
+            partition_columns.join(", ")
+        )));
+    }
+
     let ext = match format {
         TableFormat::Parquet => "parquet",
         TableFormat::Csv => "csv",
         TableFormat::Json => "json",
-        TableFormat::Delta | TableFormat::Iceberg => {
-            return Err(DataFusionError::NotImplemented(format!(
-                "{format:?} is not a supported CTAS write target"
-            )));
-        }
+        TableFormat::Delta => unreachable!("handled above"),
+        TableFormat::Iceberg => return Err(iceberg_not_a_write_target()),
     };
     let bytes = encode_batches(format, schema, &batches)?;
     let path = url.prefix().clone().join(format!("part-00000.{ext}"));
@@ -1520,6 +1629,114 @@ async fn write_batches_to_location(
         .await
         .map_err(|e| DataFusionError::Execution(format!("write `{location}`: {e}")))?;
     Ok(())
+}
+
+/// Whether a write adds to the table or replaces its whole contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    /// `CREATE TABLE ... AS SELECT` and `INSERT INTO`.
+    Append,
+    /// `INSERT OVERWRITE`: the prior files are retired in the same commit that adds the new ones,
+    /// so a concurrent reader sees the whole old table or the whole new one, never a mixture.
+    Replace,
+}
+
+/// Write `batches` as Delta data files under `root` and commit them, returning the rows committed.
+///
+/// Opening the writer reads the existing `_delta_log` once, so this both creates a brand-new table
+/// (CTAS) and adds to an established one (`INSERT`) without the caller having to know which.
+async fn write_delta_batches(
+    store: Arc<dyn object_store::ObjectStore>,
+    root: object_store::path::Path,
+    location: &str,
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    partition_columns: &[String],
+    mode: WriteMode,
+) -> DfResult<u64> {
+    use oxidant_datasource::delta_write::{
+        new_file_prefix, stable_table_id, DeltaTableWriter, DeltaWriterConfig,
+    };
+
+    let mut writer = DeltaTableWriter::open(
+        store,
+        root,
+        schema.clone(),
+        DeltaWriterConfig {
+            table_id: stable_table_id(location),
+            partition_columns: partition_columns.to_vec(),
+            // No `appId`. `txn` actions deduplicate a *replayed* batch of a streaming query, which
+            // has a stable batch id; a SQL statement has none, and two `INSERT INTO`s of identical
+            // rows are two inserts, not a replay to be swallowed.
+            app_id: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(oxidant_to_df)?;
+
+    let prefix = new_file_prefix();
+    let commit = match mode {
+        WriteMode::Append => writer.append(batches, &prefix, None).await,
+        WriteMode::Replace => writer.replace(batches, &prefix, None).await,
+    }
+    .map_err(oxidant_to_df)?;
+    Ok(commit.rows)
+}
+
+/// Cast `batch` to `schema` when it does not already match it.
+///
+/// The rows an `INSERT` produces do not always arrive in the table's own types — a Spark integer
+/// literal is retyped to `Int32` after planning, so `INSERT INTO t SELECT 9` feeds an `Int32`
+/// column to a `BIGINT` table. Writing that straight through would put a file in the table whose
+/// Parquet schema disagrees with the table's, which every reader would then have to guess at.
+/// Casting here is what Spark does for compatible types; an incompatible one is an error naming
+/// the column rather than a silently wrong value.
+fn conform_to_schema(batch: RecordBatch, schema: &SchemaRef) -> DfResult<RecordBatch> {
+    if batch.schema() == *schema {
+        return Ok(batch);
+    }
+    if batch.num_columns() != schema.fields().len() {
+        return Err(DataFusionError::Plan(format!(
+            "INSERT provides {} column(s) but the table has {}",
+            batch.num_columns(),
+            schema.fields().len()
+        )));
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                return Ok(column.clone());
+            }
+            datafusion::arrow::compute::cast(column, field.data_type()).map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "INSERT column `{}` is {:?}, which cannot be written to a {:?} column: {e}",
+                    field.name(),
+                    column.data_type(),
+                    field.data_type()
+                ))
+            })
+        })
+        .collect::<DfResult<Vec<_>>>()?;
+    RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| DataFusionError::Execution(format!("conform INSERT batch to table: {e}")))
+}
+
+/// The one shared refusal for a write that names Iceberg as its storage format.
+///
+/// Iceberg is deliberately read-only here: a Delta table published with `icebergCompat`
+/// (`oxidant_datasource::uniform`) is readable by an Iceberg reader over the *same* Parquet files,
+/// so one copy of the data serves both. Writing a second, independent Iceberg table would be a
+/// second copy with its own divergent history.
+fn iceberg_not_a_write_target() -> DataFusionError {
+    DataFusionError::NotImplemented(
+        "Iceberg is not a write target. Write the table as Delta with `icebergCompat` and it is \
+         readable as Iceberg over the same files."
+            .to_string(),
+    )
 }
 
 /// Serialize `batches` into an in-memory buffer in `format` (Parquet/Csv/Json).
@@ -1564,10 +1781,12 @@ fn encode_batches(
                 .finish()
                 .map_err(|e| DataFusionError::Execution(format!("finish json writer: {e}")))?;
         }
-        TableFormat::Delta | TableFormat::Iceberg => {
-            return Err(DataFusionError::NotImplemented(format!(
-                "{format:?} is not a supported CTAS write target"
-            )));
+        TableFormat::Iceberg => return Err(iceberg_not_a_write_target()),
+        // Delta is committed through `write_delta_batches`, never serialized as one flat file.
+        TableFormat::Delta => {
+            return Err(DataFusionError::Internal(
+                "Delta batches must be written through `write_delta_batches`".to_string(),
+            ));
         }
     }
     Ok(buf)
@@ -1635,6 +1854,9 @@ async fn parquet_metadata_provider_with_assignment(
         Some(schema) => schema.clone(),
         None => infer_listed_parquet_schema(state, &listed).await?,
     };
+    // Best effort: a table whose object store will not resolve is simply read-only, which is what
+    // it already was before `insert_into` existed.
+    let write_target = write_target_for(state, md);
     let (file_schema, partition_columns) =
         split_partition_schema(&table_schema, &md.partition_columns);
     let partition_fields = md
@@ -1689,6 +1911,7 @@ async fn parquet_metadata_provider_with_assignment(
         groups,
         case_insensitive_schema_adapter: md.schema.is_some(),
         statistics: logical_statistics,
+        write_target,
     });
     match dim_cache_fingerprint {
         Some((fingerprint, source_bytes)) => {
@@ -1711,6 +1934,15 @@ async fn resolve_lakehouse_provider(
         .map_err(loc_err(md))?;
     ensure_remote_store(state, &root, Some(&md.storage_options))?;
     let store = state.runtime_env().object_store(&root)?;
+    // Captured now, while the object store for this table's scheme is known to be registered, so
+    // an `INSERT` later does not have to re-derive credentials from a `TaskContext`.
+    let write_target = Some(LakehouseWriteTarget {
+        location: md.location.clone(),
+        format: md.format,
+        partition_columns: md.partition_columns.clone(),
+        store: store.clone(),
+        root: root.prefix().clone(),
+    });
     let pinned_snapshot = requested_lakehouse_snapshot(&md.name);
     if require_snapshot_pin {
         if !lakehouse_snapshot_context_is_set() {
@@ -1755,10 +1987,25 @@ async fn resolve_lakehouse_provider(
     }
 
     if resolved.files.is_empty() {
-        return Err(DataFusionError::Plan(format!(
-            "table `{}` has no active data files",
-            md.location
-        )));
+        // A table with no live files is **empty**, not broken. `CREATE TABLE ... AS SELECT` over
+        // an empty result, an `INSERT OVERWRITE ... WHERE false`, and a freshly declared streaming
+        // table before its first batch all land here — an error would make each of them produce a
+        // table that cannot be selected from at all.
+        //
+        // This needs a schema, and only the catalog has one: there is no data file to infer from.
+        // Without a declared schema the old error stands, because guessing a column list would
+        // make a downstream query fail somewhere much less obvious.
+        return match &md.schema {
+            Some(schema) => Ok(ProviderResolution {
+                provider: crate::shard::empty_table(schema.clone()).map_err(oxidant_to_df)?,
+                snapshot_key: Some(md.name.clone()),
+                snapshot: Some(resolved.snapshot),
+            }),
+            None => Err(DataFusionError::Plan(format!(
+                "table `{}` has no active data files and the catalog does not declare a schema,                  so its columns cannot be determined",
+                md.location
+            ))),
+        };
     }
 
     let table_schema = match &md.schema {
@@ -1910,6 +2157,7 @@ async fn resolve_lakehouse_provider(
         groups,
         case_insensitive_schema_adapter: md.schema.is_some(),
         statistics: logical_statistics,
+        write_target,
     });
     let provider = match dim_source_bytes {
         Some(source_bytes) => {
@@ -1948,12 +2196,106 @@ struct LakehouseTableProvider {
     /// instead of DataFusion's `Statistics::new_unknown` default. `None` keeps the unknown
     /// shape (statistics disabled or no footer readable).
     statistics: Option<datafusion::common::Statistics>,
+    /// Where an `INSERT` into this table writes, when one is possible. `None` makes the table
+    /// read-only — the object store for its location could not be resolved.
+    write_target: Option<LakehouseWriteTarget>,
+}
+
+/// Everything an `INSERT` into a lakehouse table needs, captured when the provider is built.
+///
+/// The object store is held rather than re-resolved because `DataSink::write_all` only gets a
+/// `TaskContext`, and re-deriving an `s3://` table's credentials from there would repeat the
+/// assumed-role/vended-credential resolution that [`ensure_remote_store`] already did.
+#[derive(Debug, Clone)]
+struct LakehouseWriteTarget {
+    location: String,
+    format: TableFormat,
+    partition_columns: Vec<String>,
+    store: Arc<dyn object_store::ObjectStore>,
+    root: object_store::path::Path,
 }
 
 #[async_trait]
 impl TableProvider for LakehouseTableProvider {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    /// `INSERT INTO` / `INSERT OVERWRITE` into a catalog table.
+    ///
+    /// Delta takes both: `INSERT INTO` adds files and `INSERT OVERWRITE` retires every
+    /// currently-live file in the same commit that adds the new ones, so a concurrent reader sees
+    /// the whole old table or the whole new one and never a mixture. A plain Parquet table takes
+    /// only `INSERT INTO` (a new file in the directory); it has no commit log, so an overwrite
+    /// could not be made atomic and is refused rather than faked. Iceberg is read-only — see
+    /// [`iceberg_not_a_write_target`].
+    async fn insert_into(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> DfResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        use datafusion::datasource::sink::DataSinkExec;
+        use datafusion::logical_expr::dml::InsertOp;
+
+        let Some(target) = self.write_target.clone() else {
+            return Err(DataFusionError::NotImplemented(
+                "this table's storage location cannot be written to".to_string(),
+            ));
+        };
+        let mode = match insert_op {
+            InsertOp::Append => WriteMode::Append,
+            InsertOp::Overwrite => WriteMode::Replace,
+            // `REPLACE INTO` needs row-level matching on a key — Delta expresses that as MERGE,
+            // which this writer does not implement. Refusing beats silently appending duplicates.
+            InsertOp::Replace => {
+                return Err(DataFusionError::NotImplemented(
+                    "`REPLACE INTO` is not supported here; use `INSERT OVERWRITE` to replace the \
+                     whole table"
+                        .to_string(),
+                ));
+            }
+        };
+        // Rejected at planning time rather than mid-write, so a statement that cannot work never
+        // starts producing rows.
+        match (target.format, mode) {
+            (TableFormat::Delta, _) => {}
+            // A Hive-partitioned Parquet table keeps its partition columns in the *directory
+            // path*, not in the file — which is what the reader
+            // (`parquet_metadata_provider_with_assignment` → `split_partition_schema`) expects.
+            // The flat single-file write below would put a file with those columns still in it at
+            // the table root, and every row would read back with the wrong partition values.
+            (TableFormat::Parquet, WriteMode::Append) if !target.partition_columns.is_empty() => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "`INSERT` into the partitioned Parquet table at `{}` is not supported: its \
+                     partition columns ({}) live in the directory path, and this writer emits one \
+                     flat file. Use a Delta table, which partitions on write.",
+                    target.location,
+                    target.partition_columns.join(", ")
+                )));
+            }
+            (TableFormat::Parquet, WriteMode::Append) => {}
+            (TableFormat::Parquet, WriteMode::Replace) => {
+                return Err(DataFusionError::NotImplemented(
+                    "`INSERT OVERWRITE` is not supported for a plain Parquet table: it has no \
+                     transaction log, so replacing its files could not be made atomic and a \
+                     concurrent reader would see a half-empty table. Use a Delta table."
+                        .to_string(),
+                ));
+            }
+            (TableFormat::Iceberg, _) => return Err(iceberg_not_a_write_target()),
+            (format, _) => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "`INSERT` into a {format:?} catalog table is not supported"
+                )))
+            }
+        }
+        let sink = Arc::new(LakehouseDataSink {
+            target,
+            schema: self.schema.clone(),
+            mode,
+        });
+        Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
 
     fn table_type(&self) -> datafusion::logical_expr::TableType {
@@ -2704,6 +3046,107 @@ fn loc_err(md: &TableMetadata) -> impl Fn(DataFusionError) -> DataFusionError + 
 }
 
 /// Map a oxidant error onto DataFusion's error type, preserving the failure class.
+/// Resolve where an `INSERT` into `md`'s table would write, or `None` when it cannot (an object
+/// store that will not resolve, or a location that does not parse) — the table is then read-only,
+/// exactly as it was before `insert_into` existed.
+fn write_target_for(state: &SessionState, md: &TableMetadata) -> Option<LakehouseWriteTarget> {
+    use datafusion::datasource::listing::ListingTableUrl;
+
+    let url = ListingTableUrl::parse(crate::shard::ensure_collection_url(&md.location)).ok()?;
+    let store = state.runtime_env().object_store(&url).ok()?;
+    Some(LakehouseWriteTarget {
+        location: md.location.clone(),
+        format: md.format,
+        partition_columns: md.partition_columns.clone(),
+        store,
+        root: url.prefix().clone(),
+    })
+}
+
+/// Commits an `INSERT`'s rows into a catalog table.
+#[derive(Debug)]
+struct LakehouseDataSink {
+    target: LakehouseWriteTarget,
+    schema: SchemaRef,
+    mode: WriteMode,
+}
+
+impl datafusion::physical_plan::DisplayAs for LakehouseDataSink {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        let op = match self.mode {
+            WriteMode::Append => "append",
+            WriteMode::Replace => "overwrite",
+        };
+        write!(
+            f,
+            "LakehouseDataSink(format={:?}, op={op}, location={})",
+            self.target.format, self.target.location
+        )
+    }
+}
+
+#[async_trait]
+impl datafusion::datasource::sink::DataSink for LakehouseDataSink {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut data: datafusion::execution::SendableRecordBatchStream,
+        _context: &Arc<datafusion::execution::TaskContext>,
+    ) -> DfResult<u64> {
+        use futures::StreamExt;
+        use object_store::ObjectStoreExt;
+
+        // Collected rather than streamed: one Delta commit is atomic over the file set it carries,
+        // so the whole insert has to be written before any of it is visible. See `docs/TODOS.md` —
+        // staging a large insert's files before the commit is the follow-up, and is the same work
+        // as streaming a derived table's recompute.
+        let mut batches = Vec::new();
+        while let Some(batch) = data.next().await {
+            batches.push(conform_to_schema(batch?, &self.schema)?);
+        }
+
+        if self.target.format == TableFormat::Delta {
+            return write_delta_batches(
+                self.target.store.clone(),
+                self.target.root.clone(),
+                &self.target.location,
+                &self.schema,
+                &batches,
+                &self.target.partition_columns,
+                self.mode,
+            )
+            .await;
+        }
+
+        // Plain Parquet: one new file per insert. The name has to be unique across every writer of
+        // the directory, so it carries the same random prefix a Delta data file does — a fixed
+        // `part-00000.parquet` would have each insert silently overwrite the last.
+        let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        if rows == 0 {
+            return Ok(0);
+        }
+        let bytes = encode_batches(TableFormat::Parquet, &self.schema, &batches)?;
+        let name = format!(
+            "part-{}-c000.snappy.parquet",
+            oxidant_datasource::delta_write::new_file_prefix()
+        );
+        let path = self.target.root.clone().join(name);
+        self.target
+            .store
+            .put(&path, bytes.into())
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("write `{path}`: {e}")))?;
+        Ok(rows)
+    }
+}
+
 fn oxidant_to_df(e: Error) -> DataFusionError {
     match e {
         Error::Plan(m) => DataFusionError::Plan(m),
@@ -4186,6 +4629,7 @@ mod tests {
             Arc::new(SessionContext::new()),
             Arc::new(AtomicBool::new(false)),
             version.clone(),
+            PendingCtas::default(),
         );
         (provider, version)
     }
@@ -5260,6 +5704,7 @@ mod tests {
             Arc::new(engine.ctx().clone()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            PendingCtas::default(),
         );
 
         let md = TableMetadata::new(
@@ -5315,6 +5760,7 @@ mod tests {
             Arc::new(engine.ctx().clone()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            PendingCtas::default(),
         );
         let md = TableMetadata::new(
             "t",

@@ -13,7 +13,10 @@ in a few minutes.
 | [getting-started.md](getting-started.md) | Install/run (binary or Docker) and first query via Web UI, `oxidant sql`, or PySpark Connect |
 | [web-ui.md](web-ui.md) | Monitoring UI tour, SQL editor, and notebooks on `:4040` |
 | [api.md](api.md) | REST statement API reference (`/api/v1/statements`, cluster status) with curl examples |
+| [config.md](config.md) | `oxidant.yaml` reference: catalogs (including a local catalog over directories), engine tuning, config precedence |
+| [pipelines.md](pipelines.md) | Declarative Kafka → lakehouse table DAG run by the binary (`oxidant pipeline`) |
 | [cli.md](cli.md) | `oxidant sql` command-line SQL client reference |
+| [sql-writes.md](sql-writes.md) | Writing tables from SQL: `CREATE TABLE … USING delta AS SELECT`, `INSERT INTO`/`OVERWRITE`, per-format support |
 | [mcp.md](mcp.md) | `oxidant mcp` MCP server setup for Claude Desktop / Cursor + tool reference |
 | [workers.md](workers.md) | Adding workers: single-node default, local-cluster, multi-host, Docker |
 | [catalogs-glue.md](catalogs-glue.md) | AWS Glue Data Catalog end-to-end (IAM, config, CTAS, troubleshooting) |

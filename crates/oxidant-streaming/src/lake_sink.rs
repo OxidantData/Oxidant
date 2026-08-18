@@ -25,7 +25,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use oxidant_catalog::{CatalogProvider, TableChange, TableFormat};
 use oxidant_common::{Error, Result};
-use oxidant_datasource::delta_write::{DeltaTableWriter, DeltaWriterConfig};
+use oxidant_datasource::delta_write::{stable_table_id, DeltaTableWriter, DeltaWriterConfig};
 use oxidant_datasource::uniform::UniformTable;
 use oxidant_loom::arrow::datatypes::SchemaRef;
 use oxidant_loom::arrow::record_batch::RecordBatch;
@@ -368,6 +368,17 @@ impl LakeSink {
         Ok(())
     }
 
+    /// The highest idempotency version this table's log already carries, or 0.
+    ///
+    /// A caller that stamps its own versions (the pipeline's derived-table recompute) needs this
+    /// to guarantee its next one is recognized as new rather than as a replay.
+    pub fn committed_txn_version(&self) -> i64 {
+        match &self.writer {
+            Writer::Delta(writer) => writer.committed_txn_version(),
+            _ => 0,
+        }
+    }
+
     pub fn location(&self) -> &str {
         &self.location
     }
@@ -383,8 +394,58 @@ impl LakeSink {
     ///
     /// A uuid rather than a counter: a restarted query starts counting from zero again, and a
     /// name it had already used would overwrite live data rather than add to it.
+    /// Replace the table's entire contents with `batches`, in one atomic commit.
+    ///
+    /// This is what a *derived* table needs: it is defined by a query over other tables and is
+    /// recomputed in full, so each update must swap the whole contents rather than append to
+    /// them. Delta only — a bare Parquet directory has no commit protocol, so "replace" there
+    /// would mean deleting files while readers are listing them.
+    ///
+    /// Unlike [`write_batch`](Sink::write_batch), no rows is not a no-op: a query that now
+    /// matches nothing means the table should be empty, and leaving the previous contents in
+    /// place would serve stale rows indefinitely.
+    pub async fn replace_batch(&mut self, batches: &[RecordBatch], batch_id: u64) -> Result<u64> {
+        let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        for b in batches {
+            if b.schema() != self.schema {
+                return Err(Error::Execution(format!(
+                    "sink `{}`: batch schema {:?} does not match the table schema {:?}",
+                    self.target.display_name(),
+                    b.schema(),
+                    self.schema
+                )));
+            }
+        }
+
+        let prefix = self.next_file_prefix();
+        let published_at = match &mut self.writer {
+            Writer::Delta(writer) => {
+                let commit = writer
+                    .replace(batches, &prefix, Some(batch_id as i64))
+                    .await?;
+                if commit.deduplicated {
+                    return Ok(0);
+                }
+                let interval = self.options.checkpoint_interval;
+                let due = interval > 0 && (commit.version + 1) % interval == 0;
+                (commit.version == 0 || due).then_some(commit.version)
+            }
+            Writer::Parquet => {
+                return Err(Error::Unsupported(format!(
+                    "`{}` is a parquet table, which has no commit protocol and so cannot be \
+                     replaced atomically; declare it as delta to have it recomputed",
+                    self.target.display_name()
+                )))
+            }
+        };
+        if let Some(version) = published_at {
+            self.publish_iceberg(version).await;
+        }
+        Ok(rows)
+    }
+
     fn next_file_prefix(&self) -> String {
-        uuid::Uuid::new_v4().to_string()
+        oxidant_datasource::delta_write::new_file_prefix()
     }
 
     /// Publish Iceberg metadata for the table as of `version`, and point the catalog at it.
@@ -593,12 +654,6 @@ fn column_mismatch(declared: &SchemaRef, produced: &SchemaRef) -> Option<String>
         }
     }
     None
-}
-
-/// A UUID derived from the table location, so re-declaring a table produces the same `metaData`
-/// id rather than a fresh random one on every restart.
-fn stable_table_id(location: &str) -> String {
-    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, location.as_bytes()).to_string()
 }
 
 #[cfg(test)]

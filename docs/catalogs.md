@@ -90,7 +90,12 @@ then wire its `type` string into `oxidant-connect`'s `build_provider` factory
   location resolves to (S3 buckets are registered automatically, honoring
   `fs.s3a.*` storage options). Validated end-to-end against AWS Glue + S3 at TPC-H SF10
   (all 8 tables, `count(*)` + Q1/Q6 identical to the Parquet baseline).
-- **Not yet:** DDL through the catalog (read-only); `hdfs://` locations; Delta/Iceberg
+- **Writes:** `CREATE TABLE … USING <fmt> AS SELECT` and `INSERT INTO`/`INSERT OVERWRITE`
+  against a catalog that implements write DDL (`local`, `glue`) — Delta transactionally,
+  Parquet append-only. See [sql-writes.md](sql-writes.md) for what each format takes.
+- **Not yet:** `DROP TABLE`/`SHOW PARTITIONS`/`MSCK REPAIR` through the catalog (the SPI
+  methods exist; no SQL path reaches them); `ALTER TABLE`; non-CTAS `CREATE TABLE` against an
+  external catalog; write DDL for Hive and REST/Unity; `hdfs://` locations; Delta/Iceberg
   **column-mapping** tables (refused with an explicit error rather than misread);
   `USE <catalog>` / current-database affects the `spark.catalog.*` listing context but not yet the
   resolution of *unqualified* table names in queries — use fully-qualified names with external

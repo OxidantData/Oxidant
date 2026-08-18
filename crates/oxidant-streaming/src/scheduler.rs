@@ -1,6 +1,6 @@
 //! Micro-batch trigger scheduling and query manager.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,11 +8,12 @@ use datafusion::logical_expr::LogicalPlan;
 use oxidant_catalog::TableFormat;
 use oxidant_common::{Error, Result};
 use oxidant_loom::arrow::datatypes::SchemaRef;
+use oxidant_loom::arrow::record_batch::RecordBatch;
 use oxidant_loom::Engine;
 use tokio::sync::RwLock;
 
 use crate::checkpoint::CheckpointStore;
-use crate::config::StreamQueryConfig;
+use crate::config::{ExpectationAction, StreamExpectation, StreamQueryConfig};
 use crate::input::MicroBatchInput;
 use crate::kafka::KafkaSource;
 use crate::lake_sink::{LakeSink, LakeSinkOptions, LakeTarget};
@@ -22,7 +23,7 @@ use crate::query::{
 use crate::sink::{FileSink, MemorySink, Sink};
 use crate::source::{FileSource, MemoryRateSource, Source, SourceOffsets};
 use crate::state::DedupState;
-use crate::watermark::WatermarkConfig;
+use crate::watermark::{WatermarkConfig, WatermarkTracker};
 
 /// Attempts a transient I/O failure gets before the query gives up on it.
 const RETRY_ATTEMPTS: u32 = 4;
@@ -125,9 +126,14 @@ struct QueryRuntime {
     trigger: Trigger,
     pipeline: Option<MicroBatchPipeline>,
     watermark: Option<WatermarkConfig>,
+    /// The moving event-time high-water mark, resumed from the checkpoint.
+    tracker: WatermarkTracker,
+    /// `dropDuplicates` keys, resumed from the checkpoint and expired by the watermark.
     dedup: Option<DedupState>,
     dedup_columns: Vec<String>,
     dedup_key_cols: Vec<usize>,
+    /// Counted checks run against each micro-batch before it reaches the sink.
+    expectations: Vec<StreamExpectation>,
 }
 
 impl StreamingQueryManager {
@@ -177,7 +183,7 @@ impl StreamingQueryManager {
         let mut source = build_source(&config)?;
         // Resume before the first poll: a restarted query must continue from the last committed
         // batch, not replay from `startingOffsets`.
-        let restored = checkpoint.load().await.unwrap_or_default();
+        let restored = recover_from_log(&checkpoint).await?;
         if let Some(offsets) = &restored.source_offsets {
             source.restore_offsets(offsets);
         }
@@ -224,13 +230,17 @@ impl StreamingQueryManager {
                 trigger,
                 pipeline: options.pipeline,
                 watermark,
+                tracker: WatermarkTracker::restore(restored.max_event_time_micros),
                 dedup: if config.dedup_columns.is_empty() {
                     None
                 } else {
-                    Some(DedupState::new(100_000))
+                    // Resumed rather than started empty: a fresh set would re-admit every
+                    // duplicate the previous run had already filtered out.
+                    Some(restored.dedup_state.clone().unwrap_or_default())
                 },
                 dedup_columns: config.dedup_columns.clone(),
                 dedup_key_cols: vec![],
+                expectations: config.expectations.clone(),
             }),
             state: RwLock::new(q),
             checkpoint,
@@ -302,61 +312,179 @@ impl StreamingQueryManager {
         // Held for the whole batch — a Kafka fetch plus an object-store write. Status readers
         // take `state` instead, so they are never blocked by it.
         let mut rt = q.runtime.lock().await;
+
+        Self::run_batch_inner(&q, &mut rt, engine).await
+    }
+
+    /// The body of one micro-batch.
+    ///
+    /// The order of the three durable writes is the whole guarantee, and none of them commute:
+    ///
+    /// 1. **the offset log**, naming what this batch will read, *before* it reads anything;
+    /// 2. **the sink**, stamped with the batch id so a replay is recognized;
+    /// 3. **the commit log**, then the fast-resume record.
+    ///
+    /// A crash between any two is recoverable because the surviving prefix says exactly which
+    /// batch was in flight and what it covered.
+    async fn run_batch_inner(
+        q: &Arc<ManagedQuery>,
+        rt: &mut QueryRuntime,
+        engine: &Engine,
+    ) -> Result<u64> {
         let started = std::time::Instant::now();
 
-        // Where this batch starts, captured before the poll moves the source forward.
-        let start_offset = offsets_json(rt.source.committed_offsets().as_ref());
-        let source_batches = with_retry!("source poll", rt.source.poll_batch(engine))?;
+        // Batch ids are not burned by failure: an attempt that never committed leaves its range
+        // in the log, and the next attempt picks up the same id and the same extent. Retrying
+        // under a *fresh* id instead would stop the sink recognizing a replay of a batch it had
+        // in fact committed — an acknowledgement lost on the way back, say — and write the rows
+        // a second time.
+        let batch_id = q.state.read().await.batch_id + 1;
+
+        let range = match q.checkpoint.load_planned(batch_id).await.map_err(|e| {
+            Error::Io(format!(
+                "streaming checkpoint `{}`: reading the planned range for batch {batch_id}: {e}",
+                q.checkpoint.location()
+            ))
+        })? {
+            // An attempt at this batch was already recorded. Replaying its *recorded* extent —
+            // rather than asking the source what is available now — is what keeps the sink's
+            // idempotency stamp sound: a wider replay would be recognized by batch id and
+            // discarded whole, taking the records that arrived in between with it.
+            Some(range) => range,
+            None => {
+                let range = with_retry!("source plan", rt.source.plan_batch(engine))?;
+                if range.is_empty() {
+                    // Nothing arrived. Do not plan, do not touch the sink, do not advance the
+                    // batch id — an idle trigger must leave the table (and its version history)
+                    // alone.
+                    q.state.write().await.status.is_data_available = false;
+                    return Ok(0);
+                }
+                q.checkpoint
+                    .save_planned(batch_id, &range)
+                    .await
+                    .map_err(|e| {
+                        Error::Io(format!(
+                            "streaming checkpoint `{}`: recording batch {batch_id}: {e}",
+                            q.checkpoint.location()
+                        ))
+                    })?;
+                range
+            }
+        };
+
+        let start_offset = offsets_json(Some(&SourceOffsets {
+            source: range.source.clone(),
+            entries: range.start.clone(),
+        }));
+        let source_batches = with_retry!("source poll", rt.source.poll_range(engine, &range))?;
         let input_rows: u64 = source_batches.iter().map(|b| b.num_rows() as u64).sum();
-        if input_rows == 0 {
-            // Nothing arrived. Do not run the plan, do not touch the sink, do not advance the
-            // batch id — an idle trigger must leave the table (and its version history) alone.
-            q.state.write().await.status.is_data_available = false;
-            return Ok(0);
-        }
 
-        // Run the user's DataFrame transformation over this batch. `execute_logical_plan`
-        // collects fully, so the input can be released as soon as it returns — otherwise a
-        // stopped or idle query would pin its last micro-batch in memory indefinitely.
-        let mut batches = match &rt.pipeline {
-            Some(p) => {
-                p.input.set_batches(source_batches).await?;
-                let out = engine.execute_logical_plan(p.plan.clone()).await;
-                p.input.set_batches(vec![]).await?;
-                out?
+        // A recorded range that yields no records — every offset in it compacted away, or a
+        // spool file of blank lines — still has to be got past, or it is replayed forever. But
+        // it must not reach the sink: an empty commit per trigger fills the table's version
+        // history with versions that change nothing.
+        #[allow(unused_assignments)]
+        let mut late_records = 0u64;
+        let rows = if input_rows == 0 {
+            0
+        } else {
+            // Run the user's DataFrame transformation over this batch. `execute_logical_plan`
+            // collects fully, so the input can be released as soon as it returns — otherwise a
+            // stopped or idle query would pin its last micro-batch in memory indefinitely.
+            let mut batches = match &rt.pipeline {
+                Some(p) => {
+                    p.input.set_batches(source_batches).await?;
+                    let out = engine.execute_logical_plan(p.plan.clone()).await;
+                    p.input.set_batches(vec![]).await?;
+                    out?
+                }
+                None => source_batches,
+            };
+
+            // The watermark advances from the data, and the value this batch is judged against
+            // is the one that preceded it — otherwise a single record from the future would mark
+            // its own batch late and expire state the rest of the batch still needed.
+            if let Some(wm) = &rt.watermark {
+                let before = rt.tracker.observe(wm, &batches);
+                if let Some(watermark) = before {
+                    late_records = WatermarkTracker::count_late(wm, &batches, watermark);
+                    if late_records > 0 {
+                        eprintln!(
+                            "[oxidant] streaming batch {batch_id}: {late_records} record(s) \
+                             behind the watermark — kept, not dropped"
+                        );
+                    }
+                }
             }
-            None => source_batches,
-        };
-
-        if let Some(wm) = &rt.watermark {
-            let now = chrono::Utc::now().timestamp_micros();
-            let watermark = wm.watermark_micros(now);
-            batches = apply_watermark(batches, &wm.event_time_column, watermark);
-            let mut state = q.checkpoint.load().await.unwrap_or_default();
-            state.watermark_micros = watermark;
-            let _ = q.checkpoint.save(&state).await;
-        }
-        if rt.dedup.is_some() {
-            if rt.dedup_key_cols.is_empty() && !batches.is_empty() {
-                rt.dedup_key_cols = resolve_dedup_cols(&batches[0], &rt.dedup_columns);
+            if rt.dedup.is_some() {
+                if rt.dedup_key_cols.is_empty() && !batches.is_empty() {
+                    rt.dedup_key_cols =
+                        crate::state::resolve_key_columns(&batches[0], &rt.dedup_columns)?;
+                }
+                let keys = rt.dedup_key_cols.clone();
+                let event_time_col = rt.watermark.as_ref().and_then(|wm| {
+                    batches
+                        .first()
+                        .and_then(|b| b.schema().index_of(&wm.event_time_column).ok())
+                });
+                let dedup = rt.dedup.as_mut().expect("checked above");
+                batches = dedup.dedup_batches(&batches, &keys, event_time_col)?;
+                // Forgetting is driven by the watermark, never by a key count: a bounded set
+                // that cleared itself would start re-admitting duplicates mid-run, silently.
+                if let (Some(wm), Some(max)) = (&rt.watermark, rt.tracker.max_event_time_micros()) {
+                    dedup.expire(wm.watermark_for(max));
+                }
             }
-            let keys = rt.dedup_key_cols.clone();
-            let dedup = rt.dedup.as_mut().expect("checked above");
-            batches = dedup.dedup_batches(&batches, &keys);
-        }
 
-        // The batch id is what the sink stamps into its commit, so it has to be settled before
-        // the write, not after: a replayed batch is only recognizable if it carries the same id
-        // the first attempt did.
-        let batch_id = {
-            let mut state = q.state.write().await;
-            state.batch_id += 1;
-            state.batch_id
+            // Counted checks run against the batch that is about to be written — after `drop`
+            // filtering has already been composed into the query, so a row a `drop` removed is
+            // not also counted here.
+            //
+            // A `fail` returns before the sink write, which is what "leaves the table at its
+            // last good version" means: the batch's range stays in the offset log uncommitted,
+            // so fixing the data and retrying replays exactly these records.
+            for expectation in &rt.expectations {
+                let violations = count_violations(engine, &batches, &expectation.check).await?;
+                if violations == 0 {
+                    continue;
+                }
+                match expectation.action {
+                    ExpectationAction::Warn => eprintln!(
+                        "[oxidant] batch={batch_id} expectation={} failed_records={violations}",
+                        expectation.label
+                    ),
+                    ExpectationAction::Fail => {
+                        return Err(Error::Execution(format!(
+                            "expectation `{}` failed on batch {batch_id}: {violations} record(s) \
+                             do not satisfy `{}`; the table is unchanged",
+                            expectation.label, expectation.check
+                        )))
+                    }
+                }
+            }
+
+            with_retry!("sink write", rt.sink.write_batch(&batches, batch_id))?
         };
-        let rows = with_retry!("sink write", rt.sink.write_batch(&batches, batch_id))?;
+        // The rows are durable. Everything from here on is bookkeeping, and a failure in it must
+        // not make the next attempt re-read them.
+        let committed_offsets = rt.source.committed_offsets();
+        q.checkpoint
+            .save_commit(&crate::checkpoint::BatchCommit {
+                batch_id,
+                num_output_rows: rows,
+                resume_position: committed_offsets.clone(),
+            })
+            .await
+            .map_err(|e| {
+                Error::Io(format!(
+                    "streaming checkpoint `{}`: committing batch {batch_id}: {e}",
+                    q.checkpoint.location()
+                ))
+            })?;
+        q.state.write().await.batch_id = batch_id;
         let source_description = rt.source.description();
         let sink_description = rt.sink.description();
-        let committed_offsets = rt.source.committed_offsets();
         let end_offset = offsets_json(committed_offsets.as_ref());
 
         let elapsed = started.elapsed();
@@ -402,8 +530,19 @@ impl StreamingQueryManager {
         checkpoint.batch_id = batch_id;
         checkpoint.committed_batch_id = batch_id;
         checkpoint.source_offsets = committed_offsets;
+        // Operator state travels with the batch that produced it, so a restart resumes the
+        // watermark and the dedup keys rather than starting either over.
+        checkpoint.max_event_time_micros = rt.tracker.max_event_time_micros();
+        if let (Some(wm), Some(max)) = (&rt.watermark, checkpoint.max_event_time_micros) {
+            checkpoint.watermark_micros = wm.watermark_for(max);
+        }
+        checkpoint.dedup_state = rt.dedup.clone();
         // A checkpoint that cannot be written is not cosmetic: without it a restart re-reads from
         // wherever the last successful save left off, so the failure has to reach the user.
+        checkpoint.pruned_through = q
+            .checkpoint
+            .prune_log(checkpoint.pruned_through, batch_id)
+            .await;
         q.checkpoint.save(&checkpoint).await.map_err(|e| {
             Error::Io(format!(
                 "streaming checkpoint `{}`: {e}",
@@ -414,16 +553,75 @@ impl StreamingQueryManager {
     }
 
     /// Process all available data for `query_id` (for `availableNow` / `once` triggers).
+    ///
+    /// "Available" means *available when the drain started*, which is the whole difference from
+    /// an unbounded loop. Draining until a batch comes back empty never terminates against a
+    /// source that is still being written to faster than the batches consume it — and `once` is
+    /// exactly the trigger someone puts in a cron job and expects to exit. The end of the first
+    /// batch's planned range is the boundary; anything produced after it is the next run's.
     pub async fn process_all_available(&self, query_id: &str, engine: &Engine) -> Result<u64> {
+        /// Batches one drain will run before giving up on reaching the boundary. Generous: it is
+        /// a backstop against a pathological source, not a throughput limit.
+        const MAX_DRAIN_BATCHES: usize = 100_000;
+
         let mut total = 0u64;
-        loop {
+        let mut boundary: Option<BTreeMap<String, i64>> = None;
+        for _ in 0..MAX_DRAIN_BATCHES {
+            // The boundary is fixed by the first plan of the drain: everything the source could
+            // offer at that moment.
+            if boundary.is_none() {
+                boundary = self.available_now_boundary(query_id, engine).await?;
+            }
             let rows = self.run_batch(query_id, engine).await?;
             if rows == 0 {
                 break;
             }
             total += rows;
+            if self.reached_boundary(query_id, boundary.as_ref()).await {
+                break;
+            }
         }
         Ok(total)
+    }
+
+    /// Where the source ends right now, as the drain's stopping point.
+    async fn available_now_boundary(
+        &self,
+        query_id: &str,
+        engine: &Engine,
+    ) -> Result<Option<BTreeMap<String, i64>>> {
+        let Some(q) = self.lookup(query_id).await else {
+            return Ok(None);
+        };
+        let mut rt = q.runtime.lock().await;
+        // The source's current end, not this batch's planned range: with a per-batch budget the
+        // two differ, and stopping at the planned end would drain one batch and call the topic
+        // exhausted.
+        rt.source.available_end(engine).await
+    }
+
+    /// Whether the source has reached the position the drain started against.
+    async fn reached_boundary(
+        &self,
+        query_id: &str,
+        boundary: Option<&BTreeMap<String, i64>>,
+    ) -> bool {
+        let Some(boundary) = boundary else {
+            return false;
+        };
+        let Some(q) = self.lookup(query_id).await else {
+            return true;
+        };
+        let rt = q.runtime.lock().await;
+        let Some(position) = rt.source.committed_offsets() else {
+            return false;
+        };
+        boundary.iter().all(|(key, end)| {
+            position
+                .entries
+                .get(key)
+                .is_some_and(|current| current >= end)
+        })
     }
 
     pub async fn active_queries(&self) -> Vec<StreamingQueryId> {
@@ -443,6 +641,96 @@ impl Default for StreamingQueryManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Count the rows in `batches` that do not satisfy `check`.
+///
+/// `IS NOT TRUE` rather than `NOT (check)`: a null column makes the comparison null, and `NOT
+/// null` is null, so a row of nulls would count as neither passing nor failing — which is how a
+/// column that is entirely null sails through a quality gate.
+async fn count_violations(engine: &Engine, batches: &[RecordBatch], check: &str) -> Result<u64> {
+    use datafusion::datasource::MemTable;
+
+    let Some(first) = batches.first() else {
+        return Ok(0);
+    };
+    let table = MemTable::try_new(first.schema(), vec![batches.to_vec()])
+        .map_err(|e| Error::Execution(format!("expectation `{check}`: {e}")))?;
+    // A name no user table can collide with, deregistered before returning either way.
+    let name = "_oxidant_expect_batch";
+    let ctx = engine.ctx();
+    ctx.register_table(name, Arc::new(table))
+        .map_err(|e| Error::Execution(format!("expectation `{check}`: {e}")))?;
+    let counted = engine
+        .sql(&format!(
+            "SELECT count(*) AS c FROM {name} WHERE ({check}) IS NOT TRUE"
+        ))
+        .await;
+    let _ = ctx.deregister_table(name);
+    let rows = counted?;
+    Ok(rows
+        .first()
+        .and_then(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<oxidant_loom::arrow::array::Int64Array>()
+                .map(|c| c.value(0).max(0) as u64)
+        })
+        .unwrap_or(0))
+}
+
+/// Reconcile the fast-resume record with the offset and commit logs.
+///
+/// The logs are written in order — planned, sink, committed, resume record — so a crash can
+/// leave the last step undone, with a batch that is durably in the table but not in the resume
+/// record. The next start would then re-run that batch id: harmless for the table, because the
+/// sink recognizes the replay and drops it, but the *records* would be discarded with it and the
+/// resume point would jump straight past them. Reading the batch's recorded range instead
+/// recovers exactly where it ended.
+///
+/// Bounded rather than unbounded: several batches can only be in this state if the process died
+/// repeatedly in the same narrow window, and a runaway loop over a corrupt log is worse than
+/// replaying one batch.
+async fn recover_from_log(
+    checkpoint: &CheckpointStore,
+) -> Result<crate::checkpoint::CheckpointState> {
+    /// Consecutive committed-but-unrecorded batches reconciled at start.
+    const MAX_RECOVERED: u64 = 64;
+
+    let mut state = checkpoint.load().await.unwrap_or_default();
+    for _ in 0..MAX_RECOVERED {
+        let next = state.committed_batch_id + 1;
+        let commit = checkpoint.load_commit(next).await.map_err(|e| {
+            Error::Io(format!(
+                "streaming checkpoint `{}`: reading the commit log: {e}",
+                checkpoint.location()
+            ))
+        })?;
+        if commit.is_none() {
+            break;
+        }
+        let Some(resumed) = commit.and_then(|c| c.resume_position) else {
+            // Committed with no recorded position. Nothing can be said about where that batch
+            // ended, and guessing would either duplicate or skip, so stop and let the resume
+            // record stand.
+            break;
+        };
+        eprintln!(
+            "[oxidant] streaming batch {next} was committed but not recorded; \
+             recovering its position from the offset log"
+        );
+        state.committed_batch_id = next;
+        state.batch_id = next;
+        state.source_offsets = Some(resumed);
+        checkpoint.save(&state).await.map_err(|e| {
+            Error::Io(format!(
+                "streaming checkpoint `{}`: {e}",
+                checkpoint.location()
+            ))
+        })?;
+    }
+    Ok(state)
 }
 
 /// Resolve `checkpointLocation` to a store and a prefix within it.
@@ -589,105 +877,389 @@ async fn build_sink(
     Ok(Box::new(MemorySink::new()))
 }
 
-fn resolve_dedup_cols(
-    batch: &oxidant_loom::arrow::record_batch::RecordBatch,
-    names: &[String],
-) -> Vec<usize> {
-    names
-        .iter()
-        .filter_map(|n| batch.schema().index_of(n).ok())
-        .collect()
-}
-
-fn apply_watermark(
-    batches: Vec<oxidant_loom::arrow::record_batch::RecordBatch>,
-    event_col: &str,
-    watermark_micros: i64,
-) -> Vec<oxidant_loom::arrow::record_batch::RecordBatch> {
-    use oxidant_loom::arrow::array::{Array, AsArray, BooleanArray};
-    use oxidant_loom::arrow::compute::filter_record_batch;
-    use oxidant_loom::arrow::datatypes::{DataType, TimeUnit};
-
-    let mut out = Vec::new();
-    for batch in batches {
-        let Ok(col_idx) = batch.schema().index_of(event_col) else {
-            out.push(batch);
-            continue;
-        };
-        let arr = batch.column(col_idx);
-        let mut keep = vec![true; batch.num_rows()];
-        match arr.data_type() {
-            // Each Arrow timestamp unit is a distinct concrete array type. Reading them all as
-            // microseconds panics on anything else — and Kafka's own `timestamp` column is
-            // milliseconds, so the obvious `withWatermark("timestamp", …)` was a crash.
-            DataType::Timestamp(unit, _) => {
-                use oxidant_loom::arrow::datatypes::{
-                    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-                    TimestampSecondType,
-                };
-                let micros_at: Box<dyn Fn(usize) -> i64> = match unit {
-                    TimeUnit::Second => {
-                        let a = arr.as_primitive::<TimestampSecondType>().clone();
-                        Box::new(move |row| a.value(row).saturating_mul(1_000_000))
-                    }
-                    TimeUnit::Millisecond => {
-                        let a = arr.as_primitive::<TimestampMillisecondType>().clone();
-                        Box::new(move |row| a.value(row).saturating_mul(1_000))
-                    }
-                    TimeUnit::Microsecond => {
-                        let a = arr.as_primitive::<TimestampMicrosecondType>().clone();
-                        Box::new(move |row| a.value(row))
-                    }
-                    TimeUnit::Nanosecond => {
-                        let a = arr.as_primitive::<TimestampNanosecondType>().clone();
-                        Box::new(move |row| a.value(row) / 1_000)
-                    }
-                };
-                for (row, slot) in keep.iter_mut().enumerate() {
-                    if !arr.is_null(row) && micros_at(row) < watermark_micros {
-                        *slot = false;
-                    }
-                }
-            }
-            DataType::Date32 => {
-                let d = arr.as_primitive::<oxidant_loom::arrow::datatypes::Date32Type>();
-                // `div_euclid`, not `/`: plain integer division truncates toward zero, so a
-                // watermark before the epoch would round *up* to the next day and drop rows it
-                // should keep. Identical for positive watermarks.
-                let wm_days = watermark_micros.div_euclid(86_400_000_000) as i32;
-                for (row, slot) in keep.iter_mut().enumerate() {
-                    if !arr.is_null(row) && d.value(row) < wm_days {
-                        *slot = false;
-                    }
-                }
-            }
-            _ => {}
-        }
-        let mask = BooleanArray::from(keep);
-        if let Ok(filtered) = filter_record_batch(&batch, &mask) {
-            if filtered.num_rows() > 0 {
-                out.push(filtered);
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::SinkDestination;
+    use oxidant_loom::arrow::record_batch::RecordBatch;
     use std::collections::BTreeMap;
+
+    /// A sink that fails its first `fail_times` writes, then records what it was handed.
+    ///
+    /// Exists to drive the one path no real sink makes reachable on demand: a batch that reads
+    /// its records and then cannot write them.
+    struct FlakySink {
+        fail_times: usize,
+        writes: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for FlakySink {
+        async fn write_batch(&mut self, batches: &[RecordBatch], batch_id: u64) -> Result<u64> {
+            if self.fail_times > 0 {
+                self.fail_times -= 1;
+                return Err(Error::Execution("sink is down".into()));
+            }
+            let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+            self.writes.lock().expect("poisoned").push((batch_id, rows));
+            Ok(rows)
+        }
+    }
+
+    /// Register a query with a caller-supplied source and sink, bypassing `build_source`/
+    /// `build_sink` so a test can inject failure.
+    ///
+    /// Mirrors the recovery and resume that `start_with_config` performs, so a test can restart
+    /// a query over an existing checkpoint and exercise the same path a real restart takes.
+    async fn register(
+        mgr: &StreamingQueryManager,
+        checkpoint_dir: &std::path::Path,
+        source: Box<dyn Source>,
+        sink: Box<dyn Sink>,
+    ) -> String {
+        let mut q = StreamingQuery::new("t".into(), checkpoint_dir.to_string_lossy().into_owned());
+        let id = q.query_id.id.clone();
+        let checkpoint = CheckpointStore::new(
+            Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(checkpoint_dir)
+                    .expect("store"),
+            ),
+            object_store::path::Path::from(""),
+            checkpoint_dir.to_string_lossy().into_owned(),
+        );
+        let mut source = source;
+        let restored = recover_from_log(&checkpoint).await.expect("recover");
+        if let Some(offsets) = &restored.source_offsets {
+            source.restore_offsets(offsets);
+        }
+        q.batch_id = restored.committed_batch_id;
+        let managed = ManagedQuery {
+            runtime: tokio::sync::Mutex::new(QueryRuntime {
+                source,
+                sink,
+                trigger: Trigger::Once,
+                pipeline: None,
+                watermark: None,
+                tracker: WatermarkTracker::default(),
+                dedup: None,
+                dedup_columns: vec![],
+                dedup_key_cols: vec![],
+                expectations: vec![],
+            }),
+            state: RwLock::new(q),
+            checkpoint,
+        };
+        mgr.queries
+            .write()
+            .await
+            .insert(id.clone(), Arc::new(managed));
+        id
+    }
+
+    fn spool_source(dir: &std::path::Path) -> Box<dyn Source> {
+        let options = [
+            ("oxidant.spool.dir", dir.to_str().expect("utf-8")),
+            ("subscribe", "orders"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+        Box::new(KafkaSource::from_options(&options).expect("source"))
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_cannot_write_gives_its_records_back() {
+        // The failure this rules out: the source advanced past `batch-0.json` while the sink was
+        // down, the next trigger polled `batch-1.json`, and the first file's rows were never
+        // written and never read again — no crash, no error after the one failed batch.
+        let spool = tempfile::TempDir::new().expect("tmp");
+        let checkpoints = tempfile::TempDir::new().expect("tmp");
+        std::fs::write(spool.path().join("batch-0.json"), "{\"n\":1}\n{\"n\":2}\n").expect("write");
+        std::fs::write(spool.path().join("batch-1.json"), "{\"n\":3}\n").expect("write");
+
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mgr = StreamingQueryManager::new();
+        let engine = Engine::new();
+        let id = register(
+            &mgr,
+            checkpoints.path(),
+            spool_source(spool.path()),
+            Box::new(FlakySink {
+                fail_times: 1,
+                writes: writes.clone(),
+            }),
+        )
+        .await;
+
+        let err = mgr
+            .run_batch(&id, &engine)
+            .await
+            .expect_err("the sink is down");
+        assert!(err.to_string().contains("sink is down"), "{err}");
+
+        // The sink recovers. The next batch must re-read the file the failed one consumed.
+        let rows = mgr.run_batch(&id, &engine).await.expect("sink recovered");
+        assert_eq!(rows, 2, "batch-0 is read again, not skipped");
+        let rows = mgr.run_batch(&id, &engine).await.expect("next file");
+        assert_eq!(rows, 1, "and batch-1 follows it");
+
+        let written = writes.lock().expect("poisoned").clone();
+        assert_eq!(
+            written,
+            vec![(1, 2), (2, 1)],
+            "every row reaches the sink exactly once, and the failed batch did not burn id 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_failed_after_writing_does_not_re_read_its_records() {
+        // The other half of the rule, and the one a naive rewind gets wrong: once the rows are
+        // in the sink, re-reading them writes them twice — under the *next* batch id, so no
+        // `txn` stamp catches it. A post-commit failure must leave the source where it is.
+        let spool = tempfile::TempDir::new().expect("tmp");
+        let checkpoints = tempfile::TempDir::new().expect("tmp");
+        std::fs::write(spool.path().join("batch-0.json"), "{\"n\":1}\n").expect("write");
+        std::fs::write(spool.path().join("batch-1.json"), "{\"n\":2}\n").expect("write");
+
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mgr = StreamingQueryManager::new();
+        let engine = Engine::new();
+        let id = register(
+            &mgr,
+            checkpoints.path(),
+            spool_source(spool.path()),
+            Box::new(FlakySink {
+                fail_times: 0,
+                writes: writes.clone(),
+            }),
+        )
+        .await;
+
+        // Make the checkpoint save fail *after* the sink write succeeds, by occupying the path
+        // it writes with a directory: the store's final rename onto it cannot succeed.
+        std::fs::create_dir_all(checkpoints.path().join("offsets.json")).expect("mkdir");
+
+        let err = mgr
+            .run_batch(&id, &engine)
+            .await
+            .expect_err("the checkpoint cannot be written");
+        assert!(err.to_string().contains("checkpoint"), "{err}");
+
+        assert_eq!(
+            writes.lock().expect("poisoned").clone(),
+            vec![(1, 1)],
+            "the rows did reach the sink"
+        );
+
+        // Repair the checkpoint location and carry on. The next batch must be batch-1, not a
+        // second copy of batch-0.
+        std::fs::remove_dir_all(checkpoints.path().join("offsets.json")).expect("rm");
+        let rows = mgr.run_batch(&id, &engine).await.expect("recovered");
+        assert_eq!(rows, 1);
+        assert_eq!(
+            writes.lock().expect("poisoned").clone(),
+            vec![(1, 1), (2, 1)],
+            "batch-0 was not written a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_the_sink_commit_and_the_resume_record_loses_nothing() {
+        // The window the offset log exists to close, on a source whose replay can genuinely be
+        // *wider* than the batch it replaces. (The spool cannot show this: it reads one whole
+        // file per batch, so a replay is identical by construction.)
+        //
+        // Batch 1's rows are durably in the table and its commit marker is written, but the
+        // process dies before the fast-resume record. Without a recorded range the restart plans
+        // afresh — picking up the file that landed in the meantime — the sink recognizes batch
+        // id 1 and discards the whole thing, and that file is never read again.
+        let data = tempfile::TempDir::new().unwrap();
+        let checkpoints = tempfile::TempDir::new().unwrap();
+        let table = tempfile::TempDir::new().unwrap();
+        std::fs::write(data.path().join("a.json"), "{\"n\":1}\n{\"n\":2}\n").unwrap();
+
+        let engine = Engine::new();
+        let schema = Arc::new(oxidant_loom::arrow::datatypes::Schema::new(vec![
+            oxidant_loom::arrow::datatypes::Field::new(
+                "n",
+                oxidant_loom::arrow::datatypes::DataType::Int64,
+                true,
+            ),
+        ]));
+        async fn delta_sink(engine: &Engine, location: &str, schema: SchemaRef) -> Box<dyn Sink> {
+            Box::new(
+                LakeSink::open(
+                    engine,
+                    LakeTarget::location_only(location, TableFormat::Delta),
+                    schema,
+                    LakeSinkOptions {
+                        // Stable across the restart, the way a persisted query id is: this is
+                        // what makes a replayed batch recognizable at all.
+                        app_id: Some("crash-test".into()),
+                        checkpoint_interval: 10,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("sink"),
+            )
+        }
+        let location = table.path().to_str().unwrap().to_string();
+
+        let mgr = StreamingQueryManager::new();
+        let id = register(
+            &mgr,
+            checkpoints.path(),
+            Box::new(FileSource::new(data.path(), "json")),
+            delta_sink(&engine, &location, schema.clone()).await,
+        )
+        .await;
+        assert_eq!(mgr.run_batch(&id, &engine).await.unwrap(), 2);
+
+        // The crash: the resume record never lands. The offset and commit logs survive it —
+        // they were written first, which is the entire point of the ordering.
+        let store = checkpoint_store(&engine, &checkpoints.path().to_string_lossy()).unwrap();
+        assert!(store.is_committed(1).await.unwrap());
+        let mut crashed = store.load().await.unwrap();
+        crashed.committed_batch_id = 0;
+        crashed.batch_id = 0;
+        crashed.source_offsets = None;
+        store.save(&crashed).await.unwrap();
+
+        // A second file arrives while the query is down. A replay that swept it up would be
+        // discarded along with the batch it was attached to.
+        std::fs::write(data.path().join("b.json"), "{\"n\":3}\n").unwrap();
+
+        let restarted = StreamingQueryManager::new();
+        let id2 = register(
+            &restarted,
+            checkpoints.path(),
+            Box::new(FileSource::new(data.path(), "json")),
+            delta_sink(&engine, &location, schema.clone()).await,
+        )
+        .await;
+        restarted
+            .process_all_available(&id2, &engine)
+            .await
+            .unwrap();
+
+        engine
+            .register_delta("recovered", table.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let batches = engine
+            .sql("SELECT count(*) AS c FROM recovered")
+            .await
+            .unwrap();
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<oxidant_loom::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(
+            count, 3,
+            "two records from the committed batch, one from the file that arrived after it — \
+             nothing lost to the replay, nothing written twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_that_yields_no_records_is_got_past_without_touching_the_sink() {
+        // A spool file of blank lines stands in for the real case: every offset in the range
+        // compacted away. The batch must advance — otherwise it is replayed forever — but it
+        // must not reach the sink, or the table gains a version that changes nothing per trigger.
+        let spool = tempfile::TempDir::new().unwrap();
+        let checkpoints = tempfile::TempDir::new().unwrap();
+        std::fs::write(spool.path().join("batch-0.json"), "\n\n").unwrap();
+        std::fs::write(spool.path().join("batch-1.json"), "a\n").unwrap();
+
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mgr = StreamingQueryManager::new();
+        let engine = Engine::new();
+        let id = register(
+            &mgr,
+            checkpoints.path(),
+            spool_source(spool.path()),
+            Box::new(FlakySink {
+                fail_times: 0,
+                writes: writes.clone(),
+            }),
+        )
+        .await;
+
+        assert_eq!(mgr.run_batch(&id, &engine).await.unwrap(), 0);
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "an empty batch must not be written"
+        );
+        assert_eq!(
+            mgr.run_batch(&id, &engine).await.unwrap(),
+            1,
+            "and the next file is reached rather than the empty one being replayed"
+        );
+        assert_eq!(writes.lock().unwrap().clone(), vec![(2, 1)]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_batch_replays_its_recorded_range_rather_than_replanning() {
+        // The in-process half of the same rule. A batch that could not be written keeps its
+        // recorded extent, so the retry reads exactly what the failed attempt read — even
+        // though more data has landed in the meantime.
+        let spool = tempfile::TempDir::new().unwrap();
+        let checkpoints = tempfile::TempDir::new().unwrap();
+        std::fs::write(spool.path().join("batch-0.json"), "a\nb\n").unwrap();
+
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mgr = StreamingQueryManager::new();
+        let engine = Engine::new();
+        let id = register(
+            &mgr,
+            checkpoints.path(),
+            spool_source(spool.path()),
+            Box::new(FlakySink {
+                fail_times: 1,
+                writes: writes.clone(),
+            }),
+        )
+        .await;
+
+        mgr.run_batch(&id, &engine)
+            .await
+            .expect_err("the sink is down");
+
+        // New data lands before the retry. It must not be swept into batch 1.
+        std::fs::write(spool.path().join("batch-1.json"), "c\n").unwrap();
+
+        assert_eq!(
+            mgr.run_batch(&id, &engine).await.unwrap(),
+            2,
+            "the retry covers the recorded range, not the newcomer"
+        );
+        assert_eq!(
+            mgr.run_batch(&id, &engine).await.unwrap(),
+            1,
+            "which then arrives as its own batch"
+        );
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![(1, 2), (2, 1)],
+            "every record written exactly once, and the failed batch did not burn id 1"
+        );
+    }
 
     #[tokio::test]
     async fn start_and_run_batch() {
+        // Its own checkpoint directory: the rate source now resumes from one, so a path shared
+        // between runs would make the second run of the test read nothing.
+        let dir = tempfile::TempDir::new().unwrap();
         let mgr = StreamingQueryManager::new();
         let engine = Engine::new();
         let id = mgr
             .start(
                 &engine,
                 "test".into(),
-                "/tmp/oxidant-stream-test".into(),
+                dir.path().to_string_lossy().into_owned(),
                 Trigger::Once,
             )
             .await
@@ -789,8 +1361,9 @@ mod tests {
             .await
             .unwrap();
         let offsets = state.source_offsets.expect("offsets committed");
-        assert_eq!(offsets.source, "kafka");
-        assert_eq!(offsets.entries.get("events-0"), Some(&2));
+        assert_eq!(offsets.source, "kafka-spool");
+        assert_eq!(offsets.entries.get("offset"), Some(&2));
+        assert_eq!(offsets.entries.get("file"), Some(&1));
 
         // A second query on the same checkpoint resumes from the committed offset.
         let mgr2 = StreamingQueryManager::new();
@@ -814,7 +1387,7 @@ mod tests {
             state2
                 .source_offsets
                 .as_ref()
-                .and_then(|o| o.entries.get("events-0")),
+                .and_then(|o| o.entries.get("offset")),
             Some(&2),
             "a restart must keep the committed offsets, not reset them"
         );

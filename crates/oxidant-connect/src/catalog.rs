@@ -91,10 +91,150 @@ pub async fn build_provider(
                 .map_err(err_to_status)?;
             Ok(Arc::new(cat))
         }
+        "local" => {
+            let cat = build_local_catalog(name, options).await?;
+            Ok(Arc::new(cat))
+        }
         other => Err(Status::unimplemented(format!(
-            "catalog type `{other}` is not supported yet (have: hive, glue, rest/unity/iceberg)"
+            "catalog type `{other}` is not supported yet \
+             (have: local, hive, glue, rest/unity/iceberg)"
         ))),
     }
+}
+
+/// Build a filesystem/object-store catalog from its options.
+///
+/// `tables` and `discover` arrive as JSON strings under a single option each. The rest of the
+/// catalog config is flat `key=value`, and a nested structure has nowhere to live in that shape —
+/// carrying them as JSON keeps a config-file catalog and a `--catalog-conf` one on one code path
+/// instead of two. `oxidant-config` writes exactly this encoding.
+async fn build_local_catalog(
+    name: &str,
+    options: &HashMap<String, String>,
+) -> Result<oxidant_catalog_local::LocalCatalog, Status> {
+    let warehouse = options
+        .get("warehouse")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "local catalog `{name}` needs `spark.sql.catalog.{name}.warehouse` — it is where \
+                 tables created by a pipeline or by CREATE TABLE are written"
+            ))
+        })?;
+
+    let declared = match options.get("tables") {
+        Some(json) => parse_declared_tables(name, json)?,
+        None => Vec::new(),
+    };
+    // Storage credentials for the warehouse itself, and the default for every `discover:` root
+    // that does not carry its own. Without this an `s3://` warehouse can only ever use the
+    // ambient AWS chain, and the pinned keys in the config are silently ignored.
+    let storage = storage_options(options);
+    let discover = match options.get("discover") {
+        Some(json) => parse_discover_roots(name, json, &storage)?,
+        None => Vec::new(),
+    };
+
+    oxidant_catalog_local::LocalCatalog::new(name, warehouse, storage, declared, discover)
+        .await
+        .map_err(err_to_status)
+}
+
+/// The storage-credential subset of a catalog's flat options.
+///
+/// An allowlist by prefix rather than the whole map: the catalog's options also carry `warehouse`,
+/// `type`, and the JSON blobs, and handing those to `AmazonS3Builder` would be meaningless at best.
+fn storage_options(options: &HashMap<String, String>) -> HashMap<String, String> {
+    const STORAGE_PREFIXES: &[&str] = &["s3.", "fs.s3a.", "aws."];
+    options
+        .iter()
+        .filter(|(key, _)| STORAGE_PREFIXES.iter().any(|p| key.starts_with(p)))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Decode the `tables` option: a JSON object of `"namespace.table" -> {format, location, ...}`.
+fn parse_declared_tables(
+    name: &str,
+    json: &str,
+) -> Result<Vec<oxidant_catalog_local::DeclaredTable>, Status> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        format: String,
+        location: String,
+        #[serde(default)]
+        options: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        partition_columns: Vec<String>,
+    }
+
+    let parsed: std::collections::BTreeMap<String, Entry> =
+        serde_json::from_str(json).map_err(|e| {
+            Status::invalid_argument(format!("catalog `{name}`: `tables` is not valid JSON: {e}"))
+        })?;
+    let mut out = Vec::with_capacity(parsed.len());
+    for (key, entry) in parsed {
+        let (namespace, table) = key.split_once('.').ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "catalog `{name}`: table key `{key}` must be `namespace.table`"
+            ))
+        })?;
+        let format =
+            oxidant_catalog::TableFormat::from_provider(&entry.format).ok_or_else(|| {
+                // Named rather than defaulted: silently reading an ORC table as Parquet would fail
+                // deep in a scan with an error that points nowhere near the config.
+                Status::invalid_argument(format!(
+                    "catalog `{name}`: table `{key}` has unreadable format `{}`",
+                    entry.format
+                ))
+            })?;
+        out.push(oxidant_catalog_local::DeclaredTable {
+            namespace: namespace.to_string(),
+            table: table.to_string(),
+            format,
+            location: entry.location,
+            storage_options: entry.options,
+            partition_columns: entry.partition_columns,
+        });
+    }
+    Ok(out)
+}
+
+/// Decode the `discover` option: a JSON array of `{namespace, path}`.
+fn parse_discover_roots(
+    name: &str,
+    json: &str,
+    inherited: &HashMap<String, String>,
+) -> Result<Vec<oxidant_catalog_local::DiscoverRoot>, Status> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        namespace: String,
+        path: String,
+        /// Per-root storage credentials. Absent, the catalog's own are inherited — a root in the
+        /// same bucket as the warehouse should not have to repeat them.
+        #[serde(default)]
+        options: Option<std::collections::BTreeMap<String, String>>,
+    }
+
+    let parsed: Vec<Entry> = serde_json::from_str(json).map_err(|e| {
+        Status::invalid_argument(format!(
+            "catalog `{name}`: `discover` is not valid JSON: {e}"
+        ))
+    })?;
+    Ok(parsed
+        .into_iter()
+        .map(|entry| oxidant_catalog_local::DiscoverRoot {
+            namespace: entry.namespace,
+            path: entry.path,
+            storage_options: entry.options.unwrap_or_else(|| {
+                inherited
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            }),
+        })
+        .collect())
 }
 
 /// Parse a boolean catalog option (`true`/`1`/`yes`/`on`, case-insensitive). Anything else that is

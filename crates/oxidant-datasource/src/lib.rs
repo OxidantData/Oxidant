@@ -474,86 +474,14 @@ fn extract_partition_value(path: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Append Parquet data files to an Iceberg table by writing a new manifest + snapshot metadata.
-pub fn iceberg_append(
-    table_path: &str,
-    relative_path: &str,
-    batches: &[arrow::record_batch::RecordBatch],
-) -> Result<()> {
-    use std::path::Path;
-
-    let base = Path::new(table_path);
-    let data_path = base.join(relative_path);
-    if let Some(parent) = data_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::Io(format!("mkdir {}: {e}", parent.display())))?;
-    }
-    write_parquet(data_path.to_str().unwrap(), batches)?;
-    let meta_dir = base.join("metadata");
-    std::fs::create_dir_all(&meta_dir)
-        .map_err(|e| Error::Io(format!("mkdir {}: {e}", meta_dir.display())))?;
-
-    let version = std::fs::read_dir(&meta_dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-                .count()
-        })
-        .unwrap_or(0) as i64
-        + 1;
-    let manifest = base.join(format!("metadata/snap-{version}.avro"));
-    let data_file = data_path.to_string_lossy();
-    write_avro_manifest(&manifest, &data_file)?;
-    let metadata = serde_json::json!({
-        "format-version": 2,
-        "table-uuid": uuid_simple(),
-        "location": base.to_string_lossy(),
-        "current-snapshot-id": version,
-        "snapshots": [{
-            "snapshot-id": version,
-            "manifest-list": manifest.to_string_lossy(),
-        }]
-    });
-    std::fs::write(
-        meta_dir.join(format!("v{version}.metadata.json")),
-        serde_json::to_string_pretty(&metadata).unwrap(),
-    )
-    .map_err(|e| Error::Io(format!("write metadata: {e}")))?;
-    std::fs::write(meta_dir.join("version-hint.text"), version.to_string())
-        .map_err(|e| Error::Io(format!("write version hint: {e}")))?;
-    Ok(())
-}
-
-fn uuid_simple() -> String {
-    format!("oxidant-{}", std::process::id())
-}
-
-fn write_avro_manifest(path: &std::path::Path, data_file: &str) -> Result<()> {
-    use apache_avro::{types::Value, Schema, Writer};
-    let schema = Schema::parse_str(
-        r#"{"type":"record","name":"manifest_entry","fields":[
-            {"name":"status","type":"int"},
-            {"name":"data_file","type":{"type":"record","name":"data_file","fields":[
-                {"name":"content","type":"int"},
-                {"name":"file_path","type":"string"}]}}]}"#,
-    )
-    .map_err(|e| Error::Io(format!("avro schema: {e}")))?;
-    let mut w = Writer::new(&schema, Vec::new());
-    w.append(Value::Record(vec![
-        ("status".into(), Value::Int(1)),
-        (
-            "data_file".into(),
-            Value::Record(vec![
-                ("content".into(), Value::Int(0)),
-                ("file_path".into(), Value::String(data_file.into())),
-            ]),
-        ),
-    ]))
-    .map_err(|e| Error::Io(format!("avro append: {e}")))?;
-    std::fs::write(path, w.into_inner().unwrap())
-        .map_err(|e| Error::Io(format!("write {}: {e}", path.display())))
-}
-
+// `iceberg_append` lived here: a stub that wrote a hand-rolled two-field Avro manifest with
+// `std::fs` (so no object store), derived snapshot ids by counting files in `metadata/`, and
+// produced metadata no real Iceberg reader would accept. It had no callers and was `pub`, which
+// is the worst combination — an exported function that looks like a supported write path.
+//
+// Iceberg is written by publishing metadata *over* Delta files (`uniform.rs`), which is why a
+// Delta sink with `icebergCompat` yields one copy of the data readable by both. See
+// docs/streaming.md, "Reading one table from any engine".
 // ---- Iceberg -------------------------------------------------------------------------------
 
 #[derive(Clone)]

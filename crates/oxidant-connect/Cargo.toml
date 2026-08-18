@@ -23,6 +23,9 @@ oxidant-catalog-glue = { workspace = true }
 # here rather than in oxidant-catalog-glue so the Glue provider keeps a Glue-only dependency tree.
 oxidant-catalog-lakeformation = { workspace = true }
 oxidant-catalog-rest = { workspace = true }
+# The filesystem/object-store catalog: `spark.sql.catalog.<name>.type=local`. This is what makes
+# a pipeline sink work without AWS — it is the only provider besides Glue with write DDL.
+oxidant-catalog-local = { workspace = true }
 oxidant-loom = { workspace = true }
 oxidant-streaming = { workspace = true }
 oxidant-observability = { workspace = true }

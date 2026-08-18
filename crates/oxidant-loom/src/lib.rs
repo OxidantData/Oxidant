@@ -79,6 +79,10 @@ pub mod progress_pool;
 /// Re-export of the exact `arrow` DataFusion uses, so every crate in the workspace encodes
 /// Arrow IPC against one version (no cross-crate `arrow` mismatch).
 pub use datafusion::arrow;
+// Re-exported so downstream crates (the CLI's pipeline planner) can use DataFusion's own SQL
+// parser without taking a direct `datafusion` dependency and risking a second, incompatible
+// copy of it in the tree.
+pub use datafusion;
 
 use arrow::record_batch::RecordBatch;
 
@@ -3586,6 +3590,18 @@ impl Engine {
                 }
             }
         }
+        // Spark's `CREATE TABLE <catalog>.<db>.<t> USING <fmt> [LOCATION …] [PARTITIONED BY …]
+        // AS SELECT …`. DataFusion's parser rejects `USING` outright, and its CTAS planning has no
+        // seam for a storage format, an explicit location, or partition columns — so the storage
+        // clauses are parsed off here, staged for `catalog_bridge`'s `register_table`, and the
+        // stripped statement is planned normally. Only for names that actually target a registered
+        // external catalog; everything else falls through to the local-warehouse lowerings below.
+        if let Some(ext) = spark_create_table::lower_external_ctas(query)
+            .filter(|e| self.name_targets_external_catalog(&e.name))
+        {
+            self.run_external_ctas(&ext).await?;
+            return Ok(vec![]);
+        }
         // Faithful lowering of Spark's `CREATE TABLE … USING <fmt>` to a real, format-backed
         // `CREATE EXTERNAL TABLE` (genuine durable storage — NOT the forbidden MemTable shim). On
         // success the statement produces no result set, matching Spark's `struct<>`. If the lowered
@@ -3602,7 +3618,7 @@ impl Engine {
                         format: low.format.clone(),
                         comment: low.comment.clone(),
                         properties: low.properties.clone(),
-                        partition_columns: Vec::new(),
+                        partition_columns: low.partition_columns.clone(),
                     },
                 );
                 return Ok(vec![]);
@@ -3627,10 +3643,19 @@ impl Engine {
             // Spark's `spark.sql("INSERT …")` returns an empty DataFrame; DataFusion returns a
             // one-row `count`. Execute the write for its side effects, then drop the count row so
             // the result renders as Spark's `struct<>` + empty.
-            let df = self.plan_spark(query).await?;
+            let statement = self.quote_insert_catalog_segment(query);
+            let df = self.plan_spark(statement.as_ref()).await?;
             df.collect()
                 .await
                 .map_err(|e| Error::Execution(e.to_string()))?;
+            // A catalog-backed table's provider embeds the file list it was resolved with, so an
+            // INSERT that just added files would otherwise be invisible to the next SELECT in this
+            // session — it would be served from the pre-insert snapshot. Local-warehouse
+            // `ListingTable`s re-list on every scan and are unaffected; the eviction is a no-op
+            // for them.
+            if let Some(target) = spark_create_table::insert_target(query) {
+                self.refresh_table(&target).await?;
+            }
             return Ok(vec![]);
         }
         let df = self.plan_spark(query).await?;
@@ -3667,6 +3692,121 @@ impl Engine {
         Ok(())
     }
 
+    /// Backtick the leading segment of an `INSERT` target that names a registered external
+    /// catalog, leaving the statement otherwise byte-identical.
+    ///
+    /// sqlparser consumes `LOCAL` as Hive's `INSERT OVERWRITE LOCAL DIRECTORY` keyword, so
+    /// `INSERT INTO local.live.t` fails at parse for a catalog named `local` — which is the name
+    /// [`docs/config.md`]'s example uses. Quoting makes it an identifier again, and the
+    /// *registered* spelling is substituted so quoting (which makes the identifier
+    /// case-sensitive) cannot change which catalog the statement names. Only the leading segment
+    /// is quoted: quoting the namespace or table would make those case-sensitive too, and a name
+    /// stored lowercase but written uppercase would stop resolving.
+    fn quote_insert_catalog_segment<'a>(&self, query: &'a str) -> std::borrow::Cow<'a, str> {
+        let Some((offset, segment)) = spark_create_table::insert_target_catalog(query) else {
+            return std::borrow::Cow::Borrowed(query);
+        };
+        let registered = self
+            .oxidant_catalogs
+            .lock()
+            .expect("oxidant_catalogs poisoned")
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(&segment))
+            .cloned();
+        match registered {
+            Some(name) => std::borrow::Cow::Owned(format!(
+                "{}`{name}`{}",
+                &query[..offset],
+                &query[offset + segment.len()..]
+            )),
+            None => std::borrow::Cow::Borrowed(query),
+        }
+    }
+
+    /// Run a `CREATE TABLE <catalog>.<db>.<t> USING <fmt> … AS SELECT …` against an external
+    /// catalog: stage the storage attributes the DDL carries, then let DataFusion plan the
+    /// stripped statement, whose `register_table` call lands in
+    /// [`catalog_bridge::register_table_async`] and reads them back.
+    ///
+    /// Clauses that would be silently lost are refused rather than dropped. `OPTIONS(…)` decides
+    /// how a CSV table is even read (`header`, `delimiter`); `COMMENT` / `TBLPROPERTIES` have
+    /// nowhere to go in `CatalogProvider::create_table`. Accepting and discarding any of them
+    /// would produce a table that does not match its own DDL.
+    async fn run_external_ctas(&self, ext: &spark_create_table::ExternalCtas) -> Result<()> {
+        use oxidant_catalog::TableFormat;
+
+        for (clause, present) in [
+            ("OPTIONS", !ext.clauses.options.is_empty()),
+            ("COMMENT", ext.clauses.comment.is_some()),
+            ("TBLPROPERTIES", !ext.clauses.properties.is_empty()),
+        ] {
+            if present {
+                return Err(Error::Unsupported(format!(
+                    "`{clause}` is not yet carried through to an external catalog's \
+                     `CREATE TABLE … AS SELECT`; remove it or create the table in the catalog first"
+                )));
+            }
+        }
+        let format = TableFormat::from_provider(&ext.format).ok_or_else(|| {
+            Error::Unsupported(format!("unsupported table format `{}`", ext.format))
+        })?;
+
+        // `catalog.namespace….table`: the leading segment is DataFusion's own catalog routing, and
+        // the rest is exactly what the schema provider will see when it calls `register_table`.
+        let segments = split_name_segments(&ext.name);
+        let unquote = |s: &&str| s.trim_matches('`').to_string();
+        let table = segments
+            .last()
+            .map(|s| s.trim_matches('`').to_string())
+            .ok_or_else(|| Error::Plan(format!("cannot parse table name `{}`", ext.name)))?;
+        let namespace: Vec<String> = segments[1..segments.len() - 1]
+            .iter()
+            .map(unquote)
+            .collect();
+
+        // Staged on the target catalog's own provider (per session), so two catalogs — or two
+        // sessions — running a CTAS for the same `namespace.table` cannot take each other's
+        // attributes. This is the same downcast `refresh_table` uses to reach the bridge.
+        let catalog_name = segments[0].trim_matches('`');
+        let provider = self
+            .ctx
+            .catalog(catalog_name)
+            .ok_or_else(|| Error::Plan(format!("catalog `{catalog_name}` is not registered")))?;
+        let any: &dyn std::any::Any = provider.as_ref();
+        let bridge = any
+            .downcast_ref::<catalog_bridge::OxidantCatalogProvider>()
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "`CREATE TABLE … USING <fmt> AS SELECT` is not supported for catalog \
+                     `{catalog_name}`"
+                ))
+            })?;
+
+        bridge.set_pending_ctas_attributes(
+            &namespace,
+            &table,
+            catalog_bridge::CtasAttributes {
+                format: Some(format),
+                location: ext.clauses.location.clone(),
+                partition_columns: ext.clauses.partition_columns.clone(),
+            },
+        );
+        let executed = match self.plan_spark(&ext.ddl).await {
+            Ok(df) => df
+                .collect()
+                .await
+                .map(|_| ())
+                .map_err(|e| Error::Execution(e.to_string())),
+            Err(e) => Err(e),
+        };
+        // Whether or not the statement ever reached `register_table`, nothing may be left staged —
+        // a failed `USING delta` must not hand its format to the next plain CTAS of this name.
+        bridge.clear_pending_ctas_attributes(&namespace, &table);
+        executed?;
+        self.note_catalog_change(&ext.name);
+        Ok(())
+    }
+
     /// CTAS: execute SELECT, write result as format files, then CREATE EXTERNAL TABLE.
     async fn run_create_table_ctas(&self, ctas: &spark_create_table::LoweredCtas) -> Result<()> {
         use datafusion::parquet::arrow::ArrowWriter;
@@ -3684,24 +3824,74 @@ impl Engine {
             .await
             .map_err(|e| Error::Execution(e.to_string()))?;
 
+        // The writer has to match the format the DDL is about to declare. It used to be an
+        // `ArrowWriter` unconditionally while only the *extension* followed `ctas.fmt`, so
+        // `CREATE TABLE t USING csv AS SELECT ...` wrote Parquet bytes into `part-00000.csv`
+        // and then registered the table as `STORED AS CSV`. Nothing failed at write time; the
+        // table simply could not be read back.
         let ext = match ctas.fmt.as_str() {
             "json" => "json",
             "csv" => "csv",
-            _ => "parquet",
+            "parquet" => "parquet",
+            // `orc` parses as a Spark format but Oxidant can neither write nor read it, and
+            // silently substituting Parquet under an `.orc` name is how this bug started.
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "CREATE TABLE ... USING {other} AS SELECT is not supported \
+                     (writable formats: parquet, csv, json)"
+                )))
+            }
         };
         let file = ctas.table_dir.join(format!("part-00000.{ext}"));
         let f = std::fs::File::create(&file).map_err(|e| Error::Execution(e.to_string()))?;
-        let mut writer = ArrowWriter::try_new(f, stream.schema(), None)
-            .map_err(|e| Error::Execution(e.to_string()))?;
-        while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|e| Error::Execution(e.to_string()))?;
-            writer
-                .write(&batch)
-                .map_err(|e| Error::Execution(e.to_string()))?;
+        // Each arm streams: at most one record batch is held at a time, so a
+        // `CREATE TABLE ... AS SELECT * FROM bigtable` does not buffer the source in driver RAM.
+        match ctas.fmt.as_str() {
+            "csv" => {
+                let mut writer = arrow::csv::Writer::new(f);
+                while let Some(batch) = stream.next().await {
+                    let batch = batch.map_err(|e| Error::Execution(e.to_string()))?;
+                    writer
+                        .write(&batch)
+                        .map_err(|e| Error::Execution(e.to_string()))?;
+                }
+                // The JSON arm has `finish()` and the Parquet arm has `close()`; the CSV writer
+                // has neither, and its inner `csv::Writer` flushes on drop with the result
+                // *discarded*. A failure on that last flush — disk full, closed pipe — would
+                // otherwise leave a truncated file while this goes on to register the table and
+                // report success. Take the file back and flush it where the error can be seen.
+                let mut f = writer.into_inner();
+                std::io::Write::flush(&mut f)
+                    .map_err(|e| Error::Execution(format!("flush `{}`: {e}", file.display())))?;
+            }
+            "json" => {
+                // Newline-delimited, which is what DataFusion's JSON reader expects — a single
+                // JSON array would write cleanly and then fail to scan.
+                let mut writer = arrow::json::LineDelimitedWriter::new(f);
+                while let Some(batch) = stream.next().await {
+                    let batch = batch.map_err(|e| Error::Execution(e.to_string()))?;
+                    writer
+                        .write(&batch)
+                        .map_err(|e| Error::Execution(e.to_string()))?;
+                }
+                writer
+                    .finish()
+                    .map_err(|e| Error::Execution(e.to_string()))?;
+            }
+            _ => {
+                let mut writer = ArrowWriter::try_new(f, stream.schema(), None)
+                    .map_err(|e| Error::Execution(e.to_string()))?;
+                while let Some(batch) = stream.next().await {
+                    let batch = batch.map_err(|e| Error::Execution(e.to_string()))?;
+                    writer
+                        .write(&batch)
+                        .map_err(|e| Error::Execution(e.to_string()))?;
+                }
+                writer
+                    .close()
+                    .map_err(|e| Error::Execution(e.to_string()))?;
+            }
         }
-        writer
-            .close()
-            .map_err(|e| Error::Execution(e.to_string()))?;
 
         let ddl = normalize_spark_sql(&ctas.ddl);
         self.ctx

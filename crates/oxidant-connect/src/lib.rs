@@ -414,7 +414,18 @@ impl OxidantService {
                          queries against it will fail rather than read unfiltered"
                     );
                 }
-                Err(_) => {}
+                // Not fatal — one bad catalog must not take down a session that also declared
+                // good ones — but never silent either. Dropped without a word, the only symptom
+                // is "catalog `x` is not registered" from whatever query touches it next, which
+                // reads like a typo in the query rather than a catalog that failed to start.
+                Err(e) => {
+                    tracing::warn!(
+                        catalog = %name,
+                        error = %e,
+                        "catalog failed to build; it is NOT registered and queries against it \
+                         will fail with `not registered`"
+                    );
+                }
             }
         }
         if let Some(def) = snapshot.get("spark.sql.defaultCatalog") {
