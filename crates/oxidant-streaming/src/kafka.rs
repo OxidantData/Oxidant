@@ -660,11 +660,18 @@ impl KafkaSource {
 
     /// Read the one file `range` names, numbering its records from the offset the range fixed.
     fn read_spool(&mut self, range: &BatchRange) -> Result<Vec<KafkaRecord>> {
-        let dir = self
-            .options
-            .spool_dir
-            .clone()
-            .expect("spool_mode() checked spool_dir is set");
+        // Not an `expect`: `poll_range` dispatches on the *recorded* range's source, not on the
+        // source's current mode. A query switched from the offline spool to a real broker while
+        // keeping its checkpoint replays a spool-shaped range with no spool directory
+        // configured, and that has to be an error rather than a panic.
+        let Some(dir) = self.options.spool_dir.clone() else {
+            return Err(Error::Plan(
+                "this batch was recorded against the offline spool, but no spool directory is \
+                 configured now — set `oxidant.spool.dir` (or OXIDANT_KAFKA_SPOOL) to finish it, \
+                 or start the query from a fresh checkpoint"
+                    .into(),
+            ));
+        };
         std::fs::create_dir_all(&dir)
             .map_err(|e| Error::Io(format!("kafka spool: mkdir {}: {e}", dir.display())))?;
         let topic = self.options.topics.first().cloned().unwrap_or_default();
@@ -1058,6 +1065,39 @@ mod tests {
             .as_primitive::<Int64Type>()
             .values()
             .to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_spool_range_replayed_without_a_spool_directory_errors_rather_than_panicking() {
+        // `poll_range` dispatches on the recorded range's source, not on the source's current
+        // mode — so a query switched from the offline spool to a broker while keeping its
+        // checkpoint reaches the spool reader with no spool directory set.
+        let engine = Engine::new();
+        let mut broker = KafkaSource::from_options(&opts(&[
+            ("kafka.bootstrap.servers", "localhost:9092"),
+            ("subscribe", "orders"),
+        ]))
+        .unwrap();
+        let recorded = BatchRange {
+            source: SPOOL_SOURCE.into(),
+            start: [
+                (SPOOL_FILE_KEY.to_string(), 0),
+                (SPOOL_OFFSET_KEY.to_string(), 0),
+            ]
+            .into(),
+            end: [
+                (SPOOL_FILE_KEY.to_string(), 1),
+                (SPOOL_OFFSET_KEY.to_string(), 2),
+            ]
+            .into(),
+            items: vec![],
+        };
+
+        let err = broker
+            .poll_range(&engine, &recorded)
+            .await
+            .expect_err("there is no spool directory to read");
+        assert!(err.to_string().contains("spool"), "{err}");
     }
 
     #[tokio::test]

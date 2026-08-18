@@ -356,6 +356,48 @@ async fn partitioning_a_non_delta_table_is_refused_rather_than_written_flat() {
 }
 
 #[tokio::test]
+async fn a_ctas_whose_write_fails_does_not_leave_a_table_behind() {
+    // The catalog entry is created before the data is written. If the write fails and the entry
+    // stayed, the statement would be un-retryable in a way the user cannot clear: `CREATE TABLE`
+    // reports the table already exists, and no SQL path reaches `DROP TABLE` to remove it.
+    let warehouse = tempfile::TempDir::new().expect("tempdir");
+    let engine = engine_with_live_db(warehouse.path()).await;
+
+    // A location that passes every pre-flight check — it exists, and it is a directory — but
+    // that the writer cannot actually write into. The failure has to land *after* the catalog
+    // entry is created, which is the window this test is about.
+    let blocked = warehouse.path().join("blocked");
+    std::fs::create_dir_all(&blocked).expect("mkdir");
+    let mut perms = std::fs::metadata(&blocked).expect("metadata").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+    std::fs::set_permissions(&blocked, perms).expect("chmod");
+
+    let write_error = engine
+        .sql(&format!(
+            "CREATE TABLE lake.live.blocked_ctas USING delta LOCATION '{}/' AS SELECT 1 AS id",
+            blocked.display()
+        ))
+        .await
+        .expect_err("the write cannot succeed")
+        .to_string();
+
+    // Asked of the catalog directly, not through a `SELECT`: a query against the half-created
+    // table fails either way — because it is absent, or because it is registered and its data is
+    // not there — so a failing `SELECT` proves nothing about which happened.
+    let registered = engine
+        .external_catalog("lake")
+        .expect("the local catalog is registered")
+        .table_exists(&["live".to_string()], "blocked_ctas")
+        .await
+        .expect("catalog lookup");
+    assert!(
+        !registered,
+        "the failed CTAS left `blocked_ctas` in the catalog with no data behind it, and no SQL \
+         path can drop it (write error was: {write_error})"
+    );
+}
+
+#[tokio::test]
 async fn insert_into_a_partitioned_parquet_table_is_refused() {
     // The reader derives partition values from the directory path, so a flat single-file write
     // would come back with wrong or missing partition columns on every row.

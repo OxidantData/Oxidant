@@ -445,7 +445,10 @@ impl StreamingQueryManager {
             // last good version" means: the batch's range stays in the offset log uncommitted,
             // so fixing the data and retrying replays exactly these records.
             for expectation in &rt.expectations {
-                let violations = count_violations(engine, &batches, &expectation.check).await?;
+                let query_id = q.state.read().await.query_id.id.clone();
+                let violations =
+                    count_violations(engine, &batches, &expectation.check, &query_id, batch_id)
+                        .await?;
                 if violations == 0 {
                     continue;
                 }
@@ -537,12 +540,12 @@ impl StreamingQueryManager {
             checkpoint.watermark_micros = wm.watermark_for(max);
         }
         checkpoint.dedup_state = rt.dedup.clone();
-        // A checkpoint that cannot be written is not cosmetic: without it a restart re-reads from
-        // wherever the last successful save left off, so the failure has to reach the user.
         checkpoint.pruned_through = q
             .checkpoint
             .prune_log(checkpoint.pruned_through, batch_id)
             .await;
+        // A checkpoint that cannot be written is not cosmetic: without it a restart re-reads from
+        // wherever the last successful save left off, so the failure has to reach the user.
         q.checkpoint.save(&checkpoint).await.map_err(|e| {
             Error::Io(format!(
                 "streaming checkpoint `{}`: {e}",
@@ -648,7 +651,13 @@ impl Default for StreamingQueryManager {
 /// `IS NOT TRUE` rather than `NOT (check)`: a null column makes the comparison null, and `NOT
 /// null` is null, so a row of nulls would count as neither passing nor failing — which is how a
 /// column that is entirely null sails through a quality gate.
-async fn count_violations(engine: &Engine, batches: &[RecordBatch], check: &str) -> Result<u64> {
+async fn count_violations(
+    engine: &Engine,
+    batches: &[RecordBatch],
+    check: &str,
+    query_id: &str,
+    batch_id: u64,
+) -> Result<u64> {
     use datafusion::datasource::MemTable;
 
     let Some(first) = batches.first() else {
@@ -656,17 +665,21 @@ async fn count_violations(engine: &Engine, batches: &[RecordBatch], check: &str)
     };
     let table = MemTable::try_new(first.schema(), vec![batches.to_vec()])
         .map_err(|e| Error::Execution(format!("expectation `{check}`: {e}")))?;
-    // A name no user table can collide with, deregistered before returning either way.
-    let name = "_oxidant_expect_batch";
+    // Unique per query and batch, not a fixed name. The Connect path spawns a task per
+    // streaming query and they all share one session, so a constant name means two queries
+    // running a counted expectation at the same time collide: the second registration fails, or
+    // one deregisters the table the other is still reading.
+    let name = format!("_oxidant_expect_{query_id}_{batch_id}");
+    let name = name.replace('-', "_");
     let ctx = engine.ctx();
-    ctx.register_table(name, Arc::new(table))
+    ctx.register_table(&name, Arc::new(table))
         .map_err(|e| Error::Execution(format!("expectation `{check}`: {e}")))?;
     let counted = engine
         .sql(&format!(
             "SELECT count(*) AS c FROM {name} WHERE ({check}) IS NOT TRUE"
         ))
         .await;
-    let _ = ctx.deregister_table(name);
+    let _ = ctx.deregister_table(&name);
     let rows = counted?;
     Ok(rows
         .first()
@@ -1161,6 +1174,63 @@ mod tests {
             count, 3,
             "two records from the committed batch, one from the file that arrived after it — \
              nothing lost to the replay, nothing written twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_queries_can_evaluate_expectations_at_the_same_time() {
+        // The Connect path spawns a task per streaming query and they share one session, so a
+        // fixed staging-table name means two queries counting violations concurrently collide:
+        // the second registration fails, or one deregisters the table the other is reading.
+        let engine = Engine::new();
+        let schema = Arc::new(oxidant_loom::arrow::datatypes::Schema::new(vec![
+            oxidant_loom::arrow::datatypes::Field::new(
+                "amount",
+                oxidant_loom::arrow::datatypes::DataType::Int64,
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(oxidant_loom::arrow::array::Int64Array::from(
+                vec![-1, 5, -3],
+            ))],
+        )
+        .unwrap();
+
+        let batches = [batch];
+        let (first, second) = tokio::join!(
+            count_violations(&engine, &batches, "amount > 0", "query-a", 7),
+            count_violations(&engine, &batches, "amount > 0", "query-b", 7),
+        );
+        assert_eq!(first.unwrap(), 2);
+        assert_eq!(second.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_null_check_counts_as_a_violation() {
+        // `NOT (check)` would miss this: a null column makes the comparison null, and `NOT null`
+        // is null — so a column that is entirely null sails through the gate.
+        let engine = Engine::new();
+        let schema = Arc::new(oxidant_loom::arrow::datatypes::Schema::new(vec![
+            oxidant_loom::arrow::datatypes::Field::new(
+                "amount",
+                oxidant_loom::arrow::datatypes::DataType::Int64,
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(oxidant_loom::arrow::array::Int64Array::from(
+                vec![None, Some(5)],
+            ))],
+        )
+        .unwrap();
+        assert_eq!(
+            count_violations(&engine, &[batch], "amount > 0", "q", 1)
+                .await
+                .unwrap(),
+            1
         );
     }
 

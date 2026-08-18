@@ -1047,6 +1047,14 @@ async fn register_table_async(
     let (schema, batches) = extract_mem_table_data(&table).await?;
     let format = attributes.format.unwrap_or(TableFormat::Parquet);
 
+    // Whether the table was already in the catalog, so the cleanup below only removes what this
+    // statement created. `create_table` overwrites an existing entry rather than refusing one, so
+    // an unconditional drop on failure would delete a table that was here before.
+    let existed = catalog
+        .table_exists(&namespace, &name)
+        .await
+        .unwrap_or(false);
+
     let metadata = catalog
         .create_table(
             &namespace,
@@ -1060,7 +1068,7 @@ async fn register_table_async(
         .map_err(oxidant_to_df)?;
 
     let state = ctx.state();
-    write_batches_to_location(
+    if let Err(error) = write_batches_to_location(
         &state,
         &metadata.location,
         metadata.format,
@@ -1069,7 +1077,26 @@ async fn register_table_async(
         &metadata.storage_options,
         &metadata.partition_columns,
     )
-    .await?;
+    .await
+    {
+        // The catalog entry is registered but its data is not there. Leaving it would make the
+        // statement un-retryable in a way the user cannot clear: `CREATE TABLE` then reports the
+        // table already exists, and no SQL path reaches `DROP TABLE` to remove it — so the only
+        // recovery would be editing the catalog manifest by hand.
+        //
+        // Best-effort, and the write's error is what propagates: a failure to clean up must not
+        // replace the message explaining why the write failed.
+        if !existed {
+            if let Err(cleanup) = catalog.drop_table(&namespace, &name, true).await {
+                eprintln!(
+                    "[oxidant] `{}` was registered but its data could not be written, and the \
+                     registration could not be undone ({cleanup}); drop it before retrying",
+                    metadata.name
+                );
+            }
+        }
+        return Err(error);
+    }
 
     Ok(metadata_to_provider(&state, &metadata, &name, false)
         .await?
