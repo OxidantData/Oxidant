@@ -25,6 +25,9 @@ futures = "0.3.33"
 url = "2.5.8"
 serde = { version = "1.0.229", features = ["derive"] }
 bytes = "1.12.1"
+# Iceberg manifests are written through iceberg-rust's own FileIO, which this build only has a
+# local backend for; they are staged here and uploaded through the engine's ObjectStore.
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"

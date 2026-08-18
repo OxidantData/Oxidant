@@ -29,7 +29,14 @@ No CLI binary or extra env wiring is needed on the server. (The Docker image and
 bundle AWS CLI v2 for operator scripts; the engine itself no longer uses it.)
 
 **Region precedence:** the `spark.sql.catalog.glue.region` option → `AWS_REGION` →
-`AWS_DEFAULT_REGION` → `us-west-2`.
+`AWS_DEFAULT_REGION` → the shared profile's `region` (`~/.aws/config`, honouring `AWS_PROFILE`) →
+EC2 instance metadata → `us-west-2`.
+
+That last step is a legacy fallback, not a default worth relying on: reaching it means no region is
+configured anywhere. A wrong region is invisible in a way a wrong credential is not — the client
+builds fine and talks to the wrong regional endpoint, so it surfaces as a missing database or a
+bucket that "does not exist" rather than as a configuration error. The same chain resolves the
+region for the S3 object store and the Lake Formation client, so all three agree.
 
 ## Configure
 

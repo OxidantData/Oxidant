@@ -475,7 +475,11 @@ impl OxidantSchemaProvider {
             .or_else(|| md.storage_options.get("fs.s3a.endpoint.region"))
             .cloned()
             .unwrap_or_else(|| {
-                std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string())
+                // The same ambient chain the ambient store uses, so a governed table cannot end up
+                // in a different region than its ungoverned neighbours in the same bucket.
+                oxidant_catalog::aws_region::ambient_region().unwrap_or_else(|| {
+                    oxidant_catalog::aws_region::LEGACY_FALLBACK_REGION.to_string()
+                })
             });
         let credential_provider = Arc::new(
             crate::lakeformation_store::LakeFormationCredentialProvider::new(
@@ -555,16 +559,7 @@ fn apply_s3_storage_options(
     options: &HashMap<String, String>,
 ) -> object_store::aws::AmazonS3Builder {
     for (key, value) in options {
-        let normalized = match key.as_str() {
-            "s3.access-key-id" | "fs.s3a.access.key" => "access_key_id",
-            "s3.secret-access-key" | "fs.s3a.secret.key" => "secret_access_key",
-            "s3.session-token" | "fs.s3a.session.token" => "session_token",
-            "s3.endpoint" | "fs.s3a.endpoint" => "endpoint",
-            "s3.region" | "fs.s3a.endpoint.region" => "region",
-            "s3.allow-http" => "allow_http",
-            "s3.virtual-hosted-style-request" => "virtual_hosted_style_request",
-            other => other.strip_prefix("s3.").unwrap_or(other),
-        };
+        let normalized = normalize_s3_config_key(key);
         if let Ok(config_key) = normalized.parse::<object_store::aws::AmazonS3ConfigKey>() {
             builder = builder.with_config(config_key, value);
         }
@@ -1309,7 +1304,78 @@ static REGISTERED_BUCKET_ROLES: std::sync::Mutex<Option<HashMap<String, Option<S
 /// guarantee that the session's registered store for this bucket matches `storage_options`, not
 /// just "some store exists for this bucket." See `REGISTERED_BUCKET_ROLES`'s doc comment for why
 /// that guarantee needs an explicit check instead of being automatic.
-fn ensure_remote_store(
+/// Map a table's storage-option key to the `object_store` config key it means.
+///
+/// The accepted spellings are the real Iceberg (`s3.*`) and Hadoop-AWS (`fs.s3a.*`) names, not
+/// Oxidant-invented equivalents, so a config ported from Spark or Trino works unchanged.
+///
+/// Iceberg spells its properties with hyphens and `object_store` parses only underscores, so the
+/// fallback converts them. Without that, any `s3.*` key outside the explicit list above parses as
+/// nothing and is **silently dropped** — the setting looks applied and simply is not.
+fn normalize_s3_config_key(key: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match key {
+        "s3.access-key-id" | "fs.s3a.access.key" => Cow::Borrowed("access_key_id"),
+        "s3.secret-access-key" | "fs.s3a.secret.key" => Cow::Borrowed("secret_access_key"),
+        "s3.session-token" | "fs.s3a.session.token" => Cow::Borrowed("session_token"),
+        "s3.endpoint" | "fs.s3a.endpoint" => Cow::Borrowed("endpoint"),
+        "s3.region" | "fs.s3a.endpoint.region" => Cow::Borrowed("region"),
+        "s3.allow-http" => Cow::Borrowed("allow_http"),
+        "s3.virtual-hosted-style-request" => Cow::Borrowed("virtual_hosted_style_request"),
+        other => match other.strip_prefix("s3.") {
+            Some(rest) if rest.contains('-') => Cow::Owned(rest.replace('-', "_")),
+            Some(rest) => Cow::Borrowed(rest),
+            None => Cow::Borrowed(other),
+        },
+    }
+}
+
+/// Does this (already normalized) config key state *who the table is* to S3?
+///
+/// Such a key has to outrank the ambient default credential chain: a table carrying its own keys
+/// means them, one naming a web-identity token or container endpoint means that identity, and
+/// `skip_signature` means the bucket is public and must be read unsigned — which attaching any
+/// credential provider at all would break.
+///
+/// `object_store` accepts every one of these both bare and `aws_`-prefixed, so match on the bare
+/// form after stripping the prefix. Missing an alias here is not a cosmetic slip: it would let the
+/// ambient chain silently override the identity the table explicitly asked for.
+fn pins_s3_identity(normalized_key: &str) -> bool {
+    matches!(
+        normalized_key
+            .strip_prefix("aws_")
+            .unwrap_or(normalized_key),
+        "access_key_id"
+            | "secret_access_key"
+            | "session_token"
+            | "token"
+            | "skip_signature"
+            | "web_identity_token_file"
+            | "role_arn"
+            | "role_session_name"
+            | "container_credentials_relative_uri"
+            | "container_credentials_full_uri"
+            | "container_authorization_token_file"
+    )
+}
+
+/// Should this store resolve credentials through the AWS default chain
+/// ([`crate::default_credentials::DefaultChainCredentialProvider`])?
+///
+/// Only when the table has not said who it is. Attaching the chain on top of an explicit identity
+/// would override it — silently, and with the *ambient* identity, which is the worst way to get
+/// this wrong. `fs.s3a.assumed.role.arn` is handled before this is consulted and takes its own
+/// branch.
+fn should_use_default_chain(storage_options: Option<&HashMap<String, String>>) -> bool {
+    match storage_options {
+        None => true,
+        Some(options) => !options
+            .keys()
+            .any(|key| pins_s3_identity(&normalize_s3_config_key(key))),
+    }
+}
+
+pub(crate) fn ensure_remote_store(
     state: &SessionState,
     url: &datafusion::datasource::listing::ListingTableUrl,
     storage_options: Option<&HashMap<String, String>>,
@@ -1357,7 +1423,12 @@ fn ensure_remote_store(
         };
     }
 
-    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
+    // `AWS_REGION`, then `AWS_DEFAULT_REGION`, then the shared profile, then IMDS — the order the
+    // AWS CLI uses. This used to read `AWS_REGION` alone and hardcode `us-west-2` otherwise, which
+    // also meant it *overwrote* whatever `from_env` had resolved above. A table's own `s3.region`
+    // still wins: it is applied to the builder after this.
+    let region = oxidant_catalog::aws_region::ambient_region()
+        .unwrap_or_else(|| oxidant_catalog::aws_region::LEGACY_FALLBACK_REGION.to_string());
     let mut builder = object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(&bucket)
         .with_region(region.clone());
@@ -1375,6 +1446,15 @@ fn ensure_remote_store(
             session_name,
             region,
         );
+        builder = builder.with_credentials(std::sync::Arc::new(provider));
+    } else if should_use_default_chain(storage_options) {
+        // Nothing pinned this table's identity, so resolve it the way the AWS CLI does — through
+        // the full default chain, which is a superset of what `from_env` alone covers and adds the
+        // shared profile (`~/.aws/credentials`, SSO, `credential_process`). Env vars, IRSA, ECS,
+        // and IMDS keep their existing precedence because the chain checks them in that same
+        // order; the only behaviour that changes is that a profile is now found instead of the
+        // request falling through to the instance-metadata endpoint and failing there.
+        let provider = crate::default_credentials::DefaultChainCredentialProvider::new(region);
         builder = builder.with_credentials(std::sync::Arc::new(provider));
     }
     match builder.build() {
@@ -2634,6 +2714,118 @@ fn oxidant_to_df(e: Error) -> DataFusionError {
 
 #[cfg(test)]
 mod tests {
+    /// Credential resolution order. The default chain is only reached when the table has *not*
+    /// stated who it is — otherwise a table carrying its own keys, or a public bucket read
+    /// unsigned, would silently get the ambient identity instead.
+    #[test]
+    fn a_table_that_states_its_own_s3_identity_outranks_the_default_chain() {
+        for key in [
+            "s3.access-key-id",
+            "fs.s3a.access.key",
+            "s3.secret-access-key",
+            "fs.s3a.secret.key",
+            "s3.session-token",
+            "fs.s3a.session.token",
+            "s3.skip-signature",
+            // `object_store` accepts an `aws_`-prefixed alias for every key. Missing one here
+            // would let the ambient chain override the identity the table asked for.
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+            "aws_skip_signature",
+            // IRSA and the ECS container endpoint name an identity just as much as a key pair.
+            "aws_web_identity_token_file",
+            "web_identity_token_file",
+            "aws_role_arn",
+            "container_credentials_full_uri",
+        ] {
+            assert!(
+                pins_s3_identity(&normalize_s3_config_key(key)),
+                "`{key}` states an S3 identity and must outrank the default chain"
+            );
+        }
+        // Everything else describes *where* the bucket is, not who we are, so it must leave the
+        // credential chain in play.
+        for key in [
+            "s3.endpoint",
+            "fs.s3a.endpoint",
+            "s3.region",
+            "fs.s3a.endpoint.region",
+            "s3.allow-http",
+            "s3.virtual-hosted-style-request",
+        ] {
+            assert!(
+                !pins_s3_identity(&normalize_s3_config_key(key)),
+                "`{key}` is not an identity and must not suppress the default chain"
+            );
+        }
+    }
+
+    /// The wiring decision itself: which tables actually reach the default credential chain.
+    /// `pins_s3_identity` being right is only half of it — this is the call site's behaviour.
+    #[test]
+    fn the_default_chain_is_used_exactly_when_the_table_names_no_identity() {
+        let opts = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+
+        // A table with no storage options at all — the overwhelmingly common case, and the one
+        // that used to fall through to the instance-metadata endpoint on a developer machine.
+        assert!(should_use_default_chain(None));
+        assert!(should_use_default_chain(Some(&opts(&[]))));
+
+        // Options that describe *where* the bucket is leave the chain in play.
+        assert!(should_use_default_chain(Some(&opts(&[
+            ("s3.endpoint", "https://s3.example"),
+            ("s3.region", "eu-west-1"),
+            ("s3.allow-http", "true"),
+        ]))));
+
+        // Anything naming an identity takes over completely.
+        for pinned in [
+            vec![("s3.access-key-id", "AKIA"), ("s3.secret-access-key", "s")],
+            vec![("fs.s3a.access.key", "AKIA")],
+            vec![("aws_session_token", "t")],
+            vec![("s3.skip-signature", "true")],
+            vec![("aws_web_identity_token_file", "/var/run/token")],
+            // Mixed with location options, the identity still wins.
+            vec![
+                ("s3.endpoint", "https://s3.example"),
+                ("s3.access-key-id", "AKIA"),
+            ],
+        ] {
+            assert!(
+                !should_use_default_chain(Some(&opts(&pinned))),
+                "`{pinned:?}` names an identity, so the ambient chain must not override it"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_option_keys_normalize_to_object_store_config_keys() {
+        for (key, expected) in [
+            ("s3.access-key-id", "access_key_id"),
+            ("fs.s3a.access.key", "access_key_id"),
+            ("s3.secret-access-key", "secret_access_key"),
+            ("fs.s3a.secret.key", "secret_access_key"),
+            ("s3.endpoint", "endpoint"),
+            ("s3.region", "region"),
+            // An unprefixed key passes through unchanged.
+            ("access_key_id", "access_key_id"),
+            // Iceberg spells properties with hyphens; object_store parses only underscores. A key
+            // outside the explicit list above still has to survive the trip, or it is silently
+            // dropped and the setting never takes effect.
+            ("s3.skip-signature", "skip_signature"),
+            ("s3.checksum-algorithm", "checksum_algorithm"),
+            ("s3.request-payer", "request_payer"),
+        ] {
+            assert_eq!(normalize_s3_config_key(key), expected, "key `{key}`");
+        }
+    }
+
     use super::*;
     use datafusion::arrow::array::{Int32Array, Int64Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};

@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Field, SchemaRef};
 
 /// Shared Hive/Glue type-string → Arrow schema mapping (used by the Hive and Glue providers).
+pub mod aws_region;
 pub mod hive_types;
 // Re-exported so external `CatalogProvider` implementors (e.g. `oxidant-catalog-glue`) can build the
 // `TableMetadata.schema` from arrow types using the *same* arrow version the engine embeds, without

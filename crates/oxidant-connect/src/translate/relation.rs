@@ -4,15 +4,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder, SortExpr};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::unparser::Unparser;
 use oxidant_proto::spark::connect as sc;
 use tonic::Status;
 
-use super::expr::{is_wildcard, to_expr};
+use super::expr::{star_target, to_expr};
 use super::inval;
 
 type PlanFuture<'a> = Pin<Box<dyn Future<Output = Result<LogicalPlan, Status>> + Send + 'a>>;
@@ -168,7 +170,9 @@ fn rel_name(rt: &sc::relation::RelType) -> &'static str {
 }
 
 async fn read(ctx: &SessionContext, r: &sc::Read) -> Result<LogicalPlan, Status> {
-    let _is_streaming = r.is_streaming;
+    if r.is_streaming {
+        return streaming_read(ctx, r).await;
+    }
     match r.read_type.as_ref().ok_or_else(|| inval("empty read"))? {
         sc::read::ReadType::NamedTable(t) => ctx
             .table(&t.unparsed_identifier)
@@ -244,13 +248,76 @@ fn project_exprs(
 ) -> Result<Vec<Expr>, Status> {
     let mut out = Vec::with_capacity(exprs.len());
     for e in exprs {
-        if is_wildcard(e) {
-            out.extend(input.schema().columns().into_iter().map(Expr::Column));
-        } else {
-            out.push(to_expr(ctx, e, None)?);
+        match star_target(e) {
+            Some(None) => out.extend(input.schema().columns().into_iter().map(Expr::Column)),
+            Some(Some(target)) => out.extend(expand_star_target(input, target)?),
+            None => out.push(to_expr(ctx, e, None)?),
         }
     }
     Ok(out)
+}
+
+/// Expand a targeted star — `t.*` or `payload.*` — against the input schema.
+///
+/// Spark overloads one syntax for two expansions, and which one applies depends on what the name
+/// resolves to: a relation qualifier gives that relation's columns, while a struct column gives
+/// that struct's fields as top-level columns. `df.select("payload.*")` after a `from_json` is the
+/// second, and it is the ordinary way to flatten a parsed payload.
+fn expand_star_target(input: &LogicalPlan, target: &str) -> Result<Vec<Expr>, Status> {
+    let schema = input.schema();
+
+    // A relation qualifier first: `t.*` must keep meaning "every column of t" even if some other
+    // column happens to be a struct named `t`.
+    let qualified: Vec<Expr> = schema
+        .columns()
+        .into_iter()
+        .filter(|c| c.relation.as_ref().is_some_and(|r| r.table() == target))
+        .map(Expr::Column)
+        .collect();
+    if !qualified.is_empty() {
+        return Ok(qualified);
+    }
+
+    // Otherwise a struct column, possibly nested (`a.b.*`). Walk the dotted path so each step is
+    // either a column name or a field of the struct reached so far.
+    let mut parts = target.split('.');
+    let head = parts.next().unwrap_or(target);
+    let column = schema
+        .columns()
+        .into_iter()
+        .find(|c| c.name() == head)
+        .ok_or_else(|| inval(format!("`{target}.*`: no column named `{head}`")))?;
+    let idx = schema
+        .index_of_column(&column)
+        .map_err(|e| inval(format!("`{target}.*`: {e}")))?;
+    let mut dt = schema.field(idx).data_type().clone();
+    let mut base = Expr::Column(column);
+    for part in parts {
+        let DataType::Struct(fields) = &dt else {
+            return Err(inval(format!(
+                "`{target}.*`: `{part}` is not a field — the value it is read from is {dt}, not a struct"
+            )));
+        };
+        let field = fields
+            .iter()
+            .find(|f| f.name() == part)
+            .ok_or_else(|| inval(format!("`{target}.*`: no field named `{part}`")))?
+            .clone();
+        base = get_field(base, part);
+        dt = field.data_type().clone();
+    }
+
+    let DataType::Struct(fields) = &dt else {
+        return Err(inval(format!(
+            "`{target}.*`: `{target}` is {dt}, not a struct — `.*` only expands a struct or a relation"
+        )));
+    };
+    // Alias each field to its bare name, which is what Spark's expansion produces: the point of
+    // `payload.*` is that the fields stop being nested.
+    Ok(fields
+        .iter()
+        .map(|f| get_field(base.clone(), f.name()).alias(f.name()))
+        .collect())
 }
 
 async fn aggregate(ctx: &SessionContext, a: &sc::Aggregate) -> Result<LogicalPlan, Status> {
@@ -1012,33 +1079,93 @@ fn plan_err(e: datafusion::error::DataFusionError) -> Status {
     Status::invalid_argument(format!("plan: {e}"))
 }
 
+/// The `(format, options)` of a streaming `Read` — `readStream.format(f).option(k, v)`.
+pub type StreamingReadSpec = (String, std::collections::BTreeMap<String, String>);
+
+/// Extract the streaming read's format and options from a `Read` node.
+pub fn streaming_read_spec(r: &sc::Read) -> Result<StreamingReadSpec, Status> {
+    let Some(sc::read::ReadType::DataSource(d)) = r.read_type.as_ref() else {
+        return Err(Status::unimplemented(
+            "readStream only supports `.format(...).load()`, not `.table(...)`",
+        ));
+    };
+    let format = d.format.clone().unwrap_or_default();
+    let mut options: std::collections::BTreeMap<String, String> = d
+        .options
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    // `readStream.format("json").load(path)` puts the path outside the option map; the sources
+    // read it from the options, so fold it in rather than losing it.
+    if let Some(path) = d.paths.first() {
+        options.entry("path".to_string()).or_insert(path.clone());
+    }
+    Ok((format, options))
+}
+
+/// Lower a streaming `Read` to a scan of its micro-batch input table.
+///
+/// A Structured Streaming DataFrame is planned once and re-executed per batch, so the leaf has to
+/// be a table whose *contents* the query manager can swap without rebuilding the plan — see
+/// `oxidant_streaming::input`. The input is keyed by the read's format and options so this
+/// translator and the `WriteStreamOperationStart` handler independently land on the same one.
+async fn streaming_read(ctx: &SessionContext, r: &sc::Read) -> Result<LogicalPlan, Status> {
+    let (format, options) = streaming_read_spec(r)?;
+    let schema = oxidant_streaming::source_schema(&oxidant_streaming::StreamQueryConfig {
+        source_format: format.clone(),
+        source_options: options.clone(),
+        ..Default::default()
+    })
+    .map_err(|e| inval(format!("readStream.format(`{format}`): {e}")))?;
+
+    let input = oxidant_streaming::stream_input(&format, &options, schema)
+        .map_err(|e| inval(format!("streaming input: {e}")))?;
+    if !ctx.table_exist(input.name()).unwrap_or(false) {
+        ctx.register_table(input.name(), input.provider())
+            .map_err(|e| inval(format!("register streaming input: {e}")))?;
+    }
+
+    ctx.table(input.name())
+        .await
+        .map_err(|e| inval(format!("streaming input `{}`: {e}", input.name())))?
+        .into_unoptimized_plan()
+        .pipe(Ok)
+}
+
 /// Returns true when the relation tree contains a streaming read.
 pub fn relation_is_streaming(rel: &sc::Relation) -> bool {
+    find_streaming_read(rel).is_some()
+}
+
+/// Find the streaming `Read` at the bottom of a relation tree.
+///
+/// The writer side of a streaming query (`WriteStreamOperationStart`) carries the *sink's* format
+/// and options, not the source's — the source is only described here, at the leaf. This is what
+/// lets the query manager build the right source for a
+/// `readStream.format("kafka")…writeStream.format("delta")` pipeline.
+pub fn find_streaming_read(rel: &sc::Relation) -> Option<&sc::Read> {
     use sc::relation::RelType;
-    let Some(rt) = rel.rel_type.as_ref() else {
-        return false;
-    };
+    let rt = rel.rel_type.as_ref()?;
+    fn first(a: &Option<Box<sc::Relation>>) -> Option<&sc::Read> {
+        a.as_deref().and_then(find_streaming_read)
+    }
     match rt {
-        RelType::Read(r) => r.is_streaming,
-        RelType::Project(p) => p.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        RelType::Filter(f) => f.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        RelType::Aggregate(a) => a.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        RelType::Join(j) => {
-            j.left.as_ref().is_some_and(|l| relation_is_streaming(l))
-                || j.right.as_ref().is_some_and(|r| relation_is_streaming(r))
-        }
-        RelType::Sort(s) => s.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        RelType::Limit(l) => l.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        RelType::SetOp(u) => {
-            u.left_input
-                .as_ref()
-                .is_some_and(|l| relation_is_streaming(l))
-                || u.right_input
-                    .as_ref()
-                    .is_some_and(|r| relation_is_streaming(r))
-        }
-        RelType::SubqueryAlias(s) => s.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
-        _ => false,
+        RelType::Read(r) => r.is_streaming.then_some(r),
+        RelType::Project(p) => first(&p.input),
+        RelType::Filter(f) => first(&f.input),
+        RelType::Aggregate(a) => first(&a.input),
+        RelType::Join(j) => first(&j.left).or_else(|| first(&j.right)),
+        RelType::Sort(s) => first(&s.input),
+        RelType::Limit(l) => first(&l.input),
+        RelType::SetOp(u) => first(&u.left_input).or_else(|| first(&u.right_input)),
+        RelType::SubqueryAlias(s) => first(&s.input),
+        RelType::WithColumns(w) => first(&w.input),
+        RelType::WithColumnsRenamed(w) => first(&w.input),
+        RelType::Drop(d) => first(&d.input),
+        RelType::Deduplicate(d) => first(&d.input),
+        RelType::ToDf(t) => first(&t.input),
+        RelType::Repartition(r) => first(&r.input),
+        _ => None,
     }
 }
 

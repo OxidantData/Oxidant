@@ -137,7 +137,15 @@ async fn streaming_query_status_and_stop() {
                 command_type: Some(sc::command::CommandType::WriteStreamOperationStart(
                     sc::WriteStreamOperationStart {
                         format: "memory".into(),
-                        trigger: Some(sc::write_stream_operation_start::Trigger::Once(true)),
+                        // A processing-time trigger, because this test is about the
+                        // status/stop lifecycle of a *running* query. `Once` would drain its
+                        // (empty) source and correctly go inactive on its own, so "active after
+                        // start" would be racing the trigger rather than asserting anything.
+                        trigger: Some(
+                            sc::write_stream_operation_start::Trigger::ProcessingTimeInterval(
+                                "10 seconds".into(),
+                            ),
+                        ),
                         output_mode: "append".into(),
                         query_name: "status_test".into(),
                         ..Default::default()

@@ -49,6 +49,7 @@ pub mod stage_plan_cache;
 /// `sts:AssumeRole` credential provider for S3 access (Hadoop-AWS `fs.s3a.assumed.role.arn`
 /// equivalent) — see [`assume_role_credentials::AssumeRoleCredentialProvider`].
 mod assume_role_credentials;
+mod default_credentials;
 
 /// Case-insensitive file→table column matching for catalog-declared schemas (Glue/Hive parity).
 mod schema_adapt;
@@ -5085,6 +5086,26 @@ impl Engine {
             .await
     }
 
+    /// A Delta table's declared schema and partition columns, when its log can be read.
+    ///
+    /// Best effort: anything unreadable (no log yet, an unmappable type, a permissions error)
+    /// falls back to the inference path rather than failing the registration.
+    async fn delta_table_metadata(
+        &self,
+        table_path: &str,
+    ) -> Option<oxidant_datasource::delta_write::DeltaTableMetadata> {
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        let store = self
+            .object_store_for(table_path, &std::collections::HashMap::new())
+            .ok()?;
+        let root = ListingTableUrl::parse(table_path).ok()?.prefix().clone();
+        oxidant_datasource::delta_write::current_metadata(store.as_ref(), &root)
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// Register an Iceberg table directory under `name`.
     pub async fn register_iceberg(&self, name: &str, table_path: &str) -> Result<()> {
         self.register_lakehouse(name, table_path, oxidant_catalog::TableFormat::Iceberg)
@@ -5097,7 +5118,20 @@ impl Engine {
         table_path: &str,
         format: oxidant_catalog::TableFormat,
     ) -> Result<()> {
-        let metadata = oxidant_catalog::TableMetadata::new(name, table_path, format);
+        let mut metadata = oxidant_catalog::TableMetadata::new(name, table_path, format);
+        // A *partitioned* Delta table keeps its partition columns in the path, not in the data
+        // files, so a reader given only a directory sees a table missing exactly the columns a
+        // dashboard filters on. The log's `metaData` action names them; a catalog like Glue
+        // supplies the same thing from its partition keys, which is why this only matters for the
+        // bare-path form. Unpartitioned tables keep inferring their schema, as before.
+        if format == oxidant_catalog::TableFormat::Delta {
+            if let Some(declared) = self.delta_table_metadata(table_path).await {
+                if !declared.partition_columns.is_empty() {
+                    metadata.partition_columns = declared.partition_columns;
+                    metadata.schema = Some(declared.schema);
+                }
+            }
+        }
         let table = catalog_bridge::metadata_to_provider(&self.ctx.state(), &metadata, name, false)
             .await
             .map_err(|e| Error::Execution(e.to_string()))?
@@ -6328,6 +6362,43 @@ impl Engine {
     /// Access the underlying DataFusion context (e.g. to register tables/Parquet).
     pub fn ctx(&self) -> &SessionContext {
         self.ctx.as_ref()
+    }
+
+    /// Look up a registered external catalog by name (case-sensitive, as registered).
+    ///
+    /// The streaming lake sink needs the raw [`oxidant_catalog::CatalogProvider`], not the
+    /// DataFusion bridge over it: it creates the target database and table through the SPI
+    /// (`create_database` / `create_table`) before any reader has ever resolved them.
+    pub fn external_catalog(
+        &self,
+        name: &str,
+    ) -> Option<Arc<dyn oxidant_catalog::CatalogProvider>> {
+        self.oxidant_catalog(name)
+    }
+
+    /// Resolve an [`ObjectStore`](object_store::ObjectStore) for a table location, registering an
+    /// S3 client for the bucket first when the location is `s3://` (local and `file://` paths
+    /// resolve through DataFusion's default registry with no registration).
+    ///
+    /// This is the write-side counterpart of the read path's store resolution, and it deliberately
+    /// shares `ensure_remote_store` so a streaming write to a Glue table uses exactly the same
+    /// credentials, endpoint, and assumed role that a `SELECT` from it would.
+    pub fn object_store_for(
+        &self,
+        location: &str,
+        storage_options: &std::collections::HashMap<String, String>,
+    ) -> Result<Arc<dyn object_store::ObjectStore>> {
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        let url = ListingTableUrl::parse(location)
+            .map_err(|e| Error::Plan(format!("bad table location `{location}`: {e}")))?;
+        let state = self.ctx.state();
+        catalog_bridge::ensure_remote_store(&state, &url, Some(storage_options))
+            .map_err(|e| Error::Io(format!("object store for `{location}`: {e}")))?;
+        state
+            .runtime_env()
+            .object_store(&url)
+            .map_err(|e| Error::Io(format!("object store for `{location}`: {e}")))
     }
 
     /// Estimate total file bytes for a scanned table (Glue/Parquet/Delta/Iceberg listing).

@@ -5,11 +5,14 @@
 //! default `PERMISSIVE` mode), golden file `spark-tests/{inputs,results}/json-functions.sql*`,
 //! `parse-schema-string.sql*` and `subexp-elimination.sql*`:
 //!
-//! * The schema string is parsed by [`parse_spark_schema`], a faithful Spark `DataType.fromDDL`
-//!   parser: it first tries to read the whole string as a single `DataType`
+//! * The schema string is parsed by [`parse_spark_schema`], which mirrors Spark's
+//!   `ExprUtils.parseTypeWithFallback`: the JSON form emitted by `DataType.json()` first, then the
+//!   DDL form. The DDL branch first tries to read the whole string as a single `DataType`
 //!   (`struct<a:int,b:string>` / `array<int>` / `map<string,int>` / a primitive), and falls back
 //!   to the table-schema form (`a INT, b STRING`, producing a struct). Field names may be
-//!   backtick-quoted and may be SQL keywords (`create INT`).
+//!   backtick-quoted and may be SQL keywords (`create INT`). The JSON branch is not an
+//!   embellishment: `pyspark.sql.functions.from_json(col, StructType([...]))` serializes the
+//!   `StructType` with `DataType.json()`, so it is what every stock PySpark client actually sends.
 //! * The JSON is parsed and coerced to that schema with Spark's rules:
 //!   - A JSON `null`, a missing struct field, an absent value → `null`.
 //!   - A **token-type mismatch** (e.g. a JSON string where an `int` is required, or a JSON number
@@ -63,13 +66,29 @@ fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
 // Spark DataType-string parser  (DataType.fromDDL)
 // ===========================================================================
 
-/// Parse a Spark DDL / DataType schema string into an Arrow [`DataType`].
+/// Parse a Spark schema string — either the `DataType.json()` form or the DDL form — into an
+/// Arrow [`DataType`].
 ///
-/// Mirrors Spark's `DataType.fromDDL`: try the whole string as a single `DataType` first
-/// (`struct<…>` / `array<…>` / `map<…>` / a primitive), then fall back to the table-schema form
-/// (`name TYPE, name TYPE`, yielding a struct). Returns `Err` for anything neither parse accepts —
-/// the caller turns that into the same rejection Spark raises (`PARSE_SYNTAX_ERROR`).
+/// Mirrors Spark's `ExprUtils.parseTypeWithFallback`, which reads the schema as JSON first and
+/// falls back to DDL. Both forms reach us in practice: SQL text (`from_json(v, 'a INT')`) carries
+/// DDL, while a DataFrame client passing a `StructType` carries JSON, because PySpark serializes
+/// it with `DataType.json()` before putting it on the wire. Accepting only DDL means every
+/// `from_json(col, StructType(...))` in a stock PySpark program fails to plan.
+///
+/// The DDL branch tries the whole string as a single `DataType` (`struct<…>` / `array<…>` /
+/// `map<…>` / a primitive), then falls back to the table-schema form (`name TYPE, name TYPE`,
+/// yielding a struct). Returns `Err` for anything no parse accepts — the caller turns that into
+/// the same rejection Spark raises (`PARSE_SYNTAX_ERROR`).
 pub fn parse_spark_schema(s: &str) -> std::result::Result<DataType, String> {
+    // Only a JSON object can be the `DataType.json()` form of a struct/array/map. A bare JSON
+    // string (`"long"`) is also legal JSON for a primitive, but `long` is legal DDL for the same
+    // type, so the DDL branch already covers it — and dispatching on the leading `{` keeps a
+    // malformed DDL string reporting a DDL error rather than a confusing JSON one.
+    if s.trim_start().starts_with('{') {
+        let value: serde_json::Value =
+            serde_json::from_str(s).map_err(|e| format!("malformed JSON schema: {e}"))?;
+        return json_data_type(&value);
+    }
     let tokens = tokenize(s)?;
     if tokens.is_empty() {
         return Err("empty schema".to_string());
@@ -83,6 +102,87 @@ pub fn parse_spark_schema(s: &str) -> std::result::Result<DataType, String> {
     // 2) Fallback: table schema (`col TYPE, col TYPE, …`).
     let fields = parse_table_schema(&tokens)?;
     Ok(DataType::Struct(fields))
+}
+
+/// Parse one node of Spark's `DataType.json()` form into an Arrow [`DataType`].
+///
+/// A node is either a JSON string naming a primitive (`"long"`, `"decimal(10,2)"`) or an object
+/// tagged by `type`: `struct` (with `fields`), `array` (`elementType`), or `map` (`keyType` /
+/// `valueType`). Primitive names are spelled exactly as the DDL parser already accepts them, so
+/// leaves reuse [`parse_data_type`] rather than repeating the name table.
+fn json_data_type(v: &serde_json::Value) -> std::result::Result<DataType, String> {
+    if let Some(name) = v.as_str() {
+        let toks = tokenize(name)?;
+        let (dt, next) = parse_data_type(&toks, 0)?;
+        if next != toks.len() {
+            return Err(format!("trailing input in type name `{name}`"));
+        }
+        return Ok(dt);
+    }
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "a JSON schema node must be a string or an object".to_string())?;
+    let tag = obj
+        .get("type")
+        .ok_or_else(|| "a JSON schema object needs a `type`".to_string())?;
+    // A nested type spells its own shape under `type`; anything else is a primitive name there.
+    let tag = match tag.as_str() {
+        Some(t) => t,
+        None => return json_data_type(tag),
+    };
+    match tag {
+        "struct" => {
+            let fields = obj
+                .get("fields")
+                .and_then(|f| f.as_array())
+                .ok_or_else(|| "a `struct` needs a `fields` array".to_string())?;
+            let mut out: Vec<Field> = Vec::with_capacity(fields.len());
+            for f in fields {
+                let name = f
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .ok_or_else(|| "a struct field needs a string `name`".to_string())?;
+                let ty = f
+                    .get("type")
+                    .ok_or_else(|| format!("struct field `{name}` needs a `type`"))?;
+                // Every field is nullable regardless of the declared `nullable`, matching the DDL
+                // branch. `from_json` yields null for any absent or unparseable key, so honoring a
+                // `nullable: false` here would only let us build an array that violates it.
+                out.push(Field::new(name, json_data_type(ty)?, true));
+            }
+            Ok(DataType::Struct(Fields::from(out)))
+        }
+        "array" => {
+            let inner = obj
+                .get("elementType")
+                .ok_or_else(|| "an `array` needs an `elementType`".to_string())?;
+            Ok(DataType::List(Arc::new(Field::new(
+                "element",
+                json_data_type(inner)?,
+                true,
+            ))))
+        }
+        "map" => {
+            let k = obj
+                .get("keyType")
+                .ok_or_else(|| "a `map` needs a `keyType`".to_string())?;
+            let val = obj
+                .get("valueType")
+                .ok_or_else(|| "a `map` needs a `valueType`".to_string())?;
+            Ok(map_type(json_data_type(k)?, json_data_type(val)?))
+        }
+        // `udt` is the remaining tag Spark can emit; oxidant has no UDT support, so say so plainly
+        // rather than let it fall through as an unknown primitive name.
+        "udt" => Err("user-defined types are not supported".to_string()),
+        other => {
+            let toks = tokenize(other)?;
+            let (dt, next) = parse_data_type(&toks, 0)?;
+            if next != toks.len() {
+                return Err(format!("unsupported JSON schema type `{other}`"));
+            }
+            Ok(dt)
+        }
+    }
 }
 
 /// A lexical token of a Spark schema string.
@@ -996,6 +1096,81 @@ mod tests {
     fn rejects_invalid_type() {
         assert!(parse_spark_schema("a InvalidType").is_err());
         assert!(parse_spark_schema("Array<int").is_err());
+    }
+
+    /// The exact bytes `from_json(col, StructType([...]))` puts on the wire — captured from a
+    /// stock PySpark 4 Connect client, which is the only schema form such a program can send.
+    #[test]
+    fn a_struct_type_from_a_pyspark_client_is_read_as_that_struct() {
+        let wire = r#"{"fields":[{"metadata":{},"name":"order_id","nullable":true,"type":"long"},{"metadata":{},"name":"customer","nullable":true,"type":"string"},{"metadata":{},"name":"amount","nullable":true,"type":"long"},{"metadata":{},"name":"event_ts","nullable":true,"type":"long"}],"type":"struct"}"#;
+        assert_eq!(
+            parse_spark_schema(wire).unwrap(),
+            DataType::Struct(Fields::from(vec![
+                Field::new("order_id", DataType::Int64, true),
+                Field::new("customer", DataType::Utf8, true),
+                Field::new("amount", DataType::Int64, true),
+                Field::new("event_ts", DataType::Int64, true),
+            ]))
+        );
+    }
+
+    /// Both spellings of a schema have to land on the same Arrow type, or which client wrote the
+    /// query would change the answer.
+    #[test]
+    fn the_json_and_ddl_spellings_of_a_schema_agree() {
+        for (json, ddl) in [
+            (
+                r#"{"type":"struct","fields":[{"name":"a","type":"integer","nullable":true,"metadata":{}}]}"#,
+                "a INT",
+            ),
+            (
+                r#"{"type":"struct","fields":[{"name":"a","type":{"type":"array","elementType":"string","containsNull":true},"nullable":true,"metadata":{}}]}"#,
+                "a ARRAY<STRING>",
+            ),
+            (
+                r#"{"type":"struct","fields":[{"name":"a","type":{"type":"map","keyType":"string","valueType":"long","valueContainsNull":true},"nullable":true,"metadata":{}}]}"#,
+                "a MAP<STRING, BIGINT>",
+            ),
+            (
+                r#"{"type":"struct","fields":[{"name":"a","type":"decimal(10,2)","nullable":true,"metadata":{}}]}"#,
+                "a DECIMAL(10,2)",
+            ),
+            (
+                r#"{"type":"struct","fields":[{"name":"a","type":{"type":"struct","fields":[{"name":"b","type":"date","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}"#,
+                "a STRUCT<b: DATE>",
+            ),
+        ] {
+            assert_eq!(
+                parse_spark_schema(json).unwrap(),
+                parse_spark_schema(ddl).unwrap(),
+                "json `{json}` and ddl `{ddl}` disagree"
+            );
+        }
+    }
+
+    /// A `nullable: false` field must still come back nullable: `from_json` nulls any key the
+    /// payload omits, so a non-nullable Arrow field would be one bad record away from an array
+    /// that violates its own schema.
+    #[test]
+    fn a_non_nullable_json_field_is_still_read_as_nullable() {
+        let schema = r#"{"type":"struct","fields":[{"name":"a","type":"long","nullable":false,"metadata":{}}]}"#;
+        assert_eq!(
+            parse_spark_schema(schema).unwrap(),
+            DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int64, true)]))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_and_unsupported_json_schemas() {
+        // Truncated JSON must not be mistaken for DDL.
+        assert!(parse_spark_schema(r#"{"type":"struct","fields":["#).is_err());
+        assert!(parse_spark_schema(r#"{"fields":[]}"#).is_err());
+        assert!(parse_spark_schema(r#"{"type":"struct"}"#).is_err());
+        assert!(parse_spark_schema(
+            r#"{"type":"struct","fields":[{"name":"a","type":"nonesuch","nullable":true,"metadata":{}}]}"#
+        )
+        .is_err());
+        assert!(parse_spark_schema(r#"{"type":"udt","class":"x"}"#).is_err());
     }
 
     #[test]

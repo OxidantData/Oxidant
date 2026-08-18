@@ -9,6 +9,8 @@ rust-version.workspace = true
 
 [dependencies]
 oxidant-common = { workspace = true }
+# Also carries the shared ambient-region resolver, so this client, the Glue catalog, and the S3
+# store all agree on where "no region configured" points.
 oxidant-catalog = { workspace = true }
 async-trait = "0.1"
 # Official AWS SDK for the Lake Formation authorization ops (ListPermissions/ListDataCellsFilter).

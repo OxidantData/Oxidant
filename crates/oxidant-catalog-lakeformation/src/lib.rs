@@ -114,12 +114,14 @@ impl LakeFormationAuth {
 
     /// Build from a flat options map (`region`, `catalog_id`) — the same shape the Glue catalog
     /// connection options use, so a `glue` catalog's options can be forwarded verbatim. `region`
-    /// resolves as option → `AWS_REGION` → `AWS_DEFAULT_REGION` → `us-west-2`.
+    /// resolves as option → `AWS_REGION` → `AWS_DEFAULT_REGION` → shared profile / IMDS.
     pub async fn from_config(options: &HashMap<String, String>) -> Self {
+        let ambient = oxidant_catalog::aws_region::ambient_region();
         let region = resolve_region(
             options,
             std::env::var("AWS_REGION").ok().as_deref(),
             std::env::var("AWS_DEFAULT_REGION").ok().as_deref(),
+            ambient.as_deref(),
         );
         let catalog_id = options.get("catalog_id").cloned();
         Self::new(region, catalog_id).await
@@ -495,13 +497,14 @@ where
     classify_lakeformation_failure(action, err.code(), &detail)
 }
 
-/// Resolve the AWS region: option → `AWS_REGION` → `AWS_DEFAULT_REGION` → `us-west-2`. Env
+/// Resolve the AWS region: option → `AWS_REGION` → `AWS_DEFAULT_REGION` → shared profile / IMDS. Env
 /// values are injected so unit tests can cover the full precedence chain without mutating
 /// process environment. Same precedence as the Glue catalog.
 fn resolve_region(
     options: &HashMap<String, String>,
     aws_region: Option<&str>,
     aws_default_region: Option<&str>,
+    ambient: Option<&str>,
 ) -> String {
     if let Some(r) = options.get("region").filter(|s| !s.is_empty()) {
         return r.clone();
@@ -512,7 +515,13 @@ fn resolve_region(
     if let Some(r) = aws_default_region.filter(|s| !s.is_empty()) {
         return r.to_string();
     }
-    "us-west-2".to_string()
+    // The shared profile / instance metadata, resolved by the caller. Injected rather than looked
+    // up here so this stays a pure function and its tests do not depend on the developer's
+    // ~/.aws/config.
+    if let Some(r) = ambient.filter(|s| !s.is_empty()) {
+        return r.to_string();
+    }
+    oxidant_catalog::aws_region::LEGACY_FALLBACK_REGION.to_string()
 }
 
 #[cfg(test)]
@@ -811,21 +820,49 @@ mod tests {
         let mut opts = HashMap::new();
         opts.insert("region".to_string(), "eu-west-1".to_string());
         assert_eq!(
-            resolve_region(&opts, Some("us-east-1"), Some("ap-south-1")),
+            resolve_region(&opts, Some("us-east-1"), Some("ap-south-1"), None),
             "eu-west-1"
         );
         assert_eq!(
-            resolve_region(&HashMap::new(), Some("us-east-1"), Some("ap-south-1")),
+            resolve_region(&HashMap::new(), Some("us-east-1"), Some("ap-south-1"), None),
             "us-east-1"
         );
         assert_eq!(
-            resolve_region(&HashMap::new(), None, Some("ap-south-1")),
+            resolve_region(&HashMap::new(), None, Some("ap-south-1"), None),
             "ap-south-1"
         );
-        assert_eq!(resolve_region(&HashMap::new(), None, None), "us-west-2");
+        assert_eq!(
+            resolve_region(&HashMap::new(), None, None, None),
+            "us-west-2"
+        );
+
+        // The shared profile / IMDS sits below both variables and above the legacy fallback. It is
+        // what a developer whose region lives only in ~/.aws/config gets, instead of us-west-2.
+        assert_eq!(
+            resolve_region(&HashMap::new(), None, None, Some("eu-west-1")),
+            "eu-west-1"
+        );
+        assert_eq!(
+            resolve_region(&HashMap::new(), Some("us-east-1"), None, Some("eu-west-1")),
+            "us-east-1",
+            "an explicit variable still outranks the ambient region"
+        );
+        let mut pinned = HashMap::new();
+        pinned.insert("region".to_string(), "ap-south-1".to_string());
+        assert_eq!(
+            resolve_region(&pinned, None, None, Some("eu-west-1")),
+            "ap-south-1",
+            "a catalog option outranks everything"
+        );
+        assert_eq!(
+            resolve_region(&HashMap::new(), None, None, Some("")),
+            "us-west-2",
+            "an empty ambient region is not a region"
+        );
+
         opts.insert("region".to_string(), "".to_string());
         assert_eq!(
-            resolve_region(&opts, Some(""), Some("ap-south-1")),
+            resolve_region(&opts, Some(""), Some("ap-south-1"), None),
             "ap-south-1"
         );
     }

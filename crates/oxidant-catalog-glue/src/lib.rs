@@ -77,14 +77,16 @@ impl GlueCatalog {
 
     /// Build from a flat options map (`region`, `warehouse`) — the shape used by both the gateway
     /// connection request and the `spark.sql.catalog.<name>.*` startup config. `region` resolves
-    /// as option → `AWS_REGION` → `AWS_DEFAULT_REGION` → `us-west-2`; `warehouse` (e.g.
+    /// as option → `AWS_REGION` → `AWS_DEFAULT_REGION` → shared profile / IMDS; `warehouse` (e.g.
     /// `s3://bucket/prefix`, the Spark/Iceberg connection-option convention) is optional — CTAS
     /// against this catalog needs it (or an explicit `LOCATION`).
     pub async fn from_config(name: &str, options: &HashMap<String, String>) -> Self {
+        let ambient = oxidant_catalog::aws_region::ambient_region();
         let region = resolve_region(
             options,
             std::env::var("AWS_REGION").ok().as_deref(),
             std::env::var("AWS_DEFAULT_REGION").ok().as_deref(),
+            ambient.as_deref(),
         );
         let warehouse = options.get("warehouse").cloned();
         Self::new(name, region, warehouse).await
@@ -517,12 +519,13 @@ impl GlueCatalog {
 }
 
 /// Resolve the AWS region for a Glue catalog: catalog option → `AWS_REGION` →
-/// `AWS_DEFAULT_REGION` → `us-west-2`. Env values are injected so unit tests can cover the
+/// `AWS_DEFAULT_REGION` → shared profile / IMDS. Env values are injected so unit tests can cover the
 /// full precedence chain without mutating process environment.
 fn resolve_region(
     options: &HashMap<String, String>,
     aws_region: Option<&str>,
     aws_default_region: Option<&str>,
+    ambient: Option<&str>,
 ) -> String {
     if let Some(r) = options.get("region").filter(|s| !s.is_empty()) {
         return r.clone();
@@ -533,7 +536,13 @@ fn resolve_region(
     if let Some(r) = aws_default_region.filter(|s| !s.is_empty()) {
         return r.to_string();
     }
-    "us-west-2".to_string()
+    // The shared profile / instance metadata, resolved by the caller. Injected rather than looked
+    // up here so this stays a pure function and its tests do not depend on the developer's
+    // ~/.aws/config.
+    if let Some(r) = ambient.filter(|s| !s.is_empty()) {
+        return r.to_string();
+    }
+    oxidant_catalog::aws_region::LEGACY_FALLBACK_REGION.to_string()
 }
 
 /// Infer the readable file format from a Glue table's `Parameters` map.
@@ -649,11 +658,24 @@ fn build_table_input(
         .output_format(serde.output_format)
         .serde_info(serde_info)
         .build();
-    TableInput::builder()
+    let mut input = TableInput::builder()
         .name(table)
         .storage_descriptor(storage)
         .set_partition_keys(Some(to_columns(&part_cols)?))
-        .parameters("classification", classification_for(format))
+        .parameters("classification", classification_for(format));
+    if format == TableFormat::Delta {
+        // A Delta table's SerDe is indistinguishable from a plain Parquet table's, so this
+        // parameter is what tells Spark, EMR, and Athena to read `_delta_log/` instead of
+        // listing the directory. `detect_format` reads it back on the way in.
+        input = input.parameters("spark.sql.sources.provider", "delta");
+    }
+    if format == TableFormat::Iceberg {
+        // The authoritative Iceberg signal, and the one Athena, Trino, and Glue all key off.
+        // `metadata_location` is written separately, by whatever commits a snapshot — for a
+        // streaming table that is the Iceberg metadata published alongside the Delta log.
+        input = input.parameters("table_type", "ICEBERG");
+    }
+    input
         .build()
         .map_err(|e| Error::Io(format!("build Glue TableInput: {e}")))
 }
@@ -1012,12 +1034,59 @@ mod tests {
     }
 
     #[test]
-    fn build_table_input_rejects_lakehouse_write_formats() {
+    fn build_table_input_labels_iceberg_with_the_table_type_athena_reads() {
+        // An Iceberg entry is Iceberg because of `table_type`, not its SerDe. `metadata_location`
+        // is added separately by whatever commits a snapshot — for a streaming table, the Iceberg
+        // metadata published alongside the Delta log.
         let schema = sample_schema();
-        for format in [TableFormat::Delta, TableFormat::Iceberg] {
-            let err = build_table_input("t", "s3://bucket/t/", &schema, format, &[]).unwrap_err();
-            assert!(matches!(err, Error::Unsupported(_)), "{format:?}");
-        }
+        let input =
+            build_table_input("t", "s3://bucket/t/", &schema, TableFormat::Iceberg, &[]).unwrap();
+        let params = input.parameters().expect("parameters");
+        assert_eq!(
+            params.get("table_type").map(String::as_str),
+            Some("ICEBERG")
+        );
+        assert_eq!(detect_format(params), TableFormat::Iceberg);
+    }
+
+    #[test]
+    fn build_table_input_labels_delta_so_spark_and_athena_read_the_transaction_log() {
+        let schema = sample_schema();
+        let input =
+            build_table_input("t", "s3://bucket/t/", &schema, TableFormat::Delta, &[]).unwrap();
+        let params = input.parameters().expect("parameters");
+        // A Delta table's SerDe is identical to a plain Parquet table's — this parameter is the
+        // only thing that tells a reader to consult `_delta_log/` instead of listing the
+        // directory. `detect_format` reads it back on the way in.
+        assert_eq!(
+            params.get("spark.sql.sources.provider").map(String::as_str),
+            Some("delta")
+        );
+        assert_eq!(
+            params.get("classification").map(String::as_str),
+            Some("delta")
+        );
+        assert_eq!(
+            input
+                .storage_descriptor()
+                .and_then(|sd| sd.serde_info())
+                .and_then(|s| s.serialization_library()),
+            Some("org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe")
+        );
+    }
+
+    #[test]
+    fn a_delta_table_written_by_build_table_input_round_trips_through_detect_format() {
+        let schema = sample_schema();
+        let input =
+            build_table_input("t", "s3://bucket/t/", &schema, TableFormat::Delta, &[]).unwrap();
+        let params: HashMap<String, String> = input
+            .parameters()
+            .expect("parameters")
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(detect_format(&params), TableFormat::Delta);
     }
 
     // `apply_table_changes` backs `alter_table`'s in-memory mutation of the fetched
@@ -1515,25 +1584,53 @@ mod tests {
         opts.insert("region".to_string(), "eu-west-1".to_string());
         // Option wins over both env vars.
         assert_eq!(
-            resolve_region(&opts, Some("us-east-1"), Some("ap-south-1")),
+            resolve_region(&opts, Some("us-east-1"), Some("ap-south-1"), None),
             "eu-west-1"
         );
         // AWS_REGION wins over AWS_DEFAULT_REGION when option absent.
         assert_eq!(
-            resolve_region(&HashMap::new(), Some("us-east-1"), Some("ap-south-1")),
+            resolve_region(&HashMap::new(), Some("us-east-1"), Some("ap-south-1"), None),
             "us-east-1"
         );
         // AWS_DEFAULT_REGION when AWS_REGION absent.
         assert_eq!(
-            resolve_region(&HashMap::new(), None, Some("ap-south-1")),
+            resolve_region(&HashMap::new(), None, Some("ap-south-1"), None),
             "ap-south-1"
         );
         // Hardcoded fallback when nothing is set.
-        assert_eq!(resolve_region(&HashMap::new(), None, None), "us-west-2");
+        assert_eq!(
+            resolve_region(&HashMap::new(), None, None, None),
+            "us-west-2"
+        );
+
+        // The shared profile / IMDS sits below both variables and above the legacy fallback. It is
+        // what a developer whose region lives only in ~/.aws/config gets, instead of us-west-2.
+        assert_eq!(
+            resolve_region(&HashMap::new(), None, None, Some("eu-west-1")),
+            "eu-west-1"
+        );
+        assert_eq!(
+            resolve_region(&HashMap::new(), Some("us-east-1"), None, Some("eu-west-1")),
+            "us-east-1",
+            "an explicit variable still outranks the ambient region"
+        );
+        let mut pinned = HashMap::new();
+        pinned.insert("region".to_string(), "ap-south-1".to_string());
+        assert_eq!(
+            resolve_region(&pinned, None, None, Some("eu-west-1")),
+            "ap-south-1",
+            "a catalog option outranks everything"
+        );
+        assert_eq!(
+            resolve_region(&HashMap::new(), None, None, Some("")),
+            "us-west-2",
+            "an empty ambient region is not a region"
+        );
+
         // Empty strings are ignored (treated as unset).
         opts.insert("region".to_string(), "".to_string());
         assert_eq!(
-            resolve_region(&opts, Some(""), Some("ap-south-1")),
+            resolve_region(&opts, Some(""), Some("ap-south-1"), None),
             "ap-south-1"
         );
     }

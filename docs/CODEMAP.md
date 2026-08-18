@@ -17,7 +17,7 @@ Architecture: [architecture.md](architecture.md).
 | `crates/oxidant-analyzer/` | Name/type resolve vs catalog | `src/lib.rs` |
 | `crates/oxidant-optimizer/` | Heddle logical opts (single Loom backend) | `src/lib.rs` |
 | `crates/oxidant-physical/` | Physical plan / `ExecutionPlan` | `src/lib.rs` |
-| `crates/oxidant-datasource/` | Parquet/CSV/JSON + Delta/Iceberg resolvers | `src/lib.rs` |
+| `crates/oxidant-datasource/` | Parquet/CSV/JSON + Delta/Iceberg resolvers; Delta writer + Iceberg (uniform) publishing | `src/lib.rs`, `src/delta_write.rs`, `src/uniform.rs` |
 | `crates/oxidant-catalog/` | Catalog SPI + registry | `src/lib.rs` |
 | `crates/oxidant-catalog-hive/` | Hive Metastore provider | `src/lib.rs` |
 | `crates/oxidant-catalog-glue/` | AWS Glue provider | `src/lib.rs` |
@@ -25,7 +25,7 @@ Architecture: [architecture.md](architecture.md).
 | `crates/oxidant-catalog-lakeformation/` | Lake Formation authorization: scan enforcement via `GetUnfilteredTableMetadata` + credential vending (`src/enforcement.rs`); grant introspection (`src/lib.rs`) | `src/enforcement.rs` |
 | `crates/oxidant-proto/` | Vendored Spark Connect protos (protox) | `src/lib.rs` |
 | `crates/oxidant-common/` | Shared errors, config, session identity | `src/lib.rs` |
-| `crates/oxidant-streaming/` | Structured Streaming micro-batch | `src/lib.rs` |
+| `crates/oxidant-streaming/` | Structured Streaming: Kafka source, micro-batch pipeline, Delta/Glue sink | `src/lib.rs` |
 | `crates/oxidant-observability/` | Events, Spark REST DTOs, app state | `src/lib.rs` |
 | `crates/oxidant-ui-server/` | Spark-compat `/api/v1` + embedded UI | `src/lib.rs` |
 | `crates/oxidant-spark-compat/` | Golden SQL parity harness / scoreboard | `src/lib.rs` |
@@ -41,13 +41,14 @@ Architecture: [architecture.md](architecture.md).
 | Path | Purpose |
 |------|---------|
 | `python/pyoxidant/` | Pip helper that launches Connect for stock PySpark |
+| `python/examples/` | Runnable PySpark client examples (Kafka → Glue Delta streaming) |
 | `bench/` | ClickBench / TPC harnesses + install scripts |
 | `parity/` | Spark golden baseline ratchet (`baseline.json`) |
 | `docs/` | User guides (getting started, UI, REST API, CLI, MCP, workers, Glue) + architecture, catalogs, deployment, runtime contract |
 | `deploy/docker/` | connect-server / worker container images |
 | `deploy/packer/` | Hardened AL2023 AMI for EC2 driver/workers |
 | `deploy/cloudformation/` | CFN + ASG data plane |
-| `scripts/` | CI local, repo rename helper |
+| `scripts/` | CI local, repo rename helper, streaming-on-Glue validation |
 | `jira/` | Jira import artifacts for the Databricks parity epic (CSV + JSON) |
 
 ## Docs map
@@ -62,6 +63,7 @@ Architecture: [architecture.md](architecture.md).
 | `mcp.md` | `oxidant mcp` MCP server setup/tools |
 | `workers.md` | Adding workers (local-cluster / multi-host / Docker) |
 | `catalogs-glue.md` | Glue catalog end-to-end |
+| `streaming.md` | Structured Streaming: Kafka source, Delta sink, Glue live tables, Delta/Iceberg interoperability |
 | `architecture.md` | Canonical engine design |
 | `HVM_VERDICT.md` | HVM2/Bend backend verdict + removal record |
 | `CODEMAP.md` | This file |
