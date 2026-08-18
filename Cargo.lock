@@ -4220,7 +4220,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "oxidant-analyzer"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "oxidant-catalog",
  "oxidant-common",
@@ -4229,7 +4229,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-bench"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "datafusion",
  "iceberg",
@@ -4246,7 +4246,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-catalog"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-catalog-glue"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4273,7 +4273,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-catalog-hive"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "oxidant-catalog",
@@ -4282,7 +4282,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-catalog-lakeformation"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4296,7 +4296,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-catalog-local"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "futures",
@@ -4311,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-catalog-rest"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "oxidant-catalog",
@@ -4322,7 +4322,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-cli"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "axum 0.8.9",
  "datafusion",
@@ -4343,11 +4343,11 @@ dependencies = [
 
 [[package]]
 name = "oxidant-common"
-version = "0.1.29"
+version = "0.1.30"
 
 [[package]]
 name = "oxidant-config"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "oxidant-common",
  "serde",
@@ -4358,7 +4358,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-connect"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -4400,7 +4400,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-datasource"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "apache-avro 0.17.0",
  "arrow",
@@ -4423,7 +4423,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-execution"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -4445,7 +4445,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-gateway"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "axum 0.8.9",
  "oxidant-common",
@@ -4458,7 +4458,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-gpu"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "arrow",
  "cc",
@@ -4473,7 +4473,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-loom"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4506,7 +4506,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-observability"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "chrono",
  "serde",
@@ -4517,7 +4517,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-optimizer"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "oxidant-common",
  "oxidant-plan",
@@ -4525,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-orchestrator"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "oxidant-common",
  "oxidant-execution",
@@ -4536,7 +4536,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-physical"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "oxidant-common",
  "oxidant-optimizer",
@@ -4545,14 +4545,14 @@ dependencies = [
 
 [[package]]
 name = "oxidant-plan"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "oxidant-common",
 ]
 
 [[package]]
 name = "oxidant-proto"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "prost 0.13.5",
  "prost-types 0.13.5",
@@ -4563,7 +4563,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-spark-compat"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "datafusion",
  "oxidant-loom",
@@ -4574,7 +4574,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-sql"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "datafusion",
  "oxidant-common",
@@ -4583,7 +4583,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-streaming"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4605,7 +4605,7 @@ dependencies = [
 
 [[package]]
 name = "oxidant-ui-server"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "axum 0.8.9",
  "futures",
