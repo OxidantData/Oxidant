@@ -14,6 +14,7 @@ if [[ -z "${OXIDANT_PORT:-}" ]]; then
 fi
 : "${OXIDANT_WAREHOUSE:=$(mktemp -d /tmp/sdp-warehouse-XXXXXX)}"
 : "${OXIDANT_CHECKPOINTS:=${OXIDANT_WAREHOUSE}/_checkpoints}"
+: "${SDP_SERVER_LOG:=$(mktemp /tmp/sdp-server-XXXXXX.log)}"
 
 log() { printf '==> %s\n' "$*"; }
 
@@ -23,9 +24,9 @@ ensure_venv() {
     python3 -m venv "${SDP_VENV}"
   fi
   if ! "${SDP_VENV}/bin/python" -c 'import pyspark' 2>/dev/null; then
-    log "Installing pyspark-client (fallback: pyspark>=4.0)"
-    if ! "${SDP_VENV}/bin/pip" install -q 'pyspark-client>=4.0'; then
-      "${SDP_VENV}/bin/pip" install -q 'pyspark>=4.0'
+    log "Installing pyspark-client (>=4.0,<4.3)"
+    if ! "${SDP_VENV}/bin/pip" install -q 'pyspark-client>=4.0,<4.3'; then
+      "${SDP_VENV}/bin/pip" install -q 'pyspark>=4.0,<4.3'
     fi
   fi
   # pyspark-client is Connect-only and has no bin/spark-submit; session.py requires SPARK_HOME.
@@ -51,11 +52,12 @@ log "Starting oxidant spark server on port ${OXIDANT_PORT}"
   --catalog-conf "spark.sql.catalog.local.type=local" \
   --catalog-conf "spark.sql.catalog.local.warehouse=${OXIDANT_WAREHOUSE}" \
   --catalog-conf "spark.sql.defaultCatalog=local" \
-  >"/tmp/sdp-server-$$.log" 2>&1 &
+  >"${SDP_SERVER_LOG}" 2>&1 &
 server_pid=$!
 cleanup() {
   kill "${server_pid}" 2>/dev/null || true
   wait "${server_pid}" 2>/dev/null || true
+  rm -f "${SDP_SERVER_LOG}"
 }
 trap cleanup EXIT
 
