@@ -1198,8 +1198,22 @@ impl SparkConnectService for OxidantService {
                     ]
                 }
                 Some(sc::command::CommandType::PipelineCommand(c)) => {
-                    self.handle_pipeline_command(&engine, &session_id, &operation_id, c)
+                    match self
+                        .handle_pipeline_command(&engine, &session_id, &operation_id, c)
                         .await?
+                    {
+                        pipelines::PipelineCommandOutput::Complete(responses) => responses,
+                        pipelines::PipelineCommandOutput::Failed { responses, status } => {
+                            let responses = Arc::new(responses);
+                            self.buffer_operation(&operation_id, Arc::clone(&responses));
+                            let mut items: Vec<
+                                std::result::Result<sc::ExecutePlanResponse, Status>,
+                            > = responses.iter().map(|r| Ok(r.clone())).collect();
+                            items.push(Err(status));
+                            let stream = tokio_stream::iter(items);
+                            return Ok(Response::new(Box::pin(stream)));
+                        }
+                    }
                 }
                 Some(sc::command::CommandType::RegisterFunction(rf)) => {
                     // Register in DataFusion's UDF registry so SQL cells can call the UDF.

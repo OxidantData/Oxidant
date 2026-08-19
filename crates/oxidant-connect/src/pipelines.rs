@@ -17,6 +17,16 @@ use uuid::Uuid;
 use crate::translate;
 use crate::OxidantService;
 
+/// Outcome of a [`PipelineCommand`] handler. [`Failed`](Self::Failed) streams buffered
+/// `PipelineEvent` responses before the terminal gRPC error (StartRun only).
+pub(crate) enum PipelineCommandOutput {
+    Complete(Vec<sc::ExecutePlanResponse>),
+    Failed {
+        responses: Vec<sc::ExecutePlanResponse>,
+        status: Status,
+    },
+}
+
 /// Session-scoped registry of in-memory dataflow graphs keyed by graph id.
 #[derive(Default)]
 pub struct DataflowGraphRegistry {
@@ -172,6 +182,25 @@ fn identifiers_match(a: &sc::ResolvedIdentifier, b: &sc::ResolvedIdentifier) -> 
     a.catalog_name == b.catalog_name && a.namespace == b.namespace && a.table_name == b.table_name
 }
 
+fn is_temporary_view_output(output: &OutputDef) -> bool {
+    output.output_type == sc::OutputType::TemporaryView as i32
+}
+
+fn flow_targets_temporary_view(graph: &DataflowGraph, flow: &FlowDef) -> bool {
+    graph
+        .outputs
+        .iter()
+        .any(|o| is_temporary_view_output(o) && identifiers_match(&o.resolved, &flow.target))
+}
+
+fn output_dedup_key(graph: &DataflowGraph, name: &str) -> String {
+    resolved_identifier_key(&resolve_identifier(
+        name,
+        graph.default_catalog.as_deref(),
+        graph.default_database.as_deref(),
+    ))
+}
+
 /// Fully-qualified map key for a resolved identifier (catalog.namespace.table).
 fn resolved_identifier_key(id: &sc::ResolvedIdentifier) -> String {
     let mut parts = Vec::new();
@@ -194,26 +223,26 @@ impl OxidantService {
         session_id: &str,
         operation_id: &str,
         cmd: &sc::PipelineCommand,
-    ) -> Result<Vec<sc::ExecutePlanResponse>, Status> {
+    ) -> Result<PipelineCommandOutput, Status> {
         match cmd.command_type.as_ref() {
-            Some(sc::pipeline_command::CommandType::CreateDataflowGraph(c)) => {
-                self.create_dataflow_graph(session_id, operation_id, c)
-            }
-            Some(sc::pipeline_command::CommandType::DropDataflowGraph(c)) => {
-                self.drop_dataflow_graph(session_id, operation_id, c)
-            }
-            Some(sc::pipeline_command::CommandType::DefineOutput(c)) => {
-                self.define_output(session_id, operation_id, c)
-            }
-            Some(sc::pipeline_command::CommandType::DefineFlow(c)) => {
-                self.define_flow(session_id, operation_id, c)
-            }
+            Some(sc::pipeline_command::CommandType::CreateDataflowGraph(c)) => self
+                .create_dataflow_graph(session_id, operation_id, c)
+                .map(PipelineCommandOutput::Complete),
+            Some(sc::pipeline_command::CommandType::DropDataflowGraph(c)) => self
+                .drop_dataflow_graph(session_id, operation_id, c)
+                .map(PipelineCommandOutput::Complete),
+            Some(sc::pipeline_command::CommandType::DefineOutput(c)) => self
+                .define_output(session_id, operation_id, c)
+                .map(PipelineCommandOutput::Complete),
+            Some(sc::pipeline_command::CommandType::DefineFlow(c)) => self
+                .define_flow(session_id, operation_id, c)
+                .map(PipelineCommandOutput::Complete),
             Some(sc::pipeline_command::CommandType::StartRun(c)) => {
                 self.start_run(engine, session_id, operation_id, c).await
             }
-            Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(c)) => {
-                self.define_sql_graph_elements(session_id, operation_id, c)
-            }
+            Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(c)) => self
+                .define_sql_graph_elements(session_id, operation_id, c)
+                .map(PipelineCommandOutput::Complete),
             _ => Err(Status::unimplemented("unsupported PipelineCommand")),
         }
     }
@@ -468,13 +497,19 @@ impl OxidantService {
         session_id: &str,
         operation_id: &str,
         cmd: &sc::pipeline_command::StartRun,
-    ) -> Result<Vec<sc::ExecutePlanResponse>, Status> {
+    ) -> Result<PipelineCommandOutput, Status> {
         let graph_id = cmd
             .dataflow_graph_id
             .as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Status::invalid_argument("StartRun.dataflow_graph_id is required"))?;
         let dry = cmd.dry.unwrap_or(false);
+
+        let graph_refreshes = self
+            .dataflow_graphs
+            .with_graph(graph_id, session_id, |graph| {
+                Ok(std::mem::take(&mut graph.refreshes))
+            })?;
 
         let graph = self.dataflow_graphs.get_graph(graph_id, session_id)?;
         let storage = cmd
@@ -495,16 +530,11 @@ impl OxidantService {
             .filter(|s| !s.is_empty())
             .cloned()
             .collect();
-        refresh_selection.extend(graph.refreshes.clone());
+        refresh_selection.extend(graph_refreshes.iter().cloned());
 
         let full_refresh = cmd.full_refresh_all.unwrap_or(false);
         let full_refresh_tables: Vec<String> = if full_refresh {
-            graph
-                .outputs
-                .iter()
-                .filter(|o| o.output_type != sc::OutputType::TemporaryView as i32)
-                .map(|o| o.resolved.table_name.clone())
-                .collect()
+            Vec::new()
         } else {
             cmd.full_refresh_selection
                 .iter()
@@ -513,11 +543,12 @@ impl OxidantService {
                 .collect()
         };
 
-        if full_refresh || !full_refresh_tables.is_empty() {
+        if full_refresh {
+            clear_pipeline_state(&storage, &[]).map_err(crate::err_to_status)?;
+        } else if !full_refresh_tables.is_empty() {
             clear_pipeline_state(&storage, &full_refresh_tables).map_err(crate::err_to_status)?;
-        } else if !graph.refreshes.is_empty() {
-            let tables: Vec<String> = graph
-                .refreshes
+        } else if !graph_refreshes.is_empty() {
+            let tables: Vec<String> = graph_refreshes
                 .iter()
                 .map(|name| {
                     resolve_identifier(
@@ -549,10 +580,10 @@ impl OxidantService {
                 plan.pipeline.name,
                 plan.graph.order.len()
             );
-            return Ok(vec![
+            return Ok(PipelineCommandOutput::Complete(vec![
                 self.pipeline_event(session_id, operation_id, &message, None),
                 self.result_complete(session_id, operation_id),
-            ]);
+            ]));
         }
 
         let wanted = resolve_wanted_tables(&graph, &refresh_selection);
@@ -563,15 +594,19 @@ impl OxidantService {
         })
         .await;
 
-        let mut responses: Vec<sc::ExecutePlanResponse> = events
+        let responses: Vec<sc::ExecutePlanResponse> = events
             .into_iter()
             .map(|event| self.pipeline_run_event(session_id, operation_id, event))
             .collect();
-        responses.push(self.result_complete(session_id, operation_id));
         if let Err(e) = run_result {
-            return Err(crate::err_to_status(e));
+            return Ok(PipelineCommandOutput::Failed {
+                responses,
+                status: crate::err_to_status(e),
+            });
         }
-        Ok(responses)
+        let mut responses = responses;
+        responses.push(self.result_complete(session_id, operation_id));
+        Ok(PipelineCommandOutput::Complete(responses))
     }
 
     fn pipeline_result(
@@ -678,6 +713,9 @@ async fn graph_to_config(
     }
 
     for flow in &graph.flows {
+        if flow_targets_temporary_view(graph, flow) {
+            continue;
+        }
         let target_key = resolved_identifier_key(&flow.target);
         let target_name = flow.target.table_name.clone();
         let table = tables.get_mut(&target_key).ok_or_else(|| {
@@ -747,8 +785,12 @@ fn merge_sql_elements(graph: &mut DataflowGraph, elements: oxidant_pipelines::Sq
 }
 
 fn replace_output(graph: &mut DataflowGraph, output: OutputDef) {
-    let key = output.output_name.clone();
-    if let Some(idx) = graph.outputs.iter().position(|o| o.output_name == key) {
+    let key = output_dedup_key(graph, &output.output_name);
+    if let Some(idx) = graph
+        .outputs
+        .iter()
+        .position(|o| output_dedup_key(graph, &o.output_name) == key)
+    {
         graph.outputs[idx] = output;
     } else {
         graph.outputs.push(output);
@@ -1084,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_output_replaces_by_name() {
+    fn replace_output_replaces_by_resolved_name() {
         let mut graph = DataflowGraph {
             default_catalog: Some("cat".into()),
             default_database: Some("db".into()),
@@ -1094,24 +1136,28 @@ mod tests {
             refreshes: Vec::new(),
             created_at: SystemTime::now(),
         };
-        let first = OutputDef {
-            output_name: "metrics".into(),
-            resolved: resolve_identifier("metrics", Some("cat"), Some("db")),
-            output_type: sc::OutputType::Table as i32,
-            comment: Some("v1".into()),
-            table_details: None,
-            sink_details: None,
-        };
-        replace_output(&mut graph, first);
-        let second = OutputDef {
-            output_name: "metrics".into(),
-            resolved: resolve_identifier("metrics", Some("cat"), Some("db")),
-            output_type: sc::OutputType::MaterializedView as i32,
-            comment: Some("v2".into()),
-            table_details: None,
-            sink_details: None,
-        };
-        replace_output(&mut graph, second);
+        replace_output(
+            &mut graph,
+            OutputDef {
+                output_name: "metrics".into(),
+                resolved: resolve_identifier("metrics", Some("cat"), Some("db")),
+                output_type: sc::OutputType::Table as i32,
+                comment: Some("v1".into()),
+                table_details: None,
+                sink_details: None,
+            },
+        );
+        replace_output(
+            &mut graph,
+            OutputDef {
+                output_name: "cat.db.metrics".into(),
+                resolved: resolve_identifier("cat.db.metrics", Some("cat"), Some("db")),
+                output_type: sc::OutputType::MaterializedView as i32,
+                comment: Some("v2".into()),
+                table_details: None,
+                sink_details: None,
+            },
+        );
         assert_eq!(graph.outputs.len(), 1);
         assert_eq!(
             graph.outputs[0].output_type,
