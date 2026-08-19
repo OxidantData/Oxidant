@@ -6,9 +6,14 @@
 pub mod expectations;
 pub mod graph;
 mod runner;
+pub mod sql_graph;
 
 pub use graph::{Graph, Node};
 pub use runner::{run_pipeline, Plan, RunEvent, TableOutcome, TableStatus};
+pub use sql_graph::{
+    parse, parse_with_context, split_statements, OutputKind, ParsedFlow, ParsedOutput,
+    SqlGraphElements,
+};
 
 /// The alias a streaming table's `sql:` uses to read its own source.
 ///
