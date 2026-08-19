@@ -26,6 +26,7 @@ Architecture: [architecture.md](architecture.md).
 | `crates/oxidant-proto/` | Vendored Spark Connect protos (protox) | `src/lib.rs` |
 | `crates/oxidant-common/` | Shared errors, config, session identity | `src/lib.rs` |
 | `crates/oxidant-config/` | `oxidant.yaml` parsing + validation; lowers to the `spark.sql.catalog.*` and `OXIDANT_*` contracts | `src/lib.rs` |
+| `crates/oxidant-pipelines/` | Declarative table DAG runner (graph, expectations, micro-batch execution) | `src/lib.rs` |
 | `crates/oxidant-catalog-local/` | Filesystem / object-store catalog: config-declared + discovered tables, versioned JSON manifest, real write DDL | `src/lib.rs` |
 | `crates/oxidant-streaming/` | Structured Streaming: Kafka source, micro-batch pipeline, Delta/Glue sink | `src/lib.rs` |
 | `crates/oxidant-observability/` | Events, Spark REST DTOs, app state | `src/lib.rs` |
