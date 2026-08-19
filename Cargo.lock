@@ -4550,6 +4550,7 @@ dependencies = [
 name = "oxidant-pipelines"
 version = "0.1.30"
 dependencies = [
+ "datafusion",
  "oxidant-common",
  "oxidant-config",
  "oxidant-loom",
