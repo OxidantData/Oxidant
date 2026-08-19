@@ -23,6 +23,7 @@ rust-version = "1.72"
 [workspace.dependencies]
 oxidant-common     = { path = "crates/oxidant-common" }
 oxidant-config     = { path = "crates/oxidant-config" }
+oxidant-pipelines  = { path = "crates/oxidant-pipelines" }
 oxidant-proto      = { path = "crates/oxidant-proto" }
 oxidant-plan       = { path = "crates/oxidant-plan" }
 oxidant-sql        = { path = "crates/oxidant-sql" }
