@@ -30,37 +30,39 @@ struct GraphEntry {
 
 /// In-memory graph state between `CreateDataflowGraph` and `StartRun`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct DataflowGraph {
     pub default_catalog: Option<String>,
     pub default_database: Option<String>,
+    #[allow(dead_code)]
     pub sql_conf: HashMap<String, String>,
     pub outputs: Vec<OutputDef>,
     pub flows: Vec<FlowDef>,
     /// `REFRESH MATERIALIZED VIEW` / `OR REFRESH` requests applied at the next `StartRun`.
     pub refreshes: Vec<String>,
+    #[allow(dead_code)]
     pub created_at: SystemTime,
 }
 
 /// Mirrors `PipelineCommand.DefineOutput`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct OutputDef {
     pub output_name: String,
     pub resolved: sc::ResolvedIdentifier,
     pub output_type: i32,
     pub comment: Option<String>,
     pub table_details: Option<sc::pipeline_command::define_output::TableDetails>,
+    #[allow(dead_code)]
     pub sink_details: Option<sc::pipeline_command::define_output::SinkDetails>,
 }
 
 /// Mirrors `PipelineCommand.DefineFlow`; relation stays unresolved until `StartRun`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct FlowDef {
     pub flow_name: String,
+    #[allow(dead_code)]
     pub resolved: sc::ResolvedIdentifier,
     pub target: sc::ResolvedIdentifier,
+    #[allow(dead_code)]
     pub sql_conf: HashMap<String, String>,
     pub relation: Option<sc::Relation>,
     /// Populated by `DefineSqlGraphElements` when the flow comes from SDP SQL text.
@@ -170,6 +172,21 @@ fn identifiers_match(a: &sc::ResolvedIdentifier, b: &sc::ResolvedIdentifier) -> 
     a.catalog_name == b.catalog_name && a.namespace == b.namespace && a.table_name == b.table_name
 }
 
+/// Fully-qualified map key for a resolved identifier (catalog.namespace.table).
+fn resolved_identifier_key(id: &sc::ResolvedIdentifier) -> String {
+    let mut parts = Vec::new();
+    if !id.catalog_name.is_empty() {
+        parts.push(id.catalog_name.as_str());
+    }
+    for ns in &id.namespace {
+        parts.push(ns.as_str());
+    }
+    if !id.table_name.is_empty() {
+        parts.push(id.table_name.as_str());
+    }
+    parts.join(".")
+}
+
 impl OxidantService {
     pub(crate) async fn handle_pipeline_command(
         &self,
@@ -243,10 +260,16 @@ impl OxidantService {
         operation_id: &str,
         cmd: &sc::pipeline_command::DropDataflowGraph,
     ) -> Result<Vec<sc::ExecutePlanResponse>, Status> {
-        if let Some(id) = cmd.dataflow_graph_id.as_deref().filter(|s| !s.is_empty()) {
-            let _ = self.dataflow_graphs.remove(id);
-            let _ = session_id;
-        }
+        let graph_id = cmd
+            .dataflow_graph_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Status::invalid_argument("DropDataflowGraph.dataflow_graph_id is required")
+            })?;
+        self.dataflow_graphs
+            .with_graph(graph_id, session_id, |_| Ok(()))?;
+        self.dataflow_graphs.remove(graph_id);
         Ok(vec![self.result_complete(session_id, operation_id)])
     }
 
@@ -269,11 +292,6 @@ impl OxidantService {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Status::invalid_argument("DefineOutput.output_name is required"))?;
         let output_type = cmd.output_type.unwrap_or(0);
-        if output_type == sc::OutputType::Sink as i32 {
-            return Err(Status::unimplemented(
-                "DefineOutput SINK is not supported yet (SDP Phase 4c)",
-            ));
-        }
 
         let (table_details, sink_details) = match &cmd.details {
             Some(sc::pipeline_command::define_output::Details::TableDetails(t)) => {
@@ -288,19 +306,27 @@ impl OxidantService {
         let resolved = self
             .dataflow_graphs
             .with_graph(graph_id, session_id, |graph| {
+                if output_type == sc::OutputType::Sink as i32 {
+                    return Err(Status::unimplemented(
+                        "DefineOutput SINK is not supported yet (SDP Phase 4c)",
+                    ));
+                }
                 let resolved = resolve_identifier(
                     output_name,
                     graph.default_catalog.as_deref(),
                     graph.default_database.as_deref(),
                 );
-                graph.outputs.push(OutputDef {
-                    output_name: output_name.to_string(),
-                    resolved: resolved.clone(),
-                    output_type,
-                    comment: cmd.comment.clone(),
-                    table_details,
-                    sink_details,
-                });
+                replace_output(
+                    graph,
+                    OutputDef {
+                        output_name: output_name.to_string(),
+                        resolved: resolved.clone(),
+                        output_type,
+                        comment: cmd.comment.clone(),
+                        table_details,
+                        sink_details,
+                    },
+                );
                 Ok(resolved)
             })?;
 
@@ -344,61 +370,53 @@ impl OxidantService {
                 Status::invalid_argument("DefineFlow.target_dataset_name is required")
             })?;
 
-        let (relation, once) = match &cmd.details {
-            Some(sc::pipeline_command::define_flow::Details::RelationFlowDetails(d)) => {
-                let rel = d.relation.as_ref();
-                if rel.map(|r| r.rel_type.is_none()).unwrap_or(true) {
-                    return Err(Status::failed_precondition(
-                        "DefineFlow relation is empty: Python query-function signal stream is \
-                         not supported yet (SDP Phase 4a)",
-                    ));
-                }
-                (rel.cloned(), cmd.once.unwrap_or(false))
-            }
-            Some(sc::pipeline_command::define_flow::Details::AutoCdcFlowDetails(_)) => {
-                return Err(Status::unimplemented(
-                    "DefineFlow AUTO CDC is not supported yet (SDP Phase 4b)",
-                ));
-            }
-            _ => {
-                return Err(Status::invalid_argument(
-                    "DefineFlow requires relation_flow_details or auto_cdc_flow_details",
-                ));
-            }
-        };
-
         let resolved = self
             .dataflow_graphs
             .with_graph(graph_id, session_id, |graph| {
+                let (relation, once) = match &cmd.details {
+                    Some(sc::pipeline_command::define_flow::Details::RelationFlowDetails(d)) => {
+                        let rel = d.relation.as_ref();
+                        if rel.map(|r| r.rel_type.is_none()).unwrap_or(true) {
+                            return Err(Status::failed_precondition(
+                                "DefineFlow relation is empty: Python query-function signal \
+                                 stream is not supported yet (SDP Phase 4a)",
+                            ));
+                        }
+                        (rel.cloned(), cmd.once.unwrap_or(false))
+                    }
+                    Some(sc::pipeline_command::define_flow::Details::AutoCdcFlowDetails(_)) => {
+                        return Err(Status::unimplemented(
+                            "DefineFlow AUTO CDC is not supported yet (SDP Phase 4b)",
+                        ));
+                    }
+                    _ => {
+                        return Err(Status::invalid_argument(
+                            "DefineFlow requires relation_flow_details or auto_cdc_flow_details",
+                        ));
+                    }
+                };
                 let target = resolve_identifier(
                     target_name,
                     graph.default_catalog.as_deref(),
                     graph.default_database.as_deref(),
                 );
-                let has_target = graph
-                    .outputs
-                    .iter()
-                    .any(|o| identifiers_match(&o.resolved, &target));
-                if !has_target {
-                    return Err(Status::invalid_argument(format!(
-                        "DefineFlow target `{target_name}` is not a defined output in graph \
-                     `{graph_id}`"
-                    )));
-                }
                 let resolved = resolve_identifier(
                     flow_name,
                     graph.default_catalog.as_deref(),
                     graph.default_database.as_deref(),
                 );
-                graph.flows.push(FlowDef {
-                    flow_name: flow_name.to_string(),
-                    resolved: resolved.clone(),
-                    target,
-                    sql_conf: cmd.sql_conf.clone(),
-                    relation,
-                    query_sql: None,
-                    once,
-                });
+                replace_flow(
+                    graph,
+                    FlowDef {
+                        flow_name: flow_name.to_string(),
+                        resolved: resolved.clone(),
+                        target,
+                        sql_conf: cmd.sql_conf.clone(),
+                        relation,
+                        query_sql: None,
+                        once,
+                    },
+                );
                 Ok(resolved)
             })?;
 
@@ -636,6 +654,7 @@ async fn graph_to_config(
         if output.output_type == sc::OutputType::TemporaryView as i32 {
             continue;
         }
+        let key = resolved_identifier_key(&output.resolved);
         let name = output.resolved.table_name.clone();
         let source = kafka_source_from_output(output);
         let table = TableConfig {
@@ -655,12 +674,13 @@ async fn graph_to_config(
             expect: Default::default(),
             comment: output.comment.clone(),
         };
-        tables.insert(name, table);
+        tables.insert(key, table);
     }
 
     for flow in &graph.flows {
+        let target_key = resolved_identifier_key(&flow.target);
         let target_name = flow.target.table_name.clone();
-        let table = tables.get_mut(&target_name).ok_or_else(|| {
+        let table = tables.get_mut(&target_key).ok_or_else(|| {
             Status::invalid_argument(format!(
                 "flow `{}` targets undefined table `{target_name}`",
                 flow.flow_name
@@ -679,7 +699,7 @@ async fn graph_to_config(
                 if let Some(output) = graph
                     .outputs
                     .iter()
-                    .find(|o| o.resolved.table_name == target_name)
+                    .find(|o| identifiers_match(&o.resolved, &flow.target))
                 {
                     table.source = kafka_source_from_output(output);
                 }
@@ -998,5 +1018,105 @@ mod tests {
         assert_eq!(id.catalog_name, "prod");
         assert_eq!(id.namespace, vec!["a", "b"]);
         assert_eq!(id.table_name, "orders");
+    }
+
+    #[test]
+    fn resolved_identifier_key_is_fully_qualified() {
+        let id = resolve_identifier("prod.silver.orders", None, None);
+        assert_eq!(
+            resolved_identifier_key(&id),
+            "prod.silver.orders".to_string()
+        );
+    }
+
+    #[test]
+    fn registry_drop_session_removes_graphs() {
+        let registry = DataflowGraphRegistry::default();
+        let graph = DataflowGraph {
+            default_catalog: None,
+            default_database: None,
+            sql_conf: HashMap::new(),
+            outputs: Vec::new(),
+            flows: Vec::new(),
+            refreshes: Vec::new(),
+            created_at: SystemTime::now(),
+        };
+        registry.insert("sess-a", "g1".into(), graph);
+        assert!(registry.remove("g1"));
+        registry.insert(
+            "sess-a",
+            "g2".into(),
+            DataflowGraph {
+                default_catalog: None,
+                default_database: None,
+                sql_conf: HashMap::new(),
+                outputs: Vec::new(),
+                flows: Vec::new(),
+                refreshes: Vec::new(),
+                created_at: SystemTime::now(),
+            },
+        );
+        registry.drop_session("sess-a");
+        assert!(!registry.remove("g2"));
+    }
+
+    #[test]
+    fn registry_rejects_cross_session_access() {
+        let registry = DataflowGraphRegistry::default();
+        registry.insert(
+            "owner",
+            "g1".into(),
+            DataflowGraph {
+                default_catalog: None,
+                default_database: None,
+                sql_conf: HashMap::new(),
+                outputs: Vec::new(),
+                flows: Vec::new(),
+                refreshes: Vec::new(),
+                created_at: SystemTime::now(),
+            },
+        );
+        let err = registry
+            .with_graph("g1", "intruder", |_| Ok(()))
+            .expect_err("cross-session access");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("another session"));
+    }
+
+    #[test]
+    fn replace_output_replaces_by_name() {
+        let mut graph = DataflowGraph {
+            default_catalog: Some("cat".into()),
+            default_database: Some("db".into()),
+            sql_conf: HashMap::new(),
+            outputs: Vec::new(),
+            flows: Vec::new(),
+            refreshes: Vec::new(),
+            created_at: SystemTime::now(),
+        };
+        let first = OutputDef {
+            output_name: "metrics".into(),
+            resolved: resolve_identifier("metrics", Some("cat"), Some("db")),
+            output_type: sc::OutputType::Table as i32,
+            comment: Some("v1".into()),
+            table_details: None,
+            sink_details: None,
+        };
+        replace_output(&mut graph, first);
+        let second = OutputDef {
+            output_name: "metrics".into(),
+            resolved: resolve_identifier("metrics", Some("cat"), Some("db")),
+            output_type: sc::OutputType::MaterializedView as i32,
+            comment: Some("v2".into()),
+            table_details: None,
+            sink_details: None,
+        };
+        replace_output(&mut graph, second);
+        assert_eq!(graph.outputs.len(), 1);
+        assert_eq!(
+            graph.outputs[0].output_type,
+            sc::OutputType::MaterializedView as i32
+        );
+        assert_eq!(graph.outputs[0].comment.as_deref(), Some("v2"));
     }
 }

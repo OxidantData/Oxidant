@@ -459,8 +459,159 @@ fn validate_query(query: &str) -> Result<()> {
             )),
         },
         Ok(_) => Err(plan_error(query, "query must be a single statement")),
-        Err(_) if has_dialect_extension(query) => Ok(()),
+        Err(_) if has_dialect_extension(query) => validate_dialect_extension_query(query),
         Err(e) => Err(plan_error(query, &format!("invalid query SQL: {e}"))),
+    }
+}
+
+/// Re-parse after normalizing Databricks-only constructs (`STREAM`, `READ_FILES`) so trailing
+/// junk is still rejected when the raw query does not parse.
+fn validate_dialect_extension_query(query: &str) -> Result<()> {
+    let normalized = normalize_dialect_extensions_for_parse(query);
+    match Parser::parse_sql(&DatabricksDialect {}, &normalized) {
+        Ok(stmts) if stmts.len() == 1 => match &stmts[0] {
+            Statement::Query(_) => Ok(()),
+            _ => Err(plan_error(
+                query,
+                "expected a query (SELECT, WITH, or VALUES)",
+            )),
+        },
+        Ok(_) => Err(plan_error(query, "query must be a single statement")),
+        Err(e) => Err(plan_error(query, &format!("invalid query SQL: {e}"))),
+    }
+}
+
+fn normalize_dialect_extensions_for_parse(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    let mut chars = query.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+
+    while let Some(ch) = chars.next() {
+        if in_double && ch == '\\' {
+            out.push(ch);
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+            continue;
+        }
+        if !in_single && !in_double && !in_backtick {
+            if starts_with_ci_at(&chars, "FROM STREAM") {
+                for c in "FROM STREAM".chars() {
+                    out.push(c);
+                    chars.next();
+                }
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    out.push(chars.next().unwrap());
+                }
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    let _ = take_balanced_content(&mut chars, '(', ')');
+                    if chars.peek() == Some(&')') {
+                        chars.next();
+                    }
+                    out.push_str("__databricks_stream__");
+                } else {
+                    skip_stream_target(&mut chars);
+                    out.push_str("__databricks_stream__");
+                }
+                continue;
+            }
+            if starts_with_ci_at(&chars, "READ_FILES") {
+                for c in "READ_FILES".chars() {
+                    out.push(c);
+                    chars.next();
+                }
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    out.push(chars.next().unwrap());
+                }
+                if chars.peek() == Some(&'(') {
+                    out.push(chars.next().unwrap());
+                    let _ = take_balanced_content(&mut chars, '(', ')');
+                    out.push_str("'__placeholder__'");
+                    if chars.peek() == Some(&')') {
+                        out.push(chars.next().unwrap());
+                    }
+                }
+                continue;
+            }
+        }
+        match ch {
+            '\'' if !in_double && !in_backtick => in_single = !in_single,
+            '"' if !in_single && !in_backtick => in_double = !in_double,
+            '`' if !in_single && !in_double => in_backtick = !in_backtick,
+            _ => {}
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn starts_with_ci_at<I>(chars: &std::iter::Peekable<I>, prefix: &str) -> bool
+where
+    I: Iterator<Item = char> + Clone,
+{
+    let mut peek = chars.clone();
+    for expected in prefix.chars() {
+        match peek.next() {
+            Some(c) if c.eq_ignore_ascii_case(&expected) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn take_balanced_content<I>(chars: &mut std::iter::Peekable<I>, open: char, close: char) -> String
+where
+    I: Iterator<Item = char>,
+{
+    let mut out = String::new();
+    let mut depth = 1usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    for ch in chars.by_ref() {
+        match ch {
+            '\'' if !in_double && !in_backtick => in_single = !in_single,
+            '"' if !in_single && !in_backtick => in_double = !in_double,
+            '`' if !in_single && !in_double => in_backtick = !in_backtick,
+            c if !in_single && !in_double && !in_backtick => {
+                if c == open {
+                    depth += 1;
+                } else if c == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn skip_stream_target<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(ch) = chars.peek().copied() {
+        if ch == '`' {
+            chars.next();
+            for c in chars.by_ref() {
+                if c == '`' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
+            chars.next();
+            continue;
+        }
+        break;
     }
 }
 
@@ -685,16 +836,6 @@ pub fn split_statements(sql: &str) -> Vec<(usize, String)> {
         }
 
         if in_double && ch == '\\' {
-            cur.push(ch);
-            if let Some(next) = chars.next() {
-                cur.push(next);
-                if next == '\n' {
-                    line += 1;
-                }
-            }
-            continue;
-        }
-        if in_single && ch == '\\' {
             cur.push(ch);
             if let Some(next) = chars.next() {
                 cur.push(next);
@@ -959,6 +1100,17 @@ impl<'a> Cursor<'a> {
     }
 }
 
+fn statement_code_line(stmt: &str, stmt_start_line: usize) -> usize {
+    let mut line = stmt_start_line;
+    for part in stmt.lines() {
+        if !strip_leading_comments(part.trim()).is_empty() {
+            return line;
+        }
+        line += 1;
+    }
+    stmt_start_line
+}
+
 /// Context-aware parse with file path and statement index in error messages.
 pub fn parse_with_context(sql_text: &str, sql_file_path: Option<&str>) -> Result<SqlGraphElements> {
     let mut elements = SqlGraphElements::default();
@@ -967,8 +1119,9 @@ pub fn parse_with_context(sql_text: &str, sql_file_path: Option<&str>) -> Result
         if trimmed.is_empty() || is_only_comments(trimmed) {
             continue;
         }
+        let code_line = statement_code_line(trimmed, line);
         let parsed = parse_one_statement(trimmed)
-            .map_err(|e| contextualize_error(e, sql_file_path, index + 1, line))?;
+            .map_err(|e| contextualize_error(e, sql_file_path, index + 1, code_line))?;
         parsed.apply_to(&mut elements);
     }
     Ok(elements)
@@ -1313,6 +1466,15 @@ CREATE MATERIALIZED VIEW mv AS SELECT 3";
     }
 
     #[test]
+    fn split_splits_single_quoted_strings_on_unescaped_semicolon() {
+        let parts: Vec<_> = split_statements(r"SELECT 'C:\temp\'; SELECT 2")
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(parts, vec![r"SELECT 'C:\temp\'", "SELECT 2"]);
+    }
+
+    #[test]
     fn split_respects_backslash_escape_in_double_quotes() {
         let parts: Vec<_> = split_statements(r#"SELECT "a\"; SELECT 2"#)
             .into_iter()
@@ -1322,12 +1484,25 @@ CREATE MATERIALIZED VIEW mv AS SELECT 3";
     }
 
     #[test]
-    fn split_respects_backslash_escape_in_single_quotes() {
-        let parts: Vec<_> = split_statements(r"SELECT 'a\'; SELECT 2")
-            .into_iter()
-            .map(|(_, s)| s)
-            .collect();
-        assert_eq!(parts, vec![r"SELECT 'a\'; SELECT 2"]);
+    fn dialect_extension_trailing_junk_is_rejected() {
+        let err = parse(
+            "CREATE STREAMING TABLE t AS SELECT * FROM STREAM s bogus_tail",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("invalid query SQL") || err.contains("plan error"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn dialect_extension_stream_query_without_trailing_junk_is_accepted() {
+        let sql = "CREATE STREAMING TABLE t AS SELECT * FROM STREAM raw.events";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.outputs.len(), 1);
+        assert_eq!(out.flows.len(), 1);
     }
 
     #[test]
@@ -1338,7 +1513,7 @@ CREATE MATERIALIZED VIEW mv AS SELECT 3";
             .to_string();
         assert!(err.contains("pipelines/demo.sql"), "err: {err}");
         assert!(err.contains("statement 2"), "err: {err}");
-        assert!(err.contains("line 2"), "err: {err}");
+        assert!(err.contains("line 3"), "err: {err}");
         assert!(err.contains("SELECT"), "err: {err}");
     }
 

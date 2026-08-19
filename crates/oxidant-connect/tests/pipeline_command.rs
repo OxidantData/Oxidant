@@ -381,6 +381,47 @@ async fn pipeline_rejection_paths() {
         &mut client,
         session,
         sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineOutput(
+                sc::pipeline_command::DefineOutput {
+                    dataflow_graph_id: Some("missing-graph".into()),
+                    output_name: Some("sink_out".into()),
+                    output_type: Some(sc::OutputType::Sink as i32),
+                    ..Default::default()
+                },
+            )),
+        },
+        Code::InvalidArgument,
+    )
+    .await;
+
+    expect_status(
+        &mut client,
+        session,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineFlow(
+                sc::pipeline_command::DefineFlow {
+                    dataflow_graph_id: Some("missing-graph".into()),
+                    flow_name: Some("empty".into()),
+                    target_dataset_name: Some("t".into()),
+                    details: Some(
+                        sc::pipeline_command::define_flow::Details::RelationFlowDetails(
+                            sc::pipeline_command::define_flow::WriteRelationFlowDetails {
+                                relation: None,
+                            },
+                        ),
+                    ),
+                    ..Default::default()
+                },
+            )),
+        },
+        Code::InvalidArgument,
+    )
+    .await;
+
+    expect_status(
+        &mut client,
+        session,
+        sc::PipelineCommand {
             command_type: Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(
                 sc::pipeline_command::DefineSqlGraphElements {
                     dataflow_graph_id: Some(graph_id),
@@ -392,4 +433,198 @@ async fn pipeline_rejection_paths() {
         Code::Unimplemented,
     )
     .await;
+}
+
+async fn create_graph(
+    client: &mut SparkConnectServiceClient<tonic::transport::Channel>,
+    session: &str,
+) -> String {
+    let create = execute_pipeline(
+        client,
+        session,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::CreateDataflowGraph(
+                sc::pipeline_command::CreateDataflowGraph {
+                    default_catalog: Some("spark_catalog".into()),
+                    default_database: Some("default".into()),
+                    sql_conf: Default::default(),
+                },
+            )),
+        },
+    )
+    .await
+    .expect("create graph");
+    create
+        .iter()
+        .find_map(|r| match &r.response_type {
+            Some(sc::execute_plan_response::ResponseType::PipelineCommandResult(res)) => {
+                match &res.result_type {
+                    Some(sc::pipeline_command_result::ResultType::CreateDataflowGraphResult(r)) => {
+                        r.dataflow_graph_id.clone()
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .expect("graph id")
+}
+
+#[tokio::test]
+async fn pipeline_release_session_drops_graphs() {
+    let port = pick_port();
+    let mut client = boot(port).await;
+    let session = "sdp-release";
+    let graph_id = create_graph(&mut client, session).await;
+
+    client
+        .release_session(Request::new(sc::ReleaseSessionRequest {
+            session_id: session.to_string(),
+            ..Default::default()
+        }))
+        .await
+        .expect("release session");
+
+    expect_status(
+        &mut client,
+        session,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::StartRun(
+                sc::pipeline_command::StartRun {
+                    dataflow_graph_id: Some(graph_id),
+                    dry: Some(true),
+                    ..Default::default()
+                },
+            )),
+        },
+        Code::InvalidArgument,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pipeline_cross_session_graph_access_rejected() {
+    let port = pick_port();
+    let mut client = boot(port).await;
+    let owner = "sdp-owner";
+    let intruder = "sdp-intruder";
+    let graph_id = create_graph(&mut client, owner).await;
+
+    expect_status(
+        &mut client,
+        intruder,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineOutput(
+                sc::pipeline_command::DefineOutput {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    output_name: Some("t".into()),
+                    output_type: Some(sc::OutputType::Table as i32),
+                    ..Default::default()
+                },
+            )),
+        },
+        Code::InvalidArgument,
+    )
+    .await;
+
+    expect_status(
+        &mut client,
+        intruder,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DropDataflowGraph(
+                sc::pipeline_command::DropDataflowGraph {
+                    dataflow_graph_id: Some(graph_id),
+                },
+            )),
+        },
+        Code::InvalidArgument,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pipeline_define_output_replaces_by_name() {
+    let port = pick_port();
+    let mut client = boot(port).await;
+    let session = "sdp-replace";
+    let graph_id = create_graph(&mut client, session).await;
+
+    for comment in ["v1", "v2"] {
+        execute_pipeline(
+            &mut client,
+            session,
+            sc::PipelineCommand {
+                command_type: Some(sc::pipeline_command::CommandType::DefineOutput(
+                    sc::pipeline_command::DefineOutput {
+                        dataflow_graph_id: Some(graph_id.clone()),
+                        output_name: Some("metrics".into()),
+                        output_type: Some(sc::OutputType::Table as i32),
+                        comment: Some(comment.into()),
+                        ..Default::default()
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("DefineOutput");
+    }
+
+    execute_pipeline(
+        &mut client,
+        session,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineFlow(
+                sc::pipeline_command::DefineFlow {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    flow_name: Some("fill".into()),
+                    target_dataset_name: Some("metrics".into()),
+                    details: Some(
+                        sc::pipeline_command::define_flow::Details::RelationFlowDetails(
+                            sc::pipeline_command::define_flow::WriteRelationFlowDetails {
+                                relation: Some(sc::Relation {
+                                    rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                                        query: "SELECT 1 AS id".into(),
+                                        ..Default::default()
+                                    })),
+                                    ..Default::default()
+                                }),
+                            },
+                        ),
+                    ),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+    .expect("DefineFlow without pre-defined target output");
+
+    let dry_run = execute_pipeline(
+        &mut client,
+        session,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::StartRun(
+                sc::pipeline_command::StartRun {
+                    dataflow_graph_id: Some(graph_id),
+                    dry: Some(true),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+    .expect("StartRun dry");
+    let event = dry_run
+        .iter()
+        .find_map(|r| match &r.response_type {
+            Some(sc::execute_plan_response::ResponseType::PipelineEventResult(ev)) => {
+                ev.event.as_ref()?.message.clone()
+            }
+            _ => None,
+        })
+        .expect("dry run event");
+    assert!(
+        event.contains("is valid"),
+        "flow to output defined only at DefineFlow time should validate at StartRun: {event}"
+    );
 }
