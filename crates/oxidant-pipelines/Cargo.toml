@@ -1,0 +1,18 @@
+[package]
+name = "oxidant-pipelines"
+description = "Declarative table DAG runner: graph planning, expectations, and micro-batch execution."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-common = { workspace = true }
+oxidant-config = { workspace = true }
+oxidant-connect = { workspace = true }
+oxidant-loom = { workspace = true }
+oxidant-streaming = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

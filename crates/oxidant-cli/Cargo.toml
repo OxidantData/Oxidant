@@ -14,10 +14,9 @@ path = "src/main.rs"
 [dependencies]
 oxidant-common = { workspace = true }
 oxidant-config = { workspace = true }
+oxidant-pipelines = { workspace = true }
 oxidant-connect = { workspace = true }
 oxidant-loom = { workspace = true }
-# The declarative pipeline drives the same micro-batch engine a PySpark `writeStream` does.
-oxidant-streaming = { workspace = true }
 # Enable DNS worker discovery (`OXIDANT_WORKER_SERVICE`) the same way oxidant-connect
 # does — required for EC2 ASG / Route53 multi-A membership (Spark EMR-style cores).
 oxidant-execution = { workspace = true, features = ["k8s"] }
