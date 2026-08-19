@@ -156,6 +156,7 @@ impl<'a> Plan<'a> {
 
 /// Run the pipeline subgraph, emitting events through `on_event`.
 pub async fn run_pipeline(
+    engine: &Engine,
     plan: &Plan<'_>,
     wanted: &[String],
     force_once: bool,
@@ -165,12 +166,8 @@ pub async fn run_pipeline(
     if nodes.is_empty() {
         return Err(Error::Io("nothing to run".into()));
     }
-    let catalogs: std::collections::HashMap<String, String> =
-        plan.config.catalog_conf().into_iter().collect();
-    let service = oxidant_connect::OxidantService::with_catalogs(catalogs).await;
-    let engine = service.engine();
 
-    ensure_database(&engine, plan).await?;
+    ensure_database(engine, plan).await?;
 
     engine.set_current_catalog(&plan.pipeline.catalog).await?;
     engine.set_current_namespace(&plan.pipeline.schema).await?;
@@ -181,7 +178,7 @@ pub async fn run_pipeline(
         plan.pipeline.trigger.clone()
     };
 
-    let mut streams = StreamState::start(&engine, plan, &nodes).await?;
+    let mut streams = StreamState::start(engine, plan, &nodes).await?;
     let mut state = PipelineState::load(&plan.pipeline.checkpoints);
     on_event(RunEvent::PipelineStarted {
         name: plan.pipeline.name.clone(),
@@ -196,7 +193,7 @@ pub async fn run_pipeline(
     match trigger {
         Trigger::Once | Trigger::AvailableNow => {
             let outcomes = one_pass(
-                &engine,
+                engine,
                 plan,
                 &nodes,
                 &mut streams,
@@ -224,7 +221,7 @@ pub async fn run_pipeline(
             loop {
                 ticker.tick().await;
                 let outcomes = one_pass(
-                    &engine,
+                    engine,
                     plan,
                     &nodes,
                     &mut streams,

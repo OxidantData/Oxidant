@@ -38,6 +38,7 @@ use sc::spark_connect_service_server::{SparkConnectService, SparkConnectServiceS
 
 mod catalog;
 mod distributed;
+mod pipelines;
 pub mod rest;
 mod streaming;
 mod translate;
@@ -126,6 +127,8 @@ pub struct OxidantService {
     in_flight: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
     /// Cross-query distributed caches (resolved membership, per-endpoint UDF-sync state).
     distributed_caches: distributed::DistributedCaches,
+    /// In-memory SDP dataflow graphs keyed by graph id (Phase 1A).
+    dataflow_graphs: pipelines::DataflowGraphRegistry,
     /// Runtime observability store (jobs, stages, SQL plans).
     observability: SharedStore,
 }
@@ -262,6 +265,7 @@ impl OxidantService {
             completed_ops_ttl: completed_ops_ttl(),
             in_flight: std::sync::Mutex::new(std::collections::HashMap::new()),
             distributed_caches: distributed::DistributedCaches::default(),
+            dataflow_graphs: pipelines::DataflowGraphRegistry::default(),
             observability,
         }
     }
@@ -1193,6 +1197,10 @@ impl SparkConnectService for OxidantService {
                         self.result_complete(&session_id, &operation_id),
                     ]
                 }
+                Some(sc::command::CommandType::PipelineCommand(c)) => {
+                    self.handle_pipeline_command(&engine, &session_id, &operation_id, c)
+                        .await?
+                }
                 Some(sc::command::CommandType::RegisterFunction(rf)) => {
                     // Register in DataFusion's UDF registry so SQL cells can call the UDF.
                     {
@@ -1651,6 +1659,7 @@ impl SparkConnectService for OxidantService {
         // Evict the session's catalog/namespace cell (KAN-85); in-flight requests hold their
         // own `Arc` of the cell and finish unaffected.
         self.engine.drop_session(&req.session_id);
+        self.dataflow_graphs.drop_session(&req.session_id);
         Ok(Response::new(sc::ReleaseSessionResponse {
             session_id: req.session_id,
             server_side_session_id: self.server_session_id.clone(),
@@ -2074,7 +2083,7 @@ fn signed_columns(batch: RecordBatch) -> std::result::Result<RecordBatch, Status
     RecordBatch::try_new(schema, cols).map_err(|e| Status::internal(format!("rebuild batch: {e}")))
 }
 
-fn err_to_status(e: Error) -> Status {
+pub(crate) fn err_to_status(e: Error) -> Status {
     let msg = e.to_string();
     match e {
         Error::Plan(_) => Status::invalid_argument(msg),

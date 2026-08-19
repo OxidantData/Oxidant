@@ -98,7 +98,8 @@ pub async fn run(config: Option<OxidantConfig>, command: Command) -> Result<()> 
             Ok(())
         }
         Command::Run { tables, once } => {
-            run_pipeline(&plan, &tables, once, &mut render_event).await
+            let engine = crate::embedded::build_engine(Some(&config), None).await?;
+            run_pipeline(&engine, &plan, &tables, once, &mut render_event).await
         }
     }
 }
