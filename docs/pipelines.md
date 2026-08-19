@@ -16,6 +16,27 @@ metadata published over it. This is a second door into it, not a second implemen
 Runnable example, needing neither a broker nor AWS:
 [`examples/oxidant.yaml`](../examples/oxidant.yaml).
 
+## Spark Declarative Pipelines (Connect)
+
+Stock Spark 4.x clients can define and run pipelines over `oxidant spark server` without a
+YAML file:
+
+- **`pyspark.pipelines`** (`@dp.table`, `@dp.materialized_view`, …) and **`spark-pipelines run`**
+  on `.sql` pipeline sources both speak the Spark Connect `PipelineCommand` surface
+  (`CreateDataflowGraph` → `DefineOutput` / `DefineFlow` / `DefineSqlGraphElements` → `StartRun`).
+- **What works today:** graph registry + SDP SQL parsing (`CREATE STREAMING TABLE`,
+  `CREATE MATERIALIZED VIEW`, `CREATE TEMPORARY VIEW`, `CREATE [ONCE] FLOW`, `REFRESH MATERIALIZED
+  VIEW`), dry-run validation (`StartRun.dry`), non-dry execution with `PipelineEvent` streaming,
+  `full_refresh_all` / `full_refresh_selection` (drop pipeline state), `refresh_selection` and SQL
+  `REFRESH` / `OR REFRESH` requests (subgraph + ancestors), and `once` flows (skip after first
+  successful completion unless refreshed). Kafka spool sources (`oxidant.spool.dir` in
+  `TBLPROPERTIES` or `readStream` options) exercise the same path as the YAML runner.
+- **Limits (deferred):** no AUTO CDC / `APPLY CHANGES` flows ([#91](https://github.com/oxidantdata/oxidant/issues/91)),
+  no Python query-function signal stream ([#92](https://github.com/oxidantdata/oxidant/issues/92)),
+  no external sinks / `ExecuteOutputFlows` ([#93](https://github.com/oxidantdata/oxidant/issues/93)).
+  Interactive `spark.sql("CREATE STREAMING TABLE …")` still correctly rejects those statements;
+  use `DefineSqlGraphElements` or the Python decorators instead.
+
 ## Two kinds of table
 
 ```yaml

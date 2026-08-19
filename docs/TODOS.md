@@ -169,8 +169,12 @@ path.
       while adding subcommands, but it rewrites every existing flag's parsing — its own PR,
       with its own regression surface.
 - [ ] A SQL REPL. `oxidant sql` is one-shot; there is no readline/interactive loop anywhere.
-- [ ] Wire `pipelines.proto`. The Spark Connect pipelines protobuf is vendored but no Rust
-      code references it; the declarative pipeline is config-file driven instead.
+- [ ] Wire remaining `pipelines.proto` surface (SDP Phase 4): query-function execution signal
+      stream ([#92](https://github.com/oxidantdata/oxidant/issues/92)), AUTO CDC flows
+      ([#91](https://github.com/oxidantdata/oxidant/issues/91)), sinks /
+      `ExecuteOutputFlows` ([#93](https://github.com/oxidantdata/oxidant/issues/93)). Core
+      `PipelineCommand` dispatch, SQL graph parsing, and `StartRun` execution landed in SDP
+      Phases 1–2.
 - [ ] Kafka as a *sink*. The Kafka integration is source-only.
 
 ### Gates to keep honest
