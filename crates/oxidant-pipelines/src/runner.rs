@@ -1,9 +1,9 @@
 //! Pipeline execution: plan the DAG, drive streaming and derived tables, persist state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use oxidant_common::{Error, Result};
 use oxidant_config::{
@@ -22,7 +22,14 @@ use crate::STREAM_ALIAS;
 /// Events emitted while a pipeline runs. Callers render or forward them (CLI stderr, Spark
 /// PipelineEvents in later phases).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunEvent {
+pub struct RunEvent {
+    pub at: SystemTime,
+    pub kind: RunEventKind,
+}
+
+/// Payload for [`RunEvent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunEventKind {
     /// The run loop is starting with the resolved subgraph.
     PipelineStarted {
         name: String,
@@ -41,6 +48,8 @@ pub enum RunEvent {
     TableUnchanged { name: String },
     /// A table was not run because an upstream table failed this pass.
     TableSkipped { name: String },
+    /// A `once` flow target was skipped because it already completed.
+    OnceFlowSkipped { name: String },
     /// A `warn` expectation saw failing rows.
     ExpectationViolation {
         table: String,
@@ -64,6 +73,16 @@ pub enum RunEvent {
     StatePersistFailed { error: String },
     /// One pass over the subgraph finished.
     PassComplete { outcomes: Vec<TableOutcome> },
+}
+
+fn emit<F>(on_event: &mut F, kind: RunEventKind)
+where
+    F: FnMut(RunEvent),
+{
+    on_event(RunEvent {
+        at: SystemTime::now(),
+        kind,
+    });
 }
 
 /// One table's outcome in a single pass.
@@ -154,14 +173,33 @@ impl<'a> Plan<'a> {
     }
 }
 
+/// Drop persisted pipeline-state entries so the next pass recomputes affected tables.
+pub fn clear_pipeline_state(checkpoints: &str, tables: &[String]) -> Result<()> {
+    let mut state = PipelineState::load(checkpoints);
+    if tables.is_empty() {
+        state.tables.clear();
+        state.once_completed.clear();
+    } else {
+        for name in tables {
+            state.tables.remove(name);
+            state.once_completed.remove(name);
+        }
+    }
+    state.save(checkpoints)
+}
+
 /// Run the pipeline subgraph, emitting events through `on_event`.
-pub async fn run_pipeline(
+pub async fn run_pipeline<F>(
     engine: &Engine,
     plan: &Plan<'_>,
     wanted: &[String],
     force_once: bool,
-    on_event: &mut dyn FnMut(RunEvent),
-) -> Result<()> {
+    once_tables: &HashSet<String>,
+    on_event: &mut F,
+) -> Result<()>
+where
+    F: FnMut(RunEvent) + Send,
+{
     let nodes = plan.graph.subgraph(wanted)?;
     if nodes.is_empty() {
         return Err(Error::Io("nothing to run".into()));
@@ -180,15 +218,18 @@ pub async fn run_pipeline(
 
     let mut streams = StreamState::start(engine, plan, &nodes).await?;
     let mut state = PipelineState::load(&plan.pipeline.checkpoints);
-    on_event(RunEvent::PipelineStarted {
-        name: plan.pipeline.name.clone(),
-        table_count: nodes.len(),
-        order: nodes
-            .iter()
-            .map(|n| n.name.as_str())
-            .collect::<Vec<_>>()
-            .join(" -> "),
-    });
+    emit(
+        on_event,
+        RunEventKind::PipelineStarted {
+            name: plan.pipeline.name.clone(),
+            table_count: nodes.len(),
+            order: nodes
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> "),
+        },
+    );
 
     match trigger {
         Trigger::Once | Trigger::AvailableNow => {
@@ -199,13 +240,17 @@ pub async fn run_pipeline(
                 &mut streams,
                 &mut state,
                 true,
+                once_tables,
                 on_event,
             )
             .await;
             if let Err(e) = state.save(&plan.pipeline.checkpoints) {
-                on_event(RunEvent::StatePersistFailed {
-                    error: e.to_string(),
-                });
+                emit(
+                    on_event,
+                    RunEventKind::StatePersistFailed {
+                        error: e.to_string(),
+                    },
+                );
             }
             emit_pass_outcomes(&outcomes, on_event);
             if outcomes.iter().any(|o| o.error.is_some()) {
@@ -227,13 +272,17 @@ pub async fn run_pipeline(
                     &mut streams,
                     &mut state,
                     false,
+                    once_tables,
                     on_event,
                 )
                 .await;
                 if let Err(e) = state.save(&plan.pipeline.checkpoints) {
-                    on_event(RunEvent::StatePersistFailed {
-                        error: e.to_string(),
-                    });
+                    emit(
+                        on_event,
+                        RunEventKind::StatePersistFailed {
+                            error: e.to_string(),
+                        },
+                    );
                 }
                 emit_pass_outcomes(&outcomes, on_event);
             }
@@ -241,31 +290,37 @@ pub async fn run_pipeline(
     }
 }
 
-fn emit_pass_outcomes(outcomes: &[TableOutcome], on_event: &mut dyn FnMut(RunEvent)) {
+fn emit_pass_outcomes<F>(outcomes: &[TableOutcome], on_event: &mut F)
+where
+    F: FnMut(RunEvent),
+{
     for outcome in outcomes {
         let event = match outcome.status() {
-            TableStatus::Updated => RunEvent::TableUpdated {
+            TableStatus::Updated => RunEventKind::TableUpdated {
                 name: outcome.name.clone(),
                 rows: outcome.rows,
                 elapsed: outcome.elapsed,
             },
-            TableStatus::Unchanged => RunEvent::TableUnchanged {
+            TableStatus::Unchanged => RunEventKind::TableUnchanged {
                 name: outcome.name.clone(),
             },
-            TableStatus::Skipped => RunEvent::TableSkipped {
+            TableStatus::Skipped => RunEventKind::TableSkipped {
                 name: outcome.name.clone(),
             },
-            TableStatus::Failed { error } => RunEvent::TableFailed {
+            TableStatus::Failed { error } => RunEventKind::TableFailed {
                 name: outcome.name.clone(),
                 error,
                 elapsed: outcome.elapsed,
             },
         };
-        on_event(event);
+        emit(on_event, event);
     }
-    on_event(RunEvent::PassComplete {
-        outcomes: outcomes.to_vec(),
-    });
+    emit(
+        on_event,
+        RunEventKind::PassComplete {
+            outcomes: outcomes.to_vec(),
+        },
+    );
 }
 
 async fn ensure_database(engine: &Engine, plan: &Plan<'_>) -> Result<()> {
@@ -397,23 +452,31 @@ async fn start_stream(
     Ok(id.id)
 }
 
-async fn one_pass(
+#[allow(clippy::too_many_arguments)]
+async fn one_pass<F>(
     engine: &Engine,
     plan: &Plan<'_>,
     nodes: &[Node],
     streams: &mut StreamState,
     state: &mut PipelineState,
     drain: bool,
-    on_event: &mut dyn FnMut(RunEvent),
-) -> Vec<TableOutcome> {
+    once_tables: &HashSet<String>,
+    on_event: &mut F,
+) -> Vec<TableOutcome>
+where
+    F: FnMut(RunEvent) + Send,
+{
     let mut outcomes: Vec<TableOutcome> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
 
     for node in nodes {
-        on_event(RunEvent::TableStarted {
-            name: node.name.clone(),
-        });
+        emit(
+            on_event,
+            RunEventKind::TableStarted {
+                name: node.name.clone(),
+            },
+        );
 
         if node.depends_on.iter().any(|d| failed.contains(d)) {
             outcomes.push(TableOutcome {
@@ -430,6 +493,23 @@ async fn one_pass(
         let Some(table) = plan.table(&node.name) else {
             continue;
         };
+        if once_tables.contains(&node.name) && state.once_completed(&node.name) {
+            emit(
+                on_event,
+                RunEventKind::OnceFlowSkipped {
+                    name: node.name.clone(),
+                },
+            );
+            outcomes.push(TableOutcome {
+                name: node.name.clone(),
+                rows: 0,
+                elapsed: Duration::ZERO,
+                error: None,
+                skipped: false,
+                unchanged: true,
+            });
+            continue;
+        }
         let definition = definition_fingerprint(table);
         if table.kind() == TableKind::Derived
             && state.built_as(&node.name, &definition)
@@ -437,11 +517,14 @@ async fn one_pass(
             && !node.depends_on.iter().any(|d| changed.contains(d))
         {
             if let Err(e) = bind_bare_name(engine, plan, &node.name).await {
-                on_event(RunEvent::BareNameWarning {
-                    table: node.name.clone(),
-                    error: e.to_string(),
-                    downstream_hint: false,
-                });
+                emit(
+                    on_event,
+                    RunEventKind::BareNameWarning {
+                        table: node.name.clone(),
+                        error: e.to_string(),
+                        downstream_hint: false,
+                    },
+                );
             }
             outcomes.push(TableOutcome {
                 name: node.name.clone(),
@@ -467,12 +550,18 @@ async fn one_pass(
                 if table.kind() == TableKind::Derived {
                     state.mark_built(&node.name, &definition);
                 }
+                if once_tables.contains(&node.name) {
+                    state.mark_once_completed(&node.name);
+                }
                 if let Err(e) = bind_bare_name(engine, plan, &node.name).await {
-                    on_event(RunEvent::BareNameWarning {
-                        table: node.name.clone(),
-                        error: e.to_string(),
-                        downstream_hint: true,
-                    });
+                    emit(
+                        on_event,
+                        RunEventKind::BareNameWarning {
+                            table: node.name.clone(),
+                            error: e.to_string(),
+                            downstream_hint: true,
+                        },
+                    );
                 }
                 outcomes.push(TableOutcome {
                     name: node.name.clone(),
@@ -526,13 +615,16 @@ async fn advance_stream(
     }
 }
 
-async fn recompute(
+async fn recompute<F>(
     engine: &Engine,
     plan: &Plan<'_>,
     table: &TableConfig,
     state: &mut PipelineState,
-    on_event: &mut dyn FnMut(RunEvent),
-) -> Result<u64> {
+    on_event: &mut F,
+) -> Result<u64>
+where
+    F: FnMut(RunEvent) + Send,
+{
     let name = table.name.trim();
     let sql = table
         .sql
@@ -556,11 +648,14 @@ async fn recompute(
                 )))
             }
             ExpectAction::Warn => {
-                on_event(RunEvent::ExpectationViolation {
-                    table: name.to_string(),
-                    label: label.to_string(),
-                    failed_records: violations,
-                });
+                emit(
+                    on_event,
+                    RunEventKind::ExpectationViolation {
+                        table: name.to_string(),
+                        label: label.to_string(),
+                        failed_records: violations,
+                    },
+                );
             }
             ExpectAction::Drop => {}
         }
@@ -610,6 +705,8 @@ async fn recompute(
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct PipelineState {
     tables: BTreeMap<String, TableState>,
+    #[serde(default)]
+    once_completed: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -664,6 +761,14 @@ impl PipelineState {
         let slot = self.tables.entry(table.to_string()).or_default();
         slot.built = true;
         slot.definition = definition.to_string();
+    }
+
+    fn once_completed(&self, table: &str) -> bool {
+        self.once_completed.contains(table)
+    }
+
+    fn mark_once_completed(&mut self, table: &str) {
+        self.once_completed.insert(table.to_string());
     }
 }
 
@@ -720,14 +825,14 @@ mod tests {
         emit_pass_outcomes(&outcomes, &mut |event| events.push(event));
         assert_eq!(events.len(), 3);
         assert!(matches!(
-            events[0],
-            RunEvent::TableUpdated { ref name, rows: 3, .. } if name == "a"
+            events[0].kind,
+            RunEventKind::TableUpdated { ref name, rows: 3, .. } if name == "a"
         ));
         assert!(matches!(
-            events[1],
-            RunEvent::TableUnchanged { ref name } if name == "b"
+            events[1].kind,
+            RunEventKind::TableUnchanged { ref name } if name == "b"
         ));
-        assert!(matches!(events[2], RunEvent::PassComplete { .. }));
+        assert!(matches!(events[2].kind, RunEventKind::PassComplete { .. }));
     }
 
     #[test]

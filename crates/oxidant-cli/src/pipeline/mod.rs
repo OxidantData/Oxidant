@@ -2,7 +2,7 @@
 
 use oxidant_common::{Error, Result};
 use oxidant_config::{OxidantConfig, TableKind};
-use oxidant_pipelines::{run_pipeline, Plan, RunEvent};
+use oxidant_pipelines::{run_pipeline, Plan, RunEvent, RunEventKind};
 
 /// What `oxidant pipeline` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +99,16 @@ pub async fn run(config: Option<OxidantConfig>, command: Command) -> Result<()> 
         }
         Command::Run { tables, once } => {
             let engine = crate::embedded::build_engine(Some(&config), None).await?;
-            run_pipeline(&engine, &plan, &tables, once, &mut render_event).await
+            let once_tables = std::collections::HashSet::new();
+            run_pipeline(
+                &engine,
+                &plan,
+                &tables,
+                once,
+                &once_tables,
+                &mut render_event,
+            )
+            .await
         }
     }
 }
@@ -141,16 +150,16 @@ fn print_graph(plan: &Plan<'_>) {
 
 /// Render pipeline events to stderr — byte-identical to the pre-extraction runner.
 fn render_event(event: RunEvent) {
-    match event {
-        RunEvent::PipelineStarted {
+    match event.kind {
+        RunEventKind::PipelineStarted {
             name,
             table_count,
             order,
         } => {
             eprintln!("[oxidant] pipeline `{name}`: {table_count} table(s), order: {order}");
         }
-        RunEvent::TableStarted { .. } | RunEvent::PassComplete { .. } => {}
-        RunEvent::TableUpdated {
+        RunEventKind::TableStarted { .. } | RunEventKind::PassComplete { .. } => {}
+        RunEventKind::TableUpdated {
             name,
             rows,
             elapsed,
@@ -162,19 +171,25 @@ fn render_event(event: RunEvent) {
                 elapsed.as_secs_f64()
             );
         }
-        RunEvent::TableUnchanged { name } => {
+        RunEventKind::TableUnchanged { name } => {
             eprintln!(
                 "[oxidant] {:<24} unchanged (nothing it reads moved this pass)",
                 name
             );
         }
-        RunEvent::TableSkipped { name } => {
+        RunEventKind::TableSkipped { name } => {
             eprintln!(
                 "[oxidant] {:<24} skipped (an upstream table failed this pass)",
                 name
             );
         }
-        RunEvent::ExpectationViolation {
+        RunEventKind::OnceFlowSkipped { name } => {
+            eprintln!(
+                "[oxidant] {:<24} skipped (once flow already completed)",
+                name
+            );
+        }
+        RunEventKind::ExpectationViolation {
             table,
             label,
             failed_records,
@@ -183,7 +198,7 @@ fn render_event(event: RunEvent) {
                 "[oxidant] table={table} expectation={label} failed_records={failed_records}"
             );
         }
-        RunEvent::BareNameWarning {
+        RunEventKind::BareNameWarning {
             table,
             error,
             downstream_hint,
@@ -201,10 +216,10 @@ fn render_event(event: RunEvent) {
                 );
             }
         }
-        RunEvent::TableFailed { name, error, .. } => {
+        RunEventKind::TableFailed { name, error, .. } => {
             eprintln!("[oxidant] {:<24} FAILED: {error}", name);
         }
-        RunEvent::StatePersistFailed { error } => {
+        RunEventKind::StatePersistFailed { error } => {
             eprintln!("[oxidant] could not persist pipeline state: {error}");
         }
     }
@@ -300,7 +315,14 @@ mod tests {
 
     #[test]
     fn render_event_ignores_table_started_and_pass_complete() {
-        render_event(RunEvent::TableStarted { name: "t".into() });
-        render_event(RunEvent::PassComplete { outcomes: vec![] });
+        use std::time::SystemTime;
+        render_event(RunEvent {
+            at: SystemTime::now(),
+            kind: RunEventKind::TableStarted { name: "t".into() },
+        });
+        render_event(RunEvent {
+            at: SystemTime::now(),
+            kind: RunEventKind::PassComplete { outcomes: vec![] },
+        });
     }
 }

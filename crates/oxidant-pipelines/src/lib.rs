@@ -9,7 +9,9 @@ mod runner;
 pub mod sql_graph;
 
 pub use graph::{Graph, Node};
-pub use runner::{run_pipeline, Plan, RunEvent, TableOutcome, TableStatus};
+pub use runner::{
+    clear_pipeline_state, run_pipeline, Plan, RunEvent, RunEventKind, TableOutcome, TableStatus,
+};
 pub use sql_graph::{
     parse, parse_with_context, split_statements, OutputKind, ParsedFlow, ParsedOutput,
     SqlGraphElements,
