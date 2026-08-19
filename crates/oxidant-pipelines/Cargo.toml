@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+datafusion = "54"
 oxidant-common = { workspace = true }
 oxidant-config = { workspace = true }
 oxidant-connect = { workspace = true }
