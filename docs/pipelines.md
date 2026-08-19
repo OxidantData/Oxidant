@@ -37,6 +37,18 @@ YAML file:
   Interactive `spark.sql("CREATE STREAMING TABLE …")` still correctly rejects those statements;
   use `DefineSqlGraphElements` or the Python decorators instead.
 
+**Client e2e gate** (stock `pyspark.pipelines` / `spark-pipelines run`, no broker):
+
+```sh
+./tests/sdp-client-e2e.sh
+```
+
+The script builds `oxidant-cli`, starts a local-catalog server, runs
+`DefineSqlGraphElements` + `StartRun` over the committed `examples/spool/orders` fixture
+(`sum(revenue)=725`), then repeats via `python -m pyspark.pipelines.cli run` on a `.sql` file.
+`StartRun.storage` must live under the catalog warehouse parent (e.g. `warehouse/_checkpoints`)
+so pipeline table data and catalog registration share the same root.
+
 ## Two kinds of table
 
 ```yaml
