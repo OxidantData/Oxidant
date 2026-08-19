@@ -869,6 +869,17 @@ AS SELECT * FROM STREAM raw.events";
     }
 
     #[test]
+    fn streaming_table_with_spool_properties_plus_mv() {
+        let sql = "CREATE OR REFRESH STREAMING TABLE orders_bronze \
+            TBLPROPERTIES ('subscribe' = 'orders', 'oxidant.spool.dir' = '/tmp/spool', 'startingOffsets' = 'earliest') \
+            USING DELTA AS SELECT 1 AS order_id FROM stream; \
+            CREATE MATERIALIZED VIEW revenue_gold AS SELECT sum(amount) FROM orders_bronze";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.outputs.len(), 2, "{out:?}");
+        assert_eq!(out.flows.len(), 2, "{out:?}");
+    }
+
+    #[test]
     fn multi_statement_file() {
         let sql = "\
 CREATE STREAMING TABLE t AS SELECT 1;

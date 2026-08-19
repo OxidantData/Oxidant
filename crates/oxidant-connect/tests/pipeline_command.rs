@@ -381,22 +381,6 @@ async fn pipeline_rejection_paths() {
         &mut client,
         session,
         sc::PipelineCommand {
-            command_type: Some(sc::pipeline_command::CommandType::StartRun(
-                sc::pipeline_command::StartRun {
-                    dataflow_graph_id: Some(graph_id.clone()),
-                    dry: Some(false),
-                    ..Default::default()
-                },
-            )),
-        },
-        Code::Unimplemented,
-    )
-    .await;
-
-    expect_status(
-        &mut client,
-        session,
-        sc::PipelineCommand {
             command_type: Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(
                 sc::pipeline_command::DefineSqlGraphElements {
                     dataflow_graph_id: Some(graph_id),
