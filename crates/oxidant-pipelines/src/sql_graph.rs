@@ -67,33 +67,44 @@ enum ParsedStatement {
 }
 
 fn parse_one_statement(stmt: &str) -> Result<ParsedStatement> {
+    let stmt = strip_leading_comments(stmt.trim());
+    if stmt.is_empty() {
+        return Err(unsupported_kind(stmt, "empty statement"));
+    }
     let upper = stmt.to_ascii_uppercase();
-    if upper.contains("AUTO CDC") || upper.contains("APPLY CHANGES INTO") {
+    if starts_with_keyword(&upper, "APPLY CHANGES INTO") {
         return Err(unsupported_kind(stmt, "AUTO CDC / APPLY CHANGES INTO"));
     }
-    if upper.starts_with("CREATE SINK") {
+    if contains_phrase_outside_literals(stmt, "AUTO CDC") {
+        return Err(unsupported_kind(stmt, "AUTO CDC / APPLY CHANGES INTO"));
+    }
+    if starts_with_keyword(&upper, "CREATE SINK") {
         return Err(unsupported_kind(stmt, "CREATE SINK"));
     }
-    if upper.starts_with("CREATE OR REFRESH STREAMING TABLE")
-        || upper.starts_with("CREATE STREAMING TABLE")
+    if starts_with_keyword(&upper, "CREATE OR REFRESH STREAMING TABLE")
+        || starts_with_keyword(&upper, "CREATE STREAMING TABLE")
     {
         return parse_create_streaming_table(stmt);
     }
-    if upper.starts_with("CREATE OR REFRESH MATERIALIZED VIEW")
-        || upper.starts_with("CREATE MATERIALIZED VIEW")
+    if starts_with_keyword(&upper, "CREATE OR REFRESH MATERIALIZED VIEW")
+        || starts_with_keyword(&upper, "CREATE MATERIALIZED VIEW")
     {
         return parse_create_materialized_view(stmt);
     }
-    if upper.starts_with("CREATE TEMPORARY VIEW") {
+    if starts_with_keyword(&upper, "CREATE TEMPORARY VIEW") {
         return parse_create_temporary_view(stmt);
     }
-    if upper.starts_with("CREATE ONCE FLOW") || upper.starts_with("CREATE FLOW") {
+    if starts_with_keyword(&upper, "CREATE ONCE FLOW") || starts_with_keyword(&upper, "CREATE FLOW")
+    {
         return parse_create_flow(stmt);
     }
-    if upper.starts_with("REFRESH MATERIALIZED VIEW") {
+    if starts_with_keyword(&upper, "REFRESH MATERIALIZED VIEW") {
         return parse_refresh_materialized_view(stmt);
     }
-    if upper.starts_with("SELECT ") || upper.starts_with("INSERT ") || upper.starts_with("WITH ") {
+    if starts_with_keyword(&upper, "SELECT")
+        || starts_with_keyword(&upper, "INSERT")
+        || starts_with_keyword(&upper, "WITH")
+    {
         return Err(unsupported_kind(stmt, "SELECT / INSERT"));
     }
     Err(unsupported_kind(stmt, "unsupported statement"))
@@ -211,17 +222,10 @@ fn hand_parse_materialized_view(stmt: &str) -> Result<ParsedStatement> {
         false => false,
     };
     let name = cursor.parse_identifier()?;
-    let mut comment = None;
-    if cursor.try_keyword("COMMENT")? {
-        comment = Some(cursor.parse_string_literal()?);
-    }
-    cursor.expect_keyword("AS")?;
-    let query = cursor.rest().trim().to_string();
-    validate_query(&query)?;
-    let output = ParsedOutput {
+    let mut output = ParsedOutput {
         name: name.clone(),
         kind: OutputKind::MaterializedView,
-        comment,
+        comment: None,
         partition_cols: Vec::new(),
         table_properties: BTreeMap::new(),
         format: None,
@@ -229,6 +233,10 @@ fn hand_parse_materialized_view(stmt: &str) -> Result<ParsedStatement> {
         if_not_exists,
         or_refresh,
     };
+    parse_view_clauses_before_as(&mut cursor, &mut output, stmt)?;
+    cursor.expect_keyword("AS")?;
+    let query = cursor.rest().trim().to_string();
+    validate_query(&query)?;
     let flow = ParsedFlow {
         name: None,
         target: name,
@@ -343,14 +351,56 @@ fn parse_refresh_materialized_view(stmt: &str) -> Result<ParsedStatement> {
     Ok(ParsedStatement::Refresh(name))
 }
 
+fn parse_view_clauses_before_as(
+    cursor: &mut Cursor<'_>,
+    output: &mut ParsedOutput,
+    stmt: &str,
+) -> Result<()> {
+    loop {
+        let rest = cursor.rest();
+        if rest.is_empty() {
+            break;
+        }
+        if rest_starts_with_keyword(rest, "AS") {
+            break;
+        }
+        if cursor.try_keyword("COMMENT")? {
+            output.comment = Some(cursor.parse_string_literal()?);
+            continue;
+        }
+        if cursor.try_keyword("PARTITIONED")? {
+            cursor.expect_keyword("BY")?;
+            cursor.expect_char('(')?;
+            let cols = cursor.parse_identifier_list(')')?;
+            cursor.expect_char(')')?;
+            output.partition_cols = cols;
+            continue;
+        }
+        if cursor.try_keyword("TBLPROPERTIES")? {
+            output.table_properties = cursor.parse_tblproperties()?;
+            continue;
+        }
+        if cursor.try_keyword("SCHEDULE")? {
+            return Err(unsupported_kind(
+                stmt,
+                "SCHEDULE EVERY on CREATE MATERIALIZED VIEW",
+            ));
+        }
+        return Err(plan_error(
+            cursor.input,
+            "unexpected clause in CREATE MATERIALIZED VIEW",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_table_clauses(cursor: &mut Cursor<'_>, output: &mut ParsedOutput) -> Result<()> {
     loop {
         let rest = cursor.rest();
         if rest.is_empty() {
             break;
         }
-        let upper = rest.to_ascii_uppercase();
-        if upper.starts_with("AS ") || upper.starts_with("FLOW ") {
+        if rest_starts_with_keyword(rest, "AS") || rest_starts_with_keyword(rest, "FLOW") {
             break;
         }
         if cursor.try_char('(')? {
@@ -396,12 +446,28 @@ fn try_parse_create_view(stmt: &str) -> Result<CreateView> {
 }
 
 fn validate_query(query: &str) -> Result<()> {
-    if query.trim().is_empty() {
+    let query = query.trim();
+    if query.is_empty() {
         return Err(plan_error(query, "query must not be empty"));
     }
-    // Best-effort: SDP queries often use STREAM/read_files syntax the Databricks parser
-    // does not model. Accept the text when DataFusion cannot represent the dialect extension.
-    Ok(())
+    match Parser::parse_sql(&DatabricksDialect {}, query) {
+        Ok(stmts) if stmts.len() == 1 => match &stmts[0] {
+            Statement::Query(_) => Ok(()),
+            _ => Err(plan_error(
+                query,
+                "expected a query (SELECT, WITH, or VALUES)",
+            )),
+        },
+        Ok(_) => Err(plan_error(query, "query must be a single statement")),
+        Err(_) if has_dialect_extension(query) => Ok(()),
+        Err(e) => Err(plan_error(query, &format!("invalid query SQL: {e}"))),
+    }
+}
+
+fn has_dialect_extension(query: &str) -> bool {
+    let sanitized = strip_strings_and_comments(query);
+    let upper = sanitized.to_ascii_uppercase();
+    word_boundary_contains(&upper, "STREAM") || word_boundary_contains(&upper, "READ_FILES")
 }
 
 fn query_to_sql(query: &datafusion::sql::sqlparser::ast::Query) -> Result<String> {
@@ -424,12 +490,151 @@ fn plan_error(_stmt: &str, msg: &str) -> Error {
 fn unsupported_kind(stmt: &str, kind: &str) -> Error {
     Error::Unsupported(format!(
         "pipeline SQL does not support {kind}: {}",
-        first_line(stmt)
+        statement_preview(stmt)
     ))
 }
 
-fn first_line(s: &str) -> &str {
-    s.lines().next().unwrap_or(s).trim()
+fn statement_preview(s: &str) -> String {
+    let lines: Vec<&str> = s.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    if lines.len() == 1 {
+        lines[0].to_string()
+    } else {
+        format!("{} ... {}", lines[0], lines.last().unwrap())
+    }
+}
+
+fn starts_with_keyword(upper: &str, kw: &str) -> bool {
+    let upper_kw = kw.to_ascii_uppercase();
+    if !upper.starts_with(&upper_kw) {
+        return false;
+    }
+    let after = upper[kw.len()..].chars().next();
+    after.is_none() || !after.unwrap().is_ascii_alphanumeric() && after != Some('_')
+}
+
+fn rest_starts_with_keyword(rest: &str, kw: &str) -> bool {
+    starts_with_keyword(&rest.to_ascii_uppercase(), kw)
+}
+
+fn strip_leading_comments(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            s = match rest.find('\n') {
+                Some(i) => &rest[i + 1..],
+                None => "",
+            };
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("/*") {
+            let mut chars = rest.char_indices().peekable();
+            while let Some((i, ch)) = chars.next() {
+                if ch == '*' && chars.peek().map(|(_, c)| *c) == Some('/') {
+                    s = &rest[i + 2..];
+                    break;
+                }
+            }
+            if s.starts_with("/*") {
+                return "";
+            }
+            continue;
+        }
+        break;
+    }
+    s
+}
+
+fn is_only_comments(s: &str) -> bool {
+    strip_leading_comments(s.trim()).is_empty()
+}
+
+fn strip_strings_and_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while let Some(ch) = chars.next() {
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+                out.push(' ');
+            }
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if in_double && ch == '\\' {
+            chars.next();
+            continue;
+        }
+        if !in_single && !in_double && !in_backtick {
+            if ch == '-' && chars.peek() == Some(&'-') {
+                chars.next();
+                in_line_comment = true;
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                in_block_comment = true;
+                continue;
+            }
+        }
+        match ch {
+            '\'' if !in_double && !in_backtick => {
+                in_single = !in_single;
+            }
+            '"' if !in_single && !in_backtick => {
+                in_double = !in_double;
+            }
+            '`' if !in_single && !in_double => {
+                in_backtick = !in_backtick;
+            }
+            c if !in_single && !in_double && !in_backtick => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn contains_phrase_outside_literals(stmt: &str, phrase: &str) -> bool {
+    let sanitized = strip_strings_and_comments(stmt);
+    let upper = sanitized.to_ascii_uppercase();
+    word_boundary_contains(&upper, phrase)
+}
+
+fn word_boundary_contains(haystack: &str, needle: &str) -> bool {
+    let needle_upper = needle.to_ascii_uppercase();
+    let needle_bytes = needle_upper.as_bytes();
+    let hay_bytes = haystack.as_bytes();
+    if needle_bytes.is_empty() || hay_bytes.len() < needle_bytes.len() {
+        return false;
+    }
+    for i in 0..=hay_bytes.len() - needle_bytes.len() {
+        if !haystack[i..i + needle_bytes.len()].eq_ignore_ascii_case(needle) {
+            continue;
+        }
+        let before_ok =
+            i == 0 || !hay_bytes[i - 1].is_ascii_alphanumeric() && hay_bytes[i - 1] != b'_';
+        let after_idx = i + needle_bytes.len();
+        let after_ok = after_idx >= hay_bytes.len()
+            || !hay_bytes[after_idx].is_ascii_alphanumeric() && hay_bytes[after_idx] != b'_';
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// Split SQL on semicolons outside quotes and comments; returns `(start_line, statement)`.
@@ -479,6 +684,27 @@ pub fn split_statements(sql: &str) -> Vec<(usize, String)> {
             }
         }
 
+        if in_double && ch == '\\' {
+            cur.push(ch);
+            if let Some(next) = chars.next() {
+                cur.push(next);
+                if next == '\n' {
+                    line += 1;
+                }
+            }
+            continue;
+        }
+        if in_single && ch == '\\' {
+            cur.push(ch);
+            if let Some(next) = chars.next() {
+                cur.push(next);
+                if next == '\n' {
+                    line += 1;
+                }
+            }
+            continue;
+        }
+
         match ch {
             '\'' if !in_double && !in_backtick => {
                 in_single = !in_single;
@@ -498,13 +724,20 @@ pub fn split_statements(sql: &str) -> Vec<(usize, String)> {
                     out.push((start_line, trimmed.to_string()));
                 }
                 cur.clear();
-                start_line = line;
             }
             '\n' => {
                 cur.push(ch);
                 line += 1;
+                if cur.trim().is_empty() {
+                    start_line = line;
+                }
             }
-            _ => cur.push(ch),
+            c => {
+                if cur.is_empty() && !c.is_whitespace() {
+                    start_line = line;
+                }
+                cur.push(c);
+            }
         }
     }
     let trimmed = cur.trim();
@@ -580,6 +813,19 @@ impl<'a> Cursor<'a> {
     }
 
     fn parse_identifier(&mut self) -> Result<String> {
+        let mut parts = Vec::new();
+        loop {
+            parts.push(self.parse_identifier_segment()?);
+            self.skip_ws();
+            if self.try_char('.')? {
+                continue;
+            }
+            break;
+        }
+        Ok(parts.join("."))
+    }
+
+    fn parse_identifier_segment(&mut self) -> Result<String> {
         self.skip_ws();
         let rest = &self.input[self.pos..];
         if let Some(rest) = rest.strip_prefix('`') {
@@ -587,18 +833,18 @@ impl<'a> Cursor<'a> {
                 .find('`')
                 .ok_or_else(|| plan_error(self.input, "unterminated quoted identifier"))?;
             let id = rest[..end].to_string();
-            self.pos += 2 + end;
+            self.pos += self.input[self.pos..].len() - rest.len() + 1 + end;
             return Ok(id);
         }
         let end = rest
-            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .unwrap_or(rest.len());
         if end == 0 {
             return Err(plan_error(self.input, "expected identifier"));
         }
         let id = rest[..end].to_string();
         self.pos += self.input[self.pos..].len() - rest.len() + end;
-        Ok(id.trim_matches('`').to_string())
+        Ok(id)
     }
 
     fn parse_string_literal(&mut self) -> Result<String> {
@@ -718,7 +964,7 @@ pub fn parse_with_context(sql_text: &str, sql_file_path: Option<&str>) -> Result
     let mut elements = SqlGraphElements::default();
     for (index, (line, stmt)) in split_statements(sql_text).into_iter().enumerate() {
         let trimmed = stmt.trim();
-        if trimmed.is_empty() || trimmed.starts_with("--") {
+        if trimmed.is_empty() || is_only_comments(trimmed) {
             continue;
         }
         let parsed = parse_one_statement(trimmed)
@@ -955,5 +1201,140 @@ CREATE MATERIALIZED VIEW mv AS SELECT 3";
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected identifier") || err.contains("plan error"));
+    }
+
+    #[test]
+    fn leading_line_comment_then_ddl_parses() {
+        let sql = "-- header\nCREATE STREAMING TABLE t AS SELECT 1";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.outputs.len(), 1);
+        assert_eq!(out.flows.len(), 1);
+        assert_eq!(out.outputs[0].name, "t");
+    }
+
+    #[test]
+    fn leading_line_comment_select_is_rejected() {
+        let err = parse("-- hi\nSELECT 1", None).unwrap_err().to_string();
+        assert!(err.contains("SELECT"));
+    }
+
+    #[test]
+    fn auto_cdc_in_string_literal_is_accepted() {
+        let sql = "CREATE STREAMING TABLE t AS SELECT 'AUTO CDC' AS x";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.outputs.len(), 1);
+        assert_eq!(out.flows.len(), 1);
+    }
+
+    #[test]
+    fn auto_cdc_in_comment_clause_is_accepted() {
+        let sql = "CREATE STREAMING TABLE t COMMENT 'AUTO CDC report' AS SELECT 1";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.outputs.len(), 1);
+        assert_eq!(out.outputs[0].comment.as_deref(), Some("AUTO CDC report"));
+    }
+
+    #[test]
+    fn apply_changes_in_string_literal_is_accepted() {
+        let sql = "CREATE MATERIALIZED VIEW mv AS SELECT * FROM t WHERE x = 'APPLY CHANGES INTO y'";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.outputs.len(), 1);
+        assert_eq!(out.flows.len(), 1);
+    }
+
+    #[test]
+    fn multiline_as_without_trailing_space() {
+        let sql = "CREATE STREAMING TABLE\nt\nAS\nSELECT 1";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.outputs.len(), 1);
+        assert_eq!(out.flows.len(), 1);
+        assert_eq!(out.flows[0].query_sql, "SELECT 1");
+    }
+
+    #[test]
+    fn block_comment_prefix_parses() {
+        let sql = "/* head */ CREATE STREAMING TABLE t AS SELECT 1";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.outputs.len(), 1);
+        assert_eq!(out.flows.len(), 1);
+    }
+
+    #[test]
+    fn trailing_junk_after_query_is_rejected() {
+        let err = parse(
+            "CREATE STREAMING TABLE t AS SELECT 1 garbage tokens here",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid query SQL") || err.contains("plan error"));
+    }
+
+    #[test]
+    fn materialized_view_partitioned_by_and_tblproperties() {
+        let sql =
+            "CREATE MATERIALIZED VIEW mv PARTITIONED BY (dt) TBLPROPERTIES ('k' = 'v') AS SELECT 1";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.outputs.len(), 1);
+        assert_eq!(out.outputs[0].partition_cols, vec!["dt"]);
+        assert_eq!(
+            out.outputs[0].table_properties.get("k"),
+            Some(&"v".to_string())
+        );
+    }
+
+    #[test]
+    fn materialized_view_schedule_every_is_rejected() {
+        let err = parse(
+            "CREATE MATERIALIZED VIEW mv SCHEDULE EVERY 1 HOUR AS SELECT 1",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("SCHEDULE EVERY"));
+    }
+
+    #[test]
+    fn chained_backtick_identifiers() {
+        let sql = "CREATE STREAMING TABLE `cat`.`schema`.`tab` AS SELECT 1";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.outputs[0].name, "cat.schema.tab");
+    }
+
+    #[test]
+    fn split_respects_backslash_escape_in_double_quotes() {
+        let parts: Vec<_> = split_statements(r#"SELECT "a\"; SELECT 2"#)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(parts, vec![r#"SELECT "a\"; SELECT 2"#]);
+    }
+
+    #[test]
+    fn split_respects_backslash_escape_in_single_quotes() {
+        let parts: Vec<_> = split_statements(r"SELECT 'a\'; SELECT 2")
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(parts, vec![r"SELECT 'a\'; SELECT 2"]);
+    }
+
+    #[test]
+    fn contextualized_error_includes_statement_number_and_line() {
+        let sql = "CREATE STREAMING TABLE t AS SELECT 1;\n-- c\nSELECT 2";
+        let err = parse_with_context(sql, Some("pipelines/demo.sql"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pipelines/demo.sql"), "err: {err}");
+        assert!(err.contains("statement 2"), "err: {err}");
+        assert!(err.contains("line 2"), "err: {err}");
+        assert!(err.contains("SELECT"), "err: {err}");
+    }
+
+    #[test]
+    fn unsupported_error_includes_multiline_preview() {
+        let sql = "CREATE STREAMING TABLE t AS SELECT 1;\nFOO\nBAR";
+        let err = parse(sql, None).unwrap_err().to_string();
+        assert!(err.contains("FOO ... BAR") || err.contains("unsupported statement"));
     }
 }
