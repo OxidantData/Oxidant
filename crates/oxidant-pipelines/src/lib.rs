@@ -5,10 +5,15 @@
 
 pub mod expectations;
 pub mod graph;
+mod output_write;
 mod runner;
 pub mod sql_graph;
 
 pub use graph::{Graph, Node};
+pub use output_write::{
+    flow_queries, parse_output_schema, split_table_properties, union_flow_sql,
+    validate_output_format, FlowQuery,
+};
 pub use runner::{
     clear_pipeline_state, run_pipeline, Plan, RunEvent, RunEventKind, TableOutcome, TableStatus,
 };

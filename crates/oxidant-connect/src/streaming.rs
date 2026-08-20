@@ -97,6 +97,7 @@ impl OxidantService {
                     1 => Some(MicroBatchPipeline {
                         input: inputs.into_iter().next().expect("len checked"),
                         plan,
+                        output_schema: None,
                     }),
                     n => {
                         return Err(Status::unimplemented(format!(

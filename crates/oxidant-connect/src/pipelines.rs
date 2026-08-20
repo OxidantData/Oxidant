@@ -1,13 +1,14 @@
 //! Spark Declarative Pipelines (`PipelineCommand`) handlers (SDP Phase 1A–2).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::SystemTime;
 
 use datafusion::sql::unparser::Unparser;
 use oxidant_config::{OxidantConfig, PipelineConfig, SourceConfig, TableConfig, Trigger};
 use oxidant_loom::Engine;
 use oxidant_pipelines::{
-    clear_pipeline_state, parse, run_pipeline, OutputKind, Plan, RunEvent, RunEventKind,
+    clear_pipeline_state, parse, run_pipeline, split_table_properties, validate_output_format,
+    OutputKind, Plan, RunEvent, RunEventKind,
 };
 use oxidant_proto::spark::connect as sc;
 use prost_types::Timestamp;
@@ -78,6 +79,7 @@ pub struct FlowDef {
     /// Populated by `DefineSqlGraphElements` when the flow comes from SDP SQL text.
     pub query_sql: Option<String>,
     pub once: bool,
+    pub by_name: bool,
     pub source_code_location: Option<sc::SourceCodeLocation>,
 }
 
@@ -625,6 +627,7 @@ impl OxidantService {
                         relation,
                         query_sql: None,
                         once,
+                        by_name: false,
                         source_code_location: cmd.source_code_location.clone(),
                     },
                 );
@@ -990,18 +993,42 @@ async fn graph_to_config(
         }
         let key = resolved_identifier_key(&output.resolved);
         let name = output.resolved.table_name.clone();
-        let source = kafka_source_from_output(output);
+        let table_details = output.table_details.as_ref();
+        let table_properties: BTreeMap<String, String> = table_details
+            .map(|t| t.table_properties.clone().into_iter().collect())
+            .unwrap_or_default();
+        let format = table_details.and_then(|t| t.format.clone());
+        if let Some(fmt) = format.as_deref() {
+            validate_output_format(fmt, &format!("table `{name}`")).map_err(|e| {
+                table_planning_failure(&name, crate::err_to_status(e), &output.source_code_location)
+            })?;
+        }
+        let (source_opts, sink_opts) = split_table_properties(&table_properties).map_err(|e| {
+            table_planning_failure(&name, crate::err_to_status(e), &output.source_code_location)
+        })?;
+        let source = kafka_source_from_properties(&source_opts);
+        let iceberg_compat = sink_opts
+            .get("icebergCompat")
+            .map(|v| v.eq_ignore_ascii_case("true"));
+        let output_schema = if let Some(details) = table_details {
+            table_schema_from_details(details).map_err(|e| {
+                table_planning_failure(&name, crate::err_to_status(e), &output.source_code_location)
+            })?
+        } else {
+            None
+        };
         let table = TableConfig {
             name: name.clone(),
             source,
             sql: None,
-            partition_by: output
-                .table_details
-                .as_ref()
+            sql_by_name: false,
+            append_flows: Vec::new(),
+            output_schema,
+            partition_by: table_details
                 .map(|t| t.partition_cols.clone())
                 .unwrap_or_default(),
-            format: output.table_details.as_ref().and_then(|t| t.format.clone()),
-            iceberg_compat: None,
+            format,
+            iceberg_compat,
             iceberg_table_suffix: None,
             checkpoint_interval: None,
             dedup_columns: Vec::new(),
@@ -1029,43 +1056,49 @@ async fn graph_to_config(
         })?;
         let (ignored, flow_snap) = svc.apply_sql_conf(&flow.sql_conf, SqlConfScope::Flow);
         flow_ignored.extend(ignored);
-        let sql_result: Result<(), TablePlanningFailure> = if let Some(relation) = &flow.relation {
-            if table.source.is_none() {
-                if let Some(source) = extract_streaming_source(relation) {
-                    table.source = Some(source);
+        let sql_result: Result<(), TablePlanningFailure> = {
+            let flow_sql = if let Some(relation) = &flow.relation {
+                if table.source.is_none() {
+                    if let Some(source) = extract_streaming_source(relation) {
+                        table.source = Some(source);
+                    }
                 }
-            }
-            relation_to_sql(engine, relation)
-                .await
-                .map(|sql| table.sql = Some(sql))
-                .map_err(|status| {
-                    table_planning_failure(
-                        &flow.target.table_name,
-                        status,
-                        &flow.source_code_location,
-                    )
-                })
-        } else if let Some(sql) = flow.query_sql.as_deref() {
-            table.sql = Some(sql.to_string());
-            if table.source.is_none() {
-                if let Some(output) = graph
-                    .outputs
-                    .iter()
-                    .find(|o| identifiers_match(&o.resolved, &flow.target))
-                {
-                    table.source = kafka_source_from_output(output);
+                relation_to_sql(engine, relation).await.map_err(|status| {
+                    table_planning_failure(&target_name, status, &flow.source_code_location)
+                })?
+            } else if let Some(sql) = flow.query_sql.as_deref() {
+                if table.source.is_none() {
+                    if let Some(output) = graph
+                        .outputs
+                        .iter()
+                        .find(|o| identifiers_match(&o.resolved, &flow.target))
+                    {
+                        if let Some(source) = kafka_source_from_output(output) {
+                            table.source = Some(source);
+                        }
+                    }
                 }
+                sql.to_string()
+            } else {
+                return Err(table_planning_failure(
+                    &target_name,
+                    Status::failed_precondition(format!(
+                        "flow `{}` has no relation or SQL at StartRun",
+                        flow.flow_name
+                    )),
+                    &flow.source_code_location,
+                ));
+            };
+            if table.sql.is_none() {
+                table.sql = Some(flow_sql);
+                table.sql_by_name = flow.by_name;
+            } else {
+                table.append_flows.push(oxidant_config::AppendFlow {
+                    sql: flow_sql,
+                    by_name: flow.by_name,
+                });
             }
             Ok(())
-        } else {
-            Err(table_planning_failure(
-                &target_name,
-                Status::failed_precondition(format!(
-                    "flow `{}` has no relation or SQL at StartRun",
-                    flow.flow_name
-                )),
-                &flow.source_code_location,
-            ))
         };
         svc.restore_sql_conf(flow_snap);
         sql_result?;
@@ -1150,7 +1183,11 @@ fn parsed_output_to_def(
             table_properties: parsed.table_properties.clone().into_iter().collect(),
             partition_cols: parsed.partition_cols.clone(),
             format: parsed.format.clone(),
-            schema: None,
+            schema: parsed.schema.as_ref().map(|ddl| {
+                sc::pipeline_command::define_output::table_details::Schema::SchemaString(
+                    ddl.clone(),
+                )
+            }),
             clustering_columns: vec![],
         }),
         sink_details: None,
@@ -1181,16 +1218,21 @@ fn parsed_flow_to_def(parsed: &oxidant_pipelines::ParsedFlow, graph: &DataflowGr
         relation: None,
         query_sql: Some(parsed.query_sql.clone()),
         once: parsed.once,
+        by_name: parsed.by_name,
         source_code_location: None,
     }
 }
 
 fn kafka_source_from_output(output: &OutputDef) -> Option<SourceConfig> {
-    let props = output
+    let props: BTreeMap<String, String> = output
         .table_details
         .as_ref()
-        .map(|t| &t.table_properties)
-        .filter(|p| !p.is_empty())?;
+        .map(|t| t.table_properties.clone().into_iter().collect())
+        .filter(|p: &BTreeMap<String, String>| !p.is_empty())?;
+    kafka_source_from_properties(&props)
+}
+
+fn kafka_source_from_properties(props: &BTreeMap<String, String>) -> Option<SourceConfig> {
     if props.contains_key("subscribe") || props.contains_key("oxidant.spool.dir") {
         Some(SourceConfig {
             format: "kafka".to_string(),
@@ -1199,6 +1241,128 @@ fn kafka_source_from_output(output: &OutputDef) -> Option<SourceConfig> {
     } else {
         None
     }
+}
+
+fn table_schema_from_details(
+    details: &sc::pipeline_command::define_output::TableDetails,
+) -> Result<Option<String>, oxidant_common::Error> {
+    match &details.schema {
+        Some(sc::pipeline_command::define_output::table_details::Schema::SchemaString(s))
+            if !s.trim().is_empty() =>
+        {
+            Ok(Some(s.clone()))
+        }
+        Some(sc::pipeline_command::define_output::table_details::Schema::SchemaDataType(dt)) => {
+            Ok(Some(proto_schema_to_ddl(dt)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn proto_schema_to_ddl(dt: &sc::DataType) -> Result<String, oxidant_common::Error> {
+    use oxidant_common::Error;
+    use sc::data_type::Kind;
+    let kind = dt.kind.as_ref().ok_or_else(|| {
+        Error::Plan("invalid schema_data_type proto for output schema: empty DataType".into())
+    })?;
+    match kind {
+        Kind::Struct(s) => {
+            let cols = s
+                .fields
+                .iter()
+                .map(|f| {
+                    let ty = f.data_type.as_ref().ok_or_else(|| {
+                        Error::Plan(format!(
+                            "invalid schema_data_type proto for output schema: field `{}` is missing a type",
+                            f.name
+                        ))
+                    })?;
+                    Ok(format!("{} {}", f.name, proto_spark_type_name(ty)?))
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+                .join(", ");
+            Ok(format!("({cols})"))
+        }
+        other => Err(Error::Plan(format!(
+            "output schema must be a struct of columns, got {other:?}"
+        ))),
+    }
+}
+
+fn proto_spark_type_name(dt: &sc::DataType) -> Result<String, oxidant_common::Error> {
+    use oxidant_common::Error;
+    use sc::data_type::Kind;
+    let kind = dt.kind.as_ref().ok_or_else(|| {
+        Error::Plan("invalid schema_data_type proto for output schema: empty field type".into())
+    })?;
+    Ok(match kind {
+        Kind::Boolean(_) => "BOOLEAN".to_string(),
+        Kind::Byte(_) => "TINYINT".to_string(),
+        Kind::Short(_) => "SMALLINT".to_string(),
+        Kind::Integer(_) => "INT".to_string(),
+        Kind::Long(_) => "BIGINT".to_string(),
+        Kind::Float(_) => "FLOAT".to_string(),
+        Kind::Double(_) => "DOUBLE".to_string(),
+        Kind::String(_) => "STRING".to_string(),
+        Kind::Binary(_) => "BINARY".to_string(),
+        Kind::Date(_) => "DATE".to_string(),
+        Kind::Timestamp(_) | Kind::TimestampNtz(_) => "TIMESTAMP".to_string(),
+        Kind::Decimal(d) => format!(
+            "DECIMAL({},{})",
+            d.precision.unwrap_or(38),
+            d.scale.unwrap_or(0)
+        ),
+        Kind::Array(a) => {
+            let inner = a.element_type.as_ref().ok_or_else(|| {
+                Error::Plan(
+                    "invalid schema_data_type proto for output schema: array element_type is missing"
+                        .into(),
+                )
+            })?;
+            format!("ARRAY<{}>", proto_spark_type_name(inner)?)
+        }
+        Kind::Struct(s) => {
+            let inner = s
+                .fields
+                .iter()
+                .map(|f| {
+                    let ty = f.data_type.as_ref().ok_or_else(|| {
+                        Error::Plan(format!(
+                            "invalid schema_data_type proto for output schema: struct field `{}` is missing a type",
+                            f.name
+                        ))
+                    })?;
+                    Ok(format!("{}:{}", f.name, proto_spark_type_name(ty)?))
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+                .join(",");
+            format!("STRUCT<{inner}>")
+        }
+        Kind::Map(m) => {
+            let key = m.key_type.as_ref().ok_or_else(|| {
+                Error::Plan(
+                    "invalid schema_data_type proto for output schema: map key_type is missing"
+                        .into(),
+                )
+            })?;
+            let value = m.value_type.as_ref().ok_or_else(|| {
+                Error::Plan(
+                    "invalid schema_data_type proto for output schema: map value_type is missing"
+                        .into(),
+                )
+            })?;
+            format!(
+                "MAP<{},{}>",
+                proto_spark_type_name(key)?,
+                proto_spark_type_name(value)?
+            )
+        }
+        other => {
+            return Err(Error::Plan(format!(
+                "invalid schema_data_type proto for output schema: unsupported type {other:?}"
+            )));
+        }
+    })
 }
 
 fn resolve_wanted_tables(graph: &DataflowGraph, refresh_selection: &[String]) -> Vec<String> {
@@ -1594,6 +1758,7 @@ mod tests {
                 relation: None,
                 query_sql: Some("SELECT 1".into()),
                 once: false,
+                by_name: false,
                 source_code_location: Some(sc::SourceCodeLocation {
                     file_name: Some("flow.sql".into()),
                     line_number: Some(9),
@@ -1797,5 +1962,35 @@ mod tests {
             sc::OutputType::MaterializedView as i32
         );
         assert_eq!(graph.outputs[0].comment.as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn proto_schema_to_ddl_renders_timestamp_for_planner() {
+        use sc::data_type::{Kind, Struct, StructField, TimestampNtz};
+        let dt = sc::DataType {
+            kind: Some(Kind::Struct(Struct {
+                fields: vec![StructField {
+                    name: "ts".into(),
+                    data_type: Some(sc::DataType {
+                        kind: Some(Kind::TimestampNtz(TimestampNtz {
+                            type_variation_reference: 0,
+                        })),
+                    }),
+                    nullable: true,
+                    metadata: None,
+                }],
+                type_variation_reference: 0,
+            })),
+        };
+        let ddl = proto_schema_to_ddl(&dt).expect("timestamp ddl");
+        assert!(ddl.contains("TIMESTAMP"), "ddl={ddl}");
+        assert!(!ddl.contains("TIMESTAMP_NTZ"), "ddl={ddl}");
+    }
+
+    #[test]
+    fn proto_schema_to_ddl_surfaces_conversion_errors() {
+        let dt = sc::DataType { kind: None };
+        let err = proto_schema_to_ddl(&dt).expect_err("invalid proto");
+        assert!(err.to_string().contains("schema_data_type"), "{err}");
     }
 }

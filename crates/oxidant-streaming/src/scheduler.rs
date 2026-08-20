@@ -88,6 +88,8 @@ pub enum Trigger {
 pub struct MicroBatchPipeline {
     pub input: Arc<MicroBatchInput>,
     pub plan: LogicalPlan,
+    /// When set, each micro-batch is cast to this schema before the sink (column-named errors).
+    pub output_schema: Option<SchemaRef>,
 }
 
 /// Everything needed to start a query, beyond what the source/sink options carry.
@@ -397,7 +399,16 @@ impl StreamingQueryManager {
                     p.input.set_batches(source_batches).await?;
                     let out = engine.execute_logical_plan(p.plan.clone()).await;
                     p.input.set_batches(vec![]).await?;
-                    out?
+                    let mut out = out?;
+                    if let Some(target) = &p.output_schema {
+                        out = out
+                            .into_iter()
+                            .map(|batch| {
+                                oxidant_loom::schema_conform::conform_batch_to_schema(batch, target)
+                            })
+                            .collect::<oxidant_common::Result<Vec<_>>>()?;
+                    }
+                    out
                 }
                 None => source_batches,
             };

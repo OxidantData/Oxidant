@@ -17,6 +17,9 @@ use oxidant_streaming::{
 
 use crate::expectations;
 use crate::graph::{Graph, Node};
+use crate::output_write::{
+    conform_batches_to_schema, flow_queries, parse_output_schema, union_flow_sql,
+};
 use crate::STREAM_ALIAS;
 
 /// Events emitted while a pipeline runs. Callers render or forward them (CLI stderr, Spark
@@ -409,26 +412,47 @@ async fn start_stream(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let synthesized = declared_sql
-        .is_none()
+    let has_flows = declared_sql.is_some() || !table.append_flows.is_empty();
+    let synthesized_sql = (!has_flows)
         .then(|| {
             expectations::has_drops(&table.expect).then(|| format!("SELECT * FROM {STREAM_ALIAS}"))
         })
         .flatten();
-    let pipeline = match declared_sql.or(synthesized.as_deref()) {
+    let needs_stream_plan = has_flows || synthesized_sql.is_some();
+    let stream_input = if needs_stream_plan {
+        let schema = oxidant_streaming::source_schema(&config)?;
+        let input = Arc::new(MicroBatchInput::new(STREAM_ALIAS, schema)?);
+        engine
+            .ctx()
+            .register_table(STREAM_ALIAS, input.provider())
+            .map_err(|e| Error::Plan(format!("register streaming input: {e}")))?;
+        Some(input)
+    } else {
+        None
+    };
+    let output_schema = table
+        .output_schema
+        .as_deref()
+        .map(parse_output_schema)
+        .transpose()?;
+    let unioned = if has_flows {
+        let flows = flow_queries(declared_sql, table.sql_by_name, &table.append_flows);
+        Some(union_flow_sql(engine, &flows, table.output_schema.as_deref()).await?)
+    } else {
+        None
+    };
+    let pipeline = match unioned.or(synthesized_sql) {
         Some(sql) => {
-            let schema = oxidant_streaming::source_schema(&config)?;
-            let input = Arc::new(MicroBatchInput::new(STREAM_ALIAS, schema)?);
-            engine
-                .ctx()
-                .register_table(STREAM_ALIAS, input.provider())
-                .map_err(|e| Error::Plan(format!("register streaming input: {e}")))?;
-            let sql = expectations::apply_drops(sql, &table.expect);
+            let input = stream_input.ok_or_else(|| {
+                Error::Plan("streaming table pipeline is missing registered input".into())
+            })?;
+            let sql = expectations::apply_drops(&sql, &table.expect);
             let plan_result = engine.logical_plan(&sql).await;
             engine.deregister_table(STREAM_ALIAS);
             Some(MicroBatchPipeline {
                 input,
                 plan: plan_result?,
+                output_schema,
             })
         }
         None => None,
@@ -626,12 +650,12 @@ where
     F: FnMut(RunEvent) + Send,
 {
     let name = table.name.trim();
-    let sql = table
-        .sql
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Plan(format!("derived table `{name}` has no `sql:`")))?;
+    let flows = flow_queries(table.sql.as_deref(), table.sql_by_name, &table.append_flows);
+    let sql = union_flow_sql(engine, &flows, table.output_schema.as_deref()).await?;
+    let sql = sql.trim();
+    if sql.is_empty() {
+        return Err(Error::Plan(format!("derived table `{name}` has no `sql:`")));
+    }
 
     for (label, expectation) in expectations::counted(&table.expect) {
         let count_sql = expectations::violation_count_sql(sql, &expectation.check);
@@ -662,10 +686,21 @@ where
     }
 
     let effective_sql = expectations::apply_drops(sql, &table.expect);
-    let batches = engine.sql(&effective_sql).await?;
-    let schema = match batches.first() {
-        Some(batch) => batch.schema(),
-        None => engine.schema(&effective_sql).await?,
+    let mut batches = engine.sql(&effective_sql).await?;
+    let declared_schema = table
+        .output_schema
+        .as_deref()
+        .map(parse_output_schema)
+        .transpose()?;
+    if let Some(target) = &declared_schema {
+        batches = conform_batches_to_schema(batches, target)?;
+    }
+    let schema = if let Some(target) = &declared_schema {
+        target.clone()
+    } else if let Some(batch) = batches.first() {
+        batch.schema()
+    } else {
+        engine.schema(&effective_sql).await?
     };
 
     let format = oxidant_streaming::writable_format(&plan.format_of(table))?;
