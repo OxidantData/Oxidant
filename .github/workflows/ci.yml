@@ -71,8 +71,8 @@ jobs:
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Fail fast rather than burning an hour on a wedged runner. The suite compiles the workspace
     # twice over (see the disk-reclaim step) and then runs the distributed tests serially, so the
-    # honest ceiling is well above the ~10 min this takes on `main`. 180: the line-tables-only
-    # debuginfo switch (CARGO_PROFILE_*_DEBUG=1 below) invalidated the cached dev/test artifacts,
+    # honest ceiling is well above the ~10 min this takes on `main`. 180: the limited-debuginfo
+    # switch (CARGO_PROFILE_*_DEBUG=1 below, `debug = 1`) invalidated the cached dev/test artifacts,
     # so the first run after it recompiles the world and blew the old 90 min ceiling — a
     # completed run re-warms the cache and later runs return to ~45 min.
     timeout-minutes: 180
@@ -142,10 +142,12 @@ jobs:
         env:
           OXIDANT_MINIO_TEST: "1"
           OXIDANT_MINIO_ENDPOINT: "http://127.0.0.1:9000"
-          # Line-tables-only debug info: the full test/dev profiles' debuginfo makes each
-          # oxidant-execution integration binary ~1-2 GB at link time, and parallel `ld`
-          # processes exhaust the 16 GB runner (collect2: ld terminated with signal 7
-          # [Bus error] on main, 2026-07-30). Assertions/backtraces are unaffected.
+          # Limited debug info (debug = 1): the full test/dev profiles' debuginfo makes each
+          # oxidant-execution integration binary ~1-2 GB at link time, and linking them in
+          # parallel exhausts the runner's free disk (collect2: ld terminated with signal 7
+          # [Bus error] on main, 2026-07-30 — `ld` mmaps its output file, so ENOSPC surfaces
+          # as SIGBUS rather than "No space left on device"). Compare the disk-reclaim step
+          # above, which buys headroom for the same job. Assertions/backtraces are unaffected.
           CARGO_PROFILE_TEST_DEBUG: "1"
           CARGO_PROFILE_DEV_DEBUG: "1"
       # Spark-SQL parity ratchet, folded in from the old standalone parity job: the binary
@@ -190,9 +192,34 @@ jobs:
     name: line coverage (informational, non-blocking)
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 90
+    # Cold-cache runs compile the whole workspace twice (oxidant-cli prebuild, then
+    # instrumented `cargo test --workspace`). ~45–60 min is a projection, not a measurement:
+    # this job has never completed a run — every attempt so far died inside the build, so
+    # there is no observed wall clock to quote. 180 matches build-test's headroom after
+    # cache invalidation.
+    timeout-minutes: 180
+    env:
+      # Same switch as build-test: limited debug info (debug = 1). With the profiles' full
+      # debuginfo each oxidant-execution integration binary is ~1–2 GB at link time, and
+      # linking ~56 of them under `-C instrument-coverage` exhausts the free disk on a
+      # public-repo `ubuntu-latest` runner (4 vCPU / 16 GB RAM / ~14 GB free SSD). `ld`
+      # mmaps its output file, so that ENOSPC surfaces as `collect2: ld terminated with
+      # signal 7 [Bus error]` — the failure PR #96's line-coverage job hit. Disk, not
+      # memory, is the binding constraint; see the disk-reclaim step below.
+      CARGO_PROFILE_TEST_DEBUG: "1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
     steps:
       - uses: actions/checkout@v4
+      # Same reclaim as build-test (and oxidant-image.yml): a standard `ubuntu-latest`
+      # runner leaves only ~14 GB free, and the instrumented build writes a second full
+      # target dir (target/llvm-cov-target) on top of the workspace's. Dropping the
+      # preinstalled SDKs buys ~25 GB, which is what keeps `ld` off ENOSPC/SIGBUS.
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          df -h /
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
           rustup show
@@ -206,8 +233,17 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Build oxidant CLI (integration tests spawn the binary under llvm-cov target dir)
         run: cargo build -p oxidant-cli --target-dir target/llvm-cov-target
+      - name: Disk free before coverage
+        run: df -h /
+      # No `--jobs` cap: throttling build parallelism does not address the binding
+      # constraint (runner disk — see the reclaim step above), it only makes the job
+      # slower. Reinstate `--jobs 2` if a future failure actually shows memory pressure
+      # rather than the ENOSPC/SIGBUS linker signature.
       - name: Generate HTML coverage report
         run: cargo llvm-cov --workspace --html
+      - name: Disk free after coverage
+        if: always()
+        run: df -h /
       # `cargo llvm-cov report` reuses the data collected by the run above — do NOT run
       # `cargo llvm-cov --summary-only` here, that flag only pairs with --json/--lcov and
       # re-executes the whole instrumented suite a second time.
