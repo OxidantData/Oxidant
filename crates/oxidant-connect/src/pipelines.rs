@@ -731,11 +731,7 @@ impl OxidantService {
         // another GetQueryFunctionExecutionSignalStream call.
         let mut responses = Vec::new();
         if !pending.is_empty() {
-            responses.push(self.pipeline_query_function_signal(
-                session_id,
-                operation_id,
-                pending,
-            ));
+            responses.push(self.pipeline_query_function_signal(session_id, operation_id, pending));
         }
         responses.push(self.result_complete(session_id, operation_id));
         Ok(responses)
@@ -752,7 +748,9 @@ impl OxidantService {
             .as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
-                Status::invalid_argument("DefineFlowQueryFunctionResult.dataflow_graph_id is required")
+                Status::invalid_argument(
+                    "DefineFlowQueryFunctionResult.dataflow_graph_id is required",
+                )
             })?;
         let relation = cmd.relation.as_ref().ok_or_else(|| {
             Status::invalid_argument("DefineFlowQueryFunctionResult.relation is required")
@@ -766,9 +764,7 @@ impl OxidantService {
         self.dataflow_graphs
             .with_graph(graph_id, session_id, |graph| {
                 let flow_idx = find_flow_index(graph, cmd).ok_or_else(|| {
-                    Status::invalid_argument(format!(
-                        "unknown flow in dataflow graph `{graph_id}`"
-                    ))
+                    Status::invalid_argument(format!("unknown flow in dataflow graph `{graph_id}`"))
                 })?;
                 graph.flows[flow_idx].relation = Some(relation.clone());
                 Ok(())
@@ -1208,9 +1204,11 @@ async fn graph_to_config(
                         table.source = Some(source);
                     }
                 }
-                sql_from_relation(engine, relation).await.map_err(|status| {
-                    table_planning_failure(&target_name, status, &flow.source_code_location)
-                })?
+                sql_from_relation(engine, relation)
+                    .await
+                    .map_err(|status| {
+                        table_planning_failure(&target_name, status, &flow.source_code_location)
+                    })?
             } else if let Some(sql) = flow.query_sql.as_deref() {
                 if table.source.is_none() {
                     if let Some(output) = graph

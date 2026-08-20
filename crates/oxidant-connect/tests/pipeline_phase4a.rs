@@ -358,9 +358,10 @@ async fn query_function_signal_backfill_and_start_run() {
                         flow_identifier: Some(flow_id.clone()),
                         relation: Some(sc::Relation {
                             rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
-                                query: "SELECT customer, sum(amount) AS revenue, count(*) AS orders \
+                                query:
+                                    "SELECT customer, sum(amount) AS revenue, count(*) AS orders \
                                          FROM orders_bronze WHERE amount > 0 GROUP BY customer"
-                                    .into(),
+                                        .into(),
                                 ..Default::default()
                             })),
                             ..Default::default()
