@@ -13,10 +13,10 @@ pub mod sql_graph;
 
 pub use auto_cdc::{build_merge_sql, output_columns, validate_auto_cdc, CdcMerge};
 pub use cdc_sink::CdcMergeSink;
-pub use graph::{Graph, Node};
+pub use graph::{table_references, Graph, Node};
 pub use output_write::{
     flow_queries, parse_output_schema, split_table_properties, union_flow_sql,
-    validate_output_format, FlowQuery,
+    validate_external_sink_format, validate_output_format, FlowQuery,
 };
 pub use runner::{
     clear_pipeline_state, run_pipeline, Plan, RunEvent, RunEventKind, TableOutcome, TableStatus,

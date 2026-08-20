@@ -236,6 +236,15 @@ pub struct TableConfig {
     /// Table comment recorded in the catalog.
     #[serde(default)]
     pub comment: Option<String>,
+    /// Path-only write target for an SDP external sink: the table is written to this location
+    /// and never registered in the catalog.
+    ///
+    /// Not a YAML key. It is set only when a Spark Connect `DefineOutput` with
+    /// `output_type=SINK` is lowered to a pipeline config — a sink has no catalog identity, so
+    /// exposing it in `oxidant.yaml` would be a second, unvalidated way to write an
+    /// unregistered table.
+    #[serde(skip)]
+    pub write_path: Option<String>,
 }
 
 impl TableConfig {
@@ -373,6 +382,7 @@ mod tests {
             auto_cdc: None,
             expect: BTreeMap::new(),
             comment: None,
+            write_path: None,
         };
         assert_eq!(streaming.kind(), TableKind::Streaming);
         let derived = TableConfig {

@@ -5,12 +5,13 @@ use std::time::SystemTime;
 
 use datafusion::sql::unparser::Unparser;
 use oxidant_config::{
-    AutoCdcConfig, OxidantConfig, PipelineConfig, SourceConfig, TableConfig, Trigger,
+    AutoCdcConfig, OxidantConfig, PipelineConfig, SourceConfig, TableConfig, TableKind, Trigger,
 };
 use oxidant_loom::Engine;
 use oxidant_pipelines::{
-    clear_pipeline_state, parse, run_pipeline, split_table_properties, validate_auto_cdc,
-    validate_output_format, OutputKind, Plan, RunEvent, RunEventKind,
+    clear_pipeline_state, parse, run_pipeline, split_table_properties, table_references,
+    validate_auto_cdc, validate_external_sink_format, validate_output_format, OutputKind, Plan,
+    RunEvent, RunEventKind,
 };
 use oxidant_proto::spark::connect as sc;
 use prost_types::Timestamp;
@@ -64,7 +65,6 @@ pub struct OutputDef {
     pub output_type: i32,
     pub comment: Option<String>,
     pub table_details: Option<sc::pipeline_command::define_output::TableDetails>,
-    #[allow(dead_code)]
     pub sink_details: Option<sc::pipeline_command::define_output::SinkDetails>,
     pub source_code_location: Option<sc::SourceCodeLocation>,
 }
@@ -189,6 +189,10 @@ pub fn resolve_identifier(
 
 fn identifiers_match(a: &sc::ResolvedIdentifier, b: &sc::ResolvedIdentifier) -> bool {
     a.catalog_name == b.catalog_name && a.namespace == b.namespace && a.table_name == b.table_name
+}
+
+fn is_sink_output(output: &OutputDef) -> bool {
+    output.output_type == sc::OutputType::Sink as i32
 }
 
 fn flow_needs_query_function_evaluation(flow: &FlowDef) -> bool {
@@ -432,6 +436,16 @@ impl<'a> DryRunTempViewGuard<'a> {
     }
 }
 
+/// Parameters shared by `StartRun` and `ExecuteOutputFlows` execution.
+struct DataflowRunParams {
+    dry: bool,
+    storage: Option<String>,
+    full_refresh: bool,
+    full_refresh_tables: Vec<String>,
+    refresh_selection: Vec<String>,
+    graph_refreshes: Vec<String>,
+}
+
 impl OxidantService {
     fn apply_sql_conf(
         &self,
@@ -516,6 +530,10 @@ impl OxidantService {
             Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(c)) => self
                 .define_sql_graph_elements(session_id, operation_id, c)
                 .map(PipelineCommandOutput::Complete),
+            Some(sc::pipeline_command::CommandType::ExecuteOutputFlows(c)) => {
+                self.execute_output_flows(engine, session_id, operation_id, c)
+                    .await
+            }
             Some(sc::pipeline_command::CommandType::GetQueryFunctionExecutionSignalStream(c)) => {
                 self.get_query_function_execution_signal_stream(session_id, operation_id, c)
                     .map(PipelineCommandOutput::Complete)
@@ -600,26 +618,14 @@ impl OxidantService {
             .as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Status::invalid_argument("DefineOutput.output_name is required"))?;
-        let output_type = cmd.output_type.unwrap_or(0);
-
-        let (table_details, sink_details) = match &cmd.details {
-            Some(sc::pipeline_command::define_output::Details::TableDetails(t)) => {
-                (Some(t.clone()), None)
-            }
-            Some(sc::pipeline_command::define_output::Details::SinkDetails(s)) => {
-                (None, Some(s.clone()))
-            }
-            _ => (None, None),
-        };
+        let (output_type, table_details, sink_details) = output_details_from_proto(cmd);
+        if output_type == sc::OutputType::Sink as i32 {
+            sink_format_and_path(sink_details.as_ref(), "DefineOutput SINK")?;
+        }
 
         let resolved = self
             .dataflow_graphs
             .with_graph(graph_id, session_id, |graph| {
-                if output_type == sc::OutputType::Sink as i32 {
-                    return Err(Status::unimplemented(
-                        "DefineOutput SINK is not supported yet (SDP Phase 4c)",
-                    ));
-                }
                 let resolved = resolve_identifier(
                     output_name,
                     graph.default_catalog.as_deref(),
@@ -667,74 +673,14 @@ impl OxidantService {
             .as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Status::invalid_argument("DefineFlow.dataflow_graph_id is required"))?;
-        let flow_name = cmd
-            .flow_name
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| Status::invalid_argument("DefineFlow.flow_name is required"))?;
-        let target_name = cmd
-            .target_dataset_name
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Status::invalid_argument("DefineFlow.target_dataset_name is required")
-            })?;
 
         let engine = self.engine();
         let resolved = self
             .dataflow_graphs
             .with_graph(graph_id, session_id, |graph| {
-                let (relation, query_sql, auto_cdc, once) = match &cmd.details {
-                    Some(sc::pipeline_command::define_flow::Details::RelationFlowDetails(d)) => {
-                        let rel = d.relation.as_ref().and_then(|r| {
-                            if r.rel_type.is_some() {
-                                Some(r.clone())
-                            } else {
-                                None
-                            }
-                        });
-                        (rel, None, None, cmd.once.unwrap_or(false))
-                    }
-                    Some(sc::pipeline_command::define_flow::Details::AutoCdcFlowDetails(d)) => {
-                        let cdc = auto_cdc_from_proto(engine.ctx(), d).map_err(|e| {
-                            Status::invalid_argument(format!("DefineFlow AUTO CDC: {e}"))
-                        })?;
-                        validate_auto_cdc(&cdc, flow_name)
-                            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-                        (None, None, Some(cdc), cmd.once.unwrap_or(false))
-                    }
-                    _ => {
-                        return Err(Status::invalid_argument(
-                            "DefineFlow requires relation_flow_details or auto_cdc_flow_details",
-                        ));
-                    }
-                };
-                let target = resolve_identifier(
-                    target_name,
-                    graph.default_catalog.as_deref(),
-                    graph.default_database.as_deref(),
-                );
-                let resolved = resolve_identifier(
-                    flow_name,
-                    graph.default_catalog.as_deref(),
-                    graph.default_database.as_deref(),
-                );
-                replace_flow(
-                    graph,
-                    FlowDef {
-                        flow_name: flow_name.to_string(),
-                        resolved: resolved.clone(),
-                        target,
-                        sql_conf: cmd.sql_conf.clone(),
-                        client_id: cmd.client_id.clone(),
-                        relation,
-                        query_sql,
-                        auto_cdc,
-                        once,
-                        by_name: false,
-                        source_code_location: cmd.source_code_location.clone(),
-                    },
-                );
+                let flow = flow_def_from_proto(cmd, graph, engine.ctx())?;
+                let resolved = flow.resolved.clone();
+                replace_flow(graph, flow);
                 Ok(resolved)
             })?;
 
@@ -900,27 +846,6 @@ impl OxidantService {
         };
 
         let graph = self.dataflow_graphs.get_graph(graph_id, session_id)?;
-        let locations = table_source_locations(&graph);
-
-        let (ignored_graph, conf_snap) = self.apply_sql_conf(&graph.sql_conf, SqlConfScope::Graph);
-        if !dry {
-            self.sync_catalogs().await;
-            self.sync_observability_env();
-        }
-        let _conf_guard = SqlConfGuard::new(self, conf_snap);
-        let mut responses = self.sql_conf_ignored_events(session_id, operation_id, &ignored_graph);
-
-        let storage = cmd
-            .storage
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                std::env::temp_dir()
-                    .join(format!("oxidant-sdp-{graph_id}"))
-                    .display()
-                    .to_string()
-            });
 
         let mut refresh_selection: Vec<String> = cmd
             .refresh_selection
@@ -940,6 +865,199 @@ impl OxidantService {
                 .cloned()
                 .collect()
         };
+
+        self.run_dataflow_graph(
+            engine,
+            session_id,
+            operation_id,
+            graph_id,
+            graph,
+            DataflowRunParams {
+                dry,
+                storage: cmd.storage.clone(),
+                full_refresh,
+                full_refresh_tables,
+                refresh_selection,
+                graph_refreshes,
+            },
+        )
+        .await
+    }
+
+    async fn execute_output_flows(
+        &self,
+        engine: &Engine,
+        session_id: &str,
+        operation_id: &str,
+        cmd: &sc::pipeline_command::ExecuteOutputFlows,
+    ) -> Result<PipelineCommandOutput, Status> {
+        let define_output = cmd.define_output.as_ref().ok_or_else(|| {
+            Status::invalid_argument("ExecuteOutputFlows.define_output is required")
+        })?;
+        if define_output
+            .dataflow_graph_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        {
+            return Err(Status::invalid_argument(
+                "ExecuteOutputFlows carries its own definitions — omit define_output.dataflow_graph_id",
+            ));
+        }
+        let output_name = define_output
+            .output_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Status::invalid_argument("ExecuteOutputFlows.define_output.output_name is required")
+            })?;
+        // No graph to inherit from — a one-shot run resolves the output against the session.
+        let (default_catalog, default_database) = {
+            let config = self.config.lock().expect("config poisoned");
+            (
+                config.get("spark.sql.defaultCatalog").cloned(),
+                config.get("spark.sql.defaultDatabase").cloned(),
+            )
+        };
+        let resolved = resolve_identifier(
+            output_name,
+            default_catalog.as_deref(),
+            default_database.as_deref(),
+        );
+        // Deterministic rather than a fresh UUID: the graph id becomes the pipeline name, which
+        // the Delta sink stamps as its idempotency `appId` and which names the default checkpoint
+        // directory. A random id per call would make every re-run of the same output look like a
+        // different writer, so a replayed batch would be appended instead of recognized. Nothing
+        // session-scoped may enter it, or `default_one_shot_storage` below inherits that scope and
+        // a re-run from a new session replays the source into the same location.
+        let graph_id = format!(
+            "execute-output-flows-{}",
+            resolved_identifier_key(&resolved)
+        );
+        let mut graph = DataflowGraph {
+            default_catalog: if resolved.catalog_name.is_empty() {
+                default_catalog
+            } else {
+                Some(resolved.catalog_name.clone())
+            },
+            default_database: if resolved.namespace.is_empty() {
+                default_database
+            } else {
+                Some(resolved.namespace.join("."))
+            },
+            sql_conf: HashMap::new(),
+            outputs: Vec::new(),
+            flows: Vec::new(),
+            refreshes: Vec::new(),
+            created_at: SystemTime::now(),
+        };
+        let (output_type, table_details, sink_details) = output_details_from_proto(define_output);
+        // An unset `output_type` is `OUTPUT_TYPE_UNSPECIFIED`, and lowering silently treats it as
+        // a table; a TEMPORARY_VIEW is registered and then skipped by the run, so the command
+        // reports success having written nothing. Neither is a run this handler can honour.
+        match output_type {
+            t if t == sc::OutputType::Sink as i32 => {
+                sink_format_and_path(sink_details.as_ref(), "ExecuteOutputFlows SINK")?;
+            }
+            t if t == sc::OutputType::MaterializedView as i32
+                || t == sc::OutputType::Table as i32 => {}
+            t if t == sc::OutputType::TemporaryView as i32 => {
+                return Err(Status::invalid_argument(
+                    "ExecuteOutputFlows cannot target a TEMPORARY_VIEW — a view is registered but \
+                     never written, so the run would produce nothing; use a TABLE, a \
+                     MATERIALIZED_VIEW, or a SINK",
+                ));
+            }
+            _ => {
+                return Err(Status::invalid_argument(format!(
+                    "ExecuteOutputFlows.define_output.output_type must be set to TABLE, \
+                     MATERIALIZED_VIEW, or SINK (got {output_type})"
+                )));
+            }
+        }
+        replace_output(
+            &mut graph,
+            OutputDef {
+                output_name: output_name.to_string(),
+                resolved,
+                output_type,
+                comment: define_output.comment.clone(),
+                table_details,
+                sink_details,
+                source_code_location: define_output.source_code_location.clone(),
+            },
+        );
+        for flow_cmd in &cmd.define_flows {
+            if flow_cmd
+                .dataflow_graph_id
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            {
+                return Err(Status::invalid_argument(
+                    "ExecuteOutputFlows carries its own definitions — omit define_flows[].dataflow_graph_id",
+                ));
+            }
+            let flow = flow_def_from_proto(flow_cmd, &graph, engine.ctx())?;
+            replace_flow(&mut graph, flow);
+        }
+        let full_refresh = cmd.full_refresh.unwrap_or(false);
+        self.run_dataflow_graph(
+            engine,
+            session_id,
+            operation_id,
+            &graph_id,
+            graph,
+            DataflowRunParams {
+                dry: false,
+                storage: Some(match cmd.storage.as_deref().map(str::trim) {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => default_one_shot_storage(&graph_id),
+                }),
+                full_refresh,
+                full_refresh_tables: Vec::new(),
+                refresh_selection: Vec::new(),
+                graph_refreshes: Vec::new(),
+            },
+        )
+        .await
+    }
+
+    async fn run_dataflow_graph(
+        &self,
+        engine: &Engine,
+        session_id: &str,
+        operation_id: &str,
+        graph_id: &str,
+        graph: DataflowGraph,
+        params: DataflowRunParams,
+    ) -> Result<PipelineCommandOutput, Status> {
+        let DataflowRunParams {
+            dry,
+            storage,
+            full_refresh,
+            full_refresh_tables,
+            refresh_selection,
+            graph_refreshes,
+        } = params;
+        let locations = table_source_locations(&graph);
+
+        let (ignored_graph, conf_snap) = self.apply_sql_conf(&graph.sql_conf, SqlConfScope::Graph);
+        if !dry {
+            self.sync_catalogs().await;
+            self.sync_observability_env();
+        }
+        let _conf_guard = SqlConfGuard::new(self, conf_snap);
+        let mut responses = self.sql_conf_ignored_events(session_id, operation_id, &ignored_graph);
+
+        let storage = storage
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join(format!("oxidant-sdp-{graph_id}"))
+                    .display()
+                    .to_string()
+            });
 
         if !dry {
             if full_refresh {
@@ -1218,6 +1336,49 @@ async fn graph_to_config(
         }
         let key = resolved_identifier_key(&output.resolved);
         let name = output.resolved.table_name.clone();
+        if is_sink_output(output) {
+            let (format, path) =
+                sink_format_and_path(output.sink_details.as_ref(), &format!("sink `{name}`"))
+                    .map_err(|status| {
+                        table_planning_failure(&name, status, &output.source_code_location)
+                    })?;
+            // A sink's streaming source, when it reads Kafka directly rather than a graph table,
+            // rides in the same `options` map as `path` — the SinkDetails proto has no other slot.
+            let source = kafka_source_from_properties(
+                &output
+                    .sink_details
+                    .as_ref()
+                    .map(|s| {
+                        s.options
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+            tables.insert(
+                key,
+                TableConfig {
+                    name: name.clone(),
+                    source,
+                    sql: None,
+                    sql_by_name: false,
+                    append_flows: Vec::new(),
+                    output_schema: None,
+                    partition_by: Vec::new(),
+                    format: Some(format.to_string()),
+                    iceberg_compat: Some(false),
+                    iceberg_table_suffix: None,
+                    checkpoint_interval: None,
+                    dedup_columns: Vec::new(),
+                    expect: Default::default(),
+                    comment: output.comment.clone(),
+                    write_path: Some(path.to_string()),
+                    auto_cdc: None,
+                },
+            );
+            continue;
+        }
         let table_details = output.table_details.as_ref();
         let table_properties: BTreeMap<String, String> = table_details
             .map(|t| t.table_properties.clone().into_iter().collect())
@@ -1260,9 +1421,26 @@ async fn graph_to_config(
             auto_cdc: None,
             expect: Default::default(),
             comment: output.comment.clone(),
+            write_path: None,
         };
         tables.insert(key, table);
     }
+
+    for output in &graph.outputs {
+        if is_temporary_view_output(output) || is_sink_output(output) {
+            continue;
+        }
+        let key = resolved_identifier_key(&output.resolved);
+        if let Some(table) = tables.get_mut(&key) {
+            if table.source.is_none() {
+                if let Some(source) = kafka_source_from_output(output) {
+                    table.source = Some(source);
+                }
+            }
+        }
+    }
+
+    validate_flows_do_not_read_sinks(graph)?;
 
     for flow in &graph.flows {
         if flow_targets_temporary_view(graph, flow) {
@@ -1357,7 +1535,42 @@ async fn graph_to_config(
         sql_result?;
     }
 
+    // Before the sink check below: folding an AUTO CDC flow into its target seats the target's
+    // streaming source, and `TableConfig::kind()` reads that. Running the derived-sink refusal
+    // first would judge a not-yet-resolved table.
     resolve_auto_cdc_flows(graph, &mut tables, pending_cdc)?;
+
+    // A sink with no streaming source of its own is a *derived* output: every pass recomputes it
+    // and replaces the location wholesale, which only `delta` can do atomically — the parquet arm
+    // of `LakeSink::replace_batch` is a hard refusal. Catch it here, where the sink and its flows
+    // were declared, instead of mid-run with a message written for catalog tables.
+    for output in &graph.outputs {
+        if !is_sink_output(output) {
+            continue;
+        }
+        let Some(table) = tables.get(&resolved_identifier_key(&output.resolved)) else {
+            continue;
+        };
+        let is_parquet = table
+            .format
+            .as_deref()
+            .is_some_and(|f| f.trim().eq_ignore_ascii_case("parquet"));
+        if !is_parquet || table.kind() != TableKind::Derived {
+            continue;
+        }
+        let name = &output.resolved.table_name;
+        return Err(table_planning_failure(
+            name,
+            Status::invalid_argument(format!(
+                "sink `{name}`: a `parquet` sink must have its own streaming source. This sink \
+                 has no streaming source of its own, which makes it a derived output — \
+                 recomputed and replaced on every pass — and parquet has no commit protocol to \
+                 replace atomically. Declare the sink as `delta`, or give it a source of its own \
+                 (`subscribe` / `oxidant.spool.dir` in the sink options; see docs/TODOS.md)."
+            )),
+            &output.source_code_location,
+        ));
+    }
 
     let pipeline = PipelineConfig {
         name: graph_id.to_string(),
@@ -1480,6 +1693,351 @@ fn resolve_auto_cdc_flows(
         table.auto_cdc = Some(cdc);
     }
     Ok(())
+}
+
+/// Split a `DefineOutput` into its output type and whichever `details` variant it carries.
+fn output_details_from_proto(
+    cmd: &sc::pipeline_command::DefineOutput,
+) -> (
+    i32,
+    Option<sc::pipeline_command::define_output::TableDetails>,
+    Option<sc::pipeline_command::define_output::SinkDetails>,
+) {
+    let output_type = cmd.output_type.unwrap_or(0);
+    let (table_details, sink_details) = match &cmd.details {
+        Some(sc::pipeline_command::define_output::Details::TableDetails(t)) => {
+            (Some(t.clone()), None)
+        }
+        Some(sc::pipeline_command::define_output::Details::SinkDetails(s)) => {
+            (None, Some(s.clone()))
+        }
+        _ => (None, None),
+    };
+    (output_type, table_details, sink_details)
+}
+
+/// Validate a SINK output's details and return its `(format, path)`.
+///
+/// Runs at `DefineOutput` / `ExecuteOutputFlows` time so a bad sink fails where it was declared,
+/// and again when the graph is lowered to a pipeline config. The second call is defense in depth
+/// for a future path that reaches `graph_to_config` without a command-level check — SQL-defined
+/// outputs cannot today (`OutputKind` has no `Sink` variant and `parsed_output_to_def` hardcodes
+/// `sink_details: None`), but the lowering must not depend on that staying true.
+fn sink_format_and_path<'a>(
+    sink_details: Option<&'a sc::pipeline_command::define_output::SinkDetails>,
+    label: &str,
+) -> Result<(&'a str, &'a str), Status> {
+    let sink = sink_details.ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "{label} requires sink_details with format and options.path"
+        ))
+    })?;
+    let format = sink
+        .format
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .unwrap_or("delta");
+    validate_external_sink_format(format, label).map_err(crate::err_to_status)?;
+    let path = sink
+        .options
+        .get("path")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| Status::invalid_argument(format!("{label} requires options.path")))?;
+    Ok((format, path))
+}
+
+/// Default checkpoint root for a one-shot `ExecuteOutputFlows` run.
+///
+/// Derived from the graph id alone, which is itself derived from the resolved output identifier:
+/// the same output gets the same root on every call, from any session, from any client. That is
+/// the whole point. The checkpoint holds the offsets and batch ids that say where the last run
+/// left off, and the data it guards — a sink's `write_path`, a table's storage — is keyed by the
+/// output, not by the caller. Scoping this path by session would hand a re-run from a new session
+/// an empty checkpoint and a fresh `appId`, so it would replay the source and append it a second
+/// time into the same location, reporting success.
+///
+/// The consequence is that callers sharing a catalog and an output name share state: two clients
+/// one-shotting `local.live.orders` concurrently contend on one `_pipeline-state.json`, and on a
+/// host with a sticky `/tmp` the second OS user gets a permission error from a path it never
+/// chose. That is the correct trade — they are writing the same table, so they *are* the same
+/// writer — but a deployment that wants isolation must say so by passing `storage` explicitly.
+///
+/// One asymmetry to know about: for a SINK the root keys on the output *name* while the data
+/// keys on `SinkDetails.options.path`, and the two are independent — so changing
+/// `spark.sql.defaultCatalog`/`defaultDatabase` between runs of the same unqualified sink name,
+/// or pointing two differently-named outputs at one path, moves the root and the `appId` while
+/// the write location stays put, and the run replays into it. That needs a deliberate config
+/// change or rename, not an ordinary re-run: `OxidantService.config` is server-wide, so two
+/// sessions on one server resolve identically. Tables and MVs are unaffected — for them the
+/// name *is* the storage key.
+fn default_one_shot_storage(graph_id: &str) -> String {
+    std::env::temp_dir()
+        .join(format!("oxidant-sdp-{graph_id}"))
+        .display()
+        .to_string()
+}
+
+fn flow_def_from_proto(
+    cmd: &sc::pipeline_command::DefineFlow,
+    graph: &DataflowGraph,
+    ctx: &datafusion::prelude::SessionContext,
+) -> Result<FlowDef, Status> {
+    let flow_name = cmd
+        .flow_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Status::invalid_argument("DefineFlow.flow_name is required"))?;
+    let target_name = cmd
+        .target_dataset_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Status::invalid_argument("DefineFlow.target_dataset_name is required"))?;
+    let (relation, auto_cdc, once) = match &cmd.details {
+        Some(sc::pipeline_command::define_flow::Details::RelationFlowDetails(d)) => {
+            // An empty relation is not an error: a Python query function has not been evaluated
+            // yet, and the flow stays pending until `DefineFlowQueryFunctionResult` backfills it.
+            let rel = d.relation.as_ref().and_then(|r| {
+                if r.rel_type.is_some() {
+                    Some(r.clone())
+                } else {
+                    None
+                }
+            });
+            (rel, None, cmd.once.unwrap_or(false))
+        }
+        Some(sc::pipeline_command::define_flow::Details::AutoCdcFlowDetails(d)) => {
+            let cdc = auto_cdc_from_proto(ctx, d)
+                .map_err(|e| Status::invalid_argument(format!("DefineFlow AUTO CDC: {e}")))?;
+            validate_auto_cdc(&cdc, flow_name)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            (None, Some(cdc), cmd.once.unwrap_or(false))
+        }
+        _ => {
+            return Err(Status::invalid_argument(
+                "DefineFlow requires relation_flow_details or auto_cdc_flow_details",
+            ));
+        }
+    };
+    let target = resolve_identifier(
+        target_name,
+        graph.default_catalog.as_deref(),
+        graph.default_database.as_deref(),
+    );
+    let resolved = resolve_identifier(
+        flow_name,
+        graph.default_catalog.as_deref(),
+        graph.default_database.as_deref(),
+    );
+    Ok(FlowDef {
+        flow_name: flow_name.to_string(),
+        resolved,
+        target,
+        sql_conf: cmd.sql_conf.clone(),
+        client_id: cmd.client_id.clone(),
+        relation,
+        query_sql: None,
+        auto_cdc,
+        once,
+        by_name: false,
+        source_code_location: cmd.source_code_location.clone(),
+    })
+}
+
+/// The graph's sinks as `(short name, resolved key)`, in declaration order.
+///
+/// A `Vec` rather than a map keyed by the short name: two sinks in different namespaces can share
+/// one, and a map would drop all but the last — so a qualified read of the dropped one would slip
+/// the check, and which one an error names would depend on hash order.
+fn sink_names(graph: &DataflowGraph) -> Vec<(String, String)> {
+    graph
+        .outputs
+        .iter()
+        .filter(|o| is_sink_output(o))
+        .map(|o| {
+            (
+                o.resolved.table_name.clone(),
+                resolved_identifier_key(&o.resolved),
+            )
+        })
+        .collect()
+}
+
+/// Table names a flow relation reads, walking the wrappers a flow nests around a read.
+///
+/// This exists so `spark.readStream.table("my_sink")` is refused as a read of a write-only sink;
+/// planning would otherwise reject it as a missing table, since sinks are never
+/// catalog-registered. A `Sql` node anywhere in the tree contributes its own references, so
+/// `spark.sql("SELECT * FROM my_sink").filter(...)` is caught too.
+///
+/// The wrapper list is a whitelist and therefore fail-open: a relation shape not listed here
+/// hides its inputs, and the read falls through to the missing-table error this check exists to
+/// replace. Add arms as new shapes show up rather than assuming the list is complete.
+fn relation_named_tables(relation: &sc::Relation, out: &mut Vec<String>) {
+    use sc::relation::RelType;
+    let Some(rel_type) = relation.rel_type.as_ref() else {
+        return;
+    };
+    let mut walk = |input: Option<&sc::Relation>| {
+        if let Some(input) = input {
+            relation_named_tables(input, out);
+        }
+    };
+    match rel_type {
+        RelType::Read(r) => {
+            if let Some(sc::read::ReadType::NamedTable(t)) = r.read_type.as_ref() {
+                out.push(t.unparsed_identifier.clone());
+            }
+        }
+        RelType::Sql(q) => {
+            // Unparseable SQL is not a verdict here — planning will produce the real error.
+            if let Ok(references) = table_references(&q.query) {
+                out.extend(references);
+            }
+        }
+        RelType::Project(p) => walk(p.input.as_deref()),
+        RelType::Filter(f) => walk(f.input.as_deref()),
+        RelType::SubqueryAlias(a) => walk(a.input.as_deref()),
+        RelType::Aggregate(a) => walk(a.input.as_deref()),
+        RelType::Sort(o) => walk(o.input.as_deref()),
+        RelType::Limit(l) => walk(l.input.as_deref()),
+        RelType::Offset(o) => walk(o.input.as_deref()),
+        RelType::Tail(t) => walk(t.input.as_deref()),
+        RelType::Deduplicate(d) => walk(d.input.as_deref()),
+        RelType::WithColumns(w) => walk(w.input.as_deref()),
+        RelType::Repartition(r) => walk(r.input.as_deref()),
+        RelType::WithWatermark(w) => walk(w.input.as_deref()),
+        RelType::Sample(s) => walk(s.input.as_deref()),
+        RelType::Drop(d) => walk(d.input.as_deref()),
+        RelType::Unpivot(u) => walk(u.input.as_deref()),
+        RelType::ToSchema(t) => walk(t.input.as_deref()),
+        RelType::Hint(h) => walk(h.input.as_deref()),
+        RelType::Join(j) => {
+            walk(j.left.as_deref());
+            walk(j.right.as_deref());
+        }
+        RelType::AsOfJoin(j) => {
+            walk(j.left.as_deref());
+            walk(j.right.as_deref());
+        }
+        RelType::SetOp(s) => {
+            walk(s.left_input.as_deref());
+            walk(s.right_input.as_deref());
+        }
+        _ => {}
+    }
+}
+
+/// Whether a flow's table reference names the dataset with resolved key `key` and unqualified
+/// name `table_name`.
+///
+/// A bare reference matches on the short name. A qualified one must match the resolved key
+/// outright, or be a suffix of it at a segment boundary (`live.orders` names
+/// `local.live.orders`) — matching a qualified reference on its last segment alone would treat
+/// `other_cat.other_db.orders`, an unrelated external table, as the graph's own `orders`.
+/// Comparisons are ASCII case-insensitive: an identifier arriving from a DataFrame read is
+/// unparsed and never normalized.
+fn reference_names_dataset(key: &str, table_name: &str, reference: &str) -> bool {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return false;
+    }
+    if !reference.contains('.') {
+        return table_name.eq_ignore_ascii_case(reference);
+    }
+    let key = key.to_ascii_lowercase();
+    let reference = reference.to_ascii_lowercase();
+    key == reference || key.ends_with(&format!(".{reference}"))
+}
+
+/// Refuse a flow that reads a sink.
+///
+/// A sink is a write target with no catalog entry, so nothing downstream can consume it. Caught
+/// before planning so the client is told *why* rather than being handed a missing-table error.
+fn validate_flows_do_not_read_sinks(graph: &DataflowGraph) -> Result<(), TablePlanningFailure> {
+    let sinks = sink_names(graph);
+    if sinks.is_empty() {
+        return Ok(());
+    }
+    let refuse = |flow: &FlowDef, sink: &str| {
+        table_planning_failure(
+            &flow.target.table_name,
+            Status::invalid_argument(format!(
+                "flow `{}` cannot read sink `{sink}` — sinks are write targets only",
+                flow.flow_name
+            )),
+            &flow.source_code_location,
+        )
+    };
+    for flow in &graph.flows {
+        let sql = flow.query_sql.as_deref().or_else(|| {
+            match flow.relation.as_ref()?.rel_type.as_ref()? {
+                sc::relation::RelType::Sql(s) => Some(s.query.as_str()),
+                _ => None,
+            }
+        });
+        let mut references = match sql {
+            Some(sql) => table_references(sql).map_err(|e| {
+                table_planning_failure(
+                    &flow.target.table_name,
+                    crate::err_to_status(e),
+                    &flow.source_code_location,
+                )
+            })?,
+            None => Vec::new(),
+        };
+        if let Some(relation) = flow.relation.as_ref() {
+            relation_named_tables(relation, &mut references);
+        }
+        // An AUTO CDC flow carries neither SQL nor a relation, so the two extractors above see
+        // nothing — its read is `auto_cdc.source`, a bare dataset name. Without this arm
+        // `APPLY CHANGES INTO t FROM my_sink` would fall through to `resolve_auto_cdc_flows`
+        // and be reported as "not a table declared in this pipeline", which is the wrong story:
+        // the sink *is* declared, it is just unreadable.
+        if let Some(cdc) = flow.auto_cdc.as_ref() {
+            references.push(cdc.source.clone());
+        }
+        for reference in references {
+            if let Some((name, _)) = sinks
+                .iter()
+                .find(|(name, key)| reference_names_dataset(key, name, &reference))
+            {
+                return Err(refuse(flow, name));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a flow's SQL names something that exists only while the pipeline runs.
+///
+/// The `stream` alias and the graph's own outputs are registered as the run builds them, so
+/// normalizing such a query through the analyzer *now* fails on a table that does not exist yet.
+/// The text is passed through instead — the runner plans it with those names in scope. Anything
+/// else still round-trips through `relation_to_sql`, which is what turns a DataFrame relation
+/// into SQL in the first place.
+///
+/// Matching is qualification-aware (see [`reference_names_dataset`]): a fully-qualified read of a
+/// real external table that happens to share a short name with a graph output still goes through
+/// the analyzer, so a session temp view mixed into the same query is still inlined.
+fn sql_needs_run_scope(sql: &str, graph: &DataflowGraph) -> bool {
+    let Ok(references) = table_references(sql) else {
+        // Unparseable here is not a verdict — let `relation_to_sql` produce the real error.
+        return false;
+    };
+    references.iter().any(|reference| {
+        reference
+            .trim()
+            .eq_ignore_ascii_case(oxidant_pipelines::STREAM_ALIAS)
+            || graph.outputs.iter().any(|o| {
+                reference_names_dataset(
+                    &resolved_identifier_key(&o.resolved),
+                    &o.resolved.table_name,
+                    reference,
+                )
+            })
+    })
 }
 
 fn merge_sql_elements(graph: &mut DataflowGraph, elements: oxidant_pipelines::SqlGraphElements) {
@@ -1921,6 +2479,16 @@ fn format_run_event(event: &RunEvent, locations: &HashMap<String, String>) -> St
         RunEventKind::TableFailed { name, error, .. } => {
             format_table_failed(name, error, source_location_for_table(locations, name))
         }
+        RunEventKind::SinkWithoutCommitProtocol {
+            table,
+            path,
+            format,
+        } => format!(
+            "[oxidant] {table:<24} warning: `{format}` sink at {path} has no commit protocol — \
+             a reader can observe a partially written run, a replayed batch is appended rather \
+             than deduplicated, and the sink cannot be replaced atomically; use `delta` for \
+             transactional writes"
+        ),
         RunEventKind::StatePersistFailed { error } => {
             format!("[oxidant] could not persist pipeline state: {error}")
         }
@@ -1948,6 +2516,11 @@ async fn sql_from_relation(
         if !sql.query.is_empty() {
             if let Some(external) = deferred_sql_references(&sql.query, graph) {
                 reject_unknown_references(engine, &external).await?;
+                return Ok(sql.query.clone());
+            }
+            // Nothing this graph builds, but it may still name the `stream` alias, which only
+            // exists while the run reads a source — that too is forwarded verbatim.
+            if sql_needs_run_scope(&sql.query, graph) {
                 return Ok(sql.query.clone());
             }
         }
@@ -2005,6 +2578,12 @@ fn deferred_sql_references(sql: &str, graph: &DataflowGraph) -> Option<Vec<Strin
                 // A name can be both a CTE and a table reference in one statement
                 // (`WITH t AS (SELECT * FROM t) …`); never report those as external.
                 && !ctes.iter().any(|cte| cte.to_string() == full)
+                // The `stream` alias is registered by the run, not by the catalog; it is
+                // run-scoped like a graph output, never a missing table (see
+                // [`sql_needs_run_scope`]).
+                && !full
+                    .trim()
+                    .eq_ignore_ascii_case(oxidant_pipelines::STREAM_ALIAS)
             {
                 external.push(full);
             }
@@ -2264,6 +2843,7 @@ mod tests {
             auto_cdc: None,
             expect: Default::default(),
             comment: None,
+            write_path: None,
         }
     }
 
@@ -2638,6 +3218,264 @@ mod tests {
                 .get("spark.sql.session.timeZone")
                 .map(String::as_str),
             Some("UTC")
+        );
+    }
+
+    fn graph_with_output(name: &str, output_type: sc::OutputType) -> DataflowGraph {
+        DataflowGraph {
+            default_catalog: Some("cat".into()),
+            default_database: Some("db".into()),
+            sql_conf: HashMap::new(),
+            outputs: vec![OutputDef {
+                output_name: name.into(),
+                resolved: resolve_identifier(name, Some("cat"), Some("db")),
+                output_type: output_type as i32,
+                comment: None,
+                table_details: None,
+                sink_details: None,
+                source_code_location: None,
+            }],
+            flows: Vec::new(),
+            refreshes: Vec::new(),
+            created_at: SystemTime::now(),
+        }
+    }
+
+    fn sql_flow(name: &str, target: &str, query: &str) -> FlowDef {
+        FlowDef {
+            flow_name: name.into(),
+            resolved: resolve_identifier(name, Some("cat"), Some("db")),
+            target: resolve_identifier(target, Some("cat"), Some("db")),
+            sql_conf: HashMap::new(),
+            client_id: None,
+            relation: Some(sc::Relation {
+                rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                    query: query.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+            query_sql: None,
+            auto_cdc: None,
+            once: false,
+            by_name: false,
+            source_code_location: None,
+        }
+    }
+
+    #[test]
+    fn run_scope_covers_the_stream_alias_and_the_graph_s_own_outputs() {
+        let graph = graph_with_output("orders_bronze", sc::OutputType::Table);
+        // Both name something the run registers as it builds; normalizing now would fail.
+        assert!(sql_needs_run_scope("SELECT * FROM stream", &graph));
+        assert!(sql_needs_run_scope(
+            "SELECT customer FROM orders_bronze WHERE amount > 0",
+            &graph
+        ));
+        // An ordinary catalog table is not run-scoped and still round-trips through the analyzer.
+        assert!(!sql_needs_run_scope(
+            "SELECT * FROM cat.db.customers",
+            &graph
+        ));
+        // A prefix match is not a match.
+        assert!(!sql_needs_run_scope("SELECT * FROM stream_archive", &graph));
+    }
+
+    #[test]
+    fn run_scope_matching_is_qualification_aware() {
+        let graph = graph_with_output("orders_bronze", sc::OutputType::Table);
+        // A real external table that merely shares the short name of a graph output is not
+        // run-scoped: it exists now, so it must still go through the analyzer.
+        assert!(!sql_needs_run_scope(
+            "SELECT * FROM prod_cat.prod_db.orders_bronze",
+            &graph
+        ));
+        // Partially qualified against the graph's own defaults is the graph's own output.
+        assert!(sql_needs_run_scope(
+            "SELECT * FROM db.orders_bronze",
+            &graph
+        ));
+        assert!(sql_needs_run_scope(
+            "SELECT * FROM cat.db.orders_bronze",
+            &graph
+        ));
+    }
+
+    #[test]
+    fn a_sql_relation_under_a_wrapper_that_reads_a_sink_is_refused() {
+        let mut graph = graph_with_output("orders_sink", sc::OutputType::Sink);
+        graph.outputs.push(OutputDef {
+            output_name: "downstream".into(),
+            resolved: resolve_identifier("downstream", Some("cat"), Some("db")),
+            output_type: sc::OutputType::MaterializedView as i32,
+            comment: None,
+            table_details: None,
+            sink_details: None,
+            source_code_location: None,
+        });
+        // `spark.sql("SELECT * FROM orders_sink").filter(...)`: neither the top-level SQL check
+        // (it sees a Filter) nor a walker without a `Sql` arm (it sees Sql and stops) catches it.
+        let inner = sql_flow("inner", "downstream", "SELECT * FROM orders_sink")
+            .relation
+            .expect("sql relation");
+        let mut flow = sql_flow("f", "downstream", "");
+        flow.relation = Some(sc::Relation {
+            rel_type: Some(sc::relation::RelType::Filter(Box::new(sc::Filter {
+                input: Some(Box::new(inner)),
+                condition: None,
+            }))),
+            ..Default::default()
+        });
+        graph.flows.push(flow);
+        let err = validate_flows_do_not_read_sinks(&graph).expect_err("sinks are write-only");
+        assert!(
+            err.inner.contains("cannot read sink `orders_sink`"),
+            "{}",
+            err.inner
+        );
+    }
+
+    #[test]
+    fn a_sink_read_is_matched_regardless_of_case() {
+        let mut graph = graph_with_output("orders_sink", sc::OutputType::Sink);
+        graph.outputs.push(OutputDef {
+            output_name: "downstream".into(),
+            resolved: resolve_identifier("downstream", Some("cat"), Some("db")),
+            output_type: sc::OutputType::MaterializedView as i32,
+            comment: None,
+            table_details: None,
+            sink_details: None,
+            source_code_location: None,
+        });
+        // `unparsed_identifier` arrives verbatim from the client; nothing normalizes it.
+        let mut flow = sql_flow("f", "downstream", "");
+        flow.relation = Some(sc::Relation {
+            rel_type: Some(sc::relation::RelType::Read(sc::Read {
+                is_streaming: true,
+                read_type: Some(sc::read::ReadType::NamedTable(sc::read::NamedTable {
+                    unparsed_identifier: "ORDERS_SINK".into(),
+                    options: HashMap::new(),
+                })),
+            })),
+            ..Default::default()
+        });
+        graph.flows.push(flow);
+        assert!(validate_flows_do_not_read_sinks(&graph).is_err());
+    }
+
+    #[test]
+    fn an_unrelated_qualified_table_sharing_a_sink_s_short_name_is_allowed() {
+        let mut graph = graph_with_output("orders", sc::OutputType::Sink);
+        graph.outputs.push(OutputDef {
+            output_name: "downstream".into(),
+            resolved: resolve_identifier("downstream", Some("cat"), Some("db")),
+            output_type: sc::OutputType::MaterializedView as i32,
+            comment: None,
+            table_details: None,
+            sink_details: None,
+            source_code_location: None,
+        });
+        graph.flows.push(sql_flow(
+            "f",
+            "downstream",
+            "SELECT * FROM other_cat.other_db.orders",
+        ));
+        assert!(
+            validate_flows_do_not_read_sinks(&graph).is_ok(),
+            "a different catalog's `orders` is not this graph's sink"
+        );
+        // The graph's own sink, partially qualified, still is.
+        graph.flows.clear();
+        graph
+            .flows
+            .push(sql_flow("f", "downstream", "SELECT * FROM db.orders"));
+        assert!(validate_flows_do_not_read_sinks(&graph).is_err());
+    }
+
+    #[test]
+    fn two_sinks_sharing_a_short_name_in_different_namespaces_are_both_checked() {
+        let mut graph = graph_with_output("orders", sc::OutputType::Sink);
+        // A second sink, same short name, a different namespace. A map keyed by the short
+        // name would keep only this one.
+        graph.outputs.push(OutputDef {
+            output_name: "other_db.orders".into(),
+            resolved: resolve_identifier("other_db.orders", Some("cat"), Some("db")),
+            output_type: sc::OutputType::Sink as i32,
+            comment: None,
+            table_details: None,
+            sink_details: None,
+            source_code_location: None,
+        });
+        graph.outputs.push(OutputDef {
+            output_name: "downstream".into(),
+            resolved: resolve_identifier("downstream", Some("cat"), Some("db")),
+            output_type: sc::OutputType::MaterializedView as i32,
+            comment: None,
+            table_details: None,
+            sink_details: None,
+            source_code_location: None,
+        });
+        // Qualified read of the FIRST sink — the one a short-name map drops.
+        graph
+            .flows
+            .push(sql_flow("f", "downstream", "SELECT * FROM cat.db.orders"));
+        assert!(
+            validate_flows_do_not_read_sinks(&graph).is_err(),
+            "a qualified read of the first sink must still be refused"
+        );
+    }
+
+    #[test]
+    fn a_named_table_read_of_a_sink_is_refused_under_wrappers() {
+        let mut graph = graph_with_output("orders_sink", sc::OutputType::Sink);
+        graph.outputs.push(OutputDef {
+            output_name: "downstream".into(),
+            resolved: resolve_identifier("downstream", Some("cat"), Some("db")),
+            output_type: sc::OutputType::MaterializedView as i32,
+            comment: None,
+            table_details: None,
+            sink_details: None,
+            source_code_location: None,
+        });
+        let read = sc::Relation {
+            rel_type: Some(sc::relation::RelType::Read(sc::Read {
+                is_streaming: true,
+                read_type: Some(sc::read::ReadType::NamedTable(sc::read::NamedTable {
+                    unparsed_identifier: "orders_sink".into(),
+                    options: HashMap::new(),
+                })),
+            })),
+            ..Default::default()
+        };
+        let mut flow = sql_flow("f", "downstream", "");
+        // `spark.readStream.table("orders_sink").filter(...)`: the sink is one wrapper down.
+        flow.relation = Some(sc::Relation {
+            rel_type: Some(sc::relation::RelType::Filter(Box::new(sc::Filter {
+                input: Some(Box::new(read)),
+                condition: None,
+            }))),
+            ..Default::default()
+        });
+        graph.flows.push(flow);
+
+        let err = validate_flows_do_not_read_sinks(&graph).expect_err("sinks are write-only");
+        assert_eq!(err.status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.inner.contains("cannot read sink `orders_sink`"),
+            "{}",
+            err.inner
+        );
+    }
+
+    #[test]
+    fn a_flow_that_only_writes_a_sink_is_allowed() {
+        let mut graph = graph_with_output("orders_sink", sc::OutputType::Sink);
+        graph
+            .flows
+            .push(sql_flow("f", "orders_sink", "SELECT * FROM stream"));
+        assert!(
+            validate_flows_do_not_read_sinks(&graph).is_ok(),
+            "writing a sink is the point"
         );
     }
 

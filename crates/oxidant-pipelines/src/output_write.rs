@@ -81,6 +81,32 @@ fn is_sink_table_property(key: &str) -> bool {
     SINK_TABLE_PROPERTIES.contains(&key)
 }
 
+/// Validate an SDP external sink format.
+///
+/// A sink writes through the same `LakeSink` a `writeStream` drives, which implements exactly
+/// two formats: `delta` (one atomic transaction per micro-batch) and bare `parquet` (one file
+/// per batch, no commit protocol). `csv` / `json` are writable *table* formats but have no
+/// streaming writer, so they are refused here rather than accepted and failed mid-run. Kafka is
+/// refused outright — the Kafka integration is source-only.
+pub fn validate_external_sink_format(format: &str, label: &str) -> Result<()> {
+    let normalized = format.trim().to_ascii_lowercase();
+    if normalized == "kafka" {
+        return Err(Error::Unsupported(format!(
+            "{label}: Kafka sink is not supported — the Kafka integration is source-only \
+             (see docs/TODOS.md)"
+        )));
+    }
+    validate_output_format(format, label)?;
+    if !matches!(normalized.as_str(), "delta" | "parquet") {
+        return Err(Error::Unsupported(format!(
+            "{label}: sink format `{format}` has no streaming writer — use `delta` (atomic \
+             per-batch commits) or `parquet` (one file per batch, no commit protocol; \
+             see docs/TODOS.md)"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a table output format; mirrors [`oxidant_config::validate`] sink rules.
 pub fn validate_output_format(format: &str, label: &str) -> Result<()> {
     let normalized = format.trim().to_ascii_lowercase();
@@ -357,6 +383,33 @@ mod tests {
     fn iceberg_format_points_at_delta_compat() {
         let err = validate_output_format("iceberg", "table `t`").expect_err("iceberg refused");
         assert!(err.to_string().contains("icebergCompat"), "{err}");
+    }
+
+    #[test]
+    fn kafka_sink_format_is_refused() {
+        let err = validate_external_sink_format("kafka", "sink `out`").expect_err("kafka refused");
+        assert!(
+            err.to_string().contains("Kafka sink is not supported"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("TODOS"), "{err}");
+    }
+
+    #[test]
+    fn sink_formats_are_the_two_the_writer_implements() {
+        validate_external_sink_format("delta", "sink `out`").expect("delta sink");
+        validate_external_sink_format("PARQUET", "sink `out`")
+            .expect("parquet sink, case-insensitive");
+        // `csv` / `json` pass `validate_output_format` but LakeSink cannot write them, so a sink
+        // must refuse them up front instead of failing on the first micro-batch.
+        for format in ["csv", "json"] {
+            validate_output_format(format, "table `out`").expect("writable table format");
+            let err = validate_external_sink_format(format, "sink `out`")
+                .expect_err("no streaming writer");
+            assert!(err.to_string().contains("has no streaming writer"), "{err}");
+        }
+        let err = validate_external_sink_format("orc", "sink `out`").expect_err("unknown format");
+        assert!(err.to_string().contains("unwritable format"), "{err}");
     }
 
     #[test]
