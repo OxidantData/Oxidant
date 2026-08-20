@@ -1,13 +1,14 @@
 //! Spark Declarative Pipelines (`PipelineCommand`) handlers (SDP Phase 1A–2).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::SystemTime;
 
 use datafusion::sql::unparser::Unparser;
 use oxidant_config::{OxidantConfig, PipelineConfig, SourceConfig, TableConfig, Trigger};
 use oxidant_loom::Engine;
 use oxidant_pipelines::{
-    clear_pipeline_state, parse, run_pipeline, OutputKind, Plan, RunEvent, RunEventKind,
+    clear_pipeline_state, parse, run_pipeline, split_table_properties, validate_output_format,
+    OutputKind, Plan, RunEvent, RunEventKind,
 };
 use oxidant_proto::spark::connect as sc;
 use prost_types::Timestamp;
@@ -78,6 +79,7 @@ pub struct FlowDef {
     /// Populated by `DefineSqlGraphElements` when the flow comes from SDP SQL text.
     pub query_sql: Option<String>,
     pub once: bool,
+    pub by_name: bool,
 }
 
 impl DataflowGraphRegistry {
@@ -444,6 +446,7 @@ impl OxidantService {
                         relation,
                         query_sql: None,
                         once,
+                        by_name: false,
                     },
                 );
                 Ok(resolved)
@@ -691,18 +694,33 @@ async fn graph_to_config(
         }
         let key = resolved_identifier_key(&output.resolved);
         let name = output.resolved.table_name.clone();
-        let source = kafka_source_from_output(output);
+        let table_details = output.table_details.as_ref();
+        let table_properties: BTreeMap<String, String> = table_details
+            .map(|t| t.table_properties.clone().into_iter().collect())
+            .unwrap_or_default();
+        let format = table_details.and_then(|t| t.format.clone());
+        if let Some(fmt) = format.as_deref() {
+            validate_output_format(fmt, &format!("table `{name}`"))
+                .map_err(crate::err_to_status)?;
+        }
+        let (source_opts, sink_opts) =
+            split_table_properties(&table_properties).map_err(crate::err_to_status)?;
+        let source = kafka_source_from_properties(&source_opts);
+        let iceberg_compat = sink_opts
+            .get("icebergCompat")
+            .map(|v| v.eq_ignore_ascii_case("true"));
         let table = TableConfig {
             name: name.clone(),
             source,
             sql: None,
-            partition_by: output
-                .table_details
-                .as_ref()
+            sql_by_name: false,
+            append_flows: Vec::new(),
+            output_schema: table_details.and_then(table_schema_from_details),
+            partition_by: table_details
                 .map(|t| t.partition_cols.clone())
                 .unwrap_or_default(),
-            format: output.table_details.as_ref().and_then(|t| t.format.clone()),
-            iceberg_compat: None,
+            format,
+            iceberg_compat,
             iceberg_table_suffix: None,
             checkpoint_interval: None,
             dedup_columns: Vec::new(),
@@ -724,29 +742,40 @@ async fn graph_to_config(
                 flow.flow_name
             ))
         })?;
-        if let Some(relation) = &flow.relation {
+        let flow_sql = if let Some(relation) = &flow.relation {
             if table.source.is_none() {
                 if let Some(source) = extract_streaming_source(relation) {
                     table.source = Some(source);
                 }
             }
-            table.sql = Some(relation_to_sql(engine, relation).await?);
+            relation_to_sql(engine, relation).await?
         } else if let Some(sql) = flow.query_sql.as_deref() {
-            table.sql = Some(sql.to_string());
             if table.source.is_none() {
                 if let Some(output) = graph
                     .outputs
                     .iter()
                     .find(|o| identifiers_match(&o.resolved, &flow.target))
                 {
-                    table.source = kafka_source_from_output(output);
+                    if let Some(source) = kafka_source_from_output(output) {
+                        table.source = Some(source);
+                    }
                 }
             }
+            sql.to_string()
         } else {
             return Err(Status::failed_precondition(format!(
                 "flow `{}` has no relation or SQL at StartRun",
                 flow.flow_name
             )));
+        };
+        if table.sql.is_none() {
+            table.sql = Some(flow_sql);
+            table.sql_by_name = flow.by_name;
+        } else {
+            table.append_flows.push(oxidant_config::AppendFlow {
+                sql: flow_sql,
+                by_name: flow.by_name,
+            });
         }
     }
 
@@ -829,7 +858,11 @@ fn parsed_output_to_def(
             table_properties: parsed.table_properties.clone().into_iter().collect(),
             partition_cols: parsed.partition_cols.clone(),
             format: parsed.format.clone(),
-            schema: None,
+            schema: parsed.schema.as_ref().map(|ddl| {
+                sc::pipeline_command::define_output::table_details::Schema::SchemaString(
+                    ddl.clone(),
+                )
+            }),
             clustering_columns: vec![],
         }),
         sink_details: None,
@@ -859,15 +892,20 @@ fn parsed_flow_to_def(parsed: &oxidant_pipelines::ParsedFlow, graph: &DataflowGr
         relation: None,
         query_sql: Some(parsed.query_sql.clone()),
         once: parsed.once,
+        by_name: parsed.by_name,
     }
 }
 
 fn kafka_source_from_output(output: &OutputDef) -> Option<SourceConfig> {
-    let props = output
+    let props: BTreeMap<String, String> = output
         .table_details
         .as_ref()
-        .map(|t| &t.table_properties)
-        .filter(|p| !p.is_empty())?;
+        .map(|t| t.table_properties.clone().into_iter().collect())
+        .filter(|p: &BTreeMap<String, String>| !p.is_empty())?;
+    kafka_source_from_properties(&props)
+}
+
+fn kafka_source_from_properties(props: &BTreeMap<String, String>) -> Option<SourceConfig> {
     if props.contains_key("subscribe") || props.contains_key("oxidant.spool.dir") {
         Some(SourceConfig {
             format: "kafka".to_string(),
@@ -875,6 +913,61 @@ fn kafka_source_from_output(output: &OutputDef) -> Option<SourceConfig> {
         })
     } else {
         None
+    }
+}
+
+fn table_schema_from_details(
+    details: &sc::pipeline_command::define_output::TableDetails,
+) -> Option<String> {
+    match &details.schema {
+        Some(sc::pipeline_command::define_output::table_details::Schema::SchemaString(s))
+            if !s.trim().is_empty() =>
+        {
+            Some(s.clone())
+        }
+        Some(sc::pipeline_command::define_output::table_details::Schema::SchemaDataType(dt)) => {
+            proto_schema_to_ddl(dt).ok()
+        }
+        _ => None,
+    }
+}
+
+fn proto_schema_to_ddl(dt: &sc::DataType) -> Result<String, ()> {
+    use crate::types;
+    let arrow = types::spark_to_arrow(dt).map_err(|_| ())?;
+    match arrow {
+        datafusion::arrow::datatypes::DataType::Struct(fields) => {
+            let cols = fields
+                .iter()
+                .map(|f| format!("{} {}", f.name(), proto_field_type(f.data_type())))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(format!("({cols})"))
+        }
+        _ => Err(()),
+    }
+}
+
+fn proto_field_type(dt: &datafusion::arrow::datatypes::DataType) -> String {
+    match dt {
+        datafusion::arrow::datatypes::DataType::Boolean => "BOOLEAN".to_string(),
+        datafusion::arrow::datatypes::DataType::Int8
+        | datafusion::arrow::datatypes::DataType::UInt8 => "TINYINT".to_string(),
+        datafusion::arrow::datatypes::DataType::Int16
+        | datafusion::arrow::datatypes::DataType::UInt16 => "SMALLINT".to_string(),
+        datafusion::arrow::datatypes::DataType::Int32
+        | datafusion::arrow::datatypes::DataType::UInt32 => "INT".to_string(),
+        datafusion::arrow::datatypes::DataType::Int64
+        | datafusion::arrow::datatypes::DataType::UInt64 => "BIGINT".to_string(),
+        datafusion::arrow::datatypes::DataType::Float32 => "FLOAT".to_string(),
+        datafusion::arrow::datatypes::DataType::Float64 => "DOUBLE".to_string(),
+        datafusion::arrow::datatypes::DataType::Utf8 => "STRING".to_string(),
+        datafusion::arrow::datatypes::DataType::Binary => "BINARY".to_string(),
+        datafusion::arrow::datatypes::DataType::Date32 => "DATE".to_string(),
+        datafusion::arrow::datatypes::DataType::Timestamp(_, Some(_)) => "TIMESTAMP".to_string(),
+        datafusion::arrow::datatypes::DataType::Timestamp(_, None) => "TIMESTAMP_NTZ".to_string(),
+        datafusion::arrow::datatypes::DataType::Decimal128(p, s) => format!("DECIMAL({p},{s})"),
+        other => format!("{other:?}"),
     }
 }
 
