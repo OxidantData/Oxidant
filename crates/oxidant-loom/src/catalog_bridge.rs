@@ -1717,39 +1717,13 @@ async fn write_delta_batches(
 /// literal is retyped to `Int32` after planning, so `INSERT INTO t SELECT 9` feeds an `Int32`
 /// column to a `BIGINT` table. Writing that straight through would put a file in the table whose
 /// Parquet schema disagrees with the table's, which every reader would then have to guess at.
-/// Casting here is what Spark does for compatible types; an incompatible one is an error naming
-/// the column rather than a silently wrong value.
+/// Casting here is what Spark does for compatible types; one that would lose the value — a
+/// string that is not a number, a timestamp that does not parse, a decimal too big for the
+/// declared precision — is an error naming the column rather than a `NULL` silently committed in
+/// its place. That is `crate::schema_conform`'s cast-or-fail, shared with the SDP pipeline and
+/// streaming sinks so every write path in the engine enforces a schema identically.
 fn conform_to_schema(batch: RecordBatch, schema: &SchemaRef) -> DfResult<RecordBatch> {
-    if batch.schema() == *schema {
-        return Ok(batch);
-    }
-    if batch.num_columns() != schema.fields().len() {
-        return Err(DataFusionError::Plan(format!(
-            "INSERT provides {} column(s) but the table has {}",
-            batch.num_columns(),
-            schema.fields().len()
-        )));
-    }
-    let columns = batch
-        .columns()
-        .iter()
-        .zip(schema.fields())
-        .map(|(column, field)| {
-            if column.data_type() == field.data_type() {
-                return Ok(column.clone());
-            }
-            datafusion::arrow::compute::cast(column, field.data_type()).map_err(|e| {
-                DataFusionError::Plan(format!(
-                    "INSERT column `{}` is {:?}, which cannot be written to a {:?} column: {e}",
-                    field.name(),
-                    column.data_type(),
-                    field.data_type()
-                ))
-            })
-        })
-        .collect::<DfResult<Vec<_>>>()?;
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| DataFusionError::Execution(format!("conform INSERT batch to table: {e}")))
+    crate::schema_conform::conform_insert_batch_to_schema(batch, schema).map_err(oxidant_to_df)
 }
 
 /// The one shared refusal for a write that names Iceberg as its storage format.

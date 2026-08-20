@@ -74,9 +74,21 @@ INSERT OVERWRITE lake.live.orders SELECT * FROM lake.raw.orders_json;
 An insert is visible to the next `SELECT` in the same session — the cached table provider is
 evicted as part of the statement.
 
-Columns are cast to the table's own types where a cast is safe (a Spark integer literal is
-`INT` while the column may be `BIGINT`), and an unsafe one is an error naming the column. The
-table's schema is not widened: adding a column needs `ALTER TABLE`, not an `INSERT`.
+Columns are cast to the table's own types positionally, because the rows do not always arrive
+in those types — a Spark integer literal plans as `INT` even when the column is `BIGINT`. The
+cast **fails the statement rather than losing the value**: a string that is not a number, a
+number past the column's range, a timestamp that does not parse, or a decimal too big for the
+declared precision is an error naming the column, and nothing is committed. It is never a
+`NULL` written in the value's place — that is Spark's ANSI store-assignment behavior, and the
+same enforcement the [pipeline](pipelines.md) and streaming write paths use.
+
+A value that was already `NULL` is not a lost value and writes through as `NULL`. A `NULL` into
+a column the table declares `NOT NULL` is an error, for the same reason.
+
+The table's schema is not widened: adding a column needs `ALTER TABLE`, not an `INSERT`.
+
+Spark's *expression* `CAST` is separate and stays lenient (`SELECT CAST('x' AS INT)` is `NULL`);
+what is strict here is the assignment of a value into a column.
 
 `REPLACE INTO` is not supported — that is row-level matching on a key, which Delta expresses
 as `MERGE`.
