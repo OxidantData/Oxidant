@@ -223,7 +223,6 @@ fn is_known_sql_conf_key(key: &str) -> bool {
     key.starts_with("spark.sql.catalog.")
         || key == "spark.sql.defaultCatalog"
         || key.starts_with("spark.sql.session.")
-        || key == "spark.sql.shuffle.partitions"
         || key.starts_with("spark.oxidant.")
         || key.starts_with("engine.")
 }
@@ -242,20 +241,67 @@ fn table_source_locations(graph: &DataflowGraph) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for output in &graph.outputs {
         if let Some(label) = source_location_label(&output.source_code_location) {
-            out.insert(output.resolved.table_name.clone(), label);
+            out.insert(resolved_identifier_key(&output.resolved), label);
         }
     }
     for flow in &graph.flows {
         if let Some(label) = source_location_label(&flow.source_code_location) {
-            out.insert(flow.target.table_name.clone(), label);
+            out.insert(resolved_identifier_key(&flow.target), label);
         }
     }
     out
 }
 
+fn source_location_for_table<'a>(
+    locations: &'a HashMap<String, String>,
+    table: &str,
+) -> Option<&'a String> {
+    locations.get(table).or_else(|| {
+        locations
+            .iter()
+            .find_map(|(key, label)| key.ends_with(&format!(".{table}")).then_some(label))
+    })
+}
+
 /// Prior values for keys touched by a scoped `sql_conf` application.
 struct SqlConfSnapshot {
     previous: HashMap<String, Option<String>>,
+}
+
+/// Restores graph-scoped `sql_conf` and re-syncs the observability environment on every exit.
+struct SqlConfGuard<'a> {
+    svc: &'a OxidantService,
+    snap: Option<SqlConfSnapshot>,
+}
+
+impl<'a> SqlConfGuard<'a> {
+    fn new(svc: &'a OxidantService, snap: SqlConfSnapshot) -> Self {
+        Self {
+            svc,
+            snap: Some(snap),
+        }
+    }
+}
+
+impl Drop for SqlConfGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(snap) = self.snap.take() {
+            self.svc.restore_sql_conf(snap);
+            self.svc.sync_observability_env();
+        }
+    }
+}
+
+/// Planning failure with the target table name threaded structurally (not re-parsed from status text).
+struct TablePlanningFailure {
+    table: String,
+    status: Status,
+}
+
+impl TablePlanningFailure {
+    fn error_message(&self) -> &str {
+        self.status.message()
+    }
 }
 
 impl OxidantService {
@@ -273,6 +319,7 @@ impl OxidantService {
                 ignored.push(key.clone());
             }
         }
+        ignored.sort();
         (ignored, SqlConfSnapshot { previous })
     }
 
@@ -614,8 +661,11 @@ impl OxidantService {
         let locations = table_source_locations(&graph);
 
         let (ignored_graph, conf_snap) = self.apply_sql_conf(&graph.sql_conf);
-        self.sync_catalogs().await;
-        self.sync_observability_env();
+        if !dry {
+            self.sync_catalogs().await;
+            self.sync_observability_env();
+        }
+        let _conf_guard = SqlConfGuard::new(self, conf_snap);
         let mut responses = self.sql_conf_ignored_events(session_id, operation_id, &ignored_graph);
 
         let storage = cmd
@@ -671,6 +721,27 @@ impl OxidantService {
             }
         }
 
+        if let Err(status) = register_temp_views(engine, &graph).await {
+            responses.push(
+                self.pipeline_table_failed_event(
+                    session_id,
+                    operation_id,
+                    graph
+                        .outputs
+                        .iter()
+                        .find(|o| is_temporary_view_output(o))
+                        .map(|o| o.resolved.table_name.as_str())
+                        .unwrap_or("temporary_view"),
+                    status.message(),
+                    &locations,
+                ),
+            );
+            return Ok(PipelineCommandOutput::Failed {
+                responses,
+                status: status_with_location(&status, &locations, None),
+            });
+        }
+
         let mut flow_ignored = Vec::new();
         let config = match graph_to_config(
             self,
@@ -683,25 +754,22 @@ impl OxidantService {
         .await
         {
             Ok(config) => config,
-            Err(status) => {
+            Err(failure) => {
                 responses.extend(self.sql_conf_ignored_events(
                     session_id,
                     operation_id,
                     &flow_ignored,
                 ));
-                if let Some((table, error)) = table_error_from_status(&status) {
-                    responses.push(self.pipeline_table_failed_event(
-                        session_id,
-                        operation_id,
-                        table,
-                        error,
-                        &locations,
-                    ));
-                }
-                self.restore_sql_conf(conf_snap);
+                responses.push(self.pipeline_table_failed_event(
+                    session_id,
+                    operation_id,
+                    &failure.table,
+                    failure.error_message(),
+                    &locations,
+                ));
                 return Ok(PipelineCommandOutput::Failed {
                     responses,
-                    status: status_with_location(&status, &locations),
+                    status: status_with_location(&failure.status, &locations, Some(&failure.table)),
                 });
             }
         };
@@ -711,12 +779,15 @@ impl OxidantService {
             Ok(plan) => plan,
             Err(e) => {
                 let status = crate::err_to_status(e);
-                self.restore_sql_conf(conf_snap);
-                return Ok(PipelineCommandOutput::Failed { responses, status });
+                return Ok(PipelineCommandOutput::Failed {
+                    responses,
+                    status: status_with_location(&status, &locations, None),
+                });
             }
         };
 
         if dry {
+            drop_temp_views(engine, &graph).await;
             let order = plan
                 .graph
                 .order
@@ -731,25 +802,7 @@ impl OxidantService {
             );
             responses.push(self.pipeline_event(session_id, operation_id, &message, None));
             responses.push(self.result_complete(session_id, operation_id));
-            self.restore_sql_conf(conf_snap);
             return Ok(PipelineCommandOutput::Complete(responses));
-        }
-
-        if let Err(status) = register_temp_views(engine, &graph).await {
-            if let Some((table, error)) = table_error_from_status(&status) {
-                responses.push(self.pipeline_table_failed_event(
-                    session_id,
-                    operation_id,
-                    table,
-                    error,
-                    &locations,
-                ));
-            }
-            self.restore_sql_conf(conf_snap);
-            return Ok(PipelineCommandOutput::Failed {
-                responses,
-                status: status_with_location(&status, &locations),
-            });
         }
 
         let wanted = resolve_wanted_tables(&graph, &refresh_selection);
@@ -765,11 +818,10 @@ impl OxidantService {
             .map(|event| self.pipeline_run_event(session_id, operation_id, &locations, event))
             .collect();
         responses.append(&mut run_responses);
-        self.restore_sql_conf(conf_snap);
         if let Err(e) = run_result {
             return Ok(PipelineCommandOutput::Failed {
                 responses,
-                status: status_with_location(&crate::err_to_status(e), &locations),
+                status: status_with_location(&crate::err_to_status(e), &locations, None),
             });
         }
         responses.push(self.result_complete(session_id, operation_id));
@@ -787,7 +839,7 @@ impl OxidantService {
         self.pipeline_event(
             session_id,
             operation_id,
-            &format_table_failed(table, error, locations.get(table)),
+            &format_table_failed(table, error, source_location_for_table(locations, table)),
             None,
         )
     }
@@ -854,7 +906,7 @@ async fn graph_to_config(
     storage: &str,
     engine: &Engine,
     flow_ignored: &mut Vec<String>,
-) -> Result<OxidantConfig, Status> {
+) -> Result<OxidantConfig, TablePlanningFailure> {
     let catalog = graph
         .default_catalog
         .clone()
@@ -904,15 +956,18 @@ async fn graph_to_config(
         let target_key = resolved_identifier_key(&flow.target);
         let target_name = flow.target.table_name.clone();
         let table = tables.get_mut(&target_key).ok_or_else(|| {
-            let at = source_location_suffix(&flow.source_code_location);
-            Status::invalid_argument(format!(
-                "flow `{}` targets undefined table `{target_name}`{at}",
-                flow.flow_name
-            ))
+            table_planning_failure(
+                &target_name,
+                Status::invalid_argument(format!(
+                    "flow `{}` targets undefined table `{target_name}`",
+                    flow.flow_name
+                )),
+                &flow.source_code_location,
+            )
         })?;
         let (ignored, flow_snap) = svc.apply_sql_conf(&flow.sql_conf);
         flow_ignored.extend(ignored);
-        let sql_result = if let Some(relation) = &flow.relation {
+        let sql_result: Result<(), TablePlanningFailure> = if let Some(relation) = &flow.relation {
             if table.source.is_none() {
                 if let Some(source) = extract_streaming_source(relation) {
                     table.source = Some(source);
@@ -922,9 +977,9 @@ async fn graph_to_config(
                 .await
                 .map(|sql| table.sql = Some(sql))
                 .map_err(|status| {
-                    table_planning_status(
+                    table_planning_failure(
                         &flow.target.table_name,
-                        &status,
+                        status,
                         &flow.source_code_location,
                     )
                 })
@@ -941,11 +996,14 @@ async fn graph_to_config(
             }
             Ok(())
         } else {
-            let at = source_location_suffix(&flow.source_code_location);
-            Err(Status::failed_precondition(format!(
-                "flow `{}` has no relation or SQL at StartRun{at}",
-                flow.flow_name
-            )))
+            Err(table_planning_failure(
+                &target_name,
+                Status::failed_precondition(format!(
+                    "flow `{}` has no relation or SQL at StartRun",
+                    flow.flow_name
+                )),
+                &flow.source_code_location,
+            ))
         };
         svc.restore_sql_conf(flow_snap);
         sql_result?;
@@ -1122,6 +1180,16 @@ async fn register_temp_views(engine: &Engine, graph: &DataflowGraph) -> Result<(
     Ok(())
 }
 
+async fn drop_temp_views(engine: &Engine, graph: &DataflowGraph) {
+    for output in &graph.outputs {
+        if output.output_type != sc::OutputType::TemporaryView as i32 {
+            continue;
+        }
+        let name = output.resolved.table_name.clone();
+        let _ = engine.sql(&format!("DROP VIEW IF EXISTS {name}")).await;
+    }
+}
+
 async fn flow_sql_for_target(
     graph: &DataflowGraph,
     target: &sc::ResolvedIdentifier,
@@ -1155,16 +1223,19 @@ fn format_table_failed(name: &str, error: &str, location: Option<&String>) -> St
     format!("[oxidant] {name:<24} FAILED{at}: {error}")
 }
 
-fn table_planning_status(
+fn table_planning_failure(
     table: &str,
-    status: &Status,
+    status: Status,
     location: &Option<sc::SourceCodeLocation>,
-) -> Status {
+) -> TablePlanningFailure {
     let at = source_location_suffix(location);
-    Status::new(
-        status.code(),
-        format!("[oxidant] {table:<24} FAILED{at}: {}", status.message()),
-    )
+    TablePlanningFailure {
+        table: table.to_string(),
+        status: Status::new(
+            status.code(),
+            format!("[oxidant] {table:<24} FAILED{at}: {}", status.message()),
+        ),
+    }
 }
 
 fn source_location_suffix(loc: &Option<sc::SourceCodeLocation>) -> String {
@@ -1173,27 +1244,21 @@ fn source_location_suffix(loc: &Option<sc::SourceCodeLocation>) -> String {
         .unwrap_or_default()
 }
 
-fn status_with_location(status: &Status, locations: &HashMap<String, String>) -> Status {
+fn status_with_location(
+    status: &Status,
+    locations: &HashMap<String, String>,
+    table: Option<&str>,
+) -> Status {
     let msg = status.message();
     if locations.values().any(|loc| msg.contains(loc)) {
         return status.clone();
     }
-    if let Some((table, _)) = table_error_from_status(status) {
-        if let Some(loc) = locations.get(table) {
+    if let Some(table) = table {
+        if let Some(loc) = source_location_for_table(locations, table) {
             return Status::new(status.code(), format!("{msg} (at {loc})"));
         }
     }
     status.clone()
-}
-
-fn table_error_from_status(status: &Status) -> Option<(&str, &str)> {
-    let msg = status.message();
-    let rest = msg.strip_prefix("[oxidant] ")?;
-    let (name_part, tail) = rest.split_once(" FAILED")?;
-    let error = tail
-        .strip_prefix(": ")
-        .or_else(|| tail.find("): ").map(|i| &tail[i + 3..]))?;
-    Some((name_part.trim(), error))
 }
 
 fn format_run_event(event: &RunEvent, locations: &HashMap<String, String>) -> String {
@@ -1230,7 +1295,7 @@ fn format_run_event(event: &RunEvent, locations: &HashMap<String, String>) -> St
             format!("[oxidant] {table:<24} warning: could not alias bare name ({error})")
         }
         RunEventKind::TableFailed { name, error, .. } => {
-            format_table_failed(name, error, locations.get(name))
+            format_table_failed(name, error, source_location_for_table(locations, name))
         }
         RunEventKind::StatePersistFailed { error } => {
             format!("[oxidant] could not persist pipeline state: {error}")
@@ -1443,10 +1508,78 @@ mod tests {
             created_at: SystemTime::now(),
         };
         let locs = table_source_locations(&graph);
-        assert_eq!(locs.get("metrics").map(String::as_str), Some("flow.sql:9"));
+        assert_eq!(
+            locs.get("cat.db.metrics").map(String::as_str),
+            Some("flow.sql:9")
+        );
         graph.flows.clear();
         let locs = table_source_locations(&graph);
-        assert_eq!(locs.get("metrics").map(String::as_str), Some("out.py:1"));
+        assert_eq!(
+            locs.get("cat.db.metrics").map(String::as_str),
+            Some("out.py:1")
+        );
+    }
+
+    #[test]
+    fn apply_sql_conf_ignored_keys_are_sorted() {
+        let svc = OxidantService::new();
+        let (ignored, snap) = svc.apply_sql_conf(&HashMap::from([
+            ("z.last".to_string(), "1".to_string()),
+            ("a.first".to_string(), "2".to_string()),
+            ("m.middle".to_string(), "3".to_string()),
+        ]));
+        assert_eq!(
+            ignored,
+            vec![
+                "a.first".to_string(),
+                "m.middle".to_string(),
+                "z.last".to_string()
+            ]
+        );
+        svc.restore_sql_conf(snap);
+    }
+
+    #[test]
+    fn shuffle_partitions_sql_conf_key_is_not_allowlisted() {
+        let svc = OxidantService::new();
+        let (ignored, snap) = svc.apply_sql_conf(&HashMap::from([(
+            "spark.sql.shuffle.partitions".to_string(),
+            "8".to_string(),
+        )]));
+        assert_eq!(ignored, vec!["spark.sql.shuffle.partitions".to_string()]);
+        assert!(svc
+            .config
+            .lock()
+            .expect("config")
+            .get("spark.sql.shuffle.partitions")
+            .is_none());
+        svc.restore_sql_conf(snap);
+    }
+
+    #[test]
+    fn sql_conf_guard_restores_on_drop() {
+        let svc = OxidantService::new();
+        let (_, snap) = svc.apply_sql_conf(&HashMap::from([(
+            "spark.sql.session.timeZone".to_string(),
+            "Europe/Berlin".to_string(),
+        )]));
+        assert_eq!(
+            svc.config
+                .lock()
+                .expect("config")
+                .get("spark.sql.session.timeZone")
+                .map(String::as_str),
+            Some("Europe/Berlin")
+        );
+        drop(SqlConfGuard::new(&svc, snap));
+        assert_eq!(
+            svc.config
+                .lock()
+                .expect("config")
+                .get("spark.sql.session.timeZone")
+                .map(String::as_str),
+            Some("UTC")
+        );
     }
 
     #[test]
