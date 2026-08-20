@@ -364,6 +364,11 @@ fn parse_view_clauses_before_as(
         if rest_starts_with_keyword(rest, "AS") {
             break;
         }
+        if cursor.try_char('(')? {
+            let inner = cursor.parse_balanced('(', ')')?;
+            output.schema = Some(format!("({inner})"));
+            continue;
+        }
         if cursor.try_keyword("COMMENT")? {
             output.comment = Some(cursor.parse_string_literal()?);
             continue;
@@ -1432,6 +1437,13 @@ CREATE MATERIALIZED VIEW mv AS SELECT 3";
         .unwrap_err()
         .to_string();
         assert!(err.contains("invalid query SQL") || err.contains("plan error"));
+    }
+
+    #[test]
+    fn materialized_view_with_inline_schema() {
+        let sql = "CREATE MATERIALIZED VIEW mv (id INT) AS SELECT 1 AS id";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.outputs[0].schema.as_deref(), Some("(id INT)"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use oxidant_streaming::{
 
 use crate::expectations;
 use crate::graph::{Graph, Node};
+use crate::output_write::{flow_queries, union_flow_sql};
 use crate::STREAM_ALIAS;
 
 /// Events emitted while a pipeline runs. Callers render or forward them (CLI stderr, Spark
@@ -409,13 +410,19 @@ async fn start_stream(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let synthesized = declared_sql
+    let unioned = if declared_sql.is_some() || !table.append_flows.is_empty() {
+        let flows = flow_queries(declared_sql, table.sql_by_name, &table.append_flows);
+        Some(union_flow_sql(engine, &flows, table.output_schema.as_deref()).await?)
+    } else {
+        None
+    };
+    let synthesized = unioned
         .is_none()
         .then(|| {
             expectations::has_drops(&table.expect).then(|| format!("SELECT * FROM {STREAM_ALIAS}"))
         })
         .flatten();
-    let pipeline = match declared_sql.or(synthesized.as_deref()) {
+    let pipeline = match unioned.or(synthesized) {
         Some(sql) => {
             let schema = oxidant_streaming::source_schema(&config)?;
             let input = Arc::new(MicroBatchInput::new(STREAM_ALIAS, schema)?);
@@ -423,7 +430,7 @@ async fn start_stream(
                 .ctx()
                 .register_table(STREAM_ALIAS, input.provider())
                 .map_err(|e| Error::Plan(format!("register streaming input: {e}")))?;
-            let sql = expectations::apply_drops(sql, &table.expect);
+            let sql = expectations::apply_drops(&sql, &table.expect);
             let plan_result = engine.logical_plan(&sql).await;
             engine.deregister_table(STREAM_ALIAS);
             Some(MicroBatchPipeline {
@@ -626,12 +633,12 @@ where
     F: FnMut(RunEvent) + Send,
 {
     let name = table.name.trim();
-    let sql = table
-        .sql
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Plan(format!("derived table `{name}` has no `sql:`")))?;
+    let flows = flow_queries(table.sql.as_deref(), table.sql_by_name, &table.append_flows);
+    let sql = union_flow_sql(engine, &flows, table.output_schema.as_deref()).await?;
+    let sql = sql.trim();
+    if sql.is_empty() {
+        return Err(Error::Plan(format!("derived table `{name}` has no `sql:`")));
+    }
 
     for (label, expectation) in expectations::counted(&table.expect) {
         let count_sql = expectations::violation_count_sql(sql, &expectation.check);
