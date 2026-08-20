@@ -182,11 +182,18 @@ path.
       `FileSink` in [`sink.rs`](../crates/oxidant-streaming/src/sink.rs) writes text output for the
       `writeStream` API, but it has no commit protocol and its `json` branch emits comma-joined
       cells, not JSON — wiring that into pipelines would ship a lie.
-- [ ] A commit protocol for the **Parquet sink**. `format=parquet` on an SDP sink is supported and
-      writes one file per micro-batch with no transaction log: a reader can observe a partially
-      written batch, and a batch replayed after a crash is appended twice rather than recognized
-      and dropped. `format=delta` (the default) commits atomically per batch and is the honest
-      choice for anything that matters; Parquet is there for consumers that cannot read Delta.
+- [ ] A commit protocol for the **Parquet sink**. `format=parquet` on an SDP sink writes one file
+      per micro-batch with no transaction log. Each individual batch *is* written atomically (the
+      whole batch is buffered and issued as a single `store.put`, which is temp-and-rename on
+      `LocalFileSystem` and a single-part upload on S3), so the precise gaps are: (a) a reader can
+      observe a partially written **run** — some batches landed, some did not, with nothing
+      marking the boundary; (b) a batch replayed after a crash is appended twice rather than
+      recognized and dropped; (c) there is no atomic *replace*, so a parquet sink cannot be a
+      derived output — one fed only by pipeline tables is refused when the graph is lowered, since
+      every pass would need to replace the location wholesale. `format=delta` (the default) commits
+      atomically per batch and is the honest choice for anything that matters; Parquet is there for
+      consumers that cannot read Delta. The run emits a warning event naming the sink at start;
+      there is no opt-in flag gating it.
 
 ### Gates to keep honest
 

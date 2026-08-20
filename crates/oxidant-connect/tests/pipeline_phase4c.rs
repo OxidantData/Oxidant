@@ -248,12 +248,25 @@ async fn define_sink(
     .expect("create graph");
     let graph_id = graph_id_from_create(&create);
 
+    define_sink_on(client, &graph_id, name, format, options).await?;
+    Ok(graph_id)
+}
+
+/// `DefineOutput` for a sink on an existing graph. Re-issuing it replaces the definition, which
+/// is how a user edits a sink's path without touching its SQL.
+async fn define_sink_on(
+    client: &mut SparkConnectServiceClient<tonic::transport::Channel>,
+    graph_id: &str,
+    name: &str,
+    format: &str,
+    options: HashMap<String, String>,
+) -> Result<(), Status> {
     execute_pipeline(
         client,
         sc::PipelineCommand {
             command_type: Some(sc::pipeline_command::CommandType::DefineOutput(
                 sc::pipeline_command::DefineOutput {
-                    dataflow_graph_id: Some(graph_id.clone()),
+                    dataflow_graph_id: Some(graph_id.to_string()),
                     output_name: Some(name.into()),
                     output_type: Some(sc::OutputType::Sink as i32),
                     details: Some(sc::pipeline_command::define_output::Details::SinkDetails(
@@ -268,7 +281,7 @@ async fn define_sink(
         },
     )
     .await?;
-    Ok(graph_id)
+    Ok(())
 }
 
 #[tokio::test]
@@ -1079,4 +1092,388 @@ async fn a_sink_fed_by_a_pipeline_table_is_recomputed_and_replaced() {
         describe.is_err(),
         "a sink fed by a pipeline table must still stay out of the catalog"
     );
+}
+
+/// `CreateDataflowGraph` + a spool-fed streaming table + a sink flow that reads *it*.
+///
+/// The sink has no source of its own, which makes it a derived output: every pass recomputes the
+/// aggregate and replaces the location.
+async fn define_derived_sink_graph(
+    client: &mut SparkConnectServiceClient<tonic::transport::Channel>,
+    sink_name: &str,
+    format: &str,
+    sink_path: &Path,
+) -> String {
+    let spool = spool_dir().canonicalize().expect("spool");
+    let graph_id = define_sink(
+        client,
+        sink_name,
+        format,
+        HashMap::from([("path".into(), sink_path.to_string_lossy().into_owned())]),
+    )
+    .await
+    .expect("define sink");
+
+    execute_pipeline(
+        client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(
+                sc::pipeline_command::DefineSqlGraphElements {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    sql_text: Some(format!(
+                        "CREATE STREAMING TABLE orders_bronze \
+                           TBLPROPERTIES ('subscribe' = 'orders', \
+                             'oxidant.spool.dir' = '{}', 'startingOffsets' = 'earliest') \
+                           AS {};",
+                        spool.display(),
+                        bronze_flow_sql()
+                    )),
+                    sql_file_path: Some("sink_pipeline.sql".into()),
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define bronze table");
+
+    execute_pipeline(
+        client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineFlow(
+                sc::pipeline_command::DefineFlow {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    flow_name: Some(format!("flow_to_{sink_name}")),
+                    target_dataset_name: Some(sink_name.into()),
+                    details: Some(
+                        sc::pipeline_command::define_flow::Details::RelationFlowDetails(
+                            sc::pipeline_command::define_flow::WriteRelationFlowDetails {
+                                relation: Some(sc::Relation {
+                                    rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                                        query: "SELECT customer, sum(amount) AS revenue \
+                                                FROM orders_bronze WHERE amount > 0 \
+                                                GROUP BY customer"
+                                            .into(),
+                                        ..Default::default()
+                                    })),
+                                    ..Default::default()
+                                }),
+                            },
+                        ),
+                    ),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define sink flow");
+    graph_id
+}
+
+async fn start_run(
+    client: &mut SparkConnectServiceClient<tonic::transport::Channel>,
+    graph_id: &str,
+    checkpoints: &Path,
+    full_refresh: bool,
+) -> Result<Vec<sc::ExecutePlanResponse>, Status> {
+    execute_pipeline(
+        client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::StartRun(
+                sc::pipeline_command::StartRun {
+                    dataflow_graph_id: Some(graph_id.to_string()),
+                    dry: Some(false),
+                    full_refresh_all: Some(full_refresh),
+                    storage: Some(checkpoints.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+}
+
+/// Changing only the sink's path must re-write, not report `unchanged`.
+///
+/// `write_path` is `#[serde(skip)]`, so it is invisible to `serde_json::to_string(table)`. If the
+/// definition fingerprint is taken over the serialized form alone, a derived sink whose path moved
+/// — same SQL, same storage, no new upstream rows — fingerprints identically, is short-circuited
+/// as `unchanged`, and the new location stays empty while the run reports success.
+#[tokio::test]
+async fn a_derived_sink_whose_path_changes_is_rewritten_not_skipped() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let checkpoints = warehouse.path().join("_checkpoints");
+    let first_path = warehouse.path().join("sink_a");
+    let second_path = warehouse.path().join("sink_b");
+    std::fs::create_dir_all(&checkpoints).expect("checkpoints dir");
+
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+
+    let graph_id =
+        define_derived_sink_graph(&mut client, "revenue_sink", "delta", &first_path).await;
+    start_run(&mut client, &graph_id, &checkpoints, true)
+        .await
+        .expect("first run");
+    assert_eq!(
+        delta_scalar_i64(&first_path, "sum(revenue)").await,
+        725,
+        "the first run must fill the original sink path"
+    );
+
+    // The user edits only `SinkDetails.options.path` and re-runs against the same storage. The
+    // upstream stream has nothing new, so nothing is in `changed` — only the path moved.
+    define_sink_on(
+        &mut client,
+        &graph_id,
+        "revenue_sink",
+        "delta",
+        HashMap::from([("path".into(), second_path.to_string_lossy().into_owned())]),
+    )
+    .await
+    .expect("redefine sink at a new path");
+
+    let run = start_run(&mut client, &graph_id, &checkpoints, false)
+        .await
+        .expect("second run");
+    let events = pipeline_event_messages(&run);
+    assert!(
+        second_path.join("_delta_log").is_dir(),
+        "a sink whose path changed must be re-written to the new location, got events {events:?}"
+    );
+    assert_eq!(
+        delta_scalar_i64(&second_path, "sum(revenue)").await,
+        725,
+        "the new sink path must hold the full recomputed result"
+    );
+}
+
+/// A parquet sink fed only by pipeline tables is refused when the graph is lowered.
+///
+/// It would otherwise reach `LakeSink::replace_batch`, whose parquet arm is a hard refusal
+/// phrased for catalog tables — the user would be told to "declare `/tmp/...` as delta".
+#[tokio::test]
+async fn a_derived_parquet_sink_is_refused_before_the_run() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let checkpoints = warehouse.path().join("_checkpoints");
+    let sink_path = warehouse.path().join("derived_parquet_sink");
+    std::fs::create_dir_all(&checkpoints).expect("checkpoints dir");
+
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+
+    let graph_id =
+        define_derived_sink_graph(&mut client, "revenue_parquet_sink", "parquet", &sink_path).await;
+
+    let err = start_run(&mut client, &graph_id, &checkpoints, true)
+        .await
+        .expect_err("a derived parquet sink cannot be replaced atomically");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    assert!(
+        err.message().contains("revenue_parquet_sink"),
+        "the error must name the sink the user declared: {err}"
+    );
+    assert!(
+        err.message().contains("own streaming source"),
+        "the error must say what to do instead: {err}"
+    );
+    assert!(err.message().contains("delta"), "{err}");
+    assert!(
+        !sink_path.exists(),
+        "nothing may be written when the sink is refused"
+    );
+}
+
+/// A parquet sink with its own source is still allowed, and warns about the missing protocol.
+#[tokio::test]
+async fn a_parquet_sink_with_its_own_source_warns_but_runs() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let checkpoints = warehouse.path().join("_checkpoints");
+    let sink_path = warehouse.path().join("sourced_parquet_sink");
+    std::fs::create_dir_all(&checkpoints).expect("checkpoints dir");
+
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+
+    let mut options = spool_table_properties(&spool_dir().canonicalize().expect("spool"));
+    options.insert("path".into(), sink_path.to_string_lossy().into_owned());
+    let graph_id = define_sink(&mut client, "sourced_parquet_sink", "parquet", options)
+        .await
+        .expect("define parquet sink");
+
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineFlow(
+                sc::pipeline_command::DefineFlow {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    flow_name: Some("flow_to_sourced_parquet_sink".into()),
+                    target_dataset_name: Some("sourced_parquet_sink".into()),
+                    details: Some(
+                        sc::pipeline_command::define_flow::Details::RelationFlowDetails(
+                            sc::pipeline_command::define_flow::WriteRelationFlowDetails {
+                                relation: Some(sc::Relation {
+                                    rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                                        query: bronze_flow_sql(),
+                                        ..Default::default()
+                                    })),
+                                    ..Default::default()
+                                }),
+                            },
+                        ),
+                    ),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define sink flow");
+
+    let run = start_run(&mut client, &graph_id, &checkpoints, true)
+        .await
+        .expect("a sourced parquet sink is supported");
+    let events = pipeline_event_messages(&run);
+    assert_eq!(parquet_scalar_i64(&sink_path, "count(*)").await, 5);
+    assert!(
+        events.iter().any(|m| m.contains("no commit protocol")),
+        "the operator must be told the sink has no commit protocol, got {events:?}"
+    );
+}
+
+/// Two identical one-shot runs must not double-write.
+///
+/// This is what pins the deterministic graph id: it becomes the pipeline name, hence the Delta
+/// `appId` and the default checkpoint root. A fresh UUID per call would make the second run a
+/// different writer starting from an empty checkpoint, so the spool would be replayed and
+/// appended. Neither call passes `storage`, so the default root is exercised too.
+#[tokio::test]
+async fn two_identical_execute_output_flows_calls_do_not_double_write() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let sink_path = warehouse.path().join("repeat_sink");
+    let spool = spool_dir().canonicalize().expect("spool");
+
+    // Unique per test process: the default checkpoint root is derived from the output name, so a
+    // fixed name would inherit a previous run's state from `$TMPDIR`.
+    let output_name = format!(
+        "repeat_sink_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+
+    let mut options = spool_table_properties(&spool);
+    options.insert("path".into(), sink_path.to_string_lossy().into_owned());
+
+    let one_shot = sc::PipelineCommand {
+        command_type: Some(sc::pipeline_command::CommandType::ExecuteOutputFlows(
+            sc::pipeline_command::ExecuteOutputFlows {
+                define_output: Some(sc::pipeline_command::DefineOutput {
+                    output_name: Some(output_name.clone()),
+                    output_type: Some(sc::OutputType::Sink as i32),
+                    details: Some(sc::pipeline_command::define_output::Details::SinkDetails(
+                        sc::pipeline_command::define_output::SinkDetails {
+                            format: Some("delta".into()),
+                            options,
+                        },
+                    )),
+                    ..Default::default()
+                }),
+                define_flows: vec![sc::pipeline_command::DefineFlow {
+                    flow_name: Some("flow_to_repeat_sink".into()),
+                    target_dataset_name: Some(output_name.clone()),
+                    details: Some(
+                        sc::pipeline_command::define_flow::Details::RelationFlowDetails(
+                            sc::pipeline_command::define_flow::WriteRelationFlowDetails {
+                                relation: Some(sc::Relation {
+                                    rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                                        query: bronze_flow_sql(),
+                                        ..Default::default()
+                                    })),
+                                    ..Default::default()
+                                }),
+                            },
+                        ),
+                    ),
+                    ..Default::default()
+                }],
+                // No `full_refresh`, no `storage`: the incremental path, on the default root.
+                ..Default::default()
+            },
+        )),
+    };
+
+    execute_pipeline(&mut client, one_shot.clone())
+        .await
+        .expect("first one-shot run");
+    assert_eq!(delta_scalar_i64(&sink_path, "count(*)").await, 5);
+
+    execute_pipeline(&mut client, one_shot)
+        .await
+        .expect("second one-shot run");
+    assert_eq!(
+        delta_scalar_i64(&sink_path, "count(*)").await,
+        5,
+        "a re-run must resume from the same checkpoint rather than replay the spool"
+    );
+}
+
+/// `ExecuteOutputFlows` must not silently accept an output type it cannot write.
+#[tokio::test]
+async fn execute_output_flows_rejects_output_types_it_cannot_write() {
+    let port = pick_port();
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+
+    let with_output_type = |output_type: Option<i32>| sc::PipelineCommand {
+        command_type: Some(sc::pipeline_command::CommandType::ExecuteOutputFlows(
+            sc::pipeline_command::ExecuteOutputFlows {
+                define_output: Some(sc::pipeline_command::DefineOutput {
+                    output_name: Some("one_shot".into()),
+                    output_type,
+                    ..Default::default()
+                }),
+                define_flows: vec![sc::pipeline_command::DefineFlow {
+                    flow_name: Some("f".into()),
+                    target_dataset_name: Some("one_shot".into()),
+                    details: Some(
+                        sc::pipeline_command::define_flow::Details::RelationFlowDetails(
+                            sc::pipeline_command::define_flow::WriteRelationFlowDetails {
+                                relation: Some(sc::Relation {
+                                    rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                                        query: "SELECT 1 AS a".into(),
+                                        ..Default::default()
+                                    })),
+                                    ..Default::default()
+                                }),
+                            },
+                        ),
+                    ),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )),
+    };
+
+    // Unset is OUTPUT_TYPE_UNSPECIFIED, which lowering would silently treat as a table.
+    let err = execute_pipeline(&mut client, with_output_type(None))
+        .await
+        .expect_err("an unset output_type must be refused");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    assert!(err.message().contains("output_type"), "{err}");
+
+    // A temporary view is registered and then skipped by the run: success, nothing written.
+    let err = execute_pipeline(
+        &mut client,
+        with_output_type(Some(sc::OutputType::TemporaryView as i32)),
+    )
+    .await
+    .expect_err("a temporary view writes nothing");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    assert!(err.message().contains("TEMPORARY_VIEW"), "{err}");
 }

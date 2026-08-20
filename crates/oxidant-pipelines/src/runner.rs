@@ -72,6 +72,17 @@ pub enum RunEventKind {
         error: String,
         elapsed: Duration,
     },
+    /// A sink is being written in a format with no commit protocol.
+    ///
+    /// Parquet writes one file per batch and has no transaction log: a reader can see a
+    /// partially written *run* (some batches landed, some did not), a replayed batch is
+    /// appended rather than recognized, and there is no atomic replace. Nothing in the write
+    /// path can enforce this, so say it out loud at run start.
+    SinkWithoutCommitProtocol {
+        table: String,
+        path: String,
+        format: String,
+    },
     /// Checkpoint state could not be written.
     StatePersistFailed { error: String },
     /// One pass over the subgraph finished.
@@ -250,6 +261,25 @@ where
                 .join(" -> "),
         },
     );
+    for node in &nodes {
+        let Some(table) = plan.table(&node.name) else {
+            continue;
+        };
+        let Some(path) = table.write_path.as_deref() else {
+            continue;
+        };
+        let format = plan.format_of(table);
+        if !format.eq_ignore_ascii_case("delta") {
+            emit(
+                on_event,
+                RunEventKind::SinkWithoutCommitProtocol {
+                    table: node.name.clone(),
+                    path: path.to_string(),
+                    format,
+                },
+            );
+        }
+    }
 
     match trigger {
         Trigger::Once | Trigger::AvailableNow => {
@@ -834,11 +864,18 @@ impl PipelineState {
     }
 }
 
+/// Hash of everything that decides what a table's contents are and where they land.
+///
+/// `write_path` is `#[serde(skip)]` — it is not an `oxidant.yaml` key, only a lowering of an SDP
+/// sink — so it is absent from the serialized form and has to be folded in by hand. Without it a
+/// sink whose path changed but whose SQL did not would fingerprint identically, be reported
+/// `unchanged`, and write nothing to the new location.
 fn definition_fingerprint(table: &TableConfig) -> String {
     use std::hash::{Hash, Hasher};
     let text = serde_json::to_string(table).unwrap_or_default();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
+    table.write_path.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 

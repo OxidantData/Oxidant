@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::SystemTime;
 
 use datafusion::sql::unparser::Unparser;
-use oxidant_config::{OxidantConfig, PipelineConfig, SourceConfig, TableConfig, Trigger};
+use oxidant_config::{
+    OxidantConfig, PipelineConfig, SourceConfig, TableConfig, TableKind, Trigger,
+};
 use oxidant_loom::Engine;
 use oxidant_pipelines::{
     clear_pipeline_state, parse, run_pipeline, split_table_properties, table_references,
@@ -754,8 +756,28 @@ impl OxidantService {
             created_at: SystemTime::now(),
         };
         let (output_type, table_details, sink_details) = output_details_from_proto(define_output);
-        if output_type == sc::OutputType::Sink as i32 {
-            sink_format_and_path(sink_details.as_ref(), "ExecuteOutputFlows SINK")?;
+        // An unset `output_type` is `OUTPUT_TYPE_UNSPECIFIED`, and lowering silently treats it as
+        // a table; a TEMPORARY_VIEW is registered and then skipped by the run, so the command
+        // reports success having written nothing. Neither is a run this handler can honour.
+        match output_type {
+            t if t == sc::OutputType::Sink as i32 => {
+                sink_format_and_path(sink_details.as_ref(), "ExecuteOutputFlows SINK")?;
+            }
+            t if t == sc::OutputType::MaterializedView as i32
+                || t == sc::OutputType::Table as i32 => {}
+            t if t == sc::OutputType::TemporaryView as i32 => {
+                return Err(Status::invalid_argument(
+                    "ExecuteOutputFlows cannot target a TEMPORARY_VIEW — a view is registered but \
+                     never written, so the run would produce nothing; use a TABLE, a \
+                     MATERIALIZED_VIEW, or a SINK",
+                ));
+            }
+            _ => {
+                return Err(Status::invalid_argument(format!(
+                    "ExecuteOutputFlows.define_output.output_type must be set to TABLE, \
+                     MATERIALIZED_VIEW, or SINK (got {output_type})"
+                )));
+            }
         }
         replace_output(
             &mut graph,
@@ -791,7 +813,10 @@ impl OxidantService {
             graph,
             DataflowRunParams {
                 dry: false,
-                storage: cmd.storage.clone(),
+                storage: Some(match cmd.storage.as_deref().map(str::trim) {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => default_one_shot_storage(&graph_id, session_id),
+                }),
                 full_refresh,
                 full_refresh_tables: Vec::new(),
                 refresh_selection: Vec::new(),
@@ -1271,6 +1296,38 @@ async fn graph_to_config(
         sql_result?;
     }
 
+    // A sink with no streaming source of its own is a *derived* output: every pass recomputes it
+    // and replaces the location wholesale, which only `delta` can do atomically — the parquet arm
+    // of `LakeSink::replace_batch` is a hard refusal. Catch it here, where the sink and its flows
+    // were declared, instead of mid-run with a message written for catalog tables.
+    for output in &graph.outputs {
+        if !is_sink_output(output) {
+            continue;
+        }
+        let Some(table) = tables.get(&resolved_identifier_key(&output.resolved)) else {
+            continue;
+        };
+        let is_parquet = table
+            .format
+            .as_deref()
+            .is_some_and(|f| f.trim().eq_ignore_ascii_case("parquet"));
+        if !is_parquet || table.kind() != TableKind::Derived {
+            continue;
+        }
+        let name = &output.resolved.table_name;
+        return Err(table_planning_failure(
+            name,
+            Status::invalid_argument(format!(
+                "sink `{name}`: a `parquet` sink must have its own streaming source. Every flow \
+                 into this sink reads a pipeline table, which makes it a derived output — \
+                 recomputed and replaced on every pass — and parquet has no commit protocol to \
+                 replace atomically. Declare the sink as `delta`, or feed it a source of its own \
+                 (see docs/TODOS.md)."
+            )),
+            &output.source_code_location,
+        ));
+    }
+
     let pipeline = PipelineConfig {
         name: graph_id.to_string(),
         catalog,
@@ -1313,8 +1370,10 @@ fn output_details_from_proto(
 /// Validate a SINK output's details and return its `(format, path)`.
 ///
 /// Runs at `DefineOutput` / `ExecuteOutputFlows` time so a bad sink fails where it was declared,
-/// and again when the graph is lowered to a pipeline config — a sink can also arrive through
-/// `DefineSqlGraphElements`, which never passes through the command-level check.
+/// and again when the graph is lowered to a pipeline config. The second call is defense in depth
+/// for a future path that reaches `graph_to_config` without a command-level check — SQL-defined
+/// outputs cannot today (`OutputKind` has no `Sink` variant and `parsed_output_to_def` hardcodes
+/// `sink_details: None`), but the lowering must not depend on that staying true.
 fn sink_format_and_path<'a>(
     sink_details: Option<&'a sc::pipeline_command::define_output::SinkDetails>,
     label: &str,
@@ -1338,6 +1397,24 @@ fn sink_format_and_path<'a>(
         .filter(|p| !p.is_empty())
         .ok_or_else(|| Status::invalid_argument(format!("{label} requires options.path")))?;
     Ok((format, path))
+}
+
+/// Default checkpoint root for a one-shot `ExecuteOutputFlows` run.
+///
+/// The graph id itself is deliberately global — it becomes the Delta `appId`, so re-runs of the
+/// same output must produce the same one. The *filesystem* path must not be: `oxidant-sdp-<id>`
+/// alone is identical across sessions, clients, and OS users on a host, so two callers writing
+/// the same output name would share `_pipeline-state.json` (and, with a sticky `/tmp`, the
+/// second would fail on a directory it never chose). Multi-tenant deployments should pass
+/// `storage` explicitly rather than rely on this.
+fn default_one_shot_storage(graph_id: &str, session_id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session_id.hash(&mut hasher);
+    std::env::temp_dir()
+        .join(format!("oxidant-sdp-{graph_id}-{:016x}", hasher.finish()))
+        .display()
+        .to_string()
 }
 
 fn flow_def_from_proto(
@@ -1414,11 +1491,16 @@ fn sink_names(graph: &DataflowGraph) -> HashMap<String, String> {
         .collect()
 }
 
-/// Table names a flow relation reads directly.
+/// Table names a flow relation reads, walking the wrappers a flow nests around a read.
 ///
-/// Only the wrappers a flow definition realistically nests around a read are walked. This exists
-/// so `spark.readStream.table("my_sink")` is refused as a read of a write-only sink; planning
-/// would otherwise reject it as a missing table, since sinks are never catalog-registered.
+/// This exists so `spark.readStream.table("my_sink")` is refused as a read of a write-only sink;
+/// planning would otherwise reject it as a missing table, since sinks are never
+/// catalog-registered. A `Sql` node anywhere in the tree contributes its own references, so
+/// `spark.sql("SELECT * FROM my_sink").filter(...)` is caught too.
+///
+/// The wrapper list is a whitelist and therefore fail-open: a relation shape not listed here
+/// hides its inputs, and the read falls through to the missing-table error this check exists to
+/// replace. Add arms as new shapes show up rather than assuming the list is complete.
 fn relation_named_tables(relation: &sc::Relation, out: &mut Vec<String>) {
     use sc::relation::RelType;
     let Some(rel_type) = relation.rel_type.as_ref() else {
@@ -1435,6 +1517,12 @@ fn relation_named_tables(relation: &sc::Relation, out: &mut Vec<String>) {
                 out.push(t.unparsed_identifier.clone());
             }
         }
+        RelType::Sql(q) => {
+            // Unparseable SQL is not a verdict here — planning will produce the real error.
+            if let Ok(references) = table_references(&q.query) {
+                out.extend(references);
+            }
+        }
         RelType::Project(p) => walk(p.input.as_deref()),
         RelType::Filter(f) => walk(f.input.as_deref()),
         RelType::SubqueryAlias(a) => walk(a.input.as_deref()),
@@ -1446,7 +1534,17 @@ fn relation_named_tables(relation: &sc::Relation, out: &mut Vec<String>) {
         RelType::Deduplicate(d) => walk(d.input.as_deref()),
         RelType::WithColumns(w) => walk(w.input.as_deref()),
         RelType::Repartition(r) => walk(r.input.as_deref()),
+        RelType::WithWatermark(w) => walk(w.input.as_deref()),
+        RelType::Sample(s) => walk(s.input.as_deref()),
+        RelType::Drop(d) => walk(d.input.as_deref()),
+        RelType::Unpivot(u) => walk(u.input.as_deref()),
+        RelType::ToSchema(t) => walk(t.input.as_deref()),
+        RelType::Hint(h) => walk(h.input.as_deref()),
         RelType::Join(j) => {
+            walk(j.left.as_deref());
+            walk(j.right.as_deref());
+        }
+        RelType::AsOfJoin(j) => {
             walk(j.left.as_deref());
             walk(j.right.as_deref());
         }
@@ -1456,6 +1554,28 @@ fn relation_named_tables(relation: &sc::Relation, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// Whether a flow's table reference names the dataset with resolved key `key` and unqualified
+/// name `table_name`.
+///
+/// A bare reference matches on the short name. A qualified one must match the resolved key
+/// outright, or be a suffix of it at a segment boundary (`live.orders` names
+/// `local.live.orders`) — matching a qualified reference on its last segment alone would treat
+/// `other_cat.other_db.orders`, an unrelated external table, as the graph's own `orders`.
+/// Comparisons are ASCII case-insensitive: an identifier arriving from a DataFrame read is
+/// unparsed and never normalized.
+fn reference_names_dataset(key: &str, table_name: &str, reference: &str) -> bool {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return false;
+    }
+    if !reference.contains('.') {
+        return table_name.eq_ignore_ascii_case(reference);
+    }
+    let key = key.to_ascii_lowercase();
+    let reference = reference.to_ascii_lowercase();
+    key == reference || key.ends_with(&format!(".{reference}"))
 }
 
 /// Refuse a flow that reads a sink.
@@ -1498,12 +1618,11 @@ fn validate_flows_do_not_read_sinks(graph: &DataflowGraph) -> Result<(), TablePl
             relation_named_tables(relation, &mut references);
         }
         for reference in references {
-            let short = reference.rsplit('.').next().unwrap_or(&reference);
-            let qualified_hit = sinks.values().any(|key| {
-                key.eq_ignore_ascii_case(&reference) || key.ends_with(&format!(".{short}"))
-            });
-            if sinks.contains_key(short) || qualified_hit {
-                return Err(refuse(flow, short));
+            if let Some((name, _)) = sinks
+                .iter()
+                .find(|(name, key)| reference_names_dataset(key, name, &reference))
+            {
+                return Err(refuse(flow, name));
             }
         }
     }
@@ -1517,18 +1636,26 @@ fn validate_flows_do_not_read_sinks(graph: &DataflowGraph) -> Result<(), TablePl
 /// The text is passed through instead — the runner plans it with those names in scope. Anything
 /// else still round-trips through `relation_to_sql`, which is what turns a DataFrame relation
 /// into SQL in the first place.
+///
+/// Matching is qualification-aware (see [`reference_names_dataset`]): a fully-qualified read of a
+/// real external table that happens to share a short name with a graph output still goes through
+/// the analyzer, so a session temp view mixed into the same query is still inlined.
 fn sql_needs_run_scope(sql: &str, graph: &DataflowGraph) -> bool {
     let Ok(references) = table_references(sql) else {
         // Unparseable here is not a verdict — let `relation_to_sql` produce the real error.
         return false;
     };
     references.iter().any(|reference| {
-        let short = reference.rsplit('.').next().unwrap_or(reference);
-        short.eq_ignore_ascii_case(oxidant_pipelines::STREAM_ALIAS)
-            || graph
-                .outputs
-                .iter()
-                .any(|o| o.resolved.table_name.eq_ignore_ascii_case(short))
+        reference
+            .trim()
+            .eq_ignore_ascii_case(oxidant_pipelines::STREAM_ALIAS)
+            || graph.outputs.iter().any(|o| {
+                reference_names_dataset(
+                    &resolved_identifier_key(&o.resolved),
+                    &o.resolved.table_name,
+                    reference,
+                )
+            })
     })
 }
 
@@ -1965,6 +2092,16 @@ fn format_run_event(event: &RunEvent, locations: &HashMap<String, String>) -> St
         RunEventKind::TableFailed { name, error, .. } => {
             format_table_failed(name, error, source_location_for_table(locations, name))
         }
+        RunEventKind::SinkWithoutCommitProtocol {
+            table,
+            path,
+            format,
+        } => format!(
+            "[oxidant] {table:<24} warning: `{format}` sink at {path} has no commit protocol — \
+             a reader can observe a partially written run, a replayed batch is appended rather \
+             than deduplicated, and the sink cannot be replaced atomically; use `delta` for \
+             transactional writes"
+        ),
         RunEventKind::StatePersistFailed { error } => {
             format!("[oxidant] could not persist pipeline state: {error}")
         }
@@ -2196,6 +2333,117 @@ mod tests {
         ));
         // A prefix match is not a match.
         assert!(!sql_needs_run_scope("SELECT * FROM stream_archive", &graph));
+    }
+
+    #[test]
+    fn run_scope_matching_is_qualification_aware() {
+        let graph = graph_with_output("orders_bronze", sc::OutputType::Table);
+        // A real external table that merely shares the short name of a graph output is not
+        // run-scoped: it exists now, so it must still go through the analyzer.
+        assert!(!sql_needs_run_scope(
+            "SELECT * FROM prod_cat.prod_db.orders_bronze",
+            &graph
+        ));
+        // Partially qualified against the graph's own defaults is the graph's own output.
+        assert!(sql_needs_run_scope(
+            "SELECT * FROM db.orders_bronze",
+            &graph
+        ));
+        assert!(sql_needs_run_scope(
+            "SELECT * FROM cat.db.orders_bronze",
+            &graph
+        ));
+    }
+
+    #[test]
+    fn a_sql_relation_under_a_wrapper_that_reads_a_sink_is_refused() {
+        let mut graph = graph_with_output("orders_sink", sc::OutputType::Sink);
+        graph.outputs.push(OutputDef {
+            output_name: "downstream".into(),
+            resolved: resolve_identifier("downstream", Some("cat"), Some("db")),
+            output_type: sc::OutputType::MaterializedView as i32,
+            comment: None,
+            table_details: None,
+            sink_details: None,
+            source_code_location: None,
+        });
+        // `spark.sql("SELECT * FROM orders_sink").filter(...)`: neither the top-level SQL check
+        // (it sees a Filter) nor a walker without a `Sql` arm (it sees Sql and stops) catches it.
+        let inner = sql_flow("inner", "downstream", "SELECT * FROM orders_sink")
+            .relation
+            .expect("sql relation");
+        let mut flow = sql_flow("f", "downstream", "");
+        flow.relation = Some(sc::Relation {
+            rel_type: Some(sc::relation::RelType::Filter(Box::new(sc::Filter {
+                input: Some(Box::new(inner)),
+                condition: None,
+            }))),
+            ..Default::default()
+        });
+        graph.flows.push(flow);
+        let err = validate_flows_do_not_read_sinks(&graph).expect_err("sinks are write-only");
+        assert!(
+            err.inner.contains("cannot read sink `orders_sink`"),
+            "{}",
+            err.inner
+        );
+    }
+
+    #[test]
+    fn a_sink_read_is_matched_regardless_of_case() {
+        let mut graph = graph_with_output("orders_sink", sc::OutputType::Sink);
+        graph.outputs.push(OutputDef {
+            output_name: "downstream".into(),
+            resolved: resolve_identifier("downstream", Some("cat"), Some("db")),
+            output_type: sc::OutputType::MaterializedView as i32,
+            comment: None,
+            table_details: None,
+            sink_details: None,
+            source_code_location: None,
+        });
+        // `unparsed_identifier` arrives verbatim from the client; nothing normalizes it.
+        let mut flow = sql_flow("f", "downstream", "");
+        flow.relation = Some(sc::Relation {
+            rel_type: Some(sc::relation::RelType::Read(sc::Read {
+                is_streaming: true,
+                read_type: Some(sc::read::ReadType::NamedTable(sc::read::NamedTable {
+                    unparsed_identifier: "ORDERS_SINK".into(),
+                    options: HashMap::new(),
+                })),
+            })),
+            ..Default::default()
+        });
+        graph.flows.push(flow);
+        assert!(validate_flows_do_not_read_sinks(&graph).is_err());
+    }
+
+    #[test]
+    fn an_unrelated_qualified_table_sharing_a_sink_s_short_name_is_allowed() {
+        let mut graph = graph_with_output("orders", sc::OutputType::Sink);
+        graph.outputs.push(OutputDef {
+            output_name: "downstream".into(),
+            resolved: resolve_identifier("downstream", Some("cat"), Some("db")),
+            output_type: sc::OutputType::MaterializedView as i32,
+            comment: None,
+            table_details: None,
+            sink_details: None,
+            source_code_location: None,
+        });
+        graph.flows.push(sql_flow(
+            "f",
+            "downstream",
+            "SELECT * FROM other_cat.other_db.orders",
+        ));
+        assert!(
+            validate_flows_do_not_read_sinks(&graph).is_ok(),
+            "a different catalog's `orders` is not this graph's sink"
+        );
+        // The graph's own sink, partially qualified, still is.
+        graph.flows.clear();
+        graph
+            .flows
+            .push(sql_flow("f", "downstream", "SELECT * FROM db.orders"));
+        assert!(validate_flows_do_not_read_sinks(&graph).is_err());
     }
 
     #[test]

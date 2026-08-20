@@ -32,18 +32,24 @@ YAML file:
   successful completion unless refreshed), external **sinks** (`DefineOutput` with
   `output_type=SINK`), and **`ExecuteOutputFlows`** (one-shot remote run of a single output plus
   its flows, from the payload alone — no pre-registered graph; `storage` is the checkpoint root
-  and `full_refresh` drops pipeline state first). Kafka spool sources (`oxidant.spool.dir` in
+  and `full_refresh` drops pipeline state first). The one-shot run's id is derived from the
+  resolved output name so re-runs share a Delta `appId`; the *default* checkpoint root is
+  additionally scoped by session, so multi-tenant deployments that want state shared across
+  sessions should pass `storage` explicitly. `output_type` must be set, and must not be
+  `TEMPORARY_VIEW` — a view is registered but never written. Kafka spool sources (`oxidant.spool.dir` in
   `TBLPROPERTIES` or `readStream` options) exercise the same path as the YAML runner.
 - **Sinks** are write targets, not datasets. `SinkDetails.options.path` is required, and the sink
   is **not** registered in the catalog — so a flow that reads one is refused at `StartRun`
   (`flow ... cannot read sink ...`) rather than failing later as a missing table. Two formats:
   `delta` (default; one atomic transaction per micro-batch) and `parquet` (**one file per batch,
-  no commit protocol** — a reader can see a partially written batch, and a replayed batch is not
-  deduplicated). `kafka`, `json`, and `csv` sinks are refused at definition time — see
-  [TODOS.md](TODOS.md). A sink that carries its own streaming source in `options` (`subscribe` /
-  `oxidant.spool.dir`) is written incrementally from the checkpoint like a streaming table; a sink
-  whose flow reads other pipeline tables is a derived output — recomputed and **replaced** on
-  every pass.
+  no commit protocol** — each batch lands atomically, but a reader can see a partially written
+  *run*, a replayed batch is not deduplicated, and there is no atomic replace; the run emits a
+  warning event naming the sink). `kafka`, `json`, and `csv` sinks are refused at definition time —
+  see [TODOS.md](TODOS.md). A sink that carries its own streaming source in `options` (`subscribe`
+  / `oxidant.spool.dir`) is written incrementally from the checkpoint like a streaming table; a
+  sink whose flow reads other pipeline tables is a derived output — recomputed and **replaced** on
+  every pass, which only `delta` can do, so a `parquet` sink with no source of its own is refused
+  when the graph is lowered rather than failing mid-run.
 - **Limits (deferred):** no AUTO CDC / `APPLY CHANGES` flows ([#92](https://github.com/oxidantdata/oxidant/issues/92)),
   no Python query-function signal stream ([#91](https://github.com/oxidantdata/oxidant/issues/91)),
   no Kafka sink. Interactive `spark.sql("CREATE STREAMING TABLE …")` still correctly rejects
