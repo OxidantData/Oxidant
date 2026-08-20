@@ -8,22 +8,8 @@
 
 use std::process::{Command, Output};
 
-fn oxidant_bin() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_oxidant") {
-        return std::path::PathBuf::from(p);
-    }
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target")
-        .join(&profile)
-        .join("oxidant");
-    assert!(
-        path.exists(),
-        "oxidant binary not found at {} — run `cargo build -p oxidant-cli` first",
-        path.display()
-    );
-    path
-}
+mod common;
+use common::oxidant_bin;
 
 /// A CDC spool (insert, out-of-order update, delete, truncate, tied keys) plus a bronze/SCD1
 /// config over it.

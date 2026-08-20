@@ -1,0 +1,10 @@
+{
+  "tables": {
+    "revenue_gold_cli": {
+      "epoch": 1,
+      "built": true,
+      "definition": "8a89b45691b813bd"
+    }
+  },
+  "once_completed": []
+}
