@@ -4,11 +4,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::SystemTime;
 
 use datafusion::sql::unparser::Unparser;
-use oxidant_config::{OxidantConfig, PipelineConfig, SourceConfig, TableConfig, Trigger};
+use oxidant_config::{
+    AutoCdcConfig, OxidantConfig, PipelineConfig, SourceConfig, TableConfig, Trigger,
+};
 use oxidant_loom::Engine;
 use oxidant_pipelines::{
-    clear_pipeline_state, parse, run_pipeline, split_table_properties, validate_output_format,
-    OutputKind, Plan, RunEvent, RunEventKind,
+    clear_pipeline_state, parse, run_pipeline, split_table_properties, validate_auto_cdc,
+    validate_output_format, OutputKind, Plan, RunEvent, RunEventKind,
 };
 use oxidant_proto::spark::connect as sc;
 use prost_types::Timestamp;
@@ -78,6 +80,7 @@ pub struct FlowDef {
     pub relation: Option<sc::Relation>,
     /// Populated by `DefineSqlGraphElements` when the flow comes from SDP SQL text.
     pub query_sql: Option<String>,
+    pub auto_cdc: Option<AutoCdcConfig>,
     pub once: bool,
     pub by_name: bool,
     pub source_code_location: Option<sc::SourceCodeLocation>,
@@ -310,6 +313,7 @@ impl Drop for SqlConfGuard<'_> {
 }
 
 /// Planning failure with the target table name threaded structurally (not re-parsed from status text).
+#[derive(Debug)]
 struct TablePlanningFailure {
     table: String,
     /// Raw planner error (for `PipelineEvent` text — avoid double-wrapping `format_table_failed`).
@@ -582,10 +586,11 @@ impl OxidantService {
                 Status::invalid_argument("DefineFlow.target_dataset_name is required")
             })?;
 
+        let engine = self.engine();
         let resolved = self
             .dataflow_graphs
             .with_graph(graph_id, session_id, |graph| {
-                let (relation, once) = match &cmd.details {
+                let (relation, query_sql, auto_cdc, once) = match &cmd.details {
                     Some(sc::pipeline_command::define_flow::Details::RelationFlowDetails(d)) => {
                         let rel = d.relation.as_ref();
                         if rel.map(|r| r.rel_type.is_none()).unwrap_or(true) {
@@ -594,12 +599,15 @@ impl OxidantService {
                                  stream is not supported yet (SDP Phase 4a)",
                             ));
                         }
-                        (rel.cloned(), cmd.once.unwrap_or(false))
+                        (rel.cloned(), None, None, cmd.once.unwrap_or(false))
                     }
-                    Some(sc::pipeline_command::define_flow::Details::AutoCdcFlowDetails(_)) => {
-                        return Err(Status::unimplemented(
-                            "DefineFlow AUTO CDC is not supported yet (SDP Phase 4b)",
-                        ));
+                    Some(sc::pipeline_command::define_flow::Details::AutoCdcFlowDetails(d)) => {
+                        let cdc = auto_cdc_from_proto(engine.ctx(), d).map_err(|e| {
+                            Status::invalid_argument(format!("DefineFlow AUTO CDC: {e}"))
+                        })?;
+                        validate_auto_cdc(&cdc, flow_name)
+                            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                        (None, None, Some(cdc), cmd.once.unwrap_or(false))
                     }
                     _ => {
                         return Err(Status::invalid_argument(
@@ -625,7 +633,8 @@ impl OxidantService {
                         target,
                         sql_conf: cmd.sql_conf.clone(),
                         relation,
-                        query_sql: None,
+                        query_sql,
+                        auto_cdc,
                         once,
                         by_name: false,
                         source_code_location: cmd.source_code_location.clone(),
@@ -987,6 +996,7 @@ async fn graph_to_config(
         .unwrap_or_else(|| format!("{storage}/{schema}"));
 
     let mut tables: HashMap<String, TableConfig> = HashMap::new();
+    let mut pending_cdc: Vec<PendingCdc> = Vec::new();
     for output in &graph.outputs {
         if output.output_type == sc::OutputType::TemporaryView as i32 {
             continue;
@@ -1032,6 +1042,7 @@ async fn graph_to_config(
             iceberg_table_suffix: None,
             checkpoint_interval: None,
             dedup_columns: Vec::new(),
+            auto_cdc: None,
             expect: Default::default(),
             comment: output.comment.clone(),
         };
@@ -1040,6 +1051,17 @@ async fn graph_to_config(
 
     for flow in &graph.flows {
         if flow_targets_temporary_view(graph, flow) {
+            if flow.auto_cdc.is_some() {
+                return Err(table_planning_failure(
+                    &flow.target.table_name,
+                    Status::invalid_argument(format!(
+                        "AUTO CDC flow `{}` cannot target temporary view `{}` — AUTO CDC \
+                         writes into a persisted table",
+                        flow.flow_name, flow.target.table_name
+                    )),
+                    &flow.source_code_location,
+                ));
+            }
             continue;
         }
         let target_key = resolved_identifier_key(&flow.target);
@@ -1056,6 +1078,20 @@ async fn graph_to_config(
         })?;
         let (ignored, flow_snap) = svc.apply_sql_conf(&flow.sql_conf, SqlConfScope::Flow);
         flow_ignored.extend(ignored);
+        if let Some(cdc) = &flow.auto_cdc {
+            // AUTO CDC flows are resolved after every append flow has been folded in, so the
+            // source table's own transformation is already known no matter what order the
+            // statements arrived in.
+            pending_cdc.push(PendingCdc {
+                target_key: target_key.clone(),
+                target_name: target_name.clone(),
+                flow_name: flow.flow_name.clone(),
+                cdc: cdc.clone(),
+                source_code_location: flow.source_code_location.clone(),
+            });
+            svc.restore_sql_conf(flow_snap);
+            continue;
+        }
         let sql_result: Result<(), TablePlanningFailure> = {
             let flow_sql = if let Some(relation) = &flow.relation {
                 if table.source.is_none() {
@@ -1104,6 +1140,8 @@ async fn graph_to_config(
         sql_result?;
     }
 
+    resolve_auto_cdc_flows(graph, &mut tables, pending_cdc)?;
+
     let pipeline = PipelineConfig {
         name: graph_id.to_string(),
         catalog,
@@ -1120,6 +1158,95 @@ async fn graph_to_config(
         tables: tables.into_values().collect(),
         ..Default::default()
     })
+}
+
+/// An AUTO CDC flow held back until every append flow has been folded into its target.
+#[derive(Clone)]
+struct PendingCdc {
+    target_key: String,
+    target_name: String,
+    flow_name: String,
+    cdc: AutoCdcConfig,
+    source_code_location: Option<sc::SourceCodeLocation>,
+}
+
+/// Fold AUTO CDC flows into their target tables.
+///
+/// The target itself declares no stream: it inherits the *source* table's streaming source and
+/// per-batch transformation, and every micro-batch of that stream is merged into the target by
+/// key instead of appended. That is why this runs after the append-flow loop — the source
+/// table's `sql` is only known once its own flows have been folded in.
+fn resolve_auto_cdc_flows(
+    graph: &DataflowGraph,
+    tables: &mut HashMap<String, TableConfig>,
+    pending: Vec<PendingCdc>,
+) -> Result<(), TablePlanningFailure> {
+    for p in pending {
+        let reject = |msg: String| {
+            table_planning_failure(
+                &p.target_name,
+                Status::invalid_argument(msg),
+                &p.source_code_location,
+            )
+        };
+        let mut cdc = p.cdc.clone();
+        validate_auto_cdc(&cdc, &p.target_name)
+            .map_err(|e| reject(format!("AUTO CDC flow `{}`: {e}", p.flow_name)))?;
+
+        let source_key = output_dedup_key(graph, &cdc.source);
+        let source_table = tables.get(&source_key).ok_or_else(|| {
+            reject(format!(
+                "AUTO CDC flow `{}` reads `{}`, which is not a table declared in this pipeline",
+                p.flow_name, cdc.source
+            ))
+        })?;
+        let Some(source_config) = source_table.source.clone() else {
+            return Err(reject(format!(
+                "AUTO CDC flow `{}` reads `{}`, which is not a streaming table — an AUTO CDC \
+                 source must declare a streaming source",
+                p.flow_name, cdc.source
+            )));
+        };
+        let source_sql = source_table.sql.clone();
+        let source_sql_by_name = source_table.sql_by_name;
+        let source_flows = source_table.append_flows.clone();
+        // Normalize to the declared table name so the dependency edge resolves in `Graph::build`.
+        cdc.source = source_table.name.clone();
+
+        let table = tables.get_mut(&p.target_key).ok_or_else(|| {
+            reject(format!(
+                "AUTO CDC flow `{}` targets undefined table `{}`",
+                p.flow_name, p.target_name
+            ))
+        })?;
+        if table.auto_cdc.is_some() {
+            return Err(reject(format!(
+                "table `{}` is the target of more than one AUTO CDC flow",
+                p.target_name
+            )));
+        }
+        if table.source.is_some() {
+            return Err(reject(format!(
+                "AUTO CDC flow `{}` cannot target streaming table `{}` — the target already \
+                 ingests its own stream; declare it as a plain `CREATE STREAMING TABLE {}` with \
+                 no query or TBLPROPERTIES",
+                p.flow_name, p.target_name, p.target_name
+            )));
+        }
+        if table.sql.is_some() || !table.append_flows.is_empty() {
+            return Err(reject(format!(
+                "AUTO CDC flow `{}` cannot target `{}` — the target already has a query or \
+                 append flow; an AUTO CDC target is defined only by its CDC flow",
+                p.flow_name, p.target_name
+            )));
+        }
+        table.source = Some(source_config);
+        table.sql = source_sql;
+        table.sql_by_name = source_sql_by_name;
+        table.append_flows = source_flows;
+        table.auto_cdc = Some(cdc);
+    }
+    Ok(())
 }
 
 fn merge_sql_elements(graph: &mut DataflowGraph, elements: oxidant_pipelines::SqlGraphElements) {
@@ -1216,7 +1343,12 @@ fn parsed_flow_to_def(parsed: &oxidant_pipelines::ParsedFlow, graph: &DataflowGr
         target,
         sql_conf: HashMap::new(),
         relation: None,
-        query_sql: Some(parsed.query_sql.clone()),
+        query_sql: if parsed.auto_cdc.is_some() {
+            None
+        } else {
+            Some(parsed.query_sql.clone())
+        },
+        auto_cdc: parsed.auto_cdc.as_ref().map(parsed_auto_cdc_to_config),
         once: parsed.once,
         by_name: parsed.by_name,
         source_code_location: None,
@@ -1578,6 +1710,131 @@ async fn relation_to_sql(engine: &Engine, relation: &sc::Relation) -> Result<Str
         .map_err(|e| Status::invalid_argument(format!("relation to sql: {e}")))
 }
 
+fn auto_cdc_from_proto(
+    ctx: &datafusion::prelude::SessionContext,
+    details: &sc::pipeline_command::define_flow::AutoCdcFlowDetails,
+) -> Result<AutoCdcConfig, String> {
+    let source = details
+        .source
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "source is required".to_string())?
+        .to_string();
+    if details.keys.is_empty() {
+        return Err("keys must not be empty".into());
+    }
+    let keys = details
+        .keys
+        .iter()
+        .map(|e| expression_to_sql(ctx, e))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sequence_by = details
+        .sequence_by
+        .as_ref()
+        .map(|e| expression_to_sql(ctx, e))
+        .transpose()?
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "sequence_by is required".to_string())?;
+    match details.stored_as_scd_type {
+        0 | 1 => {}
+        other => {
+            return Err(format!(
+                "stored_as_scd_type {other} is not supported (only SCD_TYPE_1)"
+            ));
+        }
+    }
+    Ok(AutoCdcConfig {
+        source,
+        keys,
+        sequence_by,
+        apply_as_deletes: optional_expression_to_sql(ctx, details.apply_as_deletes.as_ref())?,
+        apply_as_truncates: optional_expression_to_sql(ctx, details.apply_as_truncates.as_ref())?,
+        column_list: expression_list_to_sql(ctx, &details.column_list)?,
+        except_column_list: expression_list_to_sql(ctx, &details.except_column_list)?,
+        ignore_null_updates_columns: expression_list_to_sql(
+            ctx,
+            &details.ignore_null_updates_column_list,
+        )?,
+        ignore_null_updates_except: expression_list_to_sql(
+            ctx,
+            &details.ignore_null_updates_except_column_list,
+        )?,
+    })
+}
+
+fn parsed_auto_cdc_to_config(parsed: &oxidant_pipelines::ParsedAutoCdcFlow) -> AutoCdcConfig {
+    AutoCdcConfig {
+        source: parsed.source.clone(),
+        keys: parsed.keys.clone(),
+        sequence_by: parsed.sequence_by.clone(),
+        apply_as_deletes: parsed.apply_as_deletes.clone(),
+        apply_as_truncates: parsed.apply_as_truncates.clone(),
+        column_list: parsed.column_list.clone(),
+        except_column_list: parsed.except_column_list.clone(),
+        ignore_null_updates_columns: parsed.ignore_null_updates_columns.clone(),
+        ignore_null_updates_except: parsed.ignore_null_updates_except.clone(),
+    }
+}
+
+fn optional_expression_to_sql(
+    ctx: &datafusion::prelude::SessionContext,
+    expr: Option<&sc::Expression>,
+) -> Result<Option<String>, String> {
+    expr.map(|e| expression_to_sql(ctx, e)).transpose()
+}
+
+fn expression_list_to_sql(
+    ctx: &datafusion::prelude::SessionContext,
+    exprs: &[sc::Expression],
+) -> Result<Option<Vec<String>>, String> {
+    if exprs.is_empty() {
+        return Ok(None);
+    }
+    exprs
+        .iter()
+        .map(|e| expression_to_sql(ctx, e))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Render one AUTO CDC option expression as SQL text.
+///
+/// Column references and `expr("…")` strings are taken verbatim — round-tripping them through
+/// the planner would quote them in a dialect the merge statement is not parsed with. Anything
+/// else (`col("op") == "D"`, say) is lowered to a DataFusion expression and unparsed.
+fn expression_to_sql(
+    ctx: &datafusion::prelude::SessionContext,
+    expr: &sc::Expression,
+) -> Result<String, String> {
+    use sc::expression::ExprType;
+    match expr.expr_type.as_ref() {
+        Some(ExprType::UnresolvedAttribute(a)) => Ok(a.unparsed_identifier.clone()),
+        Some(ExprType::ExpressionString(s)) => Ok(s.expression.clone()),
+        Some(ExprType::Literal(l)) => literal_to_sql(l),
+        Some(_) => {
+            let lowered = crate::translate::expr::to_expr(ctx, expr, None)
+                .map_err(|e| format!("unsupported AUTO CDC expression: {}", e.message()))?;
+            Unparser::default()
+                .expr_to_sql(&lowered)
+                .map(|e| e.to_string())
+                .map_err(|e| format!("AUTO CDC expression to sql: {e}"))
+        }
+        None => Err("empty AUTO CDC expression".into()),
+    }
+}
+
+fn literal_to_sql(l: &sc::expression::Literal) -> Result<String, String> {
+    use sc::expression::literal::LiteralType;
+    match l.literal_type.as_ref() {
+        Some(LiteralType::String(s)) => Ok(format!("'{}'", s.replace('\'', "''"))),
+        Some(LiteralType::Integer(i)) => Ok(i.to_string()),
+        Some(LiteralType::Long(i)) => Ok(i.to_string()),
+        Some(LiteralType::Double(d)) => Ok(d.to_string()),
+        Some(LiteralType::Boolean(b)) => Ok(if *b { "true" } else { "false" }.to_string()),
+        other => Err(format!("unsupported AUTO CDC literal: {other:?}")),
+    }
+}
+
 fn extract_streaming_source(relation: &sc::Relation) -> Option<SourceConfig> {
     match relation.rel_type.as_ref()? {
         sc::relation::RelType::Read(r) if r.is_streaming => match r.read_type.as_ref()? {
@@ -1641,6 +1898,255 @@ mod tests {
             resolved_identifier_key(&id),
             "prod.silver.orders".to_string()
         );
+    }
+
+    fn cdc_graph() -> DataflowGraph {
+        DataflowGraph {
+            default_catalog: Some("local".into()),
+            default_database: Some("live".into()),
+            sql_conf: HashMap::new(),
+            outputs: Vec::new(),
+            flows: Vec::new(),
+            refreshes: Vec::new(),
+            created_at: SystemTime::now(),
+        }
+    }
+
+    fn cdc_table(name: &str) -> TableConfig {
+        TableConfig {
+            name: name.to_string(),
+            source: None,
+            sql: None,
+            sql_by_name: false,
+            append_flows: Vec::new(),
+            output_schema: None,
+            partition_by: Vec::new(),
+            format: None,
+            iceberg_compat: None,
+            iceberg_table_suffix: None,
+            checkpoint_interval: None,
+            dedup_columns: Vec::new(),
+            auto_cdc: None,
+            expect: Default::default(),
+            comment: None,
+        }
+    }
+
+    fn cdc_options() -> AutoCdcConfig {
+        AutoCdcConfig {
+            source: "bronze".into(),
+            keys: vec!["id".into()],
+            sequence_by: "seq".into(),
+            apply_as_deletes: None,
+            apply_as_truncates: None,
+            column_list: None,
+            except_column_list: None,
+            ignore_null_updates_columns: None,
+            ignore_null_updates_except: None,
+        }
+    }
+
+    fn pending(cdc: AutoCdcConfig) -> Vec<PendingCdc> {
+        vec![PendingCdc {
+            target_key: "local.live.silver".into(),
+            target_name: "silver".into(),
+            flow_name: "cdc_flow".into(),
+            cdc,
+            source_code_location: None,
+        }]
+    }
+
+    /// A streaming `bronze` and an empty `silver`, the shape an AUTO CDC flow expects.
+    fn cdc_tables() -> HashMap<String, TableConfig> {
+        let mut bronze = cdc_table("bronze");
+        bronze.source = Some(SourceConfig {
+            format: "kafka".into(),
+            options: BTreeMap::from([("subscribe".to_string(), "cdc".to_string())]),
+        });
+        bronze.sql = Some("SELECT * FROM stream".into());
+        HashMap::from([
+            ("local.live.bronze".to_string(), bronze),
+            ("local.live.silver".to_string(), cdc_table("silver")),
+        ])
+    }
+
+    #[test]
+    fn auto_cdc_target_inherits_the_source_stream() {
+        let mut tables = cdc_tables();
+        resolve_auto_cdc_flows(&cdc_graph(), &mut tables, pending(cdc_options()))
+            .expect("resolves");
+        let target = &tables["local.live.silver"];
+        assert_eq!(
+            target.source.as_ref().map(|s| s.format.as_str()),
+            Some("kafka")
+        );
+        assert_eq!(target.sql.as_deref(), Some("SELECT * FROM stream"));
+        assert_eq!(target.kind(), oxidant_config::TableKind::AutoCdc);
+        // Normalized to the declared table name so the graph edge resolves.
+        assert_eq!(target.auto_cdc.as_ref().unwrap().source, "bronze");
+    }
+
+    #[test]
+    fn auto_cdc_rejects_a_target_that_ingests_its_own_stream() {
+        let mut tables = cdc_tables();
+        tables.get_mut("local.live.silver").unwrap().source = Some(SourceConfig {
+            format: "kafka".into(),
+            options: BTreeMap::new(),
+        });
+        let err = resolve_auto_cdc_flows(&cdc_graph(), &mut tables, pending(cdc_options()))
+            .expect_err("streaming target");
+        assert!(
+            err.status.message().contains("ingests its own stream"),
+            "{}",
+            err.status.message()
+        );
+    }
+
+    #[test]
+    fn auto_cdc_rejects_a_target_that_already_has_a_query() {
+        let mut tables = cdc_tables();
+        tables.get_mut("local.live.silver").unwrap().sql = Some("SELECT 1".into());
+        let err = resolve_auto_cdc_flows(&cdc_graph(), &mut tables, pending(cdc_options()))
+            .expect_err("query target");
+        assert!(
+            err.status.message().contains("already has a query"),
+            "{}",
+            err.status.message()
+        );
+    }
+
+    #[test]
+    fn auto_cdc_rejects_an_unknown_or_non_streaming_source() {
+        let mut tables = cdc_tables();
+        let mut unknown = cdc_options();
+        unknown.source = "nope".into();
+        let err = resolve_auto_cdc_flows(&cdc_graph(), &mut tables, pending(unknown))
+            .expect_err("unknown source");
+        assert!(
+            err.status.message().contains("not a table declared"),
+            "{}",
+            err.status.message()
+        );
+
+        let mut tables = cdc_tables();
+        tables.get_mut("local.live.bronze").unwrap().source = None;
+        let err = resolve_auto_cdc_flows(&cdc_graph(), &mut tables, pending(cdc_options()))
+            .expect_err("batch source");
+        assert!(
+            err.status.message().contains("not a streaming table"),
+            "{}",
+            err.status.message()
+        );
+    }
+
+    #[test]
+    fn auto_cdc_rejects_missing_keys() {
+        let mut tables = cdc_tables();
+        let mut no_keys = cdc_options();
+        no_keys.keys.clear();
+        let err = resolve_auto_cdc_flows(&cdc_graph(), &mut tables, pending(no_keys))
+            .expect_err("keys required");
+        assert!(
+            err.status.message().contains("key column"),
+            "{}",
+            err.status.message()
+        );
+    }
+
+    #[test]
+    fn auto_cdc_rejects_two_flows_into_one_target() {
+        let mut tables = cdc_tables();
+        let mut two = pending(cdc_options());
+        two.push(two[0].clone());
+        let err = resolve_auto_cdc_flows(&cdc_graph(), &mut tables, two)
+            .expect_err("one cdc flow per target");
+        assert!(
+            err.status.message().contains("more than one AUTO CDC flow"),
+            "{}",
+            err.status.message()
+        );
+    }
+
+    fn attribute(name: &str) -> sc::Expression {
+        sc::Expression {
+            expr_type: Some(sc::expression::ExprType::UnresolvedAttribute(
+                sc::expression::UnresolvedAttribute {
+                    unparsed_identifier: name.to_string(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn expr_string(text: &str) -> sc::Expression {
+        sc::Expression {
+            expr_type: Some(sc::expression::ExprType::ExpressionString(
+                sc::expression::ExpressionString {
+                    expression: text.to_string(),
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn auto_cdc_proto_maps_columns_and_conditions() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let details = sc::pipeline_command::define_flow::AutoCdcFlowDetails {
+            source: Some("bronze".into()),
+            keys: vec![attribute("id"), attribute("tenant")],
+            sequence_by: Some(attribute("seq")),
+            apply_as_deletes: Some(expr_string("op = 'D'")),
+            except_column_list: vec![attribute("op")],
+            ignore_null_updates_column_list: vec![attribute("name")],
+            stored_as_scd_type: sc::pipeline_command::define_flow::ScdType::ScdType1 as i32,
+            ..Default::default()
+        };
+        let cdc = auto_cdc_from_proto(&ctx, &details).expect("maps");
+        assert_eq!(cdc.keys, vec!["id", "tenant"]);
+        assert_eq!(cdc.sequence_by, "seq");
+        assert_eq!(cdc.apply_as_deletes.as_deref(), Some("op = 'D'"));
+        assert_eq!(cdc.except_column_list, Some(vec!["op".to_string()]));
+        assert_eq!(
+            cdc.ignore_null_updates_columns,
+            Some(vec!["name".to_string()])
+        );
+    }
+
+    #[test]
+    fn auto_cdc_proto_rejects_scd_type_2_and_missing_options() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let base = sc::pipeline_command::define_flow::AutoCdcFlowDetails {
+            source: Some("bronze".into()),
+            keys: vec![attribute("id")],
+            sequence_by: Some(attribute("seq")),
+            ..Default::default()
+        };
+
+        // The vendored proto only knows SCD_TYPE_1, so anything else arrives as a raw enum value.
+        let scd2 = sc::pipeline_command::define_flow::AutoCdcFlowDetails {
+            stored_as_scd_type: 2,
+            ..base.clone()
+        };
+        let err = auto_cdc_from_proto(&ctx, &scd2).expect_err("scd type 2");
+        assert!(err.contains("SCD_TYPE_1"), "{err}");
+
+        let no_keys = sc::pipeline_command::define_flow::AutoCdcFlowDetails {
+            keys: Vec::new(),
+            ..base.clone()
+        };
+        assert!(auto_cdc_from_proto(&ctx, &no_keys)
+            .expect_err("keys")
+            .contains("keys"));
+
+        let no_seq = sc::pipeline_command::define_flow::AutoCdcFlowDetails {
+            sequence_by: None,
+            ..base
+        };
+        assert!(auto_cdc_from_proto(&ctx, &no_seq)
+            .expect_err("sequence_by")
+            .contains("sequence_by"));
     }
 
     #[test]
@@ -1757,6 +2263,7 @@ mod tests {
                 sql_conf: HashMap::new(),
                 relation: None,
                 query_sql: Some("SELECT 1".into()),
+                auto_cdc: None,
                 once: false,
                 by_name: false,
                 source_code_location: Some(sc::SourceCodeLocation {
