@@ -9,6 +9,23 @@
 //! replaces the table through the Delta sink's atomic `replace` commit. That is **O(target rows)
 //! per micro-batch**; see `docs/pipelines.md` for the honest limits.
 //!
+//! Three semantics are worth stating outright, because they are the ones a reader is likely to
+//! assume differently:
+//!
+//! * **Deletes are physical and leave no tombstone.** Once `APPLY AS DELETE WHEN` removes a key,
+//!   nothing records *when* it was removed, so a record for that key that arrives in a *later*
+//!   micro-batch is treated as new — even if its `SEQUENCE BY` value is older than the delete's.
+//!   Within one batch the delete still wins. This matches Databricks' SCD Type 1, which also
+//!   deletes the row outright; keeping a tombstone would mean carrying a column the target does
+//!   not declare and never being able to drop it. "Out of order safe" therefore means *within a
+//!   batch, and against rows still present in the target* — not across a delete.
+//! * **A NULL `SEQUENCE BY` value is an error**, not a silently dropped row: a row with no
+//!   ordering value cannot be placed against the target, and dropping it would lose a change
+//!   event without a word. Databricks fails the same way.
+//! * **NULL key values compare equal**, via `IS NOT DISTINCT FROM`. A NULL-keyed row is one key
+//!   like any other; with plain `=` it would never match the target and the target would grow a
+//!   fresh duplicate row per batch, forever.
+//!
 //! The generated statement is:
 //!
 //! ```sql
@@ -29,37 +46,15 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use oxidant_common::{Error, Result};
-use oxidant_config::AutoCdcConfig;
+// `simple_column` is shared with config load so `oxidant.yaml` and `CREATE FLOW ... AS AUTO CDC`
+// agree on what counts as a plain column name, and so an expression key is rejected at define
+// time rather than on the first micro-batch.
+use oxidant_config::{auto_cdc_simple_column as simple_column, AutoCdcConfig};
 use oxidant_loom::Engine;
 
 /// Validate AUTO CDC options (re-exported so the SDP wiring has one place to call).
 pub fn validate_auto_cdc(config: &AutoCdcConfig, table_name: &str) -> Result<()> {
     oxidant_config::validate_auto_cdc(config, table_name)
-}
-
-/// A key or `SEQUENCE BY` reference, which must be a plain column.
-///
-/// Databricks allows a struct expression for `SEQUENCE BY`; we do not, because the merge has to
-/// compare the batch's ordering value against the one already persisted in the target, and only
-/// a stored column survives across micro-batches.
-fn simple_column(expr: &str) -> Option<String> {
-    let trimmed = expr.trim();
-    let unquoted = trimmed
-        .strip_prefix('`')
-        .and_then(|r| r.strip_suffix('`'))
-        .unwrap_or(trimmed);
-    if unquoted.is_empty() || unquoted.contains('`') {
-        return None;
-    }
-    let mut chars = unquoted.chars();
-    let first = chars.next()?;
-    if !(first.is_alphabetic() || first == '_') {
-        return None;
-    }
-    if !chars.all(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-    Some(unquoted.to_string())
 }
 
 fn require_column(expr: &str, what: &str) -> Result<String> {
@@ -224,9 +219,14 @@ pub fn build_merge_sql(
     let seq = quote_ident(&require_column(&config.sequence_by, "SEQUENCE BY")?);
     let ignore = ignore_null_update_columns(config, columns)?;
 
+    // NULL-safe on purpose: `PARTITION BY` already treats two NULL keys as one key, so a plain
+    // `=` here would dedup a NULL-keyed row *within* a batch and then fail to match it against
+    // the target, inserting a fresh copy every batch and fanning out the LEFT JOIN below.
     let key_eq = keys
         .iter()
-        .map(|k| format!("b.{k} = t.{k}"))
+        // Parenthesized: `IS NOT DISTINCT FROM` binds looser than `AND` in the parser, so an
+        // unbracketed conjunction reads as `b.k IS NOT DISTINCT FROM (t.k AND ...)`.
+        .map(|k| format!("(b.{k} IS NOT DISTINCT FROM t.{k})"))
         .collect::<Vec<_>>()
         .join(" AND ");
     let partition_by = keys
@@ -234,6 +234,22 @@ pub fn build_merge_sql(
         .map(|k| format!("s.{k}"))
         .collect::<Vec<_>>()
         .join(", ");
+    // Two rows for one key with the *same* sequence value have no defined winner, and an
+    // arbitrary one means the table's contents can differ between two runs over the same input
+    // — including between the run that committed and the replay that recomputes it. So ties
+    // break deterministically: a delete first (it is the more conservative answer, and it is
+    // what the within-batch ordering already implied), then the remaining output columns.
+    let key_names: BTreeSet<String> = keys.iter().map(|k| k.to_ascii_lowercase()).collect();
+    let seq_lower = seq.to_ascii_lowercase();
+    let tiebreak: String = columns
+        .iter()
+        .map(|c| quote_ident(c))
+        .filter(|q| {
+            let lower = q.to_ascii_lowercase();
+            lower != seq_lower && !key_names.contains(&lower)
+        })
+        .map(|q| format!(", s.{q} DESC"))
+        .collect();
     let delete_expr = bool_expr(config.apply_as_deletes.as_ref());
     let truncate_expr = bool_expr(config.apply_as_truncates.as_ref());
 
@@ -277,7 +293,8 @@ pub fn build_merge_sql(
          __cdc_latest AS ( \
              SELECT * FROM ( \
                  SELECT s.*, ROW_NUMBER() OVER ( \
-                     PARTITION BY {partition_by} ORDER BY s.{seq} DESC \
+                     PARTITION BY {partition_by} \
+                     ORDER BY s.{seq} DESC, s.__cdc_del DESC{tiebreak} \
                  ) AS __cdc_rn \
                  FROM __cdc_scored s CROSS JOIN __cdc_trunc_at tt \
                  WHERE NOT s.__cdc_trunc \
@@ -285,7 +302,8 @@ pub fn build_merge_sql(
              ) WHERE __cdc_rn = 1 \
          ), \
          __cdc_live AS ( \
-             SELECT t.* FROM {target_view} t CROSS JOIN __cdc_trunc_at tt WHERE tt.__cdc_at IS NULL \
+             SELECT t.* FROM {target_view} t CROSS JOIN __cdc_trunc_at tt \
+             WHERE tt.__cdc_at IS NULL OR t.{seq} > tt.__cdc_at \
          ), \
          __cdc_kept AS ( \
              SELECT {kept_projection} FROM __cdc_live t \
@@ -306,6 +324,8 @@ pub fn build_merge_sql(
 #[derive(Debug, Clone)]
 pub struct CdcMerge {
     columns: Vec<String>,
+    /// The `SEQUENCE BY` column, as spelled in the source schema.
+    sequence_column: String,
     schema: SchemaRef,
     sql: String,
     batch_view: String,
@@ -319,6 +339,12 @@ impl CdcMerge {
     /// pipeline never see each other's batch.
     pub fn new(config: &AutoCdcConfig, batch_schema: &SchemaRef, id: &str) -> Result<Self> {
         let columns = output_columns(config, batch_schema)?;
+        let sequence_column = resolve_in(&columns, &config.sequence_by).ok_or_else(|| {
+            Error::Plan(format!(
+                "AUTO CDC SEQUENCE BY column `{}` is not in the target columns",
+                config.sequence_by
+            ))
+        })?;
         let id: String = id
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -339,6 +365,7 @@ impl CdcMerge {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             columns,
+            sequence_column,
             schema: Arc::new(Schema::new(fields)),
             sql,
             batch_view,
@@ -368,6 +395,7 @@ impl CdcMerge {
         batch: &[RecordBatch],
         target: &[RecordBatch],
     ) -> Result<Vec<RecordBatch>> {
+        self.reject_null_sequence(batch)?;
         let target = if target.is_empty() {
             vec![RecordBatch::new_empty(self.schema.clone())]
         } else {
@@ -382,6 +410,28 @@ impl CdcMerge {
             .into_iter()
             .map(|b| self.conform(b))
             .collect::<Result<Vec<_>>>()
+    }
+
+    /// Fail the batch if any row has no `SEQUENCE BY` value.
+    ///
+    /// The merge orders every decision by that column, so a row without one cannot be placed
+    /// against the target at all. The alternative — the `IS NOT NULL` filter in the statement
+    /// quietly eating the row — loses a change event, and a lost delete or truncate is not a
+    /// small loss. Databricks fails on a null sequencing value too.
+    fn reject_null_sequence(&self, batch: &[RecordBatch]) -> Result<()> {
+        let nulls: usize = batch
+            .iter()
+            .filter_map(|b| b.column_by_name(&self.sequence_column))
+            .map(|c| c.null_count())
+            .sum();
+        if nulls > 0 {
+            return Err(Error::Execution(format!(
+                "AUTO CDC: {nulls} row(s) in this micro-batch have a NULL `{}` — the merge \
+                 orders every row by it, so a row without one cannot be applied",
+                self.sequence_column
+            )));
+        }
+        Ok(())
     }
 
     /// Force the merge output onto the declared target schema.
@@ -463,7 +513,89 @@ mod tests {
         .expect("batch")
     }
 
+    /// The same shape as [`schema`], but with `id` and `seq` nullable so the NULL-key and
+    /// NULL-sequence cases can be built at all.
+    fn nullable_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("seq", DataType::Int64, true),
+            Field::new("op", DataType::Utf8, true),
+        ]))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn nullable_batch(rows: &[(Option<i64>, Option<&str>, Option<i64>, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            nullable_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| Some(r.3)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// Like [`rows`], but keeps a NULL key visible instead of unwrapping it.
+    async fn nullable_rows(
+        engine: &Engine,
+        batches: &[RecordBatch],
+    ) -> Vec<(Option<i64>, Option<String>, i64)> {
+        if batches.is_empty() {
+            return Vec::new();
+        }
+        engine
+            .register_batches("__cdc_probe_n", batches.to_vec())
+            .expect("register");
+        let out = engine
+            .sql("SELECT id, name, seq FROM __cdc_probe_n ORDER BY id NULLS FIRST, seq")
+            .await
+            .expect("probe");
+        engine.deregister_table("__cdc_probe_n");
+        let mut collected = Vec::new();
+        for b in out {
+            let ids = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id");
+            let names = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name");
+            let seqs = b
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("seq");
+            for i in 0..b.num_rows() {
+                collected.push((
+                    (!ids.is_null(i)).then(|| ids.value(i)),
+                    (!names.is_null(i)).then(|| names.value(i).to_string()),
+                    seqs.value(i),
+                ));
+            }
+        }
+        collected
+    }
+
     async fn rows(engine: &Engine, batches: &[RecordBatch]) -> Vec<(i64, Option<String>, i64)> {
+        // An empty merge result is a legitimate outcome (everything deleted or truncated) and
+        // arrives as zero batches, which is not something a view can be registered from.
+        if batches.is_empty() {
+            return Vec::new();
+        }
         engine
             .register_batches("__cdc_probe", batches.to_vec())
             .expect("register");
@@ -682,6 +814,13 @@ mod tests {
             )
             .await
             .expect("batch 1");
+        // A row the target already advanced *past* the truncate: the truncate is at seq 5, so
+        // only rows at or below 5 are wiped. Without this row the test passes even when the
+        // target side of the merge drops everything unconditionally.
+        let state = merge
+            .apply(&engine, &[batch(&[(4, Some("newer"), 9, "I")])], &state)
+            .await
+            .expect("batch 2");
         let state = merge
             .apply(
                 &engine,
@@ -692,8 +831,192 @@ mod tests {
             .expect("truncate batch");
         assert_eq!(
             rows(&engine, &state).await,
-            vec![(7, Some("post".into()), 6)]
+            vec![(4, Some("newer".into()), 9), (7, Some("post".into()), 6)]
         );
+    }
+
+    #[tokio::test]
+    async fn a_truncate_older_than_the_target_leaves_it_alone() {
+        // A truncate that arrives late must not wipe state that is strictly newer than it. The
+        // batch side of the merge always compared against the truncate's sequence; the target
+        // side dropped every row whenever *any* truncate was present.
+        let mut c = cfg();
+        c.apply_as_truncates = Some("op = 'T'".into());
+        let engine = Engine::new();
+        let merge = CdcMerge::new(&c, &schema(), "t6").expect("plan");
+
+        let state = merge
+            .apply(&engine, &[batch(&[(1, Some("a"), 10, "I")])], &[])
+            .await
+            .expect("batch 1");
+        assert_eq!(rows(&engine, &state).await, vec![(1, Some("a".into()), 10)]);
+
+        let state = merge
+            .apply(&engine, &[batch(&[(9, None, 5, "T")])], &state)
+            .await
+            .expect("late truncate");
+        assert_eq!(
+            rows(&engine, &state).await,
+            vec![(1, Some("a".into()), 10)],
+            "a truncate at seq 5 must not remove a row committed at seq 10"
+        );
+
+        // And a truncate that *is* newer still empties the table.
+        let state = merge
+            .apply(&engine, &[batch(&[(9, None, 11, "T")])], &state)
+            .await
+            .expect("current truncate");
+        assert!(rows(&engine, &state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_null_key_is_one_key_across_batches() {
+        // `PARTITION BY` already treats two NULLs as one key, so a NULL-unsafe `=` in the merge
+        // dedups within a batch and then never matches the target — one row per batch, forever.
+        let engine = Engine::new();
+        let merge = CdcMerge::new(&cfg(), &nullable_schema(), "t7").expect("plan");
+
+        let state = merge
+            .apply(
+                &engine,
+                &[nullable_batch(&[(None, Some("a"), Some(1), "I")])],
+                &[],
+            )
+            .await
+            .expect("batch 1");
+        let state = merge
+            .apply(
+                &engine,
+                &[nullable_batch(&[(None, Some("b"), Some(2), "U")])],
+                &state,
+            )
+            .await
+            .expect("batch 2");
+        assert_eq!(
+            nullable_rows(&engine, &state).await,
+            vec![(None, Some("b".into()), 2)],
+            "a NULL key must be superseded like any other key"
+        );
+
+        // A stale NULL-keyed row loses, and a delete for it still lands.
+        let state = merge
+            .apply(
+                &engine,
+                &[nullable_batch(&[(None, Some("stale"), Some(1), "U")])],
+                &state,
+            )
+            .await
+            .expect("stale");
+        assert_eq!(
+            nullable_rows(&engine, &state).await,
+            vec![(None, Some("b".into()), 2)]
+        );
+        let state = merge
+            .apply(
+                &engine,
+                &[nullable_batch(&[(None, None, Some(3), "D")])],
+                &state,
+            )
+            .await
+            .expect("delete");
+        assert!(nullable_rows(&engine, &state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_null_sequence_value_fails_the_batch() {
+        // Dropping the row silently would lose a change event — and a lost delete or truncate
+        // is not a small loss. Databricks fails on a null sequencing value too.
+        let engine = Engine::new();
+        let merge = CdcMerge::new(&cfg(), &nullable_schema(), "t8").expect("plan");
+        let err = merge
+            .apply(
+                &engine,
+                &[nullable_batch(&[
+                    (Some(1), Some("a"), Some(1), "I"),
+                    (Some(2), Some("b"), None, "I"),
+                ])],
+                &[],
+            )
+            .await
+            .expect_err("a NULL sequence value is an error")
+            .to_string();
+        assert!(err.contains("NULL `seq`"), "{err}");
+        assert!(err.contains("1 row(s)"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tied_sequences_resolve_deterministically() {
+        // Two rows for one key with the same sequence had no defined winner, so the committed
+        // table could differ from the one a replay recomputes.
+        let engine = Engine::new();
+        let merge = CdcMerge::new(&cfg(), &schema(), "t9").expect("plan");
+
+        // Ties break on the remaining output columns, descending: `zzz` beats `aaa`.
+        let tied = batch(&[(1, Some("aaa"), 5, "U"), (1, Some("zzz"), 5, "U")]);
+        let reversed = batch(&[(1, Some("zzz"), 5, "U"), (1, Some("aaa"), 5, "U")]);
+        let a = merge.apply(&engine, &[tied], &[]).await.expect("tied");
+        let b = merge
+            .apply(&engine, &[reversed], &[])
+            .await
+            .expect("tied, other input order");
+        assert_eq!(rows(&engine, &a).await, vec![(1, Some("zzz".into()), 5)]);
+        assert_eq!(rows(&engine, &a).await, rows(&engine, &b).await);
+
+        // A delete outranks a non-delete at the same sequence: the conservative answer, and the
+        // one the within-batch ordering already implied.
+        let state = merge
+            .apply(&engine, &[batch(&[(1, Some("live"), 1, "I")])], &[])
+            .await
+            .expect("insert");
+        let state = merge
+            .apply(
+                &engine,
+                &[batch(&[(1, Some("keep"), 5, "U"), (1, None, 5, "D")])],
+                &state,
+            )
+            .await
+            .expect("tied delete");
+        assert!(rows(&engine, &state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_record_arriving_after_a_delete_recreates_the_key() {
+        // Documented, not accidental: an SCD1 delete is physical and leaves no tombstone, so
+        // nothing remains to compare a later record's sequence against. Databricks behaves the
+        // same way. Locked in here so a change to it is a deliberate one.
+        let engine = Engine::new();
+        let merge = CdcMerge::new(&cfg(), &schema(), "t10").expect("plan");
+
+        let state = merge
+            .apply(&engine, &[batch(&[(1, Some("a"), 1, "I")])], &[])
+            .await
+            .expect("insert");
+        let state = merge
+            .apply(&engine, &[batch(&[(1, None, 5, "D")])], &state)
+            .await
+            .expect("delete");
+        assert!(rows(&engine, &state).await.is_empty());
+
+        let state = merge
+            .apply(&engine, &[batch(&[(1, Some("late"), 3, "U")])], &state)
+            .await
+            .expect("late record");
+        assert_eq!(
+            rows(&engine, &state).await,
+            vec![(1, Some("late".into()), 3)],
+            "no tombstone survives the delete, so the key comes back"
+        );
+
+        // Within one batch the delete still wins over an older record.
+        let state = merge
+            .apply(
+                &engine,
+                &[batch(&[(1, None, 9, "D"), (1, Some("older"), 8, "U")])],
+                &state,
+            )
+            .await
+            .expect("delete and older record together");
+        assert!(rows(&engine, &state).await.is_empty());
     }
 
     #[tokio::test]

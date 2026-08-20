@@ -146,15 +146,45 @@ There is **no Delta `MERGE` operator** in the engine yet. Each micro-batch is ap
 **read–modify–write** over the whole target table: read the current Delta snapshot, merge in
 memory/SQL, then commit a replacement version via the existing Delta sink (same atomic replace
 path derived tables use). That is **O(target table size) per batch** — honest for correctness,
-not for large targets at fast triggers. Native Delta merge is future work.
+not for large targets at fast triggers. It is also O(target table size) in *memory*: the whole
+target is held between batches so a run of N batches reads the table once instead of N times, and
+the merge builds a second copy while it runs. Budget roughly twice the target for the worker —
+in practice that ceiling, not the per-batch time, is what decides whether a target fits. Native
+Delta merge is future work.
 
-The target is declared **empty** — `CREATE STREAMING TABLE cdc_target;`, no `AS` query and no
-`TBLPROPERTIES` — and is defined entirely by its CDC flow: it inherits the *source* table's stream
-and per-batch transformation, then merges instead of appending. A target that already ingests its
-own stream, or that already has a query or an append flow, is rejected: those are append-only
-sinks, and one table cannot be both. The `KEYS` and `SEQUENCE BY` columns must survive `COLUMNS` /
-`COLUMNS * EXCEPT` into the target — the next batch compares against the values stored there, so
-dropping them would let an older event overwrite newer state.
+The target is declared with **no query** — `CREATE STREAMING TABLE cdc_target;` — and is defined
+entirely by its CDC flow: it inherits the *source* table's stream, per-batch transformation,
+expectations and `dedup_columns`, then merges instead of appending. (Format and partitioning
+`TBLPROPERTIES` on the target are fine; what is rejected is a target that has its own `source:`,
+query, append flow, or expectations — those are append-only sinks, and one table cannot be both.)
+The `KEYS` and `SEQUENCE BY` columns must survive `COLUMNS` / `COLUMNS * EXCEPT` into the target
+— the next batch compares against the values stored there, so dropping them would let an older
+event overwrite newer state.
+
+#### What "out of order safe" does and does not cover
+
+A record whose `sequence_by` value is older than the target's loses, and a truncate only removes
+rows at or below its own sequence. But three cases are worth stating outright:
+
+- **A delete leaves no tombstone.** SCD Type 1 removes the row, and nothing records *when*. A
+  record for that key arriving in a **later** micro-batch is therefore treated as new, even if
+  its `sequence_by` value is older than the delete's — the key comes back. Within one batch the
+  delete still wins. This matches Databricks' SCD Type 1; retaining tombstones would mean
+  carrying a column the target does not declare, with no rule for ever dropping it.
+- **A NULL `sequence_by` value fails the batch.** A row with no ordering value cannot be placed
+  against the target, and dropping it silently would lose a change event — including a delete or
+  a truncate. Databricks fails the same way.
+- **NULL key values compare equal.** A NULL-keyed row is one key like any other, matched with
+  `IS NOT DISTINCT FROM`.
+
+Two rows for the same key with the *same* `sequence_by` value have no natural winner. The merge
+breaks the tie deterministically — a delete first, then the remaining target columns descending
+— so a replay recomputes the table that was committed rather than a different one.
+
+`APPLY AS DELETE WHEN` / `APPLY AS TRUNCATE WHEN` expressions end at the next AUTO CDC clause
+keyword (`SEQUENCE`, `APPLY`, `COLUMNS`, `IGNORE`, `STORED`, `TRACK`). An unquoted column with
+one of those names truncates the clause — spell it with backticks (`` `stored` ``). Each clause
+may appear only once; a repeat is an error rather than a silent overwrite.
 
 The same merge is reachable from a YAML pipeline with `auto_cdc:` on a table that declares the
 streaming source itself:
@@ -173,6 +203,12 @@ streaming source itself:
       except_column_list: [op]    # or column_list: [...], not both
       ignore_null_updates_columns: [name]   # or ignore_null_updates_except: [...], not both
 ```
+
+`auto_cdc.source` must name a table declared in the same `tables:` list — it is what puts the
+dependency edge in the graph, so a typo would leave the merge running in an arbitrary order. The
+target's `source:`, `sql:`, `expect:` and `dedup_columns:` must be **identical** to that table's:
+both re-read the same stream, and letting them drift means the CDC target silently merges a
+different projection, or a different set of rows, than the table it claims to follow.
 
 ## Dependencies and ordering
 

@@ -1210,6 +1210,13 @@ fn resolve_auto_cdc_flows(
         let source_sql = source_table.sql.clone();
         let source_sql_by_name = source_table.sql_by_name;
         let source_flows = source_table.append_flows.clone();
+        // In Databricks an AUTO CDC flow reads the source *dataset* — i.e. what the source table
+        // actually holds, after its expectations and deduplication. Since the target re-ingests
+        // the raw stream rather than reading the table, those have to come along: a bronze table
+        // with `ON VIOLATION DROP ROW` that dropped rows from itself while the CDC target merged
+        // them would leave the two tables disagreeing about the same events.
+        let source_expect = source_table.expect.clone();
+        let source_dedup = source_table.dedup_columns.clone();
         // Normalize to the declared table name so the dependency edge resolves in `Graph::build`.
         cdc.source = source_table.name.clone();
 
@@ -1240,10 +1247,19 @@ fn resolve_auto_cdc_flows(
                 p.flow_name, p.target_name
             )));
         }
+        if !table.expect.is_empty() {
+            return Err(reject(format!(
+                "AUTO CDC flow `{}` targets `{}`, which declares its own expectations — an AUTO \
+                 CDC target inherits the source table's, so declare them on `{}` instead",
+                p.flow_name, p.target_name, cdc.source
+            )));
+        }
         table.source = Some(source_config);
         table.sql = source_sql;
         table.sql_by_name = source_sql_by_name;
         table.append_flows = source_flows;
+        table.expect = source_expect;
+        table.dedup_columns = source_dedup;
         table.auto_cdc = Some(cdc);
     }
     Ok(())
@@ -1984,6 +2000,75 @@ mod tests {
         assert_eq!(target.kind(), oxidant_config::TableKind::AutoCdc);
         // Normalized to the declared table name so the graph edge resolves.
         assert_eq!(target.auto_cdc.as_ref().unwrap().source, "bronze");
+    }
+
+    #[test]
+    fn auto_cdc_target_inherits_the_source_expectations_and_dedup() {
+        // Databricks' AUTO CDC reads the source *dataset*, i.e. post-expectation. Since the
+        // target re-ingests the raw stream instead of reading the table, the source's quality
+        // rules have to be copied — otherwise a bronze `ON VIOLATION DROP ROW` drops rows from
+        // bronze while the CDC target happily merges them.
+        let mut tables = cdc_tables();
+        {
+            let bronze = tables.get_mut("local.live.bronze").unwrap();
+            bronze.expect.insert(
+                "positive_id".into(),
+                oxidant_config::Expectation {
+                    check: "id > 0".into(),
+                    action: oxidant_config::ExpectAction::Drop,
+                },
+            );
+            bronze.dedup_columns = vec!["id".into()];
+        }
+        resolve_auto_cdc_flows(&cdc_graph(), &mut tables, pending(cdc_options()))
+            .expect("resolves");
+        let target = &tables["local.live.silver"];
+        assert_eq!(
+            target.expect.get("positive_id").map(|e| e.check.as_str()),
+            Some("id > 0")
+        );
+        assert_eq!(target.dedup_columns, vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn auto_cdc_rejects_a_target_with_its_own_expectations() {
+        // Two sets of rules over the same stream is a silent disagreement, not a merge.
+        let mut tables = cdc_tables();
+        tables.get_mut("local.live.silver").unwrap().expect.insert(
+            "own".into(),
+            oxidant_config::Expectation {
+                check: "id > 0".into(),
+                action: oxidant_config::ExpectAction::Drop,
+            },
+        );
+        let err = resolve_auto_cdc_flows(&cdc_graph(), &mut tables, pending(cdc_options()))
+            .expect_err("target expectations");
+        assert!(
+            err.status.message().contains("its own expectations"),
+            "{}",
+            err.status.message()
+        );
+    }
+
+    #[test]
+    fn a_once_auto_cdc_flow_marks_its_target_as_once() {
+        // `ONCE` is carried by the flow, not by the CDC options, so it has to survive the fold
+        // into the target table — a `CREATE FLOW ... AS ONCE AUTO CDC` that ran on every trigger
+        // would re-merge the whole source stream forever.
+        let mut graph = cdc_graph();
+        graph.flows.push(FlowDef {
+            flow_name: "cdc_flow".into(),
+            resolved: resolve_identifier("cdc_flow", Some("local"), Some("live")),
+            target: resolve_identifier("silver", Some("local"), Some("live")),
+            sql_conf: HashMap::new(),
+            relation: None,
+            query_sql: None,
+            auto_cdc: Some(cdc_options()),
+            once: true,
+            by_name: false,
+            source_code_location: None,
+        });
+        assert!(once_table_targets(&graph).contains("silver"));
     }
 
     #[test]

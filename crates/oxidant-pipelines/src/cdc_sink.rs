@@ -32,30 +32,22 @@ impl CdcMergeSink {
         }
     }
 
-    /// Read the target as it stands. A table that does not exist yet is an empty target; any
-    /// other read failure is a real error — swallowing it would silently overwrite live data.
+    /// Read the target as it stands.
+    ///
+    /// A target that has never been committed to is an empty target; every *other* read failure
+    /// is a real error, because swallowing it would make the next `replace_batch` write the
+    /// whole table as just this micro-batch. The two cases are told apart by asking the sink
+    /// whether it has ever committed — not by matching on the text of the error, which cannot
+    /// tell "no such table" from an object-store 404 on a log file or a catalog blip.
     async fn read_target(&self) -> Result<Vec<RecordBatch>> {
-        match self
-            .engine
+        if self.inner.next_commit_version() == 0 {
+            return Ok(Vec::new());
+        }
+        self.engine
             .sql(&format!("SELECT * FROM {}", self.target_table))
             .await
-        {
-            Ok(batches) => Ok(batches),
-            Err(e) if is_missing_table(&e) => Ok(Vec::new()),
-            Err(e) => Err(Error::Execution(format!(
-                "AUTO CDC target `{}`: {e}",
-                self.target_table
-            ))),
-        }
+            .map_err(|e| Error::Execution(format!("AUTO CDC target `{}`: {e}", self.target_table)))
     }
-}
-
-fn is_missing_table(err: &Error) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    msg.contains("not found")
-        || msg.contains("does not exist")
-        || msg.contains("no table")
-        || msg.contains("table or view not found")
 }
 
 #[async_trait::async_trait]
@@ -69,8 +61,17 @@ impl Sink for CdcMergeSink {
             None => self.read_target().await?,
         };
         let merged = self.merge.apply(&self.engine, batches, &target).await?;
+        let before = self.inner.next_commit_version();
         let rows = self.inner.replace_batch(&merged, batch_id).await?;
-        self.state = Some(merged);
+        if self.inner.next_commit_version() == before {
+            // Nothing was committed: this `batch_id` had already been applied, so the table holds
+            // what *that* commit wrote, which is not guaranteed to equal what we just recomputed.
+            // Caching the recomputed value would leave every later batch merging against a base
+            // the table does not have, so drop it and re-read instead.
+            self.state = None;
+        } else {
+            self.state = Some(merged);
+        }
         Ok(rows)
     }
 

@@ -25,7 +25,8 @@ fn oxidant_bin() -> std::path::PathBuf {
     path
 }
 
-/// A CDC spool (insert, out-of-order update, delete) plus a bronze/SCD1 config over it.
+/// A CDC spool (insert, out-of-order update, delete, truncate, tied keys) plus a bronze/SCD1
+/// config over it.
 struct Fixture {
     dir: tempfile::TempDir,
 }
@@ -47,6 +48,33 @@ impl Fixture {
              {\"id\":3,\"name\":\"cy\",\"seq\":1,\"op\":\"I\"}\n",
         )
         .expect("batch-0");
+
+        // A truncate whose sequence is *older* than everything committed: it must remove
+        // nothing. The whole-target wipe this used to do is invisible unless live rows sit
+        // above the truncate's sequence.
+        std::fs::write(
+            spool.join("batch-1.json"),
+            "{\"id\":9,\"seq\":0,\"op\":\"T\"}\n\
+             {\"id\":5,\"name\":\"eve\",\"seq\":3,\"op\":\"I\"}\n",
+        )
+        .expect("batch-1");
+
+        // Two rows for one key at the same sequence: the winner has to be the same on every
+        // run, or a replay recomputes a different table than the one that was committed.
+        std::fs::write(
+            spool.join("batch-2.json"),
+            "{\"id\":4,\"name\":\"aaa\",\"seq\":5,\"op\":\"I\"}\n\
+             {\"id\":4,\"name\":\"zzz\",\"seq\":5,\"op\":\"I\"}\n",
+        )
+        .expect("batch-2");
+
+        // A truncate at seq 1: rows committed above it survive, `cy` (seq 1) does not.
+        std::fs::write(
+            spool.join("batch-3.json"),
+            "{\"id\":9,\"seq\":1,\"op\":\"T\"}\n\
+             {\"id\":6,\"name\":\"six\",\"seq\":6,\"op\":\"I\"}\n",
+        )
+        .expect("batch-3");
 
         let source = format!(
             r#"    source:
@@ -88,6 +116,7 @@ tables:
       keys: [id]
       sequence_by: seq
       apply_as_deletes: "op = 'D'"
+      apply_as_truncates: "op = 'T'"
       except_column_list: [op]
 "#,
             warehouse = dir.path().join("warehouse").display(),
@@ -163,12 +192,16 @@ fn a_yaml_auto_cdc_table_merges_by_key_instead_of_appending() {
     // The bronze table appends every change event; the SCD1 target keeps one row per key.
     assert_eq!(
         fixture.query("SELECT count(*) FROM local.live.customers_bronze"),
-        vec!["6"]
+        vec!["12"]
     );
-    // id 1 keeps its highest-sequence value (not the `seq: 0` row that arrived later), id 2 is
-    // deleted by `op = 'D'`, id 3 is inserted. `op` is dropped by `except_column_list`.
+    // id 1 keeps its highest-sequence value (not the `seq: 0` row that arrived later) and
+    // survives both truncates, which are older than it. id 2 is deleted by `op = 'D'`. id 3 is
+    // inserted at seq 1 and then removed by the seq-1 truncate — the one truncate that reaches
+    // it. id 4 resolves its tied sequence deterministically (`zzz`, the larger remaining
+    // column). ids 5 and 6 arrive above every truncate. `op` is dropped by
+    // `except_column_list`.
     assert_eq!(
         fixture.query("SELECT id, name, seq FROM local.live.customers_scd1 ORDER BY id"),
-        vec!["1,ada_renamed,2", "3,cy,1"]
+        vec!["1,ada_renamed,2", "4,zzz,5", "5,eve,3", "6,six,6"]
     );
 }

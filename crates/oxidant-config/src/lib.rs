@@ -33,7 +33,7 @@ mod validate;
 
 use interpolate::interpolate_config;
 
-pub use auto_cdc::validate as validate_auto_cdc;
+pub use auto_cdc::{simple_column as auto_cdc_simple_column, validate as validate_auto_cdc};
 pub use pipeline::{
     AppendFlow, AutoCdcConfig, ExpectAction, Expectation, PipelineConfig, SourceConfig,
     TableConfig, TableKind, Trigger,

@@ -368,6 +368,23 @@ impl LakeSink {
         Ok(())
     }
 
+    /// The Delta version the *next* commit will take — `0` before anything has been written.
+    ///
+    /// Two callers need this. [`open`](Self::open) creates the catalog entry but writes no Delta
+    /// log, so reading a freshly created target legitimately fails; `0` here is what tells that
+    /// apart from a read failure over a table that *does* exist, which matching on the text of
+    /// the error cannot do safely. And a caller that has to know whether its last
+    /// [`replace_batch`](Self::replace_batch) actually committed — as opposed to being dropped as
+    /// a replay — can compare this across the call, which `rows == 0` cannot distinguish from a
+    /// merge that legitimately produced no rows.
+    pub fn next_commit_version(&self) -> u64 {
+        match &self.writer {
+            Writer::Delta(writer) => writer.next_version(),
+            // A bare Parquet directory has no commit protocol; `replace_batch` rejects it.
+            Writer::Parquet => 0,
+        }
+    }
+
     /// The highest idempotency version this table's log already carries, or 0.
     ///
     /// A caller that stamps its own versions (the pipeline's derived-table recompute) needs this

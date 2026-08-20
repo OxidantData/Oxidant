@@ -368,6 +368,21 @@ type ColumnListPair = (Option<Vec<String>>, Option<Vec<String>>);
 /// clause's expression.
 const AUTO_CDC_CLAUSES: &[&str] = &["SEQUENCE", "APPLY", "COLUMNS", "IGNORE", "STORED", "TRACK"];
 
+/// Reject a clause that appears twice.
+///
+/// The clause loop is a `continue`-driven match, so without this a second `SEQUENCE BY` or
+/// `COLUMNS` simply replaced the first — the statement would run, silently, under whichever one
+/// happened to come last.
+fn reject_repeat(stmt: &str, already_set: bool, clause: &str) -> Result<()> {
+    if already_set {
+        return Err(plan_error(
+            stmt,
+            &format!("AUTO CDC {clause} is specified more than once"),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_create_auto_cdc_flow(
     cursor: &mut Cursor<'_>,
     name: Option<String>,
@@ -405,6 +420,7 @@ fn parse_create_auto_cdc_flow(
         }
         if cursor.try_keyword("SEQUENCE")? {
             cursor.expect_keyword("BY")?;
+            reject_repeat(stmt, sequence_by.is_some(), "SEQUENCE BY")?;
             sequence_by = Some(cursor.parse_clause_expression(AUTO_CDC_CLAUSES)?);
             continue;
         }
@@ -412,9 +428,11 @@ fn parse_create_auto_cdc_flow(
             cursor.expect_keyword("AS")?;
             if cursor.try_keyword("DELETE")? {
                 cursor.expect_keyword("WHEN")?;
+                reject_repeat(stmt, apply_as_deletes.is_some(), "APPLY AS DELETE WHEN")?;
                 apply_as_deletes = Some(cursor.parse_clause_expression(AUTO_CDC_CLAUSES)?);
             } else if cursor.try_keyword("TRUNCATE")? {
                 cursor.expect_keyword("WHEN")?;
+                reject_repeat(stmt, apply_as_truncates.is_some(), "APPLY AS TRUNCATE WHEN")?;
                 apply_as_truncates = Some(cursor.parse_clause_expression(AUTO_CDC_CLAUSES)?);
             } else {
                 return Err(plan_error(
@@ -425,6 +443,11 @@ fn parse_create_auto_cdc_flow(
             continue;
         }
         if cursor.try_keyword("COLUMNS")? {
+            reject_repeat(
+                stmt,
+                column_list.is_some() || except_column_list.is_some(),
+                "COLUMNS",
+            )?;
             let (list, except) = cursor.parse_columns_clause()?;
             column_list = list;
             except_column_list = except;
@@ -433,6 +456,11 @@ fn parse_create_auto_cdc_flow(
         if cursor.try_keyword("IGNORE")? {
             cursor.expect_keyword("NULL")?;
             cursor.expect_keyword("UPDATES")?;
+            reject_repeat(
+                stmt,
+                ignore_null_updates_columns.is_some() || ignore_null_updates_except.is_some(),
+                "IGNORE NULL UPDATES",
+            )?;
             let (list, except) = cursor.parse_ignore_null_updates_clause()?;
             ignore_null_updates_columns = list;
             ignore_null_updates_except = except;
@@ -447,6 +475,7 @@ fn parse_create_auto_cdc_flow(
             cursor.expect_keyword("AS")?;
             cursor.expect_keyword("SCD")?;
             cursor.expect_keyword("TYPE")?;
+            reject_repeat(stmt, scd_type.is_some(), "STORED AS SCD TYPE")?;
             scd_type = Some(cursor.parse_identifier_segment()?);
             continue;
         }
@@ -466,13 +495,6 @@ fn parse_create_auto_cdc_flow(
             )));
         }
     }
-    if column_list.is_some() && except_column_list.is_some() {
-        return Err(plan_error(
-            stmt,
-            "AUTO CDC cannot specify both COLUMNS list and EXCEPT list",
-        ));
-    }
-
     Ok(ParsedStatement::Flow(ParsedFlow {
         name,
         target,
@@ -1704,6 +1726,45 @@ CREATE MATERIALIZED VIEW mv AS SELECT 3";
             .unwrap_err()
             .to_string();
         assert!(missing_seq.contains("SEQUENCE BY"), "{missing_seq}");
+    }
+
+    #[test]
+    fn auto_cdc_rejects_a_repeated_clause() {
+        // The clause loop `continue`s, so a repeat used to overwrite the first silently — the
+        // statement ran under whichever spelling happened to come last.
+        for (sql, clause) in [
+            (
+                "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+                 SEQUENCE BY other",
+                "SEQUENCE BY",
+            ),
+            (
+                "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+                 COLUMNS (id, seq) COLUMNS * EXCEPT (op)",
+                "COLUMNS",
+            ),
+            (
+                "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+                 APPLY AS DELETE WHEN op = 'D' APPLY AS DELETE WHEN op = 'X'",
+                "APPLY AS DELETE WHEN",
+            ),
+            (
+                "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+                 APPLY AS TRUNCATE WHEN op = 'T' APPLY AS TRUNCATE WHEN op = 'X'",
+                "APPLY AS TRUNCATE WHEN",
+            ),
+            (
+                "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+                 IGNORE NULL UPDATES ON (name) IGNORE NULL UPDATES",
+                "IGNORE NULL UPDATES",
+            ),
+        ] {
+            let err = parse(sql, None)
+                .expect_err("a repeated clause is an error")
+                .to_string();
+            assert!(err.contains(clause), "{clause}: {err}");
+            assert!(err.contains("more than once"), "{clause}: {err}");
+        }
     }
 
     #[test]
