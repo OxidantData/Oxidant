@@ -10,42 +10,15 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+mod common;
+use common::oxidant_bin;
+
 fn pick_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
         .local_addr()
         .expect("local_addr")
         .port()
-}
-
-fn oxidant_bin() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_oxidant") {
-        return std::path::PathBuf::from(p);
-    }
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
-        candidates.push(std::path::PathBuf::from(td).join(&profile).join("oxidant"));
-    }
-    let workspace_target =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
-    candidates.push(workspace_target.join(&profile).join("oxidant"));
-    // `cargo llvm-cov` uses a separate target dir; CI pre-builds oxidant-cli there.
-    candidates.push(
-        workspace_target
-            .join("llvm-cov-target")
-            .join(&profile)
-            .join("oxidant"),
-    );
-    for c in &candidates {
-        if c.exists() {
-            return c.clone();
-        }
-    }
-    candidates
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| workspace_target.join(&profile).join("oxidant"))
 }
 
 struct ServerGuard(Child);

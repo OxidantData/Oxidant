@@ -457,3 +457,174 @@ async fn insert_into_a_partitioned_parquet_table_is_refused() {
         "this must be the partition refusal, not some other failure: {message}"
     );
 }
+
+/// `docs/sql-writes.md` promises that a value an `INSERT` cannot store in the column's type is
+/// an error, not a `NULL` quietly committed in its place. Arrow's *default* cast is the safe one
+/// — it substitutes `NULL` for anything that does not fit — so a write path that reaches for
+/// `cast` rather than `cast_with_options(safe: false)` silently corrupts the table instead of
+/// refusing the statement. These are the shapes that would land as `NULL` under a safe cast.
+///
+/// The sources are real columns rather than literals so the values survive constant folding and
+/// the cast happens on the way to the file, which is where the damage would be done.
+#[tokio::test]
+async fn insert_of_a_value_too_big_for_the_column_errors_rather_than_writing_null() {
+    let warehouse = tempfile::tempdir().expect("tempdir");
+    let engine = engine_with_live_db(warehouse.path()).await;
+
+    engine
+        .sql(
+            "CREATE TABLE lake.live.typed USING delta AS \
+             SELECT CAST(1 AS INT) AS id, CAST(1.50 AS DECIMAL(5,2)) AS amount",
+        )
+        .await
+        .expect("CTAS");
+    engine
+        .sql(
+            "CREATE TABLE lake.live.oversized USING delta AS \
+             SELECT '2147483648' AS id_text, CAST(2147483648 AS BIGINT) AS id_big, \
+                    '100000.00' AS amount_text, CAST(100000.00 AS DECIMAL(12,2)) AS amount_wide, \
+                    'not-a-number' AS junk",
+        )
+        .await
+        .expect("CTAS oversized");
+
+    for (sql, why) in [
+        (
+            "INSERT INTO lake.live.typed SELECT id_text, amount FROM lake.live.oversized, \
+             lake.live.typed",
+            "a string past INT range",
+        ),
+        (
+            "INSERT INTO lake.live.typed SELECT id_big, amount FROM lake.live.oversized, \
+             lake.live.typed",
+            "a BIGINT past INT range",
+        ),
+        (
+            "INSERT INTO lake.live.typed SELECT id, amount_text FROM lake.live.oversized, \
+             lake.live.typed",
+            "a string past DECIMAL(5,2) range",
+        ),
+        (
+            "INSERT INTO lake.live.typed SELECT id, amount_wide FROM lake.live.oversized, \
+             lake.live.typed",
+            "a DECIMAL(12,2) past DECIMAL(5,2) range",
+        ),
+        (
+            "INSERT INTO lake.live.typed SELECT junk, amount FROM lake.live.oversized, \
+             lake.live.typed",
+            "a string that is not a number at all",
+        ),
+    ] {
+        let err =
+            engine.sql(sql).await.err().unwrap_or_else(|| {
+                panic!("{why} must fail the INSERT, not be stored as NULL: {sql}")
+            });
+        // Whichever layer catches it, the message has to be about the value not fitting — an
+        // unrelated failure would make this test pass for the wrong reason.
+        let text = err.to_string();
+        assert!(
+            text.contains("Cast error")
+                || text.contains("too large")
+                || text.contains("cannot be written to"),
+            "{why}: expected a cast/range failure, got: {text}"
+        );
+    }
+
+    assert_eq!(
+        count(&engine, "SELECT count(*) FROM lake.live.typed").await,
+        1,
+        "only the CTAS row may be in the table; a refused INSERT must commit nothing"
+    );
+    assert_eq!(
+        count(
+            &engine,
+            "SELECT count(*) FROM lake.live.typed WHERE id IS NULL OR amount IS NULL"
+        )
+        .await,
+        0,
+        "a refused INSERT must not have left a NULL behind"
+    );
+    assert_eq!(
+        commits(&warehouse.path().join("live.db").join("typed")).len(),
+        1,
+        "a refused INSERT must not produce a transaction-log commit"
+    );
+}
+
+/// The same contract for a timestamp, which lives on a Parquet table because Delta has no
+/// mapping for the nanosecond timestamp `CAST(… AS TIMESTAMP)` produces.
+#[tokio::test]
+async fn insert_of_an_unparseable_timestamp_errors_rather_than_writing_null() {
+    let warehouse = tempfile::tempdir().expect("tempdir");
+    let engine = engine_with_live_db(warehouse.path()).await;
+
+    engine
+        .sql(
+            "CREATE TABLE lake.live.events USING parquet AS \
+             SELECT CAST('2026-01-01 00:00:00' AS TIMESTAMP) AS ts",
+        )
+        .await
+        .expect("CTAS");
+    engine
+        .sql("CREATE TABLE lake.live.raw_events USING parquet AS SELECT 'not-a-timestamp' AS ts")
+        .await
+        .expect("CTAS raw");
+
+    let err = engine
+        .sql("INSERT INTO lake.live.events SELECT ts FROM lake.live.raw_events")
+        .await
+        .expect_err("an unparseable timestamp must fail the INSERT, not be stored as NULL")
+        .to_string();
+    assert!(
+        err.contains("not-a-timestamp") || err.contains("cannot be written to"),
+        "expected a timestamp-parse failure, got: {err}"
+    );
+
+    assert_eq!(
+        count(
+            &engine,
+            "SELECT count(*) FROM lake.live.events WHERE ts IS NULL"
+        )
+        .await,
+        0,
+        "a refused INSERT must not have left a NULL timestamp behind"
+    );
+}
+
+/// The cast is cast-or-*fail*, not cast-or-reject-nulls: a value that was already absent stays
+/// absent. Rejecting these would make every nullable column unwritable, which is the opposite
+/// over-correction.
+#[tokio::test]
+async fn insert_of_a_null_stays_null_and_still_commits() {
+    let warehouse = tempfile::tempdir().expect("tempdir");
+    let engine = engine_with_live_db(warehouse.path()).await;
+
+    engine
+        .sql(
+            "CREATE TABLE lake.live.nullable_orders USING delta AS \
+             SELECT CAST(1 AS INT) AS id, CAST(NULL AS DECIMAL(5,2)) AS amount",
+        )
+        .await
+        .expect("CTAS");
+    engine
+        .sql(
+            "INSERT INTO lake.live.nullable_orders \
+             SELECT CAST(2 AS INT), CAST(NULL AS DECIMAL(5,2))",
+        )
+        .await
+        .expect("a NULL into a nullable column is a legal INSERT");
+
+    assert_eq!(
+        count(&engine, "SELECT count(*) FROM lake.live.nullable_orders").await,
+        2
+    );
+    assert_eq!(
+        count(
+            &engine,
+            "SELECT count(*) FROM lake.live.nullable_orders WHERE amount IS NULL"
+        )
+        .await,
+        2,
+        "a NULL must read back as NULL, not as a substituted value"
+    );
+}

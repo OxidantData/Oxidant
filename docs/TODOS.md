@@ -163,17 +163,48 @@ path.
       (`icebergCompat`), so one copy of the data is readable by both. That design is why the stub
       was not worth repairing.
 
+### SDP Phase 4a follow-ups
+
+The Python query-function signal stream (see
+[pipelines.md](pipelines.md)) works against a client that
+defines its empty-relation flows *before* opening the stream. Nothing below can produce a wrong
+result silently — each one fails loudly, just later or with a worse message than it should.
+
+- [ ] **Hold the signal stream open and push at `StartRun`.** `execute_plan` materializes the
+      full response list before streaming, so the RPC emits whatever is pending at call time and
+      completes. Upstream Spark pushes signals during graph resolution while the client holds the
+      stream. A 4.2+ client following that order gets an empty, already-closed stream and fails at
+      `StartRun`. This is the load-bearing constraint on whether the feature works against a real
+      client, not a cosmetic one — no stock client calls the path today, which is the only reason
+      it is deferred.
+- [ ] **Harden the deferred SQL pass-through gate.** Forwarded text is only checked for
+      parseability: `DFParser::parse_sql` returns multiple statements and the predicate is `any`,
+      so `SELECT … FROM bronze; DROP TABLE x` is stored verbatim and blows up as a parse error
+      once the runner wraps it as a subquery. DDL/DML resolves table references too, so
+      `INSERT INTO bronze SELECT …` passes the same way. Require exactly one statement and that
+      it be a `Statement::Query`, and reject with `invalid_argument` up front.
+- [ ] **Keep parameterized `SQL` relations on the planning path.** `sc::Sql` carries
+      `args` / `pos_args` / `named_arguments` / `pos_arguments`; the pass-through forwards
+      `sql.query` alone, so `spark.sql("… WHERE d = :d", args={...})` ships raw `:d` to the
+      runner. Not a regression (the planning path ignores them too), but restricting the
+      pass-through to the no-arguments case moves the failure back to analysis time for free.
+- [ ] **Leaf-name matching over-defers across catalogs.** `other_catalog.other_db.orders_bronze`
+      matches a graph output named `orders_bronze`, so it both skips planning and gets a false
+      dependency edge in the runner's DAG. `oxidant_pipelines::Graph::build` matches the same way,
+      so the two are at least consistent; fixing it means fixing both together.
+
 ### Not doing (and why)
 
 - [ ] Migrate the CLI to `clap` ([main.rs](../crates/oxidant-cli/src/main.rs) TODO). Tempting
       while adding subcommands, but it rewrites every existing flag's parsing — its own PR,
       with its own regression surface.
 - [ ] A SQL REPL. `oxidant sql` is one-shot; there is no readline/interactive loop anywhere.
-- [ ] Wire remaining `pipelines.proto` surface (SDP Phase 4): query-function execution signal
-      stream ([#91](https://github.com/oxidantdata/oxidant/issues/91)), AUTO CDC flows
+- [ ] Wire remaining `pipelines.proto` surface (SDP Phase 4): AUTO CDC flows
       ([#92](https://github.com/oxidantdata/oxidant/issues/92)). Core `PipelineCommand` dispatch,
-      SQL graph parsing, `StartRun` execution, external sinks, and `ExecuteOutputFlows` landed in
-      SDP Phases 1–2 and 4c ([#93](https://github.com/oxidantdata/oxidant/issues/93)).
+      SQL graph parsing, and `StartRun` execution landed in SDP Phases 1–2; the query-function
+      execution signal stream ([#91](https://github.com/oxidantdata/oxidant/issues/91)) landed in
+      Phase 4a, with the follow-ups listed above; external sinks and `ExecuteOutputFlows`
+      ([#93](https://github.com/oxidantdata/oxidant/issues/93)) landed in Phase 4c.
 - [ ] Kafka as a *sink*. The Kafka integration is source-only — `DefineOutput` with
       `output_type=SINK` and `format=kafka` is refused at definition time.
 - [ ] Run-scope names in the **DataFrame** encoding. `spark.sql("SELECT * FROM <graph output>")`

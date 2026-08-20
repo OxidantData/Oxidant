@@ -331,7 +331,7 @@ async fn pipeline_rejection_paths() {
     .await
     .expect("define table");
 
-    expect_status(
+    let empty_flow = execute_pipeline(
         &mut client,
         session,
         sc::PipelineCommand {
@@ -347,6 +347,26 @@ async fn pipeline_rejection_paths() {
                             },
                         ),
                     ),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+    .expect("empty relation DefineFlow is accepted for query-function backfill");
+    assert!(empty_flow.iter().any(|r| matches!(
+        &r.response_type,
+        Some(sc::execute_plan_response::ResponseType::PipelineCommandResult(_))
+    )));
+
+    expect_status(
+        &mut client,
+        session,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::StartRun(
+                sc::pipeline_command::StartRun {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    dry: Some(true),
                     ..Default::default()
                 },
             )),

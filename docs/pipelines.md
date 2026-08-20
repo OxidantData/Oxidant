@@ -40,7 +40,9 @@ YAML file:
   share checkpoint state; a deployment that wants isolation must pass `storage` explicitly.
   `output_type` must be set, and must not be `TEMPORARY_VIEW` — a view is registered but never
   written. Kafka spool sources (`oxidant.spool.dir` in `TBLPROPERTIES` or `readStream` options)
-  exercise the same path as the YAML runner.
+  exercise the same path as the YAML runner. Python source functions whose relation is empty at
+  `DefineFlow` time round-trip via `GetQueryFunctionExecutionSignalStream` → client-side
+  evaluation → `DefineFlowQueryFunctionResult` backfill before `StartRun`.
 - **Sinks** are write targets, not datasets. `SinkDetails.options.path` is required, and the sink
   is **not** registered in the catalog — so a flow that reads one is refused at `StartRun`
   (`flow ... cannot read sink ...`) rather than failing later as a missing table. Two formats:
@@ -54,9 +56,67 @@ YAML file:
   every pass, which only `delta` can do, so a `parquet` sink with no source of its own is refused
   when the graph is lowered rather than failing mid-run.
 - **Limits (deferred):** no AUTO CDC / `APPLY CHANGES` flows ([#92](https://github.com/oxidantdata/oxidant/issues/92)),
-  no Python query-function signal stream ([#91](https://github.com/oxidantdata/oxidant/issues/91)),
   no Kafka sink. Interactive `spark.sql("CREATE STREAMING TABLE …")` still correctly rejects
   unsupported statements; use `DefineSqlGraphElements` or the Python decorators instead.
+
+**Python query-function signal stream**
+
+When `pyspark.pipelines` cannot analyze a flow's Python function at definition time, it sends
+`DefineFlow` with an empty `relation_flow_details.relation`. The client then opens
+`GetQueryFunctionExecutionSignalStream` (scoped by `client_id`, matching the value on
+`DefineFlow`) and receives `PipelineQueryFunctionExecutionSignal` responses naming pending flows.
+After evaluating the Python function locally, the client sends `DefineFlowQueryFunctionResult` to
+backfill the stored relation; `StartRun` then plans those flows like any other. Flows still
+relation-less at `StartRun` fail with `failed_precondition` naming the flow.
+
+A flow is "pending" while it has neither a relation nor SDP SQL text. Signals are routed by
+`client_id`: a stream request only sees flows whose `DefineFlow.client_id` matches it, plus flows
+registered without a `client_id` (which the stock client does not set today). Pending state lives
+in the session's dataflow graph, so `DropDataflowGraph` or closing the session clears it.
+
+**Backfill is accepted once, and only for a pending flow.** A `DefineFlowQueryFunctionResult`
+naming a flow that already has a relation (an earlier backfill) or SDP SQL text (a flow from
+`DefineSqlGraphElements`) is rejected with `failed_precondition`; an unknown flow is rejected with
+`invalid_argument`. Re-evaluation is deliberately not supported: `StartRun` prefers a flow's
+relation over its SQL, so accepting a second result would let a stale or misaddressed one replace
+a `.sql` file's query — different table contents, no diagnostic, no source location. Send another
+`DefineFlow` if a flow genuinely needs redefining.
+
+> **Load-bearing caveat — register empty-relation flows *before* opening the signal stream.**
+> Oxidant's `execute_plan` handler materializes the full response list before streaming, so each
+> signal-stream RPC emits whatever is pending *at call time* in one
+> `PipelineQueryFunctionExecutionSignal` and then completes; it does not hold the stream open.
+> Upstream Spark's model is the inverse — the client opens the stream and holds it while the
+> server pushes signals during graph resolution at `StartRun`. A client following *that* order
+> (open the stream, then define flows) gets an empty, already-closed stream, evaluates nothing,
+> and fails at `StartRun` with `failed_precondition`. Define the flows first, or call the stream
+> again after late arrivals. Holding the stream open is tracked in
+> [docs/TODOS.md](TODOS.md#sdp-phase-4a-follow-ups).
+
+Both the current `flow_identifiers` field and the pre-4.2 `flow_names` field are populated;
+backfill requests are accepted against either.
+
+A backfilled relation is normally planned through DataFusion and unparsed, so a bad flow fails at
+`StartRun` with its source location attached. The exception is a plain `SQL` relation that reads a
+table this graph builds: that table does not exist until the run creates it, so the text is
+forwarded to the runner verbatim, exactly like an SDP-SQL flow's `query_sql`. Deferring is
+all-or-nothing per statement — one graph-built reference forwards the whole query — so the tables
+it names that the graph does *not* build are checked against the catalog at `StartRun` instead,
+and a typo among them is rejected there with the flow's source location rather than surfacing from
+inside the runner. Two known rough edges on this path: leaf-name matching means
+`other_catalog.other_db.orders_bronze` counts as the graph's `orders_bronze` (the runner's DAG
+builder matches the same way, so the two agree), and the forwarded text is only checked for
+parseability, not for being a single `SELECT`.
+
+`PipelineAnalysisContext` rides along as a packed `google.protobuf.Any` in
+`ExecutePlanRequest.user_context.extensions` (see `pyspark.pipelines.add_pipeline_analysis_context`),
+not as a top-level request field. Oxidant ignores user-context extensions, so requests carrying it
+are accepted unchanged; pipeline-scoped analysis (resolving names against the in-flight graph
+rather than the catalog) is not implemented.
+
+Note that `pyspark` 4.2 always evaluates the Python query function at `DefineFlow` time and sends a
+populated relation, so this round-trip is exercised by
+`crates/oxidant-connect/tests/pipeline_phase4a.rs` rather than by the client e2e gate below.
 
 **Client e2e gate** (stock `pyspark.pipelines` / `spark-pipelines run`, no broker):
 

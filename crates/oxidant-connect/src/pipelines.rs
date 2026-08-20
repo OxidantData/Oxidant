@@ -69,7 +69,8 @@ pub struct OutputDef {
     pub source_code_location: Option<sc::SourceCodeLocation>,
 }
 
-/// Mirrors `PipelineCommand.DefineFlow`; relation stays unresolved until `StartRun`.
+/// Mirrors `PipelineCommand.DefineFlow`; relation may stay unresolved until
+/// `DefineFlowQueryFunctionResult` or `StartRun`.
 #[derive(Debug, Clone)]
 pub struct FlowDef {
     pub flow_name: String,
@@ -77,6 +78,8 @@ pub struct FlowDef {
     pub resolved: sc::ResolvedIdentifier,
     pub target: sc::ResolvedIdentifier,
     pub sql_conf: HashMap<String, String>,
+    /// Routes query-function evaluation signals to the client's signal stream.
+    pub client_id: Option<String>,
     pub relation: Option<sc::Relation>,
     /// Populated by `DefineSqlGraphElements` when the flow comes from SDP SQL text.
     pub query_sql: Option<String>,
@@ -189,6 +192,88 @@ fn identifiers_match(a: &sc::ResolvedIdentifier, b: &sc::ResolvedIdentifier) -> 
 
 fn is_sink_output(output: &OutputDef) -> bool {
     output.output_type == sc::OutputType::Sink as i32
+}
+
+fn flow_needs_query_function_evaluation(flow: &FlowDef) -> bool {
+    flow.relation.is_none() && flow.query_sql.is_none()
+}
+
+fn flow_matches_client_id(flow: &FlowDef, request_client_id: Option<&str>) -> bool {
+    match (flow.client_id.as_deref(), request_client_id) {
+        (None, _) => true,
+        (Some(flow_id), Some(req_id)) => flow_id == req_id,
+        (Some(_), None) => false,
+    }
+}
+
+fn pending_query_function_flows(
+    graph: &DataflowGraph,
+    request_client_id: Option<&str>,
+) -> Vec<sc::ResolvedIdentifier> {
+    graph
+        .flows
+        .iter()
+        .filter(|flow| {
+            flow_needs_query_function_evaluation(flow)
+                && flow_matches_client_id(flow, request_client_id)
+        })
+        .map(|flow| flow.resolved.clone())
+        .collect()
+}
+
+/// The flow a `DefineFlowQueryFunctionResult` addresses, and whether it may be backfilled.
+enum BackfillTarget {
+    /// Awaiting its query-function result: neither a relation nor SDP SQL text, i.e. exactly what
+    /// the signal stream reported as pending.
+    Pending(usize),
+    /// The flow exists but is already defined — by an earlier backfill, or by SDP SQL from
+    /// `DefineSqlGraphElements`. Backfilling it would silently replace that definition, because
+    /// `graph_to_config` prefers `relation` over `query_sql`, so it is rejected instead.
+    AlreadyDefined(usize),
+    NotFound,
+}
+
+/// Resolve the addressed flow. Matching is by identifier or name, but the result is *also* gated
+/// on the flow still being pending: backfill is accepted **once**, and only against a flow the
+/// signal stream actually signalled. Without that gate a stale or duplicated result silently
+/// overwrites a resolved relation, and — worse — one naming an SDP-SQL flow replaces the query
+/// its `.sql` file defined, with no diagnostic and no source location.
+fn find_backfill_target(
+    graph: &DataflowGraph,
+    cmd: &sc::pipeline_command::DefineFlowQueryFunctionResult,
+) -> BackfillTarget {
+    let index = if let Some(id) = cmd.flow_identifier.as_ref() {
+        graph
+            .flows
+            .iter()
+            .position(|flow| identifiers_match(&flow.resolved, id))
+    } else {
+        #[allow(deprecated)]
+        let name = cmd.flow_name.as_deref().filter(|s| !s.is_empty());
+        // Pre-4.2 clients echo back whatever we put in the deprecated `flow_names` signal field,
+        // which is fully qualified — accept both that and the short `DefineFlow.flow_name`.
+        name.and_then(|name| {
+            graph.flows.iter().position(|flow| {
+                flow.flow_name == name || resolved_identifier_key(&flow.resolved) == name
+            })
+        })
+    };
+    match index {
+        None => BackfillTarget::NotFound,
+        Some(idx) if flow_needs_query_function_evaluation(&graph.flows[idx]) => {
+            BackfillTarget::Pending(idx)
+        }
+        Some(idx) => BackfillTarget::AlreadyDefined(idx),
+    }
+}
+
+/// Human-readable name of the flow a `DefineFlowQueryFunctionResult` addressed, for errors.
+fn requested_flow_label(cmd: &sc::pipeline_command::DefineFlowQueryFunctionResult) -> String {
+    if let Some(id) = cmd.flow_identifier.as_ref() {
+        return resolved_identifier_key(id);
+    }
+    #[allow(deprecated)]
+    cmd.flow_name.clone().unwrap_or_default()
 }
 
 fn is_temporary_view_output(output: &OutputDef) -> bool {
@@ -445,6 +530,13 @@ impl OxidantService {
                 self.execute_output_flows(engine, session_id, operation_id, c)
                     .await
             }
+            Some(sc::pipeline_command::CommandType::GetQueryFunctionExecutionSignalStream(c)) => {
+                self.get_query_function_execution_signal_stream(session_id, operation_id, c)
+                    .map(PipelineCommandOutput::Complete)
+            }
+            Some(sc::pipeline_command::CommandType::DefineFlowQueryFunctionResult(c)) => self
+                .define_flow_query_function_result(session_id, operation_id, c)
+                .map(PipelineCommandOutput::Complete),
             _ => Err(Status::unimplemented("unsupported PipelineCommand")),
         }
     }
@@ -601,6 +693,102 @@ impl OxidantService {
             ),
             self.result_complete(session_id, operation_id),
         ])
+    }
+
+    fn get_query_function_execution_signal_stream(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        cmd: &sc::pipeline_command::GetQueryFunctionExecutionSignalStream,
+    ) -> Result<Vec<sc::ExecutePlanResponse>, Status> {
+        let graph_id = cmd
+            .dataflow_graph_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Status::invalid_argument(
+                    "GetQueryFunctionExecutionSignalStream.dataflow_graph_id is required",
+                )
+            })?;
+        let request_client_id = cmd.client_id.as_deref().filter(|s| !s.is_empty());
+
+        let pending = self
+            .dataflow_graphs
+            .with_graph(graph_id, session_id, |graph| {
+                Ok(pending_query_function_flows(graph, request_client_id))
+            })?;
+
+        // `execute_plan` buffers the full response list before streaming, so we emit all
+        // currently-pending signals in one shot and complete — late DefineFlow arrivals need
+        // another GetQueryFunctionExecutionSignalStream call.
+        let mut responses = Vec::new();
+        if !pending.is_empty() {
+            responses.push(self.pipeline_query_function_signal(session_id, operation_id, pending));
+        }
+        responses.push(self.result_complete(session_id, operation_id));
+        Ok(responses)
+    }
+
+    fn define_flow_query_function_result(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        cmd: &sc::pipeline_command::DefineFlowQueryFunctionResult,
+    ) -> Result<Vec<sc::ExecutePlanResponse>, Status> {
+        let graph_id = cmd
+            .dataflow_graph_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Status::invalid_argument(
+                    "DefineFlowQueryFunctionResult.dataflow_graph_id is required",
+                )
+            })?;
+        let label = requested_flow_label(cmd);
+        if label.is_empty() {
+            return Err(Status::invalid_argument(
+                "DefineFlowQueryFunctionResult.flow_identifier is required (the deprecated \
+                 `flow_name` is accepted too)",
+            ));
+        }
+        let relation = cmd.relation.as_ref().ok_or_else(|| {
+            Status::invalid_argument("DefineFlowQueryFunctionResult.relation is required")
+        })?;
+        if relation.rel_type.is_none() {
+            return Err(Status::invalid_argument(
+                "DefineFlowQueryFunctionResult.relation is empty",
+            ));
+        }
+
+        self.dataflow_graphs.with_graph(
+            graph_id,
+            session_id,
+            |graph| match find_backfill_target(graph, cmd) {
+                BackfillTarget::Pending(idx) => {
+                    graph.flows[idx].relation = Some(relation.clone());
+                    Ok(())
+                }
+                BackfillTarget::AlreadyDefined(idx) => {
+                    let defined_by = if graph.flows[idx].query_sql.is_some() {
+                        "SDP SQL text"
+                    } else {
+                        "an earlier DefineFlowQueryFunctionResult"
+                    };
+                    Err(Status::failed_precondition(format!(
+                        "DefineFlowQueryFunctionResult: flow `{label}` in dataflow graph \
+                             `{graph_id}` is not awaiting a query-function result — it is \
+                             already defined by {defined_by}. Backfill is accepted once, and \
+                             only for a flow the signal stream reported as pending."
+                    )))
+                }
+                BackfillTarget::NotFound => Err(Status::invalid_argument(format!(
+                    "DefineFlowQueryFunctionResult: unknown flow `{label}` in dataflow \
+                         graph `{graph_id}`"
+                ))),
+            },
+        )?;
+
+        Ok(vec![self.result_complete(session_id, operation_id)])
     }
 
     fn define_sql_graph_elements(
@@ -1087,6 +1275,30 @@ impl OxidantService {
             Some(event.at),
         )
     }
+
+    fn pipeline_query_function_signal(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        flow_identifiers: Vec<sc::ResolvedIdentifier>,
+    ) -> sc::ExecutePlanResponse {
+        // `flow_names` is deprecated since Spark 4.2 but is still the only field a 4.0/4.1
+        // client reads, so populate both with the same fully-qualified names.
+        let flow_names = flow_identifiers
+            .iter()
+            .map(resolved_identifier_key)
+            .collect();
+        #[allow(deprecated)]
+        let signal = sc::PipelineQueryFunctionExecutionSignal {
+            flow_names,
+            flow_identifiers,
+        };
+        self.response(
+            session_id,
+            operation_id,
+            sc::execute_plan_response::ResponseType::PipelineQueryFunctionExecutionSignal(signal),
+        )
+    }
 }
 
 async fn graph_to_config(
@@ -1247,19 +1459,11 @@ async fn graph_to_config(
                         table.source = Some(source);
                     }
                 }
-                if let Some(sc::relation::RelType::Sql(s)) = relation.rel_type.as_ref() {
-                    if sql_needs_run_scope(&s.query, graph) {
-                        s.query.clone()
-                    } else {
-                        relation_to_sql(engine, relation).await.map_err(|status| {
-                            table_planning_failure(&target_name, status, &flow.source_code_location)
-                        })?
-                    }
-                } else {
-                    relation_to_sql(engine, relation).await.map_err(|status| {
+                sql_from_relation(engine, relation, graph)
+                    .await
+                    .map_err(|status| {
                         table_planning_failure(&target_name, status, &flow.source_code_location)
                     })?
-                }
             } else if let Some(sql) = flow.query_sql.as_deref() {
                 if table.source.is_none() {
                     if let Some(output) = graph
@@ -1448,14 +1652,16 @@ fn flow_def_from_proto(
         .ok_or_else(|| Status::invalid_argument("DefineFlow.target_dataset_name is required"))?;
     let (relation, once) = match &cmd.details {
         Some(sc::pipeline_command::define_flow::Details::RelationFlowDetails(d)) => {
-            let rel = d.relation.as_ref();
-            if rel.map(|r| r.rel_type.is_none()).unwrap_or(true) {
-                return Err(Status::failed_precondition(
-                    "DefineFlow relation is empty: Python query-function signal stream is not \
-                     supported yet (SDP Phase 4a)",
-                ));
-            }
-            (rel.cloned(), cmd.once.unwrap_or(false))
+            // An empty relation is not an error: a Python query function has not been evaluated
+            // yet, and the flow stays pending until `DefineFlowQueryFunctionResult` backfills it.
+            let rel = d.relation.as_ref().and_then(|r| {
+                if r.rel_type.is_some() {
+                    Some(r.clone())
+                } else {
+                    None
+                }
+            });
+            (rel, cmd.once.unwrap_or(false))
         }
         Some(sc::pipeline_command::define_flow::Details::AutoCdcFlowDetails(_)) => {
             return Err(Status::unimplemented(
@@ -1483,6 +1689,7 @@ fn flow_def_from_proto(
         resolved,
         target,
         sql_conf: cmd.sql_conf.clone(),
+        client_id: cmd.client_id.clone(),
         relation,
         query_sql: None,
         once,
@@ -1771,6 +1978,7 @@ fn parsed_flow_to_def(parsed: &oxidant_pipelines::ParsedFlow, graph: &DataflowGr
         resolved,
         target,
         sql_conf: HashMap::new(),
+        client_id: None,
         relation: None,
         query_sql: Some(parsed.query_sql.clone()),
         once: parsed.once,
@@ -2134,6 +2342,118 @@ fn format_run_event(event: &RunEvent, locations: &HashMap<String, String>) -> St
     }
 }
 
+/// Flow relations are planned through DataFusion and unparsed, so a bad flow fails at `StartRun`
+/// with its source location attached. A plain `SQL` relation that reads another table this graph
+/// builds cannot be planned yet — that table only exists once the run creates it — so its text is
+/// forwarded verbatim, exactly like an SDP-SQL flow's `query_sql`. This is what lets a Python
+/// query function backfilled by `DefineFlowQueryFunctionResult` read an upstream pipeline table.
+async fn sql_from_relation(
+    engine: &Engine,
+    relation: &sc::Relation,
+    graph: &DataflowGraph,
+) -> Result<String, Status> {
+    if let Some(sc::relation::RelType::Sql(sql)) = relation.rel_type.as_ref() {
+        if !sql.query.is_empty() {
+            if let Some(external) = deferred_sql_references(&sql.query, graph) {
+                reject_unknown_references(engine, &external).await?;
+                return Ok(sql.query.clone());
+            }
+            // Nothing this graph builds, but it may still name the `stream` alias, which only
+            // exists while the run reads a source — that too is forwarded verbatim.
+            if sql_needs_run_scope(&sql.query, graph) {
+                return Ok(sql.query.clone());
+            }
+        }
+    }
+    relation_to_sql(engine, relation).await
+}
+
+/// Whether `output` is the table `full` (fully qualified) / `short` (leaf name) refers to.
+///
+/// Leaf-name matching is deliberately loose — `other_catalog.other_db.bronze` matches a graph
+/// output named `bronze` — because that is exactly how `oxidant_pipelines::Graph::build` derives
+/// its dependency edges, and the two must agree about what a flow depends on.
+fn reference_matches_output(full: &str, short: &str, output: &OutputDef) -> bool {
+    output.resolved.table_name == short || resolved_identifier_key(&output.resolved) == full
+}
+
+/// Classify the tables `sql` reads.
+///
+/// `None` means nothing it reads is built by this graph, so it can be planned normally.
+/// `Some(external)` means it must be deferred, and carries the references this graph does *not*
+/// build.
+///
+/// Note the asymmetry this creates: deferring is all-or-nothing per query. A single graph-built
+/// reference sends the whole statement to the runner unplanned, so the rest of its references
+/// never reach the analyzer — that is why the caller catalog-checks `external` separately.
+/// Graph-built references genuinely cannot be checked here: those tables only exist once the run
+/// creates them.
+///
+/// Temporary views are not "built" for this purpose: they are registered on the session before
+/// planning, so they resolve normally — and, for the same reason, are not reported as external.
+fn deferred_sql_references(sql: &str, graph: &DataflowGraph) -> Option<Vec<String>> {
+    use datafusion::sql::parser::DFParser;
+    use datafusion::sql::resolve::resolve_table_references;
+
+    // Unparseable text falls through to the planner, which reports the real error.
+    let statements = DFParser::parse_sql(sql).ok()?;
+    let mut reads_graph_output = false;
+    let mut external = Vec::new();
+    for statement in &statements {
+        let (references, ctes) = resolve_table_references(statement, true).ok()?;
+        for reference in &references {
+            let full = reference.to_string();
+            let short = full.rsplit('.').next().unwrap_or(full.as_str());
+            if graph
+                .outputs
+                .iter()
+                .filter(|output| !is_temporary_view_output(output))
+                .any(|output| reference_matches_output(&full, short, output))
+            {
+                reads_graph_output = true;
+            } else if !graph
+                .outputs
+                .iter()
+                .any(|output| reference_matches_output(&full, short, output))
+                // A name can be both a CTE and a table reference in one statement
+                // (`WITH t AS (SELECT * FROM t) …`); never report those as external.
+                && !ctes.iter().any(|cte| cte.to_string() == full)
+                // The `stream` alias is registered by the run, not by the catalog; it is
+                // run-scoped like a graph output, never a missing table (see
+                // [`sql_needs_run_scope`]).
+                && !full
+                    .trim()
+                    .eq_ignore_ascii_case(oxidant_pipelines::STREAM_ALIAS)
+            {
+                external.push(full);
+            }
+        }
+    }
+    reads_graph_output.then_some(external)
+}
+
+/// Reject a deferred query's references to tables that neither this graph builds nor the catalog
+/// already holds. Without this, a typo sitting next to a legitimate pipeline table
+/// (`FROM orders_bronze JOIN typo_tabel`) rides through unplanned and fails from deep inside the
+/// runner, losing the `SourceCodeLocation` that `table_planning_failure` attaches here.
+async fn reject_unknown_references(engine: &Engine, references: &[String]) -> Result<(), Status> {
+    for reference in references {
+        if engine
+            .ctx()
+            .table_provider(reference.as_str())
+            .await
+            .is_err()
+        {
+            return Err(Status::invalid_argument(format!(
+                "table `{reference}` not found: this flow's SQL reads a table the pipeline \
+                 builds, so it is forwarded to the run unplanned — every other table it names \
+                 must already exist"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn relation_to_sql(engine: &Engine, relation: &sc::Relation) -> Result<String, Status> {
     let plan = translate::to_plan(engine.ctx(), relation)
         .await
@@ -2322,6 +2642,7 @@ mod tests {
             resolved: resolve_identifier(name, Some("cat"), Some("db")),
             target: resolve_identifier(target, Some("cat"), Some("db")),
             sql_conf: HashMap::new(),
+            client_id: None,
             relation: Some(sc::Relation {
                 rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
                     query: query.into(),
@@ -2577,6 +2898,7 @@ mod tests {
                 resolved: resolve_identifier("f", Some("cat"), Some("db")),
                 target: resolve_identifier("metrics", Some("cat"), Some("db")),
                 sql_conf: HashMap::new(),
+                client_id: None,
                 relation: None,
                 query_sql: Some("SELECT 1".into()),
                 once: false,
@@ -2814,5 +3136,140 @@ mod tests {
         let dt = sc::DataType { kind: None };
         let err = proto_schema_to_ddl(&dt).expect_err("invalid proto");
         assert!(err.to_string().contains("schema_data_type"), "{err}");
+    }
+
+    fn graph_with_outputs(outputs: &[(&str, i32)]) -> DataflowGraph {
+        DataflowGraph {
+            default_catalog: Some("local".into()),
+            default_database: Some("live".into()),
+            sql_conf: HashMap::new(),
+            outputs: outputs
+                .iter()
+                .map(|(name, output_type)| OutputDef {
+                    output_name: (*name).to_string(),
+                    resolved: resolve_identifier(name, Some("local"), Some("live")),
+                    output_type: *output_type,
+                    comment: None,
+                    table_details: None,
+                    sink_details: None,
+                    source_code_location: None,
+                })
+                .collect(),
+            flows: Vec::new(),
+            refreshes: Vec::new(),
+            created_at: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn deferred_sql_references_defers_only_pipeline_built_tables() {
+        let graph = graph_with_outputs(&[
+            ("orders_bronze", sc::OutputType::Table as i32),
+            ("scratch", sc::OutputType::TemporaryView as i32),
+        ]);
+
+        // Reads a table this run builds: cannot be planned before the run.
+        assert_eq!(
+            deferred_sql_references("SELECT customer FROM orders_bronze", &graph),
+            Some(vec![])
+        );
+        assert_eq!(
+            deferred_sql_references("SELECT customer FROM local.live.orders_bronze", &graph),
+            Some(vec![])
+        );
+        // Reads only catalog tables, so it must still be validated at StartRun.
+        assert_eq!(
+            deferred_sql_references("SELECT * FROM definitely_missing_table_xyz", &graph),
+            None
+        );
+        // Temporary views are registered before planning and resolve normally.
+        assert_eq!(
+            deferred_sql_references("SELECT * FROM scratch", &graph),
+            None
+        );
+        // Unparseable text falls through to the planner, which reports the real error.
+        assert_eq!(deferred_sql_references("NOT SQL AT ALL (", &graph), None);
+    }
+
+    #[test]
+    fn deferred_sql_references_reports_non_graph_tables() {
+        let graph = graph_with_outputs(&[
+            ("orders_bronze", sc::OutputType::Table as i32),
+            ("scratch", sc::OutputType::TemporaryView as i32),
+        ]);
+
+        // The whole statement is deferred because of `orders_bronze`, so `typo_tabel` never
+        // reaches the analyzer — it is handed back for a catalog check instead.
+        assert_eq!(
+            deferred_sql_references(
+                "SELECT * FROM orders_bronze JOIN typo_tabel ON orders_bronze.id = typo_tabel.id",
+                &graph
+            ),
+            Some(vec!["typo_tabel".to_string()])
+        );
+        // Graph temporary views resolve normally, so they are not reported as external.
+        assert_eq!(
+            deferred_sql_references(
+                "SELECT * FROM orders_bronze JOIN scratch USING (id)",
+                &graph
+            ),
+            Some(vec![])
+        );
+        // CTEs are not tables, even when a CTE shadows a name used as a table reference.
+        assert_eq!(
+            deferred_sql_references(
+                "WITH t AS (SELECT * FROM orders_bronze) SELECT * FROM t",
+                &graph
+            ),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn pending_query_function_flows_respects_client_id() {
+        let graph = DataflowGraph {
+            default_catalog: Some("local".into()),
+            default_database: Some("live".into()),
+            sql_conf: HashMap::new(),
+            outputs: Vec::new(),
+            flows: vec![
+                FlowDef {
+                    flow_name: "pending_a".into(),
+                    resolved: resolve_identifier("pending_a", Some("local"), Some("live")),
+                    target: resolve_identifier("out_a", Some("local"), Some("live")),
+                    sql_conf: HashMap::new(),
+                    client_id: Some("client-a".into()),
+                    relation: None,
+                    query_sql: None,
+                    once: false,
+                    by_name: false,
+                    source_code_location: None,
+                },
+                FlowDef {
+                    flow_name: "resolved".into(),
+                    resolved: resolve_identifier("resolved", Some("local"), Some("live")),
+                    target: resolve_identifier("out_b", Some("local"), Some("live")),
+                    sql_conf: HashMap::new(),
+                    client_id: Some("client-a".into()),
+                    relation: Some(sc::Relation {
+                        rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                            query: "SELECT 1".into(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }),
+                    query_sql: None,
+                    once: false,
+                    by_name: false,
+                    source_code_location: None,
+                },
+            ],
+            refreshes: Vec::new(),
+            created_at: SystemTime::now(),
+        };
+        let pending = pending_query_function_flows(&graph, Some("client-a"));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].table_name, "pending_a");
+        assert!(pending_query_function_flows(&graph, Some("client-b")).is_empty());
     }
 }

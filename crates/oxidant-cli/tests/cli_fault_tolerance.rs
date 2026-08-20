@@ -16,6 +16,9 @@ use oxidant_loom::arrow::record_batch::RecordBatch;
 use oxidant_loom::Engine;
 use tempfile::TempDir;
 
+mod common;
+use common::oxidant_bin;
+
 fn pick_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
@@ -47,34 +50,6 @@ fn write_parquet(path: &Path, batch: &RecordBatch) {
     let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
     writer.write(batch).unwrap();
     writer.close().unwrap();
-}
-
-fn oxidant_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_oxidant") {
-        return PathBuf::from(p);
-    }
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
-        candidates.push(PathBuf::from(td).join(&profile).join("oxidant"));
-    }
-    let workspace_target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
-    candidates.push(workspace_target.join(&profile).join("oxidant"));
-    candidates.push(
-        workspace_target
-            .join("llvm-cov-target")
-            .join(&profile)
-            .join("oxidant"),
-    );
-    for c in &candidates {
-        if c.exists() {
-            return c.clone();
-        }
-    }
-    candidates
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| workspace_target.join(&profile).join("oxidant"))
 }
 
 struct WorkerHandle {

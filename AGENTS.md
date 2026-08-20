@@ -144,7 +144,17 @@ build orphan binaries, so `CARGO_BIN_EXE_oxidant` is unset unless you built it e
   `CARGO_BIN_EXE_oxidant` when the test is built via `cargo test -p oxidant-cli`.
 - **`oxidant_bin()` fallback:** when the env var is missing, probe (in order)
   `$CARGO_TARGET_DIR/$PROFILE/oxidant`, `target/$PROFILE/oxidant`, and
-  `target/llvm-cov-target/$PROFILE/oxidant` (see llvm-cov below).
+  `target/llvm-cov-target/$PROFILE/oxidant` (see llvm-cov below). A relative
+  `CARGO_TARGET_DIR` resolves against **the directory `cargo` was invoked from** — the workspace
+  root in CI and under `scripts/ci-local.sh`, which is why the resolver joins it against the
+  workspace root rather than the test's cwd (which for an integration test is the package dir).
+  Invoking `cargo` from a package dir with a relative `CARGO_TARGET_DIR` is therefore unsupported:
+  the probe would miss and fall through to a stale `target/$PROFILE/oxidant`.
+- **One implementation only:** the resolver lives in `crates/oxidant-cli/tests/common/mod.rs`;
+  every test does `mod common; use common::oxidant_bin;`. It used to be hand-copied into each
+  test file, and two copies (`cli_pipeline.rs`, `cli_sql_embedded.rs`) never got the llvm-cov
+  probe — issue #110, where `line-coverage` failed while every blocking job was green.
+  `tests/cli_bin_resolution.rs` pins the chain and fails if any test file grows a local copy.
 
 #### `cargo llvm-cov` uses a separate target directory
 
@@ -155,10 +165,24 @@ re-runs the full test suite under `target/llvm-cov-target/` (not `target/debug/`
   even when `clippy + test + tpch` passes.
 - **Fix (CI):** `cargo build -p oxidant-cli --target-dir target/llvm-cov-target` before
   `cargo llvm-cov`. Upload artifact from `target/llvm-cov/html` (not `coverage/`).
+- **Runner-disk gotcha (`ld` SIGBUS):** the job must set `CARGO_PROFILE_TEST_DEBUG=1` and
+  `CARGO_PROFILE_DEV_DEBUG=1` — limited debug info (`debug = 1`), same as `build-test`.
+  Without them, full debuginfo + `-C instrument-coverage` makes each `oxidant-execution`
+  integration binary ~1–2 GB at link time, and ~56 of them fill the free disk on a
+  public-repo `ubuntu-latest` runner (**4 vCPU / 16 GB RAM / ~14 GB free SSD**). `ld` mmaps
+  its output file, so the ENOSPC surfaces as `collect2: ld terminated with signal 7 [Bus
+  error]` (~54–60 min wall clock) rather than as `No space left on device` — and it is not a
+  missing oxidant-cli build. The fix is the **`Reclaim runner disk` step** (copied from
+  `build-test`/`oxidant-image.yml`; buys ~25 GB), plus `df -h /` probes around the coverage
+  step for diagnosability. Do **not** reach for `--jobs 2`: capping link parallelism only
+  slows the build and leaves the disk ceiling where it was. Reinstate it only if a failure
+  actually shows memory pressure. Job timeout is 180 min for cold-cache compiles; the
+  ~45–60 min figure quoted in the workflow is a **projection** — the job has not yet
+  completed a run.
 - **Flag gotcha:** do **not** pass `--output-path coverage/` together with `--html` —
   `cargo-llvm-cov` rejects incompatible flags. Use `--html` alone.
 - **Job is non-blocking** (`continue-on-error: true`) but should still be kept green for
-  trending artifacts.
+  trending artifacts. Nightly uses the same recipe (`coverage-nightly.yml`).
 
 #### `tpch-distributed` auto-splitter SQL must re-parse on workers
 
@@ -187,5 +211,5 @@ Databricks dialect. Some Unparser output is **invalid on round-trip**:
 | query-gates (main / `full-gates`) | yes | official TPC kits + `tpch`/`tpcds`/`*-distributed` at **SF1** |
 | coverage gates | yes | clickbench, clickbench-grpc, correctness |
 | Spark SQL parity ratchet | yes | `oxidant-parity ratchet --baseline parity/baseline.json` |
-| line coverage | no (informational) | `cargo llvm-cov --workspace --html` |
+| line coverage | no (informational) | disk reclaim + `CARGO_PROFILE_*_DEBUG=1` + `cargo llvm-cov --workspace --html` |
 
