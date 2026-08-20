@@ -31,9 +31,9 @@ YAML file:
   `REFRESH` / `OR REFRESH` requests (subgraph + ancestors), and `once` flows (skip after first
   successful completion unless refreshed). Kafka spool sources (`oxidant.spool.dir` in
   `TBLPROPERTIES` or `readStream` options) exercise the same path as the YAML runner.
-- **Limits (deferred):** no AUTO CDC / `APPLY CHANGES` flows ([#91](https://github.com/oxidantdata/oxidant/issues/91)),
-  no Python query-function signal stream ([#92](https://github.com/oxidantdata/oxidant/issues/92)),
+- **Limits (deferred):** no Python query-function signal stream ([#91](https://github.com/oxidantdata/oxidant/issues/91)),
   no external sinks / `ExecuteOutputFlows` ([#93](https://github.com/oxidantdata/oxidant/issues/93)).
+  `APPLY CHANGES INTO` (Databricks legacy syntax) is rejected — use `CREATE FLOW … AS AUTO CDC …` instead.
   Interactive `spark.sql("CREATE STREAMING TABLE …")` still correctly rejects those statements;
   use `DefineSqlGraphElements` or the Python decorators instead.
 
@@ -67,7 +67,7 @@ so pipeline table data and catalog registration share the same root.
   session keys such as `spark.sql.session.*` apply there, but catalog keys are ignored with a
   `PipelineEvent` — register catalogs on the graph instead.
 
-## Two kinds of table
+## Kinds of table
 
 ```yaml
 pipeline:
@@ -132,6 +132,47 @@ cross-batch state — which the engine does not have (see
 O(whole table) per update, so a gold aggregate over a large bronze table will dominate the
 trigger interval. Size the trigger to the recompute, not to the ingestion rate. Incremental
 derived tables are [not implemented](TODOS.md).
+
+### AUTO CDC (SCD Type 1)
+
+`CREATE FLOW … AS AUTO CDC INTO … FROM …` (Connect `DefineFlow.auto_cdc_flow_details`, or the
+same clause in SDP SQL) merges each micro-batch from a streaming CDC source into a target table
+by key, ordered by `sequence_by` (latest wins). Optional
+`APPLY AS DELETE WHEN …` and `APPLY AS TRUNCATE WHEN …` clauses remove rows; `IGNORE NULL UPDATES`
+preserves existing target values when the batch carries nulls. Only **SCD Type 1** is supported
+today (`STORED AS SCD TYPE 1` / `SCD_TYPE_1`).
+
+There is **no Delta `MERGE` operator** in the engine yet. Each micro-batch is applied as a
+**read–modify–write** over the whole target table: read the current Delta snapshot, merge in
+memory/SQL, then commit a replacement version via the existing Delta sink (same atomic replace
+path derived tables use). That is **O(target table size) per batch** — honest for correctness,
+not for large targets at fast triggers. Native Delta merge is future work.
+
+The target is declared **empty** — `CREATE STREAMING TABLE cdc_target;`, no `AS` query and no
+`TBLPROPERTIES` — and is defined entirely by its CDC flow: it inherits the *source* table's stream
+and per-batch transformation, then merges instead of appending. A target that already ingests its
+own stream, or that already has a query or an append flow, is rejected: those are append-only
+sinks, and one table cannot be both. The `KEYS` and `SEQUENCE BY` columns must survive `COLUMNS` /
+`COLUMNS * EXCEPT` into the target — the next batch compares against the values stored there, so
+dropping them would let an older event overwrite newer state.
+
+The same merge is reachable from a YAML pipeline with `auto_cdc:` on a table that declares the
+streaming source itself:
+
+```yaml
+  - name: customers_scd1
+    source:                       # the CDC stream, same shape as any streaming table
+      format: kafka
+      options: {subscribe: customers, startingOffsets: earliest}
+    sql: SELECT id, name, seq, op FROM stream
+    auto_cdc:
+      source: customers_bronze    # declared table this stream feeds — the DAG edge
+      keys: [id]
+      sequence_by: seq
+      apply_as_deletes: "op = 'D'"
+      except_column_list: [op]    # or column_list: [...], not both
+      ignore_null_updates_columns: [name]   # or ignore_null_updates_except: [...], not both
+```
 
 ## Dependencies and ordering
 

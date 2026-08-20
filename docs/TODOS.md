@@ -89,6 +89,15 @@ Left, in rough order of value:
       [streaming.md](streaming.md) "no stateful aggregation across batches") — a separate
       project, not a follow-up commit.
 
+### AUTO CDC rewrites the whole target per batch
+
+- [ ] Give AUTO CDC a real Delta `MERGE`. There is no merge operator in the engine, so each
+      micro-batch is a read-modify-write of the entire target: read the current snapshot, merge
+      in SQL, commit a replacement version through the Delta sink. Correct and atomic, but
+      O(target rows) per batch — not viable for a large target at a fast trigger.
+- [ ] SCD Type 2 / `TRACK HISTORY`. Rejected outright today; only SCD Type 1 is implemented.
+      Type 2 needs per-key validity ranges, which is a different merge, not a flag on this one.
+
 ### Derived-table writes are materialized in memory
 
 - [ ] Stream a derived table's recompute to its sink instead of collecting the whole result
@@ -170,11 +179,11 @@ path.
       with its own regression surface.
 - [ ] A SQL REPL. `oxidant sql` is one-shot; there is no readline/interactive loop anywhere.
 - [ ] Wire remaining `pipelines.proto` surface (SDP Phase 4): query-function execution signal
-      stream ([#92](https://github.com/oxidantdata/oxidant/issues/92)), AUTO CDC flows
-      ([#91](https://github.com/oxidantdata/oxidant/issues/91)), sinks /
+      stream ([#91](https://github.com/oxidantdata/oxidant/issues/91)), sinks /
       `ExecuteOutputFlows` ([#93](https://github.com/oxidantdata/oxidant/issues/93)). Core
       `PipelineCommand` dispatch, SQL graph parsing, and `StartRun` execution landed in SDP
-      Phases 1–2.
+      Phases 1–2; AUTO CDC / SCD Type 1 flows
+      ([#92](https://github.com/oxidantdata/oxidant/issues/92)) landed in Phase 4b.
 - [ ] Kafka as a *sink*. The Kafka integration is source-only.
 
 ### Gates to keep honest
