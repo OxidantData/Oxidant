@@ -15,6 +15,19 @@ use tonic::{Code, Request, Status};
 
 const SESSION: &str = "sdp-phase4a";
 const CLIENT_ID: &str = "pyspark-client-001";
+/// Source location declared on the empty `DefineFlow` in [`setup_spool_graph`], so tests can
+/// assert that flow failures at `StartRun` carry it.
+const FLOW_FILE: &str = "pipeline.py";
+const FLOW_LINE: i32 = 42;
+
+/// The flow `DefineSqlGraphElements` synthesizes for `CREATE STREAMING TABLE orders_bronze`.
+/// It carries `query_sql`, never a relation, so it must never be a backfill target.
+const SQL_FLOW_NAME: &str = "flow_to_orders_bronze";
+
+/// The query function the client evaluates for `revenue_gold`; reads a table the run builds, so
+/// it is forwarded to the runner unplanned.
+const GOLD_QUERY: &str = "SELECT customer, sum(amount) AS revenue, count(*) AS orders \
+                          FROM orders_bronze WHERE amount > 0 GROUP BY customer";
 
 fn pick_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -307,7 +320,11 @@ async fn setup_spool_graph(
                     target_dataset_name: Some("revenue_gold".into()),
                     sql_conf: Default::default(),
                     client_id: Some(CLIENT_ID.into()),
-                    source_code_location: None,
+                    source_code_location: Some(sc::SourceCodeLocation {
+                        file_name: Some(FLOW_FILE.into()),
+                        line_number: Some(FLOW_LINE),
+                        ..Default::default()
+                    }),
                     details: Some(
                         sc::pipeline_command::define_flow::Details::RelationFlowDetails(
                             sc::pipeline_command::define_flow::WriteRelationFlowDetails {
@@ -835,4 +852,194 @@ async fn backfill_requires_flow_and_relation() {
     .expect_err("backfill with an empty relation");
     assert_eq!(err.code(), Code::InvalidArgument);
     assert!(err.message().contains("relation is empty"), "{err}");
+}
+
+/// Build a `DefineFlowQueryFunctionResult` addressing a flow by resolved identifier.
+fn backfill_by_id(
+    graph_id: &str,
+    flow_id: &sc::ResolvedIdentifier,
+    query: &str,
+) -> sc::PipelineCommand {
+    sc::PipelineCommand {
+        command_type: Some(
+            sc::pipeline_command::CommandType::DefineFlowQueryFunctionResult(
+                sc::pipeline_command::DefineFlowQueryFunctionResult {
+                    dataflow_graph_id: Some(graph_id.to_string()),
+                    flow_identifier: Some(flow_id.clone()),
+                    relation: Some(sc::Relation {
+                        rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                            query: query.to_string(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ),
+    }
+}
+
+fn start_run(graph_id: &str, checkpoints: &Path) -> sc::PipelineCommand {
+    sc::PipelineCommand {
+        command_type: Some(sc::pipeline_command::CommandType::StartRun(
+            sc::pipeline_command::StartRun {
+                dataflow_graph_id: Some(graph_id.to_string()),
+                dry: Some(false),
+                storage: Some(checkpoints.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+/// Backfill is accepted **once**. A second `DefineFlowQueryFunctionResult` for the same flow is
+/// rejected rather than silently overwriting the relation the first one stored.
+#[tokio::test]
+async fn double_backfill_is_rejected_and_keeps_the_first_relation() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let checkpoints = warehouse.path().join("_checkpoints");
+    std::fs::create_dir_all(&checkpoints).expect("checkpoints dir");
+
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+    let (graph_id, flow_id) = setup_spool_graph(&mut client).await;
+
+    execute_pipeline(&mut client, backfill_by_id(&graph_id, &flow_id, GOLD_QUERY))
+        .await
+        .expect("first backfill");
+
+    // A second result — here one that would produce visibly different contents.
+    let err = execute_pipeline(
+        &mut client,
+        backfill_by_id(
+            &graph_id,
+            &flow_id,
+            "SELECT customer, CAST(1 AS BIGINT) AS revenue, CAST(1 AS BIGINT) AS orders \
+             FROM orders_bronze GROUP BY customer",
+        ),
+    )
+    .await
+    .expect_err("second backfill must be rejected");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(
+        err.message().contains("already defined by an earlier"),
+        "{err}"
+    );
+
+    execute_pipeline(&mut client, start_run(&graph_id, &checkpoints))
+        .await
+        .expect("start run");
+    let total = sql_scalar_i64(
+        &mut client,
+        "SELECT sum(revenue) FROM local.live.revenue_gold",
+    )
+    .await;
+    assert_eq!(
+        total, 725,
+        "the first backfilled relation must be the one that ran"
+    );
+}
+
+/// A stray result naming an SDP-SQL flow must not replace the query its `.sql` file defined —
+/// `graph_to_config` prefers `relation` over `query_sql`, so accepting it would silently swap the
+/// table's contents.
+#[tokio::test]
+async fn backfill_targeting_a_sql_defined_flow_is_rejected() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let checkpoints = warehouse.path().join("_checkpoints");
+    std::fs::create_dir_all(&checkpoints).expect("checkpoints dir");
+
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+    let (graph_id, flow_id) = setup_spool_graph(&mut client).await;
+
+    let sql_flow_id = sc::ResolvedIdentifier {
+        catalog_name: "local".into(),
+        namespace: vec!["live".into()],
+        table_name: SQL_FLOW_NAME.into(),
+    };
+    let err = execute_pipeline(
+        &mut client,
+        backfill_by_id(
+            &graph_id,
+            &sql_flow_id,
+            "SELECT CAST(0 AS BIGINT) AS order_id, 'nobody' AS customer, \
+             CAST(0 AS BIGINT) AS amount",
+        ),
+    )
+    .await
+    .expect_err("backfill of an SDP-SQL flow must be rejected");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(
+        err.message().contains("already defined by SDP SQL"),
+        "{err}"
+    );
+    assert!(err.message().contains(SQL_FLOW_NAME), "{err}");
+
+    // The SQL definition is intact: the run still reads the spool fixture.
+    execute_pipeline(&mut client, backfill_by_id(&graph_id, &flow_id, GOLD_QUERY))
+        .await
+        .expect("backfill the pending flow");
+    execute_pipeline(&mut client, start_run(&graph_id, &checkpoints))
+        .await
+        .expect("start run");
+    let total = sql_scalar_i64(
+        &mut client,
+        "SELECT sum(revenue) FROM local.live.revenue_gold",
+    )
+    .await;
+    assert_eq!(
+        total, 725,
+        "the SQL-defined bronze flow must still feed the run"
+    );
+}
+
+/// Deferring is all-or-nothing per query: one reference to a table the run builds forwards the
+/// whole statement unplanned. The references the graph does *not* build are still catalog-checked
+/// at `StartRun`, so a typo fails through `table_planning_failure` with the flow's source
+/// location instead of from deep inside the runner.
+#[tokio::test]
+async fn deferred_query_with_unknown_table_fails_at_start_run() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let checkpoints = warehouse.path().join("_checkpoints");
+    std::fs::create_dir_all(&checkpoints).expect("checkpoints dir");
+
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+    let (graph_id, flow_id) = setup_spool_graph(&mut client).await;
+
+    execute_pipeline(
+        &mut client,
+        backfill_by_id(
+            &graph_id,
+            &flow_id,
+            "SELECT b.customer, sum(b.amount) AS revenue, count(*) AS orders \
+             FROM orders_bronze b JOIN typo_tabel t ON b.customer = t.customer \
+             GROUP BY b.customer",
+        ),
+    )
+    .await
+    .expect("backfill with a typo'd non-graph table");
+
+    let (_, status) =
+        execute_pipeline_expect_error(&mut client, start_run(&graph_id, &checkpoints)).await;
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("typo_tabel"),
+        "StartRun must name the missing table: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("revenue_gold"),
+        "table_planning_failure must name the target table: {}",
+        status.message()
+    );
+    assert!(
+        status
+            .message()
+            .contains(&format!("(at {FLOW_FILE}:{FLOW_LINE})")),
+        "table_planning_failure must carry the flow's source location: {}",
+        status.message()
+    );
 }

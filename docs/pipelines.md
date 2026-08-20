@@ -54,12 +54,39 @@ A flow is "pending" while it has neither a relation nor SDP SQL text. Signals ar
 registered without a `client_id` (which the stock client does not set today). Pending state lives
 in the session's dataflow graph, so `DropDataflowGraph` or closing the session clears it.
 
-Oxidant's `execute_plan` handler materializes the full response list before streaming, so each
-signal-stream RPC emits all currently-pending flows in one `PipelineQueryFunctionExecutionSignal`
-and then completes, rather than holding the stream open — register empty-relation flows before
-opening the stream, or call the stream again after late arrivals. Both the current
-`flow_identifiers` field and the pre-4.2 `flow_names` field are populated; backfill requests are
-accepted against either.
+**Backfill is accepted once, and only for a pending flow.** A `DefineFlowQueryFunctionResult`
+naming a flow that already has a relation (an earlier backfill) or SDP SQL text (a flow from
+`DefineSqlGraphElements`) is rejected with `failed_precondition`; an unknown flow is rejected with
+`invalid_argument`. Re-evaluation is deliberately not supported: `StartRun` prefers a flow's
+relation over its SQL, so accepting a second result would let a stale or misaddressed one replace
+a `.sql` file's query — different table contents, no diagnostic, no source location. Send another
+`DefineFlow` if a flow genuinely needs redefining.
+
+> **Load-bearing caveat — register empty-relation flows *before* opening the signal stream.**
+> Oxidant's `execute_plan` handler materializes the full response list before streaming, so each
+> signal-stream RPC emits whatever is pending *at call time* in one
+> `PipelineQueryFunctionExecutionSignal` and then completes; it does not hold the stream open.
+> Upstream Spark's model is the inverse — the client opens the stream and holds it while the
+> server pushes signals during graph resolution at `StartRun`. A client following *that* order
+> (open the stream, then define flows) gets an empty, already-closed stream, evaluates nothing,
+> and fails at `StartRun` with `failed_precondition`. Define the flows first, or call the stream
+> again after late arrivals. Holding the stream open is tracked in
+> [docs/TODOS.md](TODOS.md#sdp-phase-4a-follow-ups).
+
+Both the current `flow_identifiers` field and the pre-4.2 `flow_names` field are populated;
+backfill requests are accepted against either.
+
+A backfilled relation is normally planned through DataFusion and unparsed, so a bad flow fails at
+`StartRun` with its source location attached. The exception is a plain `SQL` relation that reads a
+table this graph builds: that table does not exist until the run creates it, so the text is
+forwarded to the runner verbatim, exactly like an SDP-SQL flow's `query_sql`. Deferring is
+all-or-nothing per statement — one graph-built reference forwards the whole query — so the tables
+it names that the graph does *not* build are checked against the catalog at `StartRun` instead,
+and a typo among them is rejected there with the flow's source location rather than surfacing from
+inside the runner. Two known rough edges on this path: leaf-name matching means
+`other_catalog.other_db.orders_bronze` counts as the graph's `orders_bronze` (the runner's DAG
+builder matches the same way, so the two agree), and the forwarded text is only checked for
+parseability, not for being a single `SELECT`.
 
 `PipelineAnalysisContext` rides along as a packed `google.protobuf.Any` in
 `ExecutePlanRequest.user_context.extensions` (see `pyspark.pipelines.add_pipeline_analysis_context`),

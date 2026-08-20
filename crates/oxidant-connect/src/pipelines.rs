@@ -215,24 +215,50 @@ fn pending_query_function_flows(
         .collect()
 }
 
-fn find_flow_index(
+/// The flow a `DefineFlowQueryFunctionResult` addresses, and whether it may be backfilled.
+enum BackfillTarget {
+    /// Awaiting its query-function result: neither a relation nor SDP SQL text, i.e. exactly what
+    /// the signal stream reported as pending.
+    Pending(usize),
+    /// The flow exists but is already defined — by an earlier backfill, or by SDP SQL from
+    /// `DefineSqlGraphElements`. Backfilling it would silently replace that definition, because
+    /// `graph_to_config` prefers `relation` over `query_sql`, so it is rejected instead.
+    AlreadyDefined(usize),
+    NotFound,
+}
+
+/// Resolve the addressed flow. Matching is by identifier or name, but the result is *also* gated
+/// on the flow still being pending: backfill is accepted **once**, and only against a flow the
+/// signal stream actually signalled. Without that gate a stale or duplicated result silently
+/// overwrites a resolved relation, and — worse — one naming an SDP-SQL flow replaces the query
+/// its `.sql` file defined, with no diagnostic and no source location.
+fn find_backfill_target(
     graph: &DataflowGraph,
     cmd: &sc::pipeline_command::DefineFlowQueryFunctionResult,
-) -> Option<usize> {
-    if let Some(id) = cmd.flow_identifier.as_ref() {
-        return graph
+) -> BackfillTarget {
+    let index = if let Some(id) = cmd.flow_identifier.as_ref() {
+        graph
             .flows
             .iter()
-            .position(|flow| identifiers_match(&flow.resolved, id));
+            .position(|flow| identifiers_match(&flow.resolved, id))
+    } else {
+        #[allow(deprecated)]
+        let name = cmd.flow_name.as_deref().filter(|s| !s.is_empty());
+        // Pre-4.2 clients echo back whatever we put in the deprecated `flow_names` signal field,
+        // which is fully qualified — accept both that and the short `DefineFlow.flow_name`.
+        name.and_then(|name| {
+            graph.flows.iter().position(|flow| {
+                flow.flow_name == name || resolved_identifier_key(&flow.resolved) == name
+            })
+        })
+    };
+    match index {
+        None => BackfillTarget::NotFound,
+        Some(idx) if flow_needs_query_function_evaluation(&graph.flows[idx]) => {
+            BackfillTarget::Pending(idx)
+        }
+        Some(idx) => BackfillTarget::AlreadyDefined(idx),
     }
-    #[allow(deprecated)]
-    let name = cmd.flow_name.as_deref().filter(|s| !s.is_empty())?;
-    // Pre-4.2 clients echo back whatever we put in the deprecated `flow_names` signal field,
-    // which is fully qualified — accept both that and the short `DefineFlow.flow_name`.
-    graph
-        .flows
-        .iter()
-        .position(|flow| flow.flow_name == name || resolved_identifier_key(&flow.resolved) == name)
 }
 
 /// Human-readable name of the flow a `DefineFlowQueryFunctionResult` addressed, for errors.
@@ -766,9 +792,11 @@ impl OxidantService {
                     "DefineFlowQueryFunctionResult.dataflow_graph_id is required",
                 )
             })?;
-        if requested_flow_label(cmd).is_empty() {
+        let label = requested_flow_label(cmd);
+        if label.is_empty() {
             return Err(Status::invalid_argument(
-                "DefineFlowQueryFunctionResult.flow_identifier is required",
+                "DefineFlowQueryFunctionResult.flow_identifier is required (the deprecated \
+                 `flow_name` is accepted too)",
             ));
         }
         let relation = cmd.relation.as_ref().ok_or_else(|| {
@@ -780,18 +808,33 @@ impl OxidantService {
             ));
         }
 
-        self.dataflow_graphs
-            .with_graph(graph_id, session_id, |graph| {
-                let flow_idx = find_flow_index(graph, cmd).ok_or_else(|| {
-                    Status::invalid_argument(format!(
-                        "DefineFlowQueryFunctionResult: unknown flow `{}` in dataflow graph \
-                         `{graph_id}`",
-                        requested_flow_label(cmd)
-                    ))
-                })?;
-                graph.flows[flow_idx].relation = Some(relation.clone());
-                Ok(())
-            })?;
+        self.dataflow_graphs.with_graph(
+            graph_id,
+            session_id,
+            |graph| match find_backfill_target(graph, cmd) {
+                BackfillTarget::Pending(idx) => {
+                    graph.flows[idx].relation = Some(relation.clone());
+                    Ok(())
+                }
+                BackfillTarget::AlreadyDefined(idx) => {
+                    let defined_by = if graph.flows[idx].query_sql.is_some() {
+                        "SDP SQL text"
+                    } else {
+                        "an earlier DefineFlowQueryFunctionResult"
+                    };
+                    Err(Status::failed_precondition(format!(
+                        "DefineFlowQueryFunctionResult: flow `{label}` in dataflow graph \
+                             `{graph_id}` is not awaiting a query-function result — it is \
+                             already defined by {defined_by}. Backfill is accepted once, and \
+                             only for a flow the signal stream reported as pending."
+                    )))
+                }
+                BackfillTarget::NotFound => Err(Status::invalid_argument(format!(
+                    "DefineFlowQueryFunctionResult: unknown flow `{label}` in dataflow \
+                         graph `{graph_id}`"
+                ))),
+            },
+        )?;
 
         Ok(vec![self.result_complete(session_id, operation_id)])
     }
@@ -1752,41 +1795,94 @@ async fn sql_from_relation(
     graph: &DataflowGraph,
 ) -> Result<String, Status> {
     if let Some(sc::relation::RelType::Sql(sql)) = relation.rel_type.as_ref() {
-        if !sql.query.is_empty() && sql_reads_graph_output(&sql.query, graph) {
-            return Ok(sql.query.clone());
+        if !sql.query.is_empty() {
+            if let Some(external) = deferred_sql_references(&sql.query, graph) {
+                reject_unknown_references(engine, &external).await?;
+                return Ok(sql.query.clone());
+            }
         }
     }
     relation_to_sql(engine, relation).await
 }
 
-/// Whether `sql` reads a table this graph builds. Temporary views are excluded: they are already
-/// registered on the session before planning, so they resolve normally.
-fn sql_reads_graph_output(sql: &str, graph: &DataflowGraph) -> bool {
+/// Whether `output` is the table `full` (fully qualified) / `short` (leaf name) refers to.
+///
+/// Leaf-name matching is deliberately loose — `other_catalog.other_db.bronze` matches a graph
+/// output named `bronze` — because that is exactly how `oxidant_pipelines::Graph::build` derives
+/// its dependency edges, and the two must agree about what a flow depends on.
+fn reference_matches_output(full: &str, short: &str, output: &OutputDef) -> bool {
+    output.resolved.table_name == short || resolved_identifier_key(&output.resolved) == full
+}
+
+/// Classify the tables `sql` reads.
+///
+/// `None` means nothing it reads is built by this graph, so it can be planned normally.
+/// `Some(external)` means it must be deferred, and carries the references this graph does *not*
+/// build.
+///
+/// Note the asymmetry this creates: deferring is all-or-nothing per query. A single graph-built
+/// reference sends the whole statement to the runner unplanned, so the rest of its references
+/// never reach the analyzer — that is why the caller catalog-checks `external` separately.
+/// Graph-built references genuinely cannot be checked here: those tables only exist once the run
+/// creates them.
+///
+/// Temporary views are not "built" for this purpose: they are registered on the session before
+/// planning, so they resolve normally — and, for the same reason, are not reported as external.
+fn deferred_sql_references(sql: &str, graph: &DataflowGraph) -> Option<Vec<String>> {
     use datafusion::sql::parser::DFParser;
     use datafusion::sql::resolve::resolve_table_references;
 
-    let Ok(statements) = DFParser::parse_sql(sql) else {
-        return false;
-    };
-    statements.iter().any(|statement| {
-        let Ok((references, _ctes)) = resolve_table_references(statement, true) else {
-            return false;
-        };
-        references.iter().any(|reference| {
+    // Unparseable text falls through to the planner, which reports the real error.
+    let statements = DFParser::parse_sql(sql).ok()?;
+    let mut reads_graph_output = false;
+    let mut external = Vec::new();
+    for statement in &statements {
+        let (references, ctes) = resolve_table_references(statement, true).ok()?;
+        for reference in &references {
             let full = reference.to_string();
-            // Both forms are checked so a fully-qualified `local.live.bronze` matches `bronze`,
-            // mirroring how `oxidant_pipelines::Graph::build` derives its edges.
             let short = full.rsplit('.').next().unwrap_or(full.as_str());
-            graph
+            if graph
                 .outputs
                 .iter()
                 .filter(|output| !is_temporary_view_output(output))
-                .any(|output| {
-                    output.resolved.table_name == short
-                        || resolved_identifier_key(&output.resolved) == full
-                })
-        })
-    })
+                .any(|output| reference_matches_output(&full, short, output))
+            {
+                reads_graph_output = true;
+            } else if !graph
+                .outputs
+                .iter()
+                .any(|output| reference_matches_output(&full, short, output))
+                // A name can be both a CTE and a table reference in one statement
+                // (`WITH t AS (SELECT * FROM t) …`); never report those as external.
+                && !ctes.iter().any(|cte| cte.to_string() == full)
+            {
+                external.push(full);
+            }
+        }
+    }
+    reads_graph_output.then_some(external)
+}
+
+/// Reject a deferred query's references to tables that neither this graph builds nor the catalog
+/// already holds. Without this, a typo sitting next to a legitimate pipeline table
+/// (`FROM orders_bronze JOIN typo_tabel`) rides through unplanned and fails from deep inside the
+/// runner, losing the `SourceCodeLocation` that `table_planning_failure` attaches here.
+async fn reject_unknown_references(engine: &Engine, references: &[String]) -> Result<(), Status> {
+    for reference in references {
+        if engine
+            .ctx()
+            .table_provider(reference.as_str())
+            .await
+            .is_err()
+        {
+            return Err(Status::invalid_argument(format!(
+                "table `{reference}` not found: this flow's SQL reads a table the pipeline \
+                 builds, so it is forwarded to the run unplanned — every other table it names \
+                 must already exist"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn relation_to_sql(engine: &Engine, relation: &sc::Relation) -> Result<String, Status> {
@@ -2240,30 +2336,67 @@ mod tests {
     }
 
     #[test]
-    fn sql_reads_graph_output_defers_only_pipeline_built_tables() {
+    fn deferred_sql_references_defers_only_pipeline_built_tables() {
         let graph = graph_with_outputs(&[
             ("orders_bronze", sc::OutputType::Table as i32),
             ("scratch", sc::OutputType::TemporaryView as i32),
         ]);
 
         // Reads a table this run builds: cannot be planned before the run.
-        assert!(sql_reads_graph_output(
-            "SELECT customer FROM orders_bronze",
-            &graph
-        ));
-        assert!(sql_reads_graph_output(
-            "SELECT customer FROM local.live.orders_bronze",
-            &graph
-        ));
+        assert_eq!(
+            deferred_sql_references("SELECT customer FROM orders_bronze", &graph),
+            Some(vec![])
+        );
+        assert_eq!(
+            deferred_sql_references("SELECT customer FROM local.live.orders_bronze", &graph),
+            Some(vec![])
+        );
         // Reads only catalog tables, so it must still be validated at StartRun.
-        assert!(!sql_reads_graph_output(
-            "SELECT * FROM definitely_missing_table_xyz",
-            &graph
-        ));
+        assert_eq!(
+            deferred_sql_references("SELECT * FROM definitely_missing_table_xyz", &graph),
+            None
+        );
         // Temporary views are registered before planning and resolve normally.
-        assert!(!sql_reads_graph_output("SELECT * FROM scratch", &graph));
+        assert_eq!(
+            deferred_sql_references("SELECT * FROM scratch", &graph),
+            None
+        );
         // Unparseable text falls through to the planner, which reports the real error.
-        assert!(!sql_reads_graph_output("NOT SQL AT ALL (", &graph));
+        assert_eq!(deferred_sql_references("NOT SQL AT ALL (", &graph), None);
+    }
+
+    #[test]
+    fn deferred_sql_references_reports_non_graph_tables() {
+        let graph = graph_with_outputs(&[
+            ("orders_bronze", sc::OutputType::Table as i32),
+            ("scratch", sc::OutputType::TemporaryView as i32),
+        ]);
+
+        // The whole statement is deferred because of `orders_bronze`, so `typo_tabel` never
+        // reaches the analyzer — it is handed back for a catalog check instead.
+        assert_eq!(
+            deferred_sql_references(
+                "SELECT * FROM orders_bronze JOIN typo_tabel ON orders_bronze.id = typo_tabel.id",
+                &graph
+            ),
+            Some(vec!["typo_tabel".to_string()])
+        );
+        // Graph temporary views resolve normally, so they are not reported as external.
+        assert_eq!(
+            deferred_sql_references(
+                "SELECT * FROM orders_bronze JOIN scratch USING (id)",
+                &graph
+            ),
+            Some(vec![])
+        );
+        // CTEs are not tables, even when a CTE shadows a name used as a table reference.
+        assert_eq!(
+            deferred_sql_references(
+                "WITH t AS (SELECT * FROM orders_bronze) SELECT * FROM t",
+                &graph
+            ),
+            Some(vec![])
+        );
     }
 
     #[test]
