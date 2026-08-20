@@ -27,9 +27,12 @@ pub fn bin_candidates(
 ) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(dir) = cargo_target_dir.filter(|d| !d.is_empty()) {
-        // Cargo resolves a relative `CARGO_TARGET_DIR` against the workspace root, but an
-        // integration test's cwd is the *package* dir — join explicitly. An absolute `dir`
-        // replaces the base, so this covers both spellings.
+        // Cargo resolves a relative `CARGO_TARGET_DIR` against the directory `cargo` was
+        // invoked from — the workspace root in CI and under `scripts/ci-local.sh`, which is
+        // why we join against the workspace root here rather than the test's cwd (which for
+        // an integration test is the *package* dir). Invoking `cargo` from a package dir with
+        // a relative value is unsupported: we would probe the wrong root and fall through to a
+        // stale `target/$PROFILE/oxidant`. An absolute `dir` replaces the base either way.
         candidates.push(workspace_root.join(dir).join(profile).join("oxidant"));
     }
     let target = workspace_root.join("target");
