@@ -176,6 +176,16 @@ path.
       SDP Phases 1–2 and 4c ([#93](https://github.com/oxidantdata/oxidant/issues/93)).
 - [ ] Kafka as a *sink*. The Kafka integration is source-only — `DefineOutput` with
       `output_type=SINK` and `format=kafka` is refused at definition time.
+- [ ] Run-scope names in the **DataFrame** encoding. `spark.sql("SELECT * FROM <graph output>")`
+      is passed through to the runner unnormalized (`sql_needs_run_scope`), but the equivalent
+      `spark.readStream.table("<graph output>")` — a `Read`/`NamedTable` relation, and the
+      idiomatic SDP spelling — still round-trips through `relation_to_sql` and hits the analyzer
+      before the table exists. Same for a `spark.sql(...)` nested under a relation wrapper. The
+      two encodings should agree; making them agree means resolving run-scope names in the
+      relation path, not another special case.
+- [ ] The flow-reads-a-sink walker (`relation_named_tables`) is a whitelist of relation shapes and
+      is therefore fail-open: a shape not listed hides its inputs, and a read of a sink through it
+      falls through to the missing-table error the check exists to replace.
 - [ ] `json` / `csv` SDP sinks. Both are writable *table* formats, but the streaming writer
       (`LakeSink`) implements only Delta and Parquet, so `output_type=SINK` refuses them at
       definition time rather than accepting the graph and dying on the first micro-batch. The

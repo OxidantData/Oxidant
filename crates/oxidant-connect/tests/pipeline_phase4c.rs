@@ -73,9 +73,17 @@ async fn execute_pipeline(
     client: &mut SparkConnectServiceClient<tonic::transport::Channel>,
     cmd: sc::PipelineCommand,
 ) -> Result<Vec<sc::ExecutePlanResponse>, Status> {
+    execute_pipeline_in_session(client, SESSION, cmd).await
+}
+
+async fn execute_pipeline_in_session(
+    client: &mut SparkConnectServiceClient<tonic::transport::Channel>,
+    session_id: &str,
+    cmd: sc::PipelineCommand,
+) -> Result<Vec<sc::ExecutePlanResponse>, Status> {
     let mut stream = client
         .execute_plan(Request::new(sc::ExecutePlanRequest {
-            session_id: SESSION.to_string(),
+            session_id: session_id.to_string(),
             plan: Some(pipeline_plan(cmd)),
             ..Default::default()
         }))
@@ -1341,12 +1349,15 @@ async fn a_parquet_sink_with_its_own_source_warns_but_runs() {
     );
 }
 
-/// Two identical one-shot runs must not double-write.
+/// Two identical one-shot runs must not double-write — including from *different sessions*.
 ///
-/// This is what pins the deterministic graph id: it becomes the pipeline name, hence the Delta
-/// `appId` and the default checkpoint root. A fresh UUID per call would make the second run a
-/// different writer starting from an empty checkpoint, so the spool would be replayed and
-/// appended. Neither call passes `storage`, so the default root is exercised too.
+/// This is what pins the deterministic graph id and the default checkpoint root derived from it.
+/// The id becomes the pipeline name, hence the Delta `appId`; the root holds the offsets. A fresh
+/// UUID per call, or a root scoped by anything the caller varies between runs (a session id),
+/// would make the second run a different writer starting from an empty checkpoint — and since the
+/// sink's `write_path` is *not* caller-scoped, the spool would be replayed and appended into the
+/// same location. No call passes `storage`, so the default root is what is under test. The third
+/// run carries a different `session_id`, which is the arrangement a session-scoped root breaks.
 #[tokio::test]
 async fn two_identical_execute_output_flows_calls_do_not_double_write() {
     let warehouse = tempfile::TempDir::new().expect("warehouse");
@@ -1412,13 +1423,24 @@ async fn two_identical_execute_output_flows_calls_do_not_double_write() {
         .expect("first one-shot run");
     assert_eq!(delta_scalar_i64(&sink_path, "count(*)").await, 5);
 
-    execute_pipeline(&mut client, one_shot)
+    execute_pipeline(&mut client, one_shot.clone())
         .await
         .expect("second one-shot run");
     assert_eq!(
         delta_scalar_i64(&sink_path, "count(*)").await,
         5,
         "a re-run must resume from the same checkpoint rather than replay the spool"
+    );
+
+    // Same output, same server, a session that has never seen it: still the same writer.
+    execute_pipeline_in_session(&mut client, "sdp-phase4c-other-session", one_shot)
+        .await
+        .expect("one-shot run from a second session");
+    assert_eq!(
+        delta_scalar_i64(&sink_path, "count(*)").await,
+        5,
+        "the default checkpoint root must be stable across sessions — a session-scoped root \
+         hands the new session an empty checkpoint and it replays the spool into the same sink"
     );
 }
 

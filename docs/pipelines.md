@@ -33,11 +33,14 @@ YAML file:
   `output_type=SINK`), and **`ExecuteOutputFlows`** (one-shot remote run of a single output plus
   its flows, from the payload alone — no pre-registered graph; `storage` is the checkpoint root
   and `full_refresh` drops pipeline state first). The one-shot run's id is derived from the
-  resolved output name so re-runs share a Delta `appId`; the *default* checkpoint root is
-  additionally scoped by session, so multi-tenant deployments that want state shared across
-  sessions should pass `storage` explicitly. `output_type` must be set, and must not be
-  `TEMPORARY_VIEW` — a view is registered but never written. Kafka spool sources (`oxidant.spool.dir` in
-  `TBLPROPERTIES` or `readStream` options) exercise the same path as the YAML runner.
+  resolved output name, so re-runs share a Delta `appId`, and the *default* checkpoint root
+  (`$TMPDIR/oxidant-sdp-execute-output-flows-<catalog.database.name>`) is derived from that same
+  id — stable across sessions and clients, so a re-run resumes rather than replaying its source
+  into the same location. The corollary is that callers sharing a catalog and an output name
+  share checkpoint state; a deployment that wants isolation must pass `storage` explicitly.
+  `output_type` must be set, and must not be `TEMPORARY_VIEW` — a view is registered but never
+  written. Kafka spool sources (`oxidant.spool.dir` in `TBLPROPERTIES` or `readStream` options)
+  exercise the same path as the YAML runner.
 - **Sinks** are write targets, not datasets. `SinkDetails.options.path` is required, and the sink
   is **not** registered in the catalog — so a flow that reads one is refused at `StartRun`
   (`flow ... cannot read sink ...`) rather than failing later as a missing table. Two formats:

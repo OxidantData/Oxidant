@@ -733,7 +733,9 @@ impl OxidantService {
         // Deterministic rather than a fresh UUID: the graph id becomes the pipeline name, which
         // the Delta sink stamps as its idempotency `appId` and which names the default checkpoint
         // directory. A random id per call would make every re-run of the same output look like a
-        // different writer, so a replayed batch would be appended instead of recognized.
+        // different writer, so a replayed batch would be appended instead of recognized. Nothing
+        // session-scoped may enter it, or `default_one_shot_storage` below inherits that scope and
+        // a re-run from a new session replays the source into the same location.
         let graph_id = format!(
             "execute-output-flows-{}",
             resolved_identifier_key(&resolved)
@@ -815,7 +817,7 @@ impl OxidantService {
                 dry: false,
                 storage: Some(match cmd.storage.as_deref().map(str::trim) {
                     Some(s) if !s.is_empty() => s.to_string(),
-                    _ => default_one_shot_storage(&graph_id, session_id),
+                    _ => default_one_shot_storage(&graph_id),
                 }),
                 full_refresh,
                 full_refresh_tables: Vec::new(),
@@ -1318,11 +1320,11 @@ async fn graph_to_config(
         return Err(table_planning_failure(
             name,
             Status::invalid_argument(format!(
-                "sink `{name}`: a `parquet` sink must have its own streaming source. Every flow \
-                 into this sink reads a pipeline table, which makes it a derived output — \
+                "sink `{name}`: a `parquet` sink must have its own streaming source. This sink \
+                 has no streaming source of its own, which makes it a derived output — \
                  recomputed and replaced on every pass — and parquet has no commit protocol to \
-                 replace atomically. Declare the sink as `delta`, or feed it a source of its own \
-                 (see docs/TODOS.md)."
+                 replace atomically. Declare the sink as `delta`, or give it a source of its own \
+                 (`subscribe` / `oxidant.spool.dir` in the sink options; see docs/TODOS.md)."
             )),
             &output.source_code_location,
         ));
@@ -1401,18 +1403,22 @@ fn sink_format_and_path<'a>(
 
 /// Default checkpoint root for a one-shot `ExecuteOutputFlows` run.
 ///
-/// The graph id itself is deliberately global — it becomes the Delta `appId`, so re-runs of the
-/// same output must produce the same one. The *filesystem* path must not be: `oxidant-sdp-<id>`
-/// alone is identical across sessions, clients, and OS users on a host, so two callers writing
-/// the same output name would share `_pipeline-state.json` (and, with a sticky `/tmp`, the
-/// second would fail on a directory it never chose). Multi-tenant deployments should pass
-/// `storage` explicitly rather than rely on this.
-fn default_one_shot_storage(graph_id: &str, session_id: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    session_id.hash(&mut hasher);
+/// Derived from the graph id alone, which is itself derived from the resolved output identifier:
+/// the same output gets the same root on every call, from any session, from any client. That is
+/// the whole point. The checkpoint holds the offsets and batch ids that say where the last run
+/// left off, and the data it guards — a sink's `write_path`, a table's storage — is keyed by the
+/// output, not by the caller. Scoping this path by session would hand a re-run from a new session
+/// an empty checkpoint and a fresh `appId`, so it would replay the source and append it a second
+/// time into the same location, reporting success.
+///
+/// The consequence is that callers sharing a catalog and an output name share state: two clients
+/// one-shotting `local.live.orders` concurrently contend on one `_pipeline-state.json`, and on a
+/// host with a sticky `/tmp` the second OS user gets a permission error from a path it never
+/// chose. That is the correct trade — they are writing the same table, so they *are* the same
+/// writer — but a deployment that wants isolation must say so by passing `storage` explicitly.
+fn default_one_shot_storage(graph_id: &str) -> String {
     std::env::temp_dir()
-        .join(format!("oxidant-sdp-{graph_id}-{:016x}", hasher.finish()))
+        .join(format!("oxidant-sdp-{graph_id}"))
         .display()
         .to_string()
 }
@@ -1476,8 +1482,12 @@ fn flow_def_from_proto(
     })
 }
 
-/// Fully-qualified keys of every sink in the graph, indexed by unqualified name.
-fn sink_names(graph: &DataflowGraph) -> HashMap<String, String> {
+/// The graph's sinks as `(short name, resolved key)`, in declaration order.
+///
+/// A `Vec` rather than a map keyed by the short name: two sinks in different namespaces can share
+/// one, and a map would drop all but the last — so a qualified read of the dropped one would slip
+/// the check, and which one an error names would depend on hash order.
+fn sink_names(graph: &DataflowGraph) -> Vec<(String, String)> {
     graph
         .outputs
         .iter()
