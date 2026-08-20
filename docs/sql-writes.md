@@ -74,9 +74,29 @@ INSERT OVERWRITE lake.live.orders SELECT * FROM lake.raw.orders_json;
 An insert is visible to the next `SELECT` in the same session — the cached table provider is
 evicted as part of the statement.
 
-Columns are cast to the table's own types where a cast is safe (a Spark integer literal is
-`INT` while the column may be `BIGINT`), and an unsafe one is an error naming the column. The
-table's schema is not widened: adding a column needs `ALTER TABLE`, not an `INSERT`.
+Columns are cast to the table's own types positionally, because the rows do not always arrive
+in those types — a Spark integer literal plans as `INT` even when the column is `BIGINT`. The
+cast **fails the statement rather than losing the value**: a string that is not a number, a
+number past the column's range, a timestamp that does not parse, or a decimal too big for the
+declared precision is an error naming the column, and nothing is committed. It is never a
+`NULL` written in the value's place — the overflow behaviour matches Spark's ANSI store
+assignment, and it is the same enforcement the [pipeline](pipelines.md) and streaming write
+paths use. The full ANSI policy is stricter still: Spark rejects a `STRING` → numeric store
+assignment at *analysis* time, where this engine plans the conversion and is strict only about
+the value surviving it, so `INSERT INTO t(int_col) SELECT '42'` succeeds here and does not in
+Spark under ANSI.
+
+A value that was already `NULL` is not a lost value and writes through as `NULL`. A `NULL` into
+a column the table declares `NOT NULL` is an error, for the same reason.
+
+The table's schema is not widened: adding a column needs `ALTER TABLE`, not an `INSERT`.
+
+A store assignment is not an expression `CAST`, but the two are strict in the same direction
+here: this engine's expression `CAST` errors on an invalid cast rather than yielding `NULL`
+(`SELECT CAST('x' AS INT)` is an error, where Spark with `spark.sql.ansi.enabled=false` returns
+`NULL` — the Spark-SQL parity baseline records that divergence against `nonansi/cast.sql`).
+There is no non-ANSI mode to switch to; `TRY_CAST` is the lenient form. Cast-or-fail
+on the write path is therefore consistent with the rest of the engine, not an exception to it.
 
 `REPLACE INTO` is not supported — that is row-level matching on a key, which Delta expresses
 as `MERGE`.
