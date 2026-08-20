@@ -41,6 +41,20 @@ pub struct ParsedOutput {
     pub or_refresh: bool,
 }
 
+/// AUTO CDC options parsed from SDP SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedAutoCdcFlow {
+    pub source: String,
+    pub keys: Vec<String>,
+    pub sequence_by: String,
+    pub apply_as_deletes: Option<String>,
+    pub apply_as_truncates: Option<String>,
+    pub column_list: Option<Vec<String>>,
+    pub except_column_list: Option<Vec<String>>,
+    pub ignore_null_updates_columns: Option<Vec<String>>,
+    pub ignore_null_updates_except: Option<Vec<String>>,
+}
+
 /// A flow that appends query results into a target output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedFlow {
@@ -49,6 +63,7 @@ pub struct ParsedFlow {
     pub query_sql: String,
     pub once: bool,
     pub by_name: bool,
+    pub auto_cdc: Option<ParsedAutoCdcFlow>,
 }
 
 /// Parse multi-statement SDP SQL text into outputs, flows, and refresh requests.
@@ -73,10 +88,10 @@ fn parse_one_statement(stmt: &str) -> Result<ParsedStatement> {
     }
     let upper = stmt.to_ascii_uppercase();
     if starts_with_keyword(&upper, "APPLY CHANGES INTO") {
-        return Err(unsupported_kind(stmt, "AUTO CDC / APPLY CHANGES INTO"));
-    }
-    if contains_phrase_outside_literals(stmt, "AUTO CDC") {
-        return Err(unsupported_kind(stmt, "AUTO CDC / APPLY CHANGES INTO"));
+        return Err(unsupported_kind(
+            stmt,
+            "APPLY CHANGES INTO (use CREATE FLOW … AS AUTO CDC … instead)",
+        ));
     }
     if starts_with_keyword(&upper, "CREATE SINK") {
         return Err(unsupported_kind(stmt, "CREATE SINK"));
@@ -152,6 +167,7 @@ fn parse_create_streaming_table(stmt: &str) -> Result<ParsedStatement> {
             query_sql: query,
             once: false,
             by_name: false,
+            auto_cdc: None,
         };
         return Ok(ParsedStatement::OutputAndFlow { output, flow });
     }
@@ -194,6 +210,7 @@ fn parse_create_materialized_view(stmt: &str) -> Result<ParsedStatement> {
                 query_sql: query,
                 once: false,
                 by_name: false,
+                auto_cdc: None,
             };
             return Ok(ParsedStatement::OutputAndFlow { output, flow });
         }
@@ -243,6 +260,7 @@ fn hand_parse_materialized_view(stmt: &str) -> Result<ParsedStatement> {
         query_sql: query,
         once: false,
         by_name: false,
+        auto_cdc: None,
     };
     Ok(ParsedStatement::OutputAndFlow { output, flow })
 }
@@ -270,6 +288,7 @@ fn parse_create_temporary_view(stmt: &str) -> Result<ParsedStatement> {
                 query_sql: query,
                 once: false,
                 by_name: false,
+                auto_cdc: None,
             };
             return Ok(ParsedStatement::OutputAndFlow { output, flow });
         }
@@ -303,6 +322,7 @@ fn hand_parse_temporary_view(stmt: &str) -> Result<ParsedStatement> {
         query_sql: query,
         once: false,
         by_name: false,
+        auto_cdc: None,
     };
     Ok(ParsedStatement::OutputAndFlow { output, flow })
 }
@@ -314,6 +334,10 @@ fn parse_create_flow(stmt: &str) -> Result<ParsedStatement> {
     cursor.expect_keyword("FLOW")?;
     let name = Some(cursor.parse_identifier()?);
     cursor.expect_keyword("AS")?;
+    if cursor.try_keyword("AUTO")? {
+        cursor.expect_keyword("CDC")?;
+        return parse_create_auto_cdc_flow(&mut cursor, name, header_once, stmt);
+    }
     cursor.expect_keyword("INSERT")?;
     let insert_once = cursor.try_keyword("ONCE")?;
     cursor.expect_keyword("INTO")?;
@@ -333,7 +357,173 @@ fn parse_create_flow(stmt: &str) -> Result<ParsedStatement> {
         query_sql: query,
         once: header_once || insert_once,
         by_name,
+        auto_cdc: None,
     }))
+}
+
+/// A `(explicit list, `EXCEPT` list)` pair; at most one side is ever `Some`.
+type ColumnListPair = (Option<Vec<String>>, Option<Vec<String>>);
+
+/// Keywords that start a clause of `CREATE FLOW … AS AUTO CDC`, and therefore end the previous
+/// clause's expression.
+const AUTO_CDC_CLAUSES: &[&str] = &["SEQUENCE", "APPLY", "COLUMNS", "IGNORE", "STORED", "TRACK"];
+
+/// Reject a clause that appears twice.
+///
+/// The clause loop is a `continue`-driven match, so without this a second `SEQUENCE BY` or
+/// `COLUMNS` simply replaced the first — the statement would run, silently, under whichever one
+/// happened to come last.
+fn reject_repeat(stmt: &str, already_set: bool, clause: &str) -> Result<()> {
+    if already_set {
+        return Err(plan_error(
+            stmt,
+            &format!("AUTO CDC {clause} is specified more than once"),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_create_auto_cdc_flow(
+    cursor: &mut Cursor<'_>,
+    name: Option<String>,
+    once: bool,
+    stmt: &str,
+) -> Result<ParsedStatement> {
+    cursor.expect_keyword("INTO")?;
+    let target = cursor.parse_identifier()?;
+    cursor.expect_keyword("FROM")?;
+    let source = parse_auto_cdc_source(cursor)?;
+    cursor.expect_keyword("KEYS")?;
+    cursor.expect_char('(')?;
+    let keys = cursor.parse_comma_separated_exprs(')')?;
+    cursor.expect_char(')')?;
+    if keys.is_empty() {
+        return Err(plan_error(
+            stmt,
+            "AUTO CDC KEYS must name at least one column",
+        ));
+    }
+
+    let mut apply_as_deletes = None;
+    let mut apply_as_truncates = None;
+    let mut column_list = None;
+    let mut except_column_list = None;
+    let mut ignore_null_updates_columns = None;
+    let mut ignore_null_updates_except = None;
+    let mut sequence_by = None;
+    let mut scd_type = None;
+
+    loop {
+        cursor.skip_ws();
+        if cursor.rest().is_empty() {
+            break;
+        }
+        if cursor.try_keyword("SEQUENCE")? {
+            cursor.expect_keyword("BY")?;
+            reject_repeat(stmt, sequence_by.is_some(), "SEQUENCE BY")?;
+            sequence_by = Some(cursor.parse_clause_expression(AUTO_CDC_CLAUSES)?);
+            continue;
+        }
+        if cursor.try_keyword("APPLY")? {
+            cursor.expect_keyword("AS")?;
+            if cursor.try_keyword("DELETE")? {
+                cursor.expect_keyword("WHEN")?;
+                reject_repeat(stmt, apply_as_deletes.is_some(), "APPLY AS DELETE WHEN")?;
+                apply_as_deletes = Some(cursor.parse_clause_expression(AUTO_CDC_CLAUSES)?);
+            } else if cursor.try_keyword("TRUNCATE")? {
+                cursor.expect_keyword("WHEN")?;
+                reject_repeat(stmt, apply_as_truncates.is_some(), "APPLY AS TRUNCATE WHEN")?;
+                apply_as_truncates = Some(cursor.parse_clause_expression(AUTO_CDC_CLAUSES)?);
+            } else {
+                return Err(plan_error(
+                    stmt,
+                    "expected DELETE or TRUNCATE after APPLY AS",
+                ));
+            }
+            continue;
+        }
+        if cursor.try_keyword("COLUMNS")? {
+            reject_repeat(
+                stmt,
+                column_list.is_some() || except_column_list.is_some(),
+                "COLUMNS",
+            )?;
+            let (list, except) = cursor.parse_columns_clause()?;
+            column_list = list;
+            except_column_list = except;
+            continue;
+        }
+        if cursor.try_keyword("IGNORE")? {
+            cursor.expect_keyword("NULL")?;
+            cursor.expect_keyword("UPDATES")?;
+            reject_repeat(
+                stmt,
+                ignore_null_updates_columns.is_some() || ignore_null_updates_except.is_some(),
+                "IGNORE NULL UPDATES",
+            )?;
+            let (list, except) = cursor.parse_ignore_null_updates_clause()?;
+            ignore_null_updates_columns = list;
+            ignore_null_updates_except = except;
+            continue;
+        }
+        if cursor.try_keyword("TRACK")? {
+            return Err(Error::Unsupported(
+                "AUTO CDC TRACK HISTORY is SCD Type 2 only, which is not supported yet".into(),
+            ));
+        }
+        if cursor.try_keyword("STORED")? {
+            cursor.expect_keyword("AS")?;
+            cursor.expect_keyword("SCD")?;
+            cursor.expect_keyword("TYPE")?;
+            reject_repeat(stmt, scd_type.is_some(), "STORED AS SCD TYPE")?;
+            scd_type = Some(cursor.parse_identifier_segment()?);
+            continue;
+        }
+        return Err(plan_error(
+            stmt,
+            "unexpected token in CREATE FLOW AS AUTO CDC",
+        ));
+    }
+
+    let sequence_by =
+        sequence_by.ok_or_else(|| plan_error(stmt, "AUTO CDC requires SEQUENCE BY"))?;
+    match scd_type.as_deref() {
+        None | Some("1") => {}
+        Some(other) => {
+            return Err(Error::Unsupported(format!(
+                "AUTO CDC STORED AS SCD TYPE {other} is not supported (only SCD TYPE 1 today)"
+            )));
+        }
+    }
+    Ok(ParsedStatement::Flow(ParsedFlow {
+        name,
+        target,
+        query_sql: String::new(),
+        once,
+        by_name: false,
+        auto_cdc: Some(ParsedAutoCdcFlow {
+            source,
+            keys,
+            sequence_by,
+            apply_as_deletes,
+            apply_as_truncates,
+            column_list,
+            except_column_list,
+            ignore_null_updates_columns,
+            ignore_null_updates_except,
+        }),
+    }))
+}
+
+fn parse_auto_cdc_source(cursor: &mut Cursor<'_>) -> Result<String> {
+    if cursor.try_keyword("STREAM")? {
+        // `parse_balanced` consumes the closing paren itself.
+        cursor.expect_char('(')?;
+        let inner = cursor.parse_balanced('(', ')')?;
+        Ok(inner.trim().to_string())
+    } else {
+        cursor.parse_identifier()
+    }
 }
 
 fn parse_refresh_materialized_view(stmt: &str) -> Result<ParsedStatement> {
@@ -764,12 +954,6 @@ fn strip_strings_and_comments(s: &str) -> String {
     out
 }
 
-fn contains_phrase_outside_literals(stmt: &str, phrase: &str) -> bool {
-    let sanitized = strip_strings_and_comments(stmt);
-    let upper = sanitized.to_ascii_uppercase();
-    word_boundary_contains(&upper, phrase)
-}
-
 fn word_boundary_contains(haystack: &str, needle: &str) -> bool {
     let needle_upper = needle.to_ascii_uppercase();
     let needle_bytes = needle_upper.as_bytes();
@@ -1074,6 +1258,161 @@ impl<'a> Cursor<'a> {
         Ok(ids)
     }
 
+    fn parse_comma_separated_exprs(&mut self, end_char: char) -> Result<Vec<String>> {
+        let mut exprs = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.input[self.pos..].starts_with(end_char) {
+                break;
+            }
+            exprs.push(self.parse_balanced_expr()?);
+            self.skip_ws();
+            if self.input[self.pos..].starts_with(',') {
+                self.pos += 1;
+                continue;
+            }
+            if self.input[self.pos..].starts_with(end_char) {
+                break;
+            }
+            return Err(plan_error(
+                self.input,
+                "expected ',' or closing paren in expression list",
+            ));
+        }
+        Ok(exprs)
+    }
+
+    fn parse_balanced_expr(&mut self) -> Result<String> {
+        self.skip_ws();
+        let start = self.pos;
+        let mut depth = 0i32;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut in_backtick = false;
+        while self.pos < self.input.len() {
+            let ch = self.input[self.pos..].chars().next().unwrap();
+            if !in_single && !in_double && !in_backtick {
+                if ch == '(' {
+                    depth += 1;
+                } else if ch == ')' {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                } else if depth == 0
+                    && (ch == ','
+                        || AUTO_CDC_CLAUSES
+                            .iter()
+                            .any(|kw| rest_starts_with_keyword(&self.input[self.pos..], kw)))
+                {
+                    break;
+                }
+            }
+            match ch {
+                '\'' if !in_double && !in_backtick => in_single = !in_single,
+                '"' if !in_single && !in_backtick => in_double = !in_double,
+                '`' if !in_single && !in_double => in_backtick = !in_backtick,
+                _ => {}
+            }
+            self.pos += ch.len_utf8();
+        }
+        let expr = self.input[start..self.pos].trim();
+        if expr.is_empty() {
+            return Err(plan_error(self.input, "expected expression"));
+        }
+        Ok(expr.to_string())
+    }
+
+    fn parse_clause_expression(&mut self, stop_keywords: &[&str]) -> Result<String> {
+        self.skip_ws();
+        let start = self.pos;
+        let mut depth = 0i32;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut in_backtick = false;
+        while self.pos < self.input.len() {
+            if !in_single && !in_double && !in_backtick && depth == 0 {
+                for kw in stop_keywords {
+                    if rest_starts_with_keyword(&self.input[self.pos..], kw) {
+                        let expr = self.input[start..self.pos].trim();
+                        if expr.is_empty() {
+                            return Err(plan_error(self.input, "expected expression"));
+                        }
+                        return Ok(expr.to_string());
+                    }
+                }
+            }
+            let ch = self.input[self.pos..].chars().next().unwrap();
+            if !in_single && !in_double && !in_backtick {
+                if ch == '(' {
+                    depth += 1;
+                } else if ch == ')' {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+            }
+            match ch {
+                '\'' if !in_double && !in_backtick => in_single = !in_single,
+                '"' if !in_single && !in_backtick => in_double = !in_double,
+                '`' if !in_single && !in_double => in_backtick = !in_backtick,
+                _ => {}
+            }
+            self.pos += ch.len_utf8();
+        }
+        let expr = self.input[start..self.pos].trim();
+        if expr.is_empty() {
+            return Err(plan_error(self.input, "expected expression"));
+        }
+        Ok(expr.to_string())
+    }
+
+    fn parse_columns_clause(&mut self) -> Result<ColumnListPair> {
+        if self.try_char('*')? {
+            if self.try_keyword("EXCEPT")? {
+                self.expect_char('(')?;
+                let cols = self.parse_identifier_list(')')?;
+                self.expect_char(')')?;
+                return Ok((None, Some(cols)));
+            }
+            return Ok((None, None));
+        }
+        self.expect_char('(')?;
+        let cols = self.parse_identifier_list(')')?;
+        self.expect_char(')')?;
+        Ok((Some(cols), None))
+    }
+
+    /// `IGNORE NULL UPDATES [ON {(cols) | * [EXCEPT (cols)]}] [EXCEPT (cols)]`.
+    ///
+    /// A bare `IGNORE NULL UPDATES` means every column, which is what Databricks' boolean
+    /// `ignore_null_updates` flag does.
+    fn parse_ignore_null_updates_clause(&mut self) -> Result<ColumnListPair> {
+        if self.try_keyword("ON")? {
+            if self.try_char('*')? {
+                if self.try_keyword("EXCEPT")? {
+                    self.expect_char('(')?;
+                    let cols = self.parse_identifier_list(')')?;
+                    self.expect_char(')')?;
+                    return Ok((None, Some(cols)));
+                }
+                return Ok((Some(vec!["*".into()]), None));
+            }
+            self.expect_char('(')?;
+            let cols = self.parse_identifier_list(')')?;
+            self.expect_char(')')?;
+            return Ok((Some(cols), None));
+        }
+        if self.try_keyword("EXCEPT")? {
+            self.expect_char('(')?;
+            let cols = self.parse_identifier_list(')')?;
+            self.expect_char(')')?;
+            return Ok((None, Some(cols)));
+        }
+        Ok((Some(vec!["*".into()]), None))
+    }
+
     fn parse_tblproperties(&mut self) -> Result<BTreeMap<String, String>> {
         self.expect_char('(')?;
         let mut props = BTreeMap::new();
@@ -1297,14 +1636,158 @@ CREATE MATERIALIZED VIEW mv AS SELECT 3";
     }
 
     #[test]
-    fn rejects_auto_cdc() {
-        let err = parse(
-            "CREATE FLOW cdc AS AUTO CDC INTO t FROM stream(s) KEYS (id)",
+    fn parses_auto_cdc_flow() {
+        let sql = "CREATE FLOW cdc AS AUTO CDC INTO target FROM cdc_source KEYS (id) \
+            APPLY AS DELETE WHEN op = 'D' SEQUENCE BY seq STORED AS SCD TYPE 1";
+        let out = parse(sql, None).unwrap();
+        assert_eq!(out.flows.len(), 1);
+        let flow = &out.flows[0];
+        assert_eq!(flow.target, "target");
+        let cdc = flow.auto_cdc.as_ref().expect("auto cdc");
+        assert_eq!(cdc.source, "cdc_source");
+        assert_eq!(cdc.keys, vec!["id"]);
+        assert_eq!(cdc.sequence_by, "seq");
+        assert_eq!(cdc.apply_as_deletes.as_deref(), Some("op = 'D'"));
+    }
+
+    #[test]
+    fn parses_every_auto_cdc_clause() {
+        let sql = "CREATE FLOW cdc AS AUTO CDC INTO target FROM STREAM(cdc_source) \
+            KEYS (tenant, id) IGNORE NULL UPDATES ON (name, email) \
+            APPLY AS DELETE WHEN op = 'D' APPLY AS TRUNCATE WHEN op = 'T' \
+            SEQUENCE BY seq COLUMNS * EXCEPT (op, _ingested) STORED AS SCD TYPE 1";
+        let out = parse(sql, None).unwrap();
+        let cdc = out.flows[0].auto_cdc.as_ref().expect("auto cdc");
+        assert_eq!(cdc.source, "cdc_source");
+        assert_eq!(cdc.keys, vec!["tenant", "id"]);
+        assert_eq!(cdc.sequence_by, "seq");
+        assert_eq!(cdc.apply_as_deletes.as_deref(), Some("op = 'D'"));
+        assert_eq!(cdc.apply_as_truncates.as_deref(), Some("op = 'T'"));
+        assert_eq!(cdc.column_list, None);
+        assert_eq!(
+            cdc.except_column_list,
+            Some(vec!["op".to_string(), "_ingested".to_string()])
+        );
+        assert_eq!(
+            cdc.ignore_null_updates_columns,
+            Some(vec!["name".to_string(), "email".to_string()])
+        );
+    }
+
+    #[test]
+    fn auto_cdc_columns_list_and_bare_ignore_null_updates() {
+        let sql = "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+            COLUMNS (id, name, seq) IGNORE NULL UPDATES";
+        let out = parse(sql, None).unwrap();
+        let cdc = out.flows[0].auto_cdc.as_ref().expect("auto cdc");
+        assert_eq!(
+            cdc.column_list,
+            Some(vec![
+                "id".to_string(),
+                "name".to_string(),
+                "seq".to_string()
+            ])
+        );
+        assert_eq!(cdc.ignore_null_updates_columns, Some(vec!["*".to_string()]));
+    }
+
+    #[test]
+    fn auto_cdc_ignore_null_updates_except() {
+        let sql = "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) \
+            IGNORE NULL UPDATES EXCEPT (name) SEQUENCE BY seq";
+        let out = parse(sql, None).unwrap();
+        let cdc = out.flows[0].auto_cdc.as_ref().expect("auto cdc");
+        assert_eq!(cdc.ignore_null_updates_columns, None);
+        assert_eq!(
+            cdc.ignore_null_updates_except,
+            Some(vec!["name".to_string()])
+        );
+    }
+
+    #[test]
+    fn auto_cdc_requires_keys_and_sequence_by() {
+        let missing_keys = parse(
+            "CREATE FLOW cdc AS AUTO CDC INTO t FROM s SEQUENCE BY seq",
             None,
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("AUTO CDC"));
+        assert!(missing_keys.contains("KEYS"), "{missing_keys}");
+
+        let empty_keys = parse(
+            "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS () SEQUENCE BY seq",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(empty_keys.contains("KEYS"), "{empty_keys}");
+
+        let missing_seq = parse("CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id)", None)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_seq.contains("SEQUENCE BY"), "{missing_seq}");
+    }
+
+    #[test]
+    fn auto_cdc_rejects_a_repeated_clause() {
+        // The clause loop `continue`s, so a repeat used to overwrite the first silently — the
+        // statement ran under whichever spelling happened to come last.
+        for (sql, clause) in [
+            (
+                "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+                 SEQUENCE BY other",
+                "SEQUENCE BY",
+            ),
+            (
+                "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+                 COLUMNS (id, seq) COLUMNS * EXCEPT (op)",
+                "COLUMNS",
+            ),
+            (
+                "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+                 APPLY AS DELETE WHEN op = 'D' APPLY AS DELETE WHEN op = 'X'",
+                "APPLY AS DELETE WHEN",
+            ),
+            (
+                "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+                 APPLY AS TRUNCATE WHEN op = 'T' APPLY AS TRUNCATE WHEN op = 'X'",
+                "APPLY AS TRUNCATE WHEN",
+            ),
+            (
+                "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+                 IGNORE NULL UPDATES ON (name) IGNORE NULL UPDATES",
+                "IGNORE NULL UPDATES",
+            ),
+        ] {
+            let err = parse(sql, None)
+                .expect_err("a repeated clause is an error")
+                .to_string();
+            assert!(err.contains(clause), "{clause}: {err}");
+            assert!(err.contains("more than once"), "{clause}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_track_history() {
+        let err = parse(
+            "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq \
+             STORED AS SCD TYPE 1 TRACK HISTORY ON (name)",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("TRACK HISTORY"), "{err}");
+    }
+
+    #[test]
+    fn rejects_scd_type_2() {
+        let err = parse(
+            "CREATE FLOW cdc AS AUTO CDC INTO t FROM s KEYS (id) SEQUENCE BY seq STORED AS SCD TYPE 2",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("SCD TYPE 2"), "{err}");
     }
 
     #[test]

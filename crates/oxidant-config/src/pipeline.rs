@@ -139,6 +139,36 @@ impl<'de> Deserialize<'de> for Trigger {
     }
 }
 
+/// AUTO CDC merge options (SCD Type 1 only today).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct AutoCdcConfig {
+    /// Pipeline-local name of the streaming CDC source table or view.
+    pub source: String,
+    /// Key column expressions (SQL), in declaration order.
+    pub keys: Vec<String>,
+    /// Expression defining event order within a key.
+    pub sequence_by: String,
+    /// Rows matching this expression are treated as deletes for their key.
+    #[serde(default)]
+    pub apply_as_deletes: Option<String>,
+    /// Rows matching this expression truncate the target before applying the batch.
+    #[serde(default)]
+    pub apply_as_truncates: Option<String>,
+    /// Explicit output columns; mutually exclusive with [`except_column_list`](Self::except_column_list).
+    #[serde(default)]
+    pub column_list: Option<Vec<String>>,
+    /// Output is all source columns except these; mutually exclusive with [`column_list`](Self::column_list).
+    #[serde(default)]
+    pub except_column_list: Option<Vec<String>>,
+    /// On update, do not overwrite a non-null target value with a null batch value.
+    #[serde(default)]
+    pub ignore_null_updates_columns: Option<Vec<String>>,
+    /// Ignore-null-updates for all columns except these.
+    #[serde(default)]
+    pub ignore_null_updates_except: Option<Vec<String>>,
+}
+
 /// One append flow into a declared table (SDP multi-flow semantics).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
@@ -197,6 +227,9 @@ pub struct TableConfig {
     /// Deduplicate on these columns within a bounded window. Streaming tables only.
     #[serde(default)]
     pub dedup_columns: Vec<String>,
+    /// When set, micro-batches from [`AutoCdcConfig::source`] are merged into this table (SCD1).
+    #[serde(default)]
+    pub auto_cdc: Option<AutoCdcConfig>,
     /// Data-quality constraints, keyed by name.
     #[serde(default)]
     pub expect: BTreeMap<String, Expectation>,
@@ -215,9 +248,11 @@ pub struct TableConfig {
 }
 
 impl TableConfig {
-    /// Whether this is a streaming or a derived table.
+    /// Whether this is a streaming, AUTO CDC, or derived table.
     pub fn kind(&self) -> TableKind {
-        if self.source.is_some() {
+        if self.auto_cdc.is_some() {
+            TableKind::AutoCdc
+        } else if self.source.is_some() {
             TableKind::Streaming
         } else {
             TableKind::Derived
@@ -225,11 +260,13 @@ impl TableConfig {
     }
 }
 
-/// Which of the two table kinds an entry declares.
+/// Which table kind an entry declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableKind {
     /// Reads a streaming source; appended per micro-batch.
     Streaming,
+    /// Streaming CDC merge into a managed table (SCD Type 1).
+    AutoCdc,
     /// Defined by SQL over other tables; fully recomputed per update.
     Derived,
 }
@@ -342,6 +379,7 @@ mod tests {
             iceberg_table_suffix: None,
             checkpoint_interval: None,
             dedup_columns: vec![],
+            auto_cdc: None,
             expect: BTreeMap::new(),
             comment: None,
             write_path: None,
@@ -353,6 +391,25 @@ mod tests {
             ..streaming
         };
         assert_eq!(derived.kind(), TableKind::Derived);
+        let cdc = TableConfig {
+            source: Some(SourceConfig {
+                format: "kafka".into(),
+                options: BTreeMap::new(),
+            }),
+            auto_cdc: Some(AutoCdcConfig {
+                source: "bronze".into(),
+                keys: vec!["id".into()],
+                sequence_by: "seq".into(),
+                apply_as_deletes: None,
+                apply_as_truncates: None,
+                column_list: None,
+                except_column_list: None,
+                ignore_null_updates_columns: None,
+                ignore_null_updates_except: None,
+            }),
+            ..derived.clone()
+        };
+        assert_eq!(cdc.kind(), TableKind::AutoCdc);
     }
 
     #[test]

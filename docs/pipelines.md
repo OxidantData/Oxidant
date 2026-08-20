@@ -43,21 +43,26 @@ YAML file:
   exercise the same path as the YAML runner. Python source functions whose relation is empty at
   `DefineFlow` time round-trip via `GetQueryFunctionExecutionSignalStream` → client-side
   evaluation → `DefineFlowQueryFunctionResult` backfill before `StartRun`.
+  `CREATE FLOW … AS AUTO CDC INTO …` and `AutoCdcFlowDetails` merge a change stream into a target
+  table (SCD Type 1) — see [AUTO CDC (SCD Type 1)](#auto-cdc-scd-type-1).
 - **Sinks** are write targets, not datasets. `SinkDetails.options.path` is required, and the sink
   is **not** registered in the catalog — so a flow that reads one is refused at `StartRun`
-  (`flow ... cannot read sink ...`) rather than failing later as a missing table. Two formats:
-  `delta` (default; one atomic transaction per micro-batch) and `parquet` (**one file per batch,
-  no commit protocol** — each batch lands atomically, but a reader can see a partially written
-  *run*, a replayed batch is not deduplicated, and there is no atomic replace; the run emits a
-  warning event naming the sink). `kafka`, `json`, and `csv` sinks are refused at definition time —
-  see [TODOS.md](TODOS.md). A sink that carries its own streaming source in `options` (`subscribe`
-  / `oxidant.spool.dir`) is written incrementally from the checkpoint like a streaming table; a
-  sink whose flow reads other pipeline tables is a derived output — recomputed and **replaced** on
-  every pass, which only `delta` can do, so a `parquet` sink with no source of its own is refused
-  when the graph is lowered rather than failing mid-run.
-- **Limits (deferred):** no AUTO CDC / `APPLY CHANGES` flows ([#92](https://github.com/oxidantdata/oxidant/issues/92)),
-  no Kafka sink. Interactive `spark.sql("CREATE STREAMING TABLE …")` still correctly rejects
-  unsupported statements; use `DefineSqlGraphElements` or the Python decorators instead.
+  (`flow ... cannot read sink ...`) rather than failing later as a missing table. That covers an
+  AUTO CDC flow too: its source is `auto_cdc.source`, not a relation, and it is checked the same
+  way. Two formats: `delta` (default; one atomic transaction per micro-batch) and `parquet`
+  (**one file per batch, no commit protocol** — each batch lands atomically, but a reader can see
+  a partially written *run*, a replayed batch is not deduplicated, and there is no atomic
+  replace; the run emits a warning event naming the sink). `kafka`, `json`, and `csv` sinks are
+  refused at definition time — see [TODOS.md](TODOS.md). A sink that carries its own streaming
+  source in `options` (`subscribe` / `oxidant.spool.dir`) is written incrementally from the
+  checkpoint like a streaming table; a sink whose flow reads other pipeline tables is a derived
+  output — recomputed and **replaced** on every pass, which only `delta` can do, so a `parquet`
+  sink with no source of its own is refused when the graph is lowered rather than failing
+  mid-run.
+- **Limits (deferred):** no Kafka sink.
+  `APPLY CHANGES INTO` (Databricks legacy syntax) is rejected — use `CREATE FLOW … AS AUTO CDC …` instead.
+  Interactive `spark.sql("CREATE STREAMING TABLE …")` still correctly rejects those statements;
+  use `DefineSqlGraphElements` or the Python decorators instead.
 
 **Python query-function signal stream**
 
@@ -148,7 +153,7 @@ so pipeline table data and catalog registration share the same root.
   session keys such as `spark.sql.session.*` apply there, but catalog keys are ignored with a
   `PipelineEvent` — register catalogs on the graph instead.
 
-## Two kinds of table
+## Kinds of table
 
 ```yaml
 pipeline:
@@ -213,6 +218,86 @@ cross-batch state — which the engine does not have (see
 O(whole table) per update, so a gold aggregate over a large bronze table will dominate the
 trigger interval. Size the trigger to the recompute, not to the ingestion rate. Incremental
 derived tables are [not implemented](TODOS.md).
+
+### AUTO CDC (SCD Type 1)
+
+`CREATE FLOW … AS AUTO CDC INTO … FROM …` (Connect `DefineFlow.auto_cdc_flow_details`, or the
+same clause in SDP SQL) merges each micro-batch from a streaming CDC source into a target table
+by key, ordered by `sequence_by` (latest wins). Optional
+`APPLY AS DELETE WHEN …` and `APPLY AS TRUNCATE WHEN …` clauses remove rows; `IGNORE NULL UPDATES`
+preserves existing target values when the batch carries nulls. Only **SCD Type 1** is supported
+today (`STORED AS SCD TYPE 1` / `SCD_TYPE_1`).
+
+There is **no Delta `MERGE` operator** in the engine yet. Each micro-batch is applied as a
+**read–modify–write** over the whole target table: read the current Delta snapshot, merge in
+memory/SQL, then commit a replacement version via the existing Delta sink (same atomic replace
+path derived tables use). That is **O(target table size) per batch** — honest for correctness,
+not for large targets at fast triggers. It is also O(target table size) in *memory*: the whole
+target is held between batches so a run of N batches reads the table once instead of N times, and
+the merge builds a second copy while it runs. Budget roughly twice the target for the worker —
+in practice that ceiling, not the per-batch time, is what decides whether a target fits. Native
+Delta merge is future work.
+
+The target is declared with **no query** — `CREATE STREAMING TABLE cdc_target;` — and is defined
+entirely by its CDC flow: it inherits the *source* table's stream, per-batch transformation,
+expectations and `dedup_columns`, then merges instead of appending. (Format and partitioning
+`TBLPROPERTIES` on the target are fine; what is rejected is a target that has its own `source:`,
+query, append flow, or expectations — those are append-only sinks, and one table cannot be both.)
+The `KEYS` and `SEQUENCE BY` columns must survive `COLUMNS` / `COLUMNS * EXCEPT` into the target
+— the next batch compares against the values stored there, so dropping them would let an older
+event overwrite newer state.
+
+#### What "out of order safe" does and does not cover
+
+A record whose `sequence_by` value is older than the target's loses, and a truncate only removes
+rows at or below its own sequence. But three cases are worth stating outright:
+
+- **A delete leaves no tombstone.** SCD Type 1 removes the row, and nothing records *when*. A
+  record for that key arriving in a **later** micro-batch is therefore treated as new, even if
+  its `sequence_by` value is older than the delete's — the key comes back. Within one batch the
+  delete still wins. This matches Databricks' SCD Type 1; retaining tombstones would mean
+  carrying a column the target does not declare, with no rule for ever dropping it.
+- **A NULL `sequence_by` value fails the batch.** A row with no ordering value cannot be placed
+  against the target, and dropping it silently would lose a change event — including a delete or
+  a truncate. Databricks fails the same way.
+- **NULL key values compare equal.** A NULL-keyed row is one key like any other, matched with
+  `IS NOT DISTINCT FROM`. This is the one case here that **deliberately diverges from
+  Databricks**: Spark's `MERGE` matches keys with `=`, so a NULL-keyed row never matches the
+  target and is re-inserted on every micro-batch — an unbounded set of duplicates for one key,
+  which is a leak rather than a semantic. Expect a Databricks parity test to differ on this row.
+
+Two rows for the same key with the *same* `sequence_by` value have no natural winner. The merge
+breaks the tie deterministically — a delete first, then the remaining target columns descending
+— so a replay recomputes the table that was committed rather than a different one.
+
+`APPLY AS DELETE WHEN` / `APPLY AS TRUNCATE WHEN` expressions end at the next AUTO CDC clause
+keyword (`SEQUENCE`, `APPLY`, `COLUMNS`, `IGNORE`, `STORED`, `TRACK`). An unquoted column with
+one of those names truncates the clause — spell it with backticks (`` `stored` ``). Each clause
+may appear only once; a repeat is an error rather than a silent overwrite.
+
+The same merge is reachable from a YAML pipeline with `auto_cdc:` on a table that declares the
+streaming source itself:
+
+```yaml
+  - name: customers_scd1
+    source:                       # the CDC stream, same shape as any streaming table
+      format: kafka
+      options: {subscribe: customers, startingOffsets: earliest}
+    sql: SELECT id, name, seq, op FROM stream
+    auto_cdc:
+      source: customers_bronze    # declared table this stream feeds — the DAG edge
+      keys: [id]
+      sequence_by: seq
+      apply_as_deletes: "op = 'D'"
+      except_column_list: [op]    # or column_list: [...], not both
+      ignore_null_updates_columns: [name]   # or ignore_null_updates_except: [...], not both
+```
+
+`auto_cdc.source` must name a table declared in the same `tables:` list — it is what puts the
+dependency edge in the graph, so a typo would leave the merge running in an arbitrary order. The
+target's `source:`, `sql:`, `expect:` and `dedup_columns:` must be **identical** to that table's:
+both re-read the same stream, and letting them drift means the CDC target silently merges a
+different projection, or a different set of rows, than the table it claims to follow.
 
 ## Dependencies and ordering
 

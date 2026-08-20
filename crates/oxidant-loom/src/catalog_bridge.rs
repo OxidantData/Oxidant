@@ -2006,7 +2006,8 @@ async fn resolve_lakehouse_provider(
                 snapshot: Some(resolved.snapshot),
             }),
             None => Err(DataFusionError::Plan(format!(
-                "table `{}` has no active data files and the catalog does not declare a schema,                  so its columns cannot be determined",
+                "table `{}` has no active data files and the catalog does not declare a schema, \
+                 so its columns cannot be determined",
                 md.location
             ))),
         };

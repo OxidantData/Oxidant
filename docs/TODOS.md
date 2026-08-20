@@ -89,6 +89,15 @@ Left, in rough order of value:
       [streaming.md](streaming.md) "no stateful aggregation across batches") — a separate
       project, not a follow-up commit.
 
+### AUTO CDC rewrites the whole target per batch
+
+- [ ] Give AUTO CDC a real Delta `MERGE`. There is no merge operator in the engine, so each
+      micro-batch is a read-modify-write of the entire target: read the current snapshot, merge
+      in SQL, commit a replacement version through the Delta sink. Correct and atomic, but
+      O(target rows) per batch — not viable for a large target at a fast trigger.
+- [ ] SCD Type 2 / `TRACK HISTORY`. Rejected outright today; only SCD Type 1 is implemented.
+      Type 2 needs per-key validity ranges, which is a different merge, not a flag on this one.
+
 ### Derived-table writes are materialized in memory
 
 - [ ] Stream a derived table's recompute to its sink instead of collecting the whole result
@@ -199,12 +208,14 @@ result silently — each one fails loudly, just later or with a worse message th
       while adding subcommands, but it rewrites every existing flag's parsing — its own PR,
       with its own regression surface.
 - [ ] A SQL REPL. `oxidant sql` is one-shot; there is no readline/interactive loop anywhere.
-- [ ] Wire remaining `pipelines.proto` surface (SDP Phase 4): AUTO CDC flows
-      ([#92](https://github.com/oxidantdata/oxidant/issues/92)). Core `PipelineCommand` dispatch,
-      SQL graph parsing, and `StartRun` execution landed in SDP Phases 1–2; the query-function
-      execution signal stream ([#91](https://github.com/oxidantdata/oxidant/issues/91)) landed in
-      Phase 4a, with the follow-ups listed above; external sinks and `ExecuteOutputFlows`
-      ([#93](https://github.com/oxidantdata/oxidant/issues/93)) landed in Phase 4c.
+- The `pipelines.proto` surface (SDP Phase 4) is wired. Core `PipelineCommand` dispatch, SQL
+  graph parsing, and `StartRun` execution landed in SDP Phases 1–2; the query-function execution
+  signal stream ([#91](https://github.com/oxidantdata/oxidant/issues/91)) in Phase 4a, with the
+  follow-ups listed above; AUTO CDC / SCD Type 1 flows
+  ([#92](https://github.com/oxidantdata/oxidant/issues/92)) in Phase 4b, with the Delta `MERGE`
+  and SCD Type 2 gaps listed above; external sinks and `ExecuteOutputFlows`
+  ([#93](https://github.com/oxidantdata/oxidant/issues/93)) in Phase 4c. What is left of each is
+  its own entry, here or above — nothing is deferred under the Phase 4 heading itself.
 - [ ] Kafka as a *sink*. The Kafka integration is source-only — `DefineOutput` with
       `output_type=SINK` and `format=kafka` is refused at definition time.
 - [ ] Run-scope names in the **DataFrame** encoding. `spark.sql("SELECT * FROM <graph output>")`

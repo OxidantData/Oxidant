@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use oxidant_common::{Error, Result};
 
-use crate::{OxidantConfig, TableKind};
+use crate::{OxidantConfig, SourceConfig, TableKind};
 
 /// Catalog types that implement enough write DDL to be a pipeline sink.
 ///
@@ -170,6 +170,10 @@ impl OxidantConfig {
 
     fn validate_tables(&self) -> Result<()> {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
+        // Collected up front rather than as the loop goes: an AUTO CDC target is allowed to
+        // name a source declared *after* it, and checking against a half-filled set would
+        // reject a legal ordering.
+        let declared: BTreeSet<&str> = self.tables.iter().map(|t| t.name.trim()).collect();
         for table in &self.tables {
             let name = table.name.trim();
             if name.is_empty() {
@@ -205,6 +209,83 @@ impl OxidantConfig {
                         )));
                     }
                 }
+                TableKind::AutoCdc => {
+                    // `kind()` answers AutoCdc for *any* table carrying an `auto_cdc:` block,
+                    // so this arm — not the Derived one — is where a target with no `source:`
+                    // arrives. Reporting it here is the difference between an error and a panic.
+                    let Some(source) = table.source.as_ref() else {
+                        return Err(Error::Io(format!(
+                            "table `{name}` sets `auto_cdc:` but has no `source:` — an AUTO CDC \
+                             target is fed by a streaming source, so it must declare one"
+                        )));
+                    };
+                    if source.format.trim().is_empty() {
+                        return Err(Error::Io(format!(
+                            "table `{name}` has a `source:` with no `format:`"
+                        )));
+                    }
+                    validate_dedup_watermark(name, source, &table.dedup_columns)?;
+                    let Some(cdc) = table.auto_cdc.as_ref() else {
+                        return Err(Error::Io(format!(
+                            "table `{name}` is an AUTO CDC table with no `auto_cdc:` options"
+                        )));
+                    };
+                    crate::auto_cdc::validate(cdc, name)?;
+                    // `auto_cdc.source` is what puts the dependency edge in the graph. A name
+                    // that matches nothing produces no edge and no error, so the merge just runs
+                    // in an arbitrary order against whatever the bronze table happens to hold —
+                    // the Connect surface rejects the same typo outright.
+                    let cdc_source = cdc.source.trim();
+                    if cdc_source == name {
+                        return Err(Error::Io(format!(
+                            "table `{name}` declares itself as its own `auto_cdc.source:`"
+                        )));
+                    }
+                    let Some(upstream) = self.tables.iter().find(|t| t.name.trim() == cdc_source)
+                    else {
+                        return Err(Error::Io(format!(
+                            "table `{name}` sets `auto_cdc.source: {cdc_source}`, which is not a \
+                             table declared in `tables:` (declared: {})",
+                            declared.iter().copied().collect::<Vec<_>>().join(", ")
+                        )));
+                    };
+                    // An AUTO CDC target re-ingests the source's stream rather than reading its
+                    // table, so its `source:`/`sql:`/`expect:` are a *copy* of the source's. Let
+                    // them drift and the target quietly merges a different projection — or a
+                    // different set of rows — than the table it claims to follow. The SDP SQL
+                    // surface copies them outright; here they are written twice, so check.
+                    if table.source != upstream.source {
+                        return Err(Error::Io(format!(
+                            "table `{name}` has a different `source:` from its \
+                             `auto_cdc.source: {cdc_source}` — an AUTO CDC target re-reads the \
+                             same stream, so the two must be identical"
+                        )));
+                    }
+                    let sql_of = |t: &crate::TableConfig| {
+                        t.sql.as_deref().map(str::trim).unwrap_or("").to_string()
+                    };
+                    if sql_of(table) != sql_of(upstream) {
+                        return Err(Error::Io(format!(
+                            "table `{name}` has a different `sql:` from its \
+                             `auto_cdc.source: {cdc_source}` — the merge would run over a \
+                             different projection than `{cdc_source}` holds"
+                        )));
+                    }
+                    if table.expect != upstream.expect {
+                        return Err(Error::Io(format!(
+                            "table `{name}` has different `expect:` entries from its \
+                             `auto_cdc.source: {cdc_source}` — the CDC target would merge rows \
+                             `{cdc_source}` dropped, or drop rows it kept"
+                        )));
+                    }
+                    if table.dedup_columns != upstream.dedup_columns {
+                        return Err(Error::Io(format!(
+                            "table `{name}` has different `dedup_columns:` from its \
+                             `auto_cdc.source: {cdc_source}` — both read the same stream, so \
+                             both must deduplicate it the same way"
+                        )));
+                    }
+                }
                 TableKind::Streaming => {
                     let source = table.source.as_ref().expect("streaming implies a source");
                     if source.format.trim().is_empty() {
@@ -212,22 +293,7 @@ impl OxidantConfig {
                             "table `{name}` has a `source:` with no `format:`"
                         )));
                     }
-                    // Deduplicating means remembering keys, and remembering them forever is not
-                    // an option — so there has to be a rule for forgetting. The watermark is
-                    // that rule: it is the only thing that can say a key is safe to drop. A
-                    // count-based bound cannot, which is why the previous version silently
-                    // started re-admitting duplicates once it hit one.
-                    if !table.dedup_columns.is_empty()
-                        && !source.options.contains_key("eventTimeColumn")
-                        && !source.options.contains_key("watermarkColumn")
-                    {
-                        return Err(Error::Io(format!(
-                            "table `{name}` sets `dedup_columns:` but no watermark. Deduplication \
-                             has to remember every key it has seen, and only a watermark can say \
-                             when one is safe to forget — add `eventTimeColumn` (and optionally \
-                             `delayMs`) to the source's `options:`"
-                        )));
-                    }
+                    validate_dedup_watermark(name, source, &table.dedup_columns)?;
                 }
             }
             for (label, expectation) in &table.expect {
@@ -389,6 +455,29 @@ fn find_cycle<'a>(edges: &BTreeMap<&'a str, Vec<&'a str>>) -> Option<Vec<&'a str
     None
 }
 
+/// Deduplicating means remembering keys, and remembering them forever is not an option — so
+/// there has to be a rule for forgetting. The watermark is that rule: it is the only thing that
+/// can say a key is safe to drop. A count-based bound cannot, which is why an earlier version
+/// silently started re-admitting duplicates once it hit one.
+fn validate_dedup_watermark(
+    name: &str,
+    source: &SourceConfig,
+    dedup_columns: &[String],
+) -> Result<()> {
+    if !dedup_columns.is_empty()
+        && !source.options.contains_key("eventTimeColumn")
+        && !source.options.contains_key("watermarkColumn")
+    {
+        return Err(Error::Io(format!(
+            "table `{name}` sets `dedup_columns:` but no watermark. Deduplication has to \
+             remember every key it has seen, and only a watermark can say when one is safe to \
+             forget — add `eventTimeColumn` (and optionally `delayMs`) to the source's \
+             `options:`"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +506,147 @@ pipeline:
 tables:
 {tables}"
         )
+    }
+
+    /// A bronze table plus an AUTO CDC target over it, with `extra` spliced into the target.
+    fn cdc_yaml(extra: &str) -> String {
+        with_pipeline(&format!(
+            r#"  - name: customers_bronze
+    source:
+      format: kafka
+      options:
+        subscribe: customers
+  - name: customers_scd1
+    source:
+      format: kafka
+      options:
+        subscribe: customers
+    auto_cdc:
+      source: customers_bronze
+      keys: [id]
+      sequence_by: seq
+{extra}"#
+        ))
+    }
+
+    #[test]
+    fn an_auto_cdc_table_without_a_source_errors_instead_of_panicking() {
+        // `TableConfig::kind()` answers AutoCdc for any table with an `auto_cdc:` block, so this
+        // config lands in the AutoCdc arm, not the Derived one — it used to unwrap its way to a
+        // panic there.
+        let err = parse_err(&with_pipeline(
+            r#"  - name: customers_bronze
+    source:
+      format: kafka
+      options:
+        subscribe: customers
+  - name: customers_scd1
+    auto_cdc:
+      source: customers_bronze
+      keys: [id]
+      sequence_by: seq
+"#,
+        ));
+        assert!(err.contains("no `source:`"), "got: {err}");
+        assert!(err.contains("customers_scd1"), "got: {err}");
+    }
+
+    #[test]
+    fn an_auto_cdc_source_must_name_a_declared_table() {
+        // A typo here produces no dependency edge, so the merge would silently run against
+        // whatever the bronze table happened to hold at the time.
+        let err = parse_err(&with_pipeline(
+            r#"  - name: customers_bronze
+    source:
+      format: kafka
+      options:
+        subscribe: customers
+  - name: customers_scd1
+    source:
+      format: kafka
+      options:
+        subscribe: customers
+    auto_cdc:
+      source: customers_bronz
+      keys: [id]
+      sequence_by: seq
+"#,
+        ));
+        assert!(err.contains("customers_bronz"), "got: {err}");
+        assert!(err.contains("not a table declared"), "got: {err}");
+
+        let err = parse_err(&cdc_yaml("").replace(
+            "source: customers_bronze\n      keys",
+            "source: customers_scd1\n      keys",
+        ));
+        assert!(err.contains("its own `auto_cdc.source:`"), "got: {err}");
+    }
+
+    #[test]
+    fn an_auto_cdc_target_may_precede_the_source_it_names() {
+        // The source is allowed to be declared later in the file; validation collects every
+        // declared name before checking.
+        let config = OxidantConfig::parse(&with_pipeline(
+            r#"  - name: customers_scd1
+    source:
+      format: kafka
+      options:
+        subscribe: customers
+    auto_cdc:
+      source: customers_bronze
+      keys: [id]
+      sequence_by: seq
+  - name: customers_bronze
+    source:
+      format: kafka
+      options:
+        subscribe: customers
+"#,
+        ));
+        assert!(config.is_ok(), "got: {config:?}");
+    }
+
+    #[test]
+    fn an_auto_cdc_expression_key_is_rejected_at_load() {
+        let err = parse_err(&cdc_yaml("").replace("keys: [id]", "keys: [\"lower(id)\"]"));
+        assert!(err.contains("plain column name"), "got: {err}");
+    }
+
+    #[test]
+    fn an_auto_cdc_target_must_mirror_the_source_it_follows() {
+        // The target re-ingests the source's stream rather than reading its table, so the two
+        // declarations are a copy of one another. Drift means merging a different projection —
+        // or a different set of rows — than the table it claims to follow.
+        let err = parse_err(&cdc_yaml("").replace(
+            "        subscribe: customers
+    auto_cdc",
+            "        subscribe: other
+    auto_cdc",
+        ));
+        assert!(err.contains("different `source:`"), "got: {err}");
+
+        let drifted_sql = cdc_yaml(
+            "    sql: SELECT id, seq FROM stream
+",
+        );
+        let err = parse_err(&drifted_sql);
+        assert!(err.contains("different `sql:`"), "got: {err}");
+
+        let drifted_expect = cdc_yaml(
+            "    expect:
+      positive:
+        check: id > 0
+        action: drop
+",
+        );
+        let err = parse_err(&drifted_expect);
+        assert!(err.contains("different `expect:`"), "got: {err}");
+    }
+
+    #[test]
+    fn an_auto_cdc_table_needs_a_watermark_to_dedup() {
+        let err = parse_err(&cdc_yaml("    dedup_columns: [id]\n"));
+        assert!(err.contains("no watermark"), "got: {err}");
     }
 
     #[test]

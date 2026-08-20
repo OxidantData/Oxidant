@@ -123,6 +123,7 @@ impl OxidantService {
                     pipeline,
                     current_catalog,
                     current_namespace,
+                    sink_override: None,
                 },
             )
             .await

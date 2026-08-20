@@ -4550,6 +4550,7 @@ dependencies = [
 name = "oxidant-pipelines"
 version = "0.1.30"
 dependencies = [
+ "async-trait",
  "datafusion",
  "oxidant-common",
  "oxidant-config",
@@ -4557,6 +4558,7 @@ dependencies = [
  "oxidant-streaming",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -4608,6 +4610,7 @@ dependencies = [
  "futures",
  "object_store",
  "oxidant-catalog",
+ "oxidant-catalog-local",
  "oxidant-common",
  "oxidant-datasource",
  "oxidant-loom",

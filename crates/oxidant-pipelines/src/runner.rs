@@ -15,6 +15,8 @@ use oxidant_streaming::{
     StreamQueryConfig, StreamingQueryManager, Trigger as StreamTrigger,
 };
 
+use crate::auto_cdc::CdcMerge;
+use crate::cdc_sink::CdcMergeSink;
 use crate::expectations;
 use crate::graph::{Graph, Node};
 use crate::output_write::{
@@ -405,7 +407,7 @@ impl StreamState {
             let Some(table) = plan.table(&node.name) else {
                 continue;
             };
-            if table.kind() != TableKind::Streaming {
+            if !matches!(table.kind(), TableKind::Streaming | TableKind::AutoCdc) {
                 continue;
             }
             let id = start_stream(engine, plan, table, &manager).await?;
@@ -460,11 +462,16 @@ async fn start_stream(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let has_flows = declared_sql.is_some() || !table.append_flows.is_empty();
-    let synthesized_sql = (!has_flows)
-        .then(|| {
-            expectations::has_drops(&table.expect).then(|| format!("SELECT * FROM {STREAM_ALIAS}"))
-        })
-        .flatten();
+    let synthesized_sql = if table.auto_cdc.is_some() && !has_flows {
+        Some(format!("SELECT * FROM {STREAM_ALIAS}"))
+    } else {
+        (!has_flows)
+            .then(|| {
+                expectations::has_drops(&table.expect)
+                    .then(|| format!("SELECT * FROM {STREAM_ALIAS}"))
+            })
+            .flatten()
+    };
     let needs_stream_plan = has_flows || synthesized_sql.is_some();
     let stream_input = if needs_stream_plan {
         let schema = oxidant_streaming::source_schema(&config)?;
@@ -506,6 +513,59 @@ async fn start_stream(
     };
 
     let checkpoint = format!("{}/{name}", plan.pipeline.checkpoints.trim_end_matches('/'));
+
+    let mut start_options = StartOptions {
+        pipeline,
+        current_catalog: plan.pipeline.catalog.clone(),
+        current_namespace: vec![plan.pipeline.schema.clone()],
+        sink_override: None,
+    };
+    if let Some(cdc) = table.auto_cdc.as_ref() {
+        let target_fqn = plan.target_of(name);
+        let format = oxidant_streaming::writable_format(&plan.format_of(table))?;
+        let lake_target = LakeTarget::from_table_identifier(
+            &target_fqn,
+            &plan.pipeline.catalog,
+            std::slice::from_ref(&plan.pipeline.schema),
+            format,
+            plan.location_of(name),
+        )?;
+        // The micro-batch schema is what the source's transformation produces; the *target*
+        // schema is that projected through COLUMNS / COLUMNS * EXCEPT, so the sink has to be
+        // opened on the merge's schema rather than the stream's.
+        let batch_schema = if let Some(p) = &start_options.pipeline {
+            Arc::new(p.plan.schema().as_arrow().clone())
+        } else {
+            oxidant_streaming::source_schema(&config)?
+        };
+        let merge = CdcMerge::new(cdc, &batch_schema, name)?;
+        let sink_schema = merge.schema();
+        let inner = LakeSink::open(
+            engine,
+            lake_target,
+            sink_schema,
+            LakeSinkOptions {
+                app_id: Some(format!("{}::{name}", plan.pipeline.name)),
+                partition_columns: table.partition_by.clone(),
+                publish_iceberg: table.iceberg_compat.unwrap_or(plan.pipeline.iceberg_compat),
+                iceberg_table_suffix: table
+                    .iceberg_table_suffix
+                    .clone()
+                    .unwrap_or_else(|| oxidant_streaming::DEFAULT_ICEBERG_SUFFIX.to_string()),
+                checkpoint_interval: table
+                    .checkpoint_interval
+                    .unwrap_or(oxidant_streaming::DEFAULT_CHECKPOINT_INTERVAL),
+            },
+        )
+        .await?;
+        start_options.sink_override = Some(Box::new(CdcMergeSink::new(
+            engine.clone(),
+            merge,
+            target_fqn,
+            inner,
+        )));
+    }
+
     let id = manager
         .start_with_config(
             engine,
@@ -513,11 +573,7 @@ async fn start_stream(
             checkpoint,
             StreamTrigger::AvailableNow,
             config,
-            StartOptions {
-                pipeline,
-                current_catalog: plan.pipeline.catalog.clone(),
-                current_namespace: vec![plan.pipeline.schema.clone()],
-            },
+            start_options,
         )
         .await?;
     Ok(id.id)
@@ -610,7 +666,9 @@ where
 
         let started = Instant::now();
         let result = match table.kind() {
-            TableKind::Streaming => advance_stream(engine, streams, &node.name, drain).await,
+            TableKind::Streaming | TableKind::AutoCdc => {
+                advance_stream(engine, streams, &node.name, drain).await
+            }
             TableKind::Derived => recompute(engine, plan, table, state, on_event).await,
         };
         match result {

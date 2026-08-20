@@ -1499,3 +1499,98 @@ async fn execute_output_flows_rejects_output_types_it_cannot_write() {
     assert_eq!(err.code(), Code::InvalidArgument, "{err}");
     assert!(err.message().contains("TEMPORARY_VIEW"), "{err}");
 }
+
+/// The 4b/4c union point: an AUTO CDC flow reads its source through `auto_cdc.source`, not
+/// through a relation or SQL text, so the sink-read refusal has to look there too. Without that
+/// arm this graph reaches `resolve_auto_cdc_flows` and is rejected as "not a table declared in
+/// this pipeline", which is the wrong story — the sink is declared, it is just unreadable.
+#[tokio::test]
+async fn start_run_rejects_auto_cdc_flow_that_reads_a_sink() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let checkpoints = warehouse.path().join("_checkpoints");
+    std::fs::create_dir_all(&checkpoints).expect("checkpoints dir");
+
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+
+    let create = execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::CreateDataflowGraph(
+                sc::pipeline_command::CreateDataflowGraph {
+                    default_catalog: Some("local".into()),
+                    default_database: Some("live".into()),
+                    sql_conf: Default::default(),
+                },
+            )),
+        },
+    )
+    .await
+    .expect("create graph");
+    let graph_id = graph_id_from_create(&create);
+
+    // A sink cannot be declared in SDP SQL, so it comes in over `DefineOutput`; the CDC flow that
+    // tries to read it comes in over SDP SQL. Both halves of the merge, one graph.
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineOutput(
+                sc::pipeline_command::DefineOutput {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    output_name: Some("orders_sink".into()),
+                    output_type: Some(sc::OutputType::Sink as i32),
+                    details: Some(sc::pipeline_command::define_output::Details::SinkDetails(
+                        sc::pipeline_command::define_output::SinkDetails {
+                            format: Some("delta".into()),
+                            options: HashMap::from([(
+                                "path".into(),
+                                warehouse.path().join("sink").to_string_lossy().into_owned(),
+                            )]),
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define sink");
+
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(
+                sc::pipeline_command::DefineSqlGraphElements {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    sql_text: Some(
+                        "CREATE STREAMING TABLE cdc_target; \
+                         CREATE FLOW cdc_flow AS AUTO CDC INTO cdc_target FROM orders_sink \
+                         KEYS (id) SEQUENCE BY seq STORED AS SCD TYPE 1"
+                            .into(),
+                    ),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define sql");
+
+    let err = execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::StartRun(
+                sc::pipeline_command::StartRun {
+                    dataflow_graph_id: Some(graph_id),
+                    dry: Some(true),
+                    storage: Some(checkpoints.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+    .expect_err("an AUTO CDC flow reading a sink must fail planning");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    assert!(err.message().contains("cannot read sink"), "{err}");
+}

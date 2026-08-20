@@ -393,7 +393,7 @@ async fn pipeline_rejection_paths() {
                 },
             )),
         },
-        Code::Unimplemented,
+        Code::InvalidArgument,
     )
     .await;
 

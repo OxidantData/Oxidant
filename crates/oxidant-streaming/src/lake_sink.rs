@@ -187,6 +187,10 @@ pub struct LakeSink {
     /// Namespace and name of the sibling Iceberg catalog entry, when one was registered.
     iceberg_entry: Option<(Vec<String>, String)>,
     location: String,
+    /// Engine handle kept so a landed commit can drop the cached provider behind this table's
+    /// name — see [`LakeSink::invalidate_readers`]. A clone shares the engine's state; it does
+    /// not keep a second one alive beyond the managed directories every handle shares.
+    engine: Engine,
 }
 
 impl LakeSink {
@@ -331,7 +335,30 @@ impl LakeSink {
             catalog: catalog_handle,
             iceberg_entry: None,
             location,
+            engine: engine.clone(),
         })
+    }
+
+    /// Drop the cached provider behind this table's *name*, so the next reader of it in this
+    /// process resolves the version this sink just committed.
+    ///
+    /// A resolved provider embeds the file list it was built from, and the catalog bridge caches
+    /// lakehouse entries with no TTL revalidation — so without this, the first query to touch the
+    /// table pins the snapshot it saw and every later commit by this very sink is invisible to
+    /// it. The failure is silent: a `SELECT` after a micro-batch simply returns the old rows, and
+    /// a read-modify-write reader (the AUTO CDC merge) recomputes the table *without* the rows it
+    /// could not see and then commits that.
+    ///
+    /// Called only where a commit actually landed — a deduplicated replay published nothing, so
+    /// there is nothing to invalidate. A location-only sink has no name to invalidate at all,
+    /// which is why [`Engine::read_delta`] exists for readers that must not depend on this.
+    async fn invalidate_readers(&self) {
+        if self.target.catalog.is_none() || self.target.table.is_empty() {
+            return;
+        }
+        // A refresh that evicts nothing is a no-op; a name that cannot be resolved is not worth
+        // failing a durable commit over.
+        let _ = self.engine.refresh_table(&self.target.display_name()).await;
     }
 
     /// Register the sibling Iceberg catalog entry that Iceberg-only engines query.
@@ -366,6 +393,23 @@ impl LakeSink {
         }
         self.iceberg_entry = Some((self.target.namespace.clone(), name));
         Ok(())
+    }
+
+    /// The Delta version the *next* commit will take — `0` before anything has been written.
+    ///
+    /// Two callers need this. [`open`](Self::open) creates the catalog entry but writes no Delta
+    /// log, so reading a freshly created target legitimately fails; `0` here is what tells that
+    /// apart from a read failure over a table that *does* exist, which matching on the text of
+    /// the error cannot do safely. And a caller that has to know whether its last
+    /// [`replace_batch`](Self::replace_batch) actually committed — as opposed to being dropped as
+    /// a replay — can compare this across the call, which `rows == 0` cannot distinguish from a
+    /// merge that legitimately produced no rows.
+    pub fn next_commit_version(&self) -> u64 {
+        match &self.writer {
+            Writer::Delta(writer) => writer.next_version(),
+            // A bare Parquet directory has no commit protocol; `replace_batch` rejects it.
+            Writer::Parquet => 0,
+        }
     }
 
     /// The highest idempotency version this table's log already carries, or 0.
@@ -441,6 +485,7 @@ impl LakeSink {
         if let Some(version) = published_at {
             self.publish_iceberg(version).await;
         }
+        self.invalidate_readers().await;
         Ok(rows)
     }
 
@@ -580,6 +625,7 @@ impl Sink for LakeSink {
         if let Some(version) = published_at {
             self.publish_iceberg(version).await;
         }
+        self.invalidate_readers().await;
         Ok(rows)
     }
 }
