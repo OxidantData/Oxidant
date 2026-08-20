@@ -433,11 +433,26 @@ async fn failed_flow_error_event_includes_source_code_location() {
     .await;
 
     let events = pipeline_event_messages(&responses);
+    let failed_event = events
+        .iter()
+        .find(|m| m.contains("bad") && m.contains("FAILED"))
+        .expect("failure event with table name");
     assert!(
-        events.iter().any(|m| {
-            m.contains("bad") && m.contains("FAILED") && m.contains("pipeline.sql:17")
-        }),
-        "failure event must echo SourceCodeLocation file:line, got {events:?}"
+        failed_event.starts_with("[oxidant] bad"),
+        "event must use oxidant table-failed prefix, got {failed_event}"
+    );
+    assert!(
+        failed_event.contains("FAILED (pipeline.sql:17): "),
+        "event must echo SourceCodeLocation in wrapper shape, got {failed_event}"
+    );
+    assert_eq!(
+        failed_event.matches("FAILED").count(),
+        1,
+        "event must not double-wrap status text: {failed_event}"
+    );
+    assert!(
+        !failed_event.contains("FAILED (at "),
+        "event must use PipelineEvent location shape, not terminal status shape: {failed_event}"
     );
     assert!(
         status.message().contains("pipeline.sql:17"),
@@ -851,4 +866,236 @@ async fn relation_flow_reads_temporary_view_at_start_run() {
         "MV should update when a relation flow reads a temp view, got {:?}",
         pipeline_event_messages(&run)
     );
+}
+
+#[tokio::test]
+async fn failed_dry_start_run_leaves_no_temporary_views() {
+    let port = pick_port();
+    let mut client = boot_default(port).await;
+    let graph_id = create_graph(&mut client, HashMap::new()).await;
+
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(
+                sc::pipeline_command::DefineSqlGraphElements {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    sql_file_path: Some("pipeline.sql".into()),
+                    sql_text: Some(
+                        "CREATE TEMPORARY VIEW tv AS SELECT 42 AS n; \
+                         CREATE TEMPORARY VIEW tv2 AS SELECT * FROM definitely_missing_table_xyz"
+                            .into(),
+                    ),
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define sql");
+
+    let (_responses, status) = execute_pipeline_expect_error(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::StartRun(
+                sc::pipeline_command::StartRun {
+                    dataflow_graph_id: Some(graph_id),
+                    dry: Some(true),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await;
+    assert_ne!(status.code(), Code::Ok, "dry run should fail validation");
+
+    let err = sql_query(&mut client, "SELECT * FROM tv")
+        .await
+        .expect_err("temp view must not exist after a failed dry run");
+    assert_ne!(err.code(), Code::Ok);
+    let err = sql_query(&mut client, "SELECT * FROM tv2")
+        .await
+        .expect_err("partially registered temp view must not exist after a failed dry run");
+    assert_ne!(err.code(), Code::Ok);
+}
+
+#[tokio::test]
+async fn dry_run_preserves_pre_existing_session_temp_view() {
+    let port = pick_port();
+    let mut client = boot_default(port).await;
+
+    sql_query(&mut client, "CREATE TEMPORARY VIEW tv AS SELECT 99 AS n")
+        .await
+        .expect("pre-create session temp view");
+
+    let graph_id = create_graph(&mut client, HashMap::new()).await;
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(
+                sc::pipeline_command::DefineSqlGraphElements {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    sql_file_path: Some("pipeline.sql".into()),
+                    sql_text: Some(
+                        "CREATE TEMPORARY VIEW tv AS SELECT 42 AS n; \
+                         CREATE MATERIALIZED VIEW mv AS SELECT * FROM tv"
+                            .into(),
+                    ),
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define sql");
+
+    let (_responses, status) = execute_pipeline_expect_error(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::StartRun(
+                sc::pipeline_command::StartRun {
+                    dataflow_graph_id: Some(graph_id),
+                    dry: Some(true),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await;
+    assert!(
+        status.message().contains("same name already exists"),
+        "dry run must not clobber a pre-existing session temp view, got {}",
+        status.message()
+    );
+
+    let mut stream = client
+        .execute_plan(Request::new(sc::ExecutePlanRequest {
+            session_id: SESSION.to_string(),
+            plan: Some(sc::Plan {
+                op_type: Some(sc::plan::OpType::Root(sc::Relation {
+                    rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                        query: "SELECT n FROM tv".into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("pre-existing temp view should still be queryable")
+        .into_inner();
+    while let Some(item) = stream.next().await {
+        item.expect("read pre-existing temp view");
+    }
+}
+
+#[tokio::test]
+async fn flow_level_catalog_sql_conf_emits_ignored_event() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+    let graph_id = create_graph(&mut client, HashMap::new()).await;
+
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineOutput(
+                sc::pipeline_command::DefineOutput {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    output_name: Some("metrics".into()),
+                    output_type: Some(sc::OutputType::Table as i32),
+                    comment: None,
+                    source_code_location: None,
+                    details: Some(sc::pipeline_command::define_output::Details::TableDetails(
+                        sc::pipeline_command::define_output::TableDetails {
+                            table_properties: Default::default(),
+                            partition_cols: vec![],
+                            format: Some("delta".into()),
+                            schema: None,
+                            clustering_columns: vec![],
+                        },
+                    )),
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define output");
+
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineFlow(
+                sc::pipeline_command::DefineFlow {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    flow_name: Some("fill_metrics".into()),
+                    target_dataset_name: Some("metrics".into()),
+                    sql_conf: HashMap::from([
+                        (
+                            "spark.sql.catalog.flowonly.type".to_string(),
+                            "local".to_string(),
+                        ),
+                        (
+                            "spark.sql.catalog.flowonly.warehouse".to_string(),
+                            warehouse.path().to_string_lossy().to_string(),
+                        ),
+                        (
+                            "spark.sql.defaultCatalog".to_string(),
+                            "flowonly".to_string(),
+                        ),
+                    ]),
+                    client_id: None,
+                    source_code_location: None,
+                    details: Some(
+                        sc::pipeline_command::define_flow::Details::RelationFlowDetails(
+                            sc::pipeline_command::define_flow::WriteRelationFlowDetails {
+                                relation: Some(sc::Relation {
+                                    rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                                        query: "SELECT 1 AS id".into(),
+                                        ..Default::default()
+                                    })),
+                                    ..Default::default()
+                                }),
+                            },
+                        ),
+                    ),
+                    once: None,
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define flow");
+
+    let dry = execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::StartRun(
+                sc::pipeline_command::StartRun {
+                    dataflow_graph_id: Some(graph_id),
+                    dry: Some(true),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+    .expect("dry start run");
+    let events = pipeline_event_messages(&dry);
+    assert!(
+        events
+            .iter()
+            .any(|m| m.contains("ignored sql_conf key `spark.sql.catalog.flowonly.type`")),
+        "flow-level catalog keys must emit ignored events, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|m| m.contains("ignored sql_conf key `spark.sql.defaultCatalog`")),
+        "flow-level defaultCatalog must emit ignored event, got {events:?}"
+    );
+
+    let err = sql_query(&mut client, "SELECT * FROM flowonly.default.metrics")
+        .await
+        .expect_err("flow-level catalog keys must not register a catalog");
+    assert_ne!(err.code(), Code::Ok);
 }
