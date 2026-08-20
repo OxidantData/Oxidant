@@ -6,6 +6,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use oxidant_common::{Error, Result};
 use oxidant_config::AppendFlow;
+use oxidant_loom::schema_conform::conform_batch_to_schema;
 use oxidant_loom::spark_functions::parse_spark_schema;
 use oxidant_loom::Engine;
 
@@ -19,13 +20,12 @@ pub struct FlowQuery {
 /// Kafka / streaming source options allowed in SDP `TBLPROPERTIES`.
 const SOURCE_TABLE_PROPERTIES: &[&str] = &[
     "subscribe",
+    "topic",
     "oxidant.spool.dir",
     "startingOffsets",
     "maxOffsetsPerTrigger",
     "kafka.bootstrap.servers",
-    "eventTimeColumn",
-    "delayMs",
-    "watermarkColumn",
+    "bootstrap.servers",
 ];
 
 /// Sink-side table properties the pipeline runner understands today.
@@ -124,6 +124,20 @@ pub fn flow_queries(
     out
 }
 
+fn validate_by_name_requires_schema(flows: &[FlowQuery], has_declared_schema: bool) -> Result<()> {
+    if has_declared_schema {
+        return Ok(());
+    }
+    for flow in flows {
+        if flow.by_name {
+            return Err(Error::Plan(
+                "BY NAME requires a declared output schema on the target table".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Union flow queries, optionally enforcing a declared output schema on each branch.
 pub async fn union_flow_sql(
     engine: &Engine,
@@ -134,6 +148,7 @@ pub async fn union_flow_sql(
         return Err(Error::Plan("table has no flow SQL".into()));
     }
     let target = output_schema.map(parse_output_schema).transpose()?;
+    validate_by_name_requires_schema(flows, target.is_some())?;
     let mut branches = Vec::with_capacity(flows.len());
     for flow in flows {
         let branch = if let Some(schema) = &target {
@@ -185,7 +200,7 @@ fn positional_projections(source: &SchemaRef, target: &SchemaRef) -> Result<Vec<
         .fields()
         .iter()
         .zip(target.fields())
-        .map(|(src, dst)| cast_projection(src.name(), dst))
+        .map(|(src, dst)| column_projection(src.name(), dst))
         .collect())
 }
 
@@ -202,15 +217,28 @@ fn by_name_projections(source: &SchemaRef, target: &SchemaRef) -> Result<Vec<Str
                     dst.name()
                 ))
             })?;
-        out.push(cast_projection(src.name(), dst));
+        out.push(column_projection(src.name(), dst));
     }
     Ok(out)
 }
 
-fn cast_projection(source_name: &str, target: &Field) -> String {
-    let quoted = quote_ident(source_name);
-    let ddl = spark_ddl_type(target.data_type());
-    format!("CAST({quoted} AS {ddl}) AS {}", quote_ident(target.name()))
+fn column_projection(source_name: &str, target: &Field) -> String {
+    format!(
+        "{} AS {}",
+        quote_ident(source_name),
+        quote_ident(target.name())
+    )
+}
+
+/// Cast query batches to a declared output schema with column-named errors.
+pub fn conform_batches_to_schema(
+    batches: Vec<datafusion::arrow::record_batch::RecordBatch>,
+    target: &SchemaRef,
+) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
+    batches
+        .into_iter()
+        .map(|batch| conform_batch_to_schema(batch, target))
+        .collect()
 }
 
 fn quote_ident(name: &str) -> String {
@@ -224,6 +252,7 @@ fn quote_ident(name: &str) -> String {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn spark_ddl_type(dt: &DataType) -> String {
     match dt {
         DataType::Boolean => "BOOLEAN".to_string(),
@@ -239,8 +268,7 @@ fn spark_ddl_type(dt: &DataType) -> String {
         | DataType::BinaryView
         | DataType::FixedSizeBinary(_) => "BINARY".to_string(),
         DataType::Date32 | DataType::Date64 => "DATE".to_string(),
-        DataType::Timestamp(_, Some(_)) => "TIMESTAMP".to_string(),
-        DataType::Timestamp(_, None) => "TIMESTAMP_NTZ".to_string(),
+        DataType::Timestamp(_, Some(_)) | DataType::Timestamp(_, None) => "TIMESTAMP".to_string(),
         DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("DECIMAL({p},{s})"),
         DataType::List(f)
         | DataType::LargeList(f)
@@ -250,7 +278,13 @@ fn spark_ddl_type(dt: &DataType) -> String {
         DataType::Struct(fields) => {
             let inner: Vec<String> = fields
                 .iter()
-                .map(|f| format!("{}:{}", f.name(), spark_ddl_type(f.data_type())))
+                .map(|f| {
+                    format!(
+                        "{}:{}",
+                        quote_ident(f.name()),
+                        spark_ddl_type(f.data_type())
+                    )
+                })
                 .collect();
             format!("STRUCT<{}>", inner.join(","))
         }
@@ -269,6 +303,22 @@ fn spark_ddl_type(dt: &DataType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::StringArray;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    #[test]
+    fn conform_rejects_invalid_string_to_bigint() {
+        let source = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let target = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            source,
+            vec![Arc::new(StringArray::from(vec!["1", "not-a-number"]))],
+        )
+        .expect("batch");
+        let err = conform_batch_to_schema(batch, &target).expect_err("invalid cast");
+        assert!(err.to_string().contains("`id`"), "{err}");
+    }
 
     #[test]
     fn parse_output_schema_accepts_parenthesized_ddl() {
@@ -346,7 +396,62 @@ mod tests {
             Field::new("b", DataType::Utf8, true),
         ]));
         let projections = by_name_projections(&source, &target).expect("maps");
-        assert!(projections[0].contains("CAST(a AS BIGINT)"));
-        assert!(projections[1].contains("CAST(b AS STRING)"));
+        assert!(projections[0].contains("a AS a"));
+        assert!(projections[1].contains("b AS b"));
+    }
+
+    #[test]
+    fn kafka_aliases_are_allowed_in_tblproperties() {
+        let props = BTreeMap::from([
+            ("topic".to_string(), "orders".to_string()),
+            ("bootstrap.servers".to_string(), "b1:9092".to_string()),
+        ]);
+        let (source, sink) = split_table_properties(&props).expect("allowed");
+        assert_eq!(source.get("topic").map(String::as_str), Some("orders"));
+        assert_eq!(
+            source.get("bootstrap.servers").map(String::as_str),
+            Some("b1:9092")
+        );
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn by_name_without_declared_schema_is_refused() {
+        let flows = vec![FlowQuery {
+            sql: "SELECT 1".into(),
+            by_name: true,
+        }];
+        let err =
+            validate_by_name_requires_schema(&flows, false).expect_err("by name needs schema");
+        assert!(
+            err.to_string()
+                .contains("BY NAME requires a declared output schema"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn spark_ddl_type_renders_timestamp_for_planner() {
+        assert_eq!(
+            spark_ddl_type(&DataType::Timestamp(
+                datafusion::arrow::datatypes::TimeUnit::Microsecond,
+                None
+            )),
+            "TIMESTAMP"
+        );
+    }
+
+    #[test]
+    fn spark_ddl_type_quotes_struct_field_names() {
+        assert_eq!(
+            spark_ddl_type(&DataType::Struct(
+                datafusion::arrow::datatypes::Fields::from(vec![Field::new(
+                    "a b",
+                    DataType::Int32,
+                    true
+                )])
+            )),
+            "STRUCT<`a b`:INT>"
+        );
     }
 }

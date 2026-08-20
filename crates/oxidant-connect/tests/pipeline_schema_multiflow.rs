@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use oxidant_connect::{serve, ServerConfig};
@@ -250,10 +250,13 @@ CREATE FLOW widen AS INSERT INTO typed_mv SELECT 'not-a-number' AS id";
         "expected TableFailed event for typed_mv, got {events:?}; status={status}"
     );
     assert!(
-        events
-            .iter()
-            .any(|m| { m.contains("Cast") || m.contains("Int64") || m.contains("not-a-number") }),
-        "failure should mention the incompatible cast, got {events:?}"
+        events.iter().any(|m| {
+            m.contains("Cast")
+                || m.contains("Int64")
+                || m.contains("not-a-number")
+                || m.contains("`id`")
+        }),
+        "failure should name the column and incompatible cast, got {events:?}"
     );
 }
 
@@ -403,4 +406,173 @@ CREATE FLOW swapped AS INSERT INTO by_name_mv BY NAME SELECT 20 AS b, 2 AS a";
     let sum_b = sql_scalar_i64(&mut client, "SELECT sum(b) FROM local.live.by_name_mv").await;
     assert_eq!(sum_a, 3, "column a should be 1 and 2");
     assert_eq!(sum_b, 30, "column b should be 10 and 20");
+}
+
+fn spool_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/spool/orders")
+}
+
+#[tokio::test]
+async fn streaming_table_with_declared_schema_ingests_spool() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let checkpoints = warehouse.path().join("_ckpt");
+    std::fs::create_dir_all(&checkpoints).expect("checkpoints");
+    let spool = spool_dir().canonicalize().expect("spool");
+
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+    let graph_id = create_graph(&mut client).await;
+
+    let sql = format!(
+        "CREATE STREAMING TABLE orders_typed (order_id BIGINT, customer STRING, amount BIGINT) \
+         TBLPROPERTIES ('subscribe' = 'orders', 'oxidant.spool.dir' = '{}', 'startingOffsets' = 'earliest') \
+         USING DELTA \
+         AS SELECT \
+           CAST(get_json_object(CAST(value AS STRING), '$.order_id') AS BIGINT) AS order_id, \
+           get_json_object(CAST(value AS STRING), '$.customer') AS customer, \
+           CAST(get_json_object(CAST(value AS STRING), '$.amount') AS BIGINT) AS amount \
+         FROM stream",
+        spool.display()
+    );
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(
+                sc::pipeline_command::DefineSqlGraphElements {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    sql_file_path: None,
+                    sql_text: Some(sql),
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define sql");
+
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::StartRun(
+                sc::pipeline_command::StartRun {
+                    dataflow_graph_id: Some(graph_id),
+                    dry: Some(false),
+                    storage: Some(checkpoints.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+    .expect("start run");
+
+    let count = sql_scalar_i64(&mut client, "SELECT count(*) FROM local.live.orders_typed").await;
+    assert_eq!(
+        count, 5,
+        "all spool rows should land in the typed streaming table"
+    );
+}
+
+#[tokio::test]
+async fn declared_timestamp_schema_enforces_on_materialized_view() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let checkpoints = warehouse.path().join("_ckpt");
+    std::fs::create_dir_all(&checkpoints).expect("checkpoints");
+
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+    let graph_id = create_graph(&mut client).await;
+
+    let sql = "\
+CREATE MATERIALIZED VIEW ts_mv (id BIGINT, ts TIMESTAMP) AS \
+SELECT 1 AS id, timestamp '2020-01-01 00:00:00' AS ts";
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(
+                sc::pipeline_command::DefineSqlGraphElements {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    sql_file_path: None,
+                    sql_text: Some(sql.into()),
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define sql");
+
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::StartRun(
+                sc::pipeline_command::StartRun {
+                    dataflow_graph_id: Some(graph_id),
+                    dry: Some(false),
+                    storage: Some(checkpoints.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await
+    .expect("start run");
+
+    let count = sql_scalar_i64(&mut client, "SELECT count(*) FROM local.live.ts_mv").await;
+    assert_eq!(count, 1, "timestamp schema should not break enforcement");
+}
+
+#[tokio::test]
+async fn by_name_flow_without_declared_schema_is_refused() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let checkpoints = warehouse.path().join("_ckpt");
+    std::fs::create_dir_all(&checkpoints).expect("checkpoints");
+
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+    let graph_id = create_graph(&mut client).await;
+
+    let sql = "\
+CREATE MATERIALIZED VIEW plain_mv AS SELECT 1 AS a;
+CREATE FLOW bad_by_name AS INSERT INTO plain_mv BY NAME SELECT 2 AS a";
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(
+                sc::pipeline_command::DefineSqlGraphElements {
+                    dataflow_graph_id: Some(graph_id.clone()),
+                    sql_file_path: None,
+                    sql_text: Some(sql.into()),
+                },
+            )),
+        },
+    )
+    .await
+    .expect("define sql");
+
+    let (responses, status) = execute_pipeline_expect_error(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(sc::pipeline_command::CommandType::StartRun(
+                sc::pipeline_command::StartRun {
+                    dataflow_graph_id: Some(graph_id),
+                    dry: Some(false),
+                    storage: Some(checkpoints.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )),
+        },
+    )
+    .await;
+    let events = pipeline_event_messages(&responses);
+    assert!(
+        events
+            .iter()
+            .any(|m| m.contains("FAILED") && m.contains("plain_mv")),
+        "expected TableFailed event for plain_mv, got {events:?}; status={status}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|m| { m.contains("BY NAME requires a declared output schema") }),
+        "must refuse silent positional fallback, got {events:?}; status={status}"
+    );
 }

@@ -709,13 +709,18 @@ async fn graph_to_config(
         let iceberg_compat = sink_opts
             .get("icebergCompat")
             .map(|v| v.eq_ignore_ascii_case("true"));
+        let output_schema = if let Some(details) = table_details {
+            table_schema_from_details(details).map_err(crate::err_to_status)?
+        } else {
+            None
+        };
         let table = TableConfig {
             name: name.clone(),
             source,
             sql: None,
             sql_by_name: false,
             append_flows: Vec::new(),
-            output_schema: table_details.and_then(table_schema_from_details),
+            output_schema,
             partition_by: table_details
                 .map(|t| t.partition_cols.clone())
                 .unwrap_or_default(),
@@ -918,57 +923,124 @@ fn kafka_source_from_properties(props: &BTreeMap<String, String>) -> Option<Sour
 
 fn table_schema_from_details(
     details: &sc::pipeline_command::define_output::TableDetails,
-) -> Option<String> {
+) -> Result<Option<String>, oxidant_common::Error> {
     match &details.schema {
         Some(sc::pipeline_command::define_output::table_details::Schema::SchemaString(s))
             if !s.trim().is_empty() =>
         {
-            Some(s.clone())
+            Ok(Some(s.clone()))
         }
         Some(sc::pipeline_command::define_output::table_details::Schema::SchemaDataType(dt)) => {
-            proto_schema_to_ddl(dt).ok()
+            Ok(Some(proto_schema_to_ddl(dt)?))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
-fn proto_schema_to_ddl(dt: &sc::DataType) -> Result<String, ()> {
-    use crate::types;
-    let arrow = types::spark_to_arrow(dt).map_err(|_| ())?;
-    match arrow {
-        datafusion::arrow::datatypes::DataType::Struct(fields) => {
-            let cols = fields
+fn proto_schema_to_ddl(dt: &sc::DataType) -> Result<String, oxidant_common::Error> {
+    use oxidant_common::Error;
+    use sc::data_type::Kind;
+    let kind = dt.kind.as_ref().ok_or_else(|| {
+        Error::Plan("invalid schema_data_type proto for output schema: empty DataType".into())
+    })?;
+    match kind {
+        Kind::Struct(s) => {
+            let cols = s
+                .fields
                 .iter()
-                .map(|f| format!("{} {}", f.name(), proto_field_type(f.data_type())))
-                .collect::<Vec<_>>()
+                .map(|f| {
+                    let ty = f.data_type.as_ref().ok_or_else(|| {
+                        Error::Plan(format!(
+                            "invalid schema_data_type proto for output schema: field `{}` is missing a type",
+                            f.name
+                        ))
+                    })?;
+                    Ok(format!("{} {}", f.name, proto_spark_type_name(ty)?))
+                })
+                .collect::<Result<Vec<_>, Error>>()?
                 .join(", ");
             Ok(format!("({cols})"))
         }
-        _ => Err(()),
+        other => Err(Error::Plan(format!(
+            "output schema must be a struct of columns, got {other:?}"
+        ))),
     }
 }
 
-fn proto_field_type(dt: &datafusion::arrow::datatypes::DataType) -> String {
-    match dt {
-        datafusion::arrow::datatypes::DataType::Boolean => "BOOLEAN".to_string(),
-        datafusion::arrow::datatypes::DataType::Int8
-        | datafusion::arrow::datatypes::DataType::UInt8 => "TINYINT".to_string(),
-        datafusion::arrow::datatypes::DataType::Int16
-        | datafusion::arrow::datatypes::DataType::UInt16 => "SMALLINT".to_string(),
-        datafusion::arrow::datatypes::DataType::Int32
-        | datafusion::arrow::datatypes::DataType::UInt32 => "INT".to_string(),
-        datafusion::arrow::datatypes::DataType::Int64
-        | datafusion::arrow::datatypes::DataType::UInt64 => "BIGINT".to_string(),
-        datafusion::arrow::datatypes::DataType::Float32 => "FLOAT".to_string(),
-        datafusion::arrow::datatypes::DataType::Float64 => "DOUBLE".to_string(),
-        datafusion::arrow::datatypes::DataType::Utf8 => "STRING".to_string(),
-        datafusion::arrow::datatypes::DataType::Binary => "BINARY".to_string(),
-        datafusion::arrow::datatypes::DataType::Date32 => "DATE".to_string(),
-        datafusion::arrow::datatypes::DataType::Timestamp(_, Some(_)) => "TIMESTAMP".to_string(),
-        datafusion::arrow::datatypes::DataType::Timestamp(_, None) => "TIMESTAMP_NTZ".to_string(),
-        datafusion::arrow::datatypes::DataType::Decimal128(p, s) => format!("DECIMAL({p},{s})"),
-        other => format!("{other:?}"),
-    }
+fn proto_spark_type_name(dt: &sc::DataType) -> Result<String, oxidant_common::Error> {
+    use oxidant_common::Error;
+    use sc::data_type::Kind;
+    let kind = dt.kind.as_ref().ok_or_else(|| {
+        Error::Plan("invalid schema_data_type proto for output schema: empty field type".into())
+    })?;
+    Ok(match kind {
+        Kind::Boolean(_) => "BOOLEAN".to_string(),
+        Kind::Byte(_) => "TINYINT".to_string(),
+        Kind::Short(_) => "SMALLINT".to_string(),
+        Kind::Integer(_) => "INT".to_string(),
+        Kind::Long(_) => "BIGINT".to_string(),
+        Kind::Float(_) => "FLOAT".to_string(),
+        Kind::Double(_) => "DOUBLE".to_string(),
+        Kind::String(_) => "STRING".to_string(),
+        Kind::Binary(_) => "BINARY".to_string(),
+        Kind::Date(_) => "DATE".to_string(),
+        Kind::Timestamp(_) | Kind::TimestampNtz(_) => "TIMESTAMP".to_string(),
+        Kind::Decimal(d) => format!(
+            "DECIMAL({},{})",
+            d.precision.unwrap_or(38),
+            d.scale.unwrap_or(0)
+        ),
+        Kind::Array(a) => {
+            let inner = a.element_type.as_ref().ok_or_else(|| {
+                Error::Plan(
+                    "invalid schema_data_type proto for output schema: array element_type is missing"
+                        .into(),
+                )
+            })?;
+            format!("ARRAY<{}>", proto_spark_type_name(inner)?)
+        }
+        Kind::Struct(s) => {
+            let inner = s
+                .fields
+                .iter()
+                .map(|f| {
+                    let ty = f.data_type.as_ref().ok_or_else(|| {
+                        Error::Plan(format!(
+                            "invalid schema_data_type proto for output schema: struct field `{}` is missing a type",
+                            f.name
+                        ))
+                    })?;
+                    Ok(format!("{}:{}", f.name, proto_spark_type_name(ty)?))
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+                .join(",");
+            format!("STRUCT<{inner}>")
+        }
+        Kind::Map(m) => {
+            let key = m.key_type.as_ref().ok_or_else(|| {
+                Error::Plan(
+                    "invalid schema_data_type proto for output schema: map key_type is missing"
+                        .into(),
+                )
+            })?;
+            let value = m.value_type.as_ref().ok_or_else(|| {
+                Error::Plan(
+                    "invalid schema_data_type proto for output schema: map value_type is missing"
+                        .into(),
+                )
+            })?;
+            format!(
+                "MAP<{},{}>",
+                proto_spark_type_name(key)?,
+                proto_spark_type_name(value)?
+            )
+        }
+        other => {
+            return Err(Error::Plan(format!(
+                "invalid schema_data_type proto for output schema: unsupported type {other:?}"
+            )));
+        }
+    })
 }
 
 fn resolve_wanted_tables(graph: &DataflowGraph, refresh_selection: &[String]) -> Vec<String> {
@@ -1257,5 +1329,35 @@ mod tests {
             sc::OutputType::MaterializedView as i32
         );
         assert_eq!(graph.outputs[0].comment.as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn proto_schema_to_ddl_renders_timestamp_for_planner() {
+        use sc::data_type::{Kind, Struct, StructField, TimestampNtz};
+        let dt = sc::DataType {
+            kind: Some(Kind::Struct(Struct {
+                fields: vec![StructField {
+                    name: "ts".into(),
+                    data_type: Some(sc::DataType {
+                        kind: Some(Kind::TimestampNtz(TimestampNtz {
+                            type_variation_reference: 0,
+                        })),
+                    }),
+                    nullable: true,
+                    metadata: None,
+                }],
+                type_variation_reference: 0,
+            })),
+        };
+        let ddl = proto_schema_to_ddl(&dt).expect("timestamp ddl");
+        assert!(ddl.contains("TIMESTAMP"), "ddl={ddl}");
+        assert!(!ddl.contains("TIMESTAMP_NTZ"), "ddl={ddl}");
+    }
+
+    #[test]
+    fn proto_schema_to_ddl_surfaces_conversion_errors() {
+        let dt = sc::DataType { kind: None };
+        let err = proto_schema_to_ddl(&dt).expect_err("invalid proto");
+        assert!(err.to_string().contains("schema_data_type"), "{err}");
     }
 }

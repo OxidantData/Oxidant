@@ -27,6 +27,7 @@ pub mod catalog_bridge;
 pub mod lakeformation_provider;
 /// Reads governed tables with Lake Formation's vended, per-table credentials.
 pub mod lakeformation_store;
+pub mod schema_conform;
 pub mod shard;
 
 /// Shuffle-input scans carrying driver-measured row counts (runtime join-strategy
