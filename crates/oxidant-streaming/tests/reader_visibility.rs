@@ -143,3 +143,35 @@ async fn a_derived_table_recomputes_from_the_upstream_it_was_just_given() {
         "a derived table must recompute from the upstream's committed contents"
     );
 }
+
+/// A table emptied by a `replace` is still a table: both ways of reading it return no rows.
+///
+/// A recompute whose result is empty — an `INSERT OVERWRITE ... WHERE false`, a CDC target
+/// drained by deletes — retires every live file, leaving a log with a schema and nothing to
+/// infer one from. The by-name path has always been served by the catalog's declared schema;
+/// the by-location path has to ask the Delta log for the same thing, and when it did not, the
+/// two disagreed about the same table at the same instant: `SELECT` said empty and `read_delta`
+/// said the columns could not be determined.
+#[tokio::test]
+async fn an_emptied_table_reads_as_empty_by_name_and_by_location() {
+    let (engine, _dir) = engine_with_catalog().await;
+    let mut sink = open_sink(&engine, "drained").await;
+    sink.write_batch(&[batch(&[1])], 0).await.expect("batch 0");
+    let location = sink.location().to_string();
+    assert_eq!(ids(&engine, "local.live.drained").await, vec![1]);
+
+    sink.replace_batch(&[batch(&[])], 1)
+        .await
+        .expect("replace with nothing");
+
+    assert_eq!(
+        ids(&engine, "local.live.drained").await,
+        Vec::<i64>::new(),
+        "an emptied table must read as empty, not fail"
+    );
+    let rows = engine
+        .read_delta("local.live.drained", &location)
+        .await
+        .expect("an emptied table must be readable by location too");
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+}

@@ -5316,16 +5316,27 @@ impl Engine {
         format: oxidant_catalog::TableFormat,
     ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
         let mut metadata = oxidant_catalog::TableMetadata::new(name, table_path, format);
-        // A *partitioned* Delta table keeps its partition columns in the path, not in the data
-        // files, so a reader given only a directory sees a table missing exactly the columns a
-        // dashboard filters on. The log's `metaData` action names them; a catalog like Glue
-        // supplies the same thing from its partition keys, which is why this only matters for the
-        // bare-path form. Unpartitioned tables keep inferring their schema, as before.
+        // The log's `metaData` action is this form's catalog: given only a directory there is
+        // nothing else to declare the table with, and a catalog like Glue supplies the same two
+        // things from its own entry — which is why this only matters for the bare-path form.
+        //
+        // The schema is supplied whether or not the table is partitioned, because the resolver's
+        // fallback is to infer from a data file and an **empty** table has none: a table whose
+        // live files have all been removed — a CDC target drained by deletes or a truncate, an
+        // `INSERT OVERWRITE ... WHERE false` — is empty, not broken, but without a declared
+        // schema it cannot be read at all, and for a read-modify-write sink that is a table that
+        // can never be written to again. A committed Delta log always carries a schema, so this
+        // asks it rather than guessing. (Tables with no readable log at all — no commits yet, an
+        // unmappable type — still fall through to inference, which is what serves them today.)
+        //
+        // Partition columns matter for the same reason but only when there are any: a partitioned
+        // table keeps them in the path, not in the data files, so a reader that does not know
+        // their names sees a table missing exactly the columns a dashboard filters on.
         if format == oxidant_catalog::TableFormat::Delta {
             if let Some(declared) = self.delta_table_metadata(table_path).await {
+                metadata.schema = Some(declared.schema);
                 if !declared.partition_columns.is_empty() {
                     metadata.partition_columns = declared.partition_columns;
-                    metadata.schema = Some(declared.schema);
                 }
             }
         }
@@ -10681,6 +10692,158 @@ mod tests {
             .value(0);
         assert_eq!((c, s), (4, 10));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write a Delta table holding one data file and then retire it, leaving a table that has a
+    /// committed log and a declared schema but **no live files**. Returns its directory.
+    ///
+    /// `partition` names the partition column when the table is partitioned; the data file then
+    /// holds only `x`, exactly as a partitioned writer writes it.
+    async fn delta_table_emptied_by_a_remove(partition: Option<(&str, &str)>) -> tempfile::TempDir {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("_delta_log")).unwrap();
+
+        let file_path = match partition {
+            Some((col, value)) => {
+                std::fs::create_dir_all(dir.join(format!("{col}={value}"))).unwrap();
+                format!("{col}={value}/part-0.parquet")
+            }
+            None => "part-0.parquet".to_string(),
+        };
+        let file_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            file_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        {
+            let f = std::fs::File::create(dir.join(&file_path)).unwrap();
+            let mut w = ArrowWriter::try_new(f, file_schema, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        let file_size = std::fs::metadata(dir.join(&file_path)).unwrap().len();
+
+        let mut fields = vec![serde_json::json!({
+            "name": "x", "type": "long", "nullable": false, "metadata": {}
+        })];
+        let mut partition_columns = Vec::new();
+        let mut partition_values = serde_json::Map::new();
+        if let Some((col, value)) = partition {
+            fields.push(serde_json::json!({
+                "name": col, "type": "string", "nullable": true, "metadata": {}
+            }));
+            partition_columns.push(col.to_string());
+            partition_values.insert(col.to_string(), serde_json::Value::String(value.into()));
+        }
+        let schema_string = serde_json::json!({"type": "struct", "fields": fields}).to_string();
+        let commit0 = [
+            serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}})
+                .to_string(),
+            serde_json::json!({
+                "metaData": {
+                    "id": "00000000-0000-0000-0000-000000000002",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": schema_string,
+                    "partitionColumns": partition_columns,
+                    "configuration": {}
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "add": {
+                    "path": file_path,
+                    "partitionValues": partition_values,
+                    "size": file_size,
+                    "modificationTime": 0,
+                    "dataChange": true
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        std::fs::write(dir.join("_delta_log/00000000000000000000.json"), commit0).unwrap();
+
+        // Everything the table held, retired — what a CDC target drained by deletes, a truncate,
+        // or an `INSERT OVERWRITE ... WHERE false` leaves behind.
+        let commit1 = serde_json::json!({
+            "remove": {
+                "path": file_path,
+                "deletionTimestamp": 1,
+                "dataChange": true,
+                "partitionValues": partition_values,
+                "size": file_size,
+                "extendedFileMetadata": true
+            }
+        })
+        .to_string();
+        std::fs::write(dir.join("_delta_log/00000000000000000001.json"), commit1).unwrap();
+        tmp
+    }
+
+    /// A Delta table whose files have all been removed is **empty**, not unreadable.
+    ///
+    /// There is no data file left to infer a schema from, so the only thing that can name the
+    /// columns is the log's `metaData` — and if the bare-path form does not supply it, the table
+    /// cannot be selected from at all. For a read-modify-write sink (AUTO CDC) that is worse than
+    /// a failed query: the sink re-reads its target at the start of every run, so a target that
+    /// legitimately went empty could never be written to again.
+    #[tokio::test]
+    async fn reads_an_unpartitioned_delta_table_with_no_live_files() {
+        let tmp = delta_table_emptied_by_a_remove(None).await;
+        let path = tmp.path().to_str().unwrap();
+        let engine = Engine::new();
+
+        // By location, the way `read_delta` (and so the AUTO CDC sink) reads its target.
+        let rows = engine.read_delta("emptied", path).await.unwrap();
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+
+        // And by name: the columns still resolve, so a query naming them plans and returns
+        // nothing rather than failing on an unknown column.
+        engine.register_delta("emptied", path).await.unwrap();
+        let out = engine.sql("SELECT x FROM emptied").await.unwrap();
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+        let counted = engine
+            .sql("SELECT COUNT(*) AS c FROM emptied WHERE x > 0")
+            .await
+            .unwrap();
+        assert_eq!(
+            counted[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .unwrap()
+                .value(0),
+            0
+        );
+    }
+
+    /// The partitioned case has always worked — the declared schema was already supplied for it.
+    /// Pinned so the unpartitioned fix cannot be undone by narrowing this back.
+    #[tokio::test]
+    async fn reads_a_partitioned_delta_table_with_no_live_files() {
+        let tmp = delta_table_emptied_by_a_remove(Some(("day", "2024-01-01"))).await;
+        let path = tmp.path().to_str().unwrap();
+        let engine = Engine::new();
+
+        let rows = engine.read_delta("emptied_parts", path).await.unwrap();
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+
+        engine.register_delta("emptied_parts", path).await.unwrap();
+        // The partition column is in the path, never in a data file, so an emptied partitioned
+        // table can only know about `day` from the log.
+        let out = engine
+            .sql("SELECT x, day FROM emptied_parts WHERE day = '2024-01-01'")
+            .await
+            .unwrap();
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
     }
 
     // ---- KAN-25: hash-join build-side memory guard -----------------------------

@@ -75,14 +75,25 @@ fn rows_with_seq(rows: &[(i64, &str, i64, &str)], seq: &[Option<i64>]) -> Record
 /// A fresh sink over `location`, as a restart would build one: no cached state, everything it
 /// knows about the target comes from the Delta log.
 async fn open_sink(engine: &Engine, location: &str, target_table: &str) -> CdcMergeSink {
-    let merge = CdcMerge::new(&cfg(), &schema(), "sink_test").expect("plan merge");
+    open_sink_with(engine, location, target_table, cfg(), Vec::new()).await
+}
+
+/// [`open_sink`] with the flow's config and the target's partitioning spelled out.
+async fn open_sink_with(
+    engine: &Engine,
+    location: &str,
+    target_table: &str,
+    config: AutoCdcConfig,
+    partition_columns: Vec<String>,
+) -> CdcMergeSink {
+    let merge = CdcMerge::new(&config, &schema(), "sink_test").expect("plan merge");
     let inner = LakeSink::open(
         engine,
         LakeTarget::location_only(location, writable_format("delta").expect("delta")),
         merge.schema(),
         LakeSinkOptions {
             app_id: Some("cdc-sink-test".into()),
-            partition_columns: vec![],
+            partition_columns,
             publish_iceberg: false,
             iceberg_table_suffix: "_iceberg".into(),
             checkpoint_interval: 0,
@@ -321,4 +332,119 @@ async fn a_failed_batch_does_not_destroy_the_rows_committed_before_it() {
         ],
         "the batch after a failure must merge against everything committed, not a stale snapshot"
     );
+}
+
+/// A target that legitimately goes **empty** must stay readable, or the flow is over.
+///
+/// Draining the last key leaves a Delta table with a committed log and no live files. There is
+/// no data file left to infer a schema from, so a reader that does not ask the log's `metaData`
+/// cannot name the table's columns and fails outright — and this sink re-reads its target
+/// whenever it has no cached state (the first batch of a run, a failed batch, a deduplicated
+/// replay), so that failure is not one bad query: the target can never be written to again.
+#[tokio::test]
+async fn a_target_emptied_by_deletes_still_takes_the_next_batch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let location = dir.path().join("scd1").to_string_lossy().to_string();
+    let engine = Engine::new();
+
+    let mut sink = open_sink(&engine, &location, "cdc_target").await;
+    sink.write_batch(&[batch(&[(1, "ada", 1, "I"), (2, "bob", 1, "I")])], 0)
+        .await
+        .expect("batch 0");
+    sink.write_batch(&[batch(&[(1, "ada", 2, "D"), (2, "bob", 2, "D")])], 1)
+        .await
+        .expect("batch 1 (drains the table)");
+    // The plain read path too: an emptied table reads as empty, not as an error.
+    assert_eq!(committed(&engine, &location).await, vec![]);
+
+    // The next run: a fresh sink with no cached state, so this batch goes through `read_target`.
+    let mut sink = open_sink(&engine, &location, "cdc_target").await;
+    sink.write_batch(&[batch(&[(3, "cy", 3, "I")])], 2)
+        .await
+        .expect("a batch after an emptied target must still merge");
+    assert_eq!(
+        committed(&engine, &location).await,
+        vec![(3, "cy".into(), 3)],
+        "the re-inserted row is the whole table"
+    );
+}
+
+/// The same, reached by `APPLY AS TRUNCATE` rather than by deletes — the other way a target
+/// legitimately empties, and the one a source can trigger with a single row.
+#[tokio::test]
+async fn a_target_emptied_by_a_truncate_still_takes_the_next_batch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let location = dir.path().join("scd1").to_string_lossy().to_string();
+    let engine = Engine::new();
+    let mut config = cfg();
+    config.apply_as_truncates = Some("op = 'T'".into());
+
+    let mut sink =
+        open_sink_with(&engine, &location, "cdc_target", config.clone(), Vec::new()).await;
+    sink.write_batch(&[batch(&[(1, "ada", 1, "I"), (2, "bob", 1, "I")])], 0)
+        .await
+        .expect("batch 0");
+    sink.write_batch(&[batch(&[(9, "-", 5, "T")])], 1)
+        .await
+        .expect("truncate batch");
+    assert_eq!(committed(&engine, &location).await, vec![]);
+
+    let mut sink = open_sink_with(&engine, &location, "cdc_target", config, Vec::new()).await;
+    sink.write_batch(&[batch(&[(3, "cy", 6, "I")])], 2)
+        .await
+        .expect("a batch after a truncate must still merge");
+    assert_eq!(
+        committed(&engine, &location).await,
+        vec![(3, "cy".into(), 6)]
+    );
+}
+
+/// A partitioned target has always survived being emptied — its declared schema was supplied
+/// because the partition columns had to be. Pinned so the unpartitioned case cannot regress back
+/// to being the only one that is handled.
+///
+/// Asserted by row count rather than through `committed`: a bare-path read of a partitioned Delta
+/// table serves the partition column in the position the *scan* puts it (last), not the position
+/// the declared schema gives it, so `id, name, seq` comes back mis-ordered here. That is a
+/// separate, pre-existing defect of the partitioned read path — this test is about the empty one.
+#[tokio::test]
+async fn a_partitioned_target_emptied_by_deletes_still_takes_the_next_batch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let location = dir.path().join("scd1").to_string_lossy().to_string();
+    let engine = Engine::new();
+    let partitioned = || vec!["name".to_string()];
+
+    let mut sink = open_sink_with(&engine, &location, "cdc_target", cfg(), partitioned()).await;
+    sink.write_batch(&[batch(&[(1, "ada", 1, "I")])], 0)
+        .await
+        .expect("batch 0");
+    sink.write_batch(&[batch(&[(1, "ada", 2, "D")])], 1)
+        .await
+        .expect("batch 1 (drains the table)");
+    assert_eq!(committed_rows(&engine, &location).await, 0);
+
+    let mut sink = open_sink_with(&engine, &location, "cdc_target", cfg(), partitioned()).await;
+    sink.write_batch(&[batch(&[(3, "cy", 3, "I")])], 2)
+        .await
+        .expect("a batch after an emptied partitioned target must still merge");
+    assert_eq!(committed_rows(&engine, &location).await, 1);
+}
+
+/// How many rows the committed table holds — [`committed`] without reading any column of it.
+async fn committed_rows(engine: &Engine, location: &str) -> i64 {
+    engine
+        .register_delta("__count_probe", location)
+        .await
+        .expect("register delta");
+    let out = engine
+        .sql("SELECT COUNT(*) AS c FROM __count_probe")
+        .await
+        .expect("count target");
+    engine.deregister_table("__count_probe");
+    out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count")
+        .value(0)
 }
