@@ -190,7 +190,16 @@ jobs:
     name: line coverage (informational, non-blocking)
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 90
+    # Cold-cache runs compile the whole workspace twice (oxidant-cli prebuild, then
+    # instrumented `cargo test --workspace`). With line-tables-only debuginfo below that
+    # finishes in ~45–60 min; 180 matches build-test's headroom after cache invalidation.
+    timeout-minutes: 180
+    env:
+      # Same switch as build-test: full debuginfo makes each oxidant-execution integration
+      # binary ~1–2 GB at link time; parallel `ld` under `-C instrument-coverage` exhausts
+      # the 7 GiB ubuntu-latest runner (collect2: ld signal 7 on PR #96's line-coverage job).
+      CARGO_PROFILE_TEST_DEBUG: "1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
@@ -207,7 +216,9 @@ jobs:
       - name: Build oxidant CLI (integration tests spawn the binary under llvm-cov target dir)
         run: cargo build -p oxidant-cli --target-dir target/llvm-cov-target
       - name: Generate HTML coverage report
-        run: cargo llvm-cov --workspace --html
+        # Cap parallel link jobs: instrument-coverage + even line-tables-only debuginfo
+        # still links one binary per oxidant-execution integration test (~56 of them).
+        run: cargo llvm-cov --workspace --html --jobs 2
       # `cargo llvm-cov report` reuses the data collected by the run above — do NOT run
       # `cargo llvm-cov --summary-only` here, that flag only pairs with --json/--lcov and
       # re-executes the whole instrumented suite a second time.

@@ -29,7 +29,11 @@ jobs:
     name: line coverage (informational)
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 90
+    timeout-minutes: 180
+    env:
+      # Keep in sync with ci.yml line-coverage — see build-test's CARGO_PROFILE_*_DEBUG notes.
+      CARGO_PROFILE_TEST_DEBUG: "1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
@@ -46,7 +50,7 @@ jobs:
       - name: Build oxidant CLI (integration tests spawn the binary under llvm-cov target dir)
         run: cargo build -p oxidant-cli --target-dir target/llvm-cov-target
       - name: Generate HTML coverage report
-        run: cargo llvm-cov --workspace --html
+        run: cargo llvm-cov --workspace --html --jobs 2
       - name: Upload coverage HTML
         uses: actions/upload-artifact@v4
         with:
