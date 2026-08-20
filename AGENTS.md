@@ -148,19 +148,27 @@ build orphan binaries, so `CARGO_BIN_EXE_oxidant` is unset unless you built it e
 
 #### `cargo llvm-cov` uses a separate target directory
 
-The informational `line-coverage` job runs `cargo llvm-cov --workspace --html --jobs 2`, which
+The informational `line-coverage` job runs `cargo llvm-cov --workspace --html`, which
 re-runs the full test suite under `target/llvm-cov-target/` (not `target/debug/`).
 
 - **Symptom:** same `oxidant binary not found` failure, but only in the `line-coverage` job
   even when `clippy + test + tpch` passes.
 - **Fix (CI):** `cargo build -p oxidant-cli --target-dir target/llvm-cov-target` before
   `cargo llvm-cov`. Upload artifact from `target/llvm-cov/html` (not `coverage/`).
-- **Linker OOM gotcha:** the job must set `CARGO_PROFILE_TEST_DEBUG=1` and
-  `CARGO_PROFILE_DEV_DEBUG=1` (same as `build-test`). Without them, full debuginfo +
-  `-C instrument-coverage` makes each `oxidant-execution` integration binary ~1–2 GB at link
-  time; parallel `ld` on the 7 GiB `ubuntu-latest` runner dies with `collect2: ld terminated
-  with signal 7 [Bus error]` (~54–60 min wall clock, not a missing oxidant-cli build). Cap
-  link parallelism with `--jobs 2`; job timeout is 180 min for cold-cache compiles.
+- **Runner-disk gotcha (`ld` SIGBUS):** the job must set `CARGO_PROFILE_TEST_DEBUG=1` and
+  `CARGO_PROFILE_DEV_DEBUG=1` — limited debug info (`debug = 1`), same as `build-test`.
+  Without them, full debuginfo + `-C instrument-coverage` makes each `oxidant-execution`
+  integration binary ~1–2 GB at link time, and ~56 of them fill the free disk on a
+  public-repo `ubuntu-latest` runner (**4 vCPU / 16 GB RAM / ~14 GB free SSD**). `ld` mmaps
+  its output file, so the ENOSPC surfaces as `collect2: ld terminated with signal 7 [Bus
+  error]` (~54–60 min wall clock) rather than as `No space left on device` — and it is not a
+  missing oxidant-cli build. The fix is the **`Reclaim runner disk` step** (copied from
+  `build-test`/`oxidant-image.yml`; buys ~25 GB), plus `df -h /` probes around the coverage
+  step for diagnosability. Do **not** reach for `--jobs 2`: capping link parallelism only
+  slows the build and leaves the disk ceiling where it was. Reinstate it only if a failure
+  actually shows memory pressure. Job timeout is 180 min for cold-cache compiles; the
+  ~45–60 min figure quoted in the workflow is a **projection** — the job has not yet
+  completed a run.
 - **Flag gotcha:** do **not** pass `--output-path coverage/` together with `--html` —
   `cargo-llvm-cov` rejects incompatible flags. Use `--html` alone.
 - **Job is non-blocking** (`continue-on-error: true`) but should still be kept green for
@@ -193,5 +201,5 @@ Databricks dialect. Some Unparser output is **invalid on round-trip**:
 | query-gates (main / `full-gates`) | yes | official TPC kits + `tpch`/`tpcds`/`*-distributed` at **SF1** |
 | coverage gates | yes | clickbench, clickbench-grpc, correctness |
 | Spark SQL parity ratchet | yes | `oxidant-parity ratchet --baseline parity/baseline.json` |
-| line coverage | no (informational) | `CARGO_PROFILE_*_DEBUG=1` + `cargo llvm-cov --workspace --html --jobs 2` |
+| line coverage | no (informational) | disk reclaim + `CARGO_PROFILE_*_DEBUG=1` + `cargo llvm-cov --workspace --html` |
 
