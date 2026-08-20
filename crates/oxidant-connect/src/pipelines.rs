@@ -67,7 +67,8 @@ pub struct OutputDef {
     pub source_code_location: Option<sc::SourceCodeLocation>,
 }
 
-/// Mirrors `PipelineCommand.DefineFlow`; relation stays unresolved until `StartRun`.
+/// Mirrors `PipelineCommand.DefineFlow`; relation may stay unresolved until
+/// `DefineFlowQueryFunctionResult` or `StartRun`.
 #[derive(Debug, Clone)]
 pub struct FlowDef {
     pub flow_name: String,
@@ -75,6 +76,8 @@ pub struct FlowDef {
     pub resolved: sc::ResolvedIdentifier,
     pub target: sc::ResolvedIdentifier,
     pub sql_conf: HashMap<String, String>,
+    /// Routes query-function evaluation signals to the client's signal stream.
+    pub client_id: Option<String>,
     pub relation: Option<sc::Relation>,
     /// Populated by `DefineSqlGraphElements` when the flow comes from SDP SQL text.
     pub query_sql: Option<String>,
@@ -183,6 +186,48 @@ pub fn resolve_identifier(
 
 fn identifiers_match(a: &sc::ResolvedIdentifier, b: &sc::ResolvedIdentifier) -> bool {
     a.catalog_name == b.catalog_name && a.namespace == b.namespace && a.table_name == b.table_name
+}
+
+fn flow_needs_query_function_evaluation(flow: &FlowDef) -> bool {
+    flow.relation.is_none() && flow.query_sql.is_none()
+}
+
+fn flow_matches_client_id(flow: &FlowDef, request_client_id: Option<&str>) -> bool {
+    match (flow.client_id.as_deref(), request_client_id) {
+        (None, _) => true,
+        (Some(flow_id), Some(req_id)) => flow_id == req_id,
+        (Some(_), None) => false,
+    }
+}
+
+fn pending_query_function_flows(
+    graph: &DataflowGraph,
+    request_client_id: Option<&str>,
+) -> Vec<sc::ResolvedIdentifier> {
+    graph
+        .flows
+        .iter()
+        .filter(|flow| {
+            flow_needs_query_function_evaluation(flow)
+                && flow_matches_client_id(flow, request_client_id)
+        })
+        .map(|flow| flow.resolved.clone())
+        .collect()
+}
+
+fn find_flow_index(
+    graph: &DataflowGraph,
+    cmd: &sc::pipeline_command::DefineFlowQueryFunctionResult,
+) -> Option<usize> {
+    if let Some(id) = cmd.flow_identifier.as_ref() {
+        return graph
+            .flows
+            .iter()
+            .position(|flow| identifiers_match(&flow.resolved, id));
+    }
+    #[allow(deprecated)]
+    let name = cmd.flow_name.as_deref().filter(|s| !s.is_empty())?;
+    graph.flows.iter().position(|flow| flow.flow_name == name)
 }
 
 fn is_temporary_view_output(output: &OutputDef) -> bool {
@@ -425,6 +470,13 @@ impl OxidantService {
             Some(sc::pipeline_command::CommandType::DefineSqlGraphElements(c)) => self
                 .define_sql_graph_elements(session_id, operation_id, c)
                 .map(PipelineCommandOutput::Complete),
+            Some(sc::pipeline_command::CommandType::GetQueryFunctionExecutionSignalStream(c)) => {
+                self.get_query_function_execution_signal_stream(session_id, operation_id, c)
+                    .map(PipelineCommandOutput::Complete)
+            }
+            Some(sc::pipeline_command::CommandType::DefineFlowQueryFunctionResult(c)) => self
+                .define_flow_query_function_result(session_id, operation_id, c)
+                .map(PipelineCommandOutput::Complete),
             _ => Err(Status::unimplemented("unsupported PipelineCommand")),
         }
     }
@@ -587,14 +639,14 @@ impl OxidantService {
             .with_graph(graph_id, session_id, |graph| {
                 let (relation, once) = match &cmd.details {
                     Some(sc::pipeline_command::define_flow::Details::RelationFlowDetails(d)) => {
-                        let rel = d.relation.as_ref();
-                        if rel.map(|r| r.rel_type.is_none()).unwrap_or(true) {
-                            return Err(Status::failed_precondition(
-                                "DefineFlow relation is empty: Python query-function signal \
-                                 stream is not supported yet (SDP Phase 4a)",
-                            ));
-                        }
-                        (rel.cloned(), cmd.once.unwrap_or(false))
+                        let rel = d.relation.as_ref().and_then(|r| {
+                            if r.rel_type.is_some() {
+                                Some(r.clone())
+                            } else {
+                                None
+                            }
+                        });
+                        (rel, cmd.once.unwrap_or(false))
                     }
                     Some(sc::pipeline_command::define_flow::Details::AutoCdcFlowDetails(_)) => {
                         return Err(Status::unimplemented(
@@ -624,6 +676,7 @@ impl OxidantService {
                         resolved: resolved.clone(),
                         target,
                         sql_conf: cmd.sql_conf.clone(),
+                        client_id: cmd.client_id.clone(),
                         relation,
                         query_sql: None,
                         once,
@@ -648,6 +701,80 @@ impl OxidantService {
             ),
             self.result_complete(session_id, operation_id),
         ])
+    }
+
+    fn get_query_function_execution_signal_stream(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        cmd: &sc::pipeline_command::GetQueryFunctionExecutionSignalStream,
+    ) -> Result<Vec<sc::ExecutePlanResponse>, Status> {
+        let graph_id = cmd
+            .dataflow_graph_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Status::invalid_argument(
+                    "GetQueryFunctionExecutionSignalStream.dataflow_graph_id is required",
+                )
+            })?;
+        let request_client_id = cmd.client_id.as_deref().filter(|s| !s.is_empty());
+
+        let pending = self
+            .dataflow_graphs
+            .with_graph(graph_id, session_id, |graph| {
+                Ok(pending_query_function_flows(graph, request_client_id))
+            })?;
+
+        // `execute_plan` buffers the full response list before streaming, so we emit all
+        // currently-pending signals in one shot and complete — late DefineFlow arrivals need
+        // another GetQueryFunctionExecutionSignalStream call.
+        let mut responses = Vec::new();
+        if !pending.is_empty() {
+            responses.push(self.pipeline_query_function_signal(
+                session_id,
+                operation_id,
+                pending,
+            ));
+        }
+        responses.push(self.result_complete(session_id, operation_id));
+        Ok(responses)
+    }
+
+    fn define_flow_query_function_result(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        cmd: &sc::pipeline_command::DefineFlowQueryFunctionResult,
+    ) -> Result<Vec<sc::ExecutePlanResponse>, Status> {
+        let graph_id = cmd
+            .dataflow_graph_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Status::invalid_argument("DefineFlowQueryFunctionResult.dataflow_graph_id is required")
+            })?;
+        let relation = cmd.relation.as_ref().ok_or_else(|| {
+            Status::invalid_argument("DefineFlowQueryFunctionResult.relation is required")
+        })?;
+        if relation.rel_type.is_none() {
+            return Err(Status::invalid_argument(
+                "DefineFlowQueryFunctionResult.relation is empty",
+            ));
+        }
+
+        self.dataflow_graphs
+            .with_graph(graph_id, session_id, |graph| {
+                let flow_idx = find_flow_index(graph, cmd).ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "unknown flow in dataflow graph `{graph_id}`"
+                    ))
+                })?;
+                graph.flows[flow_idx].relation = Some(relation.clone());
+                Ok(())
+            })?;
+
+        Ok(vec![self.result_complete(session_id, operation_id)])
     }
 
     fn define_sql_graph_elements(
@@ -962,6 +1089,24 @@ impl OxidantService {
             Some(event.at),
         )
     }
+
+    fn pipeline_query_function_signal(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        flow_identifiers: Vec<sc::ResolvedIdentifier>,
+    ) -> sc::ExecutePlanResponse {
+        self.response(
+            session_id,
+            operation_id,
+            sc::execute_plan_response::ResponseType::PipelineQueryFunctionExecutionSignal(
+                sc::PipelineQueryFunctionExecutionSignal {
+                    flow_identifiers,
+                    ..Default::default()
+                },
+            ),
+        )
+    }
 }
 
 async fn graph_to_config(
@@ -1063,7 +1208,7 @@ async fn graph_to_config(
                         table.source = Some(source);
                     }
                 }
-                relation_to_sql(engine, relation).await.map_err(|status| {
+                sql_from_relation(engine, relation).await.map_err(|status| {
                     table_planning_failure(&target_name, status, &flow.source_code_location)
                 })?
             } else if let Some(sql) = flow.query_sql.as_deref() {
@@ -1215,6 +1360,7 @@ fn parsed_flow_to_def(parsed: &oxidant_pipelines::ParsedFlow, graph: &DataflowGr
         resolved,
         target,
         sql_conf: HashMap::new(),
+        client_id: None,
         relation: None,
         query_sql: Some(parsed.query_sql.clone()),
         once: parsed.once,
@@ -1568,6 +1714,15 @@ fn format_run_event(event: &RunEvent, locations: &HashMap<String, String>) -> St
     }
 }
 
+async fn sql_from_relation(engine: &Engine, relation: &sc::Relation) -> Result<String, Status> {
+    if let Some(sc::relation::RelType::Sql(sql)) = relation.rel_type.as_ref() {
+        if !sql.query.is_empty() {
+            return Ok(sql.query.clone());
+        }
+    }
+    relation_to_sql(engine, relation).await
+}
+
 async fn relation_to_sql(engine: &Engine, relation: &sc::Relation) -> Result<String, Status> {
     let plan = translate::to_plan(engine.ctx(), relation)
         .await
@@ -1755,6 +1910,7 @@ mod tests {
                 resolved: resolve_identifier("f", Some("cat"), Some("db")),
                 target: resolve_identifier("metrics", Some("cat"), Some("db")),
                 sql_conf: HashMap::new(),
+                client_id: None,
                 relation: None,
                 query_sql: Some("SELECT 1".into()),
                 once: false,
@@ -1992,5 +2148,53 @@ mod tests {
         let dt = sc::DataType { kind: None };
         let err = proto_schema_to_ddl(&dt).expect_err("invalid proto");
         assert!(err.to_string().contains("schema_data_type"), "{err}");
+    }
+
+    #[test]
+    fn pending_query_function_flows_respects_client_id() {
+        let graph = DataflowGraph {
+            default_catalog: Some("local".into()),
+            default_database: Some("live".into()),
+            sql_conf: HashMap::new(),
+            outputs: Vec::new(),
+            flows: vec![
+                FlowDef {
+                    flow_name: "pending_a".into(),
+                    resolved: resolve_identifier("pending_a", Some("local"), Some("live")),
+                    target: resolve_identifier("out_a", Some("local"), Some("live")),
+                    sql_conf: HashMap::new(),
+                    client_id: Some("client-a".into()),
+                    relation: None,
+                    query_sql: None,
+                    once: false,
+                    by_name: false,
+                    source_code_location: None,
+                },
+                FlowDef {
+                    flow_name: "resolved".into(),
+                    resolved: resolve_identifier("resolved", Some("local"), Some("live")),
+                    target: resolve_identifier("out_b", Some("local"), Some("live")),
+                    sql_conf: HashMap::new(),
+                    client_id: Some("client-a".into()),
+                    relation: Some(sc::Relation {
+                        rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                            query: "SELECT 1".into(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }),
+                    query_sql: None,
+                    once: false,
+                    by_name: false,
+                    source_code_location: None,
+                },
+            ],
+            refreshes: Vec::new(),
+            created_at: SystemTime::now(),
+        };
+        let pending = pending_query_function_flows(&graph, Some("client-a"));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].table_name, "pending_a");
+        assert!(pending_query_function_flows(&graph, Some("client-b")).is_empty());
     }
 }
