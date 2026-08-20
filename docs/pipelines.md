@@ -49,6 +49,24 @@ The script builds `oxidant-cli`, starts a local-catalog server, runs
 `StartRun.storage` must live under the catalog warehouse parent (e.g. `warehouse/_checkpoints`)
 so pipeline table data and catalog registration share the same root.
 
+**Temp views and refresh semantics**
+
+- Chained temporary views resolve in **definition order** only. A `CREATE TEMPORARY VIEW` that
+  references another temp view defined later in the same graph fails loudly at `StartRun` (Spark
+  resolves by dependency; oxidant does not reorder definitions).
+- `REFRESH MATERIALIZED VIEW` / `OR REFRESH` requests queued on the graph are drained at the
+  next non-dry `StartRun` and are **at-most-once**: if that run fails after the drain, the refresh
+  is not retried automatically — issue another `REFRESH` or run again with `refresh_selection`.
+- **Dry-run temp views:** validation registers graph temporary views in the session so downstream
+  SQL can be planned, then drops only what it registered on every exit (success, failure, or panic).
+  A dry run errors instead of `CREATE OR REPLACE` when a same-named session view already exists,
+  so interactive temp views are never clobbered.
+- **`sql_conf` scope:** graph-level `sql_conf` (on `CreateDataflowGraph`) is applied for the whole
+  `StartRun` and catalog keys (`spark.sql.catalog.*`, `spark.sql.defaultCatalog`) take effect via
+  `sync_catalogs()`. Flow-level `sql_conf` (on `DefineFlow`) is scoped to that flow's planning only;
+  session keys such as `spark.sql.session.*` apply there, but catalog keys are ignored with a
+  `PipelineEvent` — register catalogs on the graph instead.
+
 ## Two kinds of table
 
 ```yaml
