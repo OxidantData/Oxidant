@@ -46,6 +46,13 @@ impl Graph {
             let name = table.name.trim().to_string();
             let mut deps: Vec<String> = Vec::new();
             let mut reads_outside = false;
+            if let Some(cdc) = &table.auto_cdc {
+                let source = cdc.source.trim();
+                if source != name && declared.contains(source) && !deps.iter().any(|d| d == source)
+                {
+                    deps.push(source.to_string());
+                }
+            }
             if let Some(sql) = table.sql.as_deref() {
                 for reference in table_references(sql)? {
                     // Only *declared* names are edges. Everything else is a catalog table the
@@ -250,6 +257,7 @@ tables:
             iceberg_table_suffix: None,
             checkpoint_interval: None,
             dedup_columns: vec![],
+            auto_cdc: None,
             expect: Default::default(),
             comment: None,
         }

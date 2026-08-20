@@ -99,6 +99,8 @@ pub struct StartOptions {
     /// Session catalog/namespace a partially-qualified `toTable(...)` resolves against.
     pub current_catalog: String,
     pub current_namespace: Vec<String>,
+    /// When set, used instead of building a sink from [`StreamQueryConfig`].
+    pub sink_override: Option<Box<dyn Sink>>,
 }
 
 /// Manages active streaming queries.
@@ -203,7 +205,11 @@ impl StreamingQueryManager {
         } else {
             restored.query_id.clone()
         };
-        let sink = build_sink(engine, &config, &options, sink_schema, app_id).await?;
+        let sink = if let Some(sink) = options.sink_override {
+            sink
+        } else {
+            build_sink(engine, &config, &options, sink_schema, app_id).await?
+        };
 
         // A checkpoint location that cannot be written is a misconfiguration the user has to see
         // at `writeStream.start()`. Discovering it later means the query has already ingested data
