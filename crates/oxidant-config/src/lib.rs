@@ -26,15 +26,17 @@ use std::path::{Path, PathBuf};
 use oxidant_common::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+mod auto_cdc;
 mod interpolate;
 mod pipeline;
 mod validate;
 
 use interpolate::interpolate_config;
 
+pub use auto_cdc::validate as validate_auto_cdc;
 pub use pipeline::{
-    AppendFlow, ExpectAction, Expectation, PipelineConfig, SourceConfig, TableConfig, TableKind,
-    Trigger,
+    AppendFlow, AutoCdcConfig, ExpectAction, Expectation, PipelineConfig, SourceConfig,
+    TableConfig, TableKind, Trigger,
 };
 
 /// Environment variable naming a config file, consulted when `--config` is absent.

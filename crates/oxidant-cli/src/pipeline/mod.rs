@@ -130,6 +130,7 @@ fn print_graph(plan: &Plan<'_>) {
         };
         let kind = match table.kind() {
             TableKind::Streaming => "streaming",
+            TableKind::AutoCdc => "auto_cdc",
             TableKind::Derived => "derived",
         };
         println!("  {} ({kind}, {})", node.name, plan.format_of(table));

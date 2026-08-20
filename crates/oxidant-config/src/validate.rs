@@ -204,6 +204,22 @@ impl OxidantConfig {
                              SELECT DISTINCT in its `sql:` instead"
                         )));
                     }
+                    if table.auto_cdc.is_some() {
+                        return Err(Error::Io(format!(
+                            "table `{name}` sets `auto_cdc:` on a derived table — AUTO CDC \
+                             targets must declare a streaming `source:`"
+                        )));
+                    }
+                }
+                TableKind::AutoCdc => {
+                    let source = table.source.as_ref().expect("auto cdc implies a source");
+                    if source.format.trim().is_empty() {
+                        return Err(Error::Io(format!(
+                            "table `{name}` has a `source:` with no `format:`"
+                        )));
+                    }
+                    let cdc = table.auto_cdc.as_ref().expect("auto cdc kind");
+                    crate::auto_cdc::validate(cdc, name)?;
                 }
                 TableKind::Streaming => {
                     let source = table.source.as_ref().expect("streaming implies a source");
