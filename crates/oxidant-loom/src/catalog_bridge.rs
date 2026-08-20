@@ -1721,7 +1721,10 @@ async fn write_delta_batches(
 /// string that is not a number, a timestamp that does not parse, a decimal too big for the
 /// declared precision — is an error naming the column rather than a `NULL` silently committed in
 /// its place. That is `crate::schema_conform`'s cast-or-fail, shared with the SDP pipeline and
-/// streaming sinks so every write path in the engine enforces a schema identically.
+/// streaming sinks so every catalog-table write path enforces a schema identically. (The
+/// local-warehouse `ListingTable` insert path does not route through it — it is DataFusion's own
+/// `ListingTable::insert_into` — and a CTAS writes at the `SELECT`'s schema, having no declared
+/// table schema yet to conform to.)
 fn conform_to_schema(batch: RecordBatch, schema: &SchemaRef) -> DfResult<RecordBatch> {
     crate::schema_conform::conform_insert_batch_to_schema(batch, schema).map_err(oxidant_to_df)
 }

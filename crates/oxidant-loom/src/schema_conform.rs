@@ -1,13 +1,23 @@
 //! Cast query output batches to a declared table schema with column-named errors.
 //!
-//! Every write path in the engine funnels through here so they all enforce a schema the same
+//! Every catalog-table write path funnels through here so they all enforce a schema the same
 //! way: an SDP flow writing to its declared output schema, a streaming query's sink, and a SQL
-//! `INSERT INTO` / `INSERT OVERWRITE` writing to a catalog table. The cast is **not** safe —
-//! a value that does not fit the target type is an error naming the column, never a silent
-//! `NULL` in the committed file. That matches Spark's ANSI store-assignment policy and what
-//! `docs/sql-writes.md` promises. Spark's *expression* `CAST` is the lenient one, and the
-//! `spark_functions` casts stay lenient for that reason; a store assignment is not an
-//! expression cast.
+//! `INSERT INTO` / `INSERT OVERWRITE` writing to a catalog table. (The local-warehouse
+//! `ListingTable` insert path does not — that is DataFusion's own `ListingTable::insert_into` —
+//! and a CTAS writes at the `SELECT`'s schema, having no declared table schema yet to conform
+//! to.) The cast is **not** safe — a value that does not fit the target type is an
+//! error naming the column, never a silent `NULL` in the committed file. Its overflow
+//! behaviour matches Spark's ANSI store assignment and what `docs/sql-writes.md` promises;
+//! Spark's ANSI policy additionally rejects a `STRING` → numeric assignment during analysis,
+//! which this engine plans and then checks for value survival instead.
+//!
+//! Cast-or-fail here is consistent with the rest of the engine rather than an exception to it:
+//! expression `CAST` is ANSI-erroring too (`SELECT CAST('x' AS INT)` is an error, not `NULL`,
+//! which is what the parity baseline's `nonansi/cast.sql` divergences record), and the
+//! `spark_functions` cast-alias constructors lower to a `safe = false` `Expr::Cast` for the
+//! same reason. `TRY_CAST` is the lenient form. What remains distinct about a store assignment
+//! is only that it is implicit — the user did not write the cast — so its failure names the
+//! column being written.
 
 use datafusion::arrow::compute::kernels::cast::cast_with_options;
 use datafusion::arrow::compute::CastOptions;
