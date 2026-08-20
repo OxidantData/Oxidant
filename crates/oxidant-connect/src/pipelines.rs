@@ -1416,6 +1416,15 @@ fn sink_format_and_path<'a>(
 /// host with a sticky `/tmp` the second OS user gets a permission error from a path it never
 /// chose. That is the correct trade — they are writing the same table, so they *are* the same
 /// writer — but a deployment that wants isolation must say so by passing `storage` explicitly.
+///
+/// One asymmetry to know about: for a SINK the root keys on the output *name* while the data
+/// keys on `SinkDetails.options.path`, and the two are independent — so changing
+/// `spark.sql.defaultCatalog`/`defaultDatabase` between runs of the same unqualified sink name,
+/// or pointing two differently-named outputs at one path, moves the root and the `appId` while
+/// the write location stays put, and the run replays into it. That needs a deliberate config
+/// change or rename, not an ordinary re-run: `OxidantService.config` is server-wide, so two
+/// sessions on one server resolve identically. Tables and MVs are unaffected — for them the
+/// name *is* the storage key.
 fn default_one_shot_storage(graph_id: &str) -> String {
     std::env::temp_dir()
         .join(format!("oxidant-sdp-{graph_id}"))
@@ -2454,6 +2463,39 @@ mod tests {
             .flows
             .push(sql_flow("f", "downstream", "SELECT * FROM db.orders"));
         assert!(validate_flows_do_not_read_sinks(&graph).is_err());
+    }
+
+    #[test]
+    fn two_sinks_sharing_a_short_name_in_different_namespaces_are_both_checked() {
+        let mut graph = graph_with_output("orders", sc::OutputType::Sink);
+        // A second sink, same short name, a different namespace. A map keyed by the short
+        // name would keep only this one.
+        graph.outputs.push(OutputDef {
+            output_name: "other_db.orders".into(),
+            resolved: resolve_identifier("other_db.orders", Some("cat"), Some("db")),
+            output_type: sc::OutputType::Sink as i32,
+            comment: None,
+            table_details: None,
+            sink_details: None,
+            source_code_location: None,
+        });
+        graph.outputs.push(OutputDef {
+            output_name: "downstream".into(),
+            resolved: resolve_identifier("downstream", Some("cat"), Some("db")),
+            output_type: sc::OutputType::MaterializedView as i32,
+            comment: None,
+            table_details: None,
+            sink_details: None,
+            source_code_location: None,
+        });
+        // Qualified read of the FIRST sink — the one a short-name map drops.
+        graph
+            .flows
+            .push(sql_flow("f", "downstream", "SELECT * FROM cat.db.orders"));
+        assert!(
+            validate_flows_do_not_read_sinks(&graph).is_err(),
+            "a qualified read of the first sink must still be refused"
+        );
     }
 
     #[test]
