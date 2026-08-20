@@ -9,20 +9,8 @@
 
 use std::process::{Command, Output};
 
-fn oxidant_bin() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_oxidant") {
-        return std::path::PathBuf::from(p);
-    }
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
-    let target = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
-    let path = target.join(&profile).join("oxidant");
-    assert!(
-        path.exists(),
-        "oxidant binary not found at {} — run `cargo build -p oxidant-cli` first",
-        path.display()
-    );
-    path
-}
+mod common;
+use common::oxidant_bin;
 
 fn sample_data() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

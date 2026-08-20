@@ -144,7 +144,17 @@ build orphan binaries, so `CARGO_BIN_EXE_oxidant` is unset unless you built it e
   `CARGO_BIN_EXE_oxidant` when the test is built via `cargo test -p oxidant-cli`.
 - **`oxidant_bin()` fallback:** when the env var is missing, probe (in order)
   `$CARGO_TARGET_DIR/$PROFILE/oxidant`, `target/$PROFILE/oxidant`, and
-  `target/llvm-cov-target/$PROFILE/oxidant` (see llvm-cov below).
+  `target/llvm-cov-target/$PROFILE/oxidant` (see llvm-cov below). A relative
+  `CARGO_TARGET_DIR` resolves against **the directory `cargo` was invoked from** — the workspace
+  root in CI and under `scripts/ci-local.sh`, which is why the resolver joins it against the
+  workspace root rather than the test's cwd (which for an integration test is the package dir).
+  Invoking `cargo` from a package dir with a relative `CARGO_TARGET_DIR` is therefore unsupported:
+  the probe would miss and fall through to a stale `target/$PROFILE/oxidant`.
+- **One implementation only:** the resolver lives in `crates/oxidant-cli/tests/common/mod.rs`;
+  every test does `mod common; use common::oxidant_bin;`. It used to be hand-copied into each
+  test file, and two copies (`cli_pipeline.rs`, `cli_sql_embedded.rs`) never got the llvm-cov
+  probe — issue #110, where `line-coverage` failed while every blocking job was green.
+  `tests/cli_bin_resolution.rs` pins the chain and fails if any test file grows a local copy.
 
 #### `cargo llvm-cov` uses a separate target directory
 
