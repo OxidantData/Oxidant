@@ -30,12 +30,31 @@ YAML file:
   `full_refresh_all` / `full_refresh_selection` (drop pipeline state), `refresh_selection` and SQL
   `REFRESH` / `OR REFRESH` requests (subgraph + ancestors), and `once` flows (skip after first
   successful completion unless refreshed). Kafka spool sources (`oxidant.spool.dir` in
-  `TBLPROPERTIES` or `readStream` options) exercise the same path as the YAML runner.
-- **Limits (deferred):** no AUTO CDC / `APPLY CHANGES` flows ([#91](https://github.com/oxidantdata/oxidant/issues/91)),
-  no Python query-function signal stream ([#92](https://github.com/oxidantdata/oxidant/issues/92)),
+  `TBLPROPERTIES` or `readStream` options) exercise the same path as the YAML runner. Python source
+  functions whose relation is empty at `DefineFlow` time round-trip via
+  `GetQueryFunctionExecutionSignalStream` → client-side evaluation →
+  `DefineFlowQueryFunctionResult` backfill before `StartRun`.
+- **Limits (deferred):** no AUTO CDC / `APPLY CHANGES` flows ([#92](https://github.com/oxidantdata/oxidant/issues/92)),
   no external sinks / `ExecuteOutputFlows` ([#93](https://github.com/oxidantdata/oxidant/issues/93)).
   Interactive `spark.sql("CREATE STREAMING TABLE …")` still correctly rejects those statements;
   use `DefineSqlGraphElements` or the Python decorators instead.
+
+**Python query-function signal stream**
+
+When `pyspark.pipelines` cannot analyze a flow's Python function at definition time, it sends
+`DefineFlow` with an empty `relation_flow_details.relation`. The client then opens
+`GetQueryFunctionExecutionSignalStream` (scoped by `client_id`, matching the value on
+`DefineFlow`) and receives `PipelineQueryFunctionExecutionSignal` responses naming pending flows.
+After evaluating the Python function locally, the client sends `DefineFlowQueryFunctionResult` to
+backfill the stored relation; `StartRun` then plans those flows like any other. Flows still
+relation-less at `StartRun` fail with `failed_precondition` naming the flow.
+
+Oxidant's `execute_plan` handler materializes the full response list before streaming, so each
+signal-stream RPC emits all currently-pending flows in one response and completes — register new
+empty-relation flows before opening the stream, or call the stream again after late arrivals.
+`PipelineAnalysisContext` on `ExecutePlanRequest` is not wired in our vendored Connect protos yet;
+when upstream adds it, oxidant will accept and ignore it until pipeline-scoped analysis is
+implemented.
 
 **Client e2e gate** (stock `pyspark.pipelines` / `spark-pipelines run`, no broker):
 
