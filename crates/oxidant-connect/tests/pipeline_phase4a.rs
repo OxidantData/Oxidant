@@ -158,6 +158,24 @@ fn signal_flow_identifiers(resps: &[sc::ExecutePlanResponse]) -> Vec<sc::Resolve
         .collect()
 }
 
+/// The deprecated pre-4.2 `flow_names` field, which oxidant populates alongside identifiers.
+fn signal_flow_names(resps: &[sc::ExecutePlanResponse]) -> Vec<String> {
+    resps
+        .iter()
+        .filter_map(|r| match &r.response_type {
+            Some(
+                sc::execute_plan_response::ResponseType::PipelineQueryFunctionExecutionSignal(sig),
+            ) =>
+            {
+                #[allow(deprecated)]
+                Some(sig.flow_names.clone())
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
 fn spool_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/spool/orders")
 }
@@ -552,4 +570,269 @@ async fn release_session_clears_pending_query_function_state() {
     .await
     .expect_err("graph must be gone after session release");
     assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+/// The stock client packs `PipelineAnalysisContext` into `user_context.extensions` while it
+/// evaluates a query function (`pyspark.pipelines.add_pipeline_analysis_context`); the server must
+/// accept requests carrying it even though it does not act on it yet.
+fn analysis_context_extension(graph_id: &str, flow_name: &str) -> prost_types::Any {
+    let ctx = {
+        #[allow(deprecated)]
+        sc::PipelineAnalysisContext {
+            dataflow_graph_id: Some(graph_id.to_string()),
+            definition_path: Some("pipeline.py".into()),
+            flow_name: Some(flow_name.to_string()),
+            flow_identifier: None,
+            extension: vec![],
+        }
+    };
+    prost_types::Any {
+        type_url: "type.googleapis.com/spark.connect.PipelineAnalysisContext".to_string(),
+        value: prost::Message::encode_to_vec(&ctx),
+    }
+}
+
+async fn execute_pipeline_with_user_context(
+    client: &mut SparkConnectServiceClient<tonic::transport::Channel>,
+    cmd: sc::PipelineCommand,
+    user_context: sc::UserContext,
+) -> Result<Vec<sc::ExecutePlanResponse>, Status> {
+    let mut stream = client
+        .execute_plan(Request::new(sc::ExecutePlanRequest {
+            session_id: SESSION.to_string(),
+            plan: Some(pipeline_plan(cmd)),
+            user_context: Some(user_context),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    let mut responses = Vec::new();
+    while let Some(item) = stream.next().await {
+        responses.push(item?);
+    }
+    Ok(responses)
+}
+
+#[tokio::test]
+async fn pipeline_analysis_context_extension_is_accepted() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+    let (graph_id, flow_id) = setup_spool_graph(&mut client).await;
+
+    let user_context = sc::UserContext {
+        user_id: "oxidant".into(),
+        user_name: "oxidant".into(),
+        extensions: vec![analysis_context_extension(&graph_id, "to_revenue_gold")],
+    };
+
+    // 1. A plain query issued while the analysis context is active.
+    let mut stream = client
+        .execute_plan(Request::new(sc::ExecutePlanRequest {
+            session_id: SESSION.to_string(),
+            user_context: Some(user_context.clone()),
+            plan: Some(sc::Plan {
+                op_type: Some(sc::plan::OpType::Root(sc::Relation {
+                    rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                        query: "SELECT 1 AS one".into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("execute_plan with analysis context")
+        .into_inner();
+    while let Some(item) = stream.next().await {
+        item.expect("query with analysis context must succeed");
+    }
+
+    // 2. The backfill itself, which the client sends from the same context.
+    execute_pipeline_with_user_context(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(
+                sc::pipeline_command::CommandType::DefineFlowQueryFunctionResult(
+                    sc::pipeline_command::DefineFlowQueryFunctionResult {
+                        dataflow_graph_id: Some(graph_id.clone()),
+                        flow_identifier: Some(flow_id),
+                        relation: Some(sc::Relation {
+                            rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                                query: "SELECT customer, sum(amount) AS revenue, count(*) AS \
+                                        orders FROM orders_bronze GROUP BY customer"
+                                    .into(),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            ),
+        },
+        user_context,
+    )
+    .await
+    .expect("backfill with analysis context");
+}
+
+#[tokio::test]
+async fn signal_stream_is_scoped_to_client_id() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+    let (graph_id, flow_id) = setup_spool_graph(&mut client).await;
+
+    let other = execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(
+                sc::pipeline_command::CommandType::GetQueryFunctionExecutionSignalStream(
+                    sc::pipeline_command::GetQueryFunctionExecutionSignalStream {
+                        dataflow_graph_id: Some(graph_id.clone()),
+                        client_id: Some("some-other-client".into()),
+                    },
+                ),
+            ),
+        },
+    )
+    .await
+    .expect("signal stream for other client");
+    assert!(
+        signal_flow_identifiers(&other).is_empty(),
+        "a flow registered by another client_id must not be signalled"
+    );
+    assert!(
+        other.iter().any(|r| matches!(
+            r.response_type,
+            Some(sc::execute_plan_response::ResponseType::ResultComplete(_))
+        )),
+        "signal stream must complete even with nothing pending"
+    );
+
+    // The owning client still sees it, and gets the deprecated `flow_names` field too.
+    let mine = execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(
+                sc::pipeline_command::CommandType::GetQueryFunctionExecutionSignalStream(
+                    sc::pipeline_command::GetQueryFunctionExecutionSignalStream {
+                        dataflow_graph_id: Some(graph_id.clone()),
+                        client_id: Some(CLIENT_ID.into()),
+                    },
+                ),
+            ),
+        },
+    )
+    .await
+    .expect("signal stream for owning client");
+    assert_eq!(signal_flow_identifiers(&mine).len(), 1);
+    let names = signal_flow_names(&mine);
+    assert_eq!(names, vec!["local.live.to_revenue_gold".to_string()]);
+
+    // A pre-4.2 client echoes that deprecated name back; the backfill must still land.
+    #[allow(deprecated)]
+    let by_name = sc::pipeline_command::DefineFlowQueryFunctionResult {
+        dataflow_graph_id: Some(graph_id.clone()),
+        flow_name: Some(names[0].clone()),
+        flow_identifier: None,
+        relation: Some(sc::Relation {
+            rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                query: "SELECT customer, sum(amount) AS revenue, count(*) AS orders FROM \
+                        orders_bronze GROUP BY customer"
+                    .into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }),
+    };
+    execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(
+                sc::pipeline_command::CommandType::DefineFlowQueryFunctionResult(by_name),
+            ),
+        },
+    )
+    .await
+    .expect("backfill by deprecated flow_name");
+
+    let resync = execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(
+                sc::pipeline_command::CommandType::GetQueryFunctionExecutionSignalStream(
+                    sc::pipeline_command::GetQueryFunctionExecutionSignalStream {
+                        dataflow_graph_id: Some(graph_id),
+                        client_id: Some(CLIENT_ID.into()),
+                    },
+                ),
+            ),
+        },
+    )
+    .await
+    .expect("resync signal stream");
+    assert!(
+        signal_flow_identifiers(&resync).is_empty(),
+        "flow backfilled by deprecated name must clear"
+    );
+    assert_eq!(flow_id.table_name, "to_revenue_gold");
+}
+
+#[tokio::test]
+async fn backfill_requires_flow_and_relation() {
+    let warehouse = tempfile::TempDir::new().expect("warehouse");
+    let port = pick_port();
+    let mut client = boot(port, local_catalog_conf(warehouse.path())).await;
+    let (graph_id, flow_id) = setup_spool_graph(&mut client).await;
+
+    let err = execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(
+                sc::pipeline_command::CommandType::DefineFlowQueryFunctionResult(
+                    sc::pipeline_command::DefineFlowQueryFunctionResult {
+                        dataflow_graph_id: Some(graph_id.clone()),
+                        relation: Some(sc::Relation {
+                            rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                                query: "SELECT 1".into(),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            ),
+        },
+    )
+    .await
+    .expect_err("backfill without a flow identifier");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(err.message().contains("flow_identifier"), "{err}");
+
+    let err = execute_pipeline(
+        &mut client,
+        sc::PipelineCommand {
+            command_type: Some(
+                sc::pipeline_command::CommandType::DefineFlowQueryFunctionResult(
+                    sc::pipeline_command::DefineFlowQueryFunctionResult {
+                        dataflow_graph_id: Some(graph_id),
+                        flow_identifier: Some(flow_id),
+                        relation: Some(sc::Relation {
+                            rel_type: None,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            ),
+        },
+    )
+    .await
+    .expect_err("backfill with an empty relation");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(err.message().contains("relation is empty"), "{err}");
 }

@@ -227,7 +227,21 @@ fn find_flow_index(
     }
     #[allow(deprecated)]
     let name = cmd.flow_name.as_deref().filter(|s| !s.is_empty())?;
-    graph.flows.iter().position(|flow| flow.flow_name == name)
+    // Pre-4.2 clients echo back whatever we put in the deprecated `flow_names` signal field,
+    // which is fully qualified — accept both that and the short `DefineFlow.flow_name`.
+    graph
+        .flows
+        .iter()
+        .position(|flow| flow.flow_name == name || resolved_identifier_key(&flow.resolved) == name)
+}
+
+/// Human-readable name of the flow a `DefineFlowQueryFunctionResult` addressed, for errors.
+fn requested_flow_label(cmd: &sc::pipeline_command::DefineFlowQueryFunctionResult) -> String {
+    if let Some(id) = cmd.flow_identifier.as_ref() {
+        return resolved_identifier_key(id);
+    }
+    #[allow(deprecated)]
+    cmd.flow_name.clone().unwrap_or_default()
 }
 
 fn is_temporary_view_output(output: &OutputDef) -> bool {
@@ -752,6 +766,11 @@ impl OxidantService {
                     "DefineFlowQueryFunctionResult.dataflow_graph_id is required",
                 )
             })?;
+        if requested_flow_label(cmd).is_empty() {
+            return Err(Status::invalid_argument(
+                "DefineFlowQueryFunctionResult.flow_identifier is required",
+            ));
+        }
         let relation = cmd.relation.as_ref().ok_or_else(|| {
             Status::invalid_argument("DefineFlowQueryFunctionResult.relation is required")
         })?;
@@ -764,7 +783,11 @@ impl OxidantService {
         self.dataflow_graphs
             .with_graph(graph_id, session_id, |graph| {
                 let flow_idx = find_flow_index(graph, cmd).ok_or_else(|| {
-                    Status::invalid_argument(format!("unknown flow in dataflow graph `{graph_id}`"))
+                    Status::invalid_argument(format!(
+                        "DefineFlowQueryFunctionResult: unknown flow `{}` in dataflow graph \
+                         `{graph_id}`",
+                        requested_flow_label(cmd)
+                    ))
                 })?;
                 graph.flows[flow_idx].relation = Some(relation.clone());
                 Ok(())
@@ -1092,15 +1115,21 @@ impl OxidantService {
         operation_id: &str,
         flow_identifiers: Vec<sc::ResolvedIdentifier>,
     ) -> sc::ExecutePlanResponse {
+        // `flow_names` is deprecated since Spark 4.2 but is still the only field a 4.0/4.1
+        // client reads, so populate both with the same fully-qualified names.
+        let flow_names = flow_identifiers
+            .iter()
+            .map(resolved_identifier_key)
+            .collect();
+        #[allow(deprecated)]
+        let signal = sc::PipelineQueryFunctionExecutionSignal {
+            flow_names,
+            flow_identifiers,
+        };
         self.response(
             session_id,
             operation_id,
-            sc::execute_plan_response::ResponseType::PipelineQueryFunctionExecutionSignal(
-                sc::PipelineQueryFunctionExecutionSignal {
-                    flow_identifiers,
-                    ..Default::default()
-                },
-            ),
+            sc::execute_plan_response::ResponseType::PipelineQueryFunctionExecutionSignal(signal),
         )
     }
 }
@@ -1204,7 +1233,7 @@ async fn graph_to_config(
                         table.source = Some(source);
                     }
                 }
-                sql_from_relation(engine, relation)
+                sql_from_relation(engine, relation, graph)
                     .await
                     .map_err(|status| {
                         table_planning_failure(&target_name, status, &flow.source_code_location)
@@ -1712,13 +1741,52 @@ fn format_run_event(event: &RunEvent, locations: &HashMap<String, String>) -> St
     }
 }
 
-async fn sql_from_relation(engine: &Engine, relation: &sc::Relation) -> Result<String, Status> {
+/// Flow relations are planned through DataFusion and unparsed, so a bad flow fails at `StartRun`
+/// with its source location attached. A plain `SQL` relation that reads another table this graph
+/// builds cannot be planned yet — that table only exists once the run creates it — so its text is
+/// forwarded verbatim, exactly like an SDP-SQL flow's `query_sql`. This is what lets a Python
+/// query function backfilled by `DefineFlowQueryFunctionResult` read an upstream pipeline table.
+async fn sql_from_relation(
+    engine: &Engine,
+    relation: &sc::Relation,
+    graph: &DataflowGraph,
+) -> Result<String, Status> {
     if let Some(sc::relation::RelType::Sql(sql)) = relation.rel_type.as_ref() {
-        if !sql.query.is_empty() {
+        if !sql.query.is_empty() && sql_reads_graph_output(&sql.query, graph) {
             return Ok(sql.query.clone());
         }
     }
     relation_to_sql(engine, relation).await
+}
+
+/// Whether `sql` reads a table this graph builds. Temporary views are excluded: they are already
+/// registered on the session before planning, so they resolve normally.
+fn sql_reads_graph_output(sql: &str, graph: &DataflowGraph) -> bool {
+    use datafusion::sql::parser::DFParser;
+    use datafusion::sql::resolve::resolve_table_references;
+
+    let Ok(statements) = DFParser::parse_sql(sql) else {
+        return false;
+    };
+    statements.iter().any(|statement| {
+        let Ok((references, _ctes)) = resolve_table_references(statement, true) else {
+            return false;
+        };
+        references.iter().any(|reference| {
+            let full = reference.to_string();
+            // Both forms are checked so a fully-qualified `local.live.bronze` matches `bronze`,
+            // mirroring how `oxidant_pipelines::Graph::build` derives its edges.
+            let short = full.rsplit('.').next().unwrap_or(full.as_str());
+            graph
+                .outputs
+                .iter()
+                .filter(|output| !is_temporary_view_output(output))
+                .any(|output| {
+                    output.resolved.table_name == short
+                        || resolved_identifier_key(&output.resolved) == full
+                })
+        })
+    })
 }
 
 async fn relation_to_sql(engine: &Engine, relation: &sc::Relation) -> Result<String, Status> {
@@ -2146,6 +2214,56 @@ mod tests {
         let dt = sc::DataType { kind: None };
         let err = proto_schema_to_ddl(&dt).expect_err("invalid proto");
         assert!(err.to_string().contains("schema_data_type"), "{err}");
+    }
+
+    fn graph_with_outputs(outputs: &[(&str, i32)]) -> DataflowGraph {
+        DataflowGraph {
+            default_catalog: Some("local".into()),
+            default_database: Some("live".into()),
+            sql_conf: HashMap::new(),
+            outputs: outputs
+                .iter()
+                .map(|(name, output_type)| OutputDef {
+                    output_name: (*name).to_string(),
+                    resolved: resolve_identifier(name, Some("local"), Some("live")),
+                    output_type: *output_type,
+                    comment: None,
+                    table_details: None,
+                    sink_details: None,
+                    source_code_location: None,
+                })
+                .collect(),
+            flows: Vec::new(),
+            refreshes: Vec::new(),
+            created_at: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn sql_reads_graph_output_defers_only_pipeline_built_tables() {
+        let graph = graph_with_outputs(&[
+            ("orders_bronze", sc::OutputType::Table as i32),
+            ("scratch", sc::OutputType::TemporaryView as i32),
+        ]);
+
+        // Reads a table this run builds: cannot be planned before the run.
+        assert!(sql_reads_graph_output(
+            "SELECT customer FROM orders_bronze",
+            &graph
+        ));
+        assert!(sql_reads_graph_output(
+            "SELECT customer FROM local.live.orders_bronze",
+            &graph
+        ));
+        // Reads only catalog tables, so it must still be validated at StartRun.
+        assert!(!sql_reads_graph_output(
+            "SELECT * FROM definitely_missing_table_xyz",
+            &graph
+        ));
+        // Temporary views are registered before planning and resolve normally.
+        assert!(!sql_reads_graph_output("SELECT * FROM scratch", &graph));
+        // Unparseable text falls through to the planner, which reports the real error.
+        assert!(!sql_reads_graph_output("NOT SQL AT ALL (", &graph));
     }
 
     #[test]

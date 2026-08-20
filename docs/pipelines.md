@@ -49,12 +49,27 @@ After evaluating the Python function locally, the client sends `DefineFlowQueryF
 backfill the stored relation; `StartRun` then plans those flows like any other. Flows still
 relation-less at `StartRun` fail with `failed_precondition` naming the flow.
 
+A flow is "pending" while it has neither a relation nor SDP SQL text. Signals are routed by
+`client_id`: a stream request only sees flows whose `DefineFlow.client_id` matches it, plus flows
+registered without a `client_id` (which the stock client does not set today). Pending state lives
+in the session's dataflow graph, so `DropDataflowGraph` or closing the session clears it.
+
 Oxidant's `execute_plan` handler materializes the full response list before streaming, so each
-signal-stream RPC emits all currently-pending flows in one response and completes — register new
-empty-relation flows before opening the stream, or call the stream again after late arrivals.
-`PipelineAnalysisContext` on `ExecutePlanRequest` is not wired in our vendored Connect protos yet;
-when upstream adds it, oxidant will accept and ignore it until pipeline-scoped analysis is
-implemented.
+signal-stream RPC emits all currently-pending flows in one `PipelineQueryFunctionExecutionSignal`
+and then completes, rather than holding the stream open — register empty-relation flows before
+opening the stream, or call the stream again after late arrivals. Both the current
+`flow_identifiers` field and the pre-4.2 `flow_names` field are populated; backfill requests are
+accepted against either.
+
+`PipelineAnalysisContext` rides along as a packed `google.protobuf.Any` in
+`ExecutePlanRequest.user_context.extensions` (see `pyspark.pipelines.add_pipeline_analysis_context`),
+not as a top-level request field. Oxidant ignores user-context extensions, so requests carrying it
+are accepted unchanged; pipeline-scoped analysis (resolving names against the in-flight graph
+rather than the catalog) is not implemented.
+
+Note that `pyspark` 4.2 always evaluates the Python query function at `DefineFlow` time and sends a
+populated relation, so this round-trip is exercised by
+`crates/oxidant-connect/tests/pipeline_phase4a.rs` rather than by the client e2e gate below.
 
 **Client e2e gate** (stock `pyspark.pipelines` / `spark-pipelines run`, no broker):
 
