@@ -175,7 +175,10 @@ rows at or below its own sequence. But three cases are worth stating outright:
   against the target, and dropping it silently would lose a change event — including a delete or
   a truncate. Databricks fails the same way.
 - **NULL key values compare equal.** A NULL-keyed row is one key like any other, matched with
-  `IS NOT DISTINCT FROM`.
+  `IS NOT DISTINCT FROM`. This is the one case here that **deliberately diverges from
+  Databricks**: Spark's `MERGE` matches keys with `=`, so a NULL-keyed row never matches the
+  target and is re-inserted on every micro-batch — an unbounded set of duplicates for one key,
+  which is a leak rather than a semantic. Expect a Databricks parity test to differ on this row.
 
 Two rows for the same key with the *same* `sequence_by` value have no natural winner. The merge
 breaks the tie deterministically — a delete first, then the remaining target columns descending

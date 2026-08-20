@@ -34,6 +34,19 @@ impl CdcMergeSink {
 
     /// Read the target as it stands.
     ///
+    /// Read by **location**, through a provider built for this call, rather than by name. A
+    /// registered name is a snapshot — the provider behind it embeds the file list it was
+    /// resolved from — so a read of the target's name returns whatever the first read of it in
+    /// this process saw, including for the commits this sink itself has made since. The write
+    /// path invalidates that cache after every commit ([`LakeSink`]), but only where there is a
+    /// name to invalidate: a location-only sink has none. Depending on it either way would be
+    /// wrong here, because getting it wrong is not a stale read but silent data loss — the merge
+    /// recomputes the table without the rows it could not see, and `replace_batch` commits that.
+    ///
+    /// Every batch re-reads: the state cache short-circuits the happy path, and the paths that
+    /// reach here (first batch of a run, a failed batch, a deduplicated replay) are exactly the
+    /// ones where what this sink last computed is not what the table holds.
+    ///
     /// A target that has never been committed to is an empty target; every *other* read failure
     /// is a real error, because swallowing it would make the next `replace_batch` write the
     /// whole table as just this micro-batch. The two cases are told apart by asking the sink
@@ -44,7 +57,7 @@ impl CdcMergeSink {
             return Ok(Vec::new());
         }
         self.engine
-            .sql(&format!("SELECT * FROM {}", self.target_table))
+            .read_delta(&self.target_table, self.inner.location())
             .await
             .map_err(|e| Error::Execution(format!("AUTO CDC target `{}`: {e}", self.target_table)))
     }

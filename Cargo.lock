@@ -4610,6 +4610,7 @@ dependencies = [
  "futures",
  "object_store",
  "oxidant-catalog",
+ "oxidant-catalog-local",
  "oxidant-common",
  "oxidant-datasource",
  "oxidant-loom",

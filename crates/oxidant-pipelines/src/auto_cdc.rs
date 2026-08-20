@@ -24,7 +24,9 @@
 //!   event without a word. Databricks fails the same way.
 //! * **NULL key values compare equal**, via `IS NOT DISTINCT FROM`. A NULL-keyed row is one key
 //!   like any other; with plain `=` it would never match the target and the target would grow a
-//!   fresh duplicate row per batch, forever.
+//!   fresh duplicate row per batch, forever. This is the one semantic here that **deliberately
+//!   diverges from Databricks**, whose `MERGE` matches keys with `=` and so does re-insert a
+//!   NULL-keyed row every batch — a parity test would differ on exactly that row.
 //!
 //! The generated statement is:
 //!

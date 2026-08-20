@@ -5303,12 +5303,18 @@ impl Engine {
             .await
     }
 
-    async fn register_lakehouse(
+    /// Build a provider for the lakehouse table at `table_path` — resolved *now*, and NOT
+    /// registered under any name.
+    ///
+    /// `name` is not a registration: it only feeds the shard/replicate classification
+    /// ([`shard::is_replicated_table`]) and the error messages, so a read through this path makes
+    /// the same file-listing decision a read of the registered name would.
+    async fn lakehouse_provider(
         &self,
         name: &str,
         table_path: &str,
         format: oxidant_catalog::TableFormat,
-    ) -> Result<()> {
+    ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
         let mut metadata = oxidant_catalog::TableMetadata::new(name, table_path, format);
         // A *partitioned* Delta table keeps its partition columns in the path, not in the data
         // files, so a reader given only a directory sees a table missing exactly the columns a
@@ -5323,10 +5329,44 @@ impl Engine {
                 }
             }
         }
-        let table = catalog_bridge::metadata_to_provider(&self.ctx.state(), &metadata, name, false)
+        catalog_bridge::metadata_to_provider(&self.ctx.state(), &metadata, name, false)
             .await
-            .map_err(|e| Error::Execution(e.to_string()))?
-            .provider;
+            .map(|resolved| resolved.provider)
+            .map_err(|e| Error::Execution(e.to_string()))
+    }
+
+    /// Read a Delta table at `table_path` in full, through a provider built *for this call*.
+    ///
+    /// A registered name is a **snapshot**: the provider behind it embeds the file list it was
+    /// resolved from, and neither `register_delta`'s session registration nor the catalog
+    /// bridge's lakehouse cache revalidates it (see [`catalog_bridge`] — only non-lakehouse
+    /// entries have a TTL). Anything that reads a table *this process has just written* must not
+    /// go through a name, or it reads its own pre-commit snapshot back. For a read-modify-write
+    /// — the AUTO CDC sink's per-batch merge — that is not a stale read but silent data loss:
+    /// the rows it cannot see are absent from the merge result it then commits.
+    ///
+    /// [`Engine::refresh_table`] closes the same gap for readers that go by name, and the write
+    /// path calls it after every commit; this is for the readers that should not have to depend
+    /// on that being true.
+    pub async fn read_delta(&self, name: &str, table_path: &str) -> Result<Vec<RecordBatch>> {
+        let provider = self
+            .lakehouse_provider(name, table_path, oxidant_catalog::TableFormat::Delta)
+            .await?;
+        self.ctx
+            .read_table(provider)
+            .map_err(|e| Error::Execution(format!("read `{name}` at `{table_path}`: {e}")))?
+            .collect()
+            .await
+            .map_err(|e| Error::Execution(format!("read `{name}` at `{table_path}`: {e}")))
+    }
+
+    async fn register_lakehouse(
+        &self,
+        name: &str,
+        table_path: &str,
+        format: oxidant_catalog::TableFormat,
+    ) -> Result<()> {
+        let table = self.lakehouse_provider(name, table_path, format).await?;
         self.ctx
             .register_table(name, table)
             .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
