@@ -200,13 +200,41 @@ result silently — each one fails loudly, just later or with a worse message th
       with its own regression surface.
 - [ ] A SQL REPL. `oxidant sql` is one-shot; there is no readline/interactive loop anywhere.
 - [ ] Wire remaining `pipelines.proto` surface (SDP Phase 4): AUTO CDC flows
-      ([#92](https://github.com/oxidantdata/oxidant/issues/92)), sinks /
-      `ExecuteOutputFlows` ([#93](https://github.com/oxidantdata/oxidant/issues/93)). Core
-      `PipelineCommand` dispatch, SQL graph parsing, and `StartRun` execution landed in SDP
-      Phases 1–2; the query-function execution signal stream
-      ([#91](https://github.com/oxidantdata/oxidant/issues/91)) landed in Phase 4a, with the
-      follow-ups listed above.
-- [ ] Kafka as a *sink*. The Kafka integration is source-only.
+      ([#92](https://github.com/oxidantdata/oxidant/issues/92)). Core `PipelineCommand` dispatch,
+      SQL graph parsing, and `StartRun` execution landed in SDP Phases 1–2; the query-function
+      execution signal stream ([#91](https://github.com/oxidantdata/oxidant/issues/91)) landed in
+      Phase 4a, with the follow-ups listed above; external sinks and `ExecuteOutputFlows`
+      ([#93](https://github.com/oxidantdata/oxidant/issues/93)) landed in Phase 4c.
+- [ ] Kafka as a *sink*. The Kafka integration is source-only — `DefineOutput` with
+      `output_type=SINK` and `format=kafka` is refused at definition time.
+- [ ] Run-scope names in the **DataFrame** encoding. `spark.sql("SELECT * FROM <graph output>")`
+      is passed through to the runner unnormalized (`sql_needs_run_scope`), but the equivalent
+      `spark.readStream.table("<graph output>")` — a `Read`/`NamedTable` relation, and the
+      idiomatic SDP spelling — still round-trips through `relation_to_sql` and hits the analyzer
+      before the table exists. Same for a `spark.sql(...)` nested under a relation wrapper. The
+      two encodings should agree; making them agree means resolving run-scope names in the
+      relation path, not another special case.
+- [ ] The flow-reads-a-sink walker (`relation_named_tables`) is a whitelist of relation shapes and
+      is therefore fail-open: a shape not listed hides its inputs, and a read of a sink through it
+      falls through to the missing-table error the check exists to replace.
+- [ ] `json` / `csv` SDP sinks. Both are writable *table* formats, but the streaming writer
+      (`LakeSink`) implements only Delta and Parquet, so `output_type=SINK` refuses them at
+      definition time rather than accepting the graph and dying on the first micro-batch. The
+      `FileSink` in [`sink.rs`](../crates/oxidant-streaming/src/sink.rs) writes text output for the
+      `writeStream` API, but it has no commit protocol and its `json` branch emits comma-joined
+      cells, not JSON — wiring that into pipelines would ship a lie.
+- [ ] A commit protocol for the **Parquet sink**. `format=parquet` on an SDP sink writes one file
+      per micro-batch with no transaction log. Each individual batch *is* written atomically (the
+      whole batch is buffered and issued as a single `store.put`, which is temp-and-rename on
+      `LocalFileSystem` and a single-part upload on S3), so the precise gaps are: (a) a reader can
+      observe a partially written **run** — some batches landed, some did not, with nothing
+      marking the boundary; (b) a batch replayed after a crash is appended twice rather than
+      recognized and dropped; (c) there is no atomic *replace*, so a parquet sink cannot be a
+      derived output — one fed only by pipeline tables is refused when the graph is lowered, since
+      every pass would need to replace the location wholesale. `format=delta` (the default) commits
+      atomically per batch and is the honest choice for anything that matters; Parquet is there for
+      consumers that cannot read Delta. The run emits a warning event naming the sink at start;
+      there is no opt-in flag gating it.
 
 ### Gates to keep honest
 

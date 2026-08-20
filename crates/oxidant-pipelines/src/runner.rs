@@ -72,6 +72,17 @@ pub enum RunEventKind {
         error: String,
         elapsed: Duration,
     },
+    /// A sink is being written in a format with no commit protocol.
+    ///
+    /// Parquet writes one file per batch and has no transaction log: a reader can see a
+    /// partially written *run* (some batches landed, some did not), a replayed batch is
+    /// appended rather than recognized, and there is no atomic replace. Nothing in the write
+    /// path can enforce this, so say it out loud at run start.
+    SinkWithoutCommitProtocol {
+        table: String,
+        path: String,
+        format: String,
+    },
     /// Checkpoint state could not be written.
     StatePersistFailed { error: String },
     /// One pass over the subgraph finished.
@@ -169,10 +180,27 @@ impl<'a> Plan<'a> {
 
     /// Where a table's files live, when the pipeline pins a storage root.
     pub fn location_of(&self, name: &str) -> Option<String> {
+        if let Some(table) = self.table(name) {
+            if let Some(path) = &table.write_path {
+                return Some(path.trim_end_matches('/').to_string());
+            }
+        }
         self.pipeline
             .storage
             .as_ref()
             .map(|root| format!("{}/{name}/", root.trim_end_matches('/')))
+    }
+
+    /// Catalog sink target, or `None` for a path-only external sink.
+    ///
+    /// An SDP sink is a write target with no catalog identity, so the streaming writer must be
+    /// pointed at a location instead of a table name — see [`location_of`](Self::location_of).
+    pub fn sink_table_of(&self, table: &TableConfig) -> Option<String> {
+        if table.write_path.is_some() {
+            None
+        } else {
+            Some(self.target_of(&table.name))
+        }
     }
 }
 
@@ -233,6 +261,25 @@ where
                 .join(" -> "),
         },
     );
+    for node in &nodes {
+        let Some(table) = plan.table(&node.name) else {
+            continue;
+        };
+        let Some(path) = table.write_path.as_deref() else {
+            continue;
+        };
+        let format = plan.format_of(table);
+        if !format.eq_ignore_ascii_case("delta") {
+            emit(
+                on_event,
+                RunEventKind::SinkWithoutCommitProtocol {
+                    table: node.name.clone(),
+                    path: path.to_string(),
+                    format,
+                },
+            );
+        }
+    }
 
     match trigger {
         Trigger::Once | Trigger::AvailableNow => {
@@ -384,7 +431,7 @@ async fn start_stream(
         &source.format,
         source.options.clone().into_iter().collect(),
         &plan.format_of(table),
-        plan.target_of(name),
+        plan.sink_table_of(table),
         plan.location_of(name),
         table.partition_by.clone(),
         table.dedup_columns.clone(),
@@ -613,6 +660,12 @@ where
 }
 
 async fn bind_bare_name(engine: &Engine, plan: &Plan<'_>, name: &str) -> Result<()> {
+    let Some(table) = plan.table(name) else {
+        return Ok(());
+    };
+    if table.write_path.is_some() {
+        return Ok(());
+    }
     let target = plan.target_of(name);
     let _ = engine.refresh_table(&target).await;
     engine
@@ -704,13 +757,17 @@ where
     };
 
     let format = oxidant_streaming::writable_format(&plan.format_of(table))?;
-    let target = LakeTarget::from_table_identifier(
-        &plan.target_of(name),
-        &plan.pipeline.catalog,
-        std::slice::from_ref(&plan.pipeline.schema),
-        format,
-        plan.location_of(name),
-    )?;
+    let target = if let Some(path) = &table.write_path {
+        LakeTarget::location_only(path, format)
+    } else {
+        LakeTarget::from_table_identifier(
+            &plan.target_of(name),
+            &plan.pipeline.catalog,
+            std::slice::from_ref(&plan.pipeline.schema),
+            format,
+            plan.location_of(name),
+        )?
+    };
     let mut sink = LakeSink::open(
         engine,
         target,
@@ -807,11 +864,18 @@ impl PipelineState {
     }
 }
 
+/// Hash of everything that decides what a table's contents are and where they land.
+///
+/// `write_path` is `#[serde(skip)]` — it is not an `oxidant.yaml` key, only a lowering of an SDP
+/// sink — so it is absent from the serialized form and has to be folded in by hand. Without it a
+/// sink whose path changed but whose SQL did not would fingerprint identically, be reported
+/// `unchanged`, and write nothing to the new location.
 fn definition_fingerprint(table: &TableConfig) -> String {
     use std::hash::{Hash, Hasher};
     let text = serde_json::to_string(table).unwrap_or_default();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
+    table.write_path.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 

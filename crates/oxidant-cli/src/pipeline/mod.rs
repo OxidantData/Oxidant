@@ -219,6 +219,19 @@ fn render_event(event: RunEvent) {
         RunEventKind::TableFailed { name, error, .. } => {
             eprintln!("[oxidant] {:<24} FAILED: {error}", name);
         }
+        RunEventKind::SinkWithoutCommitProtocol {
+            table,
+            path,
+            format,
+        } => {
+            eprintln!(
+                "[oxidant] {:<24} warning: `{format}` sink at {path} has no commit protocol — \
+                 a reader can observe a partially written run, a replayed batch is appended \
+                 rather than deduplicated, and the sink cannot be replaced atomically; use \
+                 `delta` for transactional writes",
+                table
+            );
+        }
         RunEventKind::StatePersistFailed { error } => {
             eprintln!("[oxidant] could not persist pipeline state: {error}");
         }
