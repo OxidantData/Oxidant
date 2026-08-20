@@ -170,12 +170,23 @@ path.
       with its own regression surface.
 - [ ] A SQL REPL. `oxidant sql` is one-shot; there is no readline/interactive loop anywhere.
 - [ ] Wire remaining `pipelines.proto` surface (SDP Phase 4): query-function execution signal
-      stream ([#92](https://github.com/oxidantdata/oxidant/issues/92)), AUTO CDC flows
-      ([#91](https://github.com/oxidantdata/oxidant/issues/91)), sinks /
-      `ExecuteOutputFlows` ([#93](https://github.com/oxidantdata/oxidant/issues/93)). Core
-      `PipelineCommand` dispatch, SQL graph parsing, and `StartRun` execution landed in SDP
-      Phases 1–2.
-- [ ] Kafka as a *sink*. The Kafka integration is source-only.
+      stream ([#91](https://github.com/oxidantdata/oxidant/issues/91)), AUTO CDC flows
+      ([#92](https://github.com/oxidantdata/oxidant/issues/92)). Core `PipelineCommand` dispatch,
+      SQL graph parsing, `StartRun` execution, external sinks, and `ExecuteOutputFlows` landed in
+      SDP Phases 1–2 and 4c ([#93](https://github.com/oxidantdata/oxidant/issues/93)).
+- [ ] Kafka as a *sink*. The Kafka integration is source-only — `DefineOutput` with
+      `output_type=SINK` and `format=kafka` is refused at definition time.
+- [ ] `json` / `csv` SDP sinks. Both are writable *table* formats, but the streaming writer
+      (`LakeSink`) implements only Delta and Parquet, so `output_type=SINK` refuses them at
+      definition time rather than accepting the graph and dying on the first micro-batch. The
+      `FileSink` in [`sink.rs`](../crates/oxidant-streaming/src/sink.rs) writes text output for the
+      `writeStream` API, but it has no commit protocol and its `json` branch emits comma-joined
+      cells, not JSON — wiring that into pipelines would ship a lie.
+- [ ] A commit protocol for the **Parquet sink**. `format=parquet` on an SDP sink is supported and
+      writes one file per micro-batch with no transaction log: a reader can observe a partially
+      written batch, and a batch replayed after a crash is appended twice rather than recognized
+      and dropped. `format=delta` (the default) commits atomically per batch and is the honest
+      choice for anything that matters; Parquet is there for consumers that cannot read Delta.
 
 ### Gates to keep honest
 

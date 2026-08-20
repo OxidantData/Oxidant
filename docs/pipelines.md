@@ -28,14 +28,26 @@ YAML file:
   `CREATE MATERIALIZED VIEW`, `CREATE TEMPORARY VIEW`, `CREATE [ONCE] FLOW`, `REFRESH MATERIALIZED
   VIEW`), dry-run validation (`StartRun.dry`), non-dry execution with `PipelineEvent` streaming,
   `full_refresh_all` / `full_refresh_selection` (drop pipeline state), `refresh_selection` and SQL
-  `REFRESH` / `OR REFRESH` requests (subgraph + ancestors), and `once` flows (skip after first
-  successful completion unless refreshed). Kafka spool sources (`oxidant.spool.dir` in
+  `REFRESH` / `OR REFRESH` requests (subgraph + ancestors), `once` flows (skip after first
+  successful completion unless refreshed), external **sinks** (`DefineOutput` with
+  `output_type=SINK`), and **`ExecuteOutputFlows`** (one-shot remote run of a single output plus
+  its flows, from the payload alone — no pre-registered graph; `storage` is the checkpoint root
+  and `full_refresh` drops pipeline state first). Kafka spool sources (`oxidant.spool.dir` in
   `TBLPROPERTIES` or `readStream` options) exercise the same path as the YAML runner.
-- **Limits (deferred):** no AUTO CDC / `APPLY CHANGES` flows ([#91](https://github.com/oxidantdata/oxidant/issues/91)),
-  no Python query-function signal stream ([#92](https://github.com/oxidantdata/oxidant/issues/92)),
-  no external sinks / `ExecuteOutputFlows` ([#93](https://github.com/oxidantdata/oxidant/issues/93)).
-  Interactive `spark.sql("CREATE STREAMING TABLE …")` still correctly rejects those statements;
-  use `DefineSqlGraphElements` or the Python decorators instead.
+- **Sinks** are write targets, not datasets. `SinkDetails.options.path` is required, and the sink
+  is **not** registered in the catalog — so a flow that reads one is refused at `StartRun`
+  (`flow ... cannot read sink ...`) rather than failing later as a missing table. Two formats:
+  `delta` (default; one atomic transaction per micro-batch) and `parquet` (**one file per batch,
+  no commit protocol** — a reader can see a partially written batch, and a replayed batch is not
+  deduplicated). `kafka`, `json`, and `csv` sinks are refused at definition time — see
+  [TODOS.md](TODOS.md). A sink that carries its own streaming source in `options` (`subscribe` /
+  `oxidant.spool.dir`) is written incrementally from the checkpoint like a streaming table; a sink
+  whose flow reads other pipeline tables is a derived output — recomputed and **replaced** on
+  every pass.
+- **Limits (deferred):** no AUTO CDC / `APPLY CHANGES` flows ([#92](https://github.com/oxidantdata/oxidant/issues/92)),
+  no Python query-function signal stream ([#91](https://github.com/oxidantdata/oxidant/issues/91)),
+  no Kafka sink. Interactive `spark.sql("CREATE STREAMING TABLE …")` still correctly rejects
+  unsupported statements; use `DefineSqlGraphElements` or the Python decorators instead.
 
 **Client e2e gate** (stock `pyspark.pipelines` / `spark-pipelines run`, no broker):
 

@@ -127,7 +127,9 @@ impl Graph {
 ///
 /// CTE names are excluded: `resolve_table_references` reports them separately, and a
 /// `WITH orders AS (...)` is a local definition, not a read of a table called `orders`.
-fn table_references(sql: &str) -> Result<Vec<String>> {
+///
+/// Public so the Spark Connect layer can reuse it to refuse a flow that reads a sink.
+pub fn table_references(sql: &str) -> Result<Vec<String>> {
     use oxidant_loom::datafusion::sql::parser::DFParser;
     use oxidant_loom::datafusion::sql::resolve::resolve_table_references;
 
@@ -252,6 +254,7 @@ tables:
             dedup_columns: vec![],
             expect: Default::default(),
             comment: None,
+            write_path: None,
         }
     }
 

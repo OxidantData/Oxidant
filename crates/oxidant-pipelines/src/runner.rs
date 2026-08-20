@@ -169,10 +169,27 @@ impl<'a> Plan<'a> {
 
     /// Where a table's files live, when the pipeline pins a storage root.
     pub fn location_of(&self, name: &str) -> Option<String> {
+        if let Some(table) = self.table(name) {
+            if let Some(path) = &table.write_path {
+                return Some(path.trim_end_matches('/').to_string());
+            }
+        }
         self.pipeline
             .storage
             .as_ref()
             .map(|root| format!("{}/{name}/", root.trim_end_matches('/')))
+    }
+
+    /// Catalog sink target, or `None` for a path-only external sink.
+    ///
+    /// An SDP sink is a write target with no catalog identity, so the streaming writer must be
+    /// pointed at a location instead of a table name — see [`location_of`](Self::location_of).
+    pub fn sink_table_of(&self, table: &TableConfig) -> Option<String> {
+        if table.write_path.is_some() {
+            None
+        } else {
+            Some(self.target_of(&table.name))
+        }
     }
 }
 
@@ -384,7 +401,7 @@ async fn start_stream(
         &source.format,
         source.options.clone().into_iter().collect(),
         &plan.format_of(table),
-        plan.target_of(name),
+        plan.sink_table_of(table),
         plan.location_of(name),
         table.partition_by.clone(),
         table.dedup_columns.clone(),
@@ -613,6 +630,12 @@ where
 }
 
 async fn bind_bare_name(engine: &Engine, plan: &Plan<'_>, name: &str) -> Result<()> {
+    let Some(table) = plan.table(name) else {
+        return Ok(());
+    };
+    if table.write_path.is_some() {
+        return Ok(());
+    }
     let target = plan.target_of(name);
     let _ = engine.refresh_table(&target).await;
     engine
@@ -704,13 +727,17 @@ where
     };
 
     let format = oxidant_streaming::writable_format(&plan.format_of(table))?;
-    let target = LakeTarget::from_table_identifier(
-        &plan.target_of(name),
-        &plan.pipeline.catalog,
-        std::slice::from_ref(&plan.pipeline.schema),
-        format,
-        plan.location_of(name),
-    )?;
+    let target = if let Some(path) = &table.write_path {
+        LakeTarget::location_only(path, format)
+    } else {
+        LakeTarget::from_table_identifier(
+            &plan.target_of(name),
+            &plan.pipeline.catalog,
+            std::slice::from_ref(&plan.pipeline.schema),
+            format,
+            plan.location_of(name),
+        )?
+    };
     let mut sink = LakeSink::open(
         engine,
         target,
