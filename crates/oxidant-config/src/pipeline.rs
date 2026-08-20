@@ -139,6 +139,16 @@ impl<'de> Deserialize<'de> for Trigger {
     }
 }
 
+/// One append flow into a declared table (SDP multi-flow semantics).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct AppendFlow {
+    pub sql: String,
+    /// When true, map query columns to the declared output schema by name rather than position.
+    #[serde(default)]
+    pub by_name: bool,
+}
+
 /// One declared table in the DAG.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
@@ -152,8 +162,19 @@ pub struct TableConfig {
     ///
     /// For a streaming table this is optional and runs over the source, which is in scope as
     /// `stream`. For a derived table it is required and references other declared tables.
+    /// When [`append_flows`](Self::append_flows) is non-empty, this is the first flow and the
+    /// rest are unioned with it in declaration order.
     #[serde(default)]
     pub sql: Option<String>,
+    /// Whether the primary [`sql`](Self::sql) flow uses `INSERT BY NAME` column matching.
+    #[serde(default)]
+    pub sql_by_name: bool,
+    /// Additional flows appended into this table within the same pass (`UNION ALL`).
+    #[serde(default)]
+    pub append_flows: Vec<AppendFlow>,
+    /// Declared output schema DDL, e.g. `(id INT, name STRING)`. Enforced at write (cast-or-fail).
+    #[serde(default)]
+    pub output_schema: Option<String>,
     /// Hive-style partition columns.
     ///
     /// The single biggest lever on read cost. Partition on something queries filter on that
@@ -303,6 +324,9 @@ mod tests {
                 options: BTreeMap::new(),
             }),
             sql: None,
+            sql_by_name: false,
+            append_flows: vec![],
+            output_schema: None,
             partition_by: vec![],
             format: None,
             iceberg_compat: None,

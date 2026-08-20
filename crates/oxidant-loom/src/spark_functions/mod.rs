@@ -40,6 +40,7 @@ mod spark_datetime2;
 mod spark_datetime3;
 mod spark_encoding;
 mod spark_from_json;
+pub use spark_from_json::parse_spark_schema;
 mod spark_if;
 mod spark_json;
 mod spark_math;

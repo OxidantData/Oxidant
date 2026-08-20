@@ -33,7 +33,8 @@ mod validate;
 use interpolate::interpolate_config;
 
 pub use pipeline::{
-    ExpectAction, Expectation, PipelineConfig, SourceConfig, TableConfig, TableKind, Trigger,
+    AppendFlow, ExpectAction, Expectation, PipelineConfig, SourceConfig, TableConfig, TableKind,
+    Trigger,
 };
 
 /// Environment variable naming a config file, consulted when `--config` is absent.
