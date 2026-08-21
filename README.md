@@ -105,8 +105,8 @@ reads it. Details: **[docs/pipelines.md](docs/pipelines.md)** ·
 | **Lakehouse I/O** | Delta (read + write), Iceberg (read + compat publish), Parquet/CSV/JSON |
 | **Catalogs** | AWS Glue (+ Lake Formation column/row security), Hive, Unity/REST, local |
 | **Interfaces** | Web UI (SQL editor, notebooks, monitoring) · REST statement API · CLI · MCP server |
-| **Distributed** | Driver/worker cluster over Arrow Flight; EC2 autoscaling via CloudFormation |
-| **Performance** | Vectorized Arrow-native CPU core (Loom); ClickBench-tracked, reproducible |
+| **Distributed** | Driver/worker cluster over Arrow Flight; fixed-size EC2 deploy via CloudFormation |
+| **Performance** | Vectorized Arrow-native CPU core (Loom); self-hosted, reproducible ClickBench/TPC gates |
 
 ## Architecture (one screen)
 
@@ -137,7 +137,7 @@ and reproducible — see the site for the current ClickBench/TPC numbers.
 ## Deploy
 
 Free Community AMI on AWS Marketplace (listing in progress) ·
-`docker pull ghcr.io/oxidantdata/oxidant` · EC2 autoscaling:
+`docker pull ghcr.io/oxidantdata/oxidant` · fixed-size EC2 clusters:
 **[docs/distributed-ec2.md](docs/distributed-ec2.md)** · self-hosted platform:
 **[docs/deployment.md](docs/deployment.md)**.
 

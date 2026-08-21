@@ -83,8 +83,8 @@ as the Docker image); drop the flag for a clean server without the `samples` sch
 ### Coming soon: AWS AMI / Marketplace
 
 A free Community AMI on AWS Marketplace is in progress (listing pending) — until
-then, use any install path above on an EC2 instance. EC2 autoscaling via
-CloudFormation is documented in [distributed-ec2.md](distributed-ec2.md).
+then, use any install path above on an EC2 instance. Fixed-size EC2 clusters via
+CloudFormation are documented in [distributed-ec2.md](distributed-ec2.md).
 
 > **Glue catalog users:** no AWS CLI needed — the engine uses `aws-sdk-glue` in-process with
 > the standard AWS credential chain (env vars, shared config, instance role / IRSA). See

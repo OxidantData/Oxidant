@@ -20,5 +20,5 @@
 </g></g>
 <text x="440" y="290" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="96" font-weight="700" letter-spacing="-2" fill="#ffffff">Oxidant</text>
 <text x="444" y="380" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="38" font-weight="400" fill="#b3b3b3">The lakehouse engine in a single binary.</text>
-<text x="444" y="436" font-family="JetBrains Mono, ui-monospace, monospace" font-size="26" fill="#737373">SQL · Streaming · Declarative Pipelines — wire-compatible with Spark Connect</text>
+<text x="444" y="436" font-family="JetBrains Mono, ui-monospace, monospace" font-size="26" fill="#737373">SQL · Streaming · Declarative Pipelines</text>
 </svg>
