@@ -1,0 +1,5 @@
+# The runtime crates (tonic, arrow, datafusion) need a recent compiler.
+# 1.90 is installed locally; CI uses rust:1-bookworm (latest 1.x).
+[toolchain]
+channel = "1.90"
+components = ["rustfmt", "clippy"]

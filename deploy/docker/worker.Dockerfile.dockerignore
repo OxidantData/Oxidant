@@ -1,0 +1,16 @@
+# The worker image only rebases the connect-server image (no COPY from context),
+# so the build context can be near-empty. Excluding the heavy trees keeps `docker
+# build .` from streaming gigabytes to the daemon.
+**/target/
+.git/
+**/node_modules/
+web/
+bench/
+site/
+docs/
+python/
+.github/
+scratchpad/
+**/*.parquet
+**/*.tbl
+**/.DS_Store

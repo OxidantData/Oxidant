@@ -1,0 +1,19 @@
+[package]
+name = "oxidant-catalog-rest"
+description = "Iceberg REST / Unity Catalog-compatible catalog provider."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-catalog = { workspace = true }
+oxidant-common = { workspace = true }
+async-trait = "0.1"
+serde_json = "1"
+
+[dev-dependencies]
+# Stub-endpoint integration test drives the async CatalogProvider surface (a raw
+# std::net::TcpListener mini-HTTP server stands in for the REST catalog).
+tokio = { version = "1", features = ["macros", "rt"] }

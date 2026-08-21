@@ -1,0 +1,45 @@
+# Rust
+/target
+**/*.rs.bk
+# Cargo.lock IS committed: the workspace ships a binary (oxidant-cli), so we pin deps.
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+myenv/
+dist/
+*.egg-info/
+
+# Benchmark artifacts
+bench/**/hits.parquet
+bench/**/hits_*.parquet
+bench/**/*.tbl
+bench/**/result.csv
+bench/**/results/*.json
+# Multi-engine harness runtime artifacts (created on the bench box)
+bench/clickbench/multi/.venv-*
+bench/clickbench/multi/logs/
+bench/clickbench/multi/jars/
+bench/clickbench/multi/.register-*.sql
+
+# Node / web
+node_modules/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code local state + agent worktrees (never commit)
+.claude/
+
+# Session-scoped AWS runner: keypair PEM, state, sweep scripts (never commit secrets)
+scratchpad/
+
+# Local agent code-intelligence indexes (regenerate locally; never commit)
+.codegraph/
+.gitnexus/
+
+# Local output from the runnable example (examples/README.md)
+examples/warehouse/

@@ -1,0 +1,191 @@
+name: oxidant-image
+
+# Build & publish the open-source Oxidant ENGINE image to GHCR as
+# `ghcr.io/oxidantdata/oxidant`.
+#
+# This is the `oxidant` binary (crate oxidant-cli) in a hardened distroless image. The
+# control-plane gateway provisions per-user compute pods from THIS one image,
+# overriding the command per role:
+#     oxidant spark server --port 50051   -> Spark Connect driver  ("cluster")
+#     oxidant worker       --port 50561   -> Arrow Flight worker    (same image, diff args)
+# so a single `ghcr.io/oxidantdata/oxidant` image covers both; no separate worker image
+# is needed.
+#
+# Multi-arch (amd64 + arm64) built on NATIVE runners — amd64 on ubuntu-latest, arm64
+# on ubuntu-24.04-arm — then merged into one manifest. No QEMU emulation, so each
+# arch builds at native speed. `:latest` runs on Intel OR Graviton EKS nodes, and the
+# control plane lets a user pick the arch at compute-create (pod nodeSelector).
+#
+# SCOPE — engine only. The proprietary control-plane GATEWAY image is built in the
+# PRIVATE GitLab repo and is deliberately NOT built or published here.
+#
+# BUILD CACHE lives in GHCR as `ghcr.io/oxidantdata/oxidant:buildcache-{amd64,arm64}` —
+# see the comment on cache-to below for why this is not the GitHub Actions cache.
+#
+# Auth: the built-in GITHUB_TOKEN with `packages: write` (no repo secrets needed).
+# First push note: an org admin may need to link the `oxidant` package to this repo
+# and mark it public under the org's package settings.
+#
+# RELEASE GATING — ordinary merges to main do NOT publish here. Images are built only
+# for semver release tags (`v*`, created by `.github/workflows/release.yml`) or an
+# explicit workflow_dispatch (usually fired by release.yml after it tags).
+
+on:
+  push:
+    tags: ["v*"]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "sample-data/**"
+      - "deploy/docker/connect-server.Dockerfile"
+      - ".github/workflows/oxidant-image.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Extra tag to publish alongside latest/sha (e.g. demo, v0.1.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: oxidant-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/oxidantdata/oxidant
+
+jobs:
+  # Build each arch on its own native runner and push BY DIGEST (no tag yet).
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk (engine build is large)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /opt/az \
+            /usr/local/lib/node_modules /usr/share/swift || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tagged releases get the fully tuned `release` profile (thin LTO, one codegen
+      # unit). Everything else builds with `release-ci`, which trades a small amount of
+      # runtime performance for dropping the serialized whole-program link.
+      - name: Select cargo profile
+        id: profile
+        run: |
+          if [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ]; then
+            echo "cargo_profile=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "cargo_profile=release-ci" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build & push by digest (${{ matrix.arch }})
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/connect-server.Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          build-args: |
+            CARGO_PROFILE=${{ steps.profile.outputs.cargo_profile }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # Registry cache, NOT type=gha. The Actions cache is capped at 10 GB per
+          # repository with LRU eviction; a `mode=max` export of this build (cargo-chef
+          # cook layer + full cargo registry, times two architectures) blows past that,
+          # so the two arch scopes evicted each other and most runs started cold. A
+          # registry cache tag has no such cap. `type=gha` stays as a secondary read
+          # source so a run that happens to still have a warm Actions cache can use it.
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+            type=gha,scope=${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          # Strip the `sha256:` prefix: the bare hash is the filename (the merge job
+          # re-adds `@sha256:`), and upload-artifact@v4 rejects ':' in paths.
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  # Merge the per-arch digests into one multi-arch manifest under latest/sha/semver.
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+
+      - name: Create & push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect
+        run: |
+          docker buildx imagetools inspect "${{ env.IMAGE }}:latest" || true
+          {
+            echo "### Published multi-arch \`ghcr.io/oxidantdata/oxidant\` (amd64 + arm64)"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,13 @@
+{
+  "system": "Oxidant",
+  "date": "TODO",
+  "machine": "c6a.4xlarge",
+  "cluster_size": 1,
+  "proprietary": "no",
+  "hardware": "cpu",
+  "tuned": "no",
+  "tags": ["Rust", "column-oriented", "Spark Connect", "stateless"],
+  "load_time": 0,
+  "data_size": 14779976446,
+  "result": []
+}

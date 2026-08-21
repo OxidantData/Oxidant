@@ -1,0 +1,40 @@
+# nFPM (https://nfpm.goreleaser.com) config — packages the `oxidant` binary as
+# .deb and .rpm for GitHub Releases. Driven by the `package-linux` job in
+# .github/workflows/binaries.yml, which exports PKG_VERSION (no `v` prefix),
+# TARGET (Rust triple) and PKG_ARCH (amd64|arm64); nfpm expands ${VARS} below
+# and maps amd64->x86_64 / arm64->aarch64 automatically for the rpm packager.
+
+name: oxidant
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+section: database
+priority: optional
+maintainer: Oxidant Data <hello@oxidantdata.com>
+description: |
+  Drop-in Apache Spark replacement on a vectorized CPU core (Loom).
+  Speaks the Spark Connect gRPC protocol, so unmodified PySpark / Spark SQL
+  clients connect with a one-line URL change — no JVM. Ships the `oxidant`
+  binary: `oxidant spark server --port 50051` starts the engine (Spark
+  Connect on 50051, Web UI + REST API on 4040).
+  No runtime dependencies. AWS Glue Data Catalogs are read in-process via
+  aws-sdk-glue with the standard AWS credential chain (env, shared config,
+  instance role / IRSA) — no AWS CLI needed.
+homepage: https://github.com/OxidantData/Oxidant
+license: AGPL-3.0-or-later
+# No `depends:` — the binary is statically self-contained (rustls, no OpenSSL).
+contents:
+  - src: target/${TARGET}/release/oxidant
+    dst: /usr/bin/oxidant
+    expand: true
+  - src: LICENSE
+    dst: /usr/share/doc/oxidant/LICENSE
+  - src: README.md
+    dst: /usr/share/doc/oxidant/README.md
+  # Bundled TPC-H SF 0.01 samples — auto-discovered by the server as the `samples` schema
+  # (no --sample-data flag needed) at this fixed path. `type: tree` preserves the
+  # directory hierarchy; without it nfpm globs files FLAT into dst and the
+  # delta/iceberg `part-00000.snappy.parquet` files collide (v0.1.0 failure).
+  - src: sample-data/
+    dst: /usr/share/oxidant/sample-data/
+    type: tree

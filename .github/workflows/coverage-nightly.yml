@@ -1,0 +1,82 @@
+name: line coverage (nightly)
+
+# Informational llvm-cov line-coverage report, uploaded as an HTML artifact for trending.
+#
+# This used to run on every PR as a `continue-on-error` job in ci.yml. It never gated
+# anything, but it built the whole workspace a second time under a separate target dir
+# and then instrumented and re-ran it — so it occupied a runner and a cache slot on every
+# push for a number nobody blocks on. Nightly gives the same trend line for a fraction of
+# the cost. Trigger it by hand from the Actions tab when you want a fresh report.
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: line-coverage
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  line-coverage:
+    name: line coverage (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # ~45–60 min is a projection, not a measurement: this job has never completed a run —
+    # every attempt so far died inside the build. 180 matches build-test's headroom.
+    timeout-minutes: 180
+    env:
+      # Keep in sync with ci.yml line-coverage — limited debug info (debug = 1), which keeps
+      # the ~56 instrumented oxidant-execution test binaries off the runner's free disk.
+      # See build-test's CARGO_PROFILE_*_DEBUG notes and the disk-reclaim step below.
+      CARGO_PROFILE_TEST_DEBUG: "1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
+    steps:
+      - uses: actions/checkout@v4
+      # Same reclaim as build-test (and oxidant-image.yml): a standard `ubuntu-latest`
+      # runner leaves only ~14 GB free, and the instrumented build writes a second full
+      # target dir (target/llvm-cov-target) on top of the workspace's. Dropping the
+      # preinstalled SDKs buys ~25 GB, which is what keeps `ld` off ENOSPC/SIGBUS.
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          df -h /
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: llvm-cov # instrumented artifacts must not pollute the shared CI cache
+      # Prebuilt binary. `cargo install cargo-llvm-cov --locked` compiled it from source
+      # on every run, which cost more than the coverage pass itself.
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Build oxidant CLI (integration tests spawn the binary under llvm-cov target dir)
+        run: cargo build -p oxidant-cli --target-dir target/llvm-cov-target
+      - name: Disk free before coverage
+        run: df -h /
+      # No `--jobs` cap: throttling build parallelism does not address the binding
+      # constraint (runner disk — see the reclaim step above). Reinstate `--jobs 2` if a
+      # future failure actually shows memory pressure rather than ENOSPC/SIGBUS.
+      - name: Generate HTML coverage report
+        run: cargo llvm-cov --workspace --html
+      - name: Disk free after coverage
+        if: always()
+        run: df -h /
+      - name: Upload coverage HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-cov-html
+          path: target/llvm-cov/html
+          retention-days: 14
+          if-no-files-found: ignore

@@ -1,0 +1,16 @@
+[package]
+name = "oxidant-sql"
+description = "Spark SQL dialect parser + analyzer; lowers SQL text into the warp plan IR."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-common = { workspace = true }
+oxidant-plan = { workspace = true }
+# The dialect pipeline speaks DataFusion's own AST/plan types (and its vendored `sqlparser`),
+# so the version must stay pinned to the one `oxidant-loom` embeds — a second `sqlparser`
+# copy in the tree would make `Statement` a different type across the crate boundary.
+datafusion = "54"

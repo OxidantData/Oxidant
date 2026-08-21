@@ -1,0 +1,4 @@
+Apache Spark SQL golden test corpus
+Source: github.com/apache/spark  sql/core/src/test/resources/sql-tests
+Tag: v4.0.0
+Commit: fa33ea000a0bda9e5a3fa1af98e8e85b8cc5e4d4

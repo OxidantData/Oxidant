@@ -1,0 +1,31 @@
+[package]
+name = "oxidant-catalog-glue"
+description = "AWS Glue Data Catalog provider for Oxidant, built on the official AWS SDK for Rust (in-process `aws-sdk-glue`; credentials via the standard AWS chain — env, shared config, instance role / IRSA). Shared by the gateway and the cluster-side engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-catalog = { workspace = true }
+async-trait = "0.1"
+# Official AWS SDK for the Glue metadata ops (GetDatabases/GetTables/GetTable/CreateTable) —
+# replaces the old `aws glue` CLI shell-out (KAN-82: ~0.5–2s per subprocess spawn, stderr
+# string-matching, and a hard dependency on the `aws` binary). Pinned (not "1") to versions
+# whose MSRV matches this workspace's toolchain — the same pin discipline as oxidant-loom's
+# aws-config/aws-sdk-sts.
+aws-config = "=1.8.13"
+aws-sdk-glue = "=1.137.0"
+# REPAIR TABLE scans the table's storage for `key=value/` partition directories — object_store
+# covers `s3://` via the standard AWS chain and `file://` for local tables (same pin as
+# oxidant-datasource); `url`/`futures` are its URL parsing and stream-draining companions.
+object_store = { version = "=0.13.2", features = ["aws"] }
+url = "2"
+futures = "0.3"
+
+[dev-dependencies]
+# Stub-endpoint integration test: a raw TcpListener mini-HTTP server stands in for Glue.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+# REPAIR TABLE test: a temp directory stands in for the table's storage root.
+tempfile = "3"

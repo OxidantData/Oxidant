@@ -1,0 +1,38 @@
+[Unit]
+Description=Oxidant Spark Connect server (standalone single-node)
+Documentation=https://github.com/OxidantData/Oxidant
+# Standalone is the zero-config Marketplace path: an untagged instance boots
+# straight into a single-node Connect server. It is ENABLED at provision time
+# and only Wants (not Requires) bootstrap: Requires would deadlock first boot
+# when bootstrap disables it on cluster images, and there is no UserData to
+# start a unit that is merely enabled mid-boot (KAN-58 lesson). Ordering still
+# guarantees /etc/oxidant/oxidant.env exists before we start; on cluster
+# images bootstrap disables + cancels this unit before it runs.
+After=network-online.target oxidant-bootstrap.service
+Wants=network-online.target oxidant-bootstrap.service
+
+[Service]
+Type=simple
+User=oxidant
+Group=oxidant
+EnvironmentFile=-/etc/oxidant/oxidant.env
+WorkingDirectory=/var/lib/oxidant
+ExecStart=/usr/local/bin/oxidant spark server --port 50051 --ui-bind 127.0.0.1
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+# Match container PodSecurity posture where practical.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/oxidant /tmp
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

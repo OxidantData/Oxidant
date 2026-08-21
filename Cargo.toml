@@ -1,0 +1,79 @@
+# Oxidant — drop-in Apache Spark replacement on a vectorized CPU core (Loom).
+# See plan: docs/architecture.md.
+#
+# This is the workspace skeleton. Crates are intentionally dependency-free today so
+# the tree builds green offline on Rust 1.72+. Real dependencies (DataFusion, Arrow,
+# tonic/prost, delta-kernel-rs, iceberg-rust) are listed as TODOs inside each
+# crate's Cargo.toml and require Rust >= 1.80 + protoc when added.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.30"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/OxidantData/Oxidant"
+authors = ["Oxidant Data <hello@oxidantdata.com>"]
+rust-version = "1.72"
+
+# Internal crates are wired as path dependencies here so the dependency DAG is
+# expressed once and inherited via `{ workspace = true }` in each crate.
+[workspace.dependencies]
+oxidant-common     = { path = "crates/oxidant-common" }
+oxidant-config     = { path = "crates/oxidant-config" }
+oxidant-pipelines  = { path = "crates/oxidant-pipelines" }
+oxidant-proto      = { path = "crates/oxidant-proto" }
+oxidant-plan       = { path = "crates/oxidant-plan" }
+oxidant-sql        = { path = "crates/oxidant-sql" }
+oxidant-analyzer   = { path = "crates/oxidant-analyzer" }
+oxidant-catalog    = { path = "crates/oxidant-catalog" }
+oxidant-catalog-hive = { path = "crates/oxidant-catalog-hive" }
+oxidant-catalog-glue = { path = "crates/oxidant-catalog-glue" }
+oxidant-catalog-rest = { path = "crates/oxidant-catalog-rest" }
+oxidant-catalog-lakeformation = { path = "crates/oxidant-catalog-lakeformation" }
+oxidant-catalog-local = { path = "crates/oxidant-catalog-local" }
+oxidant-optimizer  = { path = "crates/oxidant-optimizer" }
+oxidant-physical   = { path = "crates/oxidant-physical" }
+oxidant-datasource = { path = "crates/oxidant-datasource" }
+oxidant-loom       = { path = "crates/oxidant-loom" }
+oxidant-execution  = { path = "crates/oxidant-execution" }
+oxidant-gpu        = { path = "crates/oxidant-gpu" }
+oxidant-connect    = { path = "crates/oxidant-connect" }
+# Control-plane / platform crates (Databricks-like layer).
+# Spark parity harness (golden SQL tests + scoreboard).
+oxidant-spark-compat = { path = "crates/oxidant-spark-compat" }
+oxidant-streaming   = { path = "crates/oxidant-streaming" }
+oxidant-orchestrator = { path = "crates/oxidant-orchestrator" }
+oxidant-gateway     = { path = "crates/oxidant-gateway" }
+oxidant-observability = { path = "crates/oxidant-observability" }
+oxidant-ui-server   = { path = "crates/oxidant-ui-server" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Optimize third-party deps (datafusion, arrow) even in debug builds. The bench
+# gates in CI (`cargo run -p oxidant-bench -- tpcds ...`) run whole query suites
+# through these crates; unoptimized they dominate the job. Workspace crates stay
+# at opt-level 0 so compile time is unaffected, and deps are cached after run 1.
+[profile.dev.package."*"]
+opt-level = 2
+
+# CI image builds: skipping LTO and letting rustc use 16 codegen units removes
+# the serialized whole-program link that dominates `release`. Use for branch and
+# `main` images; tagged releases must still build with the tuned `release`
+# profile above.
+[profile.release-ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+
+# The profile that 'dist' builds release binaries with (dist-workspace.toml →
+# .github/workflows/binaries.yml). Same tuning as `release`; kept as a separate
+# name so cargo-dist builds are explicit and can diverge later without touching
+# the image-build profiles above.
+[profile.dist]
+inherits = "release"

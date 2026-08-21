@@ -1,0 +1,18 @@
+# dist (https://axodotdev.github.io/cargo-dist/) package-level overrides.
+#
+# The crate is `oxidant-cli`, but the distributed application — release
+# tarballs, checksums, the `oxidant-installer.sh` curl|sh installer, and the
+# Homebrew formula — is named `oxidant` after the binary it ships. dist still
+# builds with `cargo build -p oxidant-cli` (it tracks the crate name
+# separately); only artifact naming comes from here.
+
+[package]
+name = "oxidant"
+# Used by the Homebrew formula (the crate Cargo.toml only sets `repository`).
+homepage = "https://github.com/OxidantData/Oxidant"
+
+[dist]
+# Fold the workspace-root sample-data tree into every release archive (paths are relative to
+# this config file), so a tarball extract gives `oxidant` + `sample-data/` side by side and
+# the server auto-discovers the `samples` schema without `--sample-data`. ~19 MB per tarball.
+include = ["../../sample-data"]

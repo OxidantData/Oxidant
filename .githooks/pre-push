@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the fast Rust CI gates before pushing.
+# Install: git config core.hooksPath .githooks
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "[pre-push] rustfmt..."
+cargo fmt --all -- --check
+
+echo "[pre-push] clippy..."
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "[pre-push] build oxidant CLI..."
+cargo build -p oxidant-cli
+
+echo "[pre-push] test..."
+cargo test --workspace
+
+echo "[pre-push] OK"

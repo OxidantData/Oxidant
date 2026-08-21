@@ -1,0 +1,725 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Oxidant distributed data plane on EC2 Auto Scaling Groups (no EKS).
+  One Spark Connect driver + N fixed Arrow Flight workers, discovered via
+  ASG private-IP membership (OXIDANT_WORKERS). Worker count is pinned
+  (Min=Max=Desired) — dynamic scale-out is incompatible with file-list sharding.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Network }
+        Parameters: [VpcId, SubnetIds, HostedZoneName, ExposeConnect, ClientCidr]
+      - Label: { default: AMI / capacity }
+        Parameters: [AmiId, KeyName, DriverInstanceType, WorkerInstanceType, WorkerCount]
+      - Label: { default: Volumes }
+        Parameters:
+          - DriverRootVolumeSize
+          - DriverRootVolumeType
+          - WorkerRootVolumeSize
+          - WorkerRootVolumeType
+          - DriverSpillVolumeSize
+          - DriverSpillVolumeType
+          - WorkerSpillVolumeSize
+          - WorkerSpillVolumeType
+      - Label: { default: Engine tuning }
+        Parameters:
+          - MemoryLimitBytes
+          - ShuffleSpillBytes
+          - CatalogConf
+          - DistributedStrict
+          - PreferHashJoin
+      - Label: { default: IAM data access }
+        Parameters: [DataBucketArns, EnableGlueAccess]
+
+Parameters:
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Oxidant runtime AMI from deploy/packer (AL2023 + oxidant binary).
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC for the cluster.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Subnets for driver/worker ASGs (prefer private). Public subnets only if
+      clients must hit the driver public IP. Do not use ExposeConnect/NLB.
+
+  KeyName:
+    Type: String
+    Default: ''
+    Description: Optional EC2 key pair (SSM Session Manager is preferred).
+
+  DriverInstanceType:
+    Type: String
+    Default: m6i.xlarge
+    Description: EC2 instance type for the Spark Connect driver.
+
+  WorkerInstanceType:
+    Type: String
+    Default: m6i.2xlarge
+    Description: EC2 instance type for each Flight worker.
+
+  WorkerCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 64
+    Description: >
+      Fixed worker count (ASG Min=Max=Desired). Must stay constant for the stack
+      lifetime — resizing changes the shard modulus.
+
+  DriverRootVolumeSize:
+    Type: Number
+    Default: 40
+    MinValue: 20
+    Description: Driver root EBS size (GiB).
+
+  DriverRootVolumeType:
+    Type: String
+    Default: gp3
+    AllowedValues: [gp3, gp2, io1, io2]
+    Description: Driver root EBS volume type.
+
+  WorkerRootVolumeSize:
+    Type: Number
+    Default: 40
+    MinValue: 20
+    Description: Worker root EBS size (GiB).
+
+  WorkerRootVolumeType:
+    Type: String
+    Default: gp3
+    AllowedValues: [gp3, gp2, io1, io2]
+    Description: Worker root EBS volume type.
+
+  DriverSpillVolumeSize:
+    Type: Number
+    Default: 100
+    MinValue: 0
+    Description: >
+      Extra EBS volume (GiB) mounted at /var/lib/oxidant/spill on the driver.
+      Set 0 to skip and spill on the root volume.
+
+  DriverSpillVolumeType:
+    Type: String
+    Default: gp3
+    AllowedValues: [gp3, gp2, io1, io2]
+    Description: Driver spill EBS volume type.
+
+  WorkerSpillVolumeSize:
+    Type: Number
+    Default: 200
+    MinValue: 0
+    Description: >
+      Extra EBS volume (GiB) mounted at /var/lib/oxidant/spill on each worker.
+      Set 0 to skip and spill on the root volume.
+
+  WorkerSpillVolumeType:
+    Type: String
+    Default: gp3
+    AllowedValues: [gp3, gp2, io1, io2]
+    Description: Worker spill EBS volume type.
+
+  MemoryLimitBytes:
+    Type: String
+    Default: ''
+    Description: >
+      Optional OXIDANT_MEMORY_LIMIT_BYTES (DataFusion spill pool). Empty leaves the
+      engine default (unbounded shuffle cache if ShuffleSpillBytes is also empty).
+
+  ShuffleSpillBytes:
+    Type: String
+    Default: ''
+    Description: >
+      Optional OXIDANT_SHUFFLE_SPILL_BYTES threshold. Empty leaves SpillStore unset
+      unless MemoryLimitBytes is set. Prefer setting both for large workloads.
+
+  CatalogConf:
+    Type: String
+    Default: ''
+    Description: >
+      Optional OXIDANT_CATALOG_CONF for driver and workers (; -separated spark.sql.catalog.*
+      keys). Example:
+      spark.sql.catalog.glue.type=glue;spark.sql.catalog.glue.region=us-west-2;spark.sql.catalog.glue.warehouse=s3://bucket/wh
+      Must be ≤256 chars (EC2 tag limit). Leave empty and configure from the PySpark
+      client for driver-only smoke tests; distributed scans need this on workers too.
+
+  DistributedStrict:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      When true, set OXIDANT_DISTRIBUTED_STRICT=1 on the driver (honesty runs / SF100).
+      Local fallback becomes an error instead of silently single-node executing.
+
+  PreferHashJoin:
+    Type: String
+    Default: 'auto'
+    AllowedValues: ['auto', 'true', 'false']
+    Description: >
+      OXIDANT_PREFER_HASH_JOIN on driver and workers. Keep auto (KAN-53): the engine picks
+      hash vs sort-merge per query from build-side statistics — forced values are legacy.
+      Forcing false (sort-merge everywhere) is severely pathological on big fact joins
+      (TPC-DS SF10 Q4: 178s single-node vs 40s hash; distributed Q72 6.7s auto vs 22s
+      forced) and forcing true risks an OOM on unbounded builds (KAN-57).
+
+  ShufflePartitions:
+    Type: String
+    Default: ''
+    AllowedPattern: '^[0-9]*$'
+    Description: >
+      Optional OXIDANT_SHUFFLE_PARTITIONS (hash-shuffle fan-out, driver-side). Empty leaves
+      the env unset so the engine uses its Spark-like default max(200, worker_vcpus) —
+      never WorkerCount (a 2-worker cluster must not collapse to a 2-bucket shuffle).
+      For SF100 honesty runs leave empty or set >= 200. Digits only; a non-empty value
+      below the engine floor stamps anyway but logs a loud boot warning (KAN-139).
+
+  DataBucketArns:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >
+      Optional S3 bucket ARNs for instance-profile read/write (e.g.
+      arn:aws:s3:::my-bucket, arn:aws:s3:::my-bucket/*). Leave empty for no S3 policy.
+
+  EnableGlueAccess:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: When true, attach AWSGlueConsoleFullAccess-style Glue API permissions.
+
+  ExposeConnect:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      DEPRECATED — leave false. When true, creates an internet-facing NLB on TCP
+      50051. Do not use for SF100 / honesty runs: one Connect driver needs no LB;
+      NLB health checks add false downtime. Connect to the driver instance IP
+      instead (see docs/distributed-ec2.md § Do not put Spark Connect behind an NLB).
+
+  ClientCidr:
+    Type: String
+    Default: '10.0.0.0/8'
+    Description: >
+      CIDR allowed to reach the driver on TCP 50051 (VPC / VPN / laptop /32).
+      Primary client path — prefer this over ExposeConnect.
+
+  HostedZoneName:
+    Type: String
+    Default: oxidant.internal
+    Description: Private hosted zone name created in the VPC for worker DNS.
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+  ExposeConnectEnabled: !Equals [!Ref ExposeConnect, 'true']
+  GlueEnabled: !Equals [!Ref EnableGlueAccess, 'true']
+  HasDataBuckets: !Not [!Equals [!Join ['', !Ref DataBucketArns], '']]
+  HasCatalogConf: !Not [!Equals [!Ref CatalogConf, '']]
+  DriverSpillEnabled: !Not [!Equals [!Ref DriverSpillVolumeSize, 0]]
+  WorkerSpillEnabled: !Not [!Equals [!Ref WorkerSpillVolumeSize, 0]]
+  HasShufflePartitions: !Not [!Equals [!Ref ShufflePartitions, '']]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Networking
+  # ---------------------------------------------------------------------------
+  DriverSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Oxidant Spark Connect driver
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 50051
+          ToPort: 50051
+          CidrIp: !Ref ClientCidr
+          Description: Spark Connect clients
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: S3/Glue/DNS/updates
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-driver'
+
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Oxidant Arrow Flight workers
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: S3/Glue/DNS/updates + peer Flight
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-worker'
+
+  WorkerFlightFromDriver:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WorkerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 50561
+      ToPort: 50561
+      SourceSecurityGroupId: !Ref DriverSecurityGroup
+      Description: Driver to worker Flight
+
+  WorkerFlightFromWorkers:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WorkerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 50561
+      ToPort: 50561
+      SourceSecurityGroupId: !Ref WorkerSecurityGroup
+      Description: Worker to worker Flight shuffle
+
+  # ---------------------------------------------------------------------------
+  # Private DNS (multi-A for OXIDANT_WORKER_SERVICE)
+  # ---------------------------------------------------------------------------
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref HostedZoneName
+      VPCs:
+        - VPCId: !Ref VpcId
+          VPCRegion: !Ref AWS::Region
+      HostedZoneConfig:
+        Comment: !Sub 'Oxidant worker discovery for ${AWS::StackName}'
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-zone'
+
+  # ---------------------------------------------------------------------------
+  # IAM
+  # ---------------------------------------------------------------------------
+  DriverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: oxidant-driver
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Ec2Read
+                Effect: Allow
+                Action:
+                  - ec2:DescribeTags
+                  - ec2:DescribeInstances
+                Resource: '*'
+              - Sid: AsgRead
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                Resource: '*'
+              - !If
+                - HasDataBuckets
+                - Sid: S3Data
+                  Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:DeleteObject
+                    - s3:ListBucket
+                    - s3:GetBucketLocation
+                  Resource: !Ref DataBucketArns
+                - !Ref AWS::NoValue
+              - !If
+                - GlueEnabled
+                - Sid: Glue
+                  Effect: Allow
+                  Action:
+                    - glue:GetDatabase
+                    - glue:GetDatabases
+                    - glue:GetTable
+                    - glue:GetTables
+                    - glue:GetPartition
+                    - glue:GetPartitions
+                    - glue:BatchGetPartition
+                  Resource: '*'
+                - !Ref AWS::NoValue
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: oxidant-worker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Ec2Read
+                Effect: Allow
+                Action:
+                  - ec2:DescribeTags
+                  - ec2:DescribeInstances
+                Resource: '*'
+              - Sid: AsgRead
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                Resource: '*'
+              - Sid: Route53WorkerDns
+                Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                  - route53:ListResourceRecordSets
+                Resource: !Sub 'arn:aws:route53:::hostedzone/${PrivateHostedZone}'
+              - !If
+                - HasDataBuckets
+                - Sid: S3Data
+                  Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:DeleteObject
+                    - s3:ListBucket
+                    - s3:GetBucketLocation
+                  Resource: !Ref DataBucketArns
+                - !Ref AWS::NoValue
+              - !If
+                - GlueEnabled
+                - Sid: Glue
+                  Effect: Allow
+                  Action:
+                    - glue:GetDatabase
+                    - glue:GetDatabases
+                    - glue:GetTable
+                    - glue:GetTables
+                    - glue:GetPartition
+                    - glue:GetPartitions
+                    - glue:BatchGetPartition
+                  Resource: '*'
+                - !Ref AWS::NoValue
+
+  DriverInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref DriverRole]
+
+  WorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref WorkerRole]
+
+  # ---------------------------------------------------------------------------
+  # Launch templates
+  # ---------------------------------------------------------------------------
+  DriverLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref DriverInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt DriverInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref DriverSecurityGroup
+        KeyName: !If [HasKeyName, !Ref KeyName, !Ref AWS::NoValue]
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          InstanceMetadataTags: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref DriverRootVolumeSize
+              VolumeType: !Ref DriverRootVolumeType
+              Encrypted: true
+              DeleteOnTermination: true
+          - !If
+            - DriverSpillEnabled
+            - DeviceName: /dev/xvdf
+              Ebs:
+                VolumeSize: !Ref DriverSpillVolumeSize
+                VolumeType: !Ref DriverSpillVolumeType
+                Encrypted: true
+                DeleteOnTermination: true
+            - !Ref AWS::NoValue
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-driver'
+              - Key: oxidant:role
+                Value: driver
+              - Key: oxidant:worker-count
+                Value: !Sub '${WorkerCount}'
+              - Key: oxidant:worker-asg
+                Value: !Sub '${AWS::StackName}-workers'
+              - Key: oxidant:hosted-zone-id
+                Value: !Ref PrivateHostedZone
+              - Key: oxidant:worker-dns-name
+                Value: !Sub 'workers.${AWS::StackName}.${HostedZoneName}'
+              - Key: oxidant:memory-limit-bytes
+                Value: !Ref MemoryLimitBytes
+              - Key: oxidant:shuffle-spill-bytes
+                Value: !Ref ShuffleSpillBytes
+              - Key: oxidant:shuffle-partitions
+                Value: !If [HasShufflePartitions, !Ref ShufflePartitions, '']
+              - Key: oxidant:catalog-conf
+                Value: !If [HasCatalogConf, !Ref CatalogConf, 'none']
+              - Key: oxidant:distributed-strict
+                Value: !Ref DistributedStrict
+              - Key: oxidant:prefer-hash-join
+                Value: !Ref PreferHashJoin
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-driver-vol'
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -uo pipefail
+            exec > >(tee -a /var/log/oxidant-userdata.log) 2>&1
+            echo "[userdata] driver boot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            # Tags are also readable via IMDS InstanceMetadataTags; bootstrap
+            # uses DescribeTags as the source of truth. Kick bootstrap early.
+            # Ordering contract (KAN-58): bootstrap must COMPLETE (spill mount,
+            # env file, DNS upsert) before the role unit starts — that is why
+            # bootstrap only *enables* oxidant-driver and UserData starts it here
+            # after `systemctl start oxidant-bootstrap` returns. On reboots the
+            # unit graph (Requires/After on oxidant-bootstrap) enforces the same.
+            systemctl start oxidant-bootstrap.service
+            systemctl enable --now oxidant-driver.service
+            systemctl is-active oxidant-bootstrap oxidant-driver || true
+            ss -lntp | grep 50051 || true
+
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref WorkerInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt WorkerInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WorkerSecurityGroup
+        KeyName: !If [HasKeyName, !Ref KeyName, !Ref AWS::NoValue]
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          InstanceMetadataTags: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref WorkerRootVolumeSize
+              VolumeType: !Ref WorkerRootVolumeType
+              Encrypted: true
+              DeleteOnTermination: true
+          - !If
+            - WorkerSpillEnabled
+            - DeviceName: /dev/xvdf
+              Ebs:
+                VolumeSize: !Ref WorkerSpillVolumeSize
+                VolumeType: !Ref WorkerSpillVolumeType
+                Encrypted: true
+                DeleteOnTermination: true
+            - !Ref AWS::NoValue
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-worker'
+              - Key: oxidant:role
+                Value: worker
+              - Key: oxidant:worker-count
+                Value: !Sub '${WorkerCount}'
+              - Key: oxidant:worker-asg
+                Value: !Sub '${AWS::StackName}-workers'
+              - Key: oxidant:hosted-zone-id
+                Value: !Ref PrivateHostedZone
+              - Key: oxidant:worker-dns-name
+                Value: !Sub 'workers.${AWS::StackName}.${HostedZoneName}'
+              - Key: oxidant:memory-limit-bytes
+                Value: !Ref MemoryLimitBytes
+              - Key: oxidant:shuffle-spill-bytes
+                Value: !Ref ShuffleSpillBytes
+              - Key: oxidant:shuffle-partitions
+                Value: !If [HasShufflePartitions, !Ref ShufflePartitions, '']
+              - Key: oxidant:catalog-conf
+                Value: !If [HasCatalogConf, !Ref CatalogConf, 'none']
+              - Key: oxidant:distributed-strict
+                Value: !Ref DistributedStrict
+              - Key: oxidant:prefer-hash-join
+                Value: !Ref PreferHashJoin
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-worker-vol'
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -uo pipefail
+            exec > >(tee -a /var/log/oxidant-userdata.log) 2>&1
+            echo "[userdata] worker boot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            # Ordering contract (KAN-58): bootstrap must COMPLETE (spill mount,
+            # env file with shard index, Route53 upsert) before the worker
+            # starts — bootstrap only *enables* oxidant-worker; UserData starts it
+            # here after `systemctl start oxidant-bootstrap` returns. On reboots
+            # the unit graph (Requires/After on oxidant-bootstrap) does the same.
+            systemctl start oxidant-bootstrap.service
+            systemctl enable --now oxidant-worker.service
+            systemctl is-active oxidant-bootstrap oxidant-worker || true
+
+  # ---------------------------------------------------------------------------
+  # Auto Scaling Groups (fixed size — no scaling policies)
+  # ---------------------------------------------------------------------------
+  DriverAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-driver'
+      VPCZoneIdentifier: !Ref SubnetIds
+      DesiredCapacity: '1'
+      MinSize: '1'
+      MaxSize: '1'
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 180
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DriverLaunchTemplate
+        Version: !GetAtt DriverLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: !If
+        - ExposeConnectEnabled
+        - [!Ref ConnectTargetGroup]
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-driver'
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT3M
+
+  WorkerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-workers'
+      VPCZoneIdentifier: !Ref SubnetIds
+      DesiredCapacity: !Ref WorkerCount
+      MinSize: !Ref WorkerCount
+      MaxSize: !Ref WorkerCount
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLaunchTemplate
+        Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-worker'
+          PropagateAtLaunch: true
+        - Key: oxidant:role
+          Value: worker
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT5M
+
+  # ---------------------------------------------------------------------------
+  # DEPRECATED optional Connect NLB — leave ExposeConnect=false; use driver IP.
+  # See docs/distributed-ec2.md § Do not put Spark Connect behind an NLB.
+  # ---------------------------------------------------------------------------
+  ConnectTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: ExposeConnectEnabled
+    Properties:
+      Port: 50051
+      Protocol: TCP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: TCP
+      HealthCheckPort: '50051'
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-connect-tg'
+
+  ConnectNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: ExposeConnectEnabled
+    Properties:
+      Type: network
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-connect-nlb'
+
+  ConnectListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: ExposeConnectEnabled
+    Properties:
+      LoadBalancerArn: !Ref ConnectNlb
+      Port: 50051
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ConnectTargetGroup
+
+Outputs:
+  StackName:
+    Value: !Ref AWS::StackName
+
+  AmiId:
+    Description: AMI used by driver and worker launch templates
+    Value: !Ref AmiId
+
+  WorkerDnsName:
+    Description: Set as OXIDANT_WORKER_SERVICE on the driver (bootstrap does this)
+    Value: !Sub 'workers.${AWS::StackName}.${HostedZoneName}'
+
+  HostedZoneId:
+    Value: !Ref PrivateHostedZone
+
+  DriverSecurityGroupId:
+    Value: !Ref DriverSecurityGroup
+
+  WorkerSecurityGroupId:
+    Value: !Ref WorkerSecurityGroup
+
+  DriverAutoScalingGroupName:
+    Value: !Ref DriverAutoScalingGroup
+
+  WorkerAutoScalingGroupName:
+    Value: !Ref WorkerAutoScalingGroup
+
+  ConnectEndpoint:
+    Description: >
+      Spark Connect URL. Supported path is always the driver instance IP
+      (PublicIpAddress or PrivateIpAddress of ${AWS::StackName}-driver).
+      NLB DNS is deprecated — do not use for SF100.
+    Value: !If
+      - ExposeConnectEnabled
+      - !Sub 'DEPRECATED-NLB sc://${ConnectNlb.DNSName}:50051 — use driver IP instead'
+      - !Sub 'sc://<driver-ip>:50051 (resolve ${AWS::StackName}-driver PublicIpAddress or PrivateIpAddress)'
+
+  WorkerCount:
+    Value: !Ref WorkerCount

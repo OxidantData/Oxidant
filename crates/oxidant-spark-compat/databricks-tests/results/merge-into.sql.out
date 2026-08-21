@@ -1,0 +1,2 @@
+-- Skipped via `--SKIP requires-delta-storage` — see inputs/merge-into.sql.
+-- MERGE INTO requires a Delta Lake target table; unskip once the engine supports Delta DML.

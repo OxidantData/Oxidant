@@ -1,0 +1,3 @@
+{"order_id":1,"customer":"ada","amount":100,"event_ts":1755000000}
+{"order_id":2,"customer":"bob","amount":250,"event_ts":1755000060}
+{"order_id":3,"customer":"ada","amount":-5,"event_ts":1755000120}

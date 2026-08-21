@@ -1,0 +1,409 @@
+name: CI
+
+# Rust CI for Oxidant. The heavy gates run on Blacksmith managed runners
+# (blacksmith-4vcpu-ubuntu-2404, per-minute billing); rustfmt stays on GitHub-hosted
+# `ubuntu-latest` as a fast canary that also proves hosted runners still work.
+# Per-run tiers:
+#   - every PR/push: rustfmt, clippy+test (the Spark-SQL parity ratchet is folded into it
+#     as steps — fails anything that drops parity below parity/baseline.json), coverage gates
+#   - main pushes, PRs labeled `full-gates`, manual dispatch: query-gates (official TPC
+#     dbgen/dsdgen at SF1 — TPC-H/TPC-DS/distributed suites) — skipped on routine PRs
+# Heavier gates live elsewhere:
+#   - ClickBench on real 14.78 GB data -> bench.yml, Blacksmith 16-vCPU runner
+#   - llvm-cov line coverage also runs nightly for trending -> coverage-nightly.yml
+#
+# BUILD TIME: every compiling job restores ONE cargo cache via `shared-key: workspace` below.
+# Keyed per job (the rust-cache default) the workspace got compiled from scratch four times
+# over, and the four caches evicted each other against the 10 GB per-repo Actions cache cap.
+# `build-test` is the only writer; the rest set `save-if: false`. A shared key with several
+# writers does not work -- GitHub lets exactly one job reserve a key, so they race and the
+# job that happens to finish first defines what everyone restores next run.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "LICENSE"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "LICENSE"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+# A newer push to the same ref cancels the in-progress run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add rustfmt
+          rustc --version && cargo --version
+      - run: cargo fmt --all -- --check
+      - name: ASG membership bootstrap tests
+        run: bash deploy/packer/tests/test_asg_membership.sh
+
+  build-test:
+    name: clippy + test
+    # 8vcpu for the NVMe, not the cores: with cache restore + clippy's separate
+    # artifact set + per-crate test binaries this job consumes ~100 GB in ~5 min
+    # (PR #34 died 3x on XMinioStorageFull with 101 GB free at job start). The
+    # 4vcpu tier's disk is too small even though its CPU is adequate. KAN-74
+    # tracks getting back to 4vcpu (single-Arrow toolchain, throwaway clippy
+    # target dir).
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Fail fast rather than burning an hour on a wedged runner. The suite compiles the workspace
+    # twice over (see the disk-reclaim step) and then runs the distributed tests serially, so the
+    # honest ceiling is well above the ~10 min this takes on `main`. 180: the limited-debuginfo
+    # switch (CARGO_PROFILE_*_DEBUG=1 below, `debug = 1`) invalidated the cached dev/test artifacts,
+    # so the first run after it recompiles the world and blew the old 90 min ceiling — a
+    # completed run re-warms the cache and later runs return to ~45 min.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
+      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
+      - name: Add Rust toolchain to PATH (self-hosted runner)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # `iceberg` 0.8 is the newest release compatible with the pinned Rust 1.90, and it pulls
+      # `parquet`/`arrow` 57 alongside the workspace's 58. `cargo test --workspace` therefore builds
+      # two full Arrow stacks plus a test binary per crate, which overruns the ~14 GB a standard
+      # runner leaves free and kills the job with no log to show for it. Reclaiming the preinstalled
+      # SDKs buys ~25 GB. This can go away once the toolchain moves to 1.92+ and `iceberg` 0.9 can
+      # share the workspace's Arrow.
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          df -h /
+      - name: Start MinIO service container
+        run: |
+          # Self-hosted runners are persistent: a canceled earlier job can leave the
+          # container behind, and docker run --name then fails with a name conflict.
+          docker rm -f oxidant-minio 2>/dev/null || true
+          docker run -d --name oxidant-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin123 \
+            quay.io/minio/minio:latest server /data
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:9000/minio/health/live && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:9000/minio/health/live
+          docker run --rm --network host \
+            -e MC_HOST_local=http://minioadmin:minioadmin123@127.0.0.1:9000 \
+            minio/mc mb --ignore-existing local/oxidant-test
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add clippy
+          rustc --version && cargo --version
+      # Sole writer of the shared cache. Every job below restores this same key with
+      # `save-if: false`: they all use one key, and GitHub only lets one job reserve it, so
+      # without a designated writer they race and the first to finish wins. That was the
+      # smallest job, which meant the rest restored a cache missing most of their artifacts.
+      # This job compiles the broadest set, so its cache is the useful one to keep.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+      - name: Build oxidant CLI (integration tests in oxidant-cli spawn the binary)
+        run: cargo build -p oxidant-cli
+      - name: local-cluster CLI parse smoke
+        run: cargo test -p oxidant-cli local_cluster_mode_parses --bin oxidant
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # Not nextest. It runs every test in its own process and schedules the whole workspace in
+      # parallel, which the distributed tests cannot take: they each spawn several workers and
+      # bind ports, so on a 4 vCPU runner they oversubscribe and start timing out. Measured here
+      # it took the suite to 2207 s and flaked two_worker_groupby_with_forced_spill and
+      # two_sharded_tables_auto_shuffle_join; cargo test runs the binaries serially and stays
+      # well under that.
+      - name: test (workspace)
+        run: cargo test --workspace
+        env:
+          OXIDANT_MINIO_TEST: "1"
+          OXIDANT_MINIO_ENDPOINT: "http://127.0.0.1:9000"
+          # Limited debug info (debug = 1): the full test/dev profiles' debuginfo makes each
+          # oxidant-execution integration binary ~1-2 GB at link time, and linking them in
+          # parallel exhausts the runner's free disk (collect2: ld terminated with signal 7
+          # [Bus error] on main, 2026-07-30 — `ld` mmaps its output file, so ENOSPC surfaces
+          # as SIGBUS rather than "No space left on device"). Compare the disk-reclaim step
+          # above, which buys headroom for the same job. Assertions/backtraces are unaffected.
+          CARGO_PROFILE_TEST_DEBUG: "1"
+          CARGO_PROFILE_DEV_DEBUG: "1"
+      # Spark-SQL parity ratchet, folded in from the old standalone parity job: the binary
+      # compiles incrementally on this job's workspace artifacts, and one fewer job means one
+      # fewer checkout + cache restore. Fails the run if parity drops below parity/baseline.json.
+      - name: Build oxidant-parity
+        run: cargo build -p oxidant-spark-compat --bin oxidant-parity
+      - name: Spark parity ratchet (vs parity/baseline.json)
+        run: |
+          set -o pipefail
+          ./target/debug/oxidant-parity ratchet --baseline parity/baseline.json --out-dir parity | tee parity-run.log
+      - name: Publish parity headline to job summary
+        if: always()
+        run: |
+          {
+            echo "## Spark parity gate"
+            echo ""
+            echo '```'
+            grep -E '^(parity:|✓|✗)' parity-run.log 2>/dev/null || echo "(no headline — see logs)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload parity scoreboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-scoreboard
+          path: |
+            parity/parity.json
+            parity/report.md
+            parity/parity.html
+            parity/scoreboard.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # Informational llvm-cov line-coverage report on every PR and main push. Mirrors the
+  # nightly job in coverage-nightly.yml so coverage deltas are visible on the PR itself.
+  # NON-BLOCKING by design (continue-on-error: true): it must never gate a merge — do not
+  # add it to required status checks. Gotchas (AGENTS.md): separate target dir
+  # target/llvm-cov-target, build oxidant-cli into it first, `--html` without
+  # `--output-path`, artifact lives at target/llvm-cov/html.
+  line-coverage:
+    name: line coverage (informational, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # Cold-cache runs compile the whole workspace twice (oxidant-cli prebuild, then
+    # instrumented `cargo test --workspace`). ~45–60 min is a projection, not a measurement:
+    # this job has never completed a run — every attempt so far died inside the build, so
+    # there is no observed wall clock to quote. 180 matches build-test's headroom after
+    # cache invalidation.
+    timeout-minutes: 180
+    env:
+      # Same switch as build-test: limited debug info (debug = 1). With the profiles' full
+      # debuginfo each oxidant-execution integration binary is ~1–2 GB at link time, and
+      # linking ~56 of them under `-C instrument-coverage` exhausts the free disk on a
+      # public-repo `ubuntu-latest` runner (4 vCPU / 16 GB RAM / ~14 GB free SSD). `ld`
+      # mmaps its output file, so that ENOSPC surfaces as `collect2: ld terminated with
+      # signal 7 [Bus error]` — the failure PR #96's line-coverage job hit. Disk, not
+      # memory, is the binding constraint; see the disk-reclaim step below.
+      CARGO_PROFILE_TEST_DEBUG: "1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
+    steps:
+      - uses: actions/checkout@v4
+      # Same reclaim as build-test (and oxidant-image.yml): a standard `ubuntu-latest`
+      # runner leaves only ~14 GB free, and the instrumented build writes a second full
+      # target dir (target/llvm-cov-target) on top of the workspace's. Dropping the
+      # preinstalled SDKs buys ~25 GB, which is what keeps `ld` off ENOSPC/SIGBUS.
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          df -h /
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: llvm-cov # instrumented artifacts must not pollute the shared CI cache
+      # Prebuilt binary. `cargo install cargo-llvm-cov --locked` compiled it from source
+      # on every run, which cost more than the coverage pass itself.
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Build oxidant CLI (integration tests spawn the binary under llvm-cov target dir)
+        run: cargo build -p oxidant-cli --target-dir target/llvm-cov-target
+      - name: Disk free before coverage
+        run: df -h /
+      # No `--jobs` cap: throttling build parallelism does not address the binding
+      # constraint (runner disk — see the reclaim step above), it only makes the job
+      # slower. Reinstate `--jobs 2` if a future failure actually shows memory pressure
+      # rather than the ENOSPC/SIGBUS linker signature.
+      - name: Generate HTML coverage report
+        run: cargo llvm-cov --workspace --html
+      - name: Disk free after coverage
+        if: always()
+        run: df -h /
+      # `cargo llvm-cov report` reuses the data collected by the run above — do NOT run
+      # `cargo llvm-cov --summary-only` here, that flag only pairs with --json/--lcov and
+      # re-executes the whole instrumented suite a second time.
+      - name: Publish coverage summary to job summary
+        if: always()
+        run: |
+          cargo llvm-cov report --summary-only --json --output-path /tmp/cov-summary.json || true
+          if [[ -s /tmp/cov-summary.json ]]; then
+            {
+              echo "## Line coverage (informational)"
+              echo ""
+              echo "| Crate | Covered | Coverable | % |"
+              echo "|-------|---------|-----------|---|"
+              python3 - <<'EOF'
+          import json
+          data = json.load(open("/tmp/cov-summary.json"))
+          crates = {}
+          for f in data["data"][0]["files"]:
+              parts = f["filename"].split("/")
+              name = "/".join(parts[1:3]) if parts[0] == "crates" and len(parts) > 2 else "(other)"
+              s = f["summary"]["lines"]
+              c = crates.setdefault(name, [0, 0])
+              c[0] += s["covered"]
+              c[1] += s["count"]
+          tot = data["data"][0]["totals"]["lines"]
+          for name in sorted(crates):
+              cov, cnt = crates[name]
+              pct = (100.0 * cov / cnt) if cnt else 0.0
+              print(f"| {name} | {cov} | {cnt} | {pct:.2f}% |")
+          pct = (100.0 * tot["covered"] / tot["count"]) if tot["count"] else 0.0
+          print(f"| **TOTAL** | **{tot['covered']}** | **{tot['count']}** | **{pct:.2f}%** |")
+          EOF
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload coverage HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-cov-html
+          path: target/llvm-cov/html
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # TPC-H / TPC-DS / distributed gates. Official TPC.org kits (`dbgen` / `dsdgen`) at SF1 —
+  # not DuckDB. Needs the `oxidant-bench` binary only, so this runs in parallel with build-test
+  # against the shared cargo cache. Dev profile is fine: `[profile.dev.package."*"] opt-level = 2`
+  # keeps datafusion/arrow hot.
+  # Runs on every main push (main is the fully-gated record), on PRs labeled `full-gates`,
+  # and on manual dispatch. Routine PRs skip this job to keep iteration cheap and fast.
+  query-gates:
+    name: TPC-H + TPC-DS + distributed gates (official kits, SF1)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-gates'))
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # SF1 dsdgen + parquet convert + full Q1–Q99 + distributed execute is the long pole.
+    timeout-minutes: 180
+    env:
+      OXIDANT_TPC_KITS: ${{ github.workspace }}/.tpc-kits
+      OXIDANT_TPC_DATA: ${{ github.workspace }}/.tpc-data
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add Rust toolchain to PATH (self-hosted runner)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+          save-if: "false" # build-test writes this cache
+      - name: Cache official TPC kits (dbgen / dsdgen)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OXIDANT_TPC_KITS }}
+          key: tpc-kits-${{ runner.os }}-${{ hashFiles('bench/tpc/fetch-kits.sh', 'bench/tpc/build-kits.sh') }}
+          restore-keys: |
+            tpc-kits-${{ runner.os }}-
+      - name: Cache SF1 harness data (CSV / Parquet)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OXIDANT_TPC_DATA }}
+          key: tpc-sf1-data-${{ runner.os }}-${{ hashFiles('crates/oxidant-bench/src/tpch_data.rs', 'crates/oxidant-bench/src/tpcds_data.rs', 'bench/tpc/tpcds_columns.tsv') }}
+          restore-keys: |
+            tpc-sf1-data-${{ runner.os }}-
+      - name: Build oxidant-bench once (every gate below reuses this binary)
+        run: cargo build -p oxidant-bench
+      - name: Fetch + build official TPC kits (dbgen / dsdgen)
+        run: |
+          command -v gcc >/dev/null || { sudo apt-get update -y && sudo apt-get install -y build-essential flex bison; }
+          export DATA_ROOT="$(dirname "$OXIDANT_TPC_KITS")"
+          export KITS_DIR="$OXIDANT_TPC_KITS"
+          mkdir -p "$KITS_DIR" "$OXIDANT_TPC_DATA"
+          if [[ ! -x "$KITS_DIR/tpch-kit/dbgen/dbgen" || ! -x "$KITS_DIR/tpcds-kit/tools/dsdgen" ]]; then
+            ./bench/tpc/fetch-kits.sh
+            ./bench/tpc/build-kits.sh
+          else
+            echo "TPC kits already present under $KITS_DIR — skipping fetch/build"
+            "$KITS_DIR/tpch-kit/dbgen/dbgen" -h 2>&1 | head -3 || true
+            "$KITS_DIR/tpcds-kit/tools/dsdgen" -HELP 2>&1 | head -3 || true
+          fi
+      - name: Install DuckDB CLI (optional result oracle)
+        id: duckdb
+        continue-on-error: true
+        run: |
+          command -v unzip >/dev/null || { sudo apt-get update -y && sudo apt-get install -y unzip; }
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.3.2/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
+          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
+          duckdb --version
+      - name: TPC-H coverage (official dbgen SF1)
+        run: cargo run -p oxidant-bench -- tpch --sf 1 --data "${OXIDANT_TPC_DATA}/tpch-sf1"
+      - name: TPC-H distributed (2 workers, SF1)
+        run: cargo run -p oxidant-bench -- tpch-distributed --sf 1 --workers 2 --data "${OXIDANT_TPC_DATA}/tpch-sf1"
+        env:
+          OXIDANT_TPCH_DIST_REQUIRE_ALL: "1"
+      - name: TPC-DS coverage (Q1–Q99, official dsdgen SF1, pass-set ratchet)
+        run: |
+          if [[ "${{ steps.duckdb.outcome }}" != "success" ]]; then
+            echo "DuckDB oracle unavailable — execute-only (OXIDANT_TPCDS_ALLOW_NO_ORACLE=1)"
+            export OXIDANT_TPCDS_ALLOW_NO_ORACLE=1
+          fi
+          cargo run -p oxidant-bench -- tpcds --sf 1 --data "${OXIDANT_TPC_DATA}/tpcds-sf1"
+      - name: TPC-DS distributed planner ratchet (SF1)
+        run: cargo run -p oxidant-bench -- tpcds-distributed --sf 1 --data "${OXIDANT_TPC_DATA}/tpcds-sf1"
+      # The planner ratchet above only proves a distributed plan can be BUILT. This runs every
+      # distributable query on a real two-worker cluster and compares row-for-row against
+      # single-node. It fails on ANY mismatch or execution error, and on any query dropping out of
+      # bench/distributed/tpcds-execute-baseline.json. Full sweep, not a sample.
+      - name: TPC-DS distributed EXECUTE correctness ratchet (SF1, 2 workers)
+        run: cargo run -p oxidant-bench -- tpcds-distributed --execute --sf 1 --workers 2 --data "${OXIDANT_TPC_DATA}/tpcds-sf1"
+      - name: Distributed correctness gate
+        run: cargo run -p oxidant-bench -- correctness-distributed --rows 2000 --sf 1 --data "${OXIDANT_TPC_DATA}/tpcds-sf1"
+        env:
+          OXIDANT_DIST_TPCDS_SAMPLE: "8"
+
+  # ClickBench / correctness coverage on small synthetic data. Required gate: all 43 queries must
+  # pass. Fixed by switching queries.sql identifiers from ANSI double-quotes to backtick-quotes so
+  # they are parsed as identifiers (not string literals) under the Databricks dialect. See
+  # bench/clickbench/COVERAGE_GATE_KNOWN_ISSUES.md for the historical context.
+  coverage:
+    name: coverage gates
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
+      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
+      - name: Add Rust toolchain to PATH (self-hosted runner)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+          save-if: "false" # build-test writes this cache
+      - name: ClickBench coverage (43 queries, engine-direct)
+        run: cargo run -p oxidant-bench -- clickbench --rows 20000
+      - name: ClickBench coverage (43 queries, live Spark Connect over gRPC)
+        run: cargo run -p oxidant-bench -- clickbench-grpc --rows 20000
+      - name: correctness (gRPC/Arrow-IPC vs engine-direct + ground truth)
+        run: cargo run -p oxidant-bench -- correctness --rows 5000

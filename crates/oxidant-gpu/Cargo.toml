@@ -1,0 +1,37 @@
+[package]
+name = "oxidant-gpu"
+description = "GPU offload spike (KAN-70): conservative DataFusion plan rule + plain-C FFI to a libcudf shim. Builds against a CPU mock shim by default so the plumbing is testable in CI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Same DataFusion the engine embeds; re-exports the workspace's single `arrow` so the
+# Arrow C Data Interface import below speaks the same ABI as everything downstream.
+datafusion = "54"
+# Same arrow line datafusion 54.1 pulls; `ffi` enables the Arrow C Data Interface
+# types (FFI_ArrowArray/FFI_ArrowSchema/from_ffi) used in `src/ffi.rs`.
+arrow = { version = "58", features = ["ffi"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `stream::once` for the single-batch result stream in `GpuScanAggExec::execute`.
+futures = "0.3"
+
+[build-dependencies]
+# Compiles csrc/mock_shim.c in the default (non-`gpu`) build. Already in the tree.
+cc = "1"
+
+[features]
+default = []
+# `gpu` links the real libcudf shim (`-lcudf_shim`, search path from the
+# OXIDANT_GPU_SHIM_DIR env var) instead of the built-in CPU mock shim.
+gpu = []
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Same parquet line datafusion-datasource-parquet 54.1 pulls (arrow 58 ABI); the rule
+# tests generate their own tiny parquet fixtures with ArrowWriter.
+parquet = { version = "58", features = ["arrow"] }

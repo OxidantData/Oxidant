@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Run one SQL statement (stdin) against a running Oxidant Spark Connect server and print the
+# elapsed wall-clock seconds on the LAST line of stderr (ClickBench contract).
+set -euo pipefail
+PORT="${OXIDANT_PORT:-50051}"
+exec python3 - "$PORT" <<'PY'
+import sys, time
+port = sys.argv[1]
+sql = sys.stdin.read()
+# TODO(issue #1): once oxidant-connect is live, use the stock pyspark client:
+#   from pyspark.sql import SparkSession
+#   spark = SparkSession.builder.remote(f"sc://localhost:{port}").getOrCreate()
+#   t = time.monotonic(); spark.sql(sql).toPandas(); dt = time.monotonic() - t
+# Until then, fail loudly so the harness is obviously not yet wired.
+try:
+    from pyspark.sql import SparkSession
+except Exception:
+    print("pyspark client not installed; see install", file=sys.stderr)
+    print("null", file=sys.stderr)
+    sys.exit(1)
+spark = SparkSession.builder.remote(f"sc://localhost:{port}").getOrCreate()
+t = time.monotonic()
+df = spark.sql(sql)
+df.toPandas()
+dt = time.monotonic() - t
+print(f"{dt:.3f}", file=sys.stderr)
+PY

@@ -1,0 +1,36 @@
+[package]
+name = "oxidant-datasource"
+description = "Scan sources into Arrow: Parquet/CSV/JSON + Delta (delta-kernel-rs) and Iceberg (iceberg-rust) reads."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-common = { workspace = true }
+serde_json = "1"
+apache-avro = "0.17"
+arrow = "58"
+parquet = "58"
+chrono = "0.4"
+object_store = { version = "=0.13.2", features = ["aws"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+# Keep this exact pair together: the ObjectStore-backed default engine is
+# currently published at 0.25.0 and depends on delta_kernel 0.25.0.
+delta_kernel = { version = "=0.25.0", features = ["arrow-58"] }
+delta_kernel_default_engine = "=0.25.0"
+iceberg = { version = "=0.8.0", default-features = false, features = ["storage-fs"] }
+futures = "0.3.33"
+url = "2.5.8"
+serde = { version = "1.0.229", features = ["derive"] }
+bytes = "1.12.1"
+# Iceberg manifests are written through iceberg-rust's own FileIO, which this build only has a
+# local backend for; they are staged here and uploaded through the engine's ObjectStore.
+tempfile = "3"
+# Delta identity: v5 (name-based) for `stable_table_id`, v4 (random) for `new_file_prefix`.
+# Already in the lockfile via oxidant-streaming, so this adds no new dependency tree.
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[dev-dependencies]
+tempfile = "3"

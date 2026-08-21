@@ -1,0 +1,21 @@
+# BuildKit honors this per-Dockerfile ignore file (named <dockerfile>.dockerignore,
+# next to the Dockerfile) and it takes precedence over a root .dockerignore. Keeps the
+# build context to just the Cargo workspace; everything cargo-chef needs (crates/,
+# Cargo.toml, Cargo.lock) is kept.
+**/target/
+.git/
+**/node_modules/
+web/dist/
+bench/
+site/
+docs/
+deploy/
+python/
+.github/
+scratchpad/
+**/*.parquet
+**/*.tbl
+# Exception: the committed sample-data tree ships IN the image (the bundled `samples` schema,
+# see the Dockerfile). Its parquet data files must survive the blanket exclusion above.
+!sample-data/**/*.parquet
+**/.DS_Store

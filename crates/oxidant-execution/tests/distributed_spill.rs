@@ -1,0 +1,142 @@
+//! Force shuffle spill via `OXIDANT_SHUFFLE_SPILL_DIR` and assert the distributed GROUP BY still
+//! matches the single-node result (gap item 10).
+
+use std::sync::Arc;
+
+use oxidant_execution::driver::{run_distributed, Cluster, DistributedPlan};
+use oxidant_execution::flight::serve_worker;
+use oxidant_loom::arrow::array::Int64Array;
+use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
+use oxidant_loom::arrow::record_batch::RecordBatch;
+use oxidant_loom::Engine;
+
+fn ephemeral_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+fn make_batch(start: i64, end: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let ks: Vec<i64> = (start..end).map(|i| i % 5).collect();
+    let vs: Vec<i64> = (start..end).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ks)),
+            Arc::new(Int64Array::from(vs)),
+        ],
+    )
+    .unwrap()
+}
+
+fn rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
+    let mut out = Vec::new();
+    for b in batches {
+        let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let c = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let s = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..b.num_rows() {
+            out.push((k.value(i), c.value(i), s.value(i)));
+        }
+    }
+    out.sort();
+    out
+}
+
+fn spill_file_count(dir: &std::path::Path) -> usize {
+    fn walk(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut n = 0;
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if path.is_dir() {
+                n += walk(&path);
+            } else if path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.ends_with(".arrow"))
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+    walk(dir)
+}
+
+#[tokio::test]
+async fn two_worker_groupby_with_forced_spill() {
+    const N: i64 = 100;
+    let query = "SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t GROUP BY k";
+
+    let single = Engine::new();
+    single
+        .register_batches("t", vec![make_batch(0, N)])
+        .unwrap();
+    let expected = rows(&single.sql(query).await.unwrap());
+
+    // One shared spill root for both in-process workers (process-global env). Keep files after
+    // the driver's post-query clear_stages so we can assert spill actually happened.
+    let spill = std::env::temp_dir().join(format!("oxidant-spill-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&spill);
+    std::fs::create_dir_all(&spill).unwrap();
+    std::env::set_var("OXIDANT_SHUFFLE_SPILL_DIR", &spill);
+    std::env::set_var("OXIDANT_KEEP_SHUFFLE_SPILL", "1");
+
+    let (p0, p1) = (ephemeral_port(), ephemeral_port());
+    let e0 = Arc::new(Engine::new());
+    e0.register_batches("t", vec![make_batch(0, N / 2)])
+        .unwrap();
+    let e1 = Arc::new(Engine::new());
+    e1.register_batches("t", vec![make_batch(N / 2, N)])
+        .unwrap();
+
+    tokio::spawn(async move {
+        let _ = serve_worker(p0, e0).await;
+    });
+    tokio::spawn(async move {
+        let _ = serve_worker(p1, e1).await;
+    });
+
+    let cluster = Cluster::new(vec![
+        format!("http://127.0.0.1:{p0}"),
+        format!("http://127.0.0.1:{p1}"),
+    ]);
+    let plan = DistributedPlan {
+        partial_sql: "SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t GROUP BY k".into(),
+        final_sql: "SELECT k, SUM(c) AS c, SUM(s) AS s FROM shuffle_input GROUP BY k".into(),
+        hash_key_cols: vec![0],
+    };
+
+    let mut actual = None;
+    for _ in 0..50 {
+        match run_distributed(&cluster, &plan).await {
+            Ok(b) => {
+                actual = Some(rows(&b));
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    let actual = actual.expect("distributed query with spill never succeeded");
+
+    assert!(
+        spill_file_count(&spill) > 0,
+        "expected at least one spill file under worker spill dir"
+    );
+    assert_eq!(
+        actual, expected,
+        "spilled distributed result must equal single-node"
+    );
+
+    std::env::remove_var("OXIDANT_SHUFFLE_SPILL_DIR");
+    std::env::remove_var("OXIDANT_KEEP_SHUFFLE_SPILL");
+    let _ = std::fs::remove_dir_all(&spill);
+}

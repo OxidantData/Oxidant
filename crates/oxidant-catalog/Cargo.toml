@@ -1,0 +1,24 @@
+[package]
+name = "oxidant-catalog"
+description = "Pluggable catalog SPI + registry: bring your own metastore (Hive, Unity, Glue) or implement CatalogProvider."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidant-common = { workspace = true }
+async-trait = "0.1"
+# Arrow `SchemaRef` for `TableMetadata.schema`. Pulled from DataFusion's re-export so the whole
+# workspace shares one `arrow` version (the same one `oxidant-loom` embeds and the bridge consumes).
+datafusion = { version = "54", default-features = false }
+# Ambient AWS region resolution (`aws_region`), shared by the S3 store, the Glue catalog, and the
+# Lake Formation client so all three agree on where "no region configured" points. Pinned to the
+# same version as oxidant-catalog-glue/-lakeformation/-loom already use — no new crate enters the
+# workspace, only an edge. `net`/`time` are what the chain's IMDS step needs.
+aws-config = "=1.8.13"
+tokio = { version = "1", features = ["macros", "rt", "net", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
