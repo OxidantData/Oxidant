@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 72">
+<g fill="none" stroke="#0a0a0a" stroke-width="8" stroke-linecap="round">
+<path d="M12.0 19.2 L12.0 36.8"/>
+<path d="M12.0 51.2 L12.0 64.0"/>
+<path d="M28.0 8.0 L28.0 20.8"/>
+<path d="M28.0 35.2 L28.0 52.8"/>
+<path d="M44.0 19.2 L44.0 36.8"/>
+<path d="M44.0 51.2 L44.0 64.0"/>
+<path d="M60.0 8.0 L60.0 20.8"/>
+<path d="M60.0 35.2 L60.0 52.8"/>
+<path d="M8.0 12.0 L20.8 12.0"/>
+<path d="M35.2 12.0 L52.8 12.0"/>
+<path d="M19.2 28.0 L36.8 28.0"/>
+<path d="M51.2 28.0 L64.0 28.0"/>
+<path d="M8.0 44.0 L20.8 44.0"/>
+<path d="M35.2 44.0 L52.8 44.0"/>
+<path d="M19.2 60.0 L36.8 60.0"/>
+<path d="M51.2 60.0 L64.0 60.0"/>
+</g>
+<text x="88" y="51" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="44" font-weight="700" letter-spacing="-1" fill="#0a0a0a">Oxidant</text>
+</svg>
