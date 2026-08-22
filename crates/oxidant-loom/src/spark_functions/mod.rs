@@ -43,6 +43,8 @@ mod spark_from_json;
 pub use spark_from_json::parse_spark_schema;
 mod spark_if;
 mod spark_json;
+// SPIKE (issue #118): ONNX scoring UDFs. See `docs/spikes/ml-predict.md`.
+pub mod ml_predict;
 mod spark_math;
 mod spark_misc;
 pub(crate) mod spark_nonzero_divisor;
@@ -57,6 +59,7 @@ mod try_arithmetic;
 /// Register all Spark-only scalar functions into `ctx`.
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(SparkTypeof::new()));
+    ml_predict::register(ctx);
     spark_cast_constructors::register(ctx);
     try_arithmetic::register(ctx);
     spark_strings::register(ctx);

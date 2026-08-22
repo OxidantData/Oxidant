@@ -38,6 +38,8 @@ oxidant-optimizer  = { path = "crates/oxidant-optimizer" }
 oxidant-physical   = { path = "crates/oxidant-physical" }
 oxidant-datasource = { path = "crates/oxidant-datasource" }
 oxidant-loom       = { path = "crates/oxidant-loom" }
+# SPIKE (issue #118): ONNX inference behind the `ml_predict` UDF.
+oxidant-ml         = { path = "crates/oxidant-ml" }
 oxidant-execution  = { path = "crates/oxidant-execution" }
 oxidant-gpu        = { path = "crates/oxidant-gpu" }
 oxidant-connect    = { path = "crates/oxidant-connect" }

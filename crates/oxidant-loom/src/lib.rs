@@ -38,6 +38,9 @@ pub mod measured_scan;
 /// read + decoded once per worker per data version, then served from memory. See [`dim_cache`].
 pub mod dim_cache;
 
+/// SPIKE (issue #118): `s3://` ONNX model URIs resolved through the engine's object store.
+pub mod ml_blob_source;
+
 /// Disk-caching object_store wrapper for remote analytical reads (`OXIDANT_S3_CACHE_DIR`).
 pub mod s3_cache;
 

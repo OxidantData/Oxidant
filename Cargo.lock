@@ -4697,6 +4697,7 @@ dependencies = [
  "oxidant-common",
  "oxidant-datasource",
  "oxidant-gpu",
+ "oxidant-ml",
  "oxidant-physical",
  "oxidant-plan",
  "oxidant-sql",

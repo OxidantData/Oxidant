@@ -9,6 +9,8 @@ rust-version.workspace = true
 
 [dependencies]
 oxidant-common = { workspace = true }
+# SPIKE (issue #118): ONNX inference for the `ml_predict` UDF.
+oxidant-ml = { workspace = true }
 oxidant-plan = { workspace = true }
 # The Spark-SQL dialect layer: `normalize_spark_sql` runs its Stage-1 string-prefilter registry.
 oxidant-sql = { workspace = true }
