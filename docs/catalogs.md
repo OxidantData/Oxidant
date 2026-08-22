@@ -42,7 +42,9 @@ oxidant spark server --port 50051 \
 Supported `type` values today: **`hive`** (Hive Metastore over Thrift), **`glue`**
 (AWS Glue Data Catalog via `aws-sdk-glue` in-process, with the standard AWS credential
 chain — env, shared config, instance role / IRSA), and **`rest`** / `unity` / `iceberg`
-(Iceberg REST). Glue options: `region`, optional `warehouse`
+(Iceberg REST — Unity Catalog is reached over this surface; see
+[catalogs-unity.md](catalogs-unity.md) for its exact keys and its verified limits).
+Glue options: `region`, optional `warehouse`
 (`s3://bucket/prefix` for CTAS without `LOCATION`).
 
 EC2 ASG walkthrough (create Glue DB/table, IAM, `CatalogConf`):
@@ -78,7 +80,9 @@ then wire its `type` string into `oxidant-connect`'s `build_provider` factory
 ## What works / what's next (v1)
 
 - **Works:** three-part-qualified queries (`cat.db.tbl`) and `spark.read.table("cat.db.tbl")`
-  resolve lazily; `spark.catalog.listCatalogs/listDatabases/listTables/tableExists/databaseExists`
+  resolve lazily; unqualified and two-part names resolve against the session's current catalog
+  when that is an external one (`spark.sql.defaultCatalog` / `spark.sql.defaultDatabase` seed it
+  at startup, `USE` changes it per session; session temp views keep resolving either way); `spark.catalog.listCatalogs/listDatabases/listTables/tableExists/databaseExists`
   and `currentCatalog`/`setCurrentCatalog`/`currentDatabase`/`setCurrentDatabase`;
   `refreshTable` (evicts the driver-side cached table provider and invalidates cached stage
   plans — workers converge via `OXIDANT_CATALOG_CACHE_TTL_MS`, see
@@ -96,7 +100,6 @@ then wire its `type` string into `oxidant-connect`'s `build_provider` factory
 - **Not yet:** `DROP TABLE`/`SHOW PARTITIONS`/`MSCK REPAIR` through the catalog (the SPI
   methods exist; no SQL path reaches them); `ALTER TABLE`; non-CTAS `CREATE TABLE` against an
   external catalog; write DDL for Hive and REST/Unity; `hdfs://` locations; Delta/Iceberg
-  **column-mapping** tables (refused with an explicit error rather than misread);
-  `USE <catalog>` / current-database affects the `spark.catalog.*` listing context but not yet the
-  resolution of *unqualified* table names in queries — use fully-qualified names with external
-  catalogs for now; ORC/Avro tables.
+  **column-mapping** tables (Delta refuses them with an explicit error; the Iceberg reader does
+  NOT and surfaces the physical `col-<uuid>` names instead — see
+  [catalogs-unity.md](catalogs-unity.md#limitations-found)); ORC/Avro tables.

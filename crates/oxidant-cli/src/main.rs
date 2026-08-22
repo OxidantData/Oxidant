@@ -148,6 +148,11 @@ async fn run_server(
     if !catalogs.is_empty() {
         eprintln!("Declared {} catalog config entrie(s)", catalogs.len());
     }
+    // `serve` re-checks this — it is the library's own guarantee — but only after this function
+    // has already printed "listening on …", which would make a config error read like a crash
+    // after a successful boot. Check it here so the refusal comes *before* the banner.
+    oxidant_connect::validate_default_catalog(&catalogs)
+        .map_err(|e| oxidant_common::Error::Plan(e.message().to_string()))?;
     let sample_data_dir = sample_data_dir(args);
     let workers = match mode {
         ServerMode::Local => static_workers(args)?,

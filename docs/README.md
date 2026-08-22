@@ -21,6 +21,7 @@ in a few minutes.
 | [workers.md](workers.md) | Adding workers: single-node default, local-cluster, multi-host, Docker |
 | [catalogs-glue.md](catalogs-glue.md) | AWS Glue Data Catalog end-to-end (IAM, config, CTAS, troubleshooting) |
 | [catalogs-lakeformation.md](catalogs-lakeformation.md) | AWS Lake Formation column/row security on Glue tables (identity modes, fail-closed behavior, security boundary) |
+| [catalogs-unity.md](catalogs-unity.md) | Unity Catalog over its Iceberg REST surface (exact config, verified behavior, and the column-mapping gap that blocks reads) |
 | [streaming.md](streaming.md) | Structured Streaming: Kafka → live Delta tables in Glue, readable as Iceberg |
 | [catalogs.md](catalogs.md) | External catalog SPI overview (Hive / Glue / REST) and bring-your-own catalog |
 

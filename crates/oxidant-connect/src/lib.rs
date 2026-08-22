@@ -45,6 +45,7 @@ mod translate;
 mod types;
 mod udf;
 
+pub use catalog::validate_default_catalog;
 pub use distributed::parse_worker_list;
 
 /// Max gRPC message size (Spark Connect defaults to 128 MB; we allow 256 MB headroom).
@@ -435,7 +436,28 @@ impl OxidantService {
         if let Some(def) = snapshot.get("spark.sql.defaultCatalog") {
             // New sessions seed from this catalog (KAN-85); existing sessions keep their
             // (possibly `USE`-adjusted) state.
-            let _ = self.engine.set_default_catalog(def);
+            //
+            // A failure here is NOT fatal on this path: a PySpark client sets config one key per
+            // `Config` RPC, so `spark.sql.defaultCatalog=uc` routinely arrives before
+            // `spark.sql.catalog.uc.type`, and the next `Config` set retries. It is never silent
+            // either — dropped without a word, the only symptom is that every unqualified name
+            // keeps resolving against `spark_catalog`, which reads as "my table is missing"
+            // rather than "my default catalog never took". `serve` rejects the same mistake up
+            // front for the startup path (see [`catalog::validate_default_catalog`]), where the
+            // whole config IS available at once and a warning would scroll past.
+            if let Err(e) = self.engine.set_default_catalog(def) {
+                tracing::warn!(
+                    catalog = %def,
+                    error = %e,
+                    "spark.sql.defaultCatalog names a catalog that is not registered (yet); \
+                     unqualified names still resolve against `spark_catalog`"
+                );
+            }
+        }
+        // Companion to the above: the namespace new sessions start in. Without it an external
+        // default catalog can only be reached as `<namespace>.<table>` — never a bare table name.
+        if let Some(db) = snapshot.get("spark.sql.defaultDatabase") {
+            self.engine.set_default_namespace(db);
         }
     }
 
@@ -2126,6 +2148,12 @@ fn strict_refusal_message(plan_build_error: Option<&Error>) -> String {
 
 /// Start the Spark Connect server and serve until the process is killed.
 pub async fn serve(config: ServerConfig) -> Result<()> {
+    // Refuse to boot on a `spark.sql.defaultCatalog` that names nothing declared: the failure is
+    // otherwise silent (unqualified names keep resolving against `spark_catalog`) and the whole
+    // startup config is in hand here, so the typo can be named exactly. See
+    // [`catalog::validate_default_catalog`].
+    catalog::validate_default_catalog(&config.catalogs)
+        .map_err(|e| Error::Plan(e.message().to_string()))?;
     let port = config.port;
     let ui_port = config.ui_port;
     let sample_data_dir = config.sample_data_dir.clone();

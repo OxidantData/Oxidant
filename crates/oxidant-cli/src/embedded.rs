@@ -37,7 +37,12 @@ pub async fn build_engine(
         .map(|c| c.catalog_conf().into_iter().collect())
         .unwrap_or_default();
     let service = OxidantService::with_catalogs(catalogs).await;
-    let engine = service.engine();
+    // A *session* handle, not the bare engine: `spark.sql.defaultCatalog` seeds new sessions
+    // (`Engine::for_session`), and the bare handle is not one — it keeps the builtin
+    // `spark_catalog`/`default` pointers forever. Without this, a config file that sets a default
+    // catalog is honored over Spark Connect but silently ignored by `oxidant sql`. With no
+    // default configured the seeded pointers are `spark_catalog`/`default`, i.e. unchanged.
+    let engine = std::sync::Arc::new(service.engine().for_session("oxidant-cli"));
 
     if let Some(dir) = sample_data {
         // Best-effort, exactly as the server treats it: a missing or unreadable sample tree is

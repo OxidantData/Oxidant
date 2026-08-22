@@ -37,7 +37,7 @@ Rows I could not settle either way are not given a status. They are collected un
 | **Supported** | Probe ran and returned Spark-shaped results, or the owning code path implements the section. |
 | **Partial** | Some of the section works; a named part does not, or it parses but the semantics diverge from Databricks. |
 | **Missing** | Probe failed outright (parser or planner rejects it) and no code path implements it. |
-| **N/A** | Requires the Databricks control plane (Unity Catalog, Delta Sharing, serverless, workspace identities, AI/Model Serving). Out of scope per the plan's scope boundaries. |
+| **N/A** | Requires the Databricks control plane (Unity Catalog *securables and DDL*, Delta Sharing, serverless, workspace identities, AI/Model Serving). Out of scope per the plan's scope boundaries. Unity Catalog as a read-only *metadata source* is a separate, partially working thing — see [catalogs-unity.md](catalogs-unity.md). |
 
 ## Baseline counts (freshly read)
 

@@ -53,6 +53,44 @@ pub fn group_catalog_options(
     out
 }
 
+/// Validate a startup catalog config's `spark.sql.defaultCatalog` against the catalogs the same
+/// config declares.
+///
+/// The startup path (`oxidant spark server --catalog-conf …` / `OXIDANT_CATALOG_CONF` / the
+/// `catalogs:` block of `oxidant.yaml`) hands the whole config over at once, so a
+/// `spark.sql.defaultCatalog` naming a catalog nothing declares is a typo the operator can only
+/// have made here — and one whose runtime symptom is *silence*: every unqualified table name goes
+/// on resolving against the builtin `spark_catalog` and reads as a missing table. Refusing to boot
+/// names the mistake instead. The incremental `Config`-RPC path deliberately does NOT go through
+/// here (a client sets one key per RPC, so the default legitimately arrives before its catalog).
+///
+/// `spark_catalog` — the builtin catalog — is always valid and needs no declaration.
+pub fn validate_default_catalog(config: &HashMap<String, String>) -> Result<(), Status> {
+    let Some(default) = config.get("spark.sql.defaultCatalog") else {
+        return Ok(());
+    };
+    let default = default.trim();
+    if default.eq_ignore_ascii_case(oxidant_catalog::DEFAULT_CATALOG) {
+        return Ok(());
+    }
+    let declared = group_catalog_options(config);
+    if declared.contains_key(default) {
+        return Ok(());
+    }
+    let mut names: Vec<&str> = declared.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    let known = if names.is_empty() {
+        format!("only the builtin `{}`", oxidant_catalog::DEFAULT_CATALOG)
+    } else {
+        format!("declared: {}", names.join(", "))
+    };
+    Err(Status::invalid_argument(format!(
+        "spark.sql.defaultCatalog=`{default}` names a catalog that is not declared — add \
+         `spark.sql.catalog.{default}.type=<local|hive|glue|rest|unity|iceberg>` (and its \
+         `uri`/`warehouse`) or drop the setting ({known})"
+    )))
+}
+
 /// Build a catalog provider from its grouped options. Dispatches on `type` (the
 /// `spark.sql.catalog.<name>.type` value). New built-in provider types are added here.
 ///
@@ -1276,5 +1314,100 @@ mod tests {
         // Blank is treated as unset rather than as a region named "".
         opts.insert("region".to_string(), "  ".to_string());
         assert!(!resolve_catalog_region(&opts).trim().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod default_catalog_tests {
+    use super::*;
+
+    /// The exact startup config `docs/catalogs-unity.md` documents.
+    fn unity_conf(default: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("spark.sql.catalog.uc.type".to_string(), "unity".to_string()),
+            (
+                "spark.sql.catalog.uc.uri".to_string(),
+                "http://localhost:8080/api/2.1/unity-catalog/iceberg".to_string(),
+            ),
+            ("spark.sql.defaultCatalog".to_string(), default.to_string()),
+        ])
+    }
+
+    #[test]
+    fn a_declared_unity_catalog_is_a_valid_default() {
+        validate_default_catalog(&unity_conf("uc")).expect("`uc` is declared right above it");
+    }
+
+    /// The whole point of the check: a typo in the default-catalog name is otherwise SILENT —
+    /// the server boots and every unqualified name goes on resolving against `spark_catalog`.
+    #[test]
+    fn an_undeclared_default_catalog_is_refused_by_name() {
+        let err = validate_default_catalog(&unity_conf("ucc")).expect_err("`ucc` is not declared");
+        let msg = err.message();
+        assert!(msg.contains("ucc"), "the error must name the typo: {msg}");
+        assert!(
+            msg.contains("spark.sql.catalog.ucc.type"),
+            "the error must name the key that would fix it: {msg}"
+        );
+        assert!(
+            msg.contains("declared: uc"),
+            "the error must list what IS declared: {msg}"
+        );
+    }
+
+    /// The builtin catalog needs no `spark.sql.catalog.*` declaration, so pointing the default at
+    /// it must not be mistaken for a typo.
+    #[test]
+    fn the_builtin_catalog_is_always_a_valid_default() {
+        let mut conf = unity_conf(oxidant_catalog::DEFAULT_CATALOG);
+        validate_default_catalog(&conf).expect("the builtin catalog is always available");
+        // …even with nothing else declared at all.
+        conf.remove("spark.sql.catalog.uc.type");
+        conf.remove("spark.sql.catalog.uc.uri");
+        validate_default_catalog(&conf).expect("the builtin catalog needs no declaration");
+    }
+
+    /// Spark's implementation-class spelling (`spark.sql.catalog.<name>=<impl>`, no `.type`)
+    /// declares a catalog just as much as the `.type` form — `group_catalog_options` maps it onto
+    /// `type`, and the validator must see it the same way or it would reject a working config.
+    #[test]
+    fn the_bare_implementation_class_spelling_declares_a_catalog() {
+        let conf = HashMap::from([
+            ("spark.sql.catalog.uc".to_string(), "unity".to_string()),
+            ("spark.sql.defaultCatalog".to_string(), "uc".to_string()),
+        ]);
+        validate_default_catalog(&conf).expect("`spark.sql.catalog.uc=unity` declares `uc`");
+    }
+
+    /// No `spark.sql.defaultCatalog` at all is the overwhelmingly common config and must stay a
+    /// no-op — the validator runs on every `serve()`.
+    #[test]
+    fn no_default_catalog_setting_is_not_an_error() {
+        let mut conf = unity_conf("uc");
+        conf.remove("spark.sql.defaultCatalog");
+        validate_default_catalog(&conf).expect("nothing to validate");
+        validate_default_catalog(&HashMap::new()).expect("empty config");
+    }
+
+    /// A value that only differs by surrounding whitespace is a working config in every other
+    /// consumer (`catalog_conf` trims), so it must not be rejected here.
+    #[test]
+    fn the_default_catalog_name_is_trimmed_before_matching() {
+        let mut conf = unity_conf("uc");
+        conf.insert("spark.sql.defaultCatalog".to_string(), "  uc  ".to_string());
+        validate_default_catalog(&conf).expect("whitespace is not part of the name");
+    }
+
+    /// With nothing declared the message cannot list alternatives — it must still say what the
+    /// only available catalog is rather than printing an empty list.
+    #[test]
+    fn the_error_names_the_builtin_when_nothing_is_declared() {
+        let conf = HashMap::from([("spark.sql.defaultCatalog".to_string(), "uc".to_string())]);
+        let err = validate_default_catalog(&conf).expect_err("`uc` is not declared");
+        assert!(
+            err.message().contains("only the builtin `spark_catalog`"),
+            "{}",
+            err.message()
+        );
     }
 }

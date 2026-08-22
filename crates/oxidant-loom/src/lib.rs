@@ -2853,6 +2853,10 @@ type SessionCurrent = Arc<Mutex<(String, Vec<String>)>>;
 /// Existing sessions keep their (possibly `USE`-adjusted) state when the default changes.
 struct SessionState {
     default_catalog: String,
+    /// The namespace NEW sessions seed from (`spark.sql.defaultDatabase`), when the operator
+    /// set one. `None` keeps the per-catalog derivation in [`Engine::for_session`]
+    /// (`["default"]` for the builtin catalog, empty for an external one).
+    default_namespace: Option<Vec<String>>,
     cells: HashMap<String, SessionCurrent>,
 }
 
@@ -3437,6 +3441,7 @@ impl Engine {
             ))),
             sessions: Arc::new(Mutex::new(SessionState {
                 default_catalog: oxidant_catalog::DEFAULT_CATALOG.to_string(),
+                default_namespace: None,
                 cells: HashMap::new(),
             })),
             created_tables: Arc::new(Mutex::new(HashMap::new())),
@@ -3964,8 +3969,65 @@ impl Engine {
         &self,
         query: &str,
     ) -> Result<datafusion::logical_expr::LogicalPlan> {
+        // Plan against the session's CURRENT catalog/namespace when that is an external
+        // (registered `spark.sql.catalog.<name>.*`) catalog, so `SELECT … FROM ns.tbl` — and a
+        // bare `FROM tbl` once a namespace is selected — resolve there instead of always falling
+        // back to the builtin `spark_catalog`. `session_default_state` returns `None` whenever the
+        // session still points at the builtin catalog, which keeps every existing caller on the
+        // byte-identical original path.
+        let Some(state) = self.session_default_state() else {
+            return self
+                .create_logical_plan_with(&self.ctx.state(), query)
+                .await;
+        };
+        match self.create_logical_plan_with(&state, query).await {
+            Ok(plan) => Ok(plan),
+            // Spark resolves session-temporary views (and anything registered ad hoc into the
+            // builtin catalog) regardless of the current catalog. Retrying under the untouched
+            // state keeps those names working after a `USE <external-catalog>`; the reported
+            // error stays the external-catalog one, which is the catalog the user selected.
+            Err(external_err) => self
+                .create_logical_plan_with(&self.ctx.state(), query)
+                .await
+                .map_err(|_| external_err),
+        }
+    }
+
+    /// A [`SessionState`](datafusion::execution::context::SessionState) whose DataFusion default
+    /// catalog/schema are this session's current catalog/namespace — or `None` when the session
+    /// still points at the builtin `spark_catalog` (or at a catalog no longer registered), in
+    /// which case the unmodified `ctx.state()` is already correct.
+    ///
+    /// DataFusion resolves an unqualified/2-part `TableReference` against
+    /// `config.options().catalog.{default_catalog,default_schema}`, which [`Engine::new`] pins to
+    /// `spark_catalog`/`default` for the whole process. Overriding them on a per-plan CLONE of the
+    /// state (never on the shared context) is what makes `spark.sql.defaultCatalog` and
+    /// `USE <catalog>` affect *query* resolution rather than only the SHOW/DESCRIBE listing
+    /// context.
+    fn session_default_state(&self) -> Option<datafusion::execution::context::SessionState> {
+        let (catalog, namespace) = self.current_catalog_and_namespace();
+        if catalog == oxidant_catalog::DEFAULT_CATALOG || self.oxidant_catalog(&catalog).is_none() {
+            return None;
+        }
+        let mut state = self.ctx.state();
+        let opts = state.config_mut().options_mut();
+        opts.catalog.default_catalog = catalog;
+        // The bridge exposes single-part namespaces (see `catalog_bridge`), so the LAST segment is
+        // the schema DataFusion looks up. With no namespace selected the schema stays `default`,
+        // and a bare name simply fails to resolve there — the pre-existing behavior.
+        if let Some(schema) = namespace.last() {
+            opts.catalog.default_schema = schema.clone();
+        }
+        Some(state)
+    }
+
+    /// [`Engine::create_logical_plan_spark`]'s body, against an explicit session state.
+    async fn create_logical_plan_with(
+        &self,
+        state: &datafusion::execution::context::SessionState,
+        query: &str,
+    ) -> Result<datafusion::logical_expr::LogicalPlan> {
         use datafusion::sql::parser::Statement as DFStatement;
-        let state = self.ctx.state();
         // Spark rejects several ordered-set / window percentile shapes (WITHIN GROUP on an
         // unsupported function, DISTINCT inside WITHIN GROUP, a percentile/median window with a
         // non-full-partition frame) that DataFusion would silently plan. Detect them up front and
@@ -6433,15 +6495,18 @@ impl Engine {
         let cell = {
             let mut state = self.sessions.lock().expect("sessions poisoned");
             let default_catalog = state.default_catalog.clone();
+            let default_namespace = state.default_namespace.clone();
             state
                 .cells
                 .entry(session_id.to_string())
                 .or_insert_with(|| {
-                    let namespace = if default_catalog == oxidant_catalog::DEFAULT_CATALOG {
-                        vec![oxidant_catalog::DEFAULT_NAMESPACE.to_string()]
-                    } else {
-                        Vec::new()
-                    };
+                    let namespace = default_namespace.unwrap_or_else(|| {
+                        if default_catalog == oxidant_catalog::DEFAULT_CATALOG {
+                            vec![oxidant_catalog::DEFAULT_NAMESPACE.to_string()]
+                        } else {
+                            Vec::new()
+                        }
+                    });
                     Arc::new(Mutex::new((default_catalog, namespace)))
                 })
                 .clone()
@@ -6490,6 +6555,32 @@ impl Engine {
             .expect("sessions poisoned")
             .default_catalog = canonical;
         Ok(())
+    }
+
+    /// Set the namespace NEW sessions seed from (`spark.sql.defaultDatabase`); existing sessions
+    /// keep their (possibly `USE`-adjusted) state, exactly like [`Engine::set_default_catalog`].
+    ///
+    /// Deliberately NOT validated against the catalog: a namespace check is an async provider
+    /// call, and this runs on the synchronous startup/`Config`-RPC path where the catalog it
+    /// names may not have been built yet. An unknown namespace surfaces at query time as
+    /// `TABLE_OR_VIEW_NOT_FOUND` against the qualified name, which names the namespace. The
+    /// *catalog* is the part that is validated, because an unregistered one silently keeps the
+    /// builtin catalog as the default — a wrong answer rather than an error.
+    ///
+    /// An empty/blank name clears the override (back to the per-catalog derivation in
+    /// [`Engine::for_session`]).
+    pub fn set_default_namespace(&self, namespace: &str) {
+        // Blank first: `parse_qualified_name("  ")` yields `["  "]`, so trimming only afterwards
+        // would install a namespace literally NAMED "  " and every bare table name would resolve
+        // into it and fail.
+        let segments = match namespace.trim() {
+            "" => Vec::new(),
+            name => parse_qualified_name(name),
+        };
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .default_namespace = (!segments.is_empty()).then_some(segments);
     }
 
     /// Spark Catalog RPC `setCurrentCatalog`: identical semantics to SQL `USE CATALOG <name>`
@@ -9054,6 +9145,95 @@ mod tests {
         );
         // An unregistered default is rejected.
         assert!(engine.set_default_catalog("nope").is_err());
+    }
+
+    /// A session whose default catalog is EXTERNAL resolves a 2-part `ns.table` there, with no
+    /// catalog prefix in the SQL. This is the whole point of `spark.sql.defaultCatalog`: before
+    /// it, DataFusion's process-wide default catalog (`spark_catalog`) claimed every unqualified
+    /// name and external catalogs were reachable only fully qualified.
+    #[tokio::test]
+    async fn a_default_external_catalog_resolves_two_part_names() {
+        let dir = kan81_parquet_dir("defaultcat-2part");
+        let tables = HashMap::from([(
+            "db1.orders".to_string(),
+            format!("file://{}/", dir.display()),
+        )]);
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(tables)));
+        engine.set_default_catalog("testcat").unwrap();
+
+        let session = engine.for_session("s1");
+        let batches = session
+            .sql("SELECT count(*) AS n FROM db1.orders")
+            .await
+            .expect("`db1.orders` must resolve against the default catalog");
+        let n = batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .expect("one row")
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("Int64 count")
+            .value(0);
+        assert_eq!(n, 3, "the three rows written by the fixture");
+    }
+
+    /// With `spark.sql.defaultDatabase` also set, a BARE table name resolves — the config pair a
+    /// Unity Catalog user needs to write `SELECT … FROM numbers` with no prefix at all.
+    #[tokio::test]
+    async fn a_default_namespace_makes_bare_names_resolve() {
+        let dir = kan81_parquet_dir("defaultcat-bare");
+        let tables = HashMap::from([(
+            "db1.orders".to_string(),
+            format!("file://{}/", dir.display()),
+        )]);
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(tables)));
+        engine.set_default_catalog("testcat").unwrap();
+        engine.set_default_namespace("db1");
+
+        let session = engine.for_session("s1");
+        assert_eq!(
+            session.current_catalog_and_namespace(),
+            ("testcat".to_string(), vec!["db1".to_string()]),
+            "the configured namespace seeds the session instead of the empty default"
+        );
+        session
+            .sql("SELECT count(*) FROM orders")
+            .await
+            .expect("a bare name must resolve against the default catalog + namespace");
+    }
+
+    /// The builtin catalog must be untouched by all of this: with no default configured, a
+    /// session resolves exactly as it always did, and a blank `defaultDatabase` clears rather
+    /// than sets an empty-named namespace.
+    #[tokio::test]
+    async fn the_builtin_catalog_path_is_unchanged() {
+        let engine = Engine::new();
+        engine.register_catalog("testcat", Arc::new(RecordingCatalog::new(HashMap::new())));
+        assert_eq!(
+            engine.for_session("s1").current_catalog_and_namespace(),
+            ("spark_catalog".to_string(), vec!["default".to_string()]),
+        );
+        engine.set_default_namespace("  ");
+        assert_eq!(
+            engine.for_session("s2").current_catalog_and_namespace(),
+            ("spark_catalog".to_string(), vec!["default".to_string()]),
+            "a blank default namespace is unset, not a namespace named \"\""
+        );
+        // A temp view still resolves after the session points at an external catalog — Spark
+        // resolves session-temporary objects regardless of the current catalog.
+        engine.set_default_catalog("testcat").unwrap();
+        let session = engine.for_session("s3");
+        session
+            .sql("CREATE TEMPORARY VIEW tv AS SELECT 1 AS a")
+            .await
+            .expect("temp view creates");
+        session
+            .sql("SELECT a FROM tv")
+            .await
+            .expect("temp views survive an external default catalog");
     }
 
     /// KAN-86/RPC: `setCurrentDatabase("")` is rejected — an empty name would otherwise parse
