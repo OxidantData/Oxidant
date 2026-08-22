@@ -107,3 +107,128 @@ fn all_leaves_target_class_zero(node: &NodeProto) -> bool {
         .find(|a: &&AttributeProto| a.name == "class_ids")
         .is_some_and(|a| !a.ints.is_empty() && a.ints.iter().all(|&c| c == 0))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tract_onnx::pb::{AttributeProto, GraphProto, ModelProto, NodeProto};
+
+    fn ints(name: &str, values: &[i64]) -> AttributeProto {
+        AttributeProto {
+            name: name.into(),
+            ints: values.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn floats(name: &str, values: &[f32]) -> AttributeProto {
+        AttributeProto {
+            name: name.into(),
+            floats: values.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// A `TreeEnsembleClassifier` shaped like skl2onnx's binary `GradientBoostingClassifier`
+    /// export: two class labels, every leaf contributing to class 0, one base value.
+    fn binary_gbdt_node() -> NodeProto {
+        NodeProto {
+            op_type: "TreeEnsembleClassifier".into(),
+            attribute: vec![
+                ints("classlabels_int64s", &[0, 1]),
+                ints("class_ids", &[0, 0, 0, 0]),
+                floats("base_values", &[0.139]),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn graph_of(nodes: Vec<NodeProto>) -> ModelProto {
+        ModelProto {
+            graph: Some(GraphProto {
+                node: nodes,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn base_values(model: &ModelProto) -> Vec<f32> {
+        model.graph.as_ref().unwrap().node[0]
+            .attribute
+            .iter()
+            .find(|a| a.name == "base_values")
+            .unwrap()
+            .floats
+            .clone()
+    }
+
+    #[test]
+    fn binary_gbdt_base_values_are_padded_to_n_classes() {
+        let mut model = graph_of(vec![binary_gbdt_node()]);
+        let rewrites = patch_for_tract(&mut model);
+        assert_eq!(rewrites.base_values_padded, 1);
+        // Padded with the real base value, not zero — see `pad_base_values`.
+        assert_eq!(base_values(&model), vec![0.139, 0.139]);
+    }
+
+    #[test]
+    fn binary_gbdt_reports_its_class_labels_so_the_label_can_be_recomputed() {
+        let mut model = graph_of(vec![binary_gbdt_node()]);
+        assert_eq!(
+            patch_for_tract(&mut model).binary_class_labels,
+            Some(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn multiclass_ensembles_are_left_completely_alone() {
+        // Three classes, and leaves target more than class 0 — tract's `binary_result_layout`
+        // does not apply, its argmax is over the right tensor, and `base_values` is already
+        // the length tract wants.
+        let mut node = binary_gbdt_node();
+        node.attribute = vec![
+            ints("classlabels_int64s", &[0, 1, 2]),
+            ints("class_ids", &[0, 1, 2, 0]),
+            floats("base_values", &[0.1, 0.2, 0.3]),
+        ];
+        let mut model = graph_of(vec![node]);
+        let rewrites = patch_for_tract(&mut model);
+        assert!(rewrites.is_empty(), "{rewrites:?}");
+        assert_eq!(base_values(&model), vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn two_class_ensemble_whose_leaves_target_both_classes_is_not_the_binary_layout() {
+        // A `RandomForestClassifier` emits per-class leaf weights, so `class_ids` is not all
+        // zero. tract handles it on the normal path; padding would corrupt the second column.
+        let mut node = binary_gbdt_node();
+        node.attribute = vec![
+            ints("classlabels_int64s", &[0, 1]),
+            ints("class_ids", &[0, 1, 0, 1]),
+            floats("base_values", &[0.139]),
+        ];
+        let mut model = graph_of(vec![node]);
+        assert!(patch_for_tract(&mut model).is_empty());
+        assert_eq!(base_values(&model), vec![0.139]);
+    }
+
+    #[test]
+    fn two_binary_classifiers_in_one_graph_leave_the_label_ambiguous() {
+        // We would not know which node's labels to argmax with, so we decline to guess and
+        // fall back to tract's (wrong-for-binary) label rather than a confidently wrong one.
+        let mut model = graph_of(vec![binary_gbdt_node(), binary_gbdt_node()]);
+        let rewrites = patch_for_tract(&mut model);
+        assert_eq!(rewrites.base_values_padded, 2);
+        assert_eq!(rewrites.binary_class_labels, None);
+    }
+
+    #[test]
+    fn a_graph_with_no_tree_ensemble_is_untouched() {
+        let mut model = graph_of(vec![NodeProto {
+            op_type: "Gemm".into(),
+            ..Default::default()
+        }]);
+        assert!(patch_for_tract(&mut model).is_empty());
+    }
+}

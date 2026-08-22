@@ -110,7 +110,7 @@ impl ScalarUDFImpl for MlPredict {
             );
         }
         let mut coerced = vec![DataType::Utf8];
-        coerced.extend(std::iter::repeat_n(DataType::Float64, arg_types.len() - 1));
+        coerced.extend(vec![DataType::Float64; arg_types.len() - 1]);
         Ok(coerced)
     }
 
