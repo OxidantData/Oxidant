@@ -454,23 +454,29 @@ pub fn aws_partition(region: &str) -> &'static str {
 /// (`arn:aws:iam::123:role/Analyst`). Without this rewrite every lookup for a role-based engine
 /// matches nothing, which fails closed as a total denial and looks exactly like a broken
 /// integration. Federated-user ARNs collapse the same way; anything else passes through.
+///
+/// The *partition* is carried over from the input rather than written as `aws`, for the same
+/// reason [`aws_partition`] exists: in GovCloud and China a grant is held against
+/// `arn:aws-us-gov:iam::…` / `arn:aws-cn:iam::…`, so emitting `arn:aws:iam::…` would match no
+/// grant at all — a total denial for every governed table, indistinguishable from a broken setup.
 pub fn normalize_principal_arn(arn: &str) -> String {
     let parts: Vec<&str> = arn.splitn(6, ':').collect();
     if parts.len() < 6 || parts[2] != "sts" {
         return arn.to_string();
     }
+    let partition = parts[1];
     let account = parts[4];
     let resource = parts[5];
     if let Some(rest) = resource.strip_prefix("assumed-role/") {
         // `Role/session-name` — the role name is everything before the first `/`.
         let role = rest.split('/').next().unwrap_or(rest);
         if !role.is_empty() {
-            return format!("arn:aws:iam::{account}:role/{role}");
+            return format!("arn:{partition}:iam::{account}:role/{role}");
         }
     }
     if let Some(rest) = resource.strip_prefix("federated-user/") {
         if !rest.is_empty() {
-            return format!("arn:aws:iam::{account}:user/{rest}");
+            return format!("arn:{partition}:iam::{account}:user/{rest}");
         }
     }
     arn.to_string()
@@ -558,6 +564,7 @@ where
 mod tests {
     use super::*;
     use aws_sdk_glue::types::ColumnRowFilter;
+    use std::sync::Arc;
 
     fn cell(column: &str, expr: &str) -> ColumnRowFilter {
         ColumnRowFilter::builder()
@@ -609,6 +616,26 @@ mod tests {
             "arn:aws:iam::123456789012:role/oxidant"
         );
         assert_eq!(normalize_principal_arn("not-an-arn"), "not-an-arn");
+    }
+
+    /// The partition must survive normalization. A GovCloud/China grant is held against
+    /// `arn:aws-us-gov:iam::…`, so rewriting the caller ARN to `arn:aws:iam::…` matches no grant —
+    /// every governed table denies, and the failure looks exactly like a misconfigured setup
+    /// rather than a wrong ARN. Same reason `aws_partition` is not hardcoded.
+    #[test]
+    fn normalization_preserves_the_partition() {
+        assert_eq!(
+            normalize_principal_arn("arn:aws-us-gov:sts::123456789012:assumed-role/Analyst/sess"),
+            "arn:aws-us-gov:iam::123456789012:role/Analyst"
+        );
+        assert_eq!(
+            normalize_principal_arn("arn:aws-cn:sts::123456789012:assumed-role/Analyst/sess"),
+            "arn:aws-cn:iam::123456789012:role/Analyst"
+        );
+        assert_eq!(
+            normalize_principal_arn("arn:aws-us-gov:sts::123456789012:federated-user/alice"),
+            "arn:aws-us-gov:iam::123456789012:user/alice"
+        );
     }
 
     /// An empty `AuthorizedColumns` is a total denial. `TableAccess::authorized_columns == None`
@@ -758,9 +785,31 @@ mod tests {
     /// What live Lake Formation returns when more than one `SupportedPermissionTypes` tier is named.
     const INVALID_PERMISSION_TYPE_JSON: &str = r#"{"__type":"InvalidInputException","message":"Invalid permission type, it must be one of the following: COLUMN_PERMISSION, CELL_FILTER_PERMISSION, NESTED_PERMISSION, NESTED_CELL_PERMISSION, or DATA_LOCATION_PERMISSION"}"#;
 
+    /// What `GetTemporaryGlueTableCredentials` returns for a table the principal may read.
+    /// `Expiration` is `EpochSeconds` on the wire (Lake Formation is `restJson1`); 4102444800 is
+    /// 2100-01-01, comfortably outside any refresh margin.
+    const VENDED_CREDENTIALS_JSON: &str = r#"{"AccessKeyId":"ASIAVENDEDEXAMPLE","SecretAccessKey":"vended-secret","SessionToken":"vended-token","Expiration":4102444800}"#;
+    /// Absolute expiry [`VENDED_CREDENTIALS_JSON`] states, as seconds since the epoch.
+    const VENDED_EXPIRY_EPOCH_SECS: u64 = 4_102_444_800;
+    /// A 200 that carries no credentials. Every field of the response is optional in the model, so
+    /// the mapping has to reject this rather than hand back an empty `AwsCredential`.
+    const VENDED_NOTHING_JSON: &str = r#"{}"#;
+
+    /// Every request the stub answered, newest last: `(uri line + headers + body)`.
+    type StubLog = Arc<std::sync::Mutex<Vec<String>>>;
+
     /// Bind a stub Glue endpoint; each connection is answered from the request body's table name.
     async fn spawn_glue_stub() -> u16 {
+        spawn_stub_recording().await.0
+    }
+
+    /// As [`spawn_glue_stub`], but also hands back the log of raw requests — the only way to assert
+    /// on what was *sent* (the table ARN, the audit correlation id, or that no credential-vending
+    /// call was made at all).
+    async fn spawn_stub_recording() -> (u16, StubLog) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let log: StubLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_for_server = log.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub");
@@ -770,6 +819,7 @@ mod tests {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
+                let log = log_for_server.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0_u8; 8192];
@@ -801,12 +851,26 @@ mod tests {
                         buf.extend_from_slice(&chunk[..n]);
                     }
                     let request = String::from_utf8_lossy(&buf).to_string();
+                    log.lock().expect("stub log poisoned").push(request.clone());
+                    // Lake Formation is `restJson1`: the operation is the URI path, not an
+                    // `X-Amz-Target` header like Glue's `awsJson1.1`. Dispatch on it FIRST — the
+                    // vending request carries the table ARN, whose text would otherwise fall
+                    // through to the metadata branches below.
+                    let is_vending = request.contains("/GetTemporaryGlueTableCredentials");
                     // Model the real service's rule: `SupportedPermissionTypes` is a hierarchy and
                     // naming more than one tier is rejected. Without this the stub would happily
                     // accept a request live Lake Formation refuses.
                     let names_multiple_permission_types = request.contains("COLUMN_PERMISSION")
                         && request.contains("CELL_FILTER_PERMISSION");
-                    let (status, body) = if names_multiple_permission_types {
+                    let (status, body) = if is_vending {
+                        if request.contains("/vendingdenied") {
+                            ("400 Bad Request", ACCESS_DENIED_JSON)
+                        } else if request.contains("/vendsnothing") {
+                            ("200 OK", VENDED_NOTHING_JSON)
+                        } else {
+                            ("200 OK", VENDED_CREDENTIALS_JSON)
+                        }
+                    } else if names_multiple_permission_types {
                         ("400 Bad Request", INVALID_PERMISSION_TYPE_JSON)
                     } else if request.contains("\"mismatch\"") {
                         ("400 Bad Request", PERMISSION_MISMATCH_JSON)
@@ -829,10 +893,14 @@ mod tests {
                 });
             }
         });
-        port
+        (port, log)
     }
 
     fn stub_authorizer(port: u16) -> LakeFormationAuthorizer {
+        stub_authorizer_with_vending(port, false)
+    }
+
+    fn stub_authorizer_with_vending(port: u16, vend_credentials: bool) -> LakeFormationAuthorizer {
         let creds =
             SharedCredentialsProvider::new(Credentials::new("akid", "secret", None, None, "test"));
         let glue = aws_sdk_glue::Client::from_conf(
@@ -863,9 +931,7 @@ mod tests {
             "123456789012",
             "us-west-2",
             "arn:aws:iam::123456789012:role/analyst",
-            // Credential vending off: these tests cover the authorization decision, and the stub
-            // does not model STS-backed credential responses.
-            false,
+            vend_credentials,
         )
     }
 
@@ -996,6 +1062,175 @@ mod tests {
             .authorize_scan(&[], "orders")
             .await
             .expect_err("no database");
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
+    }
+
+    // ---------------------------------------------------------------------
+    // Credential vending. The tests above all run with vending OFF, which leaves the documented
+    // default path (`lakeformation.vend_credentials` defaults to TRUE) entirely unexercised: the
+    // ARN the credentials are requested for, the audit correlation id, the expiry mapping, and
+    // the fail-closed behaviour when vending is refused.
+    // ---------------------------------------------------------------------
+
+    /// The requests the stub saw for `op`, where `op` is a Lake Formation URI path or a Glue
+    /// `X-Amz-Target` suffix.
+    fn requests_for(log: &StubLog, op: &str) -> Vec<String> {
+        log.lock()
+            .expect("stub log poisoned")
+            .iter()
+            .filter(|r| r.contains(op))
+            .cloned()
+            .collect()
+    }
+
+    /// With vending on, the decision carries table-scoped credentials — the step that makes
+    /// enforcement real rather than advisory, because the bytes are then fetched under a token
+    /// Lake Formation scoped to this one table instead of the engine's own identity.
+    #[tokio::test]
+    async fn vending_on_returns_table_scoped_credentials_with_their_expiry() {
+        let (port, log) = spawn_stub_recording().await;
+        let auth = stub_authorizer_with_vending(port, true);
+        let access = auth
+            .authorize_scan(&["oxidant_lf_secure".to_string()], "lf_protected_customers")
+            .await
+            .expect("governed table with vending on");
+
+        let creds = access
+            .credentials
+            .expect("vending on must yield credentials");
+        assert_eq!(creds.access_key_id, "ASIAVENDEDEXAMPLE");
+        assert_eq!(creds.secret_access_key, "vended-secret");
+        assert_eq!(creds.session_token.as_deref(), Some("vended-token"));
+        assert_eq!(
+            creds.expires_at,
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(VENDED_EXPIRY_EPOCH_SECS)),
+            "an expiry that does not survive the mapping makes the refresh path unreachable"
+        );
+
+        // The vending call must name THIS table's ARN — a wrong or missing ARN is how a table
+        // silently ends up read with somebody else's scope.
+        let sent = requests_for(&log, "/GetTemporaryGlueTableCredentials");
+        assert_eq!(sent.len(), 1, "exactly one vending call per authorization");
+        assert!(
+            sent[0].contains(
+                "arn:aws:glue:us-west-2:123456789012:table/oxidant_lf_secure/lf_protected_customers"
+            ),
+            "{}",
+            sent[0]
+        );
+        // …and carry the authorization id from the metadata response, which is what ties the
+        // credential grant to the decision that produced it in Lake Formation's audit trail.
+        assert!(sent[0].contains("qid-1"), "{}", sent[0]);
+    }
+
+    /// Vending refused must fail the scan. Falling back to the engine's ambient credentials would
+    /// read exactly the data Lake Formation just declined to scope access to.
+    #[tokio::test]
+    async fn refused_vending_fails_the_scan_instead_of_falling_back_to_ambient_credentials() {
+        let (port, _log) = spawn_stub_recording().await;
+        let auth = stub_authorizer_with_vending(port, true);
+        let err = auth
+            .authorize_scan(&["oxidant_lf_secure".to_string()], "vendingdenied")
+            .await
+            .expect_err("vending refused");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("GetTemporaryGlueTableCredentials"), "{msg}");
+        assert!(msg.contains("AccessDenied"), "{msg}");
+    }
+
+    /// A 200 with no credentials in it is still a failure: every field of the response is optional
+    /// in the model, and an empty `AwsCredential` would be sent to S3 as an anonymous request.
+    #[tokio::test]
+    async fn a_credential_response_with_no_credentials_is_an_error() {
+        let (port, _log) = spawn_stub_recording().await;
+        let auth = stub_authorizer_with_vending(port, true);
+        let err = auth
+            .authorize_scan(&["oxidant_lf_secure".to_string()], "vendsnothing")
+            .await
+            .expect_err("no credentials in the response");
+        assert!(
+            format!("{err:?}").contains("returned no credentials"),
+            "{err:?}"
+        );
+    }
+
+    /// An ungoverned table must not trigger vending at all — the decision returns before it, so a
+    /// mixed catalog does not pay a Lake Formation round trip per unregistered table.
+    #[tokio::test]
+    async fn an_ungoverned_table_makes_no_credential_vending_call() {
+        let (port, log) = spawn_stub_recording().await;
+        let auth = stub_authorizer_with_vending(port, true);
+        let access = auth
+            .authorize_scan(&["oxidant_lf_secure".to_string()], "plain")
+            .await
+            .expect("ungoverned");
+        assert!(!access.enforced);
+        assert!(access.credentials.is_none());
+        assert!(
+            requests_for(&log, "/GetTemporaryGlueTableCredentials").is_empty(),
+            "an unregistered table must not be vended for"
+        );
+    }
+
+    /// `vend_credentials=false` is the documented escape hatch: the column/row policy still
+    /// applies, but no credential call is made and reads use the ambient identity.
+    #[tokio::test]
+    async fn vending_off_applies_the_policy_and_makes_zero_vending_calls() {
+        let (port, log) = spawn_stub_recording().await;
+        let auth = stub_authorizer_with_vending(port, false);
+        let access = auth
+            .authorize_scan(&["oxidant_lf_secure".to_string()], "lf_protected_customers")
+            .await
+            .expect("governed table, vending off");
+        assert!(access.enforced);
+        assert_eq!(access.row_filter.as_deref(), Some("region = 'us'"));
+        assert!(access.credentials.is_none());
+        assert!(
+            requests_for(&log, "/GetTemporaryGlueTableCredentials").is_empty(),
+            "vend_credentials=false must not call Lake Formation for credentials"
+        );
+    }
+
+    /// `identity=user` with no runtime role is one of the documented fail-closed cases, and it has
+    /// to fail *before* any AWS call — otherwise a deployment that requires user attribution would
+    /// silently enforce as the engine role until the first STS round trip said otherwise.
+    #[tokio::test]
+    async fn identity_user_without_a_runtime_role_is_refused_before_any_aws_call() {
+        let err = LakeFormationAuthorizer::new(AuthorizerConfig {
+            region: "us-west-2".to_string(),
+            catalog_id: Some("123456789012".to_string()),
+            identity: IdentityMode::User,
+            runtime_role_arn: None,
+            authorized_caller: None,
+            vend_credentials: false,
+        })
+        .await
+        .err()
+        .expect("identity=user requires a runtime role");
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
+        assert!(
+            format!("{err:?}").contains("runtime_role_arn"),
+            "the error must name the setting that is missing: {err:?}"
+        );
+    }
+
+    /// An empty runtime role string is the same mistake spelled differently (`--catalog-conf
+    /// ….runtime_role_arn=`), and must not be accepted as "a role was configured".
+    #[tokio::test]
+    async fn identity_user_with_a_blank_runtime_role_is_refused() {
+        // `build_lakeformation_authorizer` filters blanks out before constructing the config, so
+        // this asserts the same outcome the connect layer's filtering produces.
+        let err = LakeFormationAuthorizer::new(AuthorizerConfig {
+            region: "us-west-2".to_string(),
+            catalog_id: Some("123456789012".to_string()),
+            identity: IdentityMode::User,
+            runtime_role_arn: None,
+            authorized_caller: Some("oxidant".to_string()),
+            vend_credentials: true,
+        })
+        .await
+        .err()
+        .expect("blank runtime role is no runtime role");
         assert!(matches!(err, Error::Plan(_)), "{err:?}");
     }
 
