@@ -14,7 +14,10 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::{static_files, status};
+use crate::{
+    dashboards::{self, DashboardStore},
+    static_files, status,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -43,7 +46,8 @@ pub struct SparkProxyQuery {
     pub url: String,
 }
 
-/// Router with the status token taken from `OXIDANT_STATUS_TOKEN`.
+/// Router with the status token taken from `OXIDANT_STATUS_TOKEN` and dashboards persisted
+/// under `OXIDANT_DASHBOARD_DIR` (see [`crate::dashboards`]).
 pub fn app_router(store: SharedStore) -> Router {
     app_router_with_status_token(store, status::status_token_from_env())
 }
@@ -51,6 +55,16 @@ pub fn app_router(store: SharedStore) -> Router {
 /// Router with an explicit status token — the env-free form, used by tests and by callers
 /// that resolve the token themselves.
 pub fn app_router_with_status_token(store: SharedStore, status_token: Option<String>) -> Router {
+    app_router_with(store, status_token, DashboardStore::from_env())
+}
+
+/// Fully explicit form: nothing is read from the environment. Tests use this to point the
+/// dashboard store at a temp directory (or at memory) instead of the user's home.
+pub fn app_router_with(
+    store: SharedStore,
+    status_token: Option<String>,
+    dashboard_store: DashboardStore,
+) -> Router {
     let state = AppState {
         store,
         status_token: status::normalize_token(status_token).map(Into::into),
@@ -79,6 +93,9 @@ pub fn app_router_with_status_token(store: SharedStore, status_token: Option<Str
         .route("/health", get(|| async { "ok" }))
         .fallback(static_files::serve_static)
         .with_state(state)
+        // Dashboard CRUD carries its own state, so it is merged after `with_state`. It brings
+        // no fallback of its own, leaving the SPA fallback above in effect.
+        .merge(dashboards::router(dashboard_store))
 }
 
 async fn list_applications(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -214,7 +231,8 @@ mod tests {
     #[tokio::test]
     async fn applications_endpoint_returns_app() {
         let store = Arc::new(AppStateStore::new());
-        let app = app_router(store);
+        // Explicit form: this test must not create a dashboard directory in the user's home.
+        let app = app_router_with(store, None, DashboardStore::in_memory());
         let resp = app
             .oneshot(
                 axum::http::Request::builder()

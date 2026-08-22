@@ -1,5 +1,6 @@
 //! HTTP server for the Oxidant monitoring UI: Spark-compatible `/api/v1` REST, SSE, and static SPA.
 
+pub mod dashboards;
 mod routes;
 mod static_files;
 pub mod status;
@@ -11,7 +12,8 @@ use oxidant_common::Result;
 use oxidant_observability::SharedStore;
 use tower_http::cors::{Any, CorsLayer};
 
-pub use routes::{app_router, app_router_with_status_token};
+pub use dashboards::DashboardStore;
+pub use routes::{app_router, app_router_with, app_router_with_status_token};
 
 /// Configuration for the monitoring UI HTTP server.
 #[derive(Clone)]
