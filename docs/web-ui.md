@@ -68,6 +68,93 @@ The **SQL Editor** page runs ad-hoc SQL over the REST statement API — no clien
   `succeeded`, `failed`, `canceled` — with the error message for failures; click one to
   re-inspect its result.
 
+## Dashboards
+
+The **Dashboards** page is a grid of SQL-backed widgets. Each widget is one statement, run
+against this engine on demand through the same [statement API](api.md) the SQL Editor uses —
+so a widget refresh appears on the **Jobs** and **SQL** pages like any other query, with the
+same distributed routing.
+
+- **List page** — every dashboard with its widget count and when it last changed. Name one and
+  press **Create** to start.
+- **View mode** — **Refresh** re-runs every widget; each card has its own **Refresh** too. The
+  **Auto** dropdown sets a per-dashboard refresh interval (off, 5s … 15m) and is saved with the
+  dashboard.
+- **Edit mode** — drag a card by its title bar, resize from its bottom-right corner, **Add
+  widget**, **Edit** or **Remove** one, then **Save**. **Cancel** discards the whole draft.
+
+### Widgets
+
+| Type | Draws |
+|------|-------|
+| **Bar** | One bar group per label; optionally stacked or horizontal |
+| **Line** | One line per numeric column; optionally smoothed or stacked |
+| **Area** | A line with its area filled |
+| **Pie** | A donut of the first numeric column |
+| **Scatter** | `[x, y]` points against two value axes |
+| **Table** | Every column, sortable, paginated |
+| **KPI counter** | A single number |
+
+Funnel, gauge, sankey, heatmap, combo and pivot widgets — plus cross-filters, parameters,
+scheduled refresh, share/embed and export — are [Oxidant Platform](../COMMERCIAL.md) features,
+not part of the engine UI.
+
+### How a result becomes a chart
+
+One rule covers every widget type:
+
+> **The first column labels the point. Every numeric column after it is a series.**
+
+```sql
+SELECT region, revenue, orders FROM sales GROUP BY region
+--     ^label   ^series  ^series
+```
+
+- Column 1 is the category: the bar's label, the point on the line, the pie slice's name.
+- Every column after it whose type is numeric becomes a series named after the column.
+  Non-numeric trailing columns are ignored by charts; the **Table** widget shows everything.
+- **Pie** uses only the first numeric column — a pie has one dimension. **Scatter** reads
+  column 1 as the x value, falling back to the row number when it is not numeric.
+- **KPI** takes the first numeric cell of the first row. A one-column, one-row result is used
+  whatever its type, so `SELECT 'healthy' AS state` is a legal KPI.
+- A lone numeric column is plotted against the row number.
+
+NULL is absence, not zero:
+
+| Where | Renders as |
+|-------|------------|
+| A value column | A gap — the line breaks, no bar is drawn |
+| The label column | `∅` |
+| A pie slice | Dropped |
+| A table cell | `NULL`, and sorts last in **both** directions |
+
+Whether a column counts as numeric comes from the Arrow type the statement API reports
+(`Int64`, `Float64`, `Decimal128(10, 2)`, …), so an all-NULL `Int64` is still a series rather
+than being mistaken for text. Widgets fetch at most **1000 rows** — aggregate in SQL rather
+than shipping raw rows to a chart.
+
+### Where dashboards are stored
+
+There is no metadata database in the engine, so each dashboard is a JSON file under
+`OXIDANT_DASHBOARD_DIR` (default `$XDG_DATA_HOME/oxidant/dashboards`, else
+`~/.oxidant/dashboards`), written atomically. They are plain documents — check them into git,
+copy them between servers, or edit them over
+`GET`/`POST`/`PATCH`/`DELETE /api/dashboards`. If the directory cannot be written, dashboards
+still work for the life of the process but are not persisted.
+
+### Serving the dashboards page
+
+The page compiled into the binary is a single self-contained HTML file, which cannot carry a
+charting library or a grid engine. Dashboards therefore live in the React app under
+[`ui/`](../ui); point the server at a build of it:
+
+```sh
+cd ui && npm install && npm run build
+OXIDANT_UI_DIR=$PWD/dist oxidant spark server --port 50051 --ui-port 4040
+```
+
+Unset, nothing changes and the embedded monitoring page is served as before.
+
 ## Notebook
 
 The **Notebook** page is a lightweight SQL notebook that runs entirely in your browser against

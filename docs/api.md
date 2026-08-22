@@ -17,6 +17,11 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/v1/statements/{id}/result` | Result rows as JSON or CSV |
 | `POST` | `/api/v1/statements/{id}/cancel` | Cancel a pending/running statement |
 | `GET` | `/api/v1/cluster/status` | Cluster mode, workers, engine version |
+| `GET` | `/api/dashboards` | Dashboards, newest-updated first |
+| `POST` | `/api/dashboards` | Create a dashboard |
+| `GET` | `/api/dashboards/{id}` | One dashboard document |
+| `PATCH` | `/api/dashboards/{id}` | Update name, widgets, layout or refresh interval |
+| `DELETE` | `/api/dashboards/{id}` | Delete a dashboard |
 | `GET` | `/api/status` | Driver status for a control plane — **bearer token required** |
 
 ## Submit a statement
@@ -113,6 +118,49 @@ curl -s http://localhost:4040/api/v1/cluster/status
 
 `mode` is `single-node`, `local-cluster`, or `distributed`; `workers` lists the connected
 worker endpoints (see [workers.md](workers.md)).
+
+## Dashboards
+
+A dashboard is a JSON document: a [react-grid-layout](https://github.com/react-grid-layout/react-grid-layout)
+`layout` array plus a list of widget specs, each of which is a SQL statement the browser runs
+through the statement API above. The server stores and validates them; it never executes a
+widget's SQL itself. See [web-ui.md](web-ui.md#dashboards) for the page and the
+SQL-to-chart convention.
+
+```sh
+curl -s -X POST http://localhost:4040/api/dashboards \
+  -H 'content-type: application/json' -d '{
+    "name": "Sales overview",
+    "widgets": [
+      {"id": "w1", "type": "bar", "title": "Revenue by region",
+       "sql": "SELECT region, revenue FROM sales", "options": {"stacked": false}}
+    ],
+    "layout": [{"i": "w1", "x": 0, "y": 0, "w": 6, "h": 8}],
+    "refreshIntervalSecs": 30
+  }'
+```
+
+```json
+{
+  "id": "d3f1…",
+  "name": "Sales overview",
+  "widgets": [{"id": "w1", "type": "bar", "title": "Revenue by region", "sql": "…", "options": {}}],
+  "layout": [{"i": "w1", "x": 0, "y": 0, "w": 6, "h": 8}],
+  "refreshIntervalSecs": 30,
+  "createdAtMs": 1787405314595,
+  "updatedAtMs": 1787405314595
+}
+```
+
+`type` is one of `bar`, `line`, `area`, `pie`, `scatter`, `table`, `kpi`; anything else is a
+`400` naming the accepted set. Empty SQL, an empty name, duplicate widget ids, unknown fields
+and a `layout` entry pointing at no widget are refused the same way, with
+`{"error": "..."}` explaining which. `PATCH` replaces only the fields it is given; sending
+`"refreshIntervalSecs": null` turns auto-refresh off, while omitting the key leaves it alone.
+`DELETE` answers `204`.
+
+Documents live under `OXIDANT_DASHBOARD_DIR` (default `$XDG_DATA_HOME/oxidant/dashboards`,
+else `~/.oxidant/dashboards`), one file per dashboard.
 
 ## Driver status
 

@@ -1,3 +1,4 @@
+import { lazy, Suspense } from "react";
 import { NavLink, Route, Routes } from "react-router-dom";
 import { useAppMeta } from "@/lib/usePolling";
 import { useTheme } from "@/lib/theme";
@@ -13,12 +14,19 @@ import EnvironmentPage from "@/pages/EnvironmentPage";
 import ComparePage from "@/pages/ComparePage";
 import ClusterPage from "@/pages/ClusterPage";
 
+// Dashboards are the only pages that pull in ECharts, react-grid-layout and TanStack Table —
+// together roughly four times the rest of the app. Loading them on demand keeps the monitoring
+// tabs, which are what most people open this UI for, at their previous weight.
+const DashboardsPage = lazy(() => import("@/pages/DashboardsPage"));
+const DashboardPage = lazy(() => import("@/pages/DashboardPage"));
+
 const tabs = [
   { to: "/", label: "Jobs", end: true },
   { to: "/stages", label: "Stages" },
   { to: "/sql", label: "SQL" },
   { to: "/editor", label: "Editor" },
   { to: "/notebook", label: "Notebook" },
+  { to: "/dashboards", label: "Dashboards" },
   { to: "/catalog", label: "Catalog" },
   { to: "/cluster", label: "Cluster" },
   { to: "/executors", label: "Executors" },
@@ -78,18 +86,22 @@ export default function App() {
         ))}
       </nav>
       <main className="flex-1 overflow-auto bg-bg p-4">
-        <Routes>
-          <Route path="/" element={<JobsPage />} />
-          <Route path="/stages" element={<StagesPage />} />
-          <Route path="/sql" element={<SqlPage />} />
-          <Route path="/editor" element={<EditorPage />} />
-          <Route path="/notebook" element={<NotebookPage />} />
-          <Route path="/catalog" element={<CatalogPage />} />
-          <Route path="/cluster" element={<ClusterPage />} />
-          <Route path="/executors" element={<ExecutorsPage />} />
-          <Route path="/environment" element={<EnvironmentPage />} />
-          <Route path="/compare" element={<ComparePage />} />
-        </Routes>
+        <Suspense fallback={<p className="text-sm text-muted">Loading…</p>}>
+          <Routes>
+            <Route path="/" element={<JobsPage />} />
+            <Route path="/stages" element={<StagesPage />} />
+            <Route path="/sql" element={<SqlPage />} />
+            <Route path="/editor" element={<EditorPage />} />
+            <Route path="/notebook" element={<NotebookPage />} />
+            <Route path="/dashboards" element={<DashboardsPage />} />
+            <Route path="/dashboards/:id" element={<DashboardPage />} />
+            <Route path="/catalog" element={<CatalogPage />} />
+            <Route path="/cluster" element={<ClusterPage />} />
+            <Route path="/executors" element={<ExecutorsPage />} />
+            <Route path="/environment" element={<EnvironmentPage />} />
+            <Route path="/compare" element={<ComparePage />} />
+          </Routes>
+        </Suspense>
       </main>
     </div>
   );
