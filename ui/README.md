@@ -11,7 +11,20 @@ npm install
 npm run dev   # http://localhost:4041, proxies /api to :4040
 ```
 
-Production builds use the embedded SPA in `oxidant-ui-server` (no npm required at runtime).
+```bash
+npm test        # vitest: mapping, chart options, widget render smoke
+npm run build   # tsc + vite -> dist/
+```
+
+By default the binary serves the single-file page compiled into `oxidant-ui-server`, so no npm
+is required at runtime. That page cannot import anything, which is fine for the monitoring
+tables and impossible for **Dashboards** — to serve this app instead, point the server at a
+build of it:
+
+```bash
+npm run build
+OXIDANT_UI_DIR=$PWD/dist oxidant spark server --port 50051 --ui-port 4040
+```
 
 ## Theme
 
@@ -35,6 +48,8 @@ it is served by the binary itself and cannot import anything.
 - **SQL** — physical execution plans
 - **Executors** — Flight workers
 - **Environment** — session config and `OXIDANT_*` env
+- **Dashboards** — grids of SQL-backed widgets (ECharts + react-grid-layout); see
+  [docs/web-ui.md](../docs/web-ui.md#dashboards) for the SQL-to-chart convention
 - **Compare** — side-by-side Oxidant vs Spark REST metrics
 
 ## History server
