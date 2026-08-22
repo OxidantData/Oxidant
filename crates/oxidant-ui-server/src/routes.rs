@@ -13,6 +13,7 @@ use oxidant_observability::SharedStore;
 use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
     dashboards::{self, DashboardStore},
@@ -65,11 +66,27 @@ pub fn app_router_with(
     status_token: Option<String>,
     dashboard_store: DashboardStore,
 ) -> Router {
+    app_router_with_spa(
+        store,
+        status_token,
+        dashboard_store,
+        static_files::spa_dir(),
+    )
+}
+
+/// As [`app_router_with`], with the SPA directory passed in rather than read from the
+/// environment — the form tests use to exercise both static-file paths.
+pub fn app_router_with_spa(
+    store: SharedStore,
+    status_token: Option<String>,
+    dashboard_store: DashboardStore,
+    spa_dir: Option<std::path::PathBuf>,
+) -> Router {
     let state = AppState {
         store,
         status_token: status::normalize_token(status_token).map(Into::into),
     };
-    Router::new()
+    let router = Router::new()
         .route("/api/status", get(status::status))
         .route("/api/v1/applications", get(list_applications))
         .route("/api/v1/applications/{app_id}", get(get_application))
@@ -90,11 +107,21 @@ pub fn app_router_with(
         )
         .route("/api/v1/events/stream", get(events_stream))
         .route("/api/v1/spark-proxy", get(spark_proxy))
-        .route("/health", get(|| async { "ok" }))
-        .fallback(static_files::serve_static)
+        .route("/health", get(|| async { "ok" }));
+
+    // Either the built React app on disk, or the page compiled into the binary. `ServeDir`'s
+    // own fallback sends unknown paths to index.html so client-side routes (`/dashboards/<id>`)
+    // survive a hard refresh; it also rejects traversal out of the directory.
+    let router = match spa_dir {
+        Some(dir) => router
+            .fallback_service(ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html")))),
+        None => router.fallback(static_files::serve_static),
+    };
+
+    router
         .with_state(state)
         // Dashboard CRUD carries its own state, so it is merged after `with_state`. It brings
-        // no fallback of its own, leaving the SPA fallback above in effect.
+        // no fallback of its own, leaving the fallback above in effect.
         .merge(dashboards::router(dashboard_store))
 }
 
@@ -246,5 +273,105 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let apps: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(!apps.is_empty());
+    }
+
+    fn spa_router(dir: Option<std::path::PathBuf>) -> Router {
+        let store = Arc::new(AppStateStore::new());
+        app_router_with_spa(store, None, DashboardStore::in_memory(), dir)
+    }
+
+    async fn get_body(app: &Router, uri: &str) -> (StatusCode, String) {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Without `OXIDANT_UI_DIR`, nothing changes: the page compiled into the binary is served
+    /// for `/` and for client-side routes alike.
+    #[tokio::test]
+    async fn without_a_spa_dir_the_embedded_page_is_served() {
+        let app = spa_router(None);
+        for uri in ["/", "/dashboards", "/dashboards/d1"] {
+            let (status, body) = get_body(&app, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(
+                body.contains("<html"),
+                "{uri} should serve the embedded page"
+            );
+        }
+    }
+
+    /// With one, the built app is served — and a deep client-side route still resolves to
+    /// `index.html` so a hard refresh on `/dashboards/<id>` does not 404.
+    #[tokio::test]
+    async fn a_spa_dir_serves_the_built_app_and_survives_a_deep_refresh() {
+        let dir = std::env::temp_dir().join(format!("oxidant-spa-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            "<!doctype html><title>built</title>",
+        )
+        .unwrap();
+        std::fs::write(dir.join("assets/app.js"), "console.log(1)").unwrap();
+
+        let app = spa_router(Some(dir.clone()));
+        let (status, body) = get_body(&app, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("built"), "{body}");
+
+        let (status, body) = get_body(&app, "/assets/app.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "console.log(1)");
+
+        let (status, body) = get_body(&app, "/dashboards/d1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("built"),
+            "deep route must fall back to index.html"
+        );
+
+        // The API keeps precedence over the file server.
+        let (status, body) = get_body(&app, "/api/dashboards").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("dashboards"), "{body}");
+
+        // …and the file server cannot be walked out of. A traversal is not an error page:
+        // `ServeDir` refuses it, and the SPA fallback answers with index.html — so the check
+        // that matters is what came back, not the status.
+        for uri in [
+            "/../../etc/passwd",
+            "/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+            "/assets/../../../etc/passwd",
+        ] {
+            let (_, body) = get_body(&app, uri).await;
+            assert!(!body.contains("root:"), "{uri} escaped the SPA directory");
+            assert!(
+                body.contains("built"),
+                "{uri} should fall back to index.html"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mistyped path must not take the UI down — it degrades to the embedded page.
+    #[test]
+    fn a_spa_dir_without_an_index_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("oxidant-spa-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var(static_files::UI_DIR_ENV, &dir);
+        assert!(static_files::spa_dir().is_none());
+        std::env::remove_var(static_files::UI_DIR_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
