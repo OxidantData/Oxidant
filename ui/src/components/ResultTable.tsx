@@ -65,7 +65,7 @@ export default function ResultTable({
         {enablePagination && pageCount > 1 && (
           <div className="flex items-center gap-2">
             <select
-              className="rounded border border-border bg-bg px-1.5 py-1 text-xs"
+              className="rounded border border-hairline bg-bg px-1.5 py-1 text-xs"
               value={pageSize}
               onChange={(e) => {
                 setPageSize(Number(e.target.value));
@@ -79,7 +79,7 @@ export default function ResultTable({
               ))}
             </select>
             <button
-              className="rounded border border-border px-2 py-1 hover:bg-surface disabled:opacity-40"
+              className="rounded border border-hairline px-2 py-1 hover:bg-raised disabled:opacity-40"
               disabled={page === 0}
               onClick={() => setPage((p) => p - 1)}
             >
@@ -89,7 +89,7 @@ export default function ResultTable({
               {page + 1} / {pageCount}
             </span>
             <button
-              className="rounded border border-border px-2 py-1 hover:bg-surface disabled:opacity-40"
+              className="rounded border border-hairline px-2 py-1 hover:bg-raised disabled:opacity-40"
               disabled={page >= pageCount - 1}
               onClick={() => setPage((p) => p + 1)}
             >
@@ -106,11 +106,11 @@ export default function ResultTable({
               {cols.map((c) => (
                 <th
                   key={c}
-                  className="border-b border-border px-2.5 py-2 text-left"
+                  className="border-b border-hairline px-2.5 py-2 text-left"
                 >
                   <div className="flex items-center gap-2">
                     <TypeIcon type={typeOf(c)} />
-                    <span className="font-medium text-text">{c}</span>
+                    <span className="font-medium text-body">{c}</span>
                   </div>
                   <div className="mt-0.5 pl-6 text-xs font-normal text-muted">
                     {typeOf(c)}
@@ -127,7 +127,7 @@ export default function ResultTable({
                   return (
                     <td
                       key={c}
-                      className={`border-b border-border px-2.5 py-2 whitespace-nowrap ${
+                      className={`border-b border-hairline px-2.5 py-2 whitespace-nowrap ${
                         t == null ? "text-muted" : ""
                       }`}
                     >
@@ -195,7 +195,7 @@ function StringIcon() {
 function NumberIcon() {
   return (
     <svg
-      className="h-3.5 w-3.5 text-accent"
+      className="h-3.5 w-3.5 text-muted"
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -216,7 +216,7 @@ function NumberIcon() {
 function BooleanIcon() {
   return (
     <svg
-      className="h-3.5 w-3.5 text-success"
+      className="h-3.5 w-3.5 text-muted"
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -233,7 +233,7 @@ function BooleanIcon() {
 function DateIcon() {
   return (
     <svg
-      className="h-3.5 w-3.5 text-warning"
+      className="h-3.5 w-3.5 text-muted"
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"

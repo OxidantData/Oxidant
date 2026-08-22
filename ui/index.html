@@ -3,9 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Oxidant UI</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <link rel="icon" type="image/svg+xml" href="/brand/logo-tile-black.svg" />
+    <link rel="apple-touch-icon" href="/brand/logo-tile-black.svg" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#111112" />
+    <title>Oxidant</title>
+    <!-- Fonts are bundled (imported from src/main.tsx) — the driver may have no egress. -->
+    <script>
+      // Dark is the default; apply a persisted light preference before paint to avoid a flash.
+      (function () {
+        try {
+          if (localStorage.getItem("oxidant-theme") === "light")
+            document.documentElement.setAttribute("data-theme", "light");
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

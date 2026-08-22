@@ -224,7 +224,7 @@ export default function NotebookPage() {
       <CatalogSidebar onInsert={insertName} />
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <div className="oxidant-card flex flex-wrap items-center gap-2">
-          <button className="oxidant-btn" onClick={() => add("sql")}>
+          <button className="oxidant-btn-primary" onClick={() => add("sql")}>
             + SQL cell
           </button>
           <button className="nb-btn" onClick={() => add("md")}>
@@ -264,7 +264,7 @@ export default function NotebookPage() {
             return (
               <div key={cell.id} className="oxidant-card space-y-2">
                 <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="rounded border border-border px-2 py-0.5 text-xs text-muted">
+                  <span className="rounded-oxidant-sm border border-hairline bg-raised px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em] text-muted">
                     {cell.type === "sql" ? "SQL" : "Markdown"}
                   </span>
                   {cell.type === "sql" && (
@@ -297,7 +297,7 @@ export default function NotebookPage() {
                     <label className="ml-2 flex items-center gap-1.5 text-xs text-muted">
                       <input
                         type="checkbox"
-                        className="accent-accent"
+                        className="accent-solid"
                         checked={limit100}
                         onChange={(e) => setLimit100(cell.id, e.target.checked)}
                       />
@@ -310,7 +310,7 @@ export default function NotebookPage() {
                     ref={(el) => {
                       textareaRefs.current[cell.id] = el;
                     }}
-                    className="w-full rounded-md border border-border bg-bg p-3 font-mono text-sm focus:border-accent focus:outline-none"
+                    className="oxidant-input w-full p-3 font-mono"
                     rows={Math.min(
                       12,
                       Math.max(3, cell.source.split("\n").length + 1)
@@ -332,7 +332,7 @@ export default function NotebookPage() {
                   />
                 ) : (
                   <textarea
-                    className="w-full rounded-md border border-border bg-bg p-3 font-mono text-sm focus:border-accent focus:outline-none"
+                    className="oxidant-input w-full p-3 font-mono"
                     rows={Math.min(
                       12,
                       Math.max(3, cell.source.split("\n").length + 1)
@@ -363,12 +363,12 @@ export default function NotebookPage() {
                       </div>
                     )}
                     {!out.running && out.error && (
-                      <div className="whitespace-pre-wrap rounded-md border border-danger bg-danger/10 p-3 font-mono text-xs text-danger">
+                      <div className="whitespace-pre-wrap rounded-oxidant-sm border border-danger-line bg-danger-tint p-3 font-mono text-xs text-danger">
                         {out.error}
                       </div>
                     )}
                     {!out.running && out.doc?.status === "failed" && (
-                      <div className="whitespace-pre-wrap rounded-md border border-danger bg-danger/10 p-3 font-mono text-xs text-danger">
+                      <div className="whitespace-pre-wrap rounded-oxidant-sm border border-danger-line bg-danger-tint p-3 font-mono text-xs text-danger">
                         {out.doc.error ?? "statement failed"}
                       </div>
                     )}

@@ -27,7 +27,7 @@ export default function ExecutorsPage() {
         </thead>
         <tbody>
           {executors.map((e) => (
-            <tr key={e.id} className="border-t border-border">
+            <tr key={e.id} className="border-t border-hairline">
               <td className="p-2">{e.id}</td>
               <td className="p-2 font-mono text-xs">{e.hostPort}</td>
               <td className="p-2">{e.activeTasks}</td>

@@ -134,7 +134,7 @@ export default function EditorPage() {
               </label>
               <SqlAutocompleteTextarea
                 ref={textareaRef}
-                className="h-44 w-full rounded-md border border-border bg-bg p-3 font-mono text-sm focus:border-accent focus:outline-none"
+                className="oxidant-input h-44 w-full p-3 font-mono"
                 value={sql}
                 spellCheck={false}
                 onChange={(e) => setSql(e.target.value)}
@@ -147,14 +147,14 @@ export default function EditorPage() {
               />
               <div className="flex flex-wrap items-center gap-3">
                 <button
-                  className="oxidant-btn"
+                  className="oxidant-btn-primary"
                   onClick={run}
                   disabled={running}
                 >
                   {running ? "Running…" : "Run"}
                 </button>
                 <button
-                  className="rounded-md border border-border px-4 py-2 text-sm hover:border-muted disabled:opacity-50"
+                  className="oxidant-btn-ghost"
                   onClick={cancel}
                   disabled={!running}
                 >
@@ -163,7 +163,7 @@ export default function EditorPage() {
                 <label className="flex items-center gap-1.5 text-sm text-muted">
                   <input
                     type="checkbox"
-                    className="accent-accent"
+                    className="accent-solid"
                     checked={limit100}
                     onChange={(e) => setLimit100(e.target.checked)}
                   />
@@ -181,7 +181,7 @@ export default function EditorPage() {
             </div>
 
             {error && (
-              <div className="shrink-0 whitespace-pre-wrap rounded-md border border-danger bg-danger/10 p-3 font-mono text-xs text-danger">
+              <div className="shrink-0 whitespace-pre-wrap rounded-oxidant-sm border border-danger-line bg-danger-tint p-3 font-mono text-xs text-danger">
                 {error}
               </div>
             )}
@@ -221,9 +221,9 @@ export default function EditorPage() {
 
           <div className="w-72 shrink-0 oxidant-card overflow-hidden">
             <div className="mb-2 flex items-center justify-between">
-              <strong>Recent statements</strong>
+              <span className="oxidant-eyebrow">Recent statements</span>
               <button
-                className="text-xs text-muted hover:text-text"
+                className="text-xs text-muted hover:text-body"
                 onClick={refreshStatements}
               >
                 Refresh
@@ -233,7 +233,7 @@ export default function EditorPage() {
               {!statements?.length ? (
                 <span className="text-sm text-muted">No statements yet.</span>
               ) : (
-                <div className="divide-y divide-border">
+                <div className="divide-y divide-hairline">
                   {statements.map((s) => (
                     <button
                       key={s.statementId}
