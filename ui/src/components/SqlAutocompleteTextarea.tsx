@@ -17,6 +17,12 @@ export interface SqlAutocompleteTextareaHandle {
   focus: () => void;
 }
 
+/**
+ * Suggestion-kind badges are monochrome: the label already reads `table` / `column`, so hue
+ * would be pure decoration. Emphasis comes from the hairline and the raised fill.
+ */
+const KIND_BADGE_CLASS = "border border-hairline bg-raised text-muted";
+
 const SEPARATORS = /[\s,;()=<>!+\-*/'"{}\[\]]/;
 const MIN_QUERY_LEN = 1;
 const MAX_SUGGESTIONS = 8;
@@ -224,9 +230,9 @@ export default forwardRef<
         <div
           ref={popupRef}
           style={{ top: popupPos.top, left: popupPos.left }}
-          className="fixed z-50 min-w-[220px] max-w-xs overflow-hidden rounded-md border border-border bg-surface shadow-lg"
+          className="fixed z-50 min-w-[220px] max-w-xs overflow-hidden rounded-oxidant-sm border border-hairline bg-surface shadow-lg"
         >
-          <div className="border-b border-border px-2 py-1 text-[10px] text-muted">
+          <div className="border-b border-hairline px-2 py-1 text-[10px] text-muted">
             Catalog autocomplete
           </div>
           {suggestions.map((s, i) => (
@@ -238,16 +244,14 @@ export default forwardRef<
               }}
               onMouseEnter={() => setSelectedIndex(i)}
               className={`flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs ${
-                i === selectedIndex ? "bg-accent/20 text-accent" : "text-text"
+                i === selectedIndex ? "bg-raised text-body" : "text-body"
               }`}
             >
               <span className="truncate" title={s.qualified}>
                 {s.name}
               </span>
               <span
-                className={`ml-2 shrink-0 rounded px-1 py-0.5 text-[10px] ${
-                  kindBadgeClass(s.kind)
-                }`}
+                className={`ml-2 shrink-0 rounded px-1 py-0.5 text-[10px] ${KIND_BADGE_CLASS}`}
               >
                 {s.kind}
               </span>
@@ -258,21 +262,6 @@ export default forwardRef<
     </div>
   );
 });
-
-function kindBadgeClass(kind: AutocompleteSuggestion["kind"]): string {
-  switch (kind) {
-    case "catalog":
-      return "bg-warning/20 text-warning";
-    case "namespace":
-      return "bg-success/20 text-success";
-    case "table":
-      return "bg-accent/20 text-accent";
-    case "column":
-      return "bg-muted/20 text-muted";
-    default:
-      return "bg-muted/20 text-muted";
-  }
-}
 
 function scrollableAncestors(el: HTMLElement): HTMLElement[] {
   const out: HTMLElement[] = [];

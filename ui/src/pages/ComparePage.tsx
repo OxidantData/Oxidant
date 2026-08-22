@@ -66,7 +66,7 @@ export default function ComparePage() {
           </div>
           {delta != null && (
             <div className="oxidant-card">
-              <p className={oxidantDur < sparkDur ? "text-success" : "text-danger"}>
+              <p className={oxidantDur < sparkDur ? "text-success" : "text-warning"}>
                 Oxidant is {Math.abs(Number(delta))}%{" "}
                 {oxidantDur < sparkDur ? "faster" : "slower"} than Spark (job wall-clock sum)
               </p>
@@ -108,11 +108,11 @@ export default function ComparePage() {
       <div className="oxidant-card space-y-2">
         <label className="text-sm text-muted">Spark UI / History Server base URL</label>
         <input
-          className="w-full max-w-lg rounded-md border border-border bg-bg px-3 py-2 text-sm"
+          className="oxidant-input w-full max-w-lg"
           value={sparkUrl}
           onChange={(e) => setSparkUrl(e.target.value)}
         />
-        <button className="oxidant-btn" onClick={compare} disabled={loading}>
+        <button className="oxidant-btn-primary" onClick={compare} disabled={loading}>
           {loading ? "Loading…" : "Compare"}
         </button>
       </div>

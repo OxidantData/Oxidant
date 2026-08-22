@@ -112,11 +112,11 @@ export default function CatalogSidebar({
 
   if (!expanded) {
     return (
-      <div className="flex w-10 flex-col items-center border-r border-border bg-surface py-3">
+      <div className="flex w-10 flex-col items-center border-r border-hairline bg-surface py-3">
         <button
           title="Open catalog explorer"
           onClick={() => setExpanded(true)}
-          className="rounded p-1.5 text-muted hover:bg-border hover:text-text"
+          className="rounded p-1.5 text-muted hover:bg-raised hover:text-body"
         >
           <DatabaseIcon />
         </button>
@@ -125,13 +125,13 @@ export default function CatalogSidebar({
   }
 
   return (
-    <div className="flex w-60 flex-col border-r border-border bg-surface">
-      <div className="flex items-center justify-between border-b border-border px-3 py-2">
-        <span className="text-sm font-semibold">Catalog</span>
+    <div className="flex w-60 flex-col border-r border-hairline bg-surface">
+      <div className="flex items-center justify-between border-b border-hairline px-3 py-2">
+        <span className="text-sm font-semibold tracking-display">Catalog</span>
         <button
           title="Close catalog explorer"
           onClick={() => setExpanded(false)}
-          className="rounded p-1 text-muted hover:bg-border hover:text-text"
+          className="rounded p-1 text-muted hover:bg-raised hover:text-body"
         >
           <ChevronLeftIcon />
         </button>
@@ -231,7 +231,7 @@ export default function CatalogSidebar({
       </div>
 
       {error && (
-        <div className="border-t border-border p-2 text-xs text-danger">
+        <div className="border-t border-hairline p-2 text-xs text-danger">
           {error}
         </div>
       )}
@@ -249,8 +249,8 @@ function Panel({
   loading?: boolean;
 }) {
   return (
-    <div className="flex min-h-0 flex-1 flex-col border-b border-border last:border-b-0">
-      <div className="bg-bg/50 px-3 py-1 text-xs font-medium text-muted">
+    <div className="flex min-h-0 flex-1 flex-col border-b border-hairline last:border-b-0">
+      <div className="oxidant-eyebrow bg-bg-subtle px-3 py-1.5">
         {label}
       </div>
       <div className="flex-1 overflow-y-auto px-2 py-1">
@@ -277,8 +277,8 @@ function Item({
       onDoubleClick={onDblClick}
       className={`flex w-full items-center rounded px-1.5 py-1 text-left text-xs ${
         active
-          ? "bg-accent/20 text-accent"
-          : "text-text hover:bg-border/60"
+          ? "bg-raised text-body"
+          : "text-body hover:bg-raised"
       }`}
     >
       {children}
