@@ -35,3 +35,24 @@ export function useTheme() {
 
   return { theme, toggle };
 }
+
+/**
+ * The theme currently applied to `<html>`, tracked by observing the attribute rather than by
+ * sharing `useTheme`'s state. The toggle lives in one component and there is no theme context;
+ * anything that has to *react* to a switch (the charts, which bake their palette in at init)
+ * subscribes here instead of duplicating the toggle's state.
+ */
+export function useThemeMode(): Theme {
+  const [theme, setTheme] = useState<Theme>(readInitial);
+
+  useEffect(() => {
+    if (typeof MutationObserver !== "function") return;
+    const root = document.documentElement;
+    const observer = new MutationObserver(() => setTheme(readInitial()));
+    observer.observe(root, { attributes: true, attributeFilter: ["data-theme"] });
+    setTheme(readInitial());
+    return () => observer.disconnect();
+  }, []);
+
+  return theme;
+}

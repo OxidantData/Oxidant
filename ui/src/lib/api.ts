@@ -125,19 +125,32 @@ async function readJson<T>(r: Response, path: string): Promise<T> {
   return data as T;
 }
 
-async function get<T>(path: string): Promise<T> {
-  return readJson<T>(await fetch(path), path);
-}
-
-async function post<T>(path: string, body?: unknown): Promise<T> {
+/**
+ * One JSON request against the server, with the `{"error": "..."}` convention applied. Bodies
+ * are omitted entirely when `body` is undefined, so a bare POST/DELETE sends no content type.
+ * A 204 (the dashboard delete) resolves to `null`.
+ */
+export async function apiJson<T>(
+  method: string,
+  path: string,
+  body?: unknown
+): Promise<T> {
   return readJson<T>(
     await fetch(path, {
-      method: "POST",
+      method,
       headers: body === undefined ? {} : { "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
     }),
     path
   );
+}
+
+async function get<T>(path: string): Promise<T> {
+  return apiJson<T>("GET", path);
+}
+
+async function post<T>(path: string, body?: unknown): Promise<T> {
+  return apiJson<T>("POST", path, body);
 }
 
 export const api = {

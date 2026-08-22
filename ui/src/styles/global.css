@@ -132,3 +132,29 @@
   text-decoration-color: var(--oxidant-border-strong);
   text-underline-offset: 4px;
 }
+
+/* ── Dashboard grid ────────────────────────────────────────────────────────────────────
+ * react-grid-layout ships a red drop placeholder and a hard-coded dark resize chevron —
+ * both are wrong in a monochrome system that reserves red for failures and has two themes.
+ * Everything below re-skins the grid onto the brand tokens; nothing here changes geometry.
+ */
+.react-grid-item.react-grid-placeholder {
+  background: var(--oxidant-solid);
+  opacity: 0.12;
+  border-radius: var(--oxidant-radius);
+}
+
+/* The resize corner: a hairline chevron that only asserts itself on hover. */
+.react-grid-item > .react-resizable-handle::after {
+  border-right-color: var(--oxidant-border-strong);
+  border-bottom-color: var(--oxidant-border-strong);
+}
+.react-grid-item:hover > .react-resizable-handle::after {
+  border-right-color: var(--oxidant-text-muted);
+  border-bottom-color: var(--oxidant-text-muted);
+}
+
+/* A card being dragged lifts off the page — the one shadow in this UI, and it is transient. */
+.react-grid-item.react-draggable-dragging {
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
