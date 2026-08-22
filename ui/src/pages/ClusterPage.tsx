@@ -44,7 +44,7 @@ export default function ClusterPage() {
 
       <div className="oxidant-card flex min-h-0 flex-1 flex-col overflow-hidden">
         <div className="mb-2 flex items-center justify-between">
-          <strong className="text-sm">Cluster topology</strong>
+          <span className="oxidant-eyebrow">Cluster topology</span>
           <span className="text-xs text-muted">version {status?.version}</span>
         </div>
         {status?.workers.length ? (
@@ -52,7 +52,7 @@ export default function ClusterPage() {
             <table className="w-full border-collapse text-sm">
               <thead>
                 <tr>
-                  <th className="border-b border-border px-2 py-1 text-left text-muted">
+                  <th className="border-b border-hairline px-2 py-1 text-left text-muted">
                     Worker endpoint
                   </th>
                 </tr>
@@ -60,7 +60,7 @@ export default function ClusterPage() {
               <tbody>
                 {status.workers.map((w) => (
                   <tr key={w}>
-                    <td className="border-b border-border px-2 py-1.5 font-mono text-xs">
+                    <td className="border-b border-hairline px-2 py-1.5 font-mono text-xs">
                       {w}
                     </td>
                   </tr>
@@ -75,18 +75,18 @@ export default function ClusterPage() {
 
       <div className="oxidant-card flex min-h-0 flex-1 flex-col overflow-hidden">
         <div className="mb-2 flex items-center justify-between">
-          <strong className="text-sm">Process logs</strong>
+          <span className="oxidant-eyebrow">Process logs</span>
           <label className="flex items-center gap-1.5 text-xs text-muted">
             <input
               type="checkbox"
-              className="accent-accent"
+              className="accent-solid"
               checked={autoScroll}
               onChange={(e) => setAutoScroll(e.target.checked)}
             />
             Auto-scroll
           </label>
         </div>
-        <div className="min-h-0 flex-1 overflow-auto rounded bg-bg p-2 font-mono text-xs">
+        <div className="oxidant-code min-h-0 flex-1 overflow-auto p-2">
           {(logsData?.logs.length ?? 0) === 0 && (
             <span className="text-muted">No logs captured yet.</span>
           )}
@@ -105,8 +105,8 @@ export default function ClusterPage() {
 function MetricCard({ label, value }: { label: string; value: string }) {
   return (
     <div className="oxidant-card">
-      <div className="text-xs text-muted">{label}</div>
-      <div className="mt-1 text-lg font-semibold">{value}</div>
+      <div className="oxidant-eyebrow">{label}</div>
+      <div className="mt-1.5 text-xl font-semibold tracking-display">{value}</div>
     </div>
   );
 }

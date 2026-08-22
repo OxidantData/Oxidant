@@ -1,44 +1,100 @@
-:root {
-  --oxidant-bg: #0b0b0c;
-  --oxidant-surface: #141416;
-  --oxidant-border: #26262b;
-  --oxidant-text: #f4f4f5;
-  --oxidant-text-muted: #9ca3af;
-  --oxidant-accent: #ff6a00;
-  --oxidant-success: #16a34a;
-  --oxidant-danger: #dc2626;
-  --oxidant-warning: #d97706;
-  --oxidant-font-ui: Inter, ui-sans-serif, system-ui, sans-serif;
-  --oxidant-font-mono: "JetBrains Mono", ui-monospace, monospace;
-}
+/* Theme tokens first, then Tailwind layers read them through tailwind.config.js.
+   Brand typography is self-hosted and imported from main.tsx — no CDN, because the driver
+   this UI ships on may have no egress. */
+@import "./theme.css";
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-body {
-  font-family: var(--oxidant-font-ui);
-  background: var(--oxidant-bg);
-  color: var(--oxidant-text);
-  min-height: 100vh;
+/* theme.css above is a byte-for-byte copy of the website's, which names the webfont family
+   `Geist` (that is what Google Fonts serves it as). We self-host through Fontsource, whose
+   variable face registers as `Geist Variable`. Prepend that one family here rather than
+   forking the shared token file — re-syncing the brand stays a straight copy. */
+:root {
+  --oxidant-font-ui: "Geist Variable", Geist, Inter, ui-sans-serif, system-ui, -apple-system,
+    sans-serif;
+}
+
+@layer base {
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background-color: var(--oxidant-bg);
+    color: var(--oxidant-text);
+    font-family: var(--oxidant-font-ui);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  /* Hairline by default: a bare `border` is always the theme's divider colour. */
+  * {
+    border-color: var(--oxidant-border);
+  }
+  /* Typography-forward: display type is tight, never loose. */
+  h1,
+  h2,
+  h3 {
+    letter-spacing: -0.02em;
+  }
+  ::selection {
+    background: var(--oxidant-solid);
+    color: var(--oxidant-on-solid);
+  }
+  /* Scrollbars sit inside dense panels all over this UI — keep them monochrome. */
+  * {
+    scrollbar-color: var(--oxidant-border-strong) transparent;
+  }
 }
 
 @layer components {
   .oxidant-card {
-    @apply rounded-lg border border-border bg-surface p-4;
+    @apply rounded-oxidant border border-hairline bg-surface p-4;
   }
   .oxidant-btn {
-    @apply rounded-md bg-accent px-4 py-2 text-sm font-medium text-white hover:opacity-90;
+    @apply inline-flex items-center justify-center gap-2 rounded-oxidant-sm px-4 py-2 text-sm
+      font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50;
   }
+  /* The inverted slab — monochrome's primary action. */
+  .oxidant-btn-primary {
+    @apply oxidant-btn bg-solid text-on-solid hover:bg-solid-hover;
+  }
+  .oxidant-btn-ghost {
+    @apply oxidant-btn border border-hairline bg-surface text-body hover:border-hairline-strong hover:bg-raised;
+  }
+  /* Small uppercase eyebrow label — muted, not colored. */
+  .oxidant-eyebrow {
+    @apply text-xs font-medium uppercase tracking-[0.12em] text-muted;
+  }
+  /* Inline links: underline carries the emphasis, not hue. */
+  .oxidant-link {
+    @apply font-medium text-body underline decoration-hairline-strong underline-offset-4
+      transition-colors hover:decoration-body;
+  }
+  /* Text inputs, textareas and selects across the editor/notebook/compare pages. */
+  .oxidant-input {
+    @apply rounded-oxidant-sm border border-hairline bg-bg px-3 py-2 text-sm text-body
+      placeholder:text-muted focus:border-hairline-strong focus:outline-none;
+  }
+  /* Terminal-ish surface: plans, logs, error panes — one step below the page in both themes. */
+  .oxidant-code {
+    @apply rounded-oxidant-sm font-mono text-xs leading-relaxed;
+    background: var(--oxidant-code-bg);
+    color: var(--oxidant-code-text);
+  }
+  /* Status is the one place hue is allowed: green = done, amber = in flight, red = failed.
+     Neutral terminal states (canceled) stay muted rather than borrowing amber. */
   .status-SUCCEEDED, .status-COMPLETE, .status-SUCCESS { @apply text-success; }
   .status-FAILED { @apply text-danger; }
   .status-RUNNING, .status-ACTIVE { @apply text-warning; }
   /* REST statement lifecycle statuses (lowercase, per the API contract). */
   .stmt-succeeded { @apply text-success; }
   .stmt-failed { @apply text-danger; }
-  .stmt-canceled, .stmt-pending, .stmt-running { @apply text-warning; }
+  .stmt-pending, .stmt-running { @apply text-warning; }
+  .stmt-canceled { @apply text-muted; }
   .nb-btn {
-    @apply rounded border border-border px-2 py-0.5 text-xs text-muted hover:border-muted hover:text-text disabled:opacity-40;
+    @apply rounded-oxidant-sm border border-hairline px-2 py-0.5 text-xs text-muted
+      transition-colors hover:border-hairline-strong hover:text-body
+      disabled:cursor-not-allowed disabled:opacity-40;
   }
 }
 
@@ -47,11 +103,13 @@ body {
 .md-preview h4, .md-preview h5, .md-preview h6 {
   margin: 12px 0 6px;
   font-weight: 600;
+  letter-spacing: -0.02em;
 }
-.md-preview p { margin: 6px 0; }
+.md-preview p { margin: 6px 0; color: var(--oxidant-text-secondary); }
 .md-preview code {
   font-family: var(--oxidant-font-mono);
-  background: var(--oxidant-bg);
+  background: var(--oxidant-code-bg);
+  color: var(--oxidant-code-text);
   padding: 1px 5px;
   border-radius: 4px;
   font-size: 12px;
@@ -59,12 +117,18 @@ body {
 .md-preview pre {
   font-family: var(--oxidant-font-mono);
   font-size: 12px;
-  background: var(--oxidant-bg);
+  background: var(--oxidant-code-bg);
+  color: var(--oxidant-code-text);
   padding: 12px;
-  border-radius: 6px;
+  border-radius: var(--oxidant-radius-sm);
   overflow: auto;
   margin: 8px 0;
   white-space: pre-wrap;
 }
 .md-preview ul { padding-left: 20px; margin: 6px 0; list-style: disc; }
-.md-preview a { color: var(--oxidant-accent); }
+.md-preview a {
+  color: var(--oxidant-text);
+  text-decoration: underline;
+  text-decoration-color: var(--oxidant-border-strong);
+  text-underline-offset: 4px;
+}

@@ -19,7 +19,7 @@ export default function EnvironmentPage() {
         </thead>
         <tbody>
           {keys.map((k) => (
-            <tr key={k} className="border-t border-border">
+            <tr key={k} className="border-t border-hairline">
               <td className="p-2">{k}</td>
               <td className="p-2 font-mono text-xs">{props[k]}</td>
             </tr>

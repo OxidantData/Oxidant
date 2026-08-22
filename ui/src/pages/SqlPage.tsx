@@ -16,7 +16,7 @@ export default function SqlPage() {
             <span className={`status-${s.status}`}>{s.status}</span>
             <span className="text-muted">{fmtMs(s.duration)}</span>
           </div>
-          <pre className="max-h-96 overflow-auto rounded bg-[#0b0b0c] p-3 font-mono text-xs leading-relaxed">
+          <pre className="oxidant-code max-h-96 overflow-auto p-3">
             {s.physicalPlan || "(no plan captured)"}
           </pre>
         </div>
