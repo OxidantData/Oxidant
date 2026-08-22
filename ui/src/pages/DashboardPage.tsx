@@ -158,103 +158,99 @@ export default function DashboardPage() {
   const refetchIntervalMs = !editing && refreshSecs ? refreshSecs * 1000 : false;
   const { width, containerRef } = useContainerWidth();
 
-  if (isPending) return <p className="text-sm text-muted">Loading dashboard…</p>;
-  if (loadError) {
-    return (
-      <div className="oxidant-card text-sm text-danger">
-        {(loadError as Error).message}
-      </div>
-    );
-  }
-  if (!saved) return null;
-
   return (
     <div className="flex h-full flex-col gap-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          className="oxidant-link text-sm"
-          onClick={() => navigate("/dashboards")}
-        >
-          ← Dashboards
-        </button>
-        <span className="h-4 w-px bg-hairline-strong" aria-hidden="true" />
-        {editing ? (
-          <input
-            className="oxidant-input min-w-64 text-base font-medium"
-            value={draft.name}
-            aria-label="Dashboard name"
-            onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-          />
-        ) : (
-          <h1 className="truncate text-base font-medium text-body">{saved.name}</h1>
-        )}
-
-        <div className="ml-auto flex flex-wrap items-center gap-2">
+      {/* The toolbar and the editor panel come and go; the grid container below must not.
+          `useContainerWidth` attaches its ResizeObserver on mount, so a container that only
+          appears once the fetch resolves would never get measured — the grid would sit at the
+          hook's 1280px default forever, no matter how wide the window is. */}
+      {saved && (
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            className="oxidant-link text-sm"
+            onClick={() => navigate("/dashboards")}
+          >
+            ← Dashboards
+          </button>
+          <span className="h-4 w-px bg-hairline-strong" aria-hidden="true" />
           {editing ? (
-            <>
-              <button className="oxidant-btn-ghost" onClick={addWidget}>
-                Add widget
-              </button>
-              <button
-                className="oxidant-btn-primary"
-                onClick={() => save.mutate(draft)}
-                disabled={save.isPending || !draft.name.trim()}
-              >
-                {save.isPending ? "Saving…" : "Save"}
-              </button>
-              <button
-                className="oxidant-btn-ghost"
-                onClick={() => {
-                  setDraft(null);
-                  setEditingWidget(null);
-                  setError(null);
-                }}
-              >
-                Cancel
-              </button>
-            </>
+            <input
+              className="oxidant-input min-w-64 text-base font-medium"
+              value={draft.name}
+              aria-label="Dashboard name"
+              onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+            />
           ) : (
-            <>
-              <button
-                className="oxidant-btn-ghost"
-                onClick={() =>
-                  queryClient.invalidateQueries({ queryKey: [WIDGET_QUERY_KEY] })
-                }
-              >
-                Refresh
-              </button>
-              <label className="flex items-center gap-1.5 text-xs text-muted">
-                Auto
-                <select
-                  className="oxidant-input py-1 text-xs"
-                  aria-label="Auto-refresh interval"
-                  value={refreshSecs ?? ""}
-                  onChange={(e) =>
-                    setRefresh.mutate(e.target.value ? Number(e.target.value) : null)
+            <h1 className="truncate text-base font-medium text-body">{saved.name}</h1>
+          )}
+
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            {editing ? (
+              <>
+                <button className="oxidant-btn-ghost" onClick={addWidget}>
+                  Add widget
+                </button>
+                <button
+                  className="oxidant-btn-primary"
+                  onClick={() => save.mutate(draft)}
+                  disabled={save.isPending || !draft.name.trim()}
+                >
+                  {save.isPending ? "Saving…" : "Save"}
+                </button>
+                <button
+                  className="oxidant-btn-ghost"
+                  onClick={() => {
+                    setDraft(null);
+                    setEditingWidget(null);
+                    setError(null);
+                  }}
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  className="oxidant-btn-ghost"
+                  onClick={() =>
+                    queryClient.invalidateQueries({ queryKey: [WIDGET_QUERY_KEY] })
                   }
                 >
-                  {REFRESH_CHOICES.map((choice) => (
-                    <option key={choice.label} value={choice.secs ?? ""}>
-                      {choice.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button className="oxidant-btn-ghost" onClick={startEditing}>
-                Edit
-              </button>
-              <button
-                className="oxidant-btn-ghost"
-                onClick={() => {
-                  if (window.confirm(`Delete dashboard “${saved.name}”?`)) remove.mutate();
-                }}
-              >
-                Delete
-              </button>
-            </>
-          )}
+                  Refresh
+                </button>
+                <label className="flex items-center gap-1.5 text-xs text-muted">
+                  Auto
+                  <select
+                    className="oxidant-input py-1 text-xs"
+                    aria-label="Auto-refresh interval"
+                    value={refreshSecs ?? ""}
+                    onChange={(e) =>
+                      setRefresh.mutate(e.target.value ? Number(e.target.value) : null)
+                    }
+                  >
+                    {REFRESH_CHOICES.map((choice) => (
+                      <option key={choice.label} value={choice.secs ?? ""}>
+                        {choice.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button className="oxidant-btn-ghost" onClick={startEditing}>
+                  Edit
+                </button>
+                <button
+                  className="oxidant-btn-ghost"
+                  onClick={() => {
+                    if (window.confirm(`Delete dashboard “${saved.name}”?`)) remove.mutate();
+                  }}
+                >
+                  Delete
+                </button>
+              </>
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {error && (
         <div className="rounded-oxidant-sm border border-danger-line bg-danger-tint p-2 text-xs text-danger">
@@ -278,7 +274,13 @@ export default function DashboardPage() {
         ref={containerRef as React.RefObject<HTMLDivElement>}
         className="min-h-0 flex-1 overflow-auto"
       >
-        {!widgets.length ? (
+        {isPending ? (
+          <p className="text-sm text-muted">Loading dashboard…</p>
+        ) : loadError ? (
+          <div className="oxidant-card text-sm text-danger">
+            {(loadError as Error).message}
+          </div>
+        ) : !widgets.length ? (
           <div className="oxidant-card text-sm text-muted">
             No widgets yet.{" "}
             {editing
