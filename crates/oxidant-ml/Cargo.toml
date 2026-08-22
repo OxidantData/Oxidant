@@ -1,0 +1,18 @@
+[package]
+name = "oxidant-ml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# SPIKE (issue #118): ONNX batch inference in the engine.
+# Throwaway crate — see docs/spikes/ml-predict.md for the verdict.
+
+[dependencies]
+oxidant-common = { workspace = true }
+# Pure-Rust ONNX runtime: no C++ toolchain, no libonnxruntime to ship alongside the binary.
+tract-onnx = "=0.22.0"
+# Same versions oxidant-loom pins, so the lock resolves to one copy of each.
+object_store = { version = "0.13", features = ["aws"] }
+tokio = { version = "1", features = ["rt", "sync"] }
