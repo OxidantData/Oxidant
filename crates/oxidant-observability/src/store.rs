@@ -743,7 +743,14 @@ impl AppStateStore {
             .collect();
         for (k, v) in std::env::vars() {
             if k.starts_with("OXIDANT_") || k.starts_with("SPARK_") {
-                entries.push(EnvironmentEntry { key: k, value: v });
+                // This endpoint is unauthenticated. `OXIDANT_STATUS_TOKEN` (and any other
+                // credential an operator exports) must never round-trip through it.
+                let value = if is_secret_env_key(&k) {
+                    REDACTED.to_string()
+                } else {
+                    v
+                };
+                entries.push(EnvironmentEntry { key: k, value });
             }
         }
         entries.sort_by(|a, b| a.key.cmp(&b.key));
@@ -776,6 +783,27 @@ impl Default for AppStateStore {
     }
 }
 
+/// Placeholder substituted for credential-shaped environment values.
+pub const REDACTED: &str = "<redacted>";
+
+/// Does this environment variable name look like it holds a credential?
+///
+/// Matched on the *name* so a new secret env var is covered without touching this list.
+/// Deliberately narrow — `KEY` alone would redact benign knobs like `OXIDANT_HASH_KEYS`.
+fn is_secret_env_key(key: &str) -> bool {
+    const NEEDLES: [&str; 7] = [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "ACCESS_KEY",
+        "PRIVATE_KEY",
+    ];
+    let upper = key.to_ascii_uppercase();
+    NEEDLES.iter().any(|n| upper.contains(n))
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -790,6 +818,27 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_env_keys_are_recognized_but_benign_knobs_are_not() {
+        for key in [
+            "OXIDANT_STATUS_TOKEN",
+            "OXIDANT_CATALOG_TOKEN",
+            "SPARK_SECRET",
+            "OXIDANT_S3_SECRET_ACCESS_KEY",
+            "OXIDANT_DB_PASSWORD",
+        ] {
+            assert!(is_secret_env_key(key), "{key} should be redacted");
+        }
+        for key in [
+            "OXIDANT_HASH_KEYS",
+            "OXIDANT_MEMORY_LIMIT_BYTES",
+            "OXIDANT_SHUFFLE_PARTITIONS",
+            "SPARK_HOME",
+        ] {
+            assert!(!is_secret_env_key(key), "{key} should not be redacted");
+        }
+    }
 
     #[test]
     fn concurrent_stages_do_not_collide() {
