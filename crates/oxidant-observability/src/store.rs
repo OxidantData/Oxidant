@@ -12,6 +12,7 @@ use crate::model::{
     job_status_str, ms_to_iso, stage_status_str, task_status_str, ApplicationAttemptInfo,
     ApplicationInfo, EnvironmentEntry, ExecutorSummary, JobData, SqlExecution, StageData, TaskData,
 };
+use crate::status::{query_state, QueryStatus, StatusSnapshot};
 
 const DEFAULT_MAX_QUERIES: usize = 100;
 
@@ -755,6 +756,84 @@ impl AppStateStore {
         }
         entries.sort_by(|a, b| a.key.cmp(&b.key));
         entries
+    }
+
+    /// Operational status for `GET /api/status` — see [`StatusSnapshot`].
+    ///
+    /// `recent_limit` caps [`StatusSnapshot::queries`] (newest first); the counters and
+    /// `last_query_at` are always computed over *every* job the store still holds, so a
+    /// small limit never hides a running query from `active_queries`.
+    pub fn status_snapshot(&self, recent_limit: usize) -> StatusSnapshot {
+        let now = now_ms();
+        let inner = self.inner.lock().expect("store poisoned");
+
+        let mut jobs: Vec<&InnerJob> = inner.jobs.values().collect();
+        // Newest first, so truncating to `recent_limit` keeps the most recent queries.
+        jobs.sort_by_key(|j| std::cmp::Reverse((j.submission_time_ms, j.job_id)));
+
+        let active_queries = jobs
+            .iter()
+            .filter(|j| j.status == JobStatus::Running)
+            .count();
+        // The last thing that happened to any query: a submission or a completion. A driver
+        // reporting `active_queries == 0` has been idle since this instant.
+        let last_query_at = jobs
+            .iter()
+            .map(|j| j.completion_time_ms.unwrap_or(j.submission_time_ms))
+            .max()
+            .map(ms_to_iso);
+
+        let queries = jobs
+            .iter()
+            .take(recent_limit)
+            .map(|j| {
+                let stages: Vec<&InnerStage> = j
+                    .stage_ids
+                    .iter()
+                    .filter_map(|sid| inner.stages.get(&stage_key(&j.operation_id, *sid)))
+                    .collect();
+                // `QueryTracker::finish_success` reports the query's output cardinality on
+                // the stage it finishes on, which is by construction the last stage to
+                // complete — so that stage's `output_rows` is the result row count. Summing
+                // across stages would double-count every distributed shuffle boundary.
+                let rows = stages
+                    .iter()
+                    .filter(|s| s.completion_time_ms.is_some())
+                    .max_by_key(|s| (s.completion_time_ms, s.stage_id))
+                    .map(|s| s.output_rows)
+                    .unwrap_or(0);
+                let bytes: i64 = stages
+                    .iter()
+                    .map(|s| s.shuffle_read_bytes.saturating_add(s.shuffle_write_bytes))
+                    .sum();
+                let end = j.completion_time_ms.unwrap_or(now);
+                QueryStatus {
+                    id: j.operation_id.clone(),
+                    tag: j.description.clone(),
+                    state: match j.status {
+                        JobStatus::Running => query_state::RUNNING,
+                        JobStatus::Succeeded => query_state::FINISHED,
+                        JobStatus::Failed => query_state::FAILED,
+                        JobStatus::Unknown => query_state::UNKNOWN,
+                    }
+                    .to_string(),
+                    started_at: ms_to_iso(j.submission_time_ms),
+                    duration_ms: end.saturating_sub(j.submission_time_ms).max(0),
+                    rows,
+                    bytes,
+                }
+            })
+            .collect();
+
+        StatusSnapshot {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_secs: now.saturating_sub(self.start_time_ms).max(0) / 1000,
+            last_query_at,
+            active_queries,
+            // No admission queue exists in the engine today; see `StatusSnapshot::queued_queries`.
+            queued_queries: 0,
+            queries,
+        }
     }
 
     /// Load events from a JSONL event log directory (history server).
