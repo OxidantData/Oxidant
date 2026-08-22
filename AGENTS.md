@@ -15,6 +15,7 @@
 | [docs/workers.md](docs/workers.md) | Adding workers (local-cluster / multi-host) |
 | [docs/catalogs-glue.md](docs/catalogs-glue.md) | Glue catalog end-to-end |
 | [docs/catalogs-lakeformation.md](docs/catalogs-lakeformation.md) | Lake Formation column/row security on Glue tables |
+| [docs/catalogs-unity.md](docs/catalogs-unity.md) | Unity Catalog end-to-end (config keys, verified behavior, known gaps) |
 | [docs/streaming.md](docs/streaming.md) | Structured Streaming: Kafka → live Delta tables in Glue, readable as Iceberg |
 | [docs/CODEMAP.md](docs/CODEMAP.md) | Crate / bench / site ownership |
 | [docs/architecture.md](docs/architecture.md) | Engine design (Loom / Connect) |
