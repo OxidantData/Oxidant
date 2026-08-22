@@ -584,6 +584,261 @@ mod tests {
         );
     }
 
+    /// Every read path must route. `get`, `get_range` and `head` are `ObjectStoreExt` extension
+    /// methods, not trait methods — if any of them reached the fallback instead of the governed
+    /// store, a governed table's bytes would be fetched with the engine's ambient identity and
+    /// nothing would report it. Each store here holds a *different* object under the same path, so
+    /// the bytes that come back name the store that served them.
+    #[tokio::test]
+    async fn every_read_path_routes_to_the_governed_store() {
+        let object = Path::from("secure/customers/part-0.parquet");
+        let fallback = InMemory::new();
+        fallback
+            .put(&object, PutPayload::from(b"ambient".to_vec()))
+            .await
+            .expect("seed fallback");
+        let governed = InMemory::new();
+        governed
+            .put(&object, PutPayload::from(b"governed".to_vec()))
+            .await
+            .expect("seed governed");
+
+        let routing = RoutingObjectStore::new(Arc::new(fallback));
+        routing.add_route(Path::from("secure/customers"), Arc::new(governed));
+
+        let bytes = routing
+            .get(&object)
+            .await
+            .expect("get")
+            .bytes()
+            .await
+            .expect("body");
+        assert_eq!(&bytes[..], b"governed", "`get` used the ambient identity");
+        let ranged = routing.get_range(&object, 0..3).await.expect("get_range");
+        assert_eq!(&ranged[..], b"gov", "`get_range` used the ambient identity");
+        // Two ranges, as a Parquet reader issues: footer + a column chunk.
+        let ranges = routing
+            .get_ranges(&object, &[0..3, 4..8])
+            .await
+            .expect("get_ranges");
+        assert_eq!(&ranges[0][..], b"gov");
+        assert_eq!(&ranges[1][..], b"rned");
+        let meta = routing.head(&object).await.expect("head");
+        assert_eq!(
+            meta.size,
+            b"governed".len() as u64,
+            "`head` used the ambient identity"
+        );
+    }
+
+    /// A delete batch may span governed and ungoverned prefixes; each object must be removed under
+    /// the identity that governs it, not whichever one the first path happened to pick.
+    #[tokio::test]
+    async fn delete_stream_routes_each_object_by_its_own_prefix() {
+        let governed_path = Path::from("secure/customers/part-0.parquet");
+        let ambient_path = Path::from("public/events/part-0.parquet");
+        let fallback = Arc::new(InMemory::new());
+        let governed = Arc::new(InMemory::new());
+        for (store, path) in [
+            (fallback.clone(), ambient_path.clone()),
+            (governed.clone(), governed_path.clone()),
+        ] {
+            store
+                .put(&path, PutPayload::from(b"x".to_vec()))
+                .await
+                .expect("seed");
+        }
+
+        let routing = RoutingObjectStore::new(fallback.clone());
+        routing.add_route(Path::from("secure/customers"), governed.clone());
+
+        let paths =
+            futures::stream::iter(vec![Ok(governed_path.clone()), Ok(ambient_path.clone())]);
+        let deleted: Vec<_> = routing.delete_stream(paths.boxed()).collect().await;
+        assert_eq!(deleted.len(), 2);
+        assert!(deleted.iter().all(|r| r.is_ok()), "{deleted:?}");
+
+        // Each object is gone from the store that owned it — and only from that one.
+        assert!(governed.head(&governed_path).await.is_err());
+        assert!(fallback.head(&ambient_path).await.is_err());
+    }
+
+    /// An authorizer that hands out a numbered credential each call and can be made to fail —
+    /// enough to observe the re-vend the docs promise, and the revocation that rides on it.
+    struct CountingAuthorizer {
+        calls: std::sync::atomic::AtomicUsize,
+        /// Lifetime for the credentials handed out; `None` returns a decision with no credentials.
+        lifetime: std::sync::Mutex<Option<Duration>>,
+        /// Set to fail every subsequent `authorize_scan`, as a revoked grant would.
+        revoked: std::sync::atomic::AtomicBool,
+    }
+
+    impl CountingAuthorizer {
+        fn new(lifetime: Option<Duration>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                lifetime: std::sync::Mutex::new(lifetime),
+                revoked: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl TableAuthorizer for CountingAuthorizer {
+        async fn authorize_scan(
+            &self,
+            _ns: &[String],
+            table: &str,
+        ) -> oxidant_catalog::Result<oxidant_catalog::TableAccess> {
+            if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(oxidant_common::Error::Plan(format!(
+                    "lake formation authorizes no columns of `{table}`; refusing to read it"
+                )));
+            }
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let lifetime = *self.lifetime.lock().expect("lifetime poisoned");
+            Ok(oxidant_catalog::TableAccess {
+                authorized_columns: None,
+                row_filter: None,
+                credentials: lifetime.map(|d| VendedCredentials {
+                    access_key_id: format!("ASIAVEND{n}"),
+                    secret_access_key: format!("secret-{n}"),
+                    session_token: Some(format!("token-{n}")),
+                    expires_at: Some(SystemTime::now() + d),
+                }),
+                enforced: true,
+            })
+        }
+        fn principal(&self) -> &str {
+            "arn:aws:iam::123456789012:role/analyst"
+        }
+    }
+
+    fn seeded_provider(
+        authorizer: Arc<CountingAuthorizer>,
+        initial_lifetime: Duration,
+    ) -> LakeFormationCredentialProvider {
+        LakeFormationCredentialProvider::new(
+            authorizer,
+            vec!["secure".to_string()],
+            "customers".to_string(),
+            &VendedCredentials {
+                access_key_id: "ASIAINITIAL".to_string(),
+                secret_access_key: "initial-secret".to_string(),
+                session_token: Some("initial-token".to_string()),
+                expires_at: Some(SystemTime::now() + initial_lifetime),
+            },
+        )
+    }
+
+    /// The documented refresh: a credential inside the margin is re-vended on the next S3 request,
+    /// transparently, so a long query does not die holding a stale token.
+    #[tokio::test]
+    async fn a_near_expiry_credential_is_re_vended_on_the_next_request() {
+        let authorizer = CountingAuthorizer::new(Some(REFRESH_MARGIN * 4));
+        // Seeded INSIDE the margin: the first request must not use it.
+        let provider = seeded_provider(authorizer.clone(), REFRESH_MARGIN / 2);
+
+        let cred = provider.get_credential().await.expect("re-vend");
+        assert_eq!(cred.key_id, "ASIAVEND1", "the stale token was handed out");
+        assert_eq!(authorizer.calls(), 1, "exactly one re-vend");
+
+        // The re-vended credential is comfortably fresh, so the NEXT request must reuse it rather
+        // than calling Lake Formation on every S3 range read.
+        let again = provider.get_credential().await.expect("cached");
+        assert_eq!(again.key_id, "ASIAVEND1");
+        assert_eq!(authorizer.calls(), 1, "a fresh credential must be reused");
+    }
+
+    /// A credential that is still comfortably valid must not trigger a call at all — this is what
+    /// keeps a scan from turning into one Lake Formation round trip per range read.
+    #[tokio::test]
+    async fn a_fresh_credential_is_served_without_calling_lake_formation() {
+        let authorizer = CountingAuthorizer::new(Some(REFRESH_MARGIN * 4));
+        let provider = seeded_provider(authorizer.clone(), REFRESH_MARGIN * 4);
+        let cred = provider.get_credential().await.expect("cached");
+        assert_eq!(cred.key_id, "ASIAINITIAL");
+        assert_eq!(authorizer.calls(), 0);
+    }
+
+    /// Re-vending goes back through the AUTHORIZER, not just the credential API — which is what
+    /// makes a permission revoked mid-query stop working at the next refresh instead of surviving
+    /// until the process restarts. The refusal must surface as an error, never as a fall-back to
+    /// the engine's ambient identity.
+    #[tokio::test]
+    async fn a_grant_revoked_mid_query_fails_the_next_refresh() {
+        let authorizer = CountingAuthorizer::new(Some(REFRESH_MARGIN * 4));
+        let provider = seeded_provider(authorizer.clone(), REFRESH_MARGIN * 4);
+        assert_eq!(
+            provider.get_credential().await.expect("fresh").key_id,
+            "ASIAINITIAL"
+        );
+
+        // Revoke, and age the cached credential into the refresh margin as time would.
+        authorizer
+            .revoked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        provider.store(&VendedCredentials {
+            access_key_id: "ASIAINITIAL".to_string(),
+            secret_access_key: "initial-secret".to_string(),
+            session_token: None,
+            expires_at: Some(SystemTime::now() + REFRESH_MARGIN / 2),
+        });
+
+        let err = provider
+            .get_credential()
+            .await
+            .expect_err("a revoked grant must not keep reading");
+        assert!(
+            format!("{err}").contains("refusing to read"),
+            "the authorizer's refusal must reach the object store: {err}"
+        );
+    }
+
+    /// A refresh that comes back with a decision carrying no credentials is a failure, not a
+    /// licence to read with the ambient identity.
+    #[tokio::test]
+    async fn a_refresh_returning_no_credentials_is_an_error() {
+        let authorizer = CountingAuthorizer::new(None);
+        let provider = seeded_provider(authorizer.clone(), REFRESH_MARGIN / 2);
+        let err = provider
+            .get_credential()
+            .await
+            .expect_err("no credentials on refresh");
+        assert!(
+            format!("{err}").contains("no credentials when refreshing"),
+            "{err}"
+        );
+    }
+
+    /// N concurrent cache-miss readers — every range read of a Parquet file at once — must produce
+    /// ONE Lake Formation round trip, not N. Without the refresh lock this throttles instantly at
+    /// scan concurrency.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cache_misses_re_vend_exactly_once() {
+        let authorizer = CountingAuthorizer::new(Some(REFRESH_MARGIN * 4));
+        let provider = Arc::new(seeded_provider(authorizer.clone(), REFRESH_MARGIN / 2));
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let provider = provider.clone();
+            handles.push(tokio::spawn(async move {
+                provider.get_credential().await.map(|c| c.key_id.clone())
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.expect("join").expect("credential"), "ASIAVEND1");
+        }
+        assert_eq!(
+            authorizer.calls(),
+            1,
+            "16 concurrent readers must not make 16 Lake Formation calls"
+        );
+    }
+
     /// A credential expiring inside the refresh margin is already stale, so a long query re-vends
     /// rather than carrying a token that dies mid-request.
     #[test]
