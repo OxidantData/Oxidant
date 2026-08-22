@@ -14,11 +14,14 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::static_files;
+use crate::{static_files, status};
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: SharedStore,
+    /// Shared bearer token guarding `GET /api/status`. `None` disables that endpoint;
+    /// nothing else on this server is authenticated. See [`crate::status`].
+    pub status_token: Option<std::sync::Arc<str>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,9 +43,20 @@ pub struct SparkProxyQuery {
     pub url: String,
 }
 
+/// Router with the status token taken from `OXIDANT_STATUS_TOKEN`.
 pub fn app_router(store: SharedStore) -> Router {
-    let state = AppState { store };
+    app_router_with_status_token(store, status::status_token_from_env())
+}
+
+/// Router with an explicit status token — the env-free form, used by tests and by callers
+/// that resolve the token themselves.
+pub fn app_router_with_status_token(store: SharedStore, status_token: Option<String>) -> Router {
+    let state = AppState {
+        store,
+        status_token: status::normalize_token(status_token).map(Into::into),
+    };
     Router::new()
+        .route("/api/status", get(status::status))
         .route("/api/v1/applications", get(list_applications))
         .route("/api/v1/applications/{app_id}", get(get_application))
         .route("/api/v1/applications/{app_id}/jobs", get(list_jobs))
