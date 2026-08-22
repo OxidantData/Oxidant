@@ -35,6 +35,29 @@ The UI mirrors the Spark UI layout and is backed by the Spark-compatible
 | **Executors** | The driver plus any connected workers (see [workers.md](workers.md)) |
 | **Environment** | Runtime info, Spark/Oxidant properties, catalog config |
 
+## Theme
+
+The UI carries the Oxidant brand theme from <https://www.oxidantdata.com>: dark-first
+monochrome — layered near-blacks, hairline borders, Geist typography, and no decorative accent
+colour. Emphasis comes from contrast and weight; the inverted white slab is what a primary
+button gets instead of a coloured fill.
+
+Colour is reserved for status, and only for status:
+
+| Colour | Means |
+|--------|-------|
+| Green | Succeeded / completed, and "faster than Spark" on the Compare page |
+| Amber | Running, pending, truncated results, "slower than Spark" |
+| Red | Failed — a failed job, a rejected statement, a statement error pane |
+
+A toggle in the header switches to the light theme. The choice persists in `localStorage`
+under `oxidant-theme` and is applied before first paint, so there is no flash on reload.
+
+Nothing is fetched from a CDN — no external fonts, no external assets — so the pages render
+identically on a driver with no egress. The React build in [`ui/`](../ui) bundles Geist and
+JetBrains Mono as self-hosted woff2 files; the single-file page compiled into the binary has no
+asset pipeline, so it falls through to the system sans stack unless Geist is installed locally.
+
 ## SQL Editor
 
 The **SQL Editor** page runs ad-hoc SQL over the REST statement API — no client install needed.

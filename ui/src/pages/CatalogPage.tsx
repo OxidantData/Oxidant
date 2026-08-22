@@ -84,14 +84,14 @@ export default function CatalogPage() {
   return (
     <div className="grid h-full gap-4 lg:grid-cols-[200px_200px_1fr_300px]">
       <div className="oxidant-card flex flex-col overflow-hidden">
-        <h2 className="mb-2 text-sm font-semibold">Catalogs</h2>
+        <h2 className="oxidant-eyebrow mb-2">Catalogs</h2>
         <div className="-mr-2 flex-1 overflow-y-auto pr-2">
           {catalogs.map((c) => (
             <button
               key={c.name}
               onClick={() => selectCatalog(c.name)}
               className={`block w-full rounded px-2 py-1 text-left text-sm ${
-                selected?.catalog === c.name ? "bg-accent/20 text-accent" : "hover:bg-surface"
+                selected?.catalog === c.name ? "bg-raised text-body" : "hover:bg-raised"
               }`}
             >
               {c.name}
@@ -104,14 +104,14 @@ export default function CatalogPage() {
       </div>
 
       <div className="oxidant-card flex flex-col overflow-hidden">
-        <h2 className="mb-2 text-sm font-semibold">Namespaces</h2>
+        <h2 className="oxidant-eyebrow mb-2">Namespaces</h2>
         <div className="-mr-2 flex-1 overflow-y-auto pr-2">
           {namespaces.map((ns) => (
             <button
               key={ns}
               onClick={() => selectNamespace(selected?.catalog ?? "spark_catalog", ns)}
               className={`block w-full rounded px-2 py-1 text-left text-sm ${
-                selected?.namespace === ns ? "bg-accent/20 text-accent" : "hover:bg-surface"
+                selected?.namespace === ns ? "bg-raised text-body" : "hover:bg-raised"
               }`}
             >
               {ns}
@@ -125,9 +125,9 @@ export default function CatalogPage() {
 
       <div className="oxidant-card flex flex-col overflow-hidden">
         <div className="mb-2 flex items-center justify-between">
-          <h2 className="text-sm font-semibold">Tables</h2>
+          <h2 className="oxidant-eyebrow">Tables</h2>
           {selected?.namespace && (
-            <button className="text-xs text-muted hover:text-text" onClick={copyName}>
+            <button className="text-xs text-muted hover:text-body" onClick={copyName}>
               Copy namespace
             </button>
           )}
@@ -140,7 +140,7 @@ export default function CatalogPage() {
                 selectTable(selected?.catalog ?? "spark_catalog", selected?.namespace ?? "", t.name)
               }
               className={`flex w-full items-center justify-between rounded px-2 py-1 text-left text-sm ${
-                selected?.table === t.name ? "bg-accent/20 text-accent" : "hover:bg-surface"
+                selected?.table === t.name ? "bg-raised text-body" : "hover:bg-raised"
               }`}
             >
               <span>{t.name}</span>
@@ -155,9 +155,9 @@ export default function CatalogPage() {
 
       <div className="oxidant-card flex flex-col overflow-hidden">
         <div className="mb-2 flex items-center justify-between">
-          <h2 className="text-sm font-semibold">Columns</h2>
+          <h2 className="oxidant-eyebrow">Columns</h2>
           {selected?.table && (
-            <button className="text-xs text-muted hover:text-text" onClick={copyName}>
+            <button className="text-xs text-muted hover:text-body" onClick={copyName}>
               Copy table
             </button>
           )}
@@ -166,7 +166,7 @@ export default function CatalogPage() {
           {columns.map((c) => (
             <div
               key={c.name}
-              className="flex items-center justify-between border-b border-border px-1 py-1.5 text-sm"
+              className="flex items-center justify-between border-b border-hairline px-1 py-1.5 text-sm"
             >
               <span>{c.name}</span>
               <span className="text-xs text-muted">{c.type}</span>

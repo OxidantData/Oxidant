@@ -3,82 +3,394 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Oxidant UI</title>
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#111112" />
+  <title>Oxidant</title>
+  <!-- The mark, inlined as a data URI: this page is a single include_str! blob with no asset
+       route behind it, so every brand element has to travel in the document itself. -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 72 72'%3E%3Crect width='72' height='72' rx='16' fill='%230a0a0a'/%3E%3Cg fill='none' stroke='%23ffffff' stroke-width='8' stroke-linecap='round'%3E%3Cpath d='M12 19.2 L12 36.8'/%3E%3Cpath d='M12 51.2 L12 64'/%3E%3Cpath d='M28 8 L28 20.8'/%3E%3Cpath d='M28 35.2 L28 52.8'/%3E%3Cpath d='M44 19.2 L44 36.8'/%3E%3Cpath d='M44 51.2 L44 64'/%3E%3Cpath d='M60 8 L60 20.8'/%3E%3Cpath d='M60 35.2 L60 52.8'/%3E%3Cpath d='M8 12 L20.8 12'/%3E%3Cpath d='M35.2 12 L52.8 12'/%3E%3Cpath d='M19.2 28 L36.8 28'/%3E%3Cpath d='M51.2 28 L64 28'/%3E%3Cpath d='M8 44 L20.8 44'/%3E%3Cpath d='M35.2 44 L52.8 44'/%3E%3Cpath d='M19.2 60 L36.8 60'/%3E%3Cpath d='M51.2 60 L64 60'/%3E%3C/g%3E%3C/svg%3E" />
+  <script>
+    // Dark is the default; apply a persisted light preference before paint to avoid a flash.
+    // Same storage key as the React twin in `ui/`, so the two agree on a shared browser.
+    (function () {
+      try {
+        if (localStorage.getItem('oxidant-theme') === 'light')
+          document.documentElement.setAttribute('data-theme', 'light');
+      } catch (e) {}
+    })();
+  </script>
   <style>
+    /*
+     * Oxidant design tokens — dark-first monochrome. Kept in sync by hand with
+     * `ui/src/styles/theme.css` (itself a copy of the website's src/styles/theme.css); same
+     * variable names, same values. This file cannot @import it: it is compiled into the binary
+     * with include_str! and must render on a driver with no egress and no asset pipeline.
+     *
+     * There is no decorative accent hue: emphasis is contrast and weight, and the "solid"
+     * inverted slab is what a primary button gets instead of a fill. The only chromatic values
+     * are semantic status.
+     */
     :root {
-      --bg: #0b0b0c; --surface: #141416; --border: #26262b;
-      --text: #f4f4f5; --muted: #9ca3af; --accent: #ff6a00;
-      --success: #16a34a; --danger: #dc2626; --warning: #d97706;
-      --mono: "JetBrains Mono", ui-monospace, monospace;
-      --sans: Inter, system-ui, sans-serif;
+      /* Surfaces — layered near-blacks */
+      --oxidant-bg: #111112;
+      --oxidant-bg-subtle: #171719;
+      --oxidant-surface: #171719;
+      --oxidant-raised: #242428;
+      --oxidant-border: rgba(255, 255, 255, 0.09);
+      --oxidant-border-strong: rgba(255, 255, 255, 0.16);
+
+      /* Text */
+      --oxidant-text: #f5f5f5;
+      --oxidant-text-secondary: #a3a3a3;
+      --oxidant-text-muted: #737373;
+
+      /* The inverted slab — monochrome's answer to an accent fill. */
+      --oxidant-solid: #fafafa;
+      --oxidant-solid-hover: #e5e5e5;
+      --oxidant-on-solid: #111112;
+
+      /* Semantic status only — never decorative. `danger` is an engine-only addition:
+         the marketing site has no failed job to render. */
+      --oxidant-success: #22c55e;
+      --oxidant-warning: #eab308;
+      --oxidant-danger: #ef4444;
+      --oxidant-danger-tint: rgba(239, 68, 68, 0.12);
+      --oxidant-danger-line: rgba(239, 68, 68, 0.35);
+
+      /* Chart ramp — monochrome; magnitude bars take the brightest step. */
+      --oxidant-chart-1: #fafafa;
+
+      /* Code / terminal surface (dark in both themes — one step below the page) */
+      --oxidant-code-bg: #0a0a0b;
+      --oxidant-code-text: #e5e5e5;
+
+      /* Typography. The React twin bundles Geist as a woff2; a single-file page cannot, so
+         this falls through to the system stack unless Geist is installed locally. */
+      --oxidant-font-ui: Geist, Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+      --oxidant-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+      /* Shape */
+      --oxidant-radius: 8px;
+      --oxidant-radius-sm: 6px;
     }
+
+    :root[data-theme="light"] {
+      --oxidant-bg: #ffffff;
+      --oxidant-bg-subtle: #fafafa;
+      --oxidant-surface: #ffffff;
+      --oxidant-raised: #f5f5f5;
+      --oxidant-border: #e5e5e5;
+      --oxidant-border-strong: #d4d4d4;
+
+      --oxidant-text: #0a0a0a;
+      --oxidant-text-secondary: #525252;
+      --oxidant-text-muted: #737373;
+
+      --oxidant-solid: #0a0a0a;
+      --oxidant-solid-hover: #262626;
+      --oxidant-on-solid: #ffffff;
+
+      --oxidant-danger: #dc2626;
+      --oxidant-danger-tint: rgba(220, 38, 38, 0.1);
+      --oxidant-danger-line: rgba(220, 38, 38, 0.35);
+
+      --oxidant-chart-1: #0a0a0a;
+
+      /* semantic status + the dark code surface stay identical across themes */
+    }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: var(--sans); background: var(--bg); color: var(--text); min-height: 100vh; }
-    header { border-bottom: 1px solid var(--border); padding: 12px 20px; display: flex; align-items: center; gap: 16px; }
-    header h1 { font-size: 18px; font-weight: 600; }
-    header .meta { color: var(--muted); font-size: 13px; }
-    nav { display: flex; gap: 4px; padding: 8px 20px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
-    nav button { background: transparent; border: none; color: var(--muted); padding: 8px 14px; cursor: pointer; border-radius: 6px; font-size: 14px; }
-    nav button.active { background: var(--surface); color: var(--accent); }
-    nav button:hover { color: var(--text); }
+    body {
+      font-family: var(--oxidant-font-ui);
+      background: var(--oxidant-bg);
+      color: var(--oxidant-text);
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+    ::selection { background: var(--oxidant-solid); color: var(--oxidant-on-solid); }
+    h1, h2, h3, h4 { letter-spacing: -0.02em; }
+
+    /* ── Chrome ─────────────────────────────────────────────────────────────────────── */
+    header {
+      border-bottom: 1px solid var(--oxidant-border);
+      background: var(--oxidant-surface);
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; color: var(--oxidant-text); }
+    .brand svg { height: 24px; width: 24px; }
+    .brand span { font-size: 15px; font-weight: 600; letter-spacing: -0.02em; }
+    .rule { width: 1px; height: 16px; background: var(--oxidant-border-strong); }
+    header .meta { color: var(--oxidant-text-muted); font-size: 13px; }
+    #theme-toggle {
+      margin-left: auto;
+      height: 32px;
+      width: 32px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--oxidant-surface);
+      border: 1px solid var(--oxidant-border);
+      border-radius: var(--oxidant-radius-sm);
+      color: var(--oxidant-text-muted);
+      cursor: pointer;
+      font-size: 14px;
+      transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+    }
+    #theme-toggle:hover {
+      color: var(--oxidant-text);
+      border-color: var(--oxidant-border-strong);
+      background: var(--oxidant-raised);
+    }
+    nav {
+      display: flex;
+      gap: 4px;
+      padding: 8px 20px;
+      border-bottom: 1px solid var(--oxidant-border);
+      flex-wrap: wrap;
+    }
+    /* Active tab is weight + full contrast on a raised slab — never a hue. */
+    nav button {
+      background: transparent;
+      border: none;
+      color: var(--oxidant-text-muted);
+      padding: 6px 12px;
+      cursor: pointer;
+      border-radius: var(--oxidant-radius-sm);
+      font-size: 14px;
+      font-family: inherit;
+      transition: color 0.15s, background-color 0.15s;
+    }
+    nav button.active { background: var(--oxidant-raised); color: var(--oxidant-text); font-weight: 500; }
+    nav button:hover { color: var(--oxidant-text); }
     main { padding: 20px; max-width: 1400px; margin: 0 auto; }
-    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+
+    /* ── Surfaces ───────────────────────────────────────────────────────────────────── */
+    .card {
+      background: var(--oxidant-surface);
+      border: 1px solid var(--oxidant-border);
+      border-radius: var(--oxidant-radius);
+      padding: 16px;
+      margin-bottom: 16px;
+    }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-    th { color: var(--muted); font-weight: 500; }
-    tr:hover td { background: rgba(255,255,255,0.02); }
-    .status-SUCCEEDED, .status-COMPLETE, .status-SUCCESS { color: var(--success); }
-    .status-FAILED { color: var(--danger); }
-    .status-RUNNING, .status-ACTIVE { color: var(--warning); }
-    pre.plan { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; background: #0b0b0c; padding: 12px; border-radius: 6px; max-height: 400px; overflow: auto; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--oxidant-border); }
+    th {
+      color: var(--oxidant-text-muted);
+      font-weight: 500;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+    tr:hover td { background: var(--oxidant-bg-subtle); }
+
+    /* ── Status: the one place hue is allowed ───────────────────────────────────────── */
+    .status-SUCCEEDED, .status-COMPLETE, .status-SUCCESS { color: var(--oxidant-success); }
+    .status-FAILED { color: var(--oxidant-danger); }
+    .status-RUNNING, .status-ACTIVE { color: var(--oxidant-warning); }
+    .status-succeeded { color: var(--oxidant-success); }
+    .status-failed { color: var(--oxidant-danger); }
+    .status-pending, .status-running { color: var(--oxidant-warning); }
+    .status-canceled { color: var(--oxidant-text-muted); }
+    .delta-faster { color: var(--oxidant-success); }
+    /* Slower than Spark is caution, not failure. */
+    .delta-slower { color: var(--oxidant-warning); }
+
+    /* ── Code / terminal surface ────────────────────────────────────────────────────── */
+    pre.plan {
+      font-family: var(--oxidant-font-mono);
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      background: var(--oxidant-code-bg);
+      color: var(--oxidant-code-text);
+      padding: 12px;
+      border-radius: var(--oxidant-radius-sm);
+      max-height: 400px;
+      overflow: auto;
+    }
+
+    /* ── Controls ───────────────────────────────────────────────────────────────────── */
+    input[type=text], textarea {
+      background: var(--oxidant-bg);
+      border: 1px solid var(--oxidant-border);
+      color: var(--oxidant-text);
+      border-radius: var(--oxidant-radius-sm);
+      padding: 8px 12px;
+      font-size: 13px;
+      width: 100%;
+    }
+    input[type=text] { max-width: 480px; }
+    textarea { font-family: var(--oxidant-font-mono); resize: vertical; }
+    input[type=text]:focus, textarea:focus { outline: none; border-color: var(--oxidant-border-strong); }
+    label {
+      display: block;
+      font-size: 13px;
+      color: var(--oxidant-text-muted);
+      margin-bottom: 6px;
+    }
+    /* Small uppercase section label — muted, not colored. Mirrors .oxidant-eyebrow. */
+    .eyebrow {
+      font-size: 11px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--oxidant-text-muted);
+    }
+    /* The inverted slab — monochrome's primary action. */
+    .btn {
+      background: var(--oxidant-solid);
+      color: var(--oxidant-on-solid);
+      border: 1px solid transparent;
+      padding: 8px 16px;
+      border-radius: var(--oxidant-radius-sm);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      font-family: inherit;
+      transition: background-color 0.15s;
+    }
+    .btn:hover { background: var(--oxidant-solid-hover); }
+    .btn-secondary {
+      background: var(--oxidant-surface);
+      border: 1px solid var(--oxidant-border);
+      color: var(--oxidant-text);
+      padding: 8px 16px;
+      border-radius: var(--oxidant-radius-sm);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      font-family: inherit;
+      transition: border-color 0.15s, background-color 0.15s;
+    }
+    .btn-secondary:hover { border-color: var(--oxidant-border-strong); background: var(--oxidant-raised); }
+    .btn[disabled], .btn-secondary[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+    /* ── Layout helpers ─────────────────────────────────────────────────────────────── */
     .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     @media (max-width: 900px) { .compare-grid { grid-template-columns: 1fr; } }
-    .delta-faster { color: var(--success); }
-    .delta-slower { color: var(--danger); }
-    input[type=text] { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%; max-width: 480px; font-size: 13px; }
-    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-    .btn { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-    .btn:hover { opacity: 0.9; }
-    .hidden { display: none; }
-    .bar { height: 8px; background: var(--accent); border-radius: 4px; }
-    .bar-wrap { background: var(--border); border-radius: 4px; height: 8px; flex: 1; }
-    .flex { display: flex; align-items: center; gap: 8px; }
-    textarea { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; width: 100%; font-family: var(--mono); font-size: 13px; padding: 10px 12px; resize: vertical; }
-    textarea:focus { outline: none; border-color: var(--accent); }
-    .btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-    .btn-secondary:hover { border-color: var(--muted); }
-    .btn[disabled], .btn-secondary[disabled] { opacity: 0.5; cursor: default; }
     .editor-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; align-items: start; }
+    /* Grid items floor at min-content, and a long SQL string in the history pane is wider than
+       its column — without this the 1fr column steals space from the 2fr editor. */
+    .editor-grid > *, .compare-grid > * { min-width: 0; }
     @media (max-width: 900px) { .editor-grid { grid-template-columns: 1fr; } }
-    .error-pane { background: rgba(220,38,38,0.08); border: 1px solid var(--danger); color: var(--danger); border-radius: 6px; padding: 12px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; }
-    .note { color: var(--muted); font-size: 12px; margin: 8px 0; }
-    .muted { color: var(--muted); }
+    .hidden { display: none; }
+    .flex { display: flex; align-items: center; gap: 8px; }
+    .bar { height: 8px; background: var(--oxidant-chart-1); border-radius: 999px; }
+    .bar-wrap { background: var(--oxidant-raised); border-radius: 999px; height: 8px; flex: 1; }
+    .note { color: var(--oxidant-text-muted); font-size: 12px; margin: 8px 0; }
+    .muted { color: var(--oxidant-text-muted); }
     .result-wrap { overflow-x: auto; }
-    .status-succeeded { color: var(--success); }
-    .status-failed { color: var(--danger); }
-    .status-canceled, .status-pending, .status-running { color: var(--warning); }
-    .stmt-item { padding: 8px 10px; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 13px; }
-    .stmt-item:hover { background: rgba(255,255,255,0.03); }
-    .stmt-sql { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .nb-cell { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .error-pane {
+      background: var(--oxidant-danger-tint);
+      border: 1px solid var(--oxidant-danger-line);
+      color: var(--oxidant-danger);
+      border-radius: var(--oxidant-radius-sm);
+      padding: 12px;
+      font-family: var(--oxidant-font-mono);
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+
+    /* ── Statement history ──────────────────────────────────────────────────────────── */
+    .stmt-item {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--oxidant-border);
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .stmt-item:hover { background: var(--oxidant-raised); }
+    .stmt-sql {
+      font-family: var(--oxidant-font-mono);
+      font-size: 12px;
+      color: var(--oxidant-text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* ── Notebook ───────────────────────────────────────────────────────────────────── */
+    .nb-cell {
+      background: var(--oxidant-surface);
+      border: 1px solid var(--oxidant-border);
+      border-radius: var(--oxidant-radius);
+      padding: 12px;
+      margin-bottom: 12px;
+    }
     .nb-toolbar { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; align-items: center; }
-    .nb-tag { border: 1px solid var(--border); border-radius: 4px; color: var(--muted); padding: 2px 8px; font-size: 12px; }
-    .nb-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 12px; }
-    .nb-btn:hover { color: var(--text); border-color: var(--muted); }
-    .nb-btn[disabled] { opacity: 0.4; cursor: default; }
+    .nb-tag {
+      border: 1px solid var(--oxidant-border);
+      background: var(--oxidant-raised);
+      border-radius: var(--oxidant-radius-sm);
+      color: var(--oxidant-text-muted);
+      padding: 2px 8px;
+      font-size: 10px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+    .nb-btn {
+      background: transparent;
+      border: 1px solid var(--oxidant-border);
+      color: var(--oxidant-text-muted);
+      border-radius: var(--oxidant-radius-sm);
+      padding: 2px 8px;
+      cursor: pointer;
+      font-size: 12px;
+      font-family: inherit;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .nb-btn:hover { color: var(--oxidant-text); border-color: var(--oxidant-border-strong); }
+    .nb-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
     .nb-output { margin-top: 10px; overflow-x: auto; }
+
+    /* ── Rendered Markdown cells ────────────────────────────────────────────────────── */
     .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 12px 0 6px; }
-    .md p { margin: 6px 0; }
-    .md code { font-family: var(--mono); background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-    .md pre { font-family: var(--mono); font-size: 12px; background: var(--bg); padding: 12px; border-radius: 6px; overflow: auto; margin: 8px 0; white-space: pre-wrap; }
+    .md p { margin: 6px 0; color: var(--oxidant-text-secondary); }
+    .md code {
+      font-family: var(--oxidant-font-mono);
+      background: var(--oxidant-code-bg);
+      color: var(--oxidant-code-text);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    .md pre {
+      font-family: var(--oxidant-font-mono);
+      font-size: 12px;
+      background: var(--oxidant-code-bg);
+      color: var(--oxidant-code-text);
+      padding: 12px;
+      border-radius: var(--oxidant-radius-sm);
+      overflow: auto;
+      margin: 8px 0;
+      white-space: pre-wrap;
+    }
     .md ul { padding-left: 20px; margin: 6px 0; }
-    .md a { color: var(--accent); }
+    .md a {
+      color: var(--oxidant-text);
+      text-decoration: underline;
+      text-decoration-color: var(--oxidant-border-strong);
+      text-underline-offset: 4px;
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1>Oxidant</h1>
+    <!-- The Oxidant mark: a plain-weave grid, warp over weft. Stroked with currentColor so one
+         copy serves both themes. Geometry matches ui/src/components/Logo.tsx. -->
+    <div class="brand">
+      <svg viewBox="0 0 72 72" role="img" aria-label="Oxidant">
+        <g fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="round"><path d="M12 19.2 L12 36.8"/><path d="M12 51.2 L12 64"/><path d="M28 8 L28 20.8"/><path d="M28 35.2 L28 52.8"/><path d="M44 19.2 L44 36.8"/><path d="M44 51.2 L44 64"/><path d="M60 8 L60 20.8"/><path d="M60 35.2 L60 52.8"/><path d="M8 12 L20.8 12"/><path d="M35.2 12 L52.8 12"/><path d="M19.2 28 L36.8 28"/><path d="M51.2 28 L64 28"/><path d="M8 44 L20.8 44"/><path d="M35.2 44 L52.8 44"/><path d="M19.2 60 L36.8 60"/><path d="M51.2 60 L64 60"/></g>
+      </svg>
+      <span>Oxidant</span>
+    </div>
+    <span class="rule"></span>
     <span class="meta" id="app-meta">Loading…</span>
+    <button id="theme-toggle" type="button" aria-label="Toggle theme" title="Switch theme">☀</button>
   </header>
   <nav id="tabs">
     <button data-tab="jobs" class="active">Jobs</button>
@@ -113,6 +425,24 @@
     const statusClass = (s) => 'status-' + (s || '').split(' ')[0];
 
     let state = { jobs: [], stages: [], sql: [], executors: [], env: {} };
+
+    // Dark-first with a persisted light opt-in, mirroring ui/src/lib/theme.ts. The pre-paint
+    // script in <head> has already applied the stored preference; this only wires the control.
+    const themeBtn = document.getElementById('theme-toggle');
+    const isLight = () => document.documentElement.getAttribute('data-theme') === 'light';
+    const paintThemeBtn = () => {
+      themeBtn.textContent = isLight() ? '\u263E' : '\u2600';
+      themeBtn.title = isLight() ? 'Switch to dark' : 'Switch to light';
+    };
+    paintThemeBtn();
+    themeBtn.addEventListener('click', () => {
+      const next = isLight() ? 'dark' : 'light';
+      if (next === 'light') document.documentElement.setAttribute('data-theme', 'light');
+      else document.documentElement.removeAttribute('data-theme');
+      try { localStorage.setItem('oxidant-theme', next); } catch (e) {}
+      paintThemeBtn();
+    });
+
 
     document.getElementById('tabs').addEventListener('click', (e) => {
       if (e.target.tagName !== 'BUTTON') return;
@@ -195,7 +525,7 @@
       const props = state.env.sparkProperties || {};
       const keys = Object.keys(props).sort();
       el.innerHTML = '<div class="card"><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>' +
-        keys.map(k => `<tr><td>${k}</td><td style="font-family:var(--mono);font-size:12px">${props[k]}</td></tr>`).join('') +
+        keys.map(k => `<tr><td>${k}</td><td style="font-family:var(--oxidant-font-mono);font-size:12px">${props[k]}</td></tr>`).join('') +
         '</tbody></table></div>';
     }
 
@@ -246,7 +576,7 @@
           <div><h4>Spark stages</h4><pre class="plan">${sparkStages.map(s=>`Stage ${s.stageId}: ${s.name||s.details} (${fmtMs(s.executorRunTime)})`).join('\n')||'—'}</pre></div>
         </div>`;
       } catch (e) {
-        result.innerHTML = `<div class="card" style="color:var(--danger)">Compare failed: ${e.message}. Is Spark UI running at ${sparkBase}?</div>`;
+        result.innerHTML = `<div class="card" style="color:var(--oxidant-danger)">Compare failed: ${e.message}. Is Spark UI running at ${sparkBase}?</div>`;
       }
     }
 
@@ -335,7 +665,7 @@
         </div>
         <div class="card">
           <div class="flex" style="justify-content:space-between;margin-bottom:8px">
-            <strong>Recent statements</strong>
+            <span class="eyebrow">Recent statements</span>
             <button class="nb-btn" id="editor-refresh">Refresh</button>
           </div>
           <div id="editor-statements"><span class="muted">Loading…</span></div>

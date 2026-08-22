@@ -23,7 +23,7 @@ export default function JobsPage() {
         </thead>
         <tbody>
           {jobs.map((j) => (
-            <tr key={j.jobId} className="border-t border-border">
+            <tr key={j.jobId} className="border-t border-hairline">
               <td className="p-2">{j.jobId}</td>
               <td className="p-2 max-w-md truncate" title={j.description}>
                 {j.name || j.description}

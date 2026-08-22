@@ -24,15 +24,15 @@ export default function StagesPage() {
         </thead>
         <tbody>
           {stages.map((s) => (
-            <tr key={s.stageId} className="border-t border-border">
+            <tr key={s.stageId} className="border-t border-hairline">
               <td className="p-2">{s.stageId}</td>
               <td className="p-2">{s.name}</td>
               <td className="p-2">
                 <div className="flex items-center gap-2">
                   <span>{fmtMs(s.executorRunTime)}</span>
-                  <div className="h-2 flex-1 max-w-[120px] rounded bg-border">
+                  <div className="h-2 max-w-[120px] flex-1 rounded-full bg-raised">
                     <div
-                      className="h-2 rounded bg-accent"
+                      className="h-2 rounded-full bg-chart-1"
                       style={{ width: `${((s.executorRunTime || 0) / maxDur) * 100}%` }}
                     />
                   </div>
