@@ -17,6 +17,7 @@ This document defines the environment contract between the **OSS engine images**
 | `OXIDANT_WORKERS` | Recommended (bare metal / EC2) | Comma-separated static `host:port` Flight endpoints. **Authoritative when non-empty** (bare metal, VMs, EC2 ASG bootstrap pin). |
 | `OXIDANT_WORKER_SERVICE` | Optional (Kubernetes) | Headless Service DNS name (e.g. `oxidant-worker.…svc.cluster.local`). Used only when `OXIDANT_WORKERS` / config list is empty; resolves A/AAAA → Flight endpoints. Not used for EC2 ASG honesty deploys. |
 | `OXIDANT_WORKER_PORT` | Optional | Flight port workers listen on (default `50561`). Used with `OXIDANT_WORKER_SERVICE`. |
+| `OXIDANT_STATUS_TOKEN` | Optional | Shared bearer token enabling `GET /api/status` on the driver's HTTP port (see [Driver status polling](#driver-status-polling)). Unset ⇒ the endpoint returns `404` and the platform gets no auto-termination / autoscaling signal from it. One token per cluster. |
 | `OXIDANT_SHUFFLE_PARTITIONS` | Optional | Hash shuffle partition count. Default (when unset): Spark-like `max(200, OXIDANT_WORKER_VCPUS, worker_count)` — **never** bare worker count (a 2-worker cluster must not collapse to a 2-bucket shuffle). May exceed replica count. |
 | `OXIDANT_WORKER_VCPUS` / `OXIDANT_WORKER_CORES` | Optional | Hints for the shuffle default: total cluster worker vCPUs, or per-worker cores × count. |
 | `OXIDANT_AQE` | Optional | Default **on** (Spark 3+ / EMR parity). `0`/`false`/`off` disables adaptive shuffle-partition coalescing. After each producer stage the driver samples per-partition bucket row counts and, when the skew guard allows, coalesces toward Spark's advisory partition size (`OXIDANT_AQE_ADVISORY_PARTITION_BYTES`, default 64 MiB) floored at `num_workers`. Consumer `p` pulls every producer bucket `b ≡ p (mod new_p)`, so every bucket is still read exactly once. The planned partition count never shrinks mid-query. |
@@ -105,6 +106,27 @@ clusters should continue to run one connect-server pod plus an autoscaled worker
 | `OXIDANT_WORKER_MEMORY_LIMIT_BYTES` | Optional | Per-worker spill pool wired into provisioned worker manifests (gateway). |
 
 Recommendation formula: `ceil(max(shuffle_partitions, peak_stage_tasks) / OXIDANT_WORKER_TASK_SLOTS)`, clamped to `[min, max]`, scale-up only.
+
+## Driver status polling
+
+`GET /api/status` on the driver's HTTP port (`4040`) is the engine-side signal for
+auto-termination and autoscaling. It is served by the driver process itself — the connect
+server — so a single-node cluster and a distributed cluster's driver expose it identically.
+
+```sh
+curl -s http://<driver>:4040/api/status -H "Authorization: Bearer $OXIDANT_STATUS_TOKEN"
+```
+
+- **Disabled by default.** Set `OXIDANT_STATUS_TOKEN` on the driver to enable it; without the
+  token the route answers `404`. A wrong or missing bearer credential answers `401`.
+- **Auto-termination:** `active_queries == 0` and `last_query_at` older than the idle budget
+  (or `null` since boot, with `uptime_secs` past the grace period) means the cluster is idle.
+- **Autoscaling:** `active_queries` is the concurrency signal; the per-query `rows`/`bytes` and
+  `duration_ms` describe the shape of what is running. The parallelism-driven recommendation
+  above stays the primary scale-up path.
+- **Trust model:** plain HTTP — the token authenticates the caller, not the wire. Keep `4040`
+  inside the cluster's private subnet / security group; the unauthenticated `/api/v1` routes on
+  the same port already require this. Full reference: [api.md § Driver status](api.md#driver-status).
 
 ## Health checks
 

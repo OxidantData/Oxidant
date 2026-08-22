@@ -7,7 +7,7 @@
 | [docs/README.md](docs/README.md) | Docs index (user guides + internals) |
 | [docs/getting-started.md](docs/getting-started.md) | Install/run + first query (UI, CLI, PySpark) |
 | [docs/web-ui.md](docs/web-ui.md) | Monitoring UI, SQL editor, notebooks |
-| [docs/api.md](docs/api.md) | REST statement API reference |
+| [docs/api.md](docs/api.md) | REST statement API reference + authenticated `/api/status` |
 | [docs/config.md](docs/config.md) | `oxidant.yaml` reference (catalogs, engine, local catalog) |
 | [docs/pipelines.md](docs/pipelines.md) | Declarative Kafka → lakehouse table DAG (`oxidant pipeline`) |
 | [docs/cli.md](docs/cli.md) | `oxidant sql` CLI reference |

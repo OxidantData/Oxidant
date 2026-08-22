@@ -17,6 +17,10 @@ oxidant spark server --port 50051 --ui-port 4040
 > ```
 >
 > `--no-ui` disables the HTTP server entirely.
+>
+> The one authenticated route on this port is
+> [`GET /api/status`](api.md#driver-status) — the control-plane status endpoint, which stays
+> off unless `OXIDANT_STATUS_TOKEN` is set.
 
 ## Monitoring pages
 
