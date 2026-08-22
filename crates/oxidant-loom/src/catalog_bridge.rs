@@ -5654,6 +5654,379 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The worker path proper. The stage ticket carries only "this query is governed" and the
+    /// principal — NOT the column list or the row-filter fragment — so a worker re-resolves the
+    /// policy through its own authorizer and applies its own filtering. That is the correctness
+    /// claim distributed enforcement rests on: if the worker's own resolution did not filter, every
+    /// shard would come back unfiltered while the driver's own scan looked right.
+    #[tokio::test]
+    async fn worker_with_a_matching_authorizer_filters_its_own_shard() {
+        let (engine, dir) = secured_engine(Some(granted(
+            Some(&["id", "region", "amount"]),
+            Some("region = 'us'"),
+        )));
+
+        // Exactly how `Worker::run_stage` scopes a ticket the driver marked governed.
+        let batches = with_lakeformation_required(
+            true,
+            "arn:aws:iam::123456789012:role/analyst".to_string(),
+            engine.sql(&format!("SELECT * FROM {LF_TABLE} ORDER BY id")),
+        )
+        .await
+        .expect("a worker that CAN enforce must serve the query");
+
+        let names: Vec<String> = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["id", "region", "amount"],
+            "the worker must apply the column policy to its own shard"
+        );
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 2,
+            "the worker must apply the row filter to its own shard, not return all 4 rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A worker configured as a DIFFERENT principal is refused rather than allowed to apply its
+    /// own, possibly broader, policy to its shard. Driver and workers get their catalog config
+    /// independently, so this is a plain misconfiguration, and the silent form of it returns more
+    /// rows and columns than the user is entitled to with no error anywhere.
+    #[tokio::test]
+    async fn worker_enforcing_as_a_different_principal_is_refused() {
+        let (engine, dir) = secured_engine(Some(granted(Some(&["id"]), None)));
+
+        let err = with_lakeformation_required(
+            true,
+            // The driver resolved the policy as `admin`; this process enforces as `analyst`.
+            "arn:aws:iam::123456789012:role/admin".to_string(),
+            engine.sql(&format!("SELECT * FROM {LF_TABLE}")),
+        )
+        .await
+        .expect_err("a principal mismatch must fail the stage, not apply the local policy");
+        let msg = format!("{err}");
+        assert!(msg.contains("principal mismatch"), "{msg}");
+        assert!(msg.contains("role/admin"), "{msg}");
+        assert!(msg.contains("role/analyst"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mismatch guard must not fire on the normal case — an identically configured worker.
+    #[tokio::test]
+    async fn worker_with_the_same_principal_is_not_refused() {
+        let (engine, dir) = secured_engine(Some(granted(Some(&["id"]), None)));
+        let batches = with_lakeformation_required(
+            true,
+            "arn:aws:iam::123456789012:role/analyst".to_string(),
+            engine.sql(&format!("SELECT * FROM {LF_TABLE}")),
+        )
+        .await
+        .expect("identically configured worker");
+        assert_eq!(batches[0].schema().fields().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The requirement guard runs BEFORE the table cache, so a table this process already resolved
+    /// for an earlier ungoverned query cannot be served, unwrapped, to a governed one. A
+    /// miss-only check would hand the cached provider straight over.
+    #[tokio::test]
+    async fn a_table_cached_by_an_ungoverned_query_is_not_served_to_a_governed_one() {
+        let dir = write_lf_fixture();
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "lf",
+            Arc::new(FakeCatalog {
+                location: format!("file://{}", dir.to_string_lossy()),
+            }),
+        );
+
+        // Resolve and cache it under no requirement at all.
+        engine
+            .sql("SELECT * FROM lf.ns.orders")
+            .await
+            .expect("ungoverned read caches the provider");
+
+        // Now the same process is asked to serve a stage the driver marked governed.
+        let err = with_lakeformation_required(
+            true,
+            String::new(),
+            engine.sql("SELECT * FROM lf.ns.orders"),
+        )
+        .await
+        .expect_err("the cached provider must not satisfy a governed query");
+        assert!(
+            format!("{err}").contains("no Lake Formation authorizer"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Enforcement off means enforcement off: a catalog that reports no authorizer must make ZERO
+    /// authorization calls and read every column and row, exactly as before the feature existed.
+    /// The A/B is against the same catalog with the same authorizer merely exposed.
+    #[tokio::test]
+    async fn enforcement_off_makes_zero_authorization_calls() {
+        /// Counts every decision it is asked for; `enabled` mirrors `lakeformation=true` deciding
+        /// whether the catalog exposes an authorizer at all.
+        struct CountingCatalog {
+            location: String,
+            authorizer: Arc<CountingAuthorizer>,
+            enabled: bool,
+        }
+        struct CountingAuthorizer {
+            calls: AtomicU64,
+        }
+        #[async_trait]
+        impl oxidant_catalog::TableAuthorizer for CountingAuthorizer {
+            async fn authorize_scan(
+                &self,
+                _ns: &[String],
+                _table: &str,
+            ) -> CatResult<oxidant_catalog::TableAccess> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(oxidant_catalog::TableAccess {
+                    authorized_columns: Some(vec!["id".to_string()]),
+                    row_filter: Some("region = 'us'".to_string()),
+                    credentials: None,
+                    enforced: true,
+                })
+            }
+            fn principal(&self) -> &str {
+                "arn:aws:iam::123456789012:role/analyst"
+            }
+        }
+        #[async_trait]
+        impl OxidantCatalog for CountingCatalog {
+            fn name(&self) -> &str {
+                "lf"
+            }
+            fn authorizer(&self) -> Option<Arc<dyn oxidant_catalog::TableAuthorizer>> {
+                self.enabled
+                    .then(|| self.authorizer.clone() as Arc<dyn oxidant_catalog::TableAuthorizer>)
+            }
+            async fn list_namespaces(&self, _parent: &[String]) -> CatResult<Vec<Vec<String>>> {
+                Ok(vec![vec!["oxidant_lf_secure".to_string()]])
+            }
+            async fn list_tables(&self, _ns: &[String]) -> CatResult<Vec<String>> {
+                Ok(vec!["lf_protected_customers".to_string()])
+            }
+            async fn load_table(&self, ns: &[String], table: &str) -> CatResult<TableMetadata> {
+                if ns == ["oxidant_lf_secure"] && table == "lf_protected_customers" {
+                    Ok(TableMetadata::new(
+                        "lf.oxidant_lf_secure.lf_protected_customers",
+                        self.location.clone(),
+                        TableFormat::Parquet,
+                    ))
+                } else {
+                    Err(Error::Plan(format!(
+                        "no such table: {}.{table}",
+                        ns.join(".")
+                    )))
+                }
+            }
+        }
+
+        let dir = write_lf_fixture();
+        let location = format!("file://{}", dir.to_string_lossy());
+
+        let off_counter = Arc::new(CountingAuthorizer {
+            calls: AtomicU64::new(0),
+        });
+        let off = crate::Engine::new();
+        off.register_catalog(
+            "lf",
+            Arc::new(CountingCatalog {
+                location: location.clone(),
+                authorizer: off_counter.clone(),
+                enabled: false,
+            }),
+        );
+        let (batches, required, _) = capture_lakeformation_enforcement(async {
+            off.sql(&format!("SELECT * FROM {LF_TABLE}")).await
+        })
+        .await
+        .expect("enforcement off");
+        assert_eq!(
+            off_counter.calls.load(Ordering::SeqCst),
+            0,
+            "no `lakeformation=true` must mean not one Lake Formation call"
+        );
+        assert_eq!(
+            batches[0].schema().fields().len(),
+            4,
+            "every column, including ssn"
+        );
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        assert!(
+            !required,
+            "an unenforced catalog must not demand worker enforcement"
+        );
+
+        // Same catalog, same table, authorizer exposed: now it is consulted and the policy applies.
+        let on_counter = Arc::new(CountingAuthorizer {
+            calls: AtomicU64::new(0),
+        });
+        let on = crate::Engine::new();
+        on.register_catalog(
+            "lf",
+            Arc::new(CountingCatalog {
+                location,
+                authorizer: on_counter.clone(),
+                enabled: true,
+            }),
+        );
+        let batches = on
+            .sql(&format!("SELECT * FROM {LF_TABLE}"))
+            .await
+            .expect("enforcement on");
+        assert!(on_counter.calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(batches[0].schema().fields().len(), 1);
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A denied column named in a `WHERE` clause must be an error too. Resolving it to NULL would
+    /// silently change the query's meaning instead of telling the user the column is not theirs.
+    #[tokio::test]
+    async fn a_denied_column_in_a_predicate_is_an_error_not_a_silent_null() {
+        let (engine, dir) = secured_engine(Some(granted(Some(&["id", "region", "amount"]), None)));
+        for sql in [
+            format!("SELECT id FROM {LF_TABLE} WHERE ssn = 'aaa'"),
+            format!("SELECT id FROM {LF_TABLE} ORDER BY ssn"),
+            format!("SELECT COUNT(DISTINCT ssn) FROM {LF_TABLE}"),
+        ] {
+            let err = match engine.sql(&sql).await {
+                Ok(_) => panic!("`{sql}` must not silently succeed against a denied column"),
+                Err(e) => format!("{e}"),
+            };
+            assert!(err.contains("ssn"), "`{sql}` -> {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Credential vending is S3-only, as documented. A governed table on other storage must still
+    /// get its column and row policy — just not scoped credentials.
+    #[tokio::test]
+    async fn a_governed_table_off_s3_still_gets_its_policy_without_vended_credentials() {
+        let dir = write_lf_fixture();
+        let access = oxidant_catalog::TableAccess {
+            authorized_columns: Some(vec!["id".to_string(), "region".to_string()]),
+            row_filter: Some("region = 'us'".to_string()),
+            credentials: Some(oxidant_catalog::VendedCredentials {
+                access_key_id: "ASIAEXAMPLE".to_string(),
+                secret_access_key: "secret".to_string(),
+                session_token: Some("token".to_string()),
+                expires_at: Some(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                ),
+            }),
+            enforced: true,
+        };
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "lf",
+            Arc::new(SecuredCatalog {
+                location: format!("file://{}", dir.to_string_lossy()),
+                authorizer: Arc::new(StaticAuthorizer {
+                    access: Some(access),
+                    principal: "arn:aws:iam::123456789012:role/analyst".to_string(),
+                }),
+            }),
+        );
+
+        // Vending is skipped for a non-S3 location, and skipping it must not fail the query…
+        let batches = engine
+            .sql(&format!("SELECT * FROM {LF_TABLE} ORDER BY id"))
+            .await
+            .expect("a governed table on local storage must still be readable");
+        // …and must not skip the policy either.
+        let names: Vec<String> = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, vec!["id", "region"]);
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two governed tables in ONE bucket, through the real wiring: DataFusion registers object
+    /// stores per bucket, so the second table must add a route to the EXISTING router rather than
+    /// replace it — replacing would leave the first table reading with the ambient identity,
+    /// silently.
+    #[tokio::test]
+    async fn two_governed_tables_in_one_bucket_share_one_router_with_separate_routes() {
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        crate::lakeformation_store::reset_routing_stores();
+        let creds = |k: &str| oxidant_catalog::VendedCredentials {
+            access_key_id: k.to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: Some("token".to_string()),
+            expires_at: Some(std::time::SystemTime::now() + std::time::Duration::from_secs(3600)),
+        };
+        let access = |k: &str| oxidant_catalog::TableAccess {
+            authorized_columns: Some(vec!["id".to_string()]),
+            row_filter: None,
+            credentials: Some(creds(k)),
+            enforced: true,
+        };
+
+        let engine = crate::Engine::new();
+        let state = engine.ctx().state();
+        for (table, key) in [
+            ("customers", "ASIACUSTOMERS"),
+            ("orders", "ASIAORDERS"),
+            // A third table under a prefix that merely shares a stem with the first: it must get
+            // its OWN route, not be swallowed by `secure/customers`.
+            ("customers_public", "ASIAPUBLIC"),
+        ] {
+            let location = format!("s3://lf-shared-bucket/secure/{table}/");
+            let provider = OxidantSchemaProvider::new(
+                Arc::new(SecuredCatalog {
+                    location: location.clone(),
+                    authorizer: Arc::new(StaticAuthorizer {
+                        access: Some(access(key)),
+                        principal: "arn:aws:iam::123456789012:role/analyst".to_string(),
+                    }),
+                }),
+                vec!["oxidant_lf_secure".to_string()],
+                Arc::new(engine.ctx().clone()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)),
+                PendingCtas::default(),
+            );
+            let md = TableMetadata::new(table, location, TableFormat::Parquet);
+            provider
+                .install_vended_credentials(&state, &md, table, &access(key))
+                .expect("install vended credentials");
+        }
+
+        let url = ListingTableUrl::parse("s3://lf-shared-bucket/secure/customers/").expect("url");
+        let registered = state
+            .runtime_env()
+            .object_store(url.object_store())
+            .expect("store registered for the bucket");
+        let rendered = format!("{registered}");
+        assert!(
+            rendered.contains("LakeFormationRoutingObjectStore"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("3 governed prefixes"),
+            "the second and third table must ADD routes, not replace the first: {rendered}"
+        );
+        crate::lakeformation_store::reset_routing_stores();
+    }
+
     /// The driver-side half: resolving a governed table must be *observed*, so the flag it stamps
     /// on the stage tickets is set. Without this the guard above would never engage.
     #[tokio::test]
