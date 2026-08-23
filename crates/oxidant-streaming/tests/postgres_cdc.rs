@@ -451,6 +451,16 @@ async fn the_connector_log_records_the_snapshot_the_batches_and_the_slot() {
     assert_eq!(snapshot["rows"], 1);
     assert_eq!(snapshot["table"], "public.ox_cdc_log");
 
+    // The resolved row identity is in the log too: it is what a delete is matched on, and an
+    // operator debugging a merge should not have to guess which columns the connector picked.
+    let start = events
+        .iter()
+        .find(|e| e["event"] == "snapshot_start")
+        .expect("a snapshot_start event");
+    assert_eq!(start["tables"][0]["table"], "public.ox_cdc_log");
+    assert_eq!(start["tables"][0]["keys"][0], "id");
+    assert_eq!(start["tables"][0]["replica_identity"], "d");
+
     fixture.drop_all().await;
 }
 
@@ -480,6 +490,32 @@ async fn a_table_that_cannot_be_replicated_says_exactly_how_to_fix_it() {
         .await;
     let source = fixture.source();
     assert_eq!(source.schema().fields().len(), 5, "two columns plus three");
+    drop(source);
+
+    fixture.drop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_column_may_not_be_named_like_a_metadata_column() {
+    gated!(connect);
+    let fixture = Fixture::new(
+        &connect,
+        "ox_cdc_collide",
+        "id bigint primary key, __oxidant_lsn text",
+    )
+    .await;
+    let err = build_err(
+        &fixture.options(),
+        "the column collides with `__oxidant_lsn`",
+    );
+    assert!(err.contains("__oxidant_lsn"), "got: {err}");
+    assert!(err.contains("exclude_columns"), "and the way out: {err}");
+
+    // Excluding it is the way out, and then the table replicates.
+    let mut options = fixture.options();
+    options.insert("exclude_columns".into(), "__oxidant_lsn".into());
+    let source = PostgresCdcSource::from_options(&options).expect("builds once the column is out");
+    assert_eq!(source.schema().fields().len(), 4, "id plus the three");
     drop(source);
 
     fixture.drop_all().await;

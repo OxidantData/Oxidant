@@ -76,7 +76,8 @@ pub const TS_COLUMN: &str = "__oxidant_ts";
 const DEFAULT_MAX_SLOT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// Decoded change bytes one micro-batch may cover before it stops at the next commit boundary.
 const DEFAULT_MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
-/// Rows per Arrow batch while a snapshot is being read.
+/// Rows per emitted Arrow batch. Named for the snapshot because that is where it matters — a
+/// whole source table arrives as one micro-batch — but a WAL batch is chunked by it too.
 const DEFAULT_SNAPSHOT_BATCH_ROWS: usize = 65_536;
 /// How long planning waits for more WAL before deciding the publisher is caught up.
 ///
@@ -1117,7 +1118,17 @@ impl PostgresCdcSource {
                 json!({
                     "slot": self.options.slot,
                     "consistent_point": self.position.to_string(),
-                    "tables": self.tables.iter().map(TableSchema::qualified).collect::<Vec<_>>(),
+                    "tables": self
+                        .tables
+                        .iter()
+                        .map(|t| json!({
+                            "table": t.qualified(),
+                            // The identity a delete is matched on, and the REPLICA IDENTITY that
+                            // decides how much of the old row arrives with one.
+                            "keys": t.keys,
+                            "replica_identity": t.replica_identity.to_string(),
+                        }))
+                        .collect::<Vec<_>>(),
                 }),
             );
         }
@@ -1949,6 +1960,19 @@ async fn introspect(
         return Err(Error::Plan(format!(
             "postgres_cdc: every column of `{qualified}` is in `exclude_columns:`"
         )));
+    }
+    // The three metadata columns are appended to the emitted schema, so a source column of the
+    // same name would produce two fields with one name — and AUTO CDC's `sequence_by:
+    // __oxidant_lsn` would resolve to whichever came first.
+    for column in &columns {
+        if [OP_COLUMN, LSN_COLUMN, TS_COLUMN].contains(&column.name.as_str()) {
+            return Err(Error::Plan(format!(
+                "postgres_cdc: `{qualified}` has a column named `{}`, which is the name this \
+                 source gives one of its own metadata columns. Keep it out with \
+                 `exclude_columns: {}`, or rename it on the source.",
+                column.name, column.name
+            )));
+        }
     }
 
     // `keys:` overrides the primary key as the row's identity, so it has to name columns that
