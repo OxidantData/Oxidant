@@ -1124,6 +1124,30 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    /// An ephemeral loopback port, taken by binding and immediately releasing it — the
+    /// fixed-port schemes elsewhere in this workspace collide when two `cargo test` runs
+    /// overlap.
+    fn ephemeral_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        listener.local_addr().expect("local_addr").port()
+    }
+
+    /// [`test_state`] for a driver with `workers` attached, so statements take the
+    /// distributed path.
+    fn test_state_with_workers(
+        workers: Vec<String>,
+    ) -> (MutexGuard<'static, ()>, RestState, Router) {
+        let guard = crate::distributed::env_lock();
+        let mut service = OxidantService::new();
+        service.workers = workers;
+        let state = RestState {
+            service: Arc::new(service),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+        };
+        (guard, state.clone(), app(state))
+    }
+
     /// Build the test router, holding the process-global env lock for the caller's test.
     ///
     /// These tests execute real SQL, and the engine reads `OXIDANT_DISTRIBUTED_STRICT` /
@@ -1522,5 +1546,137 @@ mod tests {
         assert!(suggestions
             .iter()
             .any(|s| s["kind"] == "column" && s["name"] == "id"));
+    }
+
+    /// Regression for issue #130: a `CREATE TABLE … AS SELECT` submitted through the statement
+    /// API must be readable by a *later* statement on the same server. The write and the read
+    /// are separate REST requests, which is exactly the split the bug lived in — `SHOW TABLES`
+    /// listed the table while `SELECT` reported it missing.
+    #[tokio::test]
+    async fn ctas_is_readable_by_a_later_statement() {
+        let (_env, _state, app) = test_state();
+
+        for sql in [
+            "CREATE SCHEMA ctas_demo",
+            "CREATE TABLE ctas_demo.sales USING parquet AS \
+             SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)",
+        ] {
+            let (status, body) =
+                post_json(&app, "/api/v1/statements?wait=true", json!({ "sql": sql })).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "succeeded", "`{sql}` failed: {body}");
+        }
+
+        // The metastore lists it ...
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/spark_catalog/tables?namespace=ctas_demo",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["tables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "sales"),
+            "SHOW TABLES equivalent did not list the CTAS table: {body}"
+        );
+
+        // ... and so must a plain SELECT in a second statement.
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/statements?wait=true",
+            json!({ "sql": "SELECT id, name FROM ctas_demo.sales ORDER BY id" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "succeeded", "read-back failed: {body}");
+        assert_eq!(body["rowCount"], 2);
+
+        let id = body["statementId"].as_str().unwrap().to_string();
+        let (status, result) = get_json(&app, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result["rows"][0]["id"], 1);
+        assert_eq!(result["rows"][0]["name"], "a");
+        assert_eq!(result["rows"][1]["id"], 2);
+        assert_eq!(result["rows"][1]["name"], "b");
+    }
+
+    /// The #130 repro, and the reason the fix lives in the distributed decision rather than in
+    /// the catalog: with workers attached, `SELECT * FROM ctas_demo.sales` used to be split into
+    /// stage SQL and shipped to a worker whose engine has never heard of `ctas_demo.sales`,
+    /// coming back as `do_get: … table 'spark_catalog.ctas_demo.sales' not found` one statement
+    /// after the CTAS reported success. The worker here is a bare `Engine` — exactly a real
+    /// worker's view of a table the driver created for itself.
+    #[tokio::test]
+    async fn ctas_is_readable_by_a_later_statement_with_workers_attached() {
+        let worker_port = ephemeral_port();
+        tokio::spawn(async move {
+            let _ = oxidant_execution::flight::serve_worker(
+                worker_port,
+                Arc::new(oxidant_loom::Engine::new()),
+            )
+            .await;
+        });
+        let (_env, _state, app) =
+            test_state_with_workers(vec![format!("http://127.0.0.1:{worker_port}")]);
+        // The worker's Flight listener comes up asynchronously; the driver's membership probe
+        // silently drops an unreachable endpoint, which would take the query local and pass the
+        // test for the wrong reason.
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", worker_port)).is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        for sql in [
+            "CREATE SCHEMA ctas_demo_dist",
+            "CREATE TABLE ctas_demo_dist.sales USING parquet AS \
+             SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)",
+        ] {
+            let (status, body) =
+                post_json(&app, "/api/v1/statements?wait=true", json!({ "sql": sql })).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "succeeded", "`{sql}` failed: {body}");
+        }
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/statements?wait=true",
+            json!({ "sql": "SELECT * FROM ctas_demo_dist.sales" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "succeeded", "read-back failed: {body}");
+        assert_eq!(body["rowCount"], 2);
+
+        // The bare (no `USING`) form registers a DataFusion `MemTable` instead, and is just as
+        // invisible to a worker — issue #130 reports both shapes failing identically.
+        for sql in [
+            "CREATE SCHEMA ctas_demo_mem",
+            "CREATE TABLE ctas_demo_mem.sales AS \
+             SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)",
+        ] {
+            let (status, body) =
+                post_json(&app, "/api/v1/statements?wait=true", json!({ "sql": sql })).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "succeeded", "`{sql}` failed: {body}");
+        }
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/statements?wait=true",
+            json!({ "sql": "SELECT count(*) AS n FROM ctas_demo_mem.sales" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["status"], "succeeded",
+            "MemTable read-back failed: {body}"
+        );
+        let id = body["statementId"].as_str().unwrap().to_string();
+        let (_, result) = get_json(&app, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(result["rows"][0]["n"], 2);
     }
 }

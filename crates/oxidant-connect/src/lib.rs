@@ -810,10 +810,17 @@ impl OxidantService {
                     None => oxidant_loom::shard::replicated_tables_override_from_env(),
                 };
                 let replicated_refs: Vec<&str> = replicated.iter().map(String::as_str).collect();
+                // Issue #130: a table this driver created with `CREATE TABLE …` exists only in
+                // this process — a DataFusion `MemTable`, or files under the engine's
+                // process-private managed warehouse — and cluster DDL is never replayed to
+                // workers. Splitting such a query ships stage SQL naming a table no worker can
+                // resolve, which is how `SELECT * FROM demo.sales` came back as
+                // `table 'spark_catalog.demo.sales' not found` right after its CTAS succeeded.
+                let driver_only_table = driver_only_table_in(engine, plan_and_pins.as_ref());
                 // A plan that failed to build skips the distributed attempt; the local
                 // path below re-parses and surfaces the same error to the client.
                 let dist_result = match &plan_and_pins {
-                    Some((plan, pins)) => {
+                    Some((plan, pins)) if driver_only_table.is_none() => {
                         distributed::try_run_distributed_plan(
                             engine,
                             &workers,
@@ -829,7 +836,7 @@ impl OxidantService {
                         )
                         .await
                     }
-                    None => Ok(None),
+                    _ => Ok(None),
                 };
                 match dist_result {
                     Ok(Some(dist)) => {
@@ -869,7 +876,12 @@ impl OxidantService {
                         // Soft mode still falls through — but never when discovery env is
                         // set and the membership set was empty (handled above). If we got
                         // here with workers configured under strict, refuse local SF100.
-                        if distributed::distributed_strict_public()
+                        // A driver-only table is exempt: strict mode guards against an
+                        // accidental SF100 driver-local *fact scan*, and this data is
+                        // driver-local by construction — refusing would leave the query with
+                        // nowhere to run at all.
+                        if driver_only_table.is_none()
+                            && distributed::distributed_strict_public()
                             && (!workers.is_empty()
                                 || std::env::var("OXIDANT_WORKER_SERVICE")
                                     .ok()
@@ -990,21 +1002,32 @@ impl OxidantService {
                 if let Some(t) = &tracker {
                     self.spawn_plan_explain(t, plan.clone());
                 }
-                match distributed::try_run_distributed_plan(
-                    engine,
-                    &workers,
-                    &plan,
-                    "DataFrame",
-                    &replicated_refs,
-                    Some(&udf_json),
-                    tracker.as_deref(),
-                    &lakehouse_snapshot_pins,
-                    lakeformation_required,
-                    &lakeformation_principal,
-                    &self.distributed_caches,
-                )
-                .await
-                {
+                // Same driver-only-table exemption as the SQL arm above (issue #130): a
+                // DataFrame over a table this driver created with `CREATE TABLE …` cannot be
+                // split into worker stages, because no worker can resolve the name.
+                let driver_only_table = engine.locally_created_table_in_plan(&plan);
+                if let Some(name) = &driver_only_table {
+                    log_driver_only_table(name);
+                }
+                let dist_result = if driver_only_table.is_some() {
+                    Ok(None)
+                } else {
+                    distributed::try_run_distributed_plan(
+                        engine,
+                        &workers,
+                        &plan,
+                        "DataFrame",
+                        &replicated_refs,
+                        Some(&udf_json),
+                        tracker.as_deref(),
+                        &lakehouse_snapshot_pins,
+                        lakeformation_required,
+                        &lakeformation_principal,
+                        &self.distributed_caches,
+                    )
+                    .await
+                };
+                match dist_result {
                     Ok(Some(dist)) => {
                         let mut batches = dist
                             .into_iter()
@@ -1020,7 +1043,8 @@ impl OxidantService {
                         return Ok((batches, None));
                     }
                     Ok(None) => {
-                        if distributed::distributed_strict_public()
+                        if driver_only_table.is_none()
+                            && distributed::distributed_strict_public()
                             && (!workers.is_empty()
                                 || std::env::var("OXIDANT_WORKER_SERVICE")
                                     .ok()
@@ -2117,6 +2141,28 @@ fn signed_columns(batch: RecordBatch) -> std::result::Result<RecordBatch, Status
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     RecordBatch::try_new(schema, cols).map_err(|e| Status::internal(format!("rebuild batch: {e}")))
+}
+
+/// The first table in `plan_and_pins`' plan that only this driver process knows about
+/// ([`Engine::locally_created_table_in_plan`]), logging the decision when there is one.
+///
+/// `None` for a plan that failed to build — that query never reaches the splitter anyway.
+fn driver_only_table_in(
+    engine: &Engine,
+    plan_and_pins: Option<&(oxidant_loom::datafusion::logical_expr::LogicalPlan, String)>,
+) -> Option<String> {
+    let name = engine.locally_created_table_in_plan(&plan_and_pins?.0)?;
+    log_driver_only_table(&name);
+    Some(name)
+}
+
+/// Always-on journal line for the #130 decision, in the same style as the other
+/// `Oxidant distributed:` lines (RUST_LOG is routinely unset on the AMI).
+fn log_driver_only_table(name: &str) {
+    eprintln!(
+        "Oxidant distributed: `{name}` was created by this driver's own DDL and does not exist \
+         on any worker; running the query locally"
+    );
 }
 
 pub(crate) fn err_to_status(e: Error) -> Status {
