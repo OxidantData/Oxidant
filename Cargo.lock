@@ -4424,6 +4424,7 @@ name = "oxidant-cli"
 version = "0.1.31"
 dependencies = [
  "axum 0.8.9",
+ "chrono",
  "datafusion",
  "oxidant-common",
  "oxidant-config",
@@ -4650,7 +4651,9 @@ name = "oxidant-pipelines"
 version = "0.1.31"
 dependencies = [
  "async-trait",
+ "chrono",
  "datafusion",
+ "oxidant-catalog-local",
  "oxidant-common",
  "oxidant-config",
  "oxidant-loom",

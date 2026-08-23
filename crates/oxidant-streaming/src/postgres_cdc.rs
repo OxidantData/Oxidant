@@ -2368,6 +2368,34 @@ impl Source for PostgresCdcSource {
 // Setup validation and introspection
 // ---------------------------------------------------------------------------------------------
 
+/// Resolve and introspect the source tables **without changing anything on the publisher**.
+///
+/// [`PostgresCdcSource::from_options`] takes the other path: it also checks `wal_level`, the
+/// role's REPLICATION privilege, and creates the publication when it is missing — all correct
+/// for a pipeline that is about to replicate, and all wrong for `oxidant pipeline reconcile`,
+/// which exists to *report* on a publisher rather than to alter one. The two share
+/// [`resolve_tables`], so a reconcile reads the same columns, keys and replica identities the
+/// stream does; it just never writes.
+pub async fn introspect_read_only(options: &PostgresCdcOptions) -> Result<Vec<TableSchema>> {
+    let control = options.connect.connect_control().await?;
+    resolve_tables(&control, options).await
+}
+
+/// Convert one column's Postgres text form to Arrow through the connector's own mapping.
+///
+/// Reconcile compares the *value the stream would have written* against the value in the target,
+/// so it has to convert the source exactly as a micro-batch does — otherwise a `numeric` that
+/// prints `1.50` on one side and `1.5` on the other reads as drift that is not there. Values
+/// that are legal in Postgres but unrepresentable in the mapped Arrow type land as NULL here,
+/// same as in a batch; the source logs those, and reconcile compares what it would have stored.
+pub fn text_column_to_arrow(
+    data_type: &DataType,
+    column: &str,
+    values: &[Option<&str>],
+) -> Result<ArrayRef> {
+    build_array(data_type, column, values).map(|(array, _dropped)| array)
+}
+
 /// Run the setup checks and introspection on a runtime of their own.
 ///
 /// A thread rather than `block_on` on the caller's runtime, which would panic: `build_source` is

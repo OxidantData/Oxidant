@@ -111,25 +111,163 @@ pgoutput's text representation except bytea (`\x` hex).
 ## 4. Reconciliation (manual + scheduled)
 
 Drift happens: slot dropped, WAL recycled past `restart_lsn`, source restored
-from backup, a bug. Detection and repair are first-class:
+from backup, a bug. Detection is **built** — read-only, exit-code driven, and
+scriptable. Repair (`--repair`, the ClickPipes "table resync" analog) is v2;
+see the end of this section.
 
-- **`oxidant pipeline reconcile -c oxidant.yaml [--table t] [--repair]`** —
-  for every postgres_cdc table: compare the source's `count(*)` and a
-  key-ordered aggregate hash (`md5(string_agg(md5(row::text), '' ORDER BY
-  key))` on the source, the same folded hash over the Delta target via the
-  engine) and report `in_sync | row_count_drift | hash_drift`. `--repair`
-  re-snapshots the table (drop + fresh `USE_SNAPSHOT` load, resuming the
-  stream from the new consistent point) — the ClickPipes "table resync"
-  analog.
-- **Auto**: optional `reconcile:` block on the pipeline —
-  ```yaml
-  reconcile:
-    cron: "0 */6 * * *"     # engine-side scheduler, same cron parser as triggers
-    mode: check             # check | repair
-  ```
-  `check` logs and emits a metric/event; `repair` additionally re-snapshots
-  drifting tables. Runs between micro-batch triggers so it never interleaves
-  a batch.
+```sh
+oxidant pipeline reconcile -c oxidant.yaml                    # every postgres_cdc table
+oxidant pipeline reconcile -c oxidant.yaml --table public.sales_suppliers
+oxidant pipeline reconcile -c oxidant.yaml --sample 100000    # widen the key walk
+oxidant pipeline reconcile -c oxidant.yaml --cron '0 6 * * *' # register a schedule
+oxidant pipeline reconcile -c oxidant.yaml --cron off         # and clear it
+```
+
+The source's own `options:` block is what it connects with — host, port, TLS,
+and `password_env` resolved exactly as `run` resolves them. There is no second
+config surface, and no credential that only reconcile knows about.
+
+**What it compares.** For every `postgres_cdc` table in the pipeline, against
+the lakehouse table that source feeds:
+
+- **Row counts** — `count(*)` upstream (summed across the source's `tables:`)
+  against `count(*)` on the target.
+- **A key-set diff**, walked in ascending key order on both sides and cut at
+  `--sample` keys (default 10,000), reporting three classes by key:
+  `missing_in_target` (the stream never carried it), `missing_in_source`
+  (phantoms — a delete that never landed), and `hash_mismatches` (present on
+  both sides, different contents).
+
+Counts and keys are both there because either alone lies. An insert and a
+delete between two runs leave the count unchanged and the key set completely
+different; a table whose sample covers the first 10,000 of 40 million keys has
+a count that covers all of them.
+
+**Verdicts**, per table: `in_sync`, `row_count_drift`, `key_drift`,
+`schema_drift` (the target is missing a source column), `target_missing` (the
+pipeline has not created it yet), `source_error` (this table could not be read
+at all). The process exits **0** when every table is `in_sync`, **1** when any
+drifted, and **2** when any could not be compared — an unreachable publisher, a
+`--table` that matches nothing, a key type the walk refuses, an overlapping key
+space. Drift and "could not run" get different codes on purpose: a CI step
+written as `reconcile || page_the_data_team` should not page for a network
+blip. A run that hit both exits 2, because an incomplete run's "no drift here"
+is only a claim about the tables it read.
+
+One table's failure does not discard the others' results: it is reported as
+that table's `source_error`, with its error in place of the comparison, and
+every other table is still compared.
+
+**How the two sides are made comparable.** This is the part that decides
+whether the report is worth reading.
+
+- Source rows are read as Postgres text and converted to Arrow through *the
+  connector's own type mapping* (§3) — the mapping a micro-batch uses. The
+  target's columns are cast to the same Arrow types before either side is
+  rendered. So a `numeric` that prints `1.50` in `psql` and a
+  `Decimal128(38,2)` in Delta compare equal, and a reported difference is a
+  difference the stream would have written rather than two systems spelling
+  one value two ways.
+- The row hash covers the **non-key** columns, over that shared rendering. A
+  column the target does not have is excluded from *both* hashes and reported
+  once as `schema_drift` — otherwise one dropped column reads as every row
+  mismatching.
+- The key walk is over the key's **text form under byte (`C`) collation** on
+  both sides, because ordering has to agree across two engines. That is exact
+  for integer, text, uuid, date and numeric keys. A key type where a Postgres
+  text form and an Arrow one genuinely disagree — `float8`, `timestamptz`,
+  `bytea` — is **refused by name** rather than compared, because comparing it
+  would put the two walks in different orders and report the whole table as
+  drifted. `keys:` on the source can name a different identity when that bites.
+- When either side hits `--sample`, each side's cut bounds only what the
+  *other* may be accused of: "missing from the target" holds for any key below
+  the last one the target read. The report prints the key full coverage stops
+  at, so a sampled run never reads as a complete one.
+
+- `auto_cdc`'s projection decides which source columns the target owes.
+  `column_list` / `except_column_list` are applied before the schema check, so
+  a column the merge is configured to drop is not `schema_drift`; the report
+  lists it as *not compared*, which is a different thing from matched. The
+  metadata columns the merge adds (`__oxidant_*`) are plumbing and never drift.
+
+The walk is deterministic — same tables, same report — so two runs differing is
+itself a signal. `--sample` is capped at 5,000,000 keys: both sides of a walk
+are materialized to compare them, and the row counts cover every row whatever
+the sample is.
+
+**A NULL in the row identity is refused**, like an unwalkable key type. A NULL
+is not a key: two NULL-keyed rows render to one string and one of them
+disappears from a report whose whole output is per-key. A primary key is
+`NOT NULL`, so this only reaches a `keys:` override naming a nullable column —
+and it is checked against the values rather than the schema, so a nullable
+column holding no NULLs stays a perfectly good identity.
+
+**A source with more than one upstream table** is compared as the union of
+them, because that is what `auto_cdc` merges into the one target. That reading
+is only true while the tables have **disjoint key values**: the merge keeps one
+row per key, so two upstream tables that both contain `id = 1` give the union
+more rows than the target will ever hold, and the key walk — which needs
+strictly ascending keys, not merely sorted ones — reports the duplicate as
+missing from a target that has it. Reconcile probes for the overlap (one
+grouped scan of the union, only for a source that declares more than one table)
+and **refuses** rather than reporting drift that is not there. Namespacing the
+keys per table would make the walk self-consistent but not true — the target
+has no column saying which table a row came from. Declare one `postgres_cdc`
+source per upstream table; §9 already lists a multi-table single source as a v1
+non-goal.
+
+**Scheduling.** `--cron '<expr>'` writes `reconcile.json` into the pipeline's
+checkpoint directory (path, expression, sample, `--table` filters, last run and
+its verdict) and notes the schedule in each connector's JSONL log.
+`oxidant pipeline show` prints it, including when it last ran and when it fires
+next:
+
+```text
+reconcile: `0 6 * * *`
+      sample: 10000 key(s)
+      last:   2026-08-23T06:00:00Z — in_sync
+      next:   2026-08-24T06:00:00Z
+      from:   /srv/oxidant/checkpoints/reconcile.json
+```
+
+The expression is standard five-field cron — `minute hour day-of-month month
+day-of-week`, with `*`, `N`, `A-B`, `,` lists, `/steps` and `JAN`/`MON` names —
+evaluated in **UTC**, and with Vixie cron's rule that a restricted
+day-of-month and day-of-week are a union rather than an intersection. It is
+checked before anything is written, so a typo is an error and not a schedule
+that silently never fires.
+
+The tick itself lives in **`oxidant pipeline run`**: after each trigger pass —
+never inside one, so a reconcile can never read a target mid-write — the run
+loop re-reads `reconcile.json` and runs the reconcile if it is due, printing
+the whole report and recording the verdict. Two consequences worth knowing:
+a `trigger: once` run does one pass and exits, so it never reaches "between
+triggers" and never ticks; and a scheduled reconcile that *fails* is reported
+and dropped, because a drift report is not a reason to stop replicating.
+
+The standalone command is the operational path. The scheduler exists so a
+schedule fires without a second process, not as a replacement for running the
+command when you want an answer now.
+
+Every run — scheduled or not — appends a `reconcile` event to the connector's
+log (§6) with the verdict and the per-class counts, so the platform console
+sees it without shell access.
+
+**Not in v1:** `--repair`. Re-snapshotting a drifting table means dropping the
+slot, taking a fresh `USE_SNAPSHOT` load and resuming the stream from the new
+consistent point *while the pipeline is running* — a change to the source's
+state machine rather than to a reporting command, and one whose failure mode is
+data loss rather than a wrong number. Detection is what tells an operator to do
+it; today the repair is "delete the table's checkpoint directory and restart
+the pipeline", which is the same re-snapshot done by hand and with the pipeline
+stopped.
+
+Also not v1: the `reconcile:` YAML block this section originally sketched. A
+schedule is operational state — you register one from a laptop against a
+running deployment, and `pipeline run` has to pick it up without the config
+file being reloaded — so it lives beside the checkpoints instead of in a file
+that is checked into a repository. `mode: repair` follows `--repair`.
+
 - **WAL-growth self-defense**: if the slot's retained WAL (from
   `pg_replication_slots`) passes `max_slot_bytes` (default 10 GiB, option),
   the source pauses with a loud error rather than letting the slot fill the
@@ -190,7 +328,7 @@ into `/api/status` so a list page can show health at a glance.
 | Sync interval / pull batch size | ✅ pipeline `trigger:` + `max_batch_bytes` |
 | Slot size monitoring + alerts | ✅ slot metrics in logs + `/api/status`; `max_slot_bytes` self-defense |
 | Add tables to a running pipe | v2 (v1: add to YAML, restart pipeline — state resumes from checkpoints) |
-| Table resync | ✅ `pipeline reconcile --repair` (also cron) |
+| Table resync | ⚠️ detection shipped (`pipeline reconcile`, manual + cron); the re-snapshot itself is v2 — see §4 |
 | TLS modes + custom CA | ✅ v1 |
 | SSH tunnel / PrivateLink / static IPs | n/a — engine runs in the customer's VPC beside the database |
 | RDS IAM auth | v2 |
@@ -201,15 +339,24 @@ into `/api/status` so a list page can show health at a glance.
 
 ## 8. Testing
 
-- **Unit**: pgoutput decoder against recorded WAL message bytes (a captured
-  fixture of Begin/Relation/Insert/Update/Delete/Commit covering every §3
-  type); type-mapping table tests; snapshot-handoff sequence test against a
-  fake wire; reconcile-hash equivalence test.
-- **Integration** (`#[ignore]` unless `OXIDANT_PG_TEST_DSN` is set): real
-  Postgres — snapshot, insert/update/delete, truncate, additive schema
-  change, kill-and-resume mid-batch (replayed range must reproduce),
-  reconcile drift detection + repair. CI gets a service container later; the
-  gate for this PR is the local e2e below.
+- **Unit** (run by CI, no server): pgoutput decoder against recorded WAL
+  message bytes (a captured fixture of Begin/Relation/Insert/Update/Delete/
+  Commit covering every §3 type); type-mapping table tests; snapshot-handoff
+  sequence test against a fake wire; the diff walker over synthetic windows;
+  the cron evaluator; and the **cross-engine agreement tests** — for every
+  walkable type, the text Postgres returns for the projection reconcile builds
+  against the same value rendered from the Arrow array the lakehouse holds,
+  through the same formatter, for both the key spelling and the row hash. Those
+  are what keep the two sides comparable without a database in the loop; the
+  live suite below is what says the fixtures are what a server really returns.
+- **Integration**, real Postgres — snapshot, insert/update/delete, truncate,
+  additive schema change, kill-and-resume mid-batch (replayed range must
+  reproduce), reconcile drift detection. `#[ignore]`d unless
+  `OXIDANT_PG_TEST_DSN` is set, conditionally through each crate's `build.rs`,
+  so a run without a server reports them as *ignored* rather than as passed —
+  a skipped test that reports as passed is worse than no test — and
+  `OXIDANT_PG_TEST_DSN=… cargo test` runs them unchanged. CI gets a service
+  container later; the gate for this PR is the local e2e below.
 - **E2E (this machine)**: Homebrew postgresql@17, `wal_level=logical` scratch
   cluster, `oxidant pipeline run` against `examples/postgres-cdc.yaml`,
   mutations applied live, Delta target verified with `oxidant sql`.
@@ -342,10 +489,14 @@ the memory and 2x the time. With `publish_via_partition_root` at its default
 `false` a *change* arrives attributed to the partition, and is matched to the
 parent by the publication rather than by a second `tables:` entry.
 
-**Reconciliation (§4) is not in this PR** beyond the WAL-growth self-defense,
-which is: `max_slot_bytes` (default 10 GiB) is checked on every plan, logged as
-`slot_metrics`, and stops the pipeline with the `pg_drop_replication_slot` SQL
-when it is exceeded. The `reconcile` subcommand and its cron are PR2.
+**Reconciliation (§4) is built, minus repair.** `oxidant pipeline reconcile`
+reports drift and `--cron` schedules it; both are described in §4, including the
+two places the shipped design departs from the sketch there (a bounded key walk
+rather than one folded aggregate hash, and a schedule in the checkpoint
+directory rather than a `reconcile:` YAML block). `--repair` is v2. The
+WAL-growth self-defense is unchanged: `max_slot_bytes` (default 10 GiB) is
+checked on every plan, logged as `slot_metrics`, and stops the pipeline with the
+`pg_drop_replication_slot` SQL when it is exceeded.
 
 **The ui-server endpoint (§6) is not in this PR.** The connector log is written
 in the documented place and format; serving it is a separate change.

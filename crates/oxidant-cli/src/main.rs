@@ -11,6 +11,7 @@
 //!   --hash-keys 0
 //! oxidant pipeline run -c oxidant.yaml      # build the declarative table DAG (Kafka -> lake)
 //! oxidant pipeline validate -c oxidant.yaml  # parse + plan + topo-sort, run nothing
+//! oxidant pipeline reconcile -c oxidant.yaml # postgres_cdc drift report; 1 drifted, 2 could not run
 //! oxidant sql -e "SELECT 1"                 # run SQL in-process (no server needed)
 //! oxidant sql -c oxidant.yaml -e "SELECT count(*) FROM local.live.orders"
 //! oxidant sql --url http://driver:4040 -e "SELECT 1"   # ... or via a server's REST API
@@ -106,6 +107,9 @@ fn usage() {
     eprintln!(
         "  oxidant pipeline (run|validate|show) [--config <FILE>] [--table <NAME>]... [--once]"
     );
+    eprintln!(
+        "  oxidant pipeline reconcile [--config <FILE>] [--table <NAME>]... [--sample <KEYS>] [--cron <EXPR>|off]"
+    );
     eprintln!();
     eprintln!(
         "  `oxidant sql` runs the statement IN-PROCESS by default — no server needed. Catalogs"
@@ -115,6 +119,12 @@ fn usage() {
     );
     eprintln!("  $OXIDANT_URL) to run it against a running server's REST API instead.");
     eprintln!("  `oxidant mcp` always talks to the REST statement API on the UI port.");
+    eprintln!(
+        "  `oxidant pipeline reconcile` reads only. It exits 0 when every postgres_cdc table"
+    );
+    eprintln!(
+        "  matches its lakehouse target and 1 when any drifted, so it drops into cron or CI."
+    );
 }
 
 async fn run_server(
@@ -573,7 +583,7 @@ async fn run_pipeline(
     args: &[String],
     config: Option<oxidant_config::OxidantConfig>,
 ) -> oxidant_common::Result<()> {
-    let command = pipeline::parse_command(args)?;
+    let command = pipeline::parse_command_or_exit(args)?;
     pipeline::run(config, command).await
 }
 

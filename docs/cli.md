@@ -98,6 +98,17 @@ oxidant sql -f report.sql --format csv > report.csv
 - A `failed` statement prints the server-side error to stderr and exits non-zero, so
   `oxidant sql -e ... && next-step` works in scripts.
 
+## Other subcommands
+
+| Command | What it does |
+|---|---|
+| `oxidant spark server` | Spark Connect server (`sc://host:port`) plus the web UI — see [server.md](server.md) |
+| `oxidant worker` / `oxidant driver` | A distributed Flight worker, and a two-stage distributed aggregation across workers |
+| `oxidant history-server` | Serves completed application event logs |
+| `oxidant mcp` | stdio MCP server over the same REST statement API |
+| `oxidant pipeline (run\|validate\|show)` | Builds, checks or prints the table DAG in `oxidant.yaml` — see [pipelines.md](pipelines.md) |
+| `oxidant pipeline reconcile` | Read-only drift report between a `postgres_cdc` source and the lakehouse tables it feeds. `--table <NAME>` scopes it, `--sample <KEYS>` widens the key walk (default 10,000), `--cron '<EXPR>'` registers a schedule (`--cron off` clears it). **Exits 0 in sync, 1 on drift, 2 when it could not run** (unreachable publisher, a `--table` that names nothing, a key type the walk refuses), so `reconcile || page_the_data_team` does not page for a network blip — see [postgres-cdc.md](postgres-cdc.md) §4 |
+
 ## Server flags: `--sample-data` (bundled sample tables)
 
 `oxidant spark server` accepts `--sample-data <DIR>` (env: `OXIDANT_SAMPLE_DATA_DIR`). When
