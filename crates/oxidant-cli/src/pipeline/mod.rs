@@ -107,6 +107,20 @@ fn missing_value(flag: &str) -> Error {
     ))
 }
 
+/// [`parse_command`], exiting with reconcile's own code when it is reconcile's arguments that
+/// were wrong.
+///
+/// `main`'s generic handler exits 1, which under this command's contract means "the comparison
+/// ran and found drift". A `--sample` that is not a number never ran anything, so it is a `2`
+/// like every other "could not run". Kept apart from [`parse_command`] so the parser stays a
+/// function the tests can call without it taking the process down with it.
+pub fn parse_command_or_exit(args: &[String]) -> Result<Command> {
+    match parse_command(args) {
+        Err(e) if subcommand(args) == Some("reconcile") => reconcile_failed(&e),
+        other => other,
+    }
+}
+
 /// Parse the `pipeline` subcommand's arguments.
 pub fn parse_command(args: &[String]) -> Result<Command> {
     let sub = subcommand(args);
@@ -695,6 +709,23 @@ mod tests {
             .expect_err("empty")
             .to_string();
         assert!(err.contains("--cron"), "got: {err}");
+    }
+
+    #[test]
+    fn a_usage_error_is_reconciles_own_failure_code_rather_than_the_one_drift_owns() {
+        // `parse_command_or_exit` takes the process down, so what is testable here is the
+        // condition it keys on: reconcile's own arguments being wrong, versus a `pipeline`
+        // usage error that has nothing to do with this command's exit-code contract.
+        assert_eq!(
+            subcommand(&args(&["oxidant", "pipeline", "reconcile", "--cron"])),
+            Some("reconcile"),
+            "a flag with no value still names the subcommand whose contract it breaks"
+        );
+        assert_eq!(
+            subcommand(&args(&["oxidant", "pipeline", "vlaidate"])),
+            Some("vlaidate"),
+            "and a typo'd subcommand is an ordinary CLI failure, not reconcile's `2`"
+        );
     }
 
     #[test]

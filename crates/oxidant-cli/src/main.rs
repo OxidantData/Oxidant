@@ -583,7 +583,7 @@ async fn run_pipeline(
     args: &[String],
     config: Option<oxidant_config::OxidantConfig>,
 ) -> oxidant_common::Result<()> {
-    let command = pipeline::parse_command(args)?;
+    let command = pipeline::parse_command_or_exit(args)?;
     pipeline::run(config, command).await
 }
 
