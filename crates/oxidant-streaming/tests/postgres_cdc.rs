@@ -1,6 +1,6 @@
 //! End-to-end tests for the `postgres_cdc` source against a real PostgreSQL server.
 //!
-//! Skipped silently unless `OXIDANT_PG_TEST_DSN` names a server with `wal_level = logical` and a
+//! `#[ignore]`d unless `OXIDANT_PG_TEST_DSN` names a server with `wal_level = logical` and a
 //! role that may create replication slots — for example:
 //!
 //! ```text
@@ -238,6 +238,10 @@ fn rows(batches: &[RecordBatch]) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_snapshot_hands_over_to_the_stream_with_no_gap_and_no_overlap() {
     gated!(connect);
     let fixture = Fixture::new(
@@ -310,6 +314,10 @@ async fn a_snapshot_hands_over_to_the_stream_with_no_gap_and_no_overlap() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_batch_that_never_committed_replays_identically_after_a_restart() {
     gated!(connect);
     let fixture = Fixture::new(
@@ -361,6 +369,10 @@ async fn a_batch_that_never_committed_replays_identically_after_a_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn an_added_column_is_reported_and_the_stream_keeps_running() {
     gated!(connect);
     let fixture = Fixture::new(
@@ -416,6 +428,10 @@ async fn an_added_column_is_reported_and_the_stream_keeps_running() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn the_connector_log_records_the_snapshot_the_batches_and_the_slot() {
     gated!(connect);
     let fixture = Fixture::new(&connect, "ox_cdc_log", "id bigint primary key, name text").await;
@@ -479,6 +495,10 @@ async fn the_connector_log_records_the_snapshot_the_batches_and_the_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn legal_values_this_mapping_cannot_hold_arrive_as_null_and_the_pipeline_keeps_running() {
     gated!(connect);
     // Every value here is something Postgres prints for an ordinary column — `'infinity'` on a
@@ -545,6 +565,10 @@ async fn legal_values_this_mapping_cannot_hold_arrive_as_null_and_the_pipeline_k
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_table_that_cannot_be_replicated_says_exactly_how_to_fix_it() {
     gated!(connect);
     // No primary key and REPLICA IDENTITY NOTHING: Postgres writes no old row image, so an
@@ -576,6 +600,10 @@ async fn a_table_that_cannot_be_replicated_says_exactly_how_to_fix_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_source_column_may_not_be_named_like_a_metadata_column() {
     gated!(connect);
     let fixture = Fixture::new(
@@ -602,6 +630,10 @@ async fn a_source_column_may_not_be_named_like_a_metadata_column() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_slot_someone_else_is_holding_is_a_diagnosis_and_not_a_hang() {
     gated!(connect);
     // `DROP_REPLICATION_SLOT … WAIT` blocks until the slot goes inactive, with no timeout at any
@@ -650,6 +682,10 @@ async fn a_slot_someone_else_is_holding_is_a_diagnosis_and_not_a_hang() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_whole_schema_resolves_a_partitioned_table_once_and_not_once_per_partition() {
     gated!(connect);
     // `relkind IN ('r','p')` matches the partitioned parent *and* every leaf partition, and a
@@ -729,6 +765,10 @@ async fn a_whole_schema_resolves_a_partitioned_table_once_and_not_once_per_parti
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn an_excluded_column_does_not_raise_a_schema_change_alarm() {
     gated!(connect);
     // The shipped integration configuration's own shape: `exclude_columns: city` used to write a
@@ -801,6 +841,10 @@ async fn an_excluded_column_does_not_raise_a_schema_change_alarm() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_table_that_does_not_exist_is_refused_before_a_slot_is_created() {
     gated!(connect);
     let mut options: HashMap<String, String> = [
@@ -839,6 +883,10 @@ async fn a_table_that_does_not_exist_is_refused_before_a_slot_is_created() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn the_thousand_row_fixture_snapshots_every_row_exactly_once() {
     gated!(connect);
     // `public.sales_suppliers` is the standing fixture on the test cluster. It is read-only here

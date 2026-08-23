@@ -339,15 +339,24 @@ into `/api/status` so a list page can show health at a glance.
 
 ## 8. Testing
 
-- **Unit**: pgoutput decoder against recorded WAL message bytes (a captured
-  fixture of Begin/Relation/Insert/Update/Delete/Commit covering every §3
-  type); type-mapping table tests; snapshot-handoff sequence test against a
-  fake wire; reconcile-hash equivalence test.
-- **Integration** (`#[ignore]` unless `OXIDANT_PG_TEST_DSN` is set): real
-  Postgres — snapshot, insert/update/delete, truncate, additive schema
-  change, kill-and-resume mid-batch (replayed range must reproduce),
-  reconcile drift detection + repair. CI gets a service container later; the
-  gate for this PR is the local e2e below.
+- **Unit** (run by CI, no server): pgoutput decoder against recorded WAL
+  message bytes (a captured fixture of Begin/Relation/Insert/Update/Delete/
+  Commit covering every §3 type); type-mapping table tests; snapshot-handoff
+  sequence test against a fake wire; the diff walker over synthetic windows;
+  the cron evaluator; and the **cross-engine agreement tests** — for every
+  walkable type, the text Postgres returns for the projection reconcile builds
+  against the same value rendered from the Arrow array the lakehouse holds,
+  through the same formatter, for both the key spelling and the row hash. Those
+  are what keep the two sides comparable without a database in the loop; the
+  live suite below is what says the fixtures are what a server really returns.
+- **Integration**, real Postgres — snapshot, insert/update/delete, truncate,
+  additive schema change, kill-and-resume mid-batch (replayed range must
+  reproduce), reconcile drift detection. `#[ignore]`d unless
+  `OXIDANT_PG_TEST_DSN` is set, conditionally through each crate's `build.rs`,
+  so a run without a server reports them as *ignored* rather than as passed —
+  a skipped test that reports as passed is worse than no test — and
+  `OXIDANT_PG_TEST_DSN=… cargo test` runs them unchanged. CI gets a service
+  container later; the gate for this PR is the local e2e below.
 - **E2E (this machine)**: Homebrew postgresql@17, `wal_level=logical` scratch
   cluster, `oxidant pipeline run` against `examples/postgres-cdc.yaml`,
   mutations applied live, Delta target verified with `oxidant sql`.

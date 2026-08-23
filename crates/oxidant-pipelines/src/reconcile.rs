@@ -2375,6 +2375,196 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------
+    // The two engines, without a server
+    // ---------------------------------------------------------------------------------------
+
+    /// One column, as Postgres hands it over and as the lakehouse holds it.
+    ///
+    /// The `postgres` side is what `(col)::text` returns — the projection [`source_key_text`]
+    /// builds — captured from a live server (PostgreSQL 17, the `datestyle`/`extra_float_digits`
+    /// GUCs `SESSION_SETUP` pins). The `target` side is the Arrow array the lakehouse holds. Every
+    /// cross-engine claim this module makes is a claim about these two agreeing.
+    struct Fixture {
+        column: &'static str,
+        data_type: DataType,
+        postgres: Vec<Option<&'static str>>,
+        target: ArrayRef,
+    }
+
+    fn days_from_epoch(text: &str) -> i32 {
+        let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").expect("a date");
+        (date - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32
+    }
+
+    fn fixtures() -> Vec<Fixture> {
+        use oxidant_loom::arrow::array::{
+            BooleanArray, Date32Array, Decimal128Array, Int32Array, Int64Array,
+        };
+
+        vec![
+            Fixture {
+                column: "active",
+                data_type: DataType::Boolean,
+                postgres: vec![Some("true"), Some("false"), None],
+                target: Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+            },
+            Fixture {
+                column: "quantity",
+                data_type: DataType::Int32,
+                postgres: vec![Some("42"), Some("-7"), Some("0")],
+                target: Arc::new(Int32Array::from(vec![42, -7, 0])),
+            },
+            Fixture {
+                column: "supplierid",
+                data_type: DataType::Int64,
+                // Past 2^53: a detour through a float would round this to …92.
+                postgres: vec![Some("9007199254740993"), Some("-1")],
+                target: Arc::new(Int64Array::from(vec![9_007_199_254_740_993, -1])),
+            },
+            Fixture {
+                column: "name",
+                data_type: DataType::Utf8,
+                postgres: vec![Some("Acme"), Some("  spaced "), Some(""), None],
+                target: Arc::new(StringArray::from(vec![
+                    Some("Acme"),
+                    Some("  spaced "),
+                    Some(""),
+                    None,
+                ])),
+            },
+            Fixture {
+                column: "signed_on",
+                data_type: DataType::Date32,
+                postgres: vec![Some("2026-08-23"), Some("1969-12-31")],
+                target: Arc::new(Date32Array::from(vec![
+                    days_from_epoch("2026-08-23"),
+                    days_from_epoch("1969-12-31"),
+                ])),
+            },
+            Fixture {
+                column: "rating",
+                data_type: DataType::Decimal128(38, 2),
+                // The trailing zero is the whole point: `4.5` and `4.50` are the same number and
+                // different strings, and a hash is over the string.
+                postgres: vec![Some("4.50"), Some("-0.05"), Some("0.00")],
+                target: Arc::new(
+                    Decimal128Array::from(vec![450, -5, 0])
+                        .with_precision_and_scale(38, 2)
+                        .expect("a valid decimal"),
+                ),
+            },
+        ]
+    }
+
+    #[test]
+    fn every_walkable_key_type_spells_the_same_string_on_both_sides() {
+        // The cross-engine assumptions used to be exercised only by the gated live suite, so on
+        // any machine without `OXIDANT_PG_TEST_DSN` — including CI — nothing checked them at all.
+        // A key type whose two spellings disagree does not mis-render one key: it puts the two
+        // walks in different orders and reports the whole table as drifted, in both directions.
+        for fixture in fixtures() {
+            if !key_type_is_walkable(&fixture.data_type) {
+                continue;
+            }
+            let target = engine_text(fixture.target.clone());
+            for (index, expected) in fixture.postgres.iter().enumerate() {
+                let Some(expected) = expected else {
+                    continue; // a NULL key is refused before the walk; see `refuse_null_keys`.
+                };
+                assert_eq!(
+                    &target[index], expected,
+                    "`{}` ({:?}): Postgres says `{expected}`, the target says `{}`",
+                    fixture.column, fixture.data_type, target[index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_column_hashes_the_same_on_both_sides() {
+        // The other half: the source's text goes through the connector's own mapping and the
+        // target's array is rendered as the type it already is, and the row hash has to come out
+        // the same — otherwise every row of a healthy table reads as a content mismatch.
+        for fixture in fixtures() {
+            let source = text_column_to_arrow(
+                &fixture.data_type,
+                fixture.column,
+                &fixture
+                    .postgres
+                    .iter()
+                    .map(|v| v.as_deref())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|e| panic!("`{}` converts: {e}", fixture.column));
+            let rows = fixture.postgres.len();
+            assert_eq!(
+                hash_rows(&[source], rows).expect("hashes"),
+                hash_rows(&[fixture.target.clone()], rows).expect("hashes"),
+                "`{}` ({:?}) hashes differently on the two sides",
+                fixture.column,
+                fixture.data_type
+            );
+        }
+    }
+
+    #[test]
+    fn a_null_and_an_empty_string_are_not_the_same_value_on_either_side() {
+        let text = |values: Vec<Option<&str>>| -> ArrayRef { Arc::new(StringArray::from(values)) };
+        let with_null = hash_rows(&[text(vec![Some("a"), None])], 2).expect("hashes");
+        let with_empty = hash_rows(&[text(vec![Some("a"), Some("")])], 2).expect("hashes");
+        assert_eq!(with_null[0], with_empty[0], "the shared row is unaffected");
+        assert_ne!(
+            with_null[1], with_empty[1],
+            "a NULL and an empty string are different values and must hash differently"
+        );
+    }
+
+    #[test]
+    fn a_composite_key_lines_up_across_both_engines_column_by_column() {
+        // No test covered a composite key at all, and it is where the encoding, the per-column
+        // ordering and the two spellings all have to agree at once.
+        let keys = [
+            fixtures().into_iter().find(|f| f.column == "name").unwrap(),
+            fixtures()
+                .into_iter()
+                .find(|f| f.column == "signed_on")
+                .unwrap(),
+        ];
+        let source: Vec<String> = (0..2)
+            .map(|row| encode_key(keys.iter().map(|f| f.postgres.get(row).copied().flatten())))
+            .collect();
+        let rendered: Vec<Vec<String>> =
+            keys.iter().map(|f| engine_text(f.target.clone())).collect();
+        let target: Vec<String> = (0..2)
+            .map(|row| encode_key(rendered.iter().map(|c| Some(c[row].as_str()))))
+            .collect();
+        assert_eq!(source, target, "the two sides join to the same key");
+        // And the joined keys order the way the columns do, which is what lets each side be
+        // ordered by its columns while the walk compares one string.
+        let parts = |row: usize| (rendered[0][row].clone(), rendered[1][row].clone());
+        assert_eq!(
+            source[0].cmp(&source[1]),
+            parts(0).cmp(&parts(1)),
+            "{source:?}"
+        );
+    }
+
+    #[test]
+    fn a_text_key_orders_byte_wise_on_both_sides() {
+        // `COLLATE "C"` on the source against DataFusion's byte ordering. Under an `en_US`
+        // database collation Postgres puts `a` before `B` and the target puts `B` first, so the
+        // two walks would interleave differently and report every row as drift. These are the six
+        // keys in the order a live server returns them under `COLLATE "C"`.
+        let postgres_order = ["1", "B", "D", "_", "a", "c"];
+        let mut byte_order = postgres_order;
+        byte_order.sort_unstable();
+        assert_eq!(
+            byte_order, postgres_order,
+            "`COLLATE \"C\"` is byte order, which is what the target walks in"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
     // The persisted schedule
     // ---------------------------------------------------------------------------------------
 

@@ -8,7 +8,9 @@
 //! silent: a reconcile that always reports drift is indistinguishable from a pipeline that is
 //! always broken.
 //!
-//! Skipped silently unless `OXIDANT_PG_TEST_DSN` names a server with `wal_level = logical`:
+//! `#[ignore]`d unless `OXIDANT_PG_TEST_DSN` names a server with `wal_level = logical` — the
+//! attribute is conditional (`build.rs`), so a run with the variable set runs them and a run
+//! without it reports them as ignored rather than as passed:
 //!
 //! ```text
 //! OXIDANT_PG_TEST_DSN=postgres://postgres@127.0.0.1:5433/postgres \
@@ -220,6 +222,10 @@ async fn run_reconcile(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_freshly_snapshotted_target_is_in_sync_and_every_upstream_change_is_a_named_drift_class()
 {
     let Some(connect) = dsn() else {
@@ -348,6 +354,10 @@ async fn a_freshly_snapshotted_target_is_in_sync_and_every_upstream_change_is_a_
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_text_key_walks_in_the_same_order_on_both_sides_and_a_short_sample_bounds_it() {
     let Some(connect) = dsn() else {
         eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
@@ -442,6 +452,10 @@ async fn a_text_key_walks_in_the_same_order_on_both_sides_and_a_short_sample_bou
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_registered_cron_schedule_fires_between_triggers_and_records_what_it_found() {
     let Some(connect) = dsn() else {
         eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
@@ -540,6 +554,10 @@ async fn a_registered_cron_schedule_fires_between_triggers_and_records_what_it_f
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_table_filter_scopes_the_report_and_a_name_that_matches_nothing_is_an_error() {
     let Some(connect) = dsn() else {
         eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
@@ -650,6 +668,10 @@ async fn a_table_filter_scopes_the_report_and_a_name_that_matches_nothing_is_an_
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_boolean_key_is_spelled_the_same_way_by_both_engines_and_drifts_one_row_at_a_time() {
     let Some(connect) = dsn() else {
         eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
@@ -719,6 +741,10 @@ async fn a_boolean_key_is_spelled_the_same_way_by_both_engines_and_drifts_one_ro
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_column_the_merge_is_configured_to_drop_is_not_reported_as_schema_drift() {
     let Some(connect) = dsn() else {
         eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
@@ -817,6 +843,10 @@ async fn a_column_the_merge_is_configured_to_drop_is_not_reported_as_schema_drif
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn two_upstream_tables_reconcile_as_one_target_until_their_key_spaces_overlap() {
     let Some(connect) = dsn() else {
         eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
@@ -911,6 +941,10 @@ async fn two_upstream_tables_reconcile_as_one_target_until_their_key_spaces_over
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn an_unreachable_publisher_for_one_table_does_not_discard_the_others_report() {
     let Some(connect) = dsn() else {
         eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
@@ -1015,6 +1049,10 @@ async fn an_unreachable_publisher_for_one_table_does_not_discard_the_others_repo
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn a_null_in_the_row_identity_is_refused_rather_than_walked() {
     let Some(connect) = dsn() else {
         eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
@@ -1089,6 +1127,10 @@ async fn a_null_in_the_row_identity_is_refused_rather_than_walked() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
 async fn an_empty_target_is_still_schema_checked() {
     let Some(connect) = dsn() else {
         eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
@@ -1158,6 +1200,92 @@ async fn an_empty_target_is_still_schema_checked() {
         "{rendered}"
     );
     assert_eq!(drifted.exit_code(), 1, "{rendered}");
+
+    drop_fixtures(&connect, &table).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(pg_live),
+    ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"
+)]
+async fn a_composite_key_over_every_walkable_type_reconciles_clean_and_names_its_drift() {
+    let Some(connect) = dsn() else {
+        eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
+        return;
+    };
+    // The unit-level cross-engine tests pin each type's two spellings against a fixture; this is
+    // the same claim against a real server and a real Delta table, with a *composite* key — where
+    // the encoding, the per-column ordering and the two spellings all have to agree at once.
+    let table = format!("{TABLE}_types");
+    drop_fixtures(&connect, &table).await;
+    sql(
+        &connect,
+        &format!(
+            "CREATE TABLE public.{table} (\
+               supplierid bigint, signed_on date, active boolean, quantity int4, \
+               name text, rating numeric(38,2), PRIMARY KEY (supplierid, signed_on))"
+        ),
+    )
+    .await;
+    sql(
+        &connect,
+        &format!(
+            "INSERT INTO public.{table} VALUES \
+               (1, '2026-08-23', true, 42, 'Acme', 4.50), \
+               (1, '1969-12-31', false, -7, '  spaced ', -0.05), \
+               (9007199254740993, '2026-01-01', NULL, 0, NULL, 0.00)"
+        ),
+    )
+    .await;
+
+    let root = tempfile::TempDir::new().expect("temp dir");
+    let config = OxidantConfig::parse(&config_yaml_keyed(
+        &connect,
+        root.path(),
+        &table,
+        "supplierid, signed_on",
+    ))
+    .expect("the fixture config parses");
+    let engine = engine_for(root.path()).await;
+    seed_target(&engine, &config).await;
+
+    let clean = run_reconcile(&engine, &config, &ReconcileOptions::default()).await;
+    let rendered = clean.render();
+    assert_eq!(
+        clean.exit_code(),
+        0,
+        "every walkable type must line up on both sides:\n{rendered}"
+    );
+    assert_eq!(
+        clean.tables[0].keys,
+        vec!["supplierid".to_string(), "signed_on".to_string()]
+    );
+    assert_eq!(clean.tables[0].diff.compared, 3, "{rendered}");
+
+    // A change of one hundredth of a unit is a content mismatch, named by its composite key —
+    // `4.5` and `4.50` are the same number and different strings, so this also proves the two
+    // sides render a `numeric` the same way rather than merely comparing equal by luck.
+    sql(
+        &connect,
+        &format!(
+            "UPDATE public.{table} SET rating = 4.51 \
+             WHERE supplierid = 1 AND signed_on = '2026-08-23'"
+        ),
+    )
+    .await;
+    let drifted = run_reconcile(&engine, &config, &ReconcileOptions::default()).await;
+    let rendered = drifted.render();
+    assert_eq!(
+        drifted.tables[0].diff.hash_mismatches.len(),
+        1,
+        "only the row that changed:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("1 | 2026-08-23"),
+        "the composite key is readable in the report:\n{rendered}"
+    );
+    assert_eq!(drifted.tables[0].diff.compared, 3, "{rendered}");
 
     drop_fixtures(&connect, &table).await;
 }
