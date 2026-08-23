@@ -77,7 +77,11 @@ pub trait Source: Send + Sync {
     /// decodes WAL to find the next commit boundary — may move its committed position over a
     /// stretch it has established holds no records, because re-planning from either end of that
     /// stretch yields the same batch. It must not acknowledge anything to a server from here:
-    /// only [`Source::mark_durable`] knows the batch survived.
+    /// only [`Source::mark_durable`] knows the batch survived. The one carve-out is a
+    /// protocol-level keepalive: a source whose server demands periodic liveness replies (the
+    /// Postgres walsender's `wal_sender_timeout`) may answer with the position it has *already*
+    /// reported as committed — never with a position past it — because that acknowledges
+    /// nothing the checkpoint does not already say.
     async fn plan_batch(&mut self, engine: &Engine) -> oxidant_common::Result<BatchRange>;
 
     /// Read exactly the records `range` names.
