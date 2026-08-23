@@ -23,6 +23,7 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `PATCH` | `/api/dashboards/{id}` | Update name, widgets, layout or refresh interval |
 | `DELETE` | `/api/dashboards/{id}` | Delete a dashboard |
 | `GET` | `/api/status` | Driver status for a control plane — **bearer token required** |
+| `GET` | `/api/v1/pipelines/{name}/logs` | Tail of a streaming connector's JSONL log — **bearer token required** |
 
 ## Submit a statement
 
@@ -236,6 +237,67 @@ endpoint:
 
 The token itself is redacted from `/api/v1/applications/{id}/environment`, which otherwise
 echoes every `OXIDANT_*` variable.
+
+The same token gates [connector logs](#connector-logs); a leak is a leak of both.
+
+## Connector logs
+
+`GET /api/v1/pipelines/{name}/logs?tail=N` returns the tail of one streaming connector's own
+log — the `postgres_cdc` connector's slot lifecycle, a Kafka reader's rebalances, the messages
+that exist nowhere else because a failed micro-batch records *that* it failed, not why. The
+**Pipelines** page in the [monitoring UI](web-ui.md#pipelines) shows it in a pipeline's detail
+drawer.
+
+Connectors append one JSON object per line to `<checkpoints>/logs/<name>.jsonl`, alongside the
+offset and commit logs they already keep. `OXIDANT_CHECKPOINT_DIR` names that checkpoint root —
+set it to the same absolute path as `pipeline.checkpoints` in
+[`oxidant.yaml`](config.md). Nothing here writes: the endpoint only reads what a connector left
+behind.
+
+It is guarded by **the same bearer token as [`/api/status`](#driver-status)** — a connector log
+names slots, tables and hosts, so it is operational data, not monitoring decoration.
+
+| Situation | Response |
+|---|---|
+| `OXIDANT_STATUS_TOKEN` unset or empty | `404` — the route does not exist |
+| token set, credential missing or wrong | `401` + `WWW-Authenticate: Bearer` |
+| `OXIDANT_CHECKPOINT_DIR` unset | `404` |
+| `<checkpoints>/logs` does not exist | `404` |
+| no `<name>.jsonl` in it | `404` |
+| `name` is not a plain `[A-Za-z0-9._-]` filename | `400` |
+| otherwise | `200` |
+
+Every absence is the same `404` on purpose: a caller learns "there is nothing here" and nothing
+more, and the UI reads it as "this driver serves no connector logs" and hides the section.
+
+```sh
+curl -s "http://localhost:4040/api/v1/pipelines/orders_live/logs?tail=5" \
+  -H "Authorization: Bearer $OXIDANT_STATUS_TOKEN"
+```
+
+```json
+{
+  "name": "orders_live",
+  "tail": 5,
+  "events": [
+    {"ts": "2026-08-22T01:23:45.101Z", "level": "info", "event": "slot_created", "slot": "orders_slot"},
+    {"ts": "2026-08-22T01:23:46.882Z", "level": "info", "event": "snapshot_complete", "rows": 120400}
+  ],
+  "malformed": 0,
+  "truncated": false
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `events` | The parsed lines, **oldest first** — newest last, the order a log reads in |
+| `tail` | The count actually applied: `?tail=N` defaults to 100 and is clamped to 1000 |
+| `malformed` | Lines that were not valid JSON. A log being appended to right now normally has none; they are counted rather than dropped silently or failed on |
+| `truncated` | `true` when the file was larger than the 1 MiB window read back from its end. The tail still ends at the newest record; only older history is out of view |
+
+The read is a bounded window on the end of the file, so the cost is the same whether the log is
+2 KiB or 2 GiB. Event *shape* is the connector's, not this endpoint's — it parses JSON and does
+not interpret it.
 
 ## Full async flow (submit → poll → result → cancel)
 

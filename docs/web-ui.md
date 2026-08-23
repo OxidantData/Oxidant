@@ -34,6 +34,51 @@ The UI mirrors the Spark UI layout and is backed by the Spark-compatible
 | **SQL** | Every SQL/DataFrame execution with its plan and duration |
 | **Executors** | The driver plus any connected workers (see [workers.md](workers.md)) |
 | **Environment** | Runtime info, Spark/Oxidant properties, catalog config |
+| **Pipelines** | Streaming pipelines running right now — see [below](#pipelines) |
+
+## Pipelines
+
+The **Pipelines** page watches streaming pipelines while they run: one row per pipeline, with
+its source (`PostgresCdcV1[orders_slot]`, `KafkaV2[Subscribe[clicks]]`), state, trigger
+interval, last batch and its rows and duration, rows/sec over the last minute, and the source
+position where one is exposed. Click a row for a detail drawer: recent batch history, source
+and sink positions, the error text, and the connector's own log.
+
+### Where the numbers come from
+
+There is no "list my streaming queries" endpoint — that registry lives in the engine, which
+this server cannot depend on — so a pipeline is *derived*, and the derivation is worth knowing:
+
+| Source | What it contributes |
+|--------|---------------------|
+| `/api/v1/applications/{app}/sql` | Every micro-batch execution with its plan, status and duration. An execution belongs to a pipeline when its description or plan names a streaming source |
+| `/api/v1/applications/{app}/jobs` + `/stages` | A batch's row count, summed over the stages its execution actually ran |
+| [`/api/status`](api.md#driver-status) | The live view the SQL history lags behind: which queries are running *now*. Bearer-token guarded, so optional — without a token the page still works, one poll behind |
+| [`/api/v1/events/stream`](api.md) | Already drives the 2 s refresh; a batch boundary repaints this page for free |
+| [`/api/v1/pipelines/{name}/logs`](api.md#connector-logs) | The connector's own JSONL log tail, in the drawer. `404` on a driver that serves none, and the section simply is not there |
+
+Only `/api/status` needs a poll of its own (every 5 s, and only while the page is on screen).
+
+Two numbers are **observed rather than reported**, and the page labels them:
+
+- **Trigger interval** — the median gap between batch starts, not a configured value.
+- **Rows/sec** — rows in the last minute over the span those batches covered.
+
+Nothing else is estimated. A batch id shown as `#3` is this page's ordinal, not the engine's:
+that driver's execution descriptions carry no batch id.
+
+### The status token
+
+The batch history comes from the unauthenticated execution API and needs nothing. The live
+query state and the connector logs come from `/api/status` and `/api/v1/pipelines/…/logs`,
+which are gated behind `OXIDANT_STATUS_TOKEN` (see [api.md](api.md#driver-status)). Paste that
+token into the field at the bottom of the page to light them up; it is kept in this browser's
+`localStorage` and sent to this driver only. Without it the page shows a `no token` chip and
+keeps working from the execution history alone.
+
+Connector logs additionally need `OXIDANT_CHECKPOINT_DIR` set to the pipeline checkpoint root —
+the same absolute path as `pipeline.checkpoints` in [`oxidant.yaml`](config.md). Unset, the
+drawer has no connector-log section at all.
 
 ## Theme
 
@@ -42,13 +87,29 @@ monochrome — layered near-blacks, hairline borders, Geist typography, and no d
 colour. Emphasis comes from contrast and weight; the inverted white slab is what a primary
 button gets instead of a coloured fill.
 
+Both consoles share one component vocabulary, so a page here reads as a sibling of the
+platform console rather than a different product:
+
+| Component | Where it shows up |
+|-----------|-------------------|
+| **Chip** — a dot plus mono text on a raised pill | Every lifecycle state: job, stage, statement, executor, pipeline. The *dot* carries the hue, so a column of chips reads as words with a colour cue rather than a row of coloured labels |
+| **ErrorState** — a tinted, hairlined banner with the raw text on the terminal surface | Every failure. Deliberately louder than a chip: an error is never just a colour change in a table cell |
+| **EmptyState** — a dashed hairline, not a filled card | "Nothing here *yet*" — no jobs, no stages, no pipelines |
+| **Card** with an eyebrow over its title | Every section |
+| **Metric tiles** — hairline-separated cells sharing one border | Rows of numbers that belong together |
+| **Detail drawer** — a right-hand sheet over a scrim | Pipeline detail. The only shadow in the UI, and it exists only while the sheet is open |
+
 Colour is reserved for status, and only for status:
 
 | Colour | Means |
 |--------|-------|
 | Green | Succeeded / completed, and "faster than Spark" on the Compare page |
 | Amber | Running, pending, truncated results, "slower than Spark" |
-| Red | Failed — a failed job, a rejected statement, a statement error pane |
+| Red | Failed — a failed job, a rejected statement, a failing pipeline |
+
+`danger` and the chip tints are the only tokens the engine adds to the website's set: the
+marketing site renders nothing that can fail or be in flight. Both are semantic, never
+decorative.
 
 A toggle in the header switches to the light theme. The choice persists in `localStorage`
 under `oxidant-theme` and is applied before first paint, so there is no flash on reload.

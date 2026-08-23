@@ -17,15 +17,19 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
     dashboards::{self, DashboardStore},
-    static_files, status,
+    pipelines, static_files, status,
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: SharedStore,
-    /// Shared bearer token guarding `GET /api/status`. `None` disables that endpoint;
-    /// nothing else on this server is authenticated. See [`crate::status`].
+    /// Shared bearer token guarding `GET /api/status` and the pipeline connector-log tail.
+    /// `None` disables both endpoints; nothing else on this server is authenticated.
+    /// See [`crate::status`].
     pub status_token: Option<std::sync::Arc<str>>,
+    /// Pipeline checkpoint root ([`pipelines::CHECKPOINT_DIR_ENV`]), under which connector
+    /// logs live. `None` — the default — makes the connector-log route answer 404.
+    pub checkpoint_dir: Option<std::sync::Arc<std::path::Path>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,20 +75,24 @@ pub fn app_router_with(
         status_token,
         dashboard_store,
         static_files::spa_dir(),
+        pipelines::checkpoint_dir_from_env(),
     )
 }
 
-/// As [`app_router_with`], with the SPA directory passed in rather than read from the
-/// environment — the form tests use to exercise both static-file paths.
+/// As [`app_router_with`], with the SPA directory and the pipeline checkpoint root passed in
+/// rather than read from the environment — the form tests use to exercise both static-file
+/// paths and the connector-log route.
 pub fn app_router_with_spa(
     store: SharedStore,
     status_token: Option<String>,
     dashboard_store: DashboardStore,
     spa_dir: Option<std::path::PathBuf>,
+    checkpoint_dir: Option<std::path::PathBuf>,
 ) -> Router {
     let state = AppState {
         store,
         status_token: status::normalize_token(status_token).map(Into::into),
+        checkpoint_dir: checkpoint_dir.map(Into::into),
     };
     let router = Router::new()
         .route("/api/status", get(status::status))
@@ -104,6 +112,10 @@ pub fn app_router_with_spa(
         .route(
             "/api/v1/applications/{app_id}/environment",
             get(list_environment),
+        )
+        .route(
+            "/api/v1/pipelines/{name}/logs",
+            get(pipelines::pipeline_logs),
         )
         .route("/api/v1/events/stream", get(events_stream))
         .route("/api/v1/spark-proxy", get(spark_proxy))
@@ -277,7 +289,7 @@ mod tests {
 
     fn spa_router(dir: Option<std::path::PathBuf>) -> Router {
         let store = Arc::new(AppStateStore::new());
-        app_router_with_spa(store, None, DashboardStore::in_memory(), dir)
+        app_router_with_spa(store, None, DashboardStore::in_memory(), dir, None)
     }
 
     async fn get_body(app: &Router, uri: &str) -> (StatusCode, String) {

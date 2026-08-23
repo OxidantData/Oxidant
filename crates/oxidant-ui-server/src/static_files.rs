@@ -68,3 +68,105 @@ fn html_response(html: &str) -> Response {
 }
 
 const EMBEDDED_INDEX: &str = include_str!("embedded_ui.html");
+
+#[cfg(test)]
+mod tests {
+    use super::EMBEDDED_INDEX;
+
+    /// The page is a single `include_str!` blob with no build step and no asset route, so the
+    /// things that would silently break it are structural: a tab whose panel is missing, a
+    /// theme token the CSS references but never declares, or an asset that has to be fetched.
+    /// This is the cheap guard for all three.
+    #[test]
+    fn the_embedded_page_is_self_contained_and_carries_every_tab() {
+        // Air-gap: a driver may have no egress, so nothing may be fetched from off-box.
+        for offender in [
+            "https://",
+            "http://fonts",
+            "cdn.",
+            "unpkg",
+            "jsdelivr",
+            "googleapis",
+        ] {
+            assert!(
+                !EMBEDDED_INDEX.contains(offender),
+                "embedded page reaches off-box for `{offender}`"
+            );
+        }
+
+        // Every nav button needs the panel it reveals.
+        for tab in [
+            "jobs",
+            "stages",
+            "sql",
+            "pipelines",
+            "editor",
+            "notebook",
+            "executors",
+            "environment",
+            "compare",
+        ] {
+            assert!(
+                EMBEDDED_INDEX.contains(&format!("data-tab=\"{tab}\"")),
+                "no nav button for {tab}"
+            );
+            assert!(
+                EMBEDDED_INDEX.contains(&format!("id=\"panel-{tab}\"")),
+                "no panel for {tab}"
+            );
+        }
+
+        // The Pipelines page reads these three surfaces and nothing else.
+        assert!(EMBEDDED_INDEX.contains("/api/v1/pipelines/"));
+        assert!(EMBEDDED_INDEX.contains("/api/status?limit="));
+        assert!(EMBEDDED_INDEX.contains("/api/v1/events/stream"));
+
+        // The platform component vocabulary, as classes the JS actually emits.
+        for class in [
+            ".chip",
+            ".error-state",
+            ".empty-state",
+            ".metric",
+            ".drawer",
+            ".eyebrow",
+        ] {
+            assert!(
+                EMBEDDED_INDEX.contains(&format!("{class} "))
+                    || EMBEDDED_INDEX.contains(&format!("{class} {{")),
+                "component `{class}` is not styled"
+            );
+        }
+    }
+
+    /// Every `var(--oxidant-*)` the page uses must be declared by the page: there is no
+    /// stylesheet behind this file to inherit a missing token from, and an undeclared one
+    /// renders as *nothing* rather than as an error.
+    #[test]
+    fn every_theme_token_used_is_also_declared() {
+        let declared: std::collections::HashSet<&str> = EMBEDDED_INDEX
+            .match_indices("--oxidant-")
+            .filter_map(|(i, _)| {
+                let rest = &EMBEDDED_INDEX[i..];
+                let name =
+                    &rest[..rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))?];
+                // A declaration is `--oxidant-foo:`; a use is `var(--oxidant-foo)`.
+                rest[name.len()..].starts_with(':').then_some(name)
+            })
+            .collect();
+
+        let mut used = Vec::new();
+        let mut rest = EMBEDDED_INDEX;
+        while let Some(i) = rest.find("var(--oxidant-") {
+            rest = &rest[i + 4..];
+            let end = rest.find(')').expect("unterminated var()");
+            used.push(rest[..end].trim());
+        }
+        assert!(!used.is_empty(), "the page stopped using theme tokens");
+        for token in used {
+            assert!(
+                declared.contains(token),
+                "`{token}` is used but never declared"
+            );
+        }
+    }
+}

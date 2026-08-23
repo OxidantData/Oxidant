@@ -53,15 +53,18 @@ pub(crate) fn normalize_token(raw: Option<String>) -> Option<String> {
     raw.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
-pub async fn status(
-    State(state): State<AppState>,
-    Query(params): Query<StatusParams>,
-    headers: HeaderMap,
-) -> Response {
+/// The shared-token gate, factored out so a second operational endpoint is guarded by
+/// *this* code rather than by a second copy of it — see [`crate::pipelines`].
+///
+/// Returns the response to send **instead of** the handler's: `404` when no token is
+/// configured (the route does not exist), `401` + `WWW-Authenticate: Bearer` when the
+/// credential is missing or wrong. `None` means the caller is authenticated.
+pub(crate) fn denied(state: &AppState, headers: &HeaderMap) -> Option<Response> {
     // No token configured: the endpoint does not exist. 404 rather than 403 so an
     // unconfigured driver leaks nothing about whether the feature is there at all.
+    // (`?` would be wrong here: `None` from this function means *authenticated*.)
     let Some(expected) = state.status_token.as_deref() else {
-        return StatusCode::NOT_FOUND.into_response();
+        return Some(StatusCode::NOT_FOUND.into_response());
     };
 
     let presented = headers
@@ -72,11 +75,24 @@ pub async fn status(
         .map(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()))
         .unwrap_or(false);
     if !authorized {
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-        )
-            .into_response();
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
+pub async fn status(
+    State(state): State<AppState>,
+    Query(params): Query<StatusParams>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(denied) = denied(&state, &headers) {
+        return denied;
     }
 
     let limit = params

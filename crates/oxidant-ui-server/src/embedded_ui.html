@@ -26,6 +26,10 @@
      * variable names, same values. This file cannot @import it: it is compiled into the binary
      * with include_str! and must render on a driver with no egress and no asset pipeline.
      *
+     * Two additions the marketing site does not define, because it renders nothing that can
+     * fail or be in flight: `danger` (a failed job, a rejected statement) and the `*-line` /
+     * `*-tint` pairs the state chips need. Both are semantic, never decorative.
+     *
      * There is no decorative accent hue: emphasis is contrast and weight, and the "solid"
      * inverted slab is what a primary button gets instead of a fill. The only chromatic values
      * are semantic status.
@@ -49,20 +53,28 @@
       --oxidant-solid-hover: #e5e5e5;
       --oxidant-on-solid: #111112;
 
-      /* Semantic status only — never decorative. `danger` is an engine-only addition:
-         the marketing site has no failed job to render. */
+      /* Semantic status only — never decorative. Tints and lines are explicit tokens, not
+         alpha modifiers, so a chip reads the same in both themes. `danger` is an engine-only
+         addition: the marketing site has no failed job to render. */
       --oxidant-success: #22c55e;
+      --oxidant-success-tint: rgba(34, 197, 94, 0.12);
+      --oxidant-success-line: rgba(34, 197, 94, 0.35);
       --oxidant-warning: #eab308;
+      --oxidant-warning-tint: rgba(234, 179, 8, 0.12);
+      --oxidant-warning-line: rgba(234, 179, 8, 0.35);
       --oxidant-danger: #ef4444;
       --oxidant-danger-tint: rgba(239, 68, 68, 0.12);
       --oxidant-danger-line: rgba(239, 68, 68, 0.35);
 
       /* Chart ramp — monochrome; magnitude bars take the brightest step. */
       --oxidant-chart-1: #fafafa;
+      --oxidant-chart-2: #a3a3a3;
+      --oxidant-chart-3: #737373;
 
       /* Code / terminal surface (dark in both themes — one step below the page) */
       --oxidant-code-bg: #0a0a0b;
       --oxidant-code-text: #e5e5e5;
+      --oxidant-code-text-dim: #737373;
 
       /* Typography. The React twin bundles Geist as a woff2; a single-file page cannot, so
          this falls through to the system stack unless Geist is installed locally. */
@@ -95,6 +107,8 @@
       --oxidant-danger-line: rgba(220, 38, 38, 0.35);
 
       --oxidant-chart-1: #0a0a0a;
+      --oxidant-chart-2: #525252;
+      --oxidant-chart-3: #737373;
 
       /* semantic status + the dark code surface stay identical across themes */
     }
@@ -187,14 +201,10 @@
     }
     tr:hover td { background: var(--oxidant-bg-subtle); }
 
-    /* ── Status: the one place hue is allowed ───────────────────────────────────────── */
-    .status-SUCCEEDED, .status-COMPLETE, .status-SUCCESS { color: var(--oxidant-success); }
-    .status-FAILED { color: var(--oxidant-danger); }
-    .status-RUNNING, .status-ACTIVE { color: var(--oxidant-warning); }
-    .status-succeeded { color: var(--oxidant-success); }
-    .status-failed { color: var(--oxidant-danger); }
-    .status-pending, .status-running { color: var(--oxidant-warning); }
-    .status-canceled { color: var(--oxidant-text-muted); }
+    /* ── Status: the one place hue is allowed ─────────────────────────────────────────
+     * Lifecycle states are chips (see `.chip` below), not coloured text — these two remain
+     * because a benchmark delta is a *sentence*, not a state, and has no chip to be.
+     */
     .delta-faster { color: var(--oxidant-success); }
     /* Slower than Spark is caution, not failure. */
     .delta-slower { color: var(--oxidant-warning); }
@@ -214,7 +224,7 @@
     }
 
     /* ── Controls ───────────────────────────────────────────────────────────────────── */
-    input[type=text], textarea {
+    input[type=text], input[type=password], textarea {
       background: var(--oxidant-bg);
       border: 1px solid var(--oxidant-border);
       color: var(--oxidant-text);
@@ -223,9 +233,9 @@
       font-size: 13px;
       width: 100%;
     }
-    input[type=text] { max-width: 480px; }
+    input[type=text], input[type=password] { max-width: 480px; }
     textarea { font-family: var(--oxidant-font-mono); resize: vertical; }
-    input[type=text]:focus, textarea:focus { outline: none; border-color: var(--oxidant-border-strong); }
+    input[type=text]:focus, input[type=password]:focus, textarea:focus { outline: none; border-color: var(--oxidant-border-strong); }
     label {
       display: block;
       font-size: 13px;
@@ -284,16 +294,6 @@
     .note { color: var(--oxidant-text-muted); font-size: 12px; margin: 8px 0; }
     .muted { color: var(--oxidant-text-muted); }
     .result-wrap { overflow-x: auto; }
-    .error-pane {
-      background: var(--oxidant-danger-tint);
-      border: 1px solid var(--oxidant-danger-line);
-      color: var(--oxidant-danger);
-      border-radius: var(--oxidant-radius-sm);
-      padding: 12px;
-      font-family: var(--oxidant-font-mono);
-      font-size: 12px;
-      white-space: pre-wrap;
-    }
 
     /* ── Statement history ──────────────────────────────────────────────────────────── */
     .stmt-item {
@@ -376,6 +376,219 @@
       text-decoration-color: var(--oxidant-border-strong);
       text-underline-offset: 4px;
     }
+
+    /* ── Chips ──────────────────────────────────────────────────────────────────────────
+     * The platform's state token: a dot plus mono text on a raised pill. The *dot* carries
+     * the hue, so a column of chips reads as a column of words with a colour cue, not as a
+     * row of coloured labels. Only `error` also tints the pill — a failure is allowed to be
+     * louder than the states around it.
+     */
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--oxidant-border);
+      background: var(--oxidant-raised);
+      border-radius: 999px;
+      padding: 2px 9px;
+      font-family: var(--oxidant-font-mono);
+      font-size: 11px;
+      line-height: 1.5;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--oxidant-text-secondary);
+      white-space: nowrap;
+    }
+    .chip i { width: 6px; height: 6px; border-radius: 999px; flex: none; background: var(--oxidant-text-muted); }
+    .chip-ok i { background: var(--oxidant-success); }
+    .chip-warn i { background: var(--oxidant-warning); }
+    .chip-idle i { background: var(--oxidant-text-muted); }
+    .chip-err { color: var(--oxidant-danger); border-color: var(--oxidant-danger-line); background: var(--oxidant-danger-tint); }
+    .chip-err i { background: var(--oxidant-danger); }
+    /* Running is the one state that moves: a slow pulse says "live" without a spinner. */
+    .chip-run i { background: var(--oxidant-warning); animation: ox-pulse 1.8s ease-in-out infinite; }
+    @keyframes ox-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    @media (prefers-reduced-motion: reduce) { .chip-run i { animation: none; } }
+
+    /* ── Card header ────────────────────────────────────────────────────────────────────
+     * Eyebrow over title, actions pushed right. Every card that is a *section* gets one, so
+     * a page scans as a stack of labelled surfaces rather than a stack of tables.
+     */
+    .card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .card-title { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+    .card-head .eyebrow { margin-bottom: 2px; }
+    /* A card that is only a table reads better without the padding around it. */
+    .card-flush { padding: 0; }
+    .card-flush .card-head { padding: 16px 16px 12px; margin-bottom: 0; }
+    .card-flush table th:first-child, .card-flush table td:first-child { padding-left: 16px; }
+    .card-flush table th:last-child, .card-flush table td:last-child { padding-right: 16px; }
+    .card-flush table tr:last-child td { border-bottom: none; }
+
+    /* ── Empty state ────────────────────────────────────────────────────────────────────
+     * A dashed hairline rather than a filled card: nothing is here *yet*, and the surface
+     * should not claim otherwise.
+     */
+    .empty-state {
+      border: 1px dashed var(--oxidant-border-strong);
+      border-radius: var(--oxidant-radius);
+      padding: 32px 20px;
+      text-align: center;
+      color: var(--oxidant-text-muted);
+      font-size: 13px;
+    }
+    .empty-state strong { display: block; color: var(--oxidant-text-secondary); font-weight: 500; margin-bottom: 4px; }
+
+    /* ── ErrorState ─────────────────────────────────────────────────────────────────────
+     * Mirrors the platform console's ErrorState: a tinted, hairlined banner with a danger
+     * eyebrow and the raw text on the terminal surface. Deliberately louder than a chip —
+     * an error must not be a colour change in a table cell.
+     */
+    .error-state {
+      border: 1px solid var(--oxidant-danger-line);
+      background: var(--oxidant-danger-tint);
+      border-radius: var(--oxidant-radius);
+      padding: 14px 16px;
+      margin-bottom: 16px;
+    }
+    .error-state .eyebrow { color: var(--oxidant-danger); }
+    .error-state .error-title { font-size: 14px; font-weight: 600; margin: 4px 0 8px; letter-spacing: -0.01em; }
+    .error-state pre {
+      font-family: var(--oxidant-font-mono);
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: var(--oxidant-code-bg);
+      color: var(--oxidant-code-text);
+      border-radius: var(--oxidant-radius-sm);
+      padding: 10px 12px;
+      max-height: 220px;
+      overflow: auto;
+    }
+
+    /* ── Metric tiles ───────────────────────────────────────────────────────────────────
+     * Hairline-separated cells sharing one border, so a row of numbers is one object.
+     */
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 1px;
+      background: var(--oxidant-border);
+      border: 1px solid var(--oxidant-border);
+      border-radius: var(--oxidant-radius);
+      overflow: hidden;
+    }
+    .metric { background: var(--oxidant-surface); padding: 12px 14px; }
+    .metric .v {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+      margin-top: 4px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Mono inline value — offsets, LSNs, ids. */
+    .mono { font-family: var(--oxidant-font-mono); font-size: 12px; }
+    /* Inline code in prose (env vars, endpoint paths). `.md code` overrides this inside a
+       rendered Markdown cell, where the terminal surface is the right backdrop. */
+    code {
+      font-family: var(--oxidant-font-mono);
+      font-size: 0.92em;
+      background: var(--oxidant-raised);
+      border: 1px solid var(--oxidant-border);
+      border-radius: 4px;
+      padding: 0 4px;
+    }
+    .num { font-variant-numeric: tabular-nums; }
+    .truncate { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    tr.selectable { cursor: pointer; }
+    tr.selectable.selected td { background: var(--oxidant-raised); }
+
+    /* Key/value rows — positions, config. Hairline between, label muted, value mono. */
+    .kv { display: grid; grid-template-columns: minmax(120px, auto) 1fr; gap: 0; font-size: 12px; }
+    .kv > div { padding: 7px 0; border-bottom: 1px solid var(--oxidant-border); min-width: 0; }
+    .kv > div:nth-child(odd) { color: var(--oxidant-text-muted); padding-right: 12px; }
+    .kv > div:nth-child(even) { font-family: var(--oxidant-font-mono); word-break: break-all; }
+    .kv > div:nth-last-child(-n+2) { border-bottom: none; }
+
+    /* ── Detail drawer ──────────────────────────────────────────────────────────────────
+     * A right-hand sheet over a scrim. Same surfaces as a card; the only shadow in the page,
+     * and it only exists while the sheet is open.
+     */
+    .scrim { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 40; }
+    .drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: min(620px, 100%);
+      background: var(--oxidant-bg-subtle);
+      border-left: 1px solid var(--oxidant-border);
+      box-shadow: -16px 0 40px rgba(0, 0, 0, 0.35);
+      z-index: 41;
+      display: flex;
+      flex-direction: column;
+    }
+    .drawer-head {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--oxidant-border);
+      background: var(--oxidant-surface);
+    }
+    .drawer-head h3 { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+    .drawer-body { padding: 16px 20px 32px; overflow: auto; flex: 1; }
+    .drawer-body section { margin-bottom: 20px; }
+    .drawer-body section > .eyebrow { display: block; margin-bottom: 8px; }
+    .drawer-close {
+      margin-left: auto;
+      background: transparent;
+      border: 1px solid var(--oxidant-border);
+      color: var(--oxidant-text-muted);
+      border-radius: var(--oxidant-radius-sm);
+      width: 28px;
+      height: 28px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 14px;
+      flex: none;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .drawer-close:hover { color: var(--oxidant-text); border-color: var(--oxidant-border-strong); }
+
+    /* Connector log tail — the terminal surface, one event per line. */
+    .logline {
+      display: flex;
+      gap: 10px;
+      padding: 5px 10px;
+      border-bottom: 1px solid var(--oxidant-border);
+      font-family: var(--oxidant-font-mono);
+      font-size: 11.5px;
+      line-height: 1.5;
+    }
+    .logline:last-child { border-bottom: none; }
+    .logline .ts { color: var(--oxidant-code-text-dim); flex: none; }
+    .logline .msg { color: var(--oxidant-code-text); word-break: break-word; min-width: 0; }
+    .logline.lvl-error .msg { color: var(--oxidant-danger); }
+    .logline.lvl-warn .msg { color: var(--oxidant-warning); }
+    .logwrap {
+      background: var(--oxidant-code-bg);
+      border: 1px solid var(--oxidant-border);
+      border-radius: var(--oxidant-radius-sm);
+      max-height: 260px;
+      overflow: auto;
+    }
   </style>
 </head>
 <body>
@@ -396,6 +609,7 @@
     <button data-tab="jobs" class="active">Jobs</button>
     <button data-tab="stages">Stages</button>
     <button data-tab="sql">SQL</button>
+    <button data-tab="pipelines">Pipelines</button>
     <button data-tab="editor">Editor</button>
     <button data-tab="notebook">Notebook</button>
     <button data-tab="executors">Executors</button>
@@ -406,12 +620,16 @@
     <section id="panel-jobs" class="panel"></section>
     <section id="panel-stages" class="panel hidden"></section>
     <section id="panel-sql" class="panel hidden"></section>
+    <section id="panel-pipelines" class="panel hidden"></section>
     <section id="panel-editor" class="panel hidden"></section>
     <section id="panel-notebook" class="panel hidden"></section>
     <section id="panel-executors" class="panel hidden"></section>
     <section id="panel-environment" class="panel hidden"></section>
     <section id="panel-compare" class="panel hidden"></section>
   </main>
+  <!-- Pipeline detail sheet. Empty until a row is clicked; it covers the page, so it sits
+       outside <main> rather than inside the panel that owns it. -->
+  <div id="pipe-drawer"></div>
   <script>
     const APP_ID = 'oxidant-local';
     const api = (path) => fetch('/api/v1/applications/' + APP_ID + path).then(r => r.json());
@@ -422,7 +640,53 @@
       const s = new Date(start).getTime(), e = new Date(end).getTime();
       return fmtMs(e - s);
     };
-    const statusClass = (s) => 'status-' + (s || '').split(' ')[0];
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+    /* ---------- Design-system primitives ----------
+     * The platform console's component vocabulary, as functions: every state in this page is a
+     * chip, every failure is an ErrorState, every "nothing here" is an EmptyState. Rendering a
+     * state any other way (a coloured <td>, a bare sentence in a card) is how the two consoles
+     * drifted apart in the first place.
+     */
+
+    // Lifecycle words the engine actually emits, mapped onto the four chip tones. Spark's
+    // job/stage statuses are SHOUTED, the REST statement API's are lowercase, and the
+    // pipeline states below are our own — all three land here.
+    const CHIP_TONE = {
+      succeeded: 'ok', success: 'ok', complete: 'ok', completed: 'ok', finished: 'ok', committed: 'ok',
+      running: 'run', active: 'run', live: 'run',
+      pending: 'warn', queued: 'warn', starting: 'warn', idle: 'idle', unknown: 'idle', canceled: 'idle', cancelled: 'idle', skipped: 'idle',
+      failed: 'err', error: 'err', fail: 'err', dead: 'err',
+    };
+
+    // `chip('RUNNING')` → a dot + the word. Pass `label` to show something other than the
+    // state itself (e.g. a batch id next to its state).
+    function chip(state, label) {
+      const word = String(state == null ? 'unknown' : state).split(' ')[0];
+      const tone = CHIP_TONE[word.toLowerCase()] || 'idle';
+      return `<span class="chip chip-${tone}"><i></i>${esc(label != null ? label : word)}</span>`;
+    }
+
+    function emptyState(title, hint) {
+      return `<div class="empty-state"><strong>${esc(title)}</strong>${hint ? esc(hint) : ''}</div>`;
+    }
+
+    // Louder than a chip, deliberately: title + the raw text on the terminal surface.
+    function errorState(title, detail) {
+      return `<div class="error-state">
+        <div class="eyebrow">Error</div>
+        <div class="error-title">${esc(title)}</div>
+        ${detail ? `<pre>${esc(detail)}</pre>` : ''}
+      </div>`;
+    }
+
+    // Eyebrow + title, with optional right-aligned actions. Every section card gets one.
+    function cardHead(eyebrow, title, actions) {
+      return `<div class="card-head">
+        <div><div class="eyebrow">${esc(eyebrow)}</div><div class="card-title">${esc(title)}</div></div>
+        ${actions ? `<div class="flex">${actions}</div>` : ''}
+      </div>`;
+    }
 
     let state = { jobs: [], stages: [], sql: [], executors: [], env: {} };
 
@@ -450,7 +714,12 @@
       e.target.classList.add('active');
       document.querySelectorAll('.panel').forEach(p => p.classList.add('hidden'));
       document.getElementById('panel-' + e.target.dataset.tab).classList.remove('hidden');
-      if (e.target.dataset.tab === 'compare') renderCompare();
+      const tab = e.target.dataset.tab;
+      if (tab === 'compare') renderCompare();
+      // Pipelines owns a poll of its own (the token-guarded /api/status); it runs only while
+      // the page is on screen.
+      if (tab === 'pipelines') openPipelines();
+      else stopPipelines();
     });
 
     async function refresh() {
@@ -468,55 +737,78 @@
           (a.name || 'Oxidant') + ' · ' + (a.attempts?.[0]?.sparkUser || 'oxidant') + ' · jobs: ' + jobs.length;
         state = { jobs, stages, sql, executors, env };
         renderJobs(); renderStages(); renderSql(); renderExecutors(); renderEnvironment();
+        // The pipeline view is derived from exactly this data, so it repaints with it — the
+        // SSE stream that drives refresh() is also what makes a new batch appear.
+        paintPipelines(); paintPipeDrawer();
       } catch (e) { console.error(e); }
     }
 
     function renderJobs() {
       const el = document.getElementById('panel-jobs');
-      if (!state.jobs.length) { el.innerHTML = '<div class="card">No jobs yet. Run a query via PySpark.</div>'; return; }
-      el.innerHTML = '<div class="card"><table><thead><tr><th>Job ID</th><th>Description</th><th>Submitted</th><th>Duration</th><th>Stages</th><th>Status</th></tr></thead><tbody>' +
+      if (!state.jobs.length) {
+        el.innerHTML = emptyState('No jobs yet', 'Run a query from the Editor, or connect a PySpark client.');
+        return;
+      }
+      el.innerHTML = '<div class="card card-flush">' +
+        cardHead('Execution', 'Jobs', `<span class="note" style="margin:0">${state.jobs.length} total</span>`) +
+        '<table><thead><tr><th>Job</th><th>Description</th><th>Submitted</th><th>Duration</th><th>Stages</th><th>Status</th></tr></thead><tbody>' +
         state.jobs.map(j => `<tr>
-          <td>${j.jobId}</td>
-          <td title="${(j.description||'').replace(/"/g,'&quot;')}">${j.name || j.description || '—'}</td>
-          <td>${j.submissionTime || '—'}</td>
-          <td>${dur(j.submissionTime, j.completionTime)}</td>
-          <td>${(j.stageIds||[]).join(', ') || '—'}</td>
-          <td class="${statusClass(j.status)}">${j.status}</td>
+          <td class="num">${j.jobId}</td>
+          <td class="truncate" title="${esc(j.description || '')}">${esc(j.name || j.description || '—')}</td>
+          <td class="mono">${esc(j.submissionTime || '—')}</td>
+          <td class="num">${dur(j.submissionTime, j.completionTime)}</td>
+          <td class="mono">${(j.stageIds||[]).join(', ') || '—'}</td>
+          <td>${chip(j.status)}</td>
         </tr>`).join('') + '</tbody></table></div>';
     }
 
     function renderStages() {
       const el = document.getElementById('panel-stages');
-      if (!state.stages.length) { el.innerHTML = '<div class="card">No stages yet.</div>'; return; }
+      if (!state.stages.length) {
+        el.innerHTML = emptyState('No stages yet', 'Stages appear as soon as a job starts executing.');
+        return;
+      }
       const maxDur = Math.max(...state.stages.map(s => s.executorRunTime || 0), 1);
-      el.innerHTML = '<div class="card"><table><thead><tr><th>Stage</th><th>Description</th><th>Duration</th><th>Tasks</th><th>Shuffle Read</th><th>Shuffle Write</th><th>Status</th></tr></thead><tbody>' +
+      el.innerHTML = '<div class="card card-flush">' +
+        cardHead('Execution', 'Stages', `<span class="note" style="margin:0">${state.stages.length} total</span>`) +
+        '<table><thead><tr><th>Stage</th><th>Description</th><th>Duration</th><th>Tasks</th><th>Shuffle read</th><th>Shuffle write</th><th>Status</th></tr></thead><tbody>' +
         state.stages.map(s => `<tr>
-          <td>${s.stageId}</td>
-          <td>${s.name || s.description || '—'}</td>
-          <td><div class="flex">${fmtMs(s.executorRunTime)}<div class="bar-wrap"><div class="bar" style="width:${((s.executorRunTime||0)/maxDur*100).toFixed(0)}%"></div></div></div></td>
-          <td>${s.numCompleteTasks}/${s.numTasks}</td>
-          <td>${fmt(s.shuffleReadBytes)}</td>
-          <td>${fmt(s.shuffleWriteBytes)}</td>
-          <td class="${statusClass(s.status)}">${s.status}</td>
+          <td class="num">${s.stageId}</td>
+          <td class="truncate" title="${esc(s.name || s.description || '')}">${esc(s.name || s.description || '—')}</td>
+          <td><div class="flex"><span class="num">${fmtMs(s.executorRunTime)}</span><div class="bar-wrap"><div class="bar" style="width:${((s.executorRunTime||0)/maxDur*100).toFixed(0)}%"></div></div></div></td>
+          <td class="num">${s.numCompleteTasks}/${s.numTasks}</td>
+          <td class="num">${fmt(s.shuffleReadBytes)}</td>
+          <td class="num">${fmt(s.shuffleWriteBytes)}</td>
+          <td>${chip(s.status)}</td>
         </tr>`).join('') + '</tbody></table></div>';
     }
 
     function renderSql() {
       const el = document.getElementById('panel-sql');
-      if (!state.sql.length) { el.innerHTML = '<div class="card">No SQL executions yet.</div>'; return; }
+      if (!state.sql.length) {
+        el.innerHTML = emptyState('No SQL executions yet', 'Every SQL or DataFrame execution lands here with its physical plan.');
+        return;
+      }
       el.innerHTML = state.sql.map(s => `<div class="card">
-        <div style="margin-bottom:8px"><strong>${s.description}</strong> · <span class="${statusClass(s.status)}">${s.status}</span> · ${fmtMs(s.duration)}</div>
-        <pre class="plan">${(s.physicalPlan||'').replace(/</g,'&lt;')}</pre>
+        ${cardHead('Execution ' + s.id, s.description || 'SQL', chip(s.status) + `<span class="note" style="margin:0">${fmtMs(s.duration)}</span>`)}
+        <pre class="plan">${esc(s.physicalPlan || '')}</pre>
       </div>`).join('');
     }
 
     function renderExecutors() {
       const el = document.getElementById('panel-executors');
-      if (!state.executors.length) { el.innerHTML = '<div class="card">No executors registered. Configure workers for distributed mode.</div>'; return; }
-      el.innerHTML = '<div class="card"><table><thead><tr><th>ID</th><th>Host</th><th>Active</th><th>Completed</th><th>Shuffle Read</th><th>Shuffle Write</th></tr></thead><tbody>' +
+      if (!state.executors.length) {
+        el.innerHTML = emptyState('No executors registered', 'Single-node mode. Attach workers to run distributed.');
+        return;
+      }
+      el.innerHTML = '<div class="card card-flush">' +
+        cardHead('Cluster', 'Executors') +
+        '<table><thead><tr><th>ID</th><th>Host</th><th>State</th><th>Active</th><th>Completed</th><th>Shuffle read</th><th>Shuffle write</th></tr></thead><tbody>' +
         state.executors.map(e => `<tr>
-          <td>${e.id}</td><td>${e.hostPort}</td><td>${e.activeTasks}</td><td>${e.completedTasks}</td>
-          <td>${fmt(e.totalShuffleRead)}</td><td>${fmt(e.totalShuffleWrite)}</td>
+          <td class="mono">${esc(e.id)}</td><td class="mono">${esc(e.hostPort)}</td>
+          <td>${chip(e.isActive === false ? 'dead' : 'active', e.isActive === false ? 'inactive' : 'active')}</td>
+          <td class="num">${fmt(e.activeTasks)}</td><td class="num">${fmt(e.completedTasks)}</td>
+          <td class="num">${fmt(e.totalShuffleRead)}</td><td class="num">${fmt(e.totalShuffleWrite)}</td>
         </tr>`).join('') + '</tbody></table></div>';
     }
 
@@ -524,8 +816,11 @@
       const el = document.getElementById('panel-environment');
       const props = state.env.sparkProperties || {};
       const keys = Object.keys(props).sort();
-      el.innerHTML = '<div class="card"><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>' +
-        keys.map(k => `<tr><td>${k}</td><td style="font-family:var(--oxidant-font-mono);font-size:12px">${props[k]}</td></tr>`).join('') +
+      if (!keys.length) { el.innerHTML = emptyState('No properties reported'); return; }
+      el.innerHTML = '<div class="card card-flush">' +
+        cardHead('Runtime', 'Environment', `<span class="note" style="margin:0">${keys.length} properties</span>`) +
+        '<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>' +
+        keys.map(k => `<tr><td>${esc(k)}</td><td class="mono">${esc(props[k])}</td></tr>`).join('') +
         '</tbody></table></div>';
     }
 
@@ -533,6 +828,7 @@
       const el = document.getElementById('panel-compare');
       const sparkUrl = localStorage.getItem('oxidant.sparkUrl') || 'http://localhost:4040';
       el.innerHTML = `<div class="card">
+        ${cardHead('Benchmark', 'Compare against Spark')}
         <label>Spark UI / History Server base URL</label>
         <input type="text" id="spark-url" value="${sparkUrl}" />
         <button class="btn" style="margin-top:12px" id="compare-btn">Compare</button>
@@ -558,30 +854,29 @@
         const oxidantDur = oxidantJobs.reduce((a,j) => a + (j.submissionTime && j.completionTime ? new Date(j.completionTime)-new Date(j.submissionTime) : 0), 0);
         const sparkDur = sparkJobs.reduce((a,j) => a + (j.submissionTime && j.completionTime ? new Date(j.completionTime)-new Date(j.submissionTime) : 0), 0);
         const delta = oxidantDur && sparkDur ? ((sparkDur - oxidantDur) / sparkDur * 100).toFixed(1) : null;
-        result.innerHTML = `<div class="card compare-grid">
-          <div><h3 style="margin-bottom:12px">Oxidant</h3>
+        result.innerHTML = `<div class="compare-grid">
+          <div class="card"><h3 style="margin-bottom:12px">Oxidant</h3>
             <p>Jobs: ${oxidantJobs.length} · Stages: ${oxidantStages.length}</p>
             <p>Total duration: ${fmtMs(oxidantDur)}</p>
             <p>Shuffle read: ${fmt(oxidantStages.reduce((a,s)=>a+(s.shuffleReadBytes||0),0))}</p>
           </div>
-          <div><h3 style="margin-bottom:12px">Spark</h3>
+          <div class="card"><h3 style="margin-bottom:12px">Spark</h3>
             <p>Jobs: ${sparkJobs.length} · Stages: ${sparkStages.length}</p>
             <p>Total duration: ${fmtMs(sparkDur)}</p>
             <p>Shuffle read: ${fmt(sparkStages.reduce((a,s)=>a+(s.shuffleReadBytes||0),0))}</p>
           </div>
         </div>
         ${delta != null ? `<div class="card"><p class="${oxidantDur < sparkDur ? 'delta-faster' : 'delta-slower'}">Oxidant is ${Math.abs(delta)}% ${oxidantDur < sparkDur ? 'faster' : 'slower'} than Spark (job wall-clock sum)</p></div>` : ''}
-        <div class="card compare-grid">
-          <div><h4>Oxidant stages</h4><pre class="plan">${oxidantStages.map(s=>`Stage ${s.stageId}: ${s.name} (${fmtMs(s.executorRunTime)})`).join('\n')||'—'}</pre></div>
-          <div><h4>Spark stages</h4><pre class="plan">${sparkStages.map(s=>`Stage ${s.stageId}: ${s.name||s.details} (${fmtMs(s.executorRunTime)})`).join('\n')||'—'}</pre></div>
+        <div class="compare-grid">
+          <div class="card"><h4 style="margin-bottom:8px">Oxidant stages</h4><pre class="plan">${oxidantStages.map(s=>`Stage ${s.stageId}: ${s.name} (${fmtMs(s.executorRunTime)})`).join('\n')||'—'}</pre></div>
+          <div class="card"><h4 style="margin-bottom:8px">Spark stages</h4><pre class="plan">${sparkStages.map(s=>`Stage ${s.stageId}: ${s.name||s.details} (${fmtMs(s.executorRunTime)})`).join('\n')||'—'}</pre></div>
         </div>`;
       } catch (e) {
-        result.innerHTML = `<div class="card" style="color:var(--oxidant-danger)">Compare failed: ${e.message}. Is Spark UI running at ${sparkBase}?</div>`;
+        result.innerHTML = errorState('Compare failed', e.message + '\n\nIs a Spark UI or History Server reachable at ' + sparkBase + '?');
       }
     }
 
     /* ---------- SQL editor + notebook (REST statements API) ---------- */
-    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     const TERMINAL = { succeeded: 1, failed: 1, canceled: 1 };
     const RESULT_LIMIT = 500;
 
@@ -652,7 +947,8 @@
       el.innerHTML = `<div class="editor-grid">
         <div>
           <div class="card">
-            <label for="editor-sql">SQL — Cmd/Ctrl+Enter to run</label>
+            ${cardHead('Query', 'SQL editor')}
+            <label for="editor-sql">Cmd/Ctrl+Enter to run</label>
             <textarea id="editor-sql" rows="8" spellcheck="false">SELECT 1 AS hello</textarea>
             <div class="flex" style="margin-top:12px">
               <button class="btn" id="editor-run">Run</button>
@@ -688,7 +984,7 @@
     function setEditorStatus(doc) {
       const el = document.getElementById('editor-status');
       if (!doc) { el.textContent = ''; return; }
-      el.innerHTML = `<span class="status-${doc.status}">${doc.status}</span>` +
+      el.innerHTML = chip(doc.status) +
         (doc.durationMs != null ? ' · ' + fmtMs(doc.durationMs) : '') +
         (doc.rowCount != null ? ' · ' + doc.rowCount.toLocaleString() + ' rows' : '');
     }
@@ -697,11 +993,11 @@
     async function showStatementResult(doc, resultEl, errorEl) {
       if (doc.status === 'failed') {
         resultEl.innerHTML = '';
-        errorEl.innerHTML = `<div class="error-pane">${esc(doc.error || 'statement failed')}</div>`;
+        errorEl.innerHTML = errorState('Statement failed', doc.error || 'statement failed');
         return;
       }
       if (doc.status === 'canceled') {
-        resultEl.innerHTML = '<div class="card muted">Statement canceled.</div>';
+        resultEl.innerHTML = emptyState('Statement canceled');
         return;
       }
       if (doc.status !== 'succeeded') return;
@@ -722,7 +1018,7 @@
         const doc = await runStatement(sql, (d) => { editorRunId = d.statementId; setEditorStatus(d); });
         await showStatementResult(doc, document.getElementById('editor-result'), document.getElementById('editor-error'));
       } catch (e) {
-        document.getElementById('editor-error').innerHTML = `<div class="error-pane">${esc(e.message)}</div>`;
+        document.getElementById('editor-error').innerHTML = errorState('Statement failed', e.message);
       } finally {
         editorBusy = false;
         editorRunId = null;
@@ -745,8 +1041,8 @@
         if (!stmts.length) { el.innerHTML = '<span class="muted">No statements yet.</span>'; return; }
         el.innerHTML = stmts.map(s => `<div class="stmt-item" data-id="${s.statementId}">
           <div class="flex" style="justify-content:space-between">
-            <span class="status-${s.status}">${s.status}</span>
-            <span class="muted">${fmtMs(s.durationMs)}</span>
+            ${chip(s.status)}
+            <span class="muted num">${fmtMs(s.durationMs)}</span>
           </div>
           <div class="stmt-sql" title="${esc(s.sql)}">${esc(s.sql)}</div>
         </div>`).join('');
@@ -767,7 +1063,7 @@
         await showStatementResult(doc, resultEl, errorEl);
       } catch (e) {
         resultEl.innerHTML = '';
-        errorEl.innerHTML = `<div class="error-pane">${esc(e.message)}</div>`;
+        errorEl.innerHTML = errorState('Could not load the statement', e.message);
       }
     }
 
@@ -838,6 +1134,7 @@
     function renderNotebook() {
       const el = document.getElementById('panel-notebook');
       el.innerHTML = `<div class="card">
+        ${cardHead('Query', 'Notebook')}
         <div class="flex" style="flex-wrap:wrap">
           <button class="btn" id="nb-add-sql">+ SQL cell</button>
           <button class="btn-secondary" id="nb-add-md">+ Markdown cell</button>
@@ -888,7 +1185,7 @@
     function renderNbCells() {
       const wrap = document.getElementById('nb-cells');
       if (!notebook.cells.length) {
-        wrap.innerHTML = '<div class="card muted">Empty notebook. Add a cell to get started.</div>';
+        wrap.innerHTML = emptyState('Empty notebook', 'Add a SQL or Markdown cell to get started.');
         return;
       }
       wrap.innerHTML = notebook.cells.map((c, i) => nbCellHtml(c, i)).join('');
@@ -966,14 +1263,14 @@
       const o = nbOutputs[id];
       if (!o) { el.innerHTML = ''; return; }
       if (o.running) {
-        el.innerHTML = `<div class="note">Running… ${o.doc ? `<span class="status-${o.doc.status}">${o.doc.status}</span>` : ''}</div>`;
+        el.innerHTML = `<div class="note">${chip(o.doc ? o.doc.status : 'running')}</div>`;
         return;
       }
-      if (o.error) { el.innerHTML = `<div class="error-pane">${esc(o.error)}</div>`; return; }
-      if (o.doc && o.doc.status === 'failed') { el.innerHTML = `<div class="error-pane">${esc(o.doc.error || 'statement failed')}</div>`; return; }
-      if (o.doc && o.doc.status === 'canceled') { el.innerHTML = '<div class="note">Canceled.</div>'; return; }
+      if (o.error) { el.innerHTML = errorState('Cell failed', o.error); return; }
+      if (o.doc && o.doc.status === 'failed') { el.innerHTML = errorState('Cell failed', o.doc.error || 'statement failed'); return; }
+      if (o.doc && o.doc.status === 'canceled') { el.innerHTML = `<div class="note">${chip('canceled')}</div>`; return; }
       if (o.doc && o.result) {
-        el.innerHTML = `<div class="note">succeeded · ${fmtMs(o.doc.durationMs)}</div>` + resultTableHtml(o.result, o.doc.rowCount);
+        el.innerHTML = `<div class="note">${chip('succeeded')} · ${fmtMs(o.doc.durationMs)}</div>` + resultTableHtml(o.result, o.doc.rowCount);
       }
     }
 
@@ -1027,6 +1324,534 @@
       };
       reader.readAsText(file);
     }
+
+    /* ---------- Pipelines: the live streaming monitor ----------
+     *
+     * There is no "list my streaming queries" endpoint on this server, and adding one would
+     * mean this crate depending on the engine that owns them. So a pipeline is *derived* from
+     * the surfaces that already exist, and the derivation is written down rather than guessed
+     * at each call site:
+     *
+     *   /api/v1/applications/{app}/sql   every micro-batch execution, with its plan, status
+     *                                    and duration. An execution belongs to a pipeline when
+     *                                    its description or plan names a streaming source —
+     *                                    `PostgresCdcV1[slot]`, `KafkaV2[Subscribe[orders]]`.
+     *   /api/v1/applications/{app}/jobs  + /stages: a batch's row count, summed over the
+     *                                    stages its execution actually ran.
+     *   /api/status                      the live view the SQL history lags behind: which
+     *                                    queries are running right now. Bearer-token guarded,
+     *                                    so it is optional — without a token the page still
+     *                                    works, one poll behind.
+     *   /api/v1/events/stream            already wired to refresh(); a batch boundary repaints
+     *                                    this page for free.
+     *   /api/v1/pipelines/{name}/logs    the connector's own JSONL log tail. 404 on a build
+     *                                    that serves none, and the section simply is not there.
+     *
+     * Two numbers on this page are *observed*, not reported, and are labelled as such: the
+     * trigger interval (median gap between batch starts) and rows/sec (rows in the last
+     * minute over the span they covered). Nothing else is estimated.
+     */
+    const PIPE_POLL_MS = 5000;
+    const PIPE_TOKEN_KEY = 'oxidant.statusToken';
+    const PIPE_RATE_WINDOW_MS = 60000;
+    const PIPE_MAX_BATCHES = 40;
+    const PIPE_LOG_TAIL = 40;
+
+    const pipeState = {
+      token: (() => { try { return localStorage.getItem(PIPE_TOKEN_KEY) || ''; } catch (e) { return ''; } })(),
+      status: null,        // last /api/status body
+      statusCode: null,    // null = never asked (no token), else the HTTP status
+      selected: null,      // name of the pipeline whose drawer is open
+      logs: {},            // name -> { code, events, malformed, truncated, at, loading }
+      timer: null,
+      derived: [],
+    };
+
+    const ts = (v) => { const t = v ? new Date(v).getTime() : NaN; return Number.isFinite(t) ? t : 0; };
+    const shortTs = (v) => { const t = ts(v); return t ? new Date(t).toISOString().slice(11, 23) : (v ? String(v) : '—'); };
+    const fmtRate = (r) => r == null ? '—' : (r >= 100 ? Math.round(r).toLocaleString() : r.toFixed(r >= 10 ? 1 : 2));
+    const fmtInterval = (ms) => ms == null ? '—' : (ms < 1000 ? ms + ' ms' : (ms < 90000 ? (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + ' s' : (ms / 60000).toFixed(1) + ' min'));
+
+    // A streaming source, as the engine spells one: `KafkaV2[Subscribe[orders]]`,
+    // `PostgresCdcV1[orders_slot]`, `FileStreamSource[/data]`. The trailing `V<n>` / `Source` /
+    // `Stream` / `Cdc` is what separates a source from any other bracketed plan node.
+    const SOURCE_HEAD = /\b([A-Za-z][A-Za-z0-9_]*(?:V\d+|Source|Stream|Cdc))\[/;
+    const SINK_HEAD = /\b([A-Za-z][A-Za-z0-9_]*Sink)\[/;
+
+    // Bracket-balanced, so `KafkaV2[Subscribe[orders]]` keeps its inner bracket instead of
+    // being cut at the first `]`.
+    function findBracketed(text, head) {
+      const t = String(text || '');
+      const m = head.exec(t);
+      if (!m) return null;
+      const open = m.index + m[0].length - 1;
+      let depth = 0;
+      for (let i = open; i < t.length; i++) {
+        if (t[i] === '[') depth++;
+        else if (t[i] === ']' && --depth === 0) {
+          return { kind: m[1], arg: t.slice(open + 1, i), desc: t.slice(m.index, i + 1), head: t.slice(0, m.index) };
+        }
+      }
+      return null;
+    }
+    const findSource = (text) => findBracketed(text, SOURCE_HEAD);
+    const findSink = (text) => findBracketed(text, SINK_HEAD);
+
+    // `orders_live: PostgresCdcV1[slot]` → `orders_live`. Without an explicit label the
+    // source's own argument is the best name a batch carries.
+    function pipelineName(src) {
+      const label = /([A-Za-z0-9][\w.-]*)\s*[:>|-]\s*$/.exec(src.head || '');
+      if (label) return label[1];
+      const arg = (src.arg || '').split(/[[\]{},]/).map(x => x.trim()).filter(Boolean).pop();
+      if (arg) return arg.split(/[/\s]/).filter(Boolean).pop() || src.kind;
+      return src.kind;
+    }
+
+    const batchIdOf = (text) => {
+      const m = /\bbatch(?:\s*id)?\s*[#=:]?\s*(\d+)/i.exec(String(text || ''));
+      return m ? Number(m[1]) : null;
+    };
+    // `startOffset={"orders-0":0}` / `end offset = 120`. Absent is normal — Spark's own
+    // description does not always carry offsets, and a CDC slot reports an LSN instead.
+    const offsetOf = (text, which) => {
+      const m = new RegExp('\\b' + which + '[\\s_]?offset\\s*[:=]\\s*([^\\s,;]+)', 'i').exec(String(text || ''));
+      return m ? m[1] : null;
+    };
+    const lsnOf = (text) => {
+      const m = /\b(?:lsn|wal|confirmed_flush_lsn|position)\s*[:=]\s*([^\s,;]+)/i.exec(String(text || ''));
+      return m ? m[1] : null;
+    };
+
+    // A /api/status query that is plausibly this pipeline — the live signal the SQL history
+    // has not caught up with yet.
+    function statusQueryFor(name, source) {
+      const qs = (pipeState.status && pipeState.status.queries) || [];
+      return qs.find(q => {
+        const tag = q.tag || '';
+        return tag.indexOf(name) >= 0 || (source && tag.indexOf(source) >= 0);
+      }) || null;
+    }
+
+    function derivePipelines() {
+      const jobById = new Map(state.jobs.map(j => [j.jobId, j]));
+      const stageById = new Map(state.stages.map(s => [s.stageId, s]));
+      // A batch's rows are the rows its stages moved. Prefer what reached the sink; a sink that
+      // reports no output rows still read some, and reading zero is itself worth seeing.
+      const rowsOf = (exec) => {
+        let out = 0, inn = 0;
+        for (const jid of exec.jobIds || []) {
+          const job = jobById.get(jid);
+          for (const sid of (job && job.stageIds) || []) {
+            const st = stageById.get(sid);
+            if (!st) continue;
+            out += st.outputRecords || 0;
+            inn += st.inputRecords || 0;
+          }
+        }
+        return out || inn;
+      };
+
+      const byName = new Map();
+      for (const exec of state.sql || []) {
+        const src = findSource(exec.description) || findSource(exec.physicalPlan);
+        if (!src) continue;
+        const text = (exec.description || '') + '\n' + (exec.physicalPlan || '');
+        const name = pipelineName(src);
+        let p = byName.get(name);
+        if (!p) {
+          p = { name, kind: src.kind, source: src.desc, sink: (findSink(text) || {}).desc || null, batches: [] };
+          byName.set(name, p);
+        }
+        p.batches.push({
+          id: batchIdOf(exec.description) ?? batchIdOf(exec.physicalPlan),
+          execId: exec.id,
+          status: exec.status,
+          startedAt: exec.submissionTime,
+          endedAt: exec.completionTime,
+          durationMs: exec.duration,
+          rows: rowsOf(exec),
+          startOffset: offsetOf(text, 'start'),
+          endOffset: offsetOf(text, 'end'),
+          latestOffset: offsetOf(text, 'latest'),
+          lsn: lsnOf(text),
+        });
+      }
+
+      const now = Date.now();
+      const pipelines = [];
+      for (const p of byName.values()) {
+        p.batches.sort((a, b) => ts(a.startedAt) - ts(b.startedAt));
+        if (p.batches.length > PIPE_MAX_BATCHES) p.batches = p.batches.slice(-PIPE_MAX_BATCHES);
+        // Use the engine's batch id when it prints one; otherwise the ordinal is the honest
+        // stand-in, and the drawer says so — it counts what this page has seen, not what the
+        // checkpoint holds.
+        p.batches.forEach((b, i) => { if (b.id == null) { b.id = i; b.idIsOrdinal = true; } });
+        p.last = p.batches[p.batches.length - 1] || null;
+
+        const failed = p.batches.filter(b => /fail|error/i.test(b.status || ''));
+        p.lastFailure = failed.length ? failed[failed.length - 1] : null;
+        const live = statusQueryFor(p.name, p.source);
+        p.live = live;
+        if ((live && live.state === 'failed') || (p.lastFailure && p.lastFailure === p.last)) p.state = 'error';
+        else if (p.batches.some(b => /run|active/i.test(b.status || '')) || (live && live.state === 'running')) p.state = 'running';
+        else p.state = 'idle';
+
+        const window = p.batches.filter(b => ts(b.endedAt || b.startedAt) >= now - PIPE_RATE_WINDOW_MS);
+        if (window.length) {
+          const rows = window.reduce((a, b) => a + (b.rows || 0), 0);
+          const first = window[0], lastW = window[window.length - 1];
+          // The span the window actually covered, floored at the batches' own runtime so a
+          // single batch does not divide by ~0 and report an absurd rate.
+          const span = Math.max(
+            ts(lastW.endedAt || lastW.startedAt) - ts(first.startedAt),
+            window.reduce((a, b) => a + (b.durationMs || 0), 0),
+            1000);
+          p.rowsPerSec = rows / (span / 1000);
+          p.windowRows = rows;
+        } else {
+          p.rowsPerSec = null;
+          p.windowRows = 0;
+        }
+
+        const gaps = [];
+        for (let i = 1; i < p.batches.length; i++) {
+          const g = ts(p.batches[i].startedAt) - ts(p.batches[i - 1].startedAt);
+          if (g > 0) gaps.push(g);
+        }
+        p.triggerMs = gaps.length ? gaps.slice().sort((a, b) => a - b)[Math.floor(gaps.length / 2)] : null;
+
+        const pos = p.batches.slice().reverse().find(b => b.endOffset || b.lsn || b.latestOffset);
+        p.position = pos ? (pos.lsn || pos.endOffset || pos.latestOffset) : null;
+        pipelines.push(p);
+      }
+      pipelines.sort((a, b) => ts((b.last || {}).startedAt) - ts((a.last || {}).startedAt) || a.name.localeCompare(b.name));
+      return pipelines;
+    }
+
+    /* ---------- Connector log tail ---------- */
+
+    // 404 means this build serves no connector logs (or this pipeline has none) — the drawer
+    // omits the section entirely rather than showing an empty box. 401 means the section is
+    // there but needs the driver token.
+    function ensurePipeLogs(name, force) {
+      const cur = pipeState.logs[name];
+      const now = Date.now();
+      if (cur && (cur.loading || (!force && now - (cur.at || 0) < PIPE_POLL_MS))) return;
+      pipeState.logs[name] = Object.assign({}, cur, { loading: true, at: now });
+      const headers = pipeState.token ? { Authorization: 'Bearer ' + pipeState.token } : {};
+      fetch('/api/v1/pipelines/' + encodeURIComponent(name) + '/logs?tail=' + PIPE_LOG_TAIL, { headers })
+        .then(async (r) => {
+          if (!r.ok) return { code: r.status };
+          const d = await r.json();
+          return { code: 200, events: d.events || [], malformed: d.malformed || 0, truncated: !!d.truncated };
+        })
+        .catch((e) => ({ code: 0, error: e.message }))
+        .then((res) => {
+          pipeState.logs[name] = Object.assign(res, { at: Date.now(), loading: false });
+          paintPipelines();
+          paintPipeDrawer();
+        });
+    }
+
+    function logLineHtml(ev) {
+      if (ev == null || typeof ev !== 'object' || Array.isArray(ev)) {
+        return `<div class="logline"><span class="msg">${esc(JSON.stringify(ev))}</span></div>`;
+      }
+      const rest = Object.assign({}, ev);
+      const stamp = rest.ts || rest.timestamp || rest.time || '';
+      const level = String(rest.level || rest.severity || '').toLowerCase();
+      ['ts', 'timestamp', 'time', 'level', 'severity'].forEach(k => delete rest[k]);
+      const headline = rest.message || rest.msg || rest.event || rest.error;
+      ['message', 'msg', 'event'].forEach(k => delete rest[k]);
+      if (headline === rest.error) delete rest.error;
+      const extras = Object.keys(rest)
+        .map(k => k + '=' + (typeof rest[k] === 'object' ? JSON.stringify(rest[k]) : String(rest[k])))
+        .join(' ');
+      const text = headline ? (extras ? headline + '  ' + extras : headline) : (extras || JSON.stringify(ev));
+      const cls = /^err|^fatal/.test(level) ? 'lvl-error' : (/^warn/.test(level) ? 'lvl-warn' : '');
+      return `<div class="logline ${cls}"><span class="ts">${esc(shortTs(stamp))}</span><span class="msg">${esc(text)}</span></div>`;
+    }
+
+    // The error text a failure banner shows. A failed SQL execution records *that* it failed,
+    // not why — the connector's own log is the only place the message exists, so prefer it.
+    function pipeLastError(p) {
+      const log = pipeState.logs[p.name];
+      if (log && log.code === 200) {
+        const errs = (log.events || []).filter(e => e && typeof e === 'object' &&
+          (/^err|^fatal/i.test(String(e.level || e.severity || '')) || e.error));
+        if (errs.length) {
+          const e = errs[errs.length - 1];
+          return String(e.error || e.message || e.msg || JSON.stringify(e));
+        }
+      }
+      if (p.lastFailure) {
+        return 'Batch ' + p.lastFailure.id + ' failed (SQL execution ' + p.lastFailure.execId + ').\n' +
+          'The execution history records the failed state but not its message — the connector log, ' +
+          'or the SQL tab’s plan for this execution, carries the text.';
+      }
+      if (p.live && p.live.state === 'failed') return 'The driver reports this query as failed (' + p.live.id + ').';
+      return null;
+    }
+
+    /* ---------- Rendering ---------- */
+
+    function pipeVisible() {
+      const el = document.getElementById('panel-pipelines');
+      return el && !el.classList.contains('hidden');
+    }
+
+    function renderPipelines() {
+      const el = document.getElementById('panel-pipelines');
+      if (el.dataset.ready) return;
+      el.dataset.ready = '1';
+      el.innerHTML = `
+        <div class="card">
+          ${cardHead('Streaming', 'Pipelines', '<span class="note" style="margin:0" id="pipe-freshness"></span>')}
+          <div class="metrics" id="pipe-metrics"></div>
+        </div>
+        <div id="pipe-banner"></div>
+        <div id="pipe-list"></div>
+        <div class="card">
+          ${cardHead('Access', 'Driver status token', '<span id="pipe-auth-chip"></span>')}
+          <div class="note" style="margin-top:0">
+            Optional. The batch history above comes from the unauthenticated execution API; the
+            live query state and the connector logs come from <code>/api/status</code> and
+            <code>/api/v1/pipelines/&hellip;/logs</code>, which are gated behind
+            <code>OXIDANT_STATUS_TOKEN</code>. The token is kept in this browser only.
+          </div>
+          <div class="flex" style="flex-wrap:wrap">
+            <input type="password" id="pipe-token" placeholder="OXIDANT_STATUS_TOKEN" autocomplete="off" spellcheck="false" />
+            <button class="btn" id="pipe-token-save">Use</button>
+            <button class="btn-secondary" id="pipe-token-clear">Clear</button>
+          </div>
+        </div>`;
+      const input = document.getElementById('pipe-token');
+      input.value = pipeState.token;
+      document.getElementById('pipe-token-save').onclick = () => {
+        pipeState.token = input.value.trim();
+        try { localStorage.setItem(PIPE_TOKEN_KEY, pipeState.token); } catch (e) {}
+        pipeState.logs = {};
+        pipeTick();
+      };
+      document.getElementById('pipe-token-clear').onclick = () => {
+        pipeState.token = '';
+        input.value = '';
+        try { localStorage.removeItem(PIPE_TOKEN_KEY); } catch (e) {}
+        pipeState.status = null;
+        pipeState.statusCode = null;
+        pipeState.logs = {};
+        paintPipelines();
+        paintPipeDrawer();
+      };
+      paintPipelines();
+    }
+
+    function authChipHtml() {
+      if (!pipeState.token) return chip('idle', 'no token');
+      if (pipeState.statusCode === 200) return chip('ok', 'authorized');
+      if (pipeState.statusCode === 401) return chip('failed', 'rejected');
+      if (pipeState.statusCode === 404) return chip('idle', 'disabled on this driver');
+      if (pipeState.statusCode === null) return chip('pending', 'not polled');
+      return chip('failed', 'error ' + pipeState.statusCode);
+    }
+
+    function paintPipelines() {
+      if (!document.getElementById('panel-pipelines').dataset.ready) return;
+      const pipelines = derivePipelines();
+      pipeState.derived = pipelines;
+
+      const running = pipelines.filter(p => p.state === 'running').length;
+      const errored = pipelines.filter(p => p.state === 'error');
+      const rate = pipelines.reduce((a, p) => a + (p.rowsPerSec || 0), 0);
+      const rows = pipelines.reduce((a, p) => a + (p.windowRows || 0), 0);
+      document.getElementById('pipe-metrics').innerHTML = [
+        ['Pipelines', String(pipelines.length)],
+        ['Running', String(running)],
+        ['Rows / s (60 s)', pipelines.length ? fmtRate(rate) : '—'],
+        ['Rows (60 s)', pipelines.length ? rows.toLocaleString() : '—'],
+      ].map(([k, v]) => `<div class="metric"><div class="eyebrow">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join('');
+
+      const last = pipelines.length && pipelines[0].last ? pipelines[0].last.startedAt : null;
+      document.getElementById('pipe-freshness').textContent =
+        (last ? 'last batch ' + shortTs(last) + ' UTC' : 'no batches seen') + ' · polling every ' + (PIPE_POLL_MS / 1000) + ' s';
+
+      // An error is louder than the chip in its row: the newest failing pipeline gets a banner.
+      errored.forEach(p => ensurePipeLogs(p.name));
+      const banner = document.getElementById('pipe-banner');
+      if (errored.length) {
+        const p = errored[0];
+        banner.innerHTML = errorState(
+          errored.length > 1 ? errored.length + ' pipelines are failing — ' + p.name : p.name + ' is failing',
+          pipeLastError(p) || 'No error text is available from this driver.');
+      } else {
+        banner.innerHTML = '';
+      }
+
+      const list = document.getElementById('pipe-list');
+      if (!pipelines.length) {
+        list.innerHTML = emptyState(
+          'No streaming pipelines running',
+          'A running pipeline appears here within a batch or two. This page reads the execution history for micro-batches whose source is a stream — PostgresCdcV1[…], KafkaV2[…], FileStreamSource[…].');
+        return;
+      }
+      list.innerHTML = '<div class="card card-flush">' +
+        cardHead('Live', 'Running pipelines', '<span class="note" style="margin:0">click a row for batch history</span>') +
+        '<table><thead><tr><th>Pipeline</th><th>Source</th><th>State</th><th>Trigger</th><th>Last batch</th><th>Rows</th><th>Duration</th><th>Rows / s</th><th>Position</th></tr></thead><tbody>' +
+        pipelines.map(p => `<tr class="selectable ${pipeState.selected === p.name ? 'selected' : ''}" data-name="${esc(p.name)}">
+          <td>${esc(p.name)}</td>
+          <td class="mono truncate" title="${esc(p.source)}">${esc(p.source)}</td>
+          <td>${chip(p.state)}</td>
+          <td class="num" title="observed: median gap between batch starts">${fmtInterval(p.triggerMs)}</td>
+          <td class="num">${p.last ? (p.last.idIsOrdinal ? '#' : '') + p.last.id : '—'}</td>
+          <td class="num">${p.last ? fmt(p.last.rows) : '—'}</td>
+          <td class="num">${p.last ? fmtMs(p.last.durationMs) : '—'}</td>
+          <td class="num">${fmtRate(p.rowsPerSec)}</td>
+          <td class="mono truncate" title="${esc(p.position || '')}">${esc(p.position || '—')}</td>
+        </tr>`).join('') + '</tbody></table></div>';
+      list.querySelectorAll('tr.selectable').forEach(tr => {
+        tr.onclick = () => openPipeDrawer(tr.dataset.name);
+      });
+
+      const authChip = document.getElementById('pipe-auth-chip');
+      if (authChip) authChip.innerHTML = authChipHtml();
+    }
+
+    function openPipeDrawer(name) {
+      pipeState.selected = name;
+      ensurePipeLogs(name, true);
+      paintPipelines();
+      paintPipeDrawer();
+    }
+
+    function closePipeDrawer() {
+      pipeState.selected = null;
+      paintPipelines();
+      paintPipeDrawer();
+    }
+
+    function paintPipeDrawer() {
+      const host = document.getElementById('pipe-drawer');
+      if (!host) return;
+      const name = pipeState.selected;
+      const p = name ? pipeState.derived.find(x => x.name === name) : null;
+      if (!p) { host.innerHTML = ''; return; }
+      const b = p.last || {};
+
+      const tiles = [
+        ['State', null],
+        ['Last batch', (b.idIsOrdinal ? '#' : '') + (b.id != null ? b.id : '—')],
+        ['Rows', b.rows != null ? fmt(b.rows) : '—'],
+        ['Duration', fmtMs(b.durationMs)],
+        ['Rows / s (60 s)', fmtRate(p.rowsPerSec)],
+        ['Trigger (observed)', fmtInterval(p.triggerMs)],
+      ].map(([k, v]) => `<div class="metric"><div class="eyebrow">${esc(k)}</div><div class="v">${v == null ? chip(p.state) : esc(v)}</div></div>`).join('');
+
+      const positions = [
+        ['Source', p.source],
+        ['Sink', p.sink],
+        ['Start offset', b.startOffset],
+        ['End offset', b.endOffset],
+        ['Latest offset', b.latestOffset],
+        ['LSN / position', b.lsn],
+        ['Driver query', p.live ? p.live.id : null],
+      ].filter(([, v]) => v != null && v !== '')
+        .map(([k, v]) => `<div>${esc(k)}</div><div>${esc(v)}</div>`).join('');
+
+      const history = p.batches.slice().reverse().map(x => `<tr>
+        <td class="num">${(x.idIsOrdinal ? '#' : '') + x.id}</td>
+        <td class="mono truncate" title="${esc((x.startOffset || '—') + ' → ' + (x.endOffset || x.lsn || '—'))}">${esc(x.startOffset || '—')} → ${esc(x.endOffset || x.lsn || '—')}</td>
+        <td class="num">${fmt(x.rows)}</td>
+        <td class="num">${fmtMs(x.durationMs)}</td>
+        <td>${chip(x.status)} <span class="muted mono">${esc(x.endedAt ? shortTs(x.endedAt) : '')}</span></td>
+      </tr>`).join('');
+
+      const err = p.state === 'error' ? errorState('Pipeline ' + p.name + ' is failing', pipeLastError(p) || 'No error text is available from this driver.') : '';
+      host.innerHTML = `<div class="scrim" id="pipe-scrim"></div>
+        <aside class="drawer" role="dialog" aria-label="Pipeline ${esc(p.name)}">
+          <div class="drawer-head">
+            <div>
+              <div class="eyebrow">${esc(p.kind)}</div>
+              <h3>${esc(p.name)}</h3>
+              ${chip(p.state)}
+            </div>
+            <button class="drawer-close" id="pipe-drawer-close" aria-label="Close">&times;</button>
+          </div>
+          <div class="drawer-body">
+            ${err}
+            <section><div class="metrics">${tiles}</div></section>
+            ${positions ? `<section><span class="eyebrow">Positions</span><div class="kv">${positions}</div></section>` : ''}
+            <section>
+              <span class="eyebrow">Batch history</span>
+              <div class="card card-flush" style="margin:0">
+                <table><thead><tr><th>Batch</th><th>Range</th><th>Rows</th><th>Duration</th><th>Commit</th></tr></thead>
+                <tbody>${history || '<tr><td colspan="5" class="muted">No batches recorded.</td></tr>'}</tbody></table>
+              </div>
+              ${p.batches.some(x => x.idIsOrdinal) ? '<div class="note">Batch ids prefixed <code>#</code> are this page’s ordinals — this driver’s execution descriptions carry no batch id.</div>' : ''}
+            </section>
+            ${pipeLogSectionHtml(p)}
+          </div>
+        </aside>`;
+      document.getElementById('pipe-drawer-close').onclick = closePipeDrawer;
+      document.getElementById('pipe-scrim').onclick = closePipeDrawer;
+    }
+
+    function pipeLogSectionHtml(p) {
+      const log = pipeState.logs[p.name];
+      // Not asked yet, or the endpoint is not there: no section at all.
+      if (!log) return '';
+      if (log.code === 404) return '';
+      if (log.code === 401 || log.code === 403) {
+        return `<section><span class="eyebrow">Connector log</span>
+          <div class="note" style="margin:0">Needs the driver status token — set one below.</div></section>`;
+      }
+      if (log.code !== 200) {
+        return `<section><span class="eyebrow">Connector log</span>
+          <div class="note" style="margin:0">${log.loading && !log.events ? 'Loading&hellip;' : 'Unavailable' + (log.error ? ': ' + esc(log.error) : '')}</div></section>`;
+      }
+      const events = log.events || [];
+      return `<section>
+        <span class="eyebrow">Connector log — last ${events.length}</span>
+        <div class="logwrap">${events.length ? events.map(logLineHtml).join('') : '<div class="logline"><span class="msg">(empty)</span></div>'}</div>
+        ${log.truncated || log.malformed ? `<div class="note">${log.truncated ? 'Tail of a larger file. ' : ''}${log.malformed ? log.malformed + ' line(s) were not valid JSON.' : ''}</div>` : ''}
+      </section>`;
+    }
+
+    /* ---------- Polling ---------- */
+
+    async function fetchPipeStatus() {
+      if (!pipeState.token) { pipeState.status = null; pipeState.statusCode = null; return; }
+      try {
+        const r = await fetch('/api/status?limit=200', { headers: { Authorization: 'Bearer ' + pipeState.token } });
+        pipeState.statusCode = r.status;
+        pipeState.status = r.ok ? await r.json() : null;
+      } catch (e) {
+        pipeState.statusCode = 0;
+        pipeState.status = null;
+      }
+    }
+
+    function pipeTick() {
+      // Only /api/status needs its own poll: the batch history rides refresh() (2 s) and the
+      // SSE stream, both of which already repaint this page.
+      fetchPipeStatus().then(() => { paintPipelines(); paintPipeDrawer(); });
+    }
+
+    function openPipelines() {
+      renderPipelines();
+      pipeTick();
+      if (!pipeState.timer) pipeState.timer = setInterval(pipeTick, PIPE_POLL_MS);
+    }
+
+    function stopPipelines() {
+      if (pipeState.timer) { clearInterval(pipeState.timer); pipeState.timer = null; }
+      // The drawer covers the whole page, so leaving the tab has to take it with us.
+      if (pipeState.selected) { pipeState.selected = null; paintPipeDrawer(); }
+    }
+
+    // Escape closes the sheet, like every other drawer the platform ships.
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && pipeState.selected) closePipeDrawer();
+    });
 
     renderEditor();
     renderNotebook();
