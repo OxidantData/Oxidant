@@ -355,6 +355,7 @@ in the documented place and format; serving it is a separate change.
 | Knob | Default | What it does |
 |---|---|---|
 | `OXIDANT_PG_CDC_IDLE_MS` | `500` | How long planning waits for more WAL before deciding the publisher is caught up. Only paid when the batch has not yet reached the flush LSN it was aiming at, so an idle stream does not pay it. |
+| `OXIDANT_PG_CDC_SLOT_WAIT_MS` | `30000` | How long recreating a slot waits for whoever holds it to let go. Restarting an interrupted snapshot needs a fresh slot, and `DROP_REPLICATION_SLOT … WAIT` blocks until the slot goes inactive with no timeout at any layer — so a pipeline started twice onto one `slot:` used to hang at start with nothing in the log. The wait is a bounded poll of `pg_replication_slots.active_pid`, and running out of it is an error naming the backend that holds it. |
 | `OXIDANT_PG_CDC_STATUS_MS` | `20000` | How often an otherwise silent source sends a standby status update. Postgres' walsender asks for a reply after `wal_sender_timeout / 2` and hangs up at `wal_sender_timeout` (60 s by default), so a pipeline over a quiet table has to speak. The message carries the position already committed, so it moves the slot nowhere. A `trigger:` longer than `wal_sender_timeout` will still lose the socket between triggers; the source re-dials and re-issues `START_REPLICATION` from the checkpointed LSN, so it costs a handshake, not the pipeline. |
 
 ### AUTO CDC wiring

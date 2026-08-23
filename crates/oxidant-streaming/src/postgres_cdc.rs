@@ -94,6 +94,8 @@ const DEFAULT_MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// Rows per emitted Arrow batch. Named for the snapshot because that is where it matters — a
 /// whole source table arrives as one micro-batch — but a WAL batch is chunked by it too.
 const DEFAULT_SNAPSHOT_BATCH_ROWS: usize = 65_536;
+/// How long recreating a slot waits for whoever holds it to let go.
+const DEFAULT_SLOT_WAIT_MS: u64 = 30_000;
 /// Buffered change bytes in one transaction past which the source says so.
 ///
 /// `max_batch_bytes` is only consulted *between* transactions, because a micro-batch must not end
@@ -240,6 +242,8 @@ pub struct PostgresCdcOptions {
     pub status_interval: Duration,
     /// Buffered change bytes in one transaction past which the source logs a warning.
     pub transaction_warn_bytes: usize,
+    /// How long recreating a slot waits for whoever holds it to let go before giving up.
+    pub slot_wait: Duration,
     /// Where the connector's JSONL log goes, injected by the pipeline runner.
     pub log_dir: Option<PathBuf>,
     /// The pipeline table this source feeds, used to name the log file.
@@ -413,6 +417,15 @@ impl PostgresCdcOptions {
                     .unwrap_or(DEFAULT_STATUS_MS),
             ),
             transaction_warn_bytes: TRANSACTION_WARN_BYTES,
+            // Not a YAML option either: a pipeline author has no way to know how long the
+            // *other* process holding their slot will take to exit. The environment variable
+            // exists so a test does not have to wait the full half minute.
+            slot_wait: Duration::from_millis(
+                std::env::var("OXIDANT_PG_CDC_SLOT_WAIT_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(DEFAULT_SLOT_WAIT_MS),
+            ),
             log_dir: options.get(LOG_DIR_OPTION).map(PathBuf::from),
             name: options
                 .get(NAME_OPTION)
@@ -923,6 +936,7 @@ pub(crate) struct PgWire {
     connect: PgConnectConfig,
     slot: String,
     publication: String,
+    slot_wait: Duration,
     control: Option<ControlConnection>,
     replication: Option<ReplicationConnection>,
     /// Names each snapshot cursor apart. A replay of a snapshot range declares a second cursor
@@ -939,6 +953,7 @@ impl PgWire {
             connect: options.connect.clone(),
             slot: options.slot.clone(),
             publication: options.publication.clone(),
+            slot_wait: options.slot_wait,
             control: None,
             replication: None,
             snapshot_cursor: 0,
@@ -990,8 +1005,7 @@ impl PgWire {
     /// `slot:` gets a diagnosis naming the process holding it rather than a start that hangs
     /// forever with nothing in the log.
     async fn drop_slot(&mut self, slot: &str) -> Result<()> {
-        const WAIT: Duration = Duration::from_secs(30);
-        let deadline = Instant::now() + WAIT;
+        let deadline = Instant::now() + self.slot_wait;
         loop {
             let held = self
                 .control()
@@ -1012,12 +1026,12 @@ impl PgWire {
             if Instant::now() >= deadline {
                 return Err(Error::Execution(format!(
                     "postgres_cdc: replication slot `{slot}` has to be recreated to restart an \
-                     interrupted snapshot, but backend pid {pid} has held it for {}s. That is \
-                     usually a previous run of this pipeline that has not exited, or a second \
-                     pipeline pointed at the same `slot:`. Stop it (or give this pipeline a slot \
-                     of its own); if the holder is gone, clear it with \
+                     interrupted snapshot, but backend pid {pid} has held it throughout the {} ms \
+                     this waited. That is usually a previous run of this pipeline that has not \
+                     exited, or a second pipeline pointed at the same `slot:`. Stop it (or give \
+                     this pipeline a slot of its own); if the holder is gone, clear it with \
                      `SELECT pg_terminate_backend({pid});`.",
-                    WAIT.as_secs()
+                    self.slot_wait.as_millis()
                 )));
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -3200,6 +3214,7 @@ mod tests {
             // one set it to zero.
             status_interval: Duration::from_secs(3600),
             transaction_warn_bytes: TRANSACTION_WARN_BYTES,
+            slot_wait: Duration::from_millis(DEFAULT_SLOT_WAIT_MS),
             log_dir: None,
             name: "sales_suppliers".into(),
         }

@@ -53,13 +53,27 @@ fn dsn() -> Option<PgConnectConfig> {
     })
 }
 
+/// Replication sessions this suite may hold at once.
+///
+/// `max_wal_senders` (8 by default) bounds replication connections *server-wide*, and these tests
+/// run concurrently by design — so without a gate the suite fails intermittently with "number of
+/// requested standby connections exceeds max_wal_senders", which says nothing about the code under
+/// test. Four leaves room for whatever else is pointed at the same scratch cluster.
+static WAL_SENDERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 /// Skip the body when the gate is unset, so `cargo test` stays green on a machine with no server.
+///
+/// Also takes this test's share of the server's replication capacity, held for its whole body.
 macro_rules! gated {
     ($connect:ident) => {
         let Some($connect) = dsn() else {
             eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
             return;
         };
+        let _wal_sender = WAL_SENDERS
+            .acquire()
+            .await
+            .expect("the gate is never closed");
     };
 }
 
@@ -584,6 +598,54 @@ async fn a_source_column_may_not_be_named_like_a_metadata_column() {
     assert_eq!(source.schema().fields().len(), 4, "id plus the three");
     drop(source);
 
+    fixture.drop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_someone_else_is_holding_is_a_diagnosis_and_not_a_hang() {
+    gated!(connect);
+    // `DROP_REPLICATION_SLOT … WAIT` blocks until the slot goes inactive, with no timeout at any
+    // layer — so a pipeline started twice onto one `slot:`, or restarted before the previous
+    // process exited, hung at start with no log line and nothing to diagnose from. The wait is
+    // bounded and the error names the backend holding it.
+    //
+    // `OXIDANT_PG_CDC_SLOT_WAIT_MS` shortens the bound so this takes a moment rather than half a
+    // minute. Safe to set process-wide: every other test drops a slot nobody holds, and that path
+    // does not wait at all.
+    std::env::set_var("OXIDANT_PG_CDC_SLOT_WAIT_MS", "750");
+    let fixture = Fixture::new(&connect, "ox_cdc_held", "id bigint primary key, name text").await;
+
+    let engine = Engine::new();
+    // The holder: a source that has finished its snapshot and is streaming, which is what puts
+    // an `active_pid` on the slot.
+    let mut holder = fixture.source();
+    drain(&mut holder, &engine).await;
+
+    // A second pipeline pointed at the same slot. It needs a *fresh* slot for its own snapshot,
+    // so it has to drop this one — which it cannot, because the first source is on it.
+    let mut intruder = fixture.source();
+    let err = intruder
+        .plan_batch(&engine)
+        .await
+        .expect_err("the slot is held; recreating it cannot succeed")
+        .to_string();
+    assert!(err.contains("ox_cdc_held"), "names the slot: {err}");
+    assert!(
+        err.contains("pg_terminate_backend("),
+        "and the backend holding it, with the way out: {err}"
+    );
+
+    // Once the holder lets go, the same call succeeds — the bound is a bound, not a refusal.
+    // Back to the real wait for this half: the walsender takes a moment to notice the socket
+    // closed, and that moment is exactly what the wait is for.
+    std::env::remove_var("OXIDANT_PG_CDC_SLOT_WAIT_MS");
+    drop(holder);
+    drop(intruder);
+    let mut resumed = fixture.source();
+    let (range, _) = one_batch(&mut resumed, &engine).await;
+    assert!(range.start.contains_key("snapshot"));
+
+    drop(resumed);
     fixture.drop_all().await;
 }
 
