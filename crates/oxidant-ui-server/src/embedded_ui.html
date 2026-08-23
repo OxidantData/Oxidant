@@ -823,8 +823,8 @@
           <td class="truncate" title="${esc(s.name || s.description || '')}">${esc(s.name || s.description || '—')}</td>
           <td><div class="flex"><span class="num">${fmtMs(s.executorRunTime)}</span><div class="bar-wrap"><div class="bar" style="width:${((s.executorRunTime||0)/maxDur*100).toFixed(0)}%"></div></div></div></td>
           <td class="num">${s.numCompleteTasks}/${s.numTasks}</td>
-          <td class="num">${fmt(s.shuffleReadBytes)}</td>
-          <td class="num">${fmt(s.shuffleWriteBytes)}</td>
+          <td class="num">${fmtBytes(s.shuffleReadBytes)}</td>
+          <td class="num">${fmtBytes(s.shuffleWriteBytes)}</td>
           <td>${chip(s.status)}</td>
         </tr>`).join('') + '</tbody></table></div>';
     }
@@ -841,6 +841,9 @@
       </div>`).join('');
     }
 
+    // The label says whether the executor is *registered*; the tone says whether it is
+    // *working*. `run` is the one tone that pulses, and a registered-but-idle worker pulsing
+    // forever reads as a cluster busy with nothing.
     function renderExecutors() {
       const el = document.getElementById('panel-executors');
       if (!state.executors.length) {
@@ -852,9 +855,9 @@
         '<table><thead><tr><th>ID</th><th>Host</th><th>State</th><th>Active</th><th>Completed</th><th>Shuffle read</th><th>Shuffle write</th></tr></thead><tbody>' +
         state.executors.map(e => `<tr>
           <td class="mono">${esc(e.id)}</td><td class="mono">${esc(e.hostPort)}</td>
-          <td>${chip(e.isActive === false ? 'dead' : 'active', e.isActive === false ? 'inactive' : 'active')}</td>
+          <td>${chip(e.isActive === false ? 'dead' : (e.activeTasks > 0 ? 'running' : 'idle'), e.isActive === false ? 'inactive' : 'active')}</td>
           <td class="num">${fmt(e.activeTasks)}</td><td class="num">${fmt(e.completedTasks)}</td>
-          <td class="num">${fmt(e.totalShuffleRead)}</td><td class="num">${fmt(e.totalShuffleWrite)}</td>
+          <td class="num">${fmtBytes(e.totalShuffleRead)}</td><td class="num">${fmtBytes(e.totalShuffleWrite)}</td>
         </tr>`).join('') + '</tbody></table></div>';
     }
 
@@ -1613,8 +1616,14 @@
      *                                   `snapshot_start` / `snapshot_done` carry backfill
      *                                   progress, and `error` carries the text that exists
      *                                   nowhere else.
-     *   /api/status                     secondary: whether the driver also thinks a query by
-     *                                   this name is running. Never the only evidence.
+     *   /api/status                     a cross-check that annotates and never overrules the
+     *                                   connector log. Its `tag` is a query *description* —
+     *                                   truncated SQL text — not a name, so a match has to be
+     *                                   a structural streaming identity for the whole tag;
+     *                                   substring-matching a pipeline name against SQL text
+     *                                   marked healthy pipelines stopped. Nothing the engine
+     *                                   emits today is such an identity, by construction: a
+     *                                   micro-batch never reaches the execution store.
      *
      * All three are gated behind `OXIDANT_STATUS_TOKEN`, so without a token this page has
      * nothing to show and says exactly that rather than "no pipelines".
@@ -1627,17 +1636,19 @@
      *
      * The connector log does not record a sink. That column is absent rather than guessed.
      */
-    const PIPE_POLL_MS = 5000;
+    /* Everything that folds a connector log into what this page says lives in
+       `pipeline_derive.js` and is spliced in here when the binary serves this page — see
+       `static_files.rs`. It is a separate file for one reason: a 200-line reducer that decides
+       whether an operator is told a pipeline has stopped has to be tested, and this page has no
+       build step, no module loader and no way to be imported. `ui/src/lib/pipelineDerive.test.ts`
+       evaluates that exact source. Everything below is fetching and rendering. */
+    /*__PIPELINE_DERIVE_JS__*/
+    const {
+      PIPE_POLL_MS, PIPE_LOG_TAIL, PIPE_MAX_TAILED,
+      shortTs, fmtRate, fmtInterval, fmtAgo,
+      pipeLastError, shouldRefetchTail, capturePipeScroll, restorePipeScroll,
+    } = __oxidantPipelines;
     const PIPE_TOKEN_KEY = 'oxidant.statusToken';
-    const PIPE_RATE_WINDOW_MS = 60000;
-    const PIPE_MAX_BATCHES = 40;
-    const PIPE_LOG_TAIL = 300;
-    /* Log tails fetched per poll. One request per pipeline per 5 s is fine for the handful a
-       driver runs; a directory with more says so in the caption instead of quietly stopping. */
-    const PIPE_MAX_TAILED = 12;
-    /* Floor on "recently enough to call it running". Batch stamps come from the driver's clock
-       and `now` from the browser's; a floor this wide makes ordinary skew a non-event. */
-    const PIPE_MIN_LIVE_MS = 30000;
 
     const pipeState = {
       token: (() => { try { return localStorage.getItem(PIPE_TOKEN_KEY) || ''; } catch (e) { return ''; } })(),
@@ -1652,12 +1663,6 @@
       derived: [],
     };
 
-    const ts = (v) => { const t = v ? new Date(v).getTime() : NaN; return Number.isFinite(t) ? t : 0; };
-    const shortTs = (v) => { const t = ts(v); return t ? new Date(t).toISOString().slice(11, 23) : (v ? String(v) : '—'); };
-    const fmtRate = (r) => r == null ? '—' : (r >= 100 ? Math.round(r).toLocaleString() : r.toFixed(r >= 10 ? 1 : 2));
-    const fmtInterval = (ms) => ms == null ? '—' : (ms < 1000 ? ms + ' ms' : (ms < 90000 ? (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + ' s' : (ms / 60000).toFixed(1) + ' min'));
-    const fmtAgo = (ms) => ms == null ? '—' : (ms < 1000 ? 'just now' : fmtInterval(ms) + ' ago');
-    const num = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : (v == null ? null : (Number.isFinite(Number(v)) ? Number(v) : null));
 
     /* ---------- Fetching ---------- */
 
@@ -1683,7 +1688,7 @@
     function ensurePipeLogs(name, force) {
       const cur = pipeState.logs[name];
       const now = Date.now();
-      if (cur && (cur.loading || (!force && now - (cur.at || 0) < PIPE_POLL_MS))) return;
+      if (!shouldRefetchTail(cur, now, force)) return;
       pipeState.logs[name] = Object.assign({}, cur, { loading: true, at: now });
       const headers = pipeState.token ? pipeAuth() : {};
       fetch('/api/v1/pipelines/' + encodeURIComponent(name) + '/logs?tail=' + PIPE_LOG_TAIL, { headers })
@@ -1694,7 +1699,9 @@
         })
         .catch((e) => ({ code: 0, error: e.message }))
         .then((res) => {
-          pipeState.logs[name] = Object.assign(res, { at: Date.now(), loading: false });
+          // `at` is when this request *started*, not when it returned: re-stamping on
+          // completion pushed the guard past the next tick and halved the refresh rate.
+          pipeState.logs[name] = Object.assign(res, { at: now, doneAt: Date.now(), loading: false });
           paintPipelines();
           paintPipeDrawer();
         });
@@ -1714,182 +1721,13 @@
 
     /* ---------- Derivation, from the connector log ---------- */
 
-    // A /api/status query that is plausibly this pipeline. Secondary: it can confirm "running",
-    // it is never the reason a pipeline is on this page.
-    function statusQueryFor(name) {
-      const qs = (pipeState.status && pipeState.status.queries) || [];
-      return qs.find(q => String(q.tag || '').indexOf(name) >= 0) || null;
-    }
-
-    // One pipeline, folded out of its log tail. Event shapes are the connector's — see
-    // `oxidant-streaming/src/postgres_cdc.rs`, which is where these keys are written.
-    function pipeFromLog(entry, log, now) {
-      const p = {
-        name: entry.name,
-        kind: 'connector',
-        source: null,
-        batches: [],
-        warnings: [],
-        slot: null,
-        commit: null,
-        snapshot: null,
-        lastError: null,
-        lastEventAt: null,
-        sizeBytes: entry.sizeBytes,
-        logCode: log ? log.code : null,
-        logLoading: !!(log && log.loading && !log.events),
-      };
-      const events = (log && log.code === 200 && log.events) || [];
-      // Progress recorded *after* the newest error. Zero means the error is still the last
-      // word, which is the difference between "failing" and "hit a bad batch an hour ago".
-      let sinceError = 0;
-      let replayPending = false;
-      let tables = null;
-      let slotName = null;
-
-      for (const ev of events) {
-        if (!ev || typeof ev !== 'object' || Array.isArray(ev)) continue;
-        const kind = String(ev.event || '');
-        const at = ev.ts || null;
-        if (at) p.lastEventAt = at;
-        switch (kind) {
-          case 'batch':
-            // A `replay: true` line announces a re-read of a range; the batch line that
-            // follows is the one with the numbers on it.
-            if (ev.replay) { replayPending = true; break; }
-            p.batches.push({
-              kind: 'batch', at,
-              rows: num(ev.rows), durationMs: num(ev.duration_ms),
-              startLsn: ev.start_lsn, endLsn: ev.end_lsn, replayed: replayPending,
-            });
-            replayPending = false;
-            sinceError++;
-            break;
-          case 'snapshot_done':
-            p.batches.push({
-              kind: 'snapshot', at, table: ev.table,
-              rows: num(ev.rows), durationMs: num(ev.duration_ms), endLsn: ev.consistent_point,
-            });
-            p.snapshot = { table: ev.table, consistentPoint: ev.consistent_point, counted: ev.counted !== false };
-            sinceError++;
-            break;
-          case 'snapshot_start':
-            if (Array.isArray(ev.tables) && ev.tables.length) {
-              tables = ev.tables.map(t => (t && t.table) || null).filter(Boolean);
-            }
-            if (ev.slot) slotName = ev.slot;
-            // A `reason` on a snapshot_start is a restart the operator did not ask for.
-            if (ev.reason) p.warnings.push({ at, kind: 'snapshot restart', text: String(ev.reason) });
-            break;
-          case 'slot_metrics':
-            if (ev.slot) slotName = ev.slot;
-            p.slot = {
-              at, slot: ev.slot,
-              retainedBytes: num(ev.retained_bytes),
-              lagBytes: num(ev.lag_bytes),
-              serverFlushLsn: ev.server_flush_lsn,
-              confirmedFlushLsn: ev.confirmed_flush_lsn,
-              position: ev.position,
-            };
-            break;
-          case 'commit':
-            p.commit = {
-              at, confirmedFlushLsn: ev.confirmed_flush_lsn,
-              // `sent: false` means the position was committed locally but never announced to
-              // the publisher — the slot keeps growing until it is.
-              sent: ev.sent !== false,
-              tablesDone: num(ev.snapshot_tables_done),
-            };
-            sinceError++;
-            break;
-          case 'schema_change':
-          case 'large_transaction':
-          case 'value_dropped':
-            p.warnings.push({ at, kind: kind.replace(/_/g, ' '), text: String(ev.action || ev.warning || ev.message || kind) });
-            break;
-          case 'error':
-            p.lastError = { at, message: String(ev.message || ev.error || 'error'), willRetry: ev.will_retry !== false };
-            sinceError = 0;
-            break;
-          default:
-            // Anything a future connector writes that reads like a failure still lands.
-            if (ev.error || /^err|^fatal/i.test(String(ev.level || ev.severity || ''))) {
-              p.lastError = { at, message: String(ev.error || ev.message || JSON.stringify(ev)), willRetry: true };
-              sinceError = 0;
-            }
-        }
-      }
-
-      // A slot or an introspected table list is what a Postgres CDC connector leaves behind;
-      // nothing else in the tree writes either.
-      if (slotName || tables) {
-        p.kind = 'postgres_cdc';
-        // Tables come from `snapshot_start`, which a long-running pipeline's tail has usually
-        // rolled past. Then the slot alone names the source — better than a `?` standing in for
-        // a list this page never saw.
-        p.source = 'PostgresCDC[' +
-          [tables && tables.length ? tables.join(', ') : null, slotName ? 'slot=' + slotName : null]
-            .filter(Boolean).join(' ') + ']';
-        p.slotName = slotName;
-        p.tables = tables;
-      }
-
-      if (p.batches.length > PIPE_MAX_BATCHES) p.batches = p.batches.slice(-PIPE_MAX_BATCHES);
-      // The log records ranges, not batch ids, so the number in the table is this page's
-      // ordinal over the tail it holds. The drawer says so.
-      p.batches.forEach((b, i) => { b.ordinal = i; });
-      p.last = p.batches[p.batches.length - 1] || null;
-
-      const gaps = [];
-      for (let i = 1; i < p.batches.length; i++) {
-        const g = ts(p.batches[i].at) - ts(p.batches[i - 1].at);
-        if (g > 0) gaps.push(g);
-      }
-      p.triggerMs = gaps.length ? gaps.slice().sort((a, b) => a - b)[Math.floor(gaps.length / 2)] : null;
-
-      const window = p.batches.filter(b => ts(b.at) >= now - PIPE_RATE_WINDOW_MS);
-      if (window.length) {
-        const rows = window.reduce((a, b) => a + (b.rows || 0), 0);
-        // The span the window actually covered, floored at the batches' own runtime so one
-        // batch does not divide by ~0 and report an absurd rate.
-        const span = Math.max(
-          ts(window[window.length - 1].at) - ts(window[0].at),
-          window.reduce((a, b) => a + (b.durationMs || 0), 0),
-          1000);
-        p.rowsPerSec = rows / (span / 1000);
-        p.windowRows = rows;
-      } else {
-        p.rowsPerSec = null;
-        p.windowRows = 0;
-      }
-
-      // Freshness falls back to the log file's own mtime, which is the same driver clock and
-      // is present even when the tail window holds no timestamped event.
-      const lastAt = ts(p.lastEventAt) || entry.modifiedMs || 0;
-      p.lastEventMs = lastAt || null;
-      p.idleMs = lastAt ? Math.max(0, now - lastAt) : null;
-      const liveWindow = Math.max(3 * (p.triggerMs || 0), PIPE_MIN_LIVE_MS);
-      const fresh = lastAt > 0 && p.idleMs <= liveWindow;
-
-      p.live = statusQueryFor(p.name);
-      p.retrying = !!(p.lastError && p.lastError.willRetry && sinceError === 0);
-      if (p.lastError && !p.lastError.willRetry && sinceError === 0) p.state = 'error';
-      else if (p.live && p.live.state === 'failed') p.state = 'error';
-      else if (fresh || (p.live && p.live.state === 'running')) p.state = 'running';
-      else p.state = 'idle';
-
-      p.position = (p.commit && p.commit.confirmedFlushLsn) ||
-        (p.slot && (p.slot.confirmedFlushLsn || p.slot.position)) ||
-        (p.last && p.last.endLsn) || null;
-      return p;
-    }
-
+    // The page's inputs, folded by `pipeline_derive.js`. `/api/status` is a cross-check that
+    // annotates and never overrules the connector log — see `statusQueryFor` there for why a
+    // substring match on a query's SQL text could not be one.
     function derivePipelines() {
-      const now = Date.now();
-      const pipelines = (pipeState.list || [])
-        .map(entry => pipeFromLog(entry, pipeState.logs[entry.name], now));
-      pipelines.sort((a, b) => (b.lastEventMs || 0) - (a.lastEventMs || 0) || a.name.localeCompare(b.name));
-      return pipelines;
+      return __oxidantPipelines.derivePipelines(
+        pipeState.list, pipeState.logs, Date.now(),
+        pipeState.status && pipeState.status.queries);
     }
 
     /* ---------- Connector log rendering ---------- */
@@ -1912,17 +1750,6 @@
       const isError = /^err|^fatal/.test(level) || String(ev.event || '') === 'error';
       const cls = isError ? 'lvl-error' : (/^warn/.test(level) ? 'lvl-warn' : '');
       return `<div class="logline ${cls}"><span class="ts">${esc(shortTs(stamp))}</span><span class="msg">${esc(text)}</span></div>`;
-    }
-
-    // The text a failure banner shows. The connector log is the only place the message exists.
-    function pipeLastError(p) {
-      if (p.lastError) {
-        return p.lastError.message + (p.lastError.willRetry
-          ? '\n\nThe connector marked this retryable and nothing has progressed since, so the batch is still being retried.'
-          : '\n\nThe connector marked this fatal: the pipeline has stopped rather than skip data.');
-      }
-      if (p.live && p.live.state === 'failed') return 'The driver reports this query as failed (' + p.live.id + ').';
-      return null;
     }
 
     /* ---------- Rendering ---------- */
@@ -2078,7 +1905,7 @@
             <td class="mono truncate" title="${esc(p.source || 'the connector log does not name its source')}">${esc(p.source || '—')}</td>
             <td>${chip(p.state)}${p.retrying && p.state !== 'error' ? ' ' + chip('pending', 'retrying') : ''}</td>
             <td class="num" title="observed: median gap between batch starts">${fmtInterval(p.triggerMs)}</td>
-            <td class="num" title="${esc(b && b.at ? b.at : 'no batch in the log tail')}">${b ? '#' + b.ordinal + (b.kind === 'snapshot' ? ' snap' : '') : '—'}</td>
+            <td class="mono truncate" title="${esc(b ? 'batch #' + b.ordinal + ' of the log tail' + (b.at ? ' · ' + b.at : '') : 'no batch in the log tail')}">${b ? esc(p.lastBatchLabel) + (b.kind === 'snapshot' ? ' snap' : '') : '—'}</td>
             <td class="num">${b ? fmt(b.rows) : '—'}</td>
             <td class="num">${b ? fmtMs(b.durationMs) : '—'}</td>
             <td class="num" title="observed: rows in the last 60 s over the span they covered">${fmtRate(p.rowsPerSec)}</td>
@@ -2111,6 +1938,10 @@
     function paintPipeDrawer() {
       const host = document.getElementById('pipe-drawer');
       if (!host) return;
+      // The sheet repaints on every poll — that is how the log tail and the batch history stay
+      // live — so where the reader had scrolled to has to survive the repaint. Panes carry
+      // `data-scroll`; one already at the bottom is re-pinned to the new bottom.
+      const scroll = capturePipeScroll(host);
       const name = pipeState.selected;
       const p = name ? pipeState.derived.find(x => x.name === name) : null;
       if (!p) { host.innerHTML = ''; return; }
@@ -2118,7 +1949,7 @@
 
       const tiles = [
         ['State', null],
-        ['Last batch', p.last ? '#' + b.ordinal : '—'],
+        ['Last batch', p.lastBatchLabel || '—'],
         ['Rows', b.rows != null ? fmt(b.rows) : '—'],
         ['Duration', fmtMs(b.durationMs)],
         ['Rows / s (60 s)', fmtRate(p.rowsPerSec)],
@@ -2168,7 +1999,7 @@
             </div>
             <button class="drawer-close" id="pipe-drawer-close" aria-label="Close">&times;</button>
           </div>
-          <div class="drawer-body">
+          <div class="drawer-body" data-scroll="body">
             ${err}
             <section><div class="metrics">${tiles}</div></section>
             ${positions ? `<section><span class="eyebrow">Positions</span><div class="kv">${positions}</div></section>` : ''}
@@ -2179,11 +2010,12 @@
                 <table><thead><tr><th>Batch</th><th>Range</th><th>Rows</th><th>Duration</th><th>Kind</th></tr></thead>
                 <tbody>${history || '<tr><td colspan="5" class="muted">No batch or snapshot events in the log tail.</td></tr>'}</tbody></table>
               </div>
-              <div class="note">Batch numbers are this page's ordinals over the log tail it holds, not the checkpoint's batch ids: the connector log records LSN ranges, not batch ids. <code>↻</code> marks a replayed range. The sink is absent because the connector log does not record one.</div>
+              <div class="note">Batch numbers are this page's ordinals over the log tail it holds, not the checkpoint's batch ids: the connector log records LSN ranges, not batch ids, so the list's <strong>Last batch</strong> column shows the newest batch's end LSN (or its timestamp) instead — a number that moves when the pipeline does. <code>↻</code> marks a replayed range. The sink is absent because the connector log does not record one.</div>
             </section>
             ${pipeLogSectionHtml(p)}
           </div>
         </aside>`;
+      restorePipeScroll(host, scroll);
       document.getElementById('pipe-drawer-close').onclick = closePipeDrawer;
       document.getElementById('pipe-scrim').onclick = closePipeDrawer;
     }
@@ -2206,7 +2038,7 @@
       const events = log.events || [];
       return `<section>
         <span class="eyebrow">Connector log — last ${events.length}</span>
-        <div class="logwrap">${events.length ? events.map(logLineHtml).join('') : '<div class="logline"><span class="msg">(empty)</span></div>'}</div>
+        <div class="logwrap" data-scroll="log">${events.length ? events.map(logLineHtml).join('') : '<div class="logline"><span class="msg">(empty)</span></div>'}</div>
         ${log.truncated || log.malformed ? `<div class="note">${log.truncated ? 'Tail of a larger file. ' : ''}${log.malformed ? log.malformed + ' line(s) were not valid JSON.' : ''}</div>` : ''}
       </section>`;
     }
