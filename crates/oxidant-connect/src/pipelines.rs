@@ -2492,6 +2492,28 @@ fn format_run_event(event: &RunEvent, locations: &HashMap<String, String>) -> St
         RunEventKind::StatePersistFailed { error } => {
             format!("[oxidant] could not persist pipeline state: {error}")
         }
+        RunEventKind::ReconcileFinished {
+            cron,
+            drifted,
+            tables,
+            report,
+        } => {
+            // The whole report, indented under its headline: a Spark client sees one event, and
+            // a count with no detail would send whoever reads it back to a shell they may not
+            // have. `report` already ends in a newline.
+            let body: String = report
+                .lines()
+                .map(|line| format!("\n[oxidant]   {line}"))
+                .collect();
+            format!(
+                "[oxidant] scheduled reconcile (`{cron}`): {drifted} of {tables} table(s) \
+                 drifted{body}"
+            )
+        }
+        RunEventKind::ReconcileFailed { cron, error } => format!(
+            "[oxidant] scheduled reconcile (`{cron}`) could not run: {error} — the pipeline keeps \
+             replicating"
+        ),
         RunEventKind::PassComplete { outcomes } => {
             let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
             format!(

@@ -76,7 +76,12 @@ fn resolve_in(columns: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
-fn quote_ident(name: &str) -> String {
+/// A column name safe to drop into engine SQL.
+///
+/// Backticks, not double quotes: the engine speaks Spark's dialect, where `"x"` is the *string*
+/// `x` and not the column `x` — a mistake that produces a perfectly valid query returning the
+/// column's name once per row.
+pub(crate) fn quote_ident(name: &str) -> String {
     if !name.is_empty()
         && name
             .chars()

@@ -2,7 +2,10 @@
 
 use oxidant_common::{Error, Result};
 use oxidant_config::{OxidantConfig, TableKind};
-use oxidant_pipelines::{run_pipeline, Plan, RunEvent, RunEventKind};
+use oxidant_pipelines::{
+    run_pipeline, set_schedule, Plan, ReconcileOptions, ReconcileSchedule, RunEvent, RunEventKind,
+    DEFAULT_SAMPLE,
+};
 
 /// What `oxidant pipeline` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,10 +21,22 @@ pub enum Command {
         /// Force a single pass regardless of the configured trigger.
         once: bool,
     },
+    /// Report drift between a `postgres_cdc` source and the tables it feeds. Reads only.
+    Reconcile {
+        /// Restrict to these tables — a pipeline table, or an upstream `schema.table`.
+        tables: Vec<String>,
+        /// Keys walked per table.
+        sample: usize,
+        /// `Some(expr)` registers a schedule instead of running now; `Some("off")` clears it.
+        cron: Option<String>,
+    },
 }
 
+/// What `--cron` takes to mean "stop running this on a schedule".
+const CRON_OFF: &[&str] = &["off", "none", "clear"];
+
 /// Flags that consume the token after them, so it is not mistaken for the subcommand.
-const VALUE_FLAGS: &[&str] = &["--config", "-c", "--table"];
+const VALUE_FLAGS: &[&str] = &["--config", "-c", "--table", "--sample", "--cron"];
 
 /// The first bare word after `pipeline`, skipping flags and their values.
 fn subcommand(args: &[String]) -> Option<&str> {
@@ -39,30 +54,74 @@ fn subcommand(args: &[String]) -> Option<&str> {
     None
 }
 
+/// Every `--table <NAME>` / `--table=<NAME>`, in the order they were given.
+fn table_flags(args: &[String]) -> Vec<String> {
+    let mut tables = Vec::new();
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--table" {
+            if let Some(name) = args.get(i + 1) {
+                tables.push(name.clone());
+            }
+        } else if let Some(name) = arg.strip_prefix("--table=") {
+            tables.push(name.to_string());
+        }
+    }
+    tables
+}
+
+/// `--flag <VALUE>` or `--flag=<VALUE>`.
+fn value_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let equals = format!("{flag}=");
+    args.iter().enumerate().find_map(|(i, arg)| {
+        if arg == flag {
+            args.get(i + 1).map(String::as_str)
+        } else {
+            arg.strip_prefix(&equals)
+        }
+    })
+}
+
 /// Parse the `pipeline` subcommand's arguments.
 pub fn parse_command(args: &[String]) -> Result<Command> {
     let sub = subcommand(args);
     match sub {
         Some("validate") => Ok(Command::Validate),
         Some("show") => Ok(Command::Show),
-        Some("run") | None => {
-            let mut tables = Vec::new();
-            for (i, arg) in args.iter().enumerate() {
-                if arg == "--table" {
-                    if let Some(name) = args.get(i + 1) {
-                        tables.push(name.clone());
-                    }
-                } else if let Some(name) = arg.strip_prefix("--table=") {
-                    tables.push(name.to_string());
-                }
+        Some("reconcile") => {
+            let sample = match value_flag(args, "--sample") {
+                None => DEFAULT_SAMPLE,
+                Some(text) => text
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        Error::Io(format!(
+                            "`--sample {text}` is not a number of keys (a positive integer)"
+                        ))
+                    })?,
+            };
+            let cron = value_flag(args, "--cron").map(str::to_string);
+            if cron.as_deref().is_some_and(|c| c.trim().is_empty()) {
+                return Err(Error::Io(
+                    "`--cron` needs an expression, for example `--cron '0 6 * * *'` (or \
+                     `--cron off` to clear a registered schedule)"
+                        .into(),
+                ));
             }
-            Ok(Command::Run {
-                tables,
-                once: args.iter().any(|a| a == "--once"),
+            Ok(Command::Reconcile {
+                tables: table_flags(args),
+                sample,
+                cron,
             })
         }
+        Some("run") | None => Ok(Command::Run {
+            tables: table_flags(args),
+            once: args.iter().any(|a| a == "--once"),
+        }),
         Some(other) => Err(Error::Io(format!(
-            "unknown `oxidant pipeline` subcommand `{other}` (expected run, validate, or show)"
+            "unknown `oxidant pipeline` subcommand `{other}` (expected run, validate, show, or \
+             reconcile)"
         ))),
     }
 }
@@ -110,7 +169,77 @@ pub async fn run(config: Option<OxidantConfig>, command: Command) -> Result<()> 
             )
             .await
         }
+        Command::Reconcile {
+            tables,
+            sample,
+            cron,
+        } => {
+            let options = ReconcileOptions { tables, sample };
+            if let Some(cron) = cron {
+                return register_schedule(&plan, &cron, config.source_path.as_deref(), &options);
+            }
+            let engine = crate::embedded::build_engine(Some(&config), None).await?;
+            let report = oxidant_pipelines::reconcile(&engine, &plan, &options).await?;
+            // The report goes to stdout — it is the command's output, and a cron job pipes it.
+            print!("{}", report.render());
+            // Exit here rather than returning an error, so drift is reported as a full report
+            // with a status code and not as `oxidant: <message>` on stderr. `run` cannot express
+            // "succeeded, and the answer is no" any other way.
+            let code = report.exit_code();
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
     }
+}
+
+/// `reconcile --cron <EXPR>`: persist the schedule (or clear it) and say what changed.
+fn register_schedule(
+    plan: &Plan<'_>,
+    cron: &str,
+    config_path: Option<&std::path::Path>,
+    options: &ReconcileOptions,
+) -> Result<()> {
+    let checkpoints = plan.pipeline.checkpoints.as_str();
+    if CRON_OFF.contains(&cron.trim().to_ascii_lowercase().as_str()) {
+        if ReconcileSchedule::remove(checkpoints)? {
+            println!(
+                "reconcile schedule removed from {}",
+                ReconcileSchedule::path_in(checkpoints).display()
+            );
+        } else {
+            println!(
+                "pipeline `{}` had no reconcile schedule",
+                plan.pipeline.name
+            );
+        }
+        return Ok(());
+    }
+    let schedule = set_schedule(plan, cron, config_path, options)?;
+    println!(
+        "reconcile scheduled for pipeline `{}`: `{}`",
+        plan.pipeline.name, schedule.cron
+    );
+    println!(
+        "  written to {}",
+        ReconcileSchedule::path_in(checkpoints).display()
+    );
+    println!(
+        "  next: {}",
+        oxidant_pipelines::Cron::parse(&schedule.cron)
+            .ok()
+            .and_then(|c| c.next_after(schedule.anchor()))
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_else(|| "never".into())
+    );
+    // `pipeline run` is what ticks it; saying so here is cheaper than an operator discovering
+    // that a schedule registered on a laptop never fires.
+    println!(
+        "  ticked by `oxidant pipeline run` between triggers; `oxidant pipeline reconcile` \
+         remains the on-demand path"
+    );
+    Ok(())
 }
 
 fn print_graph(plan: &Plan<'_>) {
@@ -147,6 +276,45 @@ fn print_graph(plan: &Plan<'_>) {
             );
         }
     }
+    print_schedule(plan);
+}
+
+/// The registered `reconcile --cron` schedule, when there is one.
+///
+/// Printed by `show` because the schedule lives in the checkpoint directory rather than in the
+/// config file: without this, the only way to find out whether a pipeline reconciles itself is to
+/// go looking for a JSON file, and "I thought it was scheduled" is the failure that matters.
+fn print_schedule(plan: &Plan<'_>) {
+    let checkpoints = plan.pipeline.checkpoints.as_str();
+    let Some(schedule) = ReconcileSchedule::load(checkpoints) else {
+        return;
+    };
+    println!();
+    println!("reconcile: `{}`", schedule.cron);
+    if !schedule.tables.is_empty() {
+        println!("      tables: {}", schedule.tables.join(", "));
+    }
+    println!("      sample: {} key(s)", schedule.sample);
+    println!(
+        "      last:   {}",
+        match (&schedule.last_run, &schedule.last_result) {
+            (Some(at), Some(result)) => format!("{at} — {result}"),
+            (Some(at), None) => at.clone(),
+            _ => format!("never (registered {})", schedule.created),
+        }
+    );
+    println!(
+        "      next:   {}",
+        oxidant_pipelines::Cron::parse(&schedule.cron)
+            .ok()
+            .and_then(|cron| cron.next_after(schedule.anchor()))
+            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_else(|| "never — the expression no longer parses".into())
+    );
+    println!(
+        "      from:   {}",
+        ReconcileSchedule::path_in(checkpoints).display()
+    );
 }
 
 /// Render pipeline events to stderr — byte-identical to the pre-extraction runner.
@@ -235,6 +403,28 @@ fn render_event(event: RunEvent) {
         }
         RunEventKind::StatePersistFailed { error } => {
             eprintln!("[oxidant] could not persist pipeline state: {error}");
+        }
+        RunEventKind::ReconcileFinished {
+            cron,
+            drifted,
+            tables,
+            report,
+        } => {
+            eprintln!(
+                "[oxidant] scheduled reconcile (`{cron}`): {} of {tables} table(s) drifted",
+                drifted
+            );
+            // The whole report, not a count: nobody is watching this terminal, and a summary
+            // would only send whoever reads the log later back to run the command by hand.
+            for line in report.lines() {
+                eprintln!("[oxidant]   {line}");
+            }
+        }
+        RunEventKind::ReconcileFailed { cron, error } => {
+            eprintln!(
+                "[oxidant] scheduled reconcile (`{cron}`) could not run: {error} — the pipeline \
+                 keeps replicating"
+            );
         }
     }
 }
@@ -325,6 +515,131 @@ mod tests {
     fn an_unknown_subcommand_is_rejected_rather_than_treated_as_run() {
         let err = parse_command(&args(&["oxidant", "pipeline", "vlaidate"])).expect_err("typo");
         assert!(err.to_string().contains("vlaidate"), "got: {err}");
+    }
+
+    fn reconcile(list: &[&str]) -> Command {
+        parse_command(&args(list)).expect("parses")
+    }
+
+    #[test]
+    fn reconcile_defaults_to_every_table_and_the_documented_sample() {
+        assert_eq!(
+            reconcile(&["oxidant", "pipeline", "reconcile", "-c", "x.yaml"]),
+            Command::Reconcile {
+                tables: vec![],
+                sample: DEFAULT_SAMPLE,
+                cron: None,
+            }
+        );
+    }
+
+    #[test]
+    fn reconcile_scopes_to_named_tables_in_either_spelling() {
+        assert_eq!(
+            reconcile(&[
+                "oxidant",
+                "pipeline",
+                "reconcile",
+                "--table",
+                "public.sales_suppliers",
+                "--table=sales_customers",
+            ]),
+            Command::Reconcile {
+                tables: vec!["public.sales_suppliers".into(), "sales_customers".into()],
+                sample: DEFAULT_SAMPLE,
+                cron: None,
+            }
+        );
+    }
+
+    #[test]
+    fn the_sample_widens_and_is_rejected_when_it_is_not_a_count() {
+        assert_eq!(
+            reconcile(&["oxidant", "pipeline", "reconcile", "--sample", "50000"]),
+            Command::Reconcile {
+                tables: vec![],
+                sample: 50_000,
+                cron: None,
+            }
+        );
+        assert_eq!(
+            reconcile(&["oxidant", "pipeline", "reconcile", "--sample=250"]),
+            Command::Reconcile {
+                tables: vec![],
+                sample: 250,
+                cron: None,
+            }
+        );
+        // A zero sample would walk nothing and report every table in sync, which is worse than
+        // an error by exactly the amount an operator trusts it.
+        for bad in ["0", "lots", "-1"] {
+            let err = parse_command(&args(&[
+                "oxidant",
+                "pipeline",
+                "reconcile",
+                "--sample",
+                bad,
+            ]))
+            .expect_err(bad)
+            .to_string();
+            assert!(err.contains("--sample"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn a_cron_expression_is_carried_through_and_off_is_a_value_not_a_subcommand() {
+        assert_eq!(
+            reconcile(&["oxidant", "pipeline", "reconcile", "--cron", "0 6 * * *"]),
+            Command::Reconcile {
+                tables: vec![],
+                sample: DEFAULT_SAMPLE,
+                cron: Some("0 6 * * *".into()),
+            }
+        );
+        // `--cron` is in VALUE_FLAGS, so `off` is its value; without that, `off` would be read as
+        // the subcommand and rejected as a typo.
+        assert_eq!(
+            reconcile(&["oxidant", "pipeline", "reconcile", "--cron", "off"]),
+            Command::Reconcile {
+                tables: vec![],
+                sample: DEFAULT_SAMPLE,
+                cron: Some("off".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_sample_value_is_never_mistaken_for_the_subcommand() {
+        // `--sample 500 reconcile` and `reconcile --sample 500` must parse the same way.
+        assert_eq!(
+            reconcile(&["oxidant", "pipeline", "--sample", "500", "reconcile"]),
+            Command::Reconcile {
+                tables: vec![],
+                sample: 500,
+                cron: None,
+            }
+        );
+    }
+
+    #[test]
+    fn render_event_prints_a_scheduled_reconcile_and_survives_a_failed_one() {
+        use std::time::SystemTime;
+        render_event(RunEvent {
+            at: SystemTime::now(),
+            kind: RunEventKind::ReconcileFinished {
+                cron: "0 6 * * *".into(),
+                drifted: 1,
+                tables: 2,
+                report: "summary: DRIFT — 1 of 2 table(s) differ\n".into(),
+            },
+        });
+        render_event(RunEvent {
+            at: SystemTime::now(),
+            kind: RunEventKind::ReconcileFailed {
+                cron: "0 6 * * *".into(),
+                error: "connection refused".into(),
+            },
+        });
     }
 
     #[test]

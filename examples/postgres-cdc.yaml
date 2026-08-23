@@ -7,6 +7,12 @@
 #   export OXIDANT_PGPASSWORD=…            # never a literal secret in this file
 #   oxidant pipeline run -c examples/postgres-cdc.yaml
 #
+# And to check the lakehouse still agrees with the source — read-only, exit 1
+# on drift, so it drops straight into cron or CI (docs/postgres-cdc.md §4):
+#
+#   oxidant pipeline reconcile -c examples/postgres-cdc.yaml
+#   oxidant pipeline reconcile -c examples/postgres-cdc.yaml --cron "0 6 * * *"
+#
 # What the source needs on the publisher, checked at startup with the exact
 # remediation SQL in the error (see docs/postgres-cdc.md §5):
 #

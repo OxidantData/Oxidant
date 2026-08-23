@@ -4,9 +4,10 @@
 file, no PySpark client and no server:
 
 ```sh
-oxidant pipeline validate -c oxidant.yaml   # parse, plan, topologically sort — run nothing
-oxidant pipeline show     -c oxidant.yaml   # print the resolved DAG
-oxidant pipeline run      -c oxidant.yaml   # build the tables
+oxidant pipeline validate  -c oxidant.yaml   # parse, plan, topologically sort — run nothing
+oxidant pipeline show      -c oxidant.yaml   # print the resolved DAG
+oxidant pipeline run       -c oxidant.yaml   # build the tables
+oxidant pipeline reconcile -c oxidant.yaml   # postgres_cdc drift report; exit 1 when it drifted
 ```
 
 The engine underneath is the same one a PySpark `writeStream` drives — the same Kafka source,
@@ -426,6 +427,71 @@ Delta tables also get Iceberg metadata published over the same Parquet files, so
 Iceberg side is republished every `checkpoint_interval` commits, so it trails the Delta view —
 see [streaming.md](streaming.md#reading-one-table-from-any-engine).
 
+## Reconciling a CDC source against its target
+
+`oxidant pipeline reconcile` compares every [`postgres_cdc`](postgres-cdc.md) table in the
+pipeline against the lakehouse table it feeds and reports what differs. It reads only — no slot
+is opened, no publication is created, nothing is written on either side — and it exits **0** when
+everything is in sync and **1** when anything drifted, so it drops into cron or a CI step
+unchanged.
+
+```sh
+oxidant pipeline reconcile -c oxidant.yaml
+oxidant pipeline reconcile -c oxidant.yaml --table public.sales_suppliers   # one source table
+oxidant pipeline reconcile -c oxidant.yaml --sample 100000                  # widen the key walk
+```
+
+```text
+reconcile pipeline `sales-cdc` — 1 table(s)
+
+table: sales_suppliers
+  source:  public.sales_suppliers
+  target:  local.live.sales_suppliers
+  keys:    supplierid
+  rows:    source 1004   target 1003   drift +1
+  sampled: 1004 source / 1003 target key(s), limit 10000
+    missing_in_target  2      1001, 1004
+    missing_in_source  1      77
+    hash_mismatches    1      3
+  verdict: row_count_drift, key_drift
+
+summary: DRIFT — 1 of 1 table(s) differ
+```
+
+Two comparisons, because either one alone lies. Row counts catch a table that fell behind; the
+key walk catches an insert and a delete that cancelled out in the count and left the target
+holding a different set of rows. `--table` takes either the pipeline table's name or an upstream
+`schema.table`; a name that matches nothing is an error rather than an empty report that a CI
+step would read as "clean".
+
+The walk is sampled — the first `--sample` keys in ascending key order, deterministically, so two
+runs against unchanged tables produce the same report — and each side's cut bounds only what the
+other can be accused of, so a table larger than the sample does not report its unexamined tail as
+drift. `docs/postgres-cdc.md` §4 has the full mechanics, including which key types are comparable
+and why a `float8` key is refused rather than walked.
+
+### Running it on a schedule
+
+```sh
+oxidant pipeline reconcile -c oxidant.yaml --cron '0 6 * * *'
+oxidant pipeline reconcile -c oxidant.yaml --cron off
+```
+
+`--cron` does not run a reconcile; it writes `reconcile.json` into the pipeline's checkpoint
+directory and notes the schedule in the connector's log. `oxidant pipeline show` then prints it,
+along with when it last ran, what it found, and when it fires next.
+
+**`oxidant pipeline run` is what ticks it** — after each trigger pass, never inside one, so a
+reconcile can never read a target mid-write. That means a `trigger: once` run never reaches
+"between triggers" and never ticks, and a pipeline that is not running does not reconcile itself.
+The standalone command is the operational path; the schedule exists so a long-running pipeline
+checks itself without a second process. A scheduled reconcile that fails is reported and dropped:
+a drift report is not a reason to stop replicating.
+
+The expression is standard five-field cron (`minute hour day-of-month month day-of-week`, with
+`*`, `N`, `A-B`, `,` lists, `/steps` and `JAN`/`MON` names), evaluated in UTC, and validated
+before anything is written — a typo is an error, not a schedule that silently never fires.
+
 ## Running without a broker
 
 Set the source option `oxidant.spool.dir` (or `OXIDANT_KAFKA_SPOOL`) to a directory of
@@ -451,3 +517,5 @@ against the same spool ingests **nothing** the second time, exactly as a Kafka s
 - **No compaction.** One file per micro-batch means a fast trigger produces many small files.
 - **Append output mode only** for streaming tables.
 - **`local` and `glue` only** as sink catalogs.
+- **`reconcile` detects drift; it does not repair it.** The re-snapshot (`--repair`) is open
+  work — see [postgres-cdc.md](postgres-cdc.md) §4.

@@ -87,6 +87,19 @@ pub enum RunEventKind {
     },
     /// Checkpoint state could not be written.
     StatePersistFailed { error: String },
+    /// A scheduled `reconcile` ran between two passes.
+    ///
+    /// `report` is the rendered drift report, printed whole: a scheduled reconcile has nobody
+    /// watching a terminal, and a line saying only "drift" would send that person back to run the
+    /// command by hand to learn what drifted.
+    ReconcileFinished {
+        cron: String,
+        drifted: usize,
+        tables: usize,
+        report: String,
+    },
+    /// A scheduled `reconcile` could not run. The pipeline keeps going.
+    ReconcileFailed { cron: String, error: String },
     /// One pass over the subgraph finished.
     PassComplete { outcomes: Vec<TableOutcome> },
 }
@@ -337,8 +350,72 @@ where
                     );
                 }
                 emit_pass_outcomes(&outcomes, on_event);
+                // Between triggers, never inside one: a reconcile that interleaved a micro-batch
+                // would compare a target mid-write and report drift that the next commit closes.
+                reconcile_tick(engine, plan, on_event).await;
             }
         }
+    }
+}
+
+/// Run the persisted `reconcile.json` schedule if it is due.
+///
+/// The standalone `oxidant pipeline reconcile` is the operational path; this exists so a schedule
+/// registered with `--cron` fires without a second process to run it. It is deliberately the
+/// simplest thing that works: the schedule is re-read each pass (so registering one does not need
+/// a restart), it only ticks on the `ProcessingTime` trigger — a `once` run does one pass and
+/// exits, and there is no "between triggers" there — and a reconcile that fails is reported and
+/// then dropped. A drift report is not a reason to stop replicating; it is a reason to look.
+async fn reconcile_tick<F>(engine: &Engine, plan: &Plan<'_>, on_event: &mut F)
+where
+    F: FnMut(RunEvent) + Send,
+{
+    let checkpoints = plan.pipeline.checkpoints.clone();
+    let Some(mut schedule) = crate::reconcile::ReconcileSchedule::load(&checkpoints) else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    if !schedule.is_due(now) {
+        return;
+    }
+    let options = crate::reconcile::ReconcileOptions {
+        tables: schedule.tables.clone(),
+        sample: schedule.sample,
+    };
+    let cron = schedule.cron.clone();
+    match crate::reconcile::reconcile(engine, plan, &options).await {
+        Ok(report) => {
+            schedule.record(now, crate::reconcile::ReconcileSchedule::result_of(&report));
+            emit(
+                on_event,
+                RunEventKind::ReconcileFinished {
+                    cron,
+                    drifted: report.drifted(),
+                    tables: report.tables.len(),
+                    report: report.render(),
+                },
+            );
+        }
+        Err(e) => {
+            // Stamped as a run even though it failed, so a source that is unreachable every
+            // morning produces one report per schedule rather than one per micro-batch.
+            schedule.record(now, format!("failed: {e}"));
+            emit(
+                on_event,
+                RunEventKind::ReconcileFailed {
+                    cron,
+                    error: e.to_string(),
+                },
+            );
+        }
+    }
+    if let Err(e) = schedule.save(&checkpoints) {
+        emit(
+            on_event,
+            RunEventKind::StatePersistFailed {
+                error: format!("reconcile schedule: {e}"),
+            },
+        );
     }
 }
 

@@ -5,18 +5,25 @@
 
 pub mod auto_cdc;
 mod cdc_sink;
+pub mod cron;
 pub mod expectations;
 pub mod graph;
 mod output_write;
+pub mod reconcile;
 mod runner;
 pub mod sql_graph;
 
 pub use auto_cdc::{build_merge_sql, output_columns, validate_auto_cdc, CdcMerge};
 pub use cdc_sink::CdcMergeSink;
+pub use cron::Cron;
 pub use graph::{table_references, Graph, Node};
 pub use output_write::{
     flow_queries, parse_output_schema, split_table_properties, union_flow_sql,
     validate_external_sink_format, validate_output_format, FlowQuery,
+};
+pub use reconcile::{
+    diff_keys, reconcile, set_schedule, KeyDiff, KeyRow, KeyWindow, ReconcileOptions,
+    ReconcileReport, ReconcileSchedule, TableReport, DEFAULT_SAMPLE,
 };
 pub use runner::{
     clear_pipeline_state, run_pipeline, Plan, RunEvent, RunEventKind, TableOutcome, TableStatus,
