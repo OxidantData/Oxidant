@@ -2986,6 +2986,10 @@ mod tests {
         streaming: bool,
         /// Every wire call, including the ones `calls` leaves out.
         call_count: usize,
+        /// Go quiet once when the read cursor reaches this point, the way a publisher that has
+        /// sent half a transaction and paused does. Without it the fake only ever stops at the
+        /// end of its script, and a batch can never end mid-transaction.
+        quiet_at: Option<usize>,
         /// Fail the Nth wire call (1-based) the way a dead socket does, then behave again.
         ///
         /// Without this the fake cannot reproduce the failure that matters most — a publisher
@@ -3085,6 +3089,10 @@ mod tests {
 
         async fn next_wire(&mut self, _idle: Duration) -> Result<Option<WireMessage>> {
             self.tick()?;
+            if self.quiet_at == Some(self.cursor) {
+                self.quiet_at = None;
+                return Ok(None);
+            }
             let next = self.stream.get(self.cursor).cloned();
             if next.is_some() {
                 self.cursor += 1;
@@ -4385,6 +4393,104 @@ mod tests {
         assert!(
             !log.contains("schema_change"),
             "nothing changed on the publisher: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publisher_that_goes_quiet_mid_transaction_does_not_end_the_batch_there() {
+        // A batch must cover whole transactions: its range has to be a commit boundary, or a
+        // replay of it cannot reproduce it. When the publisher pauses half way through one, the
+        // right answer is to cover nothing and re-seek — the `Begin` and the earlier rows are
+        // already consumed, so reading on from there would drop them.
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(a_transaction());
+        {
+            let mut wire = wire.lock().await;
+            wire.slot_existed = true;
+            // relation, begin, insert — then silence, with the update, delete and commit still
+            // to come.
+            wire.quiet_at = Some(3);
+        }
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0)].into(),
+        });
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert!(
+            range.is_empty(),
+            "half a transaction is not a batch: {range:?}"
+        );
+        assert_eq!(
+            source.committed_offsets().unwrap().entries[LSN_KEY],
+            0,
+            "and the position must not move into the middle of one"
+        );
+
+        // The publisher speaks again. The whole transaction arrives, from its `Begin`.
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert_eq!((range.start[LSN_KEY], range.end[LSN_KEY]), (0, 0x200));
+        let batches = source.poll_range(&engine, &range).await.unwrap();
+        assert_eq!(
+            strings(&batches[0], OP_COLUMN),
+            ["i", "u", "d"].map(|s| Some(s.into())),
+            "every row of it, including the ones read before the pause"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transaction_filtered_down_to_nothing_is_still_a_transaction() {
+        // The subtle half of the same rule. `open_txn` holds only *filtered-in* changes, so a
+        // transaction touching only tables this source does not replicate leaves it empty while
+        // the stream is very much mid-transaction. Reading the one for the other set the range's
+        // end to an LSN *inside* an open transaction — and, before the confirm moved out of
+        // `plan_batch`, told the server it could recycle the WAL under it.
+        const OTHER_OID: u32 = 20001;
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(vec![
+            xlog(
+                0x200,
+                relation_msg(
+                    OTHER_OID,
+                    "public",
+                    "some_other_table",
+                    &[(true, "supplierid", oids::INT8), (false, "name", 25)],
+                ),
+            ),
+            xlog(0x210, begin_msg(0x300, COMMIT_TIME)),
+            xlog(
+                0x220,
+                change_msg(b'I', OTHER_OID, b'N', &[Some("1"), Some("elsewhere")]),
+            ),
+            xlog(0x230, commit_msg(0x300, 0x300, COMMIT_TIME)),
+        ]);
+        {
+            let mut wire = wire.lock().await;
+            wire.slot_existed = true;
+            // relation, begin, insert — then silence, with the commit still to come.
+            wire.quiet_at = Some(3);
+        }
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0)].into(),
+        });
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert!(range.is_empty(), "nothing here belongs to this publication");
+        assert_eq!(
+            source.committed_offsets().unwrap().entries[LSN_KEY],
+            0,
+            "an open transaction is not an empty stretch, however little of it is ours"
+        );
+        assert_eq!(wire.lock().await.confirmed, None);
+
+        // Once the transaction closes, the stretch really is empty and the slot may move over it.
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert!(range.is_empty());
+        assert_eq!(
+            source.committed_offsets().unwrap().entries[LSN_KEY],
+            0x300,
+            "past the commit boundary, and no further"
         );
     }
 
