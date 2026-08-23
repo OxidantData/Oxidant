@@ -518,9 +518,14 @@ fn is_postgres_cdc(source: &SourceConfig) -> bool {
     source.format.trim().eq_ignore_ascii_case("postgres_cdc")
 }
 
-/// Options a `postgres_cdc` source accepts. Mirrors the list `oxidant-streaming` parses; the two
-/// are checked against each other by `crates/oxidant-streaming/src/postgres_cdc.rs`'s own tests.
-const POSTGRES_CDC_OPTIONS: &[&str] = &[
+/// Options a `postgres_cdc` source accepts.
+///
+/// Must be exactly the list `oxidant-streaming` parses. Drift either way is silent until someone
+/// hits it: an option added to the source and not here makes a valid config fail
+/// `oxidant config validate`, and one added here and not there makes a config that validates fail
+/// at pipeline start. `pub` so the two can be compared for real — `oxidant-pipelines` sees both
+/// crates and asserts it, since neither of them can see the other.
+pub const POSTGRES_CDC_OPTIONS: &[&str] = &[
     "host",
     "port",
     "database",

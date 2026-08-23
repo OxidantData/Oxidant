@@ -971,6 +971,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_two_postgres_cdc_option_lists_are_the_same_list() {
+        // `oxidant-config` validates a file's `options:` without a database, and
+        // `oxidant-streaming` parses them at pipeline start. Neither crate can see the other —
+        // this one depends on both, which is why the check lives here. Drift either way is
+        // silent until someone hits it: an option the source accepts but the validator does not
+        // makes a valid config fail `oxidant config validate`, and the reverse makes a config
+        // that validates fail at start.
+        assert_eq!(
+            oxidant_config::POSTGRES_CDC_OPTIONS,
+            oxidant_streaming::KNOWN_OPTIONS,
+            "add the option to both lists, or to neither"
+        );
+    }
+
+    #[test]
     fn pass_outcomes_map_to_run_events() {
         let outcomes = vec![
             TableOutcome {

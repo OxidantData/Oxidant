@@ -246,6 +246,31 @@ pub struct PostgresCdcOptions {
     pub name: String,
 }
 
+/// The `options:` keys this source accepts.
+///
+/// Must be exactly `oxidant_config::validate::POSTGRES_CDC_OPTIONS`, which is what
+/// `oxidant config validate` checks a file against without a database. Neither crate can see the
+/// other, so `oxidant-pipelines` — which depends on both — asserts they agree; drift either way
+/// is otherwise silent until someone hits it.
+pub const KNOWN_OPTIONS: &[&str] = &[
+    "host",
+    "port",
+    "database",
+    "user",
+    "password_env",
+    "tls",
+    "tls_ca",
+    "publication",
+    "slot",
+    "tables",
+    "exclude_columns",
+    "keys",
+    "publish_ops",
+    "max_slot_bytes",
+    "max_batch_bytes",
+    "snapshot_batch_rows",
+];
+
 /// Options the pipeline runner injects; they are not part of the YAML surface.
 const LOG_DIR_OPTION: &str = "oxidant.connector.log_dir";
 const NAME_OPTION: &str = "oxidant.connector.name";
@@ -258,29 +283,11 @@ impl PostgresCdcOptions {
     /// `exclude_column:` would publish the column the author meant to keep out — both are silent,
     /// and both are worth one error at load time.
     pub fn from_options(options: &HashMap<String, String>) -> Result<Self> {
-        const KNOWN: &[&str] = &[
-            "host",
-            "port",
-            "database",
-            "user",
-            "password_env",
-            "tls",
-            "tls_ca",
-            "publication",
-            "slot",
-            "tables",
-            "exclude_columns",
-            "keys",
-            "publish_ops",
-            "max_slot_bytes",
-            "max_batch_bytes",
-            "snapshot_batch_rows",
-        ];
         for key in options.keys() {
-            if !KNOWN.contains(&key.as_str()) && !key.starts_with("oxidant.") {
+            if !KNOWN_OPTIONS.contains(&key.as_str()) && !key.starts_with("oxidant.") {
                 return Err(Error::Plan(format!(
                     "postgres_cdc: `{key}` is not a source option (known: {})",
-                    KNOWN.join(", ")
+                    KNOWN_OPTIONS.join(", ")
                 )));
             }
         }

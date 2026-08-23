@@ -38,8 +38,8 @@ pub use input::{
 pub use kafka::{kafka_schema, KafkaOptions, KafkaSource, StartingOffsets};
 pub use lake_sink::{writable_format, LakeSink, LakeSinkOptions, LakeTarget};
 pub use postgres_cdc::{
-    postgres_cdc_pipeline_options, PostgresCdcOptions, PostgresCdcSource, LSN_COLUMN, OP_COLUMN,
-    TS_COLUMN,
+    postgres_cdc_pipeline_options, PostgresCdcOptions, PostgresCdcSource, KNOWN_OPTIONS,
+    LSN_COLUMN, OP_COLUMN, TS_COLUMN,
 };
 pub use query::{QueryProgress, QueryStatus, SourceProgress, StreamingQuery, StreamingQueryId};
 pub use scheduler::{
