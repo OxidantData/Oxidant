@@ -3,9 +3,12 @@
 The server's HTTP port (default `4040`) hosts a small REST API for running SQL statements and
 checking cluster state — no Spark client needed. Base URL below is `http://localhost:4040`.
 
-> **No auth.** The `/api/v1` endpoints are unauthenticated. Bind the UI port to loopback on
-> shared hosts (`--ui-bind 127.0.0.1`), or disable HTTP with `--no-ui`. The one exception is
-> [`/api/status`](#driver-status), which requires a bearer token and is off by default.
+> **No auth.** Most `/api/v1` endpoints are unauthenticated. Bind the UI port to loopback on
+> shared hosts (`--ui-bind 127.0.0.1`), or disable HTTP with `--no-ui`. The exceptions are the
+> four operational routes marked **bearer token required** below —
+> [`/api/status`](#driver-status), the [pipeline list](#pipelines), a
+> [connector log](#connector-logs) and the [driver log buffer](#driver-logs) — which share one
+> token and are off by default.
 
 ## Endpoints
 
@@ -17,7 +20,6 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/v1/statements/{id}/result` | Result rows as JSON or CSV |
 | `POST` | `/api/v1/statements/{id}/cancel` | Cancel a pending/running statement |
 | `GET` | `/api/v1/cluster/status` | Cluster mode, workers, engine version |
-| `GET` | `/api/v1/logs` | The driver's recent log lines — an in-memory ring buffer of the last 1000 |
 | `GET` | `/api/dashboards` | Dashboards, newest-updated first |
 | `POST` | `/api/dashboards` | Create a dashboard |
 | `GET` | `/api/dashboards/{id}` | One dashboard document |
@@ -26,6 +28,7 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/status` | Driver status for a control plane — **bearer token required** |
 | `GET` | `/api/v1/pipelines` | Streaming pipelines with a connector log on this driver — **bearer token required** |
 | `GET` | `/api/v1/pipelines/{name}/logs` | Tail of a streaming connector's JSONL log — **bearer token required** |
+| `GET` | `/api/v1/logs` | The driver's recent log lines — an in-memory ring buffer of the last 1000 — **bearer token required** |
 
 ## Submit a statement
 
@@ -240,8 +243,8 @@ endpoint:
 The token itself is redacted from `/api/v1/applications/{id}/environment`, which otherwise
 echoes every `OXIDANT_*` variable.
 
-The same token gates [the pipeline list](#pipelines) and [connector logs](#connector-logs);
-a leak is a leak of all three.
+The same token gates [the pipeline list](#pipelines), [connector logs](#connector-logs) and
+[the driver's log buffer](#driver-logs); a leak is a leak of all four.
 
 ## Pipelines
 
@@ -344,6 +347,34 @@ curl -s "http://localhost:4040/api/v1/pipelines/orders_live/logs?tail=5" \
 The read is a bounded window on the end of the file, so the cost is the same whether the log is
 2 KiB or 2 GiB. Event *shape* is the connector's, not this endpoint's — it parses JSON and does
 not interpret it.
+
+`{name}` chooses a filename, never a path: it must match `[A-Za-z0-9._-]` and may not start
+with a dot, and the file it names must be a **regular file inside** `<checkpoints>/logs` — a
+symlink is refused (`404`) even when it points at a readable file, and the resolved path is
+checked against the resolved logs directory. The listing applies the same rule, so everything
+`GET /api/v1/pipelines` offers is tailable and nothing else is. A `logs` directory that is
+itself a symlink is fine: that is the operator's own configuration, and it becomes the
+boundary.
+
+## Driver logs
+
+`GET /api/v1/logs` returns the driver's in-memory `tracing` ring buffer — the last 1000 lines,
+oldest first — which is what the [**Observability** page](web-ui.md#observability) shows.
+
+```sh
+curl -s http://localhost:4040/api/v1/logs -H "Authorization: Bearer $OXIDANT_STATUS_TOKEN"
+```
+
+```json
+{"logs": ["[INFO] oxidant_connect::rest - listening on 0.0.0.0:4040"]}
+```
+
+It is guarded by **the same bearer token as [`/api/status`](#driver-status)**, with the same
+three answers (`404` unset, `401` wrong, `200` right). The buffer captures every event at every
+enabled level *including field values*, so it names hosts, slots, tables and query text; and
+this port is served under a permissive CORS layer, which means an ungated buffer is readable
+cross-site by any origin an operator's browser visits. It is served by the engine's REST
+router, so a standalone history server has no buffer and answers `404` whatever the token says.
 
 ## Full async flow (submit → poll → result → cancel)
 

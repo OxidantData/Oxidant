@@ -879,7 +879,8 @@
      * already serves:
      *
      *   /api/v1/logs                      the driver's in-memory log ring buffer (the last
-     *                                     1000 lines, oldest first). It is served by the
+     *                                     1000 lines, oldest first), behind the same bearer
+     *                                     token as the Pipelines page. It is served by the
      *                                     engine's REST router, so it is absent on the
      *                                     standalone history server — the pane says so rather
      *                                     than showing an empty box.
@@ -911,8 +912,10 @@
       expanded: {},    // jobId -> true, for the inline stage rows
     };
 
-    // Same credential the Pipelines page stores. `/api/v1/logs` is not gated today, but a
-    // driver behind an auth proxy is, and sending the header we already hold costs nothing.
+    // Same credential the Pipelines page stores, and `/api/v1/logs` needs it: the buffer holds
+    // every tracing field the driver logged, so it is gated by the same OXIDANT_STATUS_TOKEN as
+    // /api/status and the connector logs. Without one this pane says so rather than showing an
+    // empty box.
     const obsAuthHeaders = () => pipeState.token ? { Authorization: 'Bearer ' + pipeState.token } : {};
 
     // `[INFO] oxidant_connect::rest - listening` → `info`. TRACE folds into DEBUG: the buffer
@@ -944,8 +947,8 @@
       const log = obsState.logs;
       if (!log) return '<div class="note" style="margin:0">Loading&hellip;</div>';
       if (log.code === 404) {
-        return emptyState('No log buffer on this server',
-          'GET /api/v1/logs is served by the engine’s REST router. This process serves the monitoring UI only — a standalone history server keeps no log buffer.');
+        return emptyState('No log buffer to read here',
+          'GET /api/v1/logs answers 404 when OXIDANT_STATUS_TOKEN is unset on the driver — the route is gated like /api/status, because the buffer carries every logged field — and on a process that serves the monitoring UI only: a standalone history server keeps no buffer at all.');
       }
       if (log.code === 401 || log.code === 403) {
         return emptyState('The log buffer needs a credential',

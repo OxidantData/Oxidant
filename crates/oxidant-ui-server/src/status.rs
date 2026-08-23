@@ -11,6 +11,12 @@
 //! | set                    | missing or wrong       | `401 Unauthorized` + `WWW-Authenticate: Bearer` |
 //! | set                    | `Bearer <token>`       | `200 OK` + [`StatusSnapshot`] JSON |
 //!
+//! The same gate guards the two pipeline routes ([`crate::pipelines`]) and the driver's log
+//! buffer (`GET /api/v1/logs`, whose handler lives in `oxidant-connect` and calls
+//! [`deny_unless_authorized`]). All four carry operational data — a log line names hosts,
+//! slots, tables and field values — and the server is wrapped in a permissive CORS layer, so
+//! an ungated one is readable cross-site by any origin an operator's browser visits.
+//!
 //! Trust model: the token authenticates the *poller*, not the transport. The engine serves
 //! plain HTTP, so a token on the wire is only as private as the network under it. Deploy the
 //! driver's HTTP port inside a private subnet / security group reachable only by the control
@@ -53,17 +59,14 @@ pub(crate) fn normalize_token(raw: Option<String>) -> Option<String> {
     raw.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
-/// The shared-token gate, factored out so a second operational endpoint is guarded by
-/// *this* code rather than by a second copy of it — see [`crate::pipelines`].
-///
-/// Returns the response to send **instead of** the handler's: `404` when no token is
-/// configured (the route does not exist), `401` + `WWW-Authenticate: Bearer` when the
-/// credential is missing or wrong. `None` means the caller is authenticated.
-pub(crate) fn denied(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+/// The shared-token gate for a handler that holds its own state — the form
+/// `oxidant-connect` uses for `GET /api/v1/logs`, whose router is built over there and merged
+/// into this one. Same code, same three answers; see [`denied`].
+pub fn deny_unless_authorized(expected: Option<&str>, headers: &HeaderMap) -> Option<Response> {
     // No token configured: the endpoint does not exist. 404 rather than 403 so an
     // unconfigured driver leaks nothing about whether the feature is there at all.
     // (`?` would be wrong here: `None` from this function means *authenticated*.)
-    let Some(expected) = state.status_token.as_deref() else {
+    let Some(expected) = expected else {
         return Some(StatusCode::NOT_FOUND.into_response());
     };
 
@@ -84,6 +87,16 @@ pub(crate) fn denied(state: &AppState, headers: &HeaderMap) -> Option<Response> 
         );
     }
     None
+}
+
+/// The shared-token gate, factored out so a second operational endpoint is guarded by
+/// *this* code rather than by a second copy of it — see [`crate::pipelines`].
+///
+/// Returns the response to send **instead of** the handler's: `404` when no token is
+/// configured (the route does not exist), `401` + `WWW-Authenticate: Bearer` when the
+/// credential is missing or wrong. `None` means the caller is authenticated.
+pub(crate) fn denied(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    deny_unless_authorized(state.status_token.as_deref(), headers)
 }
 
 pub async fn status(

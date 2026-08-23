@@ -1,12 +1,22 @@
 import { usePolling } from "@/lib/usePolling";
 import { api, fmtBytes, type ClusterStatus } from "@/lib/api";
+import { logBufferNotice, setStatusToken, statusToken } from "@/lib/statusToken";
 import { useEffect, useRef, useState } from "react";
 
 export default function ClusterPage() {
   const { data: status } = usePolling(() => api.cluster.status(), 3000);
-  const { data: logsData } = usePolling(() => api.cluster.logs(), 3000);
+  const {
+    data: logsData,
+    error: logsError,
+    refresh: refreshLogs,
+  } = usePolling(() => api.cluster.logs(), 3000);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [token, setToken] = useState(statusToken);
+  // `/api/v1/logs` carries the driver's own log lines and is gated by OXIDANT_STATUS_TOKEN. A
+  // refusal is a state to render, not an empty pane: say which refusal it was, and offer the
+  // one thing that fixes it.
+  const notice = logBufferNotice(logsError);
 
   useEffect(() => {
     if (autoScroll) {
@@ -86,8 +96,39 @@ export default function ClusterPage() {
             Auto-scroll
           </label>
         </div>
+        {notice && (
+          <div className="mb-2 text-sm text-muted">
+            <p>{notice.message}</p>
+            {notice.needsToken && (
+              <form
+                className="mt-2 flex flex-wrap items-center gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  setStatusToken(token);
+                  refreshLogs();
+                }}
+              >
+                <input
+                  type="password"
+                  className="oxidant-input text-xs"
+                  placeholder="OXIDANT_STATUS_TOKEN"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={token}
+                  onChange={(e) => setToken(e.target.value)}
+                />
+                <button type="submit" className="oxidant-btn-ghost text-xs">
+                  Use
+                </button>
+                <span className="text-xs">
+                  Kept in this browser only, and sent to this driver only.
+                </span>
+              </form>
+            )}
+          </div>
+        )}
         <div className="oxidant-code min-h-0 flex-1 overflow-auto p-2">
-          {(logsData?.logs.length ?? 0) === 0 && (
+          {!notice && (logsData?.logs.length ?? 0) === 0 && (
             <span className="text-muted">No logs captured yet.</span>
           )}
           {logsData?.logs.map((line, i) => (

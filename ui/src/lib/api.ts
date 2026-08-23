@@ -1,3 +1,5 @@
+import { statusAuthHeaders } from "@/lib/statusToken";
+
 export const APP_ID = "oxidant-local";
 
 export interface JobData {
@@ -133,20 +135,24 @@ async function readJson<T>(r: Response, path: string): Promise<T> {
 export async function apiJson<T>(
   method: string,
   path: string,
-  body?: unknown
+  body?: unknown,
+  headers: Record<string, string> = {}
 ): Promise<T> {
   return readJson<T>(
     await fetch(path, {
       method,
-      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      headers:
+        body === undefined
+          ? headers
+          : { "Content-Type": "application/json", ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
     }),
     path
   );
 }
 
-async function get<T>(path: string): Promise<T> {
-  return apiJson<T>("GET", path);
+async function get<T>(path: string, headers?: Record<string, string>): Promise<T> {
+  return apiJson<T>("GET", path, undefined, headers);
 }
 
 async function post<T>(path: string, body?: unknown): Promise<T> {
@@ -203,7 +209,9 @@ export const api = {
   },
   cluster: {
     status: () => get<ClusterStatus>("/api/v1/cluster/status"),
-    logs: () => get<{ logs: string[] }>("/api/v1/logs"),
+    // Gated by OXIDANT_STATUS_TOKEN — see `statusToken.ts` for why, and for where the
+    // credential comes from.
+    logs: () => get<{ logs: string[] }>("/api/v1/logs", statusAuthHeaders()),
   },
 };
 

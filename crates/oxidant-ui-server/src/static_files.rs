@@ -318,4 +318,68 @@ mod tests {
             );
         }
     }
+
+    /// The behaviours whose *logic* is tested in `ui/src/lib/pipelineDerive.test.ts` still have
+    /// to be wired up here, and this page has no build step to catch it if they are not. These
+    /// are string greps, deliberately: they assert the page reaches for the tested code rather
+    /// than re-implementing it inline.
+    #[test]
+    fn the_page_uses_the_tested_derivation_rather_than_its_own_copy() {
+        let page = embedded_index();
+
+        // A tail is due when `shouldRefetchTail` says so — not on an ad-hoc comparison that
+        // re-stamped itself on completion and halved the refresh rate.
+        assert!(page.contains("if (!shouldRefetchTail(cur, now, force)) return;"));
+        assert!(
+            !page.contains("now - (cur.at || 0) < PIPE_POLL_MS"),
+            "the old freshness guard is back; tails would refresh every other tick"
+        );
+
+        // The drawer repaints wholesale, so it has to put the reader back where they were.
+        assert!(page.contains("capturePipeScroll(host)"));
+        assert!(page.contains("restorePipeScroll(host, scroll)"));
+        for pane in ["data-scroll=\"body\"", "data-scroll=\"log\""] {
+            assert!(page.contains(pane), "no scroll anchor for {pane}");
+        }
+
+        // The list's "Last batch" column is a label that moves, not a window-edge ordinal.
+        assert!(page.contains("p.lastBatchLabel"));
+        assert!(
+            !page.contains("'#' + b.ordinal"),
+            "the list is showing a tail ordinal again; it pins at #39 on any busy pipeline"
+        );
+    }
+
+    /// One byte count, one unit, on every tab. `fmt` is `toLocaleString` — a raw count with
+    /// thousands separators — so a byte field formatted with it reads `247,483,904` two clicks
+    /// away from `236.0 MiB` for the same number.
+    #[test]
+    fn byte_counts_use_the_byte_formatter_everywhere() {
+        let page = embedded_index();
+        let mut checked = 0;
+        let mut rest = page;
+        while let Some(i) = rest.find("fmt(") {
+            // Skip `fmtBytes(`, `fmtMs(`, `fmtRate(` … only bare `fmt(` is the raw count, and
+            // only a call boundary counts (`${fmt(`, ` fmt(`, `(fmt(`).
+            let before = rest[..i].chars().next_back().unwrap_or(' ');
+            rest = &rest[i + "fmt(".len()..];
+            if before.is_ascii_alphanumeric() {
+                continue;
+            }
+            let end = rest.find(')').expect("unterminated fmt(");
+            let arg = &rest[..end];
+            assert!(
+                !arg.contains("Bytes") && !arg.contains("Shuffle"),
+                "`fmt({arg})` prints bytes as a raw count; use fmtBytes"
+            );
+            checked += 1;
+        }
+        assert!(checked > 3, "the page stopped using fmt() at all");
+
+        // The executor's tone says whether it is *working*; its label says whether it is
+        // registered. `active` maps to the one tone that pulses, and a registered-but-idle
+        // worker pulsing forever reads as a cluster busy with nothing.
+        assert!(page.contains("e.activeTasks > 0 ? 'running' : 'idle'"));
+        assert!(!page.contains("chip(e.isActive === false ? 'dead' : 'active'"));
+    }
 }
