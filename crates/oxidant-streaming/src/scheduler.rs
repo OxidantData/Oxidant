@@ -919,41 +919,21 @@ async fn build_sink(
     Ok(Box::new(MemorySink::new()))
 }
 
+/// Test-only plumbing shared with the source modules' own tests.
+///
+/// Lives here rather than inside `mod tests` because the recovery path a source has to survive —
+/// a recorded range replayed after a restart, with `plan_batch` skipped entirely — is the
+/// scheduler's, and a test that reimplements it is testing its own copy instead.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_harness {
     use super::*;
-    use crate::config::SinkDestination;
-    use oxidant_loom::arrow::record_batch::RecordBatch;
-    use std::collections::BTreeMap;
-
-    /// A sink that fails its first `fail_times` writes, then records what it was handed.
-    ///
-    /// Exists to drive the one path no real sink makes reachable on demand: a batch that reads
-    /// its records and then cannot write them.
-    struct FlakySink {
-        fail_times: usize,
-        writes: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl Sink for FlakySink {
-        async fn write_batch(&mut self, batches: &[RecordBatch], batch_id: u64) -> Result<u64> {
-            if self.fail_times > 0 {
-                self.fail_times -= 1;
-                return Err(Error::Execution("sink is down".into()));
-            }
-            let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-            self.writes.lock().expect("poisoned").push((batch_id, rows));
-            Ok(rows)
-        }
-    }
 
     /// Register a query with a caller-supplied source and sink, bypassing `build_source`/
     /// `build_sink` so a test can inject failure.
     ///
     /// Mirrors the recovery and resume that `start_with_config` performs, so a test can restart
     /// a query over an existing checkpoint and exercise the same path a real restart takes.
-    async fn register(
+    pub(crate) async fn register(
         mgr: &StreamingQueryManager,
         checkpoint_dir: &std::path::Path,
         source: Box<dyn Source>,
@@ -996,6 +976,37 @@ mod tests {
             .await
             .insert(id.clone(), Arc::new(managed));
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SinkDestination;
+    use crate::scheduler::test_harness::register;
+    use oxidant_loom::arrow::record_batch::RecordBatch;
+    use std::collections::BTreeMap;
+
+    /// A sink that fails its first `fail_times` writes, then records what it was handed.
+    ///
+    /// Exists to drive the one path no real sink makes reachable on demand: a batch that reads
+    /// its records and then cannot write them.
+    struct FlakySink {
+        fail_times: usize,
+        writes: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for FlakySink {
+        async fn write_batch(&mut self, batches: &[RecordBatch], batch_id: u64) -> Result<u64> {
+            if self.fail_times > 0 {
+                self.fail_times -= 1;
+                return Err(Error::Execution("sink is down".into()));
+            }
+            let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+            self.writes.lock().expect("poisoned").push((batch_id, rows));
+            Ok(rows)
+        }
     }
 
     fn spool_source(dir: &std::path::Path) -> Box<dyn Source> {

@@ -66,6 +66,14 @@ pub const SOURCE_NAME: &str = "postgres_cdc";
 const SNAPSHOT_KEY: &str = "snapshot";
 /// The WAL position, as an `i64`.
 const LSN_KEY: &str = "lsn";
+/// The consistent point of the slot a snapshot range was planned against.
+///
+/// Carried in the range itself because the scheduler replays a *recorded* range without asking
+/// the source to plan again — that is the whole point of the offset log — and a snapshot index on
+/// its own does not say which database it means. A slot recreated after an interrupted snapshot
+/// hands back a later point, and reading "source table 2" against it would splice two moments in
+/// time together and lose every change between them.
+const CONSISTENT_POINT_KEY: &str = "consistent_point";
 
 /// `'s'` snapshot, `'i'` insert, `'u'` update, `'d'` delete, `'t'` truncate.
 pub const OP_COLUMN: &str = "__oxidant_op";
@@ -1317,6 +1325,10 @@ impl PostgresCdcSource {
     /// `START_REPLICATION` from the checkpointed position. Believing it after an I/O error is
     /// what turns a publisher restart into a permanently wedged pipeline.
     async fn ensure_stream(&mut self, start: Lsn) -> Result<()> {
+        // `START_REPLICATION` cannot be issued inside the snapshot's transaction, so the stream
+        // is also the backstop for closing it: ordinarily `mark_durable` already has, but a plan
+        // that follows a snapshot batch nothing marked durable would otherwise find it open.
+        self.finish_snapshot().await?;
         if self.stream_at == Some(start) {
             return Ok(());
         }
@@ -1642,7 +1654,16 @@ impl PostgresCdcSource {
     }
 
     /// Read one source table inside the slot's snapshot transaction.
-    async fn poll_snapshot(&mut self, table_index: usize) -> Result<Vec<RecordBatch>> {
+    ///
+    /// `planned_at` is the consistent point the range was planned against, which is what makes
+    /// the read honest across a restart: the scheduler replays a *recorded* range without
+    /// planning again, so without it "source table 2" would be read against whatever slot happens
+    /// to be open now. See [`Self::restart_snapshot`].
+    async fn poll_snapshot(
+        &mut self,
+        table_index: usize,
+        planned_at: Option<i64>,
+    ) -> Result<Vec<RecordBatch>> {
         let Some(table) = self.tables.get(table_index).cloned() else {
             return Err(Error::Plan(format!(
                 "postgres_cdc: this batch was recorded against source table {table_index}, and \
@@ -1650,15 +1671,38 @@ impl PostgresCdcSource {
                 self.tables.len()
             )));
         };
+        // The range names a slot this source is no longer reading. `ensure_open` has already
+        // dropped and recreated the slot, so honouring the index as written would emit this table
+        // as of the *new* consistent point and then declare the snapshot complete — splicing the
+        // tables already loaded at the old point onto a stream that starts after the new one, and
+        // losing every change in between. The pass restarts from the first table instead.
+        let honourable = planned_at == Some(self.position.as_i64());
+        if !honourable {
+            self.restart_snapshot(&table, planned_at);
+        }
         if !self.snapshot_open {
             return Err(Error::Execution(format!(
                 "postgres_cdc: the snapshot of `{}` was planned, but the slot's snapshot \
-                 transaction is no longer open",
+                 transaction is no longer open. This batch is already durable — the transaction \
+                 is committed once the checkpoint holds it — so it should never be replayed; if \
+                 the pipeline is stuck here, delete this table's checkpoint directory to \
+                 re-snapshot.",
                 table.qualified()
             )));
         }
         let started = Instant::now();
-        let rows = self.wire.snapshot_rows(&table).await?;
+        let rows = match self.wire.snapshot_rows(&table).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                // The snapshot transaction died with the connection. Re-opening the slot is the
+                // only way back to a consistent point, and that is what `ensure_open` does — so
+                // forget that this run ever opened one.
+                self.opened = false;
+                self.snapshot_open = false;
+                self.stream_at = None;
+                return Err(e);
+            }
+        };
         let events: Vec<ChangeEvent> = rows
             .into_iter()
             .map(|values| ChangeEvent {
@@ -1675,7 +1719,13 @@ impl PostgresCdcSource {
             .collect();
         let batches = self.to_batches(&events)?;
 
-        self.snapshot_done = table_index + 1;
+        // Only a range planned against *this* slot counts toward the pass. A range from the slot
+        // that died is still answered — the batch has to carry something the sink can commit
+        // under its id, and re-reading a table is an upsert either way — but the pass itself
+        // begins again at table 0, so no table is left behind at an older consistent point.
+        if honourable {
+            self.snapshot_done = table_index + 1;
+        }
         self.log.event(
             "snapshot_done",
             json!({
@@ -1683,15 +1733,58 @@ impl PostgresCdcSource {
                 "rows": events.len(),
                 "duration_ms": started.elapsed().as_millis() as u64,
                 "consistent_point": self.position.to_string(),
+                "counted": honourable,
             }),
         );
-        if self.snapshot_done >= self.tables.len() {
-            // The transaction has served its purpose; holding it open would pin the publisher's
-            // oldest xmin for as long as the pipeline runs.
-            self.wire.end_snapshot().await?;
-            self.snapshot_open = false;
-        }
         Ok(batches)
+    }
+
+    /// Report that a recorded snapshot range cannot be honoured, and reset the pass.
+    ///
+    /// Loud on purpose: the alternative outcome — the one this replaces — was a pipeline that
+    /// reported a healthy, complete snapshot while silently dropping every change written between
+    /// the two consistent points.
+    fn restart_snapshot(&mut self, table: &TableSchema, planned_at: Option<i64>) {
+        self.snapshot_done = 0;
+        let planned_at = planned_at
+            .map(|lsn| Lsn::from_i64(lsn).to_string())
+            .unwrap_or_else(|| "unrecorded".to_string());
+        let message = format!(
+            "the snapshot of `{}` was planned against consistent point {planned_at}, and the \
+             slot now sits at {}. An interrupted snapshot cannot be resumed — the transaction \
+             that held it ended with the process — so re-snapshot required: every source table \
+             is read again from the first, against the new point.",
+            table.qualified(),
+            self.position
+        );
+        self.log.event(
+            "snapshot_start",
+            json!({
+                "reason": message,
+                "planned_at": planned_at,
+                "consistent_point": self.position.to_string(),
+            }),
+        );
+        eprintln!("[oxidant] postgres_cdc {}: {message}", self.options.name);
+    }
+
+    /// Commit the slot's snapshot transaction once every table has been read *and* the batch
+    /// that read the last one is durable.
+    ///
+    /// Deliberately not at the end of the last read: `poll_range` is required to be
+    /// deterministic, and a transaction closed at read time turns the ordinary retry after a
+    /// failed sink write — an object-store 503, a full disk — into a permanently wedged query,
+    /// because the recorded range can never be read a second time. Holding it open until
+    /// `mark_durable` costs the publisher one pinned xmin for the length of one batch.
+    async fn finish_snapshot(&mut self) -> Result<()> {
+        if !self.snapshot_open || self.tables.is_empty() || self.snapshot_done < self.tables.len() {
+            return Ok(());
+        }
+        // Holding it any longer would pin the publisher's oldest xmin for the life of the
+        // pipeline.
+        self.wire.end_snapshot().await?;
+        self.snapshot_open = false;
+        Ok(())
     }
 }
 
@@ -1741,7 +1834,11 @@ impl Source for PostgresCdcSource {
         if self.snapshot_done < self.tables.len() {
             return Ok(BatchRange {
                 source: SOURCE_NAME.into(),
-                start: [(SNAPSHOT_KEY.to_string(), self.snapshot_done as i64)].into(),
+                start: [
+                    (SNAPSHOT_KEY.to_string(), self.snapshot_done as i64),
+                    (CONSISTENT_POINT_KEY.to_string(), self.position.as_i64()),
+                ]
+                .into(),
                 end: [(SNAPSHOT_KEY.to_string(), self.snapshot_done as i64 + 1)].into(),
                 items: vec![],
             });
@@ -1793,7 +1890,10 @@ impl Source for PostgresCdcSource {
         self.ensure_open().await?;
 
         if let Some(index) = range.start.get(SNAPSHOT_KEY) {
-            return self.poll_snapshot((*index).max(0) as usize).await;
+            let planned_at = range.start.get(CONSISTENT_POINT_KEY).copied();
+            return self
+                .poll_snapshot((*index).max(0) as usize, planned_at)
+                .await;
         }
 
         let from = Lsn::from_i64(range.start.get(LSN_KEY).copied().unwrap_or(0));
@@ -1886,6 +1986,9 @@ impl Source for PostgresCdcSource {
         if !self.opened {
             return Ok(());
         }
+        // The snapshot batch that read the last table is durable now, so the range it covered
+        // will never be replayed and the transaction that made it re-readable can go.
+        self.finish_snapshot().await?;
         let sent = self.confirm_position().await?;
         self.log.event(
             "commit",
@@ -2488,6 +2591,8 @@ mod tests {
         /// How far into `stream` the open session has read.
         cursor: usize,
         snapshot: Vec<Vec<Option<String>>>,
+        /// Per-table rows, for the multi-table snapshot tests. Falls back to `snapshot`.
+        snapshots: HashMap<String, Vec<Vec<Option<String>>>>,
         /// Every call made, in order — this is what the sequencing tests assert on.
         calls: Vec<String>,
         consistent_point: Lsn,
@@ -2555,7 +2660,11 @@ mod tests {
             self.tick()?;
             self.calls
                 .push(format!("snapshot_rows({})", table.qualified()));
-            Ok(self.snapshot.clone())
+            Ok(self
+                .snapshots
+                .get(&table.qualified())
+                .cloned()
+                .unwrap_or_else(|| self.snapshot.clone()))
         }
 
         async fn end_snapshot(&mut self) -> Result<()> {
@@ -2644,9 +2753,13 @@ mod tests {
     const RELATION_OID: u32 = 16385;
 
     fn suppliers() -> TableSchema {
+        table_named("sales_suppliers")
+    }
+
+    fn table_named(name: &str) -> TableSchema {
         TableSchema {
             schema: "public".into(),
-            table: "sales_suppliers".into(),
+            table: name.into(),
             columns: vec![
                 ColumnSchema {
                     name: "supplierid".into(),
@@ -3166,6 +3279,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_snapshot_range_can_be_read_again_after_the_sink_refuses_it() {
+        // `poll_range` is required to be deterministic, and a snapshot batch is the first batch
+        // of every new pipeline — so the first transient sink error (an object-store 503, a full
+        // disk, a failed expectation) lands here. Closing the slot's snapshot transaction at read
+        // time made the recorded range unreadable ever after, and every later trigger failed
+        // identically until someone restarted the process.
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(a_transaction());
+        wire.lock().await.snapshot = vec![
+            vec![Some("1".into()), Some("Acme".into())],
+            vec![Some("2".into()), None],
+        ];
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        let first = source.poll_range(&engine, &range).await.unwrap();
+        assert_eq!(first[0].num_rows(), 2);
+        assert!(
+            !wire.lock().await.calls.iter().any(|c| c == "end_snapshot"),
+            "the transaction stays open until the batch is durable: {:?}",
+            wire.lock().await.calls
+        );
+
+        // The sink was down. The scheduler keeps the recorded range and polls it again.
+        let replay = source.poll_range(&engine, &range).await.unwrap();
+        assert_eq!(first, replay, "the same range yields the same records");
+
+        // Only once it is durable does the transaction go — holding it any longer would pin the
+        // publisher's oldest xmin for the life of the pipeline.
+        source.mark_durable(&engine).await.unwrap();
+        assert!(
+            wire.lock().await.calls.iter().any(|c| c == "end_snapshot"),
+            "got: {:?}",
+            wire.lock().await.calls
+        );
+    }
+
+    #[tokio::test]
     async fn an_interrupted_snapshot_restarts_from_the_first_table() {
         // The transaction that held the old snapshot died with the process, and a new one sees a
         // *later* database — so resuming table by table would splice two points in time.
@@ -3190,6 +3340,161 @@ mod tests {
             shared.lock().await.calls[0],
             "open_slot(create=true)",
             "and the slot is recreated so the new snapshot has a consistent point"
+        );
+    }
+
+    /// A sink that records what it was handed, and refuses one nominated batch.
+    struct RecordingSink {
+        fail_on: Option<u64>,
+        writes: std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<RecordBatch>)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::sink::Sink for RecordingSink {
+        async fn write_batch(&mut self, batches: &[RecordBatch], batch_id: u64) -> Result<u64> {
+            if self.fail_on == Some(batch_id) {
+                return Err(Error::Execution("sink is down".into()));
+            }
+            self.writes
+                .lock()
+                .expect("poisoned")
+                .push((batch_id, batches.to_vec()));
+            Ok(batches.iter().map(|b| b.num_rows() as u64).sum())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_interrupted_by_a_crash_re_reads_every_table_at_the_new_consistent_point() {
+        // The review's blocker, driven the way production drives it. The scheduler replays a
+        // *recorded* range rather than replanning (`load_planned`), so the snapshot reset that
+        // lives in `plan_batch` is skipped entirely on the recovery path. What used to happen:
+        // tables `a` and `b` kept their P0 image, table `c` was read at P1, the snapshot was
+        // declared complete and the stream started at P1 — so every change to `a` and `b` in
+        // [P0, P1) was in neither, with no error and no log line.
+        let engine = Engine::new();
+        let checkpoints = tempfile::TempDir::new().unwrap();
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(vec![])));
+        let tables = vec![
+            table_named("ox_a"),
+            table_named("ox_b"),
+            table_named("ox_c"),
+        ];
+        {
+            let mut wire = wire.lock().await;
+            for (name, id) in [("ox_a", "1"), ("ox_b", "2"), ("ox_c", "3")] {
+                wire.snapshots.insert(
+                    format!("public.{name}"),
+                    vec![vec![Some(id.into()), Some(name.into())]],
+                );
+            }
+        }
+        let build = |fail_on: Option<u64>| {
+            let mut options = options();
+            options.tables = tables.iter().map(TableSchema::qualified).collect();
+            (
+                Box::new(PostgresCdcSource::with_wire(
+                    options,
+                    tables.clone(),
+                    Box::new(Spy(wire.clone())),
+                    ConnectorLog::default(),
+                )) as Box<dyn Source>,
+                Box::new(RecordingSink {
+                    fail_on,
+                    writes: writes.clone(),
+                }) as Box<dyn crate::sink::Sink>,
+            )
+        };
+
+        let mgr = crate::scheduler::StreamingQueryManager::new();
+        let (source, sink) = build(Some(3));
+        let id =
+            crate::scheduler::test_harness::register(&mgr, checkpoints.path(), source, sink).await;
+
+        // Batches 1 and 2 snapshot `ox_a` and `ox_b` at the slot's consistent point and commit.
+        assert_eq!(mgr.run_batch(&id, &engine).await.unwrap(), 1);
+        assert_eq!(mgr.run_batch(&id, &engine).await.unwrap(), 1);
+        // Batch 3 records its range, reads `ox_c` — and the sink write never returns.
+        mgr.run_batch(&id, &engine).await.unwrap_err();
+
+        // The process dies. A row lands in `ox_a` before the new one starts: this is the change
+        // in [P0, P1) that the old code lost, being in neither the snapshot nor the stream.
+        wire.lock().await.snapshots.insert(
+            "public.ox_a".into(),
+            vec![
+                vec![Some("1".into()), Some("ox_a".into())],
+                vec![
+                    Some("99".into()),
+                    Some("written between the two points".into()),
+                ],
+            ],
+        );
+        let before_restart = writes.lock().unwrap().len();
+        let restart_at = wire.lock().await.calls.len();
+
+        // Restart. `register` recovers from the log exactly as `start_with_config` does, so the
+        // planned range for batch 3 is still on disk and `plan_batch` is not consulted.
+        let (source, sink) = build(None);
+        let id =
+            crate::scheduler::test_harness::register(&mgr, checkpoints.path(), source, sink).await;
+        for _ in 0..8 {
+            if mgr.run_batch(&id, &engine).await.unwrap() == 0 {
+                break;
+            }
+        }
+
+        let calls = wire.lock().await.calls[restart_at..].to_vec();
+        assert_eq!(
+            calls.first().map(String::as_str),
+            Some("open_slot(create=true)"),
+            "an interrupted snapshot recreates the slot: {calls:?}"
+        );
+        let stream_at = calls
+            .iter()
+            .position(|c| c.starts_with("start_stream"))
+            .expect("the stream eventually starts");
+        for table in ["ox_a", "ox_b", "ox_c"] {
+            assert!(
+                calls[..stream_at].contains(&format!("snapshot_rows(public.{table})")),
+                "`{table}` must be re-read before the stream starts, or its P0 image is spliced \
+                 onto a stream beginning at P1: {calls:?}"
+            );
+        }
+        assert_eq!(
+            calls[stream_at], "start_stream(0/1100)",
+            "and the stream starts at the *new* consistent point: {calls:?}"
+        );
+
+        // Every row written after the restart is as of the new consistent point. A single P0 row
+        // here would be one half of the splice.
+        let written = writes.lock().unwrap().clone();
+        let mut ids = BTreeSet::new();
+        for (_, batches) in &written[before_restart..] {
+            for batch in batches {
+                let lsn = column(batch, LSN_COLUMN)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for i in 0..batch.num_rows() {
+                    assert_eq!(lsn.value(i), 0x1100, "a row from the abandoned snapshot");
+                }
+                let key = column(batch, "supplierid")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for i in 0..batch.num_rows() {
+                    ids.insert(key.value(i));
+                }
+            }
+        }
+        assert!(
+            ids.contains(&99),
+            "the row written between the two consistent points reached the target: {ids:?}"
+        );
+        assert_eq!(
+            ids,
+            [1, 2, 3, 99].into_iter().collect::<BTreeSet<i64>>(),
+            "and every source table was read again"
         );
     }
 
