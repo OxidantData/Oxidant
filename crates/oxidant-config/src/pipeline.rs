@@ -275,10 +275,16 @@ pub enum TableKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct SourceConfig {
-    /// `kafka` | `json` | `csv` | `parquet` | `rate` | `memory`.
+    /// `kafka` | `postgres_cdc` | `json` | `csv` | `parquet` | `rate` | `memory`.
     pub format: String,
     /// Source options, passed through verbatim — the same names Spark uses
     /// (`kafka.bootstrap.servers`, `subscribe`, `startingOffsets`, `maxOffsetsPerTrigger`).
+    ///
+    /// A `postgres_cdc` source takes its own set instead — `host`, `port`, `database`, `user`,
+    /// `password_env`, `tls`, `tls_ca`, `publication`, `slot`, `tables`, `exclude_columns`,
+    /// `keys`, `publish_ops`, `max_slot_bytes`, `max_batch_bytes`, `snapshot_batch_rows` — and
+    /// unlike the Spark ones, an unrecognized key there is an error rather than an ignored
+    /// consumer property. See `docs/postgres-cdc.md`.
     #[serde(default)]
     pub options: BTreeMap<String, String>,
 }

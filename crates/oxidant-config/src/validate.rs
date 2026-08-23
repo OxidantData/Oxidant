@@ -231,6 +231,7 @@ impl OxidantConfig {
                         )));
                     };
                     crate::auto_cdc::validate(cdc, name)?;
+                    validate_postgres_cdc(name, source)?;
                     // `auto_cdc.source` is what puts the dependency edge in the graph. A name
                     // that matches nothing produces no edge and no error, so the merge just runs
                     // in an arbitrary order against whatever the bronze table happens to hold —
@@ -241,49 +242,75 @@ impl OxidantConfig {
                             "table `{name}` declares itself as its own `auto_cdc.source:`"
                         )));
                     }
-                    let Some(upstream) = self.tables.iter().find(|t| t.name.trim() == cdc_source)
-                    else {
-                        return Err(Error::Io(format!(
-                            "table `{name}` sets `auto_cdc.source: {cdc_source}`, which is not a \
-                             table declared in `tables:` (declared: {})",
-                            declared.iter().copied().collect::<Vec<_>>().join(", ")
-                        )));
+                    // A `postgres_cdc` source *is* a change stream — it emits `__oxidant_op` /
+                    // `__oxidant_lsn` / `__oxidant_ts` directly — so the changes table AUTO CDC
+                    // merges from does not have to be declared a second time. Naming it
+                    // `{table}_changes` is what asks for that implicit stream; anything else
+                    // still has to be a declared table, so a typo is still an error rather than
+                    // a merge over nothing.
+                    let implicit = is_postgres_cdc(source)
+                        && cdc_source == implicit_changes_name(name)
+                        && !declared.contains(cdc_source);
+                    let upstream = match self.tables.iter().find(|t| t.name.trim() == cdc_source) {
+                        Some(upstream) => Some(upstream),
+                        None if implicit => None,
+                        None => {
+                            return Err(Error::Io(format!(
+                                "table `{name}` sets `auto_cdc.source: {cdc_source}`, which is \
+                                 not a table declared in `tables:` (declared: {}){}",
+                                declared.iter().copied().collect::<Vec<_>>().join(", "),
+                                if is_postgres_cdc(source) {
+                                    format!(
+                                        " — a `postgres_cdc` source declares its own change \
+                                         stream, so `auto_cdc.source: {}` needs no second table \
+                                         entry",
+                                        implicit_changes_name(name)
+                                    )
+                                } else {
+                                    String::new()
+                                }
+                            )))
+                        }
                     };
                     // An AUTO CDC target re-ingests the source's stream rather than reading its
                     // table, so its `source:`/`sql:`/`expect:` are a *copy* of the source's. Let
                     // them drift and the target quietly merges a different projection — or a
                     // different set of rows — than the table it claims to follow. The SDP SQL
                     // surface copies them outright; here they are written twice, so check.
-                    if table.source != upstream.source {
-                        return Err(Error::Io(format!(
-                            "table `{name}` has a different `source:` from its \
+                    // `None` is the implicit change stream: there is no second table entry to
+                    // mirror, because the `postgres_cdc` source *is* the stream.
+                    if let Some(upstream) = upstream {
+                        if table.source != upstream.source {
+                            return Err(Error::Io(format!(
+                                "table `{name}` has a different `source:` from its \
                              `auto_cdc.source: {cdc_source}` — an AUTO CDC target re-reads the \
                              same stream, so the two must be identical"
-                        )));
-                    }
-                    let sql_of = |t: &crate::TableConfig| {
-                        t.sql.as_deref().map(str::trim).unwrap_or("").to_string()
-                    };
-                    if sql_of(table) != sql_of(upstream) {
-                        return Err(Error::Io(format!(
-                            "table `{name}` has a different `sql:` from its \
+                            )));
+                        }
+                        let sql_of = |t: &crate::TableConfig| {
+                            t.sql.as_deref().map(str::trim).unwrap_or("").to_string()
+                        };
+                        if sql_of(table) != sql_of(upstream) {
+                            return Err(Error::Io(format!(
+                                "table `{name}` has a different `sql:` from its \
                              `auto_cdc.source: {cdc_source}` — the merge would run over a \
                              different projection than `{cdc_source}` holds"
-                        )));
-                    }
-                    if table.expect != upstream.expect {
-                        return Err(Error::Io(format!(
-                            "table `{name}` has different `expect:` entries from its \
+                            )));
+                        }
+                        if table.expect != upstream.expect {
+                            return Err(Error::Io(format!(
+                                "table `{name}` has different `expect:` entries from its \
                              `auto_cdc.source: {cdc_source}` — the CDC target would merge rows \
                              `{cdc_source}` dropped, or drop rows it kept"
-                        )));
-                    }
-                    if table.dedup_columns != upstream.dedup_columns {
-                        return Err(Error::Io(format!(
-                            "table `{name}` has different `dedup_columns:` from its \
+                            )));
+                        }
+                        if table.dedup_columns != upstream.dedup_columns {
+                            return Err(Error::Io(format!(
+                                "table `{name}` has different `dedup_columns:` from its \
                              `auto_cdc.source: {cdc_source}` — both read the same stream, so \
                              both must deduplicate it the same way"
-                        )));
+                            )));
+                        }
                     }
                 }
                 TableKind::Streaming => {
@@ -294,6 +321,7 @@ impl OxidantConfig {
                         )));
                     }
                     validate_dedup_watermark(name, source, &table.dedup_columns)?;
+                    validate_postgres_cdc(name, source)?;
                 }
             }
             for (label, expectation) in &table.expect {
@@ -478,6 +506,144 @@ fn validate_dedup_watermark(
     Ok(())
 }
 
+/// The name of the change stream a `postgres_cdc` source declares implicitly.
+///
+/// One convention rather than a free-form name: `auto_cdc.source` has to be *checkable*, and a
+/// source that accepted any unmatched name would turn a typo into a merge over nothing.
+pub fn implicit_changes_name(table: &str) -> String {
+    format!("{}_changes", table.trim())
+}
+
+fn is_postgres_cdc(source: &SourceConfig) -> bool {
+    source.format.trim().eq_ignore_ascii_case("postgres_cdc")
+}
+
+/// Options a `postgres_cdc` source accepts.
+///
+/// Must be exactly the list `oxidant-streaming` parses. Drift either way is silent until someone
+/// hits it: an option added to the source and not here makes a valid config fail
+/// `oxidant config validate`, and one added here and not there makes a config that validates fail
+/// at pipeline start. `pub` so the two can be compared for real — `oxidant-pipelines` sees both
+/// crates and asserts it, since neither of them can see the other.
+pub const POSTGRES_CDC_OPTIONS: &[&str] = &[
+    "host",
+    "port",
+    "database",
+    "user",
+    "password_env",
+    "tls",
+    "tls_ca",
+    "publication",
+    "slot",
+    "tables",
+    "exclude_columns",
+    "keys",
+    "publish_ops",
+    "max_slot_bytes",
+    "max_batch_bytes",
+    "snapshot_batch_rows",
+];
+
+/// Options a `postgres_cdc` source cannot do without.
+const POSTGRES_CDC_REQUIRED: &[&str] =
+    &["host", "database", "user", "publication", "slot", "tables"];
+
+const POSTGRES_CDC_TLS_MODES: &[&str] = &["disable", "require", "verify-ca", "verify-full"];
+
+const POSTGRES_CDC_OPS: &[&str] = &["insert", "update", "delete", "truncate"];
+
+/// Check the shape of a `postgres_cdc` source's options.
+///
+/// Everything here is checkable without a network round trip, which is the point: connecting to
+/// a production database only to be told `slot:` was missing is a slow way to find a typo, and
+/// `oxidant config validate` has to work on a laptop with no database at all. The *server-side*
+/// checks — `wal_level`, privileges, REPLICA IDENTITY — happen when the source is built.
+fn validate_postgres_cdc(name: &str, source: &SourceConfig) -> Result<()> {
+    if !is_postgres_cdc(source) {
+        return Ok(());
+    }
+    let options = &source.options;
+    for key in options.keys() {
+        // A misspelled `table:` would leave the source with nothing to replicate and no error;
+        // a misspelled `exclude_column:` would publish the column the author meant to keep out.
+        // Both are silent, so unknown keys are rejected rather than ignored.
+        if !POSTGRES_CDC_OPTIONS.contains(&key.as_str()) {
+            return Err(Error::Io(format!(
+                "table `{name}`: `{key}` is not a `postgres_cdc` option (known: {})",
+                POSTGRES_CDC_OPTIONS.join(", ")
+            )));
+        }
+    }
+    let value = |key: &str| options.get(key).map(|v| v.trim()).filter(|v| !v.is_empty());
+    for key in POSTGRES_CDC_REQUIRED {
+        if value(key).is_none() {
+            return Err(Error::Io(format!(
+                "table `{name}`: `postgres_cdc` source needs `{key}:` in its `options:`"
+            )));
+        }
+    }
+    if let Some(port) = value("port") {
+        if port.parse::<u16>().is_err() {
+            return Err(Error::Io(format!(
+                "table `{name}`: `port: {port}` is not a port number"
+            )));
+        }
+    }
+    if let Some(tls) = value("tls") {
+        let normalized = tls.to_ascii_lowercase().replace('_', "-");
+        if !POSTGRES_CDC_TLS_MODES.contains(&normalized.as_str()) {
+            return Err(Error::Io(format!(
+                "table `{name}`: `tls: {tls}` is not a TLS mode (expected one of: {})",
+                POSTGRES_CDC_TLS_MODES.join(", ")
+            )));
+        }
+    }
+    for entry in comma_list(value("tables")) {
+        let (schema, table) = entry.split_once('.').unwrap_or(("public", entry.as_str()));
+        if schema.trim().is_empty() || table.trim().is_empty() || table.contains('.') {
+            return Err(Error::Io(format!(
+                "table `{name}`: `tables:` entry `{entry}` is not a `schema.table` name (or \
+                 `schema.*` for a whole schema)"
+            )));
+        }
+    }
+    let ops = comma_list(value("publish_ops"));
+    if options.contains_key("publish_ops") && ops.is_empty() {
+        return Err(Error::Io(format!(
+            "table `{name}`: `publish_ops:` is empty — the change stream would carry nothing"
+        )));
+    }
+    for op in &ops {
+        if !POSTGRES_CDC_OPS.contains(&op.to_ascii_lowercase().as_str()) {
+            return Err(Error::Io(format!(
+                "table `{name}`: `publish_ops:` has `{op}` (expected any of: {})",
+                POSTGRES_CDC_OPS.join(", ")
+            )));
+        }
+    }
+    for key in ["max_slot_bytes", "max_batch_bytes", "snapshot_batch_rows"] {
+        if let Some(text) = value(key) {
+            if text.parse::<u64>().is_err() {
+                return Err(Error::Io(format!(
+                    "table `{name}`: `{key}: {text}` is not a number"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn comma_list(value: Option<&str>) -> Vec<String> {
+    value
+        .map(|v| {
+            v.split(',')
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +693,176 @@ tables:
       sequence_by: seq
 {extra}"#
         ))
+    }
+
+    /// The spec's example: one table with a `postgres_cdc` source and an AUTO CDC merge over the
+    /// change stream that source declares implicitly.
+    fn postgres_cdc_yaml(source_extra: &str, cdc_source: &str) -> String {
+        with_pipeline(&format!(
+            r#"  - name: sales_suppliers
+    source:
+      format: postgres_cdc
+      options:
+        host: db.internal
+        database: sales
+        user: oxidant_cdc
+        publication: oxidant_sales
+        slot: oxidant_sales_suppliers
+        tables: public.sales_suppliers
+{source_extra}    auto_cdc:
+      source: {cdc_source}
+      keys: [supplierID]
+      sequence_by: __oxidant_lsn
+      apply_as_deletes: "__oxidant_op = 'd'"
+"#
+        ))
+    }
+
+    #[test]
+    fn the_shipped_postgres_cdc_example_is_a_valid_config() {
+        // An example that does not load is worse than no example: it is the first thing anyone
+        // copies, and the error they get is about their own edit.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/postgres-cdc.yaml"
+        );
+        let yaml = std::fs::read_to_string(path).expect("examples/postgres-cdc.yaml exists");
+        let config = OxidantConfig::parse(&yaml).expect("the shipped example validates");
+        let cdc = config
+            .tables
+            .iter()
+            .find(|t| t.name == "sales_suppliers")
+            .expect("the example declares the CDC table");
+        assert_eq!(cdc.kind(), TableKind::AutoCdc);
+        assert_eq!(
+            cdc.auto_cdc.as_ref().expect("auto_cdc").source,
+            implicit_changes_name("sales_suppliers"),
+            "the example uses the implicit change stream"
+        );
+    }
+
+    #[test]
+    fn a_postgres_cdc_source_declares_its_own_change_stream() {
+        // The source emits `__oxidant_op`/`__oxidant_lsn`/`__oxidant_ts` itself, so the changes
+        // table AUTO CDC merges from needs no second entry in `tables:`.
+        let config = OxidantConfig::parse(&postgres_cdc_yaml("", "sales_suppliers_changes"))
+            .expect("the implicit change stream is accepted");
+        assert_eq!(config.tables.len(), 1);
+        assert_eq!(
+            implicit_changes_name("sales_suppliers"),
+            "sales_suppliers_changes"
+        );
+    }
+
+    #[test]
+    fn an_auto_cdc_source_that_is_neither_declared_nor_the_implicit_stream_is_a_typo() {
+        let err = parse_err(&postgres_cdc_yaml("", "sales_supplier_changes"));
+        assert!(
+            err.contains("not a table declared in `tables:`"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("sales_suppliers_changes"),
+            "the error names the spelling that would have worked: {err}"
+        );
+    }
+
+    #[test]
+    fn a_postgres_cdc_source_is_checked_without_touching_the_network() {
+        // `oxidant config validate` has to work on a laptop with no database, so everything
+        // checkable from the file alone is checked here — and connecting to production only to
+        // be told `slot:` was missing is a slow way to find a typo.
+        let without = |key: &str| {
+            let yaml = postgres_cdc_yaml("", "sales_suppliers_changes");
+            yaml.lines()
+                // Matched at the option block's indentation, so removing `tables:` does not
+                // also take the pipeline's own top-level `tables:` key with it.
+                .filter(|line| !line.starts_with(&format!("        {key}:")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for key in ["host", "database", "user", "publication", "slot", "tables"] {
+            let err = parse_err(&without(key));
+            assert!(err.contains(key), "removing `{key}` gave: {err}");
+        }
+
+        // Splice an option in, replacing the base config's own line for that key — YAML has no
+        // opinion about a duplicate mapping key that is worth reading in a test failure.
+        let spliced = |option: &str| {
+            let key = option.split(':').next().unwrap_or("").trim().to_string();
+            postgres_cdc_yaml(&format!("        {option}\n"), "sales_suppliers_changes")
+                .lines()
+                .filter(|line| {
+                    !line.starts_with(&format!("        {key}:")) || line.contains(option)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let with = |option: &str| {
+            OxidantConfig::parse(&spliced(option))
+                .expect_err("expected a validation failure")
+                .to_string()
+        };
+        // An unknown option is an error: a misspelled `table:` would leave the source with
+        // nothing to replicate and no complaint.
+        assert!(with("table: public.sales_suppliers").contains("is not a `postgres_cdc` option"));
+        assert!(with("port: not-a-port").contains("is not a port number"));
+        assert!(with("tls: prefer").contains("verify-full"));
+        assert!(with("tables: a.b.c").contains("is not a `schema.table` name"));
+        assert!(with("publish_ops: upsert").contains("expected any of"));
+        assert!(with("max_slot_bytes: 10GiB").contains("is not a number"));
+
+        // And the documented spellings are accepted.
+        for option in [
+            "port: \"5433\"",
+            "tls: verify-ca",
+            "tls_ca: /etc/oxidant/pg-ca.pem",
+            "exclude_columns: notes, secret",
+            "keys: supplierID",
+            "publish_ops: insert,update,delete",
+            "max_slot_bytes: \"10737418240\"",
+            "max_batch_bytes: \"33554432\"",
+            "snapshot_batch_rows: \"65536\"",
+            "password_env: OXIDANT_PGPASSWORD",
+            "tables: public.*",
+        ] {
+            OxidantConfig::parse(&spliced(option))
+                .unwrap_or_else(|e| panic!("`{option}` should be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_declared_changes_table_still_has_to_mirror_its_auto_cdc_target() {
+        // Naming a table that *is* declared keeps the existing rule: the target re-reads the same
+        // stream, so the two `source:` blocks must be identical.
+        let err = parse_err(&with_pipeline(
+            r#"  - name: sales_suppliers_changes
+    source:
+      format: postgres_cdc
+      options:
+        host: db.internal
+        database: sales
+        user: oxidant_cdc
+        publication: oxidant_sales
+        slot: oxidant_sales_suppliers
+        tables: public.sales_suppliers
+  - name: sales_suppliers
+    source:
+      format: postgres_cdc
+      options:
+        host: OTHER.internal
+        database: sales
+        user: oxidant_cdc
+        publication: oxidant_sales
+        slot: oxidant_sales_suppliers
+        tables: public.sales_suppliers
+    auto_cdc:
+      source: sales_suppliers_changes
+      keys: [supplierID]
+      sequence_by: __oxidant_lsn
+"#,
+        ));
+        assert!(err.contains("different `source:`"), "got: {err}");
     }
 
     #[test]

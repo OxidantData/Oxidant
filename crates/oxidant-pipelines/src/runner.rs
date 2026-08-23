@@ -429,9 +429,21 @@ async fn start_stream(
         .expect("a streaming table has a source");
     let name = table.name.trim();
 
+    // A connector's operator log lives beside the pipeline's checkpoints, under a file named for
+    // the table it feeds. Both are derived here rather than read from `options:` so one
+    // connector's log can never be pointed at another's file.
+    let mut source_options: BTreeMap<String, String> = source.options.clone();
+    if source.format.trim().eq_ignore_ascii_case("postgres_cdc") {
+        oxidant_streaming::postgres_cdc_pipeline_options(
+            &mut source_options,
+            std::path::Path::new(plan.pipeline.checkpoints.trim_end_matches('/')),
+            name,
+        );
+    }
+
     let config = StreamQueryConfig::for_pipeline(
         &source.format,
-        source.options.clone().into_iter().collect(),
+        source_options,
         &plan.format_of(table),
         plan.sink_table_of(table),
         plan.location_of(name),
@@ -957,6 +969,21 @@ async fn scalar_count(engine: &Engine, sql: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_two_postgres_cdc_option_lists_are_the_same_list() {
+        // `oxidant-config` validates a file's `options:` without a database, and
+        // `oxidant-streaming` parses them at pipeline start. Neither crate can see the other —
+        // this one depends on both, which is why the check lives here. Drift either way is
+        // silent until someone hits it: an option the source accepts but the validator does not
+        // makes a valid config fail `oxidant config validate`, and the reverse makes a config
+        // that validates fail at start.
+        assert_eq!(
+            oxidant_config::POSTGRES_CDC_OPTIONS,
+            oxidant_streaming::KNOWN_OPTIONS,
+            "add the option to both lists, or to neither"
+        );
+    }
 
     #[test]
     fn pass_outcomes_map_to_run_events() {

@@ -1,0 +1,94 @@
+# Postgres CDC → Delta, merged by primary key (SCD Type 1).
+#
+# The engine snapshots `public.sales_suppliers` through a consistent replication
+# snapshot, then streams committed changes from the WAL and merges them into the
+# lakehouse table by `supplierID`. No Kafka, no Debezium, no JVM.
+#
+#   export OXIDANT_PGPASSWORD=…            # never a literal secret in this file
+#   oxidant pipeline run -c examples/postgres-cdc.yaml
+#
+# What the source needs on the publisher, checked at startup with the exact
+# remediation SQL in the error (see docs/postgres-cdc.md §5):
+#
+#   ALTER SYSTEM SET wal_level = logical;  -- then restart; RDS: rds.logical_replication = 1
+#   ALTER ROLE oxidant_cdc WITH REPLICATION;
+#   GRANT SELECT ON public.sales_suppliers TO oxidant_cdc;
+#   -- a primary key, or `ALTER TABLE … REPLICA IDENTITY FULL`
+#
+# The publication and the slot are created if they are missing and the role is
+# allowed to; the slot is what retains WAL, so `oxidant pipeline run` is the
+# thing that must keep running — see `max_slot_bytes` below.
+
+catalogs:
+  local:
+    type: local
+    warehouse: /srv/oxidant/warehouse
+
+pipeline:
+  name: sales-cdc
+  catalog: local
+  schema: live
+  checkpoints: /srv/oxidant/checkpoints
+  # The connector's JSONL operator log lands in
+  # /srv/oxidant/checkpoints/logs/sales_suppliers.jsonl — snapshot progress,
+  # per-batch ranges, confirmed LSNs, schema changes and slot size.
+  trigger: 30 seconds
+
+tables:
+  - name: sales_suppliers
+    source:
+      format: postgres_cdc
+      options:
+        host: db.internal
+        port: "5432"
+        database: sales
+        user: oxidant_cdc
+        password_env: OXIDANT_PGPASSWORD
+        tls: verify-full                    # disable | require | verify-ca | verify-full
+        # tls_ca: /etc/oxidant/pg-ca.pem    # for a private CA (RDS: the regional bundle)
+        publication: oxidant_sales
+        slot: oxidant_sales_suppliers
+        tables: public.sales_suppliers
+        # Drop `delete` for append-only history; the default is Postgres' own
+        # `insert, update, delete, truncate`.
+        publish_ops: insert,update,delete,truncate
+        # Stop rather than let an unconfirmed slot fill the *source* database's
+        # disk — the number-one operational failure of logical replication.
+        max_slot_bytes: "10737418240"       # 10 GiB
+        # Rows per FETCH from the snapshot's server-side cursor, and per emitted
+        # Arrow batch. It bounds the *read*, not the commit: a source table's
+        # Arrow batches are all in memory when the snapshot micro-batch returns,
+        # so plan for the largest table's Arrow form to fit in the engine's heap
+        # with headroom. See docs/postgres-cdc.md §10.
+        # snapshot_batch_rows: "65536"
+        # exclude_columns: internal_notes
+        # keys: supplierID                  # defaults to the table's primary key
+
+    auto_cdc:
+      # A `postgres_cdc` source *is* a change stream, so `<table>_changes` names
+      # the stream it declares — there is no second `tables:` entry for it.
+      source: sales_suppliers_changes
+      keys: [supplierID]
+      # Every change carries its own WAL position, so this orders the whole
+      # stream: a snapshot row sits at the slot's consistent point and any later
+      # change to the same key wins.
+      sequence_by: __oxidant_lsn
+      apply_as_deletes: "__oxidant_op = 'd'"
+      apply_as_truncates: "__oxidant_op = 't'"
+      # An UPDATE that did not touch a large (TOASTed) column carries no value
+      # for it, and v1 emits that as NULL. This keeps the target's current value
+      # instead of blanking it. The trade: an update that genuinely sets a
+      # non-key column to NULL is ignored too — `REPLICA IDENTITY FULL` on the
+      # source table is what buys the distinction. See docs/postgres-cdc.md §10.
+      ignore_null_updates_except: [supplierID]
+      # `__oxidant_lsn` must stay in the target: AUTO CDC compares each incoming
+      # change against the sequence already stored. The other two metadata
+      # columns are the merge's plumbing, not part of the target.
+      except_column_list: [__oxidant_op, __oxidant_ts]
+
+  # An ordinary derived table over the merged result — recomputed per pass.
+  - name: suppliers_by_continent
+    sql: |
+      SELECT continent, count(*) AS suppliers
+      FROM sales_suppliers
+      GROUP BY continent

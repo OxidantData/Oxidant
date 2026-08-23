@@ -247,6 +247,12 @@ The `KEYS` and `SEQUENCE BY` columns must survive `COLUMNS` / `COLUMNS * EXCEPT`
 — the next batch compares against the values stored there, so dropping them would let an older
 event overwrite newer state.
 
+One source is a change stream by itself and needs no separate bronze table: a
+`format: postgres_cdc` source emits `__oxidant_op` / `__oxidant_lsn` / `__oxidant_ts` alongside the
+table's own columns, so `auto_cdc.source: <table>_changes` names the stream that source declares
+rather than a second entry in `tables:`. See [postgres-cdc.md](postgres-cdc.md) and
+`examples/postgres-cdc.yaml`.
+
 #### What "out of order safe" does and does not cover
 
 A record whose `sequence_by` value is older than the target's loses, and a truncate only removes

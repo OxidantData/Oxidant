@@ -13,6 +13,16 @@ use tonic::transport::Channel;
 
 const SESSION: &str = "00112233-4455-6677-8899-aabbccddeeff";
 
+/// See `dataframe_api.rs` — hard-coded ports collide with real daemons (macOS `rapportd`
+/// holds 50603/50604), so tests bind an ephemeral port instead of reserving a number.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 async fn boot(port: u16) -> SparkConnectServiceClient<Channel> {
     tokio::spawn(async move {
         let _ = serve(ServerConfig {
@@ -138,7 +148,7 @@ fn first_i64(resps: &[sc::execute_plan_response::ResponseType]) -> Option<i64> {
 
 #[tokio::test]
 async fn sql_command_query_returns_lazy_relation_then_executes() {
-    let mut client = boot(50591).await;
+    let mut client = boot(free_port()).await;
 
     // spark.sql("SELECT 7 AS x") → a SqlCommandResult carrying a relation handle.
     let resps = run(&mut client, sql_command("SELECT 7 AS x")).await;
@@ -166,7 +176,7 @@ async fn sql_command_query_returns_lazy_relation_then_executes() {
 
 #[tokio::test]
 async fn sql_command_ddl_executes_eagerly() {
-    let mut client = boot(50592).await;
+    let mut client = boot(free_port()).await;
 
     // spark.sql("CREATE TABLE ...") must run eagerly (side effect), returning a result relation.
     let resps = run(&mut client, sql_command("CREATE TABLE t AS SELECT 42 AS v")).await;
@@ -190,7 +200,7 @@ async fn sql_command_ddl_executes_eagerly() {
 /// TPC-DS Q5/Q12-class Spark spelling must plan via Connect Sql relations (not only Engine::sql).
 #[tokio::test]
 async fn sql_relation_accepts_spark_interval_unit_in_string() {
-    let mut client = boot(50604).await;
+    let mut client = boot(free_port()).await;
     let q = "SELECT (cast('2001-01-12' AS date) + interval '30 days') AS d";
     let resps = run(&mut client, root(sql_relation(q))).await;
     assert!(
@@ -202,7 +212,7 @@ async fn sql_relation_accepts_spark_interval_unit_in_string() {
 /// Same normalize must apply when PySpark sends SqlCommand then executes the lazy relation.
 #[tokio::test]
 async fn sql_command_accepts_spark_interval_between_window() {
-    let mut client = boot(50605).await;
+    let mut client = boot(free_port()).await;
     // TPC-DS-style window: BETWEEN start AND (start + interval '30 days').
     let q = "SELECT 1 AS ok \
              WHERE cast('2001-01-12' AS date) BETWEEN cast('2001-01-12' AS date) \
@@ -223,7 +233,7 @@ async fn sql_command_accepts_spark_interval_between_window() {
 
 #[tokio::test]
 async fn show_string_renders_a_table() {
-    let mut client = boot(50594).await;
+    let mut client = boot(free_port()).await;
     // PySpark `.show()` shape: a ShowString relation wrapping the query.
     let plan = sc::Plan {
         op_type: Some(sc::plan::OpType::Root(sc::Relation {
@@ -247,7 +257,7 @@ async fn show_string_renders_a_table() {
 
 #[tokio::test]
 async fn empty_result_still_emits_a_batch() {
-    let mut client = boot(50596).await;
+    let mut client = boot(free_port()).await;
     // A zero-row result must still emit at least one ArrowBatch — PySpark `collect()` asserts it
     // received a RecordBatch, otherwise the table is None.
     let resps = run(&mut client, root(sql_relation("SELECT 1 AS x WHERE 1 = 0"))).await;
@@ -259,7 +269,7 @@ async fn empty_result_still_emits_a_batch() {
 
 #[tokio::test]
 async fn config_set_then_get_roundtrips() {
-    let mut client = boot(50597).await;
+    let mut client = boot(free_port()).await;
     let op = |op_type| sc::ConfigRequest {
         session_id: SESSION.to_string(),
         operation: Some(sc::config_request::Operation {
@@ -305,7 +315,7 @@ async fn config_set_then_get_roundtrips() {
 
 #[tokio::test]
 async fn analyze_schema_returns_spark_types() {
-    let mut client = boot(50593).await;
+    let mut client = boot(free_port()).await;
 
     let req = sc::AnalyzePlanRequest {
         session_id: SESSION.to_string(),
@@ -363,7 +373,7 @@ async fn analyze(
 
 #[tokio::test]
 async fn analyze_explain_renders_a_plan() {
-    let mut client = boot(50598).await;
+    let mut client = boot(free_port()).await;
     let result = analyze(
         &mut client,
         sc::analyze_plan_request::Analyze::Explain(sc::analyze_plan_request::Explain {
@@ -389,7 +399,7 @@ async fn analyze_explain_renders_a_plan() {
 
 #[tokio::test]
 async fn analyze_explain_shows_filter_pushdown() {
-    let mut client = boot(50599).await;
+    let mut client = boot(free_port()).await;
     // A filter over a created table must show the predicate pushed into the scan — proves the
     // optimizer runs on the resolved plan (the `.into_unoptimized_plan()` subplans get optimized
     // once, at the execution/explain seam).
@@ -421,7 +431,7 @@ async fn analyze_explain_shows_filter_pushdown() {
 
 #[tokio::test]
 async fn analyze_tree_string_formats_schema() {
-    let mut client = boot(50601).await;
+    let mut client = boot(free_port()).await;
     let result = analyze(
         &mut client,
         sc::analyze_plan_request::Analyze::TreeString(sc::analyze_plan_request::TreeString {
@@ -446,7 +456,7 @@ async fn analyze_tree_string_formats_schema() {
 
 #[tokio::test]
 async fn analyze_is_local_and_is_streaming_are_false() {
-    let mut client = boot(50602).await;
+    let mut client = boot(free_port()).await;
     let local = analyze(
         &mut client,
         sc::analyze_plan_request::Analyze::IsLocal(sc::analyze_plan_request::IsLocal {

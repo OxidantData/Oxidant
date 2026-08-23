@@ -40,6 +40,25 @@ futures = "0.3.33"
 uuid = { version = "1", features = ["v4", "v5"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# Postgres CDC. `tokio-postgres` is the control connection — validation, catalog introspection
+# and slot metrics are ordinary SQL, and a mature client is the right tool for them. It does
+# *not* speak the replication protocol (0.7.18 has no `replication=database` startup parameter
+# and no CopyBoth API), so `pg_replication.rs` opens that one socket itself on top of
+# `postgres-protocol`, the message-framing/SCRAM crate `tokio-postgres` is already built on.
+# That is protocol plumbing, not a replication framework: the pgoutput decode is hand-rolled.
+tokio-postgres = "0.7"
+postgres-protocol = "0.6"
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
+# Pinned to `ring` because the tree already builds both providers (aws-lc-rs arrives through
+# reqwest), and `ClientConfig::builder()` panics when it cannot pick between them.
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pki-types = { version = "1", features = ["std"] }
+rustls-native-certs = "0.8"
+bytes = "1"
+hex = "0.4"
+
 [dev-dependencies]
 tempfile = "3"
+serde_json = "1"
 oxidant-catalog-local = { workspace = true }

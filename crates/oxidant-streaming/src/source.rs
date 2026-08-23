@@ -71,8 +71,17 @@ pub trait Source: Send + Sync {
     /// Decide what the next micro-batch will read, without reading it.
     ///
     /// Returns an empty range when no new data is available. Must not advance any position the
-    /// source would report as committed: a planned batch that is never written has to be
-    /// re-plannable, and a plan that consumed something would lose it.
+    /// source would report as committed *over anything it did not report*: a planned batch that
+    /// is never written has to be re-plannable, and a plan that consumed something would lose it.
+    /// A source that has to read to discover the extent of a range — the Postgres CDC source
+    /// decodes WAL to find the next commit boundary — may move its committed position over a
+    /// stretch it has established holds no records, because re-planning from either end of that
+    /// stretch yields the same batch. It must not acknowledge anything to a server from here:
+    /// only [`Source::mark_durable`] knows the batch survived. The one carve-out is a
+    /// protocol-level keepalive: a source whose server demands periodic liveness replies (the
+    /// Postgres walsender's `wal_sender_timeout`) may answer with the position it has *already*
+    /// reported as committed — never with a position past it — because that acknowledges
+    /// nothing the checkpoint does not already say.
     async fn plan_batch(&mut self, engine: &Engine) -> oxidant_common::Result<BatchRange>;
 
     /// Read exactly the records `range` names.
@@ -105,6 +114,20 @@ pub trait Source: Send + Sync {
 
     /// Resume from a checkpointed position. Called once, before the first poll.
     fn restore_offsets(&mut self, _offsets: &SourceOffsets) {}
+
+    /// Called once the batch just committed is durable — its rows in the sink *and* its position
+    /// in the checkpoint.
+    ///
+    /// Most sources need nothing here: their position lives entirely in the checkpoint, so there
+    /// is no one to tell. A source reading from a server that retains data on the consumer's
+    /// behalf — a Postgres replication slot, which keeps WAL until it is confirmed — has to
+    /// acknowledge somewhere, and this is the only point at which acknowledging is safe.
+    /// Acknowledging at read time would let the server discard exactly the records a replay of a
+    /// failed batch needs; acknowledging after the sink write but before the checkpoint would
+    /// discard the records a restart from the *previous* checkpoint would ask for.
+    async fn mark_durable(&mut self, _engine: &Engine) -> oxidant_common::Result<()> {
+        Ok(())
+    }
 
     /// The furthest position available *right now*, ignoring any per-batch budget.
     ///
