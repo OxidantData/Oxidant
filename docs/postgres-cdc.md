@@ -176,8 +176,28 @@ whether the report is worth reading.
   the last one the target read. The report prints the key full coverage stops
   at, so a sampled run never reads as a complete one.
 
+- `auto_cdc`'s projection decides which source columns the target owes.
+  `column_list` / `except_column_list` are applied before the schema check, so
+  a column the merge is configured to drop is not `schema_drift`; the report
+  lists it as *not compared*, which is a different thing from matched. The
+  metadata columns the merge adds (`__oxidant_*`) are plumbing and never drift.
+
 The walk is deterministic — same tables, same report — so two runs differing is
 itself a signal.
+
+**A source with more than one upstream table** is compared as the union of
+them, because that is what `auto_cdc` merges into the one target. That reading
+is only true while the tables have **disjoint key values**: the merge keeps one
+row per key, so two upstream tables that both contain `id = 1` give the union
+more rows than the target will ever hold, and the key walk — which needs
+strictly ascending keys, not merely sorted ones — reports the duplicate as
+missing from a target that has it. Reconcile probes for the overlap (one
+grouped scan of the union, only for a source that declares more than one table)
+and **refuses** rather than reporting drift that is not there. Namespacing the
+keys per table would make the walk self-consistent but not true — the target
+has no column saying which table a row came from. Declare one `postgres_cdc`
+source per upstream table; §9 already lists a multi-table single source as a v1
+non-goal.
 
 **Scheduling.** `--cron '<expr>'` writes `reconcile.json` into the pipeline's
 checkpoint directory (path, expression, sample, `--table` filters, last run and

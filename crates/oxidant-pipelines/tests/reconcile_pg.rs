@@ -564,6 +564,23 @@ async fn a_table_filter_scopes_the_report_and_a_name_that_matches_nothing_is_an_
         1
     );
 
+    // Both documented spellings of the same table at once, which is what an operator writes when
+    // they are not sure which one the command wants. The pipeline-table entry decides the scope;
+    // the upstream entry has to be counted as explained too, or the run fails with an error that
+    // lists the very name it says does not exist.
+    let both = reconcile(
+        &engine,
+        &plan,
+        &ReconcileOptions {
+            tables: vec![table.clone(), format!("public.{table}")],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("both spellings name something, so neither is unmatched");
+    assert_eq!(both.tables.len(), 1, "and they name the same one table");
+    assert_eq!(both.exit_code(), 0);
+
     // A name that matches nothing is an error rather than an empty, clean-looking report — which
     // would read as "in sync" to a CI step that only checks the exit code.
     let err = reconcile(
@@ -764,4 +781,80 @@ async fn a_column_the_merge_is_configured_to_drop_is_not_reported_as_schema_drif
     assert_eq!(lost.exit_code(), 1, "{rendered}");
 
     drop_fixtures(&connect, &table).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_upstream_tables_reconcile_as_one_target_until_their_key_spaces_overlap() {
+    let Some(connect) = dsn() else {
+        eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
+        return;
+    };
+    // One source, two upstream tables, one target. The connector requires only that they share a
+    // *shape*, so two tables each keyed `supplierid bigint primary key` from 1 is the ordinary
+    // case. While the key spaces are disjoint the union is a fair reading of the target; the
+    // moment they overlap the merge holds one row per key and the union holds two, and every
+    // comparison here would report drift that is not there.
+    let pipeline_table = format!("{TABLE}_multi");
+    let (a, b) = (format!("{pipeline_table}_a"), format!("{pipeline_table}_b"));
+    for name in [&pipeline_table, &a, &b] {
+        drop_fixtures(&connect, name).await;
+    }
+    for name in [&a, &b] {
+        sql(
+            &connect,
+            &format!("CREATE TABLE public.{name} (supplierid bigint primary key, name text)"),
+        )
+        .await;
+    }
+    sql(
+        &connect,
+        &format!("INSERT INTO public.{a} VALUES (1, 'Acme'), (2, 'Globex')"),
+    )
+    .await;
+    sql(
+        &connect,
+        &format!("INSERT INTO public.{b} VALUES (3, 'Initech'), (4, 'Umbrella')"),
+    )
+    .await;
+
+    let root = tempfile::TempDir::new().expect("temp dir");
+    let config = OxidantConfig::parse(
+        &config_yaml(&connect, root.path(), &pipeline_table).replace(
+            &format!("tables: public.{pipeline_table}"),
+            &format!("tables: public.{a}, public.{b}"),
+        ),
+    )
+    .expect("the fixture config parses");
+    let engine = engine_for(root.path()).await;
+    seed_target(&engine, &config).await;
+    let plan = Plan::build(&config).expect("plans");
+
+    let clean = reconcile(&engine, &plan, &ReconcileOptions::default())
+        .await
+        .expect("disjoint key spaces reconcile");
+    let rendered = clean.render();
+    assert_eq!(clean.exit_code(), 0, "{rendered}");
+    assert_eq!(clean.tables[0].source_rows, 4, "both tables are counted");
+    assert_eq!(clean.tables[0].diff.compared, 4, "{rendered}");
+
+    // Now give the two tables a key in common — a row `b` has and `a` has too.
+    sql(
+        &connect,
+        &format!("INSERT INTO public.{b} VALUES (1, 'Acme (b)')"),
+    )
+    .await;
+    let err = reconcile(&engine, &plan, &ReconcileOptions::default())
+        .await
+        .expect_err("an overlapping key space is refused rather than reported as drift")
+        .to_string();
+    assert!(err.contains(&a) && err.contains(&b), "got: {err}");
+    assert!(err.contains('1'), "it names the key it found: {err}");
+    assert!(
+        err.contains("one `postgres_cdc` source per upstream table"),
+        "and what to do about it: {err}"
+    );
+
+    for name in [&pipeline_table, &a, &b] {
+        drop_fixtures(&connect, name).await;
+    }
 }

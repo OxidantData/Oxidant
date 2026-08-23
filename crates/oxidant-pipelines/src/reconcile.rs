@@ -590,28 +590,8 @@ pub async fn reconcile(
         for table in &all {
             known.insert(table.qualified());
         }
-        // `--table` names either the pipeline table (take all of its upstream tables) or one
-        // upstream `schema.table` (take just that one). Both spellings are useful: the first is
-        // what `pipeline run --table` takes, the second is what the source's `tables:` lists.
-        let selected: Vec<TableSchema> = if options.tables.is_empty() {
-            all
-        } else if let Some(wanted) = options.tables.iter().find(|w| names_table(w, &name)) {
-            matched.insert(wanted.trim());
-            all
-        } else {
-            all.into_iter()
-                .filter(|table| {
-                    let qualified = table.qualified();
-                    let hit = options.tables.iter().find(|wanted| {
-                        names_table(wanted, &qualified) || names_table(wanted, &table.table)
-                    });
-                    if let Some(wanted) = hit {
-                        matched.insert(wanted.trim());
-                    }
-                    hit.is_some()
-                })
-                .collect()
-        };
+        let (selected, hits) = select_upstream(&options.tables, &name, all);
+        matched.extend(hits);
         if selected.is_empty() {
             continue;
         }
@@ -638,6 +618,52 @@ pub async fn reconcile(
     };
     report.log_events(plan);
     Ok(report)
+}
+
+/// Which of a source's upstream tables a `--table` filter selects, and which entries it explains.
+///
+/// `--table` names either the pipeline table — in which case every upstream table of its source is
+/// in scope — or one upstream `schema.table`, in which case only that one is. Both spellings are
+/// useful and both are documented: the first is what `pipeline run --table` takes, the second is
+/// what the source's `tables:` lists.
+///
+/// The returned set is every entry this source accounted for, and it is deliberately wider than
+/// the selection: an entry naming an upstream table is explained whether or not the *pipeline*
+/// table's name was also given. Marking only the entry that decided the branch is what produced
+/// the report's one self-contradicting error — `--table sales_suppliers --table
+/// public.sales_suppliers` took the pipeline-table branch, left the second entry unaccounted for,
+/// and failed with "`--table public.sales_suppliers` names no postgres_cdc table … (it has:
+/// public.sales_suppliers, sales_suppliers)", listing the very name it said did not exist.
+fn select_upstream<'a>(
+    wanted: &'a [String],
+    pipeline_table: &str,
+    all: Vec<TableSchema>,
+) -> (Vec<TableSchema>, BTreeSet<&'a str>) {
+    if wanted.is_empty() {
+        return (all, BTreeSet::new());
+    }
+    let names_upstream = |entry: &str, table: &TableSchema| {
+        names_table(entry, &table.qualified()) || names_table(entry, &table.table)
+    };
+    let mut matched: BTreeSet<&str> = BTreeSet::new();
+    let mut whole_source = false;
+    for entry in wanted {
+        if names_table(entry, pipeline_table) {
+            matched.insert(entry.trim());
+            whole_source = true;
+        }
+        if all.iter().any(|table| names_upstream(entry, table)) {
+            matched.insert(entry.trim());
+        }
+    }
+    let selected = if whole_source {
+        all
+    } else {
+        all.into_iter()
+            .filter(|table| wanted.iter().any(|entry| names_upstream(entry, table)))
+            .collect()
+    };
+    (selected, matched)
 }
 
 /// Whether a `--table` entry names `candidate`, ignoring case and surrounding space.
@@ -693,6 +719,7 @@ async fn reconcile_table(
     );
 
     let control = pg.connect.connect_control().await?;
+    refuse_overlapping_keys(&control, upstream, &key_columns, name).await?;
     let mut source_rows: u64 = 0;
     for table in upstream {
         source_rows += control
@@ -863,6 +890,95 @@ fn split_columns<'a>(
         .filter(|c| !keys.iter().any(|k| k.eq_ignore_ascii_case(&c.name)))
         .collect();
     Ok((key_columns, value_columns))
+}
+
+/// The probe that finds a key value living in more than one of a source's upstream tables.
+///
+/// `GROUP BY … HAVING count(*) > 1` over the same union the walk reads, projected through the same
+/// [`source_key_text`], so a hit is a duplicate *as the walk would see it* rather than as Postgres
+/// would compare the raw columns.
+fn duplicate_key_sql(upstream: &[TableSchema], key_columns: &[&ColumnSchema]) -> String {
+    let projection: Vec<String> = key_columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{} AS k{i}", source_key_text(c)))
+        .collect();
+    let branches: Vec<String> = upstream
+        .iter()
+        .map(|t| {
+            format!(
+                "SELECT {} FROM {}.{}",
+                projection.join(", "),
+                quote_identifier(&t.schema),
+                quote_identifier(&t.table)
+            )
+        })
+        .collect();
+    let group: Vec<String> = (0..key_columns.len()).map(|i| format!("k{i}")).collect();
+    format!(
+        "SELECT {} FROM ({}) s GROUP BY {} HAVING count(*) > 1 LIMIT 1",
+        group.join(", "),
+        branches.join(" UNION ALL "),
+        group.join(", ")
+    )
+}
+
+/// Refuse a multi-table source whose upstream tables share key values.
+///
+/// A `postgres_cdc` source may declare several upstream tables, and the connector only requires
+/// that they share a *shape* — same column names and types. Reconcile sums their `count(*)` into
+/// one `source_rows` and `UNION ALL`s them into one key window, while `auto_cdc` merges the
+/// combined stream into **one** target keyed on `keys:`, which therefore holds one row per key
+/// value. Two upstream tables each with `id bigint primary key` starting at 1 is the ordinary
+/// case, not a pathological one, and it breaks both comparisons at once: the sum over-counts
+/// against the target's deduplicated rows, and the merge walk — which requires *strictly*
+/// ascending keys, not merely sorted ones — reports the duplicate as missing from a target that
+/// holds it, then reports whichever duplicate sorted first as the one whose contents to compare.
+///
+/// Refusing is the honest answer, and the same one the module gives an unwalkable key type: the
+/// alternative is a report that quietly answers a different question. Namespacing the keys per
+/// upstream table would make the walk self-consistent but not *true* — the target has no column
+/// saying which table a row came from, so there is nothing to namespace the target side by.
+/// (`docs/postgres-cdc.md` §9 already lists a multi-table single source as a v1 non-goal.)
+///
+/// One grouped scan of the union, and only for a source that declares more than one table.
+async fn refuse_overlapping_keys(
+    control: &ControlConnection,
+    upstream: &[TableSchema],
+    key_columns: &[&ColumnSchema],
+    name: &str,
+) -> Result<()> {
+    if upstream.len() < 2 {
+        return Ok(());
+    }
+    let duplicate = control
+        .query(&duplicate_key_sql(upstream, key_columns), &[])
+        .await?;
+    let Some(row) = duplicate.first() else {
+        return Ok(());
+    };
+    let key = row
+        .iter()
+        .map(|v| v.as_deref().unwrap_or(NULL_SENTINEL))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Err(Error::Unsupported(format!(
+        "postgres_cdc table `{name}`: its source replicates {} into one target keyed on `{}`, and they \
+         do not have disjoint key values — `{key}` is in more than one of them. The merge keeps \
+         one row per key, so the union of the sources holds more rows than the target ever \
+         will: every comparison here would report drift that is not there. Declare one \
+         `postgres_cdc` source per upstream table, or give the tables disjoint keys.",
+        upstream
+            .iter()
+            .map(TableSchema::qualified)
+            .collect::<Vec<_>>()
+            .join(", "),
+        key_columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
 }
 
 /// One key column's source projection: the text the key walk compares and orders by.
@@ -1688,6 +1804,69 @@ mod tests {
             source_key_text(&column("id", DataType::Int64)),
             "(\"id\")::text"
         );
+    }
+
+    /// An upstream table fixture: only its name and key columns reach the SQL builders.
+    fn upstream(schema: &str, table: &str) -> TableSchema {
+        TableSchema {
+            schema: schema.to_string(),
+            table: table.to_string(),
+            columns: vec![
+                column("supplierid", DataType::Int64),
+                column("name", DataType::Utf8),
+            ],
+            keys: vec!["supplierid".into()],
+            replica_identity: 'd',
+        }
+    }
+
+    #[test]
+    fn a_table_filter_accounts_for_every_spelling_of_a_table_it_selected() {
+        let all = vec![upstream("public", "sales_suppliers")];
+
+        // No filter: everything, and nothing to account for.
+        let (selected, matched) = select_upstream(&[], "sales_suppliers", all.clone());
+        assert_eq!(selected.len(), 1);
+        assert!(matched.is_empty());
+
+        // Both documented spellings at once. The pipeline-table entry decides the selection, but
+        // the upstream entry is a name this source *does* have — and calling it unmatched is what
+        // produced an error that listed the very name it said did not exist.
+        let wanted = vec![
+            "sales_suppliers".to_string(),
+            " PUBLIC.SALES_SUPPLIERS ".to_string(),
+        ];
+        let (selected, matched) = select_upstream(&wanted, "sales_suppliers", all.clone());
+        assert_eq!(selected.len(), 1, "the whole source is in scope");
+        assert_eq!(
+            matched,
+            BTreeSet::from(["sales_suppliers", "PUBLIC.SALES_SUPPLIERS"]),
+            "case and surrounding space do not decide whether a name exists"
+        );
+
+        // The upstream spelling alone selects just that table, and a name this source does not
+        // have stays unaccounted for — which is what turns a typo into an error rather than a
+        // clean-looking report over the tables that did match.
+        let wanted = vec!["public.sales_suppliers".into(), "public.nope".into()];
+        let (selected, matched) = select_upstream(&wanted, "sales_suppliers", all);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(matched, BTreeSet::from(["public.sales_suppliers"]));
+    }
+
+    #[test]
+    fn a_source_whose_tables_share_a_key_space_is_probed_for_the_overlap() {
+        let tables = [upstream("public", "a"), upstream("public", "b")];
+        let columns = [column("supplierid", DataType::Int64)];
+        let keys: Vec<&ColumnSchema> = columns.iter().collect();
+        let sql = duplicate_key_sql(&tables, &keys);
+        // The same union and the same key spelling the walk itself reads, asked the one question
+        // that decides whether the walk can be trusted at all.
+        assert!(sql.contains("UNION ALL"), "{sql}");
+        assert!(sql.contains("\"public\".\"a\""), "{sql}");
+        assert!(sql.contains("\"public\".\"b\""), "{sql}");
+        assert!(sql.contains("(\"supplierid\")::text AS k0"), "{sql}");
+        assert!(sql.contains("GROUP BY k0 HAVING count(*) > 1"), "{sql}");
+        assert!(sql.contains("LIMIT 1"), "one example is enough: {sql}");
     }
 
     #[test]
