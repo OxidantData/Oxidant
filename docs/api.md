@@ -17,12 +17,14 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/v1/statements/{id}/result` | Result rows as JSON or CSV |
 | `POST` | `/api/v1/statements/{id}/cancel` | Cancel a pending/running statement |
 | `GET` | `/api/v1/cluster/status` | Cluster mode, workers, engine version |
+| `GET` | `/api/v1/logs` | The driver's recent log lines — an in-memory ring buffer of the last 1000 |
 | `GET` | `/api/dashboards` | Dashboards, newest-updated first |
 | `POST` | `/api/dashboards` | Create a dashboard |
 | `GET` | `/api/dashboards/{id}` | One dashboard document |
 | `PATCH` | `/api/dashboards/{id}` | Update name, widgets, layout or refresh interval |
 | `DELETE` | `/api/dashboards/{id}` | Delete a dashboard |
 | `GET` | `/api/status` | Driver status for a control plane — **bearer token required** |
+| `GET` | `/api/v1/pipelines` | Streaming pipelines with a connector log on this driver — **bearer token required** |
 | `GET` | `/api/v1/pipelines/{name}/logs` | Tail of a streaming connector's JSONL log — **bearer token required** |
 
 ## Submit a statement
@@ -238,7 +240,51 @@ endpoint:
 The token itself is redacted from `/api/v1/applications/{id}/environment`, which otherwise
 echoes every `OXIDANT_*` variable.
 
-The same token gates [connector logs](#connector-logs); a leak is a leak of both.
+The same token gates [the pipeline list](#pipelines) and [connector logs](#connector-logs);
+a leak is a leak of all three.
+
+## Pipelines
+
+`GET /api/v1/pipelines` lists the streaming connectors that have written a log under
+`<OXIDANT_CHECKPOINT_DIR>/logs`, newest write first. It is the closest thing to a
+streaming-query registry this port exposes, and it is what the
+[**Pipelines** page](web-ui.md#pipelines) enumerates before tailing each log.
+
+```sh
+curl -s http://localhost:4040/api/v1/pipelines \
+  -H "Authorization: Bearer $OXIDANT_STATUS_TOKEN"
+```
+
+```json
+{
+  "pipelines": [
+    {"name": "orders_live", "sizeBytes": 48213, "modifiedMs": 1755912345678},
+    {"name": "clicks", "sizeBytes": 1204, "modifiedMs": 1755912100000}
+  ],
+  "truncated": false
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `name` | The connector's name — the value to pass as `{name}` to [the tail route](#connector-logs) |
+| `sizeBytes` | Size of the live log file. Not growing between polls is a connector that is not doing anything |
+| `modifiedMs` | Last write, epoch milliseconds on the **driver's** clock, or `null` where the filesystem reports none |
+| `truncated` | `true` when more than 200 logs were found and the list was cut |
+
+Only `<name>.jsonl` is listed. Rotated generations (`<name>.jsonl.1` …) are history, not
+pipelines, and a name the tail route would reject is skipped here too — the list never offers a
+row that `400`s when followed.
+
+Same gate as [`/api/status`](#driver-status), and the same 404s as the tail route (no token, no
+`OXIDANT_CHECKPOINT_DIR`, no `logs/` directory). The one difference: a `logs/` directory that
+exists but is empty answers `200` with an empty list, because "there are no pipelines" is a
+different fact from "this driver cannot tell you", and the UI says different things about them.
+
+> **Streaming work is not in the execution store.** `oxidant-streaming` does not register a
+> micro-batch with the observability store, so `/api/v1/applications/{app}/sql`, `/jobs` and
+> `/stages` contain no streaming executions at all. The connector log is the only per-batch
+> record this API serves. See [web-ui.md](web-ui.md#pipelines).
 
 ## Connector logs
 

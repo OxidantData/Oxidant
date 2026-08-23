@@ -1,10 +1,33 @@
-//! `GET /api/v1/pipelines/{name}/logs?tail=N` — the tail of one connector's JSONL log.
+//! Streaming pipelines, as far as this server can see them: `GET /api/v1/pipelines` lists the
+//! connector logs on disk, and `GET /api/v1/pipelines/{name}/logs?tail=N` tails one of them.
+//!
+//! ## Why the connector log is the *primary* signal, not a detail-drawer extra
+//!
+//! A micro-batch never reaches the observability store. `oxidant-streaming` does not depend on
+//! `oxidant-observability`; the scheduler runs each batch straight through
+//! `Engine::execute_logical_plan` and records its outcome as an in-process `QueryProgress` held
+//! on the `StreamingQuery` (`oxidant-streaming/src/scheduler.rs`). Nothing calls
+//! `QueryTracker::begin` for a batch, so `/api/v1/applications/{app}/sql`, `/jobs` and
+//! `/stages` are **empty of streaming work** — permanently, not just until the first batch
+//! lands. Deriving a pipeline from those surfaces, as the first cut of the Pipelines page did,
+//! cannot ever produce a row for a running `postgres_cdc` pipeline.
+//!
+//! Closing that gap means a per-batch observer on `StreamingQueryManager` plus wiring in
+//! `oxidant-connect` — a change to the streaming engine’s contract, not to this crate. Until
+//! then the connector log is not a consolation prize: it already carries per-batch rows and
+//! duration (`batch`), slot health and replication lag (`slot_metrics`), the confirmed flush
+//! LSN (`commit`), snapshot progress (`snapshot_start` / `snapshot_done`) and the failure text
+//! (`error`) — strictly more than the execution store would have held.
+//!
+//! ## The file
 //!
 //! Streaming connectors (`postgres_cdc` and friends) append one JSON object per line to
-//! `<checkpoints>/logs/<name>.jsonl`, next to the offset/commit logs they already keep. The
-//! Pipelines page in the monitoring UI shows the last few of those events in a pipeline's
-//! detail drawer, which is the only place a connector's own words — "slot created",
-//! "replication stream lost", "snapshot complete" — are visible without shelling into the box.
+//! `<checkpoints>/logs/<name>.jsonl`, next to the offset/commit logs they already keep. That
+//! file is the only place a connector’s own words — "slot metrics", "snapshot done",
+//! "replication stream lost" — are visible without shelling into the box, and its *name* is
+//! the only pipeline registry reachable from here, which is what `GET /api/v1/pipelines`
+//! enumerates. Rotated generations (`<name>.jsonl.1` …) are history, not pipelines, and are
+//! not listed.
 //!
 //! ## Where the file comes from
 //!
@@ -24,14 +47,18 @@
 //! | `<checkpoints>/logs` does not exist | `404` |
 //! | no `<name>.jsonl` in it | `404` |
 //!
-//! The UI reads that 404 as "this build does not serve connector logs" and hides the section,
-//! so the page is correct on a driver whose connectors write no log at all.
+//! The UI reads that 404 as "this build does not serve connector logs" and says so on the
+//! Pipelines page, so the page is correct on a driver whose connectors write no log at all.
+//! `GET /api/v1/pipelines` follows the same rules minus the per-name row, and a logs directory
+//! that exists but holds nothing answers `200` with an empty list: "there are no pipelines" is
+//! a different fact from "this driver cannot tell you", and the page says different things.
 //!
 //! ## Auth
 //!
-//! Guarded by exactly the same bearer token as `/api/status` ([`crate::status::denied`]) —
-//! a connector log names slots, tables and hosts, so it is operational data, not monitoring
-//! decoration.
+//! Both routes are guarded by exactly the same bearer token as `/api/status`
+//! ([`crate::status::denied`]) — a connector log names slots, tables and hosts, so it is
+//! operational data, not monitoring decoration. The *list* is guarded for the same reason: the
+//! set of pipelines a driver is running is itself operational.
 
 use std::path::{Path, PathBuf};
 
@@ -66,6 +93,9 @@ const MAX_TAIL_BYTES: u64 = 1 << 20;
 /// Longest accepted pipeline name. Names address a file, so this is also a bound on how much
 /// of a path a caller gets to choose.
 const MAX_NAME_CHARS: usize = 128;
+/// Most pipelines one listing returns. A logs directory holds one live file per connector, so
+/// this is a backstop against a directory someone else has been writing into, not a page size.
+const MAX_PIPELINES: usize = 200;
 
 /// The configured checkpoint root, if set to something non-blank.
 ///
@@ -75,6 +105,101 @@ pub fn checkpoint_dir_from_env() -> Option<PathBuf> {
     let raw = std::env::var(CHECKPOINT_DIR_ENV).ok()?;
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// One entry of `GET /api/v1/pipelines`.
+///
+/// Deliberately thin: this route knows a file, not a pipeline. Everything a caller would want
+/// to *say* about the pipeline — its state, its slot, its last batch — is inside the log, and
+/// reading it here would make a listing cost what N tails cost.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineEntry {
+    /// The connector's name, which is also the log filename without its extension — the value
+    /// to pass back as `{name}` to [`pipeline_logs`].
+    pub name: String,
+    /// Size of the live log file. A file that is not growing between polls is a connector that
+    /// is not doing anything, which is a signal the events themselves cannot give quickly.
+    pub size_bytes: u64,
+    /// Last-write time, epoch milliseconds, or `null` where the filesystem does not report one.
+    pub modified_ms: Option<u64>,
+}
+
+/// `GET /api/v1/pipelines` — the connector logs this driver can serve, newest write first.
+///
+/// This is the closest thing to a streaming-query registry that is reachable from this crate;
+/// see the module docs for why the execution store is not one.
+pub async fn list_pipelines(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(denied) = status::denied(&state, &headers) {
+        return denied;
+    }
+    let Some(root) = state.checkpoint_dir.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let logs_dir = root.join(LOGS_SUBDIR);
+    if !logs_dir.is_dir() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let read = tokio::task::spawn_blocking(move || read_pipelines(&logs_dir)).await;
+    let mut entries = match read {
+        Ok(Ok(entries)) => entries,
+        // The directory was there a moment ago and cannot be read now: same "nothing here" the
+        // per-name route answers, rather than a 500 the UI would have to render differently.
+        Ok(Err(_)) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    // Newest write first: the pipeline that just committed a batch is the one being looked for.
+    entries.sort_by(|a, b| {
+        b.modified_ms
+            .cmp(&a.modified_ms)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let truncated = entries.len() > MAX_PIPELINES;
+    entries.truncate(MAX_PIPELINES);
+
+    Json(json!({
+        "pipelines": entries,
+        "truncated": truncated,
+    }))
+    .into_response()
+}
+
+/// Every live connector log in `dir`, as [`PipelineEntry`] values.
+///
+/// Only `<name>.jsonl` counts. Rotated generations end `.jsonl.1` … and would otherwise show up
+/// as pipelines named `orders_live.jsonl`; a name the per-name route would reject is skipped
+/// here too, so the list never offers a row that 400s when clicked.
+fn read_pipelines(dir: &Path) -> std::io::Result<Vec<PipelineEntry>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(LOG_EXT) {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !is_plain_name(name) {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(meta) if meta.is_file() => meta,
+            // Raced with a rotation, or not a regular file: not a pipeline.
+            _ => continue,
+        };
+        out.push(PipelineEntry {
+            name: name.to_string(),
+            size_bytes: meta.len(),
+            modified_ms: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64),
+        });
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Deserialize)]
@@ -433,6 +558,125 @@ mod tests {
         let events = out["events"].as_array().unwrap();
         assert_eq!(events.len(), 5);
         assert_eq!(events[4]["i"], 399);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /* ---------- GET /api/v1/pipelines ---------- */
+
+    /// The listing is operational data too: same gate, same "no token, no route".
+    #[tokio::test]
+    async fn the_listing_is_gated_exactly_like_the_tail() {
+        let root = checkpoint_root("orders", &[r#"{"event":"batch"}"#]);
+        let (status, _) = get(
+            router(None, Some(root.clone())),
+            "/api/v1/pipelines",
+            Some(&bearer()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no token configured");
+
+        for auth in [None, Some("Bearer wrong")] {
+            let resp = router(Some(TOKEN), Some(root.clone()))
+                .oneshot({
+                    let mut req = axum::http::Request::builder().uri("/api/v1/pipelines");
+                    if let Some(auth) = auth {
+                        req = req.header(header::AUTHORIZATION, auth);
+                    }
+                    req.body(Body::empty()).unwrap()
+                })
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{auth:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// "This driver cannot tell you" (404) and "there are no pipelines" (200, empty) are
+    /// different answers, because the page says different things about them.
+    #[tokio::test]
+    async fn an_absent_logs_dir_is_404_but_an_empty_one_is_an_empty_list() {
+        let (status, _) = get(
+            router(Some(TOKEN), None),
+            "/api/v1/pipelines",
+            Some(&bearer()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no checkpoint root");
+
+        let bare = std::env::temp_dir().join(format!("oxidant-ckpt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&bare).unwrap();
+        let (status, _) = get(
+            router(Some(TOKEN), Some(bare.clone())),
+            "/api/v1/pipelines",
+            Some(&bearer()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no logs dir");
+
+        std::fs::create_dir_all(bare.join(LOGS_SUBDIR)).unwrap();
+        let (status, body) = get(
+            router(Some(TOKEN), Some(bare.clone())),
+            "/api/v1/pipelines",
+            Some(&bearer()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["pipelines"].as_array().unwrap().len(), 0);
+        assert_eq!(body["truncated"], false);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// Every listed name must be one the tail route will accept — a row the UI offers and then
+    /// 400s on is worse than no row. Rotated generations are history, not pipelines.
+    #[tokio::test]
+    async fn lists_live_logs_only_newest_write_first() {
+        let root = checkpoint_root("orders_live", &[r#"{"event":"batch","rows":3}"#]);
+        let logs = root.join(LOGS_SUBDIR);
+        std::fs::write(logs.join("clicks.jsonl"), "{\"event\":\"commit\"}\n").unwrap();
+        // Not pipelines: a rotated generation, a non-log file, and a name the tail would reject.
+        std::fs::write(logs.join("orders_live.jsonl.1"), "{}\n").unwrap();
+        std::fs::write(logs.join("README.txt"), "notes").unwrap();
+        std::fs::write(logs.join(".hidden.jsonl"), "{}\n").unwrap();
+        std::fs::create_dir_all(logs.join("nested.jsonl")).unwrap();
+
+        let (status, body) = get(
+            router(Some(TOKEN), Some(root.clone())),
+            "/api/v1/pipelines",
+            Some(&bearer()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = body["pipelines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names.contains(&"orders_live") && names.contains(&"clicks"),
+            "{names:?}"
+        );
+
+        // Each entry addresses a real tail.
+        for name in names {
+            let (status, _) = get(
+                router(Some(TOKEN), Some(root.clone())),
+                &format!("/api/v1/pipelines/{name}/logs"),
+                Some(&bearer()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name} is listed but not tailable");
+        }
+
+        let entry = body["pipelines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "orders_live")
+            .unwrap();
+        assert!(entry["sizeBytes"].as_u64().unwrap() > 0);
+        assert!(entry["modifiedMs"].as_u64().is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 

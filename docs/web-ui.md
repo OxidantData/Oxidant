@@ -35,50 +35,104 @@ The UI mirrors the Spark UI layout and is backed by the Spark-compatible
 | **Executors** | The driver plus any connected workers (see [workers.md](workers.md)) |
 | **Environment** | Runtime info, Spark/Oxidant properties, catalog config |
 | **Pipelines** | Streaming pipelines running right now — see [below](#pipelines) |
+| **Observability** | Driver logs, jobs expanded into their stages, and SQL executions on one screen — see [below](#observability) |
 
 ## Pipelines
 
 The **Pipelines** page watches streaming pipelines while they run: one row per pipeline, with
-its source (`PostgresCdcV1[orders_slot]`, `KafkaV2[Subscribe[clicks]]`), state, trigger
-interval, last batch and its rows and duration, rows/sec over the last minute, and the source
-position where one is exposed. Click a row for a detail drawer: recent batch history, source
-and sink positions, the error text, and the connector's own log.
+its source, state, observed trigger interval, last batch and its rows and duration, rows/sec
+over the last minute, the confirmed flush LSN and how much WAL its replication slot is holding.
+Click a row for a detail drawer: batch history, slot and snapshot positions, connector
+warnings, the error text, and the connector's own log tail.
+
+### Streaming work is not in the execution store
+
+A streaming micro-batch is **never registered with the observability store**. `oxidant-streaming`
+does not depend on `oxidant-observability`; the scheduler runs each batch straight through
+`Engine::execute_logical_plan` and records the result as an in-process `QueryProgress` on the
+`StreamingQuery`. Nothing calls `QueryTracker::begin` for a batch.
+
+So the **Jobs**, **Stages**, **SQL** and **Observability** pages hold no streaming work — not
+"until the first batch lands", but permanently, and a page derived from them would be
+permanently empty against a running `postgres_cdc` pipeline. Closing that gap means a per-batch
+observer on `StreamingQueryManager` plus wiring in `oxidant-connect`; that is a change to the
+streaming engine's contract, not to the UI.
+
+Until it lands, this page reads **the connector's own JSONL log**, which is not a consolation
+prize — it carries more than the execution store would have:
+
+| Connector event | What the page reads from it |
+|-----------------|-----------------------------|
+| `batch` | Rows, duration, and the LSN range the batch covered. A `replay: true` line marks a re-read (`↻` in the drawer) |
+| `slot_metrics` | WAL retained by the slot, replication lag, server flush LSN, reader position |
+| `commit` | The confirmed flush LSN — and whether it was actually **announced to the publisher**, because a position committed locally but never sent leaves the slot growing |
+| `snapshot_start` / `snapshot_done` | The introspected table list (which is where the `PostgresCDC[…]` source string comes from), backfill rows, and the consistent point |
+| `schema_change`, `large_transaction`, `value_dropped` | The connector-warnings list in the drawer |
+| `error` | The failure banner. `will_retry` is the difference between *retrying* and *stopped* |
 
 ### Where the numbers come from
 
-There is no "list my streaming queries" endpoint — that registry lives in the engine, which
-this server cannot depend on — so a pipeline is *derived*, and the derivation is worth knowing:
-
 | Source | What it contributes |
 |--------|---------------------|
-| `/api/v1/applications/{app}/sql` | Every micro-batch execution with its plan, status and duration. An execution belongs to a pipeline when its description or plan names a streaming source |
-| `/api/v1/applications/{app}/jobs` + `/stages` | A batch's row count, summed over the stages its execution actually ran |
-| [`/api/status`](api.md#driver-status) | The live view the SQL history lags behind: which queries are running *now*. Bearer-token guarded, so optional — without a token the page still works, one poll behind |
-| [`/api/v1/events/stream`](api.md) | Already drives the 2 s refresh; a batch boundary repaints this page for free |
-| [`/api/v1/pipelines/{name}/logs`](api.md#connector-logs) | The connector's own JSONL log tail, in the drawer. `404` on a driver that serves none, and the section simply is not there |
+| [`/api/v1/pipelines`](api.md#pipelines) | Which pipelines exist. There is no streaming-query registry this server can reach, so the set of connector logs on disk is the registry |
+| [`/api/v1/pipelines/{name}/logs`](api.md#connector-logs) | Everything in the table above. Tailed once per pipeline per poll, for the 12 most recently written |
+| [`/api/status`](api.md#driver-status) | A cross-check only: whether the driver also thinks a query by this name is running. Never the reason a pipeline is on the page |
 
-Only `/api/status` needs a poll of its own (every 5 s, and only while the page is on screen).
+All three are bearer-token guarded, so **this page needs the status token** — without one it
+says so rather than showing "no pipelines".
 
-Two numbers are **observed rather than reported**, and the page labels them:
+Three numbers are **observed rather than reported**, and the page labels them:
 
 - **Trigger interval** — the median gap between batch starts, not a configured value.
 - **Rows/sec** — rows in the last minute over the span those batches covered.
+- **Liveness** — how long since the newest logged event. Those stamps are on the *driver's*
+  clock and `now` is the browser's, so the "running" window is floored at 30 seconds rather
+  than cut fine.
 
-Nothing else is estimated. A batch id shown as `#3` is this page's ordinal, not the engine's:
-that driver's execution descriptions carry no batch id.
+Batch numbers shown `#3` are the page's ordinals over the log tail it holds: the connector log
+records LSN ranges, not batch ids. **Sink is absent, not blank** — the connector log does not
+record one, and the page does not guess.
 
-### The status token
+A query started through Spark Connect `readStream()` has no checkpoint root to log under and so
+will not appear; a pipeline declared in [`oxidant.yaml`](config.md) will.
 
-The batch history comes from the unauthenticated execution API and needs nothing. The live
-query state and the connector logs come from `/api/status` and `/api/v1/pipelines/…/logs`,
-which are gated behind `OXIDANT_STATUS_TOKEN` (see [api.md](api.md#driver-status)). Paste that
-token into the field at the bottom of the page to light them up; it is kept in this browser's
-`localStorage` and sent to this driver only. Without it the page shows a `no token` chip and
-keeps working from the execution history alone.
+### The status token and the checkpoint root
 
-Connector logs additionally need `OXIDANT_CHECKPOINT_DIR` set to the pipeline checkpoint root —
-the same absolute path as `pipeline.checkpoints` in [`oxidant.yaml`](config.md). Unset, the
-drawer has no connector-log section at all.
+Paste `OXIDANT_STATUS_TOKEN` into the field at the bottom of the page; it is kept in this
+browser's `localStorage` and sent to this driver only. The **Observability** page reuses the
+same stored token.
+
+The driver additionally needs `OXIDANT_CHECKPOINT_DIR` set to the pipeline checkpoint root —
+the same absolute path as `pipeline.checkpoints` in [`oxidant.yaml`](config.md). Unset,
+`/api/v1/pipelines` answers `404` and the page says the driver serves no connector logs.
+
+## Observability
+
+The **Observability** page is "what is this driver doing right now", on three surfaces:
+
+| Section | Source | Shows |
+|---------|--------|-------|
+| **Server logs** | [`/api/v1/logs`](api.md) | A tail of the driver's in-memory ring buffer (last 1000 lines) on the terminal surface. Level filter chips — `error` / `warn` / `info` / `debug`, matched on the line's `[LEVEL]` prefix — a **Pause** button, and a caption saying how many lines are on screen. Auto-refreshes every 5 s and stays pinned to the newest line unless you scroll up into it |
+| **Jobs & stages** | `/api/v1/applications/{app}/jobs` + `/stages` | One row per job — id, name, status, duration, stages done/total — expanding in place into its stages, with shuffle read/write where the stage reports any |
+| **SQL queries** | `/api/v1/applications/{app}/sql` | Every execution the store holds — Spark Connect sessions, the REST statement API, the Editor — with status, duration and a row count |
+
+Only the log tail needs a poll of its own; jobs, stages and SQL already ride the page's 2 s
+refresh and the SSE event stream, and fetching them twice would double the load for no extra
+freshness. The log pane sends the stored driver token if there is one — `/api/v1/logs` is not
+gated today, but a driver behind an auth proxy is.
+
+One number is **derived**, and the column says so: an execution's row count. The store records
+a plan, a status and a duration for an execution but not its cardinality, so rows are summed
+over the stages that execution's jobs ran.
+
+Two absences the page states rather than hides:
+
+- `/api/v1/logs` is served by the engine's REST router, so a standalone history server has no
+  log buffer at all. The pane says that instead of showing an empty box.
+- Statements run from the **Editor** appear both here and in the Editor's own recent-statements
+  rail, and the two are not yet one query history — [issue #134](https://github.com/OxidantData/oxidant/issues/134).
+
+Streaming micro-batches are **not** on this page; see [Pipelines](#pipelines) for why.
 
 ## Theme
 
@@ -98,14 +152,15 @@ platform console rather than a different product:
 | **Card** with an eyebrow over its title | Every section |
 | **Metric tiles** — hairline-separated cells sharing one border | Rows of numbers that belong together |
 | **Detail drawer** — a right-hand sheet over a scrim | Pipeline detail. The only shadow in the UI, and it exists only while the sheet is open |
+| **Filter chip** — a chip that is also a control | Log level filters. Off is a hairline outline, on is the raised slab; the dot keeps the level's hue in both, dimmed when off |
 
 Colour is reserved for status, and only for status:
 
 | Colour | Means |
 |--------|-------|
-| Green | Succeeded / completed, and "faster than Spark" on the Compare page |
-| Amber | Running, pending, truncated results, "slower than Spark" |
-| Red | Failed — a failed job, a rejected statement, a failing pipeline |
+| Green | Succeeded / completed |
+| Amber | Running, pending, truncated results, a `warn` log line |
+| Red | Failed — a failed job, a rejected statement, a stopped pipeline, an `error` log line |
 
 `danger` and the chip tints are the only tokens the engine adds to the website's set: the
 marketing site renders nothing that can fail or be in flight. Both are semantic, never

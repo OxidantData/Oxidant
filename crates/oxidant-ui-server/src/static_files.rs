@@ -104,7 +104,7 @@ mod tests {
             "notebook",
             "executors",
             "environment",
-            "compare",
+            "observability",
         ] {
             assert!(
                 EMBEDDED_INDEX.contains(&format!("data-tab=\"{tab}\"")),
@@ -116,10 +116,35 @@ mod tests {
             );
         }
 
-        // The Pipelines page reads these three surfaces and nothing else.
-        assert!(EMBEDDED_INDEX.contains("/api/v1/pipelines/"));
+        // The Pipelines page reads the connector logs — the pipeline *list* and one tail per
+        // pipeline — plus `/api/status` as a cross-check. Streaming work never reaches the
+        // execution store, so deriving this page from `/sql` would leave it permanently empty;
+        // see `crate::pipelines`.
+        assert!(EMBEDDED_INDEX.contains("fetch('/api/v1/pipelines'"));
+        assert!(EMBEDDED_INDEX.contains("/api/v1/pipelines/' + encodeURIComponent(name)"));
         assert!(EMBEDDED_INDEX.contains("/api/status?limit="));
         assert!(EMBEDDED_INDEX.contains("/api/v1/events/stream"));
+
+        // The Observability page reads these three, and the log buffer is the only one of them
+        // that is not already on refresh().
+        assert!(EMBEDDED_INDEX.contains("fetch('/api/v1/logs'"));
+        assert!(EMBEDDED_INDEX.contains("api('/jobs')"));
+        assert!(EMBEDDED_INDEX.contains("api('/stages?details=true')"));
+        assert!(EMBEDDED_INDEX.contains("api('/sql')"));
+
+        // The Compare page and the Spark proxy that existed only to feed it are gone; nothing
+        // in the console reaches for another engine's UI.
+        for gone in [
+            "spark-proxy",
+            "data-tab=\"compare\"",
+            "panel-compare",
+            "compare-grid",
+        ] {
+            assert!(
+                !EMBEDDED_INDEX.contains(gone),
+                "the removed Compare page left `{gone}` behind"
+            );
+        }
 
         // The platform component vocabulary, as classes the JS actually emits.
         for class in [
@@ -129,6 +154,8 @@ mod tests {
             ".metric",
             ".drawer",
             ".eyebrow",
+            ".filter-chip",
+            ".logwrap",
         ] {
             assert!(
                 EMBEDDED_INDEX.contains(&format!("{class} "))

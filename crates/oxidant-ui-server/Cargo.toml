@@ -19,7 +19,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"]
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 futures = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tracing = "0.1"
 # Server-generated dashboard ids (also the on-disk filename).
 uuid = { version = "1", features = ["v4"] }

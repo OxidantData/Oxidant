@@ -162,8 +162,6 @@ export const api = {
   executors: () => get<ExecutorSummary[]>(`${base}/executors`),
   environment: () =>
     get<{ sparkProperties: Record<string, string> }>(`${base}/environment`),
-  sparkProxy: (url: string) =>
-    get<unknown>(`/api/v1/spark-proxy?url=${encodeURIComponent(url)}`),
   statements: {
     list: () => get<{ statements: StatementSummary[] }>("/api/v1/statements"),
     submit: (sql: string, waitTimeoutSecs = 60) =>

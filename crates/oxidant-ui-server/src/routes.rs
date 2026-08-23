@@ -1,9 +1,9 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::StatusCode,
     response::{
         sse::{Event, KeepAlive},
-        IntoResponse, Response, Sse,
+        Sse,
     },
     routing::get,
     Json, Router,
@@ -23,12 +23,12 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub store: SharedStore,
-    /// Shared bearer token guarding `GET /api/status` and the pipeline connector-log tail.
-    /// `None` disables both endpoints; nothing else on this server is authenticated.
-    /// See [`crate::status`].
+    /// Shared bearer token guarding `GET /api/status` and both pipeline routes (the listing
+    /// and the connector-log tail). `None` disables all three; nothing else on this server is
+    /// authenticated. See [`crate::status`].
     pub status_token: Option<std::sync::Arc<str>>,
     /// Pipeline checkpoint root ([`pipelines::CHECKPOINT_DIR_ENV`]), under which connector
-    /// logs live. `None` — the default — makes the connector-log route answer 404.
+    /// logs live. `None` — the default — makes both pipeline routes answer 404.
     pub checkpoint_dir: Option<std::sync::Arc<std::path::Path>>,
 }
 
@@ -44,11 +44,6 @@ pub struct StageQuery {
     #[serde(rename = "withSummaries")]
     #[allow(dead_code)]
     pub with_summaries: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SparkProxyQuery {
-    pub url: String,
 }
 
 /// Router with the status token taken from `OXIDANT_STATUS_TOKEN` and dashboards persisted
@@ -113,12 +108,12 @@ pub fn app_router_with_spa(
             "/api/v1/applications/{app_id}/environment",
             get(list_environment),
         )
+        .route("/api/v1/pipelines", get(pipelines::list_pipelines))
         .route(
             "/api/v1/pipelines/{name}/logs",
             get(pipelines::pipeline_logs),
         )
         .route("/api/v1/events/stream", get(events_stream))
-        .route("/api/v1/spark-proxy", get(spark_proxy))
         .route("/health", get(|| async { "ok" }));
 
     // Either the built React app on disk, or the page compiled into the binary. `ServeDir`'s
@@ -219,43 +214,6 @@ async fn events_stream(
         }
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
-}
-
-async fn spark_proxy(Query(q): Query<SparkProxyQuery>) -> Result<Response, StatusCode> {
-    let url = q.url.trim();
-    if url.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    // Basic SSRF guard: only allow localhost and private ranges for dev.
-    if !is_allowed_proxy_url(url) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let body = resp.bytes().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
-    Ok((status, [(header::CONTENT_TYPE, "application/json")], body).into_response())
-}
-
-fn is_allowed_proxy_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.contains("localhost")
-        || lower.contains("127.0.0.1")
-        || lower.contains("0.0.0.0")
-        || lower.contains("::1")
-        || lower.contains("192.168.")
-        || lower.contains("10.")
-        || lower.contains(".local")
 }
 
 #[cfg(test)]

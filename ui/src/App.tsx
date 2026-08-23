@@ -11,7 +11,6 @@ import NotebookPage from "@/pages/NotebookPage";
 import CatalogPage from "@/pages/CatalogPage";
 import ExecutorsPage from "@/pages/ExecutorsPage";
 import EnvironmentPage from "@/pages/EnvironmentPage";
-import ComparePage from "@/pages/ComparePage";
 import ClusterPage from "@/pages/ClusterPage";
 
 // Dashboards are the only pages that pull in ECharts, react-grid-layout and TanStack Table —
@@ -31,7 +30,6 @@ const tabs = [
   { to: "/cluster", label: "Cluster" },
   { to: "/executors", label: "Executors" },
   { to: "/environment", label: "Environment" },
-  { to: "/compare", label: "Compare" },
 ];
 
 function ThemeToggle() {
@@ -99,7 +97,6 @@ export default function App() {
             <Route path="/cluster" element={<ClusterPage />} />
             <Route path="/executors" element={<ExecutorsPage />} />
             <Route path="/environment" element={<EnvironmentPage />} />
-            <Route path="/compare" element={<ComparePage />} />
           </Routes>
         </Suspense>
       </main>
