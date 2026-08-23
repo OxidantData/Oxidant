@@ -14,9 +14,11 @@
 //! Two properties of this module matter more than its size:
 //!
 //! - **Nothing here advances the slot.** [`ReplicationConnection::send_standby`] is the only
-//!   call that tells Postgres it may recycle WAL, and it is never made from a read path. The
-//!   source calls it once a batch is durable in the sink *and* in the checkpoint, which is what
-//!   keeps a crashed batch's range re-readable — see [`crate::postgres_cdc`].
+//!   call that tells Postgres it may recycle WAL, and this module never makes it on its own —
+//!   the position it carries is always chosen by the source, which sends the LSN a batch made
+//!   durable in the sink *and* in the checkpoint, and never one past it. A keepalive answer
+//!   re-sends that same LSN, so it moves the slot nowhere. That is what keeps a crashed batch's
+//!   range re-readable — see [`crate::postgres_cdc`].
 //! - **Decoding is pure.** [`decode_wire`] and [`decode_logical`] take bytes and return
 //!   messages, so the whole format is testable against constructed frames without a server.
 

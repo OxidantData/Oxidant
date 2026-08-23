@@ -9,11 +9,18 @@
 //!
 //! **The slot is only ever advanced by a durable batch.** Postgres keeps WAL until a consumer
 //! confirms it, and confirming is the one irreversible act here: WAL past `confirmed_flush_lsn`
-//! is gone. So the standby status update lives in [`Source::mark_durable`] — after the sink write
-//! *and* after the checkpoint save — and nowhere else. Everything a batch read is therefore
-//! still on the server if the batch dies, which is what makes a replayed range reproducible and
-//! turns the offset log into exactly-once. Reading ahead of the confirmed position costs nothing
-//! but memory; confirming ahead of the checkpoint costs data.
+//! is gone. So the position a standby status update carries is always `self.position` — the last
+//! batch the sink *and* the checkpoint both hold — and never one byte past it. Everything a batch
+//! read is therefore still on the server if the batch dies, which is what makes a replayed range
+//! reproducible and turns the offset log into exactly-once. Reading ahead of the confirmed
+//! position costs nothing but memory; confirming ahead of the checkpoint costs data.
+//!
+//! Two calls send that message, and they send the same number. [`Source::mark_durable`] sends it
+//! after a batch commits, which is what moves the slot. A keepalive answer sends it when the
+//! publisher asks for a reply, or on a timer when the source has been silent for
+//! `status_interval` — a walsender hangs up on a standby that says nothing for
+//! `wal_sender_timeout`, so an idle pipeline has to speak, and re-sending an unchanged position
+//! grants the server nothing.
 //!
 //! **`plan_batch` reads, and consumes nothing.** A WAL range's extent is not knowable without
 //! decoding it: the byte budget is spent on *change* bytes, and the range must end on a commit
@@ -79,6 +86,14 @@ const DEFAULT_MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// Rows per emitted Arrow batch. Named for the snapshot because that is where it matters — a
 /// whole source table arrives as one micro-batch — but a WAL batch is chunked by it too.
 const DEFAULT_SNAPSHOT_BATCH_ROWS: usize = 65_536;
+/// How often an otherwise silent source sends a standby status update.
+///
+/// Postgres' walsender asks for a reply once it has not heard from the standby for
+/// `wal_sender_timeout / 2` and hangs up at `wal_sender_timeout` — 60 seconds by default. A
+/// pipeline over a quiet table would otherwise be killed overnight for having nothing to say, so
+/// it speaks on a timer well inside that window even when it is completely caught up. The
+/// message carries the position already committed, so it grants the server nothing.
+const DEFAULT_STATUS_MS: u64 = 20_000;
 /// How long planning waits for more WAL before deciding the publisher is caught up.
 ///
 /// Only ever paid when the batch has *not* yet covered the flush LSN it is aiming at, so an idle
@@ -205,6 +220,8 @@ pub struct PostgresCdcOptions {
     pub max_batch_bytes: usize,
     pub snapshot_batch_rows: usize,
     pub idle: Duration,
+    /// How often to send a standby status update when there is nothing else to say.
+    pub status_interval: Duration,
     /// Where the connector's JSONL log goes, injected by the pipeline runner.
     pub log_dir: Option<PathBuf>,
     /// The pipeline table this source feeds, used to name the log file.
@@ -360,6 +377,15 @@ impl PostgresCdcOptions {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(DEFAULT_IDLE_MS),
+            ),
+            // Not a YAML option: the only right value is "comfortably under the publisher's
+            // `wal_sender_timeout`", which is not something a pipeline author should have to
+            // reason about. The environment variable exists so a test can make it fire at once.
+            status_interval: Duration::from_millis(
+                std::env::var("OXIDANT_PG_CDC_STATUS_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(DEFAULT_STATUS_MS),
             ),
             log_dir: options.get(LOG_DIR_OPTION).map(PathBuf::from),
             name: options
@@ -781,7 +807,12 @@ pub(crate) trait CdcWire: Send + Sync {
     /// The next frame, or `None` when the publisher stayed quiet for `idle`.
     async fn next_wire(&mut self, idle: Duration) -> Result<Option<WireMessage>>;
     /// Tell the server it may recycle WAL up to `flushed`.
-    async fn confirm(&mut self, written: Lsn, flushed: Lsn) -> Result<()>;
+    ///
+    /// Returns whether a standby status update was actually sent. There is no session to send
+    /// one on during the snapshot, and none after a connection failure, and a caller that logs
+    /// "confirmed" for a message that never left the process gives an operator a connector log
+    /// that disagrees with `pg_replication_slots` for no visible reason.
+    async fn confirm(&mut self, written: Lsn, flushed: Lsn) -> Result<bool>;
     async fn slot_metrics(&mut self) -> Result<SlotMetrics>;
 }
 
@@ -824,6 +855,71 @@ impl PgWire {
         }
         Ok(self.replication.as_mut().expect("just connected"))
     }
+
+    /// Forget the replication session when a call on it failed.
+    ///
+    /// A dead socket is only ever discovered by using it, and every caller here is one retry
+    /// away from asking again. Dropping the session is what makes the next attempt dial a fresh
+    /// one and re-issue `START_REPLICATION` from the checkpointed position — without it, a
+    /// publisher restart or an idle `wal_sender_timeout` answers every retry with the same error
+    /// until the process is restarted. Cheap and idempotent: reconnecting costs one handshake,
+    /// and the slot holds the WAL either way.
+    fn forget_on_error<T>(&mut self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            self.replication = None;
+        }
+        result
+    }
+
+    /// Drop the slot, waiting a bounded time for whoever holds it to let go.
+    ///
+    /// `DROP_REPLICATION_SLOT … WAIT` blocks until the slot goes inactive, and there is no
+    /// statement timeout on a replication session to bound it — one can be set, but it would
+    /// then also apply to the snapshot `FETCH`es, which are allowed to take as long as the table
+    /// is big. So the wait is done here instead: poll `pg_replication_slots.active_pid` until it
+    /// clears, then drop a slot that is already inactive. A pipeline started twice onto one
+    /// `slot:` gets a diagnosis naming the process holding it rather than a start that hangs
+    /// forever with nothing in the log.
+    async fn drop_slot(&mut self, slot: &str) -> Result<()> {
+        const WAIT: Duration = Duration::from_secs(30);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let held = self
+                .control()
+                .await?
+                .query(
+                    "SELECT active_pid::text FROM pg_replication_slots \
+                     WHERE slot_name::text = $1 AND active_pid IS NOT NULL",
+                    &[slot],
+                )
+                .await?;
+            let Some(pid) = held
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| v.clone())
+            else {
+                break;
+            };
+            if Instant::now() >= deadline {
+                return Err(Error::Execution(format!(
+                    "postgres_cdc: replication slot `{slot}` has to be recreated to restart an \
+                     interrupted snapshot, but backend pid {pid} has held it for {}s. That is \
+                     usually a previous run of this pipeline that has not exited, or a second \
+                     pipeline pointed at the same `slot:`. Stop it (or give this pipeline a slot \
+                     of its own); if the holder is gone, clear it with \
+                     `SELECT pg_terminate_backend({pid});`.",
+                    WAIT.as_secs()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let dropped = self
+            .replication()
+            .await?
+            .execute(&format!("DROP_REPLICATION_SLOT {}", quote_identifier(slot)))
+            .await;
+        self.forget_on_error(dropped)
+    }
 }
 
 #[async_trait::async_trait]
@@ -861,29 +957,27 @@ impl CdcWire for PgWire {
             });
         }
 
-        let connection = self.replication().await?;
         if existed {
             // Nothing durable depends on the old slot: `create` is only ever asked for when the
             // snapshot has not completed, so no batch has been committed against it.
-            connection
-                .execute(&format!(
-                    "DROP_REPLICATION_SLOT {} WAIT",
-                    quote_identifier(&slot)
-                ))
-                .await?;
+            self.drop_slot(&slot).await?;
         }
         // `CREATE_REPLICATION_SLOT … USE_SNAPSHOT` must be the first command of its transaction,
         // and the transaction has to outlive the command — that is what keeps the snapshot
         // readable for the COPY that follows.
-        connection
+        let connection = self.replication().await?;
+        let begun = connection
             .execute("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ")
-            .await?;
+            .await;
+        self.forget_on_error(begun)?;
+        let connection = self.replication().await?;
         let created = connection
             .simple_query(&format!(
                 "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput USE_SNAPSHOT",
                 quote_identifier(&slot)
             ))
-            .await?;
+            .await;
+        let created = self.forget_on_error(created)?;
         let consistent_point = created.first("consistent_point").ok_or_else(|| {
             Error::Io(format!(
                 "postgres_cdc: CREATE_REPLICATION_SLOT `{slot}` returned no consistent_point"
@@ -904,11 +998,13 @@ impl CdcWire for PgWire {
             quote_identifier(&table.schema),
             quote_identifier(&table.table)
         );
-        Ok(self.replication().await?.simple_query(&sql).await?.rows)
+        let rows = self.replication().await?.simple_query(&sql).await;
+        Ok(self.forget_on_error(rows)?.rows)
     }
 
     async fn end_snapshot(&mut self) -> Result<()> {
-        self.replication().await?.execute("COMMIT").await
+        let done = self.replication().await?.execute("COMMIT").await;
+        self.forget_on_error(done)
     }
 
     async fn start_stream(&mut self, start: Lsn) -> Result<()> {
@@ -921,24 +1017,31 @@ impl CdcWire for PgWire {
             self.replication = None;
         }
         let (slot, publication) = (self.slot.clone(), self.publication.clone());
-        self.replication()
+        let started = self
+            .replication()
             .await?
             .start_replication(&slot, &publication, start)
-            .await
+            .await;
+        self.forget_on_error(started)
     }
 
     async fn next_wire(&mut self, idle: Duration) -> Result<Option<WireMessage>> {
-        self.replication().await?.next_wire(idle).await
+        let next = self.replication().await?.next_wire(idle).await;
+        self.forget_on_error(next)
     }
 
-    async fn confirm(&mut self, written: Lsn, flushed: Lsn) -> Result<()> {
+    async fn confirm(&mut self, written: Lsn, flushed: Lsn) -> Result<bool> {
         match self.replication.as_mut() {
             Some(connection) if connection.is_streaming() => {
-                connection.send_standby(written, flushed).await
+                let sent = connection.send_standby(written, flushed).await;
+                self.forget_on_error(sent)?;
+                Ok(true)
             }
             // Nothing to confirm against: the next `START_REPLICATION` will begin from the
-            // checkpointed position anyway, and the slot keeps the WAL until then.
-            _ => Ok(()),
+            // checkpointed position anyway, and the slot keeps the WAL until then. The caller
+            // reports the `false` so the connector log never claims a confirmation the server
+            // was never told about.
+            _ => Ok(false),
         }
     }
 
@@ -1020,6 +1123,9 @@ pub struct PostgresCdcSource {
     stream_at: Option<Lsn>,
     /// The events `plan_batch` decoded, held for the poll of the range it described.
     planned: Option<(BatchRange, Vec<ChangeEvent>)>,
+    /// When a standby status update was last sent, so an idle stream still answers the walsender
+    /// before `wal_sender_timeout` runs out.
+    last_status: Instant,
 }
 
 impl PostgresCdcSource {
@@ -1071,6 +1177,9 @@ impl PostgresCdcSource {
             snapshot_open: false,
             stream_at: None,
             planned: None,
+            // A source that has just started has nothing to keep alive yet, and the first
+            // interval is measured from here rather than from the epoch.
+            last_status: Instant::now(),
         }
     }
 
@@ -1172,12 +1281,49 @@ impl PostgresCdcSource {
         Ok(metrics)
     }
 
+    /// Send a standby status update carrying the committed position, and nothing past it.
+    ///
+    /// `flushed` is the number that lets Postgres recycle WAL, so it is always `self.position` —
+    /// what a restart would resume from. Re-sending an unchanged position is free: it moves the
+    /// slot nowhere and tells the walsender the standby is alive, which is the whole point of
+    /// answering a keepalive.
+    async fn confirm_position(&mut self) -> Result<bool> {
+        let sent = self.wire.confirm(self.position, self.position).await?;
+        self.last_status = Instant::now();
+        Ok(sent)
+    }
+
+    /// Speak up if the source has been silent for `status_interval`.
+    async fn heartbeat(&mut self) -> Result<()> {
+        if self.last_status.elapsed() < self.options.status_interval {
+            return Ok(());
+        }
+        let sent = self.confirm_position().await?;
+        self.log.event(
+            "standby_status",
+            json!({
+                "reason": "keepalive",
+                "confirmed_flush_lsn": self.position.to_string(),
+                "sent": sent,
+            }),
+        );
+        Ok(())
+    }
+
     /// Point the replication stream at `start`, restarting it when it is somewhere else.
+    ///
+    /// `stream_at` is a claim about a socket, so it is only ever true while that socket is
+    /// healthy: any failure forgets it, and the next attempt dials again and re-issues
+    /// `START_REPLICATION` from the checkpointed position. Believing it after an I/O error is
+    /// what turns a publisher restart into a permanently wedged pipeline.
     async fn ensure_stream(&mut self, start: Lsn) -> Result<()> {
         if self.stream_at == Some(start) {
             return Ok(());
         }
-        self.wire.start_stream(start).await?;
+        if let Err(e) = self.wire.start_stream(start).await {
+            self.stream_at = None;
+            return Err(e);
+        }
         self.stream_at = Some(start);
         Ok(())
     }
@@ -1199,20 +1345,58 @@ impl PostgresCdcSource {
         let mut bytes_seen = 0usize;
         let mut end = from;
         let mut observed = from;
+        // Whether the stream is between a `Begin` and its `Commit`, which is *not* the same
+        // question as whether `open_txn` holds anything: a transaction touching only tables this
+        // source does not replicate, or carrying only ops `publish_ops` excludes, leaves
+        // `open_txn` empty while the stream is very much mid-transaction. Reading the one for the
+        // other is what let an earlier version end — and confirm — a range inside an open
+        // transaction.
+        let mut in_txn = false;
 
         loop {
             // A batch that has already covered whole transactions stops as soon as it has
             // reached either the flush LSN it was aiming at or its byte budget. Both tests are
             // made between transactions so a batch never ends inside one.
-            if open_txn.is_empty() && (observed >= stop_at || bytes_seen >= byte_budget) {
+            if !in_txn && (observed >= stop_at || bytes_seen >= byte_budget) {
                 break;
             }
-            let Some(message) = self.wire.next_wire(self.options.idle).await? else {
+            let next = match self.wire.next_wire(self.options.idle).await {
+                Ok(next) => next,
+                Err(e) => {
+                    // The socket is gone. Forget where the stream was so the next attempt dials
+                    // a fresh one rather than reading from a dead one forever.
+                    self.stream_at = None;
+                    return Err(e);
+                }
+            };
+            let Some(message) = next else {
                 // The publisher went quiet. Whatever it has sent is what this batch covers.
                 break;
             };
             match message {
-                WireMessage::Keepalive { wal_end, .. } => observed = observed.max(wal_end),
+                WireMessage::Keepalive {
+                    wal_end,
+                    reply_requested,
+                    ..
+                } => {
+                    observed = observed.max(wal_end);
+                    // "Answer me or I will hang up": the walsender sets this once it has not
+                    // heard from the standby for `wal_sender_timeout / 2`, and closes the socket
+                    // at `wal_sender_timeout`. The answer carries the position already
+                    // committed — never one past it — so replying costs the durability contract
+                    // nothing and costs the pipeline its connection if it is skipped.
+                    if reply_requested {
+                        let sent = self.confirm_position().await?;
+                        self.log.event(
+                            "standby_status",
+                            json!({
+                                "reason": "reply_requested",
+                                "confirmed_flush_lsn": self.position.to_string(),
+                                "sent": sent,
+                            }),
+                        );
+                    }
+                }
                 WireMessage::XLogData {
                     wal_start,
                     wal_end,
@@ -1223,13 +1407,17 @@ impl PostgresCdcSource {
                     bytes_seen += data.len();
                     match decode_logical(&data)? {
                         LogicalMessage::Relation(relation) => self.remember(relation),
-                        LogicalMessage::Begin { .. } => open_txn.clear(),
+                        LogicalMessage::Begin { .. } => {
+                            in_txn = true;
+                            open_txn.clear();
+                        }
                         LogicalMessage::Commit {
                             end_lsn,
                             commit_time,
                             ..
                         } => {
                             observed = observed.max(end_lsn);
+                            in_txn = false;
                             // Postgres restarts a stream at the oldest *unconfirmed*
                             // transaction, which can be older than the LSN asked for. A
                             // transaction that ended at or before `from` is already downstream,
@@ -1281,15 +1469,15 @@ impl PostgresCdcSource {
         // transaction still to come, and reading on from there would drop it: its `Begin` and
         // its earlier rows are already consumed. Forgetting the position forces the next read to
         // re-seek from the committed one, which replays the whole transaction.
-        self.stream_at = if open_txn.is_empty() {
-            Some(end.max(from))
-        } else {
-            None
-        };
-        if committed.is_empty() && open_txn.is_empty() {
-            // No change in this stretch of WAL belongs to the publication. Confirming it is safe
-            // — there is nothing in it to lose — and it is what stops a slot on a busy server
-            // from growing forever while a quiet table has nothing to say.
+        self.stream_at = if in_txn { None } else { Some(end.max(from)) };
+        if committed.is_empty() && !in_txn {
+            // No change in this stretch of WAL belongs to the publication, and the stream is
+            // between transactions — so `observed` is a commit boundary and covering up to it
+            // loses nothing. That is what stops a slot on a busy server from growing forever
+            // while a quiet table has nothing to say. The `!in_txn` test is load bearing: an
+            // *open* transaction whose changes were all filtered out also leaves `committed`
+            // empty, and treating that as an empty stretch would carry the range's end into the
+            // middle of a transaction the publisher has not finished sending.
             end = observed.max(from);
             self.stream_at = Some(end);
         }
@@ -1564,13 +1752,16 @@ impl Source for PostgresCdcSource {
             .read_forward(from, metrics.server_flush, self.options.max_batch_bytes)
             .await?;
         if events.is_empty() {
-            // Nothing for this publication in the WAL just read. The position still moves — the
-            // stretch is empty by construction — and confirming it now is what keeps the slot
-            // from retaining a busy server's unrelated WAL forever.
+            // Nothing for this publication in the WAL just read, and `read_forward` only reports
+            // such a stretch when the stream is between transactions — so the position moves
+            // over it, since there is nothing in it to lose. Planning does *not* confirm it: the
+            // standby status update is sent by `mark_durable` and by the keepalive below, and
+            // nowhere else. Confirming from a read path is how a slot ends up ahead of the
+            // checkpoint.
             if end > self.position {
                 self.position = end;
-                self.wire.confirm(end, end).await?;
             }
+            self.heartbeat().await?;
             return Ok(BatchRange::default());
         }
         let range = BatchRange {
@@ -1695,12 +1886,18 @@ impl Source for PostgresCdcSource {
         if !self.opened {
             return Ok(());
         }
-        self.wire.confirm(self.position, self.position).await?;
+        let sent = self.confirm_position().await?;
         self.log.event(
             "commit",
             json!({
                 "confirmed_flush_lsn": self.position.to_string(),
                 "snapshot_tables_done": self.snapshot_done,
+                // False while the snapshot is still running — there is no replication session to
+                // send a standby status update on yet — and after a connection failure. Recorded
+                // so the connector log never shows a `confirmed_flush_lsn` the server was never
+                // told about, which would look like an unexplained disagreement with
+                // `pg_replication_slots` to anyone diagnosing slot growth.
+                "sent": sent,
             }),
         );
         Ok(())
@@ -2298,6 +2495,16 @@ mod tests {
         retained_bytes: u64,
         server_flush: Lsn,
         confirmed: Option<Lsn>,
+        /// Whether `START_REPLICATION` has been issued. A standby status update has nowhere to go
+        /// until it has, exactly as on a real session.
+        streaming: bool,
+        /// Every wire call, including the ones `calls` leaves out.
+        call_count: usize,
+        /// Fail the Nth wire call (1-based) the way a dead socket does, then behave again.
+        ///
+        /// Without this the fake cannot reproduce the failure that matters most — a publisher
+        /// restart, a failover, a `wal_sender_timeout` — and every recovery path stays untested.
+        fail_nth_call: Option<usize>,
     }
 
     impl FakeWire {
@@ -2309,13 +2516,31 @@ mod tests {
                 ..Default::default()
             }
         }
+
+        /// Count this call, and blow up on it if the test asked for that.
+        fn tick(&mut self) -> Result<()> {
+            self.call_count += 1;
+            if self.fail_nth_call == Some(self.call_count) {
+                return Err(Error::Io(
+                    "postgres_cdc: the server closed the replication connection".into(),
+                ));
+            }
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]
     impl CdcWire for FakeWire {
         async fn open_slot(&mut self, create: bool) -> Result<SlotOpen> {
+            self.tick()?;
             self.calls.push(format!("open_slot(create={create})"));
             let existed = self.slot_existed;
+            if create && existed {
+                // Dropping and recreating a slot hands back a *later* consistent point, which is
+                // the whole reason an interrupted snapshot cannot be resumed table by table.
+                self.consistent_point = Lsn(self.consistent_point.0 + 0x1000);
+                self.streaming = false;
+            }
             if create {
                 self.slot_existed = true;
             }
@@ -2327,18 +2552,22 @@ mod tests {
         }
 
         async fn snapshot_rows(&mut self, table: &TableSchema) -> Result<Vec<Vec<Option<String>>>> {
+            self.tick()?;
             self.calls
                 .push(format!("snapshot_rows({})", table.qualified()));
             Ok(self.snapshot.clone())
         }
 
         async fn end_snapshot(&mut self) -> Result<()> {
+            self.tick()?;
             self.calls.push("end_snapshot".into());
             Ok(())
         }
 
         async fn start_stream(&mut self, start: Lsn) -> Result<()> {
+            self.tick()?;
             self.calls.push(format!("start_stream({start})"));
+            self.streaming = true;
             // A real publisher resumes from the oldest *unconfirmed* transaction, which can be
             // older than the LSN asked for. Rewinding to the beginning here is what makes the
             // source's "drop transactions that ended at or before the range start" filter load
@@ -2348,6 +2577,7 @@ mod tests {
         }
 
         async fn next_wire(&mut self, _idle: Duration) -> Result<Option<WireMessage>> {
+            self.tick()?;
             let next = self.stream.get(self.cursor).cloned();
             if next.is_some() {
                 self.cursor += 1;
@@ -2355,13 +2585,19 @@ mod tests {
             Ok(next)
         }
 
-        async fn confirm(&mut self, _written: Lsn, flushed: Lsn) -> Result<()> {
+        async fn confirm(&mut self, _written: Lsn, flushed: Lsn) -> Result<bool> {
+            self.tick()?;
+            if !self.streaming {
+                self.calls.push("confirm(not streaming)".into());
+                return Ok(false);
+            }
             self.calls.push(format!("confirm({flushed})"));
             self.confirmed = Some(flushed);
-            Ok(())
+            Ok(true)
         }
 
         async fn slot_metrics(&mut self) -> Result<SlotMetrics> {
+            self.tick()?;
             Ok(SlotMetrics {
                 retained_bytes: self.retained_bytes,
                 server_flush: self.server_flush,
@@ -2393,7 +2629,7 @@ mod tests {
         async fn next_wire(&mut self, idle: Duration) -> Result<Option<WireMessage>> {
             self.0.lock().await.next_wire(idle).await
         }
-        async fn confirm(&mut self, written: Lsn, flushed: Lsn) -> Result<()> {
+        async fn confirm(&mut self, written: Lsn, flushed: Lsn) -> Result<bool> {
             self.0.lock().await.confirm(written, flushed).await
         }
         async fn slot_metrics(&mut self) -> Result<SlotMetrics> {
@@ -2457,6 +2693,9 @@ mod tests {
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             snapshot_batch_rows: DEFAULT_SNAPSHOT_BATCH_ROWS,
             idle: Duration::from_millis(1),
+            // Long enough that no test sees a heartbeat it did not ask for; the tests that want
+            // one set it to zero.
+            status_interval: Duration::from_secs(3600),
             log_dir: None,
             name: "sales_suppliers".into(),
         }
@@ -3212,8 +3451,9 @@ mod tests {
     async fn a_stretch_of_wal_with_nothing_for_this_publication_advances_the_slot() {
         // A busy server whose other databases fill the WAL would otherwise make the slot grow
         // forever while this table has nothing to say. There is nothing in the stretch to lose,
-        // so confirming it is safe — and it is the difference between a healthy slot and a full
-        // disk on the source.
+        // so covering it is safe — and it is the difference between a healthy slot and a full
+        // disk on the source. Planning does not *confirm* it, though: the standby status update
+        // comes from the keepalive timer or from `mark_durable`, never from a read path.
         let engine = Engine::new();
         let (mut source, wire) = source_with(vec![WireMessage::Keepalive {
             wal_end: Lsn(0x900),
@@ -3229,7 +3469,186 @@ mod tests {
         let range = source.plan_batch(&engine).await.unwrap();
         assert!(range.is_empty(), "an idle trigger leaves the table alone");
         assert_eq!(source.committed_offsets().unwrap().entries[LSN_KEY], 0x900);
+        assert_eq!(
+            wire.lock().await.confirmed,
+            None,
+            "planning is a read path, and read paths do not confirm"
+        );
+
+        source.mark_durable(&engine).await.unwrap();
         assert_eq!(wire.lock().await.confirmed, Some(Lsn(0x900)));
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_that_was_never_sent_is_logged_as_one() {
+        // There is no replication session to send a standby status update on until the snapshot
+        // is over, so `mark_durable` genuinely confirms nothing. Recording it as a confirmation
+        // anyway would make the connector log disagree with `pg_replication_slots` for no visible
+        // reason — exactly the disagreement someone diagnosing slot growth is trying to explain.
+        let engine = Engine::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(a_transaction())));
+        let mut source = PostgresCdcSource::with_wire(
+            options(),
+            vec![suppliers()],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::new(Some(dir.path()), "sales_suppliers"),
+        );
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert_eq!(range.start[SNAPSHOT_KEY], 0, "still snapshotting");
+        source.poll_range(&engine, &range).await.unwrap();
+        source.mark_durable(&engine).await.unwrap();
+
+        let log = std::fs::read_to_string(dir.path().join("sales_suppliers.jsonl")).unwrap();
+        let commit = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|e| e["event"] == "commit")
+            .expect("a commit event");
+        assert_eq!(commit["sent"], false, "nothing left the process: {log}");
+
+        // Once the stream is open the same call really does speak, and says so.
+        let range = source.plan_batch(&engine).await.unwrap();
+        source.poll_range(&engine, &range).await.unwrap();
+        source.mark_durable(&engine).await.unwrap();
+        let log = std::fs::read_to_string(dir.path().join("sales_suppliers.jsonl")).unwrap();
+        let last = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|e| e["event"] == "commit")
+            .next_back()
+            .expect("a second commit event");
+        assert_eq!(last["sent"], true, "got: {log}");
+    }
+
+    #[tokio::test]
+    async fn a_lost_replication_connection_is_re_dialled_from_the_checkpointed_lsn() {
+        // The difference between a blip and an outage. A publisher restart, a failover or an
+        // idle `wal_sender_timeout` kills the socket mid-stream; the source must forget where it
+        // thought the stream was, dial again, and re-issue `START_REPLICATION` from the position
+        // the checkpoint holds — not answer every retry with the same error until someone
+        // restarts the process.
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(a_transaction());
+        {
+            let mut wire = wire.lock().await;
+            wire.slot_existed = true;
+            // open_slot, slot_metrics, start_stream, then the reads: die on the second one, in
+            // the middle of the transaction.
+            wire.fail_nth_call = Some(5);
+        }
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0x100)].into(),
+        });
+
+        let err = source.plan_batch(&engine).await.unwrap_err().to_string();
+        assert!(
+            err.contains("closed the replication connection"),
+            "got: {err}"
+        );
+        assert_eq!(
+            source.committed_offsets().unwrap().entries[LSN_KEY],
+            0x100,
+            "a failed read commits nothing"
+        );
+
+        // The server comes back. The retry the scheduler makes must reconnect by itself.
+        wire.lock().await.fail_nth_call = None;
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert_eq!(range.start[LSN_KEY], 0x100, "resumed from the checkpoint");
+        assert_eq!(range.end[LSN_KEY], 0x200);
+        let batches = source.poll_range(&engine, &range).await.unwrap();
+        assert_eq!(
+            strings(&batches[0], OP_COLUMN),
+            ["i", "u", "d"].map(|s| Some(s.into())),
+            "and the transaction the dead socket cut in half arrives whole"
+        );
+
+        let started: Vec<String> = wire
+            .lock()
+            .await
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("start_stream"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            started,
+            vec!["start_stream(0/100)", "start_stream(0/100)"],
+            "the stream was re-issued rather than read on from a dead socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_source_still_sends_a_standby_status_update() {
+        // The failure this rules out: a quiet table, a trigger longer than the walsender's
+        // patience, and a pipeline that dies overnight for having said nothing. The message
+        // carries the committed position, so it moves the slot nowhere.
+        let engine = Engine::new();
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(vec![
+            WireMessage::Keepalive {
+                wal_end: Lsn(0x100),
+                clock: 0,
+                reply_requested: false,
+            },
+        ])));
+        wire.lock().await.slot_existed = true;
+        let mut options = options();
+        options.status_interval = Duration::ZERO;
+        let mut source = PostgresCdcSource::with_wire(
+            options,
+            vec![suppliers()],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::default(),
+        );
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0x100)].into(),
+        });
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert!(range.is_empty(), "caught up, nothing to read");
+        assert_eq!(
+            wire.lock().await.confirmed,
+            Some(Lsn(0x100)),
+            "and it says so, rather than waiting to be hung up on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keepalive_asking_for_a_reply_gets_one_at_the_confirmed_position() {
+        // `reply_requested` is Postgres saying "answer me or I will hang up" — it is set once the
+        // walsender has not heard from the standby for `wal_sender_timeout / 2`. The answer must
+        // carry the position already committed and never one past it: a status update ahead of
+        // the checkpoint would let the server recycle WAL a replay still needs.
+        let engine = Engine::new();
+        let mut stream = vec![WireMessage::Keepalive {
+            wal_end: Lsn(0x1000),
+            clock: 0,
+            reply_requested: true,
+        }];
+        stream.extend(a_transaction());
+        let (mut source, wire) = source_with(stream);
+        wire.lock().await.slot_existed = true;
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0x100)].into(),
+        });
+
+        source.plan_batch(&engine).await.unwrap();
+        let wire = wire.lock().await;
+        assert_eq!(
+            wire.confirmed,
+            Some(Lsn(0x100)),
+            "the committed position, not the 0x1000 the keepalive reported"
+        );
+        assert!(
+            wire.calls.contains(&"confirm(0/100)".to_string()),
+            "a status update went out while the batch was still being read: {:?}",
+            wire.calls
+        );
     }
 
     #[tokio::test]

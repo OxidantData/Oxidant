@@ -71,8 +71,13 @@ pub trait Source: Send + Sync {
     /// Decide what the next micro-batch will read, without reading it.
     ///
     /// Returns an empty range when no new data is available. Must not advance any position the
-    /// source would report as committed: a planned batch that is never written has to be
-    /// re-plannable, and a plan that consumed something would lose it.
+    /// source would report as committed *over anything it did not report*: a planned batch that
+    /// is never written has to be re-plannable, and a plan that consumed something would lose it.
+    /// A source that has to read to discover the extent of a range — the Postgres CDC source
+    /// decodes WAL to find the next commit boundary — may move its committed position over a
+    /// stretch it has established holds no records, because re-planning from either end of that
+    /// stretch yields the same batch. It must not acknowledge anything to a server from here:
+    /// only [`Source::mark_durable`] knows the batch survived.
     async fn plan_batch(&mut self, engine: &Engine) -> oxidant_common::Result<BatchRange>;
 
     /// Read exactly the records `range` names.
