@@ -48,9 +48,15 @@ it is served by the binary itself and cannot import anything.
 - **SQL** — physical execution plans
 - **Executors** — Flight workers
 - **Environment** — session config and `OXIDANT_*` env
+- **Cluster** — mode, workers, process metrics, and the driver's log buffer. That last one
+  (`GET /api/v1/logs`) is gated by `OXIDANT_STATUS_TOKEN`; the pane says so and takes the token,
+  storing it under the same `oxidant.statusToken` key the embedded console uses
 - **Dashboards** — grids of SQL-backed widgets (ECharts + react-grid-layout); see
   [docs/web-ui.md](../docs/web-ui.md#dashboards) for the SQL-to-chart convention
-- **Compare** — side-by-side Oxidant vs Spark REST metrics
+
+**Pipelines** and **Observability** are not here: they are pages of the embedded console, and
+setting `OXIDANT_UI_DIR` to serve this app swaps that console out. See
+[docs/web-ui.md](../docs/web-ui.md#two-consoles).
 
 ## History server
 

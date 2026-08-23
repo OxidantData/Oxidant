@@ -18,14 +18,43 @@ oxidant spark server --port 50051 --ui-port 4040
 >
 > `--no-ui` disables the HTTP server entirely.
 >
-> The one authenticated route on this port is
-> [`GET /api/status`](api.md#driver-status) — the control-plane status endpoint, which stays
-> off unless `OXIDANT_STATUS_TOKEN` is set.
+> The authenticated routes on this port are the operational ones —
+> [`GET /api/status`](api.md#driver-status), the [pipeline list and connector
+> logs](api.md#pipelines), and [the driver's log buffer](api.md#driver-logs). They share one
+> token and stay off unless `OXIDANT_STATUS_TOKEN` is set.
+
+## Two consoles
+
+There are two front ends on this port, and which one you get is a deployment choice:
+
+| | Served when | Pages |
+|---|---|---|
+| **Embedded console** | The default — nothing to build, nothing to install | Everything in the table below, including **Pipelines** and **Observability** |
+| **Dashboards app** (`ui/`) | `OXIDANT_UI_DIR` points at a built `ui/dist` | Jobs, Stages, SQL, Executors, Environment, Cluster, Catalog, Editor, Notebook, **Dashboards** |
+
+The embedded console is a single hand-written HTML file compiled into the binary
+(`crates/oxidant-ui-server/src/embedded_ui.html`): it can import nothing, which is why
+dashboards — a charting library, a grid engine and a query cache — live in the React app
+instead. The two are not the same set of pages, and this document says which console carries
+each one.
+
+**[Pipelines](#pipelines) and [Observability](#observability) are embedded-console pages.** They
+are absent from the React app: setting `OXIDANT_UI_DIR` swaps the embedded page out entirely,
+so on that deployment those two pages are gone even though `GET /api/v1/pipelines` and
+`GET /api/v1/logs` still answer on the same port. Convergence is the intent, not the state.
+Until then: leave `OXIDANT_UI_DIR` unset to watch a streaming pipeline, or read the routes
+directly — everything both pages show comes from [the REST API](api.md), by design.
+
+Both consoles share one credential. The React app's **Cluster** page reads the gated
+[`/api/v1/logs`](api.md#driver-logs), so its log pane takes the status token and stores it
+under the same `oxidant.statusToken` key the embedded console uses — paste it into either and
+both have it. Nothing else in the React app is gated.
 
 ## Monitoring pages
 
-The UI mirrors the Spark UI layout and is backed by the Spark-compatible
-`/api/v1/applications/...` endpoints, so existing tooling against those routes works too.
+Carried by both consoles unless a row says otherwise. The UI mirrors the Spark UI layout and is
+backed by the Spark-compatible `/api/v1/applications/...` endpoints, so existing tooling
+against those routes works too.
 
 | Page | What it shows |
 |------|---------------|
@@ -34,8 +63,9 @@ The UI mirrors the Spark UI layout and is backed by the Spark-compatible
 | **SQL** | Every SQL/DataFrame execution with its plan and duration |
 | **Executors** | The driver plus any connected workers (see [workers.md](workers.md)) |
 | **Environment** | Runtime info, Spark/Oxidant properties, catalog config |
-| **Pipelines** | Streaming pipelines running right now — see [below](#pipelines) |
-| **Observability** | Driver logs, jobs expanded into their stages, and SQL executions on one screen — see [below](#observability) |
+| **Pipelines** | Streaming pipelines running right now — see [below](#pipelines). *Embedded console only* |
+| **Observability** | Driver logs, jobs expanded into their stages, and SQL executions on one screen — see [below](#observability). *Embedded console only* |
+| **Dashboards** | Grids of SQL-backed widgets — see [below](#dashboards). *React app only* |
 
 ## Pipelines
 
@@ -76,7 +106,7 @@ prize — it carries more than the execution store would have:
 |--------|---------------------|
 | [`/api/v1/pipelines`](api.md#pipelines) | Which pipelines exist. There is no streaming-query registry this server can reach, so the set of connector logs on disk is the registry |
 | [`/api/v1/pipelines/{name}/logs`](api.md#connector-logs) | Everything in the table above. Tailed once per pipeline per poll, for the 12 most recently written |
-| [`/api/status`](api.md#driver-status) | A cross-check only: whether the driver also thinks a query by this name is running. Never the reason a pipeline is on the page |
+| [`/api/status`](api.md#driver-status) | A cross-check that annotates and never overrules the connector log, consulted only where the log has no opinion. Its `tag` is a query's *description* — truncated SQL text, not a name — so a match must be a whole-tag streaming identity; matching a pipeline's name as a substring of SQL text reported healthy pipelines as stopped |
 
 All three are bearer-token guarded, so **this page needs the status token** — without one it
 says so rather than showing "no pipelines".
@@ -89,8 +119,10 @@ Three numbers are **observed rather than reported**, and the page labels them:
   clock and `now` is the browser's, so the "running" window is floored at 30 seconds rather
   than cut fine.
 
-Batch numbers shown `#3` are the page's ordinals over the log tail it holds: the connector log
-records LSN ranges, not batch ids. **Sink is absent, not blank** — the connector log does not
+Batch numbers shown `#3` in the drawer's history are the page's ordinals over the log tail it
+holds: the connector log records LSN ranges, not batch ids. The list's **Last batch** column
+shows the newest batch's end LSN (or its timestamp) for that reason — a value that moves when
+the pipeline does. **Sink is absent, not blank** — the connector log does not
 record one, and the page does not guess.
 
 A query started through Spark Connect `readStream()` has no checkpoint root to log under and so
@@ -112,14 +144,16 @@ The **Observability** page is "what is this driver doing right now", on three su
 
 | Section | Source | Shows |
 |---------|--------|-------|
-| **Server logs** | [`/api/v1/logs`](api.md) | A tail of the driver's in-memory ring buffer (last 1000 lines) on the terminal surface. Level filter chips — `error` / `warn` / `info` / `debug`, matched on the line's `[LEVEL]` prefix — a **Pause** button, and a caption saying how many lines are on screen. Auto-refreshes every 5 s and stays pinned to the newest line unless you scroll up into it |
+| **Server logs** | [`/api/v1/logs`](api.md#driver-logs) | A tail of the driver's in-memory ring buffer (last 1000 lines) on the terminal surface. Level filter chips — `error` / `warn` / `info` / `debug`, matched on the line's `[LEVEL]` prefix — a **Pause** button, and a caption saying how many lines are on screen. Auto-refreshes every 5 s and stays pinned to the newest line unless you scroll up into it |
 | **Jobs & stages** | `/api/v1/applications/{app}/jobs` + `/stages` | One row per job — id, name, status, duration, stages done/total — expanding in place into its stages, with shuffle read/write where the stage reports any |
 | **SQL queries** | `/api/v1/applications/{app}/sql` | Every execution the store holds — Spark Connect sessions, the REST statement API, the Editor — with status, duration and a row count |
 
 Only the log tail needs a poll of its own; jobs, stages and SQL already ride the page's 2 s
 refresh and the SSE event stream, and fetching them twice would double the load for no extra
-freshness. The log pane sends the stored driver token if there is one — `/api/v1/logs` is not
-gated today, but a driver behind an auth proxy is.
+freshness. The log pane sends the token the Pipelines page stores, and needs it:
+[`/api/v1/logs`](api.md#driver-logs) is gated by the same `OXIDANT_STATUS_TOKEN` as
+`/api/status`, because the buffer carries every logged field — hosts, slots, tables, query
+text.
 
 One number is **derived**, and the column says so: an execution's row count. The store records
 a plan, a status and a duration for an execution but not its cardinality, so rows are summed
@@ -127,8 +161,9 @@ over the stages that execution's jobs ran.
 
 Two absences the page states rather than hides:
 
-- `/api/v1/logs` is served by the engine's REST router, so a standalone history server has no
-  log buffer at all. The pane says that instead of showing an empty box.
+- `/api/v1/logs` answers `404` both when no status token is configured and on a process with no
+  buffer to serve — the engine's REST router carries it, so a standalone history server has
+  none. The pane says so instead of showing an empty box.
 - Statements run from the **Editor** appear both here and in the Editor's own recent-statements
   rail, and the two are not yet one query history — [issue #134](https://github.com/OxidantData/oxidant/issues/134).
 
