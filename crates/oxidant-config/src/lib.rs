@@ -38,6 +38,7 @@ pub use pipeline::{
     AppendFlow, AutoCdcConfig, ExpectAction, Expectation, PipelineConfig, SourceConfig,
     TableConfig, TableKind, Trigger,
 };
+pub use validate::implicit_changes_name;
 
 /// Environment variable naming a config file, consulted when `--config` is absent.
 pub const CONFIG_ENV: &str = "OXIDANT_CONFIG";

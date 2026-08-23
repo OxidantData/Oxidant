@@ -6,15 +6,19 @@
 //! (Delta on Glue) so a dashboard can read fresh data between batches.
 //!
 //! - [`kafka`] — the Kafka source and its Spark-parity schema.
+//! - [`postgres_cdc`] — the Postgres change-data-capture source, over [`pg_replication`].
 //! - [`input`] — the swappable table the streaming DataFrame is planned against.
 //! - [`lake_sink`] — Delta/Parquet writes plus database + table creation in the catalog.
 //! - [`scheduler`] — triggers, the micro-batch loop, and checkpoint commits.
 
 mod checkpoint;
 mod config;
+mod connector_log;
 pub mod input;
 pub mod kafka;
 pub mod lake_sink;
+pub mod pg_replication;
+pub mod postgres_cdc;
 mod query;
 mod scheduler;
 mod sink;
@@ -27,11 +31,16 @@ pub use config::{
     ExpectationAction, SinkDestination, StreamExpectation, StreamQueryConfig,
     DEFAULT_ICEBERG_SUFFIX,
 };
+pub use connector_log::ConnectorLog;
 pub use input::{
     capture as capture_stream_inputs, stream_input, stream_input_name, MicroBatchInput,
 };
 pub use kafka::{kafka_schema, KafkaOptions, KafkaSource, StartingOffsets};
 pub use lake_sink::{writable_format, LakeSink, LakeSinkOptions, LakeTarget};
+pub use postgres_cdc::{
+    postgres_cdc_pipeline_options, PostgresCdcOptions, PostgresCdcSource, LSN_COLUMN, OP_COLUMN,
+    TS_COLUMN,
+};
 pub use query::{QueryProgress, QueryStatus, SourceProgress, StreamingQuery, StreamingQueryId};
 pub use scheduler::{
     build_source, source_schema, MicroBatchPipeline, StartOptions, StreamingQueryManager, Trigger,

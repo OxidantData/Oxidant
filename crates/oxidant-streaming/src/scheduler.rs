@@ -569,6 +569,10 @@ impl StreamingQueryManager {
                 q.checkpoint.location()
             ))
         })?;
+        // Last, and only now: the batch is durable in the sink *and* in the checkpoint, so a
+        // source that has to tell an upstream server how far it may discard can finally do it.
+        // Anything earlier would release records a restart still needs.
+        rt.source.mark_durable(engine).await?;
         Ok(input_rows)
     }
 
@@ -826,6 +830,13 @@ pub fn build_source(config: &StreamQueryConfig) -> Result<Box<dyn Source>> {
             Box::new(FileSource::new(path, &config.source_format))
         }
         "kafka" => Box::new(KafkaSource::from_options(&options)?),
+        // Constructing this one talks to Postgres: it validates the server's setup and
+        // introspects the tables, because the schema it emits is not knowable any other way and
+        // a pipeline that starts before those checks would fail on its first batch instead of at
+        // `start`.
+        "postgres_cdc" => Box::new(crate::postgres_cdc::PostgresCdcSource::from_options(
+            &options,
+        )?),
         "rate" => {
             let rows = options
                 .get("rowsPerSecond")
@@ -836,7 +847,8 @@ pub fn build_source(config: &StreamQueryConfig) -> Result<Box<dyn Source>> {
         "memory" => Box::new(MemoryRateSource::new(10, 1)),
         other => {
             return Err(Error::Unsupported(format!(
-                "readStream.format(`{other}`) — supported: kafka, parquet, json, csv, rate"
+                "readStream.format(`{other}`) — supported: kafka, postgres_cdc, parquet, json, \
+                 csv, rate"
             )))
         }
     })

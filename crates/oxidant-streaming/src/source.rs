@@ -106,6 +106,20 @@ pub trait Source: Send + Sync {
     /// Resume from a checkpointed position. Called once, before the first poll.
     fn restore_offsets(&mut self, _offsets: &SourceOffsets) {}
 
+    /// Called once the batch just committed is durable — its rows in the sink *and* its position
+    /// in the checkpoint.
+    ///
+    /// Most sources need nothing here: their position lives entirely in the checkpoint, so there
+    /// is no one to tell. A source reading from a server that retains data on the consumer's
+    /// behalf — a Postgres replication slot, which keeps WAL until it is confirmed — has to
+    /// acknowledge somewhere, and this is the only point at which acknowledging is safe.
+    /// Acknowledging at read time would let the server discard exactly the records a replay of a
+    /// failed batch needs; acknowledging after the sink write but before the checkpoint would
+    /// discard the records a restart from the *previous* checkpoint would ask for.
+    async fn mark_durable(&mut self, _engine: &Engine) -> oxidant_common::Result<()> {
+        Ok(())
+    }
+
     /// The furthest position available *right now*, ignoring any per-batch budget.
     ///
     /// This is what bounds an `availableNow` / `once` drain. It is deliberately not the planned
