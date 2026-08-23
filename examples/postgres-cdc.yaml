@@ -75,8 +75,10 @@ tables:
       # non-key column to NULL is ignored too — `REPLICA IDENTITY FULL` on the
       # source table is what buys the distinction. See docs/postgres-cdc.md §10.
       ignore_null_updates_except: [supplierID]
-      # The metadata columns are the merge's plumbing, not part of the target.
-      except_column_list: [__oxidant_op, __oxidant_lsn, __oxidant_ts]
+      # `__oxidant_lsn` must stay in the target: AUTO CDC compares each incoming
+      # change against the sequence already stored. The other two metadata
+      # columns are the merge's plumbing, not part of the target.
+      except_column_list: [__oxidant_op, __oxidant_ts]
 
   # An ordinary derived table over the merged result — recomputed per pass.
   - name: suppliers_by_continent
