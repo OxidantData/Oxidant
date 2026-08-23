@@ -105,7 +105,7 @@ prize — it carries more than the execution store would have:
 | Source | What it contributes |
 |--------|---------------------|
 | [`/api/v1/pipelines`](api.md#pipelines) | Which pipelines exist. There is no streaming-query registry this server can reach, so the set of connector logs on disk is the registry |
-| [`/api/v1/pipelines/{name}/logs`](api.md#connector-logs) | Everything in the table above. Tailed once per pipeline per poll, for the 12 most recently written |
+| [`/api/v1/pipelines/{name}/logs`](api.md#connector-logs) | Everything in the table above. Tailed once per pipeline **per 5 s poll** — the interval the page's caption quotes, for the 12 most recently written |
 | [`/api/status`](api.md#driver-status) | A cross-check that annotates and never overrules the connector log, consulted only where the log has no opinion. Its `tag` is a query's *description* — truncated SQL text, not a name — so a match must be a whole-tag streaming identity; matching a pipeline's name as a substring of SQL text reported healthy pipelines as stopped |
 
 All three are bearer-token guarded, so **this page needs the status token** — without one it
