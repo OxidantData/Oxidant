@@ -15,6 +15,18 @@ use tonic::transport::Channel;
 
 const SESSION: &str = "00112233-4455-6677-8899-aabbccddeeff";
 
+/// A port nobody on this machine is already listening on. Hard-coded ports collide with
+/// real daemons in the wild (macOS `rapportd` holds 50603/50604 here, which made the window
+/// test fail with `server not ready` on a clean checkout), so tests bind an ephemeral port
+/// instead of reserving a number.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 async fn boot(port: u16) -> SparkConnectServiceClient<Channel> {
     tokio::spawn(async move {
         let _ = serve(ServerConfig {
@@ -130,7 +142,7 @@ async fn count_rows(client: &mut SparkConnectServiceClient<Channel>, plan: sc::R
 
 #[tokio::test]
 async fn filter_lowers_and_executes() {
-    let mut client = boot(50601).await;
+    let mut client = boot(free_port()).await;
     // df(id,v) of 3 rows, filter v > 1  →  2 rows.
     let src = local_relation(vec![1, 2, 3], vec![0, 5, 9]);
     let plan = rel(sc::relation::RelType::Filter(Box::new(sc::Filter {
@@ -142,7 +154,7 @@ async fn filter_lowers_and_executes() {
 
 #[tokio::test]
 async fn window_function_lowers_and_executes() {
-    let mut client = boot(50603).await;
+    let mut client = boot(free_port()).await;
     // row_number() OVER (ORDER BY v) over 3 rows → 3 rows, and the result is signed (UInt64 from
     // row_number would be unrepresentable in Spark and error at the client).
     let src = local_relation(vec![1, 2, 3], vec![30, 10, 20]);
@@ -168,7 +180,7 @@ async fn window_function_lowers_and_executes() {
 
 #[tokio::test]
 async fn project_and_aggregate_lower_and_execute() {
-    let mut client = boot(50602).await;
+    let mut client = boot(free_port()).await;
     // df(id,v): rows (1,0),(2,0),(3,9) grouped by v → 2 groups.
     let src = local_relation(vec![1, 2, 3], vec![0, 0, 9]);
     let agg = rel(sc::relation::RelType::Aggregate(Box::new(sc::Aggregate {
