@@ -2778,6 +2778,16 @@ pub struct Engine {
     /// separately at CREATE time. Consulted by later SHOW/DESCRIBE work via
     /// [`Engine::created_table_meta`].
     created_tables: Arc<Mutex<HashMap<String, CreatedTableMeta>>>,
+    /// Fully-resolved (`catalog.namespace.table`, lowercased) names of the tables this engine
+    /// created *itself* through SQL DDL — `CREATE TABLE …`, with or without `USING <fmt>` /
+    /// `AS SELECT`. Issue #130: such a table lives only in this process (a DataFusion `MemTable`,
+    /// or files under the process-private managed warehouse in [`Engine::dirs`]), and a cluster
+    /// never replays DDL to its workers — so the distributed splitter must not ship stage SQL
+    /// naming one. Read back by [`Engine::locally_created_table_in_plan`]; entries are removed by
+    /// `DROP TABLE` / `DROP SCHEMA`. Programmatic registrations (`register_parquet`,
+    /// `register_batches`, …) are deliberately NOT tracked: a worker engine is set up with the
+    /// same calls, so those names *are* resolvable cluster-wide.
+    locally_created_tables: Arc<Mutex<HashSet<String>>>,
     /// Set permanently on Flight workers so losing a distributed stage's task-local snapshot
     /// scope fails rather than silently resolving a newer lakehouse snapshot.
     require_lakehouse_snapshot_pins: Arc<AtomicBool>,
@@ -3445,6 +3455,7 @@ impl Engine {
                 cells: HashMap::new(),
             })),
             created_tables: Arc::new(Mutex::new(HashMap::new())),
+            locally_created_tables: Arc::new(Mutex::new(HashSet::new())),
             require_lakehouse_snapshot_pins: Arc::new(AtomicBool::new(false)),
             memory_pool_bytes: memory_limit,
             plan_time_smj_reroutes: Arc::new(AtomicU64::new(0)),
@@ -3694,6 +3705,9 @@ impl Engine {
             .collect()
             .await
             .map_err(|e| Error::Execution(e.to_string()))?;
+        // The table's files live under this engine's process-private managed warehouse (or a
+        // LOCATION only this process registered), so no worker can resolve the name — issue #130.
+        self.note_locally_created_table_name(&low.name);
         self.note_catalog_change(&low.name);
         Ok(())
     }
@@ -3907,6 +3921,8 @@ impl Engine {
             .collect()
             .await
             .map_err(|e| Error::Execution(e.to_string()))?;
+        // Same driver-only visibility as `run_create_external` above (issue #130).
+        self.note_locally_created_table_name(&ctas.name);
         self.note_catalog_change(&ctas.name);
         Ok(())
     }
@@ -3953,10 +3969,20 @@ impl Engine {
         // literal retype so operand types are Spark-final (an in-range literal is `int`, so `int * 2`
         // stays `int` and is not promoted to `bigint`). See `lower_checked_multiply`.
         let plan = lower_checked_multiply(plan);
-        self.ctx
+        // Issue #130: `CREATE TABLE … AS SELECT` without `USING` is planned natively by
+        // DataFusion into a process-local `MemTable`, and `DROP TABLE`/`DROP SCHEMA` retire one.
+        // Capture the effect from the plan the context is about to run, and fold it in only if
+        // that run succeeds.
+        let ddl_effect = self.ddl_catalog_effect(&plan);
+        let df = self
+            .ctx
             .execute_logical_plan(plan)
             .await
-            .map_err(|e| Error::Plan(e.to_string()))
+            .map_err(|e| Error::Plan(e.to_string()))?;
+        if let Some(effect) = ddl_effect {
+            self.apply_ddl_effect(effect);
+        }
+        Ok(df)
     }
 
     /// Build the raw (un-analyzed) logical plan for `query`, first lowering any Spark
@@ -6520,6 +6546,7 @@ impl Engine {
             current: cell,
             sessions: self.sessions.clone(),
             created_tables: self.created_tables.clone(),
+            locally_created_tables: self.locally_created_tables.clone(),
             require_lakehouse_snapshot_pins: self.require_lakehouse_snapshot_pins.clone(),
             memory_pool_bytes: self.memory_pool_bytes,
             plan_time_smj_reroutes: self.plan_time_smj_reroutes.clone(),
@@ -6690,6 +6717,151 @@ impl Engine {
             .expect("created_tables poisoned")
             .get(name)
             .cloned()
+    }
+
+    /// The first table in `plan` that this driver created itself with SQL DDL, if any — see
+    /// [`Engine::locally_created_tables`]. The Connect layer reads this to keep such a query on
+    /// the driver: the distributed splitter unparses stage SQL that names the table, and no
+    /// worker can resolve a name that only ever existed in this process (issue #130).
+    ///
+    /// Returns the name as the plan spells it, for the operator-facing log line.
+    pub fn locally_created_table_in_plan(
+        &self,
+        plan: &datafusion::logical_expr::LogicalPlan,
+    ) -> Option<String> {
+        use datafusion::common::tree_node::TreeNodeRecursion;
+        use datafusion::logical_expr::LogicalPlan;
+
+        // Cheap exit for the overwhelmingly common case: no DDL-created table on this engine.
+        if self
+            .locally_created_tables
+            .lock()
+            .expect("locally_created_tables poisoned")
+            .is_empty()
+        {
+            return None;
+        }
+        let mut hit: Option<String> = None;
+        // `apply_with_subqueries`: a scan hidden inside an `EXISTS` / `IN` / scalar subquery is
+        // shipped to workers just like a top-level one.
+        let _ = plan.apply_with_subqueries(|node| {
+            if let LogicalPlan::TableScan(scan) = node {
+                let key = self.resolved_table_key(&scan.table_name);
+                if self
+                    .locally_created_tables
+                    .lock()
+                    .expect("locally_created_tables poisoned")
+                    .contains(&key)
+                {
+                    hit = Some(scan.table_name.to_string());
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        hit
+    }
+
+    /// The lowercased, fully-resolved `catalog.namespace.table` key
+    /// [`Engine::locally_created_tables`] is keyed by. Resolution uses DataFusion's *session*
+    /// catalog/schema defaults — the same ones its SQL planner qualifies a bare or two-part
+    /// `TableReference` with — so a `CREATE TABLE demo.sales` insert and the `TableScan` a later
+    /// `SELECT … FROM demo.sales` produces agree on one key.
+    fn resolved_table_key(&self, name: &datafusion::sql::TableReference) -> String {
+        let (default_catalog, default_schema) = {
+            let state = self.ctx.state();
+            let catalog = &state.config().options().catalog;
+            (
+                catalog.default_catalog.clone(),
+                catalog.default_schema.clone(),
+            )
+        };
+        let resolved = name.clone().resolve(&default_catalog, &default_schema);
+        format!(
+            "{}.{}.{}",
+            resolved.catalog, resolved.schema, resolved.table
+        )
+        .to_ascii_lowercase()
+    }
+
+    /// Record a table created by SQL DDL, from the name as written in the statement (possibly
+    /// backtick-quoted and/or qualified) — the `CREATE TABLE … USING <fmt>` lowerings, which run
+    /// their rewritten DDL straight through `ctx.sql` rather than [`Engine::plan_spark`].
+    fn note_locally_created_table_name(&self, name: &str) {
+        let Some(reference) = table_reference_from_name(name) else {
+            return;
+        };
+        let key = self.resolved_table_key(&reference);
+        self.locally_created_tables
+            .lock()
+            .expect("locally_created_tables poisoned")
+            .insert(key);
+    }
+
+    /// Fold a DDL statement's effect into [`Engine::locally_created_tables`], after the statement
+    /// itself executed successfully.
+    fn apply_ddl_effect(&self, effect: DdlEffect) {
+        let mut created = self
+            .locally_created_tables
+            .lock()
+            .expect("locally_created_tables poisoned");
+        match effect {
+            DdlEffect::Created(key) => {
+                created.insert(key);
+            }
+            DdlEffect::Dropped(key) => {
+                created.remove(&key);
+            }
+            // `DROP SCHEMA … CASCADE` takes its tables with it; a stale entry would pin every
+            // later query naming a *worker-visible* table of the same name to the driver.
+            DdlEffect::SchemaDropped(prefix) => {
+                created.retain(|k| !k.starts_with(&prefix));
+            }
+        }
+    }
+
+    /// What a raw (un-analyzed) DDL plan does to [`Engine::locally_created_tables`], resolved to
+    /// registry keys. `None` for every non-DDL plan and for the DDL kinds that cannot produce a
+    /// driver-only table.
+    ///
+    /// `CREATE VIEW` is deliberately absent: DataFusion inlines a view's definition into every
+    /// plan that references it, so the definition travels inside the stage SQL and a worker needs
+    /// no registration of its own.
+    fn ddl_catalog_effect(
+        &self,
+        plan: &datafusion::logical_expr::LogicalPlan,
+    ) -> Option<DdlEffect> {
+        use datafusion::common::SchemaReference;
+        use datafusion::logical_expr::{DdlStatement, LogicalPlan};
+        use datafusion::sql::TableReference;
+
+        match plan {
+            LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(c)) => {
+                Some(DdlEffect::Created(self.resolved_table_key(&c.name)))
+            }
+            LogicalPlan::Ddl(DdlStatement::CreateExternalTable(c)) => {
+                Some(DdlEffect::Created(self.resolved_table_key(&c.name)))
+            }
+            LogicalPlan::Ddl(DdlStatement::DropTable(d)) => {
+                Some(DdlEffect::Dropped(self.resolved_table_key(&d.name)))
+            }
+            LogicalPlan::Ddl(DdlStatement::DropCatalogSchema(d)) => {
+                // A `SchemaReference` names no table; resolving it with an empty table name
+                // yields exactly the `<catalog>.<namespace>.` key prefix to purge.
+                let reference = match &d.name {
+                    SchemaReference::Bare { schema } => {
+                        TableReference::partial(schema.as_ref(), "")
+                    }
+                    SchemaReference::Full { schema, catalog } => {
+                        TableReference::full(catalog.as_ref(), schema.as_ref(), "")
+                    }
+                };
+                Some(DdlEffect::SchemaDropped(
+                    self.resolved_table_key(&reference),
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// Access the underlying DataFusion context (e.g. to register tables/Parquet).
@@ -7687,6 +7859,34 @@ fn parse_qualified_name(name: &str) -> Vec<String> {
 /// silently miss the entry keyed by the raw, unnormalized source span.
 fn created_table_key(name: &str) -> String {
     parse_qualified_name(name).pop().unwrap_or_default()
+}
+
+/// What one DDL statement does to [`Engine::locally_created_tables`], as registry keys —
+/// see [`Engine::ddl_catalog_effect`].
+enum DdlEffect {
+    /// Insert this key: the statement created a table that exists only in this process.
+    Created(String),
+    /// Remove this key: `DROP TABLE`.
+    Dropped(String),
+    /// Remove every key under this `catalog.namespace.` prefix: `DROP SCHEMA`.
+    SchemaDropped(String),
+}
+
+/// A `CREATE TABLE` statement's name — possibly backtick-quoted, possibly qualified — as a
+/// [`datafusion::sql::TableReference`], so it resolves to the same key DataFusion's own planner
+/// would produce for a `TableScan` of that name. Extra leading segments (beyond
+/// `catalog.namespace.table`) are dropped, matching `Engine::resolve_table_ref`.
+fn table_reference_from_name(name: &str) -> Option<datafusion::sql::TableReference> {
+    use datafusion::sql::TableReference;
+    let mut segments = parse_qualified_name(name);
+    let table = segments.pop()?;
+    let schema = segments.pop();
+    let catalog = segments.pop();
+    Some(match (catalog, schema) {
+        (Some(catalog), Some(schema)) => TableReference::full(catalog, schema, table),
+        (None, Some(schema)) => TableReference::partial(schema, table),
+        _ => TableReference::bare(table),
+    })
 }
 
 /// Single-column `Utf8` (non-null) batch — the shape shared by every SHOW form whose result is
@@ -9916,6 +10116,88 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(values.value(0), "spark_catalog");
+    }
+
+    /// Issue #130: the registry behind [`Engine::locally_created_table_in_plan`] must flag every
+    /// table this engine created with SQL DDL — the `USING <fmt>` CTAS (a file under the managed
+    /// warehouse) and the bare CTAS (a `MemTable`) alike — and must stop flagging it once the
+    /// table (or its schema) is dropped.
+    #[tokio::test]
+    async fn ddl_created_tables_are_flagged_driver_only_until_dropped() {
+        let engine = Engine::new();
+        engine.sql("CREATE SCHEMA d130").await.unwrap();
+        engine
+            .sql(
+                "CREATE TABLE d130.using_form USING parquet AS \
+                 SELECT * FROM (VALUES (1), (2)) AS t(id)",
+            )
+            .await
+            .unwrap();
+        engine
+            .sql("CREATE TABLE d130.bare_form AS SELECT * FROM (VALUES (1), (2)) AS t(id)")
+            .await
+            .unwrap();
+
+        for table in ["using_form", "bare_form"] {
+            let plan = engine
+                .logical_plan(&format!("SELECT * FROM d130.{table}"))
+                .await
+                .unwrap();
+            assert!(
+                engine.locally_created_table_in_plan(&plan).is_some(),
+                "`d130.{table}` was created by this engine and cannot exist on a worker"
+            );
+        }
+
+        // A scan hidden inside a subquery is shipped to workers just like a top-level one.
+        let plan = engine
+            .logical_plan("SELECT 1 AS one WHERE EXISTS (SELECT 1 FROM d130.bare_form)")
+            .await
+            .unwrap();
+        assert!(engine.locally_created_table_in_plan(&plan).is_some());
+
+        // Build the scan plan BEFORE the drop: after it, the name no longer resolves at all.
+        let plan = engine
+            .logical_plan("SELECT * FROM d130.using_form")
+            .await
+            .unwrap();
+        engine.sql("DROP TABLE d130.using_form").await.unwrap();
+        assert!(
+            engine.locally_created_table_in_plan(&plan).is_none(),
+            "a dropped table must not pin later queries to the driver"
+        );
+
+        let plan = engine
+            .logical_plan("SELECT * FROM d130.bare_form")
+            .await
+            .unwrap();
+        engine.sql("DROP SCHEMA d130 CASCADE").await.unwrap();
+        assert!(
+            engine.locally_created_table_in_plan(&plan).is_none(),
+            "dropping the schema must retire its tables' entries too"
+        );
+    }
+
+    /// The other half of #130's contract: a table registered *programmatically* is NOT flagged.
+    /// A real worker's engine is set up with exactly these calls (see `oxidant-bench`'s
+    /// distributed harnesses), so such a name does resolve cluster-wide — flagging it would
+    /// silently de-distribute every TPC-H/TPC-DS query.
+    #[tokio::test]
+    async fn programmatically_registered_tables_are_not_flagged_driver_only() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let engine = Engine::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2]))]).unwrap();
+        engine.register_batches("lineitem", vec![batch]).unwrap();
+
+        let plan = engine.logical_plan("SELECT * FROM lineitem").await.unwrap();
+        assert!(
+            engine.locally_created_table_in_plan(&plan).is_none(),
+            "a programmatically registered table is set up on workers too and stays distributable"
+        );
     }
 
     /// `DESCRIBE FUNCTION` reports session UDFs (with their SQL body) and built-ins (name + "N/A"
