@@ -176,13 +176,13 @@ into `/api/status` so a list page can show health at a glance.
 |---|---|
 | Logical replication, committed txns only | ✅ pgoutput v1, committed-only by construction |
 | Initial snapshot | ✅ `USE_SNAPSHOT` consistent snapshot |
-| Parallel snapshotting (threads/rows-per-partition/tables-in-parallel) | v2 — v1 is single COPY per table with `snapshot_batch_rows` pacing |
+| Parallel snapshotting (threads/rows-per-partition/tables-in-parallel) | v2 — v1 is one micro-batch per table, chunked by `snapshot_batch_rows` |
 | Table select / rename / exclude columns | ✅ v1 |
 | Custom ordering keys | ✅ `keys:` (defaults to PK) |
 | Custom destination PARTITION BY | ✅ existing `partition_by` |
-| Schema changes: ADD COLUMN auto-propagate (with defaults) | ✅ additive columns auto-added to the target on next batch |
+| Schema changes: ADD COLUMN auto-propagate (with defaults) | ⚠️ v1: detected, logged (`schema_change`), propagated on the next pipeline **restart** — see §10 |
 | DROP COLUMN detected, NULL-filled, not dropped | ✅ same behaviour |
-| TOAST columns (unchanged-TOAST marker) | ✅ unchanged-TOAST keeps the target's current value on update |
+| TOAST columns (unchanged-TOAST marker) | ⚠️ v1: emitted as NULL; `ignore_null_updates_*` on the AUTO CDC target keeps the target's value — see §10 |
 | Partitioned source tables | ✅ publish on the parent; PK/RI required on parent + partitions |
 | PK or REPLICA IDENTITY requirement | ✅ validated at setup with remediation SQL |
 | Deletes | ✅ physical delete in SCD1 (AUTO CDC parity); `publish_ops` excludes them for append-only |
@@ -219,3 +219,97 @@ into `/api/status` so a list page can show health at a glance.
 Parallel snapshotting, MySQL, multi-table single source, SSH tunnels, RDS
 IAM auth, DDL beyond additive columns, exactly-once *schema* evolution of
 partition layouts.
+
+## 10. v1 implementation notes (and where it departs from the sections above)
+
+Everything in §1–§6 is implemented except where noted here. Each departure is a
+place the design above described the destination and v1 stops short of it; none
+of them is silent.
+
+**The replication socket is hand-rolled.** `tokio-postgres` is the control
+connection — validation, catalog introspection and slot metrics are ordinary
+SQL — but no published version can open a replication session: 0.7.18 has no way
+to put `replication=database` in the startup packet (it is a startup parameter,
+not a GUC, so `options=-c …` cannot carry it) and no CopyBoth duplex. So
+`pg_replication.rs` opens that one socket itself on top of `postgres-protocol`,
+the message-framing and SCRAM crate `tokio-postgres` is already built on. That
+crate's own backend parser is not usable either — it rejects `CopyBothResponse`
+outright — so the frame reader is here too. No replication framework crate was
+added, and the pgoutput decode is hand-rolled as specified.
+
+**The snapshot reads with `SELECT`, not `COPY … TO STDOUT`.** The handoff is
+exactly as §1 describes — `CREATE_REPLICATION_SLOT … USE_SNAPSHOT` inside a
+`REPEATABLE READ` transaction on the replication session, the tables read in that
+transaction, then `START_REPLICATION` from the `consistent_point`. The rows come
+back over the **simple query protocol** rather than through `COPY`, because a
+walsender parses `Query` messages and `COPY TO STDOUT` needs a copy-out
+handshake the simple protocol does not carry. The two produce the same values in
+the same text encoding, and the text form is what the pgoutput decoder reads
+anyway, so the snapshot and the stream share one conversion table.
+
+**The snapshot is one micro-batch per source table.** `snapshot_batch_rows`
+chunks the Arrow batches inside it rather than splitting the *commit*. That
+keeps a snapshot batch replayable: a snapshot transaction cannot outlive the
+process, so an interrupted snapshot restarts from the first table (logged as
+`snapshot_start` with a reason) against a freshly created slot. Re-emitting a
+table already loaded costs nothing but time — snapshot rows are upserts merged
+by key. Parallel snapshotting (§7) is v2.
+
+**`ADD COLUMN` propagates on restart, not mid-stream.** The publisher re-sends a
+`Relation` message when a table's shape changes; v1 records it, writes a
+`schema_change` event to the connector log and a line to stderr, and keeps
+ingesting on the schema the streaming DataFrame was planned against — a column
+the source has never seen is dropped, and one the publisher no longer sends is
+NULL-filled (the `DROP COLUMN` behaviour §7 promises). Restarting the pipeline
+re-introspects and picks the new column up. Propagating it *without* a restart
+means evolving the micro-batch schema, the merge's projection and the Delta
+target together mid-query, which is a change to the streaming engine rather than
+to this connector.
+
+**Unchanged TOAST is emitted as NULL.** The decoder keeps the distinction (`u`
+is not `n` on the wire), but the emitted batch has one way to say "no value".
+Postgres does not send the old value, and re-reading it from the source would
+make `poll_range` non-deterministic — which is the property the whole replay
+contract rests on. AUTO CDC already has the setting that turns NULL into "leave
+the target alone": put the key columns in `ignore_null_updates_except` on the
+merge target, as `examples/postgres-cdc.yaml` does. Note the trade: with it set,
+an UPDATE that genuinely sets a column to NULL is also ignored. Without a
+`REPLICA IDENTITY FULL` table there is no way to tell the two apart, and that is
+what `REPLICA IDENTITY FULL` buys.
+
+**A snapshot row's `__oxidant_ts` is NULL.** It has no commit, so it has no
+commit timestamp. Its `__oxidant_lsn` is the slot's `consistent_point`, so every
+change to the same key arrives with a strictly larger value and wins — which is
+what `sequence_by: __oxidant_lsn` needs.
+
+**`__oxidant_lsn` is the change's own WAL position**, not its transaction's, so
+two changes to one key inside one transaction still order against each other.
+
+**Multiple tables in one source must share a schema.** §2 says so; v1 enforces
+it at introspection with an error naming both tables. `tables: schema.*` expands
+to every ordinary/partitioned table in the schema and creates the publication as
+`FOR TABLES IN SCHEMA` (PG 15+); a whole schema whose tables differ therefore
+fails the same check.
+
+**Reconciliation (§4) is not in this PR** beyond the WAL-growth self-defense,
+which is: `max_slot_bytes` (default 10 GiB) is checked on every plan, logged as
+`slot_metrics`, and stops the pipeline with the `pg_drop_replication_slot` SQL
+when it is exceeded. The `reconcile` subcommand and its cron are PR2.
+
+**The ui-server endpoint (§6) is not in this PR.** The connector log is written
+in the documented place and format; serving it is a separate change.
+
+### Runtime knobs
+
+| Knob | Default | What it does |
+|---|---|---|
+| `OXIDANT_PG_CDC_IDLE_MS` | `500` | How long planning waits for more WAL before deciding the publisher is caught up. Only paid when the batch has not yet reached the flush LSN it was aiming at, so an idle stream does not pay it. |
+
+### AUTO CDC wiring
+
+A `postgres_cdc` source *is* a change stream, so the changes table needs no
+second entry in `tables:`. Naming it `<table>_changes` in `auto_cdc.source` asks
+for the implicit stream; any other unmatched name is still an error, so a typo
+cannot turn into a merge over nothing. Declaring a real `<table>_changes` table
+also works and keeps the existing mirroring rules (identical `source:`, `sql:`,
+`expect:`, `dedup_columns:`).

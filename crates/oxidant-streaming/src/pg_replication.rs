@@ -195,7 +195,7 @@ impl<'a> Reader<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos.checked_add(n).unwrap_or(usize::MAX);
+        let end = self.pos.saturating_add(n);
         if end > self.buf.len() {
             return Err(Error::Io(format!(
                 "{} message is truncated: wanted {n} byte(s) at offset {}, only {} left",

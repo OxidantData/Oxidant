@@ -718,10 +718,8 @@ fn parse_date(text: &str) -> Option<i32> {
 
 fn parse_time_micros(text: &str) -> Option<i64> {
     let time = chrono::NaiveTime::parse_from_str(text, "%H:%M:%S%.f").ok()?;
-    Some(
-        time.signed_duration_since(chrono::NaiveTime::from_hms_opt(0, 0, 0)?)
-            .num_microseconds()?,
-    )
+    time.signed_duration_since(chrono::NaiveTime::from_hms_opt(0, 0, 0)?)
+        .num_microseconds()
 }
 
 /// Parse `2024-05-06 07:08:09.123456` (and the `+00` a `timestamptz` carries).
@@ -951,7 +949,7 @@ impl CdcWire for PgWire {
             .query(
                 "SELECT pg_current_wal_flush_lsn()::text, \
                         s.confirmed_flush_lsn::text, \
-                        COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn), 0)::int8 \
+                        COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn), 0)::int8::text \
                  FROM (SELECT 1) AS one \
                  LEFT JOIN pg_replication_slots s ON s.slot_name::text = $1",
                 &[slot.as_str()],
@@ -2156,4 +2154,1158 @@ pub fn postgres_cdc_pipeline_options(
         checkpoints.join("logs").to_string_lossy().into_owned(),
     );
     options.insert(NAME_OPTION.to_string(), name.to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxidant_loom::arrow::array::{
+        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int32Array, Int64Array,
+        StringArray, TimestampMicrosecondArray,
+    };
+
+    // -----------------------------------------------------------------------------------------
+    // pgoutput frame builders — the wire the fake publisher speaks
+    // -----------------------------------------------------------------------------------------
+
+    fn cstr(out: &mut Vec<u8>, text: &str) {
+        out.extend_from_slice(text.as_bytes());
+        out.push(0);
+    }
+
+    fn tuple(out: &mut Vec<u8>, values: &[Option<&str>]) {
+        out.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for value in values {
+            match value {
+                // `~` marks an unchanged TOAST column, which is not the same thing as NULL.
+                Some("~") => out.push(b'u'),
+                Some(text) => {
+                    out.push(b't');
+                    out.extend_from_slice(&(text.len() as i32).to_be_bytes());
+                    out.extend_from_slice(text.as_bytes());
+                }
+                None => out.push(b'n'),
+            }
+        }
+    }
+
+    fn relation_msg(
+        oid: u32,
+        namespace: &str,
+        name: &str,
+        columns: &[(bool, &str, u32)],
+    ) -> Vec<u8> {
+        let mut out = vec![b'R'];
+        out.extend_from_slice(&oid.to_be_bytes());
+        cstr(&mut out, namespace);
+        cstr(&mut out, name);
+        out.push(b'd');
+        out.extend_from_slice(&(columns.len() as i16).to_be_bytes());
+        for (key, name, type_oid) in columns {
+            out.push(u8::from(*key));
+            cstr(&mut out, name);
+            out.extend_from_slice(&type_oid.to_be_bytes());
+            out.extend_from_slice(&(-1i32).to_be_bytes());
+        }
+        out
+    }
+
+    fn begin_msg(final_lsn: u64, ts: i64) -> Vec<u8> {
+        let mut out = vec![b'B'];
+        out.extend_from_slice(&final_lsn.to_be_bytes());
+        out.extend_from_slice(&ts.to_be_bytes());
+        out.extend_from_slice(&7u32.to_be_bytes());
+        out
+    }
+
+    fn commit_msg(commit_lsn: u64, end_lsn: u64, ts: i64) -> Vec<u8> {
+        let mut out = vec![b'C', 0];
+        out.extend_from_slice(&commit_lsn.to_be_bytes());
+        out.extend_from_slice(&end_lsn.to_be_bytes());
+        out.extend_from_slice(&ts.to_be_bytes());
+        out
+    }
+
+    fn change_msg(tag: u8, oid: u32, section: u8, values: &[Option<&str>]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend_from_slice(&oid.to_be_bytes());
+        out.push(section);
+        tuple(&mut out, values);
+        out
+    }
+
+    fn truncate_msg(oids: &[u32]) -> Vec<u8> {
+        let mut out = vec![b'T'];
+        out.extend_from_slice(&(oids.len() as i32).to_be_bytes());
+        out.push(0);
+        for oid in oids {
+            out.extend_from_slice(&oid.to_be_bytes());
+        }
+        out
+    }
+
+    fn xlog(wal_start: u64, payload: Vec<u8>) -> WireMessage {
+        WireMessage::XLogData {
+            wal_start: Lsn(wal_start),
+            wal_end: Lsn(wal_start + payload.len() as u64),
+            clock: 0,
+            data: payload,
+        }
+    }
+
+    /// Postgres' own epoch, so `__oxidant_ts` lands on 2024-05-06T07:08:09Z.
+    const COMMIT_TIME: i64 = 767_171_289_000_000;
+
+    // -----------------------------------------------------------------------------------------
+    // The fake publisher
+    // -----------------------------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct FakeWire {
+        /// Every frame the slot holds, oldest first.
+        stream: Vec<WireMessage>,
+        /// How far into `stream` the open session has read.
+        cursor: usize,
+        snapshot: Vec<Vec<Option<String>>>,
+        /// Every call made, in order — this is what the sequencing tests assert on.
+        calls: Vec<String>,
+        consistent_point: Lsn,
+        slot_existed: bool,
+        retained_bytes: u64,
+        server_flush: Lsn,
+        confirmed: Option<Lsn>,
+    }
+
+    impl FakeWire {
+        fn new(stream: Vec<WireMessage>) -> Self {
+            Self {
+                stream,
+                consistent_point: Lsn(0x100),
+                server_flush: Lsn(0xFFFF),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CdcWire for FakeWire {
+        async fn open_slot(&mut self, create: bool) -> Result<SlotOpen> {
+            self.calls.push(format!("open_slot(create={create})"));
+            let existed = self.slot_existed;
+            if create {
+                self.slot_existed = true;
+            }
+            Ok(SlotOpen {
+                consistent_point: self.consistent_point,
+                existed,
+                snapshot_open: create,
+            })
+        }
+
+        async fn snapshot_rows(&mut self, table: &TableSchema) -> Result<Vec<Vec<Option<String>>>> {
+            self.calls
+                .push(format!("snapshot_rows({})", table.qualified()));
+            Ok(self.snapshot.clone())
+        }
+
+        async fn end_snapshot(&mut self) -> Result<()> {
+            self.calls.push("end_snapshot".into());
+            Ok(())
+        }
+
+        async fn start_stream(&mut self, start: Lsn) -> Result<()> {
+            self.calls.push(format!("start_stream({start})"));
+            // A real publisher resumes from the oldest *unconfirmed* transaction, which can be
+            // older than the LSN asked for. Rewinding to the beginning here is what makes the
+            // source's "drop transactions that ended at or before the range start" filter load
+            // bearing rather than decorative.
+            self.cursor = 0;
+            Ok(())
+        }
+
+        async fn next_wire(&mut self, _idle: Duration) -> Result<Option<WireMessage>> {
+            let next = self.stream.get(self.cursor).cloned();
+            if next.is_some() {
+                self.cursor += 1;
+            }
+            Ok(next)
+        }
+
+        async fn confirm(&mut self, _written: Lsn, flushed: Lsn) -> Result<()> {
+            self.calls.push(format!("confirm({flushed})"));
+            self.confirmed = Some(flushed);
+            Ok(())
+        }
+
+        async fn slot_metrics(&mut self) -> Result<SlotMetrics> {
+            Ok(SlotMetrics {
+                retained_bytes: self.retained_bytes,
+                server_flush: self.server_flush,
+                confirmed_flush: self.confirmed,
+            })
+        }
+    }
+
+    /// A wire whose call log the test can read back after the source has taken ownership.
+    ///
+    /// `tokio::sync::Mutex` rather than the standard one: `async_trait` boxes these futures as
+    /// `Send`, and a `std` guard held across an await is not.
+    struct Spy(std::sync::Arc<tokio::sync::Mutex<FakeWire>>);
+
+    #[async_trait::async_trait]
+    impl CdcWire for Spy {
+        async fn open_slot(&mut self, create: bool) -> Result<SlotOpen> {
+            self.0.lock().await.open_slot(create).await
+        }
+        async fn snapshot_rows(&mut self, table: &TableSchema) -> Result<Vec<Vec<Option<String>>>> {
+            self.0.lock().await.snapshot_rows(table).await
+        }
+        async fn end_snapshot(&mut self) -> Result<()> {
+            self.0.lock().await.end_snapshot().await
+        }
+        async fn start_stream(&mut self, start: Lsn) -> Result<()> {
+            self.0.lock().await.start_stream(start).await
+        }
+        async fn next_wire(&mut self, idle: Duration) -> Result<Option<WireMessage>> {
+            self.0.lock().await.next_wire(idle).await
+        }
+        async fn confirm(&mut self, written: Lsn, flushed: Lsn) -> Result<()> {
+            self.0.lock().await.confirm(written, flushed).await
+        }
+        async fn slot_metrics(&mut self) -> Result<SlotMetrics> {
+            self.0.lock().await.slot_metrics().await
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Fixtures
+    // -----------------------------------------------------------------------------------------
+
+    const RELATION_OID: u32 = 16385;
+
+    fn suppliers() -> TableSchema {
+        TableSchema {
+            schema: "public".into(),
+            table: "sales_suppliers".into(),
+            columns: vec![
+                ColumnSchema {
+                    name: "supplierid".into(),
+                    type_oid: oids::INT8,
+                    type_modifier: -1,
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    warning: None,
+                },
+                ColumnSchema {
+                    name: "name".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    warning: None,
+                },
+            ],
+            keys: vec!["supplierid".into()],
+            replica_identity: 'd',
+        }
+    }
+
+    fn options() -> PostgresCdcOptions {
+        PostgresCdcOptions {
+            connect: PgConnectConfig {
+                host: "db.internal".into(),
+                port: 5432,
+                database: "sales".into(),
+                user: "oxidant_cdc".into(),
+                password: None,
+                tls: TlsMode::Disable,
+                tls_ca: None,
+            },
+            publication: "oxidant_sales".into(),
+            slot: "oxidant_sales_suppliers".into(),
+            tables: vec!["public.sales_suppliers".into()],
+            exclude_columns: BTreeSet::new(),
+            keys: vec![],
+            publish_ops: [Op::Insert, Op::Update, Op::Delete, Op::Truncate]
+                .into_iter()
+                .collect(),
+            max_slot_bytes: DEFAULT_MAX_SLOT_BYTES,
+            max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
+            snapshot_batch_rows: DEFAULT_SNAPSHOT_BATCH_ROWS,
+            idle: Duration::from_millis(1),
+            log_dir: None,
+            name: "sales_suppliers".into(),
+        }
+    }
+
+    /// One transaction inserting `Acme`, updating it with an unchanged TOAST column, and
+    /// deleting it — every shape the change stream carries, over one relation.
+    fn a_transaction() -> Vec<WireMessage> {
+        vec![
+            xlog(
+                0x100,
+                relation_msg(
+                    RELATION_OID,
+                    "public",
+                    "sales_suppliers",
+                    &[(true, "supplierid", oids::INT8), (false, "name", 25)],
+                ),
+            ),
+            xlog(0x110, begin_msg(0x200, COMMIT_TIME)),
+            xlog(
+                0x120,
+                change_msg(b'I', RELATION_OID, b'N', &[Some("7"), Some("Acme")]),
+            ),
+            xlog(
+                0x130,
+                change_msg(b'U', RELATION_OID, b'N', &[Some("7"), Some("~")]),
+            ),
+            xlog(
+                0x140,
+                change_msg(b'D', RELATION_OID, b'K', &[Some("7"), None]),
+            ),
+            xlog(0x150, commit_msg(0x200, 0x200, COMMIT_TIME)),
+        ]
+    }
+
+    fn source_with(
+        stream: Vec<WireMessage>,
+    ) -> (
+        PostgresCdcSource,
+        std::sync::Arc<tokio::sync::Mutex<FakeWire>>,
+    ) {
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(stream)));
+        let source = PostgresCdcSource::with_wire(
+            options(),
+            vec![suppliers()],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::default(),
+        );
+        (source, wire)
+    }
+
+    fn column<'a>(batch: &'a RecordBatch, name: &str) -> &'a dyn Array {
+        batch
+            .column(batch.schema().index_of(name).expect("column exists"))
+            .as_ref()
+    }
+
+    fn strings(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
+        let array = column(batch, name)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 column");
+        (0..array.len())
+            .map(|i| (!array.is_null(i)).then(|| array.value(i).to_string()))
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Options
+    // -----------------------------------------------------------------------------------------
+
+    fn parse(pairs: &[(&str, &str)]) -> Result<PostgresCdcOptions> {
+        PostgresCdcOptions::from_options(
+            &pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    fn minimal() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("host", "db.internal"),
+            ("database", "sales"),
+            ("user", "oxidant_cdc"),
+            ("publication", "oxidant_sales"),
+            ("slot", "oxidant_sales_suppliers"),
+            ("tables", "public.sales_suppliers"),
+        ]
+    }
+
+    #[test]
+    fn the_documented_option_surface_parses() {
+        let mut pairs = minimal();
+        pairs.extend([
+            ("port", "5433"),
+            ("tls", "verify-ca"),
+            ("tls_ca", "/etc/oxidant/pg-ca.pem"),
+            ("exclude_columns", "secret, Notes"),
+            ("keys", "supplierID"),
+            ("publish_ops", "insert,update,delete"),
+            ("max_slot_bytes", "1024"),
+            ("max_batch_bytes", "4096"),
+        ]);
+        let options = parse(&pairs).expect("parses");
+        assert_eq!(options.connect.port, 5433);
+        assert_eq!(options.connect.tls, TlsMode::VerifyCa);
+        assert_eq!(
+            options.connect.tls_ca.as_deref(),
+            Some(Path::new("/etc/oxidant/pg-ca.pem"))
+        );
+        assert_eq!(options.tables, vec!["public.sales_suppliers".to_string()]);
+        // Excluded columns are matched case-insensitively, because Postgres folds the names.
+        assert!(options.exclude_columns.contains("notes"));
+        assert_eq!(options.keys, vec!["supplierID".to_string()]);
+        assert_eq!(options.publish_list(), "insert, update, delete");
+        assert_eq!(options.max_slot_bytes, 1024);
+        assert_eq!(options.max_batch_bytes, 4096);
+    }
+
+    #[test]
+    fn a_table_with_no_schema_defaults_to_public_and_folds_case() {
+        let mut pairs = minimal();
+        pairs.retain(|(k, _)| *k != "tables");
+        pairs.push(("tables", "Sales_Suppliers, Inventory.Stock"));
+        let options = parse(&pairs).expect("parses");
+        assert_eq!(
+            options.tables,
+            vec![
+                "public.sales_suppliers".to_string(),
+                "inventory.stock".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_option_is_an_error_rather_than_a_silent_default() {
+        // `table:` for `tables:` would otherwise leave the source with nothing to replicate and
+        // a perfectly healthy-looking empty stream.
+        let mut pairs = minimal();
+        pairs.push(("table", "public.sales_suppliers"));
+        let err = parse(&pairs).unwrap_err().to_string();
+        assert!(err.contains("`table` is not a source option"), "got: {err}");
+        assert!(
+            err.contains("tables"),
+            "the error lists the real names: {err}"
+        );
+    }
+
+    #[test]
+    fn every_required_option_is_named_when_it_is_missing() {
+        for missing in ["host", "database", "user", "publication", "slot", "tables"] {
+            let pairs: Vec<_> = minimal()
+                .into_iter()
+                .filter(|(k, _)| *k != missing)
+                .collect();
+            let err = parse(&pairs).unwrap_err().to_string();
+            assert!(err.contains(missing), "expected `{missing}` in: {err}");
+        }
+    }
+
+    #[test]
+    fn malformed_values_are_rejected_with_the_expected_spelling() {
+        let check = |key: &'static str, value: &'static str, expect: &str| {
+            let mut pairs = minimal();
+            pairs.retain(|(k, _)| *k != key);
+            pairs.push((key, value));
+            let err = parse(&pairs).unwrap_err().to_string();
+            assert!(err.contains(expect), "for `{key}: {value}` got: {err}");
+        };
+        check("port", "not-a-port", "is not a port number");
+        check("tls", "prefer", "verify-full");
+        check("publish_ops", "upsert", "expected any of insert");
+        check("max_slot_bytes", "10GiB", "is not a number of bytes");
+        check("tables", "a.b.c", "is not a `schema.table` name");
+    }
+
+    #[test]
+    fn a_password_is_read_from_the_environment_and_never_from_the_file() {
+        let mut pairs = minimal();
+        pairs.push(("password_env", "OXIDANT_TEST_PG_PASSWORD_UNSET"));
+        let err = parse(&pairs).unwrap_err().to_string();
+        assert!(err.contains("is not set"), "got: {err}");
+
+        // There is no `password:` option at all — a literal secret in an `oxidant.yaml` outlives
+        // the pipeline that leaked it.
+        let mut pairs = minimal();
+        pairs.push(("password", "hunter2"));
+        assert!(parse(&pairs)
+            .unwrap_err()
+            .to_string()
+            .contains("`password` is not a source option"));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Type mapping and value decoding
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn the_type_map_matches_the_documented_table() {
+        let map = |oid: u32| arrow_type_for(oid, -1, "", 'N').0;
+        assert_eq!(map(oids::BOOL), DataType::Boolean);
+        assert_eq!(map(oids::INT2), DataType::Int32);
+        assert_eq!(map(oids::INT4), DataType::Int32);
+        assert_eq!(map(oids::INT8), DataType::Int64);
+        assert_eq!(map(oids::OID), DataType::Int64);
+        assert_eq!(map(oids::XID8), DataType::Int64);
+        assert_eq!(map(oids::FLOAT4), DataType::Float32);
+        assert_eq!(map(oids::FLOAT8), DataType::Float64);
+        assert_eq!(map(oids::BYTEA), DataType::Binary);
+        assert_eq!(map(oids::DATE), DataType::Date32);
+        assert_eq!(map(oids::TIME), DataType::Time64(TimeUnit::Microsecond));
+        assert_eq!(
+            map(oids::TIMESTAMP),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            map(oids::TIMESTAMPTZ),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        // text / varchar / name / char / bpchar / uuid / json / jsonb / xml / inet / cidr /
+        // macaddr / interval / an enum / an unknown extension type: all Utf8.
+        for oid in [
+            25, 1043, 19, 18, 1042, 2950, 114, 3802, 142, 869, 650, 829, 1186, 987654,
+        ] {
+            assert_eq!(map(oid), DataType::Utf8, "oid {oid}");
+        }
+        // An array is its text form, with a warning.
+        let (array_type, warning) = arrow_type_for(1007, -1, "_int4", 'A');
+        assert_eq!(array_type, DataType::Utf8);
+        assert!(warning.unwrap().contains("text form"));
+    }
+
+    #[test]
+    fn numeric_maps_to_a_decimal_only_when_the_source_declared_a_scale() {
+        // `numeric(12,4)`: atttypmod is ((12 << 16) | 4) + 4.
+        let modifier = ((12 << 16) | 4) + 4;
+        assert_eq!(
+            arrow_type_for(oids::NUMERIC, modifier, "numeric", 'N').0,
+            DataType::Decimal128(38, 4)
+        );
+        // Unconstrained `numeric` holds values no fixed-point type can, so it stays text rather
+        // than being silently rounded.
+        let (unconstrained, warning) = arrow_type_for(oids::NUMERIC, -1, "numeric", 'N');
+        assert_eq!(unconstrained, DataType::Utf8);
+        assert!(warning.unwrap().contains("no scale"));
+        // Wider than Decimal128 can hold.
+        assert_eq!(
+            arrow_type_for(oids::NUMERIC, ((60 << 16) | 2) + 4, "numeric", 'N').0,
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn values_decode_from_their_postgres_text_form() {
+        let one = |data_type: DataType, text: &str| {
+            build_array(&data_type, "c", &[Some(text), None]).expect("decodes")
+        };
+
+        let b = one(DataType::Boolean, "t");
+        let b = b.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(b.value(0) && b.is_null(1));
+
+        let i = one(DataType::Int32, "-42");
+        assert_eq!(
+            i.as_any().downcast_ref::<Int32Array>().unwrap().value(0),
+            -42
+        );
+        let i = one(DataType::Int64, "9223372036854775807");
+        assert_eq!(
+            i.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            i64::MAX
+        );
+
+        let bytes = one(DataType::Binary, "\\xdeadbeef");
+        assert_eq!(
+            bytes
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            &[0xDE, 0xAD, 0xBE, 0xEF]
+        );
+
+        let d = one(DataType::Date32, "1970-01-02");
+        assert_eq!(
+            d.as_any().downcast_ref::<Date32Array>().unwrap().value(0),
+            1
+        );
+
+        let ts = one(
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            "2024-05-06 07:08:09.123456",
+        );
+        let ts = ts
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(
+            ts.value(0),
+            chrono::DateTime::parse_from_rfc3339("2024-05-06T07:08:09.123456Z")
+                .unwrap()
+                .timestamp_micros()
+        );
+
+        // A `timestamptz` prints with a `+00` offset because both sessions pin TIME ZONE UTC.
+        let tz = build_array(
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            "c",
+            &[Some("2024-05-06 07:08:09+00")],
+        )
+        .expect("decodes");
+        assert_eq!(
+            tz.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+
+        let time = one(DataType::Time64(TimeUnit::Microsecond), "01:02:03.5");
+        assert_eq!(
+            time.as_any()
+                .downcast_ref::<oxidant_loom::arrow::array::Time64MicrosecondArray>()
+                .unwrap()
+                .value(0),
+            3_723_500_000
+        );
+    }
+
+    #[test]
+    fn a_decimal_keeps_every_digit_the_source_declared() {
+        // The reason this is not a detour through f64: these two survive, and would not.
+        assert_eq!(parse_decimal("123.45", 2), Some(12345));
+        assert_eq!(parse_decimal("-0.0001", 4), Some(-1));
+        assert_eq!(parse_decimal("7", 3), Some(7000));
+        assert_eq!(parse_decimal("+7.5", 3), Some(7500));
+        assert_eq!(
+            parse_decimal("99999999999999999999.9999999999", 10),
+            Some(999_999_999_999_999_999_999_999_999_999i128)
+        );
+        assert_eq!(parse_decimal("", 2), None);
+        assert_eq!(parse_decimal("1e5", 2), None);
+
+        // `numeric` has a NaN and no decimal type does, so it becomes NULL rather than an error
+        // that would stop the pipeline on one row.
+        let array = build_array(&DataType::Decimal128(38, 2), "c", &[Some("NaN")]).unwrap();
+        assert!(array
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap()
+            .is_null(0));
+    }
+
+    #[test]
+    fn a_value_the_mapping_cannot_represent_names_the_column_and_the_fix() {
+        let err = build_array(&DataType::Date32, "hired_on", &[Some("infinity")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hired_on"), "got: {err}");
+        assert!(err.contains("exclude_columns"), "got: {err}");
+    }
+
+    #[test]
+    fn the_emitted_schema_is_the_source_columns_plus_three() {
+        let schema = emitted_schema(&suppliers().columns);
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["supplierid", "name", OP_COLUMN, LSN_COLUMN, TS_COLUMN]
+        );
+        // Every source column is nullable however the source declared it: a delete under
+        // REPLICA IDENTITY DEFAULT carries only the key.
+        assert!(schema.field(0).is_nullable());
+        assert!(!schema.field(2).is_nullable(), "an op is always present");
+        assert!(!schema.field(3).is_nullable(), "an LSN is always present");
+        assert!(
+            schema.field(4).is_nullable(),
+            "a snapshot row has no commit"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Snapshot ⇄ stream sequencing
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_snapshot_is_read_in_the_slot_transaction_and_the_stream_starts_after_it() {
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(a_transaction());
+        wire.lock().await.snapshot = vec![
+            vec![Some("1".into()), Some("Acme".into())],
+            vec![Some("2".into()), None],
+        ];
+
+        // Batch 1: the snapshot of the single source table.
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert_eq!(range.start[SNAPSHOT_KEY], 0);
+        assert_eq!(range.end[SNAPSHOT_KEY], 1);
+        let batches = source.poll_range(&engine, &range).await.unwrap();
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(
+            strings(&batches[0], OP_COLUMN),
+            vec![Some("s".into()), Some("s".into())],
+            "snapshot rows are upserts, so AUTO CDC merges them by key"
+        );
+        // Every snapshot row is as of the consistent point, so a later change to the same key
+        // has a strictly larger `__oxidant_lsn` and wins.
+        let lsn = column(&batches[0], LSN_COLUMN)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(lsn, 0x100);
+        assert!(
+            column(&batches[0], TS_COLUMN).is_null(0),
+            "no commit, no commit time"
+        );
+
+        // Batch 2: the WAL after it.
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert_eq!(range.start[LSN_KEY], 0x100);
+        assert_eq!(range.end[LSN_KEY], 0x200);
+
+        let calls = wire.lock().await.calls.clone();
+        assert_eq!(
+            calls,
+            vec![
+                "open_slot(create=true)",
+                "snapshot_rows(public.sales_suppliers)",
+                // The transaction is committed as soon as the last table is read, rather than
+                // held for the life of the pipeline pinning the publisher's oldest xmin.
+                "end_snapshot",
+                "start_stream(0/100)",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restored_snapshot_is_not_read_again_and_the_slot_is_not_recreated() {
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(a_transaction());
+        wire.lock().await.slot_existed = true;
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0x100)].into(),
+        });
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert_eq!(range.start[LSN_KEY], 0x100, "straight into the stream");
+        let calls = wire.lock().await.calls.clone();
+        assert_eq!(
+            calls,
+            vec!["open_slot(create=false)", "start_stream(0/100)"]
+        );
+    }
+
+    #[tokio::test]
+    async fn losing_the_slot_after_a_committed_batch_stops_rather_than_skips() {
+        // WAL written since the last commit may already be recycled, so resuming would drop
+        // changes and say nothing about it.
+        let engine = Engine::new();
+        let (mut source, _wire) = source_with(vec![]);
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0x100)].into(),
+        });
+        let err = source.plan_batch(&engine).await.unwrap_err().to_string();
+        assert!(err.contains("no longer exists"), "got: {err}");
+        assert!(err.contains("checkpoint directory"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_snapshot_restarts_from_the_first_table() {
+        // The transaction that held the old snapshot died with the process, and a new one sees a
+        // *later* database — so resuming table by table would splice two points in time.
+        let engine = Engine::new();
+        let mut wire = FakeWire::new(a_transaction());
+        wire.slot_existed = true;
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(wire));
+        let mut source = PostgresCdcSource::with_wire(
+            options(),
+            vec![suppliers(), suppliers()],
+            Box::new(Spy(shared.clone())),
+            ConnectorLog::default(),
+        );
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0x50)].into(),
+        });
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert_eq!(range.start[SNAPSHOT_KEY], 0, "back to the first table");
+        assert_eq!(
+            shared.lock().await.calls[0],
+            "open_slot(create=true)",
+            "and the slot is recreated so the new snapshot has a consistent point"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Change decoding
+    // -----------------------------------------------------------------------------------------
+
+    async fn stream_once(source: &mut PostgresCdcSource, engine: &Engine) -> Vec<RecordBatch> {
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0)].into(),
+        });
+        let range = source.plan_batch(engine).await.unwrap();
+        source.poll_range(engine, &range).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn insert_update_and_delete_carry_their_op_lsn_and_commit_time() {
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(a_transaction());
+        wire.lock().await.slot_existed = true;
+        let batches = stream_once(&mut source, &engine).await;
+
+        let batch = &batches[0];
+        assert_eq!(
+            strings(batch, OP_COLUMN),
+            ["i", "u", "d"].map(|s| Some(s.into()))
+        );
+        let lsn = column(batch, LSN_COLUMN)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // Each change carries its own WAL position, not the transaction's, so two changes to one
+        // key inside a transaction still order against each other.
+        assert_eq!(
+            (lsn.value(0), lsn.value(1), lsn.value(2)),
+            (0x120, 0x130, 0x140)
+        );
+        let ts = column(batch, TS_COLUMN)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), COMMIT_TIME + PG_EPOCH_UNIX_MICROS);
+
+        // The update's unchanged-TOAST column and the delete's non-key columns are both NULL.
+        assert_eq!(
+            strings(batch, "name"),
+            vec![Some("Acme".into()), None, None]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncate_becomes_one_row_the_merge_can_recognize() {
+        let engine = Engine::new();
+        let stream = vec![
+            xlog(
+                0x100,
+                relation_msg(
+                    RELATION_OID,
+                    "public",
+                    "sales_suppliers",
+                    &[(true, "supplierid", oids::INT8), (false, "name", 25)],
+                ),
+            ),
+            xlog(0x110, begin_msg(0x200, COMMIT_TIME)),
+            xlog(0x120, truncate_msg(&[RELATION_OID])),
+            xlog(0x130, commit_msg(0x200, 0x200, COMMIT_TIME)),
+        ];
+        let (mut source, wire) = source_with(stream);
+        wire.lock().await.slot_existed = true;
+        let batches = stream_once(&mut source, &engine).await;
+        assert_eq!(strings(&batches[0], OP_COLUMN), vec![Some("t".into())]);
+        assert!(column(&batches[0], "supplierid").is_null(0));
+    }
+
+    #[tokio::test]
+    async fn publish_ops_drops_the_operations_it_does_not_name() {
+        let engine = Engine::new();
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(a_transaction())));
+        wire.lock().await.slot_existed = true;
+        let mut options = options();
+        // Append-only history: deletes never reach the target.
+        options.publish_ops = [Op::Insert, Op::Update].into_iter().collect();
+        let mut source = PostgresCdcSource::with_wire(
+            options,
+            vec![suppliers()],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::default(),
+        );
+        let batches = stream_once(&mut source, &engine).await;
+        assert_eq!(
+            strings(&batches[0], OP_COLUMN),
+            ["i", "u"].map(|s| Some(s.into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn changes_to_a_table_the_source_does_not_replicate_are_dropped() {
+        let engine = Engine::new();
+        let mut stream = a_transaction();
+        stream.insert(
+            1,
+            xlog(
+                0x105,
+                relation_msg(999, "public", "audit_log", &[(true, "id", oids::INT8)]),
+            ),
+        );
+        stream.insert(3, xlog(0x125, change_msg(b'I', 999, b'N', &[Some("1")])));
+        let (mut source, wire) = source_with(stream);
+        wire.lock().await.slot_existed = true;
+        let batches = stream_once(&mut source, &engine).await;
+        assert_eq!(
+            batches[0].num_rows(),
+            3,
+            "only the three changes to `public.sales_suppliers`"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_added_column_is_logged_and_the_stream_keeps_running() {
+        let engine = Engine::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut stream = a_transaction();
+        // The publisher re-announces the relation with a column this source has never seen.
+        stream[0] = xlog(
+            0x100,
+            relation_msg(
+                RELATION_OID,
+                "public",
+                "sales_suppliers",
+                &[
+                    (true, "supplierid", oids::INT8),
+                    (false, "name", 25),
+                    (false, "region", 25),
+                ],
+            ),
+        );
+        stream[2] = xlog(
+            0x120,
+            change_msg(
+                b'I',
+                RELATION_OID,
+                b'N',
+                &[Some("7"), Some("Acme"), Some("EU")],
+            ),
+        );
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(stream)));
+        wire.lock().await.slot_existed = true;
+        let mut source = PostgresCdcSource::with_wire(
+            options(),
+            vec![suppliers()],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::new(Some(dir.path()), "sales_suppliers"),
+        );
+        let batches = stream_once(&mut source, &engine).await;
+
+        // Ingestion continues on the schema the query was planned against; the new column is
+        // dropped rather than breaking the batch.
+        assert_eq!(batches[0].num_rows(), 3);
+        assert_eq!(strings(&batches[0], "name")[0], Some("Acme".into()));
+        let log = std::fs::read_to_string(dir.path().join("sales_suppliers.jsonl")).unwrap();
+        assert!(log.contains("\"event\":\"schema_change\""), "got: {log}");
+        assert!(log.contains("region"), "the added column is named: {log}");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Ranges, replay, and the slot
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_replayed_range_reproduces_identical_batches() {
+        // The property the offset log converts into exactly-once. Nothing was confirmed, so the
+        // slot still holds the range, and re-reading it has to produce what the first attempt saw
+        // — not "whatever the publisher has now".
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(a_transaction());
+        wire.lock().await.slot_existed = true;
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0)].into(),
+        });
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        let first = source.poll_range(&engine, &range).await.unwrap();
+
+        // A second transaction lands between the two attempts, exactly as it would in
+        // production. The replay must not pick it up: the sink would recognize the batch id,
+        // discard the whole thing, and take the newcomer with it.
+        {
+            let mut wire = wire.lock().await;
+            wire.stream.extend(vec![
+                xlog(0x210, begin_msg(0x300, COMMIT_TIME)),
+                xlog(
+                    0x220,
+                    change_msg(b'I', RELATION_OID, b'N', &[Some("8"), Some("Beta")]),
+                ),
+                xlog(0x230, commit_msg(0x300, 0x300, COMMIT_TIME)),
+            ]);
+        }
+        let replay = source.poll_range(&engine, &range).await.unwrap();
+        assert_eq!(first, replay, "the same range yields the same records");
+
+        // And the newcomer is still there for the next batch.
+        let next = source.plan_batch(&engine).await.unwrap();
+        assert_eq!(next.start[LSN_KEY], 0x200);
+        assert_eq!(next.end[LSN_KEY], 0x300);
+        let next = source.poll_range(&engine, &next).await.unwrap();
+        assert_eq!(strings(&next[0], "name"), vec![Some("Beta".into())]);
+    }
+
+    #[tokio::test]
+    async fn planning_twice_describes_the_same_batch_and_consumes_nothing() {
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(a_transaction());
+        wire.lock().await.slot_existed = true;
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0)].into(),
+        });
+
+        let first = source.plan_batch(&engine).await.unwrap();
+        let second = source.plan_batch(&engine).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            source.committed_offsets().unwrap().entries[LSN_KEY],
+            0,
+            "planning moved no committed position"
+        );
+        assert_eq!(
+            wire.lock().await.confirmed,
+            None,
+            "and confirmed nothing to the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_confirmed_until_the_batch_is_durable() {
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(a_transaction());
+        wire.lock().await.slot_existed = true;
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0)].into(),
+        });
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        source.poll_range(&engine, &range).await.unwrap();
+        assert_eq!(
+            wire.lock().await.confirmed,
+            None,
+            "reading is not confirming: the batch is not in the sink yet"
+        );
+
+        source.mark_durable(&engine).await.unwrap();
+        assert_eq!(wire.lock().await.confirmed, Some(Lsn(0x200)));
+    }
+
+    #[tokio::test]
+    async fn a_stretch_of_wal_with_nothing_for_this_publication_advances_the_slot() {
+        // A busy server whose other databases fill the WAL would otherwise make the slot grow
+        // forever while this table has nothing to say. There is nothing in the stretch to lose,
+        // so confirming it is safe — and it is the difference between a healthy slot and a full
+        // disk on the source.
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(vec![WireMessage::Keepalive {
+            wal_end: Lsn(0x900),
+            clock: 0,
+            reply_requested: false,
+        }]);
+        wire.lock().await.slot_existed = true;
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0x100)].into(),
+        });
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        assert!(range.is_empty(), "an idle trigger leaves the table alone");
+        assert_eq!(source.committed_offsets().unwrap().entries[LSN_KEY], 0x900);
+        assert_eq!(wire.lock().await.confirmed, Some(Lsn(0x900)));
+    }
+
+    #[tokio::test]
+    async fn the_slot_size_guard_stops_the_pipeline_before_the_source_disk_fills() {
+        let engine = Engine::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(vec![])));
+        {
+            let mut wire = wire.lock().await;
+            wire.slot_existed = true;
+            wire.retained_bytes = 64 * 1024 * 1024;
+        }
+        let mut options = options();
+        options.max_slot_bytes = 1024 * 1024;
+        let mut source = PostgresCdcSource::with_wire(
+            options,
+            vec![suppliers()],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::new(Some(dir.path()), "sales_suppliers"),
+        );
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0x100)].into(),
+        });
+
+        let err = source.plan_batch(&engine).await.unwrap_err().to_string();
+        assert!(err.contains("64.0 MiB"), "got: {err}");
+        assert!(err.contains("max_slot_bytes"), "got: {err}");
+        assert!(
+            err.contains("pg_drop_replication_slot"),
+            "the way out: {err}"
+        );
+        let log = std::fs::read_to_string(dir.path().join("sales_suppliers.jsonl")).unwrap();
+        assert!(log.contains("\"event\":\"slot_metrics\""), "got: {log}");
+        assert!(log.contains("\"will_retry\":false"), "got: {log}");
+    }
+
+    #[tokio::test]
+    async fn a_range_planned_by_another_source_is_refused() {
+        let engine = Engine::new();
+        let (mut source, _wire) = source_with(vec![]);
+        let err = source
+            .poll_range(
+                &engine,
+                &BatchRange {
+                    source: "kafka".into(),
+                    start: [("events-0".to_string(), 0)].into(),
+                    end: [("events-0".to_string(), 7)].into(),
+                    items: vec![],
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("planned by `kafka`"), "got: {err}");
+    }
+
+    #[test]
+    fn offsets_do_not_cross_source_types() {
+        let (mut source, _wire) = source_with(vec![]);
+        source.restore_offsets(&SourceOffsets {
+            source: "kafka".into(),
+            entries: [("lsn".to_string(), 999)].into(),
+        });
+        assert_eq!(source.committed_offsets().unwrap().entries[LSN_KEY], 0);
+    }
+
+    #[test]
+    fn the_description_names_the_tables_the_slot_and_the_server() {
+        let (source, _wire) = source_with(vec![]);
+        assert_eq!(
+            source.description(),
+            "PostgresCDC[public.sales_suppliers@db.internal:5432/sales \
+             slot=oxidant_sales_suppliers]"
+        );
+    }
+
+    #[test]
+    fn the_pipeline_context_options_are_derived_and_not_settable_in_yaml() {
+        let mut options: BTreeMap<String, String> = BTreeMap::new();
+        postgres_cdc_pipeline_options(
+            &mut options,
+            Path::new("/srv/checkpoints"),
+            "sales_suppliers",
+        );
+        assert_eq!(options[LOG_DIR_OPTION], "/srv/checkpoints/logs");
+        assert_eq!(options[NAME_OPTION], "sales_suppliers");
+        // They start with `oxidant.`, which is the one prefix option parsing lets through — so a
+        // config author cannot point one connector's log at another's file.
+        assert!(LOG_DIR_OPTION.starts_with("oxidant."));
+        assert!(NAME_OPTION.starts_with("oxidant."));
+        let mut pairs = minimal();
+        pairs.push((LOG_DIR_OPTION, "/tmp/logs"));
+        assert!(parse(&pairs).is_ok());
+    }
+
+    #[test]
+    fn a_byte_count_reads_like_one() {
+        assert_eq!(bytes(512), "512 B");
+        assert_eq!(bytes(1024), "1.0 KiB");
+        assert_eq!(bytes(10 * 1024 * 1024 * 1024), "10.0 GiB");
+    }
 }
