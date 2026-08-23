@@ -3,9 +3,12 @@
 The server's HTTP port (default `4040`) hosts a small REST API for running SQL statements and
 checking cluster state — no Spark client needed. Base URL below is `http://localhost:4040`.
 
-> **No auth.** The `/api/v1` endpoints are unauthenticated. Bind the UI port to loopback on
-> shared hosts (`--ui-bind 127.0.0.1`), or disable HTTP with `--no-ui`. The one exception is
-> [`/api/status`](#driver-status), which requires a bearer token and is off by default.
+> **No auth.** Most `/api/v1` endpoints are unauthenticated. Bind the UI port to loopback on
+> shared hosts (`--ui-bind 127.0.0.1`), or disable HTTP with `--no-ui`. The exceptions are the
+> four operational routes marked **bearer token required** below —
+> [`/api/status`](#driver-status), the [pipeline list](#pipelines), a
+> [connector log](#connector-logs) and the [driver log buffer](#driver-logs) — which share one
+> token and are off by default.
 
 ## Endpoints
 
@@ -23,6 +26,9 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `PATCH` | `/api/dashboards/{id}` | Update name, widgets, layout or refresh interval |
 | `DELETE` | `/api/dashboards/{id}` | Delete a dashboard |
 | `GET` | `/api/status` | Driver status for a control plane — **bearer token required** |
+| `GET` | `/api/v1/pipelines` | Streaming pipelines with a connector log on this driver — **bearer token required** |
+| `GET` | `/api/v1/pipelines/{name}/logs` | Tail of a streaming connector's JSONL log — **bearer token required** |
+| `GET` | `/api/v1/logs` | The driver's recent log lines — an in-memory ring buffer of the last 1000 — **bearer token required** |
 
 ## Submit a statement
 
@@ -236,6 +242,139 @@ endpoint:
 
 The token itself is redacted from `/api/v1/applications/{id}/environment`, which otherwise
 echoes every `OXIDANT_*` variable.
+
+The same token gates [the pipeline list](#pipelines), [connector logs](#connector-logs) and
+[the driver's log buffer](#driver-logs); a leak is a leak of all four.
+
+## Pipelines
+
+`GET /api/v1/pipelines` lists the streaming connectors that have written a log under
+`<OXIDANT_CHECKPOINT_DIR>/logs`, newest write first. It is the closest thing to a
+streaming-query registry this port exposes, and it is what the
+[**Pipelines** page](web-ui.md#pipelines) enumerates before tailing each log.
+
+```sh
+curl -s http://localhost:4040/api/v1/pipelines \
+  -H "Authorization: Bearer $OXIDANT_STATUS_TOKEN"
+```
+
+```json
+{
+  "pipelines": [
+    {"name": "orders_live", "sizeBytes": 48213, "modifiedMs": 1755912345678},
+    {"name": "clicks", "sizeBytes": 1204, "modifiedMs": 1755912100000}
+  ],
+  "truncated": false
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `name` | The connector's name — the value to pass as `{name}` to [the tail route](#connector-logs) |
+| `sizeBytes` | Size of the live log file. Not growing between polls is a connector that is not doing anything |
+| `modifiedMs` | Last write, epoch milliseconds on the **driver's** clock, or `null` where the filesystem reports none |
+| `truncated` | `true` when more than 200 logs were found and the list was cut |
+
+Only `<name>.jsonl` is listed. Rotated generations (`<name>.jsonl.1` …) are history, not
+pipelines, and a name the tail route would reject is skipped here too — the list never offers a
+row that `400`s when followed.
+
+Same gate as [`/api/status`](#driver-status), and the same 404s as the tail route (no token, no
+`OXIDANT_CHECKPOINT_DIR`, no `logs/` directory). The one difference: a `logs/` directory that
+exists but is empty answers `200` with an empty list, because "there are no pipelines" is a
+different fact from "this driver cannot tell you", and the UI says different things about them.
+
+> **Streaming work is not in the execution store.** `oxidant-streaming` does not register a
+> micro-batch with the observability store, so `/api/v1/applications/{app}/sql`, `/jobs` and
+> `/stages` contain no streaming executions at all. The connector log is the only per-batch
+> record this API serves. See [web-ui.md](web-ui.md#pipelines).
+
+## Connector logs
+
+`GET /api/v1/pipelines/{name}/logs?tail=N` returns the tail of one streaming connector's own
+log — the `postgres_cdc` connector's slot lifecycle, a Kafka reader's rebalances, the messages
+that exist nowhere else because a failed micro-batch records *that* it failed, not why. The
+**Pipelines** page in the [monitoring UI](web-ui.md#pipelines) shows it in a pipeline's detail
+drawer.
+
+Connectors append one JSON object per line to `<checkpoints>/logs/<name>.jsonl`, alongside the
+offset and commit logs they already keep. `OXIDANT_CHECKPOINT_DIR` names that checkpoint root —
+set it to the same absolute path as `pipeline.checkpoints` in
+[`oxidant.yaml`](config.md). Nothing here writes: the endpoint only reads what a connector left
+behind.
+
+It is guarded by **the same bearer token as [`/api/status`](#driver-status)** — a connector log
+names slots, tables and hosts, so it is operational data, not monitoring decoration.
+
+| Situation | Response |
+|---|---|
+| `OXIDANT_STATUS_TOKEN` unset or empty | `404` — the route does not exist |
+| token set, credential missing or wrong | `401` + `WWW-Authenticate: Bearer` |
+| `OXIDANT_CHECKPOINT_DIR` unset | `404` |
+| `<checkpoints>/logs` does not exist | `404` |
+| no `<name>.jsonl` in it | `404` |
+| `name` is not a plain `[A-Za-z0-9._-]` filename | `400` |
+| otherwise | `200` |
+
+Every absence is the same `404` on purpose: a caller learns "there is nothing here" and nothing
+more, and the UI reads it as "this driver serves no connector logs" and hides the section.
+
+```sh
+curl -s "http://localhost:4040/api/v1/pipelines/orders_live/logs?tail=5" \
+  -H "Authorization: Bearer $OXIDANT_STATUS_TOKEN"
+```
+
+```json
+{
+  "name": "orders_live",
+  "tail": 5,
+  "events": [
+    {"ts": "2026-08-22T01:23:45.101Z", "level": "info", "event": "slot_created", "slot": "orders_slot"},
+    {"ts": "2026-08-22T01:23:46.882Z", "level": "info", "event": "snapshot_complete", "rows": 120400}
+  ],
+  "malformed": 0,
+  "truncated": false
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `events` | The parsed lines, **oldest first** — newest last, the order a log reads in |
+| `tail` | The count actually applied: `?tail=N` defaults to 100 and is clamped to 1000 |
+| `malformed` | Lines that were not valid JSON. A log being appended to right now normally has none; they are counted rather than dropped silently or failed on |
+| `truncated` | `true` when the file was larger than the 1 MiB window read back from its end. The tail still ends at the newest record; only older history is out of view |
+
+The read is a bounded window on the end of the file, so the cost is the same whether the log is
+2 KiB or 2 GiB. Event *shape* is the connector's, not this endpoint's — it parses JSON and does
+not interpret it.
+
+`{name}` chooses a filename, never a path: it must match `[A-Za-z0-9._-]` and may not start
+with a dot, and the file it names must be a **regular file inside** `<checkpoints>/logs` — a
+symlink is refused (`404`) even when it points at a readable file, and the resolved path is
+checked against the resolved logs directory. The listing applies the same rule, so everything
+`GET /api/v1/pipelines` offers is tailable and nothing else is. A `logs` directory that is
+itself a symlink is fine: that is the operator's own configuration, and it becomes the
+boundary.
+
+## Driver logs
+
+`GET /api/v1/logs` returns the driver's in-memory `tracing` ring buffer — the last 1000 lines,
+oldest first — which is what the [**Observability** page](web-ui.md#observability) shows.
+
+```sh
+curl -s http://localhost:4040/api/v1/logs -H "Authorization: Bearer $OXIDANT_STATUS_TOKEN"
+```
+
+```json
+{"logs": ["[INFO] oxidant_connect::rest - listening on 0.0.0.0:4040"]}
+```
+
+It is guarded by **the same bearer token as [`/api/status`](#driver-status)**, with the same
+three answers (`404` unset, `401` wrong, `200` right). The buffer captures every event at every
+enabled level *including field values*, so it names hosts, slots, tables and query text; and
+this port is served under a permissive CORS layer, which means an ungated buffer is readable
+cross-site by any origin an operator's browser visits. It is served by the engine's REST
+router, so a standalone history server has no buffer and answers `404` whatever the token says.
 
 ## Full async flow (submit → poll → result → cancel)
 

@@ -1,9 +1,9 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::StatusCode,
     response::{
         sse::{Event, KeepAlive},
-        IntoResponse, Response, Sse,
+        Sse,
     },
     routing::get,
     Json, Router,
@@ -17,15 +17,19 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
     dashboards::{self, DashboardStore},
-    static_files, status,
+    pipelines, static_files, status,
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: SharedStore,
-    /// Shared bearer token guarding `GET /api/status`. `None` disables that endpoint;
-    /// nothing else on this server is authenticated. See [`crate::status`].
+    /// Shared bearer token guarding `GET /api/status` and both pipeline routes (the listing
+    /// and the connector-log tail). `None` disables all three; nothing else on this server is
+    /// authenticated. See [`crate::status`].
     pub status_token: Option<std::sync::Arc<str>>,
+    /// Pipeline checkpoint root ([`pipelines::CHECKPOINT_DIR_ENV`]), under which connector
+    /// logs live. `None` — the default — makes both pipeline routes answer 404.
+    pub checkpoint_dir: Option<std::sync::Arc<std::path::Path>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,11 +44,6 @@ pub struct StageQuery {
     #[serde(rename = "withSummaries")]
     #[allow(dead_code)]
     pub with_summaries: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SparkProxyQuery {
-    pub url: String,
 }
 
 /// Router with the status token taken from `OXIDANT_STATUS_TOKEN` and dashboards persisted
@@ -71,20 +70,24 @@ pub fn app_router_with(
         status_token,
         dashboard_store,
         static_files::spa_dir(),
+        pipelines::checkpoint_dir_from_env(),
     )
 }
 
-/// As [`app_router_with`], with the SPA directory passed in rather than read from the
-/// environment — the form tests use to exercise both static-file paths.
+/// As [`app_router_with`], with the SPA directory and the pipeline checkpoint root passed in
+/// rather than read from the environment — the form tests use to exercise both static-file
+/// paths and the connector-log route.
 pub fn app_router_with_spa(
     store: SharedStore,
     status_token: Option<String>,
     dashboard_store: DashboardStore,
     spa_dir: Option<std::path::PathBuf>,
+    checkpoint_dir: Option<std::path::PathBuf>,
 ) -> Router {
     let state = AppState {
         store,
         status_token: status::normalize_token(status_token).map(Into::into),
+        checkpoint_dir: checkpoint_dir.map(Into::into),
     };
     let router = Router::new()
         .route("/api/status", get(status::status))
@@ -105,8 +108,12 @@ pub fn app_router_with_spa(
             "/api/v1/applications/{app_id}/environment",
             get(list_environment),
         )
+        .route("/api/v1/pipelines", get(pipelines::list_pipelines))
+        .route(
+            "/api/v1/pipelines/{name}/logs",
+            get(pipelines::pipeline_logs),
+        )
         .route("/api/v1/events/stream", get(events_stream))
-        .route("/api/v1/spark-proxy", get(spark_proxy))
         .route("/health", get(|| async { "ok" }));
 
     // Either the built React app on disk, or the page compiled into the binary. `ServeDir`'s
@@ -209,43 +216,6 @@ async fn events_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-async fn spark_proxy(Query(q): Query<SparkProxyQuery>) -> Result<Response, StatusCode> {
-    let url = q.url.trim();
-    if url.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    // Basic SSRF guard: only allow localhost and private ranges for dev.
-    if !is_allowed_proxy_url(url) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let body = resp.bytes().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
-    Ok((status, [(header::CONTENT_TYPE, "application/json")], body).into_response())
-}
-
-fn is_allowed_proxy_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.contains("localhost")
-        || lower.contains("127.0.0.1")
-        || lower.contains("0.0.0.0")
-        || lower.contains("::1")
-        || lower.contains("192.168.")
-        || lower.contains("10.")
-        || lower.contains(".local")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,7 +247,7 @@ mod tests {
 
     fn spa_router(dir: Option<std::path::PathBuf>) -> Router {
         let store = Arc::new(AppStateStore::new());
-        app_router_with_spa(store, None, DashboardStore::in_memory(), dir)
+        app_router_with_spa(store, None, DashboardStore::in_memory(), dir, None)
     }
 
     async fn get_body(app: &Router, uri: &str) -> (StatusCode, String) {

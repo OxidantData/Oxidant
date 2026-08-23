@@ -70,7 +70,7 @@
     @apply font-medium text-body underline decoration-hairline-strong underline-offset-4
       transition-colors hover:decoration-body;
   }
-  /* Text inputs, textareas and selects across the editor/notebook/compare pages. */
+  /* Text inputs, textareas and selects across the editor and notebook pages. */
   .oxidant-input {
     @apply rounded-oxidant-sm border border-hairline bg-bg px-3 py-2 text-sm text-body
       placeholder:text-muted focus:border-hairline-strong focus:outline-none;

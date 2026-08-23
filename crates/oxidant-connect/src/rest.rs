@@ -15,7 +15,14 @@
 //! - `GET  /api/v1/catalogs/{catalog}/tables/{table}/columns?namespace=...` — list columns.
 //! - `GET  /api/v1/catalogs/autocomplete?prefix=...` — catalog/schema/table/column suggestions.
 //! - `GET  /api/v1/cluster/status` — single-node / local-cluster / distributed + workers + process metrics.
-//! - `GET /api/v1/logs` — recent process log lines (in-memory ring buffer).
+//! - `GET /api/v1/logs` — recent process log lines (in-memory ring buffer). **Bearer token
+//!   required** — the same `OXIDANT_STATUS_TOKEN` that gates `/api/status` and the pipeline
+//!   routes, checked by the same code
+//!   ([`oxidant_ui_server::status::deny_unless_authorized`]). The buffer captures every
+//!   `tracing` event at every enabled level, field values included, so it names hosts, slots,
+//!   tables and query text; and this router is served under a permissive CORS layer, which
+//!   made an ungated buffer readable cross-site by any origin an operator's browser visits.
+//!   Unset token, `404`: the route does not exist, exactly like `/api/status`.
 //!
 //! Statements execute through [`OxidantService::execute_sql`], i.e. the exact `Sql`-relation
 //! arm of the gRPC path: same distributed routing, same observability hooks (statements show
@@ -550,6 +557,9 @@ struct RestState {
     service: Arc<OxidantService>,
     store: StatementStore,
     log_buffer: LogBuffer,
+    /// Shared bearer token guarding `GET /api/v1/logs`. `None` — the default — makes that one
+    /// route answer `404`; nothing else in this router is authenticated.
+    status_token: Option<Arc<str>>,
 }
 
 /// Build the REST statement-execution router around a shared Spark Connect service.
@@ -562,6 +572,7 @@ pub fn router(service: Arc<OxidantService>) -> Router {
         service,
         store: StatementStore::new(),
         log_buffer,
+        status_token: oxidant_ui_server::status::status_token_from_env().map(Into::into),
     })
 }
 
@@ -1110,8 +1121,18 @@ fn process_metrics() -> (Option<u64>, Option<u64>, Option<f32>) {
         .unwrap_or((None, None, None))
 }
 
-async fn list_logs(State(state): State<RestState>) -> Json<Value> {
-    Json(json!({ "logs": state.log_buffer.lines() }))
+/// `GET /api/v1/logs` — the driver's `tracing` ring buffer, for the monitoring UI's
+/// Observability page.
+///
+/// Gated by the same shared token as `/api/status`, through the same code: this is the
+/// driver's own log, not monitoring decoration.
+async fn list_logs(State(state): State<RestState>, headers: header::HeaderMap) -> Response {
+    if let Some(denied) =
+        oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), &headers)
+    {
+        return denied;
+    }
+    Json(json!({ "logs": state.log_buffer.lines() })).into_response()
 }
 
 #[cfg(test)]
@@ -1144,6 +1165,7 @@ mod tests {
             service: Arc::new(service),
             store: StatementStore::new(),
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            status_token: None,
         };
         (guard, state.clone(), app(state))
     }
@@ -1162,6 +1184,7 @@ mod tests {
             service: Arc::new(OxidantService::new()),
             store: StatementStore::new(),
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            status_token: None,
         };
         (guard, state.clone(), app(state))
     }
@@ -1357,11 +1380,56 @@ mod tests {
         assert!(body["process"]["memoryTotalMb"].as_u64().is_some());
     }
 
+    /// The driver's log buffer carries every `tracing` field value — hosts, slots, tables,
+    /// query text — and this router is served under a permissive CORS layer, so while it was
+    /// ungated any origin an operator's browser visited could read it cross-site. It is gated
+    /// exactly like `/api/status` and the pipeline routes, by the same code: no token
+    /// configured is `404` (the route does not exist), a missing or wrong credential is `401`
+    /// with the scheme advertised, and the token the UI stores works as a bearer header.
     #[tokio::test]
-    async fn logs_endpoint_returns_array() {
-        let (_env, _state, app) = test_state();
-        let (status, body) = get_json(&app, "/api/v1/logs").await;
-        assert_eq!(status, StatusCode::OK);
+    async fn logs_endpoint_is_gated_by_the_status_token() {
+        const TOKEN: &str = "s3cret-status-token";
+        let (_env, state, ungated) = test_state();
+        assert_eq!(
+            get_json(&ungated, "/api/v1/logs").await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        let mut gated_state = state.clone();
+        gated_state.status_token = Some(TOKEN.into());
+        let gated = app(gated_state);
+
+        for auth in [None, Some("Bearer wrong"), Some("Basic x")] {
+            let mut req = axum::http::Request::builder().uri("/api/v1/logs");
+            if let Some(auth) = auth {
+                req = req.header(header::AUTHORIZATION, auth);
+            }
+            let resp = gated
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{auth:?}");
+            assert_eq!(
+                resp.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+                "Bearer",
+                "{auth:?}"
+            );
+        }
+
+        let resp = gated
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/logs")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(body["logs"].is_array());
     }
 
