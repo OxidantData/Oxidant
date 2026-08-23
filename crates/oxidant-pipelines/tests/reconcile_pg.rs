@@ -250,7 +250,7 @@ async fn a_freshly_snapshotted_target_is_in_sync_and_every_upstream_change_is_a_
     );
     let table = &clean.tables[0];
     assert_eq!(table.verdicts(), vec!["in_sync"], "{}", clean.render());
-    assert_eq!(table.source_rows, 3);
+    assert_eq!(table.source_rows, Some(3));
     assert_eq!(table.target_rows, Some(3));
     assert_eq!(table.upstream, vec![format!("public.{TABLE}")]);
     assert_eq!(table.target, format!("local.live.{TABLE}"));
@@ -295,9 +295,9 @@ async fn a_freshly_snapshotted_target_is_in_sync_and_every_upstream_change_is_a_
     );
     // One row went in and one went out, so the counts are equal — the key walk is the only thing
     // that sees it, which is exactly why the report has both.
-    assert_eq!(table.source_rows, 3);
+    assert_eq!(table.source_rows, Some(3));
     assert_eq!(table.target_rows, Some(3));
-    assert_eq!(table.row_count_drift(), 0);
+    assert_eq!(table.row_count_drift(), Some(0));
     assert_eq!(table.verdicts(), vec!["key_drift"], "{rendered}");
 
     // A row-count drift on its own, once the counts stop cancelling out.
@@ -307,7 +307,7 @@ async fn a_freshly_snapshotted_target_is_in_sync_and_every_upstream_change_is_a_
     )
     .await;
     let counted = run_reconcile(&engine, &config, &ReconcileOptions::default()).await;
-    assert_eq!(counted.tables[0].row_count_drift(), 1);
+    assert_eq!(counted.tables[0].row_count_drift(), Some(1));
     assert_eq!(
         counted.tables[0].verdicts(),
         vec!["row_count_drift", "key_drift"],
@@ -404,7 +404,7 @@ async fn a_text_key_walks_in_the_same_order_on_both_sides_and_a_short_sample_bou
         "byte order puts the upper-case keys first, and the walk stops at the second:\n{rendered}"
     );
     // The count still covers the whole table, which is what makes a short sample useful at all.
-    assert_eq!(sampled.tables[0].source_rows, 4);
+    assert_eq!(sampled.tables[0].source_rows, Some(4));
     assert_eq!(sampled.tables[0].target_rows, Some(4));
 
     drop_fixtures(&connect, &table).await;
@@ -834,7 +834,11 @@ async fn two_upstream_tables_reconcile_as_one_target_until_their_key_spaces_over
         .expect("disjoint key spaces reconcile");
     let rendered = clean.render();
     assert_eq!(clean.exit_code(), 0, "{rendered}");
-    assert_eq!(clean.tables[0].source_rows, 4, "both tables are counted");
+    assert_eq!(
+        clean.tables[0].source_rows,
+        Some(4),
+        "both tables are counted"
+    );
     assert_eq!(clean.tables[0].diff.compared, 4, "{rendered}");
 
     // Now give the two tables a key in common — a row `b` has and `a` has too.
@@ -843,10 +847,24 @@ async fn two_upstream_tables_reconcile_as_one_target_until_their_key_spaces_over
         &format!("INSERT INTO public.{b} VALUES (1, 'Acme (b)')"),
     )
     .await;
-    let err = reconcile(&engine, &plan, &ReconcileOptions::default())
+    let refused = reconcile(&engine, &plan, &ReconcileOptions::default())
         .await
-        .expect_err("an overlapping key space is refused rather than reported as drift")
-        .to_string();
+        .expect("the refusal is this table's own, not the whole run's");
+    let rendered = refused.render();
+    assert_eq!(
+        refused.tables[0].verdicts(),
+        vec!["source_error"],
+        "an overlapping key space is refused, not reported as drift:\n{rendered}"
+    );
+    assert_eq!(
+        refused.exit_code(),
+        oxidant_pipelines::EXIT_FAILED,
+        "and it is `could not run`, not `drifted`:\n{rendered}"
+    );
+    let err = refused.tables[0]
+        .source_error
+        .clone()
+        .expect("names why it stopped");
     assert!(err.contains(&a) && err.contains(&b), "got: {err}");
     assert!(err.contains('1'), "it names the key it found: {err}");
     assert!(
@@ -857,4 +875,108 @@ async fn two_upstream_tables_reconcile_as_one_target_until_their_key_spaces_over
     for name in [&pipeline_table, &a, &b] {
         drop_fixtures(&connect, name).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_publisher_for_one_table_does_not_discard_the_others_report() {
+    let Some(connect) = dsn() else {
+        eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
+        return;
+    };
+    // The command's premise is "run this across N tables in CI". Propagating one table's error
+    // threw away every other table's result with it — so a single unreachable publisher turned a
+    // drift report into no report, and the drift stayed unreported until someone noticed.
+    let good = format!("{TABLE}_partial");
+    drop_fixtures(&connect, &good).await;
+    sql(
+        &connect,
+        &format!("CREATE TABLE public.{good} (supplierid bigint primary key, name text)"),
+    )
+    .await;
+    sql(
+        &connect,
+        &format!("INSERT INTO public.{good} VALUES (1, 'Acme')"),
+    )
+    .await;
+
+    let root = tempfile::TempDir::new().expect("temp dir");
+    let engine = engine_for(root.path()).await;
+    // Seed the reachable table on its own; the second source has no server to snapshot from.
+    seed_target(&engine, &config(&connect, root.path(), &good)).await;
+
+    // Now the same pipeline plus a table whose publisher is a closed port.
+    let dead = format!("{TABLE}_partial_dead");
+    let config = OxidantConfig::parse(&format!(
+        "{}  - name: {dead}
+    source:
+      format: postgres_cdc
+      options:
+        host: 127.0.0.1
+        port: \"1\"
+        database: {database}
+        user: {user}
+        tls: disable
+        publication: {dead}
+        slot: {dead}
+        tables: public.{dead}
+    auto_cdc:
+      source: {dead}_changes
+      keys: [supplierid]
+      sequence_by: __oxidant_lsn
+",
+        config_yaml(&connect, root.path(), &good),
+        database = connect.database,
+        user = connect.user,
+    ))
+    .expect("the fixture config parses");
+    let plan = Plan::build(&config).expect("plans");
+
+    let partial = reconcile(&engine, &plan, &ReconcileOptions::default())
+        .await
+        .expect("one unreachable source is reported, not propagated");
+    let rendered = partial.render();
+    assert_eq!(
+        partial.tables.len(),
+        2,
+        "both tables are in the report:\n{rendered}"
+    );
+    let reachable = &partial.tables[0];
+    assert_eq!(reachable.table, good);
+    assert_eq!(
+        reachable.verdicts(),
+        vec!["in_sync"],
+        "the table that could be read is still answered:\n{rendered}"
+    );
+    let unreachable = &partial.tables[1];
+    assert_eq!(unreachable.table, dead);
+    assert_eq!(unreachable.verdicts(), vec!["source_error"], "{rendered}");
+    assert!(unreachable.source_error.is_some(), "{rendered}");
+    assert_eq!(
+        unreachable.source_rows, None,
+        "an unread count is unknown, not zero:\n{rendered}"
+    );
+    // And the exit code says "could not run", not "drifted".
+    assert_eq!(
+        partial.exit_code(),
+        oxidant_pipelines::EXIT_FAILED,
+        "{rendered}"
+    );
+    assert!(rendered.contains("summary: FAILED"), "{rendered}");
+
+    // Asking for the broken table by name is the same answer, and not an "unmatched --table"
+    // complaint about a name the pipeline plainly has.
+    let scoped = reconcile(
+        &engine,
+        &plan,
+        &ReconcileOptions {
+            tables: vec![dead.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a named table that cannot be read is a report, not an unmatched name");
+    assert_eq!(scoped.tables.len(), 1);
+    assert_eq!(scoped.exit_code(), oxidant_pipelines::EXIT_FAILED);
+
+    drop_fixtures(&connect, &good).await;
 }

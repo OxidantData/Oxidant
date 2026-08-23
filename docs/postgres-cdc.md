@@ -145,10 +145,18 @@ a count that covers all of them.
 
 **Verdicts**, per table: `in_sync`, `row_count_drift`, `key_drift`,
 `schema_drift` (the target is missing a source column), `target_missing` (the
-pipeline has not created it yet). The process exits **0** when every table is
-`in_sync` and **1** when any drifted, so it drops into cron or a CI step
-unchanged. A reconcile that could not *run* — an unreachable publisher, a
-`--table` that matches nothing — is an ordinary error on stderr, also non-zero.
+pipeline has not created it yet), `source_error` (this table could not be read
+at all). The process exits **0** when every table is `in_sync`, **1** when any
+drifted, and **2** when any could not be compared — an unreachable publisher, a
+`--table` that matches nothing, a key type the walk refuses, an overlapping key
+space. Drift and "could not run" get different codes on purpose: a CI step
+written as `reconcile || page_the_data_team` should not page for a network
+blip. A run that hit both exits 2, because an incomplete run's "no drift here"
+is only a claim about the tables it read.
+
+One table's failure does not discard the others' results: it is reported as
+that table's `source_error`, with its error in place of the comparison, and
+every other table is still compared.
 
 **How the two sides are made comparable.** This is the part that decides
 whether the report is worth reading.

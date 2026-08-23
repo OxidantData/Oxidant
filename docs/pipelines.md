@@ -7,7 +7,7 @@ file, no PySpark client and no server:
 oxidant pipeline validate  -c oxidant.yaml   # parse, plan, topologically sort — run nothing
 oxidant pipeline show      -c oxidant.yaml   # print the resolved DAG
 oxidant pipeline run       -c oxidant.yaml   # build the tables
-oxidant pipeline reconcile -c oxidant.yaml   # postgres_cdc drift report; exit 1 when it drifted
+oxidant pipeline reconcile -c oxidant.yaml   # postgres_cdc drift report; 1 drifted, 2 could not run
 ```
 
 The engine underneath is the same one a PySpark `writeStream` drives — the same Kafka source,
@@ -431,9 +431,18 @@ see [streaming.md](streaming.md#reading-one-table-from-any-engine).
 
 `oxidant pipeline reconcile` compares every [`postgres_cdc`](postgres-cdc.md) table in the
 pipeline against the lakehouse table it feeds and reports what differs. It reads only — no slot
-is opened, no publication is created, nothing is written on either side — and it exits **0** when
-everything is in sync and **1** when anything drifted, so it drops into cron or a CI step
-unchanged.
+is opened, no publication is created, nothing is written on either side — and it drops into cron
+or a CI step unchanged:
+
+| Exit | Meaning |
+|---|---|
+| `0` | every table was compared and every one is in sync |
+| `1` | the comparison ran and something drifted — a data problem, and the code a CI step is written against |
+| `2` | the comparison could not be run: an unreachable publisher, a `--table` that names nothing, a key type the walk refuses, an overlapping key space. A network blip is not data loss, so it does not share a code with one |
+
+A run that hit both reports `2`: it was incomplete, so "no drift here" is only a claim about the
+tables it managed to read. One table's failure never discards the others — it is reported as that
+table's `source_error` and the rest are still compared.
 
 ```sh
 oxidant pipeline reconcile -c oxidant.yaml
@@ -456,6 +465,19 @@ table: sales_suppliers
   verdict: row_count_drift, key_drift
 
 summary: DRIFT — 1 of 1 table(s) differ
+```
+
+A table whose source could not be read prints its error in place of the comparison and the run
+ends `FAILED`:
+
+```text
+table: sales_customers
+  source:  public.sales_customers
+  target:  local.live.sales_customers
+  error:   connect to db.internal:5432: connection refused
+  verdict: source_error
+
+summary: FAILED — 1 of 2 table(s) could not be read, 0 of the rest drifted
 ```
 
 Two comparisons, because either one alone lies. Row counts catch a table that fell behind; the

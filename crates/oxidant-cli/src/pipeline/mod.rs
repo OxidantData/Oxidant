@@ -178,20 +178,39 @@ pub async fn run(config: Option<OxidantConfig>, command: Command) -> Result<()> 
             if let Some(cron) = cron {
                 return register_schedule(&plan, &cron, config.source_path.as_deref(), &options);
             }
-            let engine = crate::embedded::build_engine(Some(&config), None).await?;
-            let report = oxidant_pipelines::reconcile(&engine, &plan, &options).await?;
+            // Every exit from here carries a status code the docs name, so an error out of the
+            // reconcile itself must not fall through to the generic handler in `main` — that
+            // exits 1, which is the code reserved for "the comparison ran and found drift".
+            let engine = match crate::embedded::build_engine(Some(&config), None).await {
+                Ok(engine) => engine,
+                Err(e) => reconcile_failed(&e),
+            };
+            let report = match oxidant_pipelines::reconcile(&engine, &plan, &options).await {
+                Ok(report) => report,
+                Err(e) => reconcile_failed(&e),
+            };
             // The report goes to stdout — it is the command's output, and a cron job pipes it.
             print!("{}", report.render());
             // Exit here rather than returning an error, so drift is reported as a full report
             // with a status code and not as `oxidant: <message>` on stderr. `run` cannot express
             // "succeeded, and the answer is no" any other way.
             let code = report.exit_code();
-            if code != 0 {
+            if code != oxidant_pipelines::EXIT_IN_SYNC {
                 std::process::exit(code);
             }
             Ok(())
         }
     }
+}
+
+/// A reconcile that could not run: `EXIT_FAILED`, never the exit code drift owns.
+///
+/// `docs/cli.md` and `docs/pipelines.md` both publish this split, and a CI step written as
+/// `reconcile || page_the_data_team` is the reason it matters: a network blip should not read the
+/// same way as a target that stopped saying what the source says.
+fn reconcile_failed(error: &Error) -> ! {
+    eprintln!("oxidant: {error}");
+    std::process::exit(oxidant_pipelines::EXIT_FAILED)
 }
 
 /// `reconcile --cron <EXPR>`: persist the schedule (or clear it) and say what changed.

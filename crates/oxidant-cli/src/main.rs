@@ -11,7 +11,7 @@
 //!   --hash-keys 0
 //! oxidant pipeline run -c oxidant.yaml      # build the declarative table DAG (Kafka -> lake)
 //! oxidant pipeline validate -c oxidant.yaml  # parse + plan + topo-sort, run nothing
-//! oxidant pipeline reconcile -c oxidant.yaml # postgres_cdc drift report; exit 1 when it drifted
+//! oxidant pipeline reconcile -c oxidant.yaml # postgres_cdc drift report; 1 drifted, 2 could not run
 //! oxidant sql -e "SELECT 1"                 # run SQL in-process (no server needed)
 //! oxidant sql -c oxidant.yaml -e "SELECT count(*) FROM local.live.orders"
 //! oxidant sql --url http://driver:4040 -e "SELECT 1"   # ... or via a server's REST API

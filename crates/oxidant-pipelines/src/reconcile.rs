@@ -59,6 +59,14 @@ use crate::runner::Plan;
 /// Keys compared per table unless `--sample` widens it.
 pub const DEFAULT_SAMPLE: usize = 10_000;
 
+/// Every table was compared and every one of them is in sync.
+pub const EXIT_IN_SYNC: i32 = 0;
+/// The comparison ran and something differed. This is the one a CI step is written against.
+pub const EXIT_DRIFT: i32 = 1;
+/// The comparison could not be run — an unreachable publisher, a `--table` that names nothing, a
+/// key type the walk refuses. Distinct from drift so a network blip does not read as data loss.
+pub const EXIT_FAILED: i32 = 2;
+
 /// Joins the columns of a composite key into one comparable string.
 ///
 /// `0x01` rather than a printable character: byte-wise comparison of the joined form then orders
@@ -270,12 +278,19 @@ pub struct TableReport {
     pub target: String,
     /// The row's identity, as the source resolved it (primary key, or the `keys:` override).
     pub keys: Vec<String>,
-    /// `count(*)` on the upstream tables, summed.
-    pub source_rows: u64,
+    /// `count(*)` on the upstream tables, summed. `None` when the source could not be read —
+    /// unknown and zero are different answers, and the report presents this one as fact.
+    pub source_rows: Option<u64>,
     /// `count(*)` on the target, or `None` when the target does not exist yet.
     pub target_rows: Option<u64>,
     /// Why the target could not be read, when it could not be.
     pub target_error: Option<String>,
+    /// Why the *source* could not be read, when it could not be.
+    ///
+    /// Mirrors [`Self::target_error`] rather than aborting the whole run: the command's premise is
+    /// "run this across N tables in CI", and an unreachable publisher for one table used to
+    /// discard every other table's report along with it.
+    pub source_error: Option<String>,
     pub sample: usize,
     pub source_sampled: usize,
     pub target_sampled: usize,
@@ -288,13 +303,43 @@ pub struct TableReport {
 }
 
 impl TableReport {
-    /// Upstream rows minus target rows: positive means the target is behind.
-    pub fn row_count_drift(&self) -> i64 {
-        self.source_rows as i64 - self.target_rows.unwrap_or(0) as i64
+    /// One table the reconcile could not read at all.
+    fn failed(plan: &Plan<'_>, name: &str, upstream: Vec<String>, error: String) -> Self {
+        Self {
+            table: name.to_string(),
+            upstream,
+            target: plan.target_of(name),
+            keys: Vec::new(),
+            source_rows: None,
+            target_rows: None,
+            target_error: None,
+            source_error: Some(error),
+            sample: 0,
+            source_sampled: 0,
+            target_sampled: 0,
+            missing_columns: Vec::new(),
+            excluded_columns: Vec::new(),
+            diff: KeyDiff::default(),
+        }
+    }
+
+    /// Upstream rows minus target rows: positive means the target is behind. `None` when either
+    /// side's count is unknown, which is not the same as a drift of zero.
+    pub fn row_count_drift(&self) -> Option<i64> {
+        Some(self.source_rows? as i64 - self.target_rows? as i64)
+    }
+
+    /// Whether this table's own comparison could not be run.
+    pub fn errored(&self) -> bool {
+        self.source_error.is_some()
     }
 
     /// The drift classes this table hit, or `["in_sync"]`.
     pub fn verdicts(&self) -> Vec<&'static str> {
+        if self.errored() {
+            // Not a drift class: nothing was compared, so nothing can be said about the target.
+            return vec!["source_error"];
+        }
         let mut out = Vec::new();
         if self.target_rows.is_none() {
             out.push("target_missing");
@@ -302,7 +347,7 @@ impl TableReport {
         if !self.missing_columns.is_empty() {
             out.push("schema_drift");
         }
-        if self.target_rows.is_some() && self.row_count_drift() != 0 {
+        if self.row_count_drift().is_some_and(|drift| drift != 0) {
             out.push("row_count_drift");
         }
         if !self.diff.is_clean() {
@@ -314,8 +359,10 @@ impl TableReport {
         out
     }
 
+    /// Whether this table *was* compared and differed. A table that could not be read is
+    /// [`Self::errored`], which is a different answer and a different exit code.
     pub fn drifted(&self) -> bool {
-        self.verdicts() != ["in_sync"]
+        !self.errored() && self.verdicts() != ["in_sync"]
     }
 }
 
@@ -331,14 +378,30 @@ impl ReconcileReport {
         self.tables.iter().filter(|t| t.drifted()).count()
     }
 
-    /// `0` clean, `1` drifted — the contract a cron job or a CI step reads.
+    /// How many tables could not be compared at all.
+    pub fn errored(&self) -> usize {
+        self.tables.iter().filter(|t| t.errored()).count()
+    }
+
+    /// [`EXIT_IN_SYNC`], [`EXIT_DRIFT`] or [`EXIT_FAILED`] — the contract a cron job or a CI step
+    /// reads, and the one `docs/cli.md` and `docs/pipelines.md` state.
     ///
-    /// Deliberately *not* the shape of an ordinary CLI failure: a reconcile that could not run at
-    /// all is an error and exits non-zero through the normal path with a message, and a reconcile
-    /// that ran and found drift exits 1 having printed a full report. Both are non-zero on
-    /// purpose — the safe reading of either is "look at this".
+    /// The two non-zero answers are kept apart because they call for different things. "The target
+    /// no longer says what the source says" is a data problem someone has to look at; "the
+    /// publisher was unreachable" is a network blip, and a CI step written as
+    /// `reconcile || page_the_data_team` should not page for one. `1` is drift and only drift; any
+    /// operational failure — an unreachable publisher, a `--table` typo, an unwalkable key type —
+    /// is `2`, whether it comes back as a per-table `source_error` or as an error from the command
+    /// itself. Failure outranks drift when a run hit both: the run was incomplete, so its
+    /// "no drift here" is only a claim about the tables it managed to read.
     pub fn exit_code(&self) -> i32 {
-        i32::from(self.drifted() > 0)
+        if self.errored() > 0 {
+            EXIT_FAILED
+        } else if self.drifted() > 0 {
+            EXIT_DRIFT
+        } else {
+            EXIT_IN_SYNC
+        }
     }
 
     /// The whole report, as the CLI prints it.
@@ -356,14 +419,26 @@ impl ReconcileReport {
             let _ = writeln!(out, "table: {}", table.table);
             let _ = writeln!(out, "  source:  {}", table.upstream.join(", "));
             let _ = writeln!(out, "  target:  {}", table.target);
-            let _ = writeln!(out, "  keys:    {}", table.keys.join(", "));
+            if !table.keys.is_empty() {
+                let _ = writeln!(out, "  keys:    {}", table.keys.join(", "));
+            }
+            if let Some(error) = &table.source_error {
+                // Nothing below this line was measured, so none of it is printed: a zero here
+                // would read as a count rather than as an absence.
+                let _ = writeln!(out, "  error:   {error}");
+                let _ = writeln!(out, "  verdict: {}\n", table.verdicts().join(", "));
+                continue;
+            }
+            let source_rows = table
+                .source_rows
+                .map_or_else(|| "unknown".to_string(), |rows| rows.to_string());
             match (table.target_rows, &table.target_error) {
                 (Some(target_rows), _) => {
-                    let drift = table.row_count_drift();
+                    let drift = table.row_count_drift().unwrap_or(0);
                     let _ = writeln!(
                         out,
                         "  rows:    source {}   target {}   drift {}{}",
-                        table.source_rows,
+                        source_rows,
                         target_rows,
                         if drift > 0 { "+" } else { "" },
                         drift
@@ -372,8 +447,7 @@ impl ReconcileReport {
                 (None, Some(error)) => {
                     let _ = writeln!(
                         out,
-                        "  rows:    source {}   target unreadable ({error})",
-                        table.source_rows
+                        "  rows:    source {source_rows}   target unreadable ({error})"
                     );
                 }
                 (None, None) => {}
@@ -417,19 +491,19 @@ impl ReconcileReport {
             }
             let _ = writeln!(out, "  verdict: {}\n", table.verdicts().join(", "));
         }
-        let drifted = self.drifted();
-        if drifted == 0 {
+        let (drifted, errored, total) = (self.drifted(), self.errored(), self.tables.len());
+        if errored > 0 {
+            // The failure leads, because it is what makes the rest of the summary partial: the
+            // tables that did read are still worth having, and are still reported above.
             let _ = writeln!(
                 out,
-                "summary: in sync — {} table(s) clean",
-                self.tables.len()
+                "summary: FAILED — {errored} of {total} table(s) could not be read, {drifted} of \
+                 the rest drifted"
             );
+        } else if drifted > 0 {
+            let _ = writeln!(out, "summary: DRIFT — {drifted} of {total} table(s) differ");
         } else {
-            let _ = writeln!(
-                out,
-                "summary: DRIFT — {drifted} of {} table(s) differ",
-                self.tables.len()
-            );
+            let _ = writeln!(out, "summary: in sync — {total} table(s) clean");
         }
         out
     }
@@ -447,6 +521,7 @@ impl ReconcileReport {
                     "verdict": table.verdicts().join(","),
                     "upstream": table.upstream,
                     "target": table.target,
+                    "error": table.source_error,
                     "source_rows": table.source_rows,
                     "target_rows": table.target_rows,
                     "sampled": table.source_sampled,
@@ -571,22 +646,64 @@ pub async fn reconcile(
             &name,
         );
         let pg: HashMap<String, String> = raw.into_iter().collect();
-        let pg = PostgresCdcOptions::from_options(&pg)?;
         known.insert(name.clone());
+        // `--table` entries naming the pipeline table are settled from the config, so they stay
+        // accounted for even when this source turns out to be unreadable — "the publisher is
+        // down" and "that name does not exist" are different complaints and the second one is
+        // wrong here.
+        let named_here: Vec<&str> = options
+            .tables
+            .iter()
+            .map(|wanted| wanted.trim())
+            .filter(|wanted| names_table(wanted, &name))
+            .collect();
+
+        let pg = match PostgresCdcOptions::from_options(&pg) {
+            Ok(pg) => pg,
+            Err(e) => {
+                // The options are also what decide whether this table was asked for at all, so
+                // this is reported only when it plainly was.
+                if options.tables.is_empty() || !named_here.is_empty() {
+                    matched.extend(named_here);
+                    reports.push(TableReport::failed(plan, &name, Vec::new(), e.to_string()));
+                }
+                continue;
+            }
+        };
         known.extend(pg.tables.iter().cloned());
 
         // Decided from the config, before any connection: `--table other_source` must not fail
         // because *this* source's publisher happens to be unreachable.
         let wants_this_source = options.tables.is_empty()
-            || options
-                .tables
-                .iter()
-                .any(|wanted| names_table(wanted, &name) || declares(&pg, wanted));
+            || !named_here.is_empty()
+            || options.tables.iter().any(|wanted| declares(&pg, wanted));
         if !wants_this_source {
             continue;
         }
 
-        let all = introspect_read_only(&pg).await?;
+        // From here on, a failure is this table's own: it is reported as one and the remaining
+        // tables are still compared. A run across N tables in CI is worth more with N-1 answers
+        // and one named failure than with an error and nothing.
+        let all = match introspect_read_only(&pg).await {
+            Ok(all) => all,
+            Err(e) => {
+                matched.extend(named_here);
+                matched.extend(
+                    options
+                        .tables
+                        .iter()
+                        .map(|wanted| wanted.trim())
+                        .filter(|wanted| declares(&pg, wanted)),
+                );
+                reports.push(TableReport::failed(
+                    plan,
+                    &name,
+                    pg.tables.clone(),
+                    e.to_string(),
+                ));
+                continue;
+            }
+        };
         for table in &all {
             known.insert(table.qualified());
         }
@@ -595,7 +712,11 @@ pub async fn reconcile(
         if selected.is_empty() {
             continue;
         }
-        reports.push(reconcile_table(engine, plan, &name, &pg, &selected, sample).await?);
+        let upstream: Vec<String> = selected.iter().map(TableSchema::qualified).collect();
+        match reconcile_table(engine, plan, &name, &pg, &selected, sample).await {
+            Ok(report) => reports.push(report),
+            Err(e) => reports.push(TableReport::failed(plan, &name, upstream, e.to_string())),
+        }
     }
 
     let unmatched: Vec<&str> = options
@@ -722,7 +843,10 @@ async fn reconcile_table(
     refuse_overlapping_keys(&control, upstream, &key_columns, name).await?;
     let mut source_rows: u64 = 0;
     for table in upstream {
-        source_rows += control
+        // Every other unknown in this module is carried as an unknown; a count that did not come
+        // back must not be the one that quietly reads as zero, because zero here surfaces as a
+        // large negative `row_count_drift` — a wrong number presented as a measurement.
+        let counted = control
             .scalar(
                 &format!(
                     "SELECT count(*)::text FROM {}.{}",
@@ -731,9 +855,17 @@ async fn reconcile_table(
                 ),
                 &[],
             )
-            .await?
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
+            .await?;
+        source_rows += counted
+            .as_deref()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .ok_or_else(|| {
+                Error::Execution(format!(
+                    "reconcile: `count(*)` on `{}` came back as {}, which is not a row count",
+                    table.qualified(),
+                    counted.map_or("no row at all".to_string(), |v| format!("`{v}`"))
+                ))
+            })?;
     }
 
     let target = plan.target_of(name);
@@ -785,9 +917,10 @@ async fn reconcile_table(
         upstream: upstream.iter().map(TableSchema::qualified).collect(),
         target,
         keys,
-        source_rows,
+        source_rows: Some(source_rows),
         target_rows: target_rows.as_ref().ok().copied(),
         target_error: target_rows.err(),
+        source_error: None,
         sample,
         source_sampled: source_window.rows.len(),
         target_sampled: target_window.rows.len(),
@@ -1410,9 +1543,14 @@ impl ReconcileSchedule {
 
     /// The one-line result string a run records.
     pub fn result_of(report: &ReconcileReport) -> String {
-        match report.drifted() {
-            0 => "in_sync".to_string(),
-            n => format!("drift: {n} of {} table(s)", report.tables.len()),
+        let total = report.tables.len();
+        match (report.errored(), report.drifted()) {
+            (0, 0) => "in_sync".to_string(),
+            (0, drifted) => format!("drift: {drifted} of {total} table(s)"),
+            (errored, 0) => format!("failed: {errored} of {total} table(s) could not be read"),
+            (errored, drifted) => {
+                format!("failed: {errored} of {total} table(s) could not be read; drift: {drifted}")
+            }
         }
     }
 }
@@ -1627,9 +1765,10 @@ mod tests {
             upstream: vec!["public.sales_suppliers".into()],
             target: "local.live.sales_suppliers".into(),
             keys: vec!["supplierid".into()],
-            source_rows,
+            source_rows: Some(source_rows),
             target_rows,
             target_error: target_rows.is_none().then(|| "table not found".to_string()),
+            source_error: None,
             sample: DEFAULT_SAMPLE,
             source_sampled: source_rows as usize,
             target_sampled: target_rows.unwrap_or(0) as usize,
@@ -1678,6 +1817,100 @@ mod tests {
         assert_eq!(mixed.exit_code(), 1);
     }
 
+    /// A table whose own comparison could not be run, as `reconcile` reports one.
+    fn failed_report(error: &str) -> TableReport {
+        TableReport {
+            source_error: Some(error.to_string()),
+            source_rows: None,
+            target_rows: None,
+            target_error: None,
+            keys: Vec::new(),
+            sample: 0,
+            source_sampled: 0,
+            target_sampled: 0,
+            ..table_report(0, None, KeyDiff::default())
+        }
+    }
+
+    #[test]
+    fn a_table_that_could_not_be_read_exits_two_rather_than_one() {
+        // The two non-zero answers call for different things. `1` means the target stopped saying
+        // what the source says — someone has to look at the data. `2` means the comparison did not
+        // happen, which for a CI step written as `reconcile || page_the_data_team` is a network
+        // blip, not a page.
+        let failed = report(vec![failed_report("connection refused")]);
+        assert_eq!(failed.exit_code(), EXIT_FAILED);
+        assert_eq!(failed.errored(), 1);
+        assert_eq!(
+            failed.drifted(),
+            0,
+            "an unread table is not a table that differed"
+        );
+        assert_eq!(failed.tables[0].verdicts(), vec!["source_error"]);
+        assert_eq!(
+            failed.tables[0].row_count_drift(),
+            None,
+            "unknown is not a drift of zero"
+        );
+
+        // Failure outranks drift when a run hit both: the run was incomplete, so "no drift here"
+        // is only a claim about the tables it managed to read.
+        let both = report(vec![
+            failed_report("connection refused"),
+            table_report(11, Some(10), KeyDiff::default()),
+        ]);
+        assert_eq!(both.exit_code(), EXIT_FAILED);
+        assert_eq!((both.errored(), both.drifted()), (1, 1));
+        assert_eq!(
+            report(vec![table_report(11, Some(10), KeyDiff::default())]).exit_code(),
+            EXIT_DRIFT
+        );
+        assert_eq!(
+            report(vec![table_report(10, Some(10), KeyDiff::default())]).exit_code(),
+            EXIT_IN_SYNC
+        );
+    }
+
+    #[test]
+    fn one_unreadable_table_does_not_discard_the_others_report() {
+        // The whole premise is "run this across N tables in CI", so N-1 answers and one named
+        // failure are worth more than an error and nothing at all.
+        let mixed = report(vec![
+            failed_report("connection refused"),
+            table_report(
+                10,
+                Some(10),
+                KeyDiff {
+                    hash_mismatches: vec!["4".into()],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let rendered = mixed.render();
+        assert!(
+            rendered.contains("connection refused"),
+            "the failure is named:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("hash_mismatches"),
+            "and the table that did read is still reported:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("source 0"),
+            "an unknown count is never printed as zero:\n{rendered}"
+        );
+        assert!(rendered.contains("summary: FAILED"), "{rendered}");
+        assert_eq!(
+            ReconcileSchedule::result_of(&mixed),
+            "failed: 1 of 2 table(s) could not be read; drift: 1",
+            "and `pipeline show` says both halves"
+        );
+        assert_eq!(
+            ReconcileSchedule::result_of(&report(vec![failed_report("nope")])),
+            "failed: 1 of 1 table(s) could not be read"
+        );
+    }
+
     #[test]
     fn a_missing_target_is_drift_rather_than_a_crash() {
         let missing = report(vec![table_report(10, None, KeyDiff::default())]);
@@ -1697,7 +1930,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(table.row_count_drift(), 0);
+        assert_eq!(table.row_count_drift(), Some(0));
         assert_eq!(table.verdicts(), vec!["key_drift"]);
     }
 

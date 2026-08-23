@@ -107,7 +107,7 @@ oxidant sql -f report.sql --format csv > report.csv
 | `oxidant history-server` | Serves completed application event logs |
 | `oxidant mcp` | stdio MCP server over the same REST statement API |
 | `oxidant pipeline (run\|validate\|show)` | Builds, checks or prints the table DAG in `oxidant.yaml` — see [pipelines.md](pipelines.md) |
-| `oxidant pipeline reconcile` | Read-only drift report between a `postgres_cdc` source and the lakehouse tables it feeds. `--table <NAME>` scopes it, `--sample <KEYS>` widens the key walk (default 10,000), `--cron '<EXPR>'` registers a schedule (`--cron off` clears it). **Exits 0 in sync, 1 on drift**, so it drops into cron or CI — see [postgres-cdc.md](postgres-cdc.md) §4 |
+| `oxidant pipeline reconcile` | Read-only drift report between a `postgres_cdc` source and the lakehouse tables it feeds. `--table <NAME>` scopes it, `--sample <KEYS>` widens the key walk (default 10,000), `--cron '<EXPR>'` registers a schedule (`--cron off` clears it). **Exits 0 in sync, 1 on drift, 2 when it could not run** (unreachable publisher, a `--table` that names nothing, a key type the walk refuses), so `reconcile || page_the_data_team` does not page for a network blip — see [postgres-cdc.md](postgres-cdc.md) §4 |
 
 ## Server flags: `--sample-data` (bundled sample tables)
 
