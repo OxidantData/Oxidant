@@ -667,3 +667,101 @@ async fn a_boolean_key_is_spelled_the_same_way_by_both_engines_and_drifts_one_ro
 
     drop_fixtures(&connect, &table).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_the_merge_is_configured_to_drop_is_not_reported_as_schema_drift() {
+    let Some(connect) = dsn() else {
+        eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
+        return;
+    };
+    // `auto_cdc` projects the stream on its way into the target, so the target's column set is not
+    // the source's. Comparing the two directly reports the excluded column as `missing_columns` →
+    // `schema_drift` → exit 1, on every run, forever, for a pipeline doing exactly what its config
+    // says. That is the kind of red a CI step gets muted for.
+    let table = format!("{TABLE}_except");
+    drop_fixtures(&connect, &table).await;
+    sql(
+        &connect,
+        &format!(
+            "CREATE TABLE public.{table} \
+               (supplierid bigint primary key, name text, notes text)"
+        ),
+    )
+    .await;
+    sql(
+        &connect,
+        &format!(
+            "INSERT INTO public.{table} VALUES (1, 'Acme', 'internal only'), (2, 'Globex', NULL)"
+        ),
+    )
+    .await;
+
+    let root = tempfile::TempDir::new().expect("temp dir");
+    let config = OxidantConfig::parse(&config_yaml(&connect, root.path(), &table).replace(
+        "except_column_list: [__oxidant_op, __oxidant_ts]",
+        "except_column_list: [__oxidant_op, __oxidant_ts, notes]",
+    ))
+    .expect("the fixture config parses");
+    let engine = engine_for(root.path()).await;
+    seed_target(&engine, &config).await;
+
+    let clean = run_reconcile(&engine, &config, &ReconcileOptions::default()).await;
+    let rendered = clean.render();
+    assert_eq!(
+        clean.exit_code(),
+        0,
+        "an excluded column is not drift:\n{rendered}"
+    );
+    assert_eq!(clean.tables[0].verdicts(), vec!["in_sync"], "{rendered}");
+    assert!(
+        clean.tables[0].missing_columns.is_empty(),
+        "`notes` is absent on purpose:\n{rendered}"
+    );
+    assert_eq!(
+        clean.tables[0].excluded_columns,
+        vec!["notes"],
+        "and the report says it was never compared rather than that it matched:\n{rendered}"
+    );
+    assert!(rendered.contains("not compared"), "{rendered}");
+    assert_eq!(clean.tables[0].diff.compared, 2);
+
+    // The columns the merge *does* project are still compared: change one upstream and it lands
+    // as a content mismatch rather than being swallowed with `notes`.
+    sql(
+        &connect,
+        &format!("UPDATE public.{table} SET name = 'Acme Ltd' WHERE supplierid = 1"),
+    )
+    .await;
+    let drifted = run_reconcile(&engine, &config, &ReconcileOptions::default()).await;
+    assert_eq!(
+        drifted.tables[0].diff.hash_mismatches,
+        vec!["1"],
+        "{}",
+        drifted.render()
+    );
+
+    // And a column the target genuinely does not have is still `schema_drift`: the fix narrows the
+    // check to what `auto_cdc` projects, it does not switch it off. A column added upstream that
+    // the stream has not carried into the target yet is exactly that case — and unlike `notes`,
+    // nothing in the config says the target should be without it.
+    sql(
+        &connect,
+        &format!("ALTER TABLE public.{table} ADD COLUMN region text"),
+    )
+    .await;
+    let lost = run_reconcile(&engine, &config, &ReconcileOptions::default()).await;
+    let rendered = lost.render();
+    assert_eq!(lost.tables[0].missing_columns, vec!["region"], "{rendered}");
+    assert_eq!(
+        lost.tables[0].excluded_columns,
+        vec!["notes"],
+        "the two reasons a column is uncompared stay apart:\n{rendered}"
+    );
+    assert!(
+        lost.tables[0].verdicts().contains(&"schema_drift"),
+        "{rendered}"
+    );
+    assert_eq!(lost.exit_code(), 1, "{rendered}");
+
+    drop_fixtures(&connect, &table).await;
+}

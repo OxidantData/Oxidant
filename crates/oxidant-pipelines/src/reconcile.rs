@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use oxidant_common::{Error, Result};
+use oxidant_config::{auto_cdc_simple_column as simple_column, AutoCdcConfig};
 use oxidant_loom::arrow::array::{Array, ArrayRef, StringArray};
 use oxidant_loom::arrow::compute::cast;
 use oxidant_loom::arrow::datatypes::DataType;
@@ -280,6 +281,9 @@ pub struct TableReport {
     pub target_sampled: usize,
     /// Source columns the target does not have, excluded from the row hash and reported as drift.
     pub missing_columns: Vec<String>,
+    /// Source columns `auto_cdc` does not project into the target, so their absence is not drift.
+    /// Reported because a column that was never compared should not read as one that matched.
+    pub excluded_columns: Vec<String>,
     pub diff: KeyDiff,
 }
 
@@ -385,6 +389,14 @@ impl ReconcileReport {
                     None => String::new(),
                 }
             );
+            if !table.excluded_columns.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "    not compared      {:<6} {} (auto_cdc does not project them)",
+                    table.excluded_columns.len(),
+                    table.excluded_columns.join(", ")
+                );
+            }
             if !table.missing_columns.is_empty() {
                 let _ = writeln!(
                     out,
@@ -673,6 +685,12 @@ async fn reconcile_table(
         )));
     }
     let (key_columns, value_columns) = split_columns(first, &keys, name)?;
+    // What the *merge* was configured to write is what the target owes; a column `auto_cdc`
+    // projects away is absent on purpose and is not drift.
+    let (value_columns, excluded_columns) = projected_value_columns(
+        plan.table(name).and_then(|t| t.auto_cdc.as_ref()),
+        &value_columns,
+    );
 
     let control = pg.connect.connect_control().await?;
     let mut source_rows: u64 = 0;
@@ -747,8 +765,64 @@ async fn reconcile_table(
         source_sampled: source_window.rows.len(),
         target_sampled: target_window.rows.len(),
         missing_columns,
+        excluded_columns,
         diff,
     })
+}
+
+/// The source value columns the target is *supposed* to hold, and the ones it is not.
+///
+/// `auto_cdc` projects the change stream on its way into the target — `column_list` names what to
+/// keep, `except_column_list` what to drop (`oxidant-config`'s `AutoCdcConfig`, applied by
+/// [`crate::auto_cdc::output_columns`]). Without reading that block, a source column the merge was
+/// *configured* to drop comes back as `missing_columns` → `schema_drift` → exit 1, on every run,
+/// forever, for a pipeline doing exactly what it was told. A CI step wired to that exit code is
+/// red from the first run and gets muted, which costs more than the check was worth.
+///
+/// The rules mirror `output_columns`, including its case-insensitive, backtick-stripping name
+/// resolution, and stop where reconcile's question stops: this only decides which *source* columns
+/// the target owes. The metadata columns the merge adds on its own (`__oxidant_lsn` and friends)
+/// are not source columns at all, so they never reach here — they are plumbing, never drift.
+fn projected_value_columns<'a>(
+    auto_cdc: Option<&AutoCdcConfig>,
+    value_columns: &[&'a ColumnSchema],
+) -> (Vec<&'a ColumnSchema>, Vec<String>) {
+    let names = |list: &[String]| -> BTreeSet<String> {
+        list.iter()
+            .map(|c| {
+                simple_column(c)
+                    .unwrap_or_else(|| c.trim().to_string())
+                    .to_ascii_lowercase()
+            })
+            .collect()
+    };
+    let keeps: Box<dyn Fn(&ColumnSchema) -> bool> = match auto_cdc {
+        Some(config) => match (&config.column_list, &config.except_column_list) {
+            // An explicit list is the whole target: a source column it does not name is not the
+            // target's to hold. (`column_list` and `except_column_list` are mutually exclusive;
+            // the config layer rejects both, and naming the list first matches `output_columns`.)
+            (Some(list), _) => {
+                let listed = names(list);
+                Box::new(move |c| listed.contains(&c.name.to_ascii_lowercase()))
+            }
+            (None, Some(except)) => {
+                let dropped = names(except);
+                Box::new(move |c| !dropped.contains(&c.name.to_ascii_lowercase()))
+            }
+            (None, None) => Box::new(|_| true),
+        },
+        None => Box::new(|_| true),
+    };
+    let mut expected = Vec::with_capacity(value_columns.len());
+    let mut excluded = Vec::new();
+    for column in value_columns {
+        if keeps(column) {
+            expected.push(*column);
+        } else {
+            excluded.push(column.name.clone());
+        }
+    }
+    (expected, excluded)
 }
 
 /// Split the source's columns into the key walk's columns and the ones the row hash covers.
@@ -1419,6 +1493,7 @@ mod tests {
             source_sampled: source_rows as usize,
             target_sampled: target_rows.unwrap_or(0) as usize,
             missing_columns: Vec::new(),
+            excluded_columns: Vec::new(),
             diff,
         }
     }
@@ -1539,6 +1614,21 @@ mod tests {
         }
     }
 
+    /// An `auto_cdc:` block that varies only in its projection.
+    fn auto_cdc(column_list: Option<Vec<String>>, except: Option<Vec<String>>) -> AutoCdcConfig {
+        AutoCdcConfig {
+            source: "changes".into(),
+            keys: vec!["supplierid".into()],
+            sequence_by: "__oxidant_lsn".into(),
+            apply_as_deletes: None,
+            apply_as_truncates: None,
+            column_list,
+            except_column_list: except,
+            ignore_null_updates_columns: None,
+            ignore_null_updates_except: None,
+        }
+    }
+
     /// How the target renders a value: `CAST(col AS VARCHAR)` is `arrow_cast` to `Utf8`.
     fn engine_text(array: ArrayRef) -> Vec<String> {
         let utf8 = cast(&array, &DataType::Utf8).expect("casts to text");
@@ -1573,6 +1663,44 @@ mod tests {
             source_key_text(&column("id", DataType::Int64)),
             "(\"id\")::text"
         );
+    }
+
+    #[test]
+    fn auto_cdc_projection_decides_which_source_columns_the_target_owes() {
+        let columns = [
+            column("name", DataType::Utf8),
+            column("notes", DataType::Utf8),
+            column("rating", DataType::Decimal128(10, 2)),
+        ];
+        let value_columns: Vec<&ColumnSchema> = columns.iter().collect();
+        let names =
+            |cs: &[&ColumnSchema]| -> Vec<String> { cs.iter().map(|c| c.name.clone()).collect() };
+
+        // No `auto_cdc` block, and a block with neither list: every column is the target's.
+        for config in [None, Some(auto_cdc(None, None))] {
+            let (expected, excluded) = projected_value_columns(config.as_ref(), &value_columns);
+            assert_eq!(names(&expected), ["name", "notes", "rating"]);
+            assert!(excluded.is_empty());
+        }
+
+        // `except_column_list` — the case that made a healthy pipeline report `schema_drift` on
+        // every run. `NOTES` in the config, `notes` on the wire: names resolve case-insensitively,
+        // as `output_columns` resolves them.
+        let except = auto_cdc(None, Some(vec!["NOTES".into(), "__oxidant_op".into()]));
+        let (expected, excluded) = projected_value_columns(Some(&except), &value_columns);
+        assert_eq!(names(&expected), ["name", "rating"]);
+        assert_eq!(
+            excluded,
+            ["notes"],
+            "not drift — the merge drops it on purpose"
+        );
+
+        // `column_list` is the whole target, so anything it does not name is not owed either.
+        // Backticks are stripped the same way the merge strips them.
+        let listed = auto_cdc(Some(vec!["`name`".into(), "__oxidant_lsn".into()]), None);
+        let (expected, excluded) = projected_value_columns(Some(&listed), &value_columns);
+        assert_eq!(names(&expected), ["name"]);
+        assert_eq!(excluded, ["notes", "rating"]);
     }
 
     #[test]
