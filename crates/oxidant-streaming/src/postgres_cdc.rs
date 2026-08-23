@@ -529,8 +529,49 @@ pub fn emitted_schema(columns: &[ColumnSchema]) -> SchemaRef {
 // Value decoding
 // ---------------------------------------------------------------------------------------------
 
+/// A value a legal Postgres column can hold that no Arrow type this source emits can.
+///
+/// `date` and `timestamp` have infinities and BC years, `numeric` has infinities and a NaN, and
+/// `time` runs to `24:00:00` — Arrow has none of them. They become NULL and are reported once per
+/// column, because the alternative they replace was an `Error::Execution`, which `is_retryable`
+/// does not match: the batch failed, its recorded range stayed on disk, and every later trigger
+/// replayed it and failed on the same row. A `hired_on date` holding `'infinity'` as a "no end
+/// date" sentinel — an ordinary Postgres idiom — wedged the pipeline permanently, and the error
+/// told the operator to `exclude_columns` the column, which is to say: drop the data.
+fn unrepresentable(data_type: &DataType, text: &str) -> Option<&'static str> {
+    let lower = text.trim().to_ascii_lowercase();
+    match data_type {
+        DataType::Date32 | DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            if lower == "infinity" || lower == "-infinity" {
+                Some("`infinity`/`-infinity`, which Arrow's date and timestamp have no value for")
+            } else if lower.ends_with(" bc") {
+                Some("a BC year, which Arrow's proleptic-Gregorian calendar does not reach")
+            } else {
+                None
+            }
+        }
+        // `numeric` alone among the numeric types has a NaN and, since PostgreSQL 14,
+        // infinities. No fixed-point decimal has any of the three.
+        DataType::Decimal128(..) => (lower == "nan" || lower == "infinity" || lower == "-infinity")
+            .then_some("`NaN`/`Infinity`/`-Infinity`, which a fixed-point decimal cannot hold"),
+        // Postgres' `time` runs to `24:00:00` inclusive; Arrow's time-of-day stops one
+        // microsecond short of it.
+        DataType::Time64(TimeUnit::Microsecond) => lower
+            .starts_with("24:")
+            .then_some("`24:00:00`, which is past the end of Arrow's time-of-day"),
+        _ => None,
+    }
+}
+
 /// Build one Arrow array from the text form of every value in a column.
-fn build_array(data_type: &DataType, column: &str, values: &[Option<&str>]) -> Result<ArrayRef> {
+///
+/// Returns the array and, when values were legal but unrepresentable (see [`unrepresentable`]),
+/// what they were and how many there were — so the caller can say so once rather than per row.
+fn build_array(
+    data_type: &DataType,
+    column: &str,
+    values: &[Option<&str>],
+) -> Result<(ArrayRef, Option<(&'static str, usize)>)> {
     fn bad(column: &str, value: &str, what: &str) -> Error {
         Error::Execution(format!(
             "postgres_cdc: column `{column}`: `{value}` is not {what}. Exclude the column with \
@@ -538,7 +579,13 @@ fn build_array(data_type: &DataType, column: &str, values: &[Option<&str>]) -> R
         ))
     }
 
-    Ok(match data_type {
+    let mut dropped: Option<(&'static str, usize)> = None;
+    let mut drop_value = |reason: &'static str| {
+        let entry = dropped.get_or_insert((reason, 0));
+        entry.1 += 1;
+    };
+
+    let array: ArrayRef = match data_type {
         DataType::Boolean => {
             let mut b = BooleanBuilder::with_capacity(values.len());
             for value in values {
@@ -611,11 +658,16 @@ fn build_array(data_type: &DataType, column: &str, values: &[Option<&str>]) -> R
                 match value {
                     None => b.append_null(),
                     // `numeric` alone among the numeric types has a NaN, and no decimal does.
-                    Some("NaN") => b.append_null(),
-                    Some(text) => b.append_value(
-                        parse_decimal(text, *scale)
-                            .ok_or_else(|| bad(column, text, "a decimal number"))?,
-                    ),
+                    Some(text) => match unrepresentable(data_type, text) {
+                        Some(reason) => {
+                            drop_value(reason);
+                            b.append_null();
+                        }
+                        None => b.append_value(
+                            parse_decimal(text, *scale)
+                                .ok_or_else(|| bad(column, text, "a decimal number"))?,
+                        ),
+                    },
                 }
             }
             Arc::new(b.finish())
@@ -643,9 +695,15 @@ fn build_array(data_type: &DataType, column: &str, values: &[Option<&str>]) -> R
             for value in values {
                 match value {
                     None => b.append_null(),
-                    Some(text) => {
-                        b.append_value(parse_date(text).ok_or_else(|| bad(column, text, "a date"))?)
-                    }
+                    Some(text) => match unrepresentable(data_type, text) {
+                        Some(reason) => {
+                            drop_value(reason);
+                            b.append_null();
+                        }
+                        None => b.append_value(
+                            parse_date(text).ok_or_else(|| bad(column, text, "a date"))?,
+                        ),
+                    },
                 }
             }
             Arc::new(b.finish())
@@ -655,9 +713,15 @@ fn build_array(data_type: &DataType, column: &str, values: &[Option<&str>]) -> R
             for value in values {
                 match value {
                     None => b.append_null(),
-                    Some(text) => b.append_value(
-                        parse_time_micros(text).ok_or_else(|| bad(column, text, "a time"))?,
-                    ),
+                    Some(text) => match unrepresentable(data_type, text) {
+                        Some(reason) => {
+                            drop_value(reason);
+                            b.append_null();
+                        }
+                        None => b.append_value(
+                            parse_time_micros(text).ok_or_else(|| bad(column, text, "a time"))?,
+                        ),
+                    },
                 }
             }
             Arc::new(b.finish())
@@ -667,10 +731,16 @@ fn build_array(data_type: &DataType, column: &str, values: &[Option<&str>]) -> R
             for value in values {
                 match value {
                     None => b.append_null(),
-                    Some(text) => b.append_value(
-                        parse_timestamp_micros(text)
-                            .ok_or_else(|| bad(column, text, "a timestamp"))?,
-                    ),
+                    Some(text) => match unrepresentable(data_type, text) {
+                        Some(reason) => {
+                            drop_value(reason);
+                            b.append_null();
+                        }
+                        None => b.append_value(
+                            parse_timestamp_micros(text)
+                                .ok_or_else(|| bad(column, text, "a timestamp"))?,
+                        ),
+                    },
                 }
             }
             let array = match zone {
@@ -695,7 +765,8 @@ fn build_array(data_type: &DataType, column: &str, values: &[Option<&str>]) -> R
                  build"
             )))
         }
-    })
+    };
+    Ok((array, dropped))
 }
 
 /// Postgres prints the three special floats as words; `str::parse` reads two of the three.
@@ -1118,6 +1189,9 @@ pub struct PostgresCdcSource {
     projections: HashMap<u32, Vec<Option<usize>>>,
     /// Relations already reported as having drifted from the introspected schema.
     reported_drift: BTreeSet<u32>,
+    /// Columns already reported as holding values this mapping cannot represent, so an
+    /// `infinity` sentinel in one column is one log line rather than one per batch.
+    reported_dropped: BTreeSet<String>,
     /// Source tables whose snapshot has been committed.
     snapshot_done: usize,
     /// The last committed WAL position — what a replay resumes from, and the only LSN ever
@@ -1179,6 +1253,7 @@ impl PostgresCdcSource {
             relations: HashMap::new(),
             projections: HashMap::new(),
             reported_drift: BTreeSet::new(),
+            reported_dropped: BTreeSet::new(),
             snapshot_done: 0,
             position: Lsn(0),
             opened: false,
@@ -1717,8 +1792,9 @@ impl PostgresCdcSource {
 
     /// Build the Arrow batches for a run of change events, chunked so one batch never holds an
     /// unbounded number of rows.
-    fn to_batches(&self, events: &[ChangeEvent]) -> Result<Vec<RecordBatch>> {
+    fn build_batches(&mut self, events: &[ChangeEvent]) -> Result<Vec<RecordBatch>> {
         let mut batches = Vec::new();
+        let mut dropped: Vec<(String, &'static str, usize)> = Vec::new();
         for chunk in events.chunks(self.options.snapshot_batch_rows.max(1)) {
             let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
             for (index, field) in self
@@ -1732,7 +1808,12 @@ impl PostgresCdcSource {
                     .iter()
                     .map(|event| event.values.get(index).and_then(|v| v.as_deref()))
                     .collect();
-                columns.push(build_array(field.data_type(), field.name(), &values)?);
+                let (array, unrepresentable) =
+                    build_array(field.data_type(), field.name(), &values)?;
+                if let Some((reason, count)) = unrepresentable {
+                    dropped.push((field.name().clone(), reason, count));
+                }
+                columns.push(array);
             }
             let mut op = StringBuilder::with_capacity(chunk.len(), chunk.len());
             let mut lsn = Int64Builder::with_capacity(chunk.len());
@@ -1754,7 +1835,33 @@ impl PostgresCdcSource {
                 })?,
             );
         }
+        self.report_dropped(dropped);
         Ok(batches)
+    }
+
+    /// Say once per column that some of its values arrived as NULL, and why.
+    ///
+    /// Once, not per batch: a column using `'infinity'` as a sentinel uses it in every batch, and
+    /// a line per batch is a line an operator learns to scroll past.
+    fn report_dropped(&mut self, dropped: Vec<(String, &'static str, usize)>) {
+        for (column, reason, count) in dropped {
+            if !self.reported_dropped.insert(column.clone()) {
+                continue;
+            }
+            let message = format!(
+                "column `{column}` holds {reason}. Those values arrive as NULL; every other row \
+                 is unaffected, and the pipeline keeps running."
+            );
+            self.log.event(
+                "value_dropped",
+                json!({
+                    "column": column,
+                    "reason": reason,
+                    "rows_in_this_batch": count,
+                }),
+            );
+            eprintln!("[oxidant] postgres_cdc {}: {message}", self.options.name);
+        }
     }
 
     /// Read one source table inside the slot's snapshot transaction.
@@ -1828,7 +1935,7 @@ impl PostgresCdcSource {
                 values,
             })
             .collect();
-        let batches = self.to_batches(&events)?;
+        let batches = self.build_batches(&events)?;
 
         // Only a range planned against *this* slot counts toward the pass. A range from the slot
         // that died is still answered — the batch has to carry something the sink can commit
@@ -2038,7 +2145,7 @@ impl Source for PostgresCdcSource {
                     .collect()
             }
         };
-        let batches = self.to_batches(&events)?;
+        let batches = self.build_batches(&events)?;
         self.position = end;
         self.log.event(
             "batch",
@@ -3185,10 +3292,15 @@ mod tests {
         );
     }
 
+    /// [`build_array`] without its "and here is what it had to drop" half.
+    fn array_of(data_type: &DataType, column: &str, values: &[Option<&str>]) -> Result<ArrayRef> {
+        build_array(data_type, column, values).map(|(array, _)| array)
+    }
+
     #[test]
     fn values_decode_from_their_postgres_text_form() {
         let one = |data_type: DataType, text: &str| {
-            build_array(&data_type, "c", &[Some(text), None]).expect("decodes")
+            array_of(&data_type, "c", &[Some(text), None]).expect("decodes")
         };
 
         let b = one(DataType::Boolean, "t");
@@ -3238,7 +3350,7 @@ mod tests {
         );
 
         // A `timestamptz` prints with a `+00` offset because both sessions pin TIME ZONE UTC.
-        let tz = build_array(
+        let tz = array_of(
             &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             "c",
             &[Some("2024-05-06 07:08:09+00")],
@@ -3275,7 +3387,7 @@ mod tests {
 
         // `numeric` has a NaN and no decimal type does, so it becomes NULL rather than an error
         // that would stop the pipeline on one row.
-        let array = build_array(&DataType::Decimal128(38, 2), "c", &[Some("NaN")]).unwrap();
+        let array = array_of(&DataType::Decimal128(38, 2), "c", &[Some("NaN")]).unwrap();
         assert!(array
             .as_any()
             .downcast_ref::<Decimal128Array>()
@@ -3285,11 +3397,105 @@ mod tests {
 
     #[test]
     fn a_value_the_mapping_cannot_represent_names_the_column_and_the_fix() {
-        let err = build_array(&DataType::Date32, "hired_on", &[Some("infinity")])
+        // A value that is not legal Postgres output for the type is still an error, and the
+        // error still says which column and how to get past it.
+        let err = array_of(&DataType::Date32, "hired_on", &[Some("the fifth of May")])
             .unwrap_err()
             .to_string();
         assert!(err.contains("hired_on"), "got: {err}");
         assert!(err.contains("exclude_columns"), "got: {err}");
+    }
+
+    #[test]
+    fn a_legal_value_this_mapping_cannot_hold_becomes_null_rather_than_a_dead_pipeline() {
+        // Each of these is something Postgres prints for a perfectly ordinary column — an
+        // `infinity` sentinel on a `date` is the canonical "no end date" idiom. They used to
+        // raise `Error::Execution`, which `is_retryable` does not match: the batch failed, its
+        // recorded range stayed on disk, and every later trigger replayed it and failed on the
+        // same row. One unrepresentable value is not an unrecoverable pipeline.
+        let timestamp = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let cases: &[(&DataType, &str)] = &[
+            (&DataType::Date32, "infinity"),
+            (&DataType::Date32, "-infinity"),
+            (&DataType::Date32, "0044-03-15 BC"),
+            (&timestamp, "infinity"),
+            (&timestamp, "-infinity"),
+            (&timestamp, "2024-05-06 07:08:09 BC"),
+            (&DataType::Decimal128(38, 2), "Infinity"),
+            (&DataType::Decimal128(38, 2), "-Infinity"),
+            (&DataType::Decimal128(38, 2), "NaN"),
+            (&DataType::Time64(TimeUnit::Microsecond), "24:00:00"),
+        ];
+        for (data_type, text) in cases {
+            let (array, dropped) = build_array(data_type, "hired_on", &[Some(text), None])
+                .unwrap_or_else(|e| panic!("`{text}` as {data_type} must not stop the batch: {e}"));
+            assert!(array.is_null(0), "`{text}` as {data_type} should be NULL");
+            assert_eq!(
+                dropped.map(|(_, count)| count),
+                Some(1),
+                "`{text}` as {data_type} is reported, not silently swallowed"
+            );
+        }
+
+        // And the ordinary values of those same types are untouched.
+        assert!(!array_of(&DataType::Date32, "c", &[Some("2024-05-06")])
+            .unwrap()
+            .is_null(0));
+        assert!(!array_of(
+            &DataType::Time64(TimeUnit::Microsecond),
+            "c",
+            &[Some("23:59:59")]
+        )
+        .unwrap()
+        .is_null(0));
+    }
+
+    #[tokio::test]
+    async fn an_unrepresentable_value_is_reported_once_and_the_batch_still_lands() {
+        let engine = Engine::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut table = suppliers();
+        table.columns[1].data_type = DataType::Date32;
+        table.columns[1].type_oid = oids::DATE;
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(vec![])));
+        {
+            let mut wire = wire.lock().await;
+            wire.snapshot = vec![
+                vec![Some("1".into()), Some("infinity".into())],
+                vec![Some("2".into()), Some("2024-05-06".into())],
+            ];
+        }
+        let mut source = PostgresCdcSource::with_wire(
+            options(),
+            vec![table],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::new(Some(dir.path()), "sales_suppliers"),
+        );
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        let batches = source.poll_range(&engine, &range).await.unwrap();
+        assert_eq!(batches[0].num_rows(), 2, "the other row is unaffected");
+        assert!(column(&batches[0], "name").is_null(0));
+        assert!(!column(&batches[0], "name").is_null(1));
+
+        let log = std::fs::read_to_string(dir.path().join("sales_suppliers.jsonl")).unwrap();
+        let dropped: Vec<serde_json::Value> = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|e| e["event"] == "value_dropped")
+            .collect();
+        assert_eq!(dropped.len(), 1, "got: {log}");
+        assert_eq!(dropped[0]["column"], "name");
+
+        // Read the same range again: the column has already been reported, and a line per batch
+        // is a line an operator learns to scroll past.
+        source.poll_range(&engine, &range).await.unwrap();
+        let log = std::fs::read_to_string(dir.path().join("sales_suppliers.jsonl")).unwrap();
+        assert_eq!(
+            log.matches("\"value_dropped\"").count(),
+            1,
+            "reported once per column, not once per batch: {log}"
+        );
     }
 
     #[test]

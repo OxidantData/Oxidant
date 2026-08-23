@@ -465,6 +465,72 @@ async fn the_connector_log_records_the_snapshot_the_batches_and_the_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn legal_values_this_mapping_cannot_hold_arrive_as_null_and_the_pipeline_keeps_running() {
+    gated!(connect);
+    // Every value here is something Postgres prints for an ordinary column — `'infinity'` on a
+    // `date` is the canonical "no end date" sentinel. They used to raise `Error::Execution`,
+    // which is not retryable: the batch failed, its recorded range stayed on disk, and every
+    // later trigger replayed it and failed on the same row, forever. The fix has to be checked
+    // against a real server because it turns on exactly how Postgres spells them.
+    let fixture = Fixture::new(
+        &connect,
+        "ox_cdc_special",
+        "id bigint primary key, hired_on date, seen_at timestamp, seen_tz timestamptz, \
+         amount numeric(20,2), shift time",
+    )
+    .await;
+    fixture
+        .sql(
+            "INSERT INTO public.ox_cdc_special VALUES \
+             (1, 'infinity', 'infinity', 'infinity', 'NaN', '24:00:00'), \
+             (2, '-infinity', '-infinity', '-infinity', 12.34, '00:00:00'), \
+             (3, '0044-03-15 BC', '0044-03-15 10:11:12 BC', '2024-05-06 07:08:09+00', \
+              -1.5, '01:02:03'), \
+             (4, '2024-05-06', '2024-05-06 07:08:09', '2024-05-06 07:08:09+00', 7, '23:59:59')",
+        )
+        .await;
+
+    let engine = Engine::new();
+    let mut source = fixture.source();
+    let snapshot = drain(&mut source, &engine).await;
+    assert_eq!(rows(&snapshot), 4, "no row stops the batch");
+    assert_eq!(
+        i64s(&snapshot, "id"),
+        vec![Some(1), Some(2), Some(3), Some(4)]
+    );
+
+    // The unrepresentable values are NULL; the ordinary ones on the same columns are not.
+    for (column, unrepresentable) in [
+        ("hired_on", vec![0, 1, 2]),
+        ("seen_at", vec![0, 1, 2]),
+        ("seen_tz", vec![0, 1]),
+        ("amount", vec![0]),
+        ("shift", vec![0]),
+    ] {
+        let batch = &snapshot[0];
+        let array = batch.column(batch.schema().index_of(column).expect("column"));
+        for row in 0..4 {
+            assert_eq!(
+                array.is_null(row),
+                unrepresentable.contains(&row),
+                "`{column}` row {row}"
+            );
+        }
+    }
+
+    // And the stream carries the same values the same way.
+    fixture
+        .sql("INSERT INTO public.ox_cdc_special VALUES (5, 'infinity', NULL, NULL, NULL, NULL)")
+        .await;
+    let stream = drain(&mut source, &engine).await;
+    assert_eq!(rows(&stream), 1);
+    assert_eq!(strings(&stream, OP_COLUMN), vec![Some("i".into())]);
+
+    drop(source);
+    fixture.drop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_table_that_cannot_be_replicated_says_exactly_how_to_fix_it() {
     gated!(connect);
     // No primary key and REPLICA IDENTITY NOTHING: Postgres writes no old row image, so an
