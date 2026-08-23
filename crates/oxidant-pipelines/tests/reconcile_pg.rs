@@ -119,6 +119,16 @@ fn config(connect: &PgConnectConfig, root: &std::path::Path, name: &str) -> Oxid
 
 /// [`config`] before it is parsed, so a test can vary one line of it.
 fn config_yaml(connect: &PgConnectConfig, root: &std::path::Path, name: &str) -> String {
+    config_yaml_keyed(connect, root, name, "supplierid")
+}
+
+/// [`config_yaml`] for a table whose row identity is not `supplierid`.
+fn config_yaml_keyed(
+    connect: &PgConnectConfig,
+    root: &std::path::Path,
+    name: &str,
+    key: &str,
+) -> String {
     let root = root.display();
     format!(
         "catalogs:
@@ -147,13 +157,14 @@ tables:
         tables: public.{name}
     auto_cdc:
       source: {name}_changes
-      keys: [supplierid]
+      keys: [{key}]
       sequence_by: __oxidant_lsn
       apply_as_deletes: \"__oxidant_op = 'd'\"
       apply_as_truncates: \"__oxidant_op = 't'\"
       except_column_list: [__oxidant_op, __oxidant_ts]
 ",
         name = name,
+        key = key,
         host = connect.host,
         port = connect.port,
         database = connect.database,
@@ -583,6 +594,75 @@ async fn a_table_filter_scopes_the_report_and_a_name_that_matches_nothing_is_an_
     assert!(
         err.to_string().contains(&table),
         "the error lists what the pipeline does have: {err}"
+    );
+
+    drop_fixtures(&connect, &table).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boolean_key_is_spelled_the_same_way_by_both_engines_and_drifts_one_row_at_a_time() {
+    let Some(connect) = dsn() else {
+        eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
+        return;
+    };
+    // A boolean has two text forms in Postgres and only one of them matches the target: the output
+    // function (`t`/`f` — what pgoutput carries and `psql` prints) and the cast (`true`/`false`).
+    // The walk reads the cast on both sides. If it ever stopped doing so the two walks would
+    // interleave `f < false < t < true` and report every row of a healthy table as *both* missing
+    // from the target and a phantom in it — a permanent false alarm on a table nobody has touched.
+    // Only a live server can say which form a query actually returns, so this is where that is
+    // pinned; `a_boolean_key_is_read_through_the_cast…` holds the query shape it depends on.
+    let table = format!("{TABLE}_bool");
+    drop_fixtures(&connect, &table).await;
+    sql(
+        &connect,
+        &format!("CREATE TABLE public.{table} (active boolean primary key, name text)"),
+    )
+    .await;
+    sql(
+        &connect,
+        &format!("INSERT INTO public.{table} VALUES (true, 'on'), (false, 'off')"),
+    )
+    .await;
+
+    let root = tempfile::TempDir::new().expect("temp dir");
+    let config = OxidantConfig::parse(&config_yaml_keyed(&connect, root.path(), &table, "active"))
+        .expect("the fixture config parses");
+    let engine = engine_for(root.path()).await;
+    seed_target(&engine, &config).await;
+
+    let clean = run_reconcile(&engine, &config, &ReconcileOptions::default()).await;
+    assert_eq!(
+        clean.exit_code(),
+        0,
+        "a boolean key must not report the whole table as drifted:\n{}",
+        clean.render()
+    );
+    assert_eq!(clean.tables[0].diff.compared, 2, "{}", clean.render());
+    assert_eq!(clean.tables[0].keys, vec!["active".to_string()]);
+
+    // Drift one of the two keys upstream. Exactly one class, naming the key in the engine's
+    // spelling — not `t`, and not both rows.
+    sql(
+        &connect,
+        &format!("DELETE FROM public.{table} WHERE active = true"),
+    )
+    .await;
+    let drifted = run_reconcile(&engine, &config, &ReconcileOptions::default()).await;
+    let rendered = drifted.render();
+    assert_eq!(drifted.exit_code(), 1, "{rendered}");
+    assert_eq!(
+        drifted.tables[0].diff.missing_in_source,
+        vec!["true"],
+        "the deleted row is a phantom, named as the target spells it:\n{rendered}"
+    );
+    assert!(
+        drifted.tables[0].diff.missing_in_target.is_empty(),
+        "the surviving row is in sync, not missing:\n{rendered}"
+    );
+    assert_eq!(
+        drifted.tables[0].diff.compared, 1,
+        "`false` was compared on both sides:\n{rendered}"
     );
 
     drop_fixtures(&connect, &table).await;

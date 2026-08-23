@@ -76,6 +76,12 @@ const NULL_SENTINEL: &str = "\u{2}NULL";
 /// as drifted. Refusing by name is the honest answer; a `float8` or `timestamptz` primary key is
 /// rare enough that no one should be surprised, and `keys:` on the source can name a different
 /// column when it happens.
+///
+/// `Boolean` earns its place through the *cast*, not through Postgres' output function. `boolout`
+/// — what pgoutput sends and what `psql` prints, and what the connector's own value parser reads
+/// — spells `t`/`f`, which would not match the target's `true`/`false`; but `bool::text` is a
+/// different function and spells `true`/`false`, and the key walk only ever reads the cast. See
+/// [`source_key_text`], which is where that distinction is kept, and the tests that hold it.
 fn key_type_is_walkable(data_type: &DataType) -> bool {
     matches!(
         data_type,
@@ -785,21 +791,48 @@ fn split_columns<'a>(
     Ok((key_columns, value_columns))
 }
 
-/// Read the first `sample` keys of the union of `upstream`, in key order, with their row hashes.
-async fn source_window(
-    control: &ControlConnection,
+/// One key column's source projection: the text the key walk compares and orders by.
+///
+/// One place, and a cast rather than a bare column reference, because *which* text form a value
+/// takes is the whole basis of the walk. It matters most for `boolean`: Postgres has two spellings
+/// of one, and only one of them matches the target.
+///
+/// - `boolout`, the type's output function — `t` / `f`. It is what a bare `SELECT` sends on the
+///   wire, what `psql` prints, and what pgoutput carries, which is why the connector's own value
+///   parser reads `t`/`f` (`postgres_cdc.rs`, `build_array`).
+/// - `bool::text`, the cast — `true` / `false`. That is the target's spelling too: the target
+///   query's `CAST(col AS VARCHAR)` reaches Arrow's `value_to_string`, which formats a
+///   `BooleanArray` as `true`/`false`.
+///
+/// The walk reads the cast on both sides, so the two agree — including under the source's
+/// `COLLATE "C"` ordering, where `false` sorts before `true` exactly as the target's byte order
+/// puts them. Dropping the `::text` here (or reading the column through the wire's text format
+/// instead) would put the two walks in different orders and report every row of a healthy
+/// boolean-keyed table as both missing from the target and a phantom in it.
+fn source_key_text(column: &ColumnSchema) -> String {
+    format!("({})::text", quote_identifier(&column.name))
+}
+
+/// The upstream query the key walk reads: `sample` keys in ascending key order, with their
+/// non-key columns as text.
+fn source_window_sql(
     upstream: &[TableSchema],
     key_columns: &[&ColumnSchema],
     value_columns: &[&ColumnSchema],
     sample: usize,
-) -> Result<KeyWindow> {
+) -> String {
     // Every column comes back as text: it is what `ControlConnection` returns, what pgoutput
     // sends, and therefore what the connector's own conversion table already reads.
     let projection: Vec<String> = key_columns
         .iter()
-        .chain(value_columns.iter())
+        .map(|c| source_key_text(c))
+        .chain(
+            value_columns
+                .iter()
+                .map(|c| format!("({})::text", quote_identifier(&c.name))),
+        )
         .enumerate()
-        .map(|(i, c)| format!("({})::text AS c{i}", quote_identifier(&c.name)))
+        .map(|(i, expr)| format!("{expr} AS c{i}"))
         .collect();
     let branches: Vec<String> = upstream
         .iter()
@@ -818,12 +851,23 @@ async fn source_window(
     let order: Vec<String> = (0..key_columns.len())
         .map(|i| format!("s.c{i} COLLATE \"C\" ASC NULLS LAST"))
         .collect();
-    let sql = format!(
+    format!(
         "SELECT * FROM ({}) s ORDER BY {} LIMIT {}",
         branches.join(" UNION ALL "),
         order.join(", "),
         sample
-    );
+    )
+}
+
+/// Read the first `sample` keys of the union of `upstream`, in key order, with their row hashes.
+async fn source_window(
+    control: &ControlConnection,
+    upstream: &[TableSchema],
+    key_columns: &[&ColumnSchema],
+    value_columns: &[&ColumnSchema],
+    sample: usize,
+) -> Result<KeyWindow> {
+    let sql = source_window_sql(upstream, key_columns, value_columns, sample);
     let rows = control.query(&sql, &[]).await?;
     let truncated = rows.len() >= sample;
 
@@ -883,16 +927,15 @@ async fn count_rows(engine: &Engine, target: &str) -> Result<u64> {
     Ok(0)
 }
 
-/// Read the first `sample` keys of the lakehouse target, in the same order the source used.
-async fn target_window(
-    engine: &Engine,
+/// The target query the key walk reads: the same `sample` keys, in the same order.
+fn target_window_sql(
     target: &str,
     key_columns: &[&ColumnSchema],
     value_columns: &[&ColumnSchema],
     sample: usize,
-) -> Result<KeyWindow> {
-    // `CAST(... AS VARCHAR)` on the key mirrors the source's `::text`, so the two walks agree on
-    // both the order and the identity of every key.
+) -> String {
+    // `CAST(... AS VARCHAR)` on the key mirrors the source's [`source_key_text`], so the two
+    // walks agree on both the order and the identity of every key.
     let mut projection: Vec<String> = key_columns
         .iter()
         .map(|c| format!("CAST({} AS VARCHAR)", quote_ident(&c.name)))
@@ -901,11 +944,22 @@ async fn target_window(
     let order: Vec<String> = (1..=key_columns.len())
         .map(|i| format!("{i} ASC NULLS LAST"))
         .collect();
-    let sql = format!(
+    format!(
         "SELECT {} FROM {target} ORDER BY {} LIMIT {sample}",
         projection.join(", "),
         order.join(", ")
-    );
+    )
+}
+
+/// Read the first `sample` keys of the lakehouse target, in the same order the source used.
+async fn target_window(
+    engine: &Engine,
+    target: &str,
+    key_columns: &[&ColumnSchema],
+    value_columns: &[&ColumnSchema],
+    sample: usize,
+) -> Result<KeyWindow> {
+    let sql = target_window_sql(target, key_columns, value_columns, sample);
     let batches = engine.sql(&sql).await?;
 
     let mut rows: Vec<KeyRow> = Vec::new();
@@ -1203,6 +1257,8 @@ pub fn set_schedule(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     fn window(keys: &[(&str, u64)], truncated: bool) -> KeyWindow {
@@ -1471,9 +1527,60 @@ mod tests {
         assert_eq!(show_key(&format!("a{KEY_SEPARATOR}b")), "a | b");
     }
 
+    /// A source column fixture — only the name and the type reach the SQL builders.
+    fn column(name: &str, data_type: DataType) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            type_oid: 0,
+            type_modifier: -1,
+            data_type,
+            nullable: false,
+            warning: None,
+        }
+    }
+
+    /// How the target renders a value: `CAST(col AS VARCHAR)` is `arrow_cast` to `Utf8`.
+    fn engine_text(array: ArrayRef) -> Vec<String> {
+        let utf8 = cast(&array, &DataType::Utf8).expect("casts to text");
+        let utf8 = utf8
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("a string array");
+        (0..utf8.len()).map(|i| utf8.value(i).to_string()).collect()
+    }
+
+    #[test]
+    fn a_boolean_key_is_read_through_the_cast_that_agrees_with_the_target_not_the_output_function()
+    {
+        use oxidant_loom::arrow::array::BooleanArray;
+
+        // What the target says, through the same cast its query asks for.
+        let target = engine_text(Arc::new(BooleanArray::from(vec![true, false])));
+        assert_eq!(target, vec!["true".to_string(), "false".to_string()]);
+        // What Postgres' *output function* says — what pgoutput carries and `psql` prints. If the
+        // walk ever read a boolean key that way instead of through the cast, every key would
+        // mismatch and interleave (`f` < `false` < `t` < `true`), turning a healthy table into a
+        // permanent, both-directions false alarm.
+        assert_ne!(target, vec!["t".to_string(), "f".to_string()]);
+        // So the source projection is a cast, for booleans as for everything else. That it is
+        // `true`/`false` on a live server is what the gated `a_boolean_key_is_spelled_the_same_way…`
+        // test proves; this holds the shape of the query that makes it so.
+        assert_eq!(
+            source_key_text(&column("active", DataType::Boolean)),
+            "(\"active\")::text"
+        );
+        assert_eq!(
+            source_key_text(&column("id", DataType::Int64)),
+            "(\"id\")::text"
+        );
+    }
+
     #[test]
     fn only_key_types_that_spell_the_same_on_both_sides_are_walkable() {
         for ok in [
+            // `Boolean` is walkable because the cast the walk reads spells it the target's way;
+            // the test above is what holds that distinction in place.
+            DataType::Boolean,
             DataType::Int32,
             DataType::Int64,
             DataType::Utf8,
