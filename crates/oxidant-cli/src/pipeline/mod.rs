@@ -467,12 +467,19 @@ fn render_event(event: RunEvent) {
         RunEventKind::ReconcileFinished {
             cron,
             drifted,
+            errored,
             tables,
             report,
         } => {
             eprintln!(
-                "[oxidant] scheduled reconcile (`{cron}`): {} of {tables} table(s) drifted",
-                drifted
+                "[oxidant] scheduled reconcile (`{cron}`): {drifted} of {tables} table(s) \
+                 drifted{}",
+                // A run where every table failed would otherwise headline "0 drifted", which is
+                // true and reads as "nothing to see".
+                match errored {
+                    0 => String::new(),
+                    n => format!(", {n} could not be read"),
+                }
             );
             // The whole report, not a count: nobody is watching this terminal, and a summary
             // would only send whoever reads the log later back to run the command by hand.
@@ -748,6 +755,7 @@ mod tests {
             kind: RunEventKind::ReconcileFinished {
                 cron: "0 6 * * *".into(),
                 drifted: 1,
+                errored: 0,
                 tables: 2,
                 report: "summary: DRIFT — 1 of 2 table(s) differ\n".into(),
             },

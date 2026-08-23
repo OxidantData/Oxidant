@@ -95,6 +95,8 @@ pub enum RunEventKind {
     ReconcileFinished {
         cron: String,
         drifted: usize,
+        /// Tables whose comparison could not be run at all — not drift, and not silence either.
+        errored: usize,
         tables: usize,
         report: String,
     },
@@ -412,6 +414,7 @@ async fn reconcile_tick<F>(
                 RunEventKind::ReconcileFinished {
                     cron,
                     drifted: report.drifted(),
+                    errored: report.errored(),
                     tables: report.tables.len(),
                     report: report.render(),
                 },

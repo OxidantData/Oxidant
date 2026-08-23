@@ -2499,7 +2499,7 @@ mod tests {
             let rows = fixture.postgres.len();
             assert_eq!(
                 hash_rows(&[source], rows).expect("hashes"),
-                hash_rows(&[fixture.target.clone()], rows).expect("hashes"),
+                hash_rows(std::slice::from_ref(&fixture.target), rows).expect("hashes"),
                 "`{}` ({:?}) hashes differently on the two sides",
                 fixture.column,
                 fixture.data_type

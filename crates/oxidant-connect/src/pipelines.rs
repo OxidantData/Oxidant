@@ -2495,6 +2495,7 @@ fn format_run_event(event: &RunEvent, locations: &HashMap<String, String>) -> St
         RunEventKind::ReconcileFinished {
             cron,
             drifted,
+            errored,
             tables,
             report,
         } => {
@@ -2505,9 +2506,13 @@ fn format_run_event(event: &RunEvent, locations: &HashMap<String, String>) -> St
                 .lines()
                 .map(|line| format!("\n[oxidant]   {line}"))
                 .collect();
+            let failed = match errored {
+                0 => String::new(),
+                n => format!(", {n} could not be read"),
+            };
             format!(
                 "[oxidant] scheduled reconcile (`{cron}`): {drifted} of {tables} table(s) \
-                 drifted{body}"
+                 drifted{failed}{body}"
             )
         }
         RunEventKind::ReconcileFailed { cron, error } => format!(
