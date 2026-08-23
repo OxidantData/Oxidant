@@ -328,6 +328,10 @@ where
         Trigger::ProcessingTime(interval) => {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // This process' memory of when the reconcile schedule last ran, which is what keeps a
+            // schedule whose file could not be written from firing on every single pass. See
+            // `ReconcileSchedule::is_due_since`.
+            let mut reconciled_at: Option<chrono::DateTime<chrono::Utc>> = None;
             loop {
                 ticker.tick().await;
                 let outcomes = one_pass(
@@ -352,7 +356,7 @@ where
                 emit_pass_outcomes(&outcomes, on_event);
                 // Between triggers, never inside one: a reconcile that interleaved a micro-batch
                 // would compare a target mid-write and report drift that the next commit closes.
-                reconcile_tick(engine, plan, on_event).await;
+                reconcile_tick(engine, plan, &mut reconciled_at, on_event).await;
             }
         }
     }
@@ -366,26 +370,43 @@ where
 /// a restart), it only ticks on the `ProcessingTime` trigger — a `once` run does one pass and
 /// exits, and there is no "between triggers" there — and a reconcile that fails is reported and
 /// then dropped. A drift report is not a reason to stop replicating; it is a reason to look.
-async fn reconcile_tick<F>(engine: &Engine, plan: &Plan<'_>, on_event: &mut F)
-where
+async fn reconcile_tick<F>(
+    engine: &Engine,
+    plan: &Plan<'_>,
+    reconciled_at: &mut Option<chrono::DateTime<chrono::Utc>>,
+    on_event: &mut F,
+) where
     F: FnMut(RunEvent) + Send,
 {
     let checkpoints = plan.pipeline.checkpoints.clone();
     let Some(mut schedule) = crate::reconcile::ReconcileSchedule::load(&checkpoints) else {
         return;
     };
-    let now = chrono::Utc::now();
-    if !schedule.is_due(now) {
+    let started = chrono::Utc::now();
+    if !schedule.is_due_since(*reconciled_at, started) {
         return;
     }
+    // Claimed before the run rather than after it: whatever happens next — an error, a walk that
+    // outlives the trigger interval, a `save` that cannot write — this pass has fired the
+    // schedule, and the next one must not fire it again.
+    *reconciled_at = Some(started);
     let options = crate::reconcile::ReconcileOptions {
         tables: schedule.tables.clone(),
         sample: schedule.sample,
     };
     let cron = schedule.cron.clone();
-    match crate::reconcile::reconcile(engine, plan, &options).await {
+    let outcome = crate::reconcile::reconcile(engine, plan, &options).await;
+    // The instant it *finished*. Anchoring on `started` would make a reconcile slower than its
+    // own cron period due again the moment it lands, and the tick is awaited inline in the
+    // trigger loop — so the pipeline would stop replicating and look hung.
+    let finished = chrono::Utc::now();
+    *reconciled_at = Some(finished);
+    match outcome {
         Ok(report) => {
-            schedule.record(now, crate::reconcile::ReconcileSchedule::result_of(&report));
+            schedule.record(
+                finished,
+                crate::reconcile::ReconcileSchedule::result_of(&report),
+            );
             emit(
                 on_event,
                 RunEventKind::ReconcileFinished {
@@ -399,7 +420,7 @@ where
         Err(e) => {
             // Stamped as a run even though it failed, so a source that is unreachable every
             // morning produces one report per schedule rather than one per micro-batch.
-            schedule.record(now, format!("failed: {e}"));
+            schedule.record(finished, format!("failed: {e}"));
             emit(
                 on_event,
                 RunEventKind::ReconcileFailed {
@@ -410,6 +431,8 @@ where
         }
     }
     if let Err(e) = schedule.save(&checkpoints) {
+        // Reported, not fatal — and not a reason to re-run: `reconciled_at` above is what the
+        // next tick measures from when this file could not take the stamp.
         emit(
             on_event,
             RunEventKind::StatePersistFailed {
@@ -1059,6 +1082,98 @@ mod tests {
             oxidant_config::POSTGRES_CDC_OPTIONS,
             oxidant_streaming::KNOWN_OPTIONS,
             "add the option to both lists, or to neither"
+        );
+    }
+
+    /// A pipeline whose `postgres_cdc` source points at a closed port, so a reconcile fails
+    /// immediately and without a database.
+    fn unreachable_cdc_config(checkpoints: &str) -> oxidant_config::OxidantConfig {
+        oxidant_config::OxidantConfig::parse(&format!(
+            "catalogs:
+  local:
+    type: local
+    warehouse: {checkpoints}/warehouse
+pipeline:
+  name: sales-cdc
+  catalog: local
+  schema: live
+  checkpoints: {checkpoints}
+tables:
+  - name: sales_suppliers
+    source:
+      format: postgres_cdc
+      options:
+        host: 127.0.0.1
+        port: \"1\"
+        database: sales
+        user: oxidant_cdc
+        tls: disable
+        publication: oxidant_sales
+        slot: oxidant_sales_suppliers
+        tables: public.sales_suppliers
+    auto_cdc:
+      source: sales_suppliers_changes
+      keys: [supplierid]
+      sequence_by: __oxidant_lsn
+"
+        ))
+        .expect("the fixture config parses")
+    }
+
+    #[tokio::test]
+    async fn a_tick_whose_schedule_cannot_be_written_does_not_re_run_on_the_next_pass() {
+        // The schedule's anchor lives in `reconcile.json`. When that file cannot be written — a
+        // read-only checkpoint volume, a permissions change, an NFS blip — the anchor never
+        // advances, and with the file as the only anchor the schedule is due again on the very
+        // next pass: at a 200ms trigger that is a `count(*)` plus a sampled ordered scan against
+        // the publisher five times a second, indefinitely, with one `StatePersistFailed` line per
+        // round as the only symptom.
+        let dir = tempfile::TempDir::new().unwrap();
+        let checkpoints = dir.path().to_string_lossy().into_owned();
+        let config = unreachable_cdc_config(&checkpoints);
+        let plan = Plan::build(&config).expect("plans");
+
+        let schedule = crate::reconcile::ReconcileSchedule {
+            path: None,
+            cron: "* * * * *".into(),
+            tables: vec![],
+            sample: 10,
+            // Backdated, so the first tick is due rather than due in a minute.
+            created: "2020-01-01T00:00:00Z".into(),
+            last_run: None,
+            last_result: None,
+        };
+        schedule.save(&checkpoints).expect("writes the schedule");
+        let path = crate::reconcile::ReconcileSchedule::path_in(&checkpoints);
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).expect("makes the anchor unwritable");
+
+        let engine = Engine::new();
+        let mut reconciled_at = None;
+        let (mut ran, mut persist_failed) = (0, 0);
+        let mut on_event = |event: RunEvent| match event.kind {
+            RunEventKind::ReconcileFinished { .. } | RunEventKind::ReconcileFailed { .. } => {
+                ran += 1
+            }
+            RunEventKind::StatePersistFailed { .. } => persist_failed += 1,
+            _ => {}
+        };
+        for _ in 0..3 {
+            reconcile_tick(&engine, &plan, &mut reconciled_at, &mut on_event).await;
+        }
+
+        assert_eq!(
+            persist_failed, 1,
+            "the anchor really was unwritable — without that this test proves nothing"
+        );
+        assert_eq!(
+            ran, 1,
+            "the schedule fired once; the passes after it are not due until the next minute"
+        );
+        assert!(
+            reconciled_at.is_some(),
+            "and the run this process remembers is what says so"
         );
     }
 

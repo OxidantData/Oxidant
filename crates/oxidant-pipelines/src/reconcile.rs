@@ -1258,12 +1258,37 @@ impl ReconcileSchedule {
     /// file is only ever written through [`Self::save`] after [`Cron::parse`] accepted it, so the
     /// only way to get here is a hand-edited file, and that must not stop the pipeline.
     pub fn is_due(&self, now: DateTime<Utc>) -> bool {
-        Cron::parse(&self.cron).is_ok_and(|cron| cron.is_due(self.anchor(), now))
+        self.is_due_since(None, now)
+    }
+
+    /// [`Self::is_due`] against a caller-held anchor as well as the file's.
+    ///
+    /// The scheduler holds the instant of its last run in memory and passes it here, because the
+    /// file's anchor only advances if [`Self::save`] succeeded. A read-only checkpoint volume, a
+    /// permissions change or an NFS blip makes that write fail — none of which should stop the
+    /// pipeline, and none of which did — and with the file as the only anchor the schedule was
+    /// still due on the very next pass. At the trigger intervals people actually use that is a
+    /// `count(*)` plus a `--sample`-row ordered scan against the publisher several times a
+    /// second, indefinitely, with a repeated `StatePersistFailed` line as the only symptom.
+    ///
+    /// The later of the two anchors wins, so a failed save degrades to "the schedule does not
+    /// survive a restart" instead of "the schedule fires every pass".
+    pub fn is_due_since(&self, in_memory: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+        let anchor = match in_memory {
+            Some(remembered) => remembered.max(self.anchor()),
+            None => self.anchor(),
+        };
+        Cron::parse(&self.cron).is_ok_and(|cron| cron.is_due(anchor, now))
     }
 
     /// Record what a run found, for `pipeline show` and for the next tick's anchor.
-    pub fn record(&mut self, at: DateTime<Utc>, result: String) {
-        self.last_run = Some(at.to_rfc3339_opts(SecondsFormat::Secs, true));
+    ///
+    /// `finished_at` is the instant the run *completed*, not the instant it began. Anchoring on
+    /// the start makes a run longer than its own period due again the moment it ends — `*/5 * * *
+    /// *` with a twelve-minute walk never stops running, and since the tick is awaited inline in
+    /// the trigger loop, replication stops with it and the pipeline looks hung.
+    pub fn record(&mut self, finished_at: DateTime<Utc>, result: String) {
+        self.last_run = Some(finished_at.to_rfc3339_opts(SecondsFormat::Secs, true));
         self.last_result = Some(result);
     }
 
@@ -1894,6 +1919,66 @@ tables:
         schedule.record(at("2026-08-23T06:00:00Z"), "in_sync".into());
         assert!(!schedule.is_due(at("2026-08-23T20:00:00Z")));
         assert!(schedule.is_due(at("2026-08-24T06:00:00Z")));
+    }
+
+    #[test]
+    fn a_run_longer_than_its_own_period_is_not_due_again_the_moment_it_finishes() {
+        // The run starts at 12:00 and walks a large table until 12:12. Anchored on the start,
+        // `*/5` has fired twice by the time it lands and the next pass runs it again — forever,
+        // with the replication loop blocked behind it. Anchored on the completion, the next
+        // firing is the next `*/5` boundary after it finished.
+        let at = |t: &str| DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc);
+        let mut schedule = ReconcileSchedule {
+            path: None,
+            cron: "*/5 * * * *".into(),
+            tables: vec![],
+            sample: DEFAULT_SAMPLE,
+            created: "2026-08-23T11:55:00Z".into(),
+            last_run: None,
+            last_result: None,
+        };
+        assert!(schedule.is_due(at("2026-08-23T12:00:00Z")), "it starts due");
+
+        schedule.record(at("2026-08-23T12:12:00Z"), "in_sync".into());
+        assert!(
+            !schedule.is_due(at("2026-08-23T12:12:00Z")),
+            "a twelve-minute run must not re-fire the instant it lands"
+        );
+        assert!(!schedule.is_due(at("2026-08-23T12:14:59Z")));
+        assert!(
+            schedule.is_due(at("2026-08-23T12:15:00Z")),
+            "the next `*/5`"
+        );
+    }
+
+    #[test]
+    fn a_schedule_whose_anchor_could_not_be_written_still_waits_for_its_next_firing() {
+        // `save` failed, so the file still says the schedule has never run. The scheduler's own
+        // memory of the run is what keeps it from firing again on the very next pass.
+        let at = |t: &str| DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc);
+        let unsaved = ReconcileSchedule {
+            path: None,
+            cron: "0 6 * * *".into(),
+            tables: vec![],
+            sample: DEFAULT_SAMPLE,
+            created: "2026-08-23T05:00:00Z".into(),
+            last_run: None,
+            last_result: None,
+        };
+        let ran_at = at("2026-08-23T06:00:00Z");
+        assert!(unsaved.is_due(ran_at), "the file's anchor is still 05:00");
+        assert!(
+            !unsaved.is_due_since(Some(ran_at), at("2026-08-23T06:00:01Z")),
+            "the run that just happened is what the next firing is measured from"
+        );
+        assert!(!unsaved.is_due_since(Some(ran_at), at("2026-08-23T23:59:59Z")));
+        assert!(unsaved.is_due_since(Some(ran_at), at("2026-08-24T06:00:00Z")));
+
+        // And the file wins when it is the later of the two: a schedule that was saved by an
+        // earlier process is not un-run by a scheduler that has only just started.
+        let mut saved = unsaved.clone();
+        saved.record(at("2026-08-24T06:00:00Z"), "in_sync".into());
+        assert!(!saved.is_due_since(Some(ran_at), at("2026-08-24T06:00:01Z")));
     }
 
     #[test]
