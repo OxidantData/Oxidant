@@ -55,30 +55,56 @@ fn subcommand(args: &[String]) -> Option<&str> {
 }
 
 /// Every `--table <NAME>` / `--table=<NAME>`, in the order they were given.
-fn table_flags(args: &[String]) -> Vec<String> {
+fn table_flags(args: &[String]) -> Result<Vec<String>> {
     let mut tables = Vec::new();
     for (i, arg) in args.iter().enumerate() {
         if arg == "--table" {
-            if let Some(name) = args.get(i + 1) {
-                tables.push(name.clone());
-            }
+            tables.push(
+                args.get(i + 1)
+                    .cloned()
+                    .ok_or_else(|| missing_value("--table"))?,
+            );
         } else if let Some(name) = arg.strip_prefix("--table=") {
             tables.push(name.to_string());
         }
     }
-    tables
+    Ok(tables)
 }
 
-/// `--flag <VALUE>` or `--flag=<VALUE>`.
-fn value_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+/// `--flag <VALUE>` or `--flag=<VALUE>`; `Ok(None)` only when the flag was never given.
+///
+/// A flag at the end of the line used to be indistinguishable from a flag that was never passed:
+/// `args.get(i + 1)` returned `None` inside a `find_map`, which simply kept scanning. So
+/// `reconcile --cron` — the operator forgot to quote the expression, or the shell ate it — ran a
+/// full reconcile against the publisher and exited 0 or 1, while the operator believed they had
+/// registered a schedule and nothing had been scheduled at all. The same shape silently reverted
+/// `--sample` to its default.
+fn value_flag<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>> {
     let equals = format!("{flag}=");
-    args.iter().enumerate().find_map(|(i, arg)| {
+    for (i, arg) in args.iter().enumerate() {
         if arg == flag {
-            args.get(i + 1).map(String::as_str)
-        } else {
-            arg.strip_prefix(&equals)
+            return args
+                .get(i + 1)
+                .map(|value| Some(value.as_str()))
+                .ok_or_else(|| missing_value(flag));
         }
-    })
+        if let Some(value) = arg.strip_prefix(&equals) {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+/// The one message a flag-without-a-value gets, whichever flag it was.
+fn missing_value(flag: &str) -> Error {
+    Error::Io(format!(
+        "`{flag}` needs a value after it, for example {}",
+        match flag {
+            "--cron" => "`--cron '0 6 * * *'` (or `--cron off` to clear a registered schedule)",
+            "--sample" => "`--sample 100000`",
+            _ => "`--table public.sales_suppliers`",
+        }
+    ))
 }
 
 /// Parse the `pipeline` subcommand's arguments.
@@ -88,20 +114,35 @@ pub fn parse_command(args: &[String]) -> Result<Command> {
         Some("validate") => Ok(Command::Validate),
         Some("show") => Ok(Command::Show),
         Some("reconcile") => {
-            let sample = match value_flag(args, "--sample") {
+            let sample = match value_flag(args, "--sample")? {
                 None => DEFAULT_SAMPLE,
-                Some(text) => text
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|n| *n > 0)
-                    .ok_or_else(|| {
-                        Error::Io(format!(
-                            "`--sample {text}` is not a number of keys (a positive integer)"
-                        ))
-                    })?,
+                Some(text) => {
+                    let keys = text
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| {
+                            Error::Io(format!(
+                                "`--sample {text}` is not a number of keys (a positive integer)"
+                            ))
+                        })?;
+                    // Both sides of the walk are held in memory to compare them, so an unbounded
+                    // sample is the whole table on the heap twice. The row counts cover every row
+                    // whatever the sample is.
+                    if keys > oxidant_pipelines::MAX_SAMPLE {
+                        return Err(Error::Io(format!(
+                            "`--sample {keys}` is past the {} key ceiling — both sides of the \
+                             walk are held in memory to compare them. The row counts cover every \
+                             row at any sample; widen `--sample` for more keys, do not try to \
+                             cover the table with it.",
+                            oxidant_pipelines::MAX_SAMPLE
+                        )));
+                    }
+                    keys
+                }
             };
-            let cron = value_flag(args, "--cron").map(str::to_string);
+            let cron = value_flag(args, "--cron")?.map(str::to_string);
             if cron.as_deref().is_some_and(|c| c.trim().is_empty()) {
                 return Err(Error::Io(
                     "`--cron` needs an expression, for example `--cron '0 6 * * *'` (or \
@@ -110,13 +151,13 @@ pub fn parse_command(args: &[String]) -> Result<Command> {
                 ));
             }
             Ok(Command::Reconcile {
-                tables: table_flags(args),
+                tables: table_flags(args)?,
                 sample,
                 cron,
             })
         }
         Some("run") | None => Ok(Command::Run {
-            tables: table_flags(args),
+            tables: table_flags(args)?,
             once: args.iter().any(|a| a == "--once"),
         }),
         Some(other) => Err(Error::Io(format!(
@@ -624,6 +665,65 @@ mod tests {
                 sample: DEFAULT_SAMPLE,
                 cron: Some("off".into()),
             }
+        );
+    }
+
+    #[test]
+    fn a_flag_with_no_value_is_an_error_rather_than_a_flag_that_was_never_passed() {
+        // `reconcile --cron` — the expression went unquoted, or the shell ate it. Reading that as
+        // "no `--cron` given" runs a full reconcile against the publisher and exits 0 or 1 while
+        // the operator believes they scheduled something and nothing was scheduled.
+        for flag in ["--cron", "--sample", "--table"] {
+            let err = parse_command(&args(&["oxidant", "pipeline", "reconcile", flag]))
+                .expect_err(flag)
+                .to_string();
+            assert!(err.contains(flag), "it names the flag: {err}");
+            assert!(
+                err.contains("needs a value"),
+                "and says what is wrong: {err}"
+            );
+        }
+        // The existing empty-string guard still covers `--cron ''`, which is a different mistake.
+        let err = parse_command(&args(&["oxidant", "pipeline", "reconcile", "--cron", ""]))
+            .expect_err("empty")
+            .to_string();
+        assert!(err.contains("--cron"), "got: {err}");
+    }
+
+    #[test]
+    fn a_sample_past_the_ceiling_is_refused_where_someone_can_read_the_message() {
+        // Both sides of the walk are held in memory to compare them, so an unbounded sample is
+        // the whole table on the heap twice — and a `--sample` above `i64::MAX` would reach the
+        // server as a `LIMIT` it rejects with a bigint-range error instead.
+        let over = (oxidant_pipelines::MAX_SAMPLE + 1).to_string();
+        let err = parse_command(&args(&[
+            "oxidant",
+            "pipeline",
+            "reconcile",
+            "--sample",
+            &over,
+        ]))
+        .expect_err("past the ceiling")
+        .to_string();
+        assert!(err.contains(&over), "got: {err}");
+        assert!(
+            err.contains(&oxidant_pipelines::MAX_SAMPLE.to_string()),
+            "the message names the ceiling: {err}"
+        );
+        assert_eq!(
+            reconcile(&[
+                "oxidant",
+                "pipeline",
+                "reconcile",
+                "--sample",
+                &oxidant_pipelines::MAX_SAMPLE.to_string(),
+            ]),
+            Command::Reconcile {
+                tables: vec![],
+                sample: oxidant_pipelines::MAX_SAMPLE,
+                cron: None,
+            },
+            "the ceiling itself is allowed"
         );
     }
 

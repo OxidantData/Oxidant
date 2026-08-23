@@ -188,9 +188,19 @@ async fn engine_for(root: &std::path::Path) -> Arc<Engine> {
     engine
 }
 
+/// Serializes the phases of this suite that hold a walsender connection.
+///
+/// A running pipeline holds one, and a server allows `max_wal_senders` (8 by default) at once —
+/// fewer than this suite has tests. Without this the failure is
+/// `number of requested standby connections exceeds "max_wal_senders"`, which reads like a broken
+/// diff rather than like two tests wanting the same fixed resource. The reconciles themselves are
+/// read-only and use an ordinary connection, so only the pipeline runs are serialized.
+static SNAPSHOTTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// One `once` pass: snapshot the source into the Delta target, exactly as `pipeline run` would.
 async fn seed_target(engine: &Engine, config: &OxidantConfig) {
     let plan = Plan::build(config).expect("plans");
+    let _slot = SNAPSHOTTING.lock().await;
     run_pipeline(engine, &plan, &[], true, &HashSet::new(), &mut |event| {
         eprintln!("{:?}", event.kind)
     })
@@ -407,6 +417,27 @@ async fn a_text_key_walks_in_the_same_order_on_both_sides_and_a_short_sample_bou
     assert_eq!(sampled.tables[0].source_rows, Some(4));
     assert_eq!(sampled.tables[0].target_rows, Some(4));
 
+    // A sample that lands exactly on the table's size walked the whole table, so nothing is
+    // bounded and there is no `window_end` — the walk read one key past the sample to know that,
+    // rather than inferring truncation from a window that came back full.
+    let exact = run_reconcile(
+        &engine,
+        &config,
+        &ReconcileOptions {
+            tables: vec![],
+            sample: 4,
+        },
+    )
+    .await;
+    let rendered = exact.render();
+    assert_eq!(exact.exit_code(), 0, "{rendered}");
+    assert_eq!(exact.tables[0].source_sampled, 4);
+    assert_eq!(
+        exact.tables[0].diff.window_end, None,
+        "four keys out of four is a complete walk:\n{rendered}"
+    );
+    assert_eq!(exact.tables[0].diff.compared, 4);
+
     drop_fixtures(&connect, &table).await;
 }
 
@@ -463,9 +494,11 @@ async fn a_registered_cron_schedule_fires_between_triggers_and_records_what_it_f
             counted.fetch_add(1, Ordering::Relaxed);
         }
     };
+    let _slot = SNAPSHOTTING.lock().await;
     let run = run_pipeline(&engine, &plan, &[], false, &once_tables, &mut on_event);
     // The loop never returns on its own; a bounded wait is the whole test.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(8), run).await;
+    drop(_slot);
     assert!(
         reconciled.load(Ordering::Relaxed) >= 1,
         "the schedule should have fired at least once"
@@ -979,4 +1012,152 @@ async fn an_unreachable_publisher_for_one_table_does_not_discard_the_others_repo
     assert_eq!(scoped.exit_code(), oxidant_pipelines::EXIT_FAILED);
 
     drop_fixtures(&connect, &good).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_null_in_the_row_identity_is_refused_rather_than_walked() {
+    let Some(connect) = dsn() else {
+        eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
+        return;
+    };
+    // A primary key is `NOT NULL`, so only a `keys:` override can put a NULL in the row identity.
+    // A NULL is not a key: two NULL-keyed rows render to one string and one of them silently
+    // disappears from a report whose entire output is per-key, and neither `NULLS FIRST` nor
+    // `NULLS LAST` makes the sentinel's position agree with both engines for every key type.
+    let table = format!("{TABLE}_nullkey");
+    drop_fixtures(&connect, &table).await;
+    sql(
+        &connect,
+        &format!("CREATE TABLE public.{table} (supplierid bigint primary key, name text)"),
+    )
+    .await;
+    // A non-PK identity needs the whole old row on a delete, which the connector insists on
+    // before it will accept a `keys:` override at all.
+    sql(
+        &connect,
+        &format!("ALTER TABLE public.{table} REPLICA IDENTITY FULL"),
+    )
+    .await;
+    sql(
+        &connect,
+        &format!("INSERT INTO public.{table} VALUES (1, 'Acme'), (2, NULL)"),
+    )
+    .await;
+
+    let root = tempfile::TempDir::new().expect("temp dir");
+    // `keys: name` — a nullable column as the row identity, which is legal and usually harmless.
+    let yaml = config_yaml_keyed(&connect, root.path(), &table, "name").replace(
+        &format!("tables: public.{table}"),
+        &format!("tables: public.{table}\n        keys: name"),
+    );
+    let config = OxidantConfig::parse(&yaml).expect("the fixture config parses");
+    let engine = engine_for(root.path()).await;
+    let plan = Plan::build(&config).expect("plans");
+
+    let refused = reconcile(&engine, &plan, &ReconcileOptions::default())
+        .await
+        .expect("the refusal is this table's own");
+    let rendered = refused.render();
+    assert_eq!(
+        refused.tables[0].verdicts(),
+        vec!["source_error"],
+        "{rendered}"
+    );
+    assert_eq!(refused.exit_code(), oxidant_pipelines::EXIT_FAILED);
+    let err = refused.tables[0].source_error.clone().expect("says why");
+    assert!(err.contains("NULL"), "got: {err}");
+    assert!(err.contains("name"), "it names the column: {err}");
+    assert!(err.contains("keys:"), "and what to name instead: {err}");
+
+    // The same column with no NULL in it is a perfectly good identity, and is not refused: the
+    // check is on the values, not on the column being nullable.
+    sql(
+        &connect,
+        &format!("UPDATE public.{table} SET name = 'Globex' WHERE supplierid = 2"),
+    )
+    .await;
+    let allowed = reconcile(&engine, &plan, &ReconcileOptions::default())
+        .await
+        .expect("runs");
+    assert!(
+        !allowed.tables[0].errored(),
+        "a nullable key holding no NULLs is fine: {}",
+        allowed.render()
+    );
+
+    drop_fixtures(&connect, &table).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_target_is_still_schema_checked() {
+    let Some(connect) = dsn() else {
+        eprintln!("skipping: OXIDANT_PG_TEST_DSN is not set");
+        return;
+    };
+    // The schema comparison used to run only when the target had rows, which skipped it for the
+    // one case where the schema is *all* there is to compare: a target that exists, holds nothing,
+    // and is missing a column. Both counts agree at zero, so nothing else would have caught it.
+    let table = format!("{TABLE}_empty");
+    drop_fixtures(&connect, &table).await;
+    sql(
+        &connect,
+        &format!("CREATE TABLE public.{table} (supplierid bigint primary key, name text)"),
+    )
+    .await;
+
+    sql(
+        &connect,
+        &format!("INSERT INTO public.{table} VALUES (1, 'Acme')"),
+    )
+    .await;
+
+    let root = tempfile::TempDir::new().expect("temp dir");
+    let config = config(&connect, root.path(), &table);
+    let engine = engine_for(root.path()).await;
+    seed_target(&engine, &config).await;
+
+    // Empty the table through the pipeline rather than starting empty: a pipeline with nothing to
+    // write does not create the target at all, and `target_missing` is a different verdict with
+    // its own test. The delete goes upstream and a second pass carries it into the target, which
+    // leaves exactly what this test needs — a target that exists and holds nothing.
+    sql(&connect, &format!("DELETE FROM public.{table}")).await;
+    seed_target(&engine, &config).await;
+
+    let empty = run_reconcile(&engine, &config, &ReconcileOptions::default()).await;
+    let rendered = empty.render();
+    assert_eq!(
+        empty.tables[0].target_rows,
+        Some(0),
+        "the pipeline created the target even with nothing to put in it:\n{rendered}"
+    );
+    assert_eq!(
+        empty.exit_code(),
+        0,
+        "empty on both sides is in sync:\n{rendered}"
+    );
+
+    // Now add a column upstream. Both counts are still zero and the key walk still has nothing to
+    // walk; the schema is the only thing that differs, and it has to be reported.
+    sql(
+        &connect,
+        &format!("ALTER TABLE public.{table} ADD COLUMN region text"),
+    )
+    .await;
+    let drifted = run_reconcile(&engine, &config, &ReconcileOptions::default()).await;
+    let rendered = drifted.render();
+    assert_eq!(drifted.tables[0].source_rows, Some(0), "{rendered}");
+    assert_eq!(drifted.tables[0].target_rows, Some(0), "{rendered}");
+    assert_eq!(
+        drifted.tables[0].missing_columns,
+        vec!["region"],
+        "{rendered}"
+    );
+    assert_eq!(
+        drifted.tables[0].verdicts(),
+        vec!["schema_drift"],
+        "{rendered}"
+    );
+    assert_eq!(drifted.exit_code(), 1, "{rendered}");
+
+    drop_fixtures(&connect, &table).await;
 }

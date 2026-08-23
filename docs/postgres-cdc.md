@@ -191,7 +191,16 @@ whether the report is worth reading.
   metadata columns the merge adds (`__oxidant_*`) are plumbing and never drift.
 
 The walk is deterministic — same tables, same report — so two runs differing is
-itself a signal.
+itself a signal. `--sample` is capped at 5,000,000 keys: both sides of a walk
+are materialized to compare them, and the row counts cover every row whatever
+the sample is.
+
+**A NULL in the row identity is refused**, like an unwalkable key type. A NULL
+is not a key: two NULL-keyed rows render to one string and one of them
+disappears from a report whose whole output is per-key. A primary key is
+`NOT NULL`, so this only reaches a `keys:` override naming a nullable column —
+and it is checked against the values rather than the schema, so a nullable
+column holding no NULLs stays a perfectly good identity.
 
 **A source with more than one upstream table** is compared as the union of
 them, because that is what `auto_cdc` merges into the one target. That reading

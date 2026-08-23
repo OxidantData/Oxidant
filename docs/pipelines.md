@@ -487,7 +487,8 @@ holding a different set of rows. `--table` takes either the pipeline table's nam
 step would read as "clean".
 
 The walk is sampled — the first `--sample` keys in ascending key order, deterministically, so two
-runs against unchanged tables produce the same report — and each side's cut bounds only what the
+runs against unchanged tables produce the same report (capped at 5,000,000 keys, because both
+sides are held in memory to compare them; the row counts cover every row at any sample) — and each side's cut bounds only what the
 other can be accused of, so a table larger than the sample does not report its unexamined tail as
 drift. `docs/postgres-cdc.md` §4 has the full mechanics, including which key types are comparable
 and why a `float8` key is refused rather than walked.

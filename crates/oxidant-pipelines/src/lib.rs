@@ -24,7 +24,7 @@ pub use output_write::{
 pub use reconcile::{
     diff_keys, reconcile, set_schedule, KeyDiff, KeyRow, KeyWindow, ReconcileOptions,
     ReconcileReport, ReconcileSchedule, TableReport, DEFAULT_SAMPLE, EXIT_DRIFT, EXIT_FAILED,
-    EXIT_IN_SYNC,
+    EXIT_IN_SYNC, MAX_SAMPLE,
 };
 pub use runner::{
     clear_pipeline_state, run_pipeline, Plan, RunEvent, RunEventKind, TableOutcome, TableStatus,

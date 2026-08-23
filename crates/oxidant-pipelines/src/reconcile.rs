@@ -59,6 +59,17 @@ use crate::runner::Plan;
 /// Keys compared per table unless `--sample` widens it.
 pub const DEFAULT_SAMPLE: usize = 10_000;
 
+/// The widest key walk this will do, whatever `--sample` says.
+///
+/// Both sides are materialized to compare them: the source window is `sample` rows of text plus a
+/// full Arrow array per value column, and the target window accumulates every batch's `KeyRow`
+/// before returning. At the documented `--sample 100000` that is nothing; unbounded it is the
+/// whole table on the heap, twice, and a `--sample` above `i64::MAX` reaches the server as a
+/// `LIMIT` it rejects with a bigint-range error rather than as a message from the CLI. Five
+/// million keys is ~500 MB of window on a wide table — past the point where a *sample* is the
+/// right tool, and the row counts still cover every row either way.
+pub const MAX_SAMPLE: usize = 5_000_000;
+
 /// Every table was compared and every one of them is in sync.
 pub const EXIT_IN_SYNC: i32 = 0;
 /// The comparison ran and something differed. This is the one a CI step is written against.
@@ -69,14 +80,50 @@ pub const EXIT_FAILED: i32 = 2;
 
 /// Joins the columns of a composite key into one comparable string.
 ///
-/// `0x01` rather than a printable character: byte-wise comparison of the joined form then orders
-/// identically to tuple comparison of the parts, because no Postgres text value can contain a
-/// byte below `0x01` (`NUL` is the only one, and `text` cannot hold it). A `-` or a `|` would
-/// reverse the order of `("a","z")` and `("ab","a")`.
-const KEY_SEPARATOR: char = '\u{1}';
+/// The whole point of the encoding is that byte-wise comparison of the joined form orders
+/// identically to tuple comparison of the parts — the merge walk compares joined strings, and both
+/// sides are *ordered* by the columns. A printable separator does not have that property: `-` or
+/// `|` reverses the order of `("a","z")` and `("ab","a")`.
+///
+/// A single `0x01` byte was nearly right, and its stated reason — "no Postgres text value can
+/// contain a byte below `0x01`" — is true but does not cover `0x01` itself, which a `text` value
+/// *can* hold. That leaves two holes: `("a\u{1}b", "z")` and `("a", "b\u{1}z")` join to the same
+/// string, and the order of `("a\u{1}", "x")` against `("a", "y")` inverts.
+///
+/// So the separator leads with `0x00` — which `text` genuinely cannot hold, being the C string
+/// terminator Postgres' own protocol uses — and a part's own `0x00` (which a lakehouse string
+/// *can* hold, even if no Postgres row can) is escaped to a byte above the separator's second.
+/// That is the standard order-preserving tuple encoding: within a part, an escaped `0x00` compares
+/// greater than a separator, so a longer part still sorts after a shorter prefix of it.
+const KEY_SEPARATOR: &str = "\u{0}\u{1}";
+
+/// A `0x00` inside a key part, rewritten so it cannot be read as the separator.
+///
+/// `\u{ff}` encodes as `0xC3 0xBF` in UTF-8, and only the first byte after the `0x00` decides the
+/// comparison — `0xC3` is above the separator's `0x01`, which is what keeps the order.
+const KEY_ESCAPE: &str = "\u{0}\u{ff}";
+
+/// The byte the row hash puts between two column renderings. Not the key separator: it separates
+/// values inside one hash, where ordering is irrelevant and a single byte is enough.
+const HASH_SEPARATOR: u8 = 0x01;
 
 /// How a NULL renders inside a hashed row, distinct from an empty string.
 const NULL_SENTINEL: &str = "\u{2}NULL";
+
+/// Join one row's key columns into the string the walk compares.
+///
+/// `None` is a NULL, which [`refuse_null_keys`] has already ruled out for the source — this is
+/// what a target row would render as if one appeared anyway, and it is deliberately a value no
+/// comparison can mistake for an empty string.
+fn encode_key<'a>(parts: impl Iterator<Item = Option<&'a str>>) -> String {
+    parts
+        .map(|part| match part {
+            Some(value) => value.replace('\u{0}', KEY_ESCAPE),
+            None => NULL_SENTINEL.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(KEY_SEPARATOR)
+}
 
 /// Key types whose Postgres text form and Arrow text form are the same string.
 ///
@@ -254,7 +301,7 @@ fn row_hash(values: &[String]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
-            hash = (hash ^ u64::from(KEY_SEPARATOR as u8)).wrapping_mul(0x100_0000_01b3);
+            hash = (hash ^ u64::from(HASH_SEPARATOR)).wrapping_mul(0x100_0000_01b3);
         }
         for byte in value.as_bytes() {
             hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
@@ -582,7 +629,10 @@ fn sample_of(keys: &[String]) -> String {
 
 /// A composite key back in a form a human can paste into a `WHERE` clause.
 fn show_key(key: &str) -> String {
-    key.split(KEY_SEPARATOR).collect::<Vec<_>>().join(" | ")
+    key.split(KEY_SEPARATOR)
+        .map(|part| part.replace(KEY_ESCAPE, "\u{0}"))
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -616,7 +666,10 @@ pub async fn reconcile(
     plan: &Plan<'_>,
     options: &ReconcileOptions,
 ) -> Result<ReconcileReport> {
-    let sample = options.sample.max(1);
+    // Clamped rather than refused: a schedule carries its `--sample` in `reconcile.json`, and a
+    // hand-edited number there must not stop a scheduled run. The CLI refuses the same value up
+    // front, where there is someone to read the message.
+    let sample = options.sample.clamp(1, MAX_SAMPLE);
     let cdc_tables = cdc_table_names(plan);
     if cdc_tables.is_empty() {
         return Err(Error::Io(format!(
@@ -840,6 +893,7 @@ async fn reconcile_table(
     );
 
     let control = pg.connect.connect_control().await?;
+    refuse_null_keys(&control, upstream, &key_columns, name).await?;
     refuse_overlapping_keys(&control, upstream, &key_columns, name).await?;
     let mut source_rows: u64 = 0;
     for table in upstream {
@@ -874,8 +928,11 @@ async fn reconcile_table(
     // What the target actually has decides what either side hashes. A column the target is
     // missing has to come out of *both* row hashes, or every row in the table reads as a content
     // mismatch and the one real finding — the dropped column — is buried under it.
+    // Run for an empty target too: a table that exists, holds nothing and is missing a source
+    // column is the one case where the schema is *all* there is to compare, and skipping it there
+    // made `schema_drift` the one verdict that did not apply to it.
     let mut missing_columns = Vec::new();
-    if matches!(target_rows, Ok(rows) if rows > 0) {
+    if target_rows.is_ok() {
         let present = target_columns(engine, &target).await?;
         for key in &key_columns {
             if !present.iter().any(|c| c.eq_ignore_ascii_case(&key.name)) {
@@ -1090,11 +1147,7 @@ async fn refuse_overlapping_keys(
     let Some(row) = duplicate.first() else {
         return Ok(());
     };
-    let key = row
-        .iter()
-        .map(|v| v.as_deref().unwrap_or(NULL_SENTINEL))
-        .collect::<Vec<_>>()
-        .join(" | ");
+    let key = show_key(&encode_key(row.iter().map(Option::as_deref)));
     Err(Error::Unsupported(format!(
         "postgres_cdc table `{name}`: its source replicates {} into one target keyed on `{}`, and they \
          do not have disjoint key values — `{key}` is in more than one of them. The merge keeps \
@@ -1112,6 +1165,63 @@ async fn refuse_overlapping_keys(
             .collect::<Vec<_>>()
             .join(", ")
     )))
+}
+
+/// Refuse a key column that actually holds a NULL.
+///
+/// A NULL key breaks two things the walk needs. It is not a *value*: two NULL-keyed rows render to
+/// one identical key string and are indistinguishable, so one of them is silently dropped from a
+/// comparison whose whole output is per-key. And it is not orderable across the two engines — it
+/// renders as [`NULL_SENTINEL`], which no `NULLS FIRST`/`NULLS LAST` choice can make agree with
+/// both a Postgres ordering and a lakehouse one for every key type at once.
+///
+/// This is the same refusal an unwalkable key type gets, and for the same reason: the alternative
+/// is a report that quietly answers a different question. It is checked rather than assumed
+/// because a primary key is `NOT NULL` — only a `keys:` override can name a nullable column — and
+/// a nullable column that holds no NULLs is a perfectly good identity. So the probe runs only when
+/// the schema says a NULL is possible, and stops at the first one it finds.
+async fn refuse_null_keys(
+    control: &ControlConnection,
+    upstream: &[TableSchema],
+    key_columns: &[&ColumnSchema],
+    name: &str,
+) -> Result<()> {
+    let nullable: Vec<&&ColumnSchema> = key_columns.iter().filter(|c| c.nullable).collect();
+    if nullable.is_empty() {
+        return Ok(());
+    }
+    let predicate = nullable
+        .iter()
+        .map(|c| format!("{} IS NULL", quote_identifier(&c.name)))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    for table in upstream {
+        let found = control
+            .scalar(
+                &format!(
+                    "SELECT 1::text FROM {}.{} WHERE {predicate} LIMIT 1",
+                    quote_identifier(&table.schema),
+                    quote_identifier(&table.table)
+                ),
+                &[],
+            )
+            .await?;
+        if found.is_some() {
+            return Err(Error::Unsupported(format!(
+                "postgres_cdc table `{name}`: `{}` has a NULL in its row identity (`{}`), and a \
+                 NULL is not a key this can compare — two NULL-keyed rows are one key here, and \
+                 the two engines do not agree on where it sorts. Name an identity that cannot be \
+                 NULL with `keys:` in the source's `options:`, or make the column `NOT NULL`.",
+                table.qualified(),
+                nullable
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One key column's source projection: the text the key walk compares and orders by.
@@ -1171,14 +1281,22 @@ fn source_window_sql(
     // `COLLATE "C"` is what makes the order byte-wise, and so the same order DataFusion puts the
     // target in. Under an `en_US` database collation `ORDER BY key` is *not* byte order, and the
     // two walks would interleave differently and report the whole table as drifted.
+    // `NULLS FIRST`, not Postgres' `ASC` default: a NULL key renders as `NULL_SENTINEL`, whose
+    // leading `0x02` sorts before every printable value, so putting NULLs last would leave the
+    // window sorted by the query and *un*sorted by the string the walk compares — and `diff_keys`
+    // deliberately does not re-sort. `refuse_null_keys` means this should never come up; it is
+    // here so that if one ever does, it lands where the comparison expects it rather than
+    // cascading through every key after it.
     let order: Vec<String> = (0..key_columns.len())
-        .map(|i| format!("s.c{i} COLLATE \"C\" ASC NULLS LAST"))
+        .map(|i| format!("s.c{i} COLLATE \"C\" ASC NULLS FIRST"))
         .collect();
+    // One past the sample, so "the walk stopped early" is a fact rather than an inference: a table
+    // with exactly `sample` rows was walked to its end and must not be reported as truncated.
     format!(
         "SELECT * FROM ({}) s ORDER BY {} LIMIT {}",
         branches.join(" UNION ALL "),
         order.join(", "),
-        sample
+        sample.saturating_add(1)
     )
 }
 
@@ -1191,8 +1309,9 @@ async fn source_window(
     sample: usize,
 ) -> Result<KeyWindow> {
     let sql = source_window_sql(upstream, key_columns, value_columns, sample);
-    let rows = control.query(&sql, &[]).await?;
-    let truncated = rows.len() >= sample;
+    let mut rows = control.query(&sql, &[]).await?;
+    let truncated = rows.len() > sample;
+    rows.truncate(sample);
 
     // Convert the non-key columns through the connector's own text→Arrow mapping, so the row
     // hash is over the values a micro-batch would have written rather than over Postgres' text.
@@ -1216,12 +1335,7 @@ async fn source_window(
         truncated,
     };
     for (index, row) in rows.iter().enumerate() {
-        let key = row
-            .iter()
-            .take(key_columns.len())
-            .map(|v| v.as_deref().unwrap_or(NULL_SENTINEL))
-            .collect::<Vec<_>>()
-            .join(&KEY_SEPARATOR.to_string());
+        let key = encode_key(row.iter().take(key_columns.len()).map(Option::as_deref));
         window
             .rows
             .push(KeyRow::new(key, hashes.get(index).copied()));
@@ -1264,13 +1378,16 @@ fn target_window_sql(
         .map(|c| format!("CAST({} AS VARCHAR)", quote_ident(&c.name)))
         .collect();
     projection.extend(value_columns.iter().map(|c| quote_ident(&c.name)));
+    // `NULLS FIRST` for the same reason as the source's, and it has to be the *same* choice: the
+    // two windows are merge-walked against each other.
     let order: Vec<String> = (1..=key_columns.len())
-        .map(|i| format!("{i} ASC NULLS LAST"))
+        .map(|i| format!("{i} ASC NULLS FIRST"))
         .collect();
     format!(
-        "SELECT {} FROM {target} ORDER BY {} LIMIT {sample}",
+        "SELECT {} FROM {target} ORDER BY {} LIMIT {}",
         projection.join(", "),
-        order.join(", ")
+        order.join(", "),
+        sample.saturating_add(1)
     )
 }
 
@@ -1318,30 +1435,28 @@ async fn target_window(
             rows.push(KeyRow::new(key, hashes.get(index).copied()));
         }
     }
-    let truncated = rows.len() >= sample;
+    let truncated = rows.len() > sample;
+    rows.truncate(sample);
     Ok(KeyWindow { rows, truncated })
 }
 
-/// The target's column names, read from one row rather than from a catalog call.
+/// The target's column names, read from a planned scan rather than from a catalog call.
 ///
 /// `SELECT * … LIMIT 1` goes through the same planner the comparison queries do, so a table this
 /// can read is a table those can read; a catalog lookup can succeed against metadata a scan then
-/// fails on.
+/// fails on. The schema is taken from the *stream* rather than from a collected batch, because a
+/// query over an empty table may return no batches at all — and reading "no batches" as "no
+/// columns" is what let an empty target skip the schema check entirely.
 async fn target_columns(engine: &Engine, target: &str) -> Result<Vec<String>> {
-    let batches = engine
-        .sql(&format!("SELECT * FROM {target} LIMIT 1"))
+    let stream = engine
+        .sql_stream(&format!("SELECT * FROM {target} LIMIT 1"))
         .await?;
-    Ok(batches
-        .first()
-        .map(|batch| {
-            batch
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect()
-        })
-        .unwrap_or_default())
+    Ok(stream
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect())
 }
 
 /// The leading `count` columns of a batch, joined into one comparable key per row.
@@ -1379,19 +1494,11 @@ fn batch_keys(batch: &RecordBatch, count: usize) -> Result<Vec<String>> {
     }
     let mut out = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
-        out.push(
+        out.push(encode_key(
             columns
                 .iter()
-                .map(|c| {
-                    if c.is_null(row) {
-                        NULL_SENTINEL.to_string()
-                    } else {
-                        c.value(row).to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(&KEY_SEPARATOR.to_string()),
-        );
+                .map(|c| (!c.is_null(row)).then(|| c.value(row))),
+        ));
     }
     Ok(out)
 }
@@ -1973,7 +2080,105 @@ mod tests {
 
     #[test]
     fn a_composite_key_renders_readably_rather_than_with_a_control_byte() {
-        assert_eq!(show_key(&format!("a{KEY_SEPARATOR}b")), "a | b");
+        assert_eq!(
+            show_key(&encode_key([Some("a"), Some("b")].into_iter())),
+            "a | b"
+        );
+        // A part that contained the escape's own bytes comes back as it went in.
+        assert_eq!(
+            show_key(&encode_key([Some("a\u{0}b"), Some("c")].into_iter())),
+            "a\u{0}b | c"
+        );
+    }
+
+    #[test]
+    fn joining_a_composite_key_orders_it_the_same_way_comparing_its_parts_would() {
+        // The merge walk compares joined strings while both sides are *ordered* by their columns,
+        // so the encoding has to make those two orders the same. A `-` or a `|` separator does
+        // not: it reverses `("a","z")` against `("ab","a")`. Nor does a bare `0x01`, because a
+        // Postgres `text` value can contain `0x01` — the case that used to invert.
+        let joined = |a: &str, b: &str| encode_key([Some(a), Some(b)].into_iter());
+        for (left, right) in [
+            (("a", "z"), ("ab", "a")),
+            (("a\u{1}", "x"), ("a", "y")),
+            (("a", "b"), ("a", "b\u{1}")),
+            (("a\u{0}", "x"), ("a", "y")),
+            (("", "b"), ("", "c")),
+            (("", "z"), ("a", "")),
+        ] {
+            let (tuple_order, joined_order) = (
+                left.cmp(&right),
+                joined(left.0, left.1).cmp(&joined(right.0, right.1)),
+            );
+            assert_eq!(
+                tuple_order, joined_order,
+                "{left:?} vs {right:?}: the joined form must order like the parts"
+            );
+        }
+    }
+
+    #[test]
+    fn two_different_composite_keys_never_join_to_one_string() {
+        // `("a\u{1}b", "z")` and `("a", "b\u{1}z")` joined to the same key under a bare `0x01`
+        // separator — two distinct rows compared as one, with no way to tell from the report.
+        assert_ne!(
+            encode_key([Some("a\u{1}b"), Some("z")].into_iter()),
+            encode_key([Some("a"), Some("b\u{1}z")].into_iter())
+        );
+        // And the separator's own leading byte inside a part cannot be read as a separator.
+        assert_ne!(
+            encode_key([Some("a\u{0}\u{1}b")].into_iter()),
+            encode_key([Some("a"), Some("b")].into_iter())
+        );
+        // A NULL is not an empty string, and not the literal text either.
+        assert_ne!(
+            encode_key([None].into_iter()),
+            encode_key([Some("")].into_iter())
+        );
+    }
+
+    #[test]
+    fn a_walk_that_reached_the_end_of_its_table_is_not_reported_as_truncated() {
+        // The window is read one row past the sample, so "it stopped early" is a fact rather than
+        // an inference: a table holding exactly `sample` rows was walked to its end.
+        let columns = [column("id", DataType::Int64)];
+        let keys: Vec<&ColumnSchema> = columns.iter().collect();
+        let sql = source_window_sql(&[upstream("public", "t")], &keys, &[], 10);
+        assert!(sql.ends_with("LIMIT 11"), "{sql}");
+        let target = target_window_sql("local.live.t", &keys, &[], 10);
+        assert!(target.ends_with("LIMIT 11"), "{target}");
+
+        // And a window that came back exactly full is still complete, so nothing bounds the other
+        // side's claims: without this, the last `sample` keys of a matching pair would stop being
+        // comparable the moment the table's size hit the sample exactly.
+        let complete = KeyWindow {
+            rows: (0..3)
+                .map(|i| KeyRow::new(i.to_string(), Some(i)))
+                .collect(),
+            truncated: false,
+        };
+        let diff = diff_keys(&complete, &KeyWindow::default());
+        assert_eq!(diff.missing_in_target.len(), 3);
+        assert_eq!(diff.window_end, None, "a complete walk bounds nothing");
+    }
+
+    #[test]
+    fn both_sides_put_a_null_key_at_the_end_the_sentinel_sorts_at() {
+        let columns = [column("id", DataType::Int64)];
+        let keys: Vec<&ColumnSchema> = columns.iter().collect();
+        // `NULL_SENTINEL` leads with `0x02`, below every printable byte, so a NULL key belongs at
+        // the *start* of both windows. Postgres' `ASC` default is `NULLS LAST`, which would leave
+        // the window sorted by the query and unsorted by the string the walk compares — and
+        // `diff_keys` deliberately does not re-sort.
+        assert!(
+            NULL_SENTINEL < "0",
+            "the sentinel sorts before printable keys"
+        );
+        assert!(
+            source_window_sql(&[upstream("public", "t")], &keys, &[], 10).contains("NULLS FIRST"),
+            "the source must not leave NULLs where its default puts them"
+        );
+        assert!(target_window_sql("local.live.t", &keys, &[], 10).contains("NULLS FIRST"));
     }
 
     /// A source column fixture — only the name and the type reach the SQL builders.
