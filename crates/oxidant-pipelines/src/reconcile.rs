@@ -1179,7 +1179,9 @@ async fn refuse_overlapping_keys(
 /// is a report that quietly answers a different question. It is checked rather than assumed
 /// because a primary key is `NOT NULL` — only a `keys:` override can name a nullable column — and
 /// a nullable column that holds no NULLs is a perfectly good identity. So the probe runs only when
-/// the schema says a NULL is possible, and stops at the first one it finds.
+/// the schema says a NULL is possible, and stops at the first one it finds. Its worst case — a
+/// nullable key holding no NULLs and no index to prove it — is one sequential scan, the same order
+/// of work as the `count(*)` this run already pays for.
 async fn refuse_null_keys(
     control: &ControlConnection,
     upstream: &[TableSchema],
