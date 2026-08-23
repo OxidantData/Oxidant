@@ -1448,7 +1448,22 @@ impl PostgresCdcSource {
                         LogicalMessage::Insert { relation, new } => {
                             self.push_change(&mut open_txn, relation, Op::Insert, wal_start, &new)
                         }
-                        LogicalMessage::Update { relation, new, .. } => {
+                        LogicalMessage::Update {
+                            relation,
+                            key,
+                            old,
+                            new,
+                        } => {
+                            // An UPDATE that moved the row's identity is two changes downstream:
+                            // the row under the old key is gone, and a row under the new one
+                            // exists. The delete goes first — they name different keys, so the
+                            // shared LSN cannot make them race — and without it the old key
+                            // stays in the target forever.
+                            if let Some(was) =
+                                self.moved_key(relation, key.as_deref(), old.as_deref(), &new)
+                            {
+                                self.push_row(&mut open_txn, relation, Op::Delete, wal_start, was);
+                            }
                             self.push_change(&mut open_txn, relation, Op::Update, wal_start, &new)
                         }
                         LogicalMessage::Delete { relation, key, old } => {
@@ -1552,31 +1567,19 @@ impl PostgresCdcSource {
         self.relations.insert(relation.oid, relation);
     }
 
-    /// Turn one pgoutput tuple into a change event, dropping it when the op is not published or
-    /// the relation is not one of ours.
-    fn push_change(
-        &self,
-        into: &mut Vec<ChangeEvent>,
-        relation_oid: u32,
-        op: Op,
-        lsn: Lsn,
-        tuple: &[TupleData],
-    ) {
-        if !self.options.publish_ops.contains(&op) {
-            return;
-        }
-        let Some(relation) = self.relations.get(&relation_oid) else {
-            // A change for a relation whose shape was never announced cannot be decoded. pgoutput
-            // always sends the Relation first, so this only happens if a stream is joined mid
-            // transaction — which a replay from a commit boundary never is.
-            return;
-        };
+    /// The emitted row a pgoutput tuple projects to, or `None` when the relation is not one this
+    /// source replicates.
+    fn project(&self, relation_oid: u32, tuple: &[TupleData]) -> Option<Vec<Option<String>>> {
+        // A change for a relation whose shape was never announced cannot be decoded. pgoutput
+        // always sends the Relation first, so this only happens if a stream is joined mid
+        // transaction — which a replay from a commit boundary never is.
+        let relation = self.relations.get(&relation_oid)?;
         if !self
             .tables
             .iter()
             .any(|t| t.qualified() == relation.qualified())
         {
-            return;
+            return None;
         }
         let projection = self
             .projections
@@ -1599,12 +1602,113 @@ impl PostgresCdcSource {
                 TupleData::Null | TupleData::UnchangedToast => None,
             };
         }
+        Some(values)
+    }
+
+    /// Turn one pgoutput tuple into a change event, dropping it when the op is not published or
+    /// the relation is not one of ours.
+    fn push_change(
+        &self,
+        into: &mut Vec<ChangeEvent>,
+        relation_oid: u32,
+        op: Op,
+        lsn: Lsn,
+        tuple: &[TupleData],
+    ) {
+        if !self.options.publish_ops.contains(&op) {
+            return;
+        }
+        self.push_row(into, relation_oid, op, lsn, tuple);
+    }
+
+    /// Emit a row whatever `publish_ops` says.
+    ///
+    /// Only used for the delete half of an identity-changing UPDATE, which is not a source DELETE
+    /// the operator chose to exclude — it is half of how an UPDATE that moved a row is
+    /// represented, and dropping it would leave the orphan behind.
+    fn push_row(
+        &self,
+        into: &mut Vec<ChangeEvent>,
+        relation_oid: u32,
+        op: Op,
+        lsn: Lsn,
+        tuple: &[TupleData],
+    ) {
+        let Some(values) = self.project(relation_oid, tuple) else {
+            return;
+        };
         into.push(ChangeEvent {
             op,
             lsn: lsn.as_i64(),
             ts_micros: None,
             values,
         });
+    }
+
+    /// The old image of a row whose identity an UPDATE moved, if it moved one.
+    ///
+    /// AUTO CDC merges by key, so an UPDATE that changes the key inserts a row under the new key
+    /// and leaves the old one in the target forever — a phantom that exists in the lakehouse and
+    /// not in Postgres, with nothing to detect it. Debezium and PeerDB both answer this by
+    /// emitting a delete of the old key alongside the new image, and so does this.
+    ///
+    /// pgoutput gives two different signals. Under REPLICA IDENTITY DEFAULT or USING INDEX the
+    /// old image (`K`) is written *only* when a replica-identity column changed, so its presence
+    /// is the answer. Under FULL there is no `K` at all — the whole old row arrives as `O` on
+    /// every update — so the identity has to be compared column by column.
+    fn moved_key<'a>(
+        &self,
+        relation_oid: u32,
+        key: Option<&'a [TupleData]>,
+        old: Option<&'a [TupleData]>,
+        new: &[TupleData],
+    ) -> Option<&'a [TupleData]> {
+        if let Some(key) = key {
+            return Some(key);
+        }
+        let old = old?;
+        let positions = self.key_positions(relation_oid);
+        if positions.is_empty() {
+            return None;
+        }
+        let (was, now) = (
+            self.project(relation_oid, old)?,
+            self.project(relation_oid, new)?,
+        );
+        positions
+            .iter()
+            .any(|index| was.get(*index) != now.get(*index))
+            .then_some(old)
+    }
+
+    /// Where the row identity's columns sit in the emitted schema.
+    fn key_positions(&self, relation_oid: u32) -> Vec<usize> {
+        let Some(relation) = self.relations.get(&relation_oid) else {
+            return Vec::new();
+        };
+        let Some(table) = self
+            .tables
+            .iter()
+            .find(|t| t.qualified() == relation.qualified())
+        else {
+            return Vec::new();
+        };
+        let emitted: Vec<&str> = self
+            .schema
+            .fields()
+            .iter()
+            .take(self.emitted_columns())
+            .map(|f| f.name().as_str())
+            .collect();
+        table
+            .keys
+            .iter()
+            .filter_map(|key| {
+                emitted
+                    .iter()
+                    .position(|name| name.eq_ignore_ascii_case(key))
+            })
+            .collect()
     }
 
     fn emitted_columns(&self) -> usize {
@@ -1709,8 +1813,15 @@ impl PostgresCdcSource {
                 op: Op::Snapshot,
                 // Every snapshot row is as of the slot's consistent point, so ordering them
                 // against each other is meaningless and ordering them *before* the stream is
-                // exactly right: a change to the same key arrives with a strictly larger LSN.
-                lsn: self.position.as_i64(),
+                // exactly right. One byte *below* the consistent point, not on it: the stream
+                // starts at that LSN, and on a quiet server the very next WAL record begins
+                // exactly there — `CREATE_REPLICATION_SLOT` leaves the consistent point at the
+                // end of the last record written. AUTO CDC compares an incoming change against
+                // the stored sequence with a strict `>`, so a snapshot row stamped *on* the
+                // consistent point ties with the first change after it and silently wins. This
+                // is what makes "a change to the same key arrives with a strictly larger
+                // `__oxidant_lsn`" true rather than nearly true.
+                lsn: self.position.as_i64().saturating_sub(1),
                 // A snapshot row has no commit, so it has no commit timestamp. AUTO CDC orders
                 // by `__oxidant_lsn`, not by this.
                 ts_micros: None,
@@ -2558,6 +2669,18 @@ mod tests {
         out
     }
 
+    /// An `U` message with both sections: the old identity (`K`) and the new row (`N`), which is
+    /// exactly what pgoutput writes when an UPDATE changes a replica-identity column.
+    fn keyed_update_msg(oid: u32, was: &[Option<&str>], now: &[Option<&str>]) -> Vec<u8> {
+        let mut out = vec![b'U'];
+        out.extend_from_slice(&oid.to_be_bytes());
+        out.push(b'K');
+        tuple(&mut out, was);
+        out.push(b'N');
+        tuple(&mut out, now);
+        out
+    }
+
     fn truncate_msg(oids: &[u32]) -> Vec<u8> {
         let mut out = vec![b'T'];
         out.extend_from_slice(&(oids.len() as i32).to_be_bytes());
@@ -3219,7 +3342,10 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap()
             .value(0);
-        assert_eq!(lsn, 0x100);
+        assert_eq!(
+            lsn, 0xFF,
+            "one below the consistent point, so the first change *at* it still wins"
+        );
         assert!(
             column(&batches[0], TS_COLUMN).is_null(0),
             "no commit, no commit time"
@@ -3343,10 +3469,13 @@ mod tests {
         );
     }
 
+    /// What a [`RecordingSink`] kept: the batch id it was handed, and the rows in it.
+    type SinkWrites = std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<RecordBatch>)>>>;
+
     /// A sink that records what it was handed, and refuses one nominated batch.
     struct RecordingSink {
         fail_on: Option<u64>,
-        writes: std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<RecordBatch>)>>>,
+        writes: SinkWrites,
     }
 
     #[async_trait::async_trait]
@@ -3476,7 +3605,7 @@ mod tests {
                     .downcast_ref::<Int64Array>()
                     .unwrap();
                 for i in 0..batch.num_rows() {
-                    assert_eq!(lsn.value(i), 0x1100, "a row from the abandoned snapshot");
+                    assert_eq!(lsn.value(i), 0x10FF, "a row from the abandoned snapshot");
                 }
                 let key = column(batch, "supplierid")
                     .as_any()
@@ -3544,6 +3673,110 @@ mod tests {
             strings(batch, "name"),
             vec![Some("Acme".into()), None, None]
         );
+    }
+
+    #[tokio::test]
+    async fn an_update_that_moves_the_key_deletes_the_row_it_left_behind() {
+        // AUTO CDC merges by key, so an UPDATE that changes the key inserts a row under the new
+        // one and leaves the old one in the target forever — a supplier that exists in the
+        // lakehouse and not in Postgres, with no error and nothing to detect it. pgoutput writes
+        // the `K` section on an UPDATE only when a replica-identity column changed, so its
+        // presence is an unambiguous "this row changed identity".
+        let engine = Engine::new();
+        let (mut source, wire) = source_with(vec![
+            xlog(
+                0x100,
+                relation_msg(
+                    RELATION_OID,
+                    "public",
+                    "sales_suppliers",
+                    &[(true, "supplierid", oids::INT8), (false, "name", 25)],
+                ),
+            ),
+            xlog(0x110, begin_msg(0x200, COMMIT_TIME)),
+            xlog(
+                0x120,
+                keyed_update_msg(RELATION_OID, &[Some("7"), None], &[Some("9"), Some("Acme")]),
+            ),
+            xlog(0x150, commit_msg(0x200, 0x200, COMMIT_TIME)),
+        ]);
+        wire.lock().await.slot_existed = true;
+        let batches = stream_once(&mut source, &engine).await;
+
+        let batch = &batches[0];
+        assert_eq!(
+            strings(batch, OP_COLUMN),
+            ["d", "u"].map(|s| Some(s.into())),
+            "the old key is removed, then the new image lands"
+        );
+        let ids = column(batch, "supplierid")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!((ids.value(0), ids.value(1)), (7, 9));
+        // Both halves are the same change, and they name different keys — so the shared LSN
+        // cannot make them race in the merge.
+        let lsn = column(batch, LSN_COLUMN)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!((lsn.value(0), lsn.value(1)), (0x120, 0x120));
+    }
+
+    #[tokio::test]
+    async fn a_full_replica_identity_update_only_deletes_when_the_key_actually_moved() {
+        // Under REPLICA IDENTITY FULL there is no `K` — the whole old row arrives as `O` on
+        // *every* update — so presence proves nothing and the identity has to be compared. An
+        // ordinary column edit must stay a single `'u'`.
+        let engine = Engine::new();
+        let relation = xlog(
+            0x100,
+            relation_msg(
+                RELATION_OID,
+                "public",
+                "sales_suppliers",
+                &[(true, "supplierid", oids::INT8), (true, "name", 25)],
+            ),
+        );
+        let full_update = |was: &[Option<&str>], now: &[Option<&str>]| {
+            let mut out = vec![b'U'];
+            out.extend_from_slice(&RELATION_OID.to_be_bytes());
+            out.push(b'O');
+            tuple(&mut out, was);
+            out.push(b'N');
+            tuple(&mut out, now);
+            out
+        };
+
+        let (mut source, wire) = source_with(vec![
+            relation.clone(),
+            xlog(0x110, begin_msg(0x200, COMMIT_TIME)),
+            xlog(
+                0x120,
+                full_update(&[Some("7"), Some("Acme")], &[Some("7"), Some("Acme Ltd")]),
+            ),
+            xlog(
+                0x130,
+                full_update(
+                    &[Some("7"), Some("Acme Ltd")],
+                    &[Some("8"), Some("Acme Ltd")],
+                ),
+            ),
+            xlog(0x150, commit_msg(0x200, 0x200, COMMIT_TIME)),
+        ]);
+        wire.lock().await.slot_existed = true;
+        let batches = stream_once(&mut source, &engine).await;
+
+        assert_eq!(
+            strings(&batches[0], OP_COLUMN),
+            ["u", "d", "u"].map(|s| Some(s.into())),
+            "one plain update, then the one that moved the key"
+        );
+        let ids = column(&batches[0], "supplierid")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!((ids.value(0), ids.value(1), ids.value(2)), (7, 7, 8));
     }
 
     #[tokio::test]
