@@ -94,6 +94,14 @@ const DEFAULT_MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// Rows per emitted Arrow batch. Named for the snapshot because that is where it matters — a
 /// whole source table arrives as one micro-batch — but a WAL batch is chunked by it too.
 const DEFAULT_SNAPSHOT_BATCH_ROWS: usize = 65_536;
+/// Buffered change bytes in one transaction past which the source says so.
+///
+/// `max_batch_bytes` is only consulted *between* transactions, because a micro-batch must not end
+/// inside one — so a single bulk `UPDATE`, a migration or a nightly reload buffers entirely in
+/// memory whatever the budget says. That is a property of the contract, not a bug to fix here,
+/// but it is worth one line in the connector log before the process runs out of heap rather than
+/// after.
+const TRANSACTION_WARN_BYTES: usize = 1024 * 1024 * 1024;
 /// How often an otherwise silent source sends a standby status update.
 ///
 /// Postgres' walsender asks for a reply once it has not heard from the standby for
@@ -230,6 +238,8 @@ pub struct PostgresCdcOptions {
     pub idle: Duration,
     /// How often to send a standby status update when there is nothing else to say.
     pub status_interval: Duration,
+    /// Buffered change bytes in one transaction past which the source logs a warning.
+    pub transaction_warn_bytes: usize,
     /// Where the connector's JSONL log goes, injected by the pipeline runner.
     pub log_dir: Option<PathBuf>,
     /// The pipeline table this source feeds, used to name the log file.
@@ -395,6 +405,7 @@ impl PostgresCdcOptions {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(DEFAULT_STATUS_MS),
             ),
+            transaction_warn_bytes: TRANSACTION_WARN_BYTES,
             log_dir: options.get(LOG_DIR_OPTION).map(PathBuf::from),
             name: options
                 .get(NAME_OPTION)
@@ -877,8 +888,12 @@ pub(crate) trait CdcWire: Send + Sync {
     /// Find or create the replication slot. `create` drops and recreates it inside a snapshot
     /// transaction; without it an absent slot is reported, not conjured.
     async fn open_slot(&mut self, create: bool) -> Result<SlotOpen>;
-    /// Read `table` inside the slot's snapshot transaction.
-    async fn snapshot_rows(&mut self, table: &TableSchema) -> Result<Vec<Vec<Option<String>>>>;
+    /// Open a server-side cursor over `table` inside the slot's snapshot transaction.
+    async fn snapshot_open(&mut self, table: &TableSchema) -> Result<()>;
+    /// Take up to `rows` rows from the open cursor. An empty answer is the end of the table.
+    async fn snapshot_fetch(&mut self, rows: usize) -> Result<Vec<Vec<Option<String>>>>;
+    /// Close the cursor.
+    async fn snapshot_close(&mut self) -> Result<()>;
     /// Commit the snapshot transaction.
     async fn end_snapshot(&mut self) -> Result<()>;
     /// (Re)start the replication stream at `start`.
@@ -903,6 +918,12 @@ pub(crate) struct PgWire {
     publication: String,
     control: Option<ControlConnection>,
     replication: Option<ReplicationConnection>,
+    /// Names each snapshot cursor apart. A replay of a snapshot range declares a second cursor
+    /// over the same table, and `DECLARE` on a name already in use is an error that would abort
+    /// the whole REPEATABLE READ transaction the snapshot lives in.
+    snapshot_cursor: u64,
+    /// The cursor currently open, if any.
+    open_cursor: Option<String>,
 }
 
 impl PgWire {
@@ -913,6 +934,8 @@ impl PgWire {
             publication: options.publication.clone(),
             control: None,
             replication: None,
+            snapshot_cursor: 0,
+            open_cursor: None,
         }
     }
 
@@ -1070,15 +1093,46 @@ impl CdcWire for PgWire {
         })
     }
 
-    async fn snapshot_rows(&mut self, table: &TableSchema) -> Result<Vec<Vec<Option<String>>>> {
+    async fn snapshot_open(&mut self, table: &TableSchema) -> Result<()> {
+        self.snapshot_cursor += 1;
+        let name = format!("oxidant_cdc_snapshot_{}", self.snapshot_cursor);
+        // A cursor, not a bare `SELECT`: the simple query protocol accumulates every `DataRow`
+        // before returning, so reading a table in one statement materialised the whole thing as
+        // one `String` per cell and then converted *that* to Arrow. A 50M-row table was an OOM at
+        // pipeline start rather than a slow snapshot. `FETCH` bounds the peak at
+        // `snapshot_batch_rows`, which is what the option's name has always claimed.
         let sql = format!(
-            "SELECT {} FROM {}.{}",
+            "DECLARE {} NO SCROLL CURSOR FOR SELECT {} FROM {}.{}",
+            quote_identifier(&name),
             table.projection(),
             quote_identifier(&table.schema),
             quote_identifier(&table.table)
         );
-        let rows = self.replication().await?.simple_query(&sql).await;
-        Ok(self.forget_on_error(rows)?.rows)
+        let declared = self.replication().await?.execute(&sql).await;
+        self.forget_on_error(declared)?;
+        self.open_cursor = Some(name);
+        Ok(())
+    }
+
+    async fn snapshot_fetch(&mut self, rows: usize) -> Result<Vec<Vec<Option<String>>>> {
+        let Some(name) = self.open_cursor.clone() else {
+            return Ok(Vec::new());
+        };
+        let sql = format!("FETCH FORWARD {rows} FROM {}", quote_identifier(&name));
+        let fetched = self.replication().await?.simple_query(&sql).await;
+        Ok(self.forget_on_error(fetched)?.rows)
+    }
+
+    async fn snapshot_close(&mut self) -> Result<()> {
+        let Some(name) = self.open_cursor.take() else {
+            return Ok(());
+        };
+        let closed = self
+            .replication()
+            .await?
+            .execute(&format!("CLOSE {}", quote_identifier(&name)))
+            .await;
+        self.forget_on_error(closed)
     }
 
     async fn end_snapshot(&mut self) -> Result<()> {
@@ -1439,6 +1493,10 @@ impl PostgresCdcSource {
         // other is what let an earlier version end — and confirm — a range inside an open
         // transaction.
         let mut in_txn = false;
+        // Change bytes buffered for the transaction currently open, and whether it has already
+        // been reported as a large one.
+        let mut txn_bytes = 0usize;
+        let mut txn_reported = false;
 
         loop {
             // A batch that has already covered whole transactions stops as soon as it has
@@ -1492,10 +1550,35 @@ impl PostgresCdcSource {
                 } => {
                     observed = observed.max(wal_end);
                     bytes_seen += data.len();
+                    if in_txn {
+                        txn_bytes += data.len();
+                        if txn_bytes >= self.options.transaction_warn_bytes && !txn_reported {
+                            txn_reported = true;
+                            let message = format!(
+                                "one transaction has already sent {} of changes, and a \
+                                 micro-batch cannot end inside a transaction — so all of it is \
+                                 buffered in memory before any of it is written, whatever \
+                                 `max_batch_bytes` says. If this is a bulk UPDATE or a reload, \
+                                 run it in smaller transactions on the publisher.",
+                                bytes(txn_bytes as u64)
+                            );
+                            self.log.event(
+                                "large_transaction",
+                                json!({
+                                    "buffered_bytes": txn_bytes,
+                                    "changes": open_txn.len(),
+                                    "action": message,
+                                }),
+                            );
+                            eprintln!("[oxidant] postgres_cdc {}: {message}", self.options.name);
+                        }
+                    }
                     match decode_logical(&data)? {
                         LogicalMessage::Relation(relation) => self.remember(relation),
                         LogicalMessage::Begin { .. } => {
                             in_txn = true;
+                            txn_bytes = 0;
+                            txn_reported = false;
                             open_txn.clear();
                         }
                         LogicalMessage::Commit {
@@ -1902,8 +1985,8 @@ impl PostgresCdcSource {
             )));
         }
         let started = Instant::now();
-        let rows = match self.wire.snapshot_rows(&table).await {
-            Ok(rows) => rows,
+        let (batches, rows) = match self.read_table(&table).await {
+            Ok(read) => read,
             Err(e) => {
                 // The snapshot transaction died with the connection. Re-opening the slot is the
                 // only way back to a consistent point, and that is what `ensure_open` does — so
@@ -1914,29 +1997,6 @@ impl PostgresCdcSource {
                 return Err(e);
             }
         };
-        let events: Vec<ChangeEvent> = rows
-            .into_iter()
-            .map(|values| ChangeEvent {
-                op: Op::Snapshot,
-                // Every snapshot row is as of the slot's consistent point, so ordering them
-                // against each other is meaningless and ordering them *before* the stream is
-                // exactly right. One byte *below* the consistent point, not on it: the stream
-                // starts at that LSN, and on a quiet server the very next WAL record begins
-                // exactly there — `CREATE_REPLICATION_SLOT` leaves the consistent point at the
-                // end of the last record written. AUTO CDC compares an incoming change against
-                // the stored sequence with a strict `>`, so a snapshot row stamped *on* the
-                // consistent point ties with the first change after it and silently wins. This
-                // is what makes "a change to the same key arrives with a strictly larger
-                // `__oxidant_lsn`" true rather than nearly true.
-                lsn: self.position.as_i64().saturating_sub(1),
-                // A snapshot row has no commit, so it has no commit timestamp. AUTO CDC orders
-                // by `__oxidant_lsn`, not by this.
-                ts_micros: None,
-                values,
-            })
-            .collect();
-        let batches = self.build_batches(&events)?;
-
         // Only a range planned against *this* slot counts toward the pass. A range from the slot
         // that died is still answered — the batch has to carry something the sink can commit
         // under its id, and re-reading a table is an upsert either way — but the pass itself
@@ -1948,13 +2008,60 @@ impl PostgresCdcSource {
             "snapshot_done",
             json!({
                 "table": table.qualified(),
-                "rows": events.len(),
+                "rows": rows,
                 "duration_ms": started.elapsed().as_millis() as u64,
                 "consistent_point": self.position.to_string(),
                 "counted": honourable,
             }),
         );
         Ok(batches)
+    }
+
+    /// Read one table through a server-side cursor, a `snapshot_batch_rows` slice at a time.
+    ///
+    /// Returns the Arrow batches and the row count. The peak this pays is one slice of Postgres
+    /// text plus the Arrow batches built so far — the batches themselves still all come back at
+    /// once, because `Source::poll_range` hands the scheduler a whole micro-batch, but Arrow is a
+    /// great deal smaller than one `String` per cell and the text form is now released a slice at
+    /// a time instead of being held whole alongside it.
+    async fn read_table(&mut self, table: &TableSchema) -> Result<(Vec<RecordBatch>, usize)> {
+        self.wire.snapshot_open(table).await?;
+        let mut batches = Vec::new();
+        let mut total = 0usize;
+        loop {
+            let rows = self
+                .wire
+                .snapshot_fetch(self.options.snapshot_batch_rows)
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            total += rows.len();
+            let events: Vec<ChangeEvent> = rows
+                .into_iter()
+                .map(|values| ChangeEvent {
+                    op: Op::Snapshot,
+                    // Every snapshot row is as of the slot's consistent point, so ordering them
+                    // against each other is meaningless and ordering them *before* the stream is
+                    // exactly right. One byte *below* the consistent point, not on it: the stream
+                    // starts at that LSN, and on a quiet server the very next WAL record begins
+                    // exactly there — `CREATE_REPLICATION_SLOT` leaves the consistent point at
+                    // the end of the last record written. AUTO CDC compares an incoming change
+                    // against the stored sequence with a strict `>`, so a snapshot row stamped
+                    // *on* the consistent point ties with the first change after it and silently
+                    // wins. This is what makes "a change to the same key arrives with a strictly
+                    // larger `__oxidant_lsn`" true rather than nearly true.
+                    lsn: self.position.as_i64().saturating_sub(1),
+                    // A snapshot row has no commit, so it has no commit timestamp. AUTO CDC
+                    // orders by `__oxidant_lsn`, not by this.
+                    ts_micros: None,
+                    values,
+                })
+                .collect();
+            batches.extend(self.build_batches(&events)?);
+        }
+        self.wire.snapshot_close().await?;
+        Ok((batches, total))
     }
 
     /// Report that a recorded snapshot range cannot be honoured, and reset the pass.
@@ -2823,6 +2930,9 @@ mod tests {
         snapshot: Vec<Vec<Option<String>>>,
         /// Per-table rows, for the multi-table snapshot tests. Falls back to `snapshot`.
         snapshots: HashMap<String, Vec<Vec<Option<String>>>>,
+        /// The rows the open cursor is walking, and how far it has got.
+        snapshot_rows: Vec<Vec<Option<String>>>,
+        snapshot_at: usize,
         /// Every call made, in order — this is what the sequencing tests assert on.
         calls: Vec<String>,
         consistent_point: Lsn,
@@ -2886,15 +2996,32 @@ mod tests {
             })
         }
 
-        async fn snapshot_rows(&mut self, table: &TableSchema) -> Result<Vec<Vec<Option<String>>>> {
+        async fn snapshot_open(&mut self, table: &TableSchema) -> Result<()> {
             self.tick()?;
             self.calls
                 .push(format!("snapshot_rows({})", table.qualified()));
-            Ok(self
+            self.snapshot_rows = self
                 .snapshots
                 .get(&table.qualified())
                 .cloned()
-                .unwrap_or_else(|| self.snapshot.clone()))
+                .unwrap_or_else(|| self.snapshot.clone());
+            self.snapshot_at = 0;
+            Ok(())
+        }
+
+        async fn snapshot_fetch(&mut self, rows: usize) -> Result<Vec<Vec<Option<String>>>> {
+            self.tick()?;
+            let end = (self.snapshot_at + rows).min(self.snapshot_rows.len());
+            let slice = self.snapshot_rows[self.snapshot_at..end].to_vec();
+            self.snapshot_at = end;
+            Ok(slice)
+        }
+
+        async fn snapshot_close(&mut self) -> Result<()> {
+            self.tick()?;
+            self.snapshot_rows.clear();
+            self.snapshot_at = 0;
+            Ok(())
         }
 
         async fn end_snapshot(&mut self) -> Result<()> {
@@ -2956,8 +3083,14 @@ mod tests {
         async fn open_slot(&mut self, create: bool) -> Result<SlotOpen> {
             self.0.lock().await.open_slot(create).await
         }
-        async fn snapshot_rows(&mut self, table: &TableSchema) -> Result<Vec<Vec<Option<String>>>> {
-            self.0.lock().await.snapshot_rows(table).await
+        async fn snapshot_open(&mut self, table: &TableSchema) -> Result<()> {
+            self.0.lock().await.snapshot_open(table).await
+        }
+        async fn snapshot_fetch(&mut self, rows: usize) -> Result<Vec<Vec<Option<String>>>> {
+            self.0.lock().await.snapshot_fetch(rows).await
+        }
+        async fn snapshot_close(&mut self) -> Result<()> {
+            self.0.lock().await.snapshot_close().await
         }
         async fn end_snapshot(&mut self) -> Result<()> {
             self.0.lock().await.end_snapshot().await
@@ -3039,6 +3172,7 @@ mod tests {
             // Long enough that no test sees a heartbeat it did not ask for; the tests that want
             // one set it to zero.
             status_interval: Duration::from_secs(3600),
+            transaction_warn_bytes: TRANSACTION_WARN_BYTES,
             log_dir: None,
             name: "sales_suppliers".into(),
         }
@@ -3608,6 +3742,77 @@ mod tests {
         let err = source.plan_batch(&engine).await.unwrap_err().to_string();
         assert!(err.contains("no longer exists"), "got: {err}");
         assert!(err.contains("checkpoint directory"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_is_fetched_a_slice_at_a_time_rather_than_materialised_whole() {
+        // `snapshot_batch_rows` used to chunk only the Arrow *output*: the whole table was
+        // already in the heap as one `String` per cell by then, so a 50M-row table was an OOM at
+        // pipeline start. It now bounds the read itself, through a server-side cursor.
+        let engine = Engine::new();
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(vec![])));
+        wire.lock().await.snapshot = (1..=5)
+            .map(|i| vec![Some(i.to_string()), Some(format!("row {i}"))])
+            .collect();
+        let mut options = options();
+        options.snapshot_batch_rows = 2;
+        let mut source = PostgresCdcSource::with_wire(
+            options,
+            vec![suppliers()],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::default(),
+        );
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        let batches = source.poll_range(&engine, &range).await.unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1],
+            "one Arrow batch per FETCH, never the whole table at once"
+        );
+        let names: Vec<Option<String>> = batches.iter().flat_map(|b| strings(b, "name")).collect();
+        assert_eq!(
+            names,
+            (1..=5)
+                .map(|i| Some(format!("row {i}")))
+                .collect::<Vec<_>>(),
+            "and every row arrives exactly once, in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transaction_too_big_to_buffer_says_so_before_the_heap_runs_out() {
+        // A micro-batch cannot end inside a transaction, so `max_batch_bytes` is only consulted
+        // between them: one bulk UPDATE buffers entirely in memory whatever the budget says.
+        // That is the contract, but it should not be discovered by running out of heap.
+        let engine = Engine::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(a_transaction())));
+        wire.lock().await.slot_existed = true;
+        let mut options = options();
+        options.transaction_warn_bytes = 1;
+        let mut source = PostgresCdcSource::with_wire(
+            options,
+            vec![suppliers()],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::new(Some(dir.path()), "sales_suppliers"),
+        );
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0)].into(),
+        });
+        source.plan_batch(&engine).await.unwrap();
+
+        let log = std::fs::read_to_string(dir.path().join("sales_suppliers.jsonl")).unwrap();
+        assert_eq!(
+            log.matches("\"large_transaction\"").count(),
+            1,
+            "once for the transaction, not once per change: {log}"
+        );
+        assert!(log.contains("max_batch_bytes"), "and says why: {log}");
     }
 
     #[tokio::test]

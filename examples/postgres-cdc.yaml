@@ -55,6 +55,12 @@ tables:
         # Stop rather than let an unconfirmed slot fill the *source* database's
         # disk — the number-one operational failure of logical replication.
         max_slot_bytes: "10737418240"       # 10 GiB
+        # Rows per FETCH from the snapshot's server-side cursor, and per emitted
+        # Arrow batch. It bounds the *read*, not the commit: a source table's
+        # Arrow batches are all in memory when the snapshot micro-batch returns,
+        # so plan for the largest table's Arrow form to fit in the engine's heap
+        # with headroom. See docs/postgres-cdc.md §10.
+        # snapshot_batch_rows: "65536"
         # exclude_columns: internal_notes
         # keys: supplierID                  # defaults to the table's primary key
 

@@ -661,6 +661,9 @@ async fn the_thousand_row_fixture_snapshots_every_row_exactly_once() {
         ("slot", "ox_cdc_suppliers".to_string()),
         ("tables", "public.sales_suppliers".to_string()),
         ("exclude_columns", "city".to_string()),
+        // Small enough that the thousand rows have to be fetched in slices: the snapshot walks a
+        // server-side cursor, so this bounds the read itself and not just the Arrow output.
+        ("snapshot_batch_rows", "128".to_string()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -674,6 +677,14 @@ async fn the_thousand_row_fixture_snapshots_every_row_exactly_once() {
 
     let snapshot = drain(&mut source, &engine).await;
     assert_eq!(rows(&snapshot), 1000);
+    assert_eq!(
+        snapshot
+            .iter()
+            .map(RecordBatch::num_rows)
+            .collect::<Vec<_>>(),
+        vec![128, 128, 128, 128, 128, 128, 128, 104],
+        "one Arrow batch per FETCH, so the whole table is never in the heap at once"
+    );
     assert!(strings(&snapshot, OP_COLUMN)
         .iter()
         .all(|op| op.as_deref() == Some("s")));

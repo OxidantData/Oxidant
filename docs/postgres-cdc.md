@@ -237,23 +237,52 @@ crate's own backend parser is not usable either — it rejects `CopyBothResponse
 outright — so the frame reader is here too. No replication framework crate was
 added, and the pgoutput decode is hand-rolled as specified.
 
-**The snapshot reads with `SELECT`, not `COPY … TO STDOUT`.** The handoff is
-exactly as §1 describes — `CREATE_REPLICATION_SLOT … USE_SNAPSHOT` inside a
-`REPEATABLE READ` transaction on the replication session, the tables read in that
-transaction, then `START_REPLICATION` from the `consistent_point`. The rows come
-back over the **simple query protocol** rather than through `COPY`, because a
-walsender parses `Query` messages and `COPY TO STDOUT` needs a copy-out
-handshake the simple protocol does not carry. The two produce the same values in
-the same text encoding, and the text form is what the pgoutput decoder reads
-anyway, so the snapshot and the stream share one conversion table.
+**The snapshot reads through a server-side cursor, not `COPY … TO STDOUT`.** The
+handoff is exactly as §1 describes — `CREATE_REPLICATION_SLOT … USE_SNAPSHOT`
+inside a `REPEATABLE READ` transaction on the replication session, the tables read
+in that transaction, then `START_REPLICATION` from the `consistent_point`. Each
+table is read as `DECLARE … NO SCROLL CURSOR FOR SELECT …` followed by
+`FETCH FORWARD snapshot_batch_rows`, over the **simple query protocol** rather
+than through `COPY`, because a walsender parses `Query` messages and
+`COPY TO STDOUT` needs a copy-out handshake the simple protocol does not carry.
+The two produce the same values in the same text encoding, and the text form is
+what the pgoutput decoder reads anyway, so the snapshot and the stream share one
+conversion table.
 
 **The snapshot is one micro-batch per source table.** `snapshot_batch_rows`
-chunks the Arrow batches inside it rather than splitting the *commit*. That
-keeps a snapshot batch replayable: a snapshot transaction cannot outlive the
-process, so an interrupted snapshot restarts from the first table (logged as
-`snapshot_start` with a reason) against a freshly created slot. Re-emitting a
-table already loaded costs nothing but time — snapshot rows are upserts merged
-by key. Parallel snapshotting (§7) is v2.
+bounds the *read* — one `FETCH` and one Arrow batch per slice — but not the
+**commit**: `Source::poll_range` hands the scheduler one micro-batch, so a source
+table's Arrow batches are all in memory when it returns.
+
+> **Memory requirement.** Plan for the largest source table's Arrow form to fit
+> in the engine's heap, with headroom. The cursor keeps the Postgres text form
+> down to one slice at a time — before it, a 50M-row table was materialised whole
+> as one `String` per cell *and* converted to Arrow, which was an OOM at pipeline
+> start rather than a slow snapshot — but the Arrow side is still whole-table.
+> Splitting the snapshot across commits is v2; it needs a snapshot batch to be
+> re-readable across a process restart, and a snapshot transaction cannot outlive
+> the process.
+
+That transaction is committed by `mark_durable`, not at the end of the last read,
+so a snapshot batch whose sink write fails can be polled again — the
+`Source::poll_range` determinism contract, and the difference between a retryable
+blip and a permanently wedged query. An interrupted snapshot restarts from the
+first table (logged as `snapshot_start` with a reason) against a freshly created
+slot; because the scheduler replays a *recorded* range rather than replanning,
+each snapshot range carries the `consistent_point` it was planned against, and a
+range whose point is not the one the source would read against does not count
+toward the pass. Re-emitting a table already loaded costs nothing but time —
+snapshot rows are upserts merged by key. Parallel snapshotting (§7) is v2.
+
+**One transaction is buffered whole, whatever `max_batch_bytes` says.** A
+micro-batch must not end inside a transaction — the range would not be a commit
+boundary and a replay could not reproduce it — so the byte budget is only
+consulted *between* transactions. A single bulk `UPDATE`, a migration or a
+nightly reload is therefore held in memory in full before any of it is written.
+The source logs a `large_transaction` event and a line to stderr once the
+buffered changes pass 1 GiB, naming the size and the remedy (smaller transactions
+on the publisher), so this is discovered before the heap runs out rather than
+after.
 
 **`ADD COLUMN` propagates on restart, not mid-stream.** The publisher re-sends a
 `Relation` message when a table's shape changes; v1 records it, writes a
@@ -278,9 +307,20 @@ an UPDATE that genuinely sets a column to NULL is also ignored. Without a
 what `REPLICA IDENTITY FULL` buys.
 
 **A snapshot row's `__oxidant_ts` is NULL.** It has no commit, so it has no
-commit timestamp. Its `__oxidant_lsn` is the slot's `consistent_point`, so every
-change to the same key arrives with a strictly larger value and wins — which is
-what `sequence_by: __oxidant_lsn` needs.
+commit timestamp. Its `__oxidant_lsn` is one byte *below* the slot's
+`consistent_point`, so every change to the same key arrives with a strictly
+larger value and wins — which is what `sequence_by: __oxidant_lsn` needs. Below
+rather than on: the stream starts at the consistent point, and on a quiet server
+the next WAL record begins exactly there, so a snapshot row stamped on it ties
+with the first change after it and AUTO CDC's strict `>` discards the change.
+
+**An UPDATE that moves the row's identity emits two rows.** pgoutput writes the
+old image on an UPDATE only when a replica-identity column changed, so a `'d'`
+carrying the old key goes out ahead of the `'u'` for the new one, at the same
+LSN. They name different keys, so the tie cannot make them race. Without it AUTO
+CDC would insert the new key and leave the old row in the target forever. Under
+`REPLICA IDENTITY FULL` there is no such signal — the whole old row arrives on
+every update — so the identity columns are compared instead.
 
 **`__oxidant_lsn` is the change's own WAL position**, not its transaction's, so
 two changes to one key inside one transaction still order against each other.
@@ -304,6 +344,7 @@ in the documented place and format; serving it is a separate change.
 | Knob | Default | What it does |
 |---|---|---|
 | `OXIDANT_PG_CDC_IDLE_MS` | `500` | How long planning waits for more WAL before deciding the publisher is caught up. Only paid when the batch has not yet reached the flush LSN it was aiming at, so an idle stream does not pay it. |
+| `OXIDANT_PG_CDC_STATUS_MS` | `20000` | How often an otherwise silent source sends a standby status update. Postgres' walsender asks for a reply after `wal_sender_timeout / 2` and hangs up at `wal_sender_timeout` (60 s by default), so a pipeline over a quiet table has to speak. The message carries the position already committed, so it moves the slot nowhere. A `trigger:` longer than `wal_sender_timeout` will still lose the socket between triggers; the source re-dials and re-issues `START_REPLICATION` from the checkpointed LSN, so it costs a handshake, not the pipeline. |
 
 ### AUTO CDC wiring
 
