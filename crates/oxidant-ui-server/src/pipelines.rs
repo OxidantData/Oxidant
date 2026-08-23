@@ -53,6 +53,20 @@
 //! that exists but holds nothing answers `200` with an empty list: "there are no pipelines" is
 //! a different fact from "this driver cannot tell you", and the page says different things.
 //!
+//! ## Symlinks
+//!
+//! A name chooses a file *in* `<checkpoints>/logs`, and the filesystem must not be able to
+//! turn that into a file somewhere else. Both routes resolve through
+//! [`resolve_log_file`]: the entry itself must be a regular file by `symlink_metadata` (a
+//! symlink is not one, however it is spelled), and its canonical path must still sit inside
+//! the canonical logs directory. Without that, a symlink someone else dropped into a shared
+//! checkpoint volume was invisible to the listing and fully readable by the tail — the
+//! listing was symlink-safe only by accident of `DirEntry::metadata`'s semantics.
+//!
+//! The logs *directory* may itself be a symlink: that is the operator's own configuration,
+//! one level above any name a caller chooses, so it is resolved and then treated as the
+//! boundary.
+//!
 //! ## Auth
 //!
 //! Both routes are guarded by exactly the same bearer token as `/api/status`
@@ -184,7 +198,10 @@ fn read_pipelines(dir: &Path) -> std::io::Result<Vec<PipelineEntry>> {
         if !is_plain_name(name) {
             continue;
         }
-        let meta = match entry.metadata() {
+        // `symlink_metadata`, not `metadata`: a symlink is not a regular file and is not a
+        // pipeline, and the tail route resolves the same way. Following one here would list a
+        // row whose tail reads a file outside the logs directory.
+        let meta = match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.is_file() => meta,
             // Raced with a rotation, or not a regular file: not a pipeline.
             _ => continue,
@@ -238,10 +255,9 @@ pub async fn pipeline_logs(
     if !logs_dir.is_dir() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = logs_dir.join(format!("{name}.{LOG_EXT}"));
-    if !path.is_file() {
+    let Some(path) = resolve_log_file(&logs_dir, &name) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
 
     let tail = params.tail.unwrap_or(DEFAULT_TAIL).clamp(1, MAX_TAIL);
     let read = tokio::task::spawn_blocking(move || read_tail(&path, tail)).await;
@@ -276,6 +292,30 @@ pub async fn pipeline_logs(
         "truncated": truncated,
     }))
     .into_response()
+}
+
+/// The regular file `<logs_dir>/<name>.jsonl` addresses, or `None` if it does not resolve to
+/// one *inside* `logs_dir`.
+///
+/// Two checks, because they catch different things:
+///
+/// * `symlink_metadata(...).is_file()` — a symlink is not a regular file, so a symlinked entry
+///   is refused without ever being opened. This is the same rule [`read_pipelines`] applies,
+///   which is what keeps "listed" and "tailable" the same set.
+/// * canonicalize + prefix — belt and braces for anything that resolves out of the directory
+///   another way (a symlinked *component*, a bind mount). The logs directory is canonicalized
+///   too, so an operator's symlink to the checkpoint volume is fine: it becomes the boundary.
+///
+/// `None` for every failure. The caller answers 404 to all of them, like every other absence
+/// on this route: a caller learns "there is nothing here" and nothing more.
+fn resolve_log_file(logs_dir: &Path, name: &str) -> Option<PathBuf> {
+    let path = logs_dir.join(format!("{name}.{LOG_EXT}"));
+    if !std::fs::symlink_metadata(&path).map(|m| m.is_file()).ok()? {
+        return None;
+    }
+    let root = logs_dir.canonicalize().ok()?;
+    let resolved = path.canonicalize().ok()?;
+    resolved.starts_with(&root).then_some(resolved)
 }
 
 /// Whether `name` is a plain filename component — no separators, no `..`, no dotfile.
@@ -559,6 +599,79 @@ mod tests {
         assert_eq!(events.len(), 5);
         assert_eq!(events[4]["i"], 399);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A symlink inside the logs directory is refused by *both* routes — the escape happens in
+    /// the filesystem, not in the name, so the name whitelist is not the control that matters.
+    ///
+    /// Before this, `logs/pwned.jsonl -> <root>/outside.jsonl` was invisible to the listing
+    /// (`DirEntry::metadata` does not follow symlinks) and fully readable through the tail
+    /// (`Path::is_file` does), turning a token-holder's log drawer into an arbitrary bounded
+    /// file read on any shared checkpoint volume.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_in_the_logs_directory_is_not_a_pipeline() {
+        let root = checkpoint_root("orders", &[r#"{"event":"batch","rows":1}"#]);
+        let logs = root.join(LOGS_SUBDIR);
+        std::fs::write(root.join("outside.jsonl"), "{\"secret\":\"BADBADBAD\"}\n").unwrap();
+        std::os::unix::fs::symlink(root.join("outside.jsonl"), logs.join("pwned.jsonl")).unwrap();
+        // Also the in-directory case: a symlink to a real log is still a symlink.
+        std::os::unix::fs::symlink(logs.join("orders.jsonl"), logs.join("alias.jsonl")).unwrap();
+
+        let (status, body) = get(
+            router(Some(TOKEN), Some(root.clone())),
+            "/api/v1/pipelines",
+            Some(&bearer()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = body["pipelines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["orders"], "a symlink was listed as a pipeline");
+
+        for name in ["pwned", "alias"] {
+            let (status, body) = get(
+                router(Some(TOKEN), Some(root.clone())),
+                &format!("/api/v1/pipelines/{name}/logs"),
+                Some(&bearer()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{name} was tailable");
+            assert!(
+                !body.to_string().contains("BADBADBAD"),
+                "{name} read a file outside the logs directory"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The operator's own configuration is not the attack: a `logs` directory that *is* a
+    /// symlink (a checkpoint volume mounted elsewhere) still serves, and becomes the boundary
+    /// everything else is resolved against.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_logs_directory_still_serves() {
+        let real = std::env::temp_dir().join(format!("oxidant-real-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("orders.jsonl"), "{\"event\":\"commit\"}\n").unwrap();
+        let root = std::env::temp_dir().join(format!("oxidant-ckpt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&real, root.join(LOGS_SUBDIR)).unwrap();
+
+        let (status, body) = get(
+            router(Some(TOKEN), Some(root.clone())),
+            "/api/v1/pipelines/orders/logs",
+            Some(&bearer()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["events"][0]["event"], "commit");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&real);
     }
 
     /* ---------- GET /api/v1/pipelines ---------- */
