@@ -1685,12 +1685,23 @@ impl PostgresCdcSource {
             .map(|column| emitted.iter().position(|name| *name == column.name))
             .collect();
 
+        // A column `exclude_columns:` names is absent from the emitted schema *by construction*,
+        // so it does not map — and reporting it as "added" fired a `schema_change` alarm naming a
+        // column the operator deliberately kept out, on every run, on a correctly configured
+        // pipeline. Restarting, as the alarm instructs, reproduces it. That trains people to
+        // ignore exactly the alert a real `ADD COLUMN` needs them to read.
         let added: Vec<&str> = relation
             .columns
             .iter()
             .zip(&projection)
             .filter(|(_, mapped)| mapped.is_none())
             .map(|(column, _)| column.name.as_str())
+            .filter(|name| {
+                !self
+                    .options
+                    .exclude_columns
+                    .contains(&name.to_ascii_lowercase())
+            })
             .collect();
         let dropped: Vec<&str> = emitted
             .iter()
@@ -2421,11 +2432,20 @@ async fn resolve_tables(
             names.push(entry.clone());
             continue;
         }
+        // `AND NOT c.relispartition`: `relkind IN ('r','p')` matches the partitioned parent
+        // *and* every leaf partition, and a partition shares its parent's columns, so the shape
+        // check downstream is happy. The snapshot would then read the parent — which returns
+        // every row across all partitions — and read each partition again, emitting every row
+        // twice: 2x the rows, 2x the memory and 2x the snapshot time, silently. The parent is
+        // the replication unit; with `publish_via_partition_root` at its default `false` a
+        // change arrives attributed to the partition, and the parent entry is what keeps the
+        // snapshot and the stream describing the same table.
         let rows = control
             .query(
                 "SELECT c.relname::text FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE n.nspname::text = $1 AND c.relkind IN ('r', 'p') \
+                   AND NOT c.relispartition \
                  ORDER BY c.relname",
                 &[schema],
             )
@@ -4307,6 +4327,44 @@ mod tests {
     // -----------------------------------------------------------------------------------------
     // Ranges, replay, and the slot
     // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_excluded_column_is_not_reported_as_a_new_one() {
+        // The publisher describes the column the operator deliberately kept out, every run. It
+        // does not map to the emitted schema — that is what `exclude_columns:` means — so it used
+        // to arrive as an "added" column and write a `schema_change` event naming it. On a
+        // correctly configured, unchanged pipeline. Restarting, as the alarm instructs,
+        // reproduced it, which is how an operator learns to ignore the one alert §10 relies on.
+        let engine = Engine::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut table = suppliers();
+        table.columns.retain(|c| c.name != "name");
+        let mut options = options();
+        options.exclude_columns = ["name".to_string()].into_iter().collect();
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(a_transaction())));
+        wire.lock().await.slot_existed = true;
+        let mut source = PostgresCdcSource::with_wire(
+            options,
+            vec![table],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::new(Some(dir.path()), "sales_suppliers"),
+        );
+        source.restore_offsets(&SourceOffsets {
+            source: SOURCE_NAME.into(),
+            entries: [(SNAPSHOT_KEY.to_string(), 1), (LSN_KEY.to_string(), 0)].into(),
+        });
+
+        let range = source.plan_batch(&engine).await.unwrap();
+        let batches = source.poll_range(&engine, &range).await.unwrap();
+        assert!(batches[0].schema().index_of("name").is_err(), "kept out");
+        assert_eq!(batches[0].num_rows(), 3, "and the stream keeps running");
+
+        let log = std::fs::read_to_string(dir.path().join("sales_suppliers.jsonl")).unwrap();
+        assert!(
+            !log.contains("schema_change"),
+            "nothing changed on the publisher: {log}"
+        );
+    }
 
     #[tokio::test]
     async fn a_replayed_range_reproduces_identical_batches() {

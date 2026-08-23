@@ -588,6 +588,157 @@ async fn a_source_column_may_not_be_named_like_a_metadata_column() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_whole_schema_resolves_a_partitioned_table_once_and_not_once_per_partition() {
+    gated!(connect);
+    // `relkind IN ('r','p')` matches the partitioned parent *and* every leaf partition, and a
+    // partition shares its parent's columns — so nothing complained. The snapshot then read the
+    // parent, which returns every row across every partition, and read each partition again:
+    // every row twice, 2x the memory and 2x the time, silently.
+    let control = connect.connect_control().await.expect("connects");
+    let _ = control
+        .execute("DROP SCHEMA IF EXISTS ox_cdc_parts CASCADE")
+        .await;
+    for statement in [
+        "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+         WHERE slot_name = 'ox_cdc_parts'",
+        "DROP PUBLICATION IF EXISTS ox_cdc_parts",
+    ] {
+        let _ = control.execute(statement).await;
+    }
+    for statement in [
+        "CREATE SCHEMA ox_cdc_parts",
+        "CREATE TABLE ox_cdc_parts.sales (id bigint, sold_on date, PRIMARY KEY (id, sold_on)) \
+         PARTITION BY RANGE (sold_on)",
+        "CREATE TABLE ox_cdc_parts.sales_2024 PARTITION OF ox_cdc_parts.sales \
+         FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+        "CREATE TABLE ox_cdc_parts.sales_2025 PARTITION OF ox_cdc_parts.sales \
+         FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+        "INSERT INTO ox_cdc_parts.sales VALUES (1, '2024-03-04'), (2, '2025-06-07')",
+    ] {
+        control
+            .execute(statement)
+            .await
+            .unwrap_or_else(|e| panic!("`{statement}`: {e}"));
+    }
+
+    let options: HashMap<String, String> = [
+        ("host", connect.host.clone()),
+        ("port", connect.port.to_string()),
+        ("database", connect.database.clone()),
+        ("user", connect.user.clone()),
+        ("tls", "disable".to_string()),
+        ("publication", "ox_cdc_parts".to_string()),
+        ("slot", "ox_cdc_parts".to_string()),
+        ("tables", "ox_cdc_parts.*".to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+
+    let engine = Engine::new();
+    let mut source = PostgresCdcSource::from_options(&options).expect("builds");
+    assert!(
+        source.description().contains("ox_cdc_parts.sales@"),
+        "the parent is the replication unit: {}",
+        source.description()
+    );
+    assert!(
+        !source.description().contains("sales_2024"),
+        "and a leaf partition is not a second source table: {}",
+        source.description()
+    );
+
+    let snapshot = drain(&mut source, &engine).await;
+    assert_eq!(
+        i64s(&snapshot, "id"),
+        vec![Some(1), Some(2)],
+        "every row exactly once, not once per partition and again for the parent"
+    );
+
+    drop(source);
+    for statement in [
+        "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+         WHERE slot_name = 'ox_cdc_parts'",
+        "DROP PUBLICATION IF EXISTS ox_cdc_parts",
+        "DROP SCHEMA IF EXISTS ox_cdc_parts CASCADE",
+    ] {
+        let _ = control.execute(statement).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_excluded_column_does_not_raise_a_schema_change_alarm() {
+    gated!(connect);
+    // The shipped integration configuration's own shape: `exclude_columns: city` used to write a
+    // `schema_change` event naming `city` as *added*, and print "restart the pipeline to
+    // propagate it" to stderr, on a correctly configured, unchanged pipeline. Restarting, as
+    // instructed, reproduced it.
+    let fixture = Fixture::new(
+        &connect,
+        "ox_cdc_excluded",
+        "id bigint primary key, name text, city text",
+    )
+    .await;
+    fixture
+        .sql("INSERT INTO public.ox_cdc_excluded VALUES (1, 'a', 'Berlin')")
+        .await;
+    let logs = tempfile::TempDir::new().unwrap();
+
+    let engine = Engine::new();
+    let mut options = fixture.options();
+    options.insert("exclude_columns".into(), "city".into());
+    options.insert(
+        "oxidant.connector.log_dir".into(),
+        logs.path().to_string_lossy().into_owned(),
+    );
+    options.insert("oxidant.connector.name".into(), "excluded".into());
+    let mut source = PostgresCdcSource::from_options(&options).expect("builds");
+    drain(&mut source, &engine).await;
+
+    // A change on the stream is what makes the publisher send a `Relation` message at all.
+    fixture
+        .sql("INSERT INTO public.ox_cdc_excluded VALUES (2, 'b', 'Lisbon')")
+        .await;
+    let stream = drain(&mut source, &engine).await;
+    assert_eq!(rows(&stream), 1);
+    assert!(stream[0].schema().index_of("city").is_err(), "kept out");
+
+    // `schema_change` also carries the startup advisories (REPLICA IDENTITY DEFAULT here), so
+    // the assertion is on the drift report specifically: the `added_columns` list.
+    let added = |log: &str| -> Vec<String> {
+        log.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|e| e["added_columns"].as_array().cloned())
+            .flatten()
+            .filter_map(|c| c.as_str().map(str::to_string))
+            .collect()
+    };
+    let log = std::fs::read_to_string(logs.path().join("excluded.jsonl")).expect("a log");
+    assert!(
+        added(&log).is_empty(),
+        "nothing changed on the publisher: {log}"
+    );
+
+    // A real `ADD COLUMN` still gets through — the alarm is worth reading again.
+    fixture
+        .sql("ALTER TABLE public.ox_cdc_excluded ADD COLUMN region text")
+        .await;
+    fixture
+        .sql("INSERT INTO public.ox_cdc_excluded VALUES (3, 'c', 'Oslo', 'EU')")
+        .await;
+    drain(&mut source, &engine).await;
+    let log = std::fs::read_to_string(logs.path().join("excluded.jsonl")).expect("a log");
+    assert_eq!(
+        added(&log),
+        vec!["region".to_string()],
+        "the real change is reported, and `city` still is not: {log}"
+    );
+
+    drop(source);
+    fixture.drop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_table_that_does_not_exist_is_refused_before_a_slot_is_created() {
     gated!(connect);
     let mut options: HashMap<String, String> = [

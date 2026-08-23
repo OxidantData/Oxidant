@@ -327,9 +327,20 @@ two changes to one key inside one transaction still order against each other.
 
 **Multiple tables in one source must share a schema.** §2 says so; v1 enforces
 it at introspection with an error naming both tables. `tables: schema.*` expands
-to every ordinary/partitioned table in the schema and creates the publication as
-`FOR TABLES IN SCHEMA` (PG 15+); a whole schema whose tables differ therefore
-fails the same check.
+to every ordinary table and every partitioned **parent** in the schema —
+`AND NOT c.relispartition`, so leaf partitions are not counted a second time —
+and creates the publication as `FOR TABLES IN SCHEMA` (PG 15+); a whole schema
+whose tables differ therefore fails the same check.
+
+**The partitioned parent is the replication unit.** Naming the parent (or letting
+`schema.*` resolve it) snapshots the whole table once and publishes on the
+parent, which is what §7's parity row means. Leaf partitions are deliberately not
+resolved: a partition shares its parent's columns, so nothing would complain, and
+the snapshot would read the parent — which returns every row across every
+partition — and then read each partition again, emitting every row twice at 2x
+the memory and 2x the time. With `publish_via_partition_root` at its default
+`false` a *change* arrives attributed to the partition, and is matched to the
+parent by the publication rather than by a second `tables:` entry.
 
 **Reconciliation (§4) is not in this PR** beyond the WAL-growth self-defense,
 which is: `max_slot_bytes` (default 10 GiB) is checked on every plan, logged as
