@@ -42,7 +42,9 @@ async fn rest_statement_executes_locally_without_workers() {
     let port = pick_port();
     let ui_port = pick_port();
 
+    let data_dir = common::data_dir();
     let server = Command::new(&oxidant)
+        .env("OXIDANT_DATA_DIR", data_dir.path())
         .args([
             "spark",
             "server",

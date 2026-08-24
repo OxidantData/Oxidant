@@ -80,3 +80,14 @@ pub fn oxidant_bin() -> PathBuf {
         )
     })
 }
+
+/// An isolated data dir for a spawned server.
+///
+/// The durable-history journal (PR #139) takes an exclusive lock on its data
+/// directory, so two test servers sharing the default (`$XDG_DATA_HOME/oxidant`)
+/// make the second exit 1 on startup — `cli_sql`'s two server tests race exactly
+/// this way. Every spawned server gets its own dir; history stays on so the CLI
+/// tests still exercise the default-on path.
+pub fn data_dir() -> tempfile::TempDir {
+    tempfile::tempdir().expect("temp data dir")
+}
