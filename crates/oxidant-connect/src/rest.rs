@@ -3749,15 +3749,33 @@ async fn get_dump(
 /// Bytes of a bundle, in bounded chunks off the reactor.
 const DUMP_CHUNK: usize = 64 * 1024;
 
+/// Where a download is: not opened yet, or holding the one handle it will use throughout.
+enum DumpRead {
+    /// The first poll opens the file — off the reactor, like every other read here.
+    Unopened(std::path::PathBuf),
+    /// **One handle for the whole download.** It used to `open` + `seek` per chunk, which is
+    /// 16,384 round-trips for a 1 GiB bundle and, worse, is not atomic: the sweeper's 24 h TTL
+    /// can unlink the bundle at any moment, and it does not have to wait for a lull. Between two
+    /// chunks the next `open` would then fail — after `Content-Length` had already promised the
+    /// whole file — and the reader would get a truncated download reported as a stream error.
+    /// Holding the descriptor makes the download atomic with respect to retention on POSIX: the
+    /// bytes stay readable until the last one is served, whatever the sweeper does to the name.
+    Open(std::fs::File),
+}
+
 fn dump_chunks(
     path: std::path::PathBuf,
 ) -> impl futures::Stream<Item = Result<Vec<u8>, std::io::Error>> {
-    futures::stream::unfold(Some((path, 0u64)), |st| async move {
-        let (path, offset) = st?;
+    futures::stream::unfold(Some(DumpRead::Unopened(path)), |st| async move {
+        let state = st?;
         let read = tokio::task::spawn_blocking(move || {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = std::fs::File::open(&path)?;
-            file.seek(SeekFrom::Start(offset))?;
+            use std::io::Read;
+            // Sequential reads advance the handle's own offset, so there is no seek to get
+            // wrong either.
+            let mut file = match state {
+                DumpRead::Unopened(path) => std::fs::File::open(&path)?,
+                DumpRead::Open(file) => file,
+            };
             let mut buf = vec![0u8; DUMP_CHUNK];
             let mut filled = 0usize;
             while filled < buf.len() {
@@ -3767,18 +3785,12 @@ fn dump_chunks(
                 }
             }
             buf.truncate(filled);
-            Ok::<_, std::io::Error>((path, buf))
+            Ok::<_, std::io::Error>((file, buf))
         })
         .await;
         match read {
-            Ok(Ok((path, buf))) if buf.is_empty() => {
-                let _ = path;
-                None
-            }
-            Ok(Ok((path, buf))) => {
-                let next = offset + buf.len() as u64;
-                Some((Ok(buf), Some((path, next))))
-            }
+            Ok(Ok((_, buf))) if buf.is_empty() => None,
+            Ok(Ok((file, buf))) => Some((Ok(buf), Some(DumpRead::Open(file)))),
             Ok(Err(e)) => Some((Err(e), None)),
             Err(e) => Some((
                 Err(std::io::Error::new(
@@ -4525,6 +4537,44 @@ mod tests {
         let (status, body) = get_logs(&app, "/api/v1/logs?file=current&worker=driver").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["worker"], "driver");
+    }
+
+    /// **A download is atomic with respect to retention.**
+    ///
+    /// `dump_chunks` reopened the file and seeked to the offset for every 64 KiB — 16,384
+    /// `open` + `seek` + `spawn_blocking` round-trips for a 1 GiB bundle, and not merely
+    /// wasteful: a bundle's 24 h TTL can expire between two chunks, and the sweeper does not
+    /// wait for a lull. The next `open` then failed *after* `Content-Length` had promised the
+    /// whole file, so the operator got a truncated bundle reported as a stream error. Holding
+    /// the descriptor is what POSIX gives for free.
+    #[tokio::test]
+    async fn a_download_survives_the_sweeper_unlinking_the_bundle_under_it() {
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bundle.parquet");
+        let body: Vec<u8> = (0..DUMP_CHUNK * 3 + 17).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &body).expect("write");
+
+        let mut chunks = Box::pin(dump_chunks(path.clone()));
+        let mut got = chunks
+            .next()
+            .await
+            .expect("a first chunk")
+            .expect("the first read");
+        assert_eq!(got.len(), DUMP_CHUNK, "bounded chunks, off the reactor");
+
+        // The TTL lands mid-download, which is the whole point: the reader is holding a
+        // `Content-Length` for bytes that no longer have a name.
+        std::fs::remove_file(&path).expect("unlink");
+
+        while let Some(chunk) = chunks.next().await {
+            got.extend(chunk.expect("the rest of a download that was already promised"));
+        }
+        assert_eq!(
+            got, body,
+            "every byte, from the handle the download opened once"
+        );
     }
 
     /// **A follow shows what a node is writing now, and never substitutes another source.**

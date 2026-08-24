@@ -1426,6 +1426,17 @@ document or `docs/api.md` previously promised.
   invited would have scanned exactly those groups — and with no `q` it is answered on the
   three-column pushdown alone, without touching `message`.
 
+- **F14 — a bundle download holds one handle.** `dump_chunks` reopened the file and seeked to
+  the offset for every 64 KiB: 16,384 `open` + `seek` + `spawn_blocking` round-trips for a 1 GiB
+  bundle. The syscall churn was the smaller half. A bundle's 24 h TTL can expire between two
+  chunks and the sweeper does not wait for a lull, so the next `open` failed *after*
+  `Content-Length` had already promised the whole file — a truncated bundle, reported as a
+  stream error, on the one route an operator reaches for when something is already wrong.
+  Keeping the descriptor in the unfold's state costs nothing and makes the download atomic with
+  respect to retention on POSIX: the bytes stay readable until the last one is served, whatever
+  happens to the name. Sequential reads advance the handle's own offset, so the seek is gone as
+  well.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |
