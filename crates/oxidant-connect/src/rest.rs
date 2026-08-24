@@ -454,6 +454,11 @@ impl StoreInner {
             return;
         };
         if !self.limits.history_on {
+            // Nothing outlives the hot tier here, so neither may its alias: with history off
+            // there is no sweeper to prune it later.
+            if let (Some(session), Some(op)) = (&st.session, &st.client_op_id) {
+                self.alias.remove(&(session.clone(), op.clone()));
+            }
             return;
         }
         let last_seq = st.seq;
@@ -619,10 +624,19 @@ impl StatementStore {
                     rows_retained: true,
                 },
             );
-            if let (Some(session), Some(alias)) = (session, alias.as_deref()) {
-                inner
-                    .alias
-                    .insert((session.to_string(), alias.to_string()), id.clone());
+            // The alias index exists to resolve a Connect `(session, operation_id)` back to an
+            // engine-minted id across a restart, which only history can do. With
+            // `OXIDANT_HISTORY=off` nothing ever prunes it — `sweep_history` returns immediately
+            // and `demote` drops the statement without touching `history` — and both halves of
+            // the key are client-supplied over Spark Connect, so a client could grow it without
+            // limit at one entry per `ExecutePlan`. §8 says `off` restores today's behaviour
+            // exactly, and today there is no alias map at all.
+            if inner.limits.history_on {
+                if let (Some(session), Some(alias)) = (session, alias.as_deref()) {
+                    inner
+                        .alias
+                        .insert((session.to_string(), alias.to_string()), id.clone());
+                }
             }
             inner.enforce_hot_cap();
             seq
@@ -2574,6 +2588,71 @@ mod tests {
         let inner = store.inner.lock().expect("lock");
         assert_eq!(inner.statements.len(), MAX_STATEMENTS, "today's cap");
         assert!(inner.history.is_empty(), "no history tier");
+    }
+
+    /// M5: with `OXIDANT_HISTORY=off` the alias map had no pruner at all — `sweep_history`
+    /// returns immediately and `demote` drops the hot statement without touching `history` — so
+    /// it grew forever. Both halves of the key are client-supplied over Spark Connect, so the
+    /// growth rate is one entry per `ExecutePlan` with a fresh `operation_id`.
+    ///
+    /// §8 says `off` restores today's behaviour exactly, and today there is no alias map at all.
+    #[test]
+    fn history_off_keeps_no_alias_entries() {
+        let _env = crate::distributed::env_lock();
+        std::env::set_var("OXIDANT_HISTORY", "off");
+        let store = StatementStore::from_env("driver", 0).expect("store");
+        std::env::remove_var("OXIDANT_HISTORY");
+
+        for i in 0..(MAX_STATEMENTS + 500) {
+            store.insert_from(
+                "SELECT 1",
+                Source::Connect,
+                Some("sess-1"),
+                Some(&format!("op-{i}")),
+            );
+        }
+        let inner = store.inner.lock().expect("lock");
+        assert!(
+            inner.alias.is_empty(),
+            "history off keeps no aliases, got {}",
+            inner.alias.len()
+        );
+        // The hot tier is still capped exactly as it is today.
+        assert_eq!(inner.statements.len(), MAX_STATEMENTS);
+    }
+
+    /// The alias map is bounded with history *on* too: an entry never outlives the statement it
+    /// points at, on either eviction path.
+    #[test]
+    fn an_alias_never_outlives_its_statement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.max_records = 4;
+            c.hot_ttl = Duration::from_millis(0);
+        });
+        for i in 0..40 {
+            let (id, _) = store.insert_from(
+                &format!("SELECT {i}"),
+                Source::Connect,
+                Some("sess-1"),
+                Some(&format!("op-{i}")),
+            );
+            store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+        }
+        store.sweep_history();
+
+        let inner = store.inner.lock().expect("lock");
+        assert!(
+            inner.alias.len() <= inner.limits.max_records * 2,
+            "the alias map is bounded by the record caps, got {}",
+            inner.alias.len()
+        );
+        for target in inner.alias.values() {
+            assert!(
+                inner.statements.contains_key(target) || inner.history.contains_key(target),
+                "alias points at {target}, which is in neither tier"
+            );
+        }
     }
 
     /// Two sessions that both said `op-1` are two statements, not one merged entry.
