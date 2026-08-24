@@ -35,15 +35,6 @@ pub(crate) fn create_dir_secure(path: &Path) -> io::Result<()> {
     builder.create(path)
 }
 
-/// Create a file that must not already exist, 0600.
-pub(crate) fn create_new_secure(path: &Path) -> io::Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    opts.mode(FILE_MODE);
-    opts.open(path)
-}
-
 /// Open for append, creating at 0600 if absent.
 pub(crate) fn append_secure(path: &Path) -> io::Result<File> {
     let mut opts = OpenOptions::new();
@@ -53,7 +44,10 @@ pub(crate) fn append_secure(path: &Path) -> io::Result<File> {
     opts.open(path)
 }
 
-/// Truncating create, 0600 (the compaction `.tmp`, which is redone on every boot that finds one).
+/// Truncating create, 0600 — the compaction `.tmp` (redone on every boot that finds one) and the
+/// lockfile's, which is `hard_link`ed into place once its body is written and fsynced. Exclusive
+/// creation is spelled with that link rather than `O_EXCL` here, so that the name never becomes
+/// visible before the contents (see [`super::lock`]).
 pub(crate) fn create_secure(path: &Path) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
