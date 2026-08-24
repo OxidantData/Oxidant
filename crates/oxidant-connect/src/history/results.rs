@@ -258,15 +258,17 @@ impl ResultStore {
         Ok(batches)
     }
 
-    /// Delete one statement's result file, if it has one. Called by the statement's own eviction
-    /// — the journal is the authority (§5), so this never decides a lifetime of its own.
-    pub(crate) fn unlink(&self, id: &str) -> bool {
+    /// Delete one statement's result file, if it has one, returning the bytes it freed. Called by
+    /// the statement's own eviction — the journal is the authority (§5), so this never decides a
+    /// lifetime of its own.
+    ///
+    /// The byte count is what lets the disk sweeper track its running total instead of
+    /// re-walking the whole data directory after every single unlink (M2).
+    pub(crate) fn unlink(&self, id: &str) -> Option<u64> {
         let path = self.path_for(id);
-        let Ok(meta) = std::fs::metadata(&path) else {
-            return false;
-        };
+        let meta = std::fs::metadata(&path).ok()?;
         if std::fs::remove_file(&path).is_err() {
-            return false;
+            return None;
         }
         self.on_disk_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
@@ -274,7 +276,7 @@ impl ResultStore {
             })
             .ok();
         fs_util::fsync_dir(&self.dir);
-        true
+        Some(meta.len())
     }
 
     /// Delete every result file no live statement names — the boot pass that closes the crash
@@ -283,24 +285,27 @@ impl ResultStore {
     /// `live` must be the union of both tiers, not just the folded set: a statement still in the
     /// hot tier has no snapshot on disk yet, and deleting its result would be the one thing
     /// retention must never do.
-    pub(crate) fn reconcile(&self, live: &std::collections::HashSet<String>) -> usize {
+    pub(crate) fn reconcile(&self, live: &std::collections::HashSet<String>) -> (usize, u64) {
         let mut removed = 0;
+        let mut freed = 0;
         for (id, _) in self.files() {
             if live.contains(&id) {
                 continue;
             }
-            if self.unlink(&id) {
+            if let Some(bytes) = self.unlink(&id) {
                 removed += 1;
+                freed += bytes;
             }
         }
         if removed > 0 {
             tracing::info!(
                 removed,
+                freed_bytes = freed,
                 dir = %self.dir.display(),
                 "statement history: unlinked result files no statement references"
             );
         }
-        removed
+        (removed, freed)
     }
 
     /// Every published result file as `(statement-id, size)`, oldest-modified first — the order

@@ -104,7 +104,7 @@ impl HistoryRuntime {
         // a result file outlives its statement's journal record by at most one retention sweep,
         // and never across a restart.
         let live: std::collections::HashSet<String> = fold.statements.keys().cloned().collect();
-        results.reconcile(&live);
+        let _ = results.reconcile(&live);
 
         Ok((
             Self {

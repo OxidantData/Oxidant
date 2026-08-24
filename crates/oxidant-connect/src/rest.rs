@@ -1419,7 +1419,7 @@ impl StatementStore {
         // only follows the statement's. A crash between the two leaves an orphan, which is
         // exactly what boot's `reconcile` is for.
         for (id, submitted_at_ms) in tombstones {
-            history.results.unlink(&id);
+            let _ = history.results.unlink(&id);
             let seq = history.journal.next_seq();
             history
                 .journal
@@ -1470,57 +1470,75 @@ impl StatementStore {
 
         let cfg = &history.cfg;
         let roots = budget_roots(cfg);
-        let used = |roots: &[std::path::PathBuf]| -> u64 {
+        let measure = |roots: &[std::path::PathBuf]| -> u64 {
             roots.iter().map(|r| disk::subtree_bytes(r)).sum()
         };
-        let over = |roots: &[std::path::PathBuf]| -> bool { used(roots) > cfg.disk_max_bytes };
 
         let mut report = disk::SweepReport::default();
-        let before = used(&roots);
+        let before = measure(&roots);
+        // The running total, decremented by what each unlink reports. The whole tree used to be
+        // re-walked *per candidate* — pruning 10,000 statements meant 10,000 full recursive
+        // directory walks interleaved with 10,000 lock/unlock cycles of the store mutex that
+        // every submit, list, status and result call also takes, on a host already short on I/O.
+        //
+        // It is an estimate between the two measurements — a tombstone appended for a pruned
+        // statement grows the journal by a record the total does not see — but it errs *low*,
+        // which stops the loop early rather than deleting more than the budget asked for. The
+        // number `/api/status` and the log line report is re-measured once, below.
+        let mut used = before;
+        let spend = |used: &mut u64, freed: u64| *used = used.saturating_sub(freed);
 
         // 1. Oldest rolled logs. The live file is never a candidate — it rotates (PR3).
         for file in disk::rolled_logs(&cfg.logs_dir) {
-            if !over(&roots) {
+            if used <= cfg.disk_max_bytes {
                 break;
             }
-            if disk::remove(&file).is_some() {
+            if let Some(freed) = disk::remove(&file) {
+                spend(&mut used, freed);
                 report.rolled_logs_removed += 1;
             }
         }
         // 2. Oldest dumps.
         for file in disk::dumps(&cfg.dumps_dir) {
-            if !over(&roots) {
+            if used <= cfg.disk_max_bytes {
                 break;
             }
-            if disk::remove(&file).is_some() {
+            if let Some(freed) = disk::remove(&file) {
+                spend(&mut used, freed);
                 report.dumps_removed += 1;
             }
         }
         // 3. Result files whose statement is already pruned. Orphans are garbage whether or not
         // the budget is tight, so this pass is unconditional.
-        report.orphan_results_removed = history.results.reconcile(&self.live_ids());
+        let (orphans, orphan_bytes) = history.results.reconcile(&self.live_ids());
+        report.orphan_results_removed = orphans;
+        spend(&mut used, orphan_bytes);
 
         // 4. Oldest journal *statements* — statement-granular, never a raw segment unlink (F2).
-        while over(&roots) {
-            if !self.prune_oldest_statement() {
+        while used > cfg.disk_max_bytes {
+            let Some(freed) = self.prune_oldest_statement() else {
                 break;
-            }
+            };
+            spend(&mut used, freed);
             report.statements_pruned += 1;
         }
         // 5. Oldest live result files. The rows go, the statement stays, and `/result` answers
         // `410 result_expired` for it from here on.
         for (id, _) in history.results.files() {
-            if !over(&roots) {
+            if used <= cfg.disk_max_bytes {
                 break;
             }
-            if self.drop_result_file(&id) {
+            if let Some(freed) = self.drop_result_file(&id) {
+                spend(&mut used, freed);
                 report.live_results_removed += 1;
             }
         }
 
-        report.used_bytes = used(&roots);
+        // One re-measure at the end: what the running total estimated is not what `/api/status`
+        // reports.
+        report.used_bytes = measure(&roots);
         report.freed_bytes = before.saturating_sub(report.used_bytes);
-        report.over_budget = over(&roots);
+        report.over_budget = report.used_bytes > cfg.disk_max_bytes;
 
         // The free-space floor, measured *after* the pruning it does not drive. Nothing above
         // this line read it.
@@ -1570,11 +1588,12 @@ impl StatementStore {
     }
 
     /// Evict the single oldest terminal statement, tombstone it, and unlink its result.
-    /// `false` means there was nothing evictable — everything left is still running.
-    fn prune_oldest_statement(&self) -> bool {
-        let Some(history) = self.history.clone() else {
-            return false;
-        };
+    ///
+    /// `None` means there was nothing evictable — everything left is still running. `Some(bytes)`
+    /// is what the result unlink freed, which is what lets the sweeper keep a running total
+    /// instead of re-walking the data directory per victim (M2).
+    fn prune_oldest_statement(&self) -> Option<u64> {
+        let history = self.history.clone()?;
         let victim = (|| {
             let mut inner = self.inner.lock().expect("statement store poisoned");
             let oldest = {
@@ -1607,26 +1626,20 @@ impl StatementStore {
             inner.alias.retain(|_, target| target != &id);
             Some((id, submitted_at_ms))
         })();
-        let Some((id, submitted_at_ms)) = victim else {
-            return false;
-        };
-        history.results.unlink(&id);
+        let (id, submitted_at_ms) = victim?;
+        let freed = history.results.unlink(&id).unwrap_or(0);
         let seq = history.journal.next_seq();
         history
             .journal
             .append(JournalRecord::tombstone(&id, seq, submitted_at_ms));
-        true
+        Some(freed)
     }
 
     /// Unlink one statement's result file but keep the statement, and journal the clearing so a
     /// restart does not read a pointer to a file that is gone.
-    fn drop_result_file(&self, id: &str) -> bool {
-        let Some(history) = self.history.clone() else {
-            return false;
-        };
-        if !history.results.unlink(id) {
-            return false;
-        }
+    fn drop_result_file(&self, id: &str) -> Option<u64> {
+        let history = self.history.clone()?;
+        let freed = history.results.unlink(id)?;
         let cleared = {
             let mut inner = self.inner.lock().expect("statement store poisoned");
             if let Some(st) = inner.statements.get_mut(id) {
@@ -1645,7 +1658,7 @@ impl StatementStore {
         if let Some(folded) = cleared {
             history.journal.append_retained(folded.to_snapshot());
         }
-        true
+        Some(freed)
     }
 
     /// Publish this store's counters to `/api/status`.
@@ -4424,6 +4437,44 @@ mod tests {
             store.status_counters().map(|c| c.history_writes),
             Some(oxidant_observability::history_writes::OK.to_string()),
             "history_writes must flip back without a restart"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// M2: the sweeper measures the tree **twice** per pass — once before, once after — however
+    /// many statements it prunes.
+    ///
+    /// `over()` used to call a full recursive `subtree_bytes` of the root per loop iteration, so
+    /// pruning 10,000 statements meant 10,000 recursive walks of every journal segment, every
+    /// compacted generation and every result file, interleaved with 10,000 lock/unlock cycles of
+    /// the store mutex that every submit, list, status and result call also takes.
+    #[test]
+    fn the_disk_sweep_measures_the_tree_twice_however_many_statements_it_prunes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            c.disk_max_bytes = 0; // nothing can satisfy it: the loop walks the whole list
+            c.disk_min_free_bytes = 0;
+        });
+        for i in 0..40i64 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(i, 2)]));
+        }
+
+        crate::history::disk::reset_subtree_walks();
+        let report = store.sweep_disk();
+        let walks = crate::history::disk::subtree_walks();
+
+        assert!(
+            report.statements_pruned >= 20,
+            "the pass has to actually prune for this to mean anything: {report:?}"
+        );
+        // One budget root for a plain tempdir (every override is under it), measured before and
+        // after — and nothing per victim.
+        assert_eq!(
+            walks, 2,
+            "{} statements pruned cost {walks} recursive walks of the data directory",
+            report.statements_pruned
         );
         store.shutdown_for_test();
     }

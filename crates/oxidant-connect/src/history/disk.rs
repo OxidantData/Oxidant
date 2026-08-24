@@ -85,6 +85,30 @@ pub(crate) const LIVE_LOG: &str = "oxidant.log";
 /// Symlinks are not followed: `read_dir` + `symlink_metadata` means a link into another subtree
 /// is counted as the link, not as its target, so one file cannot be billed twice.
 pub(crate) fn subtree_bytes(dir: &Path) -> u64 {
+    #[cfg(test)]
+    SUBTREE_WALKS.with(|c| c.set(c.get() + 1));
+    subtree_bytes_inner(dir)
+}
+
+// How many times *this thread* has started a recursive walk. The sweeper's cost is dominated by
+// these, and the guard the M2 test needs is a count, not a stopwatch: a thread-local keeps it
+// exact under `cargo test`'s parallelism.
+#[cfg(test)]
+thread_local! {
+    static SUBTREE_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn subtree_walks() -> u64 {
+    SUBTREE_WALKS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_subtree_walks() {
+    SUBTREE_WALKS.with(|c| c.set(0));
+}
+
+fn subtree_bytes_inner(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -94,7 +118,7 @@ pub(crate) fn subtree_bytes(dir: &Path) -> u64 {
             continue;
         };
         if meta.is_dir() {
-            total += subtree_bytes(&entry.path());
+            total += subtree_bytes_inner(&entry.path());
         } else if meta.is_file() {
             total += meta.len();
         }
