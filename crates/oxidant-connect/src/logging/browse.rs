@@ -301,6 +301,79 @@ pub(crate) struct ForwardPage {
     pub next_after: u64,
 }
 
+/// The most one physical line may contribute to a page, and the cap on the read that produces
+/// it.
+///
+/// `BufReader::read_line` grows its target to **the whole file** when the file holds no `\n`,
+/// and [`Window::push`] will not evict a sole entry — so one newline-free file in `logs/`
+/// becomes one line, in memory, on the two paths whose entire contract is rule 3: bounded by
+/// the page, never by the file. Engine-written lines cannot do this ([`super::line`]'s
+/// `escape_line_breaks` guarantees one physical line per event); a file something *else* wrote
+/// into `logs/` can, which is the same threat model rule 1 already contemplates.
+///
+/// A page is the bound because a line longer than a whole page could never be served whole
+/// anyway.
+const MAX_LINE_BYTES: usize = MAX_PAGE_BYTES;
+
+/// Appended to a line the cap cut. A page that silently drops the rest of a line is the same
+/// defect as a page that silently drops a line.
+const LINE_TRUNCATED: &str = " … [line truncated: longer than one page]";
+
+/// Read one physical line, never more than [`MAX_LINE_BYTES`] of it.
+///
+/// The rest of an over-long line is **skipped, not returned as the next row**: splitting it into
+/// fragments would multiply the file's row count, and a row index is the cursor every caller
+/// pages with (rule 2).
+///
+/// Bytes rather than [`BufRead::read_line`]'s `String`, for two reasons: the cap can land in the
+/// middle of a multibyte character, which `read_line` reports as `InvalidData` and which would
+/// fail the whole scan; and a foreign file that is not UTF-8 at all failed it already. Lossy
+/// conversion serves the line the reader can act on instead, which is what rule 1 says about
+/// every other line no parser can decompose.
+fn read_capped_line<R: BufRead>(
+    reader: &mut R,
+    raw: &mut Vec<u8>,
+    line: &mut String,
+) -> std::io::Result<usize> {
+    raw.clear();
+    line.clear();
+    let read = (&mut *reader)
+        .take(MAX_LINE_BYTES as u64)
+        .read_until(b'\n', raw)?;
+    if read == 0 {
+        return Ok(0);
+    }
+    let cut = read == MAX_LINE_BYTES && raw.last() != Some(&b'\n');
+    if cut {
+        skip_to_newline(reader)?;
+    }
+    line.push_str(String::from_utf8_lossy(raw).trim_end_matches(['\n', '\r']));
+    if cut {
+        line.push_str(LINE_TRUNCATED);
+    }
+    Ok(read)
+}
+
+/// Advance past the rest of a physical line without materialising any of it.
+fn skip_to_newline<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(at) => {
+                reader.consume(at + 1);
+                return Ok(());
+            }
+            None => {
+                let all = available.len();
+                reader.consume(all);
+            }
+        }
+    }
+}
+
 /// Scan a text log forward from a row index — the follow mode behind `/api/v1/logs/tail`.
 pub(crate) fn scan_text_forward(
     path: &Path,
@@ -311,13 +384,12 @@ pub(crate) fn scan_text_forward(
     let file = std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut page = ForwardPage::default();
+    let mut raw = Vec::new();
     let mut buf = String::new();
     let mut index = 0u64;
     let mut bytes = 0usize;
     loop {
-        buf.clear();
-        let read = reader
-            .read_line(&mut buf)
+        let read = read_capped_line(&mut reader, &mut raw, &mut buf)
             .map_err(|e| format!("reading {}: {e}", path.display()))?;
         if read == 0 {
             break;
@@ -331,7 +403,7 @@ pub(crate) fn scan_text_forward(
             index -= 1;
             break;
         }
-        let line = buf.trim_end_matches(['\n', '\r']);
+        let line = buf.as_str();
         if filter.is_empty() || filter.keeps(&parse_line(line), line) {
             bytes += line.len();
             page.lines.push(line.to_string());
@@ -522,20 +594,19 @@ pub(crate) fn scan_text(
     let file = std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut window = Window::new(limit);
+    let mut raw = Vec::new();
     let mut buf = String::new();
     let mut index = 0u64;
     loop {
         if before.is_some_and(|b| index >= b) {
             break;
         }
-        buf.clear();
-        let read = reader
-            .read_line(&mut buf)
+        let read = read_capped_line(&mut reader, &mut raw, &mut buf)
             .map_err(|e| format!("reading {}: {e}", path.display()))?;
         if read == 0 {
             break;
         }
-        let line = buf.trim_end_matches(['\n', '\r']);
+        let line = buf.as_str();
         if filter.is_empty() || filter.keeps(&parse_line(line), line) {
             window.push(index, line.to_string());
         }
@@ -834,21 +905,30 @@ fn stamp(ms: i64) -> Option<String> {
 
 /// The first and last parseable timestamps of a text log, read from the two ends only.
 ///
-/// The tail is read by seeking back at most [`TAIL_PROBE_BYTES`]: a listing over a 256 MiB live
-/// file must not read 256 MiB, and the last line of a log is always within a few KiB of the end.
-const TAIL_PROBE_BYTES: u64 = 64 * 1024;
+/// Each end is read through at most [`PROBE_BYTES`]: a listing over a 256 MiB live file must not
+/// read 256 MiB, and the first and last lines of a log are within a few KiB of their end. The
+/// head bound is not decoration — `read_line` with no cap reads the whole file when the file has
+/// no `\n` in it, and `list_files` runs this over *every* text file in `logs/`, which is what
+/// made a listing the cheapest way to make the driver read a foreign file whole.
+const PROBE_BYTES: u64 = 64 * 1024;
 
 fn text_bounds(path: &Path) -> (Option<String>, Option<String>) {
     let Ok(mut file) = std::fs::File::open(path) else {
         return (None, None);
     };
-    let mut first = String::new();
-    if BufReader::new(&file).read_line(&mut first).is_err() {
+    let mut first = Vec::new();
+    if BufReader::new(&file)
+        .take(PROBE_BYTES)
+        .read_until(b'\n', &mut first)
+        .is_err()
+    {
         return (None, None);
     }
-    let first_ts = parse_line(first.trim_end()).ts_ms.and_then(stamp);
+    let first_ts = parse_line(String::from_utf8_lossy(&first).trim_end())
+        .ts_ms
+        .and_then(stamp);
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let back = len.min(TAIL_PROBE_BYTES);
+    let back = len.min(PROBE_BYTES);
     if file.seek(SeekFrom::End(-(back as i64))).is_err() {
         return (first_ts, None);
     }
@@ -1437,6 +1517,76 @@ mod tests {
             "`debug` is a floor: it drops the rank below it"
         );
         assert_eq!(at(Some("trace")), 2, "which is what `trace` is for");
+    }
+
+    /// **A file with no `\n` in it is one capped line, not the file.**
+    ///
+    /// `BufReader::read_line` grows its target to the whole file when there is no newline, and
+    /// `Window::push` will not evict a sole entry — so on the two paths whose whole contract is
+    /// "bounded by the page, never by the file", a single foreign file in `logs/` became the
+    /// page. Engine-written lines cannot do this (`escape_line_breaks` guarantees one physical
+    /// line per event); something else writing into the directory can, which is the threat model
+    /// rule 1 already contemplates and the same one the listing's ignored `syslog` stands for.
+    ///
+    /// The remainder is **skipped**, not served as the next rows: fragmenting one line into a
+    /// hundred would multiply the file's row count, and a row index is the cursor every caller
+    /// pages with.
+    #[test]
+    fn a_line_longer_than_a_page_is_capped_marked_and_still_one_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut body = "2026-08-23T14:00:00.000Z [ERROR] oxidant_execution - message=".to_string();
+        body.push_str(&"x".repeat(MAX_LINE_BYTES + 4096));
+        body.push('\n');
+        let next = "2026-08-23T14:00:01.000Z [INFO] oxidant_connect - message=the row after it";
+        body.push_str(next);
+        body.push('\n');
+        let path = dir.path().join("oxidant-2026-08-31.log");
+        std::fs::write(&path, &body).expect("write");
+
+        let head = scan_text_forward(&path, &filter(None, None, None), 0, 100).expect("scan");
+        assert_eq!(head.lines.len(), 1);
+        assert!(
+            head.lines[0].ends_with(LINE_TRUNCATED),
+            "a page that silently drops the rest of a line is a page that lies"
+        );
+        assert!(
+            head.lines[0].len() <= MAX_LINE_BYTES + LINE_TRUNCATED.len(),
+            "the line is capped at a page: {} bytes",
+            head.lines[0].len()
+        );
+        assert_eq!(head.next_after, 1, "and it is one row");
+
+        let tail = scan_text_forward(&path, &filter(None, None, None), 1, 100).expect("scan");
+        assert_eq!(
+            tail.lines,
+            vec![next.to_string()],
+            "the row after the over-long one is the next real line, not a fragment of it"
+        );
+        assert_eq!(tail.next_after, 2, "the file is two rows, not a hundred");
+
+        // The backward walk over a file with no `\n` anywhere: the one shape `Window`'s
+        // sole-entry guard cannot evict, so an uncapped read would return the file as the page.
+        let flat = dir.path().join("oxidant-2026-08-30.log");
+        std::fs::write(&flat, "y".repeat(MAX_LINE_BYTES + 4096)).expect("write");
+        let page = scan_text(&flat, &filter(None, None, None), None, 100).expect("scan");
+        assert_eq!(page.lines.len(), 1);
+        assert!(
+            page.lines[0].len() <= MAX_LINE_BYTES + LINE_TRUNCATED.len(),
+            "the page held the file: {} bytes",
+            page.lines[0].len()
+        );
+
+        // And the listing reads both ends of both files through a 64 KiB probe apiece — the
+        // head bound matters because `list_files` runs it over *every* text file in `logs/`.
+        let files = list_files(dir.path());
+        assert_eq!(files.len(), 2, "both files are still listed");
+        assert_eq!(
+            files
+                .iter()
+                .find(|f| f.file == "2026-08-31")
+                .and_then(|f| f.first_ts.clone()),
+            Some("2026-08-23T14:00:00.000Z".to_string()),
+        );
     }
 
     /// The listing is ordered by `(period end, split)` — the trap where `.2` sorts before the

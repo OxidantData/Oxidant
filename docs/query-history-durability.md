@@ -1397,6 +1397,22 @@ document or `docs/api.md` previously promised.
   trace-enabled node, and a second test pins both halves against a file that has a `TRACE` line
   in it.
 
+- **F12 — a line is capped at a page, on every path that promised to be.** `scan_text`,
+  `scan_text_forward` and `text_bounds` all used `BufReader::read_line`, which grows its target
+  to **the whole file** when the file holds no `\n`; `Window::push` will not evict a sole entry,
+  so that one line became the page. Rule 3 says memory is bounded by the page and never by the
+  file, and this was the one remaining way to make `?file=` materialise a whole file — reachable
+  only by a foreign file in `logs/` whose name matches the grammar, which is the same threat
+  model rule 1 already contemplates. The read is now capped at `MAX_LINE_BYTES` (one page: a
+  line longer than a page could never be served whole anyway), the remainder of the physical
+  line is **skipped rather than returned as further rows** — fragmenting one line into a hundred
+  would multiply the row count a cursor is an index into — and the cut is marked in the line so
+  a page that dropped bytes says so. The listing's head probe is bounded by the same 64 KiB as
+  its tail probe, which matters because `list_files` runs it over every text file in `logs/`.
+  The capped read also works in bytes rather than `read_line`'s `String`: the cap can land
+  mid-character, and a foreign file that is not UTF-8 at all used to fail the scan outright
+  rather than serving the line rule 1 says a reader should still see.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |
