@@ -1563,7 +1563,10 @@
       document.querySelectorAll('#obs-filters .filter-chip').forEach(btn => {
         const on = OBS_LEVELS.indexOf(btn.dataset.level) <= floor;
         btn.classList.toggle('on', on);
-        btn.setAttribute('aria-pressed', obsState.level === btn.dataset.level ? 'true' : 'false');
+        // `aria-pressed` tracks the *visual* state, because they mean the same thing — this
+        // level is showing. It used to mark only the floor chip, so a screen reader was told
+        // one button was pressed while four were lit. Which one is the floor is in the title.
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
       });
       document.getElementById('obs-pause').textContent = obsState.paused ? 'Resume' : 'Pause';
 
