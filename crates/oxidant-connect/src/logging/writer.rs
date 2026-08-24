@@ -53,8 +53,13 @@ use crate::history::fs_util;
 pub(crate) const DEDUP_FLUSH: Duration = Duration::from_secs(5);
 /// How often the background thread wakes to check the dedup timer.
 const TICK: Duration = Duration::from_millis(500);
-/// A conversion that fails this many times is abandoned: the `.log` stays on disk permanently,
-/// one loud line is logged, and `?file=` serves it as text (§6).
+/// A conversion that fails this many times is abandoned: the `.log` stays on disk, one loud line
+/// is logged, and `?file=` serves it as text (§6).
+///
+/// **"Abandoned" is per process.** The counter lives in a map owned by the converter thread, so a
+/// restart retries twice more and logs the line again. That is the right trade — a failure caused
+/// by a transient full disk or a bad mount deserves another look after a restart — but it means
+/// the loud line recurs, and §6 says so rather than implying one line ever.
 const MAX_CONVERSION_ATTEMPTS: u32 = 2;
 /// How many rendered events the writer queue holds before it starts dropping them.
 ///
@@ -596,6 +601,13 @@ impl RollingWriter {
             }
             pending.push(entry.path());
         }
+        // Forget files that are no longer on disk. `attempts` is keyed by path and only ever
+        // grew: a successful conversion removes its own key, but a rolled `.log` that failed and
+        // was then taken by `OXIDANT_LOG_KEEP_DAYS` or the size budget left its count behind
+        // forever. Bounded by the number of rolled files a process ever sees, so not a leak worth
+        // a data structure — but a map that remembers paths that do not exist is a map that lies
+        // about what it is counting.
+        attempts.retain(|path, _| path.exists());
         if !self.shared.cfg.parquet || pending.is_empty() {
             return;
         }
@@ -1265,6 +1277,46 @@ mod tests {
             ]
         );
         w.shutdown();
+    }
+
+    /// **L6.** `attempts` is keyed by path and only ever grew. A successful conversion removes
+    /// its own key, but a rolled `.log` that failed and was then taken by
+    /// `OXIDANT_LOG_KEEP_DAYS` or the size budget left its count behind for the life of the
+    /// process — a map that remembers paths that do not exist is a map that lies about what it
+    /// is counting.
+    ///
+    /// The other half matters just as much: a file that *is* still there keeps its count, or the
+    /// two-attempt cap would reset on every pass and a permanently broken conversion would log
+    /// its loud line every five minutes forever.
+    #[test]
+    fn the_attempt_map_forgets_a_file_that_is_gone_and_remembers_one_that_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut c = cfg(dir.path(), LogRoll::Daily, u64::MAX);
+        c.parquet = true;
+        let w = RollingWriter::open_at(c, utc(2026, 8, 26, 14, 0), None).expect("open");
+
+        // Retention took this one between two passes.
+        let gone = dir.path().join("oxidant-2026-08-20.log");
+        // This one is still on disk and still unconvertible — a directory where a file should be,
+        // which is the shape `a_failed_conversion_keeps_the_text_file_and_leaves_no_tmp` uses.
+        let stuck = dir.path().join("oxidant-2026-08-21.log");
+        std::fs::create_dir(&stuck).expect("mkdir");
+
+        let mut attempts = HashMap::new();
+        attempts.insert(gone.clone(), MAX_CONVERSION_ATTEMPTS);
+        attempts.insert(stuck.clone(), MAX_CONVERSION_ATTEMPTS);
+        w.convert_pending(&mut attempts);
+        w.shutdown();
+
+        assert!(
+            !attempts.contains_key(&gone),
+            "a path that no longer exists is forgotten: {attempts:?}"
+        );
+        assert_eq!(
+            attempts.get(&stuck).copied(),
+            Some(MAX_CONVERSION_ATTEMPTS),
+            "and one that does keeps its count, so the cap still caps: {attempts:?}"
+        );
     }
 
     /// `OXIDANT_LOG_PARQUET=off` keeps rolled files as text — subject to the same budget.

@@ -715,6 +715,11 @@ init is `oxidant_connect::logging::init(role, port)`.
   is never removed before the footer reads back, and why a `.parquet.tmp` found at boot
   is simply deleted and the conversion redone. A conversion that fails twice leaves the
   `.log` in place permanently and logs one loud line; `?file=` serves it as text.
+  **"Twice" is per process** *(PR3, stated)*: the attempt counter lives in a map on the
+  converter thread, so a restart retries twice more and logs the line again. That is the right
+  trade — a failure caused by a full disk or a bad mount deserves another look after a restart —
+  but the line recurs, and the map now forgets a path once the file is gone, so a `.log` that
+  retention deleted stops being counted at all.
 - **Row groups are cut at a size the converter chose** *(PR3)*: 8192 rows, ~1 MiB of raw log
   text. parquet-rs defaults `max_row_group_row_count` to 1Mi rows, which was never overridden,
   so a *maxed-out* 256 MiB day (~2M lines) became two row groups and an ordinary few-MiB day
