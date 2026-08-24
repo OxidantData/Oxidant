@@ -150,12 +150,81 @@ mod tests {
         assert!(embedded_index().contains("/api/status?limit="));
         assert!(embedded_index().contains("/api/v1/events/stream"));
 
-        // The Observability page reads these three, and the log buffer is the only one of them
-        // that is not already on refresh().
-        assert!(embedded_index().contains("fetch('/api/v1/logs'"));
+        // The Observability page's jobs/stages/SQL sections ride refresh(); its log pane is the
+        // one part with routes of its own — the §6b browser, in full.
         assert!(embedded_index().contains("api('/jobs')"));
         assert!(embedded_index().contains("api('/stages?details=true')"));
         assert!(embedded_index().contains("api('/sql')"));
+        for route in [
+            "'/api/v1/logs?'",        // the filtered, cursor-paged read
+            "'/api/v1/logs/files?'",  // the file picker
+            "'/api/v1/logs/workers'", // the worker picker
+            "'/api/v1/logs/tail?'",   // tail-follow
+            "'/api/v1/logs/dump'",    // the diagnostic bundle
+        ] {
+            assert!(
+                embedded_index().contains(route),
+                "the log pane must reach {route}"
+            );
+        }
+        // **The tail carries the bearer header.** `EventSource` cannot, and the only ways around
+        // that put the status token in a URL — proxy logs, history, `Referer` — or invent a
+        // cookie on a router served under permissive CORS. Pinned, because "use EventSource, it
+        // is simpler" is the obvious change to make here later.
+        assert!(
+            !embedded_index().contains("new EventSource('/api/v1/logs/tail"),
+            "the log tail must not be an EventSource: it cannot carry the status token"
+        );
+        assert!(
+            embedded_index().contains("headers: obsAuthHeaders(), signal: ctl.signal"),
+            "the log tail reads SSE by hand so it can send the same bearer header as every \
+             other log route"
+        );
+        // §6b's controls, as the ids the JS binds. The level chips existed and matched nothing
+        // once PR3 put a timestamp in front of `[LEVEL]`; these are the rest of the pane.
+        for control in [
+            "id=\"obs-worker\"",
+            "id=\"obs-file\"",
+            "id=\"obs-target\"",
+            "id=\"obs-q\"",
+            "id=\"obs-from\"",
+            "id=\"obs-to\"",
+            "id=\"obs-follow\"",
+            "id=\"obs-dump\"",
+            "id=\"obs-filters\"",
+        ] {
+            assert!(
+                embedded_index().contains(control),
+                "the log pane is missing {control}"
+            );
+        }
+        // The level regex is unanchored, and pinned as the literal it is. PR3 moved `[LEVEL]`
+        // off the start of the line behind an RFC-3339 timestamp; the old `^`-anchored form
+        // then matched nothing, every line came back with a null level, and the chips
+        // `docs/web-ui.md` documented could not hide one line. Both halves are asserted
+        // because the negative alone passes on a page with no level match at all.
+        assert!(
+            embedded_index().contains("/\\[(ERROR|WARN|INFO|DEBUG|TRACE)\\]/"),
+            "the pane must colour a line by its `[LEVEL]` wherever in the line it sits"
+        );
+        assert!(
+            !embedded_index().contains("/^\\s*\\[("),
+            "the level match must not assume `[LEVEL]` is line-initial"
+        );
+        // **A node that logs but does not roll still has logs.** `OXIDANT_LOG_ROLL=off` keeps
+        // durable statement history with stderr-only logs, so every `?file=` is a `404` while
+        // the memory ring answers. The pane drops to the ring once and says so, rather than
+        // reporting "no logs to read here" about a node that is logging.
+        assert!(
+            embedded_index().contains(
+                "if (code === 404 && obsState.file === 'current' && !obsState.currentMissing)"
+            ),
+            "a node with no rolled files must fall back to the memory ring"
+        );
+        assert!(
+            embedded_index().contains("this node writes no rolled files"),
+            "and the caption must say why the ring is what is on screen"
+        );
 
         // The Compare page and the Spark proxy that existed only to feed it are gone; nothing
         // in the console reaches for another engine's UI.
