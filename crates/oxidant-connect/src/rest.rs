@@ -1417,6 +1417,18 @@ impl StatementStore {
     /// in the documented order until it fits — or until there is nothing left to prune, which is
     /// what `disk: over_budget` reports.
     ///
+    /// **Pruning is driven by `OXIDANT_DISK_MAX_BYTES` and by nothing else.** The engine deletes
+    /// its own files when its own subtree is over its own budget: its mess, its documented order.
+    /// The free-space floor is a *separate* condition with a separate answer — the engine stops
+    /// spilling and reports `disk: low_free` + `history_writes: degraded`, and deletes nothing.
+    ///
+    /// That separation is H1. The two conditions used to be one boolean driving one unbounded
+    /// prune loop, and unlike the byte budget the floor cannot be *made* satisfiable by pruning:
+    /// a co-tenant filling the volume — a CI cache, another container, a `target/` directory —
+    /// ran the loop until every terminal statement in both tiers was gone, then took every
+    /// remaining result file, then did it again five minutes later, having reclaimed kilobytes
+    /// against a shortfall it never caused.
+    ///
     /// Runs at boot and every `OXIDANT_DISK_SWEEP_SECS` (300). Returns what it did, which is both
     /// the log line and the seam the test asserts the order through.
     pub(crate) fn sweep_disk(&self) -> disk::SweepReport {
@@ -1432,12 +1444,7 @@ impl StatementStore {
         let used = |roots: &[std::path::PathBuf]| -> u64 {
             roots.iter().map(|r| disk::subtree_bytes(r)).sum()
         };
-        let over = |roots: &[std::path::PathBuf]| -> bool {
-            if used(roots) > cfg.disk_max_bytes {
-                return true;
-            }
-            disk::free_bytes(&cfg.root).is_some_and(|free| free < cfg.disk_min_free_bytes)
-        };
+        let over = |roots: &[std::path::PathBuf]| -> bool { used(roots) > cfg.disk_max_bytes };
 
         let mut report = disk::SweepReport::default();
         let before = used(&roots);
@@ -1447,16 +1454,18 @@ impl StatementStore {
             if !over(&roots) {
                 break;
             }
-            report.freed_bytes += disk::remove(&file);
-            report.rolled_logs_removed += 1;
+            if disk::remove(&file).is_some() {
+                report.rolled_logs_removed += 1;
+            }
         }
         // 2. Oldest dumps.
         for file in disk::dumps(&cfg.dumps_dir) {
             if !over(&roots) {
                 break;
             }
-            report.freed_bytes += disk::remove(&file);
-            report.dumps_removed += 1;
+            if disk::remove(&file).is_some() {
+                report.dumps_removed += 1;
+            }
         }
         // 3. Result files whose statement is already pruned. Orphans are garbage whether or not
         // the budget is tight, so this pass is unconditional.
@@ -1483,23 +1492,51 @@ impl StatementStore {
         report.used_bytes = used(&roots);
         report.freed_bytes = before.saturating_sub(report.used_bytes);
         report.over_budget = over(&roots);
-        if report.removed_anything() || report.over_budget {
+
+        // The free-space floor, measured *after* the pruning it does not drive. Nothing above
+        // this line read it.
+        report.free_bytes = free_bytes_for(cfg, &cfg.root);
+        report.low_free = report
+            .free_bytes
+            .is_some_and(|free| free < cfg.disk_min_free_bytes);
+        // Stop writing rather than start deleting: a spill is by far the largest write the
+        // engine makes, and the rows it would have written are still in memory and still serve
+        // `/result`. The journal keeps writing — its records are small, and refusing them would
+        // lose exactly the statement history this guard exists to protect.
+        history.results.set_paused(report.low_free);
+
+        if report.removed_anything() || report.over_budget || report.low_free {
             tracing::info!(
                 used_bytes = report.used_bytes,
                 freed_bytes = report.freed_bytes,
                 budget_bytes = cfg.disk_max_bytes,
+                free_bytes = report.free_bytes,
+                min_free_bytes = cfg.disk_min_free_bytes,
                 rolled_logs = report.rolled_logs_removed,
                 dumps = report.dumps_removed,
                 orphan_results = report.orphan_results_removed,
                 statements = report.statements_pruned,
                 live_results = report.live_results_removed,
                 over_budget = report.over_budget,
+                low_free = report.low_free,
                 "disk sweep"
             );
         }
-        self.disk
-            .over_budget
-            .store(report.over_budget, std::sync::atomic::Ordering::Relaxed);
+        if report.low_free {
+            tracing::warn!(
+                free_bytes = report.free_bytes,
+                min_free_bytes = cfg.disk_min_free_bytes,
+                used_bytes = report.used_bytes,
+                budget_bytes = cfg.disk_max_bytes,
+                "the volume is below OXIDANT_DISK_MIN_FREE_BYTES: result spill is paused and \
+                 /api/status reports disk: low_free. No statement history is deleted for a \
+                 shortfall the engine's own budget did not condemn — raise the floor, free \
+                 space, or lower OXIDANT_DISK_MAX_BYTES to make the engine prune its own."
+            );
+        }
+        let ordering = std::sync::atomic::Ordering::Relaxed;
+        self.disk.over_budget.store(report.over_budget, ordering);
+        self.disk.low_free.store(report.low_free, ordering);
         report
     }
 
@@ -1742,6 +1779,18 @@ fn counters_for(
             oxidant_observability::disk_state::OK
         }
         .to_string(),
+    }
+}
+
+/// Free bytes on the volume holding `path`, honouring a test's fake reading.
+///
+/// The floor is the one disk guard that cannot be exercised from a tempdir — it depends on how
+/// full the *host* volume is — and it is also the guard whose misbehaviour deleted the whole
+/// statement history, so it gets a seam rather than going untested.
+fn free_bytes_for(cfg: &HistoryConfig, path: &std::path::Path) -> Option<u64> {
+    match cfg.free_bytes_override() {
+        Some(fake) => Some(fake),
+        None => disk::free_bytes(path),
     }
 }
 
@@ -4346,6 +4395,140 @@ mod tests {
             store.status_counters().map(|c| c.history_writes),
             Some(oxidant_observability::history_writes::OK.to_string()),
             "history_writes must flip back without a restart"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// H1, the finding that blocks: a free-space shortfall the engine did **not** cause must
+    /// delete nothing.
+    ///
+    /// The floor used to drive the same unbounded prune loop as the byte budget, and unlike the
+    /// byte budget it cannot be made satisfiable by pruning — so a driver sharing a volume with
+    /// a CI cache lost every statement record and every spilled result within five minutes of
+    /// that volume dipping under 1 GiB free, while `OXIDANT_DISK_MAX_BYTES` was 8 GiB and the
+    /// engine was using kilobytes.
+    #[tokio::test]
+    async fn a_free_space_shortfall_the_engine_did_not_cause_deletes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // First boot: a healthy volume, five spilled results.
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let mut ids = Vec::new();
+        for i in 0..5i64 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(i * 10, 4)]));
+            ids.push(id);
+        }
+        store.drain_spills();
+        let results = dir.path().join("history/results");
+        for id in &ids {
+            assert!(results.join(format!("{id}.arrow")).exists(), "spilled");
+        }
+        // Files the sweeper would take *first* if it were pruning at all.
+        let plant = |rel: &str, bytes: usize| {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, vec![b'x'; bytes]).expect("write");
+            path
+        };
+        let rolled = plant("logs/oxidant-2026-08-20.log", 4096);
+        let dump = plant("dumps/dump-1.parquet", 4096);
+        store.shutdown_for_test();
+        drop(store);
+
+        // Second boot: the engine is nowhere near its own budget, and the volume is "full" for
+        // reasons that have nothing to do with it. `with_history` sweeps at boot.
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            c.disk_max_bytes = u64::MAX;
+            c.disk_min_free_bytes = 8 * 1024 * 1024 * 1024;
+            c.free_bytes_override = Some(1024); // 1 KiB free on a volume wanting 8 GiB
+        });
+        let report = store.sweep_disk();
+
+        assert!(report.low_free, "the floor must be reported: {report:?}");
+        assert!(
+            !report.over_budget,
+            "the engine is not over its own budget: {report:?}"
+        );
+        assert_eq!(report.statements_pruned, 0, "{report:?}");
+        assert_eq!(report.live_results_removed, 0, "{report:?}");
+        assert_eq!(report.orphan_results_removed, 0, "{report:?}");
+        assert_eq!(report.rolled_logs_removed, 0, "{report:?}");
+        assert_eq!(report.dumps_removed, 0, "{report:?}");
+        assert_eq!(report.freed_bytes, 0, "{report:?}");
+        assert!(rolled.exists() && dump.exists(), "{report:?}");
+        for id in &ids {
+            assert!(
+                results.join(format!("{id}.arrow")).exists(),
+                "{id} lost its result to a shortfall the engine did not cause"
+            );
+        }
+        assert_eq!(
+            store.list().len(),
+            5,
+            "and the whole history is still there"
+        );
+
+        // What the engine does instead: stop writing the large thing, and say so.
+        let counters = store.status_counters().expect("history is on");
+        assert_eq!(
+            counters.disk,
+            oxidant_observability::disk_state::LOW_FREE,
+            "the operator must be able to tell a host shortfall from an engine overspend: \
+             {counters:?}"
+        );
+        assert_eq!(
+            counters.history_writes,
+            oxidant_observability::history_writes::DEGRADED,
+            "{counters:?}"
+        );
+        assert!(
+            store.history.as_ref().expect("history").results.is_paused(),
+            "spill is paused while the volume is short"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// The other side of H1: the engine still prunes — in the documented order — when its *own*
+    /// subtree is past its *own* budget, and it does so whether or not the volume is also short.
+    /// `disk:` reports `over_budget` when both hold, because that is the one the operator can act
+    /// on.
+    #[tokio::test]
+    async fn the_engine_prunes_for_its_own_budget_even_while_the_volume_is_short() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            // Nothing can satisfy this, so the sweeper walks the whole order.
+            c.disk_max_bytes = 0;
+            c.disk_min_free_bytes = u64::MAX;
+            c.free_bytes_override = Some(0);
+        });
+        let plant = |rel: &str, bytes: usize| {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, vec![b'x'; bytes]).expect("write");
+            path
+        };
+        let live = plant("logs/oxidant.log", 4096);
+        let rolled = plant("logs/oxidant-2026-08-20.log", 4096);
+        let dump = plant("dumps/dump-1.parquet", 4096);
+        for i in 0..3i64 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+        }
+
+        let report = store.sweep_disk();
+        assert!(report.low_free, "{report:?}");
+        assert!(report.over_budget, "{report:?}");
+        assert_eq!(report.rolled_logs_removed, 1, "logs first: {report:?}");
+        assert_eq!(report.dumps_removed, 1, "then dumps: {report:?}");
+        assert!(report.statements_pruned >= 1, "then statements: {report:?}");
+        assert!(!rolled.exists() && !dump.exists());
+        assert!(live.exists(), "the live log is never deleted — it rotates");
+        assert_eq!(
+            store.status_counters().map(|c| c.disk),
+            Some(oxidant_observability::disk_state::OVER_BUDGET.to_string()),
+            "over_budget wins when both hold"
         );
         store.shutdown_for_test();
     }

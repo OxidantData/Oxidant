@@ -22,6 +22,14 @@
 //! `disk: over_budget`, the engine keeps serving, and each pass logs one line naming what it
 //! removed and why.
 //!
+//! **The free-space floor does not prune.** `OXIDANT_DISK_MAX_BYTES` is the only thing that
+//! drives the order above: the engine deletes its own files when its own subtree is over its own
+//! budget. `OXIDANT_DISK_MIN_FREE_BYTES` is a separate condition with a separate answer — the
+//! engine pauses result spill and reports `disk: low_free` + `history_writes: degraded`. The two
+//! were one boolean once, driving one unbounded loop, and because pruning cannot *make* a
+//! free-space floor satisfiable that loop ran until every terminal statement in both tiers was
+//! gone — every five minutes, for a shortfall a co-tenant caused.
+//!
 //! PR2 writes nothing under `logs/` — the rolling writer is PR3 — but steps 1 and 2 are
 //! implemented and tested now, because the order is the contract and a sweeper that learns half
 //! of it later is a sweeper that prunes results while rolled logs sit on the disk.
@@ -47,8 +55,15 @@ pub(crate) struct SweepReport {
     pub statements_pruned: usize,
     pub live_results_removed: usize,
     pub freed_bytes: u64,
-    /// Still over the budget or under the free-space floor with nothing left to prune.
+    /// The engine's own subtree is still past `OXIDANT_DISK_MAX_BYTES` with nothing left to
+    /// prune. This is the only condition that drives the prune loop.
     pub over_budget: bool,
+    /// The volume is below `OXIDANT_DISK_MIN_FREE_BYTES`. Reported and acted on by pausing
+    /// spill — **never** by pruning: pruning cannot make the floor satisfiable, and the
+    /// shortfall is very often not the engine's (H1).
+    pub low_free: bool,
+    /// What the free-space probe read, or `None` when no mount matched.
+    pub free_bytes: Option<u64>,
 }
 
 impl SweepReport {
@@ -151,18 +166,22 @@ pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
     best.map(|(_, free)| free)
 }
 
-/// Delete `file`, returning the bytes it freed. Directory fsync is the caller's: a sweep pass
-/// unlinks many files from one directory and syncs it once.
-pub(crate) fn remove(file: &Prunable) -> u64 {
+/// Delete `file`, returning the bytes it freed. `None` is a *failed* unlink, which the caller
+/// must not count as a removal: on a read-only or EPERM-ing `logs/` mount the sweep line
+/// otherwise claimed "removed N rolled logs" having removed none.
+///
+/// Directory fsync is the caller's: a sweep pass unlinks many files from one directory and
+/// syncs it once.
+pub(crate) fn remove(file: &Prunable) -> Option<u64> {
     match std::fs::remove_file(&file.path) {
-        Ok(()) => file.bytes,
+        Ok(()) => Some(file.bytes),
         Err(e) => {
             tracing::warn!(
                 file = %file.path.display(),
                 error = %e,
                 "disk sweep: could not remove a file it selected for pruning"
             );
-            0
+            None
         }
     }
 }

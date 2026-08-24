@@ -170,7 +170,7 @@ engine deletes the oldest thing it owns before it lets the disk fill:
 | Knob | Default | Meaning |
 |---|---|---|
 | `OXIDANT_DISK_MAX_BYTES` | 8 GiB | total budget for `history/` + `logs/` + `results/` + `dumps/` + `event_log_dir` combined |
-| `OXIDANT_DISK_MIN_FREE_BYTES` | 1 GiB | filesystem free-space floor — prune aggressively below it regardless of retention days |
+| `OXIDANT_DISK_MIN_FREE_BYTES` | 1 GiB | filesystem free-space floor — below it the engine pauses result spill and reports `disk: low_free`; it prunes **nothing** (pruning is driven by `OXIDANT_DISK_MAX_BYTES` alone) |
 | `OXIDANT_LOG_MAX_FILE_BYTES` | 256 MiB | the live log rotates **early** at this size, even mid-period (`.N` split) |
 | `OXIDANT_LOG_MAX_TOTAL_BYTES` | 2 GiB | `logs/` subtree cap — oldest rolled files deleted first |
 | `OXIDANT_EVENT_LOG_MAX_BYTES` | 2 GiB | `event_log_dir` cap (§8) |

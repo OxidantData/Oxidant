@@ -271,6 +271,14 @@ pub(crate) struct HistoryConfig {
     pub disk_min_free_bytes: u64,
     /// How often the disk-budget sweeper runs (§3: every 5 minutes, plus at boot).
     pub disk_sweep_interval: Duration,
+    /// A fake free-space reading for the whole tree (tests only).
+    ///
+    /// The free-space floor is the one guard that cannot be driven from a tempdir — it depends
+    /// on how full the *host* volume is — and it is also the guard whose misbehaviour deleted
+    /// the entire statement history (H1). Read through [`Self::free_bytes_override`], which is
+    /// `None` in every non-test build.
+    #[cfg(test)]
+    pub free_bytes_override: Option<u64>,
     /// `driver` / `worker`, recorded in the lockfile.
     pub role: String,
     /// The process's port, recorded in the lockfile.
@@ -345,6 +353,8 @@ impl HistoryConfig {
             disk_sweep_interval: Duration::from_secs(
                 env_u64("OXIDANT_DISK_SWEEP_SECS", 300).max(1),
             ),
+            #[cfg(test)]
+            free_bytes_override: None,
             role: role.to_string(),
             port,
         })
@@ -372,9 +382,14 @@ impl HistoryConfig {
             result_persist: ResultPersist::default(),
             result_max_bytes: DEFAULT_RESULT_MAX_BYTES,
             result_memory_budget_bytes: DEFAULT_RESULT_MEMORY_BUDGET_BYTES,
-            disk_max_bytes: DEFAULT_DISK_MAX_BYTES,
-            disk_min_free_bytes: DEFAULT_DISK_MIN_FREE_BYTES,
+            // Neutral disk guards, opted into per test. Inheriting the shipped 1 GiB floor
+            // meant every history test's journal and results were at the mercy of how full
+            // *this machine* happened to be — and this repo has a documented hazard of a
+            // `target/` directory measured at 174 GB.
+            disk_max_bytes: u64::MAX,
+            disk_min_free_bytes: 0,
             disk_sweep_interval: Duration::from_secs(300),
+            free_bytes_override: None,
             flush_interval: Duration::from_millis(500),
             ack_timeout: Duration::from_millis(2000),
             hot_ttl: Duration::from_secs(3600),
@@ -385,6 +400,20 @@ impl HistoryConfig {
             segment_max_bytes: DEFAULT_SEGMENT_BYTES,
             role: "driver".to_string(),
             port: 0,
+        }
+    }
+}
+
+impl HistoryConfig {
+    /// The fake free-space reading a test installed, or `None` — always `None` outside tests.
+    pub(crate) fn free_bytes_override(&self) -> Option<u64> {
+        #[cfg(test)]
+        {
+            self.free_bytes_override
+        }
+        #[cfg(not(test))]
+        {
+            None
         }
     }
 }
