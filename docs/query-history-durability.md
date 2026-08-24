@@ -1314,6 +1314,18 @@ document or `docs/api.md` previously promised.
   then the boot snapshot. Per-session pinning is untouched for query routing, which is what it
   is for. `docs/api.md`'s "it is never an address you supply" now says what "configured" means.
 
+- **F5 — the federated tail's first poll is a position, not a page.** The seed asked for
+  `order=desc&limit=200` and emitted the answer, which the pane appends *after* having just
+  painted the newest 500 lines of the same file — so opening the pane on any worker painted 200
+  lines twice. And the cursor derived from that backward page was `next_before + lines.len()`:
+  a **match** position plus a match **count**, which is only a scan position when the matches
+  are contiguous. `ForwardPage`'s own doc states the rule that broke — a cursor built from the
+  last match re-reads and re-emits every non-matching row after it on every poll — so a
+  `level=error` follow re-printed the same errors every 2 s forever, and the tighter the filter
+  the worse it got. The first poll now asks `after = u64::MAX`, which names the end of the file
+  and returns nothing. The follow's state and its arithmetic moved out of the `unfold` closure
+  into a `Follow` value, so both are reachable from a test.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |

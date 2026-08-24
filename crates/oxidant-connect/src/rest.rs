@@ -2987,40 +2987,21 @@ fn worker_tail(
         })
         .to_string(),
     );
-    struct Follow {
-        endpoint: String,
-        params: LogsParams,
-        after: Option<u64>,
-    }
     let start = Follow {
         endpoint,
         params,
         after: None,
+        started: false,
     };
     futures::stream::once(async move { Ok(open) }).chain(futures::stream::unfold(
         start,
         |mut st| async move {
             loop {
-                let first = st.after.is_none();
-                if !first {
+                if st.started {
                     tokio::time::sleep(WORKER_TAIL_POLL).await;
                 }
-                let mut query = st.params.query();
-                query.file = Some("current".to_string());
-                query.before = None;
-                query.offset = None;
-                query.order = None;
-                query.limit = Some(TAIL_PAGE);
-                // The first poll seeds the cursor at the end of the file rather than replaying
-                // the whole live log into a browser: a follow starts where the log *is*.
-                query.after = st.after;
-                if first {
-                    query.after = None;
-                    query.before = None;
-                    query.order = Some("desc".to_string());
-                    query.limit = Some(TAIL_SEED);
-                }
-                let value = match federate(&st.endpoint, &query).await {
+                st.started = true;
+                let value = match federate(&st.endpoint, &st.query()).await {
                     Ok(v) => v,
                     Err(e) => {
                         // The follow does not end because one poll failed — a worker restart is
@@ -3034,50 +3015,109 @@ fn worker_tail(
                         return Some((Ok(event), st));
                     }
                 };
-                let lines: Vec<&str> = value
-                    .get("logs")
-                    .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(Value::as_str).collect())
-                    .unwrap_or_default();
-                let rolled = match (st.after, value.get("next_after").and_then(Value::as_u64)) {
-                    (Some(sent), Some(next)) if next < sent => true,
-                    (_, Some(next)) => {
-                        st.after = Some(next);
-                        false
+                match st.absorb(&value) {
+                    TailStep::Rolled => {
+                        let event = sse::Event::default()
+                            .event("rolled")
+                            .data(json!({ "worker": st.params.worker }).to_string());
+                        return Some((Ok(event), st));
                     }
-                    // The seeding poll answers a `before` page, which carries no `next_after`.
-                    // Its cursor is where that page *started*, plus what it returned.
-                    (_, None) => {
-                        let start = value
-                            .get("next_before")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        st.after = Some(start + lines.len() as u64);
-                        false
+                    TailStep::Lines(lines) => {
+                        let event = sse::Event::default()
+                            .event("lines")
+                            .data(json!(lines).to_string());
+                        return Some((Ok(event), st));
                     }
-                };
-                if rolled {
-                    st.after = Some(0);
-                    let event = sse::Event::default()
-                        .event("rolled")
-                        .data(json!({ "worker": st.params.worker }).to_string());
-                    return Some((Ok(event), st));
+                    TailStep::Idle => continue,
                 }
-                if lines.is_empty() {
-                    continue;
-                }
-                let event = sse::Event::default()
-                    .event("lines")
-                    .data(json!(lines).to_string());
-                return Some((Ok(event), st));
             }
         },
     ))
 }
 
-/// Lines the *first* worker poll seeds with, so a follow opens on recent context rather than on
-/// an empty pane — the same thing the driver's own pane shows from its ring.
-const TAIL_SEED: usize = 200;
+/// One worker follow, as a value: where to ask next, and what an answer means for that.
+///
+/// Its own type because the arithmetic below is the whole contract of a federated follow and it
+/// used to be inline in a `stream::unfold` closure, which no test could reach.
+struct Follow {
+    endpoint: String,
+    params: LogsParams,
+    /// The forward cursor: a **scan** position in the worker's live file. `None` until a poll
+    /// has named the end of that file.
+    after: Option<u64>,
+    /// Whether a poll has been issued at all. Deliberately *not* `after.is_some()`: a poll that
+    /// failed leaves the cursor unset, and without this flag the retry would spin without its
+    /// 2 s sleep.
+    started: bool,
+}
+
+/// What one poll's answer means for the follow.
+#[derive(Debug, PartialEq, Eq)]
+enum TailStep {
+    /// Lines to forward.
+    Lines(Vec<String>),
+    /// The worker rolled its live file under the follow.
+    Rolled,
+    /// Nothing to say — the seeding probe, or a tick with no new lines.
+    Idle,
+}
+
+impl Follow {
+    /// The query for the next poll.
+    ///
+    /// **The first poll asks for a position, not a page.** It used to ask for
+    /// `order=desc&limit=200` and emit the answer, which duplicated lines twice over: the pane
+    /// had already painted the newest 500 lines of the same file a moment earlier, and the
+    /// cursor it derived — `next_before + lines.len()` — mixed a *match* position with a match
+    /// *count*. `ForwardPage`'s own doc states the rule that violated: a cursor built from the
+    /// last match re-reads, and re-emits, every non-matching row after it on every poll, so the
+    /// tighter the filter the worse the duplication. Asking for the rows *after the end of the
+    /// file* names the end and returns nothing, which is what "a follow starts where the log is"
+    /// means — and it is what the driver's own tail, which has no seed, already did.
+    fn query(&self) -> crate::logging::LogQuery {
+        let mut query = self.params.query();
+        query.file = Some("current".to_string());
+        query.before = None;
+        query.offset = None;
+        query.order = None;
+        query.limit = Some(TAIL_PAGE);
+        query.after = Some(self.after.unwrap_or(u64::MAX));
+        query
+    }
+
+    /// Fold one node's answer into the cursor.
+    fn absorb(&mut self, value: &Value) -> TailStep {
+        let lines: Vec<String> = value
+            .get("logs")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        match (self.after, value.get("next_after").and_then(Value::as_u64)) {
+            // Backward: the worker rolled its live file, so row indices restart.
+            (Some(sent), Some(next)) if next < sent => {
+                self.after = Some(0);
+                TailStep::Rolled
+            }
+            (_, Some(next)) => {
+                self.after = Some(next);
+                if lines.is_empty() {
+                    TailStep::Idle
+                } else {
+                    TailStep::Lines(lines)
+                }
+            }
+            // No cursor at all: this was not a forward page. Leave the cursor where it is and
+            // re-ask — inventing one from whatever else the envelope carries is how the seed
+            // came to re-emit its matches forever.
+            (_, None) => TailStep::Idle,
+        }
+    }
+}
 
 /// Lines a worker tail asks for per poll. Two seconds of a chatty worker, bounded.
 const TAIL_PAGE: usize = 500;
@@ -4434,6 +4474,119 @@ mod tests {
         let (status, body) = get_logs(&app, "/api/v1/logs?file=current&worker=driver").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["worker"], "driver");
+    }
+
+    /// **A followed worker never sees a line twice**, however selective the filter — the one
+    /// property a follow has, and the one the seeding poll broke twice over.
+    ///
+    /// The seed asked for `order=desc&limit=200` and emitted the answer as a `lines` frame,
+    /// which the pane appends *after* having just painted the newest 500 lines of the same file.
+    /// Worse, the cursor it derived from that page was `next_before + lines.len()` — a **match**
+    /// position plus a match **count**. `ForwardPage`'s doc states the rule verbatim: a cursor
+    /// built from the last match re-reads, and re-emits, every non-matching row after it on
+    /// every poll. On a file with 10,000 rows and five errors, `level=error` re-printed those
+    /// five errors every 2 s, forever, and the tighter the filter the worse it got.
+    ///
+    /// Driven against the real read path — `logging::answer` over a real file — because the
+    /// arithmetic is only wrong in combination with what a page actually returns.
+    #[tokio::test]
+    async fn a_filtered_follow_emits_each_match_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A live file whose matches are sparse and *late*: the shape that makes a match
+        // position and a scan position disagree by thousands of rows.
+        let mut body = String::new();
+        for i in 0..2_000 {
+            let level = if i >= 1_500 && i % 100 == 0 {
+                "ERROR"
+            } else {
+                "INFO"
+            };
+            body.push_str(&format!(
+                "2026-08-23T14:00:00.000Z [{level}] oxidant_execution - message=line {i}\n"
+            ));
+        }
+        std::fs::write(dir.path().join(crate::history::disk::LIVE_LOG), &body).expect("write");
+        let view = LogView {
+            dir: Some(dir.path().to_path_buf()),
+            dedup: true,
+        };
+        let ring = LogBuffer::new(MAX_LOG_LINES);
+        // The worker's side of the Flight hop, without the hop.
+        let node = |query: &crate::logging::LogQuery| {
+            crate::logging::answer(query, &view, &ring).expect("the node answers")
+        };
+
+        let mut follow = Follow {
+            endpoint: "unused".to_string(),
+            params: LogsParams {
+                worker: Some("10.0.0.7:50051".to_string()),
+                level: Some("error".to_string()),
+                ..Default::default()
+            },
+            after: None,
+            started: false,
+        };
+
+        // Poll 1 — the seed. It is a *position*: no lines, and the cursor is the end of the file.
+        let seeded = follow.absorb(&node(&follow.query()));
+        assert_eq!(
+            seeded,
+            TailStep::Idle,
+            "the seed emits nothing: the pane has already painted this file"
+        );
+        assert_eq!(
+            follow.after,
+            Some(2_000),
+            "and it names the end of the file, not the last match"
+        );
+
+        // Nothing has been appended, so every further poll is silent.
+        for tick in 0..3 {
+            assert_eq!(
+                follow.absorb(&node(&follow.query())),
+                TailStep::Idle,
+                "tick {tick}: a quiet file emits nothing"
+            );
+            assert_eq!(follow.after, Some(2_000), "tick {tick}: and does not move");
+        }
+
+        // Append one more error, with a thousand non-matching rows after it.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(crate::history::disk::LIVE_LOG))
+                .expect("open");
+            writeln!(
+                file,
+                "2026-08-23T14:00:01.000Z [ERROR] oxidant_execution - message=the new one"
+            )
+            .expect("append");
+            for i in 0..1_000 {
+                writeln!(
+                    file,
+                    "2026-08-23T14:00:02.000Z [INFO] oxidant_execution - message=after {i}"
+                )
+                .expect("append");
+            }
+        }
+
+        let mut emitted: Vec<String> = Vec::new();
+        for _ in 0..5 {
+            if let TailStep::Lines(lines) = follow.absorb(&node(&follow.query())) {
+                emitted.extend(lines);
+            }
+        }
+        assert_eq!(
+            emitted,
+            vec!["2026-08-23T14:00:01.000Z [ERROR] oxidant_execution - message=the new one"],
+            "the appended match, once — not once per poll"
+        );
+        assert_eq!(
+            follow.after,
+            Some(3_001),
+            "the cursor is the scan position: past the thousand rows that did not match"
+        );
     }
 
     /// **And the list it matches against is not settable by a Connect client.**

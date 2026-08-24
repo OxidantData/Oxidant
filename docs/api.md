@@ -680,8 +680,12 @@ data: {"dropped":37}
 - **A worker's tail is honestly a poll**, and `mode` says so: the driver re-asks the worker's
   `?file=current` every 2 s over Flight and forwards what is new. A long-lived Flight stream
   would pin a worker-side task to a browser tab. "New" is a **forward cursor** — a row index,
-  so two identical lines a second apart are two events — and the first poll seeds at the end of
-  the file rather than replaying the whole live log.
+  so two identical lines a second apart are two events.
+- **The first poll asks for a position, not a page.** It requests the rows *after the end* of
+  the live file, which names the end and returns nothing: a follow emits only what arrives
+  after you started following, exactly as the driver's own tail does. So the stream never
+  repeats lines you already fetched with `/api/v1/logs`, and — because a scan position is not a
+  match position — a selective `level=` cannot make a poll re-emit the matches it already sent.
 - **The gap is never silent.** A reader the fan-out outruns is told exactly how many lines it
   lost, in its own stream.
 - `EventSource` cannot carry an `Authorization` header. Read the stream with `fetch` and a
