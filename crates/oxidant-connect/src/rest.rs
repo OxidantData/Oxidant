@@ -4416,6 +4416,27 @@ mod tests {
         assert_eq!(report.live_results_removed, 1, "then step 5: {report:?}");
         assert!(!running_file.exists());
         assert!(report.over_budget, "nothing left to prune: {report:?}");
+        // The counter has to agree with the directory afterwards, or `results_on_disk_bytes`
+        // drifts a little further from the truth with every sweep.
+        let results_dir = dir.path().join("history/results");
+        let on_disk: u64 = std::fs::read_dir(&results_dir)
+            .expect("results dir")
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum();
+        assert_eq!(
+            store
+                .history
+                .as_ref()
+                .expect("history")
+                .results
+                .on_disk_bytes(),
+            on_disk,
+            "results_on_disk_bytes must match the directory after a prune: {report:?}"
+        );
+        assert_eq!(on_disk, 0, "and everything was taken: {report:?}");
         {
             let inner = store.inner.lock().expect("lock");
             let st = inner
@@ -4520,6 +4541,104 @@ mod tests {
             "history_writes must flip back without a restart"
         );
         store.shutdown_for_test();
+    }
+
+    /// Schema fidelity is one of PR2's two promises, and every other spill test uses a single
+    /// `Int64` column. This one round-trips a dictionary, a nullable struct with a null, and a
+    /// timestamp *with* a timezone, through the file and through a restart.
+    #[tokio::test]
+    async fn a_wide_schema_survives_the_spill_round_trip() {
+        use oxidant_loom::arrow::array::{
+            ArrayRef, Int32Array, StringDictionaryBuilder, StructArray, TimestampMillisecondArray,
+        };
+        use oxidant_loom::arrow::buffer::NullBuffer;
+        use oxidant_loom::arrow::datatypes::{
+            DataType, Field, Fields, Int32Type, Schema, TimeUnit,
+        };
+
+        let mut dict = StringDictionaryBuilder::<Int32Type>::new();
+        for value in ["alpha", "beta", "alpha"] {
+            dict.append_value(value);
+        }
+        let dict: ArrayRef = Arc::new(dict.finish());
+
+        let inner_fields: Fields = vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+        ]
+        .into();
+        let strukt: ArrayRef = Arc::new(StructArray::new(
+            inner_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(oxidant_loom::arrow::array::StringArray::from(vec![
+                    Some("x"),
+                    None,
+                    Some("z"),
+                ])) as ArrayRef,
+            ],
+            // A null struct, so the outer validity buffer has to survive too.
+            Some(NullBuffer::from(vec![true, false, true])),
+        ));
+
+        let tz: Arc<str> = Arc::from("America/New_York");
+        let ts: ArrayRef = Arc::new(
+            TimestampMillisecondArray::from(vec![0_i64, 1_700_000_000_000, -86_400_000])
+                .with_timezone(Arc::clone(&tz)),
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "label",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("nested", DataType::Struct(inner_fields), true),
+            Field::new(
+                "at",
+                DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::clone(&tz))),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![dict, strukt, ts]).expect("batch");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let (id, _) = store.insert("SELECT * FROM wide");
+        store.finish(&id, ExecOutcome::Succeeded(vec![batch.clone()]));
+        store.drain_spills();
+
+        let before = app(rest_state(store.clone()));
+        let (status, json_before) =
+            get_json(&before, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK, "{json_before}");
+        store.shutdown_for_test();
+        drop(before);
+        drop(store);
+
+        // Off disk, in a new process's worth of state.
+        let replayed = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let read_back = replayed
+            .history
+            .as_ref()
+            .expect("history")
+            .results
+            .read(&id, None)
+            .expect("read the spilled result back");
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(
+            read_back[0].schema(),
+            batch.schema(),
+            "the schema must survive the IPC round trip verbatim, timezone and all"
+        );
+        assert_eq!(read_back[0], batch, "and so must every value");
+
+        let after = app(rest_state(replayed.clone()));
+        let (status, json_after) =
+            get_json(&after, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK, "{json_after}");
+        assert_eq!(json_after, json_before, "byte-for-byte across the restart");
+        replayed.shutdown_for_test();
     }
 
     /// L4: a sweep that removed statements wakes the store's waiters.
