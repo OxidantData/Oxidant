@@ -8,19 +8,26 @@
 //! > intermediate lifecycle events may be lost, up to one flush interval, on a crash.*
 //!
 //! Concretely: `running` records are dropped and counted when the channel is full — they are
-//! progress chatter and the fold needs none of them — while `submitted`, `snapshot` and
-//! `tombstone` records are never dropped and never coalesced. A terminal record carries a
-//! oneshot the writer completes *after* its fsync, and the response path (not the query) waits
-//! on that for at most `OXIDANT_HISTORY_ACK_TIMEOUT_MS`.
+//! progress chatter and the fold needs none of them — and so are `tombstone` records, whose
+//! loss is self-healing (the statement is folded again at the next boot and re-evicted by the
+//! next sweep). `submitted` and `snapshot` records are **never** dropped and never coalesced:
+//! when the channel has no room they go to an overflow queue the writer drains before anything
+//! else, so a producer neither blocks nor loses the record. A terminal record carries a oneshot
+//! the writer completes *after* its fsync — and only then — and the response path (not the
+//! query) waits on that for at most `OXIDANT_HISTORY_ACK_TIMEOUT_MS`.
+//!
+//! No producer ever blocks on the disk. `append`, `append_retained` and `append_durable` are all
+//! non-blocking, which is what lets `finish()` be called from a tokio worker without a stalled
+//! disk parking that worker (§7: *"execution never waits on history"*).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::config::HistoryConfig;
 use super::fs_util;
@@ -30,6 +37,17 @@ use super::record::{Fold, FoldedStatement, JournalRecord};
 const CHANNEL_CAPACITY: usize = 4096;
 /// Compaction runs when this share of the records in sealed inputs is superseded.
 const COMPACT_SUPERSEDED_RATIO: f64 = 0.5;
+/// Hard bound on records the channel had no room for.
+///
+/// The overflow queue is what makes `submitted` and `snapshot` un-droppable without blocking
+/// their producer, but "never dropped" cannot mean "unbounded": a disk that never answers would
+/// otherwise trade a lost history record for an OOM. Past this many queued records even a
+/// retained one is dropped, counted, and the journal is degraded — honestly, and in memory the
+/// process can survive.
+const OVERFLOW_CAPACITY: usize = 65_536;
+
+/// A record the channel had no room for, with the ack (if any) its client is waiting on.
+type Overflow = Mutex<VecDeque<(Box<JournalRecord>, Option<tokio::sync::oneshot::Sender<()>>)>>;
 
 fn seg_name(n: u64) -> String {
     format!("seg-{n:06}.jsonl")
@@ -92,6 +110,10 @@ enum Msg {
 /// Handle on the journal: a channel to the writer thread plus the counters `/api/status` reads.
 pub(crate) struct Journal {
     tx: SyncSender<Msg>,
+    /// Records that must not be dropped and found the channel full. The writer drains this
+    /// before dispatching anything it received, so an overflowed record is on disk before the
+    /// next `Sync`/`Stop`/`Compact` answers.
+    overflow: Arc<Overflow>,
     /// Monotonic sequence shared with the statement store: a statement's submit sequence and
     /// every later record's write sequence come from here, so both are globally ordered.
     seq: AtomicU64,
@@ -140,6 +162,7 @@ impl Journal {
         let dropped = Arc::new(AtomicU64::new(0));
         let write_failures = Arc::new(AtomicU64::new(0));
         let degraded = Arc::new(AtomicBool::new(false));
+        let overflow: Arc<Overflow> = Arc::new(Mutex::new(VecDeque::new()));
         let writer = Writer {
             cfg: cfg.clone(),
             file: None,
@@ -148,6 +171,7 @@ impl Journal {
             dirty: false,
             degraded: Arc::clone(&degraded),
             write_failures: Arc::clone(&write_failures),
+            overflow: Arc::clone(&overflow),
         };
         let thread = std::thread::Builder::new()
             .name("oxidant-history".to_string())
@@ -156,6 +180,7 @@ impl Journal {
         Ok((
             Arc::new(Journal {
                 tx,
+                overflow,
                 seq: AtomicU64::new(next_seq),
                 dropped,
                 write_failures,
@@ -173,7 +198,8 @@ impl Journal {
         self.seq.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Append a lifecycle record. Dropped and counted if the writer is behind (§7).
+    /// Append a best-effort record: `running` chatter and tombstones. Dropped and counted if
+    /// the writer is behind (§7). Never blocks.
     pub(crate) fn append(&self, rec: JournalRecord) {
         if let Err(TrySendError::Full(_)) = self.tx.try_send(Msg::Append(Box::new(rec), None)) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -181,37 +207,62 @@ impl Journal {
         }
     }
 
+    /// Append a record that must not be lost, without an ack: the `submitted` record (§4a — a
+    /// crash mid-statement still leaves a trace *with its SQL*) and the boot correction pass.
+    ///
+    /// A full channel sends it to the overflow queue rather than dropping it, and rather than
+    /// parking the producer — which is on a tokio worker.
+    pub(crate) fn append_retained(&self, rec: JournalRecord) {
+        match self.tx.try_send(Msg::Append(Box::new(rec), None)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(Msg::Append(rec, ack))) => {
+                self.push_overflow(rec, ack);
+            }
+            Err(_) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                self.degraded.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Append a record that must not be lost, and hand back the ack the response waits on.
     ///
-    /// `None` means the record could not even be queued within the ack timeout — the disk is
-    /// stalled, the statement is degraded, and the caller says so rather than pretending.
+    /// Never blocks: a full channel overflows rather than parking the caller, so a stalled disk
+    /// delays a *response* (bounded by `OXIDANT_HISTORY_ACK_TIMEOUT_MS`, awaited in
+    /// `await_durable`) and never a tokio worker. `None` means the record could not be held at
+    /// all — the overflow bound is exhausted, or the writer is gone — and the caller degrades.
     pub(crate) fn append_durable(
         &self,
         rec: JournalRecord,
-        queue_timeout: Duration,
     ) -> Option<tokio::sync::oneshot::Receiver<()>> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        let mut msg = Msg::Append(Box::new(rec), Some(ack_tx));
-        let deadline = Instant::now() + queue_timeout;
-        loop {
-            match self.tx.try_send(msg) {
-                Ok(()) => return Some(ack_rx),
-                Err(TrySendError::Full(returned)) => {
-                    if Instant::now() >= deadline {
-                        // The writer has been behind for the whole ack budget: the disk is
-                        // stalled. Degrade honestly rather than block a response indefinitely.
-                        self.degraded.store(true, Ordering::Relaxed);
-                        return None;
-                    }
-                    msg = returned;
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    self.degraded.store(true, Ordering::Relaxed);
-                    return None;
-                }
+        match self.tx.try_send(Msg::Append(Box::new(rec), Some(ack_tx))) {
+            Ok(()) => Some(ack_rx),
+            Err(TrySendError::Full(Msg::Append(rec, ack))) => {
+                self.push_overflow(rec, ack).then_some(ack_rx)
+            }
+            Err(_) => {
+                self.degraded.store(true, Ordering::Relaxed);
+                None
             }
         }
+    }
+
+    /// Hold a record the channel had no room for. `false` means even the overflow bound is
+    /// exhausted: the record is dropped, counted, and the journal is degraded.
+    fn push_overflow(
+        &self,
+        rec: Box<JournalRecord>,
+        ack: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> bool {
+        let mut queue = self.overflow.lock().expect("journal overflow poisoned");
+        if queue.len() >= OVERFLOW_CAPACITY {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.degraded.store(true, Ordering::Relaxed);
+            return false;
+        }
+        queue.push_back((rec, ack));
+        true
     }
 
     /// Records dropped because the writer was behind — `history_dropped_events`.
@@ -395,6 +446,7 @@ struct Writer {
     dirty: bool,
     degraded: Arc<AtomicBool>,
     write_failures: Arc<AtomicU64>,
+    overflow: Arc<Overflow>,
 }
 
 impl Writer {
@@ -404,23 +456,18 @@ impl Writer {
         // same superseded ratio as a roll-time pass.
         self.compact(false);
         let mut last_sync = Instant::now();
+        let overflow = Arc::clone(&self.overflow);
         loop {
-            match rx.recv_timeout(self.cfg.flush_interval) {
+            let msg = rx.recv_timeout(self.cfg.flush_interval);
+            // Drain between the receive and the dispatch, never after it: a producer that
+            // overflowed a record and *then* asked for a `Sync`/`Stop` must find that record on
+            // disk when the answer comes back.
+            while let Some((rec, ack)) = pop(&overflow) {
+                self.handle_append(&rec, ack, &mut last_sync);
+            }
+            match msg {
                 Ok(Msg::Append(rec, ack)) => {
-                    let written = self.append(&rec);
-                    if let Some(ack) = ack {
-                        // The response is waiting on this: fsync before answering, so what the
-                        // client is told is true. If either the append or the fsync failed, the
-                        // sender is *dropped* rather than completed — `await_durable` reads a
-                        // closed channel as "not durable" and the answer says so (§7). Acking a
-                        // write that never landed is the one thing this design must not do.
-                        let durable = written && self.sync();
-                        last_sync = Instant::now();
-                        if durable {
-                            let _ = ack.send(());
-                        }
-                    }
-                    self.roll_if_full();
+                    self.handle_append(&rec, ack, &mut last_sync);
                 }
                 Ok(Msg::Sync(done)) => {
                     self.sync();
@@ -453,6 +500,28 @@ impl Writer {
 
     fn path(&self) -> PathBuf {
         self.cfg.statements_dir.join(seg_name(self.segment))
+    }
+
+    /// Write one record and, when a client is waiting on it, fsync before answering.
+    ///
+    /// The ack is completed **only** when both the append and the fsync succeeded; otherwise the
+    /// sender is dropped, which `await_durable` reads as "not durable" (§7). Acking a write that
+    /// never landed is the one thing this design must not do.
+    fn handle_append(
+        &mut self,
+        rec: &JournalRecord,
+        ack: Option<tokio::sync::oneshot::Sender<()>>,
+        last_sync: &mut Instant,
+    ) {
+        let written = self.append(rec);
+        if let Some(ack) = ack {
+            let durable = written && self.sync();
+            *last_sync = Instant::now();
+            if durable {
+                let _ = ack.send(());
+            }
+        }
+        self.roll_if_full();
     }
 
     /// `true` when the record reached the page cache. `false` is a real failure the caller must
@@ -633,6 +702,16 @@ fn compact_sealed(cfg: &HistoryConfig, open_segment: u64, force: bool) -> std::i
     Ok(true)
 }
 
+/// Take the next overflowed record, holding the queue lock for exactly that long.
+fn pop(
+    overflow: &Overflow,
+) -> Option<(Box<JournalRecord>, Option<tokio::sync::oneshot::Sender<()>>)> {
+    overflow
+        .lock()
+        .expect("journal overflow poisoned")
+        .pop_front()
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -641,6 +720,8 @@ fn file_name(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::history::record::{
         FoldedStatement, JournalRecord, RecordKind, Source, StatementStatus, RECORD_VERSION,
@@ -694,6 +775,18 @@ mod tests {
         }
     }
 
+    /// The `running` record `mark_running` builds: progress chatter, and — the detail H3 turns
+    /// on — carrying **no** `sql`, while ranking above the `submitted` record that does.
+    fn running(id: &str, seq: u64) -> JournalRecord {
+        JournalRecord {
+            kind: RecordKind::Running,
+            sql: None,
+            sql_encoding: None,
+            status: Some(StatementStatus::Running),
+            ..submitted(id, seq)
+        }
+    }
+
     #[test]
     fn a_terminal_ack_means_the_record_is_on_disk() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -701,10 +794,7 @@ mod tests {
         let (journal, fold) = Journal::open(&cfg).expect("open");
         assert!(fold.statements.is_empty());
         let ack = journal
-            .append_durable(
-                folded("stmt-a", 1, StatementStatus::Succeeded).to_snapshot(),
-                Duration::from_secs(1),
-            )
+            .append_durable(folded("stmt-a", 1, StatementStatus::Succeeded).to_snapshot())
             .expect("queued");
         // The ack fires only after the writer's fsync; blocking on it here is the same wait the
         // response path does.
@@ -729,10 +819,7 @@ mod tests {
         std::fs::create_dir(cfg.statements_dir.join(seg_name(0))).expect("block the segment");
 
         let ack = journal
-            .append_durable(
-                folded("stmt-a", 1, StatementStatus::Succeeded).to_snapshot(),
-                Duration::from_secs(1),
-            )
+            .append_durable(folded("stmt-a", 1, StatementStatus::Succeeded).to_snapshot())
             .expect("queued");
         assert!(
             futures::executor::block_on(ack).is_err(),
@@ -757,10 +844,7 @@ mod tests {
         // One statement that finished (acked, so durable) and one still running (chatter, which
         // may or may not have made it — either way it must replay as failed, not running).
         let ack = journal
-            .append_durable(
-                folded("stmt-done", 1, StatementStatus::Succeeded).to_snapshot(),
-                Duration::from_secs(1),
-            )
+            .append_durable(folded("stmt-done", 1, StatementStatus::Succeeded).to_snapshot())
             .expect("queued");
         futures::executor::block_on(ack).expect("acked");
         journal.append(submitted("stmt-live", 2));
@@ -836,9 +920,7 @@ mod tests {
         journal.sync_blocking();
         let mut snap = folded("stmt-x", 1, StatementStatus::Succeeded);
         snap.last_seq = 5;
-        let ack = journal
-            .append_durable(snap.to_snapshot(), Duration::from_secs(1))
-            .expect("queued");
+        let ack = journal.append_durable(snap.to_snapshot()).expect("queued");
         futures::executor::block_on(ack).expect("acked");
         journal.compact_blocking();
         journal.shutdown();
@@ -954,28 +1036,65 @@ mod tests {
         }
     }
 
+    /// H2: §7 says `submitted` and `snapshot` records are *never* dropped and never coalesced,
+    /// and only `running` chatter may be. The previous version of this test flooded the channel
+    /// with `RecordKind::Submitted` and so proved the opposite of its own name.
+    ///
+    /// The flood is `running` records, and both a `submitted` and a terminal record queued
+    /// during it have to survive — the `submitted` one with its SQL, which is the whole of §4a's
+    /// crash trace.
     #[test]
-    fn running_records_are_dropped_under_backpressure_terminals_are_not() {
+    fn running_records_are_dropped_under_backpressure_submitted_and_terminals_are_not() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = cfg_for(dir.path());
         let (journal, _) = Journal::open(&cfg).expect("open");
         // Fill the channel far past its capacity as fast as a producer can; the writer drains it
         // concurrently, so this asserts the *policy*, not a specific drop count.
         for seq in 0..(CHANNEL_CAPACITY as u64 * 2) {
-            journal.append(submitted("stmt-chatter", seq));
+            journal.append(running("stmt-chatter", seq));
         }
+        // Queued while the writer is behind: neither may be lost.
+        journal.append_retained(submitted("stmt-late", 7));
         let ack = journal
-            .append_durable(
-                folded("stmt-terminal", 1, StatementStatus::Succeeded).to_snapshot(),
-                Duration::from_secs(5),
-            )
+            .append_durable(folded("stmt-terminal", 1, StatementStatus::Succeeded).to_snapshot())
             .expect("a terminal record is never refused while the disk answers");
         futures::executor::block_on(ack).expect("acked");
         journal.shutdown();
+
         let (journal, fold) = Journal::open(&cfg).expect("reopen");
         assert_eq!(
             fold.statements["stmt-terminal"].status,
             StatementStatus::Succeeded
+        );
+        let late = fold
+            .statements
+            .get("stmt-late")
+            .expect("a submitted record queued under backpressure is never dropped");
+        assert_eq!(late.sql, "SELECT 7", "and it still carries its SQL (§4a)");
+        journal.shutdown();
+    }
+
+    /// The overflow queue is what makes "never dropped" true without parking the producer, so it
+    /// has to actually hold more than the channel does — and hand every record to the writer.
+    #[test]
+    fn retained_records_survive_a_channel_that_is_full() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = cfg_for(dir.path());
+        let (journal, _) = Journal::open(&cfg).expect("open");
+        // Far more retained records than the channel can hold, from one thread, so the queue is
+        // certainly overflowed at some point during the burst.
+        let total = CHANNEL_CAPACITY as u64 * 2;
+        for seq in 0..total {
+            journal.append_retained(submitted(&format!("stmt-{seq}"), seq));
+        }
+        journal.shutdown();
+
+        cfg.max_records = total as usize * 2;
+        let (journal, fold) = Journal::open(&cfg).expect("reopen");
+        assert_eq!(
+            fold.statements.len(),
+            total as usize,
+            "every retained record reached the disk"
         );
         journal.shutdown();
     }

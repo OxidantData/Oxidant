@@ -577,7 +577,10 @@ impl StatementStore {
         };
 
         if let Some(history) = &self.history {
-            history.journal.append(JournalRecord {
+            // §4a: the `submitted` record is the crash trace, and it is the only record that
+            // carries the SQL. It is never dropped — a full channel overflows instead — and the
+            // enqueue never blocks, so this stays safe to call from a tokio worker.
+            history.journal.append_retained(JournalRecord {
                 v: RECORD_VERSION,
                 kind: RecordKind::Submitted,
                 seq,
@@ -715,9 +718,7 @@ impl StatementStore {
         let (Some(history), Some(record)) = (self.history.clone(), record) else {
             return;
         };
-        let ack = history
-            .journal
-            .append_durable(record, history.cfg.ack_timeout);
+        let ack = history.journal.append_durable(record);
         let mut inner = self.inner.lock().expect("statement store poisoned");
         if let Some(st) = inner.statements.get_mut(id) {
             st.durable_ack = ack;

@@ -73,7 +73,7 @@ impl HistoryRuntime {
                 if let Some(st) = fold.statements.get_mut(id) {
                     st.last_seq = journal.next_seq();
                     st.rank = RecordKind::Snapshot.rank();
-                    journal.append(st.to_snapshot());
+                    journal.append_retained(st.to_snapshot());
                 }
             }
             journal.sync_blocking();
