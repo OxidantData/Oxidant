@@ -48,6 +48,16 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 sysinfo = "0.33"
+# Durable statement history (docs/query-history-durability.md): RFC-3339 timestamps on journal
+# records. Workspace-internal — chrono is already a dependency of oxidant-observability, -cli,
+# -streaming, -pipelines, -loom and -datasource. The feature set is spelled out because the
+# `oxidant-loom` pin is clockless (`default-features = false, features = ["std"]`) and feature
+# unification would otherwise leave this crate without `Utc::now`.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# `OXIDANT_HISTORY_SQL=hash`: digest the query text instead of journaling it. Already in
+# Cargo.lock transitively (via the AWS/rustls stacks), so this promotes an existing tree entry
+# to a direct dependency rather than adding one.
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

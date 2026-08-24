@@ -8,7 +8,7 @@ Architecture: [architecture.md](architecture.md).
 | Path | Purpose | Entrypoint |
 |------|---------|------------|
 | `crates/oxidant-cli/` | `oxidant` binary: spark server, worker, driver, embedded `sql`, `pipeline` | `src/main.rs` |
-| `crates/oxidant-connect/` | Spark Connect gRPC + DataFrame translate | `src/lib.rs` |
+| `crates/oxidant-connect/` | Spark Connect gRPC + DataFrame translate; REST statement API; durable statement history | `src/lib.rs`, `src/rest.rs`, `src/history/` |
 | `crates/oxidant-loom/` | Vectorized CPU engine (DataFusion 54) | `src/lib.rs` |
 | `crates/oxidant-gpu/` | GPU offload spike (KAN-70): plan rule + C FFI shim (mock by default; env-gated via `OXIDANT_GPU_OFFLOAD`) | `src/lib.rs` |
 | `crates/oxidant-execution/` | Local + distributed Flight driver/worker/shuffle | `src/lib.rs` |

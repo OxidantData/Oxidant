@@ -746,7 +746,7 @@ impl AppStateStore {
             if k.starts_with("OXIDANT_") || k.starts_with("SPARK_") {
                 // This endpoint is unauthenticated. `OXIDANT_STATUS_TOKEN` (and any other
                 // credential an operator exports) must never round-trip through it.
-                let value = if is_secret_env_key(&k) {
+                let value = if is_secret_key(&k) {
                     REDACTED.to_string()
                 } else {
                     v
@@ -865,11 +865,16 @@ impl Default for AppStateStore {
 /// Placeholder substituted for credential-shaped environment values.
 pub const REDACTED: &str = "<redacted>";
 
-/// Does this environment variable name look like it holds a credential?
+/// Does this name look like it holds a credential?
 ///
 /// Matched on the *name* so a new secret env var is covered without touching this list.
 /// Deliberately narrow — `KEY` alone would redact benign knobs like `OXIDANT_HASH_KEYS`.
-fn is_secret_env_key(key: &str) -> bool {
+///
+/// Public because the statement journal reuses exactly this rule when
+/// `OXIDANT_HISTORY_SQL=redacted` decides whether a SQL option name
+/// (`OPTIONS(secret '…')`) shields the literal that follows it — one list, one behaviour,
+/// rather than a second near-copy that drifts.
+pub fn is_secret_key(key: &str) -> bool {
     const NEEDLES: [&str; 7] = [
         "TOKEN",
         "SECRET",
@@ -907,7 +912,7 @@ mod tests {
             "OXIDANT_S3_SECRET_ACCESS_KEY",
             "OXIDANT_DB_PASSWORD",
         ] {
-            assert!(is_secret_env_key(key), "{key} should be redacted");
+            assert!(is_secret_key(key), "{key} should be redacted");
         }
         for key in [
             "OXIDANT_HASH_KEYS",
@@ -915,7 +920,7 @@ mod tests {
             "OXIDANT_SHUFFLE_PARTITIONS",
             "SPARK_HOME",
         ] {
-            assert!(!is_secret_env_key(key), "{key} should not be redacted");
+            assert!(!is_secret_key(key), "{key} should not be redacted");
         }
     }
 

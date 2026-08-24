@@ -51,6 +51,10 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::Layer;
 use uuid::Uuid;
 
+use crate::history::{
+    now_rfc3339, rfc3339_from_ms, FoldedStatement, HistoryConfig, HistoryRuntime, JournalRecord,
+    RecordKind, Source, SqlMode, StatementStatus, RECORD_VERSION,
+};
 use crate::OxidantService;
 
 /// Retention for a statement (result batches included); mirrors the 1h default of the gRPC
@@ -66,6 +70,8 @@ const DEFAULT_RESULT_LIMIT: usize = 10_000;
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 30;
 /// Max retained log lines served by `GET /api/v1/logs`.
 const MAX_LOG_LINES: usize = 1000;
+/// Minimum wall-clock gap between two full retention passes over the history tier.
+const SWEEP_INTERVAL_MS: i64 = 60_000;
 
 /// In-memory ring buffer of recent log lines shared by the tracing layer and the logs endpoint.
 #[derive(Clone)]
@@ -181,32 +187,6 @@ fn system_snapshot() -> System {
     sys
 }
 
-/// Statement lifecycle, serialized lowercase exactly as the API contract spells it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatementStatus {
-    Pending,
-    Running,
-    Succeeded,
-    Failed,
-    Canceled,
-}
-
-impl StatementStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Canceled => "canceled",
-        }
-    }
-
-    fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Canceled)
-    }
-}
-
 /// One tracked statement: request text, lifecycle state, and the retained result batches the
 /// result endpoint serves from.
 struct Statement {
@@ -218,13 +198,26 @@ struct Statement {
     row_count: Option<usize>,
     batches: Vec<RecordBatch>,
     submitted_at_ms: i64,
-    /// Monotonic submit instant backing `duration_ms` and the TTL eviction.
+    /// Monotonic submit instant backing `duration_ms`.
+    ///
+    /// Live duration only. Age arithmetic uses `submitted_at_ms`, because `Instant` has no epoch
+    /// and cannot be reconstructed for a statement that came off the journal 30 days later.
     submitted: std::time::Instant,
     duration_ms: Option<i64>,
     /// Signals the execution task to drop the query future (best-effort cancel).
     cancel: watch::Sender<bool>,
-    /// Insertion order; drives oldest-first eviction and newest-first listing.
+    /// Insertion order; drives oldest-first eviction and newest-first listing. Shared with the
+    /// journal's sequence, so a replayed statement and a live one sort against each other.
     seq: u64,
+    /// Where the statement was submitted from — `rest` or `connect` (#134).
+    source: Source,
+    /// The Connect session, when there is one. Half of the `client_op_id` alias key.
+    session: Option<String>,
+    /// The client's own operation id, validated. Never used as a path or a fold key.
+    client_op_id: Option<String>,
+    /// Fires when this statement's terminal record is fsynced; taken by whoever answers the
+    /// client, at most once.
+    durable_ack: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl Statement {
@@ -238,13 +231,54 @@ impl Statement {
             row_count: self.row_count,
             submitted_at_ms: self.submitted_at_ms,
             duration_ms: self.duration_ms,
+            source: self.source,
+            client_op_id: self.client_op_id.clone(),
+            tier: Tier::Hot,
+        }
+    }
+
+    /// The journal record for this statement's current (terminal) state — self-contained, so
+    /// compaction can drop everything older without losing it.
+    fn to_folded(&self, id: &str, sql_mode: SqlMode, last_seq: u64) -> FoldedStatement {
+        FoldedStatement {
+            id: id.to_string(),
+            client_op_id: self.client_op_id.clone(),
+            session: self.session.clone(),
+            source: self.source,
+            sql: sql_mode.encode(&self.sql),
+            sql_encoding: sql_mode.as_str().to_string(),
+            status: self.status,
+            error: self.error.clone(),
+            schema: self.schema.clone(),
+            rows: self.row_count.map(|r| r as u64),
+            submitted_at_ms: self.submitted_at_ms,
+            duration_ms: self.duration_ms,
+            seq: self.seq,
+            last_seq,
+            rank: RecordKind::Snapshot.rank(),
+        }
+    }
+}
+
+/// Which tier answered a read: `hot` is live and cancellable, `history` is archival.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    Hot,
+    History,
+}
+
+impl Tier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hot => "hot",
+            Self::History => "history",
         }
     }
 }
 
 /// A point-in-time copy of a statement's public state (no result batches).
 #[derive(Clone)]
-struct StatementSnapshot {
+pub(crate) struct StatementSnapshot {
     id: String,
     sql: String,
     status: StatementStatus,
@@ -253,11 +287,39 @@ struct StatementSnapshot {
     row_count: Option<usize>,
     submitted_at_ms: i64,
     duration_ms: Option<i64>,
+    source: Source,
+    client_op_id: Option<String>,
+    tier: Tier,
+}
+
+impl StatementSnapshot {
+    fn from_history(st: &FoldedStatement) -> Self {
+        Self {
+            id: st.id.clone(),
+            sql: st.sql.clone(),
+            status: st.status,
+            error: st.error.clone(),
+            schema: st.schema.clone(),
+            row_count: st.rows.map(|r| r as usize),
+            submitted_at_ms: st.submitted_at_ms,
+            duration_ms: st.duration_ms,
+            source: st.source,
+            client_op_id: st.client_op_id.clone(),
+            tier: Tier::History,
+        }
+    }
 }
 
 /// Terminal result of an execution task, folded into the store by [`StatementStore::finish`].
-enum ExecOutcome {
+pub(crate) enum ExecOutcome {
     Succeeded(Vec<RecordBatch>),
+    /// A succeeded statement whose rows the store does not retain — the Connect path, whose
+    /// batches are already on their way to the client as Arrow IPC. Result retention for those
+    /// is PR2 (`results/<id>.arrow`), not a second copy in memory.
+    SucceededSummary {
+        rows: Option<usize>,
+        schema: Option<Vec<(String, String)>>,
+    },
     Failed(String),
     Canceled,
 }
@@ -270,93 +332,336 @@ enum CancelOutcome {
     AlreadyTerminal,
 }
 
+/// The caps and TTLs the store enforces. Defaults are today's behaviour exactly, which is what
+/// `OXIDANT_HISTORY=off` reverts to.
+#[derive(Debug, Clone)]
+struct Limits {
+    history_on: bool,
+    /// Hot-tier count cap, and the history tier's too when history is on.
+    max_records: usize,
+    hot_ttl: Duration,
+    max_per_session: usize,
+    retention_days: i64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            history_on: false,
+            max_records: MAX_STATEMENTS,
+            hot_ttl: STATEMENT_TTL,
+            max_per_session: usize::MAX,
+            retention_days: 0,
+        }
+    }
+}
+
 #[derive(Default)]
 struct StoreInner {
+    /// Hot tier: live and recently-terminal statements, with their batches and cancel channels.
     statements: std::collections::HashMap<String, Statement>,
+    /// History tier: folded snapshots off the journal. No batches, no cancel channel, and
+    /// **never touched by TTL eviction** — replay that the first new submit deletes is not replay.
+    history: std::collections::HashMap<String, FoldedStatement>,
+    /// `(session, client_op_id) → stmt-id`. The pair is the key: `client_op_id` alone would merge
+    /// two sessions that both used `op-1`.
+    alias: std::collections::HashMap<(String, String), String>,
     next_seq: u64,
+    limits: Limits,
+    /// How the SQL text is written down — echoed into demoted entries so a statement reads the
+    /// same before and after a restart.
+    sql_mode: SqlMode,
+    /// Wall clock of the last retention pass, so the sweep is not re-run on every submit.
+    last_sweep_ms: i64,
 }
 
 impl StoreInner {
-    /// Drop entries older than [`STATEMENT_TTL`].
+    /// Drop hot entries older than the hot TTL.
+    ///
+    /// Age is wall-clock (`submitted_at_ms`), not `Instant`: a replayed statement has no
+    /// `Instant`, and synthesizing one from a 30-day-old timestamp saturates. With history on, an
+    /// expiring terminal statement is *demoted* to the history tier rather than dropped, and a
+    /// non-terminal one is never evicted at all.
     fn evict_expired(&mut self) {
-        let now = std::time::Instant::now();
-        self.statements
-            .retain(|_, s| now.duration_since(s.submitted) < STATEMENT_TTL);
-    }
-}
-
-/// In-memory statement registry shared by the REST handlers and the execution tasks.
-#[derive(Clone)]
-struct StatementStore {
-    inner: Arc<Mutex<StoreInner>>,
-    /// Wakes `?wait=true` submitters when any statement reaches a terminal state.
-    notify: Arc<Notify>,
-}
-
-impl StatementStore {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(StoreInner::default())),
-            notify: Arc::new(Notify::new()),
+        let now = oxidant_observability::now_ms();
+        let ttl_ms = self.limits.hot_ttl.as_millis() as i64;
+        let expired: Vec<String> = self
+            .statements
+            .iter()
+            .filter(|(_, s)| now.saturating_sub(s.submitted_at_ms) >= ttl_ms)
+            .filter(|(_, s)| !self.limits.history_on || s.status.is_terminal())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.demote(&id);
         }
     }
 
-    /// Insert a new `pending` statement, evicting expired entries and the oldest entries once
-    /// the count cap is exceeded. Returns the statement id and the receiver end of its cancel
-    /// watch (the execution task selects on it).
-    fn insert(&self, sql: &str) -> (String, watch::Receiver<bool>) {
-        let (tx, rx) = watch::channel(false);
-        let id = Uuid::new_v4().to_string();
-        let mut inner = self.inner.lock().expect("statement store poisoned");
-        inner.evict_expired();
-        let seq = inner.next_seq;
-        inner.next_seq += 1;
-        inner.statements.insert(
-            id.clone(),
-            Statement {
-                sql: sql.to_string(),
-                status: StatementStatus::Pending,
-                error: None,
-                schema: None,
-                row_count: None,
-                batches: Vec::new(),
-                submitted_at_ms: oxidant_observability::now_ms(),
-                submitted: std::time::Instant::now(),
-                duration_ms: None,
-                cancel: tx,
-                seq,
-            },
-        );
-        while inner.statements.len() > MAX_STATEMENTS {
-            let Some(oldest) = inner
+    /// Take a statement out of the hot tier, keeping its folded state when history is on.
+    fn demote(&mut self, id: &str) {
+        let Some(st) = self.statements.remove(id) else {
+            return;
+        };
+        if !self.limits.history_on {
+            return;
+        }
+        let last_seq = st.seq;
+        let folded = st.to_folded(id, self.sql_mode, last_seq);
+        self.history.insert(id.to_string(), folded);
+    }
+
+    /// Enforce the hot-tier count cap, oldest first.
+    fn enforce_hot_cap(&mut self) {
+        while self.statements.len() > self.limits.max_records {
+            // With history on, a non-terminal statement is never the victim: it holds no result
+            // batches, so evicting it buys almost no memory, and it would drop the cancel channel
+            // of a query that is still running. The cap yields instead — bounded in practice by
+            // how many statements can be in flight at once. With history off this is today's
+            // unconditional oldest-first eviction, unchanged.
+            let oldest = self
                 .statements
                 .iter()
+                .filter(|(_, s)| !self.limits.history_on || s.status.is_terminal())
                 .min_by_key(|(_, s)| s.seq)
-                .map(|(id, _)| id.clone())
-            else {
-                break;
-            };
-            inner.statements.remove(&oldest);
+                .map(|(id, _)| id.clone());
+            let Some(oldest) = oldest else { break };
+            self.demote(&oldest);
+        }
+    }
+}
+
+/// In-memory statement registry shared by the REST handlers and the execution tasks, backed by
+/// the durable journal when history is on.
+#[derive(Clone)]
+pub(crate) struct StatementStore {
+    inner: Arc<Mutex<StoreInner>>,
+    /// Wakes `?wait=true` submitters when any statement reaches a terminal state.
+    notify: Arc<Notify>,
+    /// `None` — `OXIDANT_HISTORY=off` — is exactly today's volatile store.
+    history: Option<Arc<HistoryRuntime>>,
+}
+
+impl StatementStore {
+    /// Today's volatile store: 1000 statements, 1 h TTL, nothing on disk.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(StoreInner::default())),
+            notify: Arc::new(Notify::new()),
+            history: None,
+        }
+    }
+
+    /// Boot the durable store: lock the data dir, replay the journal into the history tier, and
+    /// keep writing to it. `Err` fails the process's boot, loudly, with the reason.
+    fn with_history(cfg: HistoryConfig) -> Result<Self, String> {
+        let (runtime, fold) = HistoryRuntime::boot(cfg)?;
+        let limits = Limits {
+            history_on: true,
+            max_records: runtime.cfg.max_records,
+            hot_ttl: runtime.cfg.hot_ttl,
+            max_per_session: runtime.cfg.max_per_session,
+            retention_days: runtime.cfg.retention_days,
+        };
+        let mut inner = StoreInner {
+            next_seq: fold.max_seq + 1,
+            limits,
+            sql_mode: runtime.cfg.sql_mode,
+            ..Default::default()
+        };
+        for (id, st) in fold.statements {
+            if let (Some(session), Some(op)) = (st.session.clone(), st.client_op_id.clone()) {
+                inner.alias.insert((session, op), id.clone());
+            }
+            inner.history.insert(id, st);
+        }
+        let replayed = inner.history.len();
+        let store = Self {
+            inner: Arc::new(Mutex::new(inner)),
+            notify: Arc::new(Notify::new()),
+            history: Some(Arc::new(runtime)),
+        };
+        store.sweep_history();
+        tracing::info!(
+            statements = replayed,
+            dir = %store
+                .history
+                .as_ref()
+                .expect("history was just built")
+                .cfg
+                .statements_dir
+                .display(),
+            "statement history replayed"
+        );
+        Ok(store)
+    }
+
+    /// Build from the environment: the durable store, or today's volatile one under
+    /// `OXIDANT_HISTORY=off`.
+    pub(crate) fn from_env(role: &str, port: u16) -> Result<Self, String> {
+        let cfg = HistoryConfig::from_env(role, port)?;
+        if !cfg.enabled {
+            return Ok(Self::new());
+        }
+        Self::with_history(cfg)
+    }
+
+    /// Insert a new `pending` statement from the REST API.
+    fn insert(&self, sql: &str) -> (String, watch::Receiver<bool>) {
+        self.insert_from(sql, Source::Rest, None, None)
+    }
+
+    /// Insert a new `pending` statement, journal its `submitted` record, and return the
+    /// engine-minted id plus the receiver end of its cancel watch.
+    ///
+    /// The id is **always** `stmt-<uuid-v4>`, on both paths. A client-supplied `operation_id` is
+    /// kept as a validated alias and never reaches a path or a fold key: Connect op ids are
+    /// client-controlled and scoped per session, so using one as a filename is a traversal bug
+    /// and using it as an identity merges two sessions that both said `op-1` (§4b).
+    pub(crate) fn insert_from(
+        &self,
+        sql: &str,
+        source: Source,
+        session: Option<&str>,
+        client_op_id: Option<&str>,
+    ) -> (String, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        let id = format!("stmt-{}", Uuid::new_v4());
+        let alias = match client_op_id {
+            Some(raw) if !raw.is_empty() => match validate_alias(raw) {
+                Some(valid) => Some(valid),
+                None => {
+                    // A logging concern must not break a query: the statement runs, the alias is
+                    // dropped, and the session is named once.
+                    tracing::warn!(
+                        session = session.unwrap_or("-"),
+                        "connect operation_id is not a valid alias ([A-Za-z0-9._:-]{{1,128}}); \
+                         recording it as null"
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
+        let submitted_at_ms = oxidant_observability::now_ms();
+        let seq = {
+            let mut inner = self.inner.lock().expect("statement store poisoned");
+            inner.evict_expired();
+            let seq = self.next_seq(&mut inner);
+            inner.statements.insert(
+                id.clone(),
+                Statement {
+                    sql: sql.to_string(),
+                    status: StatementStatus::Pending,
+                    error: None,
+                    schema: None,
+                    row_count: None,
+                    batches: Vec::new(),
+                    submitted_at_ms,
+                    submitted: std::time::Instant::now(),
+                    duration_ms: None,
+                    cancel: tx,
+                    seq,
+                    source,
+                    session: session.map(str::to_string),
+                    client_op_id: alias.clone(),
+                    durable_ack: None,
+                },
+            );
+            if let (Some(session), Some(alias)) = (session, alias.as_deref()) {
+                inner
+                    .alias
+                    .insert((session.to_string(), alias.to_string()), id.clone());
+            }
+            inner.enforce_hot_cap();
+            seq
+        };
+
+        if let Some(history) = &self.history {
+            history.journal.append(JournalRecord {
+                v: RECORD_VERSION,
+                kind: RecordKind::Submitted,
+                seq,
+                last_seq: None,
+                id: id.clone(),
+                client_op_id: alias,
+                session: session.map(str::to_string),
+                source: Some(source.as_str().to_string()),
+                sql: Some(history.cfg.sql_mode.encode(sql)),
+                sql_encoding: Some(history.cfg.sql_mode.as_str().to_string()),
+                status: Some(StatementStatus::Pending),
+                error: None,
+                schema: None,
+                rows: None,
+                submitted_at_ms,
+                duration_ms: None,
+                ts: rfc3339_from_ms(submitted_at_ms),
+            });
+            self.sweep_history();
         }
         (id, rx)
     }
 
+    /// Next sequence. With history on it comes from the journal, so statement order and record
+    /// order are one line; without, it is the store's own counter, exactly as today.
+    fn next_seq(&self, inner: &mut StoreInner) -> u64 {
+        match &self.history {
+            Some(history) => history.journal.next_seq(),
+            None => {
+                let seq = inner.next_seq;
+                inner.next_seq += 1;
+                seq
+            }
+        }
+    }
+
     /// `pending` → `running`. A cancel that landed before the task started wins (the
     /// statement is already terminal and left alone).
-    fn mark_running(&self, id: &str) {
-        let mut inner = self.inner.lock().expect("statement store poisoned");
-        if let Some(st) = inner.statements.get_mut(id) {
-            if st.status == StatementStatus::Pending {
-                st.status = StatementStatus::Running;
+    pub(crate) fn mark_running(&self, id: &str) {
+        let record = {
+            let mut inner = self.inner.lock().expect("statement store poisoned");
+            let Some(st) = inner.statements.get_mut(id) else {
+                return;
+            };
+            if st.status != StatementStatus::Pending {
+                return;
             }
+            st.status = StatementStatus::Running;
+            self.history.as_ref().map(|_| JournalRecord {
+                v: RECORD_VERSION,
+                kind: RecordKind::Running,
+                seq: st.seq,
+                last_seq: None,
+                id: id.to_string(),
+                client_op_id: st.client_op_id.clone(),
+                session: st.session.clone(),
+                source: Some(st.source.as_str().to_string()),
+                sql: None,
+                sql_encoding: None,
+                status: Some(StatementStatus::Running),
+                error: None,
+                schema: None,
+                rows: None,
+                submitted_at_ms: st.submitted_at_ms,
+                duration_ms: None,
+                ts: now_rfc3339(),
+            })
+        };
+        // Progress chatter: dropped and counted if the writer is behind, never waited on.
+        if let (Some(history), Some(record)) = (&self.history, record) {
+            history.journal.append(record);
         }
     }
 
     /// Fold an execution task's terminal outcome into the store. Never overwrites a terminal
     /// state — a cancel that landed first keeps the statement `canceled` (and the late result
     /// batches are dropped here, freeing their memory).
-    fn finish(&self, id: &str, outcome: ExecOutcome) {
-        {
+    ///
+    /// The terminal record is handed to the journal *before* memory is published and the waiters
+    /// are woken, and its ack is parked on the statement for whoever answers the client. The
+    /// query itself never waits: the wait is on the response path and is bounded by
+    /// `OXIDANT_HISTORY_ACK_TIMEOUT_MS`.
+    pub(crate) fn finish(&self, id: &str, outcome: ExecOutcome) {
+        let record = {
             let mut inner = self.inner.lock().expect("statement store poisoned");
             let Some(st) = inner.statements.get_mut(id) else {
                 return; // evicted
@@ -372,6 +677,11 @@ impl StatementStore {
                     st.batches = batches;
                     st.status = StatementStatus::Succeeded;
                 }
+                ExecOutcome::SucceededSummary { rows, schema } => {
+                    st.row_count = rows;
+                    st.schema = schema;
+                    st.status = StatementStatus::Succeeded;
+                }
                 ExecOutcome::Failed(error) => {
                     st.error = Some(error);
                     st.status = StatementStatus::Failed;
@@ -380,56 +690,250 @@ impl StatementStore {
                     st.status = StatementStatus::Canceled;
                 }
             }
-        }
+            self.terminal_record(id, st)
+        };
+        // Handing the record over can wait for room in the writer channel, so it happens with
+        // the store mutex released — every submit, list and status call takes that mutex, and a
+        // slow disk must not be able to stall them. The ack is parked before the waiters are
+        // woken, so whoever answers the client finds it.
+        self.hand_over_terminal(id, record);
         self.notify.notify_waiters();
     }
 
-    /// Best-effort cancel: mark `canceled` and signal the execution task to drop the query
-    /// future. Terminal statements are left untouched.
-    fn cancel(&self, id: &str) -> CancelOutcome {
-        let outcome = {
+    /// Build the self-contained terminal record for a statement, if history is on.
+    fn terminal_record(&self, id: &str, st: &Statement) -> Option<JournalRecord> {
+        let history = self.history.as_ref()?;
+        let last_seq = history.journal.next_seq();
+        Some(
+            st.to_folded(id, history.cfg.sql_mode, last_seq)
+                .to_snapshot(),
+        )
+    }
+
+    /// Queue a terminal record and park its durability ack on the statement.
+    fn hand_over_terminal(&self, id: &str, record: Option<JournalRecord>) {
+        let (Some(history), Some(record)) = (self.history.clone(), record) else {
+            return;
+        };
+        let ack = history
+            .journal
+            .append_durable(record, history.cfg.ack_timeout);
+        let mut inner = self.inner.lock().expect("statement store poisoned");
+        if let Some(st) = inner.statements.get_mut(id) {
+            st.durable_ack = ack;
+        }
+    }
+
+    /// Wait for a statement's terminal record to be durable. `true` means it is not, and the
+    /// answer must say so rather than implying a durability it does not have.
+    pub(crate) async fn await_durable(&self, id: &str) -> bool {
+        let Some(history) = self.history.clone() else {
+            return false;
+        };
+        let ack = {
             let mut inner = self.inner.lock().expect("statement store poisoned");
             match inner.statements.get_mut(id) {
-                None => CancelOutcome::NotFound,
-                Some(st) if st.status.is_terminal() => CancelOutcome::AlreadyTerminal,
+                Some(st) => st.durable_ack.take(),
+                // Already demoted to the history tier, which only happens after the record was
+                // written; or the ack was taken by whoever answered first.
+                None => return false,
+            }
+        };
+        let Some(ack) = ack else {
+            return history.journal.is_degraded();
+        };
+        match tokio::time::timeout(history.cfg.ack_timeout, ack).await {
+            Ok(Ok(())) => false,
+            _ => {
+                history.journal.mark_degraded();
+                true
+            }
+        }
+    }
+
+    /// Best-effort cancel: mark `canceled` and signal the execution task to drop the query
+    /// future. Terminal statements are left untouched, and so is anything in the history tier —
+    /// an archival statement has no future to cancel.
+    fn cancel(&self, id: &str) -> CancelOutcome {
+        let (outcome, record) = {
+            let mut inner = self.inner.lock().expect("statement store poisoned");
+            let archival = !inner.statements.contains_key(id) && inner.history.contains_key(id);
+            match inner.statements.get_mut(id) {
+                None if archival => (CancelOutcome::AlreadyTerminal, None),
+                None => (CancelOutcome::NotFound, None),
+                Some(st) if st.status.is_terminal() => (CancelOutcome::AlreadyTerminal, None),
                 Some(st) => {
                     st.status = StatementStatus::Canceled;
                     st.duration_ms = Some(st.submitted.elapsed().as_millis() as i64);
                     let _ = st.cancel.send(true);
-                    CancelOutcome::Canceled
+                    let record = self.terminal_record(id, st);
+                    (CancelOutcome::Canceled, record)
                 }
             }
         };
         if outcome == CancelOutcome::Canceled {
+            self.hand_over_terminal(id, record);
             self.notify.notify_waiters();
         }
         outcome
     }
 
-    fn snapshot(&self, id: &str) -> Option<StatementSnapshot> {
-        let inner = self.inner.lock().expect("statement store poisoned");
-        inner.statements.get(id).map(|st| st.snapshot(id))
-    }
-
-    /// Snapshot + retained result batches for the result endpoint.
-    fn result(&self, id: &str) -> Option<(StatementSnapshot, Vec<RecordBatch>)> {
+    /// Hot tier first, then history — `GET /api/v1/statements/{id}` reads through both.
+    pub(crate) fn snapshot(&self, id: &str) -> Option<StatementSnapshot> {
         let inner = self.inner.lock().expect("statement store poisoned");
         inner
             .statements
             .get(id)
-            .map(|st| (st.snapshot(id), st.batches.clone()))
+            .map(|st| st.snapshot(id))
+            .or_else(|| inner.history.get(id).map(StatementSnapshot::from_history))
     }
 
-    /// Newest-first snapshots, capped at [`LIST_CAP`].
-    fn list(&self) -> Vec<StatementSnapshot> {
+    /// Snapshot + retained result batches for the result endpoint. A history-tier statement has
+    /// no batches: the caller answers `410 result_expired`, not an empty result set.
+    fn result(&self, id: &str) -> Option<(StatementSnapshot, Vec<RecordBatch>)> {
         let inner = self.inner.lock().expect("statement store poisoned");
-        let mut items: Vec<(&String, &Statement)> = inner.statements.iter().collect();
-        items.sort_by(|a, b| b.1.seq.cmp(&a.1.seq));
-        items
-            .into_iter()
-            .take(LIST_CAP)
-            .map(|(id, st)| st.snapshot(id))
-            .collect()
+        if let Some(st) = inner.statements.get(id) {
+            return Some((st.snapshot(id), st.batches.clone()));
+        }
+        inner
+            .history
+            .get(id)
+            .map(|st| (StatementSnapshot::from_history(st), Vec::new()))
+    }
+
+    /// Newest-first snapshots across both tiers, capped at [`LIST_CAP`].
+    pub(crate) fn list(&self) -> Vec<StatementSnapshot> {
+        let inner = self.inner.lock().expect("statement store poisoned");
+        let mut items: Vec<(u64, StatementSnapshot)> = inner
+            .statements
+            .iter()
+            .map(|(id, st)| (st.seq, st.snapshot(id)))
+            .collect();
+        items.extend(
+            inner
+                .history
+                .iter()
+                .filter(|(id, _)| !inner.statements.contains_key(*id))
+                .map(|(_, st)| (st.seq, StatementSnapshot::from_history(st))),
+        );
+        items.sort_by(|a, b| b.0.cmp(&a.0));
+        items.into_iter().take(LIST_CAP).map(|(_, s)| s).collect()
+    }
+
+    /// Flush the journal and stop its writer thread — the clean-shutdown seam a restart test
+    /// needs so the next boot reads a settled directory.
+    #[cfg(test)]
+    fn shutdown_for_test(&self) {
+        if let Some(history) = &self.history {
+            history.journal.shutdown();
+        }
+    }
+
+    /// Resolve a Connect `(session, operation_id)` alias to the engine-minted statement id.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn resolve_alias(&self, session: &str, client_op_id: &str) -> Option<String> {
+        let inner = self.inner.lock().expect("statement store poisoned");
+        inner
+            .alias
+            .get(&(session.to_string(), client_op_id.to_string()))
+            .cloned()
+    }
+
+    /// Retention over the history tier: age, then the per-session share, then the global cap.
+    ///
+    /// Statement-granular by construction — each eviction appends a tombstone and lets compaction
+    /// physically drop the record, so a segment is never deleted out from under a statement whose
+    /// `submitted` and terminal records straddle it. A non-terminal statement is never evicted.
+    fn sweep_history(&self) {
+        let Some(history) = self.history.clone() else {
+            return;
+        };
+        let now = oxidant_observability::now_ms();
+        let tombstones = {
+            let mut inner = self.inner.lock().expect("statement store poisoned");
+            // The age sweep is O(n); throttle it so a submit storm does not re-scan 10,000
+            // records per statement. The caps below are checked every time.
+            let due = now.saturating_sub(inner.last_sweep_ms) >= SWEEP_INTERVAL_MS;
+            if due {
+                inner.last_sweep_ms = now;
+            }
+            let mut evicted: Vec<(String, i64)> = Vec::new();
+            if due && inner.limits.retention_days > 0 {
+                let cutoff = now - inner.limits.retention_days * 86_400_000;
+                let stale: Vec<String> = inner
+                    .history
+                    .iter()
+                    .filter(|(_, st)| st.status.is_terminal() && st.submitted_at_ms < cutoff)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in stale {
+                    if let Some(st) = inner.history.remove(&id) {
+                        evicted.push((id, st.submitted_at_ms));
+                    }
+                }
+            }
+            // Per-session share first, so a noisy session evicts itself before it can push
+            // another tenant's history out of the global cap.
+            let per_session = inner.limits.max_per_session;
+            if per_session < usize::MAX {
+                let mut by_session: std::collections::HashMap<String, Vec<(u64, String)>> =
+                    std::collections::HashMap::new();
+                for (id, st) in inner.history.iter() {
+                    if let Some(session) = &st.session {
+                        if st.status.is_terminal() {
+                            by_session
+                                .entry(session.clone())
+                                .or_default()
+                                .push((st.seq, id.clone()));
+                        }
+                    }
+                }
+                for (_, mut ids) in by_session {
+                    if ids.len() <= per_session {
+                        continue;
+                    }
+                    ids.sort_by_key(|(seq, _)| *seq);
+                    let excess = ids.len() - per_session;
+                    for (_, id) in ids.into_iter().take(excess) {
+                        if let Some(st) = inner.history.remove(&id) {
+                            evicted.push((id, st.submitted_at_ms));
+                        }
+                    }
+                }
+            }
+            while inner.history.len() > inner.limits.max_records {
+                let oldest = inner
+                    .history
+                    .iter()
+                    .filter(|(_, st)| st.status.is_terminal())
+                    .min_by_key(|(_, st)| st.seq)
+                    .map(|(id, _)| id.clone());
+                let Some(oldest) = oldest else {
+                    // Everything left is non-terminal: running is never evicted, so the cap
+                    // yields rather than the statement.
+                    break;
+                };
+                if let Some(st) = inner.history.remove(&oldest) {
+                    evicted.push((oldest, st.submitted_at_ms));
+                }
+            }
+            let gone: std::collections::HashSet<&str> =
+                evicted.iter().map(|(id, _)| id.as_str()).collect();
+            inner
+                .alias
+                .retain(|_, target| !gone.contains(target.as_str()));
+            drop(gone);
+            evicted
+        };
+        // Best-effort, like every other non-terminal write: a tombstone lost to backpressure
+        // means the statement is folded again at the next boot and re-evicted by the next sweep
+        // — self-healing, and never a lost statement.
+        for (id, submitted_at_ms) in tombstones {
+            let seq = history.journal.next_seq();
+            history
+                .journal
+                .append(JournalRecord::tombstone(&id, seq, submitted_at_ms));
+        }
     }
 
     /// Block until the statement reaches a terminal state or `timeout` elapses (returns the
@@ -453,6 +957,16 @@ impl StatementStore {
             let _ = tokio::time::timeout_at(deadline, notified).await;
         }
     }
+}
+
+/// `^[A-Za-z0-9._:-]{1,128}$`, hand-rolled because the tree has no regex dependency.
+fn validate_alias(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.len() > 128 {
+        return None;
+    }
+    raw.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+        .then(|| raw.to_string())
 }
 
 /// Backtick-quote an identifier, stripping any existing backticks first so we
@@ -503,7 +1017,7 @@ async fn fetch_columns(
 }
 
 /// `{"name","type"}` pairs of a result's Arrow schema (type names via `Display`, e.g. "Int64").
-fn schema_fields(batches: &[RecordBatch]) -> Option<Vec<(String, String)>> {
+pub(crate) fn schema_fields(batches: &[RecordBatch]) -> Option<Vec<(String, String)>> {
     batches.first().map(|b| {
         b.schema()
             .fields()
@@ -531,7 +1045,14 @@ fn snapshot_json(s: &StatementSnapshot) -> Value {
         "sql": s.sql,
         "status": s.status.as_str(),
         "submittedAtMs": s.submitted_at_ms,
+        // Where it came from (`rest` / `connect`) and which tier answered (`hot` / `history`).
+        // The tier is what tells a client a statement is still cancellable.
+        "source": s.source.as_str(),
+        "tier": s.tier.as_str(),
     });
+    if let Some(op) = &s.client_op_id {
+        v["clientOperationId"] = json!(op);
+    }
     if let Some(error) = &s.error {
         v["error"] = json!(error);
     }
@@ -568,12 +1089,30 @@ pub fn router(service: Arc<OxidantService>) -> Router {
     let log_buffer = LOG_BUFFER
         .get_or_init(|| LogBuffer::new(MAX_LOG_LINES))
         .clone();
+    // The statement store is attached to the service at boot ([`init_statement_store`]) so the
+    // Connect path writes into the same history this router reads. A service that never had one
+    // attached (an embedded caller building the router directly) gets today's volatile store.
+    let store = service
+        .statement_store()
+        .cloned()
+        .unwrap_or_else(StatementStore::new);
     app(RestState {
         service,
-        store: StatementStore::new(),
+        store,
         log_buffer,
         status_token: oxidant_ui_server::status::status_token_from_env().map(Into::into),
     })
+}
+
+/// Build the process's statement store from the environment and attach it to `service`.
+///
+/// Called once at boot, before anything can execute, because both the REST API and Connect's
+/// `ExecutePlan` record into it. `Err` is a boot failure with the reason already spelled out —
+/// a data dir another process holds, or a root that names an object store.
+pub fn init_statement_store(service: &OxidantService, role: &str, port: u16) -> Result<(), String> {
+    let store = StatementStore::from_env(role, port)?;
+    service.attach_statement_store(store);
+    Ok(())
 }
 
 fn app(state: RestState) -> Router {
@@ -629,7 +1168,16 @@ async fn submit_statement(
         let timeout = Duration::from_secs(params.timeout.unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS));
         return match state.store.wait_terminal(&id, timeout).await {
             // On timeout the snapshot may still be `running` — the contract allows that.
-            Some(snap) => (StatusCode::OK, Json(snapshot_json(&snap))).into_response(),
+            Some(snap) => {
+                let mut body = snapshot_json(&snap);
+                // The response, not the query, waits for the terminal record to be durable —
+                // bounded by `OXIDANT_HISTORY_ACK_TIMEOUT_MS`. If the wait times out the answer
+                // still goes out, saying plainly that history is degraded for this statement.
+                if snap.status.is_terminal() && state.store.await_durable(&id).await {
+                    body["history"] = json!("degraded");
+                }
+                (StatusCode::OK, Json(body)).into_response()
+            }
             None => error_response(StatusCode::NOT_FOUND, "unknown statement id"),
         };
     }
@@ -674,7 +1222,12 @@ async fn list_statements(State(state): State<RestState>) -> Json<Value> {
                 "sql": s.sql,
                 "status": s.status.as_str(),
                 "submittedAtMs": s.submitted_at_ms,
+                "source": s.source.as_str(),
+                "tier": s.tier.as_str(),
             });
+            if let Some(op) = &s.client_op_id {
+                v["clientOperationId"] = json!(op);
+            }
             if let Some(d) = s.duration_ms {
                 v["durationMs"] = json!(d);
             }
@@ -704,6 +1257,13 @@ async fn get_result(
             StatusCode::CONFLICT,
             "statement result is only available once it has succeeded",
         );
+    }
+    if snap.tier == Tier::History {
+        // The statement is known and succeeded, but its rows are gone: it was replayed from the
+        // journal, or its hot entry aged out. `404` would say "no such id", which is false.
+        // Reading the rows back off disk is PR2 (`results/<id>.arrow`); until then this is the
+        // honest answer, and it is the same code PR2 falls through to.
+        return error_response(StatusCode::GONE, "result_expired");
     }
     let limit = params.limit.unwrap_or(DEFAULT_RESULT_LIMIT);
     match params.format.as_deref().unwrap_or("json") {
@@ -1143,6 +1703,8 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http_body_util::BodyExt;
+    use oxidant_proto::spark::connect as sc;
+    use sc::spark_connect_service_server::SparkConnectService;
     use tower::ServiceExt;
 
     /// An ephemeral loopback port, taken by binding and immediately releasing it — the
@@ -1746,5 +2308,332 @@ mod tests {
         let id = body["statementId"].as_str().unwrap().to_string();
         let (_, result) = get_json(&app, &format!("/api/v1/statements/{id}/result")).await;
         assert_eq!(result["rows"][0]["n"], 2);
+    }
+
+    // ---- Durable statement history (docs/query-history-durability.md, PR1) ----
+
+    /// A durable store rooted at a tempdir, with the shipped defaults.
+    fn history_store(dir: &std::path::Path) -> StatementStore {
+        StatementStore::with_history(HistoryConfig::for_root(dir)).expect("boot history")
+    }
+
+    fn history_store_with(
+        dir: &std::path::Path,
+        tune: impl FnOnce(&mut HistoryConfig),
+    ) -> StatementStore {
+        let mut cfg = HistoryConfig::for_root(dir);
+        tune(&mut cfg);
+        StatementStore::with_history(cfg).expect("boot history")
+    }
+
+    /// The #134 acceptance: a Connect `SqlCommand` joins the statements rail, tagged
+    /// `source: "connect"`, and is still there after the process restarts.
+    #[tokio::test]
+    async fn a_connect_sql_command_lands_in_the_rail_and_survives_a_restart() {
+        let _env = crate::distributed::env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = Arc::new(OxidantService::new());
+        service.attach_statement_store(history_store(dir.path()));
+
+        // Exactly the shape PySpark's `spark.sql(...)` sends.
+        let request = tonic::Request::new(sc::ExecutePlanRequest {
+            session_id: "sess-1".to_string(),
+            operation_id: Some("op-1".to_string()),
+            plan: Some(sc::Plan {
+                op_type: Some(sc::plan::OpType::Command(sc::Command {
+                    command_type: Some(sc::command::CommandType::SqlCommand(sc::SqlCommand {
+                        input: Some(crate::sql_relation("SELECT 1 AS n")),
+                        ..Default::default()
+                    })),
+                })),
+            }),
+            ..Default::default()
+        });
+        <OxidantService as SparkConnectService>::execute_plan(&service, request)
+            .await
+            .expect("execute_plan");
+
+        // It is on the rail, over the real HTTP route, before any restart.
+        let state = RestState {
+            service: Arc::clone(&service),
+            store: service.statement_store().expect("attached").clone(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            status_token: None,
+        };
+        let (status, body) = get_json(&app(state), "/api/v1/statements").await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["statements"].as_array().expect("statements");
+        let connect_row = rows
+            .iter()
+            .find(|r| r["sql"] == "SELECT 1 AS n")
+            .expect("the connect statement is listed");
+        assert_eq!(connect_row["source"], "connect");
+        assert_eq!(connect_row["tier"], "hot");
+        assert_eq!(connect_row["clientOperationId"], "op-1");
+        let id = connect_row["statementId"].as_str().expect("id").to_string();
+        assert!(id.starts_with("stmt-"), "engine-minted id, got {id}");
+
+        // Restart: same data dir, brand new store.
+        service
+            .statement_store()
+            .expect("attached")
+            .shutdown_for_test();
+        drop(service);
+        let replayed = history_store(dir.path());
+        let row = replayed
+            .list()
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("the connect statement survived the restart");
+        assert_eq!(row.source, Source::Connect);
+        assert_eq!(row.tier, Tier::History);
+        assert_eq!(row.sql, "SELECT 1 AS n");
+        assert_eq!(row.status, StatementStatus::Succeeded);
+        assert_eq!(row.client_op_id.as_deref(), Some("op-1"));
+        // And the alias index came back with it.
+        assert_eq!(replayed.resolve_alias("sess-1", "op-1"), Some(id));
+    }
+
+    /// The F5 regression: replay that the first new submit deletes is not replay.
+    #[tokio::test]
+    async fn replayed_history_survives_the_first_new_submit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A hot TTL of zero makes every eviction path fire on the very next insert.
+        let store = history_store_with(dir.path(), |c| c.hot_ttl = Duration::from_millis(0));
+        let (old_id, _) = store.insert("SELECT 'replayed'");
+        store.finish(&old_id, ExecOutcome::Succeeded(Vec::new()));
+        store.shutdown_for_test();
+        drop(store);
+
+        let store = history_store_with(dir.path(), |c| c.hot_ttl = Duration::from_millis(0));
+        assert_eq!(store.list().len(), 1, "replayed into the history tier");
+        let (_new, _) = store.insert("SELECT 'fresh'");
+        let listed = store.list();
+        assert!(
+            listed.iter().any(|s| s.id == old_id),
+            "the replayed statement must outlive the first new submit: {:?}",
+            listed.iter().map(|s| s.sql.clone()).collect::<Vec<_>>()
+        );
+        let inner = store.inner.lock().expect("lock");
+        assert_eq!(inner.history.len(), 1, "eviction touched only the hot tier");
+    }
+
+    /// Eviction age is wall-clock, so a statement journaled 40 days ago folds and ages without
+    /// any `Instant` reconstruction (which would saturate past process uptime).
+    #[test]
+    fn retention_ages_on_submitted_at_ms_and_never_evicts_a_running_statement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.max_records = 2);
+        let (running_a, _) = store.insert("SELECT 'a'");
+        store.mark_running(&running_a);
+        let (done_b, _) = store.insert("SELECT 'b'");
+        store.finish(&done_b, ExecOutcome::Failed("boom".to_string()));
+        let (running_c, _) = store.insert("SELECT 'c'");
+        store.mark_running(&running_c);
+        let (done_d, _) = store.insert("SELECT 'd'");
+        store.finish(&done_d, ExecOutcome::Succeeded(Vec::new()));
+
+        let inner = store.inner.lock().expect("lock");
+        assert!(
+            inner.statements.contains_key(&running_a) && inner.statements.contains_key(&running_c),
+            "a running statement is never the eviction victim"
+        );
+        assert!(
+            inner.history.contains_key(&done_b),
+            "the terminal statement was demoted, not dropped"
+        );
+        drop(inner);
+
+        // A 40-day-old terminal statement ages out on `submitted_at_ms` alone.
+        {
+            let mut inner = store.inner.lock().expect("lock");
+            let fortyish = oxidant_observability::now_ms() - 40 * 86_400_000;
+            if let Some(st) = inner.history.get_mut(&done_b) {
+                st.submitted_at_ms = fortyish;
+            }
+            inner.last_sweep_ms = 0;
+        }
+        store.sweep_history();
+        assert!(
+            !store
+                .inner
+                .lock()
+                .expect("lock")
+                .history
+                .contains_key(&done_b),
+            "past OXIDANT_HISTORY_RETENTION_DAYS the statement is pruned"
+        );
+        assert!(
+            store.snapshot(&running_a).is_some(),
+            "and the running statement is still there"
+        );
+    }
+
+    /// `OXIDANT_HISTORY=off` is today's store: no journal, 1000 statements, the 1 h TTL.
+    #[test]
+    fn history_off_reverts_to_todays_behaviour() {
+        let _env = crate::distributed::env_lock();
+        std::env::set_var("OXIDANT_HISTORY", "off");
+        let store = StatementStore::from_env("driver", 0).expect("store");
+        std::env::remove_var("OXIDANT_HISTORY");
+        assert!(store.history.is_none(), "no journal");
+        {
+            let inner = store.inner.lock().expect("lock");
+            assert_eq!(inner.limits.max_records, MAX_STATEMENTS);
+            assert_eq!(inner.limits.hot_ttl, STATEMENT_TTL);
+            assert!(!inner.limits.history_on);
+        }
+        for _ in 0..MAX_STATEMENTS + 5 {
+            store.insert("SELECT 1");
+        }
+        let inner = store.inner.lock().expect("lock");
+        assert_eq!(inner.statements.len(), MAX_STATEMENTS, "today's cap");
+        assert!(inner.history.is_empty(), "no history tier");
+    }
+
+    /// Two sessions that both said `op-1` are two statements, not one merged entry.
+    #[test]
+    fn the_alias_key_is_the_session_and_op_id_pair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store(dir.path());
+        let (one, _) = store.insert_from("SELECT 1", Source::Connect, Some("s1"), Some("op-1"));
+        let (two, _) = store.insert_from("SELECT 2", Source::Connect, Some("s2"), Some("op-1"));
+        assert_ne!(one, two);
+        assert_eq!(store.resolve_alias("s1", "op-1").as_ref(), Some(&one));
+        assert_eq!(store.resolve_alias("s2", "op-1").as_ref(), Some(&two));
+        assert_eq!(store.list().len(), 2);
+    }
+
+    /// A client string never reaches a path: the id is engine-minted and a traversal-shaped
+    /// alias is recorded as null rather than failing the query.
+    #[test]
+    fn a_traversal_shaped_operation_id_is_recorded_as_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store(dir.path());
+        let (id, _) = store.insert_from(
+            "SELECT 1",
+            Source::Connect,
+            Some("s1"),
+            Some("../../../../home/oxidant/.ssh/authorized_keys"),
+        );
+        assert!(id.starts_with("stmt-"));
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "the id is [a-z0-9-] by construction: {id}"
+        );
+        let snap = store.snapshot(&id).expect("statement runs anyway");
+        assert_eq!(snap.client_op_id, None);
+        assert!(store
+            .resolve_alias("s1", "../../../../home/oxidant/.ssh/authorized_keys")
+            .is_none());
+    }
+
+    /// `OXIDANT_HISTORY_SQL=redacted` keeps a credential out of the file, not just out of the
+    /// response.
+    #[test]
+    fn redacted_sql_mode_keeps_the_secret_off_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.sql_mode = SqlMode::Redacted);
+        let (id, _) = store.insert("CREATE TABLE t USING delta OPTIONS(secret 'hunter2')");
+        store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+        store.shutdown_for_test();
+        drop(store);
+
+        let journal_dir = dir.path().join("history").join("statements");
+        let mut on_disk = String::new();
+        for entry in std::fs::read_dir(&journal_dir).expect("read dir").flatten() {
+            if entry.path().is_file() {
+                on_disk.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+            }
+        }
+        assert!(!on_disk.is_empty(), "the journal wrote something");
+        assert!(!on_disk.contains("hunter2"), "secret reached the journal");
+
+        let replayed = history_store(dir.path());
+        let snap = replayed.snapshot(&id).expect("replayed");
+        assert!(snap.sql.contains("<redacted>"), "{}", snap.sql);
+    }
+
+    /// A statement whose rows are gone is `410 result_expired`, not `404 unknown statement id`.
+    #[tokio::test]
+    async fn a_history_tier_result_is_gone_not_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.max_records = 1);
+        let (first, _) = store.insert("SELECT 1");
+        store.finish(&first, ExecOutcome::Succeeded(Vec::new()));
+        // Push it out of the hot tier.
+        let (second, _) = store.insert("SELECT 2");
+        store.finish(&second, ExecOutcome::Succeeded(Vec::new()));
+        assert_eq!(
+            store.snapshot(&first).expect("still known").tier,
+            Tier::History
+        );
+
+        let _env = crate::distributed::env_lock();
+        let state = RestState {
+            service: Arc::new(OxidantService::new()),
+            store,
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            status_token: None,
+        };
+        let router = app(state);
+        let (status, body) = get_json(&router, &format!("/api/v1/statements/{first}/result")).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["error"], "result_expired");
+        let (status, _) = get_json(&router, "/api/v1/statements/stmt-nope/result").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// One session cannot evict another's history: the per-session share is swept first.
+    #[test]
+    fn a_noisy_session_evicts_itself_before_another_tenant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.max_per_session = 2;
+            // Terminal statements demote to the history tier on the next insert, which is where
+            // the per-session sweep applies.
+            c.hot_ttl = Duration::from_millis(0);
+        });
+        for i in 0..5 {
+            let (id, _) =
+                store.insert_from(&format!("SELECT {i}"), Source::Connect, Some("loud"), None);
+            store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+        }
+        let (quiet, _) = store.insert_from("SELECT 'quiet'", Source::Connect, Some("quiet"), None);
+        store.finish(&quiet, ExecOutcome::Succeeded(Vec::new()));
+        // One more submit to demote the last terminal statement out of the hot tier.
+        store.insert("SELECT 'flush'");
+        store.sweep_history();
+
+        let inner = store.inner.lock().expect("lock");
+        let loud = inner
+            .history
+            .values()
+            .filter(|st| st.session.as_deref() == Some("loud"))
+            .count();
+        assert_eq!(loud, 2, "the noisy session is trimmed to its own share");
+        assert!(
+            inner.history.contains_key(&quiet),
+            "the quiet session's history is untouched"
+        );
+    }
+
+    /// The rail says where a statement came from.
+    #[tokio::test]
+    async fn the_statements_rail_reports_source_and_tier() {
+        let (_env, state, app) = test_state();
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/statements?wait=true&timeout=30",
+            json!({ "sql": "SELECT 1" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = get_json(&app, "/api/v1/statements").await;
+        let row = &body["statements"][0];
+        assert_eq!(row["source"], "rest");
+        assert_eq!(row["tier"], "hot");
+        drop(state);
     }
 }

@@ -38,6 +38,7 @@ use sc::spark_connect_service_server::{SparkConnectService, SparkConnectServiceS
 
 mod catalog;
 mod distributed;
+mod history;
 mod pipelines;
 pub mod rest;
 mod streaming;
@@ -132,6 +133,13 @@ pub struct OxidantService {
     dataflow_graphs: pipelines::DataflowGraphRegistry,
     /// Runtime observability store (jobs, stages, SQL plans).
     observability: SharedStore,
+    /// Durable statement history, shared with the REST statement API.
+    ///
+    /// Attached once at boot by [`rest::init_statement_store`] rather than built here, because
+    /// constructing it locks a data dir and replays a journal — work a unit test that just wants
+    /// an engine must not do. When it is absent, Connect executions are simply not recorded, and
+    /// the REST router falls back to today's volatile store.
+    statements: std::sync::OnceLock<rest::StatementStore>,
 }
 
 /// Count cap for the `completed_ops` reattach buffer (`OXIDANT_COMPLETED_OPS_MAX`, default 128).
@@ -268,12 +276,62 @@ impl OxidantService {
             distributed_caches: distributed::DistributedCaches::default(),
             dataflow_graphs: pipelines::DataflowGraphRegistry::default(),
             observability,
+            statements: std::sync::OnceLock::new(),
         }
     }
 
     /// Access the observability store.
     pub fn observability(&self) -> &SharedStore {
         &self.observability
+    }
+
+    /// The statement history, once boot has attached it.
+    pub(crate) fn statement_store(&self) -> Option<&rest::StatementStore> {
+        self.statements.get()
+    }
+
+    /// Attach the process's statement history. Idempotent: the first store wins, so a second
+    /// server in one process shares the first's journal rather than opening a second writer on
+    /// the same files.
+    pub(crate) fn attach_statement_store(&self, store: rest::StatementStore) {
+        let _ = self.statements.set(store);
+    }
+
+    /// Record a Connect execution as `submitted` + `running` and return its engine-minted id.
+    ///
+    /// This is the durable half of issue #134: a `spark.sql(...)` over gRPC now lands in the
+    /// same statements rail a REST submit does, tagged `source: "connect"`, with its SQL on disk
+    /// *at submit* — so a crash mid-statement still leaves a trace of what was running.
+    ///
+    /// The client's `operation_id` is passed through as an alias only. The id that identifies
+    /// the statement (and, in PR2, names its result file) is always engine-minted.
+    fn history_begin(
+        &self,
+        session_id: &str,
+        client_op_id: Option<&str>,
+        sql: &str,
+    ) -> Option<String> {
+        let store = self.statement_store()?;
+        let (id, _cancel) = store.insert_from(
+            sql,
+            history::Source::Connect,
+            Some(session_id),
+            client_op_id,
+        );
+        store.mark_running(&id);
+        Some(id)
+    }
+
+    /// Fold a Connect execution's outcome into the history and wait — bounded — for it to be
+    /// durable before the terminal response goes out.
+    async fn history_finish(&self, id: Option<String>, outcome: rest::ExecOutcome) {
+        let (Some(store), Some(id)) = (self.statement_store(), id) else {
+            return;
+        };
+        store.finish(&id, outcome);
+        // Same contract as `?wait=true`: the *response* waits for the fsync, never the query,
+        // and never for longer than `OXIDANT_HISTORY_ACK_TIMEOUT_MS`.
+        store.await_durable(&id).await;
     }
 
     fn workers_from_config(&self) -> Vec<String> {
@@ -1200,6 +1258,10 @@ impl SparkConnectService for OxidantService {
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        // The client's own operation id, kept only as a history alias. gRPC-level identity —
+        // `Interrupt`, reattach, the in-flight map — is unchanged and still keys on
+        // `operation_id`; nothing here changes what the protocol sees.
+        let client_op_id = req.operation_id.as_deref().filter(|s| !s.is_empty());
         // Track the op as in-flight so `Interrupt` can cancel it (KAN-17); the guard
         // unregisters on every exit path, including the `?` early returns below.
         let _in_flight = InFlightGuard::register(self, &session_id, &operation_id);
@@ -1214,8 +1276,33 @@ impl SparkConnectService for OxidantService {
                 Some(sc::command::CommandType::SqlCommand(c)) => {
                     let sql = sql_command_text(c)
                         .ok_or_else(|| Status::invalid_argument("empty SqlCommand"))?;
-                    self.run_sql_command(&engine, &session_id, &operation_id, &sql)
-                        .await?
+                    let tracked = self.history_begin(&session_id, client_op_id, &sql);
+                    match self
+                        .run_sql_command(&engine, &session_id, &operation_id, &sql)
+                        .await
+                    {
+                        Ok(responses) => {
+                            // A query `SqlCommand` returns a lazy relation, so there is no row
+                            // count to claim here; the `Root` execution that follows records it.
+                            self.history_finish(
+                                tracked,
+                                rest::ExecOutcome::SucceededSummary {
+                                    rows: None,
+                                    schema: None,
+                                },
+                            )
+                            .await;
+                            responses
+                        }
+                        Err(e) => {
+                            self.history_finish(
+                                tracked,
+                                rest::ExecOutcome::Failed(e.message().to_string()),
+                            )
+                            .await;
+                            return Err(e);
+                        }
+                    }
                 }
                 Some(sc::command::CommandType::WriteStreamOperationStart(s)) => {
                     let result = self.handle_write_stream_start(&engine, s).await?;
@@ -1304,10 +1391,31 @@ impl SparkConnectService for OxidantService {
             },
             // A relation (Sql, LocalRelation, ShowString, …): evaluate it and stream the result.
             Some(sc::plan::OpType::Root(rel)) => {
-                let (batches, stats) = self
-                    .eval_relation(&engine, rel, Some(&operation_id))
-                    .await?;
-                self.stream_batches(&session_id, &operation_id, &batches, stats.as_ref())?
+                // Only a `Sql` root carries statement text worth journaling; a DataFrame tree has
+                // no SQL to show in the rail and is left to the observability store.
+                let tracked = relation_sql_text(rel)
+                    .and_then(|sql| self.history_begin(&session_id, client_op_id, &sql));
+                match self.eval_relation(&engine, rel, Some(&operation_id)).await {
+                    Ok((batches, stats)) => {
+                        self.history_finish(
+                            tracked,
+                            rest::ExecOutcome::SucceededSummary {
+                                rows: Some(batches.iter().map(|b| b.num_rows()).sum()),
+                                schema: rest::schema_fields(&batches),
+                            },
+                        )
+                        .await;
+                        self.stream_batches(&session_id, &operation_id, &batches, stats.as_ref())?
+                    }
+                    Err(e) => {
+                        self.history_finish(
+                            tracked,
+                            rest::ExecOutcome::Failed(e.message().to_string()),
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                }
             }
             _ => return Err(Status::unimplemented("empty or unsupported plan")),
         };
@@ -1812,6 +1920,14 @@ fn sql_command_text(c: &sc::SqlCommand) -> Option<String> {
 }
 
 /// A bare `Sql` relation wrapping `query` (the lazy handle returned for a `SqlCommand` query).
+/// The query text of a `Sql` root relation, if that is what this relation is.
+fn relation_sql_text(rel: &sc::Relation) -> Option<String> {
+    match rel.rel_type.as_ref() {
+        Some(sc::relation::RelType::Sql(sql)) if !sql.query.is_empty() => Some(sql.query.clone()),
+        _ => None,
+    }
+}
+
 fn sql_relation(query: &str) -> sc::Relation {
     sc::Relation {
         common: None,
@@ -2213,6 +2329,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let mut cfg = config;
     cfg.observability = Some(store.clone());
     let service = Arc::new(OxidantService::with_config(cfg).await);
+
+    // Durable statement history (docs/query-history-durability.md). Attached before the first
+    // connection is accepted, because both the REST API and Connect's `ExecutePlan` record into
+    // it. A locked data dir or an object-store URL in `OXIDANT_DATA_DIR` fails the boot here,
+    // with the reason and the way out — silently sharing a journal between two processes tears
+    // records, and silently creating an `s3:/bucket/…` directory is the failure `checkpoint.rs`
+    // warns about.
+    rest::init_statement_store(&service, "driver", port).map_err(Error::Io)?;
 
     // Bundled sample data: register the `samples` schema before accepting connections so the
     // first client already sees the tables. Best-effort — registration logs and skips on

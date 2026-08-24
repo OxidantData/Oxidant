@@ -241,7 +241,16 @@ export default function EditorPage() {
                       onClick={() => load(s.statementId)}
                     >
                       <div className="flex justify-between text-sm">
-                        <span className={`stmt-${s.status}`}>{s.status}</span>
+                        <span className="flex items-center gap-1.5">
+                          <span className={`stmt-${s.status}`}>{s.status}</span>
+                          {/* Connect (PySpark) statements share this rail with REST ones since
+                              the durable history landed; the badge says which is which. */}
+                          {s.source && s.source !== "rest" ? (
+                            <span className="rounded bg-hairline px-1 text-[10px] uppercase tracking-wide text-muted">
+                              {s.source}
+                            </span>
+                          ) : null}
+                        </span>
                         <span className="text-muted">{fmtMs(s.durationMs)}</span>
                       </div>
                       <div

@@ -781,9 +781,14 @@ Guards and degradation:
 
 ## 10. Rollout
 
-1. **PR1** — the journal (snapshot records, seq, engine-minted ids, lock, fsync
+1. **PR1** — *shipped* — the journal (snapshot records, seq, engine-minted ids, lock, fsync
    discipline) + replay + the two-tier read model + Connect unification
-   (closes #134's durable half).
+   (closes #134's durable half). Lives in `crates/oxidant-connect/src/history/`; the two-tier
+   store is `rest.rs`. Two deviations, both deliberate: `410 result_expired` ships here rather
+   than in PR2, because a history-tier statement whose rows are gone must not answer `404` or an
+   empty result set in the meantime; and `/api/status` does not yet carry `history_writes` /
+   `history_dropped_events` — the per-response `"history":"degraded"` envelope does, and the
+   status fields land with PR2's disk guards.
 2. **PR2** — result spill (default `always`, byte budget, writer task) + disk
    fallback and `410` in `/result` + result GC.
 3. **PR3** — process-level logging init (driver *and* worker), rolling writer with
