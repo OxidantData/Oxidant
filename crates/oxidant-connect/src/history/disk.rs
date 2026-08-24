@@ -196,10 +196,18 @@ pub(crate) fn is_dump(name: &str) -> bool {
     (name.starts_with("dump-") || name.starts_with("oxidant-")) && name.ends_with(".parquet")
 }
 
-/// Rolled log files in `logs/`, oldest first. The live file, and anything the engine did not
-/// write, are filtered out here rather than at the delete site, so no caller can forget.
+/// Rolled log files in `logs/`, oldest **period** first. The live file, and anything the engine
+/// did not write, are filtered out here rather than at the delete site, so no caller can forget.
+///
+/// Ordered by the period the file covers rather than by mtime: a rolled `.log` that failed to
+/// convert is touched again by every retry pass, and `oxidant-2026-08-23.2.log` sorts *before*
+/// `oxidant-2026-08-23.log` lexicographically (`2` < `l`), so an mtime-then-name sort put the
+/// newest split first and pruned it ahead of the oldest.
 pub(crate) fn rolled_logs(logs_dir: &Path) -> Vec<Prunable> {
-    flat_files(logs_dir, is_rolled_log)
+    rolled_by_period(logs_dir)
+        .into_iter()
+        .map(|(_, _, file)| file)
+        .collect()
 }
 
 /// Support-bundle dumps (§6b), oldest first.
@@ -331,6 +339,18 @@ pub(crate) fn remove(file: &Prunable) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    /// Sorted directory listing, for assertions that name every survivor.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        out.sort();
+        out
+    }
 
     fn touch(path: &Path, bytes: usize) {
         if let Some(parent) = path.parent() {
@@ -406,6 +426,226 @@ mod tests {
         assert!(
             free_bytes(dir.path()).is_some(),
             "the free-space floor cannot be enforced without a mount match"
+        );
+    }
+
+    /// A converted rolled log is still the engine's own file. Matching only `.log` meant step 1
+    /// of the prune order skipped every `.parquet` — i.e. every rolled log more than one sweep
+    /// old — and the budget got paid for out of statement history instead.
+    #[test]
+    fn a_converted_rolled_log_is_still_prunable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        touch(&logs.join(LIVE_LOG), 10);
+        touch(&logs.join("oxidant-2026-08-22.log"), 10);
+        touch(&logs.join("oxidant-2026-08-21.parquet"), 10);
+        touch(&logs.join("oxidant-2026-08-23-14.2.parquet"), 10);
+        // Not ours: the grammar, not a prefix and a suffix.
+        touch(&logs.join("oxidant-nightly.log"), 10);
+        touch(&logs.join("oxidant-backup.parquet"), 10);
+        let mut names: Vec<String> = rolled_logs(&logs)
+            .iter()
+            .map(|p| p.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "oxidant-2026-08-21.parquet".to_string(),
+                "oxidant-2026-08-22.log".to_string(),
+                "oxidant-2026-08-23-14.2.parquet".to_string(),
+            ]
+        );
+        // And a rolled exec log is never mistaken for a support bundle, so one path pointed at
+        // by both `OXIDANT_LOG_DIR` and `OXIDANT_DUMP_DIR` does not select it twice.
+        assert!(!is_dump("oxidant-2026-08-21.parquet"));
+        assert!(is_dump("oxidant-backup.parquet"), "still a bundle shape");
+    }
+
+    /// Retention is evaluated against a file's **whole period**, not its name parsed as a day —
+    /// and weekly therefore rounds *up*, keeping up to six extra days rather than discarding
+    /// days that are inside the window.
+    #[test]
+    fn log_retention_expires_whole_periods_and_weekly_rounds_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 9, 20, 12, 0, 0)
+            .unwrap();
+        touch(&logs.join(LIVE_LOG), 10);
+        // 30 days back from 2026-09-20 is 2026-08-21.
+        touch(&logs.join("oxidant-2026-08-19.parquet"), 10); // ends 08-20 -> out
+        touch(&logs.join("oxidant-2026-08-20.parquet"), 10); // ends 08-21 -> exactly out
+        touch(&logs.join("oxidant-2026-08-21.log"), 10); //     ends 08-22 -> in
+        touch(&logs.join("oxidant-2026-09-19.log"), 10); //     in
+        // ISO 2026-W34 is Mon 08-17 .. Sun 08-23; its period ends 08-24, inside the window, so
+        // it survives even though most of the week is older than 30 days.
+        touch(&logs.join("oxidant-2026-W34.parquet"), 10);
+        // ISO 2026-W33 ends 08-17 -> out.
+        touch(&logs.join("oxidant-2026-W33.parquet"), 10);
+
+        let report = prune_expired_logs(&logs, 30, u64::MAX, now);
+        assert_eq!(report.expired, 3, "{:?}", report);
+        assert_eq!(report.over_cap, 0);
+        let mut left: Vec<String> = std::fs::read_dir(&logs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "oxidant-2026-08-21.log".to_string(),
+                "oxidant-2026-09-19.log".to_string(),
+                "oxidant-2026-W34.parquet".to_string(),
+                LIVE_LOG.to_string(),
+            ],
+            "the live file is never a candidate, and W34's last day is inside the window"
+        );
+    }
+
+    /// `OXIDANT_LOG_KEEP_DAYS=0` disables age-based expiry, and the subtree cap still holds —
+    /// oldest period first, live file untouched.
+    #[test]
+    fn the_logs_subtree_cap_prunes_oldest_first_and_never_the_live_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 24, 0, 0, 0).unwrap();
+        touch(&logs.join(LIVE_LOG), 500);
+        touch(&logs.join("oxidant-2026-08-21.log"), 100);
+        touch(&logs.join("oxidant-2026-08-22.log"), 100);
+        touch(&logs.join("oxidant-2026-08-23.log"), 100);
+
+        let report = prune_expired_logs(&logs, 0, 150, now);
+        assert_eq!(report.expired, 0, "keep_days=0 expires nothing");
+        assert_eq!(report.over_cap, 2);
+        assert_eq!(report.freed_bytes, 200);
+        let mut left: Vec<String> = std::fs::read_dir(&logs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["oxidant-2026-08-23.log".to_string(), LIVE_LOG.to_string()],
+            "the newest rolled file stays and the live file is never counted or deleted"
+        );
+    }
+
+    /// `event_log_dir` joins the budget by **rolling**, never by deleting the live file that
+    /// other tools are reading (§8, F16) — and a roll never ends with an empty directory.
+    #[test]
+    fn the_event_log_rolls_rather_than_being_deleted_and_prunes_oldest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = dir.path().join("events");
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 24, 9, 0, 0).unwrap();
+        let cap = 1_000;
+
+        // Under half the cap — the roll threshold — nothing happens at all.
+        touch(&events.join(LIVE_EVENT_LOG), 400);
+        assert_eq!(
+            roll_event_log(&events, cap, LogRoll::Daily, now),
+            EventLogReport {
+                used_bytes: 400,
+                ..EventLogReport::default()
+            },
+            "a live file inside the roll threshold is left alone"
+        );
+        assert_eq!(names(&events), vec![LIVE_EVENT_LOG.to_string()]);
+
+        // Past it: rolled, and **kept**. A roll that immediately prunes what it created would
+        // make every roll a data loss.
+        touch(&events.join(LIVE_EVENT_LOG), 600);
+        let report = roll_event_log(&events, cap, LogRoll::Daily, now);
+        assert!(report.rolled, "the live file is renamed, not truncated");
+        assert_eq!(report.pruned, 0, "{report:?}");
+        assert_eq!(
+            names(&events),
+            vec!["events-2026-08-24.jsonl".to_string()],
+            "the next `emit` recreates the live file; nothing here deletes it"
+        );
+
+        // The second roll takes `.2` and pushes the directory over, so the **oldest** goes —
+        // and the generation just rolled stays.
+        touch(&events.join(LIVE_EVENT_LOG), 600);
+        let report = roll_event_log(&events, cap, LogRoll::Daily, now);
+        assert!(report.rolled);
+        assert_eq!(report.pruned, 1, "oldest rolled event log goes first");
+        assert_eq!(
+            names(&events),
+            vec!["events-2026-08-24.2.jsonl".to_string()],
+            "`.2` sorts before the plain name lexicographically; ordering by period and split \
+             is what keeps the prune from taking the newer file"
+        );
+
+        // And it converges: every further roll leaves exactly one generation — never none, and
+        // always the one just rolled. (The split number restarts once its predecessor has been
+        // pruned, which is harmless: the name it reuses is the name of a file that is gone.)
+        for gen in 3..8 {
+            let body = format!("generation {gen} ").repeat(60);
+            std::fs::write(events.join(LIVE_EVENT_LOG), &body).expect("write");
+            roll_event_log(&events, cap, LogRoll::Daily, now);
+            let left = names(&events);
+            assert_eq!(left.len(), 1, "generation {gen}: {left:?}");
+            assert_eq!(
+                std::fs::read_to_string(events.join(&left[0])).expect("read"),
+                body,
+                "the survivor is the generation just rolled, not an older one"
+            );
+        }
+    }
+
+    /// `OXIDANT_EVENT_LOG_MAX_BYTES=0` restores today's unbounded behaviour exactly.
+    #[test]
+    fn a_zero_event_log_cap_is_todays_unbounded_behaviour() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = dir.path().join("events");
+        touch(&events.join(LIVE_EVENT_LOG), 10_000);
+        touch(&events.join("events-2020-01-01.jsonl"), 10_000);
+        let report = roll_event_log(&events, 0, LogRoll::Daily, chrono::Utc::now());
+        assert_eq!(report, EventLogReport::default(), "not even measured");
+        assert!(events.join(LIVE_EVENT_LOG).exists());
+        assert!(events.join("events-2020-01-01.jsonl").exists());
+    }
+
+    /// The event-log sweeper unlinks only the shape it writes. An operator points
+    /// `OXIDANT_EVENT_LOG_DIR` at a Spark-history-server path that other tools also write.
+    #[test]
+    fn the_event_log_sweeper_only_recognises_its_own_rolled_files() {
+        assert!(is_rolled_event_log("events-2026-08-24.jsonl"));
+        assert!(is_rolled_event_log("events-2026-08-24.2.jsonl"));
+        assert!(!is_rolled_event_log(LIVE_EVENT_LOG));
+        assert!(!is_rolled_event_log("application_1234_0001"));
+        assert!(!is_rolled_event_log("spark-events.jsonl"));
+        assert!(!is_rolled_event_log("events-2026-08-24.jsonl.gz"));
+    }
+
+    /// `event_log_dir` counts against the disk budget as of PR3 — but only when it is bounded.
+    /// Billing an unprunable tree would make the sweeper delete statement history to pay for it.
+    #[test]
+    fn the_event_log_dir_joins_the_budget_only_when_it_is_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = dir.path().join("elsewhere/events");
+        let mut cfg = HistoryConfig::for_root(&dir.path().join("data"));
+        assert!(
+            !budget_roots(&cfg).iter().any(|r| r == &events),
+            "unset: not in the budget"
+        );
+
+        cfg.event_log_dir = Some(events.clone());
+        cfg.event_log_max_bytes = 2 * 1024 * 1024 * 1024;
+        assert!(
+            budget_roots(&cfg).iter().any(|r| r == &events),
+            "bounded: counted, and prunable by rolling"
+        );
+
+        cfg.event_log_max_bytes = 0;
+        assert!(
+            !budget_roots(&cfg).iter().any(|r| r == &events),
+            "unbounded by the operator's explicit choice: not billed to a budget that cannot \
+             prune it"
         );
     }
 
@@ -597,9 +837,59 @@ pub(crate) fn rolled_event_log_name(period: LogPeriod, split: u32) -> String {
     }
 }
 
-/// Rolled event logs, oldest first.
+/// Rolled event logs, oldest **period** first.
+///
+/// Ordered by period and split, not by mtime-then-name: `events-2026-08-24.2.jsonl` sorts
+/// *before* `events-2026-08-24.jsonl` lexicographically (`2` < `j`), so a name-tiebroken sort
+/// would prune the second-newest generation and keep the oldest.
 pub(crate) fn rolled_event_logs(dir: &Path) -> Vec<Prunable> {
-    flat_files(dir, is_rolled_event_log)
+    let mut keyed: Vec<(Option<DateTime<Utc>>, u32, Prunable)> = flat_files(dir, is_rolled_event_log)
+        .into_iter()
+        .map(|file| {
+            let (end, split) = file
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(parse_rolled_event_log_name)
+                .map(|(period, split)| (period.end(), split))
+                .unwrap_or((None, 0));
+            (end, split, file)
+        })
+        .collect();
+    keyed.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.path.cmp(&b.2.path))
+    });
+    keyed.into_iter().map(|(_, _, file)| file).collect()
+}
+
+/// The next split for `period`: one past the highest on disk, so the sequence is monotone
+/// while any file of the period survives.
+fn next_event_log_split(dir: &Path, period: LogPeriod) -> u32 {
+    let stem = period.stem();
+    let mut highest = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some((found, split)) = parse_rolled_event_log_name(name) else {
+                continue;
+            };
+            if found.stem() == stem {
+                highest = highest.max(split);
+            }
+        }
+    }
+    highest + 1
+}
+
+/// `events-<period>[.N].jsonl` → its period and split.
+fn parse_rolled_event_log_name(name: &str) -> Option<(LogPeriod, u32)> {
+    let body = name
+        .strip_prefix(ROLLED_EVENT_PREFIX)?
+        .strip_suffix(".jsonl")?;
+    LogPeriod::parse(body)
 }
 
 /// What one `event_log_dir` pass did.
@@ -609,6 +899,9 @@ pub(crate) struct EventLogReport {
     pub rolled: bool,
     pub pruned: usize,
     pub freed_bytes: u64,
+    /// Bytes left in the directory after the pass. May exceed `OXIDANT_EVENT_LOG_MAX_BYTES` by
+    /// up to one generation — the newest rolled file is never taken.
+    pub used_bytes: u64,
 }
 
 /// Bring `event_log_dir` under `OXIDANT_EVENT_LOG_MAX_BYTES` (§8, F16).
@@ -619,6 +912,9 @@ pub(crate) struct EventLogReport {
 /// that genuinely fills a server. But an operator points this directory at a Spark-history-server
 /// path that *other tools read*, so the fix is a rename plus an oldest-first prune, not a
 /// truncate. `max_bytes == 0` restores today's unbounded behaviour exactly.
+///
+/// The live file rolls at **half** `max_bytes` so the directory keeps roughly two generations
+/// rather than oscillating between one full file and none — see the comment on the trigger.
 ///
 /// `emit` opens the path per event, so a rename between two of its opens is safe: the next
 /// append creates a fresh `events.jsonl`, and an event that raced the rename lands in the rolled
@@ -635,7 +931,13 @@ pub(crate) fn roll_event_log(
     }
     let live = dir.join(LIVE_EVENT_LOG);
     let live_bytes = live.metadata().map(|m| m.len()).unwrap_or(0);
-    if live_bytes > max_bytes {
+    // **Deviation from §8's literal wording**, which says the roll happens "when the cap is
+    // exceeded". Rolling only once the live file has reached the *whole* cap makes the very
+    // first prune pass delete the file it just created — the directory then oscillates between
+    // "one file at the cap" and "empty", and an operator loses every event at each roll.
+    // Rolling at half the cap keeps roughly two generations: roll, roll, and only the third
+    // roll prunes the oldest. The ceiling `max_bytes` still holds exactly.
+    if live_bytes > (max_bytes / 2).max(1) {
         // `LogRoll::Off` turns the *exec* log writer off; the event log still needs a period to
         // name its roll after, and daily is the design's default.
         let roll = if roll == LogRoll::Off {
@@ -644,11 +946,12 @@ pub(crate) fn roll_event_log(
             roll
         };
         if let Some(period) = LogPeriod::of(now, roll) {
-            let mut split = 1;
-            while dir.join(rolled_event_log_name(period, split)).exists() && split < 999 {
-                split += 1;
-            }
-            let target = dir.join(rolled_event_log_name(period, split));
+            // **Highest existing + 1**, never "the first free number" — the same rule
+            // `logging::writer::next_split` uses, and for a sharper reason here. Splits are
+            // pruned out from under the allocator, so "first free" hands out `1` again after
+            // `.1` has gone; the file just rolled would then sort as the *oldest* generation of
+            // its period and the very next prune would take it, keeping the stale `.2`.
+            let target = dir.join(rolled_event_log_name(period, next_event_log_split(dir, period)));
             match super::fs_util::rename_durable(&live, &target, dir) {
                 Ok(()) => report.rolled = true,
                 Err(e) => tracing::warn!(
@@ -659,23 +962,33 @@ pub(crate) fn roll_event_log(
             }
         }
     }
+    // Oldest-first, **stopping short of the newest rolled generation**. Only the live file is
+    // protected in §3's exec-log prune order, but the event log has no equivalent of "rotate
+    // instead of delete" for its rolled files: one generation can be larger than the whole cap
+    // (the sweep runs every five minutes, and `emit` does not stop between passes), and taking
+    // it would mean every roll ended with an empty directory. So the ceiling may be exceeded by
+    // at most one generation, and the sweep line says how much is there.
     let mut total: u64 = subtree_bytes(dir);
-    for file in rolled_event_logs(dir) {
+    let rolled = rolled_event_logs(dir);
+    let prunable = rolled.len().saturating_sub(1);
+    for file in rolled.iter().take(prunable) {
         if total <= max_bytes {
             break;
         }
-        if let Some(freed) = remove(&file) {
+        if let Some(freed) = remove(file) {
             total = total.saturating_sub(freed);
             report.pruned += 1;
             report.freed_bytes += freed;
         }
     }
+    report.used_bytes = total;
     if report.rolled || report.pruned > 0 {
         tracing::info!(
             dir = %dir.display(),
             rolled = report.rolled,
             pruned = report.pruned,
             freed_bytes = report.freed_bytes,
+            used_bytes = report.used_bytes,
             max_bytes,
             "event log rolled under OXIDANT_EVENT_LOG_MAX_BYTES"
         );
