@@ -235,6 +235,14 @@ fn ring_page(
         "limit": limit,
         "before": query.before,
         "next_before": page.next_before,
+        // **The ring's cursor is the one that is not stable, and the envelope says so.**
+        // Everywhere else `next_before` is a row index from the start of an append-only file, so
+        // it names the same line forever. Here it is an index into a buffer that *rolls*: every
+        // `LogBuffer::push` between two requests shifts every index by one, so paging backward
+        // with it silently repeats or skips lines. A caller that wants a stable cursor wants
+        // `?file=current`. This field is how a caller can tell without reading this comment —
+        // and why the Observability pane reads the whole ring in one page instead of paging it.
+        "cursor": "best-effort",
         "logs": page.lines,
     })
 }
@@ -423,6 +431,51 @@ mod tests {
         assert_eq!(files[1]["file"], "2026-08-23");
         assert_eq!(files[1]["format"], "text");
         assert_eq!(files[1]["first_ts"], "2026-08-23T14:00:00.000Z");
+    }
+
+    /// **The ring's cursor is best-effort and the envelope admits it.** Every other
+    /// `next_before` is a row index from the start of an append-only file and names the same
+    /// line forever; the ring's is an index into a buffer that rolls under the reader. A caller
+    /// pacing a file's cursor and a ring's cursor the same way silently repeats or skips lines,
+    /// and the ring is the *fallback* view on an `OXIDANT_LOG_ROLL=off` node — precisely where
+    /// it is the only view there is.
+    #[test]
+    fn the_rings_cursor_is_labelled_best_effort_and_a_files_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "oxidant-2026-08-23.log");
+        let ring = super::super::LogBuffer::new(8);
+        for line in LINES {
+            ring.push(line.to_string());
+        }
+        let from_ring = answer(
+            &LogQuery {
+                order: Some("desc".to_string()),
+                ..Default::default()
+            },
+            &view(dir.path()),
+            &ring,
+        )
+        .expect("ring");
+        assert_eq!(from_ring["file"], "ring");
+        assert_eq!(
+            from_ring["cursor"], "best-effort",
+            "the ring rolls under its own cursor: {from_ring}"
+        );
+
+        let from_file = answer(
+            &LogQuery {
+                file: Some("2026-08-23".to_string()),
+                order: Some("desc".to_string()),
+                ..Default::default()
+            },
+            &view(dir.path()),
+            &ring,
+        )
+        .expect("file");
+        assert!(
+            from_file.get("cursor").is_none(),
+            "a file's cursor is exact and carries no caveat: {from_file}"
+        );
     }
 
     /// `limit` is clamped, not trusted: the page cap is the memory bound, and a caller asking

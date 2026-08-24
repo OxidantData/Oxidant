@@ -182,6 +182,12 @@ fills, its oldest lines move into the scrolled-back pages with the cursor that b
 and when the browser eventually releases scroll-back it releases a whole page at a time, so
 **Load older lines** fetches it again rather than skipping past it.
 
+The **memory ring** is the one view with no **Load older lines**, and the line under the pane
+says why: it is not a file but a 1000-entry buffer that rolls as the node logs, so its cursor
+names a different line every time the node writes one. The pane asks for all 1000 lines in a
+single page — the page cap is 10,000 — so there is nothing left to walk backward into. For a
+history that still names the same line tomorrow, pick a file.
+
 Four things the pane says out loud rather than hiding:
 
 - **The token.** Every log route is gated by the same `OXIDANT_STATUS_TOKEN` as `/api/status`,

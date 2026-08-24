@@ -1065,10 +1065,22 @@
       } catch (e) { obsState.files = []; }
     }
 
+    /* Lines the memory ring holds, and therefore what one page of it asks for.
+     *
+     * **The ring is read whole, never paged.** Its `next_before` is an index into a buffer that
+     * *rolls*: every line the node logs between two requests shifts every index by one, so
+     * `before=` over the ring silently repeats lines at one end and loses them at the other —
+     * and the ring is the fallback view on an `OXIDANT_LOG_ROLL=off` node, which is exactly
+     * where it is the only view there is. The API says so with `"cursor": "best-effort"`. One
+     * page can hold 10,000 lines and the ring holds 1,000, so asking for all of it costs
+     * nothing and removes the question. */
+    const OBS_RING_LINES = 1000;
+
     // One page, newest-last. `older` is reset: changing a filter starts a new walk.
     async function fetchObsLogs() {
       if (obsState.paused) return;
-      const path = '/api/v1/logs?' + obsQuery({ limit: OBS_PAGE, order: 'desc' });
+      const limit = obsState.file === 'ring' ? OBS_RING_LINES : OBS_PAGE;
+      const path = '/api/v1/logs?' + obsQuery({ limit, order: 'desc' });
       try {
         const { code, body } = await obsFetch(path);
         // **`current` is a file, and a node can be logging without having one.**
@@ -1284,10 +1296,17 @@
         return errorState('Could not read the log', (page.error ? page.error + '\n\n' : '') + 'The log API answered ' + page.code + '.');
       }
       const lines = obsLines();
-      const more = (obsState.older.length ? obsState.older[0] : page).next_before != null;
+      // The ring is read whole and never paged: its cursor shifts under the reader as the buffer
+      // rolls, so a `before=` walk over it would repeat lines at one end and lose them at the
+      // other. The line above the pane says which of the two it is looking at.
+      const ring = obsState.file === 'ring';
+      const more = !ring && (obsState.older.length ? obsState.older[0] : page).next_before != null;
       const head = more
         ? '<button class="nb-btn" id="obs-older" style="width:100%;border-radius:0;border:none;border-bottom:1px solid var(--oxidant-border);padding:6px">Load older lines</button>'
-        : '<div class="logline"><span class="msg" style="color:var(--oxidant-code-text-dim)">— start of ' + esc(obsState.file === 'ring' ? 'the buffer' : obsState.file) + ' —</span></div>';
+        : '<div class="logline"><span class="msg" style="color:var(--oxidant-code-text-dim)">— ' +
+          (ring
+            ? 'the memory ring holds the last ' + OBS_RING_LINES.toLocaleString() + ' lines and rolls as this node logs; pick a file for a stable history'
+            : 'start of ' + esc(obsState.file)) + ' —</span></div>';
       const body = lines.length
         ? lines.map(l => {
             const lvl = obsLevelOf(l);
@@ -1523,7 +1542,7 @@
           }).join('')
         : '<option value="driver" selected>driver</option>';
       const files = obsState.files || [];
-      const opts = ['<option value="ring"' + (obsState.file === 'ring' ? ' selected' : '') + '>memory ring (last 1000)</option>']
+      const opts = ['<option value="ring"' + (obsState.file === 'ring' ? ' selected' : '') + '>memory ring (last ' + OBS_RING_LINES.toLocaleString() + ')</option>']
         .concat(files.map(f => {
           const label = f.file === 'current'
             ? 'current (live)'

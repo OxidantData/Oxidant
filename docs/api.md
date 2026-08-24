@@ -546,6 +546,13 @@ curl -s 'http://localhost:4040/api/v1/logs?file=2026-08-23&level=warn&target=oxi
   so a cursor minted against `oxidant-2026-08-23.log` still names the same line after the
   background converter has replaced it with `oxidant-2026-08-23.parquet`. **Follow it rather
   than counting**: a page is also cut short by an internal byte budget.
+- **The memory ring is the one exception, and it says so.** A no-`?file=` page carries
+  `"cursor": "best-effort"`; a file's page carries no `cursor` key at all. The ring is not
+  append-only — it *rolls*, so every line the node logs between two requests shifts every index
+  by one, and a `before=` walk over it repeats lines at one end and loses them at the other. The
+  ring holds 1000 lines and one page holds 10,000, so **read it whole rather than paging it**
+  (the Observability pane does exactly that, and hides its *Load older lines* button); if you
+  want a cursor that names the same line tomorrow, ask for `?file=current`.
 - **`?limit=` clamps at 10,000 on every log route**, including the no-`?file=` ring read. PR3's
   read path had no cap: `?file=current` on a 256 MiB file built every line in memory and then
   serialised a second copy into the body, on an endpoint the Observability page polls.

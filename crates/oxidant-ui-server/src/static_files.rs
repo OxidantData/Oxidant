@@ -202,6 +202,27 @@ mod tests {
             embedded_index().contains("obsTrimScrollback"),
             "the pane must release scroll-back a whole page at a time, from the oldest end"
         );
+
+        // **The memory ring is read whole, never paged.** Every other `next_before` is a row
+        // index into an append-only file and names the same line forever; the ring's is an index
+        // into a buffer that *rolls*, so every line the node logs between two requests shifts it
+        // by one and a `before=` walk repeats lines at one end and loses them at the other. The
+        // ring is also the fallback view on an `OXIDANT_LOG_ROLL=off` node — precisely where it
+        // is the only view there is. One page holds 10,000 lines and the ring holds 1,000, so
+        // the pane asks for all of it and suppresses the button rather than paging a cursor the
+        // API itself labels `"cursor": "best-effort"`.
+        assert!(
+            embedded_index().contains("const OBS_RING_LINES = 1000"),
+            "the pane must ask for the whole ring in one page"
+        );
+        assert!(
+            embedded_index().contains("const more = !ring &&"),
+            "`Load older lines` must not be offered over a cursor that rolls under the reader"
+        );
+        assert!(
+            embedded_index().contains("rolls as this node logs; pick a file for a stable history"),
+            "and the caption must say so, since the ring is the only view on a roll=off node"
+        );
         // §6b's controls, as the ids the JS binds. The level chips existed and matched nothing
         // once PR3 put a timestamp in front of `[LEVEL]`; these are the rest of the pane.
         for control in [

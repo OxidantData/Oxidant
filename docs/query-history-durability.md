@@ -1356,6 +1356,20 @@ document or `docs/api.md` previously promised.
   the process's lifetime — with `Building` exempt, since an assembly still running is still
   holding headroom.
 
+- **F9 — the ring is read whole, and the one unstable cursor says so.** `filter_ring`'s
+  `next_before` is an index into a buffer that *rolls*, not a row index into an append-only
+  file: every `LogBuffer::push` between two requests shifts every index by one. The pane paged
+  it with `before=` exactly as it paged a file, so on a driver logging ~50 lines/s a click on
+  **Load older lines** served ~15 lines twice and lost ~15 at the other end — on an
+  `OXIDANT_LOG_ROLL=off` node, where the ring is the *only* view there is. Stabilising the
+  cursor would mean giving the ring a monotonic sequence number it does not have and does not
+  need, so the fix is the other half of the choice: the ring's envelope now carries
+  `"cursor": "best-effort"` (a file's page carries no `cursor` key at all), the pane asks for
+  the whole ring in one page — 1000 entries against a 10,000-line page cap, so it costs
+  nothing — and it suppresses **Load older lines**, captioning the ring as rolling and
+  pointing at `?file=` for a stable history. `docs/api.md` carves the ring out of "a row index
+  from the start of the named file" instead of leaving the sentence to cover it.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |
