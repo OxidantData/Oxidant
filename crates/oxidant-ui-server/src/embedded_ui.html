@@ -1132,9 +1132,24 @@
      * the stream's `open` event says which. Both append to the page on screen, so following and
      * paging are the same view rather than two.
      */
+    /* Whether what is on screen is something this node is still *writing*.
+     *
+     * **The memory ring is followable on the driver and only there.** The driver's tail is the
+     * `tracing` broadcast itself, which is the very stream the ring holds. A worker's tail is a
+     * `?file=` poll over Flight, and a rolling buffer has no forward cursor — an index into it
+     * names a different line every time the node logs one — so there is nothing a poll could
+     * ask for. The server used to paper over this by rewriting `file` to `current`, which
+     * painted the page out of the worker's ring and appended the tail out of the worker's
+     * `oxidant.log`; it now answers `400`, and this is the switch that keeps the pane from
+     * asking. A rolled file is never followable on either: it will not grow again. */
+    function obsCanFollow() {
+      if (obsState.file === 'current') return true;
+      return obsState.file === 'ring' && obsState.worker === 'driver';
+    }
+
     function startObsTail() {
       stopObsTail();
-      if (!obsState.follow || obsState.paused) return;
+      if (!obsState.follow || obsState.paused || !obsCanFollow()) return;
       /* **`fetch` + a `ReadableStream`, not `EventSource`.** `EventSource` cannot carry an
        * `Authorization` header, and the only ways around that are a token in the query string —
        * which lands in proxy logs, browser history and `Referer` — or a cookie, which is a new
@@ -1334,7 +1349,13 @@
       if (obsState.paused) bits.push('paused');
       else if (obsState.follow && obsState.tailMode === 'follow') bits.push('following live');
       else if (obsState.follow && obsState.tailMode === 'poll') bits.push('following · polled every 2 s');
-      else bits.push('refreshing every ' + (OBS_POLL_MS / 1000) + ' s');
+      // Follow asked for and not available is the one case worth naming: the reader ticked the
+      // box on the driver, switched to a worker's ring, and would otherwise see the caption
+      // quietly stop saying "following" with no account of why.
+      else bits.push('refreshing every ' + (OBS_POLL_MS / 1000) + ' s' +
+        (obsState.follow && !obsCanFollow() && obsState.file === 'ring'
+          ? " · a worker's memory ring has no cursor a follow could resume from"
+          : ''));
       if (obsState.dropped) bits.push(obsState.dropped.toLocaleString() + ' lines dropped by the tail');
       if (obsState.tailError) bits.push('follow error: ' + obsState.tailError);
       return bits.join(' · ');
@@ -1497,7 +1518,7 @@
         // Following a rolled file is following something that will never grow again. The
         // checkbox's own state is painted from `obsState`, so this is the only place that
         // decides it.
-        if (obsState.file !== 'current' && obsState.file !== 'ring') { obsState.follow = false; }
+        if (!obsCanFollow()) { obsState.follow = false; }
         obsReload();
       };
       // Debounced: a search box that refetched per keystroke would put a Parquet decode behind
@@ -1632,8 +1653,17 @@
       // One owner for the follow switch. It used to be set only where a file was picked, so
       // choosing a rolled file and then switching node left the box disabled on a live file.
       const follow = document.getElementById('obs-follow');
-      follow.disabled = obsState.file !== 'current' && obsState.file !== 'ring';
+      follow.disabled = !obsCanFollow();
       follow.checked = obsState.follow && !follow.disabled;
+      // Disabled without a reason reads as broken. Which of the two reasons it is depends on
+      // what is selected, and the ring's one is the surprising half: it is followable on the
+      // driver, whose tail is the `tracing` stream the ring holds, and not on a worker, whose
+      // tail is a poll and has nothing with a forward cursor to poll.
+      follow.title = follow.disabled
+        ? (obsState.file === 'ring'
+            ? "A worker's memory ring cannot be followed: it is a rolling buffer with no cursor a poll could resume from. Pick current for the worker's live file."
+            : 'A rolled file will never grow again, so there is nothing to follow.')
+        : 'Append new lines as this node writes them.';
 
       // The pickers repaint only when their contents changed: rewriting a <select> under an open
       // dropdown closes it.

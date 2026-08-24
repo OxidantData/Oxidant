@@ -170,7 +170,7 @@ rail, and the two are not yet one query history —
 | **Search** | Free text over the whole file, not over the page already fetched |
 | **From** / **To** | Your own wall clock, sent as RFC-3339 instants. `To` is exclusive, so two adjacent windows tile a day without a line appearing twice |
 | **Level chips** | `error` / `warn` / `info` / `debug` — a **floor**, not four independent toggles: `warn` means warn *and* error, which is what [`level=`](api.md#filters-and-the-backward-cursor) means to `curl` |
-| **Follow** | Tail-follow. Live on the driver, a 2 s poll against a worker, and the caption says which |
+| **Follow** | Tail-follow. Live on the driver, a 2 s poll against a worker, and the caption says which. Off for a rolled file (it will never grow) and for a **worker's** memory ring — the driver's ring is the `tracing` stream its tail already rides, but a worker's is a rolling buffer with no cursor a poll could resume from. The checkbox says which of the two it is |
 | **Pause** | Stops both the follow and the 5 s fallback poll |
 | **Dump** | Copies the selected node's logs for the filtered window into a [support bundle](api.md#diagnostic-dumps) and downloads it — the one action on this page that moves log bytes |
 

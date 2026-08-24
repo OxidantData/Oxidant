@@ -1370,6 +1370,19 @@ document or `docs/api.md` previously promised.
   pointing at `?file=` for a stable history. `docs/api.md` carves the ring out of "a row index
   from the start of the named file" instead of leaving the sentence to cover it.
 
+- **F10 — a follow shows what the node is writing, not a substitute for it.** `worker_tail`
+  overrode `file` to `current` unconditionally, so **Node = worker, File = memory ring** painted
+  the page out of the worker's in-memory ring (`dedup: false`) and appended the tail out of the
+  worker's `oxidant.log` (`dedup: true`), concatenated into one pane under an `open` event
+  asserting one of them. On a worker with `OXIDANT_LOG_ROLL=off` — where the ring is the only
+  view there is — the substitution polled a file that does not exist and emitted an `error`
+  every 2 s forever under a caption reading "following". `check_tail_source` now gates the route
+  instead: `current` follows on any node, the ring follows on the **driver** and only there
+  (its tail is the `tracing` broadcast the ring holds, not a file poll), and everything else is
+  a `400` naming the value that works. The pane gained one owner for the same rule
+  (`obsCanFollow`), which disables the checkbox with the reason in its title and puts the
+  worker-ring case in the caption rather than letting "following" quietly stop appearing.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |

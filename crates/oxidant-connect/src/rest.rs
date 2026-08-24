@@ -2893,6 +2893,9 @@ const WORKER_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// worker's `?file=current` on a timer and forwards what is new. The `mode` field on the first
 /// event is `"follow"` for the driver and `"poll"` for a worker, so a reader is never told a
 /// 2 s-granular feed is live.
+///
+/// **What a tail will follow is exactly one source per node**, and naming another is a `400`
+/// rather than a silent substitution — see [`check_tail_source`].
 async fn tail_logs(
     State(state): State<RestState>,
     headers: header::HeaderMap,
@@ -2911,6 +2914,9 @@ async fn tail_logs(
         Ok(f) => f,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
+    if let Err(refusal) = check_tail_source(params.worker.as_deref(), params.file.as_deref()) {
+        return error_response(StatusCode::BAD_REQUEST, &refusal);
+    }
     match &params.worker {
         None => Sse::new(driver_tail(filter)).into_response(),
         Some(requested) => {
@@ -2920,6 +2926,35 @@ async fn tail_logs(
             };
             Sse::new(worker_tail(endpoint, params)).into_response()
         }
+    }
+}
+
+/// Whether this node can follow what the caller named — and a refusal that says why if not.
+///
+/// **A follow shows what a node is writing now, and each node has exactly one such source.**
+/// `worker_tail` used to override `file` to `current` unconditionally, so **Node = worker, File
+/// = memory ring** painted a page out of the worker's in-memory ring and then appended a tail
+/// out of the worker's `oxidant.log` — two sources with different dedup semantics concatenated
+/// into one pane, under an `open` event asserting `"dedup": true` about a ring that is never
+/// deduped. On a worker with `OXIDANT_LOG_ROLL=off` it was worse: there is no `current` to
+/// poll, so the substitution produced an `error` event every 2 s forever under a caption
+/// reading "following".
+///
+/// The ring is followable on the **driver** and only there, because the driver's tail is not a
+/// file poll at all — it is the `tracing` broadcast, which is the very stream the ring holds.
+/// A worker's is a `?file=` poll over Flight, and a rolling buffer has no forward cursor: an
+/// index into it names a different line every time the node logs one (F9), so a poll cannot
+/// tell a new line from one that shifted.
+fn check_tail_source(worker: Option<&str>, file: Option<&str>) -> Result<(), String> {
+    match (worker, file) {
+        (_, Some("current")) => Ok(()),
+        (None, None) => Ok(()),
+        (Some(worker), None) => Err(format!(
+            "worker `{worker}`'s memory ring cannot be followed: it is a rolling buffer with no              forward cursor, so a poll cannot tell a new line from one that shifted. Add              `file=current` to follow that worker's live file, or read the ring without              following it. The driver's own ring is followable because its tail is the `tracing`              stream itself rather than a poll"
+        )),
+        (_, Some(rolled)) => Err(format!(
+            "`{rolled}` is a rolled file: it will never grow again, so there is nothing to              follow. Use `file=current` for the live file, or read the rolled file with              `/api/v1/logs`"
+        )),
     }
 }
 
@@ -3075,7 +3110,10 @@ impl Follow {
     /// means — and it is what the driver's own tail, which has no seed, already did.
     fn query(&self) -> crate::logging::LogQuery {
         let mut query = self.params.query();
-        query.file = Some("current".to_string());
+        // The caller's file, *not* an unconditional `current`. Overriding it here is what made
+        // a worker's "memory ring" stream the worker's `oxidant.log` instead — see
+        // [`check_tail_source`], which is the gate that makes this line safe by having already
+        // refused every value but `current`.
         query.before = None;
         query.offset = None;
         query.order = None;
@@ -4489,6 +4527,64 @@ mod tests {
         assert_eq!(body["worker"], "driver");
     }
 
+    /// **A follow shows what a node is writing now, and never substitutes another source.**
+    ///
+    /// `worker_tail` overrode `file` to `current` unconditionally, so **Node = worker, File =
+    /// memory ring** painted the page out of the worker's in-memory ring and appended the tail
+    /// out of the worker's `oxidant.log` — two sources with different dedup semantics
+    /// concatenated into one pane, under an `open` event asserting `"dedup": true` about a ring
+    /// that is never deduped. On a worker with `OXIDANT_LOG_ROLL=off` the substitution polled a
+    /// file that does not exist, so the stream emitted an `error` every 2 s forever under a
+    /// caption reading "following".
+    ///
+    /// The ring is followable on the **driver** and only there: the driver's tail is the
+    /// `tracing` broadcast, which is the stream the ring holds. A worker's is a `?file=` poll,
+    /// and a rolling buffer has no forward cursor to poll (F9).
+    #[test]
+    fn a_worker_tail_follows_what_the_caller_named_or_refuses_to_follow_at_all() {
+        assert!(
+            check_tail_source(None, None).is_ok(),
+            "the driver's ring *is* its tracing stream, and that is what driver_tail follows"
+        );
+        assert!(check_tail_source(None, Some("current")).is_ok());
+        assert!(check_tail_source(Some("w1"), Some("current")).is_ok());
+
+        let refusal = check_tail_source(Some("w1"), None).expect_err("a worker's ring");
+        assert!(
+            refusal.contains("w1") && refusal.contains("file=current"),
+            "the refusal must name the node and the value that works: {refusal}"
+        );
+        assert!(
+            refusal.contains("rolling buffer"),
+            "and say why, since the driver's ring *is* followable: {refusal}"
+        );
+
+        for rolled in ["2026-08-23", "2026-08-23.2", "2026-W34"] {
+            for worker in [None, Some("w1")] {
+                let refusal =
+                    check_tail_source(worker, Some(rolled)).expect_err("a rolled file: {rolled}");
+                assert!(
+                    refusal.contains(rolled) && refusal.contains("never grow"),
+                    "a rolled file is not followable on any node: {refusal}"
+                );
+            }
+        }
+
+        // And the query the follow actually issues carries the caller's file rather than one of
+        // its own choosing — the line that made the substitution possible.
+        let follow = Follow {
+            endpoint: "unused".to_string(),
+            params: LogsParams {
+                worker: Some("w1".to_string()),
+                file: Some("current".to_string()),
+                ..Default::default()
+            },
+            after: Some(7),
+            started: true,
+        };
+        assert_eq!(follow.query().file.as_deref(), Some("current"));
+    }
+
     /// **A failed poll leaves the cursor alone.** The arm that handles it used to say
     /// `st.after = st.after.or(Some(0))` under the comment "seed the cursor so a recovered
     /// worker resumes rather than replaying" — but it is only reached when the cursor is
@@ -4515,7 +4611,13 @@ mod tests {
         // The pane is opened against a worker that is already down, so the *first* poll fails.
         let mut follow = Follow {
             endpoint: "unused".to_string(),
-            params: LogsParams::default(),
+            // `file` is the caller's, not an override the follow applies for itself — see
+            // `check_tail_source`, which is why every worker follow reaching here says
+            // `current`.
+            params: LogsParams {
+                file: Some("current".to_string()),
+                ..Default::default()
+            },
             after: None,
             started: false,
         };
@@ -4544,7 +4646,10 @@ mod tests {
         // What the old spelling did, for contrast: every one of those rows, a page at a time.
         let mut replaying = Follow {
             endpoint: "unused".to_string(),
-            params: LogsParams::default(),
+            params: LogsParams {
+                file: Some("current".to_string()),
+                ..Default::default()
+            },
             after: Some(0),
             started: true,
         };
@@ -4600,6 +4705,7 @@ mod tests {
             endpoint: "unused".to_string(),
             params: LogsParams {
                 worker: Some("10.0.0.7:50051".to_string()),
+                file: Some("current".to_string()),
                 level: Some("error".to_string()),
                 ..Default::default()
             },

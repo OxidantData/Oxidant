@@ -223,6 +223,27 @@ mod tests {
             embedded_index().contains("rolls as this node logs; pick a file for a stable history"),
             "and the caption must say so, since the ring is the only view on a roll=off node"
         );
+        // **Follow is offered only where there is something to follow.** The pane used to
+        // enable it for the ring on every node, and the server papered over the incoherent half
+        // by rewriting `file` to `current` — so a worker's "memory ring" painted a page from the
+        // ring and appended a tail from `oxidant.log`. The server now answers `400`; this is the
+        // switch that keeps the pane from asking, and the one place that decides it.
+        assert!(
+            embedded_index().contains("function obsCanFollow()"),
+            "the pane must have one owner for whether the selection is followable"
+        );
+        assert!(
+            !embedded_index().contains("obsState.file !== 'current' && obsState.file !== 'ring'"),
+            "the ring is followable on the driver and not on a worker, so `file` alone cannot \
+             decide it"
+        );
+        assert!(
+            embedded_index()
+                .contains("return obsState.file === 'ring' && obsState.worker === 'driver'"),
+            "the driver's ring is its `tracing` stream; a worker's has no cursor a poll resumes \
+             from"
+        );
+
         // §6b's controls, as the ids the JS binds. The level chips existed and matched nothing
         // once PR3 put a timestamp in front of `[LEVEL]`; these are the rest of the pane.
         for control in [

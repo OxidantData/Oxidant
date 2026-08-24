@@ -688,6 +688,22 @@ data: {"dropped":37}
   `?file=current` every 2 s over Flight and forwards what is new. A long-lived Flight stream
   would pin a worker-side task to a browser tab. "New" is a **forward cursor** — a row index,
   so two identical lines a second apart are two events.
+- **A tail follows exactly what you named, or it is a `400`.** One source per node is still
+  being written to, and there is no silent substitution:
+
+  | `?worker=` | `?file=` | |
+  |---|---|---|
+  | absent (driver) | absent (the ring) | **follows** — the driver's tail *is* the `tracing` stream the ring holds |
+  | absent (driver) | `current` | **follows** |
+  | a worker | `current` | **polls** every 2 s |
+  | a worker | absent (the ring) | **`400`** — a rolling buffer has no forward cursor a poll could resume from, so an index into it names a different line every time the node logs one |
+  | either | a rolled period | **`400`** — it will never grow again |
+
+  The worker case used to override `file` to `current` regardless, so following a worker's
+  memory ring painted a page from the ring and appended a tail from the worker's `oxidant.log`
+  — two sources with different `dedup` under one `open` event claiming `"dedup": true` — and on
+  an `OXIDANT_LOG_ROLL=off` worker it polled a file that does not exist, emitting an `error`
+  every 2 s under a caption reading "following".
 - **The first poll asks for a position, not a page.** It requests the rows *after the end* of
   the live file, which names the end and returns nothing: a follow emits only what arrives
   after you started following, exactly as the driver's own tail does. So the stream never
