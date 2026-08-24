@@ -496,7 +496,12 @@ are called out inline.
   encode well under the cap. The live/CSV path is the answer past the budget.
 - A **zero-batch** result has no file: an Arrow IPC stream cannot be written without a
   schema, and a succeeded statement that produced no batches has none. It answers
-  `200 {"rows":[]}` from memory and `410 result_expired` after a restart.
+  `200 {"rows":[]}` — before **and** after a restart. The terminal snapshot that was being
+  written anyway records `result_empty` in place of the pointer, and
+  `GET /api/v1/statements/{id}` surfaces it as `"resultStatus": "result_empty"`. Answering
+  `410` after a restart would have made a *correct* empty answer — DDL, and in DataFusion
+  plenty of ordinary empty result sets — indistinguishable from data loss, at the cost of
+  no extra write and no extra byte on disk.
 - **Result GC is tied to the journal, and the journal is the authority.** Pruning a
   statement (§4c) unlinks its result file in the same sweep, before the tombstone is
   considered complete. Boot reconciles `results/` against the folded id set and

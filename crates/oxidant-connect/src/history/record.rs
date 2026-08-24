@@ -138,6 +138,14 @@ impl ResultPointer {
 /// rather than leaving `/result`'s `410 result_expired` to imply they merely aged out.
 pub(crate) const RESULT_TOO_LARGE: &str = "result_too_large";
 
+/// A succeeded statement that produced **no batches** — DDL, and in DataFusion plenty of
+/// ordinary empty result sets.
+///
+/// An Arrow IPC stream cannot be written without a schema, so there is no file to point at; the
+/// marker is what keeps `/result` answering `200 {"rows": []}` for it after a restart instead of
+/// `410 result_expired`, which is what "the rows aged out" means and is not what happened here.
+pub(crate) const RESULT_EMPTY: &str = "result_empty";
+
 /// One line of `seg-NNNNNN.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JournalRecord {

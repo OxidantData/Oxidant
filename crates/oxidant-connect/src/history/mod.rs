@@ -32,7 +32,7 @@ pub(crate) use journal::Journal;
 use record::Fold;
 pub(crate) use record::{
     now_rfc3339, rfc3339_from_ms, FoldedStatement, JournalRecord, RecordKind, ResultPointer,
-    Source, StatementStatus, RECORD_VERSION, RESULT_TOO_LARGE,
+    Source, StatementStatus, RECORD_VERSION, RESULT_EMPTY, RESULT_TOO_LARGE,
 };
 #[cfg(test)]
 pub(crate) use results::SPILL_QUEUE;

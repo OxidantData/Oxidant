@@ -54,7 +54,7 @@ use uuid::Uuid;
 use crate::history::{
     disk, now_rfc3339, rfc3339_from_ms, FoldedStatement, HistoryConfig, HistoryRuntime,
     JournalRecord, RecordKind, ResultPersist, ResultPointer, Source, SpillJob, SpillOutcome,
-    SqlMode, StatementStatus, RECORD_VERSION, RESULT_TOO_LARGE,
+    SqlMode, StatementStatus, RECORD_VERSION, RESULT_EMPTY, RESULT_TOO_LARGE,
 };
 use crate::OxidantService;
 
@@ -358,6 +358,9 @@ enum ResultSource {
     Memory(Vec<RecordBatch>),
     /// `results/<id>.arrow` — read back off disk, possibly after a restart.
     Disk,
+    /// The statement succeeded with no batches at all. There is nothing to read and nothing
+    /// was lost: `200 {"rows": []}`, before and after a restart alike.
+    Empty,
     /// Neither tier has them: `410 result_expired`.
     Gone,
 }
@@ -968,6 +971,15 @@ impl StatementStore {
                     st.row_count = Some(batches.iter().map(|b| b.num_rows()).sum());
                     st.schema = schema_fields(&batches);
                     st.result_bytes = retained_bytes(&batches);
+                    // No batches means no schema, and an Arrow IPC stream cannot be written
+                    // without one — so there will never be a file for this statement. Recording
+                    // *why* on the terminal snapshot (which is already being written) is what
+                    // makes `/result` answer `200 {"rows": []}` for it after a restart, exactly
+                    // as it does before one, instead of the `410 result_expired` that means "the
+                    // rows aged out". Costs no extra write and no extra byte on disk.
+                    if batches.is_empty() {
+                        st.result_refused = Some(RESULT_EMPTY.to_string());
+                    }
                     st.batches = batches;
                     st.status = StatementStatus::Succeeded;
                 }
@@ -1220,11 +1232,14 @@ impl StatementStore {
     /// `410 result_expired` means and `404` would not.
     fn result(&self, id: &str) -> Option<(StatementSnapshot, ResultSource)> {
         let inner = self.inner.lock().expect("statement store poisoned");
+        let empty = |refused: Option<&String>| refused.is_some_and(|r| r == RESULT_EMPTY);
         if let Some(st) = inner.statements.get(id) {
             let source = if st.rows_in_memory {
                 ResultSource::Memory(st.batches.clone())
             } else if st.result_file.is_some() {
                 ResultSource::Disk
+            } else if empty(st.result_refused.as_ref()) {
+                ResultSource::Empty
             } else {
                 ResultSource::Gone
             };
@@ -1233,6 +1248,8 @@ impl StatementStore {
         inner.history.get(id).map(|st| {
             let source = if st.result.is_some() {
                 ResultSource::Disk
+            } else if empty(st.result_refused.as_ref()) {
+                ResultSource::Empty
             } else {
                 ResultSource::Gone
             };
@@ -2249,6 +2266,9 @@ async fn get_result(
             Some(batches) => batches,
             None => return error_response(StatusCode::GONE, "result_expired"),
         },
+        // A correct empty answer, not a lost one. `resultStatus: "result_empty"` on the status
+        // document says which, and this answers the same before and after a restart.
+        ResultSource::Empty => Vec::new(),
         ResultSource::Gone => return error_response(StatusCode::GONE, "result_expired"),
     };
     // The journaled schema is what the pre-restart answer carried, so it is what the post-restart
@@ -3619,8 +3639,10 @@ mod tests {
     async fn a_history_tier_result_is_gone_not_unknown() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = history_store_with(dir.path(), |c| c.max_records = 1);
+        // Rows that really existed: a *zero-batch* result is a correct empty answer and keeps
+        // answering 200 across the demotion (see `an_empty_result_answers_200_before_and_after_a_restart`).
         let (first, _) = store.insert("SELECT 1");
-        store.finish(&first, ExecOutcome::Succeeded(Vec::new()));
+        store.finish(&first, ExecOutcome::Succeeded(vec![rows_batch(1, 2)]));
         // Push it out of the hot tier.
         let (second, _) = store.insert("SELECT 2");
         store.finish(&second, ExecOutcome::Succeeded(Vec::new()));
@@ -4476,6 +4498,70 @@ mod tests {
             "history_writes must flip back without a restart"
         );
         store.shutdown_for_test();
+    }
+
+    /// L2: a succeeded statement with **no batches** — DDL, and plenty of ordinary empty result
+    /// sets — is a correct empty answer, and must read the same before and after a restart.
+    ///
+    /// It used to answer `200 {"rows": []}` live and `410 result_expired` after a restart, with
+    /// nothing on the status document saying why, so a correct empty result was indistinguishable
+    /// from data loss. There is no file to write (an Arrow IPC stream needs a schema and there is
+    /// none), so the marker rides on the terminal snapshot that was being written anyway.
+    #[tokio::test]
+    async fn an_empty_result_answers_200_before_and_after_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let (id, _) = store.insert("CREATE TABLE t (a INT)");
+        store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+        store.drain_spills();
+
+        let before = app(rest_state(store.clone()));
+        let (status, json_before) =
+            get_json(&before, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json_before["rows"].as_array().expect("rows").len(), 0);
+        let (_, status_doc) = get_json(&before, &format!("/api/v1/statements/{id}")).await;
+        assert_eq!(
+            status_doc["resultStatus"], RESULT_EMPTY,
+            "the status document says *why* there is no result file"
+        );
+        let (status, _, csv_before) = get_raw(
+            &before,
+            &format!("/api/v1/statements/{id}/result?format=csv"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !dir.path()
+                .join("history/results")
+                .join(format!("{id}.arrow"))
+                .exists(),
+            "and there is nothing on disk for it — the marker is the whole record"
+        );
+
+        store.shutdown_for_test();
+        drop(before);
+        drop(store);
+
+        let replayed = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let after = app(rest_state(replayed.clone()));
+        let (status, json_after) =
+            get_json(&after, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK, "{json_after}");
+        assert_eq!(
+            json_after, json_before,
+            "an empty result must read identically across a restart, not become a 410"
+        );
+        let (status, _, csv_after) = get_raw(
+            &after,
+            &format!("/api/v1/statements/{id}/result?format=csv"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(csv_after, csv_before);
+        let (_, status_doc) = get_json(&after, &format!("/api/v1/statements/{id}")).await;
+        assert_eq!(status_doc["resultStatus"], RESULT_EMPTY);
+        replayed.shutdown_for_test();
     }
 
     /// L1: a spill that completes after its statement was evicted must publish nothing.
