@@ -29,15 +29,55 @@ pub(crate) struct LogLine {
     pub fields: String,
 }
 
+/// Escape the two bytes that would turn one event into two file lines.
+///
+/// **One line in, one line out, always.** The rendered format is newline-delimited with a fully
+/// parseable prefix, so a newline inside a field value produces a second physical line that
+/// `parse_line` accepts as a genuine event — with an attacker-chosen timestamp, level, target,
+/// message and fields, indistinguishable in the Parquet from a real engine event. The values are
+/// remote-controlled in practice: `flight.rs` logs `error = %status.message()` from a worker, and
+/// `rest.rs`/`lib.rs`/`distributed.rs` all log `error = %e` from DataFusion and connector errors
+/// that routinely embed multi-line plan text and remote messages.
+///
+/// It is a correctness problem before it is a security one. Without this, a routine multi-line
+/// error became N physical lines and the continuation lines landed in the Parquet as
+/// `message`-only rows with **null `ts` and null `level`** — so §6b's time-range and level
+/// filters silently excluded exactly the error events an operator was searching for.
+///
+/// Escaping is idempotent: the two-character sequence `\n` this produces contains no newline, so
+/// a value that has already been through `{:?}` (which is what `record_str` does) is unchanged.
+pub(crate) fn escape_line_breaks(raw: &str) -> std::borrow::Cow<'_, str> {
+    if !raw.contains(['\n', '\r']) {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    let mut out = String::with_capacity(raw.len() + 8);
+    for c in raw.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 impl LogLine {
     /// `<ts> [LEVEL] target - fields`, or `<ts> [LEVEL] target` for an event with no fields.
+    ///
+    /// `target` and `fields` are escaped here as well as at the visitor that builds them: this is
+    /// the last point before `writeln!`, and "one event is one line" has to hold for every
+    /// [`LogLine`], not only for the ones `format_event` assembled.
     pub(crate) fn render(&self) -> String {
+        let target = escape_line_breaks(&self.target);
         if self.fields.is_empty() {
-            format!("{} [{}] {}", self.ts, self.level, self.target)
+            format!("{} [{}] {}", self.ts, self.level, target)
         } else {
             format!(
                 "{} [{}] {} - {}",
-                self.ts, self.level, self.target, self.fields
+                self.ts,
+                self.level,
+                target,
+                escape_line_breaks(&self.fields)
             )
         }
     }
@@ -65,9 +105,9 @@ impl LogLine {
 /// A parsed line, ready for the Parquet writer.
 ///
 /// The parse is **best-effort and says so**: the text file is authoritative (§6), and a line it
-/// cannot decompose is preserved whole in `message` rather than dropped. That happens for
-/// exactly one shape in practice — a field value carrying a newline, which `writeln!` has
-/// already split across two file lines.
+/// cannot decompose is preserved whole in `message` rather than dropped. Since
+/// [`escape_line_breaks`] this happens only for a line some *other* producer wrote into the log
+/// directory — the writer's own output is one physical line per event by construction.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ParsedLine {
     /// Epoch milliseconds, or `None` when the line carried no parseable timestamp.
@@ -279,6 +319,21 @@ mod tests {
             Some("    at oxidant_execution::plan::stage_planner")
         );
         assert_eq!(parsed.level, None);
+    }
+
+    /// The renderer is the last gate: whatever built the [`LogLine`], one event is one line.
+    #[test]
+    fn render_never_emits_a_second_physical_line() {
+        let mut hostile = line("message=ok\nforged=1");
+        hostile.target = "oxidant\rexecution".to_string();
+        let rendered = hostile.render();
+        assert_eq!(rendered.lines().count(), 1, "{rendered:?}");
+        assert!(rendered.contains("message=ok\\nforged=1"), "{rendered:?}");
+        assert!(rendered.contains("oxidant\\rexecution"), "{rendered:?}");
+        // Idempotent: escaping an already-escaped value changes nothing.
+        let mut again = hostile.clone();
+        again.fields = escape_line_breaks(&hostile.fields).into_owned();
+        assert_eq!(again.render(), rendered);
     }
 
     /// Dedup compares everything *but* the timestamp. Comparing rendered lines would have made

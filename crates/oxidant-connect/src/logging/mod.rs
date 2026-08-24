@@ -121,13 +121,22 @@ fn format_event(event: &tracing::Event<'_>) -> LogLine {
 struct LogVisitor(String);
 
 impl LogVisitor {
+    /// One field, `k=v`, with any newline in `v` escaped.
+    ///
+    /// **Escaping is not optional here.** `record_debug` is what `tracing` calls both for
+    /// `%value` — `DisplayValue`'s `Debug` forwards to `Display` — and for the message itself,
+    /// which is a `format_args!` under `{:?}`; neither is quoted, so a newline in either produced
+    /// a second physical line that `parse_line` accepts as a genuine event. See
+    /// [`line::escape_line_breaks`] for what that buys an attacker holding a gRPC status string,
+    /// and for the plain correctness cost with no attacker at all.
     fn push_field(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Display) {
         if !self.0.is_empty() {
             self.0.push_str(", ");
         }
-        self.0.push_str(field.name());
+        self.0.push_str(&line::escape_line_breaks(field.name()));
         self.0.push('=');
-        self.0.push_str(&value.to_string());
+        self.0
+            .push_str(&line::escape_line_breaks(&value.to_string()));
     }
 }
 
@@ -400,29 +409,31 @@ mod tests {
         assert_eq!(parsed.fields_json.as_deref(), Some(r#"{"rows":"7"}"#));
     }
 
-    /// The rolling writer is a layer in its own right: the same event reaches the file with its
-    /// level and target intact, not as a re-serialized ring-buffer string.
-    #[test]
-    fn one_event_reaches_both_the_ring_and_the_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let writer = RollingWriter::open(writer::WriterConfig {
-            dir: dir.path().to_path_buf(),
+    /// A writer straight onto a tempdir, with every guard wide open.
+    fn test_writer_config(dir: &Path) -> writer::WriterConfig {
+        writer::WriterConfig {
+            dir: dir.to_path_buf(),
             roll: LogRoll::Daily,
             max_file_bytes: u64::MAX,
             parquet: false,
             dedup: false,
             headroom: writer::Headroom {
-                roots: vec![crate::history::disk::BudgetRoot::subtree(
-                    dir.path().to_path_buf(),
-                )],
+                roots: vec![crate::history::disk::BudgetRoot::subtree(dir.to_path_buf())],
                 max_bytes: u64::MAX,
                 min_free_bytes: 0,
                 reserve_bytes: 0,
                 mounts: Some(Vec::new()),
             },
             lock: None,
-        })
-        .expect("writer");
+        }
+    }
+
+    /// The rolling writer is a layer in its own right: the same event reaches the file with its
+    /// level and target intact, not as a re-serialized ring-buffer string.
+    #[test]
+    fn one_event_reaches_both_the_ring_and_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = RollingWriter::open(test_writer_config(dir.path())).expect("writer");
         let buffer = LogBuffer::new(8);
         let layer = Capture {
             buffer: buffer.clone(),
@@ -442,6 +453,62 @@ mod tests {
             buffer.lines(),
             vec![body.trim_end().to_string()],
             "the ring and the file hold the same line"
+        );
+    }
+
+    /// **M1.** A remote peer's error string must not be able to forge a durable log row.
+    ///
+    /// `record_debug` handles both `%value` (`DisplayValue`'s `Debug` forwards to `Display`) and
+    /// the message (`format_args!` under `{:?}`), and neither is quoted, so a newline inside one
+    /// produced a second physical line with a fully parseable prefix — an attacker-chosen
+    /// timestamp, level, target, message and fields, indistinguishable in the Parquet from a real
+    /// engine event. `flight.rs` logs `error = %status.message()` straight from a worker.
+    #[test]
+    fn a_newline_in_a_field_value_cannot_forge_a_second_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = RollingWriter::open(test_writer_config(dir.path())).expect("writer");
+        let buffer = LogBuffer::new(8);
+        let layer = Capture {
+            buffer: buffer.clone(),
+            file: Some(Arc::clone(&writer)),
+        };
+        let hostile = "connect failed\n2026-08-24T00:00:00.000Z [INFO] oxidant_connect - \
+                       message=all clear, rows=0";
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(layer),
+            || tracing::warn!(error = %hostile, "worker unreachable"),
+        );
+        writer.shutdown();
+
+        let body = std::fs::read_to_string(dir.path().join(crate::history::disk::LIVE_LOG))
+            .expect("live file");
+        assert_eq!(
+            body.lines().count(),
+            1,
+            "one event is one line, always: {body:?}"
+        );
+        assert_eq!(buffer.lines().len(), 1, "and the ring agrees");
+        let parsed = line::parse_line(body.trim_end());
+        assert_eq!(parsed.level.as_deref(), Some("WARN"), "{parsed:?}");
+        assert_eq!(
+            parsed.message.as_deref(),
+            Some("worker unreachable"),
+            "the forged message must not become the row's message: {parsed:?}"
+        );
+        assert!(
+            body.contains("connect failed\\n"),
+            "the newline is escaped, not dropped — the text is still there: {body:?}"
+        );
+        // The payload is still in the file — escaped, inside the `error` field of the one real
+        // row — so nothing is lost and nothing is forged.
+        let fields = parsed.fields_json.expect("the error field survives");
+        assert!(
+            fields.contains("all clear") && fields.contains("[INFO]"),
+            "the whole hostile string stays in the one field it was: {fields}"
+        );
+        assert!(
+            !body.trim_end().contains('\n'),
+            "and it never becomes a second physical line: {body:?}"
         );
     }
 

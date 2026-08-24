@@ -661,6 +661,18 @@ init is `oxidant_connect::logging::init(role, port)`.
 - **Text is authoritative; Parquet is a derived form.** The live file `oxidant.log` is
   line-oriented text, appended and periodically flushed. This preserves the crash
   honesty of §4 — a torn tail loses the last lines, not the file.
+- **One event is one line, always** *(PR3)*. Every field value has `\n` and `\r`
+  escaped before it is rendered, at the visitor and again at the renderer. The format is
+  newline-delimited with a fully parseable prefix, so an unescaped newline inside a value
+  produced a second physical line that the parser accepted as a *genuine event* — with an
+  attacker-chosen timestamp, level, target, message and fields, indistinguishable in the
+  Parquet from a real one. The values are remote-controlled in practice: the Flight client
+  logs `error = %status.message()` from a worker, and DataFusion and connector errors
+  routinely embed multi-line plan text. It is a correctness bug before it is a security
+  one — a routine multi-line error became N rows whose continuation lines carried **null
+  `ts` and null `level`**, so §6b's time-range and level filters silently excluded exactly
+  the errors an operator was searching for. `record_str` was already safe (it renders under
+  `{:?}`); `%value` and the message itself were not.
 - **Two roll triggers, whichever first**: the UTC clock boundary (`daily` default,
   `hourly`/`weekly` via `OXIDANT_LOG_ROLL`) or the size cap
   (`OXIDANT_LOG_MAX_FILE_BYTES`), which produces a `.N` split (§3 Naming) — a chatty
