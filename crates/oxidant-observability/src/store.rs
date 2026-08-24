@@ -847,9 +847,12 @@ impl AppStateStore {
     /// history server that read only `events.jsonl` would report a cluster's history as starting
     /// at the last roll — which is precisely the data loss the roll exists to avoid.
     ///
-    /// The names sort lexicographically into chronological order within a roll mode, which is
-    /// what makes `sort()` the right replay order here; the fold is per-event and idempotent
-    /// either way.
+    /// **The replay order is `(period end, split)`, never the file name.** `apply_event` is
+    /// last-write-wins and `JobStarted` overwrites the whole job — status `Running`, no completion
+    /// time, no error — so replaying a newer generation before an older one brings a finished job
+    /// back as running. And the names do *not* sort chronologically:
+    /// `events-2026-08-24.2.jsonl` sorts before `events-2026-08-24.jsonl` (`'2'` < `'j'`), and the
+    /// `.2` split is the *newer* of the two. See [`crate::event_log`].
     pub fn load_event_log(dir: &std::path::Path) -> Self {
         let store = Self::with_options(
             "oxidant-history",
@@ -857,19 +860,22 @@ impl AppStateStore {
             None,
             DEFAULT_MAX_QUERIES,
         );
-        let mut rolled: Vec<PathBuf> = fs::read_dir(dir)
+        let mut keyed: Vec<(crate::event_log::OrderKey, PathBuf)> = fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("events-") && n.ends_with(".jsonl"))
+            .filter_map(|e| {
+                let key = crate::event_log::rolled_order_key(e.file_name().to_str()?)?;
+                Some((key, e.path()))
             })
-            .map(|e| e.path())
             .collect();
-        rolled.sort();
-        rolled.push(dir.join("events.jsonl"));
+        // The path breaks ties so two generations that somehow share a key still replay
+        // deterministically — a replay whose result depends on directory order is untestable.
+        keyed.sort();
+        let mut rolled: Vec<PathBuf> = keyed.into_iter().map(|(_, path)| path).collect();
+        // The live file is the newest generation by construction: every rolled one was renamed
+        // out of it.
+        rolled.push(dir.join(crate::event_log::LIVE_EVENT_LOG));
         for path in rolled {
             let Ok(content) = fs::read_to_string(path) else {
                 continue;
@@ -998,6 +1004,59 @@ mod tests {
                 "op-oldest".to_string()
             ],
             "every rolled generation is replayed, not just the live file"
+        );
+    }
+
+    /// **A finished job stays finished.** `apply_event` is last-write-wins and `JobStarted`
+    /// overwrites the whole job — status `Running`, `completion_time_ms: None`, `error: None` — so
+    /// the replay order is a correctness property. A job that started in
+    /// `events-2026-08-24.jsonl` and finished in the `.2` split after a roll comes back `Running`,
+    /// with its completion time erased, under the lexicographic order this replaced: `'2'` (0x32)
+    /// sorts before `'j'` (0x6a), so the split replayed first and the plain file clobbered it.
+    #[test]
+    fn a_job_that_finished_in_a_later_split_is_not_resurrected_as_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, events: &[ExecutionEvent]| {
+            let body: String = events
+                .iter()
+                .map(|e| format!("{}\n", serde_json::to_string(e).expect("json")))
+                .collect();
+            fs::write(dir.path().join(name), body).expect("write");
+        };
+        let started = ExecutionEvent::JobStarted {
+            operation_id: "op-1".into(),
+            job_id: 7,
+            description: "SELECT 1".into(),
+            submission_time_ms: 1_000,
+        };
+        let finished = ExecutionEvent::JobFinished {
+            operation_id: "op-1".into(),
+            job_id: 7,
+            status: JobStatus::Succeeded,
+            completion_time_ms: 2_000,
+            error: None,
+        };
+        // The roll landed between the two events: the start is in the plain file of the period,
+        // the finish in the `.2` split that the roll created after it.
+        write("events-2026-08-24.jsonl", &[started]);
+        write("events-2026-08-24.2.jsonl", &[finished]);
+
+        let store = AppStateStore::load_event_log(dir.path());
+        assert_eq!(
+            store.all_operation_states(),
+            vec![("op-1".to_string(), OperationState::Succeeded)],
+            "the `.2` split is the newer generation and must be replayed last"
+        );
+        let job = store
+            .list_jobs(None)
+            .into_iter()
+            .find(|j| j.job_id == 7)
+            .expect("the job survives the replay");
+        assert_eq!(job.status, job_status_str(JobStatus::Succeeded));
+        assert!(
+            job.completion_time.is_some(),
+            "a resurrected job loses its completion time: {:?}",
+            job.completion_time
         );
     }
 

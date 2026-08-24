@@ -16,8 +16,11 @@
 //! 3. **`.N` is the size-split sequence**, present only on the second and later files of a
 //!    period. A clock roll and a size roll therefore never produce the same name.
 //!
-//! Ordering is lexicographic-equals-chronological within a roll mode, which is what the prune
-//! and `GET /api/v1/logs/files` (PR4) rely on.
+//! Ordering is **`(period end, split)`, never lexicographic**: a `.N` split is the *newer*
+//! generation of its period but its name sorts *before* the plain one (`'2'` < `'l'`). Every
+//! consumer — `disk::rolled_by_period`, `disk::rolled_event_logs`,
+//! `AppStateStore::load_event_log` and `GET /api/v1/logs/files` (PR4) — computes that key rather
+//! than sorting the names.
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike, Utc};
 

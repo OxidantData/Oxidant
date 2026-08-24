@@ -158,8 +158,11 @@ oxidant-YYYY-Www[.N].{log,parquet}          # weekly, ISO year+week = chrono %G-
   2026-W53. The **rule** was right and is unchanged; only the worked example was
   wrong, and `chrono`'s `%G-W%V` produces the correct answer either way — the first
   run of the test caught the doc, not the code.)
-- Ordering is lexicographic-equals-chronological within a roll mode, which is what the
-  prune and `/api/v1/logs/files` rely on.
+- Ordering is **`(period end, split)`, never lexicographic**, and every consumer — the
+  prune, `/api/v1/logs/files`, and `AppStateStore::load_event_log` — computes it that
+  way. Lexicographic order is chronological only for the plain names of one roll mode:
+  a `.N` split is the *newer* generation of its period but sorts *before* the plain
+  file, because `'2'` (0x32) < `'l'` (0x6a) / `'j'` (0x6a).
 
 ### Retention arithmetic
 
@@ -858,10 +861,16 @@ exclusive. Concretely:
   and the file just rolled then sorts as the oldest generation of its period and the very
   next prune takes it, keeping the stale `.2`.
 
-  `AppStateStore::load_event_log` reads the rolled generations too, oldest name first,
-  then the live file. A history server that read only `events.jsonl` would report a
-  cluster's history as starting at the last roll, which is precisely the data loss the
-  roll exists to avoid.
+  `AppStateStore::load_event_log` reads the rolled generations too, ordered by
+  **`(period end, split)`** — the same key the prune uses — and the live file last. A
+  history server that read only `events.jsonl` would report a cluster's history as
+  starting at the last roll, which is precisely the data loss the roll exists to avoid.
+
+  The order is a *correctness* property, not a presentation one. The fold is
+  last-write-wins and `JobStarted` overwrites the whole job (status `Running`, no
+  completion time, no error), so replaying a newer generation before an older one brings
+  a finished job back as running. A `sort()` over the names does exactly that: the `.2`
+  split holding a `JobFinished` sorts before the plain file holding its `JobStarted`.
 
 ## 9. Test plan
 
