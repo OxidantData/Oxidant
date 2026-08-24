@@ -218,6 +218,14 @@ struct Statement {
     /// Fires when this statement's terminal record is fsynced; taken by whoever answers the
     /// client, at most once.
     durable_ack: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Are this statement's result rows retained *here*?
+    ///
+    /// False for the Connect path: its batches are already streaming to the gRPC client as Arrow
+    /// IPC and the store deliberately keeps no second copy (PR2 spills them to
+    /// `results/<id>.arrow`). Without this the statement is hot, succeeded, and has an empty
+    /// `batches` — so the result endpoint answered `200 {"rows":[]}` for a query whose own status
+    /// document said `rowCount: 5`.
+    rows_retained: bool,
 }
 
 impl Statement {
@@ -234,6 +242,7 @@ impl Statement {
             source: self.source,
             client_op_id: self.client_op_id.clone(),
             tier: Tier::Hot,
+            rows_retained: self.rows_retained,
         }
     }
 
@@ -290,6 +299,8 @@ pub(crate) struct StatementSnapshot {
     source: Source,
     client_op_id: Option<String>,
     tier: Tier,
+    /// Whether `/result` can still answer with rows, or must say `410 result_expired`.
+    rows_retained: bool,
 }
 
 impl StatementSnapshot {
@@ -306,6 +317,8 @@ impl StatementSnapshot {
             source: st.source,
             client_op_id: st.client_op_id.clone(),
             tier: Tier::History,
+            // The history tier holds no batches by construction.
+            rows_retained: false,
         }
     }
 }
@@ -565,6 +578,7 @@ impl StatementStore {
                     session: session.map(str::to_string),
                     client_op_id: alias.clone(),
                     durable_ack: None,
+                    rows_retained: true,
                 },
             );
             if let (Some(session), Some(alias)) = (session, alias.as_deref()) {
@@ -684,6 +698,10 @@ impl StatementStore {
                     st.row_count = rows;
                     st.schema = schema;
                     st.status = StatementStatus::Succeeded;
+                    // The batches went to the gRPC client, not into the store. `/result` must say
+                    // so (`410 result_expired`) rather than answer an empty row set that
+                    // contradicts the `rowCount` in this statement's own status document.
+                    st.rows_retained = false;
                 }
                 ExecOutcome::Failed(error) => {
                     st.error = Some(error);
@@ -1262,9 +1280,11 @@ async fn get_result(
             "statement result is only available once it has succeeded",
         );
     }
-    if snap.tier == Tier::History {
-        // The statement is known and succeeded, but its rows are gone: it was replayed from the
-        // journal, or its hot entry aged out. `404` would say "no such id", which is false.
+    if snap.tier == Tier::History || !snap.rows_retained {
+        // The statement is known and succeeded, but its rows are not here: it was replayed from
+        // the journal, its hot entry aged out, or it came in over Connect and its batches went
+        // straight to the gRPC client. `404` would say "no such id", which is false — and so
+        // would `200 {"rows":[]}`, which contradicts the `rowCount` this same statement reports.
         // Reading the rows back off disk is PR2 (`results/<id>.arrow`); until then this is the
         // honest answer, and it is the same code PR2 falls through to.
         return error_response(StatusCode::GONE, "result_expired");
@@ -2613,6 +2633,87 @@ mod tests {
             journal.write_failures() >= 1,
             "the /api/status-level failure counter moved"
         );
+    }
+
+    /// M2: a Connect statement's `/result` must not answer `200 {"rows":[]}` while its own
+    /// status document says `rowCount: 5`.
+    ///
+    /// Its batches stream to the gRPC client as Arrow IPC and the store keeps no second copy, so
+    /// the statement sits in the hot tier, succeeded, with an empty `batches` — falling straight
+    /// through to the JSON encoder. `docs/api.md` has `410 result_expired` for exactly this: the
+    /// id is known and the query succeeded, the rows are simply not here.
+    #[tokio::test]
+    async fn a_connect_statements_result_is_gone_not_an_empty_row_set() {
+        let _env = crate::distributed::env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = Arc::new(OxidantService::new());
+        service.attach_statement_store(history_store(dir.path()));
+
+        let request = tonic::Request::new(sc::ExecutePlanRequest {
+            session_id: "sess-m2".to_string(),
+            operation_id: Some("op-m2".to_string()),
+            plan: Some(sc::Plan {
+                op_type: Some(sc::plan::OpType::Root(crate::sql_relation(
+                    "SELECT * FROM (VALUES (1),(2),(3),(4),(5)) AS t(n)",
+                ))),
+            }),
+            ..Default::default()
+        });
+        <OxidantService as SparkConnectService>::execute_plan(&service, request)
+            .await
+            .expect("execute_plan");
+
+        let store = service.statement_store().expect("attached").clone();
+        let id = store
+            .list()
+            .into_iter()
+            .find(|s| s.source == Source::Connect)
+            .expect("the connect statement is on the rail")
+            .id;
+        let state = RestState {
+            service: Arc::clone(&service),
+            store,
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            status_token: None,
+        };
+        let router = app(state);
+
+        // The status document claims rows, and it is right — they went to the gRPC client.
+        let (status, body) = get_json(&router, &format!("/api/v1/statements/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "succeeded");
+        assert_eq!(body["source"], "connect");
+        assert_eq!(body["tier"], "hot", "still hot, which is what exposed this");
+        assert_eq!(body["rowCount"], 5);
+
+        // So the result endpoint must not claim there were none.
+        let (status, body) = get_json(&router, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(
+            status,
+            StatusCode::GONE,
+            "a hot Connect statement whose rows were never retained is `gone`, not empty: {body}"
+        );
+        assert_eq!(body["error"], "result_expired");
+    }
+
+    /// The counterpart: a REST statement that genuinely returned no rows still answers `200`
+    /// with an empty set. "No rows" and "rows not here" are different answers.
+    #[tokio::test]
+    async fn a_rest_statement_with_no_rows_is_still_an_empty_result_not_gone() {
+        let (_env, _state, app) = test_state();
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/statements?wait=true",
+            json!({ "sql": "SELECT 1 AS n WHERE 1 = 0" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "succeeded", "{body}");
+        let id = body["statementId"].as_str().expect("id");
+        let (status, body) = get_json(&app, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rowCount"], 0);
+        assert_eq!(body["rows"].as_array().expect("rows").len(), 0);
     }
 
     /// One session cannot evict another's history: the per-session share is swept first.
