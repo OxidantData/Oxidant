@@ -739,6 +739,15 @@ exclusive. Concretely:
   `history_writes: degraded` (and `disk: over_budget` if §3's sweeper has run out of
   things to prune); the engine keeps executing. Recovered disk flips it back without a
   restart.
+- **Degraded is per subsystem.** There are three — the journal, the result spill writer,
+  and the disk sweep — and each one's flag is sticky until a success **of its own**
+  clears it. `history_writes` is the aggregate (`degraded` while any is), `result_writes`
+  is the spill writer alone, and `disk` is the sweep's. Reporting a spill failure through
+  the journal's flag made it invisible: the journal clears its own on every successful
+  append, so a permanently failing `OXIDANT_RESULT_DIR` read `ok` again the microsecond
+  the next statement was submitted. `result_write_failures` counts the spills the disk
+  refused; `history_dropped_events` counts the journal records *and* spill jobs that
+  never reached a writer at all.
 - **Corruption**: quarantine-and-continue (§4c). Boot is never blocked by history.
 
 ## 8. Compatibility
@@ -852,8 +861,10 @@ Guards and degradation:
   file, and reports `over_budget` only after everything prunable is gone *(shipped in
   PR2; the `event_log_dir` half waits on PR3 — see §3)*;
 - `/api/status` reports `history_writes: degraded` under a failing-writer shim and
-  flips back to `ok` on the next successful append, with no restart; with
-  `OXIDANT_HISTORY=off` the four durability fields are absent entirely *(shipped)*;
+  flips back to `ok` on the next successful append, with no restart; a failing *spill*
+  writer is reported by `result_writes` / `result_write_failures` and is **not** cleared
+  by a healthy journal append; with `OXIDANT_HISTORY=off` all six durability fields are
+  absent entirely *(shipped)*;
 - two processes on one root: the second fails with the lock error; with
   `OXIDANT_DATA_DIR_PER_PROCESS=1` it starts in its own subdir;
 - an object-store URL in `OXIDANT_DATA_DIR` is rejected at boot;

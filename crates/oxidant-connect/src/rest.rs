@@ -588,9 +588,10 @@ pub(crate) struct StatementStore {
     notify: Arc<Notify>,
     /// `None` — `OXIDANT_HISTORY=off` — is exactly today's volatile store.
     history: Option<Arc<HistoryRuntime>>,
-    /// Set by the last disk sweep that ran out of things to prune — `disk: over_budget` on
-    /// `/api/status`. Cleared by the first sweep that fits again, with no restart (§3).
-    disk_over_budget: Arc<std::sync::atomic::AtomicBool>,
+    /// What the last disk sweep found: over the engine's own budget, and/or under the volume's
+    /// free-space floor. Both are cleared by the first sweep that finds them false again, with
+    /// no restart (§3).
+    disk: Arc<DiskHealth>,
 }
 
 impl StatementStore {
@@ -600,7 +601,7 @@ impl StatementStore {
             inner: Arc::new(Mutex::new(StoreInner::default())),
             notify: Arc::new(Notify::new()),
             history: None,
-            disk_over_budget: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            disk: Arc::new(DiskHealth::default()),
         }
     }
 
@@ -639,7 +640,7 @@ impl StatementStore {
             inner: Arc::new(Mutex::new(inner)),
             notify: Arc::new(Notify::new()),
             history: Some(Arc::new(runtime)),
-            disk_over_budget: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            disk: Arc::new(DiskHealth::default()),
         };
         store.install_spill_sink();
         store.publish_status_counters();
@@ -1459,7 +1460,8 @@ impl StatementStore {
                 "disk sweep"
             );
         }
-        self.disk_over_budget
+        self.disk
+            .over_budget
             .store(report.over_budget, std::sync::atomic::Ordering::Relaxed);
         report
     }
@@ -1554,15 +1556,17 @@ impl StatementStore {
             return;
         };
         let history = Arc::downgrade(history);
-        let over_budget = Arc::clone(&self.disk_over_budget);
+        let disk = Arc::clone(&self.disk);
         oxidant_observability::set_history_status_source(move || match history.upgrade() {
-            Some(history) => counters_for(&history, &over_budget),
+            Some(history) => counters_for(&history, &disk),
             // The store this was published for is gone (only a test drops one). Report the
             // quiet defaults rather than a stale reading of a journal that no longer exists.
             None => oxidant_observability::HistoryStatus {
                 history_writes: oxidant_observability::history_writes::OK.to_string(),
                 history_dropped_events: 0,
                 results_on_disk_bytes: 0,
+                result_writes: oxidant_observability::history_writes::OK.to_string(),
+                result_write_failures: 0,
                 disk: oxidant_observability::disk_state::OK.to_string(),
             },
         });
@@ -1577,7 +1581,7 @@ impl StatementStore {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn status_counters(&self) -> Option<oxidant_observability::HistoryStatus> {
         let history = self.history.as_ref()?;
-        Some(counters_for(history, &self.disk_over_budget))
+        Some(counters_for(history, &self.disk))
     }
 
     /// Run the disk sweep every `OXIDANT_DISK_SWEEP_SECS` for as long as the store lives.
@@ -1594,7 +1598,11 @@ impl StatementStore {
         let interval = history.cfg.disk_sweep_interval;
         let inner = Arc::downgrade(&self.inner);
         let history = Arc::downgrade(history);
-        let over_budget = Arc::clone(&self.disk_over_budget);
+        let disk = Arc::clone(&self.disk);
+        // The *same* `Notify`, not a fresh one: `prune_oldest_statement` can remove a statement
+        // a `?wait=true` caller is parked on, and a sweeper holding its own channel would leave
+        // that caller blocked to its timeout instead of waking it.
+        let notify = Arc::downgrade(&self.notify);
         let spawned = std::thread::Builder::new()
             .name("oxidant-disk-sweep".to_string())
             .spawn(move || {
@@ -1602,7 +1610,9 @@ impl StatementStore {
                 let mut waited = Duration::ZERO;
                 loop {
                     std::thread::sleep(tick);
-                    let (Some(inner), Some(history)) = (inner.upgrade(), history.upgrade()) else {
+                    let (Some(inner), Some(history), Some(notify)) =
+                        (inner.upgrade(), history.upgrade(), notify.upgrade())
+                    else {
                         return;
                     };
                     waited += tick;
@@ -1614,9 +1624,9 @@ impl StatementStore {
                     // ticks and the store can be dropped while it sleeps.
                     let store = StatementStore {
                         inner,
-                        notify: Arc::new(Notify::new()),
+                        notify,
                         history: Some(history),
-                        disk_over_budget: Arc::clone(&over_budget),
+                        disk: Arc::clone(&disk),
                     };
                     store.sweep_disk();
                 }
@@ -1654,29 +1664,61 @@ impl StatementStore {
 
 /// Read the durability counters off a booted history runtime (§3, §7).
 ///
-/// `history_dropped_events` counts the journal's dropped records *and* the spill jobs the writer
-/// had no room for: both are work history gave up on under pressure, and an operator watching one
-/// number for "am I losing history" should not have to know there are two queues.
+/// Three subsystems, three flags, one aggregate. `history_writes` is `degraded` while *any* of
+/// the journal, the spill writer or the disk sweep is, and each of those three is sticky until a
+/// success **of its own** clears it. Reporting them through one flag was H3: the journal clears
+/// its own on every successful append, so a permanently failing result volume read `ok` again
+/// the microsecond the next statement was submitted.
+///
+/// `history_dropped_events` still counts the journal's dropped records *and* the spill jobs the
+/// writer had no room for: both are work history gave up on under pressure, and an operator
+/// watching one number for "am I losing history" should not have to know there are two queues.
+/// Spills the disk *refused* are a different thing and get their own `result_write_failures`.
 fn counters_for(
     history: &HistoryRuntime,
-    over_budget: &std::sync::atomic::AtomicBool,
+    disk: &DiskHealth,
 ) -> oxidant_observability::HistoryStatus {
-    oxidant_observability::HistoryStatus {
-        history_writes: if history.journal.is_degraded() {
+    let result_degraded = history.results.is_degraded();
+    let low_free = disk.low_free.load(std::sync::atomic::Ordering::Relaxed);
+    let over_budget = disk.over_budget.load(std::sync::atomic::Ordering::Relaxed);
+    let flag = |degraded: bool| {
+        if degraded {
             oxidant_observability::history_writes::DEGRADED
         } else {
             oxidant_observability::history_writes::OK
         }
-        .to_string(),
+        .to_string()
+    };
+    oxidant_observability::HistoryStatus {
+        history_writes: flag(history.journal.is_degraded() || result_degraded || low_free),
         history_dropped_events: history.journal.dropped_events() + history.results.dropped_spills(),
         results_on_disk_bytes: history.results.on_disk_bytes(),
-        disk: if over_budget.load(std::sync::atomic::Ordering::Relaxed) {
+        result_writes: flag(result_degraded),
+        result_write_failures: history.results.write_failures(),
+        // `over_budget` wins when both hold: it is the condition the engine can act on, and the
+        // one whose remedy (raise the budget, or let the sweeper work) is the operator's.
+        disk: if over_budget {
             oxidant_observability::disk_state::OVER_BUDGET
+        } else if low_free {
+            oxidant_observability::disk_state::LOW_FREE
         } else {
             oxidant_observability::disk_state::OK
         }
         .to_string(),
     }
+}
+
+/// The disk sweep's own two flags, shared between the store, its sweeper thread and
+/// `/api/status`.
+///
+/// They are deliberately separate booleans rather than one: `over_budget` means *the engine
+/// overspent its own budget and has nothing left to prune*, and `low_free` means *the volume is
+/// short for reasons that may have nothing to do with the engine*. Collapsing them is what let a
+/// co-tenant filling the disk delete the entire statement history (H1).
+#[derive(Debug, Default)]
+pub(crate) struct DiskHealth {
+    over_budget: std::sync::atomic::AtomicBool,
+    low_free: std::sync::atomic::AtomicBool,
 }
 
 /// The distinct subtrees the disk budget covers, deduped so nothing is billed twice.
@@ -4268,6 +4310,60 @@ mod tests {
             Some(oxidant_observability::history_writes::OK.to_string()),
             "history_writes must flip back without a restart"
         );
+        store.shutdown_for_test();
+    }
+
+    /// H3: degraded is **per subsystem**, and a subsystem's flag is cleared only by a success of
+    /// its own. A failing `OXIDANT_RESULT_DIR` used to read `ok` again the microsecond the next
+    /// statement was submitted, because the spill reported through the *journal's* flag and the
+    /// journal clears that on every successful append.
+    #[tokio::test]
+    async fn a_failed_spill_stays_degraded_across_a_successful_journal_append() {
+        use oxidant_observability::history_writes::{DEGRADED, OK};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let results = dir.path().join("history/results");
+
+        // A *directory* where the spill's tmp file belongs: `create_secure` fails with EISDIR —
+        // the ENOSPC/EIO shape, deterministically, with no fault injector.
+        let (broken, _) = store.insert("SELECT 'broken'");
+        let blocked = results.join(format!("{broken}.arrow.tmp"));
+        std::fs::create_dir_all(&blocked).expect("block the spill");
+        store.finish(&broken, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+
+        let counters = store.status_counters().expect("history is on");
+        assert_eq!(counters.result_writes, DEGRADED, "{counters:?}");
+        assert_eq!(counters.result_write_failures, 1, "{counters:?}");
+        assert_eq!(
+            counters.history_writes, DEGRADED,
+            "the aggregate must carry it: {counters:?}"
+        );
+
+        // The regression: a healthy journal append (this submits *and* fsyncs a terminal record)
+        // must not clear the spill writer's flag.
+        let (chatter, _) = store.insert("SELECT 'chatter'");
+        store.finish(&chatter, ExecOutcome::Succeeded(Vec::new()));
+        assert!(
+            !store.await_durable(&chatter).await,
+            "the journal itself is healthy"
+        );
+        let counters = store.status_counters().expect("history is on");
+        assert_eq!(
+            counters.result_writes, DEGRADED,
+            "a journal success is not a spill success: {counters:?}"
+        );
+        assert_eq!(counters.history_writes, DEGRADED, "{counters:?}");
+
+        // Only a spill that lands clears it — and the failure stays counted.
+        std::fs::remove_dir(&blocked).expect("unblock");
+        let (healthy, _) = store.insert("SELECT 'healthy'");
+        store.finish(&healthy, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+        let counters = store.status_counters().expect("history is on");
+        assert_eq!(counters.result_writes, OK, "{counters:?}");
+        assert_eq!(counters.history_writes, OK, "{counters:?}");
+        assert_eq!(counters.result_write_failures, 1, "{counters:?}");
         store.shutdown_for_test();
     }
 

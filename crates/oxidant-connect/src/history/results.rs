@@ -21,7 +21,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -80,10 +80,24 @@ pub(crate) struct ResultStore {
     persist: ResultPersist,
     tx: SyncSender<Msg>,
     on_disk_bytes: Arc<AtomicU64>,
-    /// Spill jobs the queue had no room for. A lost spill is not a lost statement: the rows are
-    /// still in memory and the journal record is unchanged, so the only cost is that `/result`
-    /// answers `410 result_expired` after a restart instead of reading the file.
+    /// Spill jobs the queue had no room for. The rows are *not* stranded — [`ResultStore::spill`]
+    /// reports the refusal back to the caller, which puts the statement back into the memory
+    /// budget's candidate set — but the result never reached the disk, so `/result` answers
+    /// `410 result_expired` for it after a restart instead of reading the file.
     dropped: Arc<AtomicU64>,
+    /// This subsystem's own degraded flag (§7, H3).
+    ///
+    /// Sticky until a spill of *this* store's succeeds. It is deliberately not the journal's
+    /// flag: the journal clears its own on every successful append, so a spill failure reported
+    /// through it was visible only until the next statement was submitted — microseconds — and a
+    /// permanently failing `OXIDANT_RESULT_DIR` read `ok` forever.
+    degraded: Arc<AtomicBool>,
+    /// Spills the disk refused outright (ENOSPC/EIO/EISDIR) — `result_write_failures`.
+    write_failures: Arc<AtomicU64>,
+    /// Set while the free-space floor is breached: spills are *paused* rather than attempted,
+    /// because a spill is the largest write the engine makes and the volume is already short
+    /// (§3, H1).
+    paused: Arc<AtomicBool>,
     sink: Arc<OnceLock<Sink>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -110,11 +124,15 @@ impl ResultStore {
         let (tx, rx) = sync_channel(SPILL_QUEUE);
         let on_disk_bytes = Arc::new(AtomicU64::new(scan_bytes(&cfg.results_dir)));
         let sink: Arc<OnceLock<Sink>> = Arc::new(OnceLock::new());
+        let degraded = Arc::new(AtomicBool::new(false));
+        let write_failures = Arc::new(AtomicU64::new(0));
         let writer = SpillWriter {
             dir: cfg.results_dir.clone(),
             max_bytes: cfg.result_max_bytes,
             journal,
             on_disk_bytes: Arc::clone(&on_disk_bytes),
+            degraded: Arc::clone(&degraded),
+            write_failures: Arc::clone(&write_failures),
             sink: Arc::clone(&sink),
         };
         let thread = std::thread::Builder::new()
@@ -127,6 +145,9 @@ impl ResultStore {
             tx,
             on_disk_bytes,
             dropped: Arc::new(AtomicU64::new(0)),
+            degraded,
+            write_failures,
+            paused: Arc::new(AtomicBool::new(false)),
             sink,
             thread: Mutex::new(Some(thread)),
         }))
@@ -153,6 +174,32 @@ impl ResultStore {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    /// Spills the disk refused — `result_write_failures` on `/api/status`.
+    pub(crate) fn write_failures(&self) -> u64 {
+        self.write_failures.load(Ordering::Relaxed)
+    }
+
+    /// Is the *spill* subsystem degraded? Sticky until a spill of its own succeeds (§7, H3): a
+    /// healthy journal must not be able to report a failing result volume as `ok`.
+    pub(crate) fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// Stop attempting spills (the free-space floor is breached) or resume them.
+    ///
+    /// Pausing is not degrading: the reason is reported as `disk: low_free`, and the sweep
+    /// subsystem owns that flag. A paused [`Self::spill`] refuses the job the same way a full
+    /// queue does, so the statement goes back into the memory budget's candidate set rather
+    /// than being stranded.
+    pub(crate) fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    /// Are spills paused by the free-space floor?
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
     /// Queue a spill. Never blocks and never runs I/O on the caller's thread — the caller is
     /// `finish()`, on a tokio worker, having just released the store mutex.
     pub(crate) fn spill(&self, job: SpillJob) {
@@ -161,6 +208,7 @@ impl ResultStore {
         }
         if let Err(TrySendError::Full(_)) = self.tx.try_send(Msg::Spill(Box::new(job))) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.degraded.store(true, Ordering::Relaxed);
         }
     }
 
@@ -278,6 +326,10 @@ struct SpillWriter {
     max_bytes: u64,
     journal: Arc<Journal>,
     on_disk_bytes: Arc<AtomicU64>,
+    /// The spill subsystem's degraded flag — set by a refused write here, cleared by the next
+    /// spill that lands here, and by nothing else (§7, H3).
+    degraded: Arc<AtomicBool>,
+    write_failures: Arc<AtomicU64>,
     sink: Arc<OnceLock<Sink>>,
 }
 
@@ -309,6 +361,11 @@ impl SpillWriter {
                 folded.result_refused = None;
                 folded.last_seq = self.journal.next_seq();
                 self.journal.append_retained(folded.to_snapshot());
+                // A spill that landed is the only thing that clears the spill subsystem's own
+                // degraded flag. A successful *journal* append must not, which is the whole of
+                // H3: a permanently failing `OXIDANT_RESULT_DIR` used to read `ok` again the
+                // microsecond the next statement was submitted.
+                self.degraded.store(false, Ordering::Relaxed);
                 SpillOutcome::Spilled(pointer)
             }
             Ok(None) => {
@@ -329,10 +386,11 @@ impl SpillWriter {
                 tracing::warn!(
                     statement = %job.id,
                     error = %e,
-                    "result spill failed; the rows stay in memory and history is degraded, \
-                     execution is not"
+                    "result spill failed; the rows stay in memory and result writes are \
+                     degraded, execution is not"
                 );
-                self.journal.mark_degraded();
+                self.write_failures.fetch_add(1, Ordering::Relaxed);
+                self.degraded.store(true, Ordering::Relaxed);
                 SpillOutcome::Failed
             }
         };
