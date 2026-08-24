@@ -390,7 +390,9 @@ mod tests {
             parquet: false,
             dedup: false,
             headroom: writer::Headroom {
-                roots: vec![dir.path().to_path_buf()],
+                roots: vec![crate::history::disk::BudgetRoot::subtree(
+                    dir.path().to_path_buf(),
+                )],
                 max_bytes: u64::MAX,
                 min_free_bytes: 0,
                 reserve_bytes: 0,
@@ -469,7 +471,9 @@ mod tests {
                 parquet: false,
                 dedup: false,
                 headroom: writer::Headroom {
-                    roots: vec![dir.path().to_path_buf()],
+                    roots: vec![crate::history::disk::BudgetRoot::subtree(
+                        dir.path().to_path_buf(),
+                    )],
                     max_bytes: u64::MAX,
                     min_free_bytes: 0,
                     reserve_bytes: 0,

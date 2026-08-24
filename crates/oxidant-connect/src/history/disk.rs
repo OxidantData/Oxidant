@@ -66,8 +66,15 @@ pub(crate) struct Prunable {
 /// What one sweep pass did, for the log line and for `/api/status`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct SweepReport {
-    /// Bytes the engine owns under the root after the pass.
+    /// Bytes the engine owns under the root after the pass — the only number
+    /// `OXIDANT_DISK_MAX_BYTES` is compared against.
     pub used_bytes: u64,
+    /// Bytes another tool wrote into a directory the engine shares with it — today only
+    /// `OXIDANT_EVENT_LOG_DIR`, whose whole purpose is to be a Spark-history-server path. Measured
+    /// and reported so a large directory is explicable; **never billed**, because the engine
+    /// cannot prune a single one of them and a budget it can never satisfy runs the prune order to
+    /// exhaustion every five minutes (H2, F16).
+    pub foreign_bytes: u64,
     pub rolled_logs_removed: usize,
     /// Rolled logs whose whole *period* fell out of `OXIDANT_LOG_KEEP_DAYS`. Retention, not
     /// pressure: counted separately so a test can tell "the 30 days expired" from "the budget
@@ -628,24 +635,82 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let events = dir.path().join("elsewhere/events");
         let mut cfg = HistoryConfig::for_root(&dir.path().join("data"));
-        assert!(
-            !budget_roots(&cfg).iter().any(|r| r == &events),
-            "unset: not in the budget"
-        );
+        let has_events = |cfg: &HistoryConfig| {
+            budget_roots(cfg)
+                .into_iter()
+                .find(|r| r.path() == events)
+                .map(|r| r.owned_only)
+        };
+        assert_eq!(has_events(&cfg), None, "unset: not in the budget");
 
         cfg.event_log_dir = Some(events.clone());
         cfg.event_log_max_bytes = 2 * 1024 * 1024 * 1024;
-        assert!(
-            budget_roots(&cfg).iter().any(|r| r == &events),
-            "bounded: counted, and prunable by rolling"
+        assert_eq!(
+            has_events(&cfg),
+            Some(true),
+            "bounded: counted, and only for the generations the engine can prune"
         );
 
         cfg.event_log_max_bytes = 0;
-        assert!(
-            !budget_roots(&cfg).iter().any(|r| r == &events),
+        assert_eq!(
+            has_events(&cfg),
+            None,
             "unbounded by the operator's explicit choice: not billed to a budget that cannot \
              prune it"
         );
+    }
+
+    /// **H2, and PR2's stated hazard.** The whole reason an operator sets
+    /// `OXIDANT_EVENT_LOG_DIR` is to point it at a Spark-history-server path *other tools write*.
+    /// Those bytes cannot be pruned — `roll_event_log` only ever touches `events[-<period>].jsonl`
+    /// — so billing them to `OXIDANT_DISK_MAX_BYTES` pins `used` over the budget permanently and
+    /// runs the prune order to exhaustion every five minutes: every rolled log, every dump, then
+    /// `prune_oldest_statement()` until the journal is empty, then every live result file.
+    ///
+    /// The engine pays for what it can prune and reports the rest.
+    #[test]
+    fn a_co_tenant_in_the_event_log_dir_is_reported_but_never_billed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = dir.path().join("spark-events");
+        let mut cfg = HistoryConfig::for_root(&dir.path().join("data"));
+        cfg.event_log_dir = Some(events.clone());
+        cfg.event_log_max_bytes = 1024;
+
+        // A Spark history server's own files, and ours.
+        touch(&events.join("application_1755_0001"), 20_000);
+        touch(&events.join("application_1755_0002.inprogress"), 5_000);
+        touch(&events.join(LIVE_EVENT_LOG), 300);
+        touch(&events.join("events-2026-08-23.jsonl"), 100);
+
+        let usage = measure_roots(&budget_roots(&cfg));
+        assert_eq!(
+            usage.billed, 400,
+            "only the live event log and the generations the engine rolled"
+        );
+        assert_eq!(
+            usage.foreign, 25_000,
+            "the co-tenant's bytes are measured and reported, never billed"
+        );
+    }
+
+    /// The same rule when the directory sits *inside* the data dir: containment would otherwise
+    /// hand it to the root's recursive walk, which bills everything it finds.
+    #[test]
+    fn an_event_log_dir_inside_the_root_is_still_billed_owned_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("data");
+        let events = root.join("spark-events");
+        let mut cfg = HistoryConfig::for_root(&root);
+        cfg.event_log_dir = Some(events.clone());
+        cfg.event_log_max_bytes = 1024;
+
+        touch(&root.join("logs").join("oxidant.log"), 70);
+        touch(&events.join("application_1755_0001"), 20_000);
+        touch(&events.join(LIVE_EVENT_LOG), 30);
+
+        let usage = measure_roots(&budget_roots(&cfg));
+        assert_eq!(usage.billed, 100, "the live log plus our own event log");
+        assert_eq!(usage.foreign, 20_000);
     }
 
     /// The mount is chosen by longest-prefix match, not by "the first disk": a subtree moved to
@@ -672,6 +737,128 @@ mod tests {
     }
 }
 
+/// One subtree the disk budget covers, and how much of it the engine is willing to pay for.
+///
+/// **The engine bills itself only for files it can prune.** Every root but one is measured whole,
+/// because everything under it is the engine's: it created the directory and it wrote every file
+/// in it. `event_log_dir` is the exception, and it is the whole reason this type exists — see
+/// [`budget_roots`].
+#[derive(Debug, Clone)]
+pub(crate) struct BudgetRoot {
+    path: PathBuf,
+    /// Bill only the live `events.jsonl` and the `events-<period>[.N].jsonl` generations this
+    /// engine rolled; report everything else as foreign.
+    owned_only: bool,
+    /// Subtrees of this root measured as roots in their own right, so nothing is billed twice —
+    /// an `event_log_dir` that happens to sit *inside* the data dir still gets its own rule.
+    excluded: Vec<PathBuf>,
+}
+
+/// What one root costs: what the budget charges for, and what a co-tenant put there.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RootUsage {
+    /// Bytes the engine owns and can prune. This is what `OXIDANT_DISK_MAX_BYTES` governs.
+    pub billed: u64,
+    /// Bytes in a shared directory that another tool wrote. Reported, never billed.
+    pub foreign: u64,
+}
+
+impl RootUsage {
+    fn add(self, other: Self) -> Self {
+        Self {
+            billed: self.billed.saturating_add(other.billed),
+            foreign: self.foreign.saturating_add(other.foreign),
+        }
+    }
+}
+
+impl BudgetRoot {
+    /// A root the engine owns outright.
+    pub(crate) fn subtree(path: PathBuf) -> Self {
+        Self {
+            path,
+            owned_only: false,
+            excluded: Vec::new(),
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn measure(&self) -> RootUsage {
+        if !self.owned_only {
+            return RootUsage {
+                billed: subtree_bytes_excluding(&self.path, &self.excluded),
+                foreign: 0,
+            };
+        }
+        let billed = owned_event_log_bytes(&self.path);
+        RootUsage {
+            billed,
+            foreign: subtree_bytes(&self.path).saturating_sub(billed),
+        }
+    }
+}
+
+/// Total the roots: what the budget charges for, and what it merely reports.
+pub(crate) fn measure_roots(roots: &[BudgetRoot]) -> RootUsage {
+    roots
+        .iter()
+        .fold(RootUsage::default(), |acc, root| acc.add(root.measure()))
+}
+
+/// The bytes the engine itself wrote into `event_log_dir`: the live file plus its rolled
+/// generations, flat, because those are the only names it ever creates there.
+fn owned_event_log_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name != LIVE_EVENT_LOG && !is_rolled_event_log(name) {
+            continue;
+        }
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if meta.is_file() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// [`subtree_bytes`], skipping subtrees that are measured as roots of their own.
+fn subtree_bytes_excluding(dir: &Path, excluded: &[PathBuf]) -> u64 {
+    if excluded.is_empty() {
+        return subtree_bytes(dir);
+    }
+    #[cfg(test)]
+    SUBTREE_WALKS.with(|c| c.set(c.get() + 1));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            if excluded.iter().any(|e| e == &path) {
+                continue;
+            }
+            total += subtree_bytes_excluding(&path, excluded);
+        } else if meta.is_file() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
 /// The distinct subtrees the disk budget covers, deduped so nothing is billed twice.
 ///
 /// `OXIDANT_HISTORY_DIR` / `OXIDANT_RESULT_DIR` / `OXIDANT_LOG_DIR` / `OXIDANT_DUMP_DIR` each win
@@ -679,12 +866,20 @@ mod tests {
 /// against the budget — so the candidates are measured as a set, with any path already contained
 /// in a shallower one dropped.
 ///
-/// `event_log_dir` is in the set as of PR3 (§8/F16). PR2 left it out deliberately: F16's
-/// mechanism for it is a *roll*, the rolling writer was PR3, and counting a directory it could
-/// not prune would have pinned `disk: over_budget` on for every operator pointing
-/// `OXIDANT_EVENT_LOG_DIR` at a large Spark-history-server path. Now that [`roll_event_log`]
-/// exists, it counts.
-pub(crate) fn budget_roots(cfg: &HistoryConfig) -> Vec<PathBuf> {
+/// **`event_log_dir` is billed for the engine's own files only** (§8/F16). PR2 left it out of the
+/// budget entirely and said why: counting a directory the engine could not prune "would pin
+/// `disk: over_budget` on for anyone with a large Spark-history-server directory". PR3 gained the
+/// ability to roll and prune the `events-<period>[.N].jsonl` files it writes there — but *only*
+/// those. The whole reason an operator sets `OXIDANT_EVENT_LOG_DIR` is to point it at a path other
+/// tools write, and a recursive `subtree_bytes` over it bills every one of their bytes to a budget
+/// that can never reclaim them: `used` stays over `disk_max_bytes` forever, so the sweep runs the
+/// full prune order to exhaustion — every rolled log, every dump, then `prune_oldest_statement()`
+/// in a `while used > disk_max_bytes` loop until the journal is empty, then every live result
+/// file. Every five minutes, to pay for a co-tenant's 20 GiB.
+///
+/// So the rule is: **the engine pays for what it can prune, and reports the rest.** The foreign
+/// bytes are measured and named in the sweep line; they drive nothing.
+pub(crate) fn budget_roots(cfg: &HistoryConfig) -> Vec<BudgetRoot> {
     let history_dir = cfg
         .statements_dir
         .parent()
@@ -697,19 +892,38 @@ pub(crate) fn budget_roots(cfg: &HistoryConfig) -> Vec<PathBuf> {
         cfg.logs_dir.clone(),
         cfg.dumps_dir.clone(),
     ];
-    // Only when it is actually bounded: with `OXIDANT_EVENT_LOG_MAX_BYTES=0` the directory is
-    // unbounded by the operator's explicit choice, and billing an unprunable tree against the
-    // budget would make the sweeper delete statement history to pay for it.
-    if let (Some(dir), true) = (&cfg.event_log_dir, cfg.event_log_max_bytes > 0) {
-        candidates.push(dir.clone());
-    }
     candidates.sort_by_key(|p| p.components().count());
-    let mut kept: Vec<PathBuf> = Vec::new();
+    // Only when it is actually bounded: with `OXIDANT_EVENT_LOG_MAX_BYTES=0` the directory is
+    // unbounded by the operator's explicit choice, nothing there is rolled or pruned, and even
+    // the engine's own bytes in it are none of the budget's business.
+    let event_log = match (&cfg.event_log_dir, cfg.event_log_max_bytes > 0) {
+        (Some(dir), true) => Some(dir.clone()),
+        _ => None,
+    };
+    let mut kept: Vec<BudgetRoot> = Vec::new();
     for candidate in candidates {
-        if kept.iter().any(|k| candidate.starts_with(k)) {
+        if kept.iter().any(|k| candidate.starts_with(&k.path)) {
             continue;
         }
-        kept.push(candidate);
+        kept.push(BudgetRoot::subtree(candidate));
+    }
+    if let Some(dir) = event_log {
+        // A directory that *is* one of the engine's own roots is not a co-tenant's: the operator
+        // pointed the event log at the data dir, and the budget already owns everything in it.
+        if !kept.iter().any(|root| root.path == dir) {
+            // Its own entry even when it sits inside a kept root: containment would otherwise
+            // hand it to that root's recursive walk, which bills every foreign byte in it.
+            for root in &mut kept {
+                if dir.starts_with(&root.path) {
+                    root.excluded.push(dir.clone());
+                }
+            }
+            kept.push(BudgetRoot {
+                path: dir,
+                owned_only: true,
+                excluded: Vec::new(),
+            });
+        }
     }
     kept
 }
@@ -902,8 +1116,11 @@ pub(crate) struct EventLogReport {
     pub rolled: bool,
     pub pruned: usize,
     pub freed_bytes: u64,
-    /// Bytes left in the directory after the pass. May exceed `OXIDANT_EVENT_LOG_MAX_BYTES` by
-    /// up to one generation — the newest rolled file is never taken.
+    /// The engine's **own** bytes left in the directory after the pass — the live file plus its
+    /// rolled generations. May exceed `OXIDANT_EVENT_LOG_MAX_BYTES` by up to the live file plus
+    /// one rolled generation: the newest rolled file is never taken, and the live one is rolled
+    /// rather than deleted. Files other tools wrote here are not counted; they are neither
+    /// prunable nor the engine's to bill.
     pub used_bytes: u64,
 }
 
@@ -939,7 +1156,8 @@ pub(crate) fn roll_event_log(
     // first prune pass delete the file it just created — the directory then oscillates between
     // "one file at the cap" and "empty", and an operator loses every event at each roll.
     // Rolling at half the cap keeps roughly two generations: roll, roll, and only the third
-    // roll prunes the oldest. The ceiling `max_bytes` still holds exactly.
+    // roll prunes the oldest. The ceiling is therefore **not** exact — see the prune below,
+    // which never takes the newest generation and says by how much that can overshoot.
     if live_bytes > (max_bytes / 2).max(1) {
         // `LogRoll::Off` turns the *exec* log writer off; the event log still needs a period to
         // name its roll after, and daily is the design's default.
@@ -973,8 +1191,15 @@ pub(crate) fn roll_event_log(
     // instead of delete" for its rolled files: one generation can be larger than the whole cap
     // (the sweep runs every five minutes, and `emit` does not stop between passes), and taking
     // it would mean every roll ended with an empty directory. So the ceiling may be exceeded by
-    // at most one generation, and the sweep line says how much is there.
-    let mut total: u64 = subtree_bytes(dir);
+    // at most the live file plus one rolled generation, and the sweep line says how much is
+    // there.
+    //
+    // **The total counts only the engine's own files.** `subtree_bytes` here would count the
+    // Spark history server's `application_*` files too, and since the engine cannot prune one
+    // byte of those, a co-tenant larger than `max_bytes` made the loop take every prunable
+    // generation on every pass and still never reach the cap — it would converge on keeping
+    // exactly one generation forever, with no signal that the cap was structurally unreachable.
+    let mut total: u64 = owned_event_log_bytes(dir);
     let rolled = rolled_event_logs(dir);
     let prunable = rolled.len().saturating_sub(1);
     for file in rolled.iter().take(prunable) {

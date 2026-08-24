@@ -48,7 +48,7 @@ const MAX_CONVERSION_ATTEMPTS: u32 = 2;
 /// next roll or boot.
 #[derive(Clone, Debug)]
 pub(crate) struct Headroom {
-    pub roots: Vec<PathBuf>,
+    pub roots: Vec<crate::history::disk::BudgetRoot>,
     pub max_bytes: u64,
     pub min_free_bytes: u64,
     pub reserve_bytes: u64,
@@ -59,11 +59,7 @@ pub(crate) struct Headroom {
 impl Headroom {
     /// `Err(reason)` means "skip this conversion and retry later", never "give up".
     fn check(&self, dir: &Path) -> Result<(), String> {
-        let used: u64 = self
-            .roots
-            .iter()
-            .map(|r| crate::history::disk::subtree_bytes(r))
-            .sum();
+        let used = crate::history::disk::measure_roots(&self.roots).billed;
         if used.saturating_add(self.reserve_bytes) > self.max_bytes {
             return Err(format!(
                 "converting would need {} bytes of headroom against a {}-byte budget already \
@@ -569,7 +565,7 @@ mod tests {
             parquet: false,
             dedup: false,
             headroom: Headroom {
-                roots: vec![dir.to_path_buf()],
+                roots: vec![crate::history::disk::BudgetRoot::subtree(dir.to_path_buf())],
                 max_bytes: u64::MAX,
                 min_free_bytes: 0,
                 reserve_bytes: 0,

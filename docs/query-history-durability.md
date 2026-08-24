@@ -175,13 +175,26 @@ that are inside retention.
 
 ### Disk guards (hard ceilings — logs must never fill the server)
 
-Everything under the root, **including every overridden subtree and including
-`event_log_dir`** (F16 — see §8), lives under one budget and a free-space floor; the
-engine deletes the oldest thing it owns before it lets the disk fill:
+Everything under the root, **including every overridden subtree and including the
+engine's own files in `event_log_dir`** (F16 — see §8), lives under one budget and a
+free-space floor; the engine deletes the oldest thing it owns before it lets the disk
+fill.
+
+**The engine bills itself only for what it can prune.** Every root but one is measured
+whole, because the engine created the directory and wrote every file in it.
+`event_log_dir` is the exception and the reason the rule is stated: an operator points
+it at a Spark-history-server path *other tools write*, and the engine can prune exactly
+one shape there — the `events[-<period>[.N]].jsonl` files it rolled itself. Those bytes
+are billed; every other byte in that directory is **measured, reported as
+`foreign_bytes` in the sweep line, and billed to nothing**. Counting them would pin
+`used` over the budget for ever, and the prune order below would then run to exhaustion
+every five minutes — every rolled log, every dump, then `prune_oldest_statement()` in a
+loop until the journal was empty, then every live result file — to pay for a co-tenant's
+20 GiB it can never reclaim.
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `OXIDANT_DISK_MAX_BYTES` | 8 GiB | total budget for `history/` + `logs/` + `results/` + `dumps/` + `event_log_dir` combined |
+| `OXIDANT_DISK_MAX_BYTES` | 8 GiB | total budget for `history/` + `logs/` + `results/` + `dumps/` + **the engine's own files in** `event_log_dir`, combined |
 | `OXIDANT_DISK_MIN_FREE_BYTES` | 1 GiB | filesystem free-space floor — below it the engine pauses result spill and reports `disk: low_free`; it prunes **nothing** (pruning is driven by `OXIDANT_DISK_MAX_BYTES` alone) |
 | `OXIDANT_LOG_MAX_FILE_BYTES` | 256 MiB | the live log rotates **early** at this size, even mid-period (`.N` split) |
 | `OXIDANT_LOG_MAX_TOTAL_BYTES` | 2 GiB | `logs/` subtree cap — oldest rolled files deleted first |
@@ -224,7 +237,9 @@ floored against that volume.
 **Built in PR2** (`crates/oxidant-connect/src/history/disk.rs` + `StatementStore::sweep_disk`),
 at boot and on a `OXIDANT_DISK_SWEEP_SECS` timer. **PR3 completed it**: the roll-time
 trigger fires from the rolling writer's converter thread (`logging::set_sweep_hook`), and
-`event_log_dir` joined the budget — PR2's stated deviation from F16 is closed.
+the engine's own files in `event_log_dir` joined the budget — PR2's stated deviation
+from F16 is closed for what the engine writes, and deliberately *not* closed for what a
+co-tenant writes there (see the billing rule above).
 
 Three notes on what the sweeper measures:
 
@@ -848,13 +863,22 @@ exclusive. Concretely:
   1. **The roll fires at half the cap, not at the cap.** Rolling only once the live file
      has reached the whole cap makes the very first prune pass delete the file it just
      created: the directory then oscillates between one full file and none, and an
-     operator loses every event at each roll. Half the cap keeps the ceiling exactly and
-     lets a generation survive its own roll.
+     operator loses every event at each roll. Half the cap lets a generation survive its
+     own roll — at the price of an exact ceiling, which deviation 2 gives up anyway.
   2. **The newest rolled generation is never pruned**, so the ceiling may be exceeded by
-     at most one generation. The sweep runs every five minutes and `emit` does not stop
-     between passes, so one generation can be larger than the whole cap; taking it would
-     end every roll with an empty directory. This is the same instinct as §3's "the live
-     log file is never deleted — it rotates instead", one file further along.
+     at most the live file plus one rolled generation. The sweep runs every five minutes
+     and `emit` does not stop between passes, so one generation can be larger than the
+     whole cap; taking it would end every roll with an empty directory. This is the same
+     instinct as §3's "the live log file is never deleted — it rotates instead", one file
+     further along.
+
+  Both the cap and the roll trigger are measured over the engine's **own** files only —
+  the live `events.jsonl` and the generations it rolled. Measuring the whole directory
+  made "at most one generation" false the moment the directory was shared, which is the
+  only reason the directory exists: with a co-tenant larger than the cap, the prune took
+  every prunable generation on every pass and still never reached it, converging on
+  keeping exactly one generation for ever with no signal that the cap was structurally
+  unreachable.
 
   The split allocator is **highest-existing + 1**, never "the first free number". Splits
   are pruned out from under it, so first-free hands out `1` again after `.1` has gone —
@@ -1056,7 +1080,7 @@ Guards and degradation:
 | **F13** | Result files never GC'd against the journal | **Design change.** §5: pruning a statement unlinks its result in the same sweep, boot reconciles `results/` against the folded id set, and **the journal is named as the authority** — a result outlives its record by at most one sweep and never across a restart. |
 | **F14** | Two processes share one data dir | **Design change.** §3c adds the exclusive `.lock` (flock, pid/role/port/root recorded) on the *effective statements dir* — not the root, which `OXIDANT_HISTORY_DIR` can point away from — the exact second-process error text, its root-disagreement variant, and `OXIDANT_DATA_DIR_PER_PROCESS=1` to derive `<root>/<role>-<port>/` instead of failing. |
 | **F15** | 30 days of raw SQL and tracing fields, no mode or redaction | **Design change.** §3 "File modes and sensitivity": 0600 files / 0700 dirs set at create time, and `OXIDANT_HISTORY_SQL=text\|redacted\|hash` (default `text`, i.e. off) reusing the existing `store.rs` redaction, with the `hash` mode's API consequence stated rather than hidden. |
-| **F16** | Budget exempts `event_log_dir` | **Design change**, deferred by PR2 and **shipped in PR3.** §3's budget covers it, and §8 replaces "stays untouched" with its own knob `OXIDANT_EVENT_LOG_MAX_BYTES` (2 GiB), rolling `events.jsonl` to periodised files rather than deleting the live one, with `0` restoring today's unbounded behaviour. The directory is billed to the budget **only while it is bounded**: under `=0` it is unprunable by the operator's own choice, and counting it would make the sweeper delete statement history to pay for it. Two implementation deviations (roll at half the cap; never prune the newest generation) are argued in §8. |
+| **F16** | Budget exempts `event_log_dir` | **Design change**, deferred by PR2 and **shipped in PR3.** §3's budget covers the engine's own files there, and §8 replaces "stays untouched" with its own knob `OXIDANT_EVENT_LOG_MAX_BYTES` (2 GiB), rolling `events.jsonl` to periodised files rather than deleting the live one, with `0` restoring today's unbounded behaviour. **Scope, stated:** F16 is closed for the `events[-<period>[.N]].jsonl` files the engine writes and deliberately open for everything else in that directory. The knob exists so the directory can be a Spark-history-server path other tools write; those bytes are unprunable, so billing them would pin `used` over budget for ever and run the prune order — up to and including emptying the journal — every five minutes. They are measured and reported as `foreign_bytes`, never billed. Under `max_bytes=0` nothing there is measured at all: the directory is unbounded by the operator's own choice. Two implementation deviations (roll at half the cap; never prune the newest generation) are argued in §8. |
 | **F17** | Durable exec logs cover the driver only | **Design change**, **shipped in PR3.** §6c hoists subscriber init out of `rest::router` into a process-level `logging::init(role, port)` that `run_worker` also calls; every node writes its own logs, **collection is per-node**, and the driver federates reads (§6b) rather than ingesting. Statement history stays driver-scoped and says so. |
 | **F18** | Journal vocabulary diverges from the API | **Design change.** §4a uses the API's five values verbatim; §4e is the explicit mapping table. `finished`/`cancelled`/`state` are gone, and `interrupted` is **not** added as a status — a replayed non-terminal is `failed` + `error:"interrupted by restart"`, needing no contract change. |
 | **F19** | Two claims stated as no-ops | **Design change.** §5 announces `410 result_expired` as a **new** status code and error string with the `404`/`409`/`400` behaviour it sits beside. §8 makes `OXIDANT_HISTORY=off` revert the caps too (1000 / 1 h), renames the knob to `OXIDANT_HISTORY_MAX_RECORDS` to avoid the const collision, and **documents the 10,000-vs-1,000 divergence explicitly** as an announced behaviour change with the knob to undo it. |

@@ -1439,9 +1439,6 @@ impl StatementStore {
 
         let cfg = &history.cfg;
         let roots = disk::budget_roots(cfg);
-        let measure = |roots: &[std::path::PathBuf]| -> u64 {
-            roots.iter().map(|r| disk::subtree_bytes(r)).sum()
-        };
 
         let mut report = disk::SweepReport::default();
         // Retention runs before the budget, and unconditionally: `OXIDANT_LOG_KEEP_DAYS` and
@@ -1457,12 +1454,19 @@ impl StatementStore {
         );
         report.logs_expired = logs.expired;
         report.logs_over_cap = logs.over_cap;
+        // Retention's own bytes. They are freed *before* `before` is measured — which is the
+        // correct order for the prune loop, since it stops it from spending a second time what
+        // retention already reclaimed — so they have to be added back at the end or the line
+        // reads `logs_expired=2, event_logs_pruned=1, freed_bytes=0`, which looks like a bug in
+        // the sweeper (M3).
+        let mut retention_freed = logs.freed_bytes;
         if let Some(dir) = &cfg.event_log_dir {
             let events = disk::roll_event_log(dir, cfg.event_log_max_bytes, cfg.log_roll, now);
             report.event_logs_pruned = events.pruned;
             report.event_log_rolled = events.rolled;
+            retention_freed = retention_freed.saturating_add(events.freed_bytes);
         }
-        let before = measure(&roots);
+        let before = disk::measure_roots(&roots).billed;
         // The running total, decremented by what each unlink reports. The whole tree used to be
         // re-walked *per candidate* — pruning 10,000 statements meant 10,000 full recursive
         // directory walks interleaved with 10,000 lock/unlock cycles of the store mutex that
@@ -1523,8 +1527,12 @@ impl StatementStore {
 
         // One re-measure at the end: what the running total estimated is not what `/api/status`
         // reports.
-        report.used_bytes = measure(&roots);
-        report.freed_bytes = before.saturating_sub(report.used_bytes);
+        let usage = disk::measure_roots(&roots);
+        report.used_bytes = usage.billed;
+        report.foreign_bytes = usage.foreign;
+        report.freed_bytes = before
+            .saturating_sub(report.used_bytes)
+            .saturating_add(retention_freed);
         report.over_budget = report.used_bytes > cfg.disk_max_bytes;
 
         // The free-space floor, measured *after* the pruning it does not drive — nothing above
@@ -1536,11 +1544,11 @@ impl StatementStore {
         let mounts = mounts_for(cfg);
         let mut lowest: Option<(&std::path::Path, u64)> = None;
         for root in &roots {
-            let Some(free) = mounts.free_bytes(root) else {
+            let Some(free) = mounts.free_bytes(root.path()) else {
                 continue;
             };
             if lowest.map_or(true, |(_, seen)| free < seen) {
-                lowest = Some((root.as_path(), free));
+                lowest = Some((root.path(), free));
             }
         }
         report.free_bytes = lowest.map(|(_, free)| free);
@@ -1556,6 +1564,10 @@ impl StatementStore {
         if report.removed_anything() || report.over_budget || report.low_free {
             tracing::info!(
                 used_bytes = report.used_bytes,
+                // Bytes another tool wrote into `OXIDANT_EVENT_LOG_DIR`. Reported so an operator
+                // can see why the directory is large, never billed: the engine cannot prune one
+                // of them (H2/F16).
+                foreign_bytes = report.foreign_bytes,
                 freed_bytes = report.freed_bytes,
                 budget_bytes = cfg.disk_max_bytes,
                 free_bytes = report.free_bytes,
@@ -4727,6 +4739,61 @@ mod tests {
         assert!(
             report.used_bytes >= 4_000,
             "the directory is billed to the budget now: {report:?}"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// **H2.** `OXIDANT_EVENT_LOG_DIR` exists to be pointed at a Spark-history-server path that
+    /// *other tools write*, and the engine can prune exactly one shape there: the
+    /// `events[-<period>].jsonl` files it rolled itself. Billing the rest to
+    /// `OXIDANT_DISK_MAX_BYTES` pins `used` over the budget for ever, so the sweep runs the whole
+    /// prune order to exhaustion — every rolled log, every dump, then `prune_oldest_statement()`
+    /// in a `while used > disk_max_bytes` loop until the journal is empty — every five minutes,
+    /// to pay for a co-tenant's bytes it can never reclaim.
+    ///
+    /// The co-tenant here is 5 MiB against a 1 MiB budget. Nothing may be deleted for it.
+    #[tokio::test]
+    async fn a_spark_history_co_tenant_does_not_cost_the_statement_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = dir.path().join("spark-events");
+        std::fs::create_dir_all(&events).expect("mkdir");
+
+        let store = history_store_with(dir.path(), |c| {
+            c.disk_max_bytes = 1_000_000;
+            c.disk_min_free_bytes = 0;
+            c.event_log_dir = Some(events.clone());
+            c.event_log_max_bytes = 1_000_000;
+        });
+        let (id, _) = store.insert("SELECT 'kept'");
+        store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(0, 2)]));
+        // Five times the whole budget, and not one byte of it prunable.
+        let foreign = events.join("application_1755_0001");
+        std::fs::write(&foreign, vec![b'x'; 5_000_000]).expect("write");
+
+        let report = store.sweep_disk();
+        assert_eq!(
+            report.statements_pruned, 0,
+            "the journal is not spent on a co-tenant's bytes: {report:?}"
+        );
+        assert_eq!(report.rolled_logs_removed, 0, "{report:?}");
+        assert_eq!(report.live_results_removed, 0, "{report:?}");
+        assert!(
+            !report.over_budget,
+            "the engine's own subtree is well inside its budget: {report:?}"
+        );
+        assert!(
+            report.used_bytes < 1_000_000,
+            "only the engine's own bytes are billed: {report:?}"
+        );
+        assert!(
+            report.foreign_bytes >= 5_000_000,
+            "…and the co-tenant's are reported, so a large directory stays explicable: {report:?}"
+        );
+        assert!(foreign.exists(), "and nothing of theirs is unlinked");
+        assert_eq!(
+            store.snapshot(&id).expect("statement").status,
+            StatementStatus::Succeeded,
+            "the statement history survives"
         );
         store.shutdown_for_test();
     }
