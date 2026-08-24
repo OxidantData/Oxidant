@@ -96,6 +96,9 @@ pub(crate) struct Journal {
     /// every later record's write sequence come from here, so both are globally ordered.
     seq: AtomicU64,
     dropped: Arc<AtomicU64>,
+    /// Appends or fsyncs the disk refused (ENOSPC/EIO) — `history_write_failures`. A terminal
+    /// record counted here was never acked, so its client was told `history: degraded`.
+    write_failures: Arc<AtomicU64>,
     degraded: Arc<AtomicBool>,
     statements_dir: PathBuf,
     /// Joined by [`Journal::shutdown`].
@@ -108,6 +111,7 @@ impl std::fmt::Debug for Journal {
         f.debug_struct("Journal")
             .field("statements_dir", &self.statements_dir)
             .field("dropped", &self.dropped_events())
+            .field("write_failures", &self.write_failures())
             .field("degraded", &self.is_degraded())
             .finish()
     }
@@ -134,6 +138,7 @@ impl Journal {
 
         let (tx, rx) = sync_channel(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
+        let write_failures = Arc::new(AtomicU64::new(0));
         let degraded = Arc::new(AtomicBool::new(false));
         let writer = Writer {
             cfg: cfg.clone(),
@@ -142,6 +147,7 @@ impl Journal {
             len: 0,
             dirty: false,
             degraded: Arc::clone(&degraded),
+            write_failures: Arc::clone(&write_failures),
         };
         let thread = std::thread::Builder::new()
             .name("oxidant-history".to_string())
@@ -152,6 +158,7 @@ impl Journal {
                 tx,
                 seq: AtomicU64::new(next_seq),
                 dropped,
+                write_failures,
                 degraded,
                 statements_dir: cfg.statements_dir.clone(),
                 thread: Mutex::new(Some(thread)),
@@ -210,6 +217,12 @@ impl Journal {
     /// Records dropped because the writer was behind — `history_dropped_events`.
     pub(crate) fn dropped_events(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Appends or fsyncs the disk refused — `history_write_failures`. Moves on exactly the
+    /// events that make a terminal answer say `history: degraded` instead of implying durability.
+    pub(crate) fn write_failures(&self) -> u64 {
+        self.write_failures.load(Ordering::Relaxed)
     }
 
     /// Has a write failed (ENOSPC/EIO) or a record been dropped since the last success?
@@ -381,6 +394,7 @@ struct Writer {
     len: u64,
     dirty: bool,
     degraded: Arc<AtomicBool>,
+    write_failures: Arc<AtomicU64>,
 }
 
 impl Writer {
@@ -393,13 +407,18 @@ impl Writer {
         loop {
             match rx.recv_timeout(self.cfg.flush_interval) {
                 Ok(Msg::Append(rec, ack)) => {
-                    self.append(&rec);
+                    let written = self.append(&rec);
                     if let Some(ack) = ack {
                         // The response is waiting on this: fsync before answering, so what the
-                        // client is told is true.
-                        self.sync();
+                        // client is told is true. If either the append or the fsync failed, the
+                        // sender is *dropped* rather than completed — `await_durable` reads a
+                        // closed channel as "not durable" and the answer says so (§7). Acking a
+                        // write that never landed is the one thing this design must not do.
+                        let durable = written && self.sync();
                         last_sync = Instant::now();
-                        let _ = ack.send(());
+                        if durable {
+                            let _ = ack.send(());
+                        }
                     }
                     self.roll_if_full();
                 }
@@ -436,9 +455,13 @@ impl Writer {
         self.cfg.statements_dir.join(seg_name(self.segment))
     }
 
-    fn append(&mut self, rec: &JournalRecord) {
+    /// `true` when the record reached the page cache. `false` is a real failure the caller must
+    /// propagate — it is never safe to ack a record this returned `false` for.
+    fn append(&mut self, rec: &JournalRecord) -> bool {
         let Ok(mut line) = serde_json::to_string(rec) else {
-            return;
+            self.write_failures.fetch_add(1, Ordering::Relaxed);
+            self.degraded.store(true, Ordering::Relaxed);
+            return false;
         };
         line.push('\n');
         if self.file.is_none() {
@@ -450,34 +473,45 @@ impl Writer {
                 }
                 Err(e) => {
                     self.fail("open segment", &e);
-                    return;
+                    return false;
                 }
             }
         }
         let Some(file) = self.file.as_mut() else {
-            return;
+            return false;
         };
         match file.write_all(line.as_bytes()) {
             Ok(()) => {
                 self.len += line.len() as u64;
                 self.dirty = true;
                 self.degraded.store(false, Ordering::Relaxed);
+                true
             }
-            Err(e) => self.fail("append", &e),
+            Err(e) => {
+                self.fail("append", &e);
+                false
+            }
         }
     }
 
-    fn sync(&mut self) {
+    /// `true` when everything appended so far is on the disk. Nothing dirty is vacuously true;
+    /// a refused `fsync_data` is not.
+    fn sync(&mut self) -> bool {
         if !self.dirty {
-            return;
+            return true;
         }
-        if let Some(file) = self.file.as_mut() {
-            match file.sync_data() {
-                Ok(()) => {
-                    self.dirty = false;
-                    self.degraded.store(false, Ordering::Relaxed);
-                }
-                Err(e) => self.fail("fsync", &e),
+        let Some(file) = self.file.as_mut() else {
+            return false;
+        };
+        match file.sync_data() {
+            Ok(()) => {
+                self.dirty = false;
+                self.degraded.store(false, Ordering::Relaxed);
+                true
+            }
+            Err(e) => {
+                self.fail("fsync", &e);
+                false
             }
         }
     }
@@ -513,6 +547,7 @@ impl Writer {
 
     fn fail(&mut self, what: &str, e: &std::io::Error) {
         self.degraded.store(true, Ordering::Relaxed);
+        self.write_failures.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             error = %e,
             operation = what,
@@ -676,6 +711,41 @@ mod tests {
         futures::executor::block_on(ack).expect("acked");
         let body = std::fs::read_to_string(cfg.statements_dir.join(seg_name(0))).expect("segment");
         assert!(body.contains("stmt-a"), "{body}");
+        journal.shutdown();
+    }
+
+    /// H1: an append or an fsync the disk refused must never resolve the durability ack. The
+    /// ack is the whole of §7's promise — "on ack, the client's answer is durable" — so a
+    /// terminal record that never reached the disk has to leave the sender *dropped*, which is
+    /// what `await_durable` reads as `history: degraded`.
+    #[test]
+    fn a_failed_write_never_resolves_the_durability_ack() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_for(dir.path());
+        let (journal, _) = Journal::open(&cfg).expect("open");
+        // The writer opens its segment lazily, on the first append. A directory where that file
+        // belongs makes every open fail with EISDIR — the ENOSPC/EIO shape, deterministically,
+        // and without a filesystem fault injector.
+        std::fs::create_dir(cfg.statements_dir.join(seg_name(0))).expect("block the segment");
+
+        let ack = journal
+            .append_durable(
+                folded("stmt-a", 1, StatementStatus::Succeeded).to_snapshot(),
+                Duration::from_secs(1),
+            )
+            .expect("queued");
+        assert!(
+            futures::executor::block_on(ack).is_err(),
+            "a write that failed must drop the ack, not complete it"
+        );
+        assert!(
+            journal.is_degraded(),
+            "and the journal knows it is degraded"
+        );
+        assert!(
+            journal.write_failures() >= 1,
+            "and the failure counter moved"
+        );
         journal.shutdown();
     }
 

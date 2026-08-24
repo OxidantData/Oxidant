@@ -743,7 +743,10 @@ impl StatementStore {
             return history.journal.is_degraded();
         };
         match tokio::time::timeout(history.cfg.ack_timeout, ack).await {
-            Ok(Ok(())) => false,
+            // The writer completes the ack only after a successful fsync. A *dropped* sender is
+            // the writer saying the append or the fsync was refused, and it lands in the arm
+            // below with the timeout — both mean "we cannot claim this is on disk".
+            Ok(Ok(())) => history.journal.is_degraded(),
             _ => {
                 history.journal.mark_degraded();
                 true
@@ -2583,6 +2586,32 @@ mod tests {
         assert_eq!(body["error"], "result_expired");
         let (status, _) = get_json(&router, "/api/v1/statements/stmt-nope/result").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// H1, end to end: a client is never told `succeeded` with an implied durability the disk
+    /// refused. `docs/api.md` makes the *absence* of `history` the promise that the record is on
+    /// disk, so a failed write has to produce `"history": "degraded"` — and move the counter.
+    #[tokio::test]
+    async fn a_terminal_record_the_disk_refused_is_answered_degraded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store(dir.path());
+        // The writer opens its first segment lazily; a directory in its place fails every
+        // append with EISDIR, which is the ENOSPC/EIO shape without a fault injector.
+        let statements_dir = dir.path().join("history").join("statements");
+        std::fs::create_dir(statements_dir.join("seg-000000.jsonl")).expect("block the segment");
+
+        let (id, _) = store.insert("SELECT 1");
+        store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+        assert!(
+            store.await_durable(&id).await,
+            "a record the disk refused must be reported degraded, not durable"
+        );
+        let journal = &store.history.as_ref().expect("history on").journal;
+        assert!(journal.is_degraded());
+        assert!(
+            journal.write_failures() >= 1,
+            "the /api/status-level failure counter moved"
+        );
     }
 
     /// One session cannot evict another's history: the per-session share is swept first.
