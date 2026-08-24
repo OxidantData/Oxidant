@@ -770,6 +770,16 @@ init is `oxidant_connect::logging::init(role, port)`.
   guards in §3. The size budget can prune a file before its 30 days are up, and says so
   in the log when it does.
 
+- **The conversion headroom is measured once per pass, not once per file** *(PR3)*. The check
+  walked every budget root — `history/`, `results/`, `logs/`, `dumps/` — and probed the mount
+  table for every pending conversion; at boot after a crash with N unconverted logs that is N
+  full recursive walks of a `results/` tree that can hold gigabytes, on the converter thread,
+  before the first conversion starts. The pass now walks once and folds in its own effect
+  (text file gone, Parquet not), which is sound because it is the only writer of the bytes it is
+  moving and it checks against a whole `OXIDANT_LOG_MAX_FILE_BYTES` of reserve; anything else
+  that grew mid-pass is caught by the next pass — the same answer the per-file walk gave, one
+  sweep later.
+
 - **An unfinished conversion is swept at boot** *(PR3)*. A `.parquet.tmp` a crash left behind is
   counted by `subtree_bytes` — it is a file under a budget root — but no prune step could
   recognise it (`parse_rolled_name` rejects the name), and the only code that removed one was the

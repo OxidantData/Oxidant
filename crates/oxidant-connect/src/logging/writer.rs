@@ -79,12 +79,63 @@ pub(crate) struct Headroom {
     pub reserve_bytes: u64,
     /// A synthetic mount table, tests only — the same seam `history::disk` uses.
     pub mounts: Option<Vec<(PathBuf, u64)>>,
+    /// How many times [`Self::measure`] walked the budget roots. **The field does not exist in a
+    /// release build**; it is here because "once per pass, not once per file" is not observable
+    /// from the outside any other way, and the cost it guards — N recursive walks of a
+    /// gigabyte-scale `results/` tree — is invisible until it is a slow boot.
+    #[cfg(test)]
+    pub probes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The disk as one conversion pass found it: the billed total across every budget root, and the
+/// free space on the mount `logs/` sits on.
+///
+/// **Measured once per pass, not once per file.** [`Headroom::check`] used to walk every budget
+/// root — `history/`, `results/`, `logs/`, `dumps/` — and probe the mount table on *every* pending
+/// conversion. At boot after a crash with N unconverted logs that is N full recursive walks of a
+/// `results/` tree that can hold gigabytes, on the converter thread, before the first conversion
+/// starts. The pass measures once and then tracks its own effect: it is the only writer of the
+/// bytes it is moving, the reserve it checks against is a whole `OXIDANT_LOG_MAX_FILE_BYTES` of
+/// slack, and anything else that grew mid-pass is caught by the next pass — which is the same
+/// answer a per-file walk gave, one sweep later.
+struct Budget {
+    used: u64,
+    free: Option<u64>,
+}
+
+impl Budget {
+    /// Fold one completed conversion in: the text file is gone, the Parquet is not.
+    fn converted(&mut self, text_bytes: u64, parquet_bytes: u64) {
+        self.used = self
+            .used
+            .saturating_sub(text_bytes)
+            .saturating_add(parquet_bytes);
+        if let Some(free) = self.free.as_mut() {
+            *free = free
+                .saturating_add(text_bytes)
+                .saturating_sub(parquet_bytes);
+        }
+    }
 }
 
 impl Headroom {
+    /// Walk the budget roots and probe the mount table — **once**, at the start of a pass.
+    fn measure(&self, dir: &Path) -> Budget {
+        #[cfg(test)]
+        self.probes.fetch_add(1, Ordering::Relaxed);
+        let mounts = match &self.mounts {
+            Some(entries) => Mounts::from_entries(entries.clone()),
+            None => Mounts::probe(),
+        };
+        Budget {
+            used: crate::history::disk::measure_roots(&self.roots).billed,
+            free: mounts.free_bytes(dir),
+        }
+    }
+
     /// `Err(reason)` means "skip this conversion and retry later", never "give up".
-    fn check(&self, dir: &Path) -> Result<(), String> {
-        let used = crate::history::disk::measure_roots(&self.roots).billed;
+    fn check(&self, budget: &Budget) -> Result<(), String> {
+        let used = budget.used;
         if used.saturating_add(self.reserve_bytes) > self.max_bytes {
             return Err(format!(
                 "converting would need {} bytes of headroom against a {}-byte budget already \
@@ -92,11 +143,7 @@ impl Headroom {
                 self.reserve_bytes, self.max_bytes
             ));
         }
-        let mounts = match &self.mounts {
-            Some(entries) => Mounts::from_entries(entries.clone()),
-            None => Mounts::probe(),
-        };
-        if let Some(free) = mounts.free_bytes(dir) {
+        if let Some(free) = budget.free {
             if free < self.min_free_bytes.saturating_add(self.reserve_bytes) {
                 return Err(format!(
                     "converting would need {} bytes above a {}-byte free-space floor with only \
@@ -553,11 +600,15 @@ impl RollingWriter {
             return;
         }
         pending.sort();
+        // One walk of the budget roots for the whole pass — see [`Budget`].
+        let headroom = &self.shared.cfg.headroom;
+        let mut budget = headroom.measure(&self.shared.cfg.dir);
         for path in pending {
             if attempts.get(&path).copied().unwrap_or(0) >= MAX_CONVERSION_ATTEMPTS {
                 continue;
             }
-            if let Err(reason) = self.shared.cfg.headroom.check(&self.shared.cfg.dir) {
+            let text_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+            if let Err(reason) = headroom.check(&budget) {
                 tracing::info!(
                     file = %path.display(),
                     reason = %reason,
@@ -568,8 +619,10 @@ impl RollingWriter {
                 return;
             }
             match columnar::convert(&path) {
-                Ok(_) => {
+                Ok(parquet) => {
                     attempts.remove(&path);
+                    let parquet_bytes = parquet.metadata().map(|m| m.len()).unwrap_or(0);
+                    budget.converted(text_bytes, parquet_bytes);
                 }
                 Err(e) => {
                     let n = attempts.entry(path.clone()).or_insert(0);
@@ -754,6 +807,7 @@ mod tests {
                 min_free_bytes: 0,
                 reserve_bytes: 0,
                 mounts: Some(Vec::new()),
+                probes: Default::default(),
             },
         }
     }
@@ -1132,6 +1186,48 @@ mod tests {
         );
         assert!(!dir.path().join("oxidant-2026-08-23.log").exists());
         w.shutdown();
+    }
+
+    /// **L5.** `Headroom::check` walked every budget root — `history/`, `results/`, `logs/`,
+    /// `dumps/` — and probed the mount table once per *pending conversion*. At boot after a crash
+    /// with N unconverted logs that is N full recursive walks of a `results/` tree that can hold
+    /// gigabytes, on the converter thread, before the first conversion starts.
+    ///
+    /// One walk per pass, and the pass tracks its own effect on the total instead.
+    #[test]
+    fn the_headroom_is_measured_once_per_pass_not_once_per_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut c = cfg(dir.path(), LogRoll::Daily, u64::MAX);
+        c.parquet = true;
+        let probes = Arc::clone(&c.headroom.probes);
+        for day in 20..25 {
+            std::fs::write(
+                dir.path().join(format!("oxidant-2026-08-{day}.log")),
+                format!("2026-08-{day}T10:00:00.000Z [INFO] oxidant_test - message=day {day}\n"),
+            )
+            .expect("seed");
+        }
+        let w = RollingWriter::open_at(c, utc(2026, 8, 26, 14, 0), None).expect("open");
+        probes.store(0, Ordering::Relaxed);
+
+        let mut attempts = HashMap::new();
+        w.convert_pending(&mut attempts);
+        w.shutdown();
+
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            1,
+            "five pending conversions, one walk of the budget roots"
+        );
+        for day in 20..25 {
+            assert!(
+                dir.path()
+                    .join(format!("oxidant-2026-08-{day}.parquet"))
+                    .exists(),
+                "and all five still converted: {:?}",
+                names(dir.path())
+            );
+        }
     }
 
     /// A crash between the roll and the convert leaves the `.log`; the next boot converts it.

@@ -297,6 +297,8 @@ fn open_writer(role: &str, port: u16) -> Option<Arc<RollingWriter>> {
             min_free_bytes: cfg.disk_min_free_bytes,
             reserve_bytes: cfg.log_max_file_bytes,
             mounts: cfg.mounts_override(),
+            #[cfg(test)]
+            probes: Default::default(),
         },
     };
     match RollingWriter::open(wcfg) {
@@ -521,6 +523,7 @@ mod tests {
                 min_free_bytes: 0,
                 reserve_bytes: 0,
                 mounts: Some(Vec::new()),
+                probes: Default::default(),
             },
             lock: None,
         }
@@ -666,6 +669,7 @@ mod tests {
                     min_free_bytes: 0,
                     reserve_bytes: 0,
                     mounts: Some(Vec::new()),
+                    probes: Default::default(),
                 },
                 lock: None,
             },
