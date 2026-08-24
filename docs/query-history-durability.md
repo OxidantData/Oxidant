@@ -725,6 +725,14 @@ exclusive. Concretely:
   carrying `"history":"degraded"` in its envelope, `/api/status` flips
   `history_writes: degraded`, and the promise is explicitly downgraded to best-effort
   for that statement. The wait is bounded on a stalled disk by construction.
+- **A refused spill is retried, never stranded.** The spill queue is bounded (256 jobs).
+  A job it has no room for is counted in `history_dropped_events` and handed straight
+  back to the statement store, which clears the statement's `spilling` mark so the very
+  next budget pass can select it again. The rows never left memory and never left the
+  budget's accounting; the retry is the next terminal statement, by which time the queue
+  has had a chance to drain. Same for a spill the disk refuses outright. Leaving the mark
+  set on a job nobody took pinned the rows for the whole hot TTL and removed the
+  statement from the budget's reach.
 - **Backpressure, precisely.** The writer channel is bounded (4096 records). When it
   is full: `running` records are **dropped**, counted, and surfaced as
   `history_dropped_events` on `/api/status` — they are progress chatter and losing

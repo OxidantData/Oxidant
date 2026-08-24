@@ -35,8 +35,9 @@ use super::journal::Journal;
 use super::record::{FoldedStatement, ResultPointer, RESULT_TOO_LARGE};
 
 /// Bounded spill queue. Full means the disk is not keeping up with terminal results; the job is
-/// dropped and counted, which costs a spill and never a statement.
-const SPILL_QUEUE: usize = 256;
+/// refused, counted, and handed back to the store, which puts the statement back into the
+/// memory budget's candidate set so the next pass can retry it.
+pub(crate) const SPILL_QUEUE: usize = 256;
 
 /// What the spill thread does with a statement's rows.
 pub(crate) struct SpillJob {
@@ -70,6 +71,11 @@ enum Msg {
     Spill(Box<SpillJob>),
     /// Flush the queue and answer — the seam tests drive a spill through synchronously.
     Drain(SyncSender<()>),
+    /// Park the writer until the other end is dropped or sends. A 256-deep queue cannot be
+    /// filled against a writer that is draining it, so this is how the queue-full path is
+    /// exercised by its own code rather than by a mock.
+    #[cfg(test)]
+    Block(Receiver<()>),
     Stop(SyncSender<()>),
 }
 
@@ -202,14 +208,40 @@ impl ResultStore {
 
     /// Queue a spill. Never blocks and never runs I/O on the caller's thread — the caller is
     /// `finish()`, on a tokio worker, having just released the store mutex.
-    pub(crate) fn spill(&self, job: SpillJob) {
+    ///
+    /// **`false` means the writer never took the job**, and the caller *must* undo the
+    /// bookkeeping that handed it over — the statement is marked `spilling` before it gets
+    /// here, and `spilling` is what excludes it from the memory budget's candidate set. A job
+    /// that vanished silently used to pin its rows in memory for the hot TTL (an hour) with no
+    /// recovery path, which is exactly the terminal-result burst this queue exists to absorb.
+    #[must_use]
+    pub(crate) fn spill(&self, job: SpillJob) -> bool {
         if !self.persist.spills_at_all() {
-            return;
+            return false;
+        }
+        if self.is_paused() {
+            // The free-space floor: not lost work, just work not attempted. The rows stay in
+            // memory and serve `/result` exactly as they would have; `disk: low_free` says why.
+            tracing::debug!(
+                statement = %job.id,
+                "result spill paused: the volume is below OXIDANT_DISK_MIN_FREE_BYTES"
+            );
+            return false;
         }
         if let Err(TrySendError::Full(_)) = self.tx.try_send(Msg::Spill(Box::new(job))) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             self.degraded.store(true, Ordering::Relaxed);
+            return false;
         }
+        true
+    }
+
+    /// Park the writer thread until the returned sender is dropped (tests). See [`Msg::Block`].
+    #[cfg(test)]
+    pub(crate) fn block_writer(&self) -> SyncSender<()> {
+        let (tx, rx) = sync_channel(1);
+        let _ = self.tx.send(Msg::Block(rx));
+        tx
     }
 
     /// Read a spilled result back. Blocking by construction — the caller wraps it in
@@ -340,6 +372,10 @@ impl SpillWriter {
                 Msg::Spill(job) => self.handle(*job),
                 Msg::Drain(done) => {
                     let _ = done.send(());
+                }
+                #[cfg(test)]
+                Msg::Block(gate) => {
+                    let _ = gate.recv();
                 }
                 Msg::Stop(done) => {
                     let _ = done.send(());

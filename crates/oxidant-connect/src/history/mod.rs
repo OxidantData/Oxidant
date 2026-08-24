@@ -34,6 +34,8 @@ pub(crate) use record::{
     now_rfc3339, rfc3339_from_ms, FoldedStatement, JournalRecord, RecordKind, ResultPointer,
     Source, StatementStatus, RECORD_VERSION, RESULT_TOO_LARGE,
 };
+#[cfg(test)]
+pub(crate) use results::SPILL_QUEUE;
 pub(crate) use results::{ResultStore, SpillJob, SpillOutcome};
 
 /// The history side of the statement store: the locked data dir and the journal writing into it.

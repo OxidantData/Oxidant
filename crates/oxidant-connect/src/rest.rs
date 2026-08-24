@@ -1028,6 +1028,12 @@ impl StatementStore {
     }
 
     /// Hand the planned spills to the writer thread. Never called with the store lock held.
+    ///
+    /// A job the writer refuses — a full queue, or spills paused by the free-space floor — is
+    /// handed straight back to [`Self::abandon_spills`]. `plan_spills` marked each victim
+    /// `spilling` under the lock, and `spilling` is what keeps the memory budget from picking
+    /// it twice; leaving that flag set on a job nobody took pinned the rows in memory until the
+    /// hot TTL expired and quietly removed the statement from the budget's reach (H2).
     fn queue_spills(&self, jobs: Vec<SpillJob>) {
         if jobs.is_empty() {
             return;
@@ -1035,9 +1041,40 @@ impl StatementStore {
         let Some(history) = self.history.as_ref() else {
             return;
         };
+        let mut refused: Vec<String> = Vec::new();
         for job in jobs {
-            history.results.spill(job);
+            let id = job.id.clone();
+            if !history.results.spill(job) {
+                refused.push(id);
+            }
         }
+        self.abandon_spills(refused);
+    }
+
+    /// Put statements whose spill never reached the writer back into the memory budget.
+    ///
+    /// The rows are still in memory and still counted in `result_bytes` — nothing was lost —
+    /// so clearing `spilling` is all it takes for the next `budget_victims` pass to select them
+    /// again. That retry *is* the backoff: it happens on the next terminal statement, by which
+    /// time the queue has had a chance to drain.
+    fn abandon_spills(&self, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        {
+            let mut inner = self.inner.lock().expect("statement store poisoned");
+            for id in &ids {
+                if let Some(st) = inner.statements.get_mut(id) {
+                    st.spilling = false;
+                    st.release_on_spill = false;
+                }
+            }
+        }
+        tracing::warn!(
+            statements = ids.len(),
+            "result spill refused before it reached the writer; the rows stay in memory and \
+             remain candidates for the next budget pass"
+        );
     }
 
     /// Build the self-contained terminal record for a statement, if history is on.
@@ -4310,6 +4347,134 @@ mod tests {
             Some(oxidant_observability::history_writes::OK.to_string()),
             "history_writes must flip back without a restart"
         );
+        store.shutdown_for_test();
+    }
+
+    /// H2: a spill job the queue had no room for must go back into the memory budget.
+    ///
+    /// `plan_spills` marks each victim `spilling` under the store lock, and `budget_victims`
+    /// filters on `!spilling` — so a job that vanished on the way to the writer used to exclude
+    /// its statement from eviction *permanently*: rows pinned in memory, never written, and the
+    /// store stuck over budget until the hot TTL (an hour) or the 10,000-record cap. A
+    /// terminal-result burst past the writer's throughput is exactly when that fires.
+    #[tokio::test]
+    async fn a_dropped_spill_goes_back_into_the_budget_and_lands_on_the_next_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let one = retained_bytes(&[rows_batch(0, 4)]);
+        let budget = one + one / 2; // room for exactly one retained result
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::OnPressure;
+            c.result_memory_budget_bytes = budget;
+        });
+
+        // Park the writer: a 256-deep queue cannot be filled against one that is draining it.
+        let release = store
+            .history
+            .as_ref()
+            .expect("history")
+            .results
+            .block_writer();
+        for i in 0..(crate::history::SPILL_QUEUE + 8) as i64 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(i * 10, 4)]));
+        }
+        let dropped = store
+            .history
+            .as_ref()
+            .expect("history")
+            .results
+            .dropped_spills();
+        assert!(
+            dropped > 0,
+            "the queue must have overflowed to test the drop"
+        );
+        {
+            let inner = store.inner.lock().expect("lock");
+            let stuck = inner.statements.values().filter(|st| st.spilling).count();
+            assert!(
+                stuck <= crate::history::SPILL_QUEUE,
+                "only jobs the writer actually took may still be marked spilling: \
+                 {stuck} > {}",
+                crate::history::SPILL_QUEUE
+            );
+        }
+
+        // Let the writer catch up, then drive one more budget pass.
+        drop(release);
+        store.drain_spills();
+        let (last, _) = store.insert("SELECT 'last'");
+        store.finish(&last, ExecOutcome::Succeeded(vec![rows_batch(9_000, 4)]));
+        store.drain_spills();
+
+        let inner = store.inner.lock().expect("lock");
+        assert!(
+            inner.result_bytes <= budget,
+            "the dropped spills must be retried, not stranded: {} retained against a \
+             {budget}-byte budget ({dropped} jobs were dropped)",
+            inner.result_bytes
+        );
+        assert!(
+            !inner.statements.values().any(|st| st.spilling),
+            "no statement is left mid-spill once the writer has drained"
+        );
+        drop(inner);
+        store.shutdown_for_test();
+    }
+
+    /// The other half of H2: a spill the *disk* refused. The statement stays in the budget's
+    /// accounting and in its candidate set, and the next pass writes it successfully.
+    #[tokio::test]
+    async fn a_failed_spill_keeps_its_statement_in_the_budget_and_retries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let one = retained_bytes(&[rows_batch(0, 4)]);
+        let budget = one + one / 2;
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::OnPressure;
+            c.result_memory_budget_bytes = budget;
+        });
+        let results = dir.path().join("history/results");
+
+        let (victim, _) = store.insert("SELECT 'victim'");
+        store.finish(&victim, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        // Block the victim's tmp path, then push it over the budget so it is chosen.
+        let blocked = results.join(format!("{victim}.arrow.tmp"));
+        std::fs::create_dir_all(&blocked).expect("block the spill");
+        let (second, _) = store.insert("SELECT 'second'");
+        store.finish(&second, ExecOutcome::Succeeded(vec![rows_batch(100, 4)]));
+        store.drain_spills();
+
+        {
+            let inner = store.inner.lock().expect("lock");
+            let st = inner.statements.get(&victim).expect("hot");
+            assert!(st.rows_in_memory, "a failed spill keeps the rows");
+            assert!(st.result_bytes > 0);
+            assert!(!st.spilling, "and is a candidate again");
+            assert!(
+                inner.result_bytes >= st.result_bytes,
+                "the budget must still account for what memory actually holds"
+            );
+        }
+        assert_eq!(
+            store
+                .status_counters()
+                .map(|c| c.result_write_failures)
+                .unwrap_or_default(),
+            1
+        );
+
+        // Retry: the disk recovers, the next budget pass picks the same statement, and it lands.
+        std::fs::remove_dir(&blocked).expect("unblock");
+        let (third, _) = store.insert("SELECT 'third'");
+        store.finish(&third, ExecOutcome::Succeeded(vec![rows_batch(200, 4)]));
+        store.drain_spills();
+        assert!(
+            results.join(format!("{victim}.arrow")).exists(),
+            "the retry must write the result the first attempt could not"
+        );
+        {
+            let inner = store.inner.lock().expect("lock");
+            assert!(inner.result_bytes <= budget, "{}", inner.result_bytes);
+        }
         store.shutdown_for_test();
     }
 
