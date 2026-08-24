@@ -27,11 +27,13 @@
 //! - [`columnar`] — text → zstd Parquet, and reading either form back;
 //! - [`browse`] — PR4's filters, backward cursor, Parquet pushdown and file listing (§6b);
 //! - [`api`] — the one answer both the driver's HTTP route and the worker's Flight action
-//!   serve, so "the same filters everywhere" is a fact rather than a claim (§6b).
+//!   serve, so "the same filters everywhere" is a fact rather than a claim (§6b);
+//! - [`dump`] — the diagnostic bundle, the one time log bytes move (§6b).
 
 mod api;
 mod browse;
 mod columnar;
+mod dump;
 mod line;
 mod naming;
 mod writer;
@@ -468,7 +470,9 @@ pub(crate) use browse::{list_files, CursorPage, ForwardPage, LogFilter};
 /// to a line that never came off a file.
 pub(crate) use line::parse_line as parse_for_filter;
 /// PR4's one answer, and the Flight federation around it (§6b).
-pub(crate) use api::{answer, decode_worker_answer, LogError, LogQuery, MAX_LOG_PAGE};
+pub(crate) use api::{answer, decode_worker_answer, LogError, LogQuery};
+/// §6b's sanctioned exception to "logs never move".
+pub(crate) use dump::{DumpState, DumpStore, DUMP_TTL_SECS};
 
 /// One rolled (or live) log file, resolved from a `?file=` value.
 pub(crate) enum LogFile {

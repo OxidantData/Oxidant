@@ -232,6 +232,10 @@ const DEFAULT_LOG_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// `OXIDANT_EVENT_LOG_MAX_BYTES` (§8, F16) — `event_log_dir`'s cap. `0` restores today's
 /// unbounded `events.jsonl`.
 const DEFAULT_EVENT_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// `OXIDANT_LOG_DUMP_MAX_BYTES` default: 1 GiB (§6b). One support bundle, not a second copy of
+/// the retention window — a dump past this is refused with `507`, never truncated.
+const DEFAULT_LOG_DUMP_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// `OXIDANT_LOG_KEEP_DAYS` (§3) — evaluated against the *period* a rolled file covers.
 const DEFAULT_LOG_KEEP_DAYS: i64 = 30;
 
@@ -285,6 +289,10 @@ pub(crate) struct HistoryConfig {
     pub event_log_max_bytes: u64,
     /// `<root>/dumps`, or `OXIDANT_DUMP_DIR` — §6b support bundles, swept like results.
     pub dumps_dir: PathBuf,
+    /// `OXIDANT_LOG_DUMP_MAX_BYTES` — the ceiling on one diagnostic dump (§6b, default 1 GiB).
+    /// A request that would breach it, or §3's budget, is refused with `507` rather than
+    /// silently truncated.
+    pub log_dump_max_bytes: u64,
     pub result_persist: ResultPersist,
     /// `OXIDANT_RESULT_MAX_BYTES` — a result whose Arrow IPC encoding exceeds this is refused
     /// and the statement records `result_too_large` instead of a pointer.
@@ -379,6 +387,7 @@ impl HistoryConfig {
                 DEFAULT_EVENT_LOG_MAX_BYTES,
             ),
             dumps_dir,
+            log_dump_max_bytes: env_u64("OXIDANT_LOG_DUMP_MAX_BYTES", DEFAULT_LOG_DUMP_MAX_BYTES),
             result_persist: env_str("OXIDANT_RESULT_PERSIST")
                 .and_then(|v| ResultPersist::parse(&v))
                 .unwrap_or_default(),
@@ -437,6 +446,7 @@ impl HistoryConfig {
             event_log_dir: None,
             event_log_max_bytes: DEFAULT_EVENT_LOG_MAX_BYTES,
             dumps_dir: root.join("dumps"),
+            log_dump_max_bytes: DEFAULT_LOG_DUMP_MAX_BYTES,
             result_persist: ResultPersist::default(),
             result_max_bytes: DEFAULT_RESULT_MAX_BYTES,
             result_memory_budget_bytes: DEFAULT_RESULT_MEMORY_BUDGET_BYTES,

@@ -25,8 +25,6 @@
 //! keeps nothing. The one exception is the diagnostic dump (`rest::create_dump`), which §6b
 //! sanctions explicitly and which says so in its own name.
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -115,7 +113,11 @@ const BAD_FILE: &str = "invalid file: expected `current`, `YYYY-MM-DD`, `YYYY-MM
 
 /// Answer one query against this process's own logs. **Blocking** — `std::fs` plus, for a
 /// converted file, a real Parquet decode. Every caller runs it off the reactor.
-pub(crate) fn answer(query: &LogQuery, view: &LogView) -> Result<Value, LogError> {
+pub(crate) fn answer(
+    query: &LogQuery,
+    view: &LogView,
+    ring: &super::LogBuffer,
+) -> Result<Value, LogError> {
     let filter = LogFilter::parse(
         query.level.as_deref(),
         query.target.as_deref(),
@@ -137,7 +139,7 @@ pub(crate) fn answer(query: &LogQuery, view: &LogView) -> Result<Value, LogError
         || query.order.as_deref() == Some("desc")
         || !filter.is_empty();
     let Some(requested) = query.file.clone() else {
-        return Ok(ring(&filter, query, limit, backward));
+        return Ok(ring_page(ring, &filter, query, limit, backward));
     };
     let Some(dir) = view.dir.as_deref() else {
         return Err(LogError::new(
@@ -215,8 +217,14 @@ pub(crate) fn answer(query: &LogQuery, view: &LogView) -> Result<Value, LogError
 ///
 /// With no filter and no cursor this is **byte-identical** to what PR3 answered: `{"logs": […]}`
 /// and nothing else. That is deliberate; the envelope was documented and released.
-fn ring(filter: &LogFilter, query: &LogQuery, limit: usize, backward: bool) -> Value {
-    let lines = super::buffer().lines();
+fn ring_page(
+    ring: &super::LogBuffer,
+    filter: &LogFilter,
+    query: &LogQuery,
+    limit: usize,
+    backward: bool,
+) -> Value {
+    let lines = ring.lines();
     if !backward {
         return json!({ "logs": lines });
     }
@@ -270,7 +278,7 @@ pub(crate) fn install_flight_handler() {
         let query: LogQuery = serde_json::from_slice(body)
             .map_err(|e| serde_json::to_vec(&LogError::new(400, format!("invalid log query: {e}")).to_json()).unwrap_or_else(|_| e.to_string().into_bytes()))
             .map_err(|bytes| String::from_utf8_lossy(&bytes).into_owned())?;
-        match answer(&query, &LogView::process()) {
+        match answer(&query, &LogView::process(), &super::buffer()) {
             Ok(v) => serde_json::to_vec(&v).map_err(|e| e.to_string()),
             // A refusal travels as a *body*, not as a gRPC error: the driver must be able to
             // hand its caller the worker's own `400 invalid file` rather than flattening every
@@ -290,14 +298,15 @@ pub(crate) fn decode_worker_answer(body: &[u8]) -> Result<Value, LogError> {
     }
 }
 
-/// Where a node's logs live, for the operator-facing error when a worker has none.
-pub(crate) fn logs_dir_of(view: &LogView) -> Option<PathBuf> {
-    view.dir.clone()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty ring: every test here reads a file, and the ring's own paths are covered in
+    /// `browse::tests`.
+    fn ring() -> super::super::LogBuffer {
+        super::super::LogBuffer::new(8)
+    }
 
     fn view(dir: &std::path::Path) -> LogView {
         LogView {
@@ -328,7 +337,7 @@ mod tests {
             ..Default::default()
         };
 
-        let old = answer(&base, &view(dir.path())).expect("page");
+        let old = answer(&base, &view(dir.path()), &ring()).expect("page");
         assert_eq!(old["offset"], 0, "PR3's shape, untouched: {old}");
         assert_eq!(old["next_offset"], Value::Null);
         assert!(old.get("next_before").is_none(), "and no new key: {old}");
@@ -340,6 +349,7 @@ mod tests {
                 ..base.clone()
             },
             &view(dir.path()),
+            &ring(),
         )
         .expect("page");
         assert!(filtered.get("offset").is_none(), "a filter switches modes");
@@ -358,6 +368,7 @@ mod tests {
                 ..Default::default()
             },
             &view(dir.path()),
+            &ring(),
         )
         .expect_err("must refuse");
         assert_eq!(err.status, 400);
@@ -379,7 +390,7 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            let err = answer(&query, &empty).expect_err("must refuse");
+            let err = answer(&query, &empty, &ring()).expect_err("must refuse");
             assert_eq!(err.status, 404);
             assert!(err.message.contains("OXIDANT_LOG_ROLL=off"), "{err:?}");
         }
@@ -397,6 +408,7 @@ mod tests {
                 ..Default::default()
             },
             &view(dir.path()),
+            &ring(),
         )
         .expect("files");
         let files = body["files"].as_array().expect("an array").clone();
@@ -421,6 +433,7 @@ mod tests {
                 ..Default::default()
             },
             &view(dir.path()),
+            &ring(),
         )
         .expect("page");
         assert_eq!(body["limit"], MAX_LOG_PAGE);

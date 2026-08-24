@@ -49,7 +49,8 @@ use sysinfo::{Pid, System};
 use tokio::sync::{watch, Notify};
 use uuid::Uuid;
 
-use crate::logging::{LogBuffer, LogView, MAX_LOG_LINES, MAX_LOG_PAGE};
+use crate::logging::{LogBuffer, LogView, MAX_LOG_LINES};
+
 
 use crate::history::{
     disk, now_rfc3339, rfc3339_from_ms, FoldedStatement, HistoryConfig, HistoryRuntime,
@@ -1460,6 +1461,13 @@ impl StatementStore {
         // reads `logs_expired=2, event_logs_pruned=1, freed_bytes=0`, which looks like a bug in
         // the sweeper (M3).
         let mut retention_freed = logs.freed_bytes;
+        // §6b: "the bundle expires after 24 h and is swept like results". Unconditional, like
+        // the logs' own retention: a bundle nobody collected is not the budget's business, it
+        // is a promise about how long a copy of the cluster's logs sits on the driver's disk.
+        let expired_dumps =
+            disk::prune_expired_dumps(&cfg.dumps_dir, crate::logging::DUMP_TTL_SECS, now);
+        report.dumps_expired = expired_dumps.expired;
+        retention_freed = retention_freed.saturating_add(expired_dumps.freed_bytes);
         if let Some(dir) = &cfg.event_log_dir {
             let events = disk::roll_event_log(dir, cfg.event_log_max_bytes, cfg.log_roll, now);
             report.event_logs_pruned = events.pruned;
@@ -1575,6 +1583,7 @@ impl StatementStore {
                 rolled_logs = report.rolled_logs_removed,
                 logs_expired = report.logs_expired,
                 logs_over_cap = report.logs_over_cap,
+                dumps_expired = report.dumps_expired,
                 event_logs_pruned = report.event_logs_pruned,
                 event_log_rolled = report.event_log_rolled,
                 dumps = report.dumps_removed,
@@ -2032,6 +2041,9 @@ struct RestState {
     /// Shared bearer token guarding `GET /api/v1/logs`. `None` — the default — makes that one
     /// route answer `404`; nothing else in this router is authenticated.
     status_token: Option<Arc<str>>,
+    /// §6b's diagnostic dumps. `None` under `OXIDANT_HISTORY=off`, which promises that nothing
+    /// is written under the data dir — and a support bundle is the largest thing that would be.
+    dumps: Option<Arc<crate::logging::DumpStore>>,
 }
 
 /// Build the REST statement-execution router around a shared Spark Connect service.
@@ -2054,6 +2066,12 @@ pub fn router(service: Arc<OxidantService>) -> Router {
         log_buffer,
         logs: LogView::process(),
         status_token: oxidant_ui_server::status::status_token_from_env().map(Into::into),
+        // Built from the same env the writer and the sweeper read, so a dump cannot be the one
+        // writer with its own idea of where `dumps/` is or how large it may get.
+        dumps: crate::history::HistoryConfig::from_env("driver", 0)
+            .ok()
+            .as_ref()
+            .and_then(crate::logging::DumpStore::from_config),
     })
 }
 
@@ -2110,6 +2128,8 @@ fn app(state: RestState) -> Router {
         .route("/api/v1/logs/files", get(list_log_files))
         .route("/api/v1/logs/tail", get(tail_logs))
         .route("/api/v1/logs/workers", get(list_log_workers))
+        .route("/api/v1/logs/dump", post(create_dump))
+        .route("/api/v1/logs/dump/{dump_id}", get(get_dump))
         .with_state(state)
 }
 
@@ -2680,7 +2700,7 @@ struct LogsParams {
     /// today's answer: the in-memory ring.
     file: Option<String>,
     /// Lines per page. Defaults to [`MAX_LOG_LINES`] — the same 1000 the ring serves — and is
-    /// clamped to [`MAX_LOG_PAGE`].
+    /// clamped to `logging::MAX_LOG_PAGE`.
     limit: Option<usize>,
     /// PR3's oldest-first walk: lines to skip from the start of the file.
     offset: Option<usize>,
@@ -3110,10 +3130,12 @@ async fn run_log_query(
 
 async fn local_log_query(state: &RestState, query: crate::logging::LogQuery) -> Response {
     let view = state.logs.clone();
+    let ring = state.log_buffer.clone();
     // **`spawn_blocking`.** Reading a log is `std::fs` I/O plus, for a converted file, a full
     // Parquet decode. Doing that inline on a tokio worker parks a thread that is also serving
     // `ExecutePlan`, for as long as the read takes.
-    match tokio::task::spawn_blocking(move || crate::logging::answer(&query, &view)).await {
+    match tokio::task::spawn_blocking(move || crate::logging::answer(&query, &view, &ring)).await
+    {
         Ok(Ok(mut value)) => {
             value["worker"] = json!("driver");
             Json(value).into_response()
@@ -3209,6 +3231,382 @@ async fn federate(
 /// Parquet — and far short of the browser's own patience.
 const WORKER_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// `POST /api/v1/logs/dump` — the request body (§6b).
+#[derive(Debug, Default, Deserialize)]
+struct DumpRequest {
+    /// `driver`, `all`, or one worker id. Defaults to `all`: an operator opening a support case
+    /// wants the cluster, and asking for one node is the narrower, deliberate act.
+    worker: Option<String>,
+    /// RFC-3339 window. Both absent defaults to the **last hour** — see [`DEFAULT_DUMP_WINDOW`].
+    from: Option<String>,
+    to: Option<String>,
+    /// The same filters the browser takes, so "dump what I am looking at" is one request rather
+    /// than a second query language.
+    level: Option<String>,
+    target: Option<String>,
+    q: Option<String>,
+}
+
+/// How far back a dump reaches when the caller names no window.
+///
+/// **A default matters here in a way it does not for a page read.** With no bound, the obvious
+/// `POST /api/v1/logs/dump` with an empty body means "every node, thirty days", which the 1 GiB
+/// cap would then refuse after minutes of Flight round-trips — a refusal that is correct and
+/// useless. An hour is the window an operator reaching for a support bundle almost always wants,
+/// and the effective window is echoed in the `202` so nobody has to guess which they got.
+const DEFAULT_DUMP_WINDOW: Duration = Duration::from_secs(3600);
+
+/// `POST /api/v1/logs/dump` — assemble a bounded support bundle into `dumps/` (§6b).
+///
+/// **This is the one place log bytes move**, and it is deliberately its own route rather than a
+/// mode of the browser: an operator who copies a cluster's logs onto the driver's disk should
+/// have had to say so. Token-guarded like every other log route, bounded by
+/// `OXIDANT_LOG_DUMP_MAX_BYTES` *and* §3's budget and free-space floor, refused with `507`
+/// rather than truncated, and swept 24 h later by the dump pass that shipped in PR2.
+///
+/// Answers `202 {dumpId}` and assembles on a task: six nodes and a day is minutes of Flight
+/// round-trips, and an HTTP client that gave up halfway would otherwise leave a half-written
+/// file with nobody to finish or remove it.
+async fn create_dump(
+    State(state): State<RestState>,
+    headers: header::HeaderMap,
+    body: Option<Json<DumpRequest>>,
+) -> Response {
+    if let Some(denied) =
+        oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), &headers)
+    {
+        return denied;
+    }
+    let request = body.map(|Json(b)| b).unwrap_or_default();
+    let Some(dumps) = state.dumps.clone() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "this node writes no dumps (OXIDANT_HISTORY=off)",
+        );
+    };
+    // The window, resolved *before* anything is minted, so a bad instant is a `400` on the
+    // request rather than a failed dump an operator collects later.
+    let now = chrono::Utc::now();
+    let (from, to) = match (&request.from, &request.to) {
+        (None, None) => (
+            (now - chrono::Duration::from_std(DEFAULT_DUMP_WINDOW).unwrap_or_default())
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
+        (from, to) => {
+            for (name, raw) in [("from", from), ("to", to)] {
+                if let Some(raw) = raw {
+                    if chrono::DateTime::parse_from_rfc3339(raw).is_err() {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            &format!("invalid {name} `{raw}`: expected an RFC-3339 instant"),
+                        );
+                    }
+                }
+            }
+            (
+                from.clone().unwrap_or_else(|| {
+                    chrono::DateTime::from_timestamp_millis(0)
+                        .unwrap_or(now)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                }),
+                to.clone().unwrap_or_else(|| {
+                    now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                }),
+            )
+        }
+    };
+    // The nodes, resolved here so `?worker=` gets the same SSRF gate the browser's does.
+    let nodes = match dump_nodes(&state, request.worker.as_deref()) {
+        Ok(nodes) => nodes,
+        Err(response) => return response,
+    };
+    // §3's guards, before the id exists: a refusal must land on the request.
+    if let Err(e) = dumps.admit() {
+        return log_error_response(&e);
+    }
+    let id = dumps.begin();
+    let query = crate::logging::LogQuery {
+        level: request.level.clone(),
+        target: request.target.clone(),
+        q: request.q.clone(),
+        from: Some(from.clone()),
+        to: Some(to.clone()),
+        ..Default::default()
+    };
+    tokio::spawn(assemble_dump(
+        state.clone(),
+        dumps.clone(),
+        id.clone(),
+        nodes.clone(),
+        query,
+    ));
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "dumpId": id,
+            "status": "building",
+            "from": from,
+            "to": to,
+            "nodes": nodes.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            "maxBytes": dumps.max_bytes(),
+        })),
+    )
+        .into_response()
+}
+
+/// The nodes one dump covers: `(id, endpoint)`, with `None` for the driver's own files.
+fn dump_nodes(
+    state: &RestState,
+    requested: Option<&str>,
+) -> Result<Vec<(String, Option<String>)>, Response> {
+    let workers = state.service.workers_from_config();
+    match requested.unwrap_or("all") {
+        "driver" => Ok(vec![("driver".to_string(), None)]),
+        "all" => {
+            let mut nodes = vec![("driver".to_string(), None)];
+            nodes.extend(
+                workers
+                    .iter()
+                    .map(|w| (worker_id(w), Some(w.clone()))),
+            );
+            Ok(nodes)
+        }
+        // One named worker goes through the same gate as `?worker=`: an id from this driver's
+        // own configuration, never an address.
+        other => resolve_worker(state, other).map(|endpoint| vec![(other.to_string(), Some(endpoint))]),
+    }
+}
+
+/// Walk every node's files inside the window and write them into one Parquet.
+///
+/// **A node that could not be reached is recorded and the dump still completes.** A support
+/// bundle that silently omits the node that died is worse than no bundle at all: the missing
+/// node is the one the case is about.
+async fn assemble_dump(
+    state: RestState,
+    dumps: Arc<crate::logging::DumpStore>,
+    id: String,
+    nodes: Vec<(String, Option<String>)>,
+    query: crate::logging::LogQuery,
+) {
+    let mut writer = match dumps.open(&id) {
+        Ok(w) => w,
+        Err(e) => return dumps.set(&id, crate::logging::DumpState::Failed(e)),
+    };
+    for (node, endpoint) in &nodes {
+        let files = {
+            let mut listing = query.clone();
+            listing.op = Some("files".to_string());
+            match ask_node(&state, endpoint.as_deref(), &listing).await {
+                Ok(v) => v,
+                Err(e) => {
+                    writer.note_node(node, Some(e.message));
+                    continue;
+                }
+            }
+        };
+        let names: Vec<String> = files["files"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|f| f["file"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut failure: Option<String> = None;
+        'files: for name in names {
+            // The **forward** cursor, so each file is walked once end to end and the walk
+            // resumes exactly where it stopped however selective the filter is.
+            let mut after = 0u64;
+            loop {
+                let mut page = query.clone();
+                page.file = Some(name.clone());
+                page.after = Some(after);
+                page.limit = Some(DUMP_PAGE);
+                let value = match ask_node(&state, endpoint.as_deref(), &page).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // A file that vanished under the walk (retention took it mid-dump) is
+                        // not a failed dump; an unreachable node is.
+                        if e.status == 404 {
+                            continue 'files;
+                        }
+                        failure = Some(e.message);
+                        break 'files;
+                    }
+                };
+                for line in value["logs"].as_array().into_iter().flatten() {
+                    let Some(line) = line.as_str() else { continue };
+                    if let Err(e) = writer.push(node, line) {
+                        // The cap. Refused, not truncated: the id reports it and no bundle is
+                        // published.
+                        return dumps.set(&id, crate::logging::DumpState::Failed(e));
+                    }
+                }
+                let next = value["next_after"].as_u64().unwrap_or(after);
+                if next <= after {
+                    break;
+                }
+                after = next;
+            }
+        }
+        writer.note_node(node, failure);
+    }
+    match writer.finish() {
+        Ok(finished) => {
+            // **The audited half of "an explicit, token-guarded, audited action"** (§6b). This
+            // is the one path that copies log bytes between nodes, so its completion is a log
+            // line of its own — which node, how many rows, how large, and which nodes did not
+            // answer — and it lands in the very log it just copied.
+            if let crate::logging::DumpState::Ready {
+                bytes, rows, nodes, ..
+            } = &finished
+            {
+                let unreachable: Vec<&str> = nodes
+                    .iter()
+                    .filter(|(_, err)| err.is_some())
+                    .map(|(node, _)| node.as_str())
+                    .collect();
+                tracing::info!(
+                    dump = %id,
+                    rows,
+                    bytes,
+                    nodes = nodes.len(),
+                    unreachable = unreachable.join(","),
+                    "diagnostic dump assembled"
+                );
+            }
+            dumps.set(&id, finished)
+        }
+        Err(e) => {
+            tracing::warn!(dump = %id, error = %e.message, "diagnostic dump failed");
+            dumps.set(&id, crate::logging::DumpState::Failed(e))
+        }
+    }
+}
+
+/// Lines per page while assembling. Larger than a browser page — nobody is waiting on one
+/// round-trip — and still bounded.
+const DUMP_PAGE: usize = 5_000;
+
+/// Ask one node — this driver, or a worker over Flight.
+async fn ask_node(
+    state: &RestState,
+    endpoint: Option<&str>,
+    query: &crate::logging::LogQuery,
+) -> Result<Value, crate::logging::LogError> {
+    match endpoint {
+        Some(endpoint) => federate(endpoint, query).await,
+        None => {
+            let view = state.logs.clone();
+            let ring = state.log_buffer.clone();
+            let query = query.clone();
+            tokio::task::spawn_blocking(move || crate::logging::answer(&query, &view, &ring))
+                .await
+                .unwrap_or_else(|e| {
+                    Err(crate::logging::LogError {
+                        status: 500,
+                        message: format!("reading the log file panicked: {e}"),
+                    })
+                })
+        }
+    }
+}
+
+/// `GET /api/v1/logs/dump/{dump_id}` — collect a bundle (§6b).
+///
+/// Four answers, and each is a distinct fact: `202` it is still assembling, `200` here it is,
+/// the assembly's own status (`507` past a cap) with its reason, or `404` no such dump. A
+/// half-assembled bundle is never served as a whole one.
+async fn get_dump(
+    State(state): State<RestState>,
+    headers: header::HeaderMap,
+    Path(dump_id): Path<String>,
+) -> Response {
+    if let Some(denied) =
+        oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), &headers)
+    {
+        return denied;
+    }
+    let Some(dumps) = state.dumps.clone() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "this node writes no dumps (OXIDANT_HISTORY=off)",
+        );
+    };
+    match dumps.get(&dump_id) {
+        None => error_response(StatusCode::NOT_FOUND, "unknown dump id"),
+        Some(crate::logging::DumpState::Building) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "dumpId": dump_id, "status": "building" })),
+        )
+            .into_response(),
+        Some(crate::logging::DumpState::Failed(e)) => log_error_response(&e),
+        Some(crate::logging::DumpState::Ready { path, bytes, .. }) => {
+            // **Streamed, never buffered.** A bundle may be a gigabyte, and the driver's whole
+            // result budget is 512 MiB; reading it into a `Vec<u8>` to hand to axum would be the
+            // same unbounded read `?file=`'s page cap exists to avoid, one route along.
+            let body = axum::body::Body::from_stream(dump_chunks(path));
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/vnd.apache.parquet".to_string()),
+                    (header::CONTENT_LENGTH, bytes.to_string()),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{dump_id}.parquet\""),
+                    ),
+                ],
+                body,
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Bytes of a bundle, in bounded chunks off the reactor.
+const DUMP_CHUNK: usize = 64 * 1024;
+
+fn dump_chunks(
+    path: std::path::PathBuf,
+) -> impl futures::Stream<Item = Result<Vec<u8>, std::io::Error>> {
+    futures::stream::unfold(Some((path, 0u64)), |st| async move {
+        let (path, offset) = st?;
+        let read = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut buf = vec![0u8; DUMP_CHUNK];
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                match file.read(&mut buf[filled..])? {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+            buf.truncate(filled);
+            Ok::<_, std::io::Error>((path, buf))
+        })
+        .await;
+        match read {
+            Ok(Ok((path, buf))) if buf.is_empty() => {
+                let _ = path;
+                None
+            }
+            Ok(Ok((path, buf))) => {
+                let next = offset + buf.len() as u64;
+                Some((Ok(buf), Some((path, next))))
+            }
+            Ok(Err(e)) => Some((Err(e), None)),
+            Err(e) => Some((
+                Err(std::io::Error::other(format!("dump read panicked: {e}"))),
+                None,
+            )),
+        }
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::await_holding_lock)] // env_lock() serializes process-global env across async tests
 mod tests {
@@ -3243,6 +3641,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         };
         (guard, state.clone(), app(state))
     }
@@ -3263,6 +3662,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         };
         (guard, state.clone(), app(state))
     }
@@ -3527,6 +3927,7 @@ mod tests {
                 dedup,
             },
             status_token: Some(LOGS_TOKEN.into()),
+            dumps: None,
         };
         (guard, app(state))
     }
@@ -3677,6 +4078,7 @@ mod tests {
                 dedup: true,
             },
             status_token: Some(LOGS_TOKEN.into()),
+            dumps: None,
         };
         (guard, app(state))
     }
@@ -3885,6 +4287,7 @@ mod tests {
                 dedup: true,
             },
             status_token: None,
+            dumps: None,
         });
         for route in [
             "/api/v1/logs",
@@ -4008,6 +4411,407 @@ mod tests {
         );
     }
 
+    /// A router with a real `dumps/` directory behind it — §6b's one sanctioned copy.
+    fn dump_state(
+        logs: &std::path::Path,
+        dumps: &std::path::Path,
+        workers: Vec<String>,
+        disk_max_bytes: u64,
+        dump_max_bytes: u64,
+    ) -> (MutexGuard<'static, ()>, Router) {
+        let guard = crate::distributed::env_lock();
+        let mut cfg = crate::history::HistoryConfig::for_root(logs.parent().unwrap_or(logs));
+        cfg.logs_dir = logs.to_path_buf();
+        cfg.dumps_dir = dumps.to_path_buf();
+        cfg.disk_max_bytes = disk_max_bytes;
+        cfg.disk_min_free_bytes = 0;
+        cfg.mounts_override = Some(Vec::new());
+        cfg.log_dump_max_bytes = dump_max_bytes;
+        let mut service = OxidantService::new();
+        service.workers = workers;
+        let state = RestState {
+            service: Arc::new(service),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(logs.to_path_buf()),
+                dedup: true,
+            },
+            status_token: Some(LOGS_TOKEN.into()),
+            dumps: crate::logging::DumpStore::from_config(&cfg),
+        };
+        (guard, app(state))
+    }
+
+    async fn post_dump(app: &Router, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/logs/dump")
+                    .header(header::AUTHORIZATION, format!("Bearer {LOGS_TOKEN}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// Poll a minted dump id until it stops building. The assembly is a task, so a test that
+    /// asserted on the first `GET` would be asserting on the scheduler.
+    async fn await_dump(app: &Router, id: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        for _ in 0..200 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/api/v1/logs/dump/{id}"))
+                        .header(header::AUTHORIZATION, format!("Bearer {LOGS_TOKEN}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if resp.status() == StatusCode::ACCEPTED {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+            return (status, headers, bytes);
+        }
+        panic!("the dump never left `building`");
+    }
+
+    /// **The one time log bytes move.** A dump assembles the driver's own window into
+    /// `dumps/dump-<uuid>.parquet`, answers `202` with the id, downloads as one queryable table
+    /// with a `node` column, and takes the shape the existing dump prune already recognises.
+    #[tokio::test]
+    async fn a_dump_assembles_a_bounded_bundle_and_downloads() {
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        write_browse_log(&logs, "oxidant-2026-08-23.log");
+        write_browse_log(&logs, "oxidant.log");
+        let (_env, app) = dump_state(&logs, &dumps, Vec::new(), u64::MAX, 1 << 30);
+
+        let (status, body) = post_dump(
+            &app,
+            json!({
+                "worker": "driver",
+                "from": "2026-08-23T00:00:00Z",
+                "to": "2026-08-24T00:00:00Z",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["dumpId"].as_str().expect("a dump id").to_string();
+        assert!(id.starts_with("dump-"), "{id}");
+        assert_eq!(body["status"], "building");
+        assert_eq!(body["from"], "2026-08-23T00:00:00Z");
+        assert_eq!(body["nodes"], json!(["driver"]));
+
+        let (status, headers, bytes) = await_dump(&app, &id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.apache.parquet"
+        );
+        assert!(headers
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains(&id));
+        assert_eq!(
+            bytes.len(),
+            headers
+                .get(header::CONTENT_LENGTH)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
+            "the streamed body is the whole file"
+        );
+
+        // One table, and the rows are labelled with the node they came from.
+        // Reopened from what the *route* streamed, not from the file on disk: the assertion is
+        // that a caller who downloads a bundle gets a readable Parquet.
+        let downloaded = root.path().join("downloaded.parquet");
+        std::fs::write(&downloaded, &bytes).expect("write");
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&downloaded).unwrap())
+                .expect("builder")
+                .build()
+                .expect("reader");
+        let mut nodes: Vec<String> = Vec::new();
+        let mut targets: Vec<String> = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("batch");
+            let node = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<oxidant_loom::arrow::array::StringArray>()
+                .expect("node");
+            let target = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<oxidant_loom::arrow::array::StringArray>()
+                .expect("target");
+            for i in 0..batch.num_rows() {
+                nodes.push(node.value(i).to_string());
+                targets.push(target.value(i).to_string());
+            }
+        }
+        assert!(!nodes.is_empty(), "the bundle has rows");
+        assert!(nodes.iter().all(|n| n == "driver"), "{nodes:?}");
+        assert!(
+            targets.iter().any(|t| t == "oxidant.dump"),
+            "the manifest is in the bundle, queryable: {targets:?}"
+        );
+        assert!(
+            targets.iter().any(|t| t.starts_with("oxidant_execution")),
+            "and so are the real log rows: {targets:?}"
+        );
+
+        // The file is in `dumps/` under the name the existing prune step recognises.
+        let names: Vec<String> = std::fs::read_dir(&dumps)
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![format!("{id}.parquet")]);
+        assert!(crate::history::disk::is_dump(&names[0]), "{names:?}");
+    }
+
+    /// **A node that could not be reached is named in the bundle, and the dump completes.** A
+    /// support bundle that silently omits the node that died is worse than no bundle: the
+    /// missing node is the one the case is about.
+    #[tokio::test]
+    async fn a_dump_names_the_node_it_could_not_reach_and_still_completes() {
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        write_browse_log(&logs, "oxidant.log");
+        let dead = ephemeral_port();
+        let (_env, app) = dump_state(
+            &logs,
+            &dumps,
+            vec![format!("http://127.0.0.1:{dead}")],
+            u64::MAX,
+            1 << 30,
+        );
+
+        let (status, body) = post_dump(&app, json!({ "worker": "all" })).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(
+            body["nodes"],
+            json!(["driver", format!("127.0.0.1:{dead}")]),
+            "`all` means the driver and every configured worker"
+        );
+        let id = body["dumpId"].as_str().expect("id").to_string();
+
+        let (status, _, bytes) = await_dump(&app, &id).await;
+        assert_eq!(status, StatusCode::OK, "an unreachable worker does not fail the dump");
+        let downloaded = root.path().join("downloaded.parquet");
+        std::fs::write(&downloaded, &bytes).expect("write");
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&downloaded).unwrap())
+                .expect("builder")
+                .build()
+                .expect("reader");
+        let mut manifest: Vec<(String, String)> = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("batch");
+            let text = |i: usize| {
+                batch
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<oxidant_loom::arrow::array::StringArray>()
+                    .expect("string column")
+            };
+            let (node, target, message) = (text(0), text(3), text(4));
+            for i in 0..batch.num_rows() {
+                if target.value(i) == "oxidant.dump" {
+                    manifest.push((node.value(i).to_string(), message.value(i).to_string()));
+                }
+            }
+        }
+        assert!(
+            manifest
+                .iter()
+                .any(|(node, msg)| node == "driver" && msg.contains("answered")),
+            "{manifest:?}"
+        );
+        assert!(
+            manifest.iter().any(|(node, msg)| node
+                == &format!("127.0.0.1:{dead}")
+                && msg.contains("unreachable")),
+            "the dead worker is named in the bundle, not omitted from it: {manifest:?}"
+        );
+    }
+
+    /// **Refused, not truncated** — and refused on the *request*, so an operator does not learn
+    /// about it when they come back for the file.
+    #[tokio::test]
+    async fn a_dump_that_would_breach_the_disk_budget_is_refused_with_507() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        write_browse_log(&logs, "oxidant.log");
+        // A budget smaller than one dump's reserve.
+        let (_env, app) = dump_state(&logs, &dumps, Vec::new(), 1024, 1 << 20);
+        let (status, body) = post_dump(&app, json!({ "worker": "driver" })).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("OXIDANT_DISK_MAX_BYTES"),
+            "{body}"
+        );
+        assert!(
+            !dumps.exists() || std::fs::read_dir(&dumps).unwrap().next().is_none(),
+            "nothing is written for a refused dump"
+        );
+    }
+
+    /// A dump past `OXIDANT_LOG_DUMP_MAX_BYTES` fails with `507` on collection and publishes no
+    /// bundle: a shorter file an operator would carry to a support case believing it held the
+    /// window they asked for is the outcome the cap exists to prevent.
+    #[tokio::test]
+    async fn a_dump_past_the_byte_cap_reports_507_and_publishes_nothing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        let body: String = (0..40_000)
+            .map(|i| {
+                format!(
+                    "2026-08-23T14:00:00.000Z [INFO] oxidant_execution - message=line {i}, \
+                     payload=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{i}\n"
+                )
+            })
+            .collect();
+        std::fs::write(logs.join("oxidant.log"), body).expect("write");
+        let (_env, app) = dump_state(&logs, &dumps, Vec::new(), u64::MAX, 4096);
+
+        // An explicit window: the default is the last hour, and these lines are dated.
+        let (status, meta) = post_dump(
+            &app,
+            json!({
+                "worker": "driver",
+                "from": "2026-08-23T00:00:00Z",
+                "to": "2026-08-24T00:00:00Z",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{meta}");
+        assert_eq!(meta["maxBytes"], 4096);
+        let id = meta["dumpId"].as_str().expect("id").to_string();
+
+        let (status, _, bytes) = await_dump(&app, &id).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("OXIDANT_LOG_DUMP_MAX_BYTES"),
+            "{body}"
+        );
+        let names: Vec<String> = std::fs::read_dir(&dumps)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(names.is_empty(), "no half-bundle and no .tmp: {names:?}");
+    }
+
+    /// The dump routes inherit the same gate, and a dump id is validated rather than joined —
+    /// the same discipline as `?file=`'s typed period.
+    #[tokio::test]
+    async fn the_dump_routes_are_gated_and_the_id_is_validated() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        write_browse_log(&logs, "oxidant.log");
+        let (_env, app) = dump_state(&logs, &dumps, Vec::new(), u64::MAX, 1 << 20);
+
+        // No credential: `401`, with the scheme advertised, exactly like every other log route.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/logs/dump")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        for hostile in ["dump-not-a-uuid", "..", "dump-", "stmt-x"] {
+            let (status, body) = get_logs(
+                &app,
+                &format!("/api/v1/logs/dump/{}", urlencode(hostile)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{hostile} -> {body}");
+            assert_eq!(body["error"], "unknown dump id", "{hostile}");
+        }
+        // And a bad instant is a `400` on the request, before an id exists.
+        let (status, body) = post_dump(&app, json!({ "from": "yesterday" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("yesterday"), "{body}");
+    }
+
+    /// §6b: "the bundle expires after 24 h and is swept like results" — through the prune step
+    /// that shipped in PR2 with its own tests, on the retention pass rather than the pressure
+    /// one, so it holds whether or not the budget is tight.
+    #[test]
+    fn a_dump_expires_after_twenty_four_hours() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dumps = dir.path().join("dumps");
+        std::fs::create_dir_all(&dumps).expect("mkdir");
+        let old = dumps.join("dump-00000000-0000-0000-0000-000000000001.parquet");
+        let fresh = dumps.join("dump-00000000-0000-0000-0000-000000000002.parquet");
+        let foreign = dumps.join("someone-elses-bundle.parquet");
+        for path in [&old, &fresh, &foreign] {
+            std::fs::write(path, vec![0u8; 64]).expect("write");
+        }
+        let now = chrono::Utc::now();
+        let report = disk::prune_expired_dumps(&dumps, crate::logging::DUMP_TTL_SECS, now);
+        assert_eq!(report.expired, 0, "nothing is 24 h old yet");
+        assert!(old.exists() && fresh.exists());
+
+        // Now with a clock 25 h ahead of both files.
+        let later = now + chrono::Duration::hours(25);
+        let report = disk::prune_expired_dumps(&dumps, crate::logging::DUMP_TTL_SECS, later);
+        assert_eq!(report.expired, 2);
+        assert!(report.freed_bytes >= 128);
+        assert!(!old.exists() && !fresh.exists());
+        assert!(
+            foreign.exists(),
+            "a bundle the engine did not write is measured and never unlinked"
+        );
+    }
+
     /// `?file=` inherits the endpoint's gate unchanged — and it matters more than it did: the
     /// route now reaches up to `OXIDANT_LOG_KEEP_DAYS` of every enabled `tracing` field value
     /// rather than a 1000-line ring.
@@ -4026,6 +4830,7 @@ mod tests {
                 dedup: true,
             },
             status_token: None,
+            dumps: None,
         };
         // Unset token: the whole endpoint 404s, `?file=` included.
         assert_eq!(
@@ -4163,6 +4968,7 @@ mod tests {
                 dedup: true,
             },
             status_token: None,
+            dumps: None,
         })
     }
 
@@ -4562,6 +5368,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         };
         let (status, body) = get_json(&app(state), "/api/v1/statements").await;
         assert_eq!(status, StatusCode::OK);
@@ -4847,6 +5654,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         };
         let router = app(state);
         let (status, body) = get_json(&router, &format!("/api/v1/statements/{first}/result")).await;
@@ -4923,6 +5731,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         };
         let router = app(state);
 
@@ -5135,6 +5944,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         }
     }
 
