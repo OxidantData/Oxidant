@@ -24,9 +24,16 @@
 //! - [`naming`] — UTC names, the `?file=` grammar, ISO weeks, `.N` size splits;
 //! - [`line`] — one event's three forms (live tail string, text line, Parquet row);
 //! - [`writer`] — the live file, the two roll triggers, dedup, and the converter thread;
-//! - [`columnar`] — text → zstd Parquet, and reading either form back.
+//! - [`columnar`] — text → zstd Parquet, and reading either form back;
+//! - [`browse`] — PR4's filters, backward cursor, Parquet pushdown and file listing (§6b);
+//! - [`api`] — the one answer both the driver's HTTP route and the worker's Flight action
+//!   serve, so "the same filters everywhere" is a fact rather than a claim (§6b);
+//! - [`dump`] — the diagnostic bundle, the one time log bytes move (§6b).
 
+mod api;
+mod browse;
 mod columnar;
+mod dump;
 mod line;
 mod naming;
 mod writer;
@@ -98,7 +105,17 @@ struct Capture {
 impl<S: Subscriber> Layer<S> for Capture {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let line = format_event(event);
-        self.buffer.push(line.render());
+        let rendered = line.render();
+        // The SSE tail (§6b) rides the same event, not a file poll: `GET /api/v1/logs/tail` is a
+        // *follow*, and re-reading the tail of `oxidant.log` every second would both lag and
+        // re-decode. Guarded on the subscriber count so a process with nobody watching pays one
+        // atomic load per event rather than a `String` clone.
+        if let Some(tx) = TAIL.get() {
+            if tx.receiver_count() > 0 {
+                let _ = tx.send(rendered.clone());
+            }
+        }
+        self.buffer.push(rendered);
         if let Some(file) = &self.file {
             file.write(line);
         }
@@ -173,6 +190,27 @@ impl tracing::field::Visit for LogVisitor {
 static LOG_BUFFER: OnceLock<LogBuffer> = OnceLock::new();
 static ROLLING: OnceLock<Option<Arc<RollingWriter>>> = OnceLock::new();
 
+/// Fan-out for `GET /api/v1/logs/tail` (§6b).
+///
+/// **Bounded, and a lagging reader loses lines rather than stalling the emitter.** A `tracing`
+/// event must never wait on an HTTP client: `broadcast` drops the oldest entries for a receiver
+/// that falls behind and tells *that receiver* how many it missed, which the tail turns into an
+/// explicit `dropped` event. A silent gap in a follow is the one thing worse than a visible one.
+///
+/// The capacity matches the writer's queue for the same reason it was chosen there: a burst
+/// large enough to overrun 8192 lines is a burst the reader could not have read anyway.
+static TAIL: OnceLock<tokio::sync::broadcast::Sender<String>> = OnceLock::new();
+
+/// Subscribe to the live line stream. Every process has one whether or not it has a file writer:
+/// the tail follows `tracing`, not `oxidant.log`, so `OXIDANT_LOG_ROLL=off` still follows.
+pub(crate) fn subscribe_tail() -> tokio::sync::broadcast::Receiver<String> {
+    TAIL.get_or_init(|| tokio::sync::broadcast::channel(TAIL_CAPACITY).0)
+        .subscribe()
+}
+
+/// Lines a tail subscriber may fall behind by before it is told it lost some.
+const TAIL_CAPACITY: usize = 8192;
+
 /// The disk sweep a roll triggers (§3). Published by the statement store at boot rather than
 /// reached from here: only the store knows which statements are still running, and the writer
 /// exists before the store does.
@@ -218,6 +256,12 @@ fn run_sweep_hook() {
 /// misconfiguration fails the boot loudly a moment later in `init_statement_store`, and taking
 /// the logger down first would hide that message.
 pub fn init(role: &str, port: u16) {
+    // Before the layer is installed, so `Capture::on_event` never has to create it on a hot path.
+    let _ = TAIL.get_or_init(|| tokio::sync::broadcast::channel(TAIL_CAPACITY).0);
+    // §6b's federation, from the answering side. Installed for *every* role: the driver too,
+    // which costs nothing and keeps `oxidant driver`'s co-located worker from being the one node
+    // the browser cannot reach.
+    api::install_flight_handler();
     let buffer = LOG_BUFFER
         .get_or_init(|| LogBuffer::new(MAX_LOG_LINES))
         .clone();
@@ -420,6 +464,16 @@ impl LogView {
 /// One bounded page of a log file — see [`columnar::Page`].
 pub(crate) use columnar::Page as LogPage;
 
+/// PR4's one answer, and the Flight federation around it (§6b).
+pub(crate) use api::{answer, decode_worker_answer, LogError, LogQuery};
+/// PR4's read path: the four filters, the backward cursor, and the file listing (§6b).
+pub(crate) use browse::{list_files, CursorPage, ForwardPage, LogFilter};
+/// §6b's sanctioned exception to "logs never move".
+pub(crate) use dump::{DumpState, DumpStore, DUMP_TTL_SECS};
+/// The line parser, for the SSE tail's per-line filter — the one place a filter is applied
+/// to a line that never came off a file.
+pub(crate) use line::parse_line as parse_for_filter;
+
 /// One rolled (or live) log file, resolved from a `?file=` value.
 pub(crate) enum LogFile {
     Text(PathBuf),
@@ -439,6 +493,34 @@ impl LogFile {
         match self {
             Self::Text(p) => columnar::read_text_lines(p, offset, limit),
             Self::Parquet(p) => columnar::read_lines(p, offset, limit),
+        }
+    }
+
+    /// One filtered page, newest-first, ending before `before` (§6b). **Blocking**, same as
+    /// [`Self::read`] — and for the same reason: the Parquet path is a real decode.
+    pub(crate) fn read_filtered(
+        &self,
+        filter: &LogFilter,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<CursorPage, String> {
+        match self {
+            Self::Text(p) => browse::scan_text(p, filter, before, limit),
+            Self::Parquet(p) => browse::scan_parquet(p, filter, before, limit),
+        }
+    }
+
+    /// One filtered page **forward** from a row index — the follow cursor `/api/v1/logs/tail`
+    /// resumes on, and the only mode that reads each row exactly once across repeated polls.
+    pub(crate) fn read_forward(
+        &self,
+        filter: &LogFilter,
+        after: u64,
+        limit: usize,
+    ) -> Result<ForwardPage, String> {
+        match self {
+            Self::Text(p) => browse::scan_text_forward(p, filter, after, limit),
+            Self::Parquet(p) => browse::scan_parquet_forward(p, filter, after, limit),
         }
     }
 }

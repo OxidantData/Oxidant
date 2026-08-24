@@ -1,7 +1,7 @@
 # Durable query history and exec logs
 
-Status: **PR1–PR3 built, PR4 designed** (2026-08-24, rev 2 after design review; §10 tracks
-what has shipped). Follow-up to issue #134
+Status: **PR1–PR4 built** (2026-08-24, rev 2 after design review; §10 tracks
+what has shipped, and each PR's deviations from this document). Follow-up to issue #134
 (Connect executions must join the statements store) and the founder ask: *server exec
 logs durable, rolled daily/hourly/weekly, max lookback 30 days*.
 
@@ -874,11 +874,14 @@ the one exception is an explicit diagnostic dump (below). This is the read-side 
 `/api/v1/logs` is today):
 
 ```
-GET /api/v1/logs/files                     → [{file, rolled, format, size_bytes, first_ts, last_ts}]
+GET /api/v1/logs/files                     → {dir, dedup, files: [{file, rolled, format, size_bytes, first_ts, last_ts}]}
 GET /api/v1/logs?file=…&level=warn&target=oxidant_execution&q=pool&
-     from=…&to=…&limit=500&before=<cursor>   → {lines: [...], next_before, dedup}
+     from=…&to=…&limit=500&before=<cursor>   → {logs: [...], next_before, dedup, file, format, limit}
 GET /api/v1/logs/tail?file=current&level=… (SSE)               → live follow
 ```
+
+*(Envelope keys as built: `logs` is PR3's released spelling for the line array, and
+`/api/v1/logs/files` names the directory it read — see §10's PR4 deviations.)*
 
 - Filters compose: level (≥), target prefix, free-text `q`, time range; results
   stream newest-first with a cursor so the UI pages backward without reloading
@@ -909,8 +912,9 @@ No worker log bytes touch the driver's disk on this path.
 **Diagnostic dump (the only time logs move):**
 
 ```
-POST /api/v1/logs/dump {worker: <id>|"all", from, to}  → 202 {dump_id}
-GET  /api/v1/logs/dump/{dump_id}                       → parquet bundle download
+POST /api/v1/logs/dump {worker: <id>|"driver"|"all", from, to, level, target, q}
+                                                       → 202 {dumpId, status, from, to, nodes, maxBytes}
+GET  /api/v1/logs/dump/{dumpId}                        → parquet bundle download
 ```
 
 An explicit, token-guarded, audited action for support bundles: the worker(s)
@@ -1209,8 +1213,235 @@ Guards and degradation:
    converter leaked a `.parquet.tmp` when the source failed partway through a read (macOS
    opens a directory happily and fails at the first read), and both prune lists ordered
    `.2` ahead of the plain name because `2` < `l` lexicographically.
-4. **PR4** — the driver log browser (filters/cursor/tail) + worker federation +
-   the diagnostic dump, with the Observability screen's log UI.
+4. **PR4** — *built* — the driver log browser (filters, a backward cursor, tail-follow),
+   worker federation, the diagnostic dump, and the Observability screen's log pane. Lives in
+   `crates/oxidant-connect/src/logging/{browse,api,dump}.rs`, the log routes in `rest.rs`, the
+   `logs` Flight action in `oxidant-execution/src/flight.rs`, and the pane in
+   `oxidant-ui-server/src/embedded_ui.html`. **Six deviations, each argued where it lands:**
+   - **Federation is a Flight action, not a small HTTP surface on the worker** (§6b left the
+     choice open). A worker speaks Flight and nothing else; an HTTP listener would mean a second
+     port to open, a second bind in every deployment template, a second CORS decision and a
+     second place to get the token gate right. One `answer()` serves both transports, so
+     `level=warn` cannot come to mean two things. The action carries the **same
+     `OXIDANT_STATUS_TOKEN`** the driver's HTTP log routes require, in Flight request metadata
+     and through the same `bearer_is_authorized` — so every worker must be given the driver's
+     token. The first draft called an ungated action "not a new privilege" because the port
+     already accepts arbitrary stage SQL; the premise is true and the conclusion is not. SQL
+     reads the data *this* worker can reach, while a log page reads every enabled `tracing` field
+     value — DSNs, object-store keys in table URIs, connector bearer tokens — which are reusable
+     **off** this worker. The residual is stated in `docs/api.md` and `docs/runtime-contract.md`:
+     `Ticket::Sql` is still ungated, so the Flight port must still be firewalled.
+   - **A worker's tail is a 2 s poll, and says so** — `mode: "poll"` on the stream's first
+     event, against `mode: "follow"` for the driver's, which rides `tracing` itself. A
+     long-lived Flight stream would pin a worker-side task to a browser tab. A reader is never
+     told a 2 s-granular feed is live.
+   - **The dump is one Parquet with a `node` column**, where §6b said already-Parquet rolled
+     files "ship as is". Shipping bytes needs a second wire shape and a second bounding path,
+     and hands back a heterogeneous bundle the operator must reassemble. The cost is stated in
+     `logging/dump.rs`: rows are re-rendered through the same normalization `?file=` already
+     documents, so a bundle is faithful to what the browser shows rather than byte-identical to
+     the file.
+   - **The envelopes keep PR3's spelling.** §6b sketched `{lines, next_before, dedup}` and
+     `202 {dump_id}`; the built routes answer `logs` (PR3's released key) and `dumpId` (the
+     camelCase every other REST route here uses), and `/api/v1/logs/files` answers
+     `{dir, dedup, files}` rather than a bare array. **Which page shape you get is decided by
+     what you asked for**, not by a version flag: a `before=`, an `order=desc`, or any filter
+     gives §6b's newest-first cursor page, and nothing at all gives PR3's oldest-first
+     `?offset=` page byte-identical to what it answered before.
+   - **Two additions §6b did not name.** A forward cursor (`?after=`/`next_after`) — a *scan*
+     position, not a match position, so a follow reads each row once however selective the
+     filter is; and `MAX_LOG_PAGE = 10_000` on every log route, because PR3's read path had no
+     cap at all and `?file=current` on a 256 MiB file built every line in memory and then
+     serialised a second copy into the body.
+   - **The pane's tail is `fetch` + a `ReadableStream`, not `EventSource`**, and its level
+     chips are a *floor* rather than four independent toggles. `EventSource` cannot carry an
+     `Authorization` header, and the ways around that put the status token in a URL or invent a
+     cookie on a router served under permissive CORS. The floor is what the API's `level=`
+     means, so a chip and a `curl` agree.
+
+   Three things the work caught outside its own scope. `docs/web-ui.md` documented level filter
+   chips that had been inert since PR3 moved `[LEVEL]` off the start of the line — the pane's
+   regex was `^`-anchored, so every line came back with a null level and no chip could hide one;
+   the chips are unanchored now and drive `level=` server-side, and the doc describes the pane
+   that exists. And both gates were red on the four commits before this line was written:
+   `cargo fmt --all -- --check` had never been run, and `clippy -D warnings` found three
+   `incompatible_msrv` hits (`Option::is_none_or`, `io::Error::other`) against the workspace's
+   `rust-version = "1.72"`.
+
+### PR4 review (#143): sixteen findings, and what changed
+
+The review of PR4 is in `#143`. Every finding is fixed in the branch; the ones that changed
+*behaviour* rather than only code are recorded here, because each contradicts something this
+document or `docs/api.md` previously promised.
+
+- **F1 — the dump store resolves the data root through the statement store, not the
+  environment.** `rest::router` built its `DumpStore` from `HistoryConfig::from_env("driver", 0)`
+  — a *third* read of the environment, with a port the function does not know. Under
+  `OXIDANT_DATA_DIR_PER_PROCESS=1` (`docs/runtime-contract.md`'s recommended container setting)
+  that resolves `<root>/driver-0/dumps/` while the sweeper prunes `<root>/driver-<port>/dumps/`
+  and `disk::budget_roots` bills neither. Three §3/§6b promises broke at once: the 24 h expiry,
+  the disk budget, and `admit()`'s up-front `507` (which measured an empty tree). The router now
+  asks `StatementStore::history_config()` for the config the store actually booted with, so
+  `DumpStore.dir` is by construction the `cfg.dumps_dir` `sweep_disk` prunes.
+
+- **F2 — the window prunes what a dump *reads*, not only what it keeps.** The walk listed every
+  file in `logs/` regardless of the window and scanned each end to end with a forward scan that
+  did no row-group pruning and no projection — so the documented default (the last hour) fully
+  decoded up to `OXIDANT_LOG_KEEP_DAYS` of logs on every node. Three changes: the listing is
+  filtered by `[first_ts, last_ts]` against the window before a file is opened;
+  `scan_parquet_forward` gained the footer pruner, the `(ts, level, target)` projection and the
+  `RowSelection` its backward sibling already had, so both directions cost the same over one
+  file; and a page that comes back with **no lines ends that file's walk**, which is what stops
+  the walk of a *live* file from chasing its own growing tail on the busiest node in the
+  cluster. The file-level rule is deliberately coarser than the row filter: a rolled file whose
+  every parseable timestamp is outside the window is not opened, so the unjudgeable lines it
+  holds — which rule 1 would otherwise serve — are skipped with it. They are the continuations
+  of lines that are themselves outside the window; a `?file=` read of the same file still
+  serves them, because there the caller named the file.
+
+- **F3 — the Parquet page fits its own byte budget.** `scan_parquet`'s second pass rendered
+  every matching row of a row group into a `Vec` before the page's byte budget was consulted,
+  while the text path over the same file pushed each match straight into a `Window` that evicts
+  on bytes. So one file served 8 MiB as `.log` and more than that as `.parquet`, and a row group
+  of fat lines — 8,192 rows, one `tracing` field able to carry a whole DataFusion plan — was
+  materialised in full on a driver whose entire result budget is 512 MiB. The rendered rows now
+  go into a window sized to what is *left* of the page, and with no `q` predicate the older hits
+  are not rendered at all. §6b's rule 3 is restated to say "never by a row group" as well as
+  "never by the file".
+
+- **F4 — `?worker=` resolves against the deployment, not the session config.** The gate itself
+  was right (it matches an id and dials the configured address, never the caller's string), but
+  the list it matched against was `workers_from_config()`, which lets `spark.oxidant.workers`
+  win. That key lives in one process-global map the Spark Connect `Config`/`Set` RPC writes into
+  unconditionally, on an unauthenticated port — so the gate was decorative: one `spark.conf.set`
+  and the driver would dial an address the caller chose, and the real workers would drop out of
+  the picker and out of `dump {"worker":"all"}`. The four log routes now use
+  `OxidantService::configured_workers()` — `OXIDANT_WORKERS`, then `OXIDANT_WORKER_SERVICE` DNS,
+  then the boot snapshot. Per-session pinning is untouched for query routing, which is what it
+  is for. `docs/api.md`'s "it is never an address you supply" now says what "configured" means.
+
+- **F5 — the federated tail's first poll is a position, not a page.** The seed asked for
+  `order=desc&limit=200` and emitted the answer, which the pane appends *after* having just
+  painted the newest 500 lines of the same file — so opening the pane on any worker painted 200
+  lines twice. And the cursor derived from that backward page was `next_before + lines.len()`:
+  a **match** position plus a match **count**, which is only a scan position when the matches
+  are contiguous. `ForwardPage`'s own doc states the rule that broke — a cursor built from the
+  last match re-reads and re-emits every non-matching row after it on every poll — so a
+  `level=error` follow re-printed the same errors every 2 s forever, and the tighter the filter
+  the worse it got. The first poll now asks `after = u64::MAX`, which names the end of the file
+  and returns nothing. The follow's state and its arithmetic moved out of the `unfold` closure
+  into a `Follow` value, so both are reachable from a test.
+
+- **F6 — a failed poll leaves the follow's cursor where it is.** The error arm set
+  `st.after = st.after.or(Some(0))` under a comment promising the opposite of what it did:
+  `Some(0)` *is* the replay, and the arm is only reached when the cursor is unset — the **first**
+  poll, which is the one issued the instant a worker goes down or against one already down. A
+  recovered worker then walked its whole live file from the top, 500 rows per 2 s tick, while
+  the pane read "following". The cursor now does not move; the next successful poll re-seeds at
+  the end of the file, which is what F5's seed already does.
+
+- **F7 — "Load older lines" no longer opens a silent gap.** `obsAppend` trimmed the oldest
+  lines off the front of the live page with `.slice(-OBS_PAGE * 2)` and left `page.next_before`
+  naming one of them, so after ~500 followed lines the scroll-back cursor pointed at a line that
+  was no longer on screen: `[older page][…500 lines missing…][tail]`, presented as one
+  continuous log. The cursor cannot be advanced by arithmetic — under a filter the rows between
+  two matches are unknown — so the trimmed prefix becomes the newest scrolled-back page instead,
+  carrying the cursor that belongs to it. Scroll-back is bounded by releasing whole pages from
+  the *oldest* end, which is gap-free by construction: each page's cursor names the page before
+  itself, so a released page is re-fetched rather than skipped. Same class of defect as the SSE
+  `dropped` event, on the scroll-back axis instead of the live one.
+
+- **F8 — an admitted dump's reservation is recorded.** `admit()` reserved the whole cap and
+  never wrote the reservation down, so `measure_roots` — which reads what is on disk *now* —
+  could not see a dump admitted 200 ms ago that had written nothing yet. Five `POST`s arriving
+  together (a monitoring script, or the **Dump** button, which re-enables the instant its `202`
+  lands) all measured the same tree, all passed, and all five then wrote up to the cap:
+  `(N-1) x cap` past `OXIDANT_DISK_MAX_BYTES`. Admission and minting are now one step under one
+  lock, every id still `Building` counts as a reservation, and a terminal state releases it.
+  The registry is also pruned at the bundle's own 24 h TTL — it grew one entry per request for
+  the process's lifetime — with `Building` exempt, since an assembly still running is still
+  holding headroom.
+
+- **F9 — the ring is read whole, and the one unstable cursor says so.** `filter_ring`'s
+  `next_before` is an index into a buffer that *rolls*, not a row index into an append-only
+  file: every `LogBuffer::push` between two requests shifts every index by one. The pane paged
+  it with `before=` exactly as it paged a file, so on a driver logging ~50 lines/s a click on
+  **Load older lines** served ~15 lines twice and lost ~15 at the other end — on an
+  `OXIDANT_LOG_ROLL=off` node, where the ring is the *only* view there is. Stabilising the
+  cursor would mean giving the ring a monotonic sequence number it does not have and does not
+  need, so the fix is the other half of the choice: the ring's envelope now carries
+  `"cursor": "best-effort"` (a file's page carries no `cursor` key at all), the pane asks for
+  the whole ring in one page — 1000 entries against a 10,000-line page cap, so it costs
+  nothing — and it suppresses **Load older lines**, captioning the ring as rolling and
+  pointing at `?file=` for a stable history. `docs/api.md` carves the ring out of "a row index
+  from the start of the named file" instead of leaving the sentence to cover it.
+
+- **F10 — a follow shows what the node is writing, not a substitute for it.** `worker_tail`
+  overrode `file` to `current` unconditionally, so **Node = worker, File = memory ring** painted
+  the page out of the worker's in-memory ring (`dedup: false`) and appended the tail out of the
+  worker's `oxidant.log` (`dedup: true`), concatenated into one pane under an `open` event
+  asserting one of them. On a worker with `OXIDANT_LOG_ROLL=off` — where the ring is the only
+  view there is — the substitution polled a file that does not exist and emitted an `error`
+  every 2 s forever under a caption reading "following". `check_tail_source` now gates the route
+  instead: `current` follows on any node, the ring follows on the **driver** and only there
+  (its tail is the `tracing` broadcast the ring holds, not a file poll), and everything else is
+  a `400` naming the value that works. The pane gained one owner for the same rule
+  (`obsCanFollow`), which disables the checkbox with the reason in its title and puts the
+  worker-ring case in the caption rather than letting "following" quietly stop appearing.
+
+- **F11 — the quietest level chip is the quietest level.** `OBS_LEVELS` was
+  `['error','warn','info','debug']` while `level_rank` gives `TRACE` a rank of its own,
+  deliberately: the writer records what `tracing` emitted, and collapsing two levels in the
+  *filter* would make `level=debug` and `level=trace` the same query on a file that
+  distinguishes them. The default (no chip) sends no `level=` and shows every level including
+  `TRACE`; clicking **debug** sent `level=debug` and dropped rank 4. So on a node running
+  `RUST_LOG=trace`, the chip labelled as the most permissive floor made lines **disappear**, and
+  `obsLevelOf` folded `TRACE` into the `debug` colour bucket so nothing on screen hinted that a
+  distinct level existed. There is now a `trace` chip, the quietest chip's title says "every
+  level", and `obsLevelOf` returns the level the line actually carries. `browse.rs`'s floor test
+  no longer calls `at("debug")` "everything" — that was true of its fixture and not of a
+  trace-enabled node, and a second test pins both halves against a file that has a `TRACE` line
+  in it.
+
+- **F12 — a line is capped at a page, on every path that promised to be.** `scan_text`,
+  `scan_text_forward` and `text_bounds` all used `BufReader::read_line`, which grows its target
+  to **the whole file** when the file holds no `\n`; `Window::push` will not evict a sole entry,
+  so that one line became the page. Rule 3 says memory is bounded by the page and never by the
+  file, and this was the one remaining way to make `?file=` materialise a whole file — reachable
+  only by a foreign file in `logs/` whose name matches the grammar, which is the same threat
+  model rule 1 already contemplates. The read is now capped at `MAX_LINE_BYTES` (one page: a
+  line longer than a page could never be served whole anyway), the remainder of the physical
+  line is **skipped rather than returned as further rows** — fragmenting one line into a hundred
+  would multiply the row count a cursor is an index into — and the cut is marked in the line so
+  a page that dropped bytes says so. The listing's head probe is bounded by the same 64 KiB as
+  its tail probe, which matters because `list_files` runs it over every text file in `logs/`.
+  The capped read also works in bytes rather than `read_line`'s `String`: the cap can land
+  mid-character, and a foreign file that is not UTF-8 at all used to fail the scan outright
+  rather than serving the line rule 1 says a reader should still see.
+
+- **F13 — a cursor names an older page, never an empty one.** `scan_parquet` set
+  `more_before` when the window filled at a *group boundary*, before that group was examined —
+  and a candidate group has only survived the `ts` pruner, which ignores `level`, `target` and
+  `q`. So a page whose filter matched nothing older still came back with a non-null
+  `next_before`, and the caller followed it into a page that was empty with `next_before: null`.
+  The text path already had the tighter answer (`Window::dropped` is true only when a *match*
+  was evicted), so the two forms of one file disagreed about the cursor — the distinction rule 2
+  says a caller must not be able to see. A full page no longer ends the walk; it switches it to
+  a **probe** that decodes nothing into the page and stops at the first group holding an
+  admissible match. This is never more work than before — the empty page the false positive
+  invited would have scanned exactly those groups — and with no `q` it is answered on the
+  three-column pushdown alone, without touching `message`.
+
+- **F14 — a bundle download holds one handle.** `dump_chunks` reopened the file and seeked to
+  the offset for every 64 KiB: 16,384 `open` + `seek` + `spawn_blocking` round-trips for a 1 GiB
+  bundle. The syscall churn was the smaller half. A bundle's 24 h TTL can expire between two
+  chunks and the sweeper does not wait for a lull, so the next `open` failed *after*
+  `Content-Length` had already promised the whole file — a truncated bundle, reported as a
+  stream error, on the one route an operator reaches for when something is already wrong.
+  Keeping the descriptor in the unfold's state costs nothing and makes the download atomic with
+  respect to retention on POSIX: the bytes stay readable until the last one is served, whatever
+  happens to the name. Sequential reads advance the handle's own offset, so the seek is gone as
+  well.
 
 ## 11. Review resolutions (F1–F21)
 

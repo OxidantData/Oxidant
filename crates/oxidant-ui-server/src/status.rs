@@ -72,12 +72,8 @@ pub fn deny_unless_authorized(expected: Option<&str>, headers: &HeaderMap) -> Op
 
     let presented = headers
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(bearer_token);
-    let authorized = presented
-        .map(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()))
-        .unwrap_or(false);
-    if !authorized {
+        .and_then(|v| v.to_str().ok());
+    if !bearer_is_authorized(expected, presented) {
         return Some(
             (
                 StatusCode::UNAUTHORIZED,
@@ -114,6 +110,26 @@ pub async fn status(
         .min(MAX_QUERY_LIMIT);
     let snapshot: StatusSnapshot = state.store.status_snapshot(limit);
     Json(snapshot).into_response()
+}
+
+/// The credential check behind [`deny_unless_authorized`], reachable by callers whose transport
+/// is not HTTP.
+///
+/// The worker's Flight `logs` action (`oxidant_execution::flight::ACTION_LOGS`, §6b) serves the
+/// same bytes as `GET /api/v1/logs` — every enabled `tracing` field value of a node — and so
+/// must be gated by the same shared token. It presents the credential in gRPC metadata rather
+/// than an HTTP header, which is the only difference; the scheme parsing, the constant-time
+/// compare and the "a blank value is not a credential" rule must be the same code, because a
+/// second copy of them is a second place to get a secret comparison wrong.
+///
+/// `presented` is the raw header/metadata *value*, `Bearer ` prefix included. `expected` is an
+/// already-normalized token (see `normalize_token`); "no token configured" is the caller's
+/// decision to make, not a credential this function can accept.
+pub fn bearer_is_authorized(expected: &str, presented: Option<&str>) -> bool {
+    presented
+        .and_then(bearer_token)
+        .map(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()))
+        .unwrap_or(false)
 }
 
 /// Extract the credential from an `Authorization: Bearer <token>` header value. The scheme

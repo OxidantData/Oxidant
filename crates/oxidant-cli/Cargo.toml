@@ -41,4 +41,8 @@ tempfile = "3"
 datafusion = "54"
 # Mock statements-API server for `client`/`mcp` unit tests.
 axum = "0.8"
+# The log-federation subprocess test drives the driver's REST API from a plain thread — it is
+# orchestrating two real binaries, not running inside the runtime, so the blocking client is the
+# one that fits.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 serde = { version = "1", features = ["derive"] }

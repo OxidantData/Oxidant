@@ -35,6 +35,11 @@
      * are semantic status.
      */
     :root {
+      /* The UA's own widgets — a `<select>`'s dropdown, a `datetime-local`'s picker — take
+         their surface from this, not from a token. Without it the log pane's date fields
+         render a white sheet over a near-black page. */
+      color-scheme: dark;
+
       /* Surfaces — layered near-blacks */
       --oxidant-bg: #111112;
       --oxidant-bg-subtle: #171719;
@@ -87,6 +92,7 @@
     }
 
     :root[data-theme="light"] {
+      color-scheme: light;
       --oxidant-bg: #ffffff;
       --oxidant-bg-subtle: #fafafa;
       --oxidant-surface: #ffffff;
@@ -612,6 +618,60 @@
     .filter-chip.lvl-warn i { background: var(--oxidant-warning); }
     .filter-chip.lvl-info i { background: var(--oxidant-text-secondary); }
     .filter-chip.lvl-debug i { background: var(--oxidant-text-muted); }
+    .filter-chip.lvl-trace i { background: var(--oxidant-text-muted); opacity: 0.55; }
+
+    /* ── Log pane controls ──────────────────────────────────────────────────────────────
+     * A row of labelled fields over the terminal surface, not a toolbar of icons: each control
+     * is a filter with a name, and the name is what an operator types into `curl` when they want
+     * the same thing without a browser. Eyebrow over field, same as a card head, so the row reads
+     * as part of the surface rather than bolted above it.
+     */
+    .log-controls {
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .log-control { display: flex; flex-direction: column; gap: 4px; margin: 0; min-width: 0; }
+    .log-control.grow { flex: 1 1 220px; }
+    .log-control .eyebrow { margin: 0; }
+    .log-control input, .log-control select {
+      background: var(--oxidant-bg);
+      border: 1px solid var(--oxidant-border);
+      color: var(--oxidant-text);
+      border-radius: var(--oxidant-radius-sm);
+      padding: 6px 10px;
+      font-size: 12px;
+      font-family: var(--oxidant-font-mono);
+      max-width: none;
+      min-width: 0;
+    }
+    .log-control select { cursor: pointer; }
+    .log-control input:focus, .log-control select:focus {
+      outline: none;
+      border-color: var(--oxidant-border-strong);
+    }
+    /* A `datetime-local` with nothing in it is the *unbounded* end of the range, and it must
+       look it: the UA paints its `yyyy-mm-dd --:--` skeleton at full text colour, which reads
+       as a value that is set. The class is toggled from JS — `:invalid` does not match an
+       empty optional field, and `:placeholder-shown` does not apply to date inputs. */
+    .log-control input.empty { color: var(--oxidant-text-muted); }
+    /* The follow switch sits with the level chips: both answer "what am I watching", and both
+       are controls that look like the state they set. */
+    .log-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin: 0 0 0 auto;
+      font-size: 12px;
+      color: var(--oxidant-text-secondary);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .log-toggle input { accent-color: var(--oxidant-solid); cursor: pointer; }
+    .log-toggle input[disabled] { cursor: not-allowed; }
+    #obs-dump-note a { color: var(--oxidant-text); text-decoration: underline; text-underline-offset: 3px; }
 
     /* ── Inline sub-rows ────────────────────────────────────────────────────────────────
      * A job's stages, under the job. One step down in surface and indented, so the nesting is
@@ -898,88 +958,418 @@
      * rows are summed over the stages its jobs actually ran.
      */
     const OBS_POLL_MS = 5000;
-    const OBS_LEVELS = ['error', 'warn', 'info', 'debug'];
-    /* Lines to keep on screen. The buffer holds 1000; painting all of them on every 5 s tick
-       is the one thing on this page that could cost more than it is worth. */
-    const OBS_MAX_LINES = 400;
+    /* Severity floor, loudest first — the same order and the same words the API's `level=`
+       takes, so a chip and a curl mean one thing.
+     *
+     * **`trace` is here because a floor's quietest chip must be the quietest level.** The row
+     * stopped at `debug` while `level_rank` gives `TRACE` a rank of its own, deliberately: the
+     * writer records what `tracing` emitted, and folding two levels together in the *filter*
+     * would make `level=debug` and `level=trace` the same query on a file that distinguishes
+     * them. So on a node running `RUST_LOG=trace`, no chip meant "everything" and clicking the
+     * chip labelled as the most permissive floor made lines **disappear** — the one reading a
+     * severity floor can never afford. */
+    const OBS_LEVELS = ['error', 'warn', 'info', 'debug', 'trace'];
+    /* Lines a page asks for. The API clamps at 10,000; this is what one screenful of scrollback
+       costs, and `next_before` fetches the page before it when the reader scrolls up. */
+    const OBS_PAGE = 500;
 
     const obsState = {
       timer: null,
       paused: false,
-      levels: { error: true, warn: true, info: true, debug: true },
-      logs: null,      // { code, lines, error } — null until the first poll returns
-      at: null,        // when that poll returned
-      expanded: {},    // jobId -> true, for the inline stage rows
+      // A *floor*, not a set: `warn` is "warn and error". The API evaluates it, so the pane and
+      // a `curl` cannot disagree about what `level=warn` means.
+      level: null,       // null = every level
+      target: '',
+      q: '',
+      from: '',          // `<input type=datetime-local>` local wall clock; '' = unbounded
+      to: '',            // exclusive upper bound, so two adjacent ranges tile without overlap
+      file: 'current',   // the `?file=` value, or 'ring' for the in-memory buffer
+      // A node with `OXIDANT_LOG_ROLL=off` has no `current` file but still has the ring, and
+      // saying "no logs here" about a node that is logging is the kind of lie §6b exists to
+      // prevent. Two flags, because they answer two different questions: `currentMissing` is a
+      // fact about the node — it survives an explicit pick, so asking for `current` again gets
+      // the honest `404` rather than being redirected a second time — and `ringFallback` is
+      // *why the ring is on screen*, which only the caption cares about.
+      currentMissing: false,
+      ringFallback: false,
+      worker: 'driver',
+      follow: true,      // tail-follow, over SSE
+      files: null,       // [{file, rolled, format, size_bytes, first_ts, last_ts}] for the picker
+      workers: null,     // [{worker_id, reachable, error}] for the worker picker
+      page: null,        // { code, lines, error, next_before, dedup, format }
+      older: [],         // pages the reader scrolled back into, oldest-first
+      at: null,
+      tail: null,        // the EventSource, while following
+      tailMode: null,    // 'follow' (driver, live) or 'poll' (worker, 2 s)
+      tailError: null,   // the last thing a worker poll said when it failed mid-follow
+      dropped: 0,        // lines the SSE fan-out told us we fell behind by
+      expanded: {},      // jobId -> true, for the inline stage rows
     };
 
-    // Same credential the Pipelines page stores, and `/api/v1/logs` needs it: the buffer holds
-    // every tracing field the driver logged, so it is gated by the same OXIDANT_STATUS_TOKEN as
+    // Same credential the Pipelines page stores, and every log route needs it: the files carry
+    // every tracing field the node logged, so they are gated by the same OXIDANT_STATUS_TOKEN as
     // /api/status and the connector logs. Without one this pane says so rather than showing an
     // empty box.
     const obsAuthHeaders = () => pipeState.token ? { Authorization: 'Bearer ' + pipeState.token } : {};
 
-    // `[INFO] oxidant_connect::rest - listening` → `info`. TRACE folds into DEBUG: the buffer
-    // can carry it, and it is the same "everything else" bucket to anyone reading the page.
+    /* `2026-08-23T14:00:00.500Z [INFO] oxidant_connect - message=…` → `info`.
+     *
+     * **`[LEVEL]` is no longer line-initial.** PR3 put an RFC-3339 UTC timestamp in front of it
+     * so the rolled Parquet would have a `ts` column to filter on, and this regex still anchored
+     * at `^` — so it matched nothing, every line came back with a null level, and the filter
+     * chips this page has always drawn could not hide a single line. That is the `docs/web-ui.md`
+     * drift PR4 reconciles: the chips were drawn and documented, and they did nothing.
+     *
+     * They now drive the API's `level=` as well, so the filtering happens over the whole file
+     * rather than over the page that was already fetched. This regex is what *colours* a line. */
     function obsLevelOf(line) {
-      const m = /^\s*\[([A-Za-z]+)\]/.exec(String(line || ''));
+      const m = /\[(ERROR|WARN|INFO|DEBUG|TRACE)\]/.exec(String(line || ''));
       if (!m) return null;
-      const lvl = m[1].toLowerCase();
-      if (lvl === 'trace') return 'debug';
-      return OBS_LEVELS.indexOf(lvl) >= 0 ? lvl : null;
+      // `trace` is its own level, not a quieter `debug`: the chip row filters on it and the
+      // API ranks it separately, so folding it here would leave the pane unable to say which
+      // of the two a line is.
+      return m[1].toLowerCase();
     }
 
+    // The query string every log route takes. Built once so the pane, the tail and the dump
+    // cannot drift on what "the current filter" means.
+    function obsQuery(extra) {
+      const p = new URLSearchParams();
+      if (obsState.worker && obsState.worker !== 'driver') p.set('worker', obsState.worker);
+      if (obsState.file && obsState.file !== 'ring') p.set('file', obsState.file);
+      if (obsState.level) p.set('level', obsState.level);
+      if (obsState.target.trim()) p.set('target', obsState.target.trim());
+      if (obsState.q.trim()) p.set('q', obsState.q.trim());
+      // The API takes RFC-3339 instants; the control speaks the reader's own wall clock. The
+      // conversion happens here, once, so the pane and a `curl` mean the same window.
+      const from = obsInstant(obsState.from), to = obsInstant(obsState.to);
+      if (from) p.set('from', from);
+      if (to) p.set('to', to);
+      for (const [k, v] of Object.entries(extra || {})) if (v != null) p.set(k, v);
+      return p.toString();
+    }
+
+    // `2026-08-24T14:00` (local) → `2026-08-24T12:00:00.000Z`. An unparseable value is dropped
+    // rather than sent: a `400` on every keystroke of a half-typed date is not a filter.
+    function obsInstant(local) {
+      if (!local) return null;
+      const t = new Date(local);
+      return isNaN(t.getTime()) ? null : t.toISOString();
+    }
+
+    async function obsFetch(path) {
+      const r = await fetch(path, { headers: obsAuthHeaders() });
+      const body = await r.json().catch(() => ({}));
+      return { code: r.status, body };
+    }
+
+    // The file picker and the worker picker. Refreshed when the pane opens and when the worker
+    // changes — a rolled file appears at most once a period, and the picker is not a live view.
+    async function fetchObsPickers() {
+      try {
+        const { code, body } = await obsFetch('/api/v1/logs/workers');
+        obsState.workers = code === 200 ? (body.workers || []) : [];
+      } catch (e) { obsState.workers = []; }
+      try {
+        const { code, body } = await obsFetch('/api/v1/logs/files?' + obsQuery({}));
+        obsState.files = code === 200 ? (body.files || []) : [];
+      } catch (e) { obsState.files = []; }
+    }
+
+    /* Lines the memory ring holds, and therefore what one page of it asks for.
+     *
+     * **The ring is read whole, never paged.** Its `next_before` is an index into a buffer that
+     * *rolls*: every line the node logs between two requests shifts every index by one, so
+     * `before=` over the ring silently repeats lines at one end and loses them at the other —
+     * and the ring is the fallback view on an `OXIDANT_LOG_ROLL=off` node, which is exactly
+     * where it is the only view there is. The API says so with `"cursor": "best-effort"`. One
+     * page can hold 10,000 lines and the ring holds 1,000, so asking for all of it costs
+     * nothing and removes the question. */
+    const OBS_RING_LINES = 1000;
+
+    // One page, newest-last. `older` is reset: changing a filter starts a new walk.
     async function fetchObsLogs() {
       if (obsState.paused) return;
+      const limit = obsState.file === 'ring' ? OBS_RING_LINES : OBS_PAGE;
+      const path = '/api/v1/logs?' + obsQuery({ limit, order: 'desc' });
       try {
-        const r = await fetch('/api/v1/logs', { headers: obsAuthHeaders() });
-        if (!r.ok) { obsState.logs = { code: r.status, lines: [] }; }
-        else {
-          const d = await r.json();
-          obsState.logs = { code: 200, lines: Array.isArray(d.logs) ? d.logs : [] };
+        const { code, body } = await obsFetch(path);
+        // **`current` is a file, and a node can be logging without having one.**
+        // `OXIDANT_LOG_ROLL=off` keeps durable statement history with stderr-only logs, and
+        // then every `?file=` is a `404` — while `/api/v1/logs` with no `?file=`, the memory
+        // ring this pane read before PR4, still answers. Drop to it once and let the caption
+        // say which one is on screen, rather than reporting "no logs" about a live node.
+        if (code === 404 && obsState.file === 'current' && !obsState.currentMissing) {
+          obsState.currentMissing = true;
+          obsState.ringFallback = true;
+          obsState.file = 'ring';
+          return fetchObsLogs();
         }
+        obsState.page = code === 200
+          ? {
+              code,
+              lines: Array.isArray(body.logs) ? body.logs : [],
+              next_before: body.next_before == null ? null : body.next_before,
+              dedup: !!body.dedup,
+              format: body.format || null,
+            }
+          : { code, lines: [], error: body.error };
+        obsState.older = [];
       } catch (e) {
-        obsState.logs = { code: 0, lines: [], error: e.message };
+        obsState.page = { code: 0, lines: [], error: e.message };
       }
       obsState.at = Date.now();
     }
 
-    function obsLogsSectionHtml() {
-      const log = obsState.logs;
-      if (!log) return '<div class="note" style="margin:0">Loading&hellip;</div>';
-      if (log.code === 404) {
-        return emptyState('No log buffer to read here',
-          'GET /api/v1/logs answers 404 when OXIDANT_STATUS_TOKEN is unset on the driver — the route is gated like /api/status, because the buffer carries every logged field — and on a process that serves the monitoring UI only: a standalone history server keeps no buffer at all.');
+    // The page *before* the oldest one on screen. The cursor is the API's, so the reader walks
+    // backward through a 256 MiB day without ever loading it.
+    async function fetchObsOlder() {
+      const oldest = obsState.older.length ? obsState.older[0] : obsState.page;
+      if (!oldest || oldest.next_before == null) return;
+      const path = '/api/v1/logs?' + obsQuery({
+        limit: OBS_PAGE, order: 'desc', before: oldest.next_before,
+      });
+      const { code, body } = await obsFetch(path);
+      if (code !== 200) return;
+      obsState.older.unshift({
+        code, lines: Array.isArray(body.logs) ? body.logs : [],
+        next_before: body.next_before == null ? null : body.next_before,
+      });
+      paintObservability();
+    }
+
+    /* ---- Tail-follow (SSE) ----
+     * The driver's tail is the `tracing` stream itself; a worker's is honestly a 2 s poll, and
+     * the stream's `open` event says which. Both append to the page on screen, so following and
+     * paging are the same view rather than two.
+     */
+    /* Whether what is on screen is something this node is still *writing*.
+     *
+     * **The memory ring is followable on the driver and only there.** The driver's tail is the
+     * `tracing` broadcast itself, which is the very stream the ring holds. A worker's tail is a
+     * `?file=` poll over Flight, and a rolling buffer has no forward cursor — an index into it
+     * names a different line every time the node logs one — so there is nothing a poll could
+     * ask for. The server used to paper over this by rewriting `file` to `current`, which
+     * painted the page out of the worker's ring and appended the tail out of the worker's
+     * `oxidant.log`; it now answers `400`, and this is the switch that keeps the pane from
+     * asking. A rolled file is never followable on either: it will not grow again. */
+    function obsCanFollow() {
+      if (obsState.file === 'current') return true;
+      return obsState.file === 'ring' && obsState.worker === 'driver';
+    }
+
+    function startObsTail() {
+      stopObsTail();
+      if (!obsState.follow || obsState.paused || !obsCanFollow()) return;
+      /* **`fetch` + a `ReadableStream`, not `EventSource`.** `EventSource` cannot carry an
+       * `Authorization` header, and the only ways around that are a token in the query string —
+       * which lands in proxy logs, browser history and `Referer` — or a cookie, which is a new
+       * auth surface on a router served under a permissive CORS layer. Reading the SSE stream by
+       * hand costs the twenty lines below and keeps exactly one credential path for every log
+       * route: the same bearer header the pages use. */
+      const ctl = new AbortController();
+      obsState.tail = ctl;
+      const gen = ++obsTailGeneration;
+      const qs = obsQuery({});
+      fetch('/api/v1/logs/tail?' + qs, { headers: obsAuthHeaders(), signal: ctl.signal })
+        .then(async (r) => {
+          if (!r.ok || !r.body) return;
+          const reader = r.body.getReader();
+          const dec = new TextDecoder();
+          let buf = '';
+          for (;;) {
+            const { value, done } = await reader.read();
+            // A stale generation: a filter changed and this stream is answering the old query.
+            if (done || gen !== obsTailGeneration) return;
+            buf += dec.decode(value, { stream: true });
+            // SSE frames are separated by a blank line; a partial frame stays in the buffer.
+            let cut;
+            while ((cut = buf.indexOf('\n\n')) >= 0) {
+              obsTailFrame(buf.slice(0, cut));
+              buf = buf.slice(cut + 2);
+            }
+          }
+        })
+        .catch(() => { /* aborted, or the stream dropped: the 5 s poll is the fallback */ });
+    }
+
+    // Bumped on every (re)start, so a stream still draining under the old filter is discarded
+    // rather than appending lines the reader did not ask for.
+    let obsTailGeneration = 0;
+
+    function obsTailFrame(frame) {
+      let event = 'message';
+      const data = [];
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+        // `:` is an SSE comment (a keep-alive); everything else is a field we do not use.
       }
-      if (log.code === 401 || log.code === 403) {
-        return emptyState('The log buffer needs a credential',
+      const payload = data.join('\n');
+      if (event === 'line') { obsAppend([payload]); return; }
+      if (event === 'lines') {
+        try { obsAppend(JSON.parse(payload) || []); } catch (e) {}
+        return;
+      }
+      if (event === 'open') {
+        // The mode, so the caption says `live` or `polled` rather than implying a 2 s feed is
+        // live.
+        try { obsState.tailMode = (JSON.parse(payload) || {}).mode || null; } catch (e) {}
+        paintObservability();
+        return;
+      }
+      if (event === 'dropped') {
+        // **The gap is never silent.** The fan-out tells a slow reader exactly how many lines it
+        // lost, and the caption carries the count rather than letting a jump go unexplained.
+        try { obsState.dropped += (JSON.parse(payload) || {}).dropped || 0; } catch (e) {}
+        paintObservability();
+        return;
+      }
+      if (event === 'rolled') {
+        // The followed node rolled its live file: the picker and the page are both stale.
+        fetchObsPickers().then(fetchObsLogs).then(paintObservability);
+        return;
+      }
+      if (event === 'error') {
+        // A worker poll failed mid-follow. The stream stays open — a worker restart is exactly
+        // when someone is watching — and the failure is said out loud.
+        try {
+          const d = JSON.parse(payload) || {};
+          obsState.tailError = d.error || null;
+        } catch (e) {}
+        paintObservability();
+      }
+    }
+
+    function stopObsTail() {
+      obsTailGeneration++;
+      if (obsState.tail) { try { obsState.tail.abort(); } catch (e) {} obsState.tail = null; }
+      obsState.tailMode = null;
+      obsState.tailError = null;
+    }
+
+    function obsAppend(lines) {
+      if (!lines.length || !obsState.page) return;
+      const joined = obsState.page.lines.concat(lines);
+      const overflow = joined.length - OBS_PAGE * 2;
+      if (overflow > 0) {
+        /* **The trimmed lines move up; they are not dropped.** `page.next_before` names the
+         * oldest line *in the page*, and slicing lines off the front used to leave it naming a
+         * line that is no longer on screen — so after ~500 followed lines, `Load older lines`
+         * fetched the page before *that* line and the reader saw
+         * `[older page][…500 lines silently missing…][tail]` presented as one continuous log.
+         * That is the same class of defect the SSE `dropped` event exists to prevent, on the
+         * scroll-back axis instead of the live one.
+         *
+         * It cannot be fixed by advancing the cursor arithmetically: under a filter the rows
+         * between two matches are unknown, so `next_before + trimmed` is not a row index. The
+         * prefix becomes the newest `older` page instead, carrying the cursor that belongs to
+         * it — which is exactly the cursor `Load older lines` needs. */
+        obsState.older.push({
+          code: 200, lines: joined.slice(0, overflow), next_before: obsState.page.next_before,
+        });
+        obsState.page.lines = joined.slice(overflow);
+        // The page no longer knows what precedes it; `older` does. Every reader of the cursor
+        // prefers `older[0]` when `older` is non-empty.
+        obsState.page.next_before = null;
+        obsTrimScrollback();
+      } else {
+        obsState.page.lines = joined;
+      }
+      paintObservability();
+    }
+
+    /* Lines kept above the live page before the oldest scrolled-back page is released.
+     *
+     * Releasing whole pages *from the oldest end* is gap-free by construction: every `older`
+     * page's `next_before` names the page before **itself**, so dropping `older[0]` leaves the
+     * new `older[0]` pointing exactly at what was dropped. `Load older lines` re-fetches it.
+     * One page is always kept, or the cursor for everything above would go with it. */
+    const OBS_SCROLLBACK = OBS_PAGE * 10;
+
+    function obsTrimScrollback() {
+      let held = obsState.older.reduce((n, p) => n + p.lines.length, 0);
+      while (obsState.older.length > 1 && held > OBS_SCROLLBACK) {
+        held -= obsState.older.shift().lines.length;
+      }
+    }
+
+    // Every line on screen, oldest first: the pages the reader scrolled back into, then the one
+    // the poll or the tail owns.
+    function obsLines() {
+      const out = [];
+      for (const p of obsState.older) out.push(...p.lines);
+      if (obsState.page) out.push(...obsState.page.lines);
+      return out;
+    }
+
+    function obsLogsSectionHtml() {
+      const page = obsState.page;
+      if (!page) return '<div class="note" style="margin:0">Loading&hellip;</div>';
+      if (page.code === 404) {
+        return emptyState('No logs to read here',
+          'The log routes answer 404 when OXIDANT_STATUS_TOKEN is unset on the driver — they are gated like /api/status, because the files carry every logged field — and on a node with no rolling writer (OXIDANT_LOG_ROLL=off, or OXIDANT_HISTORY=off). ' + (page.error || ''));
+      }
+      if (page.code === 401 || page.code === 403) {
+        return emptyState('The log API needs a credential',
           'Set the driver status token on the Pipelines page; this page sends the same one.');
       }
-      if (log.code !== 200) {
-        return errorState('Could not read the log buffer',
-          (log.error ? log.error + '\n\n' : '') + 'GET /api/v1/logs answered ' + log.code + '.');
+      if (page.code === 502 || page.code === 504) {
+        return errorState('That worker did not answer',
+          (page.error || '') + '\n\nIts rows are absent because it could not be reached — not because it logged nothing. Pick another node, or check the worker.');
       }
-      // A line with no `[LEVEL]` prefix has no level to filter on, so a filter never hides it.
-      const shown = log.lines.filter(l => { const lvl = obsLevelOf(l); return !lvl || obsState.levels[lvl]; });
-      const tail = shown.slice(-OBS_MAX_LINES);
-      const body = tail.length
-        ? tail.map(l => {
+      if (page.code !== 200) {
+        return errorState('Could not read the log', (page.error ? page.error + '\n\n' : '') + 'The log API answered ' + page.code + '.');
+      }
+      const lines = obsLines();
+      // The ring is read whole and never paged: its cursor shifts under the reader as the buffer
+      // rolls, so a `before=` walk over it would repeat lines at one end and lose them at the
+      // other. The line above the pane says which of the two it is looking at.
+      const ring = obsState.file === 'ring';
+      const more = !ring && (obsState.older.length ? obsState.older[0] : page).next_before != null;
+      const head = more
+        ? '<button class="nb-btn" id="obs-older" style="width:100%;border-radius:0;border:none;border-bottom:1px solid var(--oxidant-border);padding:6px">Load older lines</button>'
+        : '<div class="logline"><span class="msg" style="color:var(--oxidant-code-text-dim)">— ' +
+          (ring
+            ? 'the memory ring holds the last ' + OBS_RING_LINES.toLocaleString() + ' lines and rolls as this node logs; pick a file for a stable history'
+            : 'start of ' + esc(obsState.file)) + ' —</span></div>';
+      const body = lines.length
+        ? lines.map(l => {
             const lvl = obsLevelOf(l);
             const cls = lvl === 'error' ? 'lvl-error' : (lvl === 'warn' ? 'lvl-warn' : '');
             return `<div class="logline ${cls}"><span class="msg">${esc(l)}</span></div>`;
           }).join('')
-        : '<div class="logline"><span class="msg">(no lines match the selected levels)</span></div>';
-      return `<div class="logwrap tall" id="obs-logwrap">${body}</div>`;
+        : '<div class="logline"><span class="msg">(no lines match these filters)</span></div>';
+      return `<div class="logwrap tall" id="obs-logwrap">${head}${body}</div>`;
     }
 
     function obsLogsCaptionHtml() {
-      const log = obsState.logs;
-      if (!log || log.code !== 200) return '';
-      const shown = log.lines.filter(l => { const lvl = obsLevelOf(l); return !lvl || obsState.levels[lvl]; });
-      const tail = Math.min(shown.length, OBS_MAX_LINES);
-      const of = shown.length === log.lines.length ? '' : ' of ' + log.lines.length.toLocaleString() + ' buffered';
-      return 'last ' + tail.toLocaleString() + ' line' + (tail === 1 ? '' : 's') +
-        (shown.length > tail ? ' of ' + shown.length.toLocaleString() + ' matching' : '') + of +
-        (obsState.paused ? ' · paused' : ' · refreshing every ' + (OBS_POLL_MS / 1000) + ' s');
+      const page = obsState.page;
+      if (!page || page.code !== 200) return '';
+      const bits = [obsState.worker === 'driver' ? 'driver' : 'worker ' + obsState.worker];
+      bits.push(obsState.file === 'ring'
+        // Why the ring: because the reader chose it, or because this node has no rolled files
+        // to choose. The second is a fact about the node and belongs on screen.
+        ? 'memory ring' + (obsState.ringFallback ? ' (this node writes no rolled files)' : '')
+        : obsState.file + (page.format ? ' · ' + page.format : ''));
+      bits.push(obsLines().length.toLocaleString() + ' line' + (obsLines().length === 1 ? '' : 's'));
+      // `dedup` is the file's own answer: an identical consecutive line was collapsed into
+      // `… repeated N times`, so a run on screen is shorter than the run that happened. The
+      // memory ring and the SSE tail are never deduped, and say so — the file is authoritative.
+      bits.push(page.dedup ? 'deduped' : 'not deduped');
+      if (obsState.paused) bits.push('paused');
+      else if (obsState.follow && obsState.tailMode === 'follow') bits.push('following live');
+      else if (obsState.follow && obsState.tailMode === 'poll') bits.push('following · polled every 2 s');
+      // Follow asked for and not available is the one case worth naming: the reader ticked the
+      // box on the driver, switched to a worker's ring, and would otherwise see the caption
+      // quietly stop saying "following" with no account of why.
+      else bits.push('refreshing every ' + (OBS_POLL_MS / 1000) + ' s' +
+        (obsState.follow && !obsCanFollow() && obsState.file === 'ring'
+          ? " · a worker's memory ring has no cursor a follow could resume from"
+          : ''));
+      if (obsState.dropped) bits.push(obsState.dropped.toLocaleString() + ' lines dropped by the tail');
+      if (obsState.tailError) bits.push('follow error: ' + obsState.tailError);
+      return bits.join(' · ');
     }
 
     // An execution's row count, summed over the stages its jobs ran. Prefer what reached the
@@ -1072,31 +1462,189 @@
       el.dataset.ready = '1';
       el.innerHTML = `
         <div class="card">
-          ${cardHead('Driver', 'Server logs',
-            '<span class="flex" id="obs-filters"></span>' +
+          ${cardHead('Cluster', 'Exec logs',
+            '<button class="btn-secondary" id="obs-dump" title="Copy the selected node\u2019s logs for the filtered window into dumps/, and download it \u2014 the one action on this page that moves log bytes">Dump</button>' +
             '<button class="btn-secondary" id="obs-pause">Pause</button>')}
+          <div class="log-controls">
+            <label class="log-control"><span class="eyebrow">Node</span><select id="obs-worker"></select></label>
+            <label class="log-control"><span class="eyebrow">File</span><select id="obs-file"></select></label>
+            <label class="log-control"><span class="eyebrow">Target</span><input type="text" id="obs-target" placeholder="oxidant_execution" /></label>
+            <label class="log-control grow"><span class="eyebrow">Search</span><input type="text" id="obs-q" placeholder="free text over the whole file" /></label>
+          </div>
+          <div class="log-controls">
+            <label class="log-control"><span class="eyebrow">From</span><input type="datetime-local" id="obs-from" class="empty" step="1" title="Inclusive lower bound, in your own time zone; sent as an RFC-3339 instant" /></label>
+            <label class="log-control"><span class="eyebrow">To</span><input type="datetime-local" id="obs-to" class="empty" step="1" title="Exclusive upper bound, so two adjacent windows tile a day without serving a line twice" /></label>
+            <span class="flex" id="obs-filters" style="flex-wrap:wrap"></span>
+            <label class="log-toggle"><input type="checkbox" id="obs-follow" checked /> Follow</label>
+          </div>
           <div id="obs-logs"></div>
           <div class="note" id="obs-caption"></div>
+          <div class="note" id="obs-dump-note"></div>
         </div>
         <div id="obs-jobs"></div>
         <div id="obs-sql"></div>`;
+
       document.getElementById('obs-pause').onclick = () => {
         obsState.paused = !obsState.paused;
+        if (obsState.paused) stopObsTail(); else { obsTick(); startObsTail(); }
         paintObservability();
-        if (!obsState.paused) obsTick();
       };
-      // Built once. A repaint only flips the `on` class: replacing this row's innerHTML every
-      // 5 s would detach the button under the pointer and drop the click that is landing on it.
-      document.getElementById('obs-filters').innerHTML = OBS_LEVELS.map(l =>
-        `<button class="filter-chip lvl-${l}" data-level="${l}" aria-pressed="false"><i></i>${l}</button>`
-      ).join('');
+      document.getElementById('obs-follow').onchange = (e) => {
+        obsState.follow = e.target.checked;
+        if (obsState.follow) startObsTail(); else stopObsTail();
+        paintObservability();
+      };
+      document.getElementById('obs-dump').onclick = obsRequestDump;
+
+      /* The level row is a **floor**, not a set of independent toggles: `warn` means "warn and
+       * error", which is what the API's `level=` means, so the chips and a `curl` agree. Clicking
+       * the chip that is already the floor clears it back to every level. Built once — replacing
+       * this row's innerHTML on a repaint would detach the button under the pointer. */
+      document.getElementById('obs-filters').innerHTML =
+        OBS_LEVELS.map((l, i) =>
+          // The quietest chip says outright that it is every level. It used to be `debug`, and
+          // on a `RUST_LOG=trace` node "debug and louder" was the label on a filter that hid
+          // lines the unfiltered view showed.
+          `<button class="filter-chip lvl-${l}" data-level="${l}" aria-pressed="false" title="${l} and louder${i === OBS_LEVELS.length - 1 ? ' — every level' : ''}"><i></i>${l}</button>`
+        ).join('');
       document.getElementById('obs-filters').onclick = (e) => {
         const btn = e.target.closest('.filter-chip');
         if (!btn) return;
-        obsState.levels[btn.dataset.level] = !obsState.levels[btn.dataset.level];
-        paintObservability();
+        obsState.level = obsState.level === btn.dataset.level ? null : btn.dataset.level;
+        obsReload();
       };
+
+      document.getElementById('obs-worker').onchange = (e) => {
+        obsState.worker = e.target.value;
+        // A different node has different files; the picker must not offer this one's, and the
+        // previous node's missing `current` says nothing about this one's.
+        obsState.file = 'current';
+        obsState.currentMissing = false;
+        obsState.ringFallback = false;
+        fetchObsPickers().then(() => obsReload());
+      };
+      document.getElementById('obs-file').onchange = (e) => {
+        obsState.file = e.target.value;
+        // An explicit pick outranks the fallback: asking for `current` again on a node that
+        // has none must produce the `404`, not be silently redirected to the ring a second
+        // time — and picking the ring on purpose is not the pane apologising for the node.
+        obsState.ringFallback = false;
+        // Following a rolled file is following something that will never grow again. The
+        // checkbox's own state is painted from `obsState`, so this is the only place that
+        // decides it.
+        if (!obsCanFollow()) { obsState.follow = false; }
+        obsReload();
+      };
+      // Debounced: a search box that refetched per keystroke would put a Parquet decode behind
+      // every character. A date field is typed a component at a time and is no different — a
+      // half-entered year is a window nobody asked for.
+      let typing = null;
+      const onType = () => {
+        clearTimeout(typing);
+        typing = setTimeout(() => {
+          obsState.target = document.getElementById('obs-target').value;
+          obsState.q = document.getElementById('obs-q').value;
+          obsState.from = document.getElementById('obs-from').value;
+          obsState.to = document.getElementById('obs-to').value;
+          obsReload();
+        }, 300);
+      };
+      for (const id of ['obs-target', 'obs-q', 'obs-from', 'obs-to']) {
+        const el = document.getElementById(id);
+        el.oninput = () => { el.classList.toggle('empty', !el.value); onType(); };
+      }
+
       paintObservability();
+    }
+
+    // A filter changed: re-fetch the page and restart the tail under the new filter, so the
+    // followed lines and the paged ones are the same query.
+    function obsReload() {
+      obsState.dropped = 0;
+      paintObservability();
+      fetchObsLogs().then(() => { paintObservability(); startObsTail(); });
+    }
+
+    function obsPickerHtml() {
+      const workers = obsState.workers || [];
+      const worker = workers.length
+        ? workers.map(w => {
+            // **An unreachable worker stays in the picker**, marked. Dropping it would read as
+            // "there is no such node", which is not what happened.
+            const label = w.worker_id + (w.reachable === false ? ' (unreachable)' : '');
+            const sel = w.worker_id === obsState.worker ? ' selected' : '';
+            return `<option value="${esc(w.worker_id)}"${sel}>${esc(label)}</option>`;
+          }).join('')
+        : '<option value="driver" selected>driver</option>';
+      const files = obsState.files || [];
+      const opts = ['<option value="ring"' + (obsState.file === 'ring' ? ' selected' : '') + '>memory ring (last ' + OBS_RING_LINES.toLocaleString() + ')</option>']
+        .concat(files.map(f => {
+          const label = f.file === 'current'
+            ? 'current (live)'
+            : f.file + ' · ' + f.format + ' · ' + fmtBytes(f.size_bytes);
+          const sel = f.file === obsState.file ? ' selected' : '';
+          return `<option value="${esc(f.file)}"${sel}>${esc(label)}</option>`;
+        }));
+      return { worker, file: opts.join('') };
+    }
+
+    /* ---- Diagnostic dump ----
+     * The one action on this page that copies bytes, and it is a button of its own rather than a
+     * mode of the pane — §6b calls it the sanctioned exception, and an operator should have had
+     * to ask. It carries the filters on screen, so "bundle what I am looking at" is one click.
+     */
+    async function obsRequestDump() {
+      const note = document.getElementById('obs-dump-note');
+      const btn = document.getElementById('obs-dump');
+      btn.disabled = true;
+      note.textContent = 'Assembling a support bundle…';
+      try {
+        // The filters on screen, verbatim — the dump route takes the same five, so the bundle
+        // is the window the reader is looking at rather than a second query language. The one
+        // it does not take is `file`: a dump is a *time* range across a node's whole history,
+        // and the server walks whichever files that range lands in.
+        const body = { worker: obsState.worker === 'driver' ? 'driver' : obsState.worker };
+        if (obsState.level) body.level = obsState.level;
+        if (obsState.target.trim()) body.target = obsState.target.trim();
+        if (obsState.q.trim()) body.q = obsState.q.trim();
+        // Both absent means the server's own default window (the last hour), and the `202`
+        // echoes whichever it used — so the note below never has to guess.
+        const from = obsInstant(obsState.from), to = obsInstant(obsState.to);
+        if (from) body.from = from;
+        if (to) body.to = to;
+        const r = await fetch('/api/v1/logs/dump', {
+          method: 'POST',
+          headers: Object.assign({ 'Content-Type': 'application/json' }, obsAuthHeaders()),
+          body: JSON.stringify(body),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.status !== 202) {
+          note.innerHTML = errorState('The dump was refused', d.error || ('HTTP ' + r.status));
+          return;
+        }
+        note.textContent = 'Assembling ' + d.dumpId + ' (' + d.from + ' → ' + d.to + ')…';
+        // 202 while building, so poll until it is a file or a reason.
+        for (let i = 0; i < 600; i++) {
+          const probe = await fetch('/api/v1/logs/dump/' + d.dumpId, { headers: obsAuthHeaders() });
+          if (probe.status === 202) { await new Promise(r => setTimeout(r, 500)); continue; }
+          if (probe.status === 200) {
+            const blob = await probe.blob();
+            const url = URL.createObjectURL(blob);
+            note.innerHTML = 'Bundle ready: <a href="' + url + '" download="' + esc(d.dumpId) +
+              '.parquet">' + esc(d.dumpId) + '.parquet</a> (' + fmtBytes(blob.size) +
+              '). It expires after 24 h and is swept with the rest of the data directory.';
+            return;
+          }
+          const err = await probe.json().catch(() => ({}));
+          note.innerHTML = errorState('The dump did not complete', err.error || ('HTTP ' + probe.status));
+          return;
+        }
+        note.textContent = 'The dump is still assembling; collect it at /api/v1/logs/dump/' + d.dumpId;
+      } catch (e) {
+        note.innerHTML = errorState('The dump could not be requested', e.message);
+      } finally {
+        btn.disabled = false;
+      }
     }
 
     function paintObservability() {
@@ -1104,12 +1652,40 @@
       // refresh() calls this every 2 s; rebuilding a hidden jobs table is pure waste.
       if (!el || !el.dataset.ready || !obsVisible()) return;
 
+      // A floor, so every chip at or above the selected level reads as on.
+      const floor = obsState.level == null ? OBS_LEVELS.length - 1 : OBS_LEVELS.indexOf(obsState.level);
       document.querySelectorAll('#obs-filters .filter-chip').forEach(btn => {
-        const on = !!obsState.levels[btn.dataset.level];
+        const on = OBS_LEVELS.indexOf(btn.dataset.level) <= floor;
         btn.classList.toggle('on', on);
+        // `aria-pressed` tracks the *visual* state, because they mean the same thing — this
+        // level is showing. It used to mark only the floor chip, so a screen reader was told
+        // one button was pressed while four were lit. Which one is the floor is in the title.
         btn.setAttribute('aria-pressed', on ? 'true' : 'false');
       });
       document.getElementById('obs-pause').textContent = obsState.paused ? 'Resume' : 'Pause';
+
+      // One owner for the follow switch. It used to be set only where a file was picked, so
+      // choosing a rolled file and then switching node left the box disabled on a live file.
+      const follow = document.getElementById('obs-follow');
+      follow.disabled = !obsCanFollow();
+      follow.checked = obsState.follow && !follow.disabled;
+      // Disabled without a reason reads as broken. Which of the two reasons it is depends on
+      // what is selected, and the ring's one is the surprising half: it is followable on the
+      // driver, whose tail is the `tracing` stream the ring holds, and not on a worker, whose
+      // tail is a poll and has nothing with a forward cursor to poll.
+      follow.title = follow.disabled
+        ? (obsState.file === 'ring'
+            ? "A worker's memory ring cannot be followed: it is a rolling buffer with no cursor a poll could resume from. Pick current for the worker's live file."
+            : 'A rolled file will never grow again, so there is nothing to follow.')
+        : 'Append new lines as this node writes them.';
+
+      // The pickers repaint only when their contents changed: rewriting a <select> under an open
+      // dropdown closes it.
+      const picks = obsPickerHtml();
+      const workerSel = document.getElementById('obs-worker');
+      if (workerSel.dataset.sig !== picks.worker) { workerSel.dataset.sig = picks.worker; workerSel.innerHTML = picks.worker; }
+      const fileSel = document.getElementById('obs-file');
+      if (fileSel.dataset.sig !== picks.file) { fileSel.dataset.sig = picks.file; fileSel.innerHTML = picks.file; }
 
       // Keep the pane pinned to the newest line unless the reader has scrolled up into it.
       const prev = document.getElementById('obs-logwrap');
@@ -1117,6 +1693,8 @@
       document.getElementById('obs-logs').innerHTML = obsLogsSectionHtml();
       const wrap = document.getElementById('obs-logwrap');
       if (wrap && pinned) wrap.scrollTop = wrap.scrollHeight;
+      const older = document.getElementById('obs-older');
+      if (older) older.onclick = fetchObsOlder;
       document.getElementById('obs-caption').textContent = obsLogsCaptionHtml();
 
       document.getElementById('obs-jobs').innerHTML = obsJobsSectionHtml();
@@ -1130,18 +1708,23 @@
       document.getElementById('obs-sql').innerHTML = obsSqlSectionHtml();
     }
 
+    // The fallback poll. It stays even while following: an SSE stream a proxy drops is silent,
+    // and a pane that has stopped updating must not look like a quiet cluster.
     function obsTick() {
       fetchObsLogs().then(paintObservability);
     }
 
     function openObservability() {
       renderObservability();
+      fetchObsPickers().then(() => { paintObservability(); });
       obsTick();
+      startObsTail();
       if (!obsState.timer) obsState.timer = setInterval(obsTick, OBS_POLL_MS);
     }
 
     function stopObservability() {
       if (obsState.timer) { clearInterval(obsState.timer); obsState.timer = null; }
+      stopObsTail();
     }
 
     /* ---------- SQL editor + notebook (REST statements API) ---------- */

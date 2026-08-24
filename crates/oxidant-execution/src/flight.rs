@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -200,6 +200,81 @@ pub const ACTION_TASK_STATUS: &str = "task_status";
 /// stage id). Lets the driver sample shuffle sizes for AQE without pulling the buckets
 /// themselves (KAN-32).
 pub const ACTION_BUCKET_ROW_COUNTS: &str = "bucket_row_counts";
+/// Flight `do_action` type: one bounded page of this node's own exec log (body: a JSON query;
+/// response: a JSON page). The driver's log browser federates over this
+/// (docs/query-history-durability.md §6b).
+///
+/// **Why an action and not an HTTP surface on the worker.** A worker speaks Flight and nothing
+/// else; an HTTP listener would mean a second port to open, a second bind in every deployment
+/// template, and a second place to get the status-token gate right. This port already exists, is
+/// already the driver→worker interconnect, is already connection-pooled, and already carries
+/// actions of exactly this shape.
+///
+/// **It carries the same credential the HTTP route does.** The rest of this port is a trusted
+/// boundary — `Ticket::Sql` accepts arbitrary stage SQL from any peer that can reach it — and
+/// it was tempting to call a log page "not a new privilege" on that basis. It is not the same
+/// privilege. Arbitrary SQL reads *the data this worker can reach*; a log page reads up to
+/// `OXIDANT_LOG_KEEP_DAYS` of every enabled `tracing` field value, which is the category that
+/// contains **credentials** — DSNs, object-store keys inside table URIs, bearer tokens in
+/// connector config, session query text. Those are reusable *off* this worker, against systems
+/// it is not part of. So this one action requires `OXIDANT_STATUS_TOKEN` as
+/// `authorization: Bearer <token>` in the request metadata: the same secret, checked by the
+/// same code (`oxidant_ui_server::status::bearer_is_authorized`), that gates the identical
+/// bytes on the driver's `GET /api/v1/logs`.
+///
+/// **The residual is unchanged and must still be firewalled.** Gating this action does not
+/// make the Flight port safe to expose — `Ticket::Sql` is still ungated, and closing that is
+/// not this action's job. What the gate buys is that opening a log browser does not *widen*
+/// what an unauthenticated peer can take from a worker.
+///
+/// **No log bytes are copied by this action.** It answers one bounded page of rendered lines,
+/// which the driver forwards and does not keep; §6b's diagnostic dump is the one sanctioned
+/// exception and is a separate, explicitly-named path.
+pub const ACTION_LOGS: &str = "logs";
+
+/// What a worker says instead of a log page. The three are distinct because the driver has to
+/// tell an operator which one it got, and because two of them must be indistinguishable to an
+/// *unauthenticated* caller — see `NO_LOGS_API`.
+pub enum LogQueryRefusal {
+    /// No credential, or the wrong one. `Status::unauthenticated`.
+    Unauthenticated,
+    /// This node has no `OXIDANT_STATUS_TOKEN`, so it can authenticate nobody and serves no
+    /// one. Reported as `NO_LOGS_API`, byte for byte the same answer as a worker that has no
+    /// logs API at all — mirroring the HTTP side, where an unset token makes the route `404`
+    /// rather than `403` so an unconfigured node leaks nothing about what it is running.
+    NotConfigured,
+    /// The credential was accepted and the query itself failed.
+    Failed(String),
+}
+
+/// The one answer a caller gets when this worker will not serve logs, whether because
+/// `logging::init` never ran or because no token is configured. Naming the two causes in one
+/// message tells an operator what to check without telling a stranger which one applies.
+const NO_LOGS_API: &str = "this worker serves no logs API (oxidant_connect::logging::init was \
+    not called, or OXIDANT_STATUS_TOKEN is unset)";
+
+/// Answers [`ACTION_LOGS`]. Installed by `oxidant_connect::logging::init`, because the code that
+/// can read this process's log files lives in `oxidant-connect` and this crate is *below* it in
+/// the dependency graph — the hook is the seam that keeps the arrow pointing one way.
+///
+/// The second argument is the raw `authorization` metadata value, `Bearer ` prefix included, or
+/// `None` when the peer sent none. **The gate lives on the far side of this hook on purpose**:
+/// `oxidant-connect` is where the expected token is resolved and where the HTTP route's own
+/// gate lives, so the credential is compared in exactly one place in the tree.
+type LogQueryHandler =
+    Box<dyn Fn(&[u8], Option<&str>) -> std::result::Result<Vec<u8>, LogQueryRefusal> + Send + Sync>;
+static LOG_QUERY_HANDLER: OnceLock<LogQueryHandler> = OnceLock::new();
+
+/// Install the [`ACTION_LOGS`] handler. First call in a process wins, matching
+/// `logging::init`'s own idempotence.
+pub fn set_log_query_handler(
+    handler: impl Fn(&[u8], Option<&str>) -> std::result::Result<Vec<u8>, LogQueryRefusal>
+        + Send
+        + Sync
+        + 'static,
+) {
+    let _ = LOG_QUERY_HANDLER.set(Box::new(handler));
+}
 
 /// Max gRPC message size for Arrow Flight (KAN-6).
 ///
@@ -1820,6 +1895,12 @@ impl FlightService for Worker {
         &self,
         request: Request<Action>,
     ) -> std::result::Result<Response<Self::DoActionStream>, Status> {
+        // Read before the request is consumed: `ACTION_LOGS` is gated on it.
+        let credential = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let action = request.into_inner();
         match action.r#type.as_str() {
             ACTION_CLEAR_STAGES => {
@@ -1847,6 +1928,20 @@ impl FlightService for Worker {
                 }))
             }
             ACTION_HEARTBEAT => Ok(action_response(self.heartbeat_payload().into_bytes())),
+            ACTION_LOGS => match LOG_QUERY_HANDLER.get() {
+                Some(handler) => match handler(&action.body, credential.as_deref()) {
+                    Ok(body) => Ok(action_response(body)),
+                    Err(LogQueryRefusal::Unauthenticated) => Err(Status::unauthenticated(
+                        "the logs action requires `authorization: Bearer $OXIDANT_STATUS_TOKEN`",
+                    )),
+                    Err(LogQueryRefusal::NotConfigured) => Err(Status::unimplemented(NO_LOGS_API)),
+                    Err(LogQueryRefusal::Failed(e)) => Err(Status::internal(e)),
+                },
+                // A worker built without the logging init — an embedded caller, or a build that
+                // predates §6b. `unimplemented` is the honest code and it is what the driver
+                // turns into `reachable: true` plus a named reason, never a silent skip.
+                None => Err(Status::unimplemented(NO_LOGS_API)),
+            },
             ACTION_BUCKET_ROW_COUNTS => {
                 let body = String::from_utf8_lossy(&action.body);
                 let stage_id: u32 = body.trim().parse().map_err(|_| {
@@ -2251,6 +2346,22 @@ impl WorkerHeartbeat {
     }
 }
 
+/// Ask a worker for one bounded page of its own exec log (§6b federation).
+///
+/// The request and the answer are both JSON, opaque here on purpose: the shapes belong to
+/// `oxidant-connect`'s log browser, and this crate is only the transport.
+pub async fn worker_logs(
+    endpoint: String,
+    request: Vec<u8>,
+    token: Option<&str>,
+) -> Result<Vec<u8>> {
+    let bodies = do_action_authenticated(endpoint, ACTION_LOGS, &request, token).await?;
+    bodies
+        .into_iter()
+        .next_back()
+        .ok_or_else(|| Error::Execution("logs: empty response".into()))
+}
+
 /// Heartbeat probe. New workers return slot metadata; older `ok`-only workers are accepted.
 pub async fn heartbeat_worker(endpoint: String) -> Result<WorkerHeartbeat> {
     let bodies = do_action_collect(endpoint, ACTION_HEARTBEAT, b"").await?;
@@ -2272,13 +2383,34 @@ async fn do_action_collect(
     action_type: &str,
     body: &[u8],
 ) -> Result<Vec<Vec<u8>>> {
+    do_action_authenticated(endpoint, action_type, body, None).await
+}
+
+/// [`do_action_collect`] with a bearer credential in the request metadata.
+///
+/// Only [`ACTION_LOGS`] needs one today — see its docs for why that action is not the same
+/// privilege as the rest of this port. A `None` token is sent as no header at all rather than
+/// as an empty one, so a driver with no token configured gets the worker's "not configured"
+/// answer instead of a malformed-credential one.
+async fn do_action_authenticated(
+    endpoint: String,
+    action_type: &str,
+    body: &[u8],
+    token: Option<&str>,
+) -> Result<Vec<Vec<u8>>> {
     let mut client = connect_flight(endpoint.clone()).await?;
-    let action = Action {
+    let mut request = Request::new(Action {
         r#type: action_type.to_string(),
         body: body.to_vec().into(),
-    };
+    });
+    if let Some(token) = token {
+        let value = format!("Bearer {token}")
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            .map_err(|e| Error::Execution(format!("do_action: unusable credential: {e}")))?;
+        request.metadata_mut().insert("authorization", value);
+    }
     let mut stream = client
-        .do_action(action)
+        .do_action(request)
         .await
         .map_err(|e| {
             // Transport-class failure: drop the pooled channel so the next action dials fresh.

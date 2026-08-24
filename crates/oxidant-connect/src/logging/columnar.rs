@@ -52,7 +52,7 @@ const ROWS_PER_BATCH: usize = 8192;
 /// min/max are tight and a time window skips everything outside it. The footer costs five column
 /// chunks per group — negligible at these counts — and zstd is applied per *data page*, not per
 /// row group, so the compression ratio is unaffected (`conversion_compresses` holds it to that).
-const ROWS_PER_ROW_GROUP: usize = 8192;
+pub(crate) const ROWS_PER_ROW_GROUP: usize = 8192;
 
 /// `(ts, level, target, message, fields_json)` — §6's schema, verbatim.
 ///
@@ -194,6 +194,106 @@ fn footer_rows(path: &Path) -> Result<i64, String> {
     Ok(builder.metadata().file_metadata().num_rows())
 }
 
+/// The five columns of one decoded batch, borrowed together so [`render_row`] can be called
+/// per row without re-downcasting.
+pub(crate) struct RowColumns<'a> {
+    pub ts: &'a TimestampMillisecondArray,
+    pub level: &'a StringArray,
+    pub target: &'a StringArray,
+    pub message: &'a StringArray,
+    pub fields: &'a StringArray,
+}
+
+impl<'a> RowColumns<'a> {
+    /// Downcast the five columns of a batch read against [`schema`].
+    pub(crate) fn of(batch: &'a RecordBatch) -> Result<Self, String> {
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .ok_or_else(|| "log parquet: ts is not a timestamp column".to_string())?;
+        let text = |idx: usize| -> Result<&StringArray, String> {
+            batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| format!("log parquet: column {idx} is not a string column"))
+        };
+        Ok(Self {
+            ts,
+            level: text(1)?,
+            target: text(2)?,
+            message: text(3)?,
+            fields: text(4)?,
+        })
+    }
+
+    /// The row's `ts`, in epoch milliseconds, or `None` for a line that carried none.
+    pub(crate) fn ts_ms(&self, row: usize) -> Option<i64> {
+        self.ts.is_valid(row).then(|| self.ts.value(row))
+    }
+
+    pub(crate) fn level(&self, row: usize) -> Option<&str> {
+        self.level.is_valid(row).then(|| self.level.value(row))
+    }
+
+    pub(crate) fn target(&self, row: usize) -> Option<&str> {
+        self.target.is_valid(row).then(|| self.target.value(row))
+    }
+}
+
+/// Reconstruct the rendered line one Parquet row stands for.
+///
+/// **The one renderer**, shared by the whole-file page read and PR4's filtered scan: `?file=X`
+/// must answer the same strings whichever path served it, exactly as it must answer the same
+/// strings before and after the converter ran (M2).
+pub(crate) fn render_row(cols: &RowColumns<'_>, row: usize) -> String {
+    let mut line = String::new();
+    if let Some(ms) = cols.ts_ms(row) {
+        if let Some(t) = chrono::DateTime::from_timestamp_millis(ms) {
+            line.push_str(&t.format(TS_FORMAT).to_string());
+            line.push(' ');
+        }
+    }
+    let level = cols.level(row);
+    if let Some(level) = level {
+        line.push('[');
+        line.push_str(level);
+        line.push_str("] ");
+    }
+    if let Some(target) = cols.target(row) {
+        line.push_str(target);
+    }
+    // In order, and with `message` back where it was. `fields_json` carries a `message`
+    // key only when the message did *not* lead the field list, so its presence is the
+    // record of the position and its absence means "first" — which is what `tracing`
+    // renders and therefore the shape that costs nothing to store.
+    let pairs = if cols.fields.is_valid(row) {
+        ordered_fields(cols.fields.value(row))
+    } else {
+        Vec::new()
+    };
+    let message_in_pairs = pairs.iter().any(|(k, _)| k == "message");
+    let mut fields_out = Vec::new();
+    if cols.message.is_valid(row) {
+        let msg = cols.message.value(row);
+        if level.is_none() {
+            // A line that never decomposed: it was preserved whole, so serve it whole.
+            line.push_str(msg);
+        } else if !message_in_pairs {
+            fields_out.push(format!("message={msg}"));
+        }
+    }
+    for (k, v) in pairs {
+        fields_out.push(format!("{k}={v}"));
+    }
+    if !fields_out.is_empty() {
+        line.push_str(" - ");
+        line.push_str(&fields_out.join(", "));
+    }
+    line
+}
+
 /// One page of a log file: the lines asked for, and whether the file has more after them.
 ///
 /// **The whole file is never materialised.** `OXIDANT_LOG_MAX_FILE_BYTES` defaults to 256 MiB, so
@@ -215,7 +315,7 @@ pub(crate) struct Page {
 /// `limit` bounds the line *count*; this bounds the memory, because one line has no fixed size —
 /// a `tracing` field can carry a whole DataFusion plan. A page is therefore at most this plus one
 /// line, whatever the caller asked for.
-const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Read a rolled Parquet log back into the rendered lines `GET /api/v1/logs?file=` serves.
 ///
@@ -243,62 +343,9 @@ pub(crate) fn read_lines(path: &Path, offset: usize, limit: usize) -> Result<Pag
     let out = &mut page.lines;
     for batch in reader {
         let batch = batch.map_err(|e| format!("reading {}: {e}", path.display()))?;
-        let ts = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
-            .ok_or_else(|| "log parquet: ts is not a timestamp column".to_string())?;
-        let text = |idx: usize| -> Result<&StringArray, String> {
-            batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| format!("log parquet: column {idx} is not a string column"))
-        };
-        let (level, target, message, fields) = (text(1)?, text(2)?, text(3)?, text(4)?);
+        let cols = RowColumns::of(&batch)?;
         for row in 0..batch.num_rows() {
-            let mut line = String::new();
-            if ts.is_valid(row) {
-                if let Some(t) = chrono::DateTime::from_timestamp_millis(ts.value(row)) {
-                    line.push_str(&t.format(TS_FORMAT).to_string());
-                    line.push(' ');
-                }
-            }
-            if level.is_valid(row) {
-                line.push('[');
-                line.push_str(level.value(row));
-                line.push_str("] ");
-            }
-            if target.is_valid(row) {
-                line.push_str(target.value(row));
-            }
-            // In order, and with `message` back where it was. `fields_json` carries a `message`
-            // key only when the message did *not* lead the field list, so its presence is the
-            // record of the position and its absence means "first" — which is what `tracing`
-            // renders and therefore the shape that costs nothing to store.
-            let pairs = if fields.is_valid(row) {
-                ordered_fields(fields.value(row))
-            } else {
-                Vec::new()
-            };
-            let message_in_pairs = pairs.iter().any(|(k, _)| k == "message");
-            let mut fields_out = Vec::new();
-            if message.is_valid(row) {
-                let msg = message.value(row);
-                if !level.is_valid(row) {
-                    // A line that never decomposed: it was preserved whole, so serve it whole.
-                    line.push_str(msg);
-                } else if !message_in_pairs {
-                    fields_out.push(format!("message={msg}"));
-                }
-            }
-            for (k, v) in pairs {
-                fields_out.push(format!("{k}={v}"));
-            }
-            if !fields_out.is_empty() {
-                line.push_str(" - ");
-                line.push_str(&fields_out.join(", "));
-            }
+            let line = render_row(&cols, row);
             bytes += line.len();
             out.push(line);
             if bytes >= MAX_PAGE_BYTES {

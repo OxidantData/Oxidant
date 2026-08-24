@@ -69,7 +69,11 @@ Equivalent alternatives:
 
 - Environment: `OXIDANT_WORKERS=10.0.0.11:50561,10.0.0.12:50561`
 - Per session: Spark conf `spark.oxidant.workers` (same comma-separated list; overrides
-  the startup list for that session)
+  the startup list for that session). It steers **query routing** only — the
+  [log browser's](api.md#worker-logs-through-the-driver-workerid) `?worker=` and its diagnostic
+  dump always resolve against `OXIDANT_WORKERS` / `OXIDANT_WORKER_SERVICE` / the startup list,
+  because the Connect port that sets this key is unauthenticated and a log route that followed
+  the pin would dial whatever address a client put in it.
 
 **Security (bare metal):** bind Flight to a private interface; firewall **50561** so only the
 driver (and peer workers for shuffle) can connect. Prefer VPC/VPN/WireGuard addresses over

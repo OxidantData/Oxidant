@@ -150,12 +150,159 @@ mod tests {
         assert!(embedded_index().contains("/api/status?limit="));
         assert!(embedded_index().contains("/api/v1/events/stream"));
 
-        // The Observability page reads these three, and the log buffer is the only one of them
-        // that is not already on refresh().
-        assert!(embedded_index().contains("fetch('/api/v1/logs'"));
+        // The Observability page's jobs/stages/SQL sections ride refresh(); its log pane is the
+        // one part with routes of its own — the §6b browser, in full.
         assert!(embedded_index().contains("api('/jobs')"));
         assert!(embedded_index().contains("api('/stages?details=true')"));
         assert!(embedded_index().contains("api('/sql')"));
+        for route in [
+            "'/api/v1/logs?'",        // the filtered, cursor-paged read
+            "'/api/v1/logs/files?'",  // the file picker
+            "'/api/v1/logs/workers'", // the worker picker
+            "'/api/v1/logs/tail?'",   // tail-follow
+            "'/api/v1/logs/dump'",    // the diagnostic bundle
+        ] {
+            assert!(
+                embedded_index().contains(route),
+                "the log pane must reach {route}"
+            );
+        }
+        // **The tail carries the bearer header.** `EventSource` cannot, and the only ways around
+        // that put the status token in a URL — proxy logs, history, `Referer` — or invent a
+        // cookie on a router served under permissive CORS. Pinned, because "use EventSource, it
+        // is simpler" is the obvious change to make here later.
+        assert!(
+            !embedded_index().contains("new EventSource('/api/v1/logs/tail"),
+            "the log tail must not be an EventSource: it cannot carry the status token"
+        );
+        // Pinned as the *identifier* next to the route, not as the whole argument list: the
+        // point is that the tail sends the same bearer header every other log route sends, and
+        // an assertion on the exact spelling of an argument list breaks on a reformat that
+        // changes nothing.
+        let tail_call = embedded_index()
+            .split_once("'/api/v1/logs/tail?'")
+            .map(|(_, rest)| rest.chars().take(200).collect::<String>())
+            .unwrap_or_default();
+        assert!(
+            tail_call.contains("obsAuthHeaders()"),
+            "the log tail reads SSE by hand so it can send the same bearer header as every \
+             other log route: {tail_call}"
+        );
+
+        // **The followed page's scroll-back cursor is never left stale.** `obsAppend` used to
+        // trim the oldest lines off the front of the page with `.slice(-OBS_PAGE * 2)` and leave
+        // `page.next_before` naming one of them, so `Load older lines` fetched the page before a
+        // line that was no longer on screen and the gap was presented as continuous log. The
+        // trimmed prefix becomes an `older` page instead.
+        assert!(
+            !embedded_index().contains(".slice(-OBS_PAGE * 2)"),
+            "trimming the live page must not silently orphan its `next_before`"
+        );
+        assert!(
+            embedded_index().contains("obsTrimScrollback"),
+            "the pane must release scroll-back a whole page at a time, from the oldest end"
+        );
+
+        // **The memory ring is read whole, never paged.** Every other `next_before` is a row
+        // index into an append-only file and names the same line forever; the ring's is an index
+        // into a buffer that *rolls*, so every line the node logs between two requests shifts it
+        // by one and a `before=` walk repeats lines at one end and loses them at the other. The
+        // ring is also the fallback view on an `OXIDANT_LOG_ROLL=off` node — precisely where it
+        // is the only view there is. One page holds 10,000 lines and the ring holds 1,000, so
+        // the pane asks for all of it and suppresses the button rather than paging a cursor the
+        // API itself labels `"cursor": "best-effort"`.
+        assert!(
+            embedded_index().contains("const OBS_RING_LINES = 1000"),
+            "the pane must ask for the whole ring in one page"
+        );
+        assert!(
+            embedded_index().contains("const more = !ring &&"),
+            "`Load older lines` must not be offered over a cursor that rolls under the reader"
+        );
+        assert!(
+            embedded_index().contains("rolls as this node logs; pick a file for a stable history"),
+            "and the caption must say so, since the ring is the only view on a roll=off node"
+        );
+        // **Follow is offered only where there is something to follow.** The pane used to
+        // enable it for the ring on every node, and the server papered over the incoherent half
+        // by rewriting `file` to `current` — so a worker's "memory ring" painted a page from the
+        // ring and appended a tail from `oxidant.log`. The server now answers `400`; this is the
+        // switch that keeps the pane from asking, and the one place that decides it.
+        assert!(
+            embedded_index().contains("function obsCanFollow()"),
+            "the pane must have one owner for whether the selection is followable"
+        );
+        assert!(
+            !embedded_index().contains("obsState.file !== 'current' && obsState.file !== 'ring'"),
+            "the ring is followable on the driver and not on a worker, so `file` alone cannot \
+             decide it"
+        );
+        assert!(
+            embedded_index()
+                .contains("return obsState.file === 'ring' && obsState.worker === 'driver'"),
+            "the driver's ring is its `tracing` stream; a worker's has no cursor a poll resumes \
+             from"
+        );
+
+        // §6b's controls, as the ids the JS binds. The level chips existed and matched nothing
+        // once PR3 put a timestamp in front of `[LEVEL]`; these are the rest of the pane.
+        for control in [
+            "id=\"obs-worker\"",
+            "id=\"obs-file\"",
+            "id=\"obs-target\"",
+            "id=\"obs-q\"",
+            "id=\"obs-from\"",
+            "id=\"obs-to\"",
+            "id=\"obs-follow\"",
+            "id=\"obs-dump\"",
+            "id=\"obs-filters\"",
+        ] {
+            assert!(
+                embedded_index().contains(control),
+                "the log pane is missing {control}"
+            );
+        }
+        // **The chip row covers every level the API ranks.** It stopped at `debug` while
+        // `level_rank` gives `TRACE` a rank of its own, so on a node running `RUST_LOG=trace`
+        // the chip labelled as the most permissive floor *hid* lines the unfiltered view showed
+        // — a severity floor whose quietest value is not the quietest level.
+        assert!(
+            embedded_index()
+                .contains("const OBS_LEVELS = ['error', 'warn', 'info', 'debug', 'trace']"),
+            "a floor's quietest chip must be the quietest level the API accepts"
+        );
+        assert!(
+            !embedded_index().contains("lvl === 'trace' ? 'debug' : lvl"),
+            "and a `TRACE` line must not be painted as a `DEBUG` one now that both are filterable"
+        );
+
+        // The level regex is unanchored, and pinned as the literal it is. PR3 moved `[LEVEL]`
+        // off the start of the line behind an RFC-3339 timestamp; the old `^`-anchored form
+        // then matched nothing, every line came back with a null level, and the chips
+        // `docs/web-ui.md` documented could not hide one line. Both halves are asserted
+        // because the negative alone passes on a page with no level match at all.
+        assert!(
+            embedded_index().contains("/\\[(ERROR|WARN|INFO|DEBUG|TRACE)\\]/"),
+            "the pane must colour a line by its `[LEVEL]` wherever in the line it sits"
+        );
+        assert!(
+            !embedded_index().contains("/^\\s*\\[("),
+            "the level match must not assume `[LEVEL]` is line-initial"
+        );
+        // **A node that logs but does not roll still has logs.** `OXIDANT_LOG_ROLL=off` keeps
+        // durable statement history with stderr-only logs, so every `?file=` is a `404` while
+        // the memory ring answers. The pane drops to the ring once and says so, rather than
+        // reporting "no logs to read here" about a node that is logging.
+        assert!(
+            embedded_index().contains(
+                "if (code === 404 && obsState.file === 'current' && !obsState.currentMissing)"
+            ),
+            "a node with no rolled files must fall back to the memory ring"
+        );
+        assert!(
+            embedded_index().contains("this node writes no rolled files"),
+            "and the caption must say why the ring is what is on screen"
+        );
 
         // The Compare page and the Spark proxy that existed only to feed it are gone; nothing
         // in the console reaches for another engine's UI.

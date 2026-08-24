@@ -87,6 +87,9 @@ pub(crate) struct SweepReport {
     /// The live `events.jsonl` was rolled this pass. Never deleted (§8, F16).
     pub event_log_rolled: bool,
     pub dumps_removed: usize,
+    /// Support bundles past their 24 h life (§6b). Retention, not pressure — counted apart from
+    /// `dumps_removed` so a test can tell "the bundle expired" from "the budget was tight".
+    pub dumps_expired: usize,
     pub orphan_results_removed: usize,
     pub statements_pruned: usize,
     pub live_results_removed: usize,
@@ -109,6 +112,7 @@ impl SweepReport {
             + self.logs_over_cap
             + self.event_logs_pruned
             + self.dumps_removed
+            + self.dumps_expired
             + self.orphan_results_removed
             + self.statements_pruned
             + self.live_results_removed
@@ -1127,6 +1131,35 @@ pub(crate) fn prune_expired_logs(
         if let Some(freed) = remove(file) {
             total = total.saturating_sub(freed);
             report.over_cap += 1;
+            report.freed_bytes += freed;
+        }
+    }
+    report
+}
+
+/// §6b retention for `dumps/`: a support bundle expires 24 h after it was written.
+///
+/// Age is the file's **mtime**, not a period parsed from its name: a dump's name is a uuid, and
+/// the window it covers is the operator's, not the clock's. Only names [`is_dump`] recognises
+/// are candidates, so a bundle an operator dropped into `OXIDANT_DUMP_DIR` by hand is measured
+/// and never unlinked — the same rule as `logs/`.
+pub(crate) fn prune_expired_dumps(
+    dumps_dir: &Path,
+    ttl_secs: i64,
+    now: DateTime<Utc>,
+) -> LogPruneReport {
+    let mut report = LogPruneReport::default();
+    if ttl_secs <= 0 {
+        return report;
+    }
+    let cutoff = now - chrono::Duration::seconds(ttl_secs);
+    for file in dumps(dumps_dir) {
+        let age: DateTime<Utc> = file.mtime.into();
+        if age > cutoff {
+            continue;
+        }
+        if let Some(freed) = remove(&file) {
+            report.expired += 1;
             report.freed_bytes += freed;
         }
     }

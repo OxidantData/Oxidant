@@ -33,10 +33,12 @@ use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
+use axum::response::sse::{self, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use datafusion::arrow::json::{ArrayWriter, WriterBuilder};
+use futures::StreamExt;
 use oxidant_catalog::DEFAULT_CATALOG;
 use oxidant_loom::arrow::array::Array;
 use oxidant_loom::arrow::record_batch::RecordBatch;
@@ -47,7 +49,7 @@ use sysinfo::{Pid, System};
 use tokio::sync::{watch, Notify};
 use uuid::Uuid;
 
-use crate::logging::{LogBuffer, LogView, MAX_LOG_LINES};
+use crate::logging::{LogBuffer, LogView};
 
 use crate::history::{
     disk, now_rfc3339, rfc3339_from_ms, FoldedStatement, HistoryConfig, HistoryRuntime,
@@ -516,6 +518,23 @@ impl StatementStore {
             history: None,
             disk: Arc::new(DiskHealth::default()),
         }
+    }
+
+    /// The config this store booted with — **the one resolver every writer under the data dir
+    /// shares**.
+    ///
+    /// `HistoryConfig::from_env` folds `(role, port)` into the root under
+    /// `OXIDANT_DATA_DIR_PER_PROCESS`, so re-reading the environment with a different port
+    /// resolves a *different tree*. That is how the dump store came to write into
+    /// `<root>/driver-0/dumps/` while the sweeper pruned `<root>/driver-<port>/dumps/` and the
+    /// disk budget measured neither: bundles that never expired and an up-front `507` that
+    /// measured an empty directory. Handing out the booted config — rather than reading the env
+    /// a third time — is what makes "the same env the writer and the sweeper read" a fact.
+    ///
+    /// `None` is a volatile store (`OXIDANT_HISTORY=off`, or an embedded caller that never
+    /// attached one), which promises that nothing is written under the data dir.
+    pub(crate) fn history_config(&self) -> Option<&HistoryConfig> {
+        self.history.as_ref().map(|h| &h.cfg)
     }
 
     /// Boot the durable store: lock the data dir, replay the journal into the history tier, and
@@ -1458,6 +1477,13 @@ impl StatementStore {
         // reads `logs_expired=2, event_logs_pruned=1, freed_bytes=0`, which looks like a bug in
         // the sweeper (M3).
         let mut retention_freed = logs.freed_bytes;
+        // §6b: "the bundle expires after 24 h and is swept like results". Unconditional, like
+        // the logs' own retention: a bundle nobody collected is not the budget's business, it
+        // is a promise about how long a copy of the cluster's logs sits on the driver's disk.
+        let expired_dumps =
+            disk::prune_expired_dumps(&cfg.dumps_dir, crate::logging::DUMP_TTL_SECS, now);
+        report.dumps_expired = expired_dumps.expired;
+        retention_freed = retention_freed.saturating_add(expired_dumps.freed_bytes);
         if let Some(dir) = &cfg.event_log_dir {
             let events = disk::roll_event_log(dir, cfg.event_log_max_bytes, cfg.log_roll, now);
             report.event_logs_pruned = events.pruned;
@@ -1573,6 +1599,7 @@ impl StatementStore {
                 rolled_logs = report.rolled_logs_removed,
                 logs_expired = report.logs_expired,
                 logs_over_cap = report.logs_over_cap,
+                dumps_expired = report.dumps_expired,
                 event_logs_pruned = report.event_logs_pruned,
                 event_log_rolled = report.event_log_rolled,
                 dumps = report.dumps_removed,
@@ -2030,6 +2057,9 @@ struct RestState {
     /// Shared bearer token guarding `GET /api/v1/logs`. `None` — the default — makes that one
     /// route answer `404`; nothing else in this router is authenticated.
     status_token: Option<Arc<str>>,
+    /// §6b's diagnostic dumps. `None` under `OXIDANT_HISTORY=off`, which promises that nothing
+    /// is written under the data dir — and a support bundle is the largest thing that would be.
+    dumps: Option<Arc<crate::logging::DumpStore>>,
 }
 
 /// Build the REST statement-execution router around a shared Spark Connect service.
@@ -2046,13 +2076,28 @@ pub fn router(service: Arc<OxidantService>) -> Router {
         .statement_store()
         .cloned()
         .unwrap_or_else(StatementStore::new);
+    // **The config the store booted with, never a fresh read of the environment.** The dump
+    // store must land in the directory the sweeper prunes and the disk budget measures, and
+    // under `OXIDANT_DATA_DIR_PER_PROCESS` that directory depends on the process's own
+    // `(role, port)` — which this function does not have and used to guess as `0`.
+    let dumps = dumps_for(&store);
     app(RestState {
         service,
         store,
         log_buffer,
         logs: LogView::process(),
         status_token: oxidant_ui_server::status::status_token_from_env().map(Into::into),
+        dumps,
     })
+}
+
+/// The dump store a router gets: built from *this* store's own [`HistoryConfig`], so
+/// `DumpStore.dir` is `cfg.dumps_dir` — the same path [`StatementStore::sweep_disk`] prunes and
+/// the same tree `disk::budget_roots` bills. Its own seam so the wiring is testable.
+fn dumps_for(store: &StatementStore) -> Option<Arc<crate::logging::DumpStore>> {
+    store
+        .history_config()
+        .and_then(crate::logging::DumpStore::from_config)
 }
 
 /// Build the process's statement store from the environment and attach it to `service`.
@@ -2105,6 +2150,11 @@ fn app(state: RestState) -> Router {
         )
         .route("/api/v1/cluster/status", get(cluster_status))
         .route("/api/v1/logs", get(list_logs))
+        .route("/api/v1/logs/files", get(list_log_files))
+        .route("/api/v1/logs/tail", get(tail_logs))
+        .route("/api/v1/logs/workers", get(list_log_workers))
+        .route("/api/v1/logs/dump", post(create_dump))
+        .route("/api/v1/logs/dump/{dump_id}", get(get_dump))
         .with_state(state)
 }
 
@@ -2667,144 +2717,1116 @@ fn process_metrics() -> (Option<u64>, Option<u64>, Option<f32>) {
         .unwrap_or((None, None, None))
 }
 
-/// `?file=` on `GET /api/v1/logs` (§6).
+/// The log-browser query string (§6, §6b) — one struct for every log route, because they take
+/// the same filters and a caller must not have to remember which route learned which one.
 #[derive(Debug, Default, Deserialize)]
 struct LogsParams {
     /// `current`, or a `LogPeriod` in §6's grammar with an optional `.N` split. Absent keeps
     /// today's answer: the in-memory ring.
     file: Option<String>,
-    /// Lines per page. Defaults to [`MAX_LOG_LINES`] — the same 1000 the ring serves — and is
-    /// clamped to [`MAX_LOG_PAGE`].
+    /// Lines per page. Defaults to `logging::MAX_LOG_LINES` — the same 1000 the ring serves — and is
+    /// clamped to `logging::MAX_LOG_PAGE`.
     limit: Option<usize>,
-    /// Lines to skip from the start of the file.
+    /// PR3's oldest-first walk: lines to skip from the start of the file.
     offset: Option<usize>,
+    /// PR4's backward cursor: serve the lines *before* this row index, newest-first (§6b).
+    before: Option<u64>,
+    /// The follow cursor: the matches at or after this row index, oldest-first, with the
+    /// position to resume from. What `/api/v1/logs/tail` rides against a worker.
+    after: Option<u64>,
+    /// `desc` asks for the newest-first page without passing a filter to imply it.
+    order: Option<String>,
+    /// Severity floor: `warn` is "warn **and** error".
+    level: Option<String>,
+    /// Target prefix — `oxidant_execution` matches `oxidant_execution::plan`.
+    target: Option<String>,
+    /// Free text over the rendered line, case-insensitive.
+    q: Option<String>,
+    /// RFC-3339 bounds on `ts`, matched against the column §6's writer emits. Half-open.
+    from: Option<String>,
+    to: Option<String>,
+    /// Federation: read *that worker's* logs instead of this node's, over its own Flight surface
+    /// (§6b). Never a raw address — see [`resolve_worker`].
+    worker: Option<String>,
 }
 
-/// The largest page `?file=` will serve, however large a `?limit=` is asked for.
-///
-/// A rolled file may hold `OXIDANT_LOG_MAX_FILE_BYTES` (256 MiB, ~2M lines) and the read path had
-/// no cap at all: `?file=current` built a `Vec<String>` of every line and `serde_json` then
-/// serialised a second copy into the body — well over half a GiB transient on a driver whose whole
-/// *result* budget is 512 MiB, multiplied by every concurrent request, on an endpoint the
-/// Observability page polls every 5 s. `MAX_LOG_LINES` applied only to the in-memory ring.
-const MAX_LOG_PAGE: usize = 10_000;
+impl LogsParams {
+    /// The transport-independent query [`crate::logging::answer`] takes.
+    fn query(&self) -> crate::logging::LogQuery {
+        crate::logging::LogQuery {
+            op: None,
+            file: self.file.clone(),
+            level: self.level.clone(),
+            target: self.target.clone(),
+            q: self.q.clone(),
+            from: self.from.clone(),
+            to: self.to.clone(),
+            limit: self.limit,
+            offset: self.offset,
+            before: self.before,
+            after: self.after,
+            order: self.order.clone(),
+        }
+    }
+}
 
-/// `GET /api/v1/logs` — the node's own exec log, for the monitoring UI's Observability page.
+/// `GET /api/v1/logs` — one node's exec log, for the monitoring UI's Observability page.
 ///
-/// Three answers, one route:
+/// Four answers, one route:
 ///
 /// - no `?file=` — today's shape, `{"logs": [...]}` from the in-memory ring, **unchanged**
 ///   except that each line now leads with an RFC-3339 UTC timestamp (§6);
 /// - `?file=current` — the live `oxidant.log` on disk;
 /// - `?file=<period>[.N]` — one rolled file, served from its `.parquet` if it has been
 ///   converted and from its `.log` if it has not. The caller never names an extension: which
-///   one exists is §6's conversion state machine, not the caller's business.
+///   one exists is §6's conversion state machine, not the caller's business;
+/// - `?worker=<id>` — any of the above, from **that worker's own files**, proxied over its
+///   Flight surface (§6b). No worker log bytes reach this driver's disk on this path.
+///
+/// Filters (`level`, `target`, `q`, `from`, `to`) and the backward cursor (`before`) compose
+/// over all four. Passing any of them switches the answer to §6b's newest-first cursor page;
+/// passing none keeps PR3's oldest-first `?offset=` page byte-for-byte.
 ///
 /// Gated by the same shared token as `/api/status`, through the same code — restated here
 /// because it now matters more. The endpoint used to expose 1000 lines of ring buffer; it now
-/// exposes up to `OXIDANT_LOG_KEEP_DAYS` of every enabled `tracing` field value, and this router
-/// is served under a permissive CORS layer. Unset `OXIDANT_STATUS_TOKEN`, `404`: the route does
-/// not exist, exactly like `/api/status`.
+/// exposes up to `OXIDANT_LOG_KEEP_DAYS` of every enabled `tracing` field value, on every node
+/// in the cluster, and this router is served under a permissive CORS layer. Unset
+/// `OXIDANT_STATUS_TOKEN`, `404`: the route does not exist, exactly like `/api/status`.
 async fn list_logs(
     State(state): State<RestState>,
     headers: header::HeaderMap,
     uri: axum::http::Uri,
+) -> Response {
+    let Some(params) = gate_log_params(&state, &headers, &uri) else {
+        return log_gate_response(&state, &headers, &uri);
+    };
+    run_log_query(&state, &params, params.query()).await
+}
+
+/// `GET /api/v1/logs/files` — every log file this node still has, newest period first (§6b).
+///
+/// "The visible history is always honestly what exists": it is a directory read, so a file
+/// retention took is simply absent rather than offered and then `404`ing.
+async fn list_log_files(
+    State(state): State<RestState>,
+    headers: header::HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let Some(params) = gate_log_params(&state, &headers, &uri) else {
+        return log_gate_response(&state, &headers, &uri);
+    };
+    let mut query = params.query();
+    query.op = Some("files".to_string());
+    run_log_query(&state, &params, query).await
+}
+
+/// `GET /api/v1/logs/workers` — the worker picker's list: every worker this driver is configured
+/// with, and whether it answers (§6b).
+///
+/// **A worker that does not answer is listed `reachable: false` with the reason, never silently
+/// skipped.** A log browser that quietly drops a node is worse than one that has none: the
+/// operator reads "no errors on worker 2" when what happened is "worker 2 is dead", which is the
+/// error they were looking for.
+async fn list_log_workers(State(state): State<RestState>, headers: header::HeaderMap) -> Response {
+    if let Some(denied) =
+        oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), &headers)
+    {
+        return denied;
+    }
+    // The same list `?worker=` resolves against, so the picker cannot offer an id the read
+    // route would then refuse — nor a node a `spark.conf.set` put there.
+    let workers = state.service.configured_workers();
+    let probes = workers.iter().map(|address| {
+        let address = address.clone();
+        async move {
+            let id = worker_id(&address);
+            // The existing liveness action, with a bound: an unreachable worker must not hold
+            // the picker open for a TCP timeout on every page load.
+            let probe = tokio::time::timeout(
+                WORKER_PROBE_TIMEOUT,
+                oxidant_execution::flight::health_check_worker(address.clone()),
+            )
+            .await;
+            let (reachable, error) = match probe {
+                Ok(Ok(())) => (true, None),
+                Ok(Err(e)) => (false, Some(e.to_string())),
+                Err(_) => (false, Some("timed out".to_string())),
+            };
+            json!({
+                "worker_id": id,
+                "address": address,
+                "reachable": reachable,
+                "error": error,
+            })
+        }
+    });
+    let mut rows = futures::future::join_all(probes).await;
+    // "driver" is a member of the picker, not a special case above it: the same filters read the
+    // same way whichever node is selected, which is the whole point of one `answer`.
+    rows.insert(
+        0,
+        json!({
+            "worker_id": "driver",
+            "address": Value::Null,
+            "reachable": true,
+            "error": Value::Null,
+        }),
+    );
+    Json(json!({ "workers": rows })).into_response()
+}
+
+/// How long a worker has to answer the liveness probe behind `GET /api/v1/logs/workers` before
+/// it is reported unreachable. Short on purpose: this runs once per page load, per worker.
+const WORKER_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `GET /api/v1/logs/tail` — SSE follow (§6b).
+///
+/// **The driver's tail rides `tracing` itself, not a file poll.** The rolling writer's queue,
+/// its dedup hold and its 5 s timer all sit between an event and the file, so a follow that
+/// re-read `oxidant.log` would lag by up to that timer and re-decode the tail every tick. The
+/// stream therefore marks itself `"dedup": false` — it is the *ring*'s view, and §6/F21 says the
+/// file is authoritative — which is the same statement `?file=current`'s `"dedup": true` makes
+/// from the other side.
+///
+/// **A worker's tail is a poll, and says so.** Flight's `do_action` returns a stream, but a
+/// long-lived one would pin a worker-side task to a browser tab; instead the driver re-asks the
+/// worker's `?file=current` on a timer and forwards what is new. The `mode` field on the first
+/// event is `"follow"` for the driver and `"poll"` for a worker, so a reader is never told a
+/// 2 s-granular feed is live.
+///
+/// **What a tail will follow is exactly one source per node**, and naming another is a `400`
+/// rather than a silent substitution — see [`check_tail_source`].
+async fn tail_logs(
+    State(state): State<RestState>,
+    headers: header::HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let Some(params) = gate_log_params(&state, &headers, &uri) else {
+        return log_gate_response(&state, &headers, &uri);
+    };
+    let filter = match crate::logging::LogFilter::parse(
+        params.level.as_deref(),
+        params.target.as_deref(),
+        params.q.as_deref(),
+        params.from.as_deref(),
+        params.to.as_deref(),
+    ) {
+        Ok(f) => f,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    if let Err(refusal) = check_tail_source(params.worker.as_deref(), params.file.as_deref()) {
+        return error_response(StatusCode::BAD_REQUEST, &refusal);
+    }
+    match &params.worker {
+        None => Sse::new(driver_tail(filter)).into_response(),
+        Some(requested) => {
+            let endpoint = match resolve_worker(&state, requested) {
+                Ok(endpoint) => endpoint,
+                Err(response) => return response,
+            };
+            Sse::new(worker_tail(endpoint, params, state.status_token.clone())).into_response()
+        }
+    }
+}
+
+/// Whether this node can follow what the caller named — and a refusal that says why if not.
+///
+/// **A follow shows what a node is writing now, and each node has exactly one such source.**
+/// `worker_tail` used to override `file` to `current` unconditionally, so **Node = worker, File
+/// = memory ring** painted a page out of the worker's in-memory ring and then appended a tail
+/// out of the worker's `oxidant.log` — two sources with different dedup semantics concatenated
+/// into one pane, under an `open` event asserting `"dedup": true` about a ring that is never
+/// deduped. On a worker with `OXIDANT_LOG_ROLL=off` it was worse: there is no `current` to
+/// poll, so the substitution produced an `error` event every 2 s forever under a caption
+/// reading "following".
+///
+/// The ring is followable on the **driver** and only there, because the driver's tail is not a
+/// file poll at all — it is the `tracing` broadcast, which is the very stream the ring holds.
+/// A worker's is a `?file=` poll over Flight, and a rolling buffer has no forward cursor: an
+/// index into it names a different line every time the node logs one (F9), so a poll cannot
+/// tell a new line from one that shifted.
+fn check_tail_source(worker: Option<&str>, file: Option<&str>) -> Result<(), String> {
+    match (worker, file) {
+        (_, Some("current")) => Ok(()),
+        (None, None) => Ok(()),
+        (Some(worker), None) => Err(format!(
+            "worker `{worker}`'s memory ring cannot be followed: it is a rolling buffer with no              forward cursor, so a poll cannot tell a new line from one that shifted. Add              `file=current` to follow that worker's live file, or read the ring without              following it. The driver's own ring is followable because its tail is the `tracing`              stream itself rather than a poll"
+        )),
+        (_, Some(rolled)) => Err(format!(
+            "`{rolled}` is a rolled file: it will never grow again, so there is nothing to              follow. Use `file=current` for the live file, or read the rolled file with              `/api/v1/logs`"
+        )),
+    }
+}
+
+/// The driver's own follow: every `tracing` event, filtered, as it happens.
+fn driver_tail(
+    filter: crate::logging::LogFilter,
+) -> impl futures::Stream<Item = Result<sse::Event, std::convert::Infallible>> {
+    let rx = crate::logging::subscribe_tail();
+    let open = sse::Event::default()
+        .event("open")
+        .data(json!({ "mode": "follow", "worker": "driver", "dedup": false }).to_string());
+    futures::stream::once(async move { Ok(open) }).chain(futures::stream::unfold(
+        (rx, filter),
+        |(mut rx, filter)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(line) => {
+                        if filter.is_empty()
+                            || filter.keeps(&crate::logging::parse_for_filter(&line), &line)
+                        {
+                            let event = sse::Event::default().event("line").data(line);
+                            return Some((Ok(event), (rx, filter)));
+                        }
+                    }
+                    // **The gap is never silent.** A reader that falls behind the fan-out is
+                    // told exactly how many lines it lost, in its own stream, rather than
+                    // seeing a jump it cannot account for.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        let event = sse::Event::default()
+                            .event("dropped")
+                            .data(json!({ "dropped": n }).to_string());
+                        return Some((Ok(event), (rx, filter)));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    ))
+}
+
+/// How often a worker tail re-asks. Matches the Observability page's own poll: a follow that
+/// asked faster would cost a Flight round-trip per second per open tab and buy nothing a reader
+/// can see.
+const WORKER_TAIL_POLL: Duration = Duration::from_secs(2);
+
+/// A worker's tail: `?file=current` re-asked on a timer, forwarding only what is new.
+///
+/// "New" is the **follow cursor**, not a text comparison: two identical lines a second apart are
+/// two events, and comparing text would swallow the second. The cursor is a scan position rather
+/// than a match position, so a selective filter does not make the poll re-read the rows it
+/// already rejected. A cursor that comes back *smaller* than the one sent means the worker rolled
+/// its live file mid-follow, and the stream says so and restarts at row 0 rather than waiting for
+/// the new file to grow past the old one's length.
+fn worker_tail(
+    endpoint: String,
+    params: LogsParams,
+    token: Option<Arc<str>>,
+) -> impl futures::Stream<Item = Result<sse::Event, std::convert::Infallible>> {
+    let worker = params.worker.clone().unwrap_or_default();
+    let open = sse::Event::default().event("open").data(
+        json!({
+            "mode": "poll",
+            "worker": worker,
+            "dedup": true,
+            "poll_ms": WORKER_TAIL_POLL.as_millis() as u64,
+        })
+        .to_string(),
+    );
+    let start = Follow {
+        endpoint,
+        params,
+        token,
+        after: None,
+        started: false,
+    };
+    futures::stream::once(async move { Ok(open) }).chain(futures::stream::unfold(
+        start,
+        |mut st| async move {
+            loop {
+                if st.started {
+                    tokio::time::sleep(WORKER_TAIL_POLL).await;
+                }
+                st.started = true;
+                let value = match federate(&st.endpoint, &st.query(), st.token.as_deref()).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // The follow does not end because one poll failed — a worker restart is
+                        // exactly when an operator is watching — but the failure is said out
+                        // loud rather than looking like a quiet worker.
+                        let event = sse::Event::default()
+                            .event("error")
+                            .data(json!({ "error": e.message, "status": e.status }).to_string());
+                        st.absorb_failure();
+                        return Some((Ok(event), st));
+                    }
+                };
+                match st.absorb(&value) {
+                    TailStep::Rolled => {
+                        let event = sse::Event::default()
+                            .event("rolled")
+                            .data(json!({ "worker": st.params.worker }).to_string());
+                        return Some((Ok(event), st));
+                    }
+                    TailStep::Lines(lines) => {
+                        let event = sse::Event::default()
+                            .event("lines")
+                            .data(json!(lines).to_string());
+                        return Some((Ok(event), st));
+                    }
+                    TailStep::Idle => continue,
+                }
+            }
+        },
+    ))
+}
+
+/// One worker follow, as a value: where to ask next, and what an answer means for that.
+///
+/// Its own type because the arithmetic below is the whole contract of a federated follow and it
+/// used to be inline in a `stream::unfold` closure, which no test could reach.
+struct Follow {
+    endpoint: String,
+    params: LogsParams,
+    /// The credential this follow presents to the worker on every poll — the same bearer the
+    /// caller presented to open the stream (F16). Held for the life of the follow because a
+    /// tail re-asks forever, and re-reading the env per poll would let a stream outlive the
+    /// configuration it was authorized under.
+    token: Option<Arc<str>>,
+    /// The forward cursor: a **scan** position in the worker's live file. `None` until a poll
+    /// has named the end of that file.
+    after: Option<u64>,
+    /// Whether a poll has been issued at all. Deliberately *not* `after.is_some()`: a poll that
+    /// failed leaves the cursor unset, and without this flag the retry would spin without its
+    /// 2 s sleep.
+    started: bool,
+}
+
+/// What one poll's answer means for the follow.
+#[derive(Debug, PartialEq, Eq)]
+enum TailStep {
+    /// Lines to forward.
+    Lines(Vec<String>),
+    /// The worker rolled its live file under the follow.
+    Rolled,
+    /// Nothing to say — the seeding probe, or a tick with no new lines.
+    Idle,
+}
+
+impl Follow {
+    /// The query for the next poll.
+    ///
+    /// **The first poll asks for a position, not a page.** It used to ask for
+    /// `order=desc&limit=200` and emit the answer, which duplicated lines twice over: the pane
+    /// had already painted the newest 500 lines of the same file a moment earlier, and the
+    /// cursor it derived — `next_before + lines.len()` — mixed a *match* position with a match
+    /// *count*. `ForwardPage`'s own doc states the rule that violated: a cursor built from the
+    /// last match re-reads, and re-emits, every non-matching row after it on every poll, so the
+    /// tighter the filter the worse the duplication. Asking for the rows *after the end of the
+    /// file* names the end and returns nothing, which is what "a follow starts where the log is"
+    /// means — and it is what the driver's own tail, which has no seed, already did.
+    fn query(&self) -> crate::logging::LogQuery {
+        let mut query = self.params.query();
+        // The caller's file, *not* an unconditional `current`. Overriding it here is what made
+        // a worker's "memory ring" stream the worker's `oxidant.log` instead — see
+        // [`check_tail_source`], which is the gate that makes this line safe by having already
+        // refused every value but `current`.
+        query.before = None;
+        query.offset = None;
+        query.order = None;
+        query.limit = Some(TAIL_PAGE);
+        query.after = Some(self.after.unwrap_or(u64::MAX));
+        query
+    }
+
+    /// Fold a *failed* poll into the cursor: it does not move, including when it is unset.
+    ///
+    /// This used to be `self.after = self.after.or(Some(0))`, under a comment saying a recovered
+    /// worker would resume rather than replay. `Some(0)` **is** the replay, and the arm is only
+    /// reached when the cursor is unset — i.e. when the *first* poll failed, which is the common
+    /// case: it is the poll issued the instant a worker goes down, or the first poll against one
+    /// already down. The worker would come back and the stream would walk its entire live file
+    /// from the top, `TAIL_PAGE` rows every 2 s — hours of ancient history under a caption
+    /// reading "following". Left unset, the next successful poll re-seeds at the end of the
+    /// file, which is all [`Follow::query`] ever needed.
+    fn absorb_failure(&mut self) {}
+
+    /// Fold one node's answer into the cursor.
+    fn absorb(&mut self, value: &Value) -> TailStep {
+        let lines: Vec<String> = value
+            .get("logs")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        match (self.after, value.get("next_after").and_then(Value::as_u64)) {
+            // Backward: the worker rolled its live file, so row indices restart.
+            (Some(sent), Some(next)) if next < sent => {
+                self.after = Some(0);
+                TailStep::Rolled
+            }
+            (_, Some(next)) => {
+                self.after = Some(next);
+                if lines.is_empty() {
+                    TailStep::Idle
+                } else {
+                    TailStep::Lines(lines)
+                }
+            }
+            // No cursor at all: this was not a forward page. Leave the cursor where it is and
+            // re-ask — inventing one from whatever else the envelope carries is how the seed
+            // came to re-emit its matches forever.
+            (_, None) => TailStep::Idle,
+        }
+    }
+}
+
+/// Lines a worker tail asks for per poll. Two seconds of a chatty worker, bounded.
+const TAIL_PAGE: usize = 500;
+
+/// Authorize, then parse — **in that order**, and never with an extractor.
+///
+/// Axum runs extractors in declaration order and short-circuits on rejection, so a
+/// `Query<LogsParams>` parameter answered `400` for `?file=a&file=b` before
+/// `deny_unless_authorized` ran — and with `OXIDANT_STATUS_TOKEN` unset these routes' contract
+/// is `404`, "the route does not exist, exactly like `/api/status`". A `400`-vs-`404` split
+/// tells an unauthenticated caller the route is there (L1).
+///
+/// `None` means "the caller gets [`log_gate_response`]'s answer instead", which is either the
+/// authorization refusal or the parse refusal, in that order.
+fn gate_log_params(
+    state: &RestState,
+    headers: &header::HeaderMap,
+    uri: &axum::http::Uri,
+) -> Option<LogsParams> {
+    if oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), headers)
+        .is_some()
+    {
+        return None;
+    }
+    Query::<LogsParams>::try_from_uri(uri).ok().map(|q| q.0)
+}
+
+fn log_gate_response(
+    state: &RestState,
+    headers: &header::HeaderMap,
+    uri: &axum::http::Uri,
+) -> Response {
+    if let Some(denied) =
+        oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), headers)
+    {
+        return denied;
+    }
+    let _ = uri;
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid query: expected at most one each of `file`, `limit`, `offset`, `before`, \
+         `level`, `target`, `q`, `from`, `to` and `worker`",
+    )
+}
+
+/// Run one query — locally, or against the named worker.
+async fn run_log_query(
+    state: &RestState,
+    params: &LogsParams,
+    query: crate::logging::LogQuery,
+) -> Response {
+    match &params.worker {
+        // "driver" is spelled out in the picker, so accept it here rather than making the UI
+        // strip it back off.
+        None => local_log_query(state, query).await,
+        Some(id) if id == "driver" => local_log_query(state, query).await,
+        Some(requested) => {
+            let endpoint = match resolve_worker(state, requested) {
+                Ok(endpoint) => endpoint,
+                Err(response) => return response,
+            };
+            match federate(&endpoint, &query, state.status_token.as_deref()).await {
+                Ok(mut value) => {
+                    // §6b: "labels the rows with their worker". The rows are the worker's; the
+                    // envelope says whose, so a UI concatenating two nodes cannot lose track.
+                    value["worker"] = json!(requested);
+                    Json(value).into_response()
+                }
+                Err(e) => log_error_response(&e),
+            }
+        }
+    }
+}
+
+async fn local_log_query(state: &RestState, query: crate::logging::LogQuery) -> Response {
+    let view = state.logs.clone();
+    let ring = state.log_buffer.clone();
+    // **`spawn_blocking`.** Reading a log is `std::fs` I/O plus, for a converted file, a full
+    // Parquet decode. Doing that inline on a tokio worker parks a thread that is also serving
+    // `ExecutePlan`, for as long as the read takes.
+    match tokio::task::spawn_blocking(move || crate::logging::answer(&query, &view, &ring)).await {
+        Ok(Ok(mut value)) => {
+            value["worker"] = json!("driver");
+            Json(value).into_response()
+        }
+        Ok(Err(e)) => log_error_response(&e),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("reading the log file panicked: {e}"),
+        ),
+    }
+}
+
+fn log_error_response(e: &crate::logging::LogError) -> Response {
+    error_response(
+        StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        &e.message,
+    )
+}
+
+/// The worker id a `?worker=` value must match: `host:port`, the address without its scheme —
+/// stable, meaningful, and the same string `/api/v1/cluster/status` already prints.
+fn worker_id(address: &str) -> String {
+    address
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Resolve a `?worker=` value to a dialable endpoint — **only** if it is one of this driver's
+/// configured workers.
+///
+/// This is the SSRF gate, and it is the reason the id is matched rather than the address used.
+/// `?worker=` is a query parameter on a route an operator's browser calls; letting it name an
+/// arbitrary host would turn the driver into a request forwarder for anything its network can
+/// reach, on an endpoint whose token an operator hands to a monitoring page.
+fn resolve_worker(state: &RestState, requested: &str) -> Result<String, Response> {
+    // **This driver's own configuration, not the session config map.** See
+    // [`OxidantService::configured_workers`]: `spark.oxidant.workers` is writable by any client
+    // that can reach the unauthenticated Connect port, so matching against it would make the
+    // id-not-address discipline below decorative.
+    let workers = state.service.configured_workers();
+    match workers.iter().find(|w| worker_id(w) == requested) {
+        Some(address) => Ok(address.clone()),
+        None if workers.is_empty() => Err(error_response(
+            StatusCode::NOT_FOUND,
+            "this driver has no workers configured (set OXIDANT_WORKERS or OXIDANT_WORKER_SERVICE)",
+        )),
+        None => Err(error_response(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "unknown worker `{requested}`: expected `driver` or one of {}",
+                workers
+                    .iter()
+                    .map(|w| worker_id(w))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
+
+/// Ask one worker, over its own Flight surface, and hand back what it said.
+///
+/// **Nothing is written to this driver's disk.** The page is a `Value` in memory, forwarded to
+/// the caller and dropped — §6b's "federation, not shipping", and the reason the diagnostic dump
+/// is a separate, explicitly-named route.
+async fn federate(
+    endpoint: &str,
+    query: &crate::logging::LogQuery,
+    token: Option<&str>,
+) -> Result<Value, crate::logging::LogError> {
+    let body = serde_json::to_vec(query).map_err(|e| crate::logging::LogError {
+        status: 500,
+        message: format!("could not encode the log query: {e}"),
+    })?;
+    // The worker's `logs` action wants the same bearer this route already required of *its*
+    // caller (F16). Every path here is behind `deny_unless_authorized`, so a `None` at this
+    // point is not "an unauthenticated read got through" — it is unreachable — but it is sent
+    // as no credential rather than as a blank one, and the worker answers accordingly.
+    let call = oxidant_execution::flight::worker_logs(endpoint.to_string(), body, token);
+    match tokio::time::timeout(WORKER_QUERY_TIMEOUT, call).await {
+        Ok(Ok(bytes)) => crate::logging::decode_worker_answer(&bytes),
+        // **Honest, and named.** A worker that cannot be reached is reported as *that*, with the
+        // transport's own message — never an empty page, which reads as "this worker logged
+        // nothing" and is the one answer a log browser must never invent.
+        Ok(Err(e)) => Err(crate::logging::LogError {
+            status: 502,
+            message: format!("worker {endpoint} did not answer: {e}"),
+        }),
+        Err(_) => Err(crate::logging::LogError {
+            status: 504,
+            message: format!(
+                "worker {endpoint} did not answer within {}s",
+                WORKER_QUERY_TIMEOUT.as_secs()
+            ),
+        }),
+    }
+}
+
+/// A federated page's deadline. Longer than the liveness probe — a worker really is decoding a
+/// Parquet — and far short of the browser's own patience.
+const WORKER_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `POST /api/v1/logs/dump` — the request body (§6b).
+#[derive(Debug, Default, Deserialize)]
+struct DumpRequest {
+    /// `driver`, `all`, or one worker id. Defaults to `all`: an operator opening a support case
+    /// wants the cluster, and asking for one node is the narrower, deliberate act.
+    worker: Option<String>,
+    /// RFC-3339 window. Both absent defaults to the **last hour** — see [`DEFAULT_DUMP_WINDOW`].
+    from: Option<String>,
+    to: Option<String>,
+    /// The same filters the browser takes, so "dump what I am looking at" is one request rather
+    /// than a second query language.
+    level: Option<String>,
+    target: Option<String>,
+    q: Option<String>,
+}
+
+/// How far back a dump reaches when the caller names no window.
+///
+/// **A default matters here in a way it does not for a page read.** With no bound, the obvious
+/// `POST /api/v1/logs/dump` with an empty body means "every node, thirty days", which the 1 GiB
+/// cap would then refuse after minutes of Flight round-trips — a refusal that is correct and
+/// useless. An hour is the window an operator reaching for a support bundle almost always wants,
+/// and the effective window is echoed in the `202` so nobody has to guess which they got.
+const DEFAULT_DUMP_WINDOW: Duration = Duration::from_secs(3600);
+
+/// `POST /api/v1/logs/dump` — assemble a bounded support bundle into `dumps/` (§6b).
+///
+/// **This is the one place log bytes move**, and it is deliberately its own route rather than a
+/// mode of the browser: an operator who copies a cluster's logs onto the driver's disk should
+/// have had to say so. Token-guarded like every other log route, bounded by
+/// `OXIDANT_LOG_DUMP_MAX_BYTES` *and* §3's budget and free-space floor, refused with `507`
+/// rather than truncated, and swept 24 h later by the dump pass that shipped in PR2.
+///
+/// Answers `202 {dumpId}` and assembles on a task: six nodes and a day is minutes of Flight
+/// round-trips, and an HTTP client that gave up halfway would otherwise leave a half-written
+/// file with nobody to finish or remove it.
+async fn create_dump(
+    State(state): State<RestState>,
+    headers: header::HeaderMap,
+    body: Option<Json<DumpRequest>>,
 ) -> Response {
     if let Some(denied) =
         oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), &headers)
     {
         return denied;
     }
-    // **Parsed after the gate, not by an extractor.** Axum runs extractors in declaration order
-    // and short-circuits on rejection, so a `Query<LogsParams>` parameter answered `400` for
-    // `?file=a&file=b` before `deny_unless_authorized` ever ran — and `400` is not what a
-    // nonexistent route answers. The endpoint's stated contract is "unset OXIDANT_STATUS_TOKEN,
-    // `404`: the route does not exist, exactly like `/api/status`", and a `400`-vs-`404` split
-    // tells an unauthenticated caller the route is there (L1).
-    let Ok(Query(params)) = Query::<LogsParams>::try_from_uri(&uri) else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid query: expected at most one each of `file`, `limit` and `offset`",
-        );
-    };
-    let offset = params.offset.unwrap_or(0);
-    let limit = params.limit.unwrap_or(MAX_LOG_LINES).min(MAX_LOG_PAGE);
-    let Some(requested) = params.file else {
-        // The ring is not deduped — dedup applies to the *file* (§6) — and this envelope
-        // deliberately keeps the exact shape it had before `?file=` existed.
-        return Json(json!({ "logs": state.log_buffer.lines() })).into_response();
-    };
-    let Some(dir) = state.logs.dir.as_deref() else {
+    let request = body.map(|Json(b)| b).unwrap_or_default();
+    let Some(dumps) = state.dumps.clone() else {
         return error_response(
             StatusCode::NOT_FOUND,
-            "no rolled exec logs on this node (OXIDANT_LOG_ROLL=off, or OXIDANT_HISTORY=off)",
+            "this node writes no dumps (OXIDANT_HISTORY=off)",
         );
     };
-    let (file, label) = if requested == "current" {
-        (crate::logging::resolve_current(dir), "current".to_string())
-    } else {
-        // Parsed into a typed `LogPeriod` and the filename *reconstructed* from it — never
-        // string-joined into a path. `..`, `/`, an extension and an absolute path all fail the
-        // grammar by construction, so no traversal shape ever reaches the join (§6, F12).
-        let Some((period, split)) = crate::logging::LogPeriod::parse(&requested) else {
+    // The window, resolved *before* anything is minted, so a bad instant is a `400` on the
+    // request rather than a failed dump an operator collects later.
+    let now = chrono::Utc::now();
+    // Both instants are judged before either is defaulted, so a malformed value is reported as
+    // malformed rather than as whatever the pairing rule below would have said about it.
+    for (name, raw) in [("from", &request.from), ("to", &request.to)] {
+        if let Some(raw) = raw {
+            if chrono::DateTime::parse_from_rfc3339(raw).is_err() {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid {name} `{raw}`: expected an RFC-3339 instant"),
+                );
+            }
+        }
+    }
+    let stamp =
+        |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let (from, to) = match (&request.from, &request.to) {
+        (None, None) => (
+            stamp(now - chrono::Duration::from_std(DEFAULT_DUMP_WINDOW).unwrap_or_default()),
+            stamp(now),
+        ),
+        // **A one-sided upper bound is a refusal, not a default.** `to` alone fell through to
+        // `from = 1970-01-01`, so `{"to": "…"}` walked the *entire* retention on every node —
+        // precisely the "every node, thirty days" request `DEFAULT_DUMP_WINDOW` exists to keep
+        // an empty body from meaning, arrived at by supplying one field instead of none. It is
+        // also the expensive direction: a dump reads what its window names (F2), so the cost of
+        // the mistake is the whole retention decoded on every node before the 1 GiB cap refuses
+        // it — "a refusal that is correct and useless", which is the reasoning the default was
+        // given in the first place.
+        //
+        // `from` alone is a different shape and stays: its open end is `now`, so the window is
+        // bounded by the instant the caller did supply.
+        (None, Some(to)) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                "invalid file: expected `current`, `YYYY-MM-DD`, `YYYY-MM-DD-HH` or `YYYY-Www`, \
-                 each with an optional `.N` split (2..999) and no extension",
+                &format!(
+                    "`to` was given as `{to}` with no `from`, which would bundle everything \
+                     recorded before it — up to OXIDANT_LOG_KEEP_DAYS on every node. Supply \
+                     `from` as well, or omit both for the last hour"
+                ),
             );
-        };
-        // The label echoes what the caller asked for, in the grammar's own spelling — no
-        // extension, because the caller does not choose one.
-        (crate::logging::resolve(dir, period, split), {
-            let stem = period.stem();
-            if split <= 1 {
-                stem
-            } else {
-                format!("{stem}.{split}")
+        }
+        (Some(from), to) => (from.clone(), to.clone().unwrap_or_else(|| stamp(now))),
+    };
+    // The nodes, resolved here so `?worker=` gets the same SSRF gate the browser's does.
+    let nodes = match dump_nodes(&state, request.worker.as_deref()) {
+        Ok(nodes) => nodes,
+        Err(response) => return response,
+    };
+    // §3's guards, before the id exists: a refusal must land on the request. Minting the id is
+    // the same step, under the same lock, because the id *is* the reservation — see
+    // [`DumpStore::admit_and_begin`].
+    let id = match dumps.admit_and_begin() {
+        Ok(id) => id,
+        Err(e) => return log_error_response(&e),
+    };
+    let query = crate::logging::LogQuery {
+        level: request.level.clone(),
+        target: request.target.clone(),
+        q: request.q.clone(),
+        from: Some(from.clone()),
+        to: Some(to.clone()),
+        ..Default::default()
+    };
+    tokio::spawn(assemble_dump(
+        state.clone(),
+        dumps.clone(),
+        id.clone(),
+        nodes.clone(),
+        query,
+    ));
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "dumpId": id,
+            "status": "building",
+            "from": from,
+            "to": to,
+            "nodes": nodes.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            "maxBytes": dumps.max_bytes(),
+        })),
+    )
+        .into_response()
+}
+
+/// The nodes one dump covers: `(id, endpoint)`, with `None` for the driver's own files.
+fn dump_nodes(
+    state: &RestState,
+    requested: Option<&str>,
+) -> Result<Vec<(String, Option<String>)>, Response> {
+    // `all` means this driver's configured cluster. A session-config override would make a
+    // bundle silently cover a node nobody deployed and silently omit the ones they did.
+    let workers = state.service.configured_workers();
+    match requested.unwrap_or("all") {
+        "driver" => Ok(vec![("driver".to_string(), None)]),
+        "all" => {
+            let mut nodes = vec![("driver".to_string(), None)];
+            nodes.extend(workers.iter().map(|w| (worker_id(w), Some(w.clone()))));
+            Ok(nodes)
+        }
+        // One named worker goes through the same gate as `?worker=`: an id from this driver's
+        // own configuration, never an address.
+        other => {
+            resolve_worker(state, other).map(|endpoint| vec![(other.to_string(), Some(endpoint))])
+        }
+    }
+}
+
+/// Walk every node's files inside the window and write them into one Parquet.
+///
+/// **A node that could not be reached is recorded and the dump still completes.** A support
+/// bundle that silently omits the node that died is worse than no bundle at all: the missing
+/// node is the one the case is about.
+async fn assemble_dump(
+    state: RestState,
+    dumps: Arc<crate::logging::DumpStore>,
+    id: String,
+    nodes: Vec<(String, Option<String>)>,
+    query: crate::logging::LogQuery,
+) {
+    let mut writer = match dumps.open(&id) {
+        Ok(w) => w,
+        Err(e) => return dumps.set(&id, crate::logging::DumpState::Failed(e)),
+    };
+    let instant = |raw: &Option<String>| -> Option<i64> {
+        raw.as_deref()
+            .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+            .map(|t| t.timestamp_millis())
+    };
+    let (from_ms, to_ms) = (instant(&query.from), instant(&query.to));
+    for (node, endpoint) in &nodes {
+        let files = {
+            let mut listing = query.clone();
+            listing.op = Some("files".to_string());
+            match ask_node(&state, endpoint.as_deref(), &listing).await {
+                Ok(v) => v,
+                Err(e) => {
+                    writer.note_node(node, Some(e.message));
+                    continue;
+                }
             }
-        })
-    };
-    let Some(file) = file else {
-        return error_response(StatusCode::NOT_FOUND, "log file not found");
-    };
-    let format = file.format();
-    // **`spawn_blocking`.** Reading a rolled log is `std::fs` I/O plus, for a converted file, a
-    // full Parquet decode. Doing that inline on a tokio worker parks a thread that is also
-    // serving `ExecutePlan`, for as long as the read takes.
-    let page = match tokio::task::spawn_blocking(move || file.read(offset, limit)).await {
-        Ok(Ok(page)) => page,
-        Ok(Err(e)) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("could not read the log file: {e}"),
-            )
+        };
+        // **The window prunes what is read, not only what is kept.** `FileInfo` already carries
+        // `first_ts`/`last_ts`, so a file the window puts wholly outside is never opened — the
+        // documented default is the last hour, and without this a one-hour bundle walked up to
+        // `OXIDANT_LOG_KEEP_DAYS` of every node's history, `DUMP_PAGE` rows at a time, to keep
+        // an hour of it.
+        let names: Vec<String> = files["files"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|f| file_in_window(f, from_ms, to_ms))
+                    .filter_map(|f| f["file"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut failure: Option<String> = None;
+        'files: for name in names {
+            // The **forward** cursor, so each file is walked once end to end and the walk
+            // resumes exactly where it stopped however selective the filter is.
+            let mut after = 0u64;
+            loop {
+                let mut page = query.clone();
+                page.file = Some(name.clone());
+                page.after = Some(after);
+                page.limit = Some(DUMP_PAGE);
+                let value = match ask_node(&state, endpoint.as_deref(), &page).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // A file that vanished under the walk (retention took it mid-dump) is
+                        // not a failed dump; an unreachable node is.
+                        if e.status == 404 {
+                            continue 'files;
+                        }
+                        failure = Some(e.message);
+                        break 'files;
+                    }
+                };
+                for line in value["logs"].as_array().into_iter().flatten() {
+                    let Some(line) = line.as_str() else { continue };
+                    if let Err(e) = writer.push(node, line) {
+                        // The cap. Refused, not truncated: the id reports it and no bundle is
+                        // published.
+                        return dumps.set(&id, crate::logging::DumpState::Failed(e));
+                    }
+                }
+                // **An empty page ends the file.** A forward page stops only at `DUMP_PAGE`
+                // matches or at the end of the file, so no lines means the scan reached the end
+                // with nothing left to match. Without this the walk of a *live* file chases its
+                // own tail: `next_after` is the growing EOF, so `next <= after` never holds on
+                // a node logging faster than the dump reads — the busiest node in the cluster
+                // being the one whose dump never completes.
+                if value["logs"].as_array().map_or(true, |a| a.is_empty()) {
+                    break;
+                }
+                let next = value["next_after"].as_u64().unwrap_or(after);
+                if next <= after {
+                    break;
+                }
+                after = next;
+            }
+        }
+        writer.note_node(node, failure);
+    }
+    match writer.finish() {
+        Ok(finished) => {
+            // **The audited half of "an explicit, token-guarded, audited action"** (§6b). This
+            // is the one path that copies log bytes between nodes, so its completion is a log
+            // line of its own — which node, how many rows, how large, and which nodes did not
+            // answer — and it lands in the very log it just copied.
+            if let crate::logging::DumpState::Ready {
+                bytes, rows, nodes, ..
+            } = &finished
+            {
+                let unreachable: Vec<&str> = nodes
+                    .iter()
+                    .filter(|(_, err)| err.is_some())
+                    .map(|(node, _)| node.as_str())
+                    .collect();
+                tracing::info!(
+                    dump = %id,
+                    rows,
+                    bytes,
+                    nodes = nodes.len(),
+                    unreachable = unreachable.join(","),
+                    "diagnostic dump assembled"
+                );
+            }
+            dumps.set(&id, finished)
         }
         Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("reading the log file panicked: {e}"),
-            )
+            tracing::warn!(dump = %id, error = %e.message, "diagnostic dump failed");
+            dumps.set(&id, crate::logging::DumpState::Failed(e))
         }
+    }
+}
+
+/// Could this listing entry hold a line inside `[from, to)`? Decided from the bounds the
+/// listing already carries, so a file outside the window is never opened.
+///
+/// **This is coarser than the row filter, deliberately, and it is the one place the dump is.**
+/// `first_ts`/`last_ts` are the first and last *parseable* timestamps, so a rolled file every
+/// one of whose timestamps sits outside the window is skipped — including any unjudgeable line
+/// it holds, which the row filter would have served under rule 1. Those lines are the
+/// continuations of lines that are themselves outside the window, so skipping them keeps the
+/// bundle's window honest; a `?file=` read of the same file still serves them, because there
+/// the caller named the file.
+///
+/// Two asymmetries, each because of what a file can still become:
+/// - a file the writer holds open (`rolled: false`) only ever grows **newer**, so its recorded
+///   `last_ts` cannot rule it out of a window that is still open;
+/// - a file with no parseable bound at either end is unjudgeable and is read.
+fn file_in_window(file: &Value, from_ms: Option<i64>, to_ms: Option<i64>) -> bool {
+    let ts = |key: &str| {
+        file[key]
+            .as_str()
+            .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+            .map(|t| t.timestamp_millis())
     };
-    let next_offset = page
-        .has_more
-        .then(|| offset.saturating_add(page.lines.len()));
-    Json(json!({
-        "file": label,
-        "format": format,
-        // The file is authoritative and it *is* deduped when the knob is on; the SSE tail
-        // PR4 adds marks itself `false`. Saying so in the envelope is what keeps an operator
-        // from reading a collapsed run as a gap (§6, F21).
-        "dedup": state.logs.dedup,
-        "offset": offset,
-        "limit": limit,
-        // `null` when this page reached the end of the file. A page may also be cut short of
-        // `limit` by the read path's byte budget, and then this is set even though fewer lines
-        // came back — so paging follows `next_offset` rather than counting.
-        "next_offset": next_offset,
-        "logs": page.lines,
-    }))
-    .into_response()
+    // `rolled` absent is read as "rolled": a node too old to say is not a reason to re-read its
+    // whole history.
+    if file["rolled"].as_bool().unwrap_or(true) {
+        if let (Some(last), Some(from)) = (ts("last_ts"), from_ms) {
+            if last < from {
+                return false;
+            }
+        }
+    }
+    // `to` is exclusive, so a file whose oldest line is at or after it holds nothing.
+    if let (Some(first), Some(to)) = (ts("first_ts"), to_ms) {
+        if first >= to {
+            return false;
+        }
+    }
+    true
+}
+
+/// Lines per page while assembling. Larger than a browser page — nobody is waiting on one
+/// round-trip — and still bounded.
+const DUMP_PAGE: usize = 5_000;
+
+/// Ask one node — this driver, or a worker over Flight.
+async fn ask_node(
+    state: &RestState,
+    endpoint: Option<&str>,
+    query: &crate::logging::LogQuery,
+) -> Result<Value, crate::logging::LogError> {
+    match endpoint {
+        Some(endpoint) => federate(endpoint, query, state.status_token.as_deref()).await,
+        None => {
+            let view = state.logs.clone();
+            let ring = state.log_buffer.clone();
+            let query = query.clone();
+            tokio::task::spawn_blocking(move || crate::logging::answer(&query, &view, &ring))
+                .await
+                .unwrap_or_else(|e| {
+                    Err(crate::logging::LogError {
+                        status: 500,
+                        message: format!("reading the log file panicked: {e}"),
+                    })
+                })
+        }
+    }
+}
+
+/// `GET /api/v1/logs/dump/{dump_id}` — collect a bundle (§6b).
+///
+/// Four answers, and each is a distinct fact: `202` it is still assembling, `200` here it is,
+/// the assembly's own status (`507` past a cap) with its reason, or `404` no such dump. A
+/// half-assembled bundle is never served as a whole one.
+async fn get_dump(
+    State(state): State<RestState>,
+    headers: header::HeaderMap,
+    Path(dump_id): Path<String>,
+) -> Response {
+    if let Some(denied) =
+        oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), &headers)
+    {
+        return denied;
+    }
+    let Some(dumps) = state.dumps.clone() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "this node writes no dumps (OXIDANT_HISTORY=off)",
+        );
+    };
+    match dumps.get(&dump_id) {
+        None => error_response(StatusCode::NOT_FOUND, "unknown dump id"),
+        Some(crate::logging::DumpState::Building) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "dumpId": dump_id, "status": "building" })),
+        )
+            .into_response(),
+        Some(crate::logging::DumpState::Failed(e)) => log_error_response(&e),
+        Some(crate::logging::DumpState::Ready { path, bytes, .. }) => {
+            // **Streamed, never buffered.** A bundle may be a gigabyte, and the driver's whole
+            // result budget is 512 MiB; reading it into a `Vec<u8>` to hand to axum would be the
+            // same unbounded read `?file=`'s page cap exists to avoid, one route along.
+            let body = axum::body::Body::from_stream(dump_chunks(path));
+            (
+                StatusCode::OK,
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        "application/vnd.apache.parquet".to_string(),
+                    ),
+                    (header::CONTENT_LENGTH, bytes.to_string()),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{dump_id}.parquet\""),
+                    ),
+                ],
+                body,
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Bytes of a bundle, in bounded chunks off the reactor.
+const DUMP_CHUNK: usize = 64 * 1024;
+
+/// Where a download is: not opened yet, or holding the one handle it will use throughout.
+enum DumpRead {
+    /// The first poll opens the file — off the reactor, like every other read here.
+    Unopened(std::path::PathBuf),
+    /// **One handle for the whole download.** It used to `open` + `seek` per chunk, which is
+    /// 16,384 round-trips for a 1 GiB bundle and, worse, is not atomic: the sweeper's 24 h TTL
+    /// can unlink the bundle at any moment, and it does not have to wait for a lull. Between two
+    /// chunks the next `open` would then fail — after `Content-Length` had already promised the
+    /// whole file — and the reader would get a truncated download reported as a stream error.
+    /// Holding the descriptor makes the download atomic with respect to retention on POSIX: the
+    /// bytes stay readable until the last one is served, whatever the sweeper does to the name.
+    Open(std::fs::File),
+}
+
+fn dump_chunks(
+    path: std::path::PathBuf,
+) -> impl futures::Stream<Item = Result<Vec<u8>, std::io::Error>> {
+    futures::stream::unfold(Some(DumpRead::Unopened(path)), |st| async move {
+        let state = st?;
+        let read = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            // Sequential reads advance the handle's own offset, so there is no seek to get
+            // wrong either.
+            let mut file = match state {
+                DumpRead::Unopened(path) => std::fs::File::open(&path)?,
+                DumpRead::Open(file) => file,
+            };
+            let mut buf = vec![0u8; DUMP_CHUNK];
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                match file.read(&mut buf[filled..])? {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+            buf.truncate(filled);
+            Ok::<_, std::io::Error>((file, buf))
+        })
+        .await;
+        match read {
+            Ok(Ok((_, buf))) if buf.is_empty() => None,
+            Ok(Ok((file, buf))) => Some((Ok(buf), Some(DumpRead::Open(file)))),
+            Ok(Err(e)) => Some((Err(e), None)),
+            Err(e) => Some((
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("dump read panicked: {e}"),
+                )),
+                None,
+            )),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2813,6 +3835,7 @@ mod tests {
     use std::sync::MutexGuard;
 
     use super::*;
+    use crate::logging::MAX_LOG_LINES;
     use axum::body::Body;
     use http_body_util::BodyExt;
     use oxidant_proto::spark::connect as sc;
@@ -2841,6 +3864,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         };
         (guard, state.clone(), app(state))
     }
@@ -2861,6 +3885,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         };
         (guard, state.clone(), app(state))
     }
@@ -3125,6 +4150,7 @@ mod tests {
                 dedup,
             },
             status_token: Some(LOGS_TOKEN.into()),
+            dumps: None,
         };
         (guard, app(state))
     }
@@ -3256,6 +4282,1438 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// A router with `?file=` over a tempdir **and** workers configured, for the federation
+    /// tests. The workers need not be alive: half of what federation owes an operator is what it
+    /// says when one is not.
+    fn logs_state_with_workers(
+        dir: &std::path::Path,
+        workers: Vec<String>,
+    ) -> (MutexGuard<'static, ()>, Router) {
+        let guard = crate::distributed::env_lock();
+        let mut service = OxidantService::new();
+        service.workers = workers;
+        let state = RestState {
+            service: Arc::new(service),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.to_path_buf()),
+                dedup: true,
+            },
+            status_token: Some(LOGS_TOKEN.into()),
+            dumps: None,
+        };
+        (guard, app(state))
+    }
+
+    /// Six lines over three targets and four levels — enough for every filter to have both a
+    /// match and a non-match, and one line the parser cannot decompose.
+    const BROWSE_LINES: [&str; 6] = [
+        "2026-08-23T14:00:00.000Z [INFO] oxidant_execution - message=stage 0 start",
+        "2026-08-23T14:00:01.000Z [WARN] oxidant_connect - message=pool exhausted",
+        "2026-08-23T14:00:02.000Z [ERROR] oxidant_execution::plan - message=stage 0 failed",
+        "2026-08-23T14:00:03.000Z [INFO] oxidant_connect - message=retrying",
+        "   at oxidant_execution::plan (a continuation line)",
+        "2026-08-23T14:00:04.000Z [DEBUG] oxidant_execution - message=stage 0 done",
+    ];
+
+    fn write_browse_log(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), format!("{}\n", BROWSE_LINES.join("\n"))).expect("write");
+    }
+
+    /// **§6b's filters, over the route.** Each one composes, each one answers the same over a
+    /// rolled `.log` and its converted `.parquet`, and passing any of them switches the envelope
+    /// to the newest-first cursor.
+    #[tokio::test]
+    async fn the_log_routes_filter_by_level_target_text_and_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant-2026-08-23.log");
+        write_browse_log(dir.path(), "oxidant-2026-08-24.log");
+        crate::logging::convert_for_test(&dir.path().join("oxidant-2026-08-24.log"))
+            .expect("convert");
+        let (_env, app) = logs_state(dir.path(), true);
+
+        for file in ["2026-08-23", "2026-08-24"] {
+            let (status, body) =
+                get_logs(&app, &format!("/api/v1/logs?file={file}&level=warn")).await;
+            assert_eq!(status, StatusCode::OK, "{file}: {body}");
+            assert_eq!(
+                body["logs"],
+                json!([BROWSE_LINES[1], BROWSE_LINES[2], BROWSE_LINES[4]]),
+                "{file}: a level floor keeps warn AND error, plus the line it cannot judge"
+            );
+            assert!(
+                body.get("offset").is_none(),
+                "{file}: a filter switches to the cursor envelope: {body}"
+            );
+            assert_eq!(body["next_before"], Value::Null, "{file}");
+
+            let (_, body) = get_logs(
+                &app,
+                &format!("/api/v1/logs?file={file}&target=oxidant_connect"),
+            )
+            .await;
+            assert_eq!(
+                body["logs"],
+                json!([BROWSE_LINES[1], BROWSE_LINES[3]]),
+                "{file}: a target prefix, and the unjudgeable line is not in it"
+            );
+
+            let (_, body) = get_logs(&app, &format!("/api/v1/logs?file={file}&q=POOL")).await;
+            assert_eq!(
+                body["logs"],
+                json!([BROWSE_LINES[1]]),
+                "{file}: free text is case-insensitive"
+            );
+
+            let (_, body) = get_logs(
+                &app,
+                &format!(
+                    "/api/v1/logs?file={file}&from={}&to={}",
+                    urlencode("2026-08-23T14:00:01Z"),
+                    urlencode("2026-08-23T14:00:03Z")
+                ),
+            )
+            .await;
+            assert_eq!(
+                body["logs"],
+                json!([BROWSE_LINES[1], BROWSE_LINES[2], BROWSE_LINES[4]]),
+                "{file}: the range is half-open"
+            );
+
+            let (_, body) = get_logs(
+                &app,
+                &format!("/api/v1/logs?file={file}&level=error&target=oxidant_execution&q=failed"),
+            )
+            .await;
+            assert_eq!(
+                body["logs"],
+                json!([BROWSE_LINES[2]]),
+                "{file}: and they compose"
+            );
+        }
+    }
+
+    /// An invalid filter is a `400` that names the value. A filter that silently did nothing
+    /// would be read as "there were no errors" — the one answer a log browser must not invent.
+    #[tokio::test]
+    async fn an_invalid_filter_is_rejected_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant-2026-08-23.log");
+        let (_env, app) = logs_state(dir.path(), true);
+        for (query, needle) in [
+            ("level=loud", "loud"),
+            ("from=yesterday", "yesterday"),
+            ("to=nownow", "nownow"),
+        ] {
+            let (status, body) =
+                get_logs(&app, &format!("/api/v1/logs?file=2026-08-23&{query}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query} -> {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains(needle),
+                "{query} -> {body}"
+            );
+        }
+    }
+
+    /// The backward cursor pages a file exactly once, and `?offset=` still answers PR3's page —
+    /// the released contract is not broken by the route learning a second one.
+    #[tokio::test]
+    async fn the_cursor_pages_backward_and_offset_still_answers_the_old_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let line = |i: usize| {
+            format!("2026-08-23T14:00:00.500Z [INFO] oxidant_execution - message=line {i}")
+        };
+        let body: String = (0..25).map(|i| format!("{}\n", line(i))).collect();
+        std::fs::write(dir.path().join("oxidant-2026-08-23.log"), &body).expect("write");
+        let (_env, app) = logs_state(dir.path(), true);
+
+        // Old shape, untouched: no filter and no cursor is the oldest-first page.
+        let (status, page) = get_logs(&app, "/api/v1/logs?file=2026-08-23&limit=10").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["offset"], 0);
+        assert_eq!(page["next_offset"], 10);
+        assert_eq!(page["logs"][0], line(0));
+        assert!(page.get("next_before").is_none(), "{page}");
+
+        // New shape: `order=desc` asks for the newest page without implying it with a filter.
+        let mut seen: Vec<String> = Vec::new();
+        let mut uri = "/api/v1/logs?file=2026-08-23&limit=10&order=desc".to_string();
+        loop {
+            let (status, page) = get_logs(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            let mut head: Vec<String> = page["logs"]
+                .as_array()
+                .expect("logs")
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            head.extend(seen);
+            seen = head;
+            match page["next_before"].as_u64() {
+                Some(cursor) => {
+                    uri =
+                        format!("/api/v1/logs?file=2026-08-23&limit=10&order=desc&before={cursor}")
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen,
+            (0..25).map(line).collect::<Vec<_>>(),
+            "the pages reassemble the file exactly, with no gap and no repeat"
+        );
+    }
+
+    /// `GET /api/v1/logs/files` is a directory read: what it lists is what exists, and it is
+    /// ordered by `(period end, split)` rather than by name — `.2` sorts *before* the plain name
+    /// lexicographically while being the newer generation.
+    #[tokio::test]
+    async fn the_files_route_lists_what_is_on_disk_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant-2026-08-23.log");
+        write_browse_log(dir.path(), "oxidant-2026-08-23.2.log");
+        write_browse_log(dir.path(), "oxidant-2026-09-01.log");
+        write_browse_log(dir.path(), "oxidant.log");
+        crate::logging::convert_for_test(&dir.path().join("oxidant-2026-09-01.log"))
+            .expect("convert");
+        std::fs::write(dir.path().join("syslog"), b"not ours").expect("write");
+        let (_env, app) = logs_state(dir.path(), true);
+
+        let (status, body) = get_logs(&app, "/api/v1/logs/files").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let files = body["files"].as_array().expect("files");
+        assert_eq!(
+            files.iter().map(|f| &f["file"]).collect::<Vec<_>>(),
+            vec!["current", "2026-09-01", "2026-08-23.2", "2026-08-23"],
+        );
+        assert_eq!(files[0]["rolled"], false);
+        assert_eq!(files[1]["format"], "parquet", "the server picks the form");
+        assert_eq!(files[2]["format"], "text");
+        assert_eq!(files[1]["first_ts"], "2026-08-23T14:00:00.000Z");
+        assert_eq!(files[1]["last_ts"], "2026-08-23T14:00:04.000Z");
+        assert!(files[0]["size_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(body["worker"], "driver");
+    }
+
+    /// The listing and the tail inherit the same gate as `?file=`, for the same reason: they
+    /// reach the same 30 days of every enabled `tracing` field value.
+    #[tokio::test]
+    async fn every_log_route_inherits_the_status_token_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant.log");
+        let _env = crate::distributed::env_lock();
+        let ungated = app(RestState {
+            service: Arc::new(OxidantService::new()),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.path().to_path_buf()),
+                dedup: true,
+            },
+            status_token: None,
+            dumps: None,
+        });
+        for route in [
+            "/api/v1/logs",
+            "/api/v1/logs/files",
+            "/api/v1/logs/tail",
+            "/api/v1/logs/workers",
+        ] {
+            assert_eq!(
+                get_json(&ungated, route).await.0,
+                StatusCode::NOT_FOUND,
+                "{route}: unset OXIDANT_STATUS_TOKEN means the route does not exist"
+            );
+        }
+    }
+
+    /// **The SSRF gate.** `?worker=` names an id from this driver's own configuration; it never
+    /// names an address. Letting it would turn the driver into a request forwarder for anything
+    /// its network can reach, on a route whose token an operator pastes into a monitoring page.
+    #[tokio::test]
+    async fn the_worker_parameter_only_accepts_configured_workers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant.log");
+        let (_env, app) =
+            logs_state_with_workers(dir.path(), vec!["http://10.0.0.7:50051".to_string()]);
+        for hostile in [
+            "169.254.169.254",
+            "127.0.0.1:1",
+            "http://evil.example.com",
+            "10.0.0.7:50052",
+        ] {
+            let (status, body) = get_logs(
+                &app,
+                &format!("/api/v1/logs?file=current&worker={}", urlencode(hostile)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{hostile} -> {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains("unknown worker"),
+                "{hostile} -> {body}"
+            );
+            // And it names the workers that *are* configured, so the caller can fix it.
+            assert!(
+                body["error"].as_str().unwrap().contains("10.0.0.7:50051"),
+                "{hostile} -> {body}"
+            );
+        }
+        // `driver` is a member of the picker, not a special case above it.
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=current&worker=driver").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["worker"], "driver");
+    }
+
+    /// **A download is atomic with respect to retention.**
+    ///
+    /// `dump_chunks` reopened the file and seeked to the offset for every 64 KiB — 16,384
+    /// `open` + `seek` + `spawn_blocking` round-trips for a 1 GiB bundle, and not merely
+    /// wasteful: a bundle's 24 h TTL can expire between two chunks, and the sweeper does not
+    /// wait for a lull. The next `open` then failed *after* `Content-Length` had promised the
+    /// whole file, so the operator got a truncated bundle reported as a stream error. Holding
+    /// the descriptor is what POSIX gives for free.
+    #[tokio::test]
+    async fn a_download_survives_the_sweeper_unlinking_the_bundle_under_it() {
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bundle.parquet");
+        let body: Vec<u8> = (0..DUMP_CHUNK * 3 + 17).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &body).expect("write");
+
+        let mut chunks = Box::pin(dump_chunks(path.clone()));
+        let mut got = chunks
+            .next()
+            .await
+            .expect("a first chunk")
+            .expect("the first read");
+        assert_eq!(got.len(), DUMP_CHUNK, "bounded chunks, off the reactor");
+
+        // The TTL lands mid-download, which is the whole point: the reader is holding a
+        // `Content-Length` for bytes that no longer have a name.
+        std::fs::remove_file(&path).expect("unlink");
+
+        while let Some(chunk) = chunks.next().await {
+            got.extend(chunk.expect("the rest of a download that was already promised"));
+        }
+        assert_eq!(
+            got, body,
+            "every byte, from the handle the download opened once"
+        );
+    }
+
+    /// **A follow shows what a node is writing now, and never substitutes another source.**
+    ///
+    /// `worker_tail` overrode `file` to `current` unconditionally, so **Node = worker, File =
+    /// memory ring** painted the page out of the worker's in-memory ring and appended the tail
+    /// out of the worker's `oxidant.log` — two sources with different dedup semantics
+    /// concatenated into one pane, under an `open` event asserting `"dedup": true` about a ring
+    /// that is never deduped. On a worker with `OXIDANT_LOG_ROLL=off` the substitution polled a
+    /// file that does not exist, so the stream emitted an `error` every 2 s forever under a
+    /// caption reading "following".
+    ///
+    /// The ring is followable on the **driver** and only there: the driver's tail is the
+    /// `tracing` broadcast, which is the stream the ring holds. A worker's is a `?file=` poll,
+    /// and a rolling buffer has no forward cursor to poll (F9).
+    #[test]
+    fn a_worker_tail_follows_what_the_caller_named_or_refuses_to_follow_at_all() {
+        assert!(
+            check_tail_source(None, None).is_ok(),
+            "the driver's ring *is* its tracing stream, and that is what driver_tail follows"
+        );
+        assert!(check_tail_source(None, Some("current")).is_ok());
+        assert!(check_tail_source(Some("w1"), Some("current")).is_ok());
+
+        let refusal = check_tail_source(Some("w1"), None).expect_err("a worker's ring");
+        assert!(
+            refusal.contains("w1") && refusal.contains("file=current"),
+            "the refusal must name the node and the value that works: {refusal}"
+        );
+        assert!(
+            refusal.contains("rolling buffer"),
+            "and say why, since the driver's ring *is* followable: {refusal}"
+        );
+
+        for rolled in ["2026-08-23", "2026-08-23.2", "2026-W34"] {
+            for worker in [None, Some("w1")] {
+                let refusal =
+                    check_tail_source(worker, Some(rolled)).expect_err("a rolled file: {rolled}");
+                assert!(
+                    refusal.contains(rolled) && refusal.contains("never grow"),
+                    "a rolled file is not followable on any node: {refusal}"
+                );
+            }
+        }
+
+        // And the query the follow actually issues carries the caller's file rather than one of
+        // its own choosing — the line that made the substitution possible.
+        let follow = Follow {
+            token: None,
+            endpoint: "unused".to_string(),
+            params: LogsParams {
+                worker: Some("w1".to_string()),
+                file: Some("current".to_string()),
+                ..Default::default()
+            },
+            after: Some(7),
+            started: true,
+        };
+        assert_eq!(follow.query().file.as_deref(), Some("current"));
+    }
+
+    /// **A failed poll leaves the cursor alone.** The arm that handles it used to say
+    /// `st.after = st.after.or(Some(0))` under the comment "seed the cursor so a recovered
+    /// worker resumes rather than replaying" — but it is only reached when the cursor is
+    /// *unset*, which is exactly the first poll, which is exactly the poll issued the moment a
+    /// worker goes down or against one already down. `Some(0)` is the replay: the recovered
+    /// worker's whole live file, 500 rows per 2 s tick, under a caption reading "following".
+    #[test]
+    fn a_worker_that_comes_back_resumes_at_the_end_of_its_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body: String = (0..5_000)
+            .map(|i| {
+                format!(
+                    "2026-08-23T14:00:00.000Z [INFO] oxidant_execution - message=old line {i}\n"
+                )
+            })
+            .collect();
+        std::fs::write(dir.path().join(crate::history::disk::LIVE_LOG), &body).expect("write");
+        let view = LogView {
+            dir: Some(dir.path().to_path_buf()),
+            dedup: true,
+        };
+        let ring = LogBuffer::new(MAX_LOG_LINES);
+
+        // The pane is opened against a worker that is already down, so the *first* poll fails.
+        let mut follow = Follow {
+            token: None,
+            endpoint: "unused".to_string(),
+            // `file` is the caller's, not an override the follow applies for itself — see
+            // `check_tail_source`, which is why every worker follow reaching here says
+            // `current`.
+            params: LogsParams {
+                file: Some("current".to_string()),
+                ..Default::default()
+            },
+            after: None,
+            started: false,
+        };
+        follow.started = true;
+        follow.absorb_failure();
+        assert_eq!(
+            follow.after, None,
+            "a failed poll must not invent a cursor — least of all row 0"
+        );
+
+        // The worker comes back. The next poll is the seed, and it replays nothing.
+        let query = follow.query();
+        assert_eq!(query.after, Some(u64::MAX), "the retry re-seeds at the end");
+        let step = follow.absorb(&crate::logging::answer(&query, &view, &ring).expect("answer"));
+        assert_eq!(
+            step,
+            TailStep::Idle,
+            "no line of the 5,000 already on disk is replayed"
+        );
+        assert_eq!(
+            follow.after,
+            Some(5_000),
+            "and the follow resumes at the end of the file, not at row 0"
+        );
+
+        // What the old spelling did, for contrast: every one of those rows, a page at a time.
+        let mut replaying = Follow {
+            token: None,
+            endpoint: "unused".to_string(),
+            params: LogsParams {
+                file: Some("current".to_string()),
+                ..Default::default()
+            },
+            after: Some(0),
+            started: true,
+        };
+        let step =
+            replaying.absorb(&crate::logging::answer(&replaying.query(), &view, &ring).unwrap());
+        assert!(
+            matches!(step, TailStep::Lines(lines) if lines.len() == TAIL_PAGE),
+            "a cursor of 0 walks the file from the top, which is what this test exists to stop"
+        );
+    }
+
+    /// **A followed worker never sees a line twice**, however selective the filter — the one
+    /// property a follow has, and the one the seeding poll broke twice over.
+    ///
+    /// The seed asked for `order=desc&limit=200` and emitted the answer as a `lines` frame,
+    /// which the pane appends *after* having just painted the newest 500 lines of the same file.
+    /// Worse, the cursor it derived from that page was `next_before + lines.len()` — a **match**
+    /// position plus a match **count**. `ForwardPage`'s doc states the rule verbatim: a cursor
+    /// built from the last match re-reads, and re-emits, every non-matching row after it on
+    /// every poll. On a file with 10,000 rows and five errors, `level=error` re-printed those
+    /// five errors every 2 s, forever, and the tighter the filter the worse it got.
+    ///
+    /// Driven against the real read path — `logging::answer` over a real file — because the
+    /// arithmetic is only wrong in combination with what a page actually returns.
+    #[tokio::test]
+    async fn a_filtered_follow_emits_each_match_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A live file whose matches are sparse and *late*: the shape that makes a match
+        // position and a scan position disagree by thousands of rows.
+        let mut body = String::new();
+        for i in 0..2_000 {
+            let level = if i >= 1_500 && i % 100 == 0 {
+                "ERROR"
+            } else {
+                "INFO"
+            };
+            body.push_str(&format!(
+                "2026-08-23T14:00:00.000Z [{level}] oxidant_execution - message=line {i}\n"
+            ));
+        }
+        std::fs::write(dir.path().join(crate::history::disk::LIVE_LOG), &body).expect("write");
+        let view = LogView {
+            dir: Some(dir.path().to_path_buf()),
+            dedup: true,
+        };
+        let ring = LogBuffer::new(MAX_LOG_LINES);
+        // The worker's side of the Flight hop, without the hop.
+        let node = |query: &crate::logging::LogQuery| {
+            crate::logging::answer(query, &view, &ring).expect("the node answers")
+        };
+
+        let mut follow = Follow {
+            token: None,
+            endpoint: "unused".to_string(),
+            params: LogsParams {
+                worker: Some("10.0.0.7:50051".to_string()),
+                file: Some("current".to_string()),
+                level: Some("error".to_string()),
+                ..Default::default()
+            },
+            after: None,
+            started: false,
+        };
+
+        // Poll 1 — the seed. It is a *position*: no lines, and the cursor is the end of the file.
+        let seeded = follow.absorb(&node(&follow.query()));
+        assert_eq!(
+            seeded,
+            TailStep::Idle,
+            "the seed emits nothing: the pane has already painted this file"
+        );
+        assert_eq!(
+            follow.after,
+            Some(2_000),
+            "and it names the end of the file, not the last match"
+        );
+
+        // Nothing has been appended, so every further poll is silent.
+        for tick in 0..3 {
+            assert_eq!(
+                follow.absorb(&node(&follow.query())),
+                TailStep::Idle,
+                "tick {tick}: a quiet file emits nothing"
+            );
+            assert_eq!(follow.after, Some(2_000), "tick {tick}: and does not move");
+        }
+
+        // Append one more error, with a thousand non-matching rows after it.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(crate::history::disk::LIVE_LOG))
+                .expect("open");
+            writeln!(
+                file,
+                "2026-08-23T14:00:01.000Z [ERROR] oxidant_execution - message=the new one"
+            )
+            .expect("append");
+            for i in 0..1_000 {
+                writeln!(
+                    file,
+                    "2026-08-23T14:00:02.000Z [INFO] oxidant_execution - message=after {i}"
+                )
+                .expect("append");
+            }
+        }
+
+        let mut emitted: Vec<String> = Vec::new();
+        for _ in 0..5 {
+            if let TailStep::Lines(lines) = follow.absorb(&node(&follow.query())) {
+                emitted.extend(lines);
+            }
+        }
+        assert_eq!(
+            emitted,
+            vec!["2026-08-23T14:00:01.000Z [ERROR] oxidant_execution - message=the new one"],
+            "the appended match, once — not once per poll"
+        );
+        assert_eq!(
+            follow.after,
+            Some(3_001),
+            "the cursor is the scan position: past the thousand rows that did not match"
+        );
+    }
+
+    /// **And the list it matches against is not settable by a Connect client.**
+    ///
+    /// `workers_from_config` lets `spark.oxidant.workers` win — that is how per-session worker
+    /// pinning works — and it reads one *process-global* map that the Spark Connect `Config`/`Set`
+    /// RPC writes into unconditionally, on an unauthenticated port. So the id-not-address
+    /// discipline above was gated behind a value any client could choose: one
+    /// `spark.conf.set("spark.oxidant.workers", "attacker.internal:80")` and the driver would
+    /// open an HTTP/2 connection from inside its own network the next time a token holder loaded
+    /// the Observability page — and the *real* workers would vanish from the picker and from
+    /// `POST /api/v1/logs/dump {"worker":"all"}`, which is precisely the bundle-that-omits-the-node
+    /// failure the manifest exists to prevent.
+    #[tokio::test]
+    async fn a_connect_client_cannot_add_a_worker_the_log_routes_will_dial() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant.log");
+        let guard = crate::distributed::env_lock();
+        std::env::remove_var("OXIDANT_WORKERS");
+        std::env::remove_var("OXIDANT_WORKER_SERVICE");
+        let mut service = OxidantService::new();
+        service.workers = vec!["http://10.0.0.7:50051".to_string()];
+        // What any client reaching the Connect port can do, verbatim.
+        service.config.lock().expect("config").insert(
+            "spark.oxidant.workers".to_string(),
+            "attacker.internal:80".to_string(),
+        );
+        let service = Arc::new(service);
+        let app = app(RestState {
+            service: service.clone(),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.path().to_path_buf()),
+                dedup: true,
+            },
+            status_token: Some(LOGS_TOKEN.into()),
+            dumps: None,
+        });
+        assert_eq!(
+            service.workers_from_config(),
+            vec!["http://attacker.internal:80".to_string()],
+            "query routing still honours the session pin — that half is deliberate"
+        );
+
+        // The picker lists the deployment, not the pin.
+        let (status, body) = get_logs(&app, "/api/v1/logs/workers").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<String> = body["workers"]
+            .as_array()
+            .expect("workers")
+            .iter()
+            .map(|w| w["worker_id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["driver".to_string(), "10.0.0.7:50051".to_string()],
+            "the real worker is still there and the injected one is not: {body}"
+        );
+
+        // And the injected id is not dialable.
+        let (status, body) = get_logs(
+            &app,
+            "/api/v1/logs?file=current&worker=attacker.internal:80",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("unknown worker"),
+            "{body}"
+        );
+        // The real worker is still resolvable, so this is a filter and not a blanket refusal.
+        let (status, body) =
+            get_logs(&app, "/api/v1/logs?file=current&worker=10.0.0.7:50051").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "the configured worker is dialed and unreachable, which is a different answer: {body}"
+        );
+        drop(guard);
+    }
+
+    /// **An unreachable worker is reported, never skipped** (§6b, §9). Silence would read as
+    /// "this worker logged nothing", which is exactly the opposite of what happened.
+    #[tokio::test]
+    async fn an_unreachable_worker_is_reported_with_its_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant.log");
+        // A port nothing is listening on — taken and released, so it is genuinely dead rather
+        // than someone else's service.
+        let dead = ephemeral_port();
+        let (_env, app) =
+            logs_state_with_workers(dir.path(), vec![format!("http://127.0.0.1:{dead}")]);
+
+        let (status, body) = get_logs(
+            &app,
+            &format!("/api/v1/logs?file=current&worker=127.0.0.1:{dead}"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "an unreachable worker is a named failure, not an empty page: {body}"
+        );
+        let error = body["error"].as_str().expect("a reason");
+        assert!(error.contains(&dead.to_string()), "{error}");
+        assert!(
+            body.get("logs").is_none(),
+            "and it never comes back as zero lines: {body}"
+        );
+
+        let (status, body) = get_logs(&app, "/api/v1/logs/workers").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let workers = body["workers"].as_array().expect("workers");
+        assert_eq!(workers[0]["worker_id"], "driver");
+        assert_eq!(workers[0]["reachable"], true);
+        assert_eq!(workers[1]["worker_id"], format!("127.0.0.1:{dead}"));
+        assert_eq!(
+            workers[1]["reachable"], false,
+            "listed with reachable:false, not dropped from the picker: {body}"
+        );
+        assert!(
+            workers[1]["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "with a reason: {body}"
+        );
+    }
+
+    /// A driver with no workers says so, rather than answering `unknown worker` and leaving the
+    /// operator hunting for a typo in a list that does not exist.
+    #[tokio::test]
+    async fn a_driver_with_no_workers_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant.log");
+        let (_env, app) = logs_state(dir.path(), true);
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=current&worker=w1").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("no workers configured"),
+            "{body}"
+        );
+        let (_, body) = get_logs(&app, "/api/v1/logs/workers").await;
+        assert_eq!(
+            body["workers"].as_array().expect("workers").len(),
+            1,
+            "the driver is always in the picker: {body}"
+        );
+    }
+
+    /// **A one-sided upper bound is a refusal, not "since the epoch".**
+    ///
+    /// `to` alone fell through to `from = 1970-01-01`, so `{"to": "…"}` bundled the *entire*
+    /// retention on every node — which is exactly the request the last-hour default exists to
+    /// keep an empty body from making, reached by supplying one field instead of none. It is
+    /// also the expensive direction: a dump reads what its window names (F2), so the mistake
+    /// costs the whole retention decoded on every node before the 1 GiB cap refuses it — the
+    /// "correct and useless" refusal the default was introduced to avoid.
+    ///
+    /// `from` alone is a different shape and still works: its open end is `now`.
+    #[tokio::test]
+    async fn a_dump_window_with_only_an_upper_bound_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        let dumps = dir.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("logs");
+        std::fs::write(
+            logs.join(crate::history::disk::LIVE_LOG),
+            "2026-08-23T14:00:00.000Z [INFO] oxidant_execution - message=a line\n",
+        )
+        .expect("write");
+        let (_guard, app) = dump_state(&logs, &dumps, Vec::new(), 1 << 30, 1 << 20);
+
+        let (status, body) = post_dump(&app, json!({ "to": "2026-08-23T15:00:00Z" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let refusal = body["error"].as_str().unwrap_or_default();
+        assert!(
+            refusal.contains("`from`") && refusal.contains("last hour"),
+            "the refusal must name what to supply and what omitting both means: {refusal}"
+        );
+        assert!(
+            refusal.contains("OXIDANT_LOG_KEEP_DAYS"),
+            "and what it would otherwise have cost: {refusal}"
+        );
+
+        // A malformed `to` is still reported as malformed rather than as the pairing rule: the
+        // caller has two things wrong and the parse error is the one they can act on first.
+        let (status, body) = post_dump(&app, json!({ "to": "yesterday" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("RFC-3339"),
+            "{body}"
+        );
+
+        // `from` alone keeps working, and the `202` echoes the window it resolved to.
+        let (status, body) = post_dump(&app, json!({ "from": "2026-08-23T13:00:00Z" })).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["from"], "2026-08-23T13:00:00Z");
+        assert!(
+            body["to"].as_str().unwrap_or_default() > "2026-08-23T13:00:00Z",
+            "its open end is `now`, which is bounded by the instant supplied: {body}"
+        );
+
+        // And so does neither, which is the documented last hour.
+        let (status, body) = post_dump(&app, json!({})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let from = body["from"].as_str().expect("from").to_string();
+        let to = body["to"].as_str().expect("to").to_string();
+        let span = chrono::DateTime::parse_from_rfc3339(&to).expect("to")
+            - chrono::DateTime::parse_from_rfc3339(&from).expect("from");
+        assert_eq!(span.num_seconds(), DEFAULT_DUMP_WINDOW.as_secs() as i64);
+    }
+
+    /// A router with a real `dumps/` directory behind it — §6b's one sanctioned copy.
+    fn dump_state(
+        logs: &std::path::Path,
+        dumps: &std::path::Path,
+        workers: Vec<String>,
+        disk_max_bytes: u64,
+        dump_max_bytes: u64,
+    ) -> (MutexGuard<'static, ()>, Router) {
+        let guard = crate::distributed::env_lock();
+        let mut cfg = crate::history::HistoryConfig::for_root(logs.parent().unwrap_or(logs));
+        cfg.logs_dir = logs.to_path_buf();
+        cfg.dumps_dir = dumps.to_path_buf();
+        cfg.disk_max_bytes = disk_max_bytes;
+        cfg.disk_min_free_bytes = 0;
+        cfg.mounts_override = Some(Vec::new());
+        cfg.log_dump_max_bytes = dump_max_bytes;
+        let mut service = OxidantService::new();
+        service.workers = workers;
+        let state = RestState {
+            service: Arc::new(service),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(logs.to_path_buf()),
+                dedup: true,
+            },
+            status_token: Some(LOGS_TOKEN.into()),
+            dumps: crate::logging::DumpStore::from_config(&cfg),
+        };
+        (guard, app(state))
+    }
+
+    async fn post_dump(app: &Router, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/logs/dump")
+                    .header(header::AUTHORIZATION, format!("Bearer {LOGS_TOKEN}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// Poll a minted dump id until it stops building. The assembly is a task, so a test that
+    /// asserted on the first `GET` would be asserting on the scheduler.
+    async fn await_dump(app: &Router, id: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        for _ in 0..200 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/api/v1/logs/dump/{id}"))
+                        .header(header::AUTHORIZATION, format!("Bearer {LOGS_TOKEN}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if resp.status() == StatusCode::ACCEPTED {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let bytes = resp
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec();
+            return (status, headers, bytes);
+        }
+        panic!("the dump never left `building`");
+    }
+
+    /// **The one time log bytes move.** A dump assembles the driver's own window into
+    /// `dumps/dump-<uuid>.parquet`, answers `202` with the id, downloads as one queryable table
+    /// with a `node` column, and takes the shape the existing dump prune already recognises.
+    #[tokio::test]
+    async fn a_dump_assembles_a_bounded_bundle_and_downloads() {
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        write_browse_log(&logs, "oxidant-2026-08-23.log");
+        write_browse_log(&logs, "oxidant.log");
+        let (_env, app) = dump_state(&logs, &dumps, Vec::new(), u64::MAX, 1 << 30);
+
+        let (status, body) = post_dump(
+            &app,
+            json!({
+                "worker": "driver",
+                "from": "2026-08-23T00:00:00Z",
+                "to": "2026-08-24T00:00:00Z",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["dumpId"].as_str().expect("a dump id").to_string();
+        assert!(id.starts_with("dump-"), "{id}");
+        assert_eq!(body["status"], "building");
+        assert_eq!(body["from"], "2026-08-23T00:00:00Z");
+        assert_eq!(body["nodes"], json!(["driver"]));
+
+        let (status, headers, bytes) = await_dump(&app, &id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.apache.parquet"
+        );
+        assert!(headers
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains(&id));
+        assert_eq!(
+            bytes.len(),
+            headers
+                .get(header::CONTENT_LENGTH)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
+            "the streamed body is the whole file"
+        );
+
+        // One table, and the rows are labelled with the node they came from.
+        // Reopened from what the *route* streamed, not from the file on disk: the assertion is
+        // that a caller who downloads a bundle gets a readable Parquet.
+        let downloaded = root.path().join("downloaded.parquet");
+        std::fs::write(&downloaded, &bytes).expect("write");
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&downloaded).unwrap())
+                .expect("builder")
+                .build()
+                .expect("reader");
+        let mut nodes: Vec<String> = Vec::new();
+        let mut targets: Vec<String> = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("batch");
+            let node = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<oxidant_loom::arrow::array::StringArray>()
+                .expect("node");
+            let target = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<oxidant_loom::arrow::array::StringArray>()
+                .expect("target");
+            for i in 0..batch.num_rows() {
+                nodes.push(node.value(i).to_string());
+                targets.push(target.value(i).to_string());
+            }
+        }
+        assert!(!nodes.is_empty(), "the bundle has rows");
+        assert!(nodes.iter().all(|n| n == "driver"), "{nodes:?}");
+        assert!(
+            targets.iter().any(|t| t == "oxidant.dump"),
+            "the manifest is in the bundle, queryable: {targets:?}"
+        );
+        assert!(
+            targets.iter().any(|t| t.starts_with("oxidant_execution")),
+            "and so are the real log rows: {targets:?}"
+        );
+
+        // The file is in `dumps/` under the name the existing prune step recognises.
+        let names: Vec<String> = std::fs::read_dir(&dumps)
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![format!("{id}.parquet")]);
+        assert!(crate::history::disk::is_dump(&names[0]), "{names:?}");
+    }
+
+    /// **A time-windowed dump must prune what it *reads*, not only what it keeps.**
+    ///
+    /// The walk used to list every file in `logs/` and scan each one end to end: the documented
+    /// default is the last hour, and `OXIDANT_LOG_KEEP_DAYS` is 30, so an empty-bodied
+    /// `POST /api/v1/logs/dump` fully decoded a month of every node's history — 5,000 rows a
+    /// round-trip, over Flight — to assemble an hour of it. No dump test had more history than
+    /// window, which is why it was invisible.
+    ///
+    /// Observable because of rule 1: a line with no parseable timestamp is *unjudgeable*, so the
+    /// row filter serves it whatever the window. A file that is never opened cannot contribute
+    /// one — which is exactly the coarser, file-level rule [`file_in_window`] documents.
+    #[tokio::test]
+    async fn a_windowed_dump_does_not_read_the_files_outside_its_window() {
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        // A month of retained history. Every day carries a continuation line with no timestamp
+        // of its own — the marker that says whether the file was opened.
+        for day in 1..=30 {
+            let name = format!("oxidant-2026-07-{day:02}.log");
+            std::fs::write(
+                logs.join(&name),
+                format!(
+                    "2026-07-{day:02}T09:00:00.000Z [INFO] oxidant_execution - message=day {day}\n\
+                        at oxidant_execution::plan (continuation of day {day})\n"
+                ),
+            )
+            .expect("write");
+        }
+        // The one day the window is about.
+        std::fs::write(
+            logs.join("oxidant-2026-08-23.log"),
+            "2026-08-23T13:30:00.000Z [ERROR] oxidant_execution - message=the incident\n   \
+             at oxidant_execution::plan (continuation of the incident)\n",
+        )
+        .expect("write");
+        let (_env, app) = dump_state(&logs, &dumps, Vec::new(), u64::MAX, 1 << 30);
+
+        let (status, body) = post_dump(
+            &app,
+            json!({
+                "worker": "driver",
+                "from": "2026-08-23T13:00:00Z",
+                "to": "2026-08-23T14:00:00Z",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["dumpId"].as_str().expect("a dump id").to_string();
+        let (status, _, bytes) = await_dump(&app, &id).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let downloaded = root.path().join("bundle.parquet");
+        std::fs::write(&downloaded, &bytes).expect("write");
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&downloaded).unwrap())
+                .expect("builder")
+                .build()
+                .expect("reader");
+        let mut messages: Vec<String> = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("batch");
+            let message = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<oxidant_loom::arrow::array::StringArray>()
+                .expect("message");
+            for i in 0..batch.num_rows() {
+                if message.is_valid(i) {
+                    messages.push(message.value(i).to_string());
+                }
+            }
+        }
+        assert!(
+            messages.iter().any(|m| m.contains("the incident")),
+            "the window's own rows are in the bundle: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("continuation of the incident")),
+            "including the unjudgeable continuation of a line inside the window: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("continuation of day")),
+            "but no line from a file the window puts wholly outside — those files are never \
+             opened: {messages:?}"
+        );
+    }
+
+    /// The listing carries `first_ts`/`last_ts`, and that is all the dump needs to decide
+    /// whether to open a file. The two asymmetries are the ones that matter: a live file only
+    /// grows *newer*, and a file with no parseable bound is unjudgeable and is read.
+    #[test]
+    fn a_file_is_read_only_when_the_window_could_reach_it() {
+        let from = chrono::DateTime::parse_from_rfc3339("2026-08-23T13:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let to = chrono::DateTime::parse_from_rfc3339("2026-08-23T14:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let rolled = |first: Value, last: Value| json!({"file": "x", "rolled": true, "first_ts": first, "last_ts": last});
+        let cases: Vec<(&str, Value, bool)> = vec![
+            (
+                "wholly before the window",
+                rolled(
+                    json!("2026-08-22T00:00:00.000Z"),
+                    json!("2026-08-22T23:59:59.000Z"),
+                ),
+                false,
+            ),
+            (
+                "wholly after the window — `to` is exclusive",
+                rolled(
+                    json!("2026-08-23T14:00:00.000Z"),
+                    json!("2026-08-23T15:00:00.000Z"),
+                ),
+                false,
+            ),
+            (
+                "overlapping at the low end",
+                rolled(
+                    json!("2026-08-23T12:00:00.000Z"),
+                    json!("2026-08-23T13:30:00.000Z"),
+                ),
+                true,
+            ),
+            (
+                "spanning the window",
+                rolled(
+                    json!("2026-08-01T00:00:00.000Z"),
+                    json!("2026-08-31T00:00:00.000Z"),
+                ),
+                true,
+            ),
+            (
+                "no parseable bound at either end is unjudgeable, and is read",
+                rolled(Value::Null, Value::Null),
+                true,
+            ),
+            (
+                "the live file only ever grows newer, so an old `last_ts` cannot rule it out",
+                json!({"file": "current", "rolled": false,
+                       "first_ts": "2026-08-20T00:00:00.000Z",
+                       "last_ts": "2026-08-22T00:00:00.000Z"}),
+                true,
+            ),
+            (
+                "but a live file that starts after the window still holds nothing",
+                json!({"file": "current", "rolled": false,
+                       "first_ts": "2026-08-24T00:00:00.000Z",
+                       "last_ts": "2026-08-24T01:00:00.000Z"}),
+                false,
+            ),
+        ];
+        for (label, file, expected) in cases {
+            assert_eq!(
+                file_in_window(&file, Some(from), Some(to)),
+                expected,
+                "{label}: {file}"
+            );
+        }
+        // An unbounded side never prunes.
+        assert!(file_in_window(
+            &rolled(
+                json!("2020-01-01T00:00:00.000Z"),
+                json!("2020-01-01T01:00:00.000Z")
+            ),
+            None,
+            Some(to)
+        ));
+    }
+
+    /// **A node that could not be reached is named in the bundle, and the dump completes.** A
+    /// support bundle that silently omits the node that died is worse than no bundle: the
+    /// missing node is the one the case is about.
+    #[tokio::test]
+    async fn a_dump_names_the_node_it_could_not_reach_and_still_completes() {
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        write_browse_log(&logs, "oxidant.log");
+        let dead = ephemeral_port();
+        let (_env, app) = dump_state(
+            &logs,
+            &dumps,
+            vec![format!("http://127.0.0.1:{dead}")],
+            u64::MAX,
+            1 << 30,
+        );
+
+        let (status, body) = post_dump(&app, json!({ "worker": "all" })).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(
+            body["nodes"],
+            json!(["driver", format!("127.0.0.1:{dead}")]),
+            "`all` means the driver and every configured worker"
+        );
+        let id = body["dumpId"].as_str().expect("id").to_string();
+
+        let (status, _, bytes) = await_dump(&app, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an unreachable worker does not fail the dump"
+        );
+        let downloaded = root.path().join("downloaded.parquet");
+        std::fs::write(&downloaded, &bytes).expect("write");
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&downloaded).unwrap())
+                .expect("builder")
+                .build()
+                .expect("reader");
+        let mut manifest: Vec<(String, String)> = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("batch");
+            let text = |i: usize| {
+                batch
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<oxidant_loom::arrow::array::StringArray>()
+                    .expect("string column")
+            };
+            let (node, target, message) = (text(0), text(3), text(4));
+            for i in 0..batch.num_rows() {
+                if target.value(i) == "oxidant.dump" {
+                    manifest.push((node.value(i).to_string(), message.value(i).to_string()));
+                }
+            }
+        }
+        assert!(
+            manifest
+                .iter()
+                .any(|(node, msg)| node == "driver" && msg.contains("answered")),
+            "{manifest:?}"
+        );
+        assert!(
+            manifest
+                .iter()
+                .any(|(node, msg)| node == &format!("127.0.0.1:{dead}")
+                    && msg.contains("unreachable")),
+            "the dead worker is named in the bundle, not omitted from it: {manifest:?}"
+        );
+    }
+
+    /// **Refused, not truncated** — and refused on the *request*, so an operator does not learn
+    /// about it when they come back for the file.
+    #[tokio::test]
+    async fn a_dump_that_would_breach_the_disk_budget_is_refused_with_507() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        write_browse_log(&logs, "oxidant.log");
+        // A budget smaller than one dump's reserve.
+        let (_env, app) = dump_state(&logs, &dumps, Vec::new(), 1024, 1 << 20);
+        let (status, body) = post_dump(&app, json!({ "worker": "driver" })).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("OXIDANT_DISK_MAX_BYTES"),
+            "{body}"
+        );
+        assert!(
+            !dumps.exists() || std::fs::read_dir(&dumps).unwrap().next().is_none(),
+            "nothing is written for a refused dump"
+        );
+    }
+
+    /// A dump past `OXIDANT_LOG_DUMP_MAX_BYTES` fails with `507` on collection and publishes no
+    /// bundle: a shorter file an operator would carry to a support case believing it held the
+    /// window they asked for is the outcome the cap exists to prevent.
+    #[tokio::test]
+    async fn a_dump_past_the_byte_cap_reports_507_and_publishes_nothing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        let body: String = (0..40_000)
+            .map(|i| {
+                format!(
+                    "2026-08-23T14:00:00.000Z [INFO] oxidant_execution - message=line {i}, \
+                     payload=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{i}\n"
+                )
+            })
+            .collect();
+        std::fs::write(logs.join("oxidant.log"), body).expect("write");
+        let (_env, app) = dump_state(&logs, &dumps, Vec::new(), u64::MAX, 4096);
+
+        // An explicit window: the default is the last hour, and these lines are dated.
+        let (status, meta) = post_dump(
+            &app,
+            json!({
+                "worker": "driver",
+                "from": "2026-08-23T00:00:00Z",
+                "to": "2026-08-24T00:00:00Z",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{meta}");
+        assert_eq!(meta["maxBytes"], 4096);
+        let id = meta["dumpId"].as_str().expect("id").to_string();
+
+        let (status, _, bytes) = await_dump(&app, &id).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("OXIDANT_LOG_DUMP_MAX_BYTES"),
+            "{body}"
+        );
+        let names: Vec<String> = std::fs::read_dir(&dumps)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(names.is_empty(), "no half-bundle and no .tmp: {names:?}");
+    }
+
+    /// The dump routes inherit the same gate, and a dump id is validated rather than joined —
+    /// the same discipline as `?file=`'s typed period.
+    #[tokio::test]
+    async fn the_dump_routes_are_gated_and_the_id_is_validated() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        write_browse_log(&logs, "oxidant.log");
+        let (_env, app) = dump_state(&logs, &dumps, Vec::new(), u64::MAX, 1 << 20);
+
+        // No credential: `401`, with the scheme advertised, exactly like every other log route.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/logs/dump")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        for hostile in ["dump-not-a-uuid", "..", "dump-", "stmt-x"] {
+            let (status, body) =
+                get_logs(&app, &format!("/api/v1/logs/dump/{}", urlencode(hostile))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{hostile} -> {body}");
+            assert_eq!(body["error"], "unknown dump id", "{hostile}");
+        }
+        // And a bad instant is a `400` on the request, before an id exists.
+        let (status, body) = post_dump(&app, json!({ "from": "yesterday" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap().contains("yesterday"),
+            "{body}"
+        );
+    }
+
+    /// §6b: "the bundle expires after 24 h and is swept like results" — through the prune step
+    /// that shipped in PR2 with its own tests, on the retention pass rather than the pressure
+    /// one, so it holds whether or not the budget is tight.
+    #[test]
+    fn a_dump_expires_after_twenty_four_hours() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dumps = dir.path().join("dumps");
+        std::fs::create_dir_all(&dumps).expect("mkdir");
+        let old = dumps.join("dump-00000000-0000-0000-0000-000000000001.parquet");
+        let fresh = dumps.join("dump-00000000-0000-0000-0000-000000000002.parquet");
+        let foreign = dumps.join("someone-elses-bundle.parquet");
+        for path in [&old, &fresh, &foreign] {
+            std::fs::write(path, vec![0u8; 64]).expect("write");
+        }
+        let now = chrono::Utc::now();
+        let report = disk::prune_expired_dumps(&dumps, crate::logging::DUMP_TTL_SECS, now);
+        assert_eq!(report.expired, 0, "nothing is 24 h old yet");
+        assert!(old.exists() && fresh.exists());
+
+        // Now with a clock 25 h ahead of both files.
+        let later = now + chrono::Duration::hours(25);
+        let report = disk::prune_expired_dumps(&dumps, crate::logging::DUMP_TTL_SECS, later);
+        assert_eq!(report.expired, 2);
+        assert!(report.freed_bytes >= 128);
+        assert!(!old.exists() && !fresh.exists());
+        assert!(
+            foreign.exists(),
+            "a bundle the engine did not write is measured and never unlinked"
+        );
+    }
+
+    /// **One resolver, shared.** The dump store must resolve the data root exactly the way the
+    /// rest of the process does, or every promise made about a bundle is made about a directory
+    /// nothing else looks at.
+    ///
+    /// `OXIDANT_DATA_DIR_PER_PROCESS=1` is `docs/runtime-contract.md`'s recommended setting for
+    /// a container that co-locates a driver and a worker, and it folds `(role, port)` into the
+    /// root. The router used to build its `DumpStore` by reading the environment a *third* time
+    /// with `port = 0`, so bundles landed in `<root>/driver-0/dumps/` while the sweeper pruned
+    /// `<root>/driver-<port>/dumps/`: a support bundle that never expired, was never billed
+    /// against `OXIDANT_DISK_MAX_BYTES`, and whose up-front `507` measured an empty tree.
+    #[test]
+    fn the_dump_store_writes_where_the_sweeper_prunes_under_a_per_process_data_dir() {
+        let _env = crate::distributed::env_lock();
+        let root = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("OXIDANT_DATA_DIR", root.path());
+        std::env::set_var("OXIDANT_DATA_DIR_PER_PROCESS", "1");
+        std::env::remove_var("OXIDANT_HISTORY");
+        std::env::remove_var("OXIDANT_DUMP_DIR");
+        // The port this process really booted on — the one `logging::init` and
+        // `init_statement_store` are handed, and the one the sweeper's config carries.
+        let store = StatementStore::from_env("driver", 50051).expect("store");
+        std::env::remove_var("OXIDANT_DATA_DIR");
+        std::env::remove_var("OXIDANT_DATA_DIR_PER_PROCESS");
+
+        let cfg = store.history_config().expect("a durable store").clone();
+        let dumps = dumps_for(&store).expect("a dump store");
+        assert_eq!(
+            dumps.dir(),
+            cfg.dumps_dir,
+            "a bundle must land in the directory `sweep_disk` prunes"
+        );
+        assert!(
+            cfg.dumps_dir.starts_with(root.path().join("driver-50051")),
+            "and that directory is this process's own: {:?}",
+            cfg.dumps_dir
+        );
+        // The tree `admit()` measures is the tree the budget bills, so the up-front `507` sees
+        // what the engine actually wrote.
+        assert!(
+            disk::budget_roots(&cfg)
+                .iter()
+                .any(|r| dumps.dir().starts_with(r.path())),
+            "the dump directory must sit under a measured budget root: {:?}",
+            disk::budget_roots(&cfg)
+                .iter()
+                .map(|r| r.path().to_path_buf())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// `?file=` inherits the endpoint's gate unchanged — and it matters more than it did: the
     /// route now reaches up to `OXIDANT_LOG_KEEP_DAYS` of every enabled `tracing` field value
     /// rather than a 1000-line ring.
@@ -3274,6 +5732,7 @@ mod tests {
                 dedup: true,
             },
             status_token: None,
+            dumps: None,
         };
         // Unset token: the whole endpoint 404s, `?file=` included.
         assert_eq!(
@@ -3411,6 +5870,7 @@ mod tests {
                 dedup: true,
             },
             status_token: None,
+            dumps: None,
         })
     }
 
@@ -3810,6 +6270,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         };
         let (status, body) = get_json(&app(state), "/api/v1/statements").await;
         assert_eq!(status, StatusCode::OK);
@@ -4095,6 +6556,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         };
         let router = app(state);
         let (status, body) = get_json(&router, &format!("/api/v1/statements/{first}/result")).await;
@@ -4171,6 +6633,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         };
         let router = app(state);
 
@@ -4383,6 +6846,7 @@ mod tests {
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
             logs: LogView::default(),
             status_token: None,
+            dumps: None,
         }
     }
 
