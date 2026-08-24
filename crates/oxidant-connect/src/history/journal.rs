@@ -869,6 +869,51 @@ mod tests {
         journal2.shutdown();
     }
 
+    /// H3 on disk: a statement's `submitted` and `running` records in *different* segments.
+    ///
+    /// Production reaches this when a 64 MiB roll lands between the two appends, which are
+    /// milliseconds apart; two boots reproduce it deterministically, since every boot opens a
+    /// fresh segment. Replay reads segments newest-first, so the `running` record — which carries
+    /// no `sql` and outranks `submitted` — is folded first.
+    #[test]
+    fn a_statement_whose_records_straddle_a_segment_keeps_its_sql() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_for(dir.path());
+        // Boot 1: the `submitted` record, with the SQL.
+        let (journal, _) = Journal::open(&cfg).expect("open");
+        journal.append_retained(submitted("stmt-x", 1));
+        journal.sync_blocking();
+        journal.shutdown();
+        // Boot 2: the `running` record, in the next segment, with no SQL.
+        let (journal, _) = Journal::open(&cfg).expect("reopen");
+        journal.append(running("stmt-x", 1));
+        journal.sync_blocking();
+        journal.shutdown();
+
+        let indexes: Vec<u64> = segments(&cfg.statements_dir)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(indexes, vec![0, 1], "the pair straddles a segment boundary");
+
+        let (journal, mut fold) = Journal::open(&cfg).expect("replay");
+        assert_eq!(
+            fold.statements["stmt-x"].sql, "SELECT 1",
+            "newest-first replay must not lose the SQL"
+        );
+        // And the crash trace §4a promises is complete: failed, with the reason, *and* the SQL
+        // that makes the row worth having.
+        assert_eq!(fold.mark_interrupted(), vec!["stmt-x".to_string()]);
+        let st = &fold.statements["stmt-x"];
+        assert_eq!(st.status, StatementStatus::Failed);
+        assert_eq!(
+            st.error.as_deref(),
+            Some(crate::history::record::INTERRUPTED_BY_RESTART)
+        );
+        assert_eq!(st.sql, "SELECT 1");
+        journal.shutdown();
+    }
+
     #[test]
     fn a_corrupt_tail_is_quarantined_and_boot_continues() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -201,6 +201,41 @@ pub(crate) struct FoldedStatement {
 }
 
 impl FoldedStatement {
+    /// Fill fields still unset from an *older* record, changing nothing already established.
+    ///
+    /// Only absent-in-the-newer-record fields are eligible, and `status` is never among them: the
+    /// newest record's status is the statement's status, whichever order the files were read in.
+    fn backfill(&mut self, rec: JournalRecord) {
+        // `sql` and its encoding travel together — an encoding without its text is a lie about
+        // what is on disk. `submitted` and `snapshot` are the only kinds that carry either.
+        if self.sql.is_empty() {
+            if let Some(sql) = rec.sql {
+                self.sql = sql;
+                if let Some(enc) = rec.sql_encoding {
+                    self.sql_encoding = enc;
+                }
+            }
+        }
+        if self.session.is_none() {
+            self.session = rec.session;
+        }
+        if self.client_op_id.is_none() {
+            self.client_op_id = rec.client_op_id;
+        }
+        if self.error.is_none() {
+            self.error = rec.error;
+        }
+        if self.schema.is_none() {
+            self.schema = rec.schema;
+        }
+        if self.rows.is_none() {
+            self.rows = rec.rows;
+        }
+        if self.duration_ms.is_none() {
+            self.duration_ms = rec.duration_ms;
+        }
+    }
+
     /// The self-contained record compaction writes for this statement.
     pub(crate) fn to_snapshot(&self) -> JournalRecord {
         JournalRecord {
@@ -258,6 +293,17 @@ impl Fold {
         match self.statements.get_mut(&rec.id) {
             Some(existing) => {
                 if (key, rank) < (existing.last_seq, existing.rank) {
+                    // An *older* record for a statement already folded. It cannot change
+                    // anything the newer record established — but it can still supply fields the
+                    // newer record left absent, and that is what makes the fold genuinely
+                    // order-independent (§4c) rather than only correct oldest-first.
+                    //
+                    // The load-bearing case: `mark_running` writes `sql: None` and outranks the
+                    // `submitted` record that carries the SQL. Replay reads newest-first, so with
+                    // the two in different segments the `running` record used to create the entry
+                    // with an empty `sql` and then reject the `submitted` record that had it —
+                    // losing exactly the crash trace §4a exists to provide.
+                    existing.backfill(rec);
                     return;
                 }
                 existing.last_seq = key;
@@ -382,7 +428,14 @@ mod tests {
             rec(RecordKind::Snapshot, "stmt-a", 1, Some(7)),
         ];
         let mut folds = Vec::new();
-        for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0], [2, 0, 1]] {
+        for order in [
+            [0, 1, 2],
+            [2, 1, 0],
+            [1, 2, 0],
+            [2, 0, 1],
+            [1, 0, 2],
+            [0, 2, 1],
+        ] {
             let mut fold = Fold::default();
             for i in order {
                 fold.apply(records[i].clone());
@@ -398,6 +451,59 @@ mod tests {
         );
         assert_eq!(folds[0].0, StatementStatus::Succeeded);
         assert_eq!(folds[0].1, "SELECT 1");
+    }
+
+    /// H3: the pair that actually straddles a segment, with no `Snapshot` to rescue it.
+    ///
+    /// `running` outranks `submitted` and carries no `sql`, so under newest-first replay the
+    /// `running` record created the entry with an empty `sql` and then rejected the `submitted`
+    /// record that had the text. §9 pins the fold as order-independent; the existing
+    /// order-independence test always included the snapshot, which always carried `sql`.
+    #[test]
+    fn a_running_record_folded_before_its_submitted_record_keeps_the_sql() {
+        let records = [
+            rec(RecordKind::Submitted, "stmt-a", 1, None),
+            rec(RecordKind::Running, "stmt-a", 1, None),
+        ];
+        for order in [[0, 1], [1, 0]] {
+            let mut fold = Fold::default();
+            for i in order {
+                fold.apply(records[i].clone());
+            }
+            let st = fold.statements.get("stmt-a").expect("folded");
+            assert_eq!(st.sql, "SELECT 1", "read order {order:?} lost the SQL");
+            assert_eq!(
+                st.status,
+                StatementStatus::Running,
+                "read order {order:?}: the newest record still decides the status"
+            );
+            assert_eq!(st.session.as_deref(), Some("s1"), "read order {order:?}");
+        }
+    }
+
+    /// An older record must not be able to *undo* the newer one it is folded after — backfill
+    /// fills absent fields, it does not overwrite present ones.
+    #[test]
+    fn an_older_record_cannot_overwrite_what_a_newer_one_established() {
+        let mut fold = Fold::default();
+        let mut terminal = rec(RecordKind::Snapshot, "stmt-a", 1, Some(9));
+        terminal.error = Some("boom".to_string());
+        terminal.rows = Some(5);
+        terminal.status = Some(StatementStatus::Failed);
+        fold.apply(terminal);
+
+        let mut older = rec(RecordKind::Submitted, "stmt-a", 1, None);
+        older.error = Some("not this one".to_string());
+        older.rows = Some(999);
+        older.sql = Some("SELECT 'stale'".to_string());
+        fold.apply(older);
+
+        let st = &fold.statements["stmt-a"];
+        assert_eq!(st.status, StatementStatus::Failed);
+        assert_eq!(st.error.as_deref(), Some("boom"));
+        assert_eq!(st.rows, Some(5));
+        assert_eq!(st.sql, "SELECT 1", "the newer record's SQL stands");
+        assert_eq!(st.last_seq, 9, "and the fold key does not go backwards");
     }
 
     #[test]
