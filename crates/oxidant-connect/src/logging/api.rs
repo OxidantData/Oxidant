@@ -135,9 +135,8 @@ pub(crate) fn answer(
     // answered before this route grew filters. Two shapes on one route is the price of not
     // breaking a released contract, and which one you get is decided by what you asked for
     // rather than by a version flag.
-    let backward = query.before.is_some()
-        || query.order.as_deref() == Some("desc")
-        || !filter.is_empty();
+    let backward =
+        query.before.is_some() || query.order.as_deref() == Some("desc") || !filter.is_empty();
     let Some(requested) = query.file.clone() else {
         return Ok(ring_page(ring, &filter, query, limit, backward));
     };
@@ -276,7 +275,10 @@ fn files(view: &LogView) -> Result<Value, LogError> {
 pub(crate) fn install_flight_handler() {
     oxidant_execution::flight::set_log_query_handler(|body| {
         let query: LogQuery = serde_json::from_slice(body)
-            .map_err(|e| serde_json::to_vec(&LogError::new(400, format!("invalid log query: {e}")).to_json()).unwrap_or_else(|_| e.to_string().into_bytes()))
+            .map_err(|e| {
+                serde_json::to_vec(&LogError::new(400, format!("invalid log query: {e}")).to_json())
+                    .unwrap_or_else(|_| e.to_string().into_bytes())
+            })
             .map_err(|bytes| String::from_utf8_lossy(&bytes).into_owned())?;
         match answer(&query, &LogView::process(), &super::buffer()) {
             Ok(v) => serde_json::to_vec(&v).map_err(|e| e.to_string()),
@@ -373,7 +375,10 @@ mod tests {
         .expect_err("must refuse");
         assert_eq!(err.status, 400);
         let wire = serde_json::to_vec(&err.to_json()).expect("encode");
-        assert_eq!(decode_worker_answer(&wire).expect_err("still an error"), err);
+        assert_eq!(
+            decode_worker_answer(&wire).expect_err("still an error"),
+            err
+        );
     }
 
     /// A node with no rolling writer says so, for every `?file=` value, on both transports.

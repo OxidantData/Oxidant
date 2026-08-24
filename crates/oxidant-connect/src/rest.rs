@@ -38,11 +38,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use datafusion::arrow::json::{ArrayWriter, WriterBuilder};
+use futures::StreamExt;
 use oxidant_catalog::DEFAULT_CATALOG;
 use oxidant_loom::arrow::array::Array;
 use oxidant_loom::arrow::record_batch::RecordBatch;
 use oxidant_loom::Engine;
-use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sysinfo::{Pid, System};
@@ -50,7 +50,6 @@ use tokio::sync::{watch, Notify};
 use uuid::Uuid;
 
 use crate::logging::{LogBuffer, LogView};
-
 
 use crate::history::{
     disk, now_rfc3339, rfc3339_from_ms, FoldedStatement, HistoryConfig, HistoryRuntime,
@@ -2802,10 +2801,7 @@ async fn list_log_files(
 /// skipped.** A log browser that quietly drops a node is worse than one that has none: the
 /// operator reads "no errors on worker 2" when what happened is "worker 2 is dead", which is the
 /// error they were looking for.
-async fn list_log_workers(
-    State(state): State<RestState>,
-    headers: header::HeaderMap,
-) -> Response {
+async fn list_log_workers(State(state): State<RestState>, headers: header::HeaderMap) -> Response {
     if let Some(denied) =
         oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), &headers)
     {
@@ -2904,9 +2900,9 @@ fn driver_tail(
     filter: crate::logging::LogFilter,
 ) -> impl futures::Stream<Item = Result<sse::Event, std::convert::Infallible>> {
     let rx = crate::logging::subscribe_tail();
-    let open = sse::Event::default().event("open").data(
-        json!({ "mode": "follow", "worker": "driver", "dedup": false }).to_string(),
-    );
+    let open = sse::Event::default()
+        .event("open")
+        .data(json!({ "mode": "follow", "worker": "driver", "dedup": false }).to_string());
     futures::stream::once(async move { Ok(open) }).chain(futures::stream::unfold(
         (rx, filter),
         |(mut rx, filter)| async move {
@@ -3134,8 +3130,7 @@ async fn local_log_query(state: &RestState, query: crate::logging::LogQuery) -> 
     // **`spawn_blocking`.** Reading a log is `std::fs` I/O plus, for a converted file, a full
     // Parquet decode. Doing that inline on a tokio worker parks a thread that is also serving
     // `ExecutePlan`, for as long as the read takes.
-    match tokio::task::spawn_blocking(move || crate::logging::answer(&query, &view, &ring)).await
-    {
+    match tokio::task::spawn_blocking(move || crate::logging::answer(&query, &view, &ring)).await {
         Ok(Ok(mut value)) => {
             value["worker"] = json!("driver");
             Json(value).into_response()
@@ -3310,9 +3305,8 @@ async fn create_dump(
                         .unwrap_or(now)
                         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
                 }),
-                to.clone().unwrap_or_else(|| {
-                    now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                }),
+                to.clone()
+                    .unwrap_or_else(|| now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             )
         }
     };
@@ -3365,16 +3359,14 @@ fn dump_nodes(
         "driver" => Ok(vec![("driver".to_string(), None)]),
         "all" => {
             let mut nodes = vec![("driver".to_string(), None)];
-            nodes.extend(
-                workers
-                    .iter()
-                    .map(|w| (worker_id(w), Some(w.clone()))),
-            );
+            nodes.extend(workers.iter().map(|w| (worker_id(w), Some(w.clone()))));
             Ok(nodes)
         }
         // One named worker goes through the same gate as `?worker=`: an id from this driver's
         // own configuration, never an address.
-        other => resolve_worker(state, other).map(|endpoint| vec![(other.to_string(), Some(endpoint))]),
+        other => {
+            resolve_worker(state, other).map(|endpoint| vec![(other.to_string(), Some(endpoint))])
+        }
     }
 }
 
@@ -3551,7 +3543,10 @@ async fn get_dump(
             (
                 StatusCode::OK,
                 [
-                    (header::CONTENT_TYPE, "application/vnd.apache.parquet".to_string()),
+                    (
+                        header::CONTENT_TYPE,
+                        "application/vnd.apache.parquet".to_string(),
+                    ),
                     (header::CONTENT_LENGTH, bytes.to_string()),
                     (
                         header::CONTENT_DISPOSITION,
@@ -4126,8 +4121,11 @@ mod tests {
             );
             assert_eq!(body["next_before"], Value::Null, "{file}");
 
-            let (_, body) =
-                get_logs(&app, &format!("/api/v1/logs?file={file}&target=oxidant_connect")).await;
+            let (_, body) = get_logs(
+                &app,
+                &format!("/api/v1/logs?file={file}&target=oxidant_connect"),
+            )
+            .await;
             assert_eq!(
                 body["logs"],
                 json!([BROWSE_LINES[1], BROWSE_LINES[3]]),
@@ -4227,9 +4225,8 @@ mod tests {
             seen = head;
             match page["next_before"].as_u64() {
                 Some(cursor) => {
-                    uri = format!(
-                        "/api/v1/logs?file=2026-08-23&limit=10&order=desc&before={cursor}"
-                    )
+                    uri =
+                        format!("/api/v1/logs?file=2026-08-23&limit=10&order=desc&before={cursor}")
                 }
                 None => break,
             }
@@ -4311,10 +4308,8 @@ mod tests {
     async fn the_worker_parameter_only_accepts_configured_workers() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_browse_log(dir.path(), "oxidant.log");
-        let (_env, app) = logs_state_with_workers(
-            dir.path(),
-            vec!["http://10.0.0.7:50051".to_string()],
-        );
+        let (_env, app) =
+            logs_state_with_workers(dir.path(), vec!["http://10.0.0.7:50051".to_string()]);
         for hostile in [
             "169.254.169.254",
             "127.0.0.1:1",
@@ -4352,10 +4347,8 @@ mod tests {
         // A port nothing is listening on — taken and released, so it is genuinely dead rather
         // than someone else's service.
         let dead = ephemeral_port();
-        let (_env, app) = logs_state_with_workers(
-            dir.path(),
-            vec![format!("http://127.0.0.1:{dead}")],
-        );
+        let (_env, app) =
+            logs_state_with_workers(dir.path(), vec![format!("http://127.0.0.1:{dead}")]);
 
         let (status, body) = get_logs(
             &app,
@@ -4381,8 +4374,7 @@ mod tests {
         assert_eq!(workers[0]["reachable"], true);
         assert_eq!(workers[1]["worker_id"], format!("127.0.0.1:{dead}"));
         assert_eq!(
-            workers[1]["reachable"],
-            false,
+            workers[1]["reachable"], false,
             "listed with reachable:false, not dropped from the picker: {body}"
         );
         assert!(
@@ -4401,7 +4393,10 @@ mod tests {
         let (status, body) = get_logs(&app, "/api/v1/logs?file=current&worker=w1").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(
-            body["error"].as_str().unwrap().contains("no workers configured"),
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("no workers configured"),
             "{body}"
         );
         let (_, body) = get_logs(&app, "/api/v1/logs/workers").await;
@@ -4460,7 +4455,10 @@ mod tests {
             .unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     /// Poll a minted dump id until it stops building. The assembly is a task, so a test that
@@ -4484,7 +4482,13 @@ mod tests {
             }
             let status = resp.status();
             let headers = resp.headers().clone();
-            let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+            let bytes = resp
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec();
             return (status, headers, bytes);
         }
         panic!("the dump never left `building`");
@@ -4626,7 +4630,11 @@ mod tests {
         let id = body["dumpId"].as_str().expect("id").to_string();
 
         let (status, _, bytes) = await_dump(&app, &id).await;
-        assert_eq!(status, StatusCode::OK, "an unreachable worker does not fail the dump");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an unreachable worker does not fail the dump"
+        );
         let downloaded = root.path().join("downloaded.parquet");
         std::fs::write(&downloaded, &bytes).expect("write");
         let reader =
@@ -4658,9 +4666,10 @@ mod tests {
             "{manifest:?}"
         );
         assert!(
-            manifest.iter().any(|(node, msg)| node
-                == &format!("127.0.0.1:{dead}")
-                && msg.contains("unreachable")),
+            manifest
+                .iter()
+                .any(|(node, msg)| node == &format!("127.0.0.1:{dead}")
+                    && msg.contains("unreachable")),
             "the dead worker is named in the bundle, not omitted from it: {manifest:?}"
         );
     }
@@ -4679,7 +4688,10 @@ mod tests {
         let (status, body) = post_dump(&app, json!({ "worker": "driver" })).await;
         assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
         assert!(
-            body["error"].as_str().unwrap().contains("OXIDANT_DISK_MAX_BYTES"),
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("OXIDANT_DISK_MAX_BYTES"),
             "{body}"
         );
         assert!(
@@ -4768,18 +4780,18 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         for hostile in ["dump-not-a-uuid", "..", "dump-", "stmt-x"] {
-            let (status, body) = get_logs(
-                &app,
-                &format!("/api/v1/logs/dump/{}", urlencode(hostile)),
-            )
-            .await;
+            let (status, body) =
+                get_logs(&app, &format!("/api/v1/logs/dump/{}", urlencode(hostile))).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{hostile} -> {body}");
             assert_eq!(body["error"], "unknown dump id", "{hostile}");
         }
         // And a bad instant is a `400` on the request, before an id exists.
         let (status, body) = post_dump(&app, json!({ "from": "yesterday" })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"].as_str().unwrap().contains("yesterday"), "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("yesterday"),
+            "{body}"
+        );
     }
 
     /// §6b: "the bundle expires after 24 h and is swept like results" — through the prune step

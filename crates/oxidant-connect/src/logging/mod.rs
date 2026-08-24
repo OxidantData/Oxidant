@@ -464,15 +464,15 @@ impl LogView {
 /// One bounded page of a log file — see [`columnar::Page`].
 pub(crate) use columnar::Page as LogPage;
 
+/// PR4's one answer, and the Flight federation around it (§6b).
+pub(crate) use api::{answer, decode_worker_answer, LogError, LogQuery};
 /// PR4's read path: the four filters, the backward cursor, and the file listing (§6b).
 pub(crate) use browse::{list_files, CursorPage, ForwardPage, LogFilter};
+/// §6b's sanctioned exception to "logs never move".
+pub(crate) use dump::{DumpState, DumpStore, DUMP_TTL_SECS};
 /// The line parser, for the SSE tail's per-line filter — the one place a filter is applied
 /// to a line that never came off a file.
 pub(crate) use line::parse_line as parse_for_filter;
-/// PR4's one answer, and the Flight federation around it (§6b).
-pub(crate) use api::{answer, decode_worker_answer, LogError, LogQuery};
-/// §6b's sanctioned exception to "logs never move".
-pub(crate) use dump::{DumpState, DumpStore, DUMP_TTL_SECS};
 
 /// One rolled (or live) log file, resolved from a `?file=` value.
 pub(crate) enum LogFile {

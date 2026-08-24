@@ -103,7 +103,11 @@ fn the_driver_federates_a_log_query_over_a_real_worker_and_copies_nothing() {
         .expect("spawn worker");
     let worker_log = worker_root.path().join("logs").join("oxidant.log");
     // Wait for a line *later* than the init line, so there is something distinctive to federate.
-    wait_for_text(&worker_log, "oxidant worker listening on Flight", "the worker");
+    wait_for_text(
+        &worker_log,
+        "oxidant worker listening on Flight",
+        "the worker",
+    );
 
     let connect_port = pick_port();
     let ui_port = pick_port();
@@ -159,14 +163,9 @@ fn the_driver_federates_a_log_query_over_a_real_worker_and_copies_nothing() {
         "the worker's live file: {body}"
     );
     assert_eq!(
-        body["dir"].as_str().map(|d| d.contains(
-            worker_root
-                .path()
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-        )),
+        body["dir"]
+            .as_str()
+            .map(|d| d.contains(worker_root.path().file_name().unwrap().to_str().unwrap())),
         Some(true),
         "and it is the *worker's* directory, not the driver's: {body}"
     );
@@ -258,10 +257,7 @@ fn the_driver_federates_a_log_query_over_a_real_worker_and_copies_nothing() {
             .is_some_and(|e| e.contains(&worker_port.to_string())),
         "and the reason names the node: {body}"
     );
-    assert!(
-        body.get("logs").is_none(),
-        "never an empty page: {body}"
-    );
+    assert!(body.get("logs").is_none(), "never an empty page: {body}");
 
     let (status, body) = get_json(&client, &format!("{base}/api/v1/logs/workers"));
     assert_eq!(status, 200, "{body}");

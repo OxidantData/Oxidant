@@ -472,7 +472,10 @@ mod tests {
             )
             .expect("push");
         let state = writer.finish().expect("finish");
-        let DumpState::Ready { path, rows, nodes, .. } = state else {
+        let DumpState::Ready {
+            path, rows, nodes, ..
+        } = state
+        else {
             panic!("not ready");
         };
         assert_eq!(
@@ -481,7 +484,11 @@ mod tests {
         );
         assert_eq!(nodes.len(), 2);
         assert!(
-            path.file_name().unwrap().to_str().unwrap().starts_with("dump-"),
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("dump-"),
             "the name is the shape `disk::is_dump` already prunes: {path:?}"
         );
         assert!(disk::is_dump(path.file_name().unwrap().to_str().unwrap()));
@@ -557,7 +564,10 @@ mod tests {
         }
         let err = err.expect("the cap must bite");
         assert_eq!(err.status, 507);
-        assert!(err.message.contains("OXIDANT_LOG_DUMP_MAX_BYTES"), "{err:?}");
+        assert!(
+            err.message.contains("OXIDANT_LOG_DUMP_MAX_BYTES"),
+            "{err:?}"
+        );
         drop(writer);
         assert!(
             !store.path_of(&id).unwrap().exists(),

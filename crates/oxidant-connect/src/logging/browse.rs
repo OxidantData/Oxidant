@@ -110,7 +110,9 @@ impl LogFilter {
             match raw.map(str::trim).filter(|s| !s.is_empty()) {
                 Some(v) => chrono::DateTime::parse_from_rfc3339(v)
                     .map(|t| Some(t.timestamp_millis()))
-                    .map_err(|e| format!("invalid {name} `{v}`: expected an RFC-3339 instant ({e})")),
+                    .map_err(|e| {
+                        format!("invalid {name} `{v}`: expected an RFC-3339 instant ({e})")
+                    }),
                 None => Ok(None),
             }
         };
@@ -135,8 +137,11 @@ impl LogFilter {
     ///
     /// Rule 1 lives here: a `None` level or `None` ts is *unjudgeable*, and unjudgeable passes.
     pub(crate) fn keeps(&self, parsed: &ParsedLine, rendered: &str) -> bool {
-        self.keeps_pushdown(parsed.ts_ms, parsed.level.as_deref(), parsed.target.as_deref())
-            && self.keeps_text(rendered)
+        self.keeps_pushdown(
+            parsed.ts_ms,
+            parsed.level.as_deref(),
+            parsed.target.as_deref(),
+        ) && self.keeps_text(rendered)
     }
 
     /// Everything but `q`, against the three columns the Parquet path decodes first.
@@ -222,9 +227,7 @@ impl Window {
     fn push(&mut self, index: u64, line: String) {
         self.bytes = self.bytes.saturating_add(line.len());
         self.kept.push_back((index, line));
-        while self.kept.len() > self.limit
-            || (self.kept.len() > 1 && self.bytes > MAX_PAGE_BYTES)
-        {
+        while self.kept.len() > self.limit || (self.kept.len() > 1 && self.bytes > MAX_PAGE_BYTES) {
             if let Some((_, old)) = self.kept.pop_front() {
                 self.bytes = self.bytes.saturating_sub(old.len());
                 self.dropped = true;
@@ -926,7 +929,11 @@ mod tests {
         let parquet = super::super::columnar::convert(&parquet_src).expect("convert");
 
         for (label, read) in [
-            ("text", &scan_text as &dyn Fn(&Path, &LogFilter, Option<u64>, usize) -> Result<CursorPage, String>),
+            (
+                "text",
+                &scan_text
+                    as &dyn Fn(&Path, &LogFilter, Option<u64>, usize) -> Result<CursorPage, String>,
+            ),
             ("parquet", &scan_parquet),
         ] {
             let path = if label == "text" { &text } else { &parquet };
@@ -964,7 +971,10 @@ mod tests {
         let parquet = super::super::columnar::convert(&text).expect("convert");
         let next = scan_parquet(&parquet, &LogFilter::default(), Some(cursor), 3).expect("parquet");
         assert_eq!(next.lines, LINES[..3].to_vec());
-        assert_eq!(next.next_before, None, "and it reached the start of the file");
+        assert_eq!(
+            next.next_before, None,
+            "and it reached the start of the file"
+        );
     }
 
     /// **The payoff §6 claims for converting.** A narrow time window must skip whole row groups
@@ -997,8 +1007,8 @@ mod tests {
         // A window opening exactly at the third group's first line: the two groups wholly before
         // it must be skipped without a decode. (Row 16384 is 04:33:04; the row before it, the
         // last of group 1, is 04:33:03 — so the bound is tight on purpose.)
-        let late = LogFilter::parse(None, None, None, Some("2026-08-23T04:33:04Z"), None)
-            .expect("filter");
+        let late =
+            LogFilter::parse(None, None, None, Some("2026-08-23T04:33:04Z"), None).expect("filter");
         let pruned: Vec<bool> = (0..md.num_row_groups())
             .map(|g| prunable(md.row_group(g), &late))
             .collect();
@@ -1030,8 +1040,8 @@ mod tests {
         let file = std::fs::File::open(&parquet).expect("open");
         let metadata =
             ArrowReaderMetadata::load(&file, ArrowReaderOptions::default()).expect("metadata");
-        let far = LogFilter::parse(None, None, None, Some("2030-01-01T00:00:00Z"), None)
-            .expect("filter");
+        let far =
+            LogFilter::parse(None, None, None, Some("2030-01-01T00:00:00Z"), None).expect("filter");
         assert!(
             !prunable(metadata.metadata().row_group(0), &far),
             "a null ts in the group means a line the filter cannot judge, so the group is read"
@@ -1121,7 +1131,10 @@ mod tests {
             files[0].first_ts.as_deref(),
             Some("2026-08-23T14:00:00.000Z")
         );
-        assert_eq!(files[0].last_ts.as_deref(), Some("2026-08-23T14:00:04.000Z"));
+        assert_eq!(
+            files[0].last_ts.as_deref(),
+            Some("2026-08-23T14:00:04.000Z")
+        );
     }
 
     /// A converted file's bounds come from the **footer**, not from a scan.
@@ -1137,7 +1150,10 @@ mod tests {
             files[0].first_ts.as_deref(),
             Some("2026-08-23T14:00:00.000Z")
         );
-        assert_eq!(files[0].last_ts.as_deref(), Some("2026-08-23T14:00:04.000Z"));
+        assert_eq!(
+            files[0].last_ts.as_deref(),
+            Some("2026-08-23T14:00:04.000Z")
+        );
     }
 
     /// The ring answers the same filters, so the Observability pane's chips mean one thing
