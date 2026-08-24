@@ -673,6 +673,20 @@ init is `oxidant_connect::logging::init(role, port)`.
   `ts` and null `level`**, so §6b's time-range and level filters silently excluded exactly
   the errors an operator was searching for. `record_str` was already safe (it renders under
   `{:?}`); `%value` and the message itself were not.
+- **A converted file answers the same strings the text file did** *(PR3)*. `?file=X`
+  must not change its answer depending on whether the background converter happened to
+  have run — a race the caller cannot see, on an endpoint whose whole point is that the
+  caller never has to know. Two things broke it: `fields_json` was a
+  `serde_json::Value::Object`, i.e. a `BTreeMap` without `preserve_order`, so
+  `zone=3, addr=7` came back `addr=7, zone=3`; and the reader always emitted `message=`
+  first regardless of where it had sat. Fields now keep their **rendered** order, and a
+  message that did not lead the field list keeps its index by staying in `fields_json`
+  alongside its own column (the common `tracing` shape — message first — stores nothing
+  extra). `preserve_order` was not the fix: cargo features are additive, so enabling it
+  would reorder every `serde_json` object in the workspace. **What is still normalized,
+  and stated in `docs/api.md`:** a `k=v` pair the field parser lifted out of a message
+  (`"failed to bind, addr=0.0.0.0:4040"`) comes back as the same string but is stored as
+  `message` + a field, so §6b's message filter sees the shortened text.
 - **Two roll triggers, whichever first**: the UTC clock boundary (`daily` default,
   `hourly`/`weekly` via `OXIDANT_LOG_ROLL`) or the size cap
   (`OXIDANT_LOG_MAX_FILE_BYTES`), which produces a `.N` split (§3 Naming) — a chatty

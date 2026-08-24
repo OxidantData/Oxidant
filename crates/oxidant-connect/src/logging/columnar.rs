@@ -30,7 +30,7 @@ use oxidant_loom::arrow::array::{Array, ArrayRef, StringArray, TimestampMillisec
 use oxidant_loom::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use oxidant_loom::arrow::record_batch::RecordBatch;
 
-use super::line::{parse_line, ParsedLine, TS_FORMAT};
+use super::line::{ordered_fields, parse_line, ParsedLine, TS_FORMAT};
 use crate::history::fs_util;
 
 /// Rows per Parquet row group written by the converter.
@@ -253,28 +253,28 @@ pub(crate) fn read_lines(path: &Path, offset: usize, limit: usize) -> Result<Pag
             if target.is_valid(row) {
                 line.push_str(target.value(row));
             }
+            // In order, and with `message` back where it was. `fields_json` carries a `message`
+            // key only when the message did *not* lead the field list, so its presence is the
+            // record of the position and its absence means "first" — which is what `tracing`
+            // renders and therefore the shape that costs nothing to store.
+            let pairs = if fields.is_valid(row) {
+                ordered_fields(fields.value(row))
+            } else {
+                Vec::new()
+            };
+            let message_in_pairs = pairs.iter().any(|(k, _)| k == "message");
             let mut fields_out = Vec::new();
             if message.is_valid(row) {
                 let msg = message.value(row);
-                if level.is_valid(row) {
-                    fields_out.push(format!("message={msg}"));
-                } else {
+                if !level.is_valid(row) {
                     // A line that never decomposed: it was preserved whole, so serve it whole.
                     line.push_str(msg);
+                } else if !message_in_pairs {
+                    fields_out.push(format!("message={msg}"));
                 }
             }
-            if fields.is_valid(row) {
-                if let Ok(serde_json::Value::Object(map)) =
-                    serde_json::from_str::<serde_json::Value>(fields.value(row))
-                {
-                    for (k, v) in map {
-                        let v = v
-                            .as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| v.to_string());
-                        fields_out.push(format!("{k}={v}"));
-                    }
-                }
+            for (k, v) in pairs {
+                fields_out.push(format!("{k}={v}"));
             }
             if !fields_out.is_empty() {
                 line.push_str(" - ");
@@ -423,6 +423,33 @@ mod tests {
         assert_eq!(footer_rows(&parquet).expect("footer"), 0);
         assert!(read_lines(&parquet, 0, 100).expect("read").lines.is_empty());
         assert!(!text.exists());
+    }
+
+    /// **M2.** The strings `?file=` returns must not change when the converter runs.
+    ///
+    /// Same file, both forms, byte-for-byte — including a line whose fields are in
+    /// non-alphabetical order and a line whose message is not first.
+    #[test]
+    fn a_converted_file_returns_the_same_strings_as_the_text_it_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lines = [
+            "2026-08-23T14:00:00.500Z [INFO] oxidant_execution - message=stage done, zone=3, addr=7",
+            "2026-08-23T14:00:01.000Z [INFO] oxidant_execution - zone=3, addr=7, message=stage done",
+            "2026-08-23T14:00:02.000Z [WARN] oxidant_connect - role=\"driver\", dir=/srv/x, message=up",
+            "2026-08-23T14:00:03.000Z [INFO] oxidant_connect - message=planned 3 stages, 2 replicated",
+            "   at oxidant_execution::plan (a continuation line)",
+        ];
+        let text = write(dir.path(), "oxidant-2026-08-28.log", &lines);
+        let before = read_text_lines(&text, 0, 100).expect("text").lines;
+        assert_eq!(before, lines, "the text form is what was written");
+
+        let parquet = convert(&text).expect("convert");
+        let after = read_lines(&parquet, 0, 100).expect("parquet").lines;
+        assert_eq!(
+            after, before,
+            "the converted form must be the same strings, or `?file=X` answers differently \
+             depending on whether the background converter happened to have run"
+        );
     }
 
     /// A line the parser could not decompose survives the conversion verbatim.

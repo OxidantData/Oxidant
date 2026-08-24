@@ -115,7 +115,14 @@ pub(crate) struct ParsedLine {
     pub level: Option<String>,
     pub target: Option<String>,
     pub message: Option<String>,
-    /// The non-`message` fields as a JSON object, or `None` when there were none.
+    /// The fields as a JSON object **in the order they were rendered**, or `None` when there
+    /// were none.
+    ///
+    /// `message` is normally *absent* from this object — it has its own column, and it leads the
+    /// field list — but it is kept here, at its own index, on the one shape where it did not come
+    /// first. That is what makes `?file=` answer the same strings before and after the background
+    /// conversion has run: without a recorded position, a reconstructed line always put
+    /// `message=` first, and a caller saw the line change under it with no way to see why.
     pub fields_json: Option<String>,
 }
 
@@ -142,25 +149,93 @@ pub(crate) fn parse_line(line: &str) -> ParsedLine {
         Some((target, fields)) => (target, fields),
         None => (rest, ""),
     };
-    let (message, other) = split_fields(fields);
+    let all = split_fields(fields);
+    let message_at = all.iter().position(|(k, _)| k == MESSAGE);
+    let message = message_at.map(|i| all[i].1.clone());
+    // Keep `message` in the object only when it was not the first field: then its index *is* the
+    // record of where it sat, and it costs nothing on the shape `tracing` actually produces,
+    // which puts the message first.
+    let keep_message = message_at.is_some_and(|i| i > 0);
+    let kept: Vec<&(String, String)> = all
+        .iter()
+        .filter(|(k, _)| k != MESSAGE || keep_message)
+        .collect();
     ParsedLine {
         ts_ms: Some(ts.with_timezone(&Utc).timestamp_millis()),
         level: Some(level.to_string()),
         target: Some(target.to_string()),
         message,
-        fields_json: (!other.is_empty()).then(|| {
-            serde_json::Value::Object(
-                other
-                    .into_iter()
-                    .map(|(k, v)| (k, serde_json::Value::String(v)))
-                    .collect(),
-            )
-            .to_string()
-        }),
+        fields_json: (!kept.is_empty()).then(|| ordered_object(&kept)),
     }
 }
 
-/// Split a `k=v, k2=v2` field list into `(message, other pairs)`.
+/// The field name the message is rendered under.
+const MESSAGE: &str = "message";
+
+/// A JSON object that keeps its insertion order.
+///
+/// `serde_json::Map` is a `BTreeMap` without the `preserve_order` feature — and turning that
+/// feature on would enable it for every crate in the workspace that touches `serde_json`, since
+/// cargo features are additive. So the object is written directly, with `serde_json` doing the
+/// string escaping.
+fn ordered_object(pairs: &[&(String, String)]) -> String {
+    let quoted = |raw: &str| {
+        serde_json::to_string(raw).unwrap_or_else(|_| serde_json::Value::Null.to_string())
+    };
+    let mut out = String::from("{");
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&quoted(k));
+        out.push(':');
+        out.push_str(&quoted(v));
+    }
+    out.push('}');
+    out
+}
+
+/// Read [`ParsedLine::fields_json`] back **in order**.
+///
+/// `serde_json::from_str::<Value>` folds the object into a `BTreeMap` and loses it, which is what
+/// made a converted file return `addr=7, zone=3` for a line that read `zone=3, addr=7`.
+pub(crate) fn ordered_fields(raw: &str) -> Vec<(String, String)> {
+    struct Ordered(Vec<(String, String)>);
+    impl<'de> serde::Deserialize<'de> for Ordered {
+        fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = Ordered;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a JSON object of log fields")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Ordered, A::Error> {
+                    let mut out = Vec::new();
+                    while let Some((k, v)) = map.next_entry::<String, serde_json::Value>()? {
+                        // Values are written as strings; anything else is rendered as its JSON,
+                        // which is what the old reader did too.
+                        let v = match v {
+                            serde_json::Value::String(s) => s,
+                            other => other.to_string(),
+                        };
+                        out.push((k, v));
+                    }
+                    Ok(Ordered(out))
+                }
+            }
+            de.deserialize_map(V)
+        }
+    }
+    serde_json::from_str::<Ordered>(raw)
+        .map(|o| o.0)
+        .unwrap_or_default()
+}
+
+/// Split a `k=v, k2=v2` field list into its pairs, **in the order they were rendered**, with
+/// `message` among them wherever it sat.
 ///
 /// Two hazards, both real in this tree's own log lines:
 ///
@@ -169,36 +244,29 @@ pub(crate) fn parse_line(line: &str) -> ParsedLine {
 /// - `message` is rendered *unquoted* (it is `format_args!` under `{:?}`), so a message
 ///   containing `, ` splits into a fragment with no `=`. A fragment with no `=` is therefore
 ///   appended back to the previous value rather than discarded.
-fn split_fields(fields: &str) -> (Option<String>, Vec<(String, String)>) {
+fn split_fields(fields: &str) -> Vec<(String, String)> {
     if fields.is_empty() {
-        return (None, Vec::new());
+        return Vec::new();
     }
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    let mut message = None;
+    let mut out: Vec<(String, String)> = Vec::new();
     for token in split_top_level(fields) {
         match token.split_once('=') {
             // A key must look like one; `a=b` inside a prose fragment must not open a new field.
             Some((key, value)) if is_field_name(key) => {
-                if key == "message" {
-                    message = Some(value.to_string());
-                } else {
-                    pairs.push((key.to_string(), value.to_string()));
-                }
+                out.push((key.to_string(), value.to_string()))
             }
-            _ => match (&mut message, pairs.last_mut()) {
-                (_, Some((_, last))) => {
+            // A fragment with no `=` belongs to whatever came before it — a message with a comma
+            // in it, most often. With nothing before it, the whole line is the message.
+            _ => match out.last_mut() {
+                Some((_, last)) => {
                     last.push_str(", ");
                     last.push_str(&token);
                 }
-                (Some(msg), None) => {
-                    msg.push_str(", ");
-                    msg.push_str(&token);
-                }
-                (None, None) => message = Some(token),
+                None => out.push((MESSAGE.to_string(), token)),
             },
         }
     }
-    (message, pairs)
+    out
 }
 
 /// `tracing` field names are Rust identifiers plus `.`; anything else is prose.
@@ -292,7 +360,8 @@ mod tests {
         let parsed = parse_line(&line(r#"error="a, b", count=2"#).render());
         assert_eq!(
             parsed.fields_json.as_deref(),
-            Some(r#"{"count":"2","error":"\"a, b\""}"#)
+            Some(r#"{"error":"\"a, b\"","count":"2"}"#),
+            "and the order is the rendered one, not the alphabetical one"
         );
     }
 
@@ -334,6 +403,42 @@ mod tests {
         let mut again = hostile.clone();
         again.fields = escape_line_breaks(&hostile.fields).into_owned();
         assert_eq!(again.render(), rendered);
+    }
+
+    /// **M2.** `?file=` must answer the same strings before and after the background converter
+    /// has run — a race the caller cannot see, on an endpoint whose whole point is that the
+    /// caller never has to know whether yesterday has been converted yet.
+    ///
+    /// Two things broke it. `fields_json` was a `serde_json::Value::Object` — a `BTreeMap`
+    /// without `preserve_order` — so `zone=3, addr=7` came back `addr=7, zone=3`; and the reader
+    /// always emitted `message=` first regardless of where it had sat.
+    #[test]
+    fn fields_keep_their_rendered_order_and_the_message_keeps_its_place() {
+        // `tracing`'s own shape: message first, then the fields in declaration order.
+        let parsed = parse_line(&line("message=stage done, zone=3, addr=7").render());
+        assert_eq!(parsed.message.as_deref(), Some("stage done"));
+        assert_eq!(
+            parsed.fields_json.as_deref(),
+            Some(r#"{"zone":"3","addr":"7"}"#),
+            "declaration order, not alphabetical"
+        );
+        assert_eq!(
+            ordered_fields(parsed.fields_json.as_deref().unwrap()),
+            vec![
+                ("zone".to_string(), "3".to_string()),
+                ("addr".to_string(), "7".to_string()),
+            ],
+            "and it reads back in that order — `from_str::<Value>` would not"
+        );
+
+        // A message that is *not* first keeps its index, so the line can be rebuilt exactly.
+        let parsed = parse_line(&line("zone=3, message=stage done, addr=7").render());
+        assert_eq!(parsed.message.as_deref(), Some("stage done"));
+        assert_eq!(
+            parsed.fields_json.as_deref(),
+            Some(r#"{"zone":"3","message":"stage done","addr":"7"}"#),
+            "the message is kept in place only when its place is not the first"
+        );
     }
 
     /// Dedup compares everything *but* the timestamp. Comparing rendered lines would have made
