@@ -833,6 +833,9 @@ impl AppStateStore {
             // No admission queue exists in the engine today; see `StatusSnapshot::queued_queries`.
             queued_queries: 0,
             queries,
+            // Published by whoever booted the statement journal; `None` with
+            // `OXIDANT_HISTORY=off`, which leaves the response exactly as it was.
+            history: crate::status::history_status(),
         }
     }
 

@@ -78,8 +78,6 @@ enum Msg {
 pub(crate) struct ResultStore {
     dir: PathBuf,
     persist: ResultPersist,
-    max_bytes: u64,
-    memory_budget_bytes: u64,
     tx: SyncSender<Msg>,
     on_disk_bytes: Arc<AtomicU64>,
     /// Spill jobs the queue had no room for. A lost spill is not a lost statement: the rows are
@@ -126,8 +124,6 @@ impl ResultStore {
         Ok(Arc::new(Self {
             dir: cfg.results_dir.clone(),
             persist: cfg.result_persist,
-            max_bytes: cfg.result_max_bytes,
-            memory_budget_bytes: cfg.result_memory_budget_bytes,
             tx,
             on_disk_bytes,
             dropped: Arc::new(AtomicU64::new(0)),
@@ -145,18 +141,6 @@ impl ResultStore {
 
     pub(crate) fn persist(&self) -> ResultPersist {
         self.persist
-    }
-
-    pub(crate) fn memory_budget_bytes(&self) -> u64 {
-        self.memory_budget_bytes
-    }
-
-    pub(crate) fn max_bytes(&self) -> u64 {
-        self.max_bytes
-    }
-
-    pub(crate) fn dir(&self) -> &Path {
-        &self.dir
     }
 
     /// `results_on_disk_bytes` for `/api/status`.
@@ -439,7 +423,8 @@ impl<W: Write> Write for Counting<W> {
 }
 
 fn io_other(msg: &str) -> io::Error {
-    io::Error::other(msg.to_string())
+    // `io::Error::other` is 1.74; this crate's MSRV is 1.72.
+    io::Error::new(io::ErrorKind::Other, msg.to_string())
 }
 
 /// Total size of every published result file — the boot value of `results_on_disk_bytes`.

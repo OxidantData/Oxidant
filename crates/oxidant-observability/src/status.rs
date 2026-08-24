@@ -32,6 +32,58 @@ pub struct QueryStatus {
     pub bytes: i64,
 }
 
+/// Durability counters for `GET /api/status` — the statement journal, the spilled results, and
+/// the disk guards that bound both (`docs/query-history-durability.md` §3, §7).
+///
+/// Published by whoever owns the journal (`oxidant-connect`'s statement store) through
+/// [`set_history_status_source`], rather than being reachable from here: this crate sits *below*
+/// `oxidant-connect` in the dependency graph, and inverting that to reach a `StatementStore`
+/// would make the observability crate depend on the Spark Connect server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryStatus {
+    /// `ok` while appends and fsyncs are landing; `degraded` once one was refused, a record was
+    /// dropped for backpressure, or a terminal ack timed out. Flips back on the next success,
+    /// with no restart (§7).
+    pub history_writes: String,
+    /// Records the writer had no room for — `running` chatter and tombstones, never a
+    /// `submitted` or a `snapshot` (§7).
+    pub history_dropped_events: u64,
+    /// Total size of `history/results/*.arrow`.
+    pub results_on_disk_bytes: u64,
+    /// `ok`, or `over_budget` once the sweeper has run out of things to prune under
+    /// `OXIDANT_DISK_MAX_BYTES` / `OXIDANT_DISK_MIN_FREE_BYTES` (§3).
+    pub disk: String,
+}
+
+/// The two values [`HistoryStatus::history_writes`] takes.
+pub mod history_writes {
+    pub const OK: &str = "ok";
+    pub const DEGRADED: &str = "degraded";
+}
+
+/// The two values [`HistoryStatus::disk`] takes.
+pub mod disk_state {
+    pub const OK: &str = "ok";
+    pub const OVER_BUDGET: &str = "over_budget";
+}
+
+type HistoryStatusSource = Box<dyn Fn() -> HistoryStatus + Send + Sync>;
+
+static HISTORY_STATUS: std::sync::OnceLock<HistoryStatusSource> = std::sync::OnceLock::new();
+
+/// Publish the durability counters `/api/status` reads. Called once, at boot, by whoever booted
+/// the journal. With `OXIDANT_HISTORY=off` it is never called and the four fields are **absent**
+/// from the response — §8 says `off` restores today's behaviour exactly, and today there are no
+/// such fields.
+pub fn set_history_status_source(source: impl Fn() -> HistoryStatus + Send + Sync + 'static) {
+    let _ = HISTORY_STATUS.set(Box::new(source));
+}
+
+/// The published counters, or `None` when history is off (or has not booted yet).
+pub fn history_status() -> Option<HistoryStatus> {
+    HISTORY_STATUS.get().map(|f| f())
+}
+
 /// Driver status: `GET /api/status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusSnapshot {
@@ -51,6 +103,11 @@ pub struct StatusSnapshot {
     pub queued_queries: usize,
     /// Most recent queries, newest first, capped by the caller's limit.
     pub queries: Vec<QueryStatus>,
+    /// Durability counters, flattened into this object as `history_writes`,
+    /// `history_dropped_events`, `results_on_disk_bytes` and `disk`. Absent with
+    /// `OXIDANT_HISTORY=off`.
+    #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryStatus>,
 }
 
 /// Query state strings used by [`QueryStatus::state`].
