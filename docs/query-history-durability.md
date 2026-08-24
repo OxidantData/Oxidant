@@ -1,7 +1,7 @@
 # Durable query history and exec logs
 
-Status: **PR1–PR3 built, PR4 designed** (2026-08-24, rev 2 after design review; §10 tracks
-what has shipped). Follow-up to issue #134
+Status: **PR1–PR4 built** (2026-08-24, rev 2 after design review; §10 tracks
+what has shipped, and each PR's deviations from this document). Follow-up to issue #134
 (Connect executions must join the statements store) and the founder ask: *server exec
 logs durable, rolled daily/hourly/weekly, max lookback 30 days*.
 
@@ -874,11 +874,14 @@ the one exception is an explicit diagnostic dump (below). This is the read-side 
 `/api/v1/logs` is today):
 
 ```
-GET /api/v1/logs/files                     → [{file, rolled, format, size_bytes, first_ts, last_ts}]
+GET /api/v1/logs/files                     → {dir, dedup, files: [{file, rolled, format, size_bytes, first_ts, last_ts}]}
 GET /api/v1/logs?file=…&level=warn&target=oxidant_execution&q=pool&
-     from=…&to=…&limit=500&before=<cursor>   → {lines: [...], next_before, dedup}
+     from=…&to=…&limit=500&before=<cursor>   → {logs: [...], next_before, dedup, file, format, limit}
 GET /api/v1/logs/tail?file=current&level=… (SSE)               → live follow
 ```
+
+*(Envelope keys as built: `logs` is PR3's released spelling for the line array, and
+`/api/v1/logs/files` names the directory it read — see §10's PR4 deviations.)*
 
 - Filters compose: level (≥), target prefix, free-text `q`, time range; results
   stream newest-first with a cursor so the UI pages backward without reloading
@@ -909,8 +912,9 @@ No worker log bytes touch the driver's disk on this path.
 **Diagnostic dump (the only time logs move):**
 
 ```
-POST /api/v1/logs/dump {worker: <id>|"all", from, to}  → 202 {dump_id}
-GET  /api/v1/logs/dump/{dump_id}                       → parquet bundle download
+POST /api/v1/logs/dump {worker: <id>|"driver"|"all", from, to, level, target, q}
+                                                       → 202 {dumpId, status, from, to, nodes, maxBytes}
+GET  /api/v1/logs/dump/{dumpId}                        → parquet bundle download
 ```
 
 An explicit, token-guarded, audited action for support bundles: the worker(s)
@@ -1209,8 +1213,54 @@ Guards and degradation:
    converter leaked a `.parquet.tmp` when the source failed partway through a read (macOS
    opens a directory happily and fails at the first read), and both prune lists ordered
    `.2` ahead of the plain name because `2` < `l` lexicographically.
-4. **PR4** — the driver log browser (filters/cursor/tail) + worker federation +
-   the diagnostic dump, with the Observability screen's log UI.
+4. **PR4** — *built* — the driver log browser (filters, a backward cursor, tail-follow),
+   worker federation, the diagnostic dump, and the Observability screen's log pane. Lives in
+   `crates/oxidant-connect/src/logging/{browse,api,dump}.rs`, the log routes in `rest.rs`, the
+   `logs` Flight action in `oxidant-execution/src/flight.rs`, and the pane in
+   `oxidant-ui-server/src/embedded_ui.html`. **Six deviations, each argued where it lands:**
+   - **Federation is a Flight action, not a small HTTP surface on the worker** (§6b left the
+     choice open). A worker speaks Flight and nothing else; an HTTP listener would mean a second
+     port to open, a second bind in every deployment template, a second CORS decision and a
+     second place to get the token gate right. The trade is stated in `docs/api.md`: the Flight
+     interconnect is a trusted network boundary that already accepts arbitrary stage SQL, so
+     serving that same peer a log page is not a new privilege. One `answer()` serves both
+     transports, so `level=warn` cannot come to mean two things.
+   - **A worker's tail is a 2 s poll, and says so** — `mode: "poll"` on the stream's first
+     event, against `mode: "follow"` for the driver's, which rides `tracing` itself. A
+     long-lived Flight stream would pin a worker-side task to a browser tab. A reader is never
+     told a 2 s-granular feed is live.
+   - **The dump is one Parquet with a `node` column**, where §6b said already-Parquet rolled
+     files "ship as is". Shipping bytes needs a second wire shape and a second bounding path,
+     and hands back a heterogeneous bundle the operator must reassemble. The cost is stated in
+     `logging/dump.rs`: rows are re-rendered through the same normalization `?file=` already
+     documents, so a bundle is faithful to what the browser shows rather than byte-identical to
+     the file.
+   - **The envelopes keep PR3's spelling.** §6b sketched `{lines, next_before, dedup}` and
+     `202 {dump_id}`; the built routes answer `logs` (PR3's released key) and `dumpId` (the
+     camelCase every other REST route here uses), and `/api/v1/logs/files` answers
+     `{dir, dedup, files}` rather than a bare array. **Which page shape you get is decided by
+     what you asked for**, not by a version flag: a `before=`, an `order=desc`, or any filter
+     gives §6b's newest-first cursor page, and nothing at all gives PR3's oldest-first
+     `?offset=` page byte-identical to what it answered before.
+   - **Two additions §6b did not name.** A forward cursor (`?after=`/`next_after`) — a *scan*
+     position, not a match position, so a follow reads each row once however selective the
+     filter is; and `MAX_LOG_PAGE = 10_000` on every log route, because PR3's read path had no
+     cap at all and `?file=current` on a 256 MiB file built every line in memory and then
+     serialised a second copy into the body.
+   - **The pane's tail is `fetch` + a `ReadableStream`, not `EventSource`**, and its level
+     chips are a *floor* rather than four independent toggles. `EventSource` cannot carry an
+     `Authorization` header, and the ways around that put the status token in a URL or invent a
+     cookie on a router served under permissive CORS. The floor is what the API's `level=`
+     means, so a chip and a `curl` agree.
+
+   Three things the work caught outside its own scope. `docs/web-ui.md` documented level filter
+   chips that had been inert since PR3 moved `[LEVEL]` off the start of the line — the pane's
+   regex was `^`-anchored, so every line came back with a null level and no chip could hide one;
+   the chips are unanchored now and drive `level=` server-side, and the doc describes the pane
+   that exists. And both gates were red on the four commits before this line was written:
+   `cargo fmt --all -- --check` had never been run, and `clippy -D warnings` found three
+   `incompatible_msrv` hits (`Option::is_none_or`, `io::Error::other`) against the workspace's
+   `rust-version = "1.72"`.
 
 ## 11. Review resolutions (F1–F21)
 

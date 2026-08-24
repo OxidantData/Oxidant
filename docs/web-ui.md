@@ -140,32 +140,59 @@ the same absolute path as `pipeline.checkpoints` in [`oxidant.yaml`](config.md).
 
 ## Observability
 
-The **Observability** page is "what is this driver doing right now", on three surfaces:
+The **Observability** page is "what is this cluster doing right now", on three surfaces:
 
 | Section | Source | Shows |
 |---------|--------|-------|
-| **Server logs** | [`/api/v1/logs`](api.md#driver-logs) | A tail of the driver's in-memory ring buffer (last 1000 lines) on the terminal surface, each line now led by an RFC-3339 UTC timestamp (the same one the [rolled files](api.md#rolled-files-file) carry, so a line on screen and a line in yesterday's log read alike). Level filter chips — `error` / `warn` / `info` / `debug`, matched on the line's `[LEVEL]` prefix — a **Pause** button, and a caption saying how many lines are on screen. Auto-refreshes every 5 s and stays pinned to the newest line unless you scroll up into it |
+| **Exec logs** | [the log browser](api.md#driver-logs) | Any node's logs on the terminal surface — see [the pane's controls](#the-log-pane) below |
 | **Jobs & stages** | `/api/v1/applications/{app}/jobs` + `/stages` | One row per job — id, name, status, duration, stages done/total — expanding in place into its stages, with shuffle read/write where the stage reports any |
 | **SQL queries** | `/api/v1/applications/{app}/sql` | Every execution the store holds — Spark Connect sessions, the REST statement API, the Editor — with status, duration and a row count |
 
-Only the log tail needs a poll of its own; jobs, stages and SQL already ride the page's 2 s
+Only the log pane has routes of its own; jobs, stages and SQL already ride the page's 2 s
 refresh and the SSE event stream, and fetching them twice would double the load for no extra
-freshness. The log pane sends the token the Pipelines page stores, and needs it:
-[`/api/v1/logs`](api.md#driver-logs) is gated by the same `OXIDANT_STATUS_TOKEN` as
-`/api/status`, because the buffer carries every logged field — hosts, slots, tables, query
-text.
+freshness.
 
 One number is **derived**, and the column says so: an execution's row count. The store records
 a plan, a status and a duration for an execution but not its cardinality, so rows are summed
 over the stages that execution's jobs ran.
 
-Two absences the page states rather than hides:
+Statements run from the **Editor** appear both here and in the Editor's own recent-statements
+rail, and the two are not yet one query history —
+[issue #134](https://github.com/OxidantData/oxidant/issues/134).
 
-- `/api/v1/logs` answers `404` both when no status token is configured and on a process with no
-  buffer to serve — the engine's REST router carries it, so a standalone history server has
-  none. The pane says so instead of showing an empty box.
-- Statements run from the **Editor** appear both here and in the Editor's own recent-statements
-  rail, and the two are not yet one query history — [issue #134](https://github.com/OxidantData/oxidant/issues/134).
+### The log pane
+
+| Control | Does |
+|---------|------|
+| **Node** | Every node the driver can browse, `driver` first. **An unreachable worker stays in the list**, marked — dropping it would read as "there is no such node", which is not what happened |
+| **File** | The memory ring, `current`, and every rolled generation this node still has, newest first, with its format and size. Picking a rolled file turns **Follow** off: following a file that will never grow again is not following anything |
+| **Target** | `tracing` target prefix |
+| **Search** | Free text over the whole file, not over the page already fetched |
+| **From** / **To** | Your own wall clock, sent as RFC-3339 instants. `To` is exclusive, so two adjacent windows tile a day without a line appearing twice |
+| **Level chips** | `error` / `warn` / `info` / `debug` — a **floor**, not four independent toggles: `warn` means warn *and* error, which is what [`level=`](api.md#filters-and-the-backward-cursor) means to `curl` |
+| **Follow** | Tail-follow. Live on the driver, a 2 s poll against a worker, and the caption says which |
+| **Pause** | Stops both the follow and the 5 s fallback poll |
+| **Dump** | Copies the selected node's logs for the filtered window into a [support bundle](api.md#diagnostic-dumps) and downloads it — the one action on this page that moves log bytes |
+
+Every filter is evaluated by the API over the whole file, not by the browser over what it
+already has, and **Load older lines** walks the API's backward cursor — so a 256 MiB day is
+readable without ever loading it. The pane stays pinned to the newest line unless you scroll up
+into it.
+
+Four things the pane says out loud rather than hiding:
+
+- **The token.** Every log route is gated by the same `OXIDANT_STATUS_TOKEN` as `/api/status`,
+  because the files carry every logged field — hosts, slots, tables, query text. The pane sends
+  the token the Pipelines page stores; without one it says so instead of showing an empty box.
+- **A node with no rolled files.** `OXIDANT_LOG_ROLL=off` keeps durable statement history with
+  stderr-only logs, so every `?file=` answers `404` while the memory ring still answers. The
+  pane drops to the ring and the caption says why. `404` is also the answer when no status token
+  is configured, and on a standalone history server, which carries no log routes at all.
+- **Dedup.** The caption says `deduped` or `not deduped`. A file collapses an identical
+  consecutive line into `… repeated N times`; the ring and the live tail do not. Without the
+  label, a collapsed run reads as a gap.
+- **Dropped lines.** If the tail's fan-out outruns the browser, the count of lost lines is in
+  the caption rather than the jump being unexplained.
 
 Streaming micro-batches are **not** on this page; see [Pipelines](#pipelines) for why.
 
