@@ -253,9 +253,24 @@ fn open_writer(role: &str, port: u16) -> Option<Arc<RollingWriter>> {
         }
     };
     // `OXIDANT_HISTORY=off` promises that nothing is written under the data dir; rolled exec
-    // logs are the largest thing that would be. `OXIDANT_LOG_ROLL=off` turns the file writer off
-    // on its own, for an operator who wants durable statement history and stderr-only logs.
-    if !cfg.enabled || cfg.log_roll == LogRoll::Off {
+    // logs are the largest thing that would be.
+    if !cfg.enabled {
+        return None;
+    }
+    // A `.parquet.tmp` a crash left behind is billed against the disk budget — it is a file under
+    // a budget root — but no prune step can recognise it, and the converter thread that would
+    // delete it does not run under `OXIDANT_LOG_ROLL=off`. So sweep it here, at boot, before this
+    // process has a writer and therefore before anything can be converting into it.
+    let freed = crate::history::disk::clear_log_tmp(&cfg.logs_dir);
+    if freed > 0 {
+        eprintln!(
+            "oxidant: removed {freed} bytes of unfinished parquet conversions from {}",
+            cfg.logs_dir.display()
+        );
+    }
+    // `OXIDANT_LOG_ROLL=off` turns the file writer off on its own, for an operator who wants
+    // durable statement history and stderr-only logs.
+    if cfg.log_roll == LogRoll::Off {
         return None;
     }
     // **One rolling writer per log directory.** A worker takes no journal lock — it runs no

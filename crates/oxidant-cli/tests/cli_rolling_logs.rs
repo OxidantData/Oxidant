@@ -209,6 +209,66 @@ fn log_roll_off_writes_no_file() {
     );
 }
 
+/// **L4.** An orphaned `oxidant-<period>.parquet.tmp` was billed against `OXIDANT_DISK_MAX_BYTES`
+/// — it is a file under a budget root — and invisible to every prune step, because
+/// `parse_rolled_name` rejects the name. The only code that removed one was the converter thread,
+/// which under `OXIDANT_LOG_ROLL=off` never runs at all, so a tmp a crash left behind was billed
+/// forever and paid for by pruning statement history instead.
+///
+/// `ROLL=off` is the case that had no cleaner at all, which is why it is the case this boots.
+#[test]
+fn boot_sweeps_an_orphan_parquet_tmp_even_with_the_writer_off() {
+    let oxidant = oxidant_bin();
+    let root = TempDir::new().expect("tempdir");
+    let logs = root.path().join("logs");
+    std::fs::create_dir_all(&logs).expect("mkdir");
+    let orphan = logs.join("oxidant-2026-08-22.parquet.tmp");
+    std::fs::write(&orphan, vec![b'x'; 4096]).expect("plant the orphan");
+    // A co-tenant's file in the same directory, and a finished file of the engine's own: neither
+    // is the engine's unfinished conversion, and neither may be touched.
+    let foreign = logs.join("postgres.parquet.tmp");
+    std::fs::write(&foreign, b"not ours").expect("plant");
+    let finished = logs.join("oxidant-2026-08-21.parquet");
+    std::fs::write(&finished, b"converted").expect("plant");
+
+    let (mut worker, port) = spawn_with_retry(|port| {
+        let mut cmd = Command::new(&oxidant);
+        cmd.args(["worker", "--port", &port.to_string()])
+            .env("OXIDANT_DATA_DIR", root.path())
+            .env("OXIDANT_LOG_ROLL", "off")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    });
+    // With no log file to wait for, wait for the port: once the worker accepts, boot is long done.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut listening = false;
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            listening = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let swept = !orphan.exists();
+    let _ = worker.kill();
+    let _ = worker.wait();
+
+    assert!(listening, "the worker never came up");
+    assert!(
+        swept,
+        "an unfinished conversion is billed to the budget and prunable by nothing else: {:?}",
+        std::fs::read_dir(&logs)
+            .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    assert!(
+        foreign.is_file(),
+        "a co-tenant's .tmp is not ours to delete"
+    );
+    assert!(finished.is_file(), "and a finished conversion stays");
+}
+
 /// Wait for `path` to contain `needle`, or give up.
 fn wait_for_text(path: &std::path::Path, needle: &str, what: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(30);

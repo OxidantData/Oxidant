@@ -189,6 +189,63 @@ pub(crate) fn is_rolled_log(name: &str) -> bool {
     )
 }
 
+/// Is `name` a Parquet conversion that never reached its rename — `oxidant-<period>[.N].parquet.tmp`?
+///
+/// The grammar, not the suffix. This runs against an operator-set `OXIDANT_LOG_DIR`, and "every
+/// `*.tmp`" would make pointing that knob at a shared directory destructive — the same reason
+/// `results::clear_tmp` matches `stmt-*.arrow.tmp` rather than `*.tmp`.
+pub(crate) fn is_rolled_log_tmp(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".tmp") else {
+        return false;
+    };
+    matches!(
+        crate::logging::parse_rolled_name(stem),
+        Some((_, _, "parquet"))
+    )
+}
+
+/// Delete every orphaned `oxidant-*.parquet.tmp` in `logs/`, answering the bytes freed.
+///
+/// **Billed but unprunable, otherwise.** `subtree_bytes` counts a `.parquet.tmp` — it is a file
+/// under a budget root — but `parse_rolled_name` rejects the name (`LogPeriod::parse` fails on
+/// `"2026-08-23.parquet"`), so `rolled_logs` never offers it and step 1 of the prune order cannot
+/// take it. The only other code that removes one is the converter thread's `convert_pending`,
+/// which does not run at all under `OXIDANT_LOG_ROLL=off` or `OXIDANT_HISTORY=off`. A tmp left by
+/// a crash in a previous run was therefore billed against `OXIDANT_DISK_MAX_BYTES` forever, and
+/// paid for by pruning statement history — exactly the class of unprunable-but-counted bytes H2
+/// was about.
+///
+/// **Boot only**, from `logging::init`, before this process has a writer: Parquet's footer sits
+/// at the end, so a `.tmp` is never salvageable and deleting one costs nothing — but deleting one
+/// mid-conversion would waste the conversion, and at boot there is none in flight. One writer per
+/// `logs/` is enforced by the directory lock, so no peer's conversion is in flight either.
+pub(crate) fn clear_log_tmp(logs_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return 0;
+    };
+    let mut freed = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_rolled_log_tmp(name) {
+            continue;
+        }
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            freed = freed.saturating_add(meta.len());
+        }
+    }
+    if freed > 0 {
+        super::fs_util::fsync_dir(logs_dir);
+    }
+    freed
+}
+
 /// Is `name` a support-bundle dump this engine wrote? `dump-*.parquet` (§6b), or the
 /// `oxidant-*.parquet` shape a bundle named after the process takes.
 ///
@@ -364,6 +421,54 @@ mod tests {
             std::fs::create_dir_all(parent).expect("mkdir");
         }
         std::fs::write(path, vec![b'x'; bytes]).expect("write");
+    }
+
+    /// **L4.** An orphaned `.parquet.tmp` was billed to the budget and invisible to every prune
+    /// step: `subtree_bytes` counts it, but `parse_rolled_name("oxidant-2026-08-23.parquet.tmp")`
+    /// is `None`, so `rolled_logs` never offers it. The only code that removed one was the
+    /// converter thread, which does not run under `OXIDANT_LOG_ROLL=off` — so a tmp left by a
+    /// crash was billed forever and paid for by pruning statement history.
+    ///
+    /// The grammar is load-bearing: this runs against an operator-set `OXIDANT_LOG_DIR`.
+    #[test]
+    fn an_orphan_parquet_tmp_is_swept_and_nothing_else_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        touch(&logs.join("oxidant-2026-08-22.parquet.tmp"), 100);
+        touch(&logs.join("oxidant-2026-08-23-14.3.parquet.tmp"), 50);
+        // Everything below must survive: two are the engine's own finished files, and the rest
+        // are a co-tenant's, in a directory `OXIDANT_LOG_DIR` may point at.
+        touch(&logs.join("oxidant-2026-08-22.log"), 10);
+        touch(&logs.join("oxidant-2026-08-21.parquet"), 10);
+        touch(&logs.join(LIVE_LOG), 10);
+        touch(&logs.join("postgres.parquet.tmp"), 10);
+        touch(&logs.join("oxidant-notaperiod.parquet.tmp"), 10);
+        touch(&logs.join("oxidant-2026-08-20.log.tmp"), 10);
+        touch(&logs.join("application_1_0001.tmp"), 10);
+
+        let before = subtree_bytes(&logs);
+        let freed = clear_log_tmp(&logs);
+
+        assert_eq!(freed, 150, "both tmps, and their bytes reported");
+        assert_eq!(
+            names(&logs),
+            vec![
+                "application_1_0001.tmp".to_string(),
+                "oxidant-2026-08-20.log.tmp".to_string(),
+                "oxidant-2026-08-21.parquet".to_string(),
+                "oxidant-2026-08-22.log".to_string(),
+                "oxidant-notaperiod.parquet.tmp".to_string(),
+                LIVE_LOG.to_string(),
+                "postgres.parquet.tmp".to_string(),
+            ],
+            "only the engine's own unfinished conversions go"
+        );
+        assert_eq!(
+            subtree_bytes(&logs),
+            before - 150,
+            "and the budget stops being billed for them"
+        );
+        assert_eq!(clear_log_tmp(&logs), 0, "idempotent");
     }
 
     /// The one file the sweeper may never take.

@@ -770,6 +770,18 @@ init is `oxidant_connect::logging::init(role, port)`.
   guards in §3. The size budget can prune a file before its 30 days are up, and says so
   in the log when it does.
 
+- **An unfinished conversion is swept at boot** *(PR3)*. A `.parquet.tmp` a crash left behind is
+  counted by `subtree_bytes` — it is a file under a budget root — but no prune step could
+  recognise it (`parse_rolled_name` rejects the name), and the only code that removed one was the
+  converter thread, which does not run under `OXIDANT_LOG_ROLL=off` or `OXIDANT_HISTORY=off`. It
+  was therefore billed against `OXIDANT_DISK_MAX_BYTES` forever and paid for by pruning statement
+  history — the class of unprunable-but-counted bytes §3 exists to avoid. `logging::init` now
+  deletes them before this process opens a writer, matched **by the grammar** (`oxidant-<period>
+  [.N].parquet.tmp`) and not by the `.tmp` suffix, because `OXIDANT_LOG_DIR` may point at a
+  shared directory — the same discipline as `results::clear_tmp`'s `stmt-*.arrow.tmp`. Boot is
+  the right moment because Parquet's footer sits at the end, so a `.tmp` is never salvageable,
+  and at boot none is in flight.
+
 ### `?file=` grammar, validation, and authz
 
 ```
