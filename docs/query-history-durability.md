@@ -197,6 +197,27 @@ after everything prunable is gone, `/api/status` reports `disk: over_budget`
 one loud line per prune pass naming what was removed and why. The sweeper runs at roll
 time, at boot, and every 5 minutes.
 
+**Built in PR2** (`crates/oxidant-connect/src/history/disk.rs` + `StatementStore::sweep_disk`),
+at boot and on a `OXIDANT_DISK_SWEEP_SECS` timer; the roll-time trigger arrives with the
+rolling writer in PR3. Two notes on what PR2's sweeper measures:
+
+- Steps 1 and 2 are implemented and tested even though PR2 writes nothing under `logs/`
+  or `dumps/`. The order *is* the contract, and a sweeper that learns half of it later
+  is one that spends a query's rows to save a rolled log.
+- **`event_log_dir` is not yet counted.** *Deviation from F16*, which brings it under
+  this budget. F16's mechanism is **rolling** `events.jsonl` to periodised files rather
+  than deleting the live one, and that writer is PR3 — counting the directory now,
+  with no way to prune it, would pin `disk: over_budget` on for every operator who
+  points `event_log_dir` at a large Spark-history-server path. It joins the budget in
+  PR3, with its own `OXIDANT_EVENT_LOG_MAX_BYTES` knob, as §8 describes.
+
+The last step (**oldest live result files**) unlinks the file and journals a snapshot
+with the pointer cleared, so a restart answers `410 result_expired` from the fold
+rather than from a failed open. The *statement* survives; only its rows go. This is
+also the one path that can take a still-running statement's result file — retention
+never does, but a last-resort disk guard with nothing else left will, and it keeps the
+statement.
+
 ### 3c. One process per data dir
 
 Two processes sharing a root would interleave `O_APPEND` writes (atomic only for small
@@ -259,9 +280,14 @@ is what the journal path is then built from.
 today's `MAX_STATEMENTS = 1000`), `OXIDANT_HISTORY_MAX_PER_SESSION` (default 2,000),
 `OXIDANT_HISTORY_RETENTION_DAYS` (default **30**), `OXIDANT_HISTORY_SQL`
 (default `text`), `OXIDANT_HISTORY_HOT_TTL_SECS` (default 3600, §5b),
-`OXIDANT_RESULT_PERSIST=always|on_pressure|never` (default **`always`**, §5),
+`OXIDANT_RESULT_PERSIST=always|on_pressure|never` (default **`on_pressure`** — see
+§5 for why this differs from F8's resolution),
 `OXIDANT_RESULT_MAX_BYTES` (default 256 MiB per file),
-`OXIDANT_RESULT_MEM_BYTES` (default 1 GiB, §5),
+`OXIDANT_RESULT_MEMORY_BUDGET_BYTES` (default **512 MiB**, §5; the spelling
+`OXIDANT_RESULT_MEM_BYTES` is accepted as a synonym so a config written against an
+earlier draft of this document keeps working),
+`OXIDANT_RESULT_DIR` / `OXIDANT_DUMP_DIR` (subtree overrides, §3),
+`OXIDANT_DISK_SWEEP_SECS` (default 300 — how often the §3 sweeper runs),
 `OXIDANT_LOG_ROLL=daily|hourly|weekly` (default `daily`),
 `OXIDANT_LOG_KEEP_DAYS` (default **30**).
 
@@ -432,35 +458,61 @@ no contract change and reads identically to a human.
 
 ## 5. Result retention
 
-- **Default is `always`** (changed from `on_pressure` on review): every terminal
-  succeeded result whose Arrow IPC encoding is under `OXIDANT_RESULT_MAX_BYTES`
-  (256 MiB) is written to `results/<statement-id>.arrow`. This is what actually
-  delivers Goal 2 — under `on_pressure` a clean restart persists *zero* results,
-  because nothing pressures.
-- `on_pressure` remains available and is now backed by a real trigger:
-  `OXIDANT_RESULT_MEM_BYTES` (default 1 GiB) is an **in-memory byte budget** across
-  retained result batches, tracked as batches are attached and released. Today's store
-  evicts by TTL and count only and has no byte accounting at all; adding it is part of
-  PR2. Under `on_pressure`, a result spills when admitting it would exceed the budget,
-  oldest-terminal-first.
-- **Spill never runs under the store mutex.** The review is right that writing
-  256 MiB of Arrow IPC inside `insert()` while holding the `std::sync::Mutex` that
-  every submit/list/status/result call takes is the exact opposite of "a query never
-  waits on history". The spill path is a **bounded writer task**, same shape as the
-  journal writer (§7): the store hands over an `Arc` of the batches and releases the
-  lock; the task encodes, writes `<id>.arrow.tmp`, fsyncs, renames, fsyncs `results/`,
-  and only then appends the snapshot record carrying the `result` pointer.
-- Files larger than `OXIDANT_RESULT_MAX_BYTES` are refused; the statement's snapshot
-  records `result_too_large` in place of the `result` pointer. The live/CSV path is
-  the answer past the budget, stated plainly.
+**Built in PR2** (`crates/oxidant-connect/src/history/results.rs`, `rest.rs`). What
+follows is what the code does; the two places it diverges from the design as written
+are called out inline.
+
+- **Default is `on_pressure`.** *Deviation from the review's F8 resolution, which set
+  the default to `always`.* Rows stay in memory until the in-memory budget would be
+  exceeded; nothing is written on a quiet driver. The trade is stated plainly rather
+  than hidden: under the default, a clean restart persists only what pressure already
+  pushed to disk, and an operator who wants Goal 2 unconditionally sets
+  `OXIDANT_RESULT_PERSIST=always` — which is implemented, tested, and one env var
+  away. The default was chosen so that turning history on does not, by itself, start
+  writing every query's rows to an operator's disk.
+- `on_pressure` is backed by a real trigger: `OXIDANT_RESULT_MEMORY_BUDGET_BYTES`
+  (default **512 MiB**, also accepted under §3's original spelling
+  `OXIDANT_RESULT_MEM_BYTES`) is an **in-memory byte budget** across retained result
+  batches, tracked as batches are attached and released. Today's store evicted by TTL
+  and count only and had no byte accounting at all; PR2 adds it. A result spills when
+  admitting a new one would exceed the budget, **oldest-terminal-first**, and the
+  victim's rows are released only once its file is durable.
+- Under `never` nothing is written **and nothing is released**: a byte budget with no
+  disk behind it would be silent data loss the old store never had, so `never` leaves
+  memory bounded by the count cap and the hot TTL exactly as before.
+- **Spill never runs under the store mutex.** Writing 256 MiB of Arrow IPC while
+  holding the `std::sync::Mutex` that every submit/list/status/result call takes is the
+  exact opposite of "a query never waits on history". `finish()` *plans* the spill under
+  the lock, doing no I/O, and a dedicated writer thread — same shape as the journal's —
+  encodes, writes `<id>.arrow.tmp`, fsyncs, renames, fsyncs `results/`, and only then
+  appends the snapshot record carrying the `result` pointer. A pointer replay reads has
+  therefore always named a file that reached the disk.
+- Results larger than `OXIDANT_RESULT_MAX_BYTES` are refused; the statement's snapshot
+  records `result_too_large` in place of the `result` pointer, and
+  `GET /api/v1/statements/{id}` surfaces it as `"resultStatus": "result_too_large"` so
+  the eventual `410` does not read as "it merely aged out". The cap is enforced **on the
+  encoding, while writing**, not on an in-memory estimate: `get_array_memory_size`
+  over-counts shared Arrow buffers, so refusing on the estimate would refuse results that
+  encode well under the cap. The live/CSV path is the answer past the budget.
+- A **zero-batch** result has no file: an Arrow IPC stream cannot be written without a
+  schema, and a succeeded statement that produced no batches has none. It answers
+  `200 {"rows":[]}` from memory and `410 result_expired` after a restart.
 - **Result GC is tied to the journal, and the journal is the authority.** Pruning a
   statement (§4c) unlinks its result file in the same sweep, before the tombstone is
   considered complete. Boot reconciles `results/` against the folded id set and
   deletes every unreferenced file — which closes the crash window between "tombstone
   appended" and "file unlinked". A result file therefore outlives its statement's
-  journal record by at most one retention sweep, and never across a restart.
-- `/api/v1/statements/{id}/result` reads memory → falls back to disk → answers
-  **`410 result_expired`** when both are gone.
+  journal record by at most one retention sweep, and never across a restart. The
+  reconcile is run against the union of **both tiers**, never the folded set alone: a
+  hot statement has no snapshot on disk yet, and a running one has nothing past its
+  `submitted` record.
+- A `snapshot` record's **absent** `result` now *clears* a pointer rather than leaving
+  it unchanged, on both sides of the fold. §4a already says a snapshot carries the
+  complete folded state; making the fold honour that is what lets §3's last prune step
+  say "this result is gone" instead of leaving a pointer to a file that is not there.
+- `/api/v1/statements/{id}/result` (`?format=json|csv`) reads memory → falls back to
+  the spilled file → answers **`410 result_expired`** when both are gone. The file is
+  decoded on a blocking thread, so a 256 MiB read-back never sits on a tokio worker.
 
   **This is a contract change, announced, not disclaimed.** Today `/result` answers
   `404 unknown statement id`, `409` for a non-succeeded statement, and `400` for a bad
@@ -761,15 +813,20 @@ Identity and tiers:
 - eviction age uses `submitted_at_ms`: a statement journaled 40 days ago folds and ages
   correctly with no `Instant` reconstruction anywhere in the path.
 
-Results:
+Results *(shipped in PR2, in `rest.rs`'s test module unless noted)*:
 
-- default `always`: result spill → process restart → `/result` still answers; oversized
-  result → `result_too_large`; `410 result_expired` once both tiers are gone;
-- `on_pressure` spills exactly when `OXIDANT_RESULT_MEM_BYTES` would be exceeded;
-- spill holds no store lock: a 256 MiB spill runs concurrently with `list`/`status`
-  calls whose p99 stays flat (a lock-hold assertion, not a timing hope);
-- pruning a statement unlinks its result in the same sweep, and boot deletes
-  `results/` files referenced by no folded id.
+- `always`: result spill → process restart → `/result` **and** `/result?format=csv`
+  answer byte-for-byte identically to the pre-restart answer;
+- oversized result → `result_too_large` on the statement, no `.arrow` and no `.tmp`
+  left behind, the rows kept in memory because they are now the only copy, and
+  `410 result_expired` after the restart;
+- `on_pressure` spills exactly when the in-memory budget would be exceeded, picks the
+  **oldest terminal** result, and frees its memory — the newest stays servable from
+  memory;
+- `never` writes nothing and releases nothing;
+- pruning a statement unlinks its result in the same sweep; boot deletes `results/`
+  files referenced by no folded id; and a **running** statement's result survives every
+  retention path there is.
 
 Logs:
 
@@ -792,8 +849,11 @@ Logs:
 Guards and degradation:
 
 - the disk-budget sweeper prunes in the documented order, never touches the live
-  file, counts `event_log_dir`, and reports `over_budget` only after everything
-  prunable is gone;
+  file, and reports `over_budget` only after everything prunable is gone *(shipped in
+  PR2; the `event_log_dir` half waits on PR3 — see §3)*;
+- `/api/status` reports `history_writes: degraded` under a failing-writer shim and
+  flips back to `ok` on the next successful append, with no restart; with
+  `OXIDANT_HISTORY=off` the four durability fields are absent entirely *(shipped)*;
 - two processes on one root: the second fails with the lock error; with
   `OXIDANT_DATA_DIR_PER_PROCESS=1` it starts in its own subdir;
 - an object-store URL in `OXIDANT_DATA_DIR` is rejected at boot;
@@ -815,9 +875,16 @@ Guards and degradation:
    than in PR2, because a history-tier statement whose rows are gone must not answer `404` or an
    empty result set in the meantime; and `/api/status` does not yet carry `history_writes` /
    `history_dropped_events` — the per-response `"history":"degraded"` envelope does, and the
-   status fields land with PR2's disk guards.
-2. **PR2** — result spill (default `always`, byte budget, writer task) + disk
-   fallback and `410` in `/result` + result GC.
+   status fields land with PR2's disk guards (they did).
+2. **PR2** — *shipped* — result spill (writer thread, byte budget) + disk fallback in
+   `/result` and `/result?format=csv` + result GC tied to the journal + §3's disk guards
+   and the `/api/status` counters PR1 deferred (`history_writes`,
+   `history_dropped_events`, `results_on_disk_bytes`, `disk`). Three deviations, each
+   argued where it lands: the persist default is `on_pressure` rather than F8's
+   `always` (§5), the in-memory budget is `OXIDANT_RESULT_MEMORY_BUDGET_BYTES` at
+   512 MiB rather than `OXIDANT_RESULT_MEM_BYTES` at 1 GiB — the old spelling is still
+   accepted (§3, §5) — and `event_log_dir` joins the disk budget in PR3 rather than
+   here, because F16's mechanism for it is a roll and the rolling writer is PR3 (§3).
 3. **PR3** — process-level logging init (driver *and* worker), rolling writer with
    timestamps, UTC naming with size splits, Parquet-on-roll, dedup, the disk-budget
    sweeper, and `?file=` on `/api/v1/logs`.
@@ -835,7 +902,7 @@ Guards and degradation:
 | **F5** | Replay neutralized by `STATEMENT_TTL`; `Instant` not reconstructible | **Design change.** New §5b defines the hot/history two-tier model, states that replay populates the history tier and that `evict_expired` sweeps only the hot tier, and switches age arithmetic to the already-existing `submitted_at_ms`, keeping `Instant` only for live duration. Regression test added in §9. |
 | **F6** | Size-roll and clock-roll collide | **Design change.** §3 "Naming" defines `oxidant-YYYY-MM-DD[-HH][.N]` with `.N` as the size-split sequence, chosen by scanning for the highest existing split so a restart mid-period is safe. `?file=` accepts `.N` (§6). |
 | **F7** | Parquet-on-roll vs crash honesty; §3/§6 disagree | **Design change.** §6 rewritten: text is authoritative, conversion is a separate step *after* close+fsync+rename, the text file is unlinked only after the Parquet footer reads back, **a crash between roll and convert leaves the text file and the next boot converts it**, a `.parquet.tmp` is deleted and redone. §3 reserves conversion headroom against the budget and the free-space floor. §6 also makes the writer a real `tracing` layer with a `ts` column (the source lines had no timestamp) and states the lost-`grep` cost with the `OXIDANT_LOG_PARQUET=off` out. |
-| **F8** | Default `on_pressure` cannot deliver Goal 2 | **Design change, both halves.** §5 makes the default **`always`**, and defines `OXIDANT_RESULT_MEM_BYTES` (1 GiB) as the real in-memory byte budget that `on_pressure` triggers on. §5 also moves spill onto a bounded writer task so it never runs under the store mutex. |
+| **F8** | Default `on_pressure` cannot deliver Goal 2 | **Design change, both halves** — and **partly reverted in PR2**. The second half shipped as written: `OXIDANT_RESULT_MEMORY_BUDGET_BYTES` (512 MiB) is a real in-memory byte budget that `on_pressure` triggers on, and spill runs on a dedicated writer thread, never under the store mutex. The first half did not: the shipped default is **`on_pressure`**, so that enabling history does not by itself start writing every query's rows to disk. `always` is implemented and tested and is one env var away; §5 states the trade rather than hiding it. |
 | **F9** | Event schema missing fields | **Design change.** §4a's schema carries `schema`, `error`, `submitted_at_ms`, `duration_ms`, `session`, `source`, `sql_encoding`, `seq`, `last_seq` and the result pointer. `seq` is defined as the writer-assigned submit sequence, stable across compaction. |
 | **F10** | Compaction races, non-atomic swap, undefined replay order, no dir fsync | **Design change.** §4d: seal-before-compact (the writer never shares an open segment), the five-step swap with a `.done` marker and boot recovery, and mandatory parent-directory fsync for every rename in the design, with the explicit note that `checkpoint.rs` offers no precedent. §4c defines replay order twice over — a deterministic numerically-sorted file order *and* a seq-monotone fold that makes order irrelevant and double-folds harmless. |
 | **F11** | Timezone/DST/ISO weeks | **Design change.** §3 pins all names to **UTC** and says so in the runtime contract; weekly is `%G-W%V` with a year-boundary test; `KEEP_DAYS` is defined against the file's *period* with weekly rounding up, stated as the operator contract. The chrono dependency note (workspace-internal, `features = ["std","clock"]`, `oxidant-loom`'s clockless pin) is in §2. |
