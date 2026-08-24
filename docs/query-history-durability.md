@@ -1413,6 +1413,19 @@ document or `docs/api.md` previously promised.
   mid-character, and a foreign file that is not UTF-8 at all used to fail the scan outright
   rather than serving the line rule 1 says a reader should still see.
 
+- **F13 — a cursor names an older page, never an empty one.** `scan_parquet` set
+  `more_before` when the window filled at a *group boundary*, before that group was examined —
+  and a candidate group has only survived the `ts` pruner, which ignores `level`, `target` and
+  `q`. So a page whose filter matched nothing older still came back with a non-null
+  `next_before`, and the caller followed it into a page that was empty with `next_before: null`.
+  The text path already had the tighter answer (`Window::dropped` is true only when a *match*
+  was evicted), so the two forms of one file disagreed about the cursor — the distinction rule 2
+  says a caller must not be able to see. A full page no longer ends the walk; it switches it to
+  a **probe** that decodes nothing into the page and stops at the first group holding an
+  admissible match. This is never more work than before — the empty page the false positive
+  invited would have scanned exactly those groups — and with no `q` it is answered on the
+  three-column pushdown alone, without touching `message`.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |

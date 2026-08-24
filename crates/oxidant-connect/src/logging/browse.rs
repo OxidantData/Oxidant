@@ -648,12 +648,21 @@ pub(crate) fn scan_parquet(
     let mut window = Window::new(limit);
     let mut more_before = false;
     for g in candidates {
-        if window.full() {
-            // Something older than this page exists and was not read. The cursor says so; the
-            // rows are not decoded, which is the whole point of stopping here.
-            more_before = true;
-            break;
-        }
+        // **A full page does not end the walk; it changes what the walk is for.** Setting
+        // `more_before` here and breaking made `next_before` a *false positive* at every group
+        // boundary: this group survived the `ts` pruner, which ignores `level`, `target` and
+        // `q`, so it may hold no match at all — and the caller then follows a non-null cursor
+        // into a page that comes back empty with `next_before: null`. The text path has the
+        // tighter answer already (`Window::dropped` is true only when a *match* was evicted),
+        // and rule 2's premise is that the two forms of one file are indistinguishable to a
+        // caller.
+        //
+        // So the walk keeps going, in **probe** mode: it decodes nothing into the page and
+        // stops at the first group that actually holds an admissible match. This is never more
+        // work than the status quo — the empty page the false positive invited would have
+        // scanned exactly these groups — and in the common case it is one group's worth of
+        // three-column pushdown.
+        let probing = window.full();
         let start = starts[g];
         let group_rows = md.row_group(g).num_rows().max(0) as u64;
         // The cursor can land inside a group; rows at or after it belong to the page already
@@ -696,12 +705,24 @@ pub(crate) fn scan_parquet(
         if hits.is_empty() {
             continue;
         }
+        if probing && filter.q.is_none() {
+            // With no free-text predicate every pushdown hit *is* a match, so the question is
+            // already answered and `message`/`fields_json` are never touched.
+            more_before = true;
+            break;
+        }
         // **Only the newest matches of this group are rendered.** With no free-text predicate
         // every pushdown hit *is* a match, so the page can only ever hold the newest
         // `remaining` of them and the older ones need not have `message`/`fields_json` decoded
         // at all. `q` is the exception — it judges the rendered line, so every candidate has to
         // be built — and there the per-group window below is what bounds the memory.
-        let remaining = limit.saturating_sub(window.len()).max(1);
+        // One line is all a probe needs: it is asking whether anything older matches, not
+        // building a page.
+        let remaining = if probing {
+            1
+        } else {
+            limit.saturating_sub(window.len()).max(1)
+        };
         if filter.q.is_none() && hits.len() > remaining {
             hits.drain(..hits.len() - remaining);
             more_before = true;
@@ -741,6 +762,16 @@ pub(crate) fn scan_parquet(
                     newest.push(start + row as u64, line);
                 }
             }
+        }
+        if probing {
+            // A `q` is the one predicate pass 1 cannot answer, so the probe had to render. If
+            // this group holds a match the cursor is real; if it does not, keep looking older
+            // rather than promising a page that is not there.
+            if newest.len() > 0 {
+                more_before = true;
+                break;
+            }
+            continue;
         }
         if newest.dropped {
             // This group held matches older than the page could carry.
@@ -1190,6 +1221,98 @@ mod tests {
         assert_eq!(
             next.next_before, None,
             "and it reached the start of the file"
+        );
+    }
+
+    /// **A cursor names an older page, or it is `null`. It never names an empty one.**
+    ///
+    /// `scan_parquet` set `more_before` when the window filled at a *group boundary*, before
+    /// that group was examined — and a candidate group has only survived the `ts` pruner, which
+    /// ignores `level`, `target` and `q`. So a page whose filter matched nothing older still
+    /// came back with a non-null `next_before`, and the caller followed it into a page that was
+    /// empty with `next_before: null`. The text path has the tighter answer already
+    /// (`Window::dropped` is true only when a *match* was evicted), so the two forms of one file
+    /// disagreed about the cursor — which is exactly the distinction rule 2 says a caller must
+    /// not be able to see. Every case below asserts both paths, byte for byte.
+    ///
+    /// Three groups, and the older two are where the false positives live: group 1 holds
+    /// `ERROR`s that no `q` matches, and neither older group holds the `target` at all.
+    #[test]
+    fn a_full_page_at_a_group_boundary_does_not_promise_a_page_that_is_not_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let count = ROWS_PER_ROW_GROUP * 2 + 100;
+        let body: Vec<String> = (0..count)
+            .map(|i| {
+                let ts = format!(
+                    "2026-08-23T{:02}:{:02}:{:02}.000Z",
+                    i / 3600,
+                    (i / 60) % 60,
+                    i % 60
+                );
+                if i >= count - 5 {
+                    // The newest group, and the only rows any of these filters wants.
+                    format!("{ts} [ERROR] oxidant_execution - message=fresh {i}")
+                } else if (9_000..9_003).contains(&i) {
+                    // Group 1: pushdown hits for `level=error` that no `q=fresh` will keep.
+                    format!("{ts} [ERROR] oxidant_connect - message=stale {i}")
+                } else {
+                    format!("{ts} [INFO] oxidant_connect - message=line {i}")
+                }
+            })
+            .collect();
+        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+        let text = write(dir.path(), "oxidant-2026-08-27.log", &refs);
+        // `convert` consumes the file it converts, so the text arm reads its own copy.
+        let parquet_src = write(dir.path(), "oxidant-2026-08-26.log", &refs);
+        let parquet = super::super::columnar::convert(&parquet_src).expect("convert");
+        let file = std::fs::File::open(&parquet).expect("open");
+        let md = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default()).expect("metadata");
+        assert_eq!(
+            md.metadata().num_row_groups(),
+            3,
+            "the boundary this test is about has to exist"
+        );
+
+        let page = |f: &LogFilter| {
+            let from_parquet = scan_parquet(&parquet, f, None, 5).expect("parquet");
+            let from_text = scan_text(&text, f, None, 5).expect("text");
+            assert_eq!(
+                from_parquet, from_text,
+                "the two forms of one file must answer the same page, cursor included"
+            );
+            from_parquet
+        };
+
+        // Nothing older matches `q`, and the group in the way holds pushdown hits — the case
+        // pass 1 alone cannot answer, so the probe renders that group and finds no match.
+        let q = page(&filter(Some("error"), None, Some("fresh")));
+        assert_eq!(q.lines.len(), 5);
+        assert!(q.lines.iter().all(|l| l.contains("fresh")));
+        assert_eq!(
+            q.next_before, None,
+            "a cursor into a page with nothing in it: {:?}",
+            q.next_before
+        );
+
+        // Nothing older carries the target at all — the probe steps over both older groups on
+        // three columns and never touches `message`.
+        let by_target = page(&filter(None, Some("oxidant_execution"), None));
+        assert_eq!(by_target.lines.len(), 5);
+        assert_eq!(by_target.next_before, None);
+
+        // And the true positive is intact: group 1's `ERROR`s are real matches for this filter,
+        // so the cursor names them and the next page serves them.
+        let real = page(&filter(Some("error"), None, None));
+        assert_eq!(real.lines.len(), 5);
+        let older = real
+            .next_before
+            .expect("older errors exist and must be offered");
+        let next = scan_parquet(&parquet, &filter(Some("error"), None, None), Some(older), 5)
+            .expect("parquet");
+        assert_eq!(
+            next.lines.len(),
+            3,
+            "the page the cursor promised is the three stale errors, not nothing"
         );
     }
 

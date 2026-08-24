@@ -546,6 +546,12 @@ curl -s 'http://localhost:4040/api/v1/logs?file=2026-08-23&level=warn&target=oxi
   so a cursor minted against `oxidant-2026-08-23.log` still names the same line after the
   background converter has replaced it with `oxidant-2026-08-23.parquet`. **Follow it rather
   than counting**: a page is also cut short by an internal byte budget.
+- **A cursor names an older page, never an empty one.** `next_before` is non-null only when a
+  line the *whole* filter keeps was left behind. On a `.parquet` it used to be set as soon as
+  the page filled at a row-group boundary, before that group was examined — and a group has only
+  survived the `ts` pruner, which ignores `level`, `target` and `q` — so a filter with nothing
+  older to show still handed back a cursor, and following it cost one empty page. The two forms
+  of one file now agree on the cursor as well as on the lines.
 - **The memory ring is the one exception, and it says so.** A no-`?file=` page carries
   `"cursor": "best-effort"`; a file's page carries no `cursor` key at all. The ring is not
   append-only — it *rolls*, so every line the node logs between two requests shifts every index
