@@ -359,3 +359,87 @@ fn per_process_roots_give_a_co_located_driver_and_worker_two_logs() {
         "two roots, two logs, no shared live file"
     );
 }
+
+/// **M5.** §6, §9 and `runtime-contract.md` all list "at shutdown" as a flush trigger for the
+/// held `… repeated N times` summary. It could not fire: `RollingWriter::shutdown` was
+/// `dead_code` outside tests, and the `Drop` that did the same work never ran because the writer
+/// lives in a `static OnceLock` and Rust runs no destructors for statics at exit. The `sync_all()`
+/// in the same block never ran either, so a host that went down behind the process lost the tail.
+///
+/// This is a subprocess test for the same reason the rest of this file is: the bug is a *wiring*
+/// bug — the code existed and was correct, nothing called it — and only the real binary taking a
+/// real SIGTERM can tell you whether it is reachable now.
+///
+/// The proof is the close line. It is written *through* `tracing` from the signal handler, so its
+/// presence at the end of the file means the handler ran, the layer was still attached, and the
+/// flush that follows it in `logging::shutdown` ran too. `child.kill()` (SIGKILL) is what every
+/// other test here sends, and it must *not* produce it — otherwise the assertion proves nothing.
+#[test]
+#[cfg(unix)]
+fn sigterm_flushes_and_closes_the_rolling_log() {
+    let oxidant = oxidant_bin();
+
+    let signal_run = |signal: &str| -> String {
+        let root = TempDir::new().expect("tempdir");
+        let (mut worker, _) = spawn_with_retry(|port| {
+            let mut cmd = Command::new(&oxidant);
+            cmd.args(["worker", "--port", &port.to_string()])
+                .env("OXIDANT_DATA_DIR", root.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        });
+        let live = root.path().join("logs").join("oxidant.log");
+        // Wait for the worker to be fully up, so the signal cannot land before `init` did.
+        wait_for_text(&live, "oxidant worker listening on Flight", "the worker");
+
+        let status = Command::new("kill")
+            .args([signal, &worker.id().to_string()])
+            .status()
+            .expect("kill");
+        assert!(status.success(), "kill {signal} failed");
+        let exit = wait_for_exit(&mut worker);
+
+        if signal == "-TERM" {
+            assert_eq!(
+                exit.code(),
+                Some(143),
+                "a flushed shutdown still exits the way a SIGTERM-killed process does"
+            );
+        }
+        std::fs::read_to_string(&live).expect("the live log")
+    };
+
+    let terminated = signal_run("-TERM");
+    assert!(
+        terminated.contains("rolling exec log closed"),
+        "SIGTERM must flush and close the log; §6 says so in three places: {terminated}"
+    );
+    assert!(
+        terminated
+            .lines()
+            .last()
+            .is_some_and(|l| l.contains("rolling exec log closed")),
+        "and it is the *last* line, so an operator can tell a stop from a crash: {terminated}"
+    );
+
+    let killed = signal_run("-KILL");
+    assert!(
+        !killed.contains("rolling exec log closed"),
+        "SIGKILL cannot be caught, so the absence of the line is what makes it evidence: {killed}"
+    );
+}
+
+/// Wait for a child to exit after a signal, rather than assuming it already has.
+#[cfg(unix)]
+fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    panic!("the worker did not exit within 30s of the signal");
+}

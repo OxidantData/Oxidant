@@ -445,14 +445,22 @@ impl RollingWriter {
         }
     }
 
-    /// Flush a held repeat and stop the worker. Idempotent, and the same work [`Drop`] does —
-    /// a test calls it explicitly so the converter thread has finished before it asserts.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Flush a held repeat, `fsync`, and stop the worker. **Idempotent**, and the same work
+    /// [`Drop`] does.
+    ///
+    /// §6 lists shutdown as one of the four flush triggers, but for a while nothing in a
+    /// non-test build called this: the writer lives in a process-global `OnceLock`, and Rust runs
+    /// no destructors for statics at exit, so `Drop` never fired either. The claim is made true
+    /// by [`super::install_shutdown_flush`], which wires SIGINT/SIGTERM to
+    /// [`super::shutdown`]; this stays idempotent because a test also calls it directly to make
+    /// the converter thread quiesce before asserting.
     pub(crate) fn shutdown(&self) {
         {
             let mut st = self.state.lock().expect("log writer poisoned");
             let now = Utc::now();
             self.flush_held(&mut st, now);
+            // Without this the tail sits in the page cache, and §6's "flushed … at shutdown"
+            // buys nothing on a host that goes down right after the process does.
             let _ = st.file.sync_all();
         }
         let _ = self.tx.send(Job::Stop);
@@ -464,18 +472,9 @@ impl RollingWriter {
 
 impl Drop for RollingWriter {
     fn drop(&mut self) {
-        // Shutdown flushes the held repeat: §6 lists shutdown as a flush trigger, and the last
-        // thing a crashing process repeats is usually the thing worth counting.
-        {
-            let mut st = self.state.lock().expect("log writer poisoned");
-            let now = Utc::now();
-            self.flush_held(&mut st, now);
-            let _ = st.file.sync_all();
-        }
-        let _ = self.tx.send(Job::Stop);
-        if let Some(handle) = self.worker.lock().expect("log worker poisoned").take() {
-            let _ = handle.join();
-        }
+        // The same work, for the writers that *are* dropped — every one in a test, and any
+        // future embedded caller that owns its writer rather than parking it in a static.
+        self.shutdown();
     }
 }
 

@@ -729,6 +729,20 @@ init is `oxidant_connect::logging::init(role, port)`.
   authoritative**, and `/api/v1/logs?file=current` says so via
   `"dedup":true` in its response envelope; the SSE tail marks itself
   `"dedup":false`.
+- **"At shutdown" is a real trigger now** *(PR3)*. It was documented here, in §9 and in the
+  runtime contract, and it could not fire: `RollingWriter::shutdown` was `dead_code` outside
+  tests, and the `Drop` that did the same work never ran because the writer lives in a
+  process-global `OnceLock` and Rust runs no destructors for statics at exit. The held-repeat
+  loss was bounded by the 5 s timer, but the `sync_all()` in the same block never ran either, so
+  a host that went down behind the process lost a page cache's worth of tail lines. `serve` and
+  `oxidant worker` now install a **SIGINT/SIGTERM handler** that writes one
+  `rolling exec log closed` line, flushes the held repeat, `fsync`s the live file, and exits
+  `128 + signo` — 143 for SIGTERM, 130 for Ctrl-C — the status a shell already reported for a
+  signal-killed process, so a supervisor reading exit codes sees no change. The close line is the
+  bookend to `rolling exec log open`: **its presence at the end of a log is how an operator tells
+  a stop from a crash**, and SIGKILL, which cannot be caught, still leaves it absent. Draining
+  in-flight gRPC first was the other option and was rejected — a long Connect stream would hold
+  `docker stop` open to its full timeout, and the log has nothing to wait for.
 - Retention: `OXIDANT_LOG_KEEP_DAYS` (default **30**, period-based — §3) plus the hard
   guards in §3. The size budget can prune a file before its 30 days are up, and says so
   in the log when it does.

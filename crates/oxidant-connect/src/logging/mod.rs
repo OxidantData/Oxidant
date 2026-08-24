@@ -293,6 +293,78 @@ fn open_writer(role: &str, port: u16) -> Option<Arc<RollingWriter>> {
     }
 }
 
+/// Flush and quiesce the process's rolling exec log — §6's "at shutdown" flush trigger.
+///
+/// **This was documented in three places and was dead code.** `RollingWriter::shutdown` carried
+/// `#[cfg_attr(not(test), allow(dead_code))]`, which was the proof: nothing in a release build
+/// called it. `Drop` did the same work, but the writer lives in a `static OnceLock` and Rust runs
+/// no destructors for statics at process exit, so it never fired either. §6, §9 and
+/// `runtime-contract.md` all listed a trigger that could not fire. The bound was small — the 5 s
+/// dedup timer caps what a held repeat can lose — but the `sync_all()` in the same block never
+/// ran, so a host that went down behind the process lost a page cache's worth of tail lines.
+///
+/// The close line is emitted *through* `tracing`, before the flush, for two reasons: a different
+/// line arriving is itself a dedup flush trigger, so it lands the held summary in the right file;
+/// and its presence is what tells an operator the process was *stopped* rather than killed. It is
+/// the bookend to the `rolling exec log open` line [`init`] writes.
+///
+/// Idempotent, and a no-op when no writer is installed (`OXIDANT_LOG_ROLL=off`, `OXIDANT_HISTORY=off`).
+pub fn shutdown() {
+    let Some(writer) = rolling() else { return };
+    tracing::info!(
+        dir = %writer.dir().display(),
+        "rolling exec log closed"
+    );
+    writer.shutdown();
+}
+
+/// Wire [`shutdown`] to the signals a supervisor actually sends, then exit.
+///
+/// Called from the two long-lived entry points — `serve` and `oxidant worker` — and deliberately
+/// **not** from [`init`]: installing a signal handler is a process-wide decision, and an embedded
+/// caller that links this crate into its own binary must be the one to make it.
+///
+/// The flush runs on the blocking pool because [`shutdown`] joins the converter thread, and the
+/// process then exits `128 + signo` — the status a shell reports for a process killed by that
+/// signal, so a supervisor reading exit codes sees what it saw before. Draining in-flight gRPC
+/// first was the other option and was rejected: a long Connect stream would hold `docker stop`
+/// open to its full timeout, and the *log* has nothing to wait for.
+#[cfg(unix)]
+pub fn install_shutdown_flush() {
+    tokio::spawn(async {
+        let signo = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => 15,
+                    _ = tokio::signal::ctrl_c() => 2,
+                }
+            }
+            // No SIGTERM handler (a sandbox that forbids it): Ctrl-C alone still flushes.
+            Err(_) => {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                2
+            }
+        };
+        let _ = tokio::task::spawn_blocking(shutdown).await;
+        std::process::exit(128 + signo);
+    });
+}
+
+/// Non-unix: Ctrl-C only, and no `128 + signo` convention to honour.
+#[cfg(not(unix))]
+pub fn install_shutdown_flush() {
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(shutdown).await;
+        std::process::exit(130);
+    });
+}
+
 /// The process's log ring, creating it if [`init`] has not run (an embedded caller building the
 /// REST router directly).
 pub(crate) fn buffer() -> LogBuffer {

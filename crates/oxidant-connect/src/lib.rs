@@ -2371,6 +2371,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     // with its own role/port — that is the whole point of hoisting it out of `rest::router`
     // (§6c), which a standalone worker never builds.
     logging::init("driver", config.port);
+    // §6's "at shutdown" flush trigger, made real: SIGINT/SIGTERM flush the held repeat and
+    // `fsync` the live file before the process goes. Here rather than in `logging::init` because
+    // installing a signal handler is a process-wide decision, and `init` is also reached from an
+    // embedded caller that owns its own.
+    logging::install_shutdown_flush();
 
     // Refuse to boot on a `spark.sql.defaultCatalog` that names nothing declared: the failure is
     // otherwise silent (unqualified names keep resolving against `spark_catalog`) and the whole

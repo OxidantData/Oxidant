@@ -402,6 +402,9 @@ async fn run_worker(
     // dig for (docs/query-history-durability.md §6c). Every node writes its own `logs/` under
     // its own root; the driver federates *reads* over them (PR4) rather than ingesting them.
     oxidant_connect::logging::init("worker", port);
+    // The worker half of §6's shutdown flush: a scaled-down worker gets SIGTERM, and the tail of
+    // its log is exactly what an operator reads afterwards.
+    oxidant_connect::logging::install_shutdown_flush();
     // Same catalog bootstrap as `oxidant spark server` so Glue/Hive tables resolve on workers.
     // Workers must see the same catalogs as the driver, or a distributed stage cannot resolve
     // the tables its plan references. Same precedence as the server: file first, flags on top.
