@@ -155,6 +155,60 @@ One JSON line per lifecycle event:
   Parquet reader (same rows the text file had). Absent file → 404, same honesty
   as the connector-log endpoint.
 
+## 6b. Browsing logs on the driver (and workers, without moving them)
+
+Logs stay **where they are written**. Browsing is a query-time read through
+REST/gRPC interfaces — the driver never ingests worker logs into its own store;
+the one exception is an explicit diagnostic dump (below).
+
+**Driver log browser API** (token-guarded like the rest of the surface):
+
+```
+GET /api/v1/logs/files                     → [{file, rolled, size_bytes, first_ts, last_ts}]
+GET /api/v1/logs?file=…&level=warn&target=oxidant_execution&q=pool&
+     from=…&to=…&limit=500&before=<cursor>   → {lines: [...], next_before}
+GET /api/v1/logs/tail?file=current&level=… (SSE)               → live follow
+```
+
+- Filters compose: level (≥), target prefix, free-text `q`, time range; results
+  stream newest-first with a cursor so the UI pages backward without reloading
+  the whole file. `tail` is the SSE follow mode over the live file.
+- Rolled files answer the same query shape — the Parquet reader evaluates the
+  level/target/time predicates as column filters, so browsing a compressed day
+  does not decompress the whole day.
+- `GET /api/v1/logs/files` works for every file the sweeper has not pruned —
+  the visible history is always honestly what exists.
+
+**Worker logs through the driver** (federation, not shipping):
+
+```
+GET /api/v1/logs/workers                   → [{worker_id, address, reachable}]
+GET /api/v1/logs?worker=<id>&…same query…  → proxied from that worker's own /api/v1/logs
+```
+
+Every worker runs the identical logs API over its own files. The driver
+proxies the query (with the same filters) at read time and labels the rows with
+their worker — the Observability screen's worker picker is a dropdown of live
+workers plus "driver". A worker that does not answer is listed `reachable:
+false` and its rows are absent with the reason — never silently skipped. No
+worker log bytes touch the driver's disk on this path.
+
+**Diagnostic dump (the only time logs move):**
+
+```
+POST /api/v1/logs/dump {worker: <id>|"all", from, to}  → 202 {dump_id}
+GET  /api/v1/logs/dump/{dump_id}                       → parquet bundle download
+```
+
+An explicit, token-guarded, audited action for support bundles: the worker(s)
+stream the requested slice (already-Parquet rolled files ship as-is; the live
+file converts on the fly), the driver assembles one download. Bounded by a dump
+size cap; the bundle expires and is swept like results.
+
+**Observability screen**: the log section gains the file picker (current +
+rolled dates), level/target/text filters, time range, tail-follow toggle, and
+the worker dropdown — all over the endpoints above, same token flow as today.
+
 ## 7. Failure semantics (the honesty section)
 
 - **A query never waits on history.** The writer channel is bounded; when full,
@@ -201,3 +255,5 @@ One JSON line per lifecycle event:
 1. **PR1** — the journal + replay + Connect unification (closes #134's durable half).
 2. **PR2** — result spill + disk fallback in `/result`.
 3. **PR3** — rolling exec logs + `?file=` on `/api/v1/logs`.
+4. **PR4** — the driver log browser (filters/cursor/tail) + worker federation +
+   the diagnostic dump, with the Observability screen's log UI.
