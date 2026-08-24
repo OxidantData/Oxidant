@@ -1262,6 +1262,22 @@ Guards and degradation:
    `incompatible_msrv` hits (`Option::is_none_or`, `io::Error::other`) against the workspace's
    `rust-version = "1.72"`.
 
+### PR4 review (#143): sixteen findings, and what changed
+
+The review of PR4 is in `#143`. Every finding is fixed in the branch; the ones that changed
+*behaviour* rather than only code are recorded here, because each contradicts something this
+document or `docs/api.md` previously promised.
+
+- **F1 — the dump store resolves the data root through the statement store, not the
+  environment.** `rest::router` built its `DumpStore` from `HistoryConfig::from_env("driver", 0)`
+  — a *third* read of the environment, with a port the function does not know. Under
+  `OXIDANT_DATA_DIR_PER_PROCESS=1` (`docs/runtime-contract.md`'s recommended container setting)
+  that resolves `<root>/driver-0/dumps/` while the sweeper prunes `<root>/driver-<port>/dumps/`
+  and `disk::budget_roots` bills neither. Three §3/§6b promises broke at once: the 24 h expiry,
+  the disk budget, and `admit()`'s up-front `507` (which measured an empty tree). The router now
+  asks `StatementStore::history_config()` for the config the store actually booted with, so
+  `DumpStore.dir` is by construction the `cfg.dumps_dir` `sweep_disk` prunes.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |

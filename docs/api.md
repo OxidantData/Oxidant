@@ -727,7 +727,10 @@ curl -s -o bundle.parquet -w '%{http_code}' \
   `507` on collection. A smaller bundle would be carried to a support case in the belief that it
   held the window that was asked for.
 - Bundles land in `$OXIDANT_DATA_DIR/dumps/` as `dump-<uuid>.parquet`, **expire after 24 h**,
-  and are swept by the same prune pass that sweeps spilled results.
+  and are swept by the same prune pass that sweeps spilled results. The directory is resolved by
+  the same code that resolves every other subtree under the data dir — so with
+  `OXIDANT_DATA_DIR_PER_PROCESS=1` it is `$OXIDANT_DATA_DIR/<role>-<port>/dumps/`, the tree the
+  sweeper prunes and the disk budget bills, and `$OXIDANT_DUMP_DIR` overrides it outright.
 
 ## Full async flow (submit → poll → result → cancel)
 

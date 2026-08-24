@@ -520,6 +520,23 @@ impl StatementStore {
         }
     }
 
+    /// The config this store booted with — **the one resolver every writer under the data dir
+    /// shares**.
+    ///
+    /// `HistoryConfig::from_env` folds `(role, port)` into the root under
+    /// `OXIDANT_DATA_DIR_PER_PROCESS`, so re-reading the environment with a different port
+    /// resolves a *different tree*. That is how the dump store came to write into
+    /// `<root>/driver-0/dumps/` while the sweeper pruned `<root>/driver-<port>/dumps/` and the
+    /// disk budget measured neither: bundles that never expired and an up-front `507` that
+    /// measured an empty directory. Handing out the booted config — rather than reading the env
+    /// a third time — is what makes "the same env the writer and the sweeper read" a fact.
+    ///
+    /// `None` is a volatile store (`OXIDANT_HISTORY=off`, or an embedded caller that never
+    /// attached one), which promises that nothing is written under the data dir.
+    pub(crate) fn history_config(&self) -> Option<&HistoryConfig> {
+        self.history.as_ref().map(|h| &h.cfg)
+    }
+
     /// Boot the durable store: lock the data dir, replay the journal into the history tier, and
     /// keep writing to it. `Err` fails the process's boot, loudly, with the reason.
     pub(crate) fn with_history(cfg: HistoryConfig) -> Result<Self, String> {
@@ -2059,19 +2076,28 @@ pub fn router(service: Arc<OxidantService>) -> Router {
         .statement_store()
         .cloned()
         .unwrap_or_else(StatementStore::new);
+    // **The config the store booted with, never a fresh read of the environment.** The dump
+    // store must land in the directory the sweeper prunes and the disk budget measures, and
+    // under `OXIDANT_DATA_DIR_PER_PROCESS` that directory depends on the process's own
+    // `(role, port)` — which this function does not have and used to guess as `0`.
+    let dumps = dumps_for(&store);
     app(RestState {
         service,
         store,
         log_buffer,
         logs: LogView::process(),
         status_token: oxidant_ui_server::status::status_token_from_env().map(Into::into),
-        // Built from the same env the writer and the sweeper read, so a dump cannot be the one
-        // writer with its own idea of where `dumps/` is or how large it may get.
-        dumps: crate::history::HistoryConfig::from_env("driver", 0)
-            .ok()
-            .as_ref()
-            .and_then(crate::logging::DumpStore::from_config),
+        dumps,
     })
+}
+
+/// The dump store a router gets: built from *this* store's own [`HistoryConfig`], so
+/// `DumpStore.dir` is `cfg.dumps_dir` — the same path [`StatementStore::sweep_disk`] prunes and
+/// the same tree `disk::budget_roots` bills. Its own seam so the wiring is testable.
+fn dumps_for(store: &StatementStore) -> Option<Arc<crate::logging::DumpStore>> {
+    store
+        .history_config()
+        .and_then(crate::logging::DumpStore::from_config)
 }
 
 /// Build the process's statement store from the environment and attach it to `service`.
@@ -4825,6 +4851,56 @@ mod tests {
         assert!(
             foreign.exists(),
             "a bundle the engine did not write is measured and never unlinked"
+        );
+    }
+
+    /// **One resolver, shared.** The dump store must resolve the data root exactly the way the
+    /// rest of the process does, or every promise made about a bundle is made about a directory
+    /// nothing else looks at.
+    ///
+    /// `OXIDANT_DATA_DIR_PER_PROCESS=1` is `docs/runtime-contract.md`'s recommended setting for
+    /// a container that co-locates a driver and a worker, and it folds `(role, port)` into the
+    /// root. The router used to build its `DumpStore` by reading the environment a *third* time
+    /// with `port = 0`, so bundles landed in `<root>/driver-0/dumps/` while the sweeper pruned
+    /// `<root>/driver-<port>/dumps/`: a support bundle that never expired, was never billed
+    /// against `OXIDANT_DISK_MAX_BYTES`, and whose up-front `507` measured an empty tree.
+    #[test]
+    fn the_dump_store_writes_where_the_sweeper_prunes_under_a_per_process_data_dir() {
+        let _env = crate::distributed::env_lock();
+        let root = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("OXIDANT_DATA_DIR", root.path());
+        std::env::set_var("OXIDANT_DATA_DIR_PER_PROCESS", "1");
+        std::env::remove_var("OXIDANT_HISTORY");
+        std::env::remove_var("OXIDANT_DUMP_DIR");
+        // The port this process really booted on — the one `logging::init` and
+        // `init_statement_store` are handed, and the one the sweeper's config carries.
+        let store = StatementStore::from_env("driver", 50051).expect("store");
+        std::env::remove_var("OXIDANT_DATA_DIR");
+        std::env::remove_var("OXIDANT_DATA_DIR_PER_PROCESS");
+
+        let cfg = store.history_config().expect("a durable store").clone();
+        let dumps = dumps_for(&store).expect("a dump store");
+        assert_eq!(
+            dumps.dir(),
+            cfg.dumps_dir,
+            "a bundle must land in the directory `sweep_disk` prunes"
+        );
+        assert!(
+            cfg.dumps_dir.starts_with(root.path().join("driver-50051")),
+            "and that directory is this process's own: {:?}",
+            cfg.dumps_dir
+        );
+        // The tree `admit()` measures is the tree the budget bills, so the up-front `507` sees
+        // what the engine actually wrote.
+        assert!(
+            disk::budget_roots(&cfg)
+                .iter()
+                .any(|r| dumps.dir().starts_with(r.path())),
+            "the dump directory must sit under a measured budget root: {:?}",
+            disk::budget_roots(&cfg)
+                .iter()
+                .map(|r| r.path().to_path_buf())
+                .collect::<Vec<_>>()
         );
     }
 

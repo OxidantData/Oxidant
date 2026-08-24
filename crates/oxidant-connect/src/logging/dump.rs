@@ -137,6 +137,12 @@ impl DumpStore {
         self.max_bytes
     }
 
+    /// Where bundles land. Must be `cfg.dumps_dir` for the config the *sweeper* holds, or a
+    /// bundle is written outside every tree the retention pass and the disk budget can see.
+    pub(crate) fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     /// Would a dump of up to `max_bytes` breach §3? Checked **before** the id is minted, so a
     /// refusal is a `507` on the `POST` rather than a `507` an operator only sees when they come
     /// back for the file.
