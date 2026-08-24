@@ -28,7 +28,7 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/status` | Driver status for a control plane — **bearer token required** |
 | `GET` | `/api/v1/pipelines` | Streaming pipelines with a connector log on this driver — **bearer token required** |
 | `GET` | `/api/v1/pipelines/{name}/logs` | Tail of a streaming connector's JSONL log — **bearer token required** |
-| `GET` | `/api/v1/logs` | The node's recent log lines — an in-memory ring buffer of the last 1000, or one rolled file with `?file=` — **bearer token required** |
+| `GET` | `/api/v1/logs` | The node's recent log lines — an in-memory ring buffer of the last 1000, or one page of a rolled file with `?file=`/`?offset=`/`?limit=` — **bearer token required** |
 
 ## Submit a statement
 
@@ -430,7 +430,15 @@ curl -s 'http://localhost:4040/api/v1/logs?file=2026-08-23-14.2' -H "Authorizati
 ```
 
 ```json
-{"file": "2026-08-23", "format": "parquet", "dedup": true, "logs": ["…"]}
+{
+  "file": "2026-08-23",
+  "format": "parquet",
+  "dedup": true,
+  "offset": 0,
+  "limit": 1000,
+  "next_offset": 1000,
+  "logs": ["…"]
+}
 ```
 
 ```text
@@ -456,6 +464,25 @@ YYYY := 4DIGIT   MM,DD,HH,ww := 2DIGIT   N := 2..999
   `dedup` key, and is otherwise byte-identical to what it was before.
 - A node with no rolling writer (`OXIDANT_LOG_ROLL=off`, or `OXIDANT_HISTORY=off`) answers
   `404` with a reason, for every `?file=` value.
+- **The answer is one page, always.** `?limit=` (default **1000**, the same number the ring
+  serves; clamped to **10,000**) and `?offset=` (default 0) walk the file, and the response
+  echoes both plus `next_offset` — the offset of the next page, or `null` at the end of the
+  file. A rolled file can hold `OXIDANT_LOG_MAX_FILE_BYTES` (256 MiB, ~2M lines); serving one
+  whole would build every line in memory and then serialise a second copy into the body.
+  **Follow `next_offset` rather than counting lines**: a page is also cut short by an internal
+  byte budget, so it can come back with fewer than `limit` lines and still have a successor.
+- **The line strings a converted file returns are normalized, not byte-verbatim.** `format`
+  tells you which form you got. A `.log` is served as written; a `.parquet` is *reconstructed*
+  from its columns, so `message=` leads unless the original had it elsewhere, the remaining
+  fields keep the order they were rendered in, and a value the field parser read as a `k=v`
+  pair inside a message (`"failed to bind, addr=0.0.0.0:4040"`) comes back as the same string
+  but is stored as `message` + a field. Time, level, target and text are preserved either way.
+
+```sh
+# page through a big day
+curl -s 'http://localhost:4040/api/v1/logs?file=2026-08-23&offset=2000&limit=500' \
+  -H "Authorization: Bearer $TOKEN"
+```
 
 **Workers write the same files**, under their own `$OXIDANT_DATA_DIR` — `oxidant worker` runs
 the same process-level logging init, which is the whole point of hoisting it out of the REST

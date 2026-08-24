@@ -899,7 +899,9 @@ mod tests {
         assert!(dir.path().join("oxidant-2026-08-20.parquet").exists());
         assert!(!dir.path().join("oxidant-2026-08-20.log").exists());
         assert_eq!(
-            columnar::read_lines(&dir.path().join("oxidant-2026-08-20.parquet")).expect("read"),
+            columnar::read_lines(&dir.path().join("oxidant-2026-08-20.parquet"), 0, 100)
+                .expect("read")
+                .lines,
             vec![
                 "2026-08-20T10:00:00.000Z [INFO] oxidant_test - message=crashed before converting"
             ]

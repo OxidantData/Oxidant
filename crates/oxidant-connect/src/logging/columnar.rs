@@ -175,18 +175,53 @@ fn footer_rows(path: &Path) -> Result<i64, String> {
     Ok(builder.metadata().file_metadata().num_rows())
 }
 
+/// One page of a log file: the lines asked for, and whether the file has more after them.
+///
+/// **The whole file is never materialised.** `OXIDANT_LOG_MAX_FILE_BYTES` defaults to 256 MiB, so
+/// `?file=current` on a full live log would build a `Vec<String>` of ~2M entries — ~300 MiB with
+/// the `String` headers — and `serde_json` would then serialise a second copy into the response
+/// body, on a driver whose entire *result* budget is 512 MiB. The Parquet path is worse: a
+/// ~25 MiB zstd file expands roughly 10× on read. Concurrent requests multiply it, and the
+/// Observability page polls every 5 s.
+#[derive(Debug, Default)]
+pub(crate) struct Page {
+    pub lines: Vec<String>,
+    /// There is at least one more line after this page — either the row count says so or the byte
+    /// budget cut the page short.
+    pub has_more: bool,
+}
+
+/// Bytes of rendered text one page may hold before it is cut short.
+///
+/// `limit` bounds the line *count*; this bounds the memory, because one line has no fixed size —
+/// a `tracing` field can carry a whole DataFusion plan. A page is therefore at most this plus one
+/// line, whatever the caller asked for.
+const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Read a rolled Parquet log back into the rendered lines `GET /api/v1/logs?file=` serves.
 ///
 /// The rendered form is reconstructed from the columns, not stored twice: what a caller reads
 /// out of a converted file is what the text file held, modulo the best-effort field parse
 /// documented in [`super::line`].
-pub(crate) fn read_lines(path: &Path) -> Result<Vec<String>, String> {
+///
+/// `offset`/`limit` are pushed into the Parquet reader, so a page from the tail of a large file
+/// decodes only the row groups it needs rather than the whole file.
+pub(crate) fn read_lines(path: &Path, offset: usize, limit: usize) -> Result<Page, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| format!("reading {}: {e}", path.display()))?
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let total = builder.metadata().file_metadata().num_rows().max(0) as usize;
+    let reader = builder
+        .with_offset(offset)
+        .with_limit(limit)
         .build()
         .map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let mut out = Vec::new();
+    let mut page = Page {
+        has_more: total > offset.saturating_add(limit),
+        ..Default::default()
+    };
+    let mut bytes = 0usize;
+    let out = &mut page.lines;
     for batch in reader {
         let batch = batch.map_err(|e| format!("reading {}: {e}", path.display()))?;
         let ts = batch
@@ -245,19 +280,50 @@ pub(crate) fn read_lines(path: &Path) -> Result<Vec<String>, String> {
                 line.push_str(" - ");
                 line.push_str(&fields_out.join(", "));
             }
+            bytes += line.len();
             out.push(line);
+            if bytes >= MAX_PAGE_BYTES {
+                page.has_more = true;
+                return Ok(page);
+            }
         }
     }
-    Ok(out)
+    Ok(page)
 }
 
-/// Read a rolled (or live) text log back as lines.
-pub(crate) fn read_text_lines(path: &Path) -> Result<Vec<String>, String> {
+/// Read one page of a rolled (or live) text log.
+///
+/// `read_line` into a reused buffer rather than `lines().skip(offset)`: skipping through
+/// `lines()` allocates a `String` per skipped line, which is the same unbounded read the page
+/// exists to avoid, just discarded afterwards.
+pub(crate) fn read_text_lines(path: &Path, offset: usize, limit: usize) -> Result<Page, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
-    BufReader::new(file)
-        .lines()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("reading {}: {e}", path.display()))
+    let mut reader = BufReader::new(file);
+    let mut page = Page::default();
+    let mut buf = String::new();
+    let mut index = 0usize;
+    let mut bytes = 0usize;
+    loop {
+        buf.clear();
+        let read = reader
+            .read_line(&mut buf)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        if read == 0 {
+            return Ok(page);
+        }
+        index += 1;
+        if index <= offset {
+            continue;
+        }
+        if page.lines.len() >= limit || bytes >= MAX_PAGE_BYTES {
+            // One line past the page: proof there is more, without reading the rest of the file.
+            page.has_more = true;
+            return Ok(page);
+        }
+        let line = buf.trim_end_matches(['\n', '\r']);
+        bytes += line.len();
+        page.lines.push(line.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -291,7 +357,7 @@ mod tests {
         assert_eq!(parquet.file_name().unwrap(), "oxidant-2026-08-23.parquet");
         assert_eq!(footer_rows(&parquet).expect("footer"), 2);
 
-        let lines = read_lines(&parquet).expect("read back");
+        let lines = read_lines(&parquet, 0, 100).expect("read back").lines;
         assert_eq!(
             lines,
             vec![
@@ -316,7 +382,13 @@ mod tests {
             parquet_bytes * 10 < text_bytes,
             "zstd parquet must be far smaller: {parquet_bytes} vs {text_bytes}"
         );
-        assert_eq!(read_lines(&parquet).expect("read back").len(), 20_000);
+        assert_eq!(
+            read_lines(&parquet, 0, 100_000)
+                .expect("read back")
+                .lines
+                .len(),
+            20_000
+        );
     }
 
     /// A conversion that fails leaves the text file — the only complete copy — where it was.
@@ -349,7 +421,7 @@ mod tests {
         std::fs::write(&text, b"").expect("write");
         let parquet = convert(&text).expect("convert");
         assert_eq!(footer_rows(&parquet).expect("footer"), 0);
-        assert!(read_lines(&parquet).expect("read").is_empty());
+        assert!(read_lines(&parquet, 0, 100).expect("read").lines.is_empty());
         assert!(!text.exists());
     }
 
@@ -364,7 +436,7 @@ mod tests {
         );
         let parquet = convert(&text).expect("convert");
         assert_eq!(
-            read_lines(&parquet).expect("read back"),
+            read_lines(&parquet, 0, 100).expect("read back").lines,
             vec!["   at oxidant_execution::plan (a continuation line)"]
         );
     }

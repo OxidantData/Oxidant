@@ -47,9 +47,7 @@ use sysinfo::{Pid, System};
 use tokio::sync::{watch, Notify};
 use uuid::Uuid;
 
-#[cfg(test)]
-use crate::logging::MAX_LOG_LINES;
-use crate::logging::{LogBuffer, LogView};
+use crate::logging::{LogBuffer, LogView, MAX_LOG_LINES};
 
 use crate::history::{
     disk, now_rfc3339, rfc3339_from_ms, FoldedStatement, HistoryConfig, HistoryRuntime,
@@ -2670,12 +2668,26 @@ fn process_metrics() -> (Option<u64>, Option<u64>, Option<f32>) {
 }
 
 /// `?file=` on `GET /api/v1/logs` (§6).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct LogsParams {
     /// `current`, or a `LogPeriod` in §6's grammar with an optional `.N` split. Absent keeps
     /// today's answer: the in-memory ring.
     file: Option<String>,
+    /// Lines per page. Defaults to [`MAX_LOG_LINES`] — the same 1000 the ring serves — and is
+    /// clamped to [`MAX_LOG_PAGE`].
+    limit: Option<usize>,
+    /// Lines to skip from the start of the file.
+    offset: Option<usize>,
 }
+
+/// The largest page `?file=` will serve, however large a `?limit=` is asked for.
+///
+/// A rolled file may hold `OXIDANT_LOG_MAX_FILE_BYTES` (256 MiB, ~2M lines) and the read path had
+/// no cap at all: `?file=current` built a `Vec<String>` of every line and `serde_json` then
+/// serialised a second copy into the body — well over half a GiB transient on a driver whose whole
+/// *result* budget is 512 MiB, multiplied by every concurrent request, on an endpoint the
+/// Observability page polls every 5 s. `MAX_LOG_LINES` applied only to the in-memory ring.
+const MAX_LOG_PAGE: usize = 10_000;
 
 /// `GET /api/v1/logs` — the node's own exec log, for the monitoring UI's Observability page.
 ///
@@ -2695,14 +2707,28 @@ struct LogsParams {
 /// not exist, exactly like `/api/status`.
 async fn list_logs(
     State(state): State<RestState>,
-    Query(params): Query<LogsParams>,
     headers: header::HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
     if let Some(denied) =
         oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), &headers)
     {
         return denied;
     }
+    // **Parsed after the gate, not by an extractor.** Axum runs extractors in declaration order
+    // and short-circuits on rejection, so a `Query<LogsParams>` parameter answered `400` for
+    // `?file=a&file=b` before `deny_unless_authorized` ever ran — and `400` is not what a
+    // nonexistent route answers. The endpoint's stated contract is "unset OXIDANT_STATUS_TOKEN,
+    // `404`: the route does not exist, exactly like `/api/status`", and a `400`-vs-`404` split
+    // tells an unauthenticated caller the route is there (L1).
+    let Ok(Query(params)) = Query::<LogsParams>::try_from_uri(&uri) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid query: expected at most one each of `file`, `limit` and `offset`",
+        );
+    };
+    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(MAX_LOG_LINES).min(MAX_LOG_PAGE);
     let Some(requested) = params.file else {
         // The ring is not deduped — dedup applies to the *file* (§6) — and this envelope
         // deliberately keeps the exact shape it had before `?file=` existed.
@@ -2742,22 +2768,43 @@ async fn list_logs(
         return error_response(StatusCode::NOT_FOUND, "log file not found");
     };
     let format = file.format();
-    match file.read() {
-        Ok(logs) => Json(json!({
-            "file": label,
-            "format": format,
-            // The file is authoritative and it *is* deduped when the knob is on; the SSE tail
-            // PR4 adds marks itself `false`. Saying so in the envelope is what keeps an operator
-            // from reading a collapsed run as a gap (§6, F21).
-            "dedup": state.logs.dedup,
-            "logs": logs,
-        }))
-        .into_response(),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("could not read the log file: {e}"),
-        ),
-    }
+    // **`spawn_blocking`.** Reading a rolled log is `std::fs` I/O plus, for a converted file, a
+    // full Parquet decode. Doing that inline on a tokio worker parks a thread that is also
+    // serving `ExecutePlan`, for as long as the read takes.
+    let page = match tokio::task::spawn_blocking(move || file.read(offset, limit)).await {
+        Ok(Ok(page)) => page,
+        Ok(Err(e)) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read the log file: {e}"),
+            )
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("reading the log file panicked: {e}"),
+            )
+        }
+    };
+    let next_offset = page
+        .has_more
+        .then(|| offset.saturating_add(page.lines.len()));
+    Json(json!({
+        "file": label,
+        "format": format,
+        // The file is authoritative and it *is* deduped when the knob is on; the SSE tail
+        // PR4 adds marks itself `false`. Saying so in the envelope is what keeps an operator
+        // from reading a collapsed run as a gap (§6, F21).
+        "dedup": state.logs.dedup,
+        "offset": offset,
+        "limit": limit,
+        // `null` when this page reached the end of the file. A page may also be cut short of
+        // `limit` by the read path's byte budget, and then this is set even though fewer lines
+        // came back — so paging follows `next_offset` rather than counting.
+        "next_offset": next_offset,
+        "logs": page.lines,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -3259,6 +3306,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// **H4.** `?file=` is paged, and the page is bounded whatever the caller asks for.
+    ///
+    /// There was no line cap, no `limit` and no cursor: `MAX_LOG_LINES` applied only to the ring.
+    /// A full live log is `OXIDANT_LOG_MAX_FILE_BYTES` (256 MiB, ~2M lines), so one request built
+    /// a `Vec<String>` of every line and `serde_json` then serialised a second copy into the body
+    /// — over half a GiB transient on a driver whose whole *result* budget is 512 MiB, multiplied
+    /// by every concurrent request, on an endpoint the Observability page polls every 5 s.
+    #[tokio::test]
+    async fn the_file_parameter_pages_and_never_serves_a_whole_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A fixed millisecond: the point here is paging, and a per-line timestamp would only
+        // re-test the Parquet round trip's 3-digit rendering.
+        let line = |i: usize| {
+            format!("2026-08-23T14:00:00.500Z [INFO] oxidant_execution - message=line {i}")
+        };
+        let body: String = (0..2_500).map(|i| format!("{}\n", line(i))).collect();
+        std::fs::write(dir.path().join("oxidant-2026-08-23.log"), &body).expect("write");
+        std::fs::write(dir.path().join("oxidant.log"), &body).expect("write");
+        let (_env, app) = logs_state(dir.path(), true);
+
+        // The default page is the ring's 1000, not the file's 2500.
+        let (status, page) = get_logs(&app, "/api/v1/logs?file=2026-08-23").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["logs"].as_array().expect("logs").len(), 1_000);
+        assert_eq!(page["offset"], 0);
+        assert_eq!(page["limit"], 1_000);
+        assert_eq!(page["next_offset"], 1_000, "and it says where to continue");
+        assert_eq!(page["logs"][0], line(0));
+
+        // The cursor walks the file and stops honestly at the end.
+        let (_, page) = get_logs(&app, "/api/v1/logs?file=2026-08-23&offset=1000").await;
+        assert_eq!(page["logs"][0], line(1_000));
+        assert_eq!(page["next_offset"], 2_000);
+        let (_, page) = get_logs(&app, "/api/v1/logs?file=2026-08-23&offset=2000").await;
+        assert_eq!(page["logs"].as_array().expect("logs").len(), 500);
+        assert_eq!(
+            page["next_offset"],
+            Value::Null,
+            "the last page has no successor"
+        );
+        assert_eq!(page["logs"][499], line(2_499));
+
+        // A caller cannot ask for the whole file by asking for a huge page.
+        let (_, page) = get_logs(&app, "/api/v1/logs?file=current&limit=999999").await;
+        assert_eq!(page["limit"], 10_000, "clamped to MAX_LOG_PAGE");
+        assert_eq!(page["logs"].as_array().expect("logs").len(), 2_500);
+        assert_eq!(page["next_offset"], Value::Null);
+
+        // Same contract through the Parquet path, where an unbounded read is worse still.
+        crate::logging::convert_for_test(&dir.path().join("oxidant-2026-08-23.log"))
+            .expect("convert");
+        let (_, page) = get_logs(&app, "/api/v1/logs?file=2026-08-23&offset=2400&limit=10").await;
+        assert_eq!(page["format"], "parquet");
+        assert_eq!(
+            page["logs"],
+            Value::from((2_400..2_410).map(line).collect::<Vec<_>>())
+        );
+        assert_eq!(page["next_offset"], 2_410);
+    }
+
+    /// **L1.** Axum runs extractors in declaration order and short-circuits on rejection, so a
+    /// `Query<LogsParams>` parameter answered `400 Bad Request` for `?file=a&file=b` before
+    /// `deny_unless_authorized` ran — with the token unset, where the endpoint's stated contract
+    /// is "`404`: the route does not exist, exactly like `/api/status`". A `400`-vs-`404` split
+    /// tells an unauthenticated caller the route is there. The query is parsed after the gate.
+    #[tokio::test]
+    async fn a_malformed_query_answers_the_gate_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_env, app) = logs_state(dir.path(), true);
+        // Gated: a bad query is a bad query, once you are through the door.
+        let (status, _) = get_logs(&app, "/api/v1/logs?file=a&file=b").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = get_logs(&app, "/api/v1/logs?limit=lots").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Ungated: every shape is `404`, malformed or not — the route does not exist.
+        // (`logs_state` already holds the process-global env lock for this test.)
+        let ungated = app_with_no_token(dir.path());
+        for uri in [
+            "/api/v1/logs",
+            "/api/v1/logs?file=a&file=b",
+            "/api/v1/logs?limit=lots",
+            "/api/v1/logs?file=2026-08-23",
+        ] {
+            assert_eq!(
+                get_json(&ungated, uri).await.0,
+                StatusCode::NOT_FOUND,
+                "{uri} must not reveal that the route exists"
+            );
+        }
+    }
+
+    /// A router whose logs endpoint has no token — the `404`-for-everything shape.
+    fn app_with_no_token(dir: &std::path::Path) -> Router {
+        app(RestState {
+            service: Arc::new(OxidantService::new()),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.to_path_buf()),
+                dedup: true,
+            },
+            status_token: None,
+        })
     }
 
     /// A node with no rolling writer answers `404`, which is the honest answer: there are no

@@ -723,6 +723,27 @@ YYYY := 4DIGIT   MM,DD,HH,ww := 2DIGIT   N := 1*3DIGIT, 2..999
   in §6b does too. The endpoint now exposes up to 30 days rather than 1000 lines, so
   the runtime contract repeats the gate in the operator-facing text rather than leaving
   a reader to assume it.
+- **The answer is one bounded page, and the read runs off the reactor.** `?limit=`
+  (default 1000 — the ring's number; clamped to 10,000) and `?offset=` walk the file,
+  and the envelope carries `offset`, `limit` and `next_offset` (`null` at the end).
+  *(PR3 addition to this section, which specified neither.* `MAX_LOG_LINES` bounded only
+  the in-memory ring, so `?file=current` on a full 256 MiB live log built a `Vec<String>`
+  of ~2M entries — ~300 MiB with the `String` headers — and `serde_json` then serialised
+  a second copy into the body, on a driver whose entire *result* budget is 512 MiB. The
+  Parquet path was worse: a ~25 MiB zstd file expands ~10× on read. The endpoint is
+  token-gated, so not remotely reachable — but an authorized operator, or the
+  Observability page's 5 s poll, could OOM the driver. The read is also wrapped in
+  `spawn_blocking`: it is `std::fs` I/O plus a full Parquet decode, and `list_logs` is an
+  `async fn` on a tokio worker that is also serving `ExecutePlan`.* PR4's cursor and
+  filters replace `offset` with a `before=<cursor>`; the byte budget and the page cap
+  stay.) A page may also be cut short of `limit` by an internal byte budget, so a caller
+  follows `next_offset` rather than counting lines.
+- **The query string is parsed after the authz gate, not by an extractor.** Axum runs
+  extractors in declaration order and short-circuits on rejection, so a
+  `Query<LogsParams>` parameter answered `400` for `?file=a&file=b` before
+  `deny_unless_authorized` ran — and with `OXIDANT_STATUS_TOKEN` unset this endpoint's
+  contract is `404`, "the route does not exist, exactly like `/api/status`". A
+  `400`-vs-`404` split tells an unauthenticated caller the route is there.
 - (The rev-1 grammar's `[‑HH]` used U+2011, a non-breaking hyphen. It is `-`.)
 
 ### 6c. Workers get the same writer

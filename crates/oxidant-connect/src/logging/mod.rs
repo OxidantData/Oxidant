@@ -319,6 +319,9 @@ impl LogView {
     }
 }
 
+/// One bounded page of a log file — see [`columnar::Page`].
+pub(crate) use columnar::Page as LogPage;
+
 /// One rolled (or live) log file, resolved from a `?file=` value.
 pub(crate) enum LogFile {
     Text(PathBuf),
@@ -333,10 +336,11 @@ impl LogFile {
         }
     }
 
-    pub(crate) fn read(&self) -> Result<Vec<String>, String> {
+    /// One bounded page of the file. **Blocking**: the caller runs it on a blocking thread.
+    pub(crate) fn read(&self, offset: usize, limit: usize) -> Result<LogPage, String> {
         match self {
-            Self::Text(p) => columnar::read_text_lines(p),
-            Self::Parquet(p) => columnar::read_lines(p),
+            Self::Text(p) => columnar::read_text_lines(p, offset, limit),
+            Self::Parquet(p) => columnar::read_lines(p, offset, limit),
         }
     }
 }
