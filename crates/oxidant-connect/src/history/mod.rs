@@ -25,7 +25,7 @@ mod config;
 pub(crate) mod disk;
 pub(crate) mod fs_util;
 mod journal;
-mod lock;
+pub(crate) mod lock;
 mod record;
 mod results;
 

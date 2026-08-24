@@ -85,7 +85,7 @@ impl Headroom {
 }
 
 /// Everything `logging::init` resolved for the writer.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct WriterConfig {
     pub dir: PathBuf,
     pub roll: LogRoll,
@@ -95,6 +95,17 @@ pub(crate) struct WriterConfig {
     /// `OXIDANT_LOG_DEDUP`.
     pub dedup: bool,
     pub headroom: Headroom,
+    /// Exclusive claim on `dir`, released when the writer drops. `None` in the tests that build a
+    /// writer straight onto a tempdir; [`super::open_writer`] always takes one.
+    ///
+    /// **One rolling writer per log directory** (§3c). Two of them each roll `oxidant.log` on
+    /// their own schedule and each converter unlinks a rolled file the other may still hold open,
+    /// so the loser's lines go to a deleted inode with no error until its own roll fires. The
+    /// lock is what makes §3c's "every node writes its own `logs/` under its own root" true
+    /// rather than merely documented — see `history::lock::acquire_logs_dir`.
+    // Never read: it is an RAII guard, and holding it *is* the behaviour.
+    #[allow(dead_code)]
+    pub lock: Option<crate::history::lock::JournalDirLock>,
 }
 
 struct Held {
@@ -564,6 +575,7 @@ mod tests {
             // converter racing them would delete the very `.log` they check for.
             parquet: false,
             dedup: false,
+            lock: None,
             headroom: Headroom {
                 roots: vec![crate::history::disk::BudgetRoot::subtree(dir.to_path_buf())],
                 max_bytes: u64::MAX,

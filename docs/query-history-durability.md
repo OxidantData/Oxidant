@@ -326,6 +326,39 @@ the container images, which is where co-located driver+worker actually happens. 
 separates two processes only when `OXIDANT_HISTORY_DIR` is unset, since the derived root
 is what the journal path is then built from.
 
+**`logs/` takes the same lock, on its own directory** *(PR3)*. "Every node writes its
+own `logs/` under its own root" was asserted in §3c and in the logging module doc and
+enforced by nothing: a **worker takes no journal lock**, because it runs no statements,
+so with `OXIDANT_DATA_DIR_PER_PROCESS` unset — "the recommended setting", not a required
+one — a co-located driver and worker both `append_secure`d the same
+`logs/oxidant.log` and each ran its own roll logic. The driver's roll renames the live
+file and reopens a fresh one; the worker keeps appending to the fd it still holds, which
+now points at the *rolled* inode; either process's converter then finds that rolled file,
+converts it, and unlinks the text. From that instant every worker log line is written to
+a deleted inode — silently, with no error — until the worker's own roll trigger fires,
+and the Parquet keeps whatever prefix it snapshotted. The worker's log is precisely what
+an operator digs through after an OOM.
+
+So `<logs-dir>/.lock` is taken by `RollingWriter::open`, with the same pid-stamped
+staleness check and the same same-process re-entrancy as the journal's. The second writer
+is **refused**, not silently merged, and it keeps stderr and `GET /api/v1/logs`:
+
+```
+oxidant: the exec log dir (/var/lib/oxidant/logs) is in use by pid 4711 (role=driver, role's data dir=/var/lib/oxidant).
+         Two processes cannot share one logs/ directory: each rolls oxidant.log on its own schedule
+         and each converter unlinks a rolled file the other may still have open, so the second writer's
+         lines go to a deleted inode. This process keeps logging to stderr and to GET /api/v1/logs,
+         but writes no rolling exec log. Set OXIDANT_DATA_DIR_PER_PROCESS=1 to use /var/lib/oxidant/<role>-<port>/,
+         or point OXIDANT_LOG_DIR at a distinct path for this process, or set OXIDANT_LOG_ROLL=off to say
+         you meant stderr only.
+```
+
+Refusing costs that process its durable log and says how to get it back in one line of
+configuration; sharing costs it the same log silently, *and* corrupts the peer's. A
+subprocess test runs both entry points against one root and against
+`OXIDANT_DATA_DIR_PER_PROCESS=1`, and asserts the refusal in the first case and two
+distinct trees in the second.
+
 ### Runtime knobs (all runtime-contract documented)
 
 `OXIDANT_HISTORY=on|off` (default on), `OXIDANT_HISTORY_FLUSH_MS` (default 500),

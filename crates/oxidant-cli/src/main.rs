@@ -426,6 +426,11 @@ async fn run_worker(
         eprintln!("registered `{table}` from {data}");
     }
     eprintln!("Oxidant worker listening on Flight 0.0.0.0:{port}");
+    // Durable, not just stderr: this is the last thing before the serve loop, so its presence in
+    // `logs/oxidant.log` is what proves the `tracing` layer is still attached after every other
+    // crate in the process has had its chance at `try_init` — the init line alone cannot say that.
+    // It is also the line an operator greps to answer "did this worker actually come up".
+    tracing::info!(role = "worker", port, "oxidant worker listening on Flight");
     serve_worker(port, engine).await
 }
 

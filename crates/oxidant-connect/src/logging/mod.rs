@@ -13,6 +13,12 @@
 //! statement from the other side. Statement history remains driver-scoped — workers run no
 //! statements.
 //!
+//! That last clause is also why `logs/` needs a lock of its own: a worker runs no statements, so
+//! it takes no *journal* lock, and with `OXIDANT_DATA_DIR_PER_PROCESS` unset a co-located driver
+//! and worker would share one `logs/oxidant.log` and unlink it out from under each other.
+//! [`open_writer`] takes `<logs-dir>/.lock` and refuses the second writer rather than merging it
+//! — see `history::lock::acquire_logs_dir`.
+//!
 //! What lives where:
 //!
 //! - [`naming`] — UTC names, the `?file=` grammar, ISO weeks, `.N` size splits;
@@ -243,8 +249,20 @@ fn open_writer(role: &str, port: u16) -> Option<Arc<RollingWriter>> {
     if !cfg.enabled || cfg.log_roll == LogRoll::Off {
         return None;
     }
+    // **One rolling writer per log directory.** A worker takes no journal lock — it runs no
+    // statements — so with a driver and a worker co-located on the default root, nothing else
+    // stops the two from sharing `logs/oxidant.log`. Refusing here costs this process its durable
+    // log and says how to get it back; sharing costs it the same log silently, plus the peer's.
+    let lock = match crate::history::lock::acquire_logs_dir(&cfg) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("{e}");
+            return None;
+        }
+    };
     let wcfg = writer::WriterConfig {
         dir: cfg.logs_dir.clone(),
+        lock: Some(lock),
         roll: cfg.log_roll,
         max_file_bytes: cfg.log_max_file_bytes,
         parquet: cfg.log_parquet,
@@ -398,6 +416,7 @@ mod tests {
                 reserve_bytes: 0,
                 mounts: Some(Vec::new()),
             },
+            lock: None,
         })
         .expect("writer");
         let buffer = LogBuffer::new(8);
@@ -479,6 +498,7 @@ mod tests {
                     reserve_bytes: 0,
                     mounts: Some(Vec::new()),
                 },
+                lock: None,
             },
             move || {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
