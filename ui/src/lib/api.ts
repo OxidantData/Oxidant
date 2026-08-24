@@ -66,6 +66,12 @@ export interface StatementSummary {
   status: string;
   submittedAtMs: number;
   durationMs?: number;
+  /** Where the statement was submitted from: `rest` (this UI, curl) or `connect` (PySpark). */
+  source?: string;
+  /** `hot` is live and cancellable; `history` was replayed from the durable journal. */
+  tier?: string;
+  /** The client's own operation id, when it supplied a usable one. */
+  clientOperationId?: string;
 }
 
 /** Full status document from `GET /api/v1/statements/{id}` (and `?wait=true` submit). */

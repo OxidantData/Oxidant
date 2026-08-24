@@ -218,6 +218,14 @@ The **SQL Editor** page runs ad-hoc SQL over the REST statement API — no clien
 - A **recent statements** list (newest first) shows status — `pending`, `running`,
   `succeeded`, `failed`, `canceled` — with the error message for failures; click one to
   re-inspect its result.
+- The rail is **one history for the whole engine**, not just for this page: a `spark.sql(...)`
+  a PySpark client ran over Spark Connect is listed here too, badged `connect`
+  ([issue #134](https://github.com/OxidantData/oxidant/issues/134)). Statements also survive a
+  restart — they are replayed from the durable journal under `$OXIDANT_DATA_DIR` — so the rail
+  after a driver restart shows what ran before it. A replayed statement can be inspected but no
+  longer has its rows: fetching its result answers `410 result_expired`. `OXIDANT_HISTORY=off`
+  restores the old volatile behaviour; see
+  [runtime-contract.md](runtime-contract.md).
 
 ## Dashboards
 

@@ -38,6 +38,7 @@ use sc::spark_connect_service_server::{SparkConnectService, SparkConnectServiceS
 
 mod catalog;
 mod distributed;
+mod history;
 mod pipelines;
 pub mod rest;
 mod streaming;
@@ -132,6 +133,13 @@ pub struct OxidantService {
     dataflow_graphs: pipelines::DataflowGraphRegistry,
     /// Runtime observability store (jobs, stages, SQL plans).
     observability: SharedStore,
+    /// Durable statement history, shared with the REST statement API.
+    ///
+    /// Attached once at boot by [`rest::init_statement_store`] rather than built here, because
+    /// constructing it locks a data dir and replays a journal — work a unit test that just wants
+    /// an engine must not do. When it is absent, Connect executions are simply not recorded, and
+    /// the REST router falls back to today's volatile store.
+    statements: std::sync::OnceLock<rest::StatementStore>,
 }
 
 /// Count cap for the `completed_ops` reattach buffer (`OXIDANT_COMPLETED_OPS_MAX`, default 128).
@@ -268,12 +276,67 @@ impl OxidantService {
             distributed_caches: distributed::DistributedCaches::default(),
             dataflow_graphs: pipelines::DataflowGraphRegistry::default(),
             observability,
+            statements: std::sync::OnceLock::new(),
         }
     }
 
     /// Access the observability store.
     pub fn observability(&self) -> &SharedStore {
         &self.observability
+    }
+
+    /// The statement history, once boot has attached it.
+    pub(crate) fn statement_store(&self) -> Option<&rest::StatementStore> {
+        self.statements.get()
+    }
+
+    /// Attach the process's statement history. Idempotent: the first store wins, so a second
+    /// server in one process shares the first's journal rather than opening a second writer on
+    /// the same files.
+    pub(crate) fn attach_statement_store(&self, store: rest::StatementStore) {
+        let _ = self.statements.set(store);
+    }
+
+    /// Record a Connect execution as `submitted` + `running` and return the guard that owns it.
+    ///
+    /// This is the durable half of issue #134: a `spark.sql(...)` over gRPC now lands in the
+    /// same statements rail a REST submit does, tagged `source: "connect"`, with its SQL on disk
+    /// *at submit* — so a crash mid-statement still leaves a trace of what was running.
+    ///
+    /// The client's `operation_id` is passed through as an alias only. The id that identifies
+    /// the statement (and, in PR2, names its result file) is always engine-minted.
+    fn history_begin(
+        &self,
+        session_id: &str,
+        client_op_id: Option<&str>,
+        sql: &str,
+    ) -> HistoryGuard<'_> {
+        let Some(store) = self.statement_store() else {
+            return HistoryGuard::inert();
+        };
+        let (id, _cancel) = store.insert_from(
+            sql,
+            history::Source::Connect,
+            Some(session_id),
+            client_op_id,
+        );
+        store.mark_running(&id);
+        HistoryGuard {
+            store: Some(store),
+            id: Some(id),
+        }
+    }
+
+    /// Fold a Connect execution's outcome into the history and wait — bounded — for it to be
+    /// durable before the terminal response goes out.
+    async fn history_finish(&self, id: Option<String>, outcome: rest::ExecOutcome) {
+        let (Some(store), Some(id)) = (self.statement_store(), id) else {
+            return;
+        };
+        store.finish(&id, outcome);
+        // Same contract as `?wait=true`: the *response* waits for the fsync, never the query,
+        // and never for longer than `OXIDANT_HISTORY_ACK_TIMEOUT_MS`.
+        store.await_durable(&id).await;
     }
 
     fn workers_from_config(&self) -> Vec<String> {
@@ -1172,6 +1235,54 @@ impl<'a> InFlightGuard<'a> {
     }
 }
 
+/// The error a Connect statement records when its request future is dropped before it finishes.
+pub(crate) const CLIENT_GONE: &str = "client disconnected or interrupted before completion";
+
+/// Finishes a Connect statement if `execute_plan`'s future is dropped before it does.
+///
+/// `history_finish` is only reached on the `Ok`/`Err` arms inside `execute_plan`. When the
+/// request future is *dropped* instead — client disconnect, a gRPC deadline, or `Interrupt`
+/// (KAN-17) — neither arm runs, and the statement stayed `Running` in the hot tier forever:
+/// `evict_expired` and `enforce_hot_cap` both skip non-terminals while history is on, and no
+/// terminal record was ever journaled, so the row only resolved at the *next process restart*
+/// via `mark_interrupted`. [`InFlightGuard`] is the same shape for the gRPC side; this is its
+/// counterpart for history.
+///
+/// `take()` hands the id to whoever is about to finish the statement properly, which disarms the
+/// guard. `finish` never overwrites a terminal state, so a late drop is harmless either way.
+struct HistoryGuard<'a> {
+    store: Option<&'a rest::StatementStore>,
+    id: Option<String>,
+}
+
+impl<'a> HistoryGuard<'a> {
+    /// A guard over nothing: history is off, or the plan carried no SQL worth journaling.
+    fn inert() -> Self {
+        Self {
+            store: None,
+            id: None,
+        }
+    }
+
+    /// Disarm, yielding the statement id for a proper terminal outcome.
+    fn take(&mut self) -> Option<String> {
+        self.id.take()
+    }
+}
+
+impl Drop for HistoryGuard<'_> {
+    fn drop(&mut self) {
+        let (Some(store), Some(id)) = (self.store, self.id.take()) else {
+            return;
+        };
+        tracing::debug!(
+            statement = %id,
+            "connect execution dropped before a terminal event; recording it as failed"
+        );
+        store.finish(&id, rest::ExecOutcome::Failed(CLIENT_GONE.to_string()));
+    }
+}
+
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
         let mut map = self.svc.in_flight.lock().expect("in_flight poisoned");
@@ -1200,6 +1311,10 @@ impl SparkConnectService for OxidantService {
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        // The client's own operation id, kept only as a history alias. gRPC-level identity —
+        // `Interrupt`, reattach, the in-flight map — is unchanged and still keys on
+        // `operation_id`; nothing here changes what the protocol sees.
+        let client_op_id = req.operation_id.as_deref().filter(|s| !s.is_empty());
         // Track the op as in-flight so `Interrupt` can cancel it (KAN-17); the guard
         // unregisters on every exit path, including the `?` early returns below.
         let _in_flight = InFlightGuard::register(self, &session_id, &operation_id);
@@ -1214,8 +1329,33 @@ impl SparkConnectService for OxidantService {
                 Some(sc::command::CommandType::SqlCommand(c)) => {
                     let sql = sql_command_text(c)
                         .ok_or_else(|| Status::invalid_argument("empty SqlCommand"))?;
-                    self.run_sql_command(&engine, &session_id, &operation_id, &sql)
-                        .await?
+                    let mut tracked = self.history_begin(&session_id, client_op_id, &sql);
+                    match self
+                        .run_sql_command(&engine, &session_id, &operation_id, &sql)
+                        .await
+                    {
+                        Ok(responses) => {
+                            // A query `SqlCommand` returns a lazy relation, so there is no row
+                            // count to claim here; the `Root` execution that follows records it.
+                            self.history_finish(
+                                tracked.take(),
+                                rest::ExecOutcome::SucceededSummary {
+                                    rows: None,
+                                    schema: None,
+                                },
+                            )
+                            .await;
+                            responses
+                        }
+                        Err(e) => {
+                            self.history_finish(
+                                tracked.take(),
+                                rest::ExecOutcome::Failed(e.message().to_string()),
+                            )
+                            .await;
+                            return Err(e);
+                        }
+                    }
                 }
                 Some(sc::command::CommandType::WriteStreamOperationStart(s)) => {
                     let result = self.handle_write_stream_start(&engine, s).await?;
@@ -1304,10 +1444,33 @@ impl SparkConnectService for OxidantService {
             },
             // A relation (Sql, LocalRelation, ShowString, …): evaluate it and stream the result.
             Some(sc::plan::OpType::Root(rel)) => {
-                let (batches, stats) = self
-                    .eval_relation(&engine, rel, Some(&operation_id))
-                    .await?;
-                self.stream_batches(&session_id, &operation_id, &batches, stats.as_ref())?
+                // Only a `Sql` root carries statement text worth journaling; a DataFrame tree has
+                // no SQL to show in the rail and is left to the observability store.
+                let mut tracked = match relation_sql_text(rel) {
+                    Some(sql) => self.history_begin(&session_id, client_op_id, &sql),
+                    None => HistoryGuard::inert(),
+                };
+                match self.eval_relation(&engine, rel, Some(&operation_id)).await {
+                    Ok((batches, stats)) => {
+                        self.history_finish(
+                            tracked.take(),
+                            rest::ExecOutcome::SucceededSummary {
+                                rows: Some(batches.iter().map(|b| b.num_rows()).sum()),
+                                schema: rest::schema_fields(&batches),
+                            },
+                        )
+                        .await;
+                        self.stream_batches(&session_id, &operation_id, &batches, stats.as_ref())?
+                    }
+                    Err(e) => {
+                        self.history_finish(
+                            tracked.take(),
+                            rest::ExecOutcome::Failed(e.message().to_string()),
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                }
             }
             _ => return Err(Status::unimplemented("empty or unsupported plan")),
         };
@@ -1812,6 +1975,14 @@ fn sql_command_text(c: &sc::SqlCommand) -> Option<String> {
 }
 
 /// A bare `Sql` relation wrapping `query` (the lazy handle returned for a `SqlCommand` query).
+/// The query text of a `Sql` root relation, if that is what this relation is.
+fn relation_sql_text(rel: &sc::Relation) -> Option<String> {
+    match rel.rel_type.as_ref() {
+        Some(sc::relation::RelType::Sql(sql)) if !sql.query.is_empty() => Some(sql.query.clone()),
+        _ => None,
+    }
+}
+
 fn sql_relation(query: &str) -> sc::Relation {
     sc::Relation {
         common: None,
@@ -2214,6 +2385,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     cfg.observability = Some(store.clone());
     let service = Arc::new(OxidantService::with_config(cfg).await);
 
+    // Durable statement history (docs/query-history-durability.md). Attached before the first
+    // connection is accepted, because both the REST API and Connect's `ExecutePlan` record into
+    // it. A locked data dir or an object-store URL in `OXIDANT_DATA_DIR` fails the boot here,
+    // with the reason and the way out — silently sharing a journal between two processes tears
+    // records, and silently creating an `s3:/bucket/…` directory is the failure `checkpoint.rs`
+    // warns about.
+    rest::init_statement_store(&service, "driver", port).map_err(Error::Io)?;
+
     // Bundled sample data: register the `samples` schema before accepting connections so the
     // first client already sees the tables. Best-effort — registration logs and skips on
     // error and never fails boot.
@@ -2550,6 +2729,90 @@ mod completed_ops_tests {
             Ok(_) => panic!("expected NOT_FOUND reattach for expired op"),
         };
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+}
+
+#[cfg(test)]
+mod history_guard_tests {
+    use super::*;
+    use crate::history::{HistoryConfig, StatementStatus};
+
+    /// M3: a Connect statement must not leak as permanently `running` when `execute_plan`'s
+    /// future is dropped without reaching either terminal arm — a client disconnect, a gRPC
+    /// deadline, or `Interrupt`.
+    ///
+    /// Nothing else resolves it: `evict_expired` and `enforce_hot_cap` both refuse to evict a
+    /// non-terminal statement while history is on, and no terminal record reaches the journal, so
+    /// before this the row survived to the *next process restart* and only then became
+    /// `failed / "interrupted by restart"`.
+    #[tokio::test]
+    async fn a_dropped_connect_execution_is_recorded_failed_not_left_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = rest::StatementStore::with_history(HistoryConfig::for_root(dir.path()))
+            .expect("boot history");
+        let service = OxidantService::new();
+        service.attach_statement_store(store.clone());
+
+        let id = {
+            let guard = service.history_begin("sess-drop", Some("op-drop"), "SELECT 1 AS n");
+            let id = guard.id.clone().expect("the statement is tracked");
+            let snap = store.snapshot(&id).expect("on the rail");
+            assert_eq!(
+                snap.status,
+                StatementStatus::Running,
+                "running while the request is in flight"
+            );
+            id
+            // The guard drops here, exactly as it would when the request future is dropped.
+        };
+
+        let snap = store.snapshot(&id).expect("still known");
+        assert_eq!(
+            snap.status,
+            StatementStatus::Failed,
+            "a dropped execution is terminal, not running forever"
+        );
+        assert_eq!(snap.error.as_deref(), Some(CLIENT_GONE));
+
+        // And it is terminal *durably*: the restart does not have to be what resolves it.
+        assert!(!store.await_durable(&id).await, "the record is on disk");
+    }
+
+    /// The guard must not fire when the statement finished properly — `take()` disarms it, and
+    /// `finish` would refuse to overwrite a terminal state anyway.
+    #[tokio::test]
+    async fn a_finished_connect_execution_keeps_its_own_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = rest::StatementStore::with_history(HistoryConfig::for_root(dir.path()))
+            .expect("boot history");
+        let service = OxidantService::new();
+        service.attach_statement_store(store.clone());
+
+        let id = {
+            let mut guard = service.history_begin("sess-ok", Some("op-ok"), "SELECT 1 AS n");
+            let id = guard.take().expect("tracked");
+            service
+                .history_finish(
+                    Some(id.clone()),
+                    rest::ExecOutcome::SucceededSummary {
+                        rows: Some(1),
+                        schema: None,
+                    },
+                )
+                .await;
+            id
+        };
+        let snap = store.snapshot(&id).expect("still known");
+        assert_eq!(snap.status, StatementStatus::Succeeded);
+        assert_eq!(snap.error, None);
+    }
+
+    /// With history off there is no statement to leak, and the guard is inert.
+    #[test]
+    fn the_guard_is_inert_when_history_is_not_attached() {
+        let service = OxidantService::new();
+        let guard = service.history_begin("sess-none", None, "SELECT 1");
+        assert!(guard.id.is_none());
     }
 }
 

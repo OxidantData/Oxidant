@@ -73,7 +73,23 @@ curl -s http://localhost:4040/api/v1/statements/9f2c1a…
 `status` is one of `pending`, `running`, `succeeded`, `failed`, `canceled`. `failed`
 statements carry an `error` field; `succeeded` statements carry `rowCount` and `schema`.
 
-List recent statements (newest first):
+Every statement also carries:
+
+- `source` — `rest` for this API, `connect` for a PySpark / Spark Connect `ExecutePlan`. The two
+  now share one rail, so a `spark.sql(...)` a client ran over gRPC is listed here too
+  (issue #134).
+- `tier` — `hot` (live: results in memory, still cancellable) or `history` (replayed from the
+  durable journal after a restart, or aged out of memory: listable and inspectable, but
+  `POST …/cancel` answers `409` and `…/result` answers `410`).
+- `clientOperationId` — the client's own `operation_id`, when it supplied one matching
+  `^[A-Za-z0-9._:-]{1,128}$`. It is an alias only: `statementId` is always engine-minted
+  `stmt-<uuid>` and is the only identity that reaches a filesystem path.
+- `history: "degraded"` — present on a `?wait=true` response only when the statement's terminal
+  record could not be made durable within `OXIDANT_HISTORY_ACK_TIMEOUT_MS`. Its absence is the
+  promise that what you were just told is on disk.
+
+List recent statements (newest first). Statements survive a restart when history is on
+(`OXIDANT_HISTORY`, see [runtime-contract.md](runtime-contract.md)):
 
 ```sh
 curl -s http://localhost:4040/api/v1/statements
@@ -101,6 +117,12 @@ JSON shape:
 ```
 
 `truncated` is `true` when `limit` cut the result short — re-fetch with a higher `limit`.
+
+**`410 result_expired` (new).** `404` still means "no such statement id" and `409`
+still means "not succeeded yet"; `410 {"error":"result_expired"}` is a third answer, meaning the
+statement is known and succeeded but its rows are gone — it was replayed from the journal after a
+restart, or it aged past `OXIDANT_HISTORY_HOT_TTL_SECS`. Reading rows back off disk is the next
+increment of the durability work; today this is the honest answer rather than an empty result set.
 
 ## Cancel
 
