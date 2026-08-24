@@ -497,6 +497,9 @@ impl StoreInner {
         st.batches = Vec::new();
         st.rows_in_memory = false;
         st.release_on_spill = false;
+        // Nothing is in flight for a statement with no rows left. Today the `result_bytes > 0`
+        // filter would exclude it anyway; leaving a stale `spilling` behind is the shape H2 was.
+        st.spilling = false;
         self.result_bytes = self.result_bytes.saturating_sub(freed);
         freed
     }
@@ -507,6 +510,15 @@ impl StoreInner {
     /// Each is marked `spilling` + `release_on_spill` so a second call cannot pick it again while
     /// its write is in flight, and so the spill's completion knows to free the memory. A
     /// non-terminal statement is never a victim: its rows do not exist yet.
+    ///
+    /// A statement whose spill was **refused** (`result_refused`, i.e. past
+    /// `OXIDANT_RESULT_MAX_BYTES`) is not a candidate either. Its rows are the only copy left and
+    /// are never dropped to honour a budget — so re-selecting it every pass only meant
+    /// `plan_spills` declined it again, having already counted its bytes as freed in the
+    /// projection below. The consequence is stated rather than hidden: the in-memory ceiling is
+    /// `OXIDANT_RESULT_MEMORY_BUDGET_BYTES` **plus** every refused result still in the hot tier,
+    /// and those leave on the hot TTL or the record cap like any other statement. The sink logs
+    /// one line per refusal saying so.
     fn budget_victims(&mut self) -> Vec<String> {
         let budget = self.limits.result_budget;
         if budget == u64::MAX || self.result_bytes <= budget {
@@ -516,7 +528,11 @@ impl StoreInner {
             .statements
             .iter()
             .filter(|(_, st)| {
-                st.status.is_terminal() && st.rows_in_memory && !st.spilling && st.result_bytes > 0
+                st.status.is_terminal()
+                    && st.rows_in_memory
+                    && !st.spilling
+                    && st.result_refused.is_none()
+                    && st.result_bytes > 0
             })
             .map(|(id, st)| (st.seq, id.clone()))
             .collect();
@@ -711,6 +727,15 @@ impl StatementStore {
                     SpillOutcome::TooLarge => {
                         st.result_refused = Some(RESULT_TOO_LARGE.to_string());
                         st.release_on_spill = false;
+                        tracing::warn!(
+                            statement = %id,
+                            retained_bytes = st.result_bytes,
+                            "result too large to spill: its rows are the only copy and stay in \
+                             memory, so they are excluded from the result budget's eviction \
+                             candidates. The effective in-memory ceiling is \
+                             OXIDANT_RESULT_MEMORY_BUDGET_BYTES plus every such result until it \
+                             ages out of the hot tier"
+                        );
                         false
                     }
                     SpillOutcome::Failed => {
@@ -977,12 +1002,16 @@ impl StatementStore {
         if !persist.spills_at_all() {
             return Vec::new();
         }
+        // Order matters (the finished statement first, then oldest victims), so this is a vec
+        // with a set beside it rather than a `contains` scan per candidate.
         let mut wanted: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         if persist.spills_eagerly() {
+            seen.insert(finished.to_string());
             wanted.push(finished.to_string());
         }
         for id in inner.budget_victims() {
-            if !wanted.contains(&id) {
+            if seen.insert(id.clone()) {
                 wanted.push(id);
             }
         }
@@ -4396,6 +4425,85 @@ mod tests {
             Some(oxidant_observability::history_writes::OK.to_string()),
             "history_writes must flip back without a restart"
         );
+        store.shutdown_for_test();
+    }
+
+    /// M1: a result the file cap refused keeps its rows — they are the only copy — but it stops
+    /// being a budget victim, so the projection stops claiming bytes it will never free.
+    ///
+    /// The consequence is documented rather than papered over: the in-memory ceiling is the
+    /// budget **plus** every refused result still in the hot tier. Nothing is truncated and
+    /// nothing is dropped; refused rows leave on the hot TTL or the record cap.
+    #[tokio::test]
+    async fn a_refused_result_stays_in_the_budget_and_stops_being_a_victim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = retained_bytes(&[rows_batch(0, 4)]);
+        let budget = small + small / 2;
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::OnPressure;
+            c.result_memory_budget_bytes = budget;
+            // Small enough that a 64-row result's IPC encoding is refused and a 4-row one is not.
+            c.result_max_bytes = 512;
+        });
+
+        let (refused, _) = store.insert("SELECT * FROM big");
+        store.finish(&refused, ExecOutcome::Succeeded(vec![rows_batch(0, 64)]));
+        // Pressure, so the big result is actually offered to the writer and refused.
+        let (nudge, _) = store.insert("SELECT 'nudge'");
+        store.finish(&nudge, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+        let refused_bytes = {
+            let inner = store.inner.lock().expect("lock");
+            let st = inner.statements.get(&refused).expect("hot");
+            assert_eq!(st.result_refused.as_deref(), Some(RESULT_TOO_LARGE));
+            assert!(st.rows_in_memory, "the rows are the only copy left");
+            st.result_bytes
+        };
+        assert!(refused_bytes > 0);
+
+        // Ten more small results: each spills and releases, and the refused one is never chosen.
+        for i in 0..10i64 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(i * 100, 4)]));
+            store.drain_spills();
+        }
+        {
+            let mut inner = store.inner.lock().expect("lock");
+            let victims = inner.budget_victims();
+            assert!(
+                !victims.contains(&refused),
+                "a refused result must not be re-selected every pass: {victims:?}"
+            );
+            // Undo what asking cost us: `budget_victims` marks whoever it picked.
+            for id in victims {
+                if let Some(st) = inner.statements.get_mut(&id) {
+                    st.spilling = false;
+                    st.release_on_spill = false;
+                }
+            }
+            assert!(
+                inner
+                    .statements
+                    .get(&refused)
+                    .expect("still hot")
+                    .rows_in_memory,
+                "and it certainly must not be released — nothing is on disk for it"
+            );
+            // The documented ceiling: the budget, plus the refused result. Not unbounded, and
+            // not a budget that silently lets go of what memory actually holds.
+            let ceiling = budget + refused_bytes;
+            assert!(
+                inner.result_bytes <= ceiling,
+                "retained {} against a ceiling of {ceiling} (budget {budget} + refused \
+                 {refused_bytes})",
+                inner.result_bytes
+            );
+            assert!(
+                inner.result_bytes >= refused_bytes,
+                "and the budget still counts the refused rows: {} < {refused_bytes}",
+                inner.result_bytes
+            );
+        }
         store.shutdown_for_test();
     }
 
