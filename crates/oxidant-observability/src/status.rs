@@ -32,6 +32,94 @@ pub struct QueryStatus {
     pub bytes: i64,
 }
 
+/// Durability counters for `GET /api/status` — the statement journal, the spilled results, and
+/// the disk guards that bound both (`docs/query-history-durability.md` §3, §7).
+///
+/// Published by whoever owns the journal (`oxidant-connect`'s statement store) through
+/// [`set_history_status_source`], rather than being reachable from here: this crate sits *below*
+/// `oxidant-connect` in the dependency graph, and inverting that to reach a `StatementStore`
+/// would make the observability crate depend on the Spark Connect server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryStatus {
+    /// The **aggregate** of the three durability subsystems — the journal, the result spill
+    /// writer, and the disk sweep. `degraded` while any one of them is; `ok` only when all three
+    /// are. Each subsystem's flag is sticky until a success *of its own* clears it, so a healthy
+    /// journal can no longer report a failing result volume as `ok` (§7).
+    ///
+    /// [`Self::result_writes`] and [`Self::disk`] say which one, and no restart is needed for
+    /// either to flip back.
+    pub history_writes: String,
+    /// Work history gave up on under backpressure: journal records the writer had no room for
+    /// (`running` chatter and tombstones, never a `submitted` or a `snapshot`) **plus** spill
+    /// jobs the spill queue had no room for. Both are dropped work, and an operator watching
+    /// "am I losing history" should not have to know there are two queues (§7).
+    pub history_dropped_events: u64,
+    /// Total size of `history/results/*.arrow`.
+    pub results_on_disk_bytes: u64,
+    /// The result spill writer alone: `ok`, or `degraded` once a spill was refused by the disk
+    /// or dropped for backpressure. Cleared only by a spill that lands.
+    pub result_writes: String,
+    /// Spills the disk refused outright (ENOSPC/EIO/…). Distinct from
+    /// [`Self::history_dropped_events`], which counts jobs that never reached the disk at all.
+    pub result_write_failures: u64,
+    /// `ok`; `over_budget` once the sweeper has run out of things to prune under
+    /// `OXIDANT_DISK_MAX_BYTES`; or `low_free` when the volume holding a managed directory is
+    /// below `OXIDANT_DISK_MIN_FREE_BYTES` — a shortfall the engine did not necessarily cause,
+    /// and never prunes history for. `over_budget` wins when both hold, because it is the one
+    /// the engine can act on (§3).
+    pub disk: String,
+}
+
+/// The two values [`HistoryStatus::history_writes`] and [`HistoryStatus::result_writes`] take.
+pub mod history_writes {
+    pub const OK: &str = "ok";
+    pub const DEGRADED: &str = "degraded";
+}
+
+/// The three values [`HistoryStatus::disk`] takes.
+pub mod disk_state {
+    pub const OK: &str = "ok";
+    /// The engine's own subtree is past `OXIDANT_DISK_MAX_BYTES` with nothing left to prune.
+    pub const OVER_BUDGET: &str = "over_budget";
+    /// The volume is below `OXIDANT_DISK_MIN_FREE_BYTES`. The engine stops spilling and reports;
+    /// it does **not** delete history it did not overspend on.
+    pub const LOW_FREE: &str = "low_free";
+}
+
+type HistoryStatusSource = Box<dyn Fn() -> HistoryStatus + Send + Sync>;
+
+static HISTORY_STATUS: std::sync::RwLock<Option<HistoryStatusSource>> =
+    std::sync::RwLock::new(None);
+
+/// Publish the durability counters `/api/status` reads. Called at boot by whoever booted the
+/// journal. With `OXIDANT_HISTORY=off` it is never called and the durability fields are
+/// **absent** from the response — §8 says `off` restores today's behaviour exactly, and today
+/// there are no such fields.
+///
+/// **Last writer wins.** A `OnceLock` here meant the *first* store to boot in a process owned
+/// the endpoint forever: once that store dropped, `/api/status` reported the quiet
+/// `ok`/0/`ok` defaults for the life of the process no matter how many stores booted after it.
+/// A production process boots exactly one, so this only ever bit test binaries — which is
+/// precisely why the wiring had no end-to-end coverage.
+pub fn set_history_status_source(source: impl Fn() -> HistoryStatus + Send + Sync + 'static) {
+    if let Ok(mut slot) = HISTORY_STATUS.write() {
+        *slot = Some(Box::new(source));
+    }
+}
+
+/// Stop publishing durability counters — `/api/status` goes back to having no such fields.
+/// Tests use this to restore the `OXIDANT_HISTORY=off` shape after booting a store.
+pub fn clear_history_status_source() {
+    if let Ok(mut slot) = HISTORY_STATUS.write() {
+        *slot = None;
+    }
+}
+
+/// The published counters, or `None` when history is off (or has not booted yet).
+pub fn history_status() -> Option<HistoryStatus> {
+    HISTORY_STATUS.read().ok()?.as_ref().map(|f| f())
+}
+
 /// Driver status: `GET /api/status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusSnapshot {
@@ -51,6 +139,11 @@ pub struct StatusSnapshot {
     pub queued_queries: usize,
     /// Most recent queries, newest first, capped by the caller's limit.
     pub queries: Vec<QueryStatus>,
+    /// Durability counters, flattened into this object as `history_writes`,
+    /// `history_dropped_events`, `results_on_disk_bytes`, `result_writes`,
+    /// `result_write_failures` and `disk`. Absent with `OXIDANT_HISTORY=off`.
+    #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryStatus>,
 }
 
 /// Query state strings used by [`QueryStatus::state`].

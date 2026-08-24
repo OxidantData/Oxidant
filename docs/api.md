@@ -246,6 +246,19 @@ curl -s http://localhost:4040/api/status -H "Authorization: Bearer $OXIDANT_STAT
 | `queries[].rows` | Output rows reported by the last stage to finish (0 while running) |
 | `queries[].bytes` | Bytes shuffled across the query's stages — `0` for a single-node query, which never shuffles |
 
+With durable statement history on (the default — see
+[runtime-contract.md](runtime-contract.md)), six more fields are flattened into the same object.
+They are **absent entirely** under `OXIDANT_HISTORY=off`:
+
+| Field | Meaning |
+|-------|---------|
+| `history_writes` | `ok` or `degraded`, aggregated over three subsystems: the statement journal, the result spill writer, and the disk sweep. Each is sticky until a success *of its own* clears it, and none needs a restart to flip back |
+| `history_dropped_events` | Work history gave up on under backpressure — journal records the writer had no room for, plus spill jobs the spill queue had no room for. Neither loses a statement |
+| `results_on_disk_bytes` | Total size of the spilled results under `history/results/` |
+| `result_writes` | The spill writer alone: `degraded` once a spill was refused by the disk or dropped, cleared by the next spill that lands |
+| `result_write_failures` | Spills the disk refused outright (ENOSPC/EIO/…) |
+| `disk` | `ok`; `over_budget` when the engine's own subtree is past `OXIDANT_DISK_MAX_BYTES` with nothing left to prune; or `low_free` when a volume holding a managed directory is below `OXIDANT_DISK_MIN_FREE_BYTES`. `low_free` pauses result spill and deletes **nothing** — it is very often a co-tenant's shortfall. `over_budget` wins when both hold |
+
 Every field comes from the same query lifecycle events that back the [monitoring UI](web-ui.md);
 nothing is sampled or estimated separately.
 

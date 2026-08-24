@@ -63,6 +63,57 @@ impl SqlMode {
     }
 }
 
+/// `OXIDANT_RESULT_PERSIST`: when a terminal result's rows are written to
+/// `history/results/<statement-id>.arrow`.
+///
+/// The default is `on_pressure`: rows stay in memory until the in-memory budget
+/// ([`HistoryConfig::result_memory_budget_bytes`]) would be exceeded, and the oldest terminal
+/// result is spilled to make room. `always` spills every terminal result as it lands, which is
+/// what makes `/result` answer across a restart for a *quiet* driver too. `never` writes nothing
+/// — and, because nothing is ever durable under it, never releases in-memory rows either: the
+/// count cap and the hot TTL bound memory exactly as they did before this design.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResultPersist {
+    Always,
+    OnPressure,
+    Never,
+}
+
+impl Default for ResultPersist {
+    fn default() -> Self {
+        Self::OnPressure
+    }
+}
+
+impl ResultPersist {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::OnPressure => "on_pressure",
+            Self::Never => "never",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "always" => Some(Self::Always),
+            "on_pressure" | "onpressure" | "on-pressure" => Some(Self::OnPressure),
+            "never" | "off" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    /// Does a terminal result get written to disk the moment it lands?
+    pub(crate) fn spills_eagerly(self) -> bool {
+        matches!(self, Self::Always)
+    }
+
+    /// May a result ever reach the disk under this mode?
+    pub(crate) fn spills_at_all(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+}
+
 /// Replace credential-shaped values in a SQL string.
 ///
 /// Two shapes, both of which appear in real DDL and both of which the review named:
@@ -166,6 +217,14 @@ fn redact_url_userinfo(sql: &str) -> String {
 
 /// Journal segment roll size (§3). Overridable so a test does not have to write 64 MiB.
 const DEFAULT_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+/// `OXIDANT_RESULT_MAX_BYTES` (§3) — the per-file ceiling on a spilled result.
+const DEFAULT_RESULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// `OXIDANT_RESULT_MEMORY_BUDGET_BYTES` (F8) — the in-memory ceiling across all retained results.
+const DEFAULT_RESULT_MEMORY_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+/// `OXIDANT_DISK_MAX_BYTES` (§3) — everything the engine owns under the root, combined.
+const DEFAULT_DISK_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// `OXIDANT_DISK_MIN_FREE_BYTES` (§3) — the filesystem free-space floor.
+const DEFAULT_DISK_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Resolved statement-history configuration.
 #[derive(Clone, Debug)]
@@ -192,6 +251,34 @@ pub(crate) struct HistoryConfig {
     pub retention_days: i64,
     pub sql_mode: SqlMode,
     pub segment_max_bytes: u64,
+    /// `<history-dir>/results`, or `OXIDANT_RESULT_DIR` — spilled Arrow IPC results (§5).
+    pub results_dir: PathBuf,
+    /// `<root>/logs`, or `OXIDANT_LOG_DIR`. PR2 does not *write* here (the rolling writer is
+    /// PR3); the disk sweeper prunes it, which is why the path is resolved now.
+    pub logs_dir: PathBuf,
+    /// `<root>/dumps`, or `OXIDANT_DUMP_DIR` — §6b support bundles, swept like results.
+    pub dumps_dir: PathBuf,
+    pub result_persist: ResultPersist,
+    /// `OXIDANT_RESULT_MAX_BYTES` — a result whose Arrow IPC encoding exceeds this is refused
+    /// and the statement records `result_too_large` instead of a pointer.
+    pub result_max_bytes: u64,
+    /// `OXIDANT_RESULT_MEMORY_BUDGET_BYTES` — the in-memory ceiling across *all* retained
+    /// results that `on_pressure` triggers on (F8).
+    pub result_memory_budget_bytes: u64,
+    /// `OXIDANT_DISK_MAX_BYTES` — total budget for everything the engine owns under the root.
+    pub disk_max_bytes: u64,
+    /// `OXIDANT_DISK_MIN_FREE_BYTES` — filesystem free-space floor.
+    pub disk_min_free_bytes: u64,
+    /// How often the disk-budget sweeper runs (§3: every 5 minutes, plus at boot).
+    pub disk_sweep_interval: Duration,
+    /// A synthetic mount table — `(mount point, available bytes)` — for tests only.
+    ///
+    /// The free-space floor is the one guard that cannot be driven from a tempdir: it depends on
+    /// how full the *host* volume is, and on which volume each managed directory sits. It is also
+    /// the guard whose misbehaviour deleted the entire statement history (H1). Read through
+    /// [`Self::mounts_override`], which is `None` in every non-test build.
+    #[cfg(test)]
+    pub mounts_override: Option<Vec<(PathBuf, u64)>>,
     /// `driver` / `worker`, recorded in the lockfile.
     pub role: String,
     /// The process's port, recorded in the lockfile.
@@ -220,6 +307,12 @@ impl HistoryConfig {
         let history_dir = env_path("OXIDANT_HISTORY_DIR")?.unwrap_or_else(|| root.join("history"));
         let statements_dir = history_dir.join("statements");
         let compacted_dir = statements_dir.join("compacted");
+        // An explicit subtree override wins over the root, and an overridden subtree is still
+        // counted against — and pruned by — the disk budget (§3, "Root and precedence").
+        let results_dir =
+            env_path("OXIDANT_RESULT_DIR")?.unwrap_or_else(|| history_dir.join("results"));
+        let logs_dir = env_path("OXIDANT_LOG_DIR")?.unwrap_or_else(|| root.join("logs"));
+        let dumps_dir = env_path("OXIDANT_DUMP_DIR")?.unwrap_or_else(|| root.join("dumps"));
         Ok(Self {
             enabled,
             root,
@@ -236,6 +329,32 @@ impl HistoryConfig {
                 .unwrap_or(SqlMode::Text),
             segment_max_bytes: env_u64("OXIDANT_HISTORY_SEGMENT_BYTES", DEFAULT_SEGMENT_BYTES)
                 .max(1),
+            results_dir,
+            logs_dir,
+            dumps_dir,
+            result_persist: env_str("OXIDANT_RESULT_PERSIST")
+                .and_then(|v| ResultPersist::parse(&v))
+                .unwrap_or_default(),
+            result_max_bytes: env_u64("OXIDANT_RESULT_MAX_BYTES", DEFAULT_RESULT_MAX_BYTES),
+            // `OXIDANT_RESULT_MEM_BYTES` is the name §3's knob table shipped with; the budget is
+            // one number under two spellings rather than two knobs that can disagree.
+            result_memory_budget_bytes: env_u64(
+                "OXIDANT_RESULT_MEMORY_BUDGET_BYTES",
+                env_u64(
+                    "OXIDANT_RESULT_MEM_BYTES",
+                    DEFAULT_RESULT_MEMORY_BUDGET_BYTES,
+                ),
+            ),
+            disk_max_bytes: env_u64("OXIDANT_DISK_MAX_BYTES", DEFAULT_DISK_MAX_BYTES),
+            disk_min_free_bytes: env_u64(
+                "OXIDANT_DISK_MIN_FREE_BYTES",
+                DEFAULT_DISK_MIN_FREE_BYTES,
+            ),
+            disk_sweep_interval: Duration::from_secs(
+                env_u64("OXIDANT_DISK_SWEEP_SECS", 300).max(1),
+            ),
+            #[cfg(test)]
+            mounts_override: None,
             role: role.to_string(),
             port,
         })
@@ -257,6 +376,20 @@ impl HistoryConfig {
             root: root.to_path_buf(),
             compacted_dir: statements_dir.join("compacted"),
             statements_dir,
+            results_dir: history_dir.join("results"),
+            logs_dir: root.join("logs"),
+            dumps_dir: root.join("dumps"),
+            result_persist: ResultPersist::default(),
+            result_max_bytes: DEFAULT_RESULT_MAX_BYTES,
+            result_memory_budget_bytes: DEFAULT_RESULT_MEMORY_BUDGET_BYTES,
+            // Neutral disk guards, opted into per test. Inheriting the shipped 1 GiB floor
+            // meant every history test's journal and results were at the mercy of how full
+            // *this machine* happened to be — and this repo has a documented hazard of a
+            // `target/` directory measured at 174 GB.
+            disk_max_bytes: u64::MAX,
+            disk_min_free_bytes: 0,
+            disk_sweep_interval: Duration::from_secs(300),
+            mounts_override: None,
             flush_interval: Duration::from_millis(500),
             ack_timeout: Duration::from_millis(2000),
             hot_ttl: Duration::from_secs(3600),
@@ -267,6 +400,20 @@ impl HistoryConfig {
             segment_max_bytes: DEFAULT_SEGMENT_BYTES,
             role: "driver".to_string(),
             port: 0,
+        }
+    }
+}
+
+impl HistoryConfig {
+    /// The synthetic mount table a test installed, or `None` — always `None` outside tests.
+    pub(crate) fn mounts_override(&self) -> Option<Vec<(PathBuf, u64)>> {
+        #[cfg(test)]
+        {
+            self.mounts_override.clone()
+        }
+        #[cfg(not(test))]
+        {
+            None
         }
     }
 }
@@ -323,10 +470,30 @@ fn env_flag(key: &str) -> bool {
     )
 }
 
+/// A byte/count/duration knob. An unparseable value is **warned about** and then defaults.
+///
+/// Silence was tolerable for `OXIDANT_HISTORY_SEGMENT_BYTES`; it is not for
+/// `OXIDANT_DISK_MAX_BYTES`, where `8GiB` (a plausible typo — this reads plain integers, not
+/// suffixed sizes) quietly becomes the 8 GiB default and `100GiB` quietly becomes 8 GiB too,
+/// after which the sweeper prunes history the operator thought they had budgeted for.
 fn env_u64(key: &str, default: u64) -> u64 {
-    env_str(key)
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(default)
+    let Some(raw) = env_str(key) else {
+        return default;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                key,
+                value = %raw,
+                error = %e,
+                default,
+                "ignoring an unparseable value and using the default; this knob takes a plain \
+                 integer, not a suffixed size like `8GiB`"
+            );
+            default
+        }
+    }
 }
 
 /// A path knob that must name a filesystem path.
@@ -386,6 +553,23 @@ mod tests {
             "digest+prefix must be bounded: {out}"
         );
         assert_eq!(SqlMode::Hash.encode(&sql), out, "digest is stable");
+    }
+
+    /// An unparseable size knob defaults *loudly*. `OXIDANT_DISK_MAX_BYTES=8GiB` silently
+    /// becoming the 8 GiB default is survivable; `100GiB` silently becoming 8 GiB is the sweeper
+    /// pruning history the operator thought they had budgeted for.
+    #[test]
+    fn an_unparseable_size_knob_falls_back_to_the_default() {
+        std::env::set_var("OXIDANT_TEST_SIZE_KNOB", "100GiB");
+        assert_eq!(env_u64("OXIDANT_TEST_SIZE_KNOB", 7), 7);
+        std::env::set_var("OXIDANT_TEST_SIZE_KNOB", " 4096 ");
+        assert_eq!(
+            env_u64("OXIDANT_TEST_SIZE_KNOB", 7),
+            4096,
+            "a plain integer, whitespace and all, is still honoured"
+        );
+        std::env::remove_var("OXIDANT_TEST_SIZE_KNOB");
+        assert_eq!(env_u64("OXIDANT_TEST_SIZE_KNOB", 7), 7);
     }
 
     #[test]

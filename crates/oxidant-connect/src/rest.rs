@@ -52,8 +52,9 @@ use tracing_subscriber::Layer;
 use uuid::Uuid;
 
 use crate::history::{
-    now_rfc3339, rfc3339_from_ms, FoldedStatement, HistoryConfig, HistoryRuntime, JournalRecord,
-    RecordKind, Source, SqlMode, StatementStatus, RECORD_VERSION,
+    disk, now_rfc3339, rfc3339_from_ms, FoldedStatement, HistoryConfig, HistoryRuntime,
+    JournalRecord, RecordKind, ResultPersist, ResultPointer, Source, SpillJob, SpillOutcome,
+    SqlMode, StatementStatus, RECORD_VERSION, RESULT_EMPTY, RESULT_TOO_LARGE,
 };
 use crate::OxidantService;
 
@@ -218,14 +219,26 @@ struct Statement {
     /// Fires when this statement's terminal record is fsynced; taken by whoever answers the
     /// client, at most once.
     durable_ack: Option<tokio::sync::oneshot::Receiver<()>>,
-    /// Are this statement's result rows retained *here*?
+    /// Can `/result` still answer from [`Self::batches`]?
     ///
-    /// False for the Connect path: its batches are already streaming to the gRPC client as Arrow
-    /// IPC and the store deliberately keeps no second copy (PR2 spills them to
-    /// `results/<id>.arrow`). Without this the statement is hot, succeeded, and has an empty
-    /// `batches` — so the result endpoint answered `200 {"rows":[]}` for a query whose own status
-    /// document said `rowCount: 5`.
-    rows_retained: bool,
+    /// False for the Connect path (its batches are already streaming to the gRPC client as Arrow
+    /// IPC and the store deliberately keeps no second copy) and false once the in-memory result
+    /// budget has released the rows to `results/<id>.arrow`. Without it the statement is hot,
+    /// succeeded, and has an empty `batches` — so the result endpoint answered
+    /// `200 {"rows":[]}` for a query whose own status document said `rowCount: 5`.
+    rows_in_memory: bool,
+    /// What [`Self::batches`] costs the store's in-memory result budget (§5, F8). Zero whenever
+    /// the rows are not here.
+    result_bytes: u64,
+    /// The spilled result file, once one is durable (§5).
+    result_file: Option<ResultPointer>,
+    /// Why there is none — [`RESULT_TOO_LARGE`].
+    result_refused: Option<String>,
+    /// A spill is in flight for this statement; the budget must not pick it as a victim twice.
+    spilling: bool,
+    /// Release the in-memory rows the moment the spill lands — the `on_pressure` path. `always`
+    /// spills without releasing, and lets the budget decide later.
+    release_on_spill: bool,
 }
 
 impl Statement {
@@ -242,7 +255,7 @@ impl Statement {
             source: self.source,
             client_op_id: self.client_op_id.clone(),
             tier: Tier::Hot,
-            rows_retained: self.rows_retained,
+            result_refused: self.result_refused.clone(),
         }
     }
 
@@ -262,6 +275,8 @@ impl Statement {
             rows: self.row_count.map(|r| r as u64),
             submitted_at_ms: self.submitted_at_ms,
             duration_ms: self.duration_ms,
+            result: self.result_file.clone(),
+            result_refused: self.result_refused.clone(),
             seq: self.seq,
             last_seq,
             rank: RecordKind::Snapshot.rank(),
@@ -299,8 +314,9 @@ pub(crate) struct StatementSnapshot {
     source: Source,
     client_op_id: Option<String>,
     tier: Tier,
-    /// Whether `/result` can still answer with rows, or must say `410 result_expired`.
-    rows_retained: bool,
+    /// Why there is no spilled result — [`RESULT_TOO_LARGE`]. Surfaced on the status document so
+    /// a client can tell "past the size cap" from "aged out".
+    result_refused: Option<String>,
 }
 
 impl StatementSnapshot {
@@ -317,8 +333,7 @@ impl StatementSnapshot {
             source: st.source,
             client_op_id: st.client_op_id.clone(),
             tier: Tier::History,
-            // The history tier holds no batches by construction.
-            rows_retained: false,
+            result_refused: st.result_refused.clone(),
         }
     }
 }
@@ -335,6 +350,21 @@ pub(crate) enum ExecOutcome {
     },
     Failed(String),
     Canceled,
+}
+
+/// Where `/result` reads a statement's rows from (§5).
+enum ResultSource {
+    /// The hot tier still holds them.
+    Memory(Vec<RecordBatch>),
+    /// `results/<id>.arrow` — read back off disk, possibly after a restart. Carries the file
+    /// name the journaled pointer names, so a pointer that disagrees with the id is rejected
+    /// rather than silently ignored.
+    Disk(Option<String>),
+    /// The statement succeeded with no batches at all. There is nothing to read and nothing
+    /// was lost: `200 {"rows": []}`, before and after a restart alike.
+    Empty,
+    /// Neither tier has them: `410 result_expired`.
+    Gone,
 }
 
 /// Outcome of a cancel request.
@@ -355,6 +385,11 @@ struct Limits {
     hot_ttl: Duration,
     max_per_session: usize,
     retention_days: i64,
+    /// In-memory ceiling across every retained result (§5, F8). `u64::MAX` when there is nowhere
+    /// durable to release rows *to* — with history off, or under
+    /// `OXIDANT_RESULT_PERSIST=never` — because a budget that evicts rows into thin air is not a
+    /// budget, it is a silent data loss the old store never had.
+    result_budget: u64,
 }
 
 impl Default for Limits {
@@ -365,6 +400,7 @@ impl Default for Limits {
             hot_ttl: STATEMENT_TTL,
             max_per_session: usize::MAX,
             retention_days: 0,
+            result_budget: u64::MAX,
         }
     }
 }
@@ -395,6 +431,10 @@ struct StoreInner {
     sql_mode: SqlMode,
     /// Wall clock of the last retention pass, so the sweep is not re-run on every submit.
     last_sweep_ms: i64,
+    /// Bytes of retained result batches across the hot tier — the budget `on_pressure` triggers
+    /// on. Maintained as batches are attached and released, which is accounting today's store
+    /// has none of.
+    result_bytes: u64,
 }
 
 impl StoreInner {
@@ -448,11 +488,85 @@ impl StoreInner {
         }
     }
 
+    /// Release one statement's in-memory rows, returning the bytes freed.
+    ///
+    /// Called only when the rows are already durable (or the caller has decided they are being
+    /// dropped anyway), because `/result` answers from the spilled file afterwards and from
+    /// nowhere at all if there is none.
+    fn release_rows(&mut self, id: &str) -> u64 {
+        let Some(st) = self.statements.get_mut(id) else {
+            return 0;
+        };
+        let freed = st.result_bytes;
+        st.result_bytes = 0;
+        st.batches = Vec::new();
+        st.rows_in_memory = false;
+        st.release_on_spill = false;
+        // Nothing is in flight for a statement with no rows left. Today the `result_bytes > 0`
+        // filter would exclude it anyway; leaving a stale `spilling` behind is the shape H2 was.
+        st.spilling = false;
+        self.result_bytes = self.result_bytes.saturating_sub(freed);
+        freed
+    }
+
+    /// The statements whose rows must leave memory for the result budget to hold,
+    /// oldest-terminal-first (§5).
+    ///
+    /// Each is marked `spilling` + `release_on_spill` so a second call cannot pick it again while
+    /// its write is in flight, and so the spill's completion knows to free the memory. A
+    /// non-terminal statement is never a victim: its rows do not exist yet.
+    ///
+    /// A statement whose spill was **refused** (`result_refused`, i.e. past
+    /// `OXIDANT_RESULT_MAX_BYTES`) is not a candidate either. Its rows are the only copy left and
+    /// are never dropped to honour a budget — so re-selecting it every pass only meant
+    /// `plan_spills` declined it again, having already counted its bytes as freed in the
+    /// projection below. The consequence is stated rather than hidden: the in-memory ceiling is
+    /// `OXIDANT_RESULT_MEMORY_BUDGET_BYTES` **plus** every refused result still in the hot tier,
+    /// and those leave on the hot TTL or the record cap like any other statement. The sink logs
+    /// one line per refusal saying so.
+    fn budget_victims(&mut self) -> Vec<String> {
+        let budget = self.limits.result_budget;
+        if budget == u64::MAX || self.result_bytes <= budget {
+            return Vec::new();
+        }
+        let mut candidates: Vec<(u64, String)> = self
+            .statements
+            .iter()
+            .filter(|(_, st)| {
+                st.status.is_terminal()
+                    && st.rows_in_memory
+                    && !st.spilling
+                    && st.result_refused.is_none()
+                    && st.result_bytes > 0
+            })
+            .map(|(id, st)| (st.seq, id.clone()))
+            .collect();
+        candidates.sort_by_key(|(seq, _)| *seq);
+
+        let mut projected = self.result_bytes;
+        let mut victims = Vec::new();
+        for (_, id) in candidates {
+            if projected <= budget {
+                break;
+            }
+            let Some(st) = self.statements.get_mut(&id) else {
+                continue;
+            };
+            projected = projected.saturating_sub(st.result_bytes);
+            st.spilling = true;
+            st.release_on_spill = true;
+            victims.push(id);
+        }
+        victims
+    }
+
     /// Take a statement out of the hot tier, keeping its folded state when history is on.
     fn demote(&mut self, id: &str) {
         let Some(st) = self.statements.remove(id) else {
             return;
         };
+        // The rows go with the hot entry; the spilled file (and its pointer) do not.
+        self.result_bytes = self.result_bytes.saturating_sub(st.result_bytes);
         if !self.limits.history_on {
             // Nothing outlives the hot tier here, so neither may its alias: with history off
             // there is no sweeper to prune it later.
@@ -495,6 +609,10 @@ pub(crate) struct StatementStore {
     notify: Arc<Notify>,
     /// `None` — `OXIDANT_HISTORY=off` — is exactly today's volatile store.
     history: Option<Arc<HistoryRuntime>>,
+    /// What the last disk sweep found: over the engine's own budget, and/or under the volume's
+    /// free-space floor. Both are cleared by the first sweep that finds them false again, with
+    /// no restart (§3).
+    disk: Arc<DiskHealth>,
 }
 
 impl StatementStore {
@@ -504,6 +622,7 @@ impl StatementStore {
             inner: Arc::new(Mutex::new(StoreInner::default())),
             notify: Arc::new(Notify::new()),
             history: None,
+            disk: Arc::new(DiskHealth::default()),
         }
     }
 
@@ -517,6 +636,13 @@ impl StatementStore {
             hot_ttl: runtime.cfg.hot_ttl,
             max_per_session: runtime.cfg.max_per_session,
             retention_days: runtime.cfg.retention_days,
+            // With nowhere durable to release rows to, the budget is not enforced by eviction —
+            // see [`Limits::result_budget`].
+            result_budget: if runtime.cfg.result_persist.spills_at_all() {
+                runtime.cfg.result_memory_budget_bytes
+            } else {
+                u64::MAX
+            },
         };
         let mut inner = StoreInner {
             next_seq: fold.max_seq + 1,
@@ -535,8 +661,14 @@ impl StatementStore {
             inner: Arc::new(Mutex::new(inner)),
             notify: Arc::new(Notify::new()),
             history: Some(Arc::new(runtime)),
+            disk: Arc::new(DiskHealth::default()),
         };
+        store.install_spill_sink();
+        store.publish_status_counters();
         store.sweep_history();
+        // §3: the sweeper runs at boot and every 5 minutes.
+        store.sweep_disk();
+        store.spawn_disk_sweeper();
         tracing::info!(
             statements = replayed,
             dir = %store
@@ -549,6 +681,94 @@ impl StatementStore {
             "statement history replayed"
         );
         Ok(store)
+    }
+
+    /// Teach the spill thread how to report back into the store.
+    ///
+    /// A [`std::sync::Weak`] rather than a clone: the callback lives on the spill thread for the
+    /// thread's whole life, and a strong reference would keep a test's store — and its data-dir
+    /// lock — alive past the end of the test.
+    fn install_spill_sink(&self) {
+        let Some(history) = self.history.as_ref() else {
+            return;
+        };
+        let weak = Arc::downgrade(&self.inner);
+        // The liveness question §5's late-spill guard asks. A store that is gone answers "dead",
+        // which is the honest answer: nothing is left to own the file.
+        let live_weak = Arc::downgrade(&self.inner);
+        let live: Box<dyn Fn(&str) -> bool + Send + Sync> = Box::new(move |id: &str| {
+            let Some(inner) = live_weak.upgrade() else {
+                return false;
+            };
+            let inner = inner.lock().expect("statement store poisoned");
+            inner.statements.contains_key(id) || inner.history.contains_key(id)
+        });
+        history.results.set_sink(
+            Box::new(move |id, outcome| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let mut inner = inner.lock().expect("statement store poisoned");
+            // The statement may have been demoted while its rows were being written, in which
+            // case the pointer belongs on the history-tier entry: the spill's own journal record
+            // already carries it, and this keeps the in-memory tier from disagreeing with the
+            // file on disk until the next boot.
+            if !inner.statements.contains_key(id) {
+                if let Some(st) = inner.history.get_mut(id) {
+                    match outcome {
+                        SpillOutcome::Spilled(pointer) => st.result = Some(pointer.clone()),
+                        SpillOutcome::TooLarge => {
+                            st.result_refused = Some(RESULT_TOO_LARGE.to_string())
+                        }
+                        SpillOutcome::Failed | SpillOutcome::Abandoned => {}
+                    }
+                }
+                return;
+            }
+            let release = {
+                let st = inner
+                    .statements
+                    .get_mut(id)
+                    .expect("checked immediately above");
+                st.spilling = false;
+                match outcome {
+                    SpillOutcome::Spilled(pointer) => {
+                        st.result_file = Some(pointer.clone());
+                        st.result_refused = None;
+                        st.release_on_spill
+                    }
+                    // Nothing is on disk, so nothing may leave memory: the rows are all that is
+                    // left of this result and dropping them would turn a size cap (or a full
+                    // disk) into silent data loss.
+                    SpillOutcome::TooLarge => {
+                        st.result_refused = Some(RESULT_TOO_LARGE.to_string());
+                        st.release_on_spill = false;
+                        tracing::warn!(
+                            statement = %id,
+                            retained_bytes = st.result_bytes,
+                            "result too large to spill: its rows are the only copy and stay in \
+                             memory, so they are excluded from the result budget's eviction \
+                             candidates. The effective in-memory ceiling is \
+                             OXIDANT_RESULT_MEMORY_BUDGET_BYTES plus every such result until it \
+                             ages out of the hot tier"
+                        );
+                        false
+                    }
+                    // The disk refused it, or it completed for a statement that had been
+                    // evicted (in which case this branch is unreachable — the id is in neither
+                    // tier by definition — but a flag left set is how H2 happened).
+                    SpillOutcome::Failed | SpillOutcome::Abandoned => {
+                        st.release_on_spill = false;
+                        false
+                    }
+                }
+            };
+            if release {
+                inner.release_rows(id);
+            }
+            }),
+            live,
+        );
     }
 
     /// Build from the environment: the durable store, or today's volatile one under
@@ -621,7 +841,12 @@ impl StatementStore {
                     session: session.map(str::to_string),
                     client_op_id: alias.clone(),
                     durable_ack: None,
-                    rows_retained: true,
+                    rows_in_memory: true,
+                    result_bytes: 0,
+                    result_file: None,
+                    result_refused: None,
+                    spilling: false,
+                    release_on_spill: false,
                 },
             );
             // The alias index exists to resolve a Connect `(session, operation_id)` back to an
@@ -663,6 +888,8 @@ impl StatementStore {
                 rows: None,
                 submitted_at_ms,
                 duration_ms: None,
+                result: None,
+                result_refused: None,
                 ts: rfc3339_from_ms(submitted_at_ms),
             });
             self.sweep_history();
@@ -712,6 +939,8 @@ impl StatementStore {
                 rows: None,
                 submitted_at_ms: st.submitted_at_ms,
                 duration_ms: None,
+                result: None,
+                result_refused: None,
                 ts: now_rfc3339(),
             })
         };
@@ -730,7 +959,7 @@ impl StatementStore {
     /// query itself never waits: the wait is on the response path and is bounded by
     /// `OXIDANT_HISTORY_ACK_TIMEOUT_MS`.
     pub(crate) fn finish(&self, id: &str, outcome: ExecOutcome) {
-        let record = {
+        let (record, spills) = {
             let mut inner = self.inner.lock().expect("statement store poisoned");
             let Some(st) = inner.statements.get_mut(id) else {
                 return; // evicted
@@ -743,6 +972,16 @@ impl StatementStore {
                 ExecOutcome::Succeeded(batches) => {
                     st.row_count = Some(batches.iter().map(|b| b.num_rows()).sum());
                     st.schema = schema_fields(&batches);
+                    st.result_bytes = retained_bytes(&batches);
+                    // No batches means no schema, and an Arrow IPC stream cannot be written
+                    // without one — so there will never be a file for this statement. Recording
+                    // *why* on the terminal snapshot (which is already being written) is what
+                    // makes `/result` answer `200 {"rows": []}` for it after a restart, exactly
+                    // as it does before one, instead of the `410 result_expired` that means "the
+                    // rows aged out". Costs no extra write and no extra byte on disk.
+                    if batches.is_empty() {
+                        st.result_refused = Some(RESULT_EMPTY.to_string());
+                    }
                     st.batches = batches;
                     st.status = StatementStatus::Succeeded;
                 }
@@ -753,7 +992,7 @@ impl StatementStore {
                     // The batches went to the gRPC client, not into the store. `/result` must say
                     // so (`410 result_expired`) rather than answer an empty row set that
                     // contradicts the `rowCount` in this statement's own status document.
-                    st.rows_retained = false;
+                    st.rows_in_memory = false;
                 }
                 ExecOutcome::Failed(error) => {
                     st.error = Some(error);
@@ -763,14 +1002,138 @@ impl StatementStore {
                     st.status = StatementStatus::Canceled;
                 }
             }
-            self.terminal_record(id, st)
+            let record = self.terminal_record(id, st);
+            let added = st.result_bytes;
+            inner.result_bytes += added;
+            let spills = self.plan_spills(&mut inner, id);
+            (record, spills)
         };
         // Handing the record over can wait for room in the writer channel, so it happens with
         // the store mutex released — every submit, list and status call takes that mutex, and a
         // slow disk must not be able to stall them. The ack is parked before the waiters are
         // woken, so whoever answers the client finds it.
         self.hand_over_terminal(id, record);
+        // Same rule, and the load-bearing one for §5: encoding Arrow IPC is the *only* genuinely
+        // large thing history does, and it happens on the spill thread with this mutex released.
+        self.queue_spills(spills);
         self.notify.notify_waiters();
+    }
+
+    /// Decide what leaves memory for `results/`, under the store lock but doing no I/O.
+    ///
+    /// Two triggers, one code path: `always` spills the statement that just finished, and any
+    /// mode spills the oldest terminal results the in-memory budget can no longer hold. A victim
+    /// already on disk needs no write at all — its rows are released here and now.
+    fn plan_spills(&self, inner: &mut StoreInner, finished: &str) -> Vec<SpillJob> {
+        let Some(history) = self.history.as_ref() else {
+            return Vec::new();
+        };
+        let persist: ResultPersist = history.results.persist();
+        if !persist.spills_at_all() {
+            return Vec::new();
+        }
+        // Order matters (the finished statement first, then oldest victims), so this is a vec
+        // with a set beside it rather than a `contains` scan per candidate.
+        let mut wanted: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if persist.spills_eagerly() {
+            seen.insert(finished.to_string());
+            wanted.push(finished.to_string());
+        }
+        for id in inner.budget_victims() {
+            if seen.insert(id.clone()) {
+                wanted.push(id);
+            }
+        }
+
+        let sql_mode = history.cfg.sql_mode;
+        let mut jobs = Vec::new();
+        for id in wanted {
+            // A victim whose file already landed does not need a second write; releasing its
+            // rows is the whole point, and that is free.
+            let already_on_disk = inner
+                .statements
+                .get(&id)
+                .is_some_and(|st| st.result_file.is_some());
+            if already_on_disk {
+                inner.release_rows(&id);
+                continue;
+            }
+            let Some(st) = inner.statements.get_mut(&id) else {
+                continue;
+            };
+            // Nothing to spill: not a succeeded statement, its rows were never retained here
+            // (the Connect path), the encoding was already refused, or it produced no batches —
+            // an Arrow IPC stream needs a schema and there is none.
+            if st.status != StatementStatus::Succeeded
+                || !st.rows_in_memory
+                || st.result_refused.is_some()
+                || st.batches.is_empty()
+            {
+                st.spilling = false;
+                st.release_on_spill = false;
+                continue;
+            }
+            st.spilling = true;
+            let folded = st.to_folded(&id, sql_mode, st.seq);
+            let batches = Arc::new(st.batches.clone());
+            jobs.push(SpillJob {
+                id,
+                batches,
+                folded: Box::new(folded),
+            });
+        }
+        jobs
+    }
+
+    /// Hand the planned spills to the writer thread. Never called with the store lock held.
+    ///
+    /// A job the writer refuses — a full queue, or spills paused by the free-space floor — is
+    /// handed straight back to [`Self::abandon_spills`]. `plan_spills` marked each victim
+    /// `spilling` under the lock, and `spilling` is what keeps the memory budget from picking
+    /// it twice; leaving that flag set on a job nobody took pinned the rows in memory until the
+    /// hot TTL expired and quietly removed the statement from the budget's reach (H2).
+    fn queue_spills(&self, jobs: Vec<SpillJob>) {
+        if jobs.is_empty() {
+            return;
+        }
+        let Some(history) = self.history.as_ref() else {
+            return;
+        };
+        let mut refused: Vec<String> = Vec::new();
+        for job in jobs {
+            let id = job.id.clone();
+            if !history.results.spill(job) {
+                refused.push(id);
+            }
+        }
+        self.abandon_spills(refused);
+    }
+
+    /// Put statements whose spill never reached the writer back into the memory budget.
+    ///
+    /// The rows are still in memory and still counted in `result_bytes` — nothing was lost —
+    /// so clearing `spilling` is all it takes for the next `budget_victims` pass to select them
+    /// again. That retry *is* the backoff: it happens on the next terminal statement, by which
+    /// time the queue has had a chance to drain.
+    fn abandon_spills(&self, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        {
+            let mut inner = self.inner.lock().expect("statement store poisoned");
+            for id in &ids {
+                if let Some(st) = inner.statements.get_mut(id) {
+                    st.spilling = false;
+                    st.release_on_spill = false;
+                }
+            }
+        }
+        tracing::warn!(
+            statements = ids.len(),
+            "result spill refused before it reached the writer; the rows stay in memory and \
+             remain candidates for the next budget pass"
+        );
     }
 
     /// Build the self-contained terminal record for a statement, if history is on.
@@ -862,17 +1225,61 @@ impl StatementStore {
             .or_else(|| inner.history.get(id).map(StatementSnapshot::from_history))
     }
 
-    /// Snapshot + retained result batches for the result endpoint. A history-tier statement has
-    /// no batches: the caller answers `410 result_expired`, not an empty result set.
-    fn result(&self, id: &str) -> Option<(StatementSnapshot, Vec<RecordBatch>)> {
+    /// Snapshot + where the result endpoint can read the rows from: memory, then the spilled
+    /// file, then nowhere (§5).
+    ///
+    /// The fall-through order is the whole of PR2's read side. Memory first because it is free;
+    /// disk second because it is what makes "Show rows" and CSV survive a restart; and
+    /// [`ResultSource::Gone`] only when both are genuinely absent — which is what
+    /// `410 result_expired` means and `404` would not.
+    fn result(&self, id: &str) -> Option<(StatementSnapshot, ResultSource)> {
         let inner = self.inner.lock().expect("statement store poisoned");
+        let empty = |refused: Option<&String>| refused.is_some_and(|r| r == RESULT_EMPTY);
         if let Some(st) = inner.statements.get(id) {
-            return Some((st.snapshot(id), st.batches.clone()));
+            let source = if st.rows_in_memory {
+                ResultSource::Memory(st.batches.clone())
+            } else if let Some(pointer) = st.result_file.as_ref() {
+                ResultSource::Disk(Some(pointer.file.clone()))
+            } else if empty(st.result_refused.as_ref()) {
+                ResultSource::Empty
+            } else {
+                ResultSource::Gone
+            };
+            return Some((st.snapshot(id), source));
         }
-        inner
-            .history
-            .get(id)
-            .map(|st| (StatementSnapshot::from_history(st), Vec::new()))
+        inner.history.get(id).map(|st| {
+            let source = if let Some(pointer) = st.result.as_ref() {
+                ResultSource::Disk(Some(pointer.file.clone()))
+            } else if empty(st.result_refused.as_ref()) {
+                ResultSource::Empty
+            } else {
+                ResultSource::Gone
+            };
+            (StatementSnapshot::from_history(st), source)
+        })
+    }
+
+    /// Decode a spilled result off disk, off the tokio worker.
+    ///
+    /// `None` covers both "history is off" and "the file is not readable any more" — a sweep or
+    /// an operator may have removed it between the snapshot and this read, and the honest answer
+    /// to that race is the same `410 result_expired` as if it had never existed.
+    async fn read_spilled(&self, id: &str, journaled: Option<String>) -> Option<Vec<RecordBatch>> {
+        let results = Arc::clone(&self.history.as_ref()?.results);
+        let owned = id.to_string();
+        match tokio::task::spawn_blocking(move || results.read(&owned, journaled.as_deref())).await
+        {
+            Ok(Ok(batches)) => Some(batches),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    statement = %id,
+                    error = %e,
+                    "spilled result could not be read back; answering 410 result_expired"
+                );
+                None
+            }
+            Err(_) => None,
+        }
     }
 
     /// Newest-first snapshots across both tiers, capped at [`LIST_CAP`].
@@ -894,11 +1301,28 @@ impl StatementStore {
         items.into_iter().take(LIST_CAP).map(|(_, s)| s).collect()
     }
 
+    /// Block until every queued spill has been written and reported back.
+    ///
+    /// The spill thread reports each outcome to the sink *before* it answers a `Drain`, so this
+    /// returning means the store's own bookkeeping — released rows, pointers, `result_too_large`
+    /// — is settled too. The disk sweeper needs the same barrier, and drives it directly on the
+    /// result store: accounting a spill that has not landed yet would prune against a byte total
+    /// that is about to change.
+    #[cfg(test)]
+    fn drain_spills(&self) {
+        if let Some(history) = &self.history {
+            history.results.drain_blocking();
+        }
+    }
+
     /// Flush the journal and stop its writer thread — the clean-shutdown seam a restart test
     /// needs so the next boot reads a settled directory.
     #[cfg(test)]
     fn shutdown_for_test(&self) {
         if let Some(history) = &self.history {
+            // Results first: a spill's own journal record is appended by the spill thread, so
+            // stopping the journal before it would drop the pointer this store just published.
+            history.results.shutdown();
             history.journal.shutdown();
         }
     }
@@ -1022,14 +1446,387 @@ impl StatementStore {
             }
             evicted
         };
-        // Best-effort, like every other non-terminal write: a tombstone lost to backpressure
-        // means the statement is folded again at the next boot and re-evicted by the next sweep
-        // — self-healing, and never a lost statement.
+        // Retained rather than droppable. A tombstone is not `running` chatter: the result file
+        // is unlinked in this same pass, so a tombstone lost to backpressure leaves the
+        // statement's *snapshot* — pointer and all — in the journal naming a file that no longer
+        // exists. `/result` degrades to `410` from the failed open, which is the right answer,
+        // but it is a worse one than not replaying the statement at all, and the overflow queue
+        // is 65,536 deep against a sweep that evicts at most `max_records`.
+        //
+        // The result file goes in the *same* sweep, before the tombstone is considered complete
+        // (§5, F13). The journal is the authority: nothing here decides a result's lifetime, it
+        // only follows the statement's. A crash between the two leaves an orphan, which is
+        // exactly what boot's `reconcile` is for.
         for (id, submitted_at_ms) in tombstones {
+            let _ = history.results.unlink(&id);
             let seq = history.journal.next_seq();
             history
                 .journal
-                .append(JournalRecord::tombstone(&id, seq, submitted_at_ms));
+                .append_retained(JournalRecord::tombstone(&id, seq, submitted_at_ms));
+        }
+    }
+
+    /// Every statement id either tier still knows about.
+    ///
+    /// The union, not the folded set: a hot statement has no snapshot on disk yet, and a
+    /// *running* one has no journal record beyond its `submitted` — deleting either's result
+    /// would be the one thing retention must never do.
+    fn live_ids(&self) -> std::collections::HashSet<String> {
+        let inner = self.inner.lock().expect("statement store poisoned");
+        inner
+            .statements
+            .keys()
+            .chain(inner.history.keys())
+            .cloned()
+            .collect()
+    }
+
+    /// The disk-budget sweep (§3): measure everything the engine owns under the root, and prune
+    /// in the documented order until it fits — or until there is nothing left to prune, which is
+    /// what `disk: over_budget` reports.
+    ///
+    /// **Pruning is driven by `OXIDANT_DISK_MAX_BYTES` and by nothing else.** The engine deletes
+    /// its own files when its own subtree is over its own budget: its mess, its documented order.
+    /// The free-space floor is a *separate* condition with a separate answer — the engine stops
+    /// spilling and reports `disk: low_free` + `history_writes: degraded`, and deletes nothing.
+    ///
+    /// That separation is H1. The two conditions used to be one boolean driving one unbounded
+    /// prune loop, and unlike the byte budget the floor cannot be *made* satisfiable by pruning:
+    /// a co-tenant filling the volume — a CI cache, another container, a `target/` directory —
+    /// ran the loop until every terminal statement in both tiers was gone, then took every
+    /// remaining result file, then did it again five minutes later, having reclaimed kilobytes
+    /// against a shortfall it never caused.
+    ///
+    /// Runs at boot and every `OXIDANT_DISK_SWEEP_SECS` (300). Returns what it did, which is both
+    /// the log line and the seam the test asserts the order through.
+    pub(crate) fn sweep_disk(&self) -> disk::SweepReport {
+        let Some(history) = self.history.clone() else {
+            return disk::SweepReport::default();
+        };
+        // A queued spill is bytes that are about to exist; accounting without it would prune
+        // against a total that changes a millisecond later.
+        history.results.drain_blocking();
+
+        let cfg = &history.cfg;
+        let roots = budget_roots(cfg);
+        let measure = |roots: &[std::path::PathBuf]| -> u64 {
+            roots.iter().map(|r| disk::subtree_bytes(r)).sum()
+        };
+
+        let mut report = disk::SweepReport::default();
+        let before = measure(&roots);
+        // The running total, decremented by what each unlink reports. The whole tree used to be
+        // re-walked *per candidate* — pruning 10,000 statements meant 10,000 full recursive
+        // directory walks interleaved with 10,000 lock/unlock cycles of the store mutex that
+        // every submit, list, status and result call also takes, on a host already short on I/O.
+        //
+        // It is an estimate between the two measurements — a tombstone appended for a pruned
+        // statement grows the journal by a record the total does not see — but it errs *low*,
+        // which stops the loop early rather than deleting more than the budget asked for. The
+        // number `/api/status` and the log line report is re-measured once, below.
+        let mut used = before;
+        let spend = |used: &mut u64, freed: u64| *used = used.saturating_sub(freed);
+
+        // 1. Oldest rolled logs. The live file is never a candidate — it rotates (PR3).
+        for file in disk::rolled_logs(&cfg.logs_dir) {
+            if used <= cfg.disk_max_bytes {
+                break;
+            }
+            if let Some(freed) = disk::remove(&file) {
+                spend(&mut used, freed);
+                report.rolled_logs_removed += 1;
+            }
+        }
+        // 2. Oldest dumps.
+        for file in disk::dumps(&cfg.dumps_dir) {
+            if used <= cfg.disk_max_bytes {
+                break;
+            }
+            if let Some(freed) = disk::remove(&file) {
+                spend(&mut used, freed);
+                report.dumps_removed += 1;
+            }
+        }
+        // 3. Result files whose statement is already pruned. Orphans are garbage whether or not
+        // the budget is tight, so this pass is unconditional.
+        let (orphans, orphan_bytes) = history.results.reconcile(&self.live_ids());
+        report.orphan_results_removed = orphans;
+        spend(&mut used, orphan_bytes);
+
+        // 4. Oldest journal *statements* — statement-granular, never a raw segment unlink (F2).
+        while used > cfg.disk_max_bytes {
+            let Some(freed) = self.prune_oldest_statement() else {
+                break;
+            };
+            spend(&mut used, freed);
+            report.statements_pruned += 1;
+        }
+        // 5. Oldest live result files. The rows go, the statement stays, and `/result` answers
+        // `410 result_expired` for it from here on.
+        for (id, _) in history.results.files() {
+            if used <= cfg.disk_max_bytes {
+                break;
+            }
+            if let Some(freed) = self.drop_result_file(&id) {
+                spend(&mut used, freed);
+                report.live_results_removed += 1;
+            }
+        }
+
+        // One re-measure at the end: what the running total estimated is not what `/api/status`
+        // reports.
+        report.used_bytes = measure(&roots);
+        report.freed_bytes = before.saturating_sub(report.used_bytes);
+        report.over_budget = report.used_bytes > cfg.disk_max_bytes;
+
+        // The free-space floor, measured *after* the pruning it does not drive — nothing above
+        // this line read it — and measured against the mount of **every** managed directory, not
+        // just the root's (§3: "a subtree moved to another volume is floored against that
+        // volume"). Asking only about the root meant an `OXIDANT_RESULT_DIR` on a second volume
+        // was never checked, and a healthy results volume was reported short because the root's
+        // was. One mount-table probe answers all of them.
+        let mounts = mounts_for(cfg);
+        let mut lowest: Option<(&std::path::Path, u64)> = None;
+        for root in &roots {
+            let Some(free) = mounts.free_bytes(root) else {
+                continue;
+            };
+            if lowest.map_or(true, |(_, seen)| free < seen) {
+                lowest = Some((root.as_path(), free));
+            }
+        }
+        report.free_bytes = lowest.map(|(_, free)| free);
+        report.low_free = report
+            .free_bytes
+            .is_some_and(|free| free < cfg.disk_min_free_bytes);
+        // Stop writing rather than start deleting: a spill is by far the largest write the
+        // engine makes, and the rows it would have written are still in memory and still serve
+        // `/result`. The journal keeps writing — its records are small, and refusing them would
+        // lose exactly the statement history this guard exists to protect.
+        history.results.set_paused(report.low_free);
+
+        if report.removed_anything() || report.over_budget || report.low_free {
+            tracing::info!(
+                used_bytes = report.used_bytes,
+                freed_bytes = report.freed_bytes,
+                budget_bytes = cfg.disk_max_bytes,
+                free_bytes = report.free_bytes,
+                min_free_bytes = cfg.disk_min_free_bytes,
+                rolled_logs = report.rolled_logs_removed,
+                dumps = report.dumps_removed,
+                orphan_results = report.orphan_results_removed,
+                statements = report.statements_pruned,
+                live_results = report.live_results_removed,
+                over_budget = report.over_budget,
+                low_free = report.low_free,
+                "disk sweep"
+            );
+        }
+        if report.low_free {
+            tracing::warn!(
+                free_bytes = report.free_bytes,
+                directory = lowest.map(|(root, _)| root.display().to_string()),
+                min_free_bytes = cfg.disk_min_free_bytes,
+                used_bytes = report.used_bytes,
+                budget_bytes = cfg.disk_max_bytes,
+                "the volume is below OXIDANT_DISK_MIN_FREE_BYTES: result spill is paused and \
+                 /api/status reports disk: low_free. No statement history is deleted for a \
+                 shortfall the engine's own budget did not condemn — raise the floor, free \
+                 space, or lower OXIDANT_DISK_MAX_BYTES to make the engine prune its own."
+            );
+        }
+        let ordering = std::sync::atomic::Ordering::Relaxed;
+        self.disk.over_budget.store(report.over_budget, ordering);
+        self.disk.low_free.store(report.low_free, ordering);
+        if report.removed_anything() {
+            // A pruned statement is one a `?wait=true` caller may be parked on, and its answer
+            // is now "gone" rather than "still running". This reaches the background sweeper's
+            // callers only because that thread shares the store's `Notify` rather than
+            // rebuilding one per tick.
+            self.notify.notify_waiters();
+        }
+        report
+    }
+
+    /// Evict the single oldest terminal statement, tombstone it, and unlink its result.
+    ///
+    /// `None` means there was nothing evictable — everything left is still running. `Some(bytes)`
+    /// is what the result unlink freed, which is what lets the sweeper keep a running total
+    /// instead of re-walking the data directory per victim (M2).
+    fn prune_oldest_statement(&self) -> Option<u64> {
+        let history = self.history.clone()?;
+        let victim = (|| {
+            let mut inner = self.inner.lock().expect("statement store poisoned");
+            let oldest = {
+                let StoreInner {
+                    history, by_seq, ..
+                } = &mut *inner;
+                by_seq
+                    .iter()
+                    .find(|(_, id)| history.get(id).is_some_and(|st| st.status.is_terminal()))
+                    .map(|(_, id)| id.clone())
+            };
+            // Nothing in the history tier: fall back to the oldest *terminal* hot statement, so a
+            // driver whose whole history is still hot can still be pruned under pressure.
+            let oldest = oldest.or_else(|| {
+                inner
+                    .statements
+                    .iter()
+                    .filter(|(_, st)| st.status.is_terminal())
+                    .min_by_key(|(_, st)| st.seq)
+                    .map(|(id, _)| id.clone())
+            });
+            let id = oldest?;
+            let submitted_at_ms = match inner.history_remove(&id) {
+                Some(st) => Some(st.submitted_at_ms),
+                None => inner.statements.remove(&id).map(|st| {
+                    inner.result_bytes = inner.result_bytes.saturating_sub(st.result_bytes);
+                    st.submitted_at_ms
+                }),
+            }?;
+            inner.alias.retain(|_, target| target != &id);
+            Some((id, submitted_at_ms))
+        })();
+        let (id, submitted_at_ms) = victim?;
+        let freed = history.results.unlink(&id).unwrap_or(0);
+        let seq = history.journal.next_seq();
+        // Retained: the file is already gone, so a dropped tombstone would leave a pointer in
+        // the journal naming nothing. See `sweep_history` for the same reasoning.
+        history
+            .journal
+            .append_retained(JournalRecord::tombstone(&id, seq, submitted_at_ms));
+        Some(freed)
+    }
+
+    /// Unlink one statement's result file but keep the statement, and journal the clearing so a
+    /// restart does not read a pointer to a file that is gone.
+    fn drop_result_file(&self, id: &str) -> Option<u64> {
+        let history = self.history.clone()?;
+        let freed = history.results.unlink(id)?;
+        let cleared = {
+            let mut inner = self.inner.lock().expect("statement store poisoned");
+            if let Some(st) = inner.statements.get_mut(id) {
+                st.result_file = None;
+                let last_seq = history.journal.next_seq();
+                Some(st.to_folded(id, history.cfg.sql_mode, last_seq))
+            } else if let Some(st) = inner.history.get_mut(id) {
+                st.result = None;
+                st.last_seq = history.journal.next_seq();
+                st.rank = RecordKind::Snapshot.rank();
+                Some(st.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(folded) = cleared {
+            history.journal.append_retained(folded.to_snapshot());
+        }
+        Some(freed)
+    }
+
+    /// Publish this store's counters to `/api/status`.
+    ///
+    /// A [`std::sync::Weak`] of the store's own two halves rather than a clone: the callback is
+    /// process-global and would otherwise keep a test's store — and its data-dir lock — alive for
+    /// the rest of the binary. When it cannot upgrade, the counters simply go absent, which is
+    /// the same thing `OXIDANT_HISTORY=off` reports.
+    fn publish_status_counters(&self) {
+        let Some(history) = self.history.as_ref() else {
+            return;
+        };
+        // The seam is process-global by design — a production process boots exactly one store —
+        // so in a test binary every store would clobber every other one's counters and the
+        // end-to-end test would read whichever store booted last. The test that drives
+        // `/api/status` for real claims the seam on its own thread first; every other store —
+        // including one booted concurrently by another test — publishes nothing and those tests
+        // read their own counters through `status_counters()`.
+        #[cfg(test)]
+        if !tests::status_seam::is_owner() {
+            return;
+        }
+        let history = Arc::downgrade(history);
+        let disk = Arc::clone(&self.disk);
+        oxidant_observability::set_history_status_source(move || match history.upgrade() {
+            Some(history) => counters_for(&history, &disk),
+            // The store this was published for is gone (only a test drops one). Report the
+            // quiet defaults rather than a stale reading of a journal that no longer exists.
+            None => oxidant_observability::HistoryStatus {
+                history_writes: oxidant_observability::history_writes::OK.to_string(),
+                history_dropped_events: 0,
+                results_on_disk_bytes: 0,
+                result_writes: oxidant_observability::history_writes::OK.to_string(),
+                result_write_failures: 0,
+                disk: oxidant_observability::disk_state::OK.to_string(),
+            },
+        });
+    }
+
+    /// This store's durability counters, exactly as `/api/status` reports them. `None` is
+    /// `OXIDANT_HISTORY=off`, where the four fields are absent from the response entirely.
+    ///
+    /// The endpoint itself reads them through the published source above rather than through a
+    /// store handle — `oxidant-observability` sits below this crate — so this is the seam the
+    /// tests assert the same values through.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn status_counters(&self) -> Option<oxidant_observability::HistoryStatus> {
+        let history = self.history.as_ref()?;
+        Some(counters_for(history, &self.disk))
+    }
+
+    /// Run the disk sweep every `OXIDANT_DISK_SWEEP_SECS` for as long as the store lives.
+    ///
+    /// A plain thread rather than a tokio task: the store is built at boot, before there is
+    /// necessarily a runtime to spawn onto, and the sweep is blocking filesystem work either way.
+    /// It holds only weak references and ticks once a second so it notices a dropped store
+    /// promptly instead of up to five minutes later — which is what keeps a test binary from
+    /// accumulating one sleeping thread per store it builds. The one thing it does **not**
+    /// rebuild per tick is the `Notify`: a sweep can prune a statement a `?wait=true` caller is
+    /// parked on, and a private channel would leave that caller blocked to its timeout.
+    fn spawn_disk_sweeper(&self) {
+        let Some(history) = self.history.as_ref() else {
+            return;
+        };
+        let interval = history.cfg.disk_sweep_interval;
+        let inner = Arc::downgrade(&self.inner);
+        let history = Arc::downgrade(history);
+        let disk = Arc::clone(&self.disk);
+        // The *same* `Notify`, not a fresh one: `prune_oldest_statement` can remove a statement
+        // a `?wait=true` caller is parked on, and a sweeper holding its own channel would leave
+        // that caller blocked to its timeout instead of waking it.
+        let notify = Arc::downgrade(&self.notify);
+        let spawned = std::thread::Builder::new()
+            .name("oxidant-disk-sweep".to_string())
+            .spawn(move || {
+                let tick = Duration::from_secs(1).min(interval);
+                let mut waited = Duration::ZERO;
+                loop {
+                    std::thread::sleep(tick);
+                    let (Some(inner), Some(history), Some(notify)) =
+                        (inner.upgrade(), history.upgrade(), notify.upgrade())
+                    else {
+                        return;
+                    };
+                    waited += tick;
+                    if waited < interval {
+                        continue;
+                    }
+                    waited = Duration::ZERO;
+                    // Rebuilt rather than captured, so the thread holds nothing strong between
+                    // ticks and the store can be dropped while it sleeps.
+                    let store = StatementStore {
+                        inner,
+                        notify,
+                        history: Some(history),
+                        disk: Arc::clone(&disk),
+                    };
+                    store.sweep_disk();
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                error = %e,
+                "could not start the disk sweeper; the disk budget will only be enforced at boot"
+            );
         }
     }
 
@@ -1054,6 +1851,124 @@ impl StatementStore {
             let _ = tokio::time::timeout_at(deadline, notified).await;
         }
     }
+}
+
+/// Read the durability counters off a booted history runtime (§3, §7).
+///
+/// Three subsystems, three flags, one aggregate. `history_writes` is `degraded` while *any* of
+/// the journal, the spill writer or the disk sweep is, and each of those three is sticky until a
+/// success **of its own** clears it. Reporting them through one flag was H3: the journal clears
+/// its own on every successful append, so a permanently failing result volume read `ok` again
+/// the microsecond the next statement was submitted.
+///
+/// `history_dropped_events` still counts the journal's dropped records *and* the spill jobs the
+/// writer had no room for: both are work history gave up on under pressure, and an operator
+/// watching one number for "am I losing history" should not have to know there are two queues.
+/// Spills the disk *refused* are a different thing and get their own `result_write_failures`.
+fn counters_for(
+    history: &HistoryRuntime,
+    disk: &DiskHealth,
+) -> oxidant_observability::HistoryStatus {
+    let result_degraded = history.results.is_degraded();
+    let low_free = disk.low_free.load(std::sync::atomic::Ordering::Relaxed);
+    let over_budget = disk.over_budget.load(std::sync::atomic::Ordering::Relaxed);
+    let flag = |degraded: bool| {
+        if degraded {
+            oxidant_observability::history_writes::DEGRADED
+        } else {
+            oxidant_observability::history_writes::OK
+        }
+        .to_string()
+    };
+    oxidant_observability::HistoryStatus {
+        history_writes: flag(history.journal.is_degraded() || result_degraded || low_free),
+        history_dropped_events: history.journal.dropped_events() + history.results.dropped_spills(),
+        results_on_disk_bytes: history.results.on_disk_bytes(),
+        result_writes: flag(result_degraded),
+        result_write_failures: history.results.write_failures(),
+        // `over_budget` wins when both hold: it is the condition the engine can act on, and the
+        // one whose remedy (raise the budget, or let the sweeper work) is the operator's.
+        disk: if over_budget {
+            oxidant_observability::disk_state::OVER_BUDGET
+        } else if low_free {
+            oxidant_observability::disk_state::LOW_FREE
+        } else {
+            oxidant_observability::disk_state::OK
+        }
+        .to_string(),
+    }
+}
+
+/// The mount table this sweep pass reads free space from — a test's synthetic one, or the host's.
+///
+/// The floor is the one disk guard that cannot be exercised from a tempdir — it depends on how
+/// full the *host* volume is, and on which volume each managed directory sits — and it is also
+/// the guard whose misbehaviour deleted the whole statement history, so it gets a seam rather
+/// than going untested.
+fn mounts_for(cfg: &HistoryConfig) -> disk::Mounts {
+    match cfg.mounts_override() {
+        Some(entries) => disk::Mounts::from_entries(entries),
+        None => disk::Mounts::probe(),
+    }
+}
+
+/// The disk sweep's own two flags, shared between the store, its sweeper thread and
+/// `/api/status`.
+///
+/// They are deliberately separate booleans rather than one: `over_budget` means *the engine
+/// overspent its own budget and has nothing left to prune*, and `low_free` means *the volume is
+/// short for reasons that may have nothing to do with the engine*. Collapsing them is what let a
+/// co-tenant filling the disk delete the entire statement history (H1).
+#[derive(Debug, Default)]
+pub(crate) struct DiskHealth {
+    over_budget: std::sync::atomic::AtomicBool,
+    low_free: std::sync::atomic::AtomicBool,
+}
+
+/// The distinct subtrees the disk budget covers, deduped so nothing is billed twice.
+///
+/// `OXIDANT_HISTORY_DIR` / `OXIDANT_RESULT_DIR` / `OXIDANT_LOG_DIR` / `OXIDANT_DUMP_DIR` each win
+/// over the root and may point *outside* it, and §3 says an overridden subtree is still counted
+/// against the budget — so the candidates are measured as a set, with any path already contained
+/// in a shallower one dropped.
+///
+/// `event_log_dir` is deliberately absent: §8/F16 brings it under the budget by *rolling*
+/// `events.jsonl`, and that writer is PR3. Counting it here without being able to prune it would
+/// pin `disk: over_budget` on for anyone with a large Spark-history-server directory.
+fn budget_roots(cfg: &HistoryConfig) -> Vec<std::path::PathBuf> {
+    let history_dir = cfg
+        .statements_dir
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| cfg.statements_dir.clone());
+    let mut candidates = vec![
+        cfg.root.clone(),
+        history_dir,
+        cfg.results_dir.clone(),
+        cfg.logs_dir.clone(),
+        cfg.dumps_dir.clone(),
+    ];
+    candidates.sort_by_key(|p| p.components().count());
+    let mut kept: Vec<std::path::PathBuf> = Vec::new();
+    for candidate in candidates {
+        if kept.iter().any(|k| candidate.starts_with(k)) {
+            continue;
+        }
+        kept.push(candidate);
+    }
+    kept
+}
+
+/// What a set of retained batches costs the store's in-memory result budget.
+///
+/// `get_array_memory_size` over-counts buffers two batches share, so this is an upper bound. That
+/// is the right direction for a budget: over-counting spills a little early, under-counting is
+/// how a 512 MiB ceiling becomes an OOM.
+fn retained_bytes(batches: &[RecordBatch]) -> u64 {
+    batches
+        .iter()
+        .map(|b| b.get_array_memory_size() as u64)
+        .sum()
 }
 
 /// `^[A-Za-z0-9._:-]{1,128}$`, hand-rolled because the tree has no regex dependency.
@@ -1161,6 +2076,12 @@ fn snapshot_json(s: &StatementSnapshot) -> Value {
     }
     if let Some(schema) = &s.schema {
         v["schema"] = schema_json(Some(schema));
+    }
+    if let Some(refused) = &s.result_refused {
+        // `result_too_large`: the rows were past `OXIDANT_RESULT_MAX_BYTES`, so `/result` will
+        // say `410 result_expired` once they leave memory. Saying *why* here is what keeps that
+        // `410` from reading as "it merely aged out" (§5).
+        v["resultStatus"] = json!(refused);
     }
     v
 }
@@ -1358,12 +2279,18 @@ async fn get_statement(State(state): State<RestState>, Path(id): Path<String>) -
     }
 }
 
+/// `GET /api/v1/statements/{id}/result?format=json|csv` — memory, then disk, then `410`.
+///
+/// Memory → spilled file → `410 result_expired` is §5's read model in three lines. `404` still
+/// means "no such id" and `409` still means "not succeeded yet"; `410` means the statement is
+/// known and succeeded and its rows are gone — which is why answering `200 {"rows":[]}` here
+/// would be a lie about a statement whose own status document reports `rowCount: 5`.
 async fn get_result(
     State(state): State<RestState>,
     Path(id): Path<String>,
     Query(params): Query<ResultParams>,
 ) -> Response {
-    let Some((snap, batches)) = state.store.result(&id) else {
+    let Some((snap, source)) = state.store.result(&id) else {
         return error_response(StatusCode::NOT_FOUND, "unknown statement id");
     };
     if snap.status != StatementStatus::Succeeded {
@@ -1372,18 +2299,28 @@ async fn get_result(
             "statement result is only available once it has succeeded",
         );
     }
-    if snap.tier == Tier::History || !snap.rows_retained {
-        // The statement is known and succeeded, but its rows are not here: it was replayed from
-        // the journal, its hot entry aged out, or it came in over Connect and its batches went
-        // straight to the gRPC client. `404` would say "no such id", which is false — and so
-        // would `200 {"rows":[]}`, which contradicts the `rowCount` this same statement reports.
-        // Reading the rows back off disk is PR2 (`results/<id>.arrow`); until then this is the
-        // honest answer, and it is the same code PR2 falls through to.
-        return error_response(StatusCode::GONE, "result_expired");
-    }
+    let batches = match source {
+        ResultSource::Memory(batches) => batches,
+        ResultSource::Disk(journaled) => match state.store.read_spilled(&id, journaled).await {
+            Some(batches) => batches,
+            None => return error_response(StatusCode::GONE, "result_expired"),
+        },
+        // A correct empty answer, not a lost one. `resultStatus: "result_empty"` on the status
+        // document says which, and this answers the same before and after a restart.
+        ResultSource::Empty => Vec::new(),
+        ResultSource::Gone => return error_response(StatusCode::GONE, "result_expired"),
+    };
+    // The journaled schema is what the pre-restart answer carried, so it is what the post-restart
+    // answer carries too; the batches' own schema is the fallback for a statement the fold has no
+    // schema for.
+    let schema = snap
+        .schema
+        .clone()
+        .or_else(|| schema_fields(&batches))
+        .unwrap_or_default();
     let limit = params.limit.unwrap_or(DEFAULT_RESULT_LIMIT);
     match params.format.as_deref().unwrap_or("json") {
-        "json" => json_result(snap.schema.as_deref(), &batches, limit),
+        "json" => json_result(Some(&schema), &batches, limit),
         "csv" => csv_result(&batches, limit),
         other => error_response(
             StatusCode::BAD_REQUEST,
@@ -2741,8 +3678,10 @@ mod tests {
     async fn a_history_tier_result_is_gone_not_unknown() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = history_store_with(dir.path(), |c| c.max_records = 1);
+        // Rows that really existed: a *zero-batch* result is a correct empty answer and keeps
+        // answering 200 across the demotion (see `an_empty_result_answers_200_before_and_after_a_restart`).
         let (first, _) = store.insert("SELECT 1");
-        store.finish(&first, ExecOutcome::Succeeded(Vec::new()));
+        store.finish(&first, ExecOutcome::Succeeded(vec![rows_batch(1, 2)]));
         // Push it out of the hot tier.
         let (second, _) = store.insert("SELECT 2");
         store.finish(&second, ExecOutcome::Succeeded(Vec::new()));
@@ -3013,5 +3952,1594 @@ mod tests {
         assert_eq!(row["source"], "rest");
         assert_eq!(row["tier"], "hot");
         drop(state);
+    }
+
+    // ---- Result spill and disk read-back (docs/query-history-durability.md §5, PR2) ----
+
+    /// `n` rows of `Int64`, wide enough that a byte budget can be set between one and two of them.
+    fn rows_batch(start: i64, n: i64) -> RecordBatch {
+        use oxidant_loom::arrow::array::Int64Array;
+        use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
+        let values: Vec<i64> = (start..start + n).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).expect("batch")
+    }
+
+    /// Every row a `/result` response returned, in order — the value the read-back has to match
+    /// byte-for-byte across a restart.
+    fn result_values(body: &Value) -> Vec<i64> {
+        body["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["n"].as_i64().expect("n"))
+            .collect()
+    }
+
+    fn rest_state(store: StatementStore) -> RestState {
+        RestState {
+            service: Arc::new(OxidantService::new()),
+            store,
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            status_token: None,
+        }
+    }
+
+    /// F8's trigger, working: the budget is exceeded, the *oldest* terminal result is written to
+    /// `results/` and its rows leave memory — the newest one, which a client is most likely to
+    /// ask for next, stays.
+    #[tokio::test]
+    async fn spill_on_pressure_writes_the_oldest_terminal_result_and_frees_its_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let one = retained_bytes(&[rows_batch(0, 4)]);
+        // Room for exactly one result: admitting the second must spill the first.
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::OnPressure;
+            c.result_memory_budget_bytes = one + one / 2;
+        });
+
+        let (first, _) = store.insert("SELECT 'first'");
+        store.finish(&first, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+        assert!(
+            !dir.path()
+                .join("history/results")
+                .join(format!("{first}.arrow"))
+                .exists(),
+            "nothing pressures a single result under the budget: no file yet"
+        );
+
+        let (second, _) = store.insert("SELECT 'second'");
+        store.finish(&second, ExecOutcome::Succeeded(vec![rows_batch(100, 4)]));
+        store.drain_spills();
+
+        let spilled = dir
+            .path()
+            .join("history/results")
+            .join(format!("{first}.arrow"));
+        assert!(
+            spilled.exists(),
+            "the oldest terminal result must be on disk"
+        );
+        assert!(
+            !dir.path()
+                .join("history/results")
+                .join(format!("{second}.arrow"))
+                .exists(),
+            "the newest result stays in memory; only the victim spills"
+        );
+        {
+            let inner = store.inner.lock().expect("lock");
+            let victim = inner.statements.get(&first).expect("still hot");
+            assert!(!victim.rows_in_memory, "the victim's rows were released");
+            assert!(victim.batches.is_empty(), "and actually dropped");
+            assert_eq!(victim.result_bytes, 0);
+            assert!(victim.result_file.is_some(), "with a pointer to the file");
+            assert!(
+                inner.result_bytes <= one + one / 2,
+                "the budget holds after the spill: {} bytes retained",
+                inner.result_bytes
+            );
+            assert!(
+                inner.statements.get(&second).expect("hot").rows_in_memory,
+                "the newest result is still served from memory"
+            );
+        }
+        // And the spilled rows are still readable — from disk, in the same process.
+        let app = app(rest_state(store.clone()));
+        let (status, body) = get_json(&app, &format!("/api/v1/statements/{first}/result")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result_values(&body), vec![0, 1, 2, 3]);
+        store.shutdown_for_test();
+    }
+
+    /// Goal 2, end to end: a result written to `results/` is served by `/result` **and** by the
+    /// CSV path after the process restarts, byte-for-byte identical to the pre-restart answer.
+    #[tokio::test]
+    async fn a_spilled_result_reads_back_identically_after_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let boot = |dir: &std::path::Path| {
+            history_store_with(dir, |c| c.result_persist = ResultPersist::Always)
+        };
+        let store = boot(dir.path());
+        let (id, _) = store.insert("SELECT n FROM t");
+        store.finish(
+            &id,
+            ExecOutcome::Succeeded(vec![rows_batch(1, 3), rows_batch(4, 2)]),
+        );
+        store.drain_spills();
+
+        let before = app(rest_state(store.clone()));
+        let (status, json_before) =
+            get_json(&before, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, csv_before) = get_raw(
+            &before,
+            &format!("/api/v1/statements/{id}/result?format=csv"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result_values(&json_before), vec![1, 2, 3, 4, 5]);
+
+        store.shutdown_for_test();
+        drop(before);
+        drop(store);
+
+        // Restart: same data dir, brand new store, nothing in memory.
+        let replayed = boot(dir.path());
+        {
+            let inner = replayed.inner.lock().expect("lock");
+            assert!(
+                inner.statements.is_empty(),
+                "replay populates the history tier only"
+            );
+            assert!(
+                inner.history.get(&id).expect("replayed").result.is_some(),
+                "and the result pointer came back with it"
+            );
+        }
+        let after = app(rest_state(replayed.clone()));
+        let (status, json_after) =
+            get_json(&after, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK, "{json_after}");
+        assert_eq!(
+            json_after, json_before,
+            "the disk read-back must be identical to the memory answer"
+        );
+        let (status, _, csv_after) = get_raw(
+            &after,
+            &format!("/api/v1/statements/{id}/result?format=csv"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(csv_after, csv_before, "and so must the CSV");
+        replayed.shutdown_for_test();
+    }
+
+    /// Past `OXIDANT_RESULT_MAX_BYTES` the file is refused rather than half-written: the
+    /// statement records `result_too_large`, `results/` is left with no `.arrow` and no `.tmp`,
+    /// and the rows stay in memory because they are now the only copy.
+    #[tokio::test]
+    async fn an_oversized_result_is_refused_and_recorded_as_result_too_large() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            c.result_max_bytes = 64; // smaller than any real Arrow IPC stream
+        });
+        let (id, _) = store.insert("SELECT n FROM big");
+        store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(0, 64)]));
+        store.drain_spills();
+
+        let results = dir.path().join("history/results");
+        assert!(
+            !results.join(format!("{id}.arrow")).exists(),
+            "an oversized result must not be published"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&results)
+            .expect("results dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "and must leave no tmp behind: {leftovers:?}"
+        );
+
+        {
+            let inner = store.inner.lock().expect("lock");
+            let st = inner.statements.get(&id).expect("hot");
+            assert_eq!(st.result_refused.as_deref(), Some(RESULT_TOO_LARGE));
+            assert!(
+                st.rows_in_memory,
+                "the rows are the only copy left; they stay"
+            );
+        }
+        // The status document says why, so the eventual `410` does not read as "aged out".
+        let live = app(rest_state(store.clone()));
+        let (_, body) = get_json(&live, &format!("/api/v1/statements/{id}")).await;
+        assert_eq!(body["resultStatus"], RESULT_TOO_LARGE);
+        // The live path still answers, which §5 names as the answer past the budget.
+        let (status, body) = get_json(&live, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result_values(&body).len(), 64);
+
+        // And it survives the restart as a recorded refusal, not as a phantom pointer.
+        store.shutdown_for_test();
+        drop(live);
+        drop(store);
+        let replayed = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let after = app(rest_state(replayed.clone()));
+        let (_, body) = get_json(&after, &format!("/api/v1/statements/{id}")).await;
+        assert_eq!(body["resultStatus"], RESULT_TOO_LARGE);
+        let (status, body) = get_json(&after, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+        assert_eq!(body["error"], "result_expired");
+        replayed.shutdown_for_test();
+    }
+
+    /// `OXIDANT_RESULT_PERSIST=never` writes nothing, ever — and, because nothing is durable
+    /// under it, never releases rows on the byte budget either. Silently dropping a result to
+    /// honour a budget with no disk behind it would be data loss the old store never had.
+    #[tokio::test]
+    async fn result_persist_never_disables_spill_entirely() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Never;
+            c.result_memory_budget_bytes = 1; // every result is "over budget"
+        });
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(i * 10, 4)]));
+            ids.push(id);
+        }
+        store.drain_spills();
+
+        let files: Vec<String> = std::fs::read_dir(dir.path().join("history/results"))
+            .expect("results dir exists even under never")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(files.is_empty(), "never means never: {files:?}");
+        {
+            let inner = store.inner.lock().expect("lock");
+            for id in &ids {
+                let st = inner.statements.get(id).expect("hot");
+                assert!(st.rows_in_memory, "{id} kept its rows");
+                assert!(st.result_file.is_none());
+            }
+        }
+        let app = app(rest_state(store.clone()));
+        for (i, id) in ids.iter().enumerate() {
+            let (status, body) = get_json(&app, &format!("/api/v1/statements/{id}/result")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(result_values(&body).len(), 4, "{i}");
+        }
+        store.shutdown_for_test();
+    }
+
+    // ---- Result GC, the disk budget, and the status counters (§3, §5, PR2) ----
+
+    /// F13: a result file no folded id names is garbage, and boot is what proves it — the crash
+    /// window between "tombstone appended" and "file unlinked" closes here.
+    #[tokio::test]
+    async fn boot_unlinks_result_files_no_statement_references() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let (kept, _) = store.insert("SELECT 'kept'");
+        store.finish(&kept, ExecOutcome::Succeeded(vec![rows_batch(0, 2)]));
+        store.drain_spills();
+        store.shutdown_for_test();
+        drop(store);
+
+        // An orphan exactly as a crash between the two steps would leave it.
+        let results = dir.path().join("history/results");
+        let orphan = results.join("stmt-00000000-0000-4000-8000-000000000000.arrow");
+        std::fs::write(&orphan, b"not a real arrow stream").expect("plant an orphan");
+        assert!(orphan.exists());
+
+        let replayed = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        assert!(
+            !orphan.exists(),
+            "boot must unlink a result no statement names"
+        );
+        assert!(
+            results.join(format!("{kept}.arrow")).exists(),
+            "and must not touch one a folded statement still points at"
+        );
+        replayed.shutdown_for_test();
+    }
+
+    /// The one thing retention must never do. A running statement has no journal snapshot yet, so
+    /// a reconcile against the *folded* set alone would delete a result out from under a query
+    /// that is still going.
+    #[tokio::test]
+    async fn a_running_statements_result_is_never_swept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Retention that expires everything, a cap of one, and a budget of nothing: every
+        // eviction path fires on every call.
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            c.retention_days = 0;
+            c.max_records = 1;
+            c.hot_ttl = Duration::from_millis(0);
+        });
+        // A statement that finished and spilled, then is *re-marked* running: the shape a hot
+        // entry has while its rows are on disk and its query is not done.
+        let (running, _) = store.insert("SELECT 'still going'");
+        store.finish(&running, ExecOutcome::Succeeded(vec![rows_batch(0, 2)]));
+        store.drain_spills();
+        {
+            let mut inner = store.inner.lock().expect("lock");
+            let st = inner.statements.get_mut(&running).expect("hot");
+            st.status = StatementStatus::Running;
+        }
+        let spilled = dir
+            .path()
+            .join("history/results")
+            .join(format!("{running}.arrow"));
+        assert!(spilled.exists());
+
+        // Force every sweep there is.
+        for i in 0..3 {
+            let (other, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&other, ExecOutcome::Succeeded(Vec::new()));
+        }
+        store.drain_spills();
+        store.sweep_disk();
+        assert!(
+            spilled.exists(),
+            "a non-terminal statement's result survived neither retention nor the disk sweep"
+        );
+        {
+            let inner = store.inner.lock().expect("lock");
+            assert!(
+                inner.statements.contains_key(&running),
+                "and the statement itself is still hot"
+            );
+        }
+        store.shutdown_for_test();
+    }
+
+    /// Pruning a statement unlinks its result in the same sweep — the journal is the authority
+    /// and a result never outlives its record (§5).
+    #[tokio::test]
+    async fn pruning_a_statement_unlinks_its_result_in_the_same_sweep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            c.hot_ttl = Duration::from_millis(0);
+            c.max_records = 1;
+        });
+        let (doomed, _) = store.insert("SELECT 'doomed'");
+        store.finish(&doomed, ExecOutcome::Succeeded(vec![rows_batch(0, 2)]));
+        store.drain_spills();
+        let file = dir
+            .path()
+            .join("history/results")
+            .join(format!("{doomed}.arrow"));
+        assert!(file.exists(), "spilled");
+
+        // Two more terminal statements push it out of a one-record history tier.
+        for i in 0..2 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+        }
+        store.drain_spills();
+        {
+            let inner = store.inner.lock().expect("lock");
+            assert!(
+                !inner.history.contains_key(&doomed) && !inner.statements.contains_key(&doomed),
+                "the statement was evicted"
+            );
+        }
+        assert!(
+            !file.exists(),
+            "so its result went with it, in the same sweep"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// §3's prune order, asserted step by step: rolled logs go before dumps, dumps before result
+    /// files, and the live log never goes at all.
+    #[tokio::test]
+    async fn the_disk_sweep_prunes_in_the_documented_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Booted first, and with a budget the empty tree already fits, so the boot sweep is a
+        // no-op and the pass under test is the explicit one below.
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            c.disk_max_bytes = 6_000;
+            c.disk_min_free_bytes = 0;
+        });
+        let (id, _) = store.insert("SELECT 'rows'");
+        store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(0, 8)]));
+        store.drain_spills();
+        let result_file = dir
+            .path()
+            .join("history/results")
+            .join(format!("{id}.arrow"));
+        assert!(result_file.exists(), "spilled before the sweep");
+
+        let plant = |rel: &str, bytes: usize| {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, vec![b'x'; bytes]).expect("write");
+            path
+        };
+        // Ordering within a directory is (mtime, name), so the two rolled logs prune oldest-first
+        // whether or not the filesystem resolved their mtimes apart — no sleep, no fake clock.
+        let live = plant("logs/oxidant.log", 4096);
+        let rolled_old = plant("logs/oxidant-2026-08-20.log", 4096);
+        let rolled_new = plant("logs/oxidant-2026-08-21.log", 4096);
+        let dump = plant("dumps/dump-1.parquet", 4096);
+
+        let report = store.sweep_disk();
+        assert!(live.exists(), "the live log is never deleted — it rotates");
+        assert!(
+            !rolled_old.exists(),
+            "the oldest rolled log goes first: {report:?}"
+        );
+        assert_eq!(
+            report.rolled_logs_removed, 2,
+            "both rolled logs: {report:?}"
+        );
+        assert!(!rolled_new.exists());
+        assert_eq!(
+            report.dumps_removed, 1,
+            "dumps go only after the logs are exhausted: {report:?}"
+        );
+        assert!(!dump.exists());
+        // The load-bearing half of the order: unlinking the logs and the dump was enough, so the
+        // sweeper stopped — a statement's rows are not spent to save a rolled log.
+        assert_eq!(report.statements_pruned, 0, "{report:?}");
+        assert_eq!(report.live_results_removed, 0, "{report:?}");
+        assert!(result_file.exists(), "results outlive everything cheaper");
+        assert!(!report.over_budget, "and it fits again: {report:?}");
+        store.shutdown_for_test();
+    }
+
+    /// The tail of §3's order: journal statements before *live* result files, and the live result
+    /// only when there is nothing else left. The statement survives losing its rows — the sweeper
+    /// takes the file, not the history entry — and `/result` says `410 result_expired`.
+    #[tokio::test]
+    async fn the_disk_sweep_reaches_live_results_only_after_everything_else() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A budget nothing can satisfy, so the sweeper walks the whole list.
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            c.disk_max_bytes = 0;
+            c.disk_min_free_bytes = 0;
+        });
+        let (terminal, _) = store.insert("SELECT 'terminal'");
+        store.finish(&terminal, ExecOutcome::Succeeded(vec![rows_batch(0, 8)]));
+        // A statement whose rows are on disk but which is still going: step 4 cannot evict it, so
+        // step 5 is the only thing that can reclaim its file.
+        let (running, _) = store.insert("SELECT 'still going'");
+        store.finish(&running, ExecOutcome::Succeeded(vec![rows_batch(100, 8)]));
+        store.drain_spills();
+        {
+            let mut inner = store.inner.lock().expect("lock");
+            inner.statements.get_mut(&running).expect("hot").status = StatementStatus::Running;
+        }
+        let running_file = dir
+            .path()
+            .join("history/results")
+            .join(format!("{running}.arrow"));
+        assert!(running_file.exists(), "spilled before the sweep");
+
+        let report = store.sweep_disk();
+        assert!(report.statements_pruned >= 1, "step 4 ran: {report:?}");
+        assert_eq!(report.live_results_removed, 1, "then step 5: {report:?}");
+        assert!(!running_file.exists());
+        assert!(report.over_budget, "nothing left to prune: {report:?}");
+        // The counter has to agree with the directory afterwards, or `results_on_disk_bytes`
+        // drifts a little further from the truth with every sweep.
+        let results_dir = dir.path().join("history/results");
+        let on_disk: u64 = std::fs::read_dir(&results_dir)
+            .expect("results dir")
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum();
+        assert_eq!(
+            store
+                .history
+                .as_ref()
+                .expect("history")
+                .results
+                .on_disk_bytes(),
+            on_disk,
+            "results_on_disk_bytes must match the directory after a prune: {report:?}"
+        );
+        assert_eq!(on_disk, 0, "and everything was taken: {report:?}");
+        {
+            let inner = store.inner.lock().expect("lock");
+            let st = inner
+                .statements
+                .get(&running)
+                .expect("the statement itself survives losing its rows");
+            assert!(st.result_file.is_none(), "and its pointer was cleared");
+        }
+        // The pointer is cleared in the journal too, so a restart does not read a file that is
+        // gone: it answers `410` from the fold, not from a failed open.
+        store.shutdown_for_test();
+        let replayed = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            c.disk_min_free_bytes = 0;
+        });
+        {
+            let inner = replayed.inner.lock().expect("lock");
+            if let Some(st) = inner.history.get(&running) {
+                assert!(st.result.is_none(), "a cleared pointer stays cleared");
+            }
+        }
+        replayed.shutdown_for_test();
+    }
+
+    /// A budget nothing can satisfy reports `over_budget` rather than pretending, and says so
+    /// through `/api/status`.
+    #[tokio::test]
+    async fn an_unsatisfiable_budget_reports_over_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            // Zero bytes: the journal segment alone is over it and cannot be deleted.
+            c.disk_max_bytes = 0;
+            c.disk_min_free_bytes = 0;
+        });
+        let (id, _) = store.insert("SELECT 'rows'");
+        store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+        let report = store.sweep_disk();
+        assert!(report.over_budget, "{report:?}");
+        assert_eq!(
+            store.status_counters().map(|c| c.disk),
+            Some(oxidant_observability::disk_state::OVER_BUDGET.to_string())
+        );
+        store.shutdown_for_test();
+    }
+
+    /// §7's honesty, on the status endpoint: a failing writer flips `history_writes` to
+    /// `degraded`, and a recovered disk flips it back with no restart.
+    #[tokio::test]
+    async fn the_status_counters_flip_degraded_and_recover() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            c.flush_interval = Duration::from_millis(20);
+        });
+        let (ok_id, _) = store.insert("SELECT 'ok'");
+        store.finish(&ok_id, ExecOutcome::Succeeded(vec![rows_batch(0, 2)]));
+        store.drain_spills();
+        let counters = store.status_counters().expect("history is on");
+        assert_eq!(
+            counters.history_writes,
+            oxidant_observability::history_writes::OK
+        );
+        assert_eq!(counters.disk, oxidant_observability::disk_state::OK);
+        assert!(
+            counters.results_on_disk_bytes > 0,
+            "the spilled result is accounted: {counters:?}"
+        );
+
+        // The failing-writer shim: a *directory* where the next segment file belongs makes every
+        // open fail with EISDIR — the ENOSPC/EIO shape, deterministically, with no fault injector.
+        let blocked = {
+            let history = store.history.as_ref().expect("history");
+            let next = history.cfg.statements_dir.join("seg-000001.jsonl");
+            history.journal.compact_blocking(); // seals seg-000000, so seg-000001 is next
+            std::fs::create_dir_all(&next).expect("block the segment");
+            next
+        };
+        let (broken, _) = store.insert("SELECT 'broken'");
+        store.finish(&broken, ExecOutcome::Succeeded(Vec::new()));
+        assert!(
+            store.await_durable(&broken).await,
+            "a refused terminal write must answer degraded"
+        );
+        assert_eq!(
+            store.status_counters().map(|c| c.history_writes),
+            Some(oxidant_observability::history_writes::DEGRADED.to_string())
+        );
+
+        // Recovery is automatic: the writer reopens on the next append.
+        std::fs::remove_dir(&blocked).expect("unblock");
+        let (healthy, _) = store.insert("SELECT 'healthy'");
+        store.finish(&healthy, ExecOutcome::Succeeded(Vec::new()));
+        assert!(
+            !store.await_durable(&healthy).await,
+            "and a recovered disk acks again"
+        );
+        assert_eq!(
+            store.status_counters().map(|c| c.history_writes),
+            Some(oxidant_observability::history_writes::OK.to_string()),
+            "history_writes must flip back without a restart"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// Schema fidelity is one of PR2's two promises, and every other spill test uses a single
+    /// `Int64` column. This one round-trips a dictionary, a nullable struct with a null, and a
+    /// timestamp *with* a timezone, through the file and through a restart.
+    #[tokio::test]
+    async fn a_wide_schema_survives_the_spill_round_trip() {
+        use oxidant_loom::arrow::array::{
+            ArrayRef, Int32Array, StringDictionaryBuilder, StructArray, TimestampMillisecondArray,
+        };
+        use oxidant_loom::arrow::buffer::NullBuffer;
+        use oxidant_loom::arrow::datatypes::{
+            DataType, Field, Fields, Int32Type, Schema, TimeUnit,
+        };
+
+        let mut dict = StringDictionaryBuilder::<Int32Type>::new();
+        for value in ["alpha", "beta", "alpha"] {
+            dict.append_value(value);
+        }
+        let dict: ArrayRef = Arc::new(dict.finish());
+
+        let inner_fields: Fields = vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+        ]
+        .into();
+        let strukt: ArrayRef = Arc::new(StructArray::new(
+            inner_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(oxidant_loom::arrow::array::StringArray::from(vec![
+                    Some("x"),
+                    None,
+                    Some("z"),
+                ])) as ArrayRef,
+            ],
+            // A null struct, so the outer validity buffer has to survive too.
+            Some(NullBuffer::from(vec![true, false, true])),
+        ));
+
+        let tz: Arc<str> = Arc::from("America/New_York");
+        let ts: ArrayRef = Arc::new(
+            TimestampMillisecondArray::from(vec![0_i64, 1_700_000_000_000, -86_400_000])
+                .with_timezone(Arc::clone(&tz)),
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "label",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("nested", DataType::Struct(inner_fields), true),
+            Field::new(
+                "at",
+                DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::clone(&tz))),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![dict, strukt, ts]).expect("batch");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let (id, _) = store.insert("SELECT * FROM wide");
+        store.finish(&id, ExecOutcome::Succeeded(vec![batch.clone()]));
+        store.drain_spills();
+
+        let before = app(rest_state(store.clone()));
+        let (status, json_before) =
+            get_json(&before, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK, "{json_before}");
+        store.shutdown_for_test();
+        drop(before);
+        drop(store);
+
+        // Off disk, in a new process's worth of state.
+        let replayed = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let read_back = replayed
+            .history
+            .as_ref()
+            .expect("history")
+            .results
+            .read(&id, None)
+            .expect("read the spilled result back");
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(
+            read_back[0].schema(),
+            batch.schema(),
+            "the schema must survive the IPC round trip verbatim, timezone and all"
+        );
+        assert_eq!(read_back[0], batch, "and so must every value");
+
+        let after = app(rest_state(replayed.clone()));
+        let (status, json_after) =
+            get_json(&after, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK, "{json_after}");
+        assert_eq!(json_after, json_before, "byte-for-byte across the restart");
+        replayed.shutdown_for_test();
+    }
+
+    /// L4: a sweep that removed statements wakes the store's waiters.
+    ///
+    /// `prune_oldest_statement` removes statements a `?wait=true` caller may be parked on. The
+    /// background sweeper rebuilds a `StatementStore` from weak handles every tick and used to
+    /// give it a **fresh** `Notify`, so anyone parked would have blocked to their timeout; it
+    /// now carries the store's own, which is what makes this wake-up reach them.
+    #[tokio::test]
+    async fn a_pruning_sweep_wakes_the_stores_waiters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.disk_max_bytes = 0; // nothing fits: the sweep prunes
+            c.disk_min_free_bytes = 0;
+        });
+        let (id, _) = store.insert("SELECT 1");
+        store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+
+        let notified = store.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let report = store.sweep_disk();
+        assert!(report.removed_anything(), "{report:?}");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), notified)
+                .await
+                .is_ok(),
+            "a waiter parked on a statement the sweep removed must be woken, not left to its \
+             timeout"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// L4: a journaled `result.file` that does not name this statement's own file is rejected
+    /// with a reason, not silently ignored — and never joined onto `results/`, which would be a
+    /// path-traversal primitive fed from a file on disk.
+    #[tokio::test]
+    async fn a_result_pointer_naming_another_file_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let (id, _) = store.insert("SELECT n FROM t");
+        store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+
+        // The honest pointer reads back.
+        let app = app(rest_state(store.clone()));
+        let (status, body) = get_json(&app, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result_values(&body), vec![0, 1, 2, 3]);
+
+        // Rewrite the pointer to name something else, exactly as a corrupted or hand-edited
+        // journal would.
+        {
+            let mut inner = store.inner.lock().expect("lock");
+            let st = inner.statements.get_mut(&id).expect("hot");
+            // Rows released, so `/result` falls through to the disk — the path the pointer is
+            // read on.
+            st.rows_in_memory = false;
+            st.batches = Vec::new();
+            st.result_file = Some(ResultPointer {
+                file: "../../etc/passwd".to_string(),
+                bytes: 1,
+            });
+        }
+        let (status, body) = get_json(&app, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+        assert_eq!(body["error"], "result_expired");
+        store.shutdown_for_test();
+    }
+
+    /// Exclusive ownership of the process-global `/api/status` publish seam.
+    ///
+    /// [`StatementStore::publish_status_counters`] writes to a process-global slot. In a test
+    /// binary that means every store that boots clobbers every other one's counters, so the
+    /// store whose counters reach `/api/status` is whichever booted last. A test that wants to
+    /// read the endpoint claims the seam for its duration; stores booted by other tests
+    /// meanwhile publish nothing and are unaffected (they read `status_counters()` directly).
+    pub(super) mod status_seam {
+        use std::sync::{Mutex, MutexGuard};
+        use std::thread::ThreadId;
+
+        static LOCK: Mutex<()> = Mutex::new(());
+        static OWNER: Mutex<Option<ThreadId>> = Mutex::new(None);
+
+        pub(super) struct Claim(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+        /// Block until the seam is free, then own it until the returned guard drops.
+        pub(super) fn claim() -> Claim {
+            let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            oxidant_observability::clear_history_status_source();
+            set_owner(Some(std::thread::current().id()));
+            Claim(guard)
+        }
+
+        /// May the *calling* thread publish? Ownership is per thread, not global: another test
+        /// booting a store on another thread while the seam is claimed must not overwrite the
+        /// owner's counters.
+        pub(crate) fn is_owner() -> bool {
+            OWNER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|owner| owner == std::thread::current().id())
+        }
+
+        fn set_owner(id: Option<ThreadId>) {
+            *OWNER.lock().unwrap_or_else(|e| e.into_inner()) = id;
+        }
+
+        impl Drop for Claim {
+            fn drop(&mut self) {
+                set_owner(None);
+                oxidant_observability::clear_history_status_source();
+            }
+        }
+    }
+
+    /// L3: the durability counters go over the wire through `GET /api/status` — the real route,
+    /// the real published source, the real serde flattening — not through `status_counters()`.
+    ///
+    /// Every other test in this PR asserts the `#[cfg(test)]` seam, so the wiring that puts the
+    /// counters on the wire had no coverage at all, and `docs/query-history-durability.md` §9
+    /// promises exactly this endpoint's behaviour.
+    #[tokio::test]
+    async fn the_status_endpoint_carries_the_durability_counters_end_to_end() {
+        let _seam = status_seam::claim();
+        let ui_store: oxidant_observability::SharedStore =
+            Arc::new(oxidant_observability::AppStateStore::new());
+        let router = oxidant_ui_server::app_router_with(
+            Arc::clone(&ui_store),
+            Some("status-token".to_string()),
+            oxidant_ui_server::DashboardStore::in_memory(),
+        );
+        let status_json = |router: Router| async move {
+            let resp = router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/api/status")
+                        .header(header::AUTHORIZATION, "Bearer status-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        };
+
+        // Nothing published — the `OXIDANT_HISTORY=off` shape. §8 says `off` restores today's
+        // behaviour exactly, and today there are no such fields.
+        let (status, body) = status_json(router.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        let keys = body.as_object().expect("object");
+        for field in [
+            "history_writes",
+            "history_dropped_events",
+            "results_on_disk_bytes",
+            "result_writes",
+            "result_write_failures",
+            "disk",
+        ] {
+            assert!(
+                !keys.contains_key(field),
+                "with history off the endpoint must not carry {field}: {body}"
+            );
+        }
+
+        // Boot a durable store. Its counters now reach the endpoint through the published
+        // source, flattened into the same object.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let (spilled, _) = store.insert("SELECT n FROM t");
+        store.finish(&spilled, ExecOutcome::Succeeded(vec![rows_batch(0, 8)]));
+        store.drain_spills();
+
+        let (status, body) = status_json(router.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["history_writes"], "ok", "{body}");
+        assert_eq!(body["result_writes"], "ok", "{body}");
+        assert_eq!(body["result_write_failures"], 0, "{body}");
+        assert_eq!(body["history_dropped_events"], 0, "{body}");
+        assert_eq!(body["disk"], "ok", "{body}");
+        let counters = store.status_counters().expect("history is on");
+        assert!(counters.results_on_disk_bytes > 0);
+        assert_eq!(
+            body["results_on_disk_bytes"], counters.results_on_disk_bytes,
+            "the endpoint must report *this* store's bytes: {body}"
+        );
+        // And the non-durability half of the snapshot is untouched by the flattening.
+        assert!(body["version"].is_string(), "{body}");
+        assert!(body["queries"].is_array(), "{body}");
+
+        // Break the spill disk: the endpoint — not just the test seam — says so.
+        let (broken, _) = store.insert("SELECT 'broken'");
+        std::fs::create_dir_all(
+            dir.path()
+                .join("history/results")
+                .join(format!("{broken}.arrow.tmp")),
+        )
+        .expect("block the spill");
+        store.finish(&broken, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+
+        let (status, body) = status_json(router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result_writes"], "degraded", "{body}");
+        assert_eq!(body["result_write_failures"], 1, "{body}");
+        assert_eq!(
+            body["history_writes"], "degraded",
+            "the aggregate has to carry it over the wire too: {body}"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// L2: a succeeded statement with **no batches** — DDL, and plenty of ordinary empty result
+    /// sets — is a correct empty answer, and must read the same before and after a restart.
+    ///
+    /// It used to answer `200 {"rows": []}` live and `410 result_expired` after a restart, with
+    /// nothing on the status document saying why, so a correct empty result was indistinguishable
+    /// from data loss. There is no file to write (an Arrow IPC stream needs a schema and there is
+    /// none), so the marker rides on the terminal snapshot that was being written anyway.
+    #[tokio::test]
+    async fn an_empty_result_answers_200_before_and_after_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let (id, _) = store.insert("CREATE TABLE t (a INT)");
+        store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+        store.drain_spills();
+
+        let before = app(rest_state(store.clone()));
+        let (status, json_before) =
+            get_json(&before, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json_before["rows"].as_array().expect("rows").len(), 0);
+        let (_, status_doc) = get_json(&before, &format!("/api/v1/statements/{id}")).await;
+        assert_eq!(
+            status_doc["resultStatus"], RESULT_EMPTY,
+            "the status document says *why* there is no result file"
+        );
+        let (status, _, csv_before) = get_raw(
+            &before,
+            &format!("/api/v1/statements/{id}/result?format=csv"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !dir.path()
+                .join("history/results")
+                .join(format!("{id}.arrow"))
+                .exists(),
+            "and there is nothing on disk for it — the marker is the whole record"
+        );
+
+        store.shutdown_for_test();
+        drop(before);
+        drop(store);
+
+        let replayed = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let after = app(rest_state(replayed.clone()));
+        let (status, json_after) =
+            get_json(&after, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK, "{json_after}");
+        assert_eq!(
+            json_after, json_before,
+            "an empty result must read identically across a restart, not become a 410"
+        );
+        let (status, _, csv_after) = get_raw(
+            &after,
+            &format!("/api/v1/statements/{id}/result?format=csv"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(csv_after, csv_before);
+        let (_, status_doc) = get_json(&after, &format!("/api/v1/statements/{id}")).await;
+        assert_eq!(status_doc["resultStatus"], RESULT_EMPTY);
+        replayed.shutdown_for_test();
+    }
+
+    /// L1: a spill that completes after its statement was evicted must publish nothing.
+    ///
+    /// `SpillWriter::handle` appended `folded.to_snapshot()` unconditionally, so a statement
+    /// tombstoned while its write was in flight left `tombstone(seq=N)` followed by
+    /// `snapshot(seq=M>N)` carrying a live result pointer. `Fold::apply` rejects records for a
+    /// tombstoned id, so replay ignored it — **unless** a segment roll and compaction fell
+    /// between the two, because `compact_sealed` does not carry tombstones into the new
+    /// generation. Then the next boot had no tombstone to reject it and the statement came back,
+    /// pointing at a file. This test builds exactly that window.
+    #[tokio::test]
+    async fn a_spill_that_lands_after_its_statement_was_evicted_publishes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let history = Arc::clone(store.history.as_ref().expect("history"));
+
+        // Park the writer so the statement can be evicted mid-write.
+        let release = history.results.block_writer();
+        let (doomed, _) = store.insert("SELECT 'doomed'");
+        store.finish(&doomed, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        assert!(
+            store.prune_oldest_statement().is_some(),
+            "the only terminal statement is evicted while its write is parked"
+        );
+        // Seal and compact, which drops the tombstone: from here the journal has no record that
+        // `doomed` ever died.
+        history.journal.sync_blocking();
+        history.journal.compact_blocking();
+
+        // Now let the write finish. Nothing may be published for a statement neither tier knows.
+        drop(release);
+        store.drain_spills();
+        let file = dir
+            .path()
+            .join("history/results")
+            .join(format!("{doomed}.arrow"));
+        assert!(
+            !file.exists(),
+            "a spill for an evicted statement must leave no file behind"
+        );
+        assert_eq!(
+            history.results.on_disk_bytes(),
+            0,
+            "and must not be counted against results_on_disk_bytes"
+        );
+
+        store.shutdown_for_test();
+        drop(history);
+        drop(store);
+        let replayed = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        assert!(
+            replayed.snapshot(&doomed).is_none(),
+            "the evicted statement must not resurrect with a live result pointer"
+        );
+        replayed.shutdown_for_test();
+    }
+
+    /// M4: `OXIDANT_LOG_DIR`, `OXIDANT_DUMP_DIR` and `OXIDANT_RESULT_DIR` are operator-set paths
+    /// that may be shared — `/var/log` is a plausible value for the first. A sweep under disk
+    /// pressure must unlink only what the engine itself wrote.
+    #[tokio::test]
+    async fn the_sweeper_never_unlinks_a_file_the_engine_did_not_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plant = |rel: &str, bytes: usize| {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, vec![b'x'; bytes]).expect("write");
+            path
+        };
+        // Planted *before* boot, so `clear_tmp` and boot's `reconcile` see them too.
+        let foreign_result = plant("history/results/customer-export.arrow", 512);
+        let foreign_tmp = plant("history/results/postgres-restore.tmp", 512);
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            // A budget nothing can satisfy: the sweeper walks every step of the order.
+            c.disk_max_bytes = 0;
+            c.disk_min_free_bytes = 0;
+        });
+        // Planted after boot so the pass under test is the explicit one below, not the boot one.
+        let foreign_log = plant("logs/syslog", 4096);
+        let foreign_dump = plant("dumps/customer-facts.parquet", 4096);
+        let ours_log = plant("logs/oxidant-2026-08-20.log", 4096);
+        let ours_dump = plant("dumps/dump-1.parquet", 4096);
+        let report = store.sweep_disk();
+
+        assert!(!ours_log.exists(), "our rolled log goes: {report:?}");
+        assert!(!ours_dump.exists(), "our dump goes: {report:?}");
+        assert!(
+            foreign_log.exists(),
+            "a foreign file in the logs dir must survive: {report:?}"
+        );
+        assert!(
+            foreign_dump.exists(),
+            "and so must one in the dumps dir: {report:?}"
+        );
+        assert!(
+            foreign_result.exists(),
+            "and one in the results dir, which boot both counts and reconciles: {report:?}"
+        );
+        assert!(
+            foreign_tmp.exists(),
+            "clear_tmp takes stmt-*.arrow.tmp, not every *.tmp: {report:?}"
+        );
+        assert_eq!(report.rolled_logs_removed, 1, "{report:?}");
+        assert_eq!(report.dumps_removed, 1, "{report:?}");
+        store.shutdown_for_test();
+    }
+
+    /// M3: the floor is measured against the mount of **every** managed directory, not just the
+    /// root's. `OXIDANT_RESULT_DIR` on a second volume was never checked, and a healthy results
+    /// volume was reported short because the root's volume was.
+    #[tokio::test]
+    async fn the_free_space_floor_covers_every_managed_directory_not_just_the_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let other_volume = tempfile::tempdir().expect("tempdir");
+        let root_mount = root.path().canonicalize().expect("canonicalize");
+        let other_mount = other_volume.path().canonicalize().expect("canonicalize");
+        let results_dir = other_volume.path().join("results");
+
+        // The root's volume is roomy; the one `OXIDANT_RESULT_DIR` was moved to is not.
+        let mounts = vec![(root_mount, 1 << 40), (other_mount.clone(), 1024)];
+        let store = history_store_with(root.path(), |c| {
+            c.results_dir = results_dir.clone();
+            c.disk_max_bytes = u64::MAX;
+            c.disk_min_free_bytes = 1 << 30;
+            c.mounts_override = Some(mounts.clone());
+        });
+        let report = store.sweep_disk();
+        assert!(
+            report.low_free,
+            "the results volume is 1 KiB free against a 1 GiB floor: {report:?}"
+        );
+        assert_eq!(
+            report.free_bytes,
+            Some(1024),
+            "and the report carries the *lowest* reading, not the root's: {report:?}"
+        );
+        assert_eq!(report.statements_pruned, 0, "still nothing is pruned");
+        assert_eq!(
+            store.status_counters().map(|c| c.disk),
+            Some(oxidant_observability::disk_state::LOW_FREE.to_string())
+        );
+        store.shutdown_for_test();
+        drop(store);
+
+        // Converse: a short *root* volume with a roomy results volume still trips, and a pair
+        // that are both roomy does not.
+        let store = history_store_with(root.path(), |c| {
+            c.results_dir = results_dir.clone();
+            c.disk_max_bytes = u64::MAX;
+            c.disk_min_free_bytes = 1 << 30;
+            c.mounts_override = Some(vec![
+                (other_mount, 1 << 40),
+                (std::path::PathBuf::from("/"), 1 << 40),
+            ]);
+        });
+        let report = store.sweep_disk();
+        assert!(!report.low_free, "both volumes are roomy: {report:?}");
+        assert_eq!(
+            store.status_counters().map(|c| c.disk),
+            Some(oxidant_observability::disk_state::OK.to_string())
+        );
+        store.shutdown_for_test();
+    }
+
+    /// M2: the sweeper measures the tree **twice** per pass — once before, once after — however
+    /// many statements it prunes.
+    ///
+    /// `over()` used to call a full recursive `subtree_bytes` of the root per loop iteration, so
+    /// pruning 10,000 statements meant 10,000 recursive walks of every journal segment, every
+    /// compacted generation and every result file, interleaved with 10,000 lock/unlock cycles of
+    /// the store mutex that every submit, list, status and result call also takes.
+    #[test]
+    fn the_disk_sweep_measures_the_tree_twice_however_many_statements_it_prunes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            c.disk_max_bytes = 0; // nothing can satisfy it: the loop walks the whole list
+            c.disk_min_free_bytes = 0;
+        });
+        for i in 0..40i64 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(i, 2)]));
+        }
+
+        crate::history::disk::reset_subtree_walks();
+        let report = store.sweep_disk();
+        let walks = crate::history::disk::subtree_walks();
+
+        assert!(
+            report.statements_pruned >= 20,
+            "the pass has to actually prune for this to mean anything: {report:?}"
+        );
+        // One budget root for a plain tempdir (every override is under it), measured before and
+        // after — and nothing per victim.
+        assert_eq!(
+            walks, 2,
+            "{} statements pruned cost {walks} recursive walks of the data directory",
+            report.statements_pruned
+        );
+        store.shutdown_for_test();
+    }
+
+    /// M1: a result the file cap refused keeps its rows — they are the only copy — but it stops
+    /// being a budget victim, so the projection stops claiming bytes it will never free.
+    ///
+    /// The consequence is documented rather than papered over: the in-memory ceiling is the
+    /// budget **plus** every refused result still in the hot tier. Nothing is truncated and
+    /// nothing is dropped; refused rows leave on the hot TTL or the record cap.
+    #[tokio::test]
+    async fn a_refused_result_stays_in_the_budget_and_stops_being_a_victim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = retained_bytes(&[rows_batch(0, 4)]);
+        let budget = small + small / 2;
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::OnPressure;
+            c.result_memory_budget_bytes = budget;
+            // Small enough that a 64-row result's IPC encoding is refused and a 4-row one is not.
+            c.result_max_bytes = 512;
+        });
+
+        let (refused, _) = store.insert("SELECT * FROM big");
+        store.finish(&refused, ExecOutcome::Succeeded(vec![rows_batch(0, 64)]));
+        // Pressure, so the big result is actually offered to the writer and refused.
+        let (nudge, _) = store.insert("SELECT 'nudge'");
+        store.finish(&nudge, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+        let refused_bytes = {
+            let inner = store.inner.lock().expect("lock");
+            let st = inner.statements.get(&refused).expect("hot");
+            assert_eq!(st.result_refused.as_deref(), Some(RESULT_TOO_LARGE));
+            assert!(st.rows_in_memory, "the rows are the only copy left");
+            st.result_bytes
+        };
+        assert!(refused_bytes > 0);
+
+        // Ten more small results: each spills and releases, and the refused one is never chosen.
+        for i in 0..10i64 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(i * 100, 4)]));
+            store.drain_spills();
+        }
+        {
+            let mut inner = store.inner.lock().expect("lock");
+            let victims = inner.budget_victims();
+            assert!(
+                !victims.contains(&refused),
+                "a refused result must not be re-selected every pass: {victims:?}"
+            );
+            // Undo what asking cost us: `budget_victims` marks whoever it picked.
+            for id in victims {
+                if let Some(st) = inner.statements.get_mut(&id) {
+                    st.spilling = false;
+                    st.release_on_spill = false;
+                }
+            }
+            assert!(
+                inner
+                    .statements
+                    .get(&refused)
+                    .expect("still hot")
+                    .rows_in_memory,
+                "and it certainly must not be released — nothing is on disk for it"
+            );
+            // The documented ceiling: the budget, plus the refused result. Not unbounded, and
+            // not a budget that silently lets go of what memory actually holds.
+            let ceiling = budget + refused_bytes;
+            assert!(
+                inner.result_bytes <= ceiling,
+                "retained {} against a ceiling of {ceiling} (budget {budget} + refused \
+                 {refused_bytes})",
+                inner.result_bytes
+            );
+            assert!(
+                inner.result_bytes >= refused_bytes,
+                "and the budget still counts the refused rows: {} < {refused_bytes}",
+                inner.result_bytes
+            );
+        }
+        store.shutdown_for_test();
+    }
+
+    /// H1, the finding that blocks: a free-space shortfall the engine did **not** cause must
+    /// delete nothing.
+    ///
+    /// The floor used to drive the same unbounded prune loop as the byte budget, and unlike the
+    /// byte budget it cannot be made satisfiable by pruning — so a driver sharing a volume with
+    /// a CI cache lost every statement record and every spilled result within five minutes of
+    /// that volume dipping under 1 GiB free, while `OXIDANT_DISK_MAX_BYTES` was 8 GiB and the
+    /// engine was using kilobytes.
+    #[tokio::test]
+    async fn a_free_space_shortfall_the_engine_did_not_cause_deletes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // First boot: a healthy volume, five spilled results.
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let mut ids = Vec::new();
+        for i in 0..5i64 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(i * 10, 4)]));
+            ids.push(id);
+        }
+        store.drain_spills();
+        let results = dir.path().join("history/results");
+        for id in &ids {
+            assert!(results.join(format!("{id}.arrow")).exists(), "spilled");
+        }
+        // Files the sweeper would take *first* if it were pruning at all.
+        let plant = |rel: &str, bytes: usize| {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, vec![b'x'; bytes]).expect("write");
+            path
+        };
+        let rolled = plant("logs/oxidant-2026-08-20.log", 4096);
+        let dump = plant("dumps/dump-1.parquet", 4096);
+        store.shutdown_for_test();
+        drop(store);
+
+        // Second boot: the engine is nowhere near its own budget, and the volume is "full" for
+        // reasons that have nothing to do with it. `with_history` sweeps at boot.
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            c.disk_max_bytes = u64::MAX;
+            c.disk_min_free_bytes = 8 * 1024 * 1024 * 1024;
+            // 1 KiB free on a volume wanting 8 GiB.
+            c.mounts_override = Some(vec![(std::path::PathBuf::from("/"), 1024)]);
+        });
+        let report = store.sweep_disk();
+
+        assert!(report.low_free, "the floor must be reported: {report:?}");
+        assert!(
+            !report.over_budget,
+            "the engine is not over its own budget: {report:?}"
+        );
+        assert_eq!(report.statements_pruned, 0, "{report:?}");
+        assert_eq!(report.live_results_removed, 0, "{report:?}");
+        assert_eq!(report.orphan_results_removed, 0, "{report:?}");
+        assert_eq!(report.rolled_logs_removed, 0, "{report:?}");
+        assert_eq!(report.dumps_removed, 0, "{report:?}");
+        assert_eq!(report.freed_bytes, 0, "{report:?}");
+        assert!(rolled.exists() && dump.exists(), "{report:?}");
+        for id in &ids {
+            assert!(
+                results.join(format!("{id}.arrow")).exists(),
+                "{id} lost its result to a shortfall the engine did not cause"
+            );
+        }
+        assert_eq!(
+            store.list().len(),
+            5,
+            "and the whole history is still there"
+        );
+
+        // What the engine does instead: stop writing the large thing, and say so.
+        let counters = store.status_counters().expect("history is on");
+        assert_eq!(
+            counters.disk,
+            oxidant_observability::disk_state::LOW_FREE,
+            "the operator must be able to tell a host shortfall from an engine overspend: \
+             {counters:?}"
+        );
+        assert_eq!(
+            counters.history_writes,
+            oxidant_observability::history_writes::DEGRADED,
+            "{counters:?}"
+        );
+        assert!(
+            store.history.as_ref().expect("history").results.is_paused(),
+            "spill is paused while the volume is short"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// The other side of H1: the engine still prunes — in the documented order — when its *own*
+    /// subtree is past its *own* budget, and it does so whether or not the volume is also short.
+    /// `disk:` reports `over_budget` when both hold, because that is the one the operator can act
+    /// on.
+    #[tokio::test]
+    async fn the_engine_prunes_for_its_own_budget_even_while_the_volume_is_short() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            // Nothing can satisfy this, so the sweeper walks the whole order.
+            c.disk_max_bytes = 0;
+            c.disk_min_free_bytes = u64::MAX;
+            c.mounts_override = Some(vec![(std::path::PathBuf::from("/"), 0)]);
+        });
+        let plant = |rel: &str, bytes: usize| {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, vec![b'x'; bytes]).expect("write");
+            path
+        };
+        let live = plant("logs/oxidant.log", 4096);
+        let rolled = plant("logs/oxidant-2026-08-20.log", 4096);
+        let dump = plant("dumps/dump-1.parquet", 4096);
+        for i in 0..3i64 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+        }
+
+        let report = store.sweep_disk();
+        assert!(report.low_free, "{report:?}");
+        assert!(report.over_budget, "{report:?}");
+        assert_eq!(report.rolled_logs_removed, 1, "logs first: {report:?}");
+        assert_eq!(report.dumps_removed, 1, "then dumps: {report:?}");
+        assert!(report.statements_pruned >= 1, "then statements: {report:?}");
+        assert!(!rolled.exists() && !dump.exists());
+        assert!(live.exists(), "the live log is never deleted — it rotates");
+        assert_eq!(
+            store.status_counters().map(|c| c.disk),
+            Some(oxidant_observability::disk_state::OVER_BUDGET.to_string()),
+            "over_budget wins when both hold"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// H2: a spill job the queue had no room for must go back into the memory budget.
+    ///
+    /// `plan_spills` marks each victim `spilling` under the store lock, and `budget_victims`
+    /// filters on `!spilling` — so a job that vanished on the way to the writer used to exclude
+    /// its statement from eviction *permanently*: rows pinned in memory, never written, and the
+    /// store stuck over budget until the hot TTL (an hour) or the 10,000-record cap. A
+    /// terminal-result burst past the writer's throughput is exactly when that fires.
+    #[tokio::test]
+    async fn a_dropped_spill_goes_back_into_the_budget_and_lands_on_the_next_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let one = retained_bytes(&[rows_batch(0, 4)]);
+        let budget = one + one / 2; // room for exactly one retained result
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::OnPressure;
+            c.result_memory_budget_bytes = budget;
+        });
+
+        // Park the writer: a 256-deep queue cannot be filled against one that is draining it.
+        let release = store
+            .history
+            .as_ref()
+            .expect("history")
+            .results
+            .block_writer();
+        for i in 0..(crate::history::SPILL_QUEUE + 8) as i64 {
+            let (id, _) = store.insert(&format!("SELECT {i}"));
+            store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(i * 10, 4)]));
+        }
+        let dropped = store
+            .history
+            .as_ref()
+            .expect("history")
+            .results
+            .dropped_spills();
+        assert!(
+            dropped > 0,
+            "the queue must have overflowed to test the drop"
+        );
+        {
+            let inner = store.inner.lock().expect("lock");
+            let stuck = inner.statements.values().filter(|st| st.spilling).count();
+            assert!(
+                stuck <= crate::history::SPILL_QUEUE,
+                "only jobs the writer actually took may still be marked spilling: \
+                 {stuck} > {}",
+                crate::history::SPILL_QUEUE
+            );
+        }
+
+        // Let the writer catch up, then drive one more budget pass.
+        drop(release);
+        store.drain_spills();
+        let (last, _) = store.insert("SELECT 'last'");
+        store.finish(&last, ExecOutcome::Succeeded(vec![rows_batch(9_000, 4)]));
+        store.drain_spills();
+
+        let inner = store.inner.lock().expect("lock");
+        assert!(
+            inner.result_bytes <= budget,
+            "the dropped spills must be retried, not stranded: {} retained against a \
+             {budget}-byte budget ({dropped} jobs were dropped)",
+            inner.result_bytes
+        );
+        assert!(
+            !inner.statements.values().any(|st| st.spilling),
+            "no statement is left mid-spill once the writer has drained"
+        );
+        drop(inner);
+        store.shutdown_for_test();
+    }
+
+    /// The other half of H2: a spill the *disk* refused. The statement stays in the budget's
+    /// accounting and in its candidate set, and the next pass writes it successfully.
+    #[tokio::test]
+    async fn a_failed_spill_keeps_its_statement_in_the_budget_and_retries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let one = retained_bytes(&[rows_batch(0, 4)]);
+        let budget = one + one / 2;
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::OnPressure;
+            c.result_memory_budget_bytes = budget;
+        });
+        let results = dir.path().join("history/results");
+
+        let (victim, _) = store.insert("SELECT 'victim'");
+        store.finish(&victim, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        // Block the victim's tmp path, then push it over the budget so it is chosen.
+        let blocked = results.join(format!("{victim}.arrow.tmp"));
+        std::fs::create_dir_all(&blocked).expect("block the spill");
+        let (second, _) = store.insert("SELECT 'second'");
+        store.finish(&second, ExecOutcome::Succeeded(vec![rows_batch(100, 4)]));
+        store.drain_spills();
+
+        {
+            let inner = store.inner.lock().expect("lock");
+            let st = inner.statements.get(&victim).expect("hot");
+            assert!(st.rows_in_memory, "a failed spill keeps the rows");
+            assert!(st.result_bytes > 0);
+            assert!(!st.spilling, "and is a candidate again");
+            assert!(
+                inner.result_bytes >= st.result_bytes,
+                "the budget must still account for what memory actually holds"
+            );
+        }
+        assert_eq!(
+            store
+                .status_counters()
+                .map(|c| c.result_write_failures)
+                .unwrap_or_default(),
+            1
+        );
+
+        // Retry: the disk recovers, the next budget pass picks the same statement, and it lands.
+        std::fs::remove_dir(&blocked).expect("unblock");
+        let (third, _) = store.insert("SELECT 'third'");
+        store.finish(&third, ExecOutcome::Succeeded(vec![rows_batch(200, 4)]));
+        store.drain_spills();
+        assert!(
+            results.join(format!("{victim}.arrow")).exists(),
+            "the retry must write the result the first attempt could not"
+        );
+        {
+            let inner = store.inner.lock().expect("lock");
+            assert!(inner.result_bytes <= budget, "{}", inner.result_bytes);
+        }
+        store.shutdown_for_test();
+    }
+
+    /// H3: degraded is **per subsystem**, and a subsystem's flag is cleared only by a success of
+    /// its own. A failing `OXIDANT_RESULT_DIR` used to read `ok` again the microsecond the next
+    /// statement was submitted, because the spill reported through the *journal's* flag and the
+    /// journal clears that on every successful append.
+    #[tokio::test]
+    async fn a_failed_spill_stays_degraded_across_a_successful_journal_append() {
+        use oxidant_observability::history_writes::{DEGRADED, OK};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let results = dir.path().join("history/results");
+
+        // A *directory* where the spill's tmp file belongs: `create_secure` fails with EISDIR —
+        // the ENOSPC/EIO shape, deterministically, with no fault injector.
+        let (broken, _) = store.insert("SELECT 'broken'");
+        let blocked = results.join(format!("{broken}.arrow.tmp"));
+        std::fs::create_dir_all(&blocked).expect("block the spill");
+        store.finish(&broken, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+
+        let counters = store.status_counters().expect("history is on");
+        assert_eq!(counters.result_writes, DEGRADED, "{counters:?}");
+        assert_eq!(counters.result_write_failures, 1, "{counters:?}");
+        assert_eq!(
+            counters.history_writes, DEGRADED,
+            "the aggregate must carry it: {counters:?}"
+        );
+
+        // The regression: a healthy journal append (this submits *and* fsyncs a terminal record)
+        // must not clear the spill writer's flag.
+        let (chatter, _) = store.insert("SELECT 'chatter'");
+        store.finish(&chatter, ExecOutcome::Succeeded(Vec::new()));
+        assert!(
+            !store.await_durable(&chatter).await,
+            "the journal itself is healthy"
+        );
+        let counters = store.status_counters().expect("history is on");
+        assert_eq!(
+            counters.result_writes, DEGRADED,
+            "a journal success is not a spill success: {counters:?}"
+        );
+        assert_eq!(counters.history_writes, DEGRADED, "{counters:?}");
+
+        // Only a spill that lands clears it — and the failure stays counted.
+        std::fs::remove_dir(&blocked).expect("unblock");
+        let (healthy, _) = store.insert("SELECT 'healthy'");
+        store.finish(&healthy, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+        let counters = store.status_counters().expect("history is on");
+        assert_eq!(counters.result_writes, OK, "{counters:?}");
+        assert_eq!(counters.history_writes, OK, "{counters:?}");
+        assert_eq!(counters.result_write_failures, 1, "{counters:?}");
+        store.shutdown_for_test();
+    }
+
+    /// With history off there are no durability counters at all — §8 says `off` restores today's
+    /// behaviour exactly, and today `/api/status` has no such fields.
+    #[test]
+    fn history_off_publishes_no_status_counters() {
+        assert!(StatementStore::new().status_counters().is_none());
     }
 }

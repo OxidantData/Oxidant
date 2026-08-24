@@ -810,6 +810,8 @@ mod tests {
             rows: Some(1),
             submitted_at_ms: recent_ms(seq),
             duration_ms: Some(7),
+            result: None,
+            result_refused: None,
             seq,
             last_seq: seq,
             rank: 2,
@@ -834,6 +836,8 @@ mod tests {
             rows: None,
             submitted_at_ms: recent_ms(seq),
             duration_ms: None,
+            result: None,
+            result_refused: None,
             ts: crate::history::record::now_rfc3339(),
         }
     }
