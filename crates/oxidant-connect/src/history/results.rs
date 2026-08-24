@@ -516,8 +516,10 @@ impl SpillWriter {
     /// the file, rename, fsync the directory, and only then let the caller journal the pointer.
     fn write(&self, id: &str, batches: &[RecordBatch]) -> io::Result<Option<ResultPointer>> {
         // Nothing to encode and no schema to encode it against: an Arrow IPC stream cannot be
-        // written without one, so a zero-batch result has no file and `/result` answers
-        // `410 result_expired` for it after a restart. Stated rather than faked.
+        // written without one, so a zero-batch result has no file. `plan_spills` does not queue
+        // one at all (`finish` records `result_empty` on the statement, which is what makes
+        // `/result` answer `200 {"rows": []}` for it after a restart) — this is the defensive
+        // arm, and refusing is the only honest thing it can do.
         let Some(first) = batches.first() else {
             return Ok(None);
         };

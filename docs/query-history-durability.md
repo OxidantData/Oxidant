@@ -192,10 +192,20 @@ it is retried at the next sweep. Conversion never pushes the disk over a guard.
 files whose statement is already pruned → oldest journal *statements* (§4c —
 statement-granular, never raw segment deletion) → oldest live result files. The live
 log file is **never** deleted — it rotates instead. If the budget is still exceeded
-after everything prunable is gone, `/api/status` reports `disk: over_budget`
-(alongside `history_writes: degraded`), the engine keeps serving, and the log carries
-one loud line per prune pass naming what was removed and why. The sweeper runs at roll
-time, at boot, and every 5 minutes.
+after everything prunable is gone, `/api/status` reports `disk: over_budget`, the
+engine keeps serving, and the log carries one loud line per prune pass naming what was
+removed and why. The sweeper runs at roll time, at boot, and every 5 minutes.
+
+**The free-space floor does not prune.** `OXIDANT_DISK_MAX_BYTES` drives the order
+above and nothing else does: the engine deletes its own files when its own subtree is
+over its own budget. Below `OXIDANT_DISK_MIN_FREE_BYTES` — a shortfall that is very
+often a co-tenant's, and one that pruning cannot make satisfiable — the engine instead
+**stops writing the large thing**: result spill is paused, `/api/status` reports
+`disk: low_free` and `history_writes: degraded`, and no statement record and no result
+file is deleted. The journal keeps writing, because its records are small and refusing
+them would lose exactly the history this guard exists to protect. The floor is measured
+per **mount**, against every managed directory, so a subtree moved to another volume is
+floored against that volume.
 
 **Built in PR2** (`crates/oxidant-connect/src/history/disk.rs` + `StatementStore::sweep_disk`),
 at boot and on a `OXIDANT_DISK_SWEEP_SECS` timer; the roll-time trigger arrives with the
@@ -846,6 +856,17 @@ Results *(shipped in PR2, in `rest.rs`'s test module unless noted)*:
   **oldest terminal** result, and frees its memory — the newest stays servable from
   memory;
 - `never` writes nothing and releases nothing;
+- a **refused** result stays in the byte budget's accounting and leaves its candidate
+  set, so the store converges to the budget plus that result rather than re-selecting
+  and re-declining it forever;
+- a spill the queue **drops** and a spill the disk **refuses** both put the statement
+  back into the budget's candidate set, and the next pass writes it;
+- a spill that lands after its statement was evicted publishes nothing: no file, no
+  pointer, and no resurrection across a seal-and-compact that drops the tombstone;
+- a **zero-batch** result answers `200 {"rows": []}` before and after a restart, and
+  says `resultStatus: "result_empty"` both times;
+- a wide schema — dictionary, nullable struct with nulls, timestamp with timezone —
+  round-trips through the file and the restart verbatim;
 - pruning a statement unlinks its result in the same sweep; boot deletes `results/`
   files referenced by no folded id; and a **running** statement's result survives every
   retention path there is.
@@ -871,8 +892,18 @@ Logs:
 Guards and degradation:
 
 - the disk-budget sweeper prunes in the documented order, never touches the live
-  file, and reports `over_budget` only after everything prunable is gone *(shipped in
-  PR2; the `event_log_dir` half waits on PR3 — see §3)*;
+  file, only ever unlinks files it can recognise as its own (`oxidant-*.log`,
+  `dump-*.parquet` / `oxidant-*.parquet`, `stmt-*.arrow`), measures the tree exactly
+  twice per pass however many statements it prunes, and reports `over_budget` only
+  after everything prunable is gone *(shipped in PR2; the `event_log_dir` half waits on
+  PR3 — see §3)*;
+- a free-space shortfall the engine did not cause deletes **nothing**: with the engine
+  far under `OXIDANT_DISK_MAX_BYTES` and the volume under
+  `OXIDANT_DISK_MIN_FREE_BYTES`, one sweep prunes no statement, no result, no log and
+  no dump, pauses spill, and reports `disk: low_free` + `history_writes: degraded`. The
+  same store with its *own* budget exceeded still prunes, in the documented order, and
+  reports `disk: over_budget`. The floor is checked against every managed directory's
+  mount, not just the root's;
 - `/api/status` reports `history_writes: degraded` under a failing-writer shim and
   flips back to `ok` on the next successful append, with no restart; a failing *spill*
   writer is reported by `result_writes` / `result_write_failures` and is **not** cleared
