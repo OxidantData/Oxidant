@@ -1334,6 +1334,17 @@ document or `docs/api.md` previously promised.
   the pane read "following". The cursor now does not move; the next successful poll re-seeds at
   the end of the file, which is what F5's seed already does.
 
+- **F7 — "Load older lines" no longer opens a silent gap.** `obsAppend` trimmed the oldest
+  lines off the front of the live page with `.slice(-OBS_PAGE * 2)` and left `page.next_before`
+  naming one of them, so after ~500 followed lines the scroll-back cursor pointed at a line that
+  was no longer on screen: `[older page][…500 lines missing…][tail]`, presented as one
+  continuous log. The cursor cannot be advanced by arithmetic — under a filter the rows between
+  two matches are unknown — so the trimmed prefix becomes the newest scrolled-back page instead,
+  carrying the cursor that belongs to it. Scroll-back is bounded by releasing whole pages from
+  the *oldest* end, which is gap-free by construction: each page's cursor names the page before
+  itself, so a released page is re-fetched rather than skipped. Same class of defect as the SSE
+  `dropped` event, on the scroll-back axis instead of the live one.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |

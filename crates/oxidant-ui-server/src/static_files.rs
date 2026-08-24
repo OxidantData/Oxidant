@@ -175,10 +175,32 @@ mod tests {
             !embedded_index().contains("new EventSource('/api/v1/logs/tail"),
             "the log tail must not be an EventSource: it cannot carry the status token"
         );
+        // Pinned as the *identifier* next to the route, not as the whole argument list: the
+        // point is that the tail sends the same bearer header every other log route sends, and
+        // an assertion on the exact spelling of an argument list breaks on a reformat that
+        // changes nothing.
+        let tail_call = embedded_index()
+            .split_once("'/api/v1/logs/tail?'")
+            .map(|(_, rest)| rest.chars().take(200).collect::<String>())
+            .unwrap_or_default();
         assert!(
-            embedded_index().contains("headers: obsAuthHeaders(), signal: ctl.signal"),
+            tail_call.contains("obsAuthHeaders()"),
             "the log tail reads SSE by hand so it can send the same bearer header as every \
-             other log route"
+             other log route: {tail_call}"
+        );
+
+        // **The followed page's scroll-back cursor is never left stale.** `obsAppend` used to
+        // trim the oldest lines off the front of the page with `.slice(-OBS_PAGE * 2)` and leave
+        // `page.next_before` naming one of them, so `Load older lines` fetched the page before a
+        // line that was no longer on screen and the gap was presented as continuous log. The
+        // trimmed prefix becomes an `older` page instead.
+        assert!(
+            !embedded_index().contains(".slice(-OBS_PAGE * 2)"),
+            "trimming the live page must not silently orphan its `next_before`"
+        );
+        assert!(
+            embedded_index().contains("obsTrimScrollback"),
+            "the pane must release scroll-back a whole page at a time, from the oldest end"
         );
         // §6b's controls, as the ids the JS binds. The level chips existed and matched nothing
         // once PR3 put a timestamp in front of `[LEVEL]`; these are the rest of the pane.

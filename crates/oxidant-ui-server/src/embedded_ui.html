@@ -1212,8 +1212,48 @@
 
     function obsAppend(lines) {
       if (!lines.length || !obsState.page) return;
-      obsState.page.lines = obsState.page.lines.concat(lines).slice(-OBS_PAGE * 2);
+      const joined = obsState.page.lines.concat(lines);
+      const overflow = joined.length - OBS_PAGE * 2;
+      if (overflow > 0) {
+        /* **The trimmed lines move up; they are not dropped.** `page.next_before` names the
+         * oldest line *in the page*, and slicing lines off the front used to leave it naming a
+         * line that is no longer on screen — so after ~500 followed lines, `Load older lines`
+         * fetched the page before *that* line and the reader saw
+         * `[older page][…500 lines silently missing…][tail]` presented as one continuous log.
+         * That is the same class of defect the SSE `dropped` event exists to prevent, on the
+         * scroll-back axis instead of the live one.
+         *
+         * It cannot be fixed by advancing the cursor arithmetically: under a filter the rows
+         * between two matches are unknown, so `next_before + trimmed` is not a row index. The
+         * prefix becomes the newest `older` page instead, carrying the cursor that belongs to
+         * it — which is exactly the cursor `Load older lines` needs. */
+        obsState.older.push({
+          code: 200, lines: joined.slice(0, overflow), next_before: obsState.page.next_before,
+        });
+        obsState.page.lines = joined.slice(overflow);
+        // The page no longer knows what precedes it; `older` does. Every reader of the cursor
+        // prefers `older[0]` when `older` is non-empty.
+        obsState.page.next_before = null;
+        obsTrimScrollback();
+      } else {
+        obsState.page.lines = joined;
+      }
       paintObservability();
+    }
+
+    /* Lines kept above the live page before the oldest scrolled-back page is released.
+     *
+     * Releasing whole pages *from the oldest end* is gap-free by construction: every `older`
+     * page's `next_before` names the page before **itself**, so dropping `older[0]` leaves the
+     * new `older[0]` pointing exactly at what was dropped. `Load older lines` re-fetches it.
+     * One page is always kept, or the cursor for everything above would go with it. */
+    const OBS_SCROLLBACK = OBS_PAGE * 10;
+
+    function obsTrimScrollback() {
+      let held = obsState.older.reduce((n, p) => n + p.lines.length, 0);
+      while (obsState.older.length > 1 && held > OBS_SCROLLBACK) {
+        held -= obsState.older.shift().lines.length;
+      }
     }
 
     // Every line on screen, oldest first: the pages the reader scrolled back into, then the one

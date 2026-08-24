@@ -177,7 +177,10 @@ rail, and the two are not yet one query history —
 Every filter is evaluated by the API over the whole file, not by the browser over what it
 already has, and **Load older lines** walks the API's backward cursor — so a 256 MiB day is
 readable without ever loading it. The pane stays pinned to the newest line unless you scroll up
-into it.
+into it. Following for a long time does not open a hole in the scroll-back: as the live page
+fills, its oldest lines move into the scrolled-back pages with the cursor that belongs to them,
+and when the browser eventually releases scroll-back it releases a whole page at a time, so
+**Load older lines** fetches it again rather than skipping past it.
 
 Four things the pane says out loud rather than hiding:
 
