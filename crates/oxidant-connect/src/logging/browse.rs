@@ -455,7 +455,7 @@ pub(crate) fn scan_parquet(
     // `ts` statistics do not put the whole group outside the requested window.
     let candidates: Vec<usize> = (0..md.num_row_groups())
         .rev()
-        .filter(|&g| before.is_none_or(|b| starts[g] < b))
+        .filter(|&g| before.map_or(true, |b| starts[g] < b))
         .filter(|&g| !prunable(md.row_group(g), filter))
         .collect();
 
@@ -589,7 +589,7 @@ fn prunable(group: &RowGroupMetaData, filter: &LogFilter) -> bool {
     let Some(stats) = group.column(0).statistics() else {
         return false;
     };
-    if stats.null_count_opt().is_none_or(|n| n > 0) {
+    if stats.null_count_opt().map_or(true, |n| n > 0) {
         return false;
     }
     let Statistics::Int64(s) = stats else {

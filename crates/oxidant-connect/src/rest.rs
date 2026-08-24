@@ -3595,7 +3595,10 @@ fn dump_chunks(
             }
             Ok(Err(e)) => Some((Err(e), None)),
             Err(e) => Some((
-                Err(std::io::Error::other(format!("dump read panicked: {e}"))),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("dump read panicked: {e}"),
+                )),
                 None,
             )),
         }
