@@ -1,0 +1,483 @@
+//! Process-level logging init, and the rolling exec-log writer behind it (§6, §6c).
+//!
+//! **Why this is not in `rest.rs` any more.** `init_logging()` was the only
+//! `tracing_subscriber` init in the tree and it was called from `rest::router`, which is built
+//! only in the Connect server bootstrap. A standalone `oxidant worker --port …` therefore
+//! installed no subscriber at all and would get no durable log — and worker OOMs are exactly
+//! what operators dig for. So the whole init (the [`LogBuffer`] ring, the rolling writer, and
+//! the stderr fmt layer) is hoisted here into [`init`], which both the Connect server bootstrap
+//! and `run_worker` call.
+//!
+//! **Collection stays per-node.** Every node writes its own `logs/` under its own root (§3c);
+//! the driver does not ingest worker logs. PR4 federates *reads* over them, which is the same
+//! statement from the other side. Statement history remains driver-scoped — workers run no
+//! statements.
+//!
+//! What lives where:
+//!
+//! - [`naming`] — UTC names, the `?file=` grammar, ISO weeks, `.N` size splits;
+//! - [`line`] — one event's three forms (live tail string, text line, Parquet row);
+//! - [`writer`] — the live file, the two roll triggers, dedup, and the converter thread;
+//! - [`columnar`] — text → zstd Parquet, and reading either form back.
+
+mod columnar;
+mod line;
+mod naming;
+mod writer;
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+use tracing::Subscriber;
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::Layer;
+
+pub use naming::{LogPeriod, LogRoll};
+/// `oxidant-<period>[.N].<ext>` → its parts, or `None` for anything this writer did not produce
+/// (the live `oxidant.log` included). The disk sweeper reads it to answer "what period does this
+/// file cover" and "is this mine to delete".
+pub(crate) use naming::parse_file_name as parse_rolled_name;
+pub(crate) use writer::RollingWriter;
+
+use crate::history::HistoryConfig;
+use line::{LogLine, TS_FORMAT};
+
+/// Max retained log lines served by `GET /api/v1/logs` with no `?file=`.
+pub(crate) const MAX_LOG_LINES: usize = 1000;
+
+/// In-memory ring buffer of recent log lines shared by the tracing layer and the logs endpoint.
+///
+/// **Not** deduped: dedup applies to the *file* (§6). The same window can therefore read
+/// differently through the ring and through `?file=current`, and the file is authoritative —
+/// which is why the `?file=` envelope carries `dedup` and the ring's does not.
+#[derive(Clone)]
+pub struct LogBuffer {
+    inner: Arc<Mutex<Vec<String>>>,
+    cap: usize,
+}
+
+impl LogBuffer {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Vec::with_capacity(cap))),
+            cap,
+        }
+    }
+
+    fn push(&self, line: String) {
+        let mut inner = self.inner.lock().expect("log buffer poisoned");
+        if inner.len() >= self.cap {
+            inner.remove(0);
+        }
+        inner.push(line);
+    }
+
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.inner.lock().expect("log buffer poisoned").clone()
+    }
+}
+
+/// The one `tracing` layer both sinks hang off.
+///
+/// The rolling writer is a layer **in its own right**, not a re-serializer of [`LogBuffer`]
+/// strings: it taps `tracing` directly and keeps the level, target and fields apart, which is
+/// what gives the Parquet its columns. Both sinks read the same [`LogLine`], so the live tail
+/// and the file cannot drift on anything but dedup.
+struct Capture {
+    buffer: LogBuffer,
+    file: Option<Arc<RollingWriter>>,
+}
+
+impl<S: Subscriber> Layer<S> for Capture {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let line = format_event(event);
+        self.buffer.push(line.render());
+        if let Some(file) = &self.file {
+            file.write(line);
+        }
+    }
+}
+
+/// Decompose a `tracing` event into [`LogLine`]'s columns, timestamped in UTC.
+fn format_event(event: &tracing::Event<'_>) -> LogLine {
+    let mut visitor = LogVisitor(String::new());
+    event.record(&mut visitor);
+    let meta = event.metadata();
+    LogLine {
+        ts: chrono::Utc::now().format(TS_FORMAT).to_string(),
+        level: meta.level().as_str(),
+        target: meta.target().to_string(),
+        fields: visitor.0,
+    }
+}
+
+struct LogVisitor(String);
+
+impl LogVisitor {
+    fn push_field(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Display) {
+        if !self.0.is_empty() {
+            self.0.push_str(", ");
+        }
+        self.0.push_str(field.name());
+        self.0.push('=');
+        self.0.push_str(&value.to_string());
+    }
+}
+
+impl tracing::field::Visit for LogVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.push_field(field, &format!("{:?}", value));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.push_field(field, &format!("{:?}", value));
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.push_field(field, &value);
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.push_field(field, &value);
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.push_field(field, &value);
+    }
+
+    fn record_error(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &(dyn std::error::Error + 'static),
+    ) {
+        self.push_field(field, &value);
+    }
+}
+
+static LOG_BUFFER: OnceLock<LogBuffer> = OnceLock::new();
+static ROLLING: OnceLock<Option<Arc<RollingWriter>>> = OnceLock::new();
+
+/// The disk sweep a roll triggers (§3). Published by the statement store at boot rather than
+/// reached from here: only the store knows which statements are still running, and the writer
+/// exists before the store does.
+type SweepHook = Box<dyn Fn() + Send + Sync>;
+static SWEEP_HOOK: RwLock<Option<SweepHook>> = RwLock::new(None);
+
+/// Install the roll-time disk sweep. **Last writer wins**, for the same reason
+/// `set_history_status_source` is: a `OnceLock` here would let the first store booted in a test
+/// process own the hook after it had been dropped.
+pub(crate) fn set_sweep_hook(hook: impl Fn() + Send + Sync + 'static) {
+    if let Ok(mut slot) = SWEEP_HOOK.write() {
+        *slot = Some(Box::new(hook));
+    }
+}
+
+/// Run the roll-time sweep, if one is installed.
+///
+/// Called only from the converter thread. The sweep logs, and a log line can roll — but a roll
+/// only *queues* another job on the converter's channel, so this never re-enters itself and the
+/// read guard cannot be taken recursively.
+fn run_sweep_hook() {
+    if let Ok(slot) = SWEEP_HOOK.read() {
+        if let Some(hook) = slot.as_ref() {
+            hook();
+        }
+    }
+}
+
+/// Initialize process-wide log capture: the in-memory ring, the rolling file writer, and a
+/// compact stderr `tracing` subscriber. **Idempotent** — the first call in a process wins and
+/// later ones are ignored, so the Connect bootstrap's `init("driver", port)` beats
+/// `rest::router`'s fallback.
+///
+/// `role`/`port` are what `OXIDANT_DATA_DIR_PER_PROCESS=1` derives `<root>/<role>-<port>/` from,
+/// so a driver and a co-located worker write to distinct trees. **Deviation from §6c**, which
+/// spells this `init(role)`: without the port, two processes sharing a root would derive
+/// `<root>/driver/` and `<root>/worker/` for their logs while the journal derives
+/// `<role>-<port>`, and one process's logs and its statement history would land in two
+/// different trees.
+///
+/// Never fails the caller. A misconfigured root (an object-store URL) is reported on stderr and
+/// leaves the process with today's behaviour — stderr plus the ring buffer — because the *same*
+/// misconfiguration fails the boot loudly a moment later in `init_statement_store`, and taking
+/// the logger down first would hide that message.
+pub fn init(role: &str, port: u16) {
+    let buffer = LOG_BUFFER
+        .get_or_init(|| LogBuffer::new(MAX_LOG_LINES))
+        .clone();
+    let file = ROLLING.get_or_init(|| open_writer(role, port)).clone();
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::INFO)
+        .finish()
+        .with(Capture {
+            buffer,
+            file: file.clone(),
+        })
+        .try_init();
+    // First line of the process's own log, and the one an operator greps for when `?file=`
+    // answers 404: where the files are and which boundary closes them.
+    if let Some(writer) = file {
+        tracing::info!(
+            role,
+            dir = %writer.dir().display(),
+            roll = writer.roll().as_str(),
+            dedup = writer.dedup_enabled(),
+            "rolling exec log open"
+        );
+    }
+}
+
+fn open_writer(role: &str, port: u16) -> Option<Arc<RollingWriter>> {
+    let cfg = match HistoryConfig::from_env(role, port) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("oxidant: rolling exec logs are disabled: {e}");
+            return None;
+        }
+    };
+    // `OXIDANT_HISTORY=off` promises that nothing is written under the data dir; rolled exec
+    // logs are the largest thing that would be. `OXIDANT_LOG_ROLL=off` turns the file writer off
+    // on its own, for an operator who wants durable statement history and stderr-only logs.
+    if !cfg.enabled || cfg.log_roll == LogRoll::Off {
+        return None;
+    }
+    let wcfg = writer::WriterConfig {
+        dir: cfg.logs_dir.clone(),
+        roll: cfg.log_roll,
+        max_file_bytes: cfg.log_max_file_bytes,
+        parquet: cfg.log_parquet,
+        dedup: cfg.log_dedup,
+        headroom: writer::Headroom {
+            roots: crate::history::disk::budget_roots(&cfg),
+            max_bytes: cfg.disk_max_bytes,
+            min_free_bytes: cfg.disk_min_free_bytes,
+            reserve_bytes: cfg.log_max_file_bytes,
+            mounts: cfg.mounts_override(),
+        },
+    };
+    match RollingWriter::open(wcfg) {
+        Ok(writer) => Some(writer),
+        Err(e) => {
+            eprintln!("oxidant: rolling exec logs are disabled: {e}");
+            None
+        }
+    }
+}
+
+/// The process's log ring, creating it if [`init`] has not run (an embedded caller building the
+/// REST router directly).
+pub(crate) fn buffer() -> LogBuffer {
+    LOG_BUFFER
+        .get_or_init(|| LogBuffer::new(MAX_LOG_LINES))
+        .clone()
+}
+
+/// The process's rolling writer, if one is installed.
+pub(crate) fn rolling() -> Option<Arc<RollingWriter>> {
+    ROLLING.get().cloned().flatten()
+}
+
+/// What `GET /api/v1/logs` needs to answer a `?file=`: where the files are, and whether the file
+/// it serves was deduped.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LogView {
+    pub dir: Option<PathBuf>,
+    pub dedup: bool,
+}
+
+impl LogView {
+    /// The view over this process's own rolling writer. `dir: None` — no writer — makes every
+    /// `?file=` answer `404`, which is the honest answer: there are no files.
+    pub(crate) fn process() -> Self {
+        match rolling() {
+            Some(w) => Self {
+                dir: Some(w.dir().to_path_buf()),
+                dedup: w.dedup_enabled(),
+            },
+            None => Self::default(),
+        }
+    }
+}
+
+/// One rolled (or live) log file, resolved from a `?file=` value.
+pub(crate) enum LogFile {
+    Text(PathBuf),
+    Parquet(PathBuf),
+}
+
+impl LogFile {
+    pub(crate) fn format(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "text",
+            Self::Parquet(_) => "parquet",
+        }
+    }
+
+    pub(crate) fn read(&self) -> Result<Vec<String>, String> {
+        match self {
+            Self::Text(p) => columnar::read_text_lines(p),
+            Self::Parquet(p) => columnar::read_lines(p),
+        }
+    }
+}
+
+/// Resolve a validated `?file=` period to the file on disk.
+///
+/// **The extension is the server's choice, never the caller's** (§6): `.parquet` if it exists,
+/// else `.log`, else `None` → `404`. That is §6's conversion state machine read from the
+/// outside, so a caller never has to know whether yesterday has been converted yet.
+pub(crate) fn resolve(dir: &Path, period: LogPeriod, split: u32) -> Option<LogFile> {
+    let parquet = dir.join(period.file_name(split, "parquet"));
+    if parquet.is_file() {
+        return Some(LogFile::Parquet(parquet));
+    }
+    let text = dir.join(period.file_name(split, "log"));
+    if text.is_file() {
+        return Some(LogFile::Text(text));
+    }
+    None
+}
+
+/// The live `oxidant.log`, or `None` if it does not exist yet.
+pub(crate) fn resolve_current(dir: &Path) -> Option<LogFile> {
+    let live = dir.join(crate::history::disk::LIVE_LOG);
+    live.is_file().then_some(LogFile::Text(live))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live tail's strings now carry the RFC-3339 UTC prefix that gives the Parquet its
+    /// `ts` column — an announced change in what `GET /api/v1/logs` returns (§8).
+    #[test]
+    fn rendered_lines_lead_with_a_utc_timestamp() {
+        let buffer = LogBuffer::new(8);
+        let layer = Capture {
+            buffer: buffer.clone(),
+            file: None,
+        };
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::info!(rows = 7, "stage done")
+        });
+        let lines = buffer.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let parsed = line::parse_line(&lines[0]);
+        assert!(parsed.ts_ms.is_some(), "no usable ts in {:?}", lines[0]);
+        assert_eq!(parsed.level.as_deref(), Some("INFO"));
+        assert_eq!(parsed.message.as_deref(), Some("stage done"));
+        assert_eq!(parsed.fields_json.as_deref(), Some(r#"{"rows":"7"}"#));
+    }
+
+    /// The rolling writer is a layer in its own right: the same event reaches the file with its
+    /// level and target intact, not as a re-serialized ring-buffer string.
+    #[test]
+    fn one_event_reaches_both_the_ring_and_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = RollingWriter::open(writer::WriterConfig {
+            dir: dir.path().to_path_buf(),
+            roll: LogRoll::Daily,
+            max_file_bytes: u64::MAX,
+            parquet: false,
+            dedup: false,
+            headroom: writer::Headroom {
+                roots: vec![dir.path().to_path_buf()],
+                max_bytes: u64::MAX,
+                min_free_bytes: 0,
+                reserve_bytes: 0,
+                mounts: Some(Vec::new()),
+            },
+        })
+        .expect("writer");
+        let buffer = LogBuffer::new(8);
+        let layer = Capture {
+            buffer: buffer.clone(),
+            file: Some(Arc::clone(&writer)),
+        };
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::warn!(slot = 3, "pool exhausted")
+        });
+        writer.shutdown();
+        let body = std::fs::read_to_string(dir.path().join(crate::history::disk::LIVE_LOG))
+            .expect("live file");
+        assert_eq!(body.lines().count(), 1, "{body}");
+        assert!(body.contains("[WARN]"), "{body}");
+        assert!(body.contains("message=pool exhausted"), "{body}");
+        assert!(body.contains("slot=3"), "{body}");
+        assert_eq!(
+            buffer.lines(),
+            vec![body.trim_end().to_string()],
+            "the ring and the file hold the same line"
+        );
+    }
+
+    /// The ring is a ring: the cap holds and the oldest line goes.
+    #[test]
+    fn the_ring_buffer_keeps_the_newest_lines() {
+        let buffer = LogBuffer::new(2);
+        for i in 0..5 {
+            buffer.push(format!("line {i}"));
+        }
+        assert_eq!(buffer.lines(), vec!["line 3", "line 4"]);
+    }
+
+    /// The server picks the extension, and `404` is the answer for a period with no file.
+    #[test]
+    fn resolution_prefers_parquet_then_text_then_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (period, split) = LogPeriod::parse("2026-08-23").expect("grammar");
+        assert!(resolve(dir.path(), period, split).is_none(), "404");
+
+        std::fs::write(dir.path().join("oxidant-2026-08-23.log"), b"x").expect("write");
+        assert!(matches!(
+            resolve(dir.path(), period, split),
+            Some(LogFile::Text(_))
+        ));
+
+        std::fs::write(dir.path().join("oxidant-2026-08-23.parquet"), b"x").expect("write");
+        assert!(
+            matches!(resolve(dir.path(), period, split), Some(LogFile::Parquet(_))),
+            "a converted file wins over the text one still awaiting its unlink"
+        );
+    }
+
+    /// A roll triggers the disk sweep §3 promises ("at roll time, at boot, and every 5
+    /// minutes"). Driven through the writer's own hook rather than the process-global one, which
+    /// any sibling test booting a statement store would otherwise swap out mid-assertion.
+    #[test]
+    fn a_roll_runs_the_disk_sweep_hook() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let writer = RollingWriter::open_with_hook(
+            writer::WriterConfig {
+                dir: dir.path().to_path_buf(),
+                roll: LogRoll::Daily,
+                max_file_bytes: u64::MAX,
+                parquet: false,
+                dedup: false,
+                headroom: writer::Headroom {
+                    roots: vec![dir.path().to_path_buf()],
+                    max_bytes: u64::MAX,
+                    min_free_bytes: 0,
+                    reserve_bytes: 0,
+                    mounts: Some(Vec::new()),
+                },
+            },
+            move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .expect("writer");
+        writer.roll_now(chrono::Utc::now());
+        // The hook runs on the converter thread; shutdown drains the queue and joins it.
+        writer.shutdown();
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "§3: the sweeper runs at boot and at roll time — one of each here"
+        );
+    }
+}

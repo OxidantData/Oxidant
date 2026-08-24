@@ -840,6 +840,16 @@ impl AppStateStore {
     }
 
     /// Load events from a JSONL event log directory (history server).
+    ///
+    /// Reads the **rolled** `events-<UTC-period>[.N].jsonl` files first, oldest name first, and
+    /// the live `events.jsonl` last. `OXIDANT_EVENT_LOG_MAX_BYTES` (default 2 GiB) rolls the
+    /// live file rather than deleting it (`docs/query-history-durability.md` §8, F16), and a
+    /// history server that read only `events.jsonl` would report a cluster's history as starting
+    /// at the last roll — which is precisely the data loss the roll exists to avoid.
+    ///
+    /// The names sort lexicographically into chronological order within a roll mode, which is
+    /// what makes `sort()` the right replay order here; the fold is per-event and idempotent
+    /// either way.
     pub fn load_event_log(dir: &std::path::Path) -> Self {
         let store = Self::with_options(
             "oxidant-history",
@@ -847,8 +857,23 @@ impl AppStateStore {
             None,
             DEFAULT_MAX_QUERIES,
         );
-        let path = dir.join("events.jsonl");
-        if let Ok(content) = fs::read_to_string(path) {
+        let mut rolled: Vec<PathBuf> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("events-") && n.ends_with(".jsonl"))
+            })
+            .map(|e| e.path())
+            .collect();
+        rolled.sort();
+        rolled.push(dir.join("events.jsonl"));
+        for path in rolled {
+            let Ok(content) = fs::read_to_string(path) else {
+                continue;
+            };
             for line in content.lines() {
                 if let Ok(event) = serde_json::from_str::<ExecutionEvent>(line) {
                     store.apply_event(&event);

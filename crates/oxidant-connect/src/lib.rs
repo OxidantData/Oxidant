@@ -39,6 +39,7 @@ use sc::spark_connect_service_server::{SparkConnectService, SparkConnectServiceS
 mod catalog;
 mod distributed;
 mod history;
+pub mod logging;
 mod pipelines;
 pub mod rest;
 mod streaming;
@@ -2365,6 +2366,12 @@ fn strict_refusal_message(plan_build_error: Option<&Error>) -> String {
 
 /// Start the Spark Connect server and serve until the process is killed.
 pub async fn serve(config: ServerConfig) -> Result<()> {
+    // Process-level logging first, before anything can log: the ring buffer, the rolling exec
+    // log under `logs/`, and the stderr subscriber. `oxidant worker` calls the same function
+    // with its own role/port — that is the whole point of hoisting it out of `rest::router`
+    // (§6c), which a standalone worker never builds.
+    logging::init("driver", config.port);
+
     // Refuse to boot on a `spark.sql.defaultCatalog` that names nothing declared: the failure is
     // otherwise silent (unqualified names keep resolving against `spark_catalog`) and the whole
     // startup config is in hand here, so the typo can be named exactly. See

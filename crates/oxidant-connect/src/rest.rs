@@ -45,11 +45,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sysinfo::{Pid, System};
 use tokio::sync::{watch, Notify};
-use tracing::Subscriber;
-use tracing_subscriber::layer::Context;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::Layer;
 use uuid::Uuid;
+
+#[cfg(test)]
+use crate::logging::MAX_LOG_LINES;
+use crate::logging::{LogBuffer, LogView};
 
 use crate::history::{
     disk, now_rfc3339, rfc3339_from_ms, FoldedStatement, HistoryConfig, HistoryRuntime,
@@ -69,114 +69,8 @@ const LIST_CAP: usize = 100;
 const DEFAULT_RESULT_LIMIT: usize = 10_000;
 /// Default `?wait=true` blocking timeout (seconds).
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 30;
-/// Max retained log lines served by `GET /api/v1/logs`.
-const MAX_LOG_LINES: usize = 1000;
 /// Minimum wall-clock gap between two full retention passes over the history tier.
 const SWEEP_INTERVAL_MS: i64 = 60_000;
-
-/// In-memory ring buffer of recent log lines shared by the tracing layer and the logs endpoint.
-#[derive(Clone)]
-pub struct LogBuffer {
-    inner: Arc<Mutex<Vec<String>>>,
-    cap: usize,
-}
-
-impl LogBuffer {
-    fn new(cap: usize) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Vec::with_capacity(cap))),
-            cap,
-        }
-    }
-
-    fn push(&self, line: String) {
-        let mut inner = self.inner.lock().expect("log buffer poisoned");
-        if inner.len() >= self.cap {
-            inner.remove(0);
-        }
-        inner.push(line);
-    }
-
-    fn lines(&self) -> Vec<String> {
-        self.inner.lock().expect("log buffer poisoned").clone()
-    }
-}
-
-impl<S: Subscriber> Layer<S> for LogBuffer {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        self.push(format_event(event));
-    }
-}
-
-fn format_event(event: &tracing::Event<'_>) -> String {
-    let mut visitor = LogVisitor(String::new());
-    event.record(&mut visitor);
-    let meta = event.metadata();
-    if visitor.0.is_empty() {
-        format!("[{}] {}", meta.level(), meta.target())
-    } else {
-        format!("[{}] {} - {}", meta.level(), meta.target(), visitor.0)
-    }
-}
-
-struct LogVisitor(String);
-
-impl LogVisitor {
-    fn push_field(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Display) {
-        if !self.0.is_empty() {
-            self.0.push_str(", ");
-        }
-        self.0.push_str(field.name());
-        self.0.push('=');
-        self.0.push_str(&value.to_string());
-    }
-}
-
-impl tracing::field::Visit for LogVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.push_field(field, &format!("{:?}", value));
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.push_field(field, &format!("{:?}", value));
-    }
-
-    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.push_field(field, &value);
-    }
-
-    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.push_field(field, &value);
-    }
-
-    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        self.push_field(field, &value);
-    }
-
-    fn record_error(
-        &mut self,
-        field: &tracing::field::Field,
-        value: &(dyn std::error::Error + 'static),
-    ) {
-        self.push_field(field, &value);
-    }
-}
-
-static LOG_BUFFER: OnceLock<LogBuffer> = OnceLock::new();
-
-/// Initialize process-wide log capture into an in-memory ring buffer and a compact
-/// `tracing` fmt subscriber. Idempotent: subsequent calls are ignored.
-pub fn init_logging() {
-    let buffer = LOG_BUFFER
-        .get_or_init(|| LogBuffer::new(MAX_LOG_LINES))
-        .clone();
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::INFO)
-        .finish()
-        .with(buffer)
-        .try_init();
-}
 
 /// Cached sysinfo `System` for process metrics. Kept in a `Mutex` so successive
 /// `refresh_process_specifics` calls can compute a meaningful CPU percentage.
@@ -665,8 +559,9 @@ impl StatementStore {
         };
         store.install_spill_sink();
         store.publish_status_counters();
+        store.install_roll_sweep_hook();
         store.sweep_history();
-        // §3: the sweeper runs at boot and every 5 minutes.
+        // §3: the sweeper runs at boot, at roll time, and every 5 minutes.
         store.sweep_disk();
         store.spawn_disk_sweeper();
         tracing::info!(
@@ -681,6 +576,41 @@ impl StatementStore {
             "statement history replayed"
         );
         Ok(store)
+    }
+
+    /// Teach the rolling log writer to sweep the disk when it rolls (§3: "The sweeper runs at
+    /// roll time, at boot, and every 5 minutes").
+    ///
+    /// A roll is the one moment the engine's own footprint jumps by a whole file, and it is also
+    /// the moment `OXIDANT_LOG_KEEP_DAYS` has a new file to consider — waiting up to five
+    /// minutes for the timer would let a chatty size-rolling driver run several files past its
+    /// budget.
+    ///
+    /// [`std::sync::Weak`], like the spill sink and the sweeper thread: the hook lives in a
+    /// process-global for the writer's whole life, and a strong reference would keep a test's
+    /// store — and its data-dir lock — alive past the end of the test.
+    fn install_roll_sweep_hook(&self) {
+        let Some(history) = self.history.as_ref() else {
+            return;
+        };
+        let inner = Arc::downgrade(&self.inner);
+        let history = Arc::downgrade(history);
+        let notify = Arc::downgrade(&self.notify);
+        let disk = Arc::clone(&self.disk);
+        crate::logging::set_sweep_hook(move || {
+            let (Some(inner), Some(history), Some(notify)) =
+                (inner.upgrade(), history.upgrade(), notify.upgrade())
+            else {
+                return;
+            };
+            StatementStore {
+                inner,
+                notify,
+                history: Some(history),
+                disk: Arc::clone(&disk),
+            }
+            .sweep_disk();
+        });
     }
 
     /// Teach the spill thread how to report back into the store.
@@ -1508,12 +1438,30 @@ impl StatementStore {
         history.results.drain_blocking();
 
         let cfg = &history.cfg;
-        let roots = budget_roots(cfg);
+        let roots = disk::budget_roots(cfg);
         let measure = |roots: &[std::path::PathBuf]| -> u64 {
             roots.iter().map(|r| disk::subtree_bytes(r)).sum()
         };
 
         let mut report = disk::SweepReport::default();
+        // Retention runs before the budget, and unconditionally: `OXIDANT_LOG_KEEP_DAYS` and
+        // `OXIDANT_LOG_MAX_TOTAL_BYTES` are the `logs/` subtree's own contract, and
+        // `OXIDANT_EVENT_LOG_MAX_BYTES` is `event_log_dir`'s. Both must hold whether or not the
+        // global budget is tight — a driver far under 8 GiB still may not keep 90 days of logs.
+        let now = chrono::Utc::now();
+        let logs = disk::prune_expired_logs(
+            &cfg.logs_dir,
+            cfg.log_keep_days,
+            cfg.log_max_total_bytes,
+            now,
+        );
+        report.logs_expired = logs.expired;
+        report.logs_over_cap = logs.over_cap;
+        if let Some(dir) = &cfg.event_log_dir {
+            let events = disk::roll_event_log(dir, cfg.event_log_max_bytes, cfg.log_roll, now);
+            report.event_logs_pruned = events.pruned;
+            report.event_log_rolled = events.rolled;
+        }
         let before = measure(&roots);
         // The running total, decremented by what each unlink reports. The whole tree used to be
         // re-walked *per candidate* — pruning 10,000 statements meant 10,000 full recursive
@@ -1613,6 +1561,10 @@ impl StatementStore {
                 free_bytes = report.free_bytes,
                 min_free_bytes = cfg.disk_min_free_bytes,
                 rolled_logs = report.rolled_logs_removed,
+                logs_expired = report.logs_expired,
+                logs_over_cap = report.logs_over_cap,
+                event_logs_pruned = report.event_logs_pruned,
+                event_log_rolled = report.event_log_rolled,
                 dumps = report.dumps_removed,
                 orphan_results = report.orphan_results_removed,
                 statements = report.statements_pruned,
@@ -1925,40 +1877,6 @@ pub(crate) struct DiskHealth {
     low_free: std::sync::atomic::AtomicBool,
 }
 
-/// The distinct subtrees the disk budget covers, deduped so nothing is billed twice.
-///
-/// `OXIDANT_HISTORY_DIR` / `OXIDANT_RESULT_DIR` / `OXIDANT_LOG_DIR` / `OXIDANT_DUMP_DIR` each win
-/// over the root and may point *outside* it, and §3 says an overridden subtree is still counted
-/// against the budget — so the candidates are measured as a set, with any path already contained
-/// in a shallower one dropped.
-///
-/// `event_log_dir` is deliberately absent: §8/F16 brings it under the budget by *rolling*
-/// `events.jsonl`, and that writer is PR3. Counting it here without being able to prune it would
-/// pin `disk: over_budget` on for anyone with a large Spark-history-server directory.
-fn budget_roots(cfg: &HistoryConfig) -> Vec<std::path::PathBuf> {
-    let history_dir = cfg
-        .statements_dir
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| cfg.statements_dir.clone());
-    let mut candidates = vec![
-        cfg.root.clone(),
-        history_dir,
-        cfg.results_dir.clone(),
-        cfg.logs_dir.clone(),
-        cfg.dumps_dir.clone(),
-    ];
-    candidates.sort_by_key(|p| p.components().count());
-    let mut kept: Vec<std::path::PathBuf> = Vec::new();
-    for candidate in candidates {
-        if kept.iter().any(|k| candidate.starts_with(k)) {
-            continue;
-        }
-        kept.push(candidate);
-    }
-    kept
-}
-
 /// What a set of retained batches costs the store's in-memory result budget.
 ///
 /// `get_array_memory_size` over-counts buffers two batches share, so this is an upper bound. That
@@ -2096,6 +2014,9 @@ struct RestState {
     service: Arc<OxidantService>,
     store: StatementStore,
     log_buffer: LogBuffer,
+    /// Where the rolled exec logs are, for `GET /api/v1/logs?file=`. `dir: None` — no rolling
+    /// writer in this process — makes every `?file=` answer `404`.
+    logs: LogView,
     /// Shared bearer token guarding `GET /api/v1/logs`. `None` — the default — makes that one
     /// route answer `404`; nothing else in this router is authenticated.
     status_token: Option<Arc<str>>,
@@ -2103,10 +2024,11 @@ struct RestState {
 
 /// Build the REST statement-execution router around a shared Spark Connect service.
 pub fn router(service: Arc<OxidantService>) -> Router {
-    init_logging();
-    let log_buffer = LOG_BUFFER
-        .get_or_init(|| LogBuffer::new(MAX_LOG_LINES))
-        .clone();
+    // Fallback for an embedded caller that builds this router directly: the Connect bootstrap
+    // and `run_worker` both call `logging::init(role, port)` first, and it is idempotent, so
+    // this only ever wins when nothing else initialized the process's logging.
+    crate::logging::init("driver", 0);
+    let log_buffer = crate::logging::buffer();
     // The statement store is attached to the service at boot ([`init_statement_store`]) so the
     // Connect path writes into the same history this router reads. A service that never had one
     // attached (an embedded caller building the router directly) gets today's volatile store.
@@ -2118,6 +2040,7 @@ pub fn router(service: Arc<OxidantService>) -> Router {
         service,
         store,
         log_buffer,
+        logs: LogView::process(),
         status_token: oxidant_ui_server::status::status_token_from_env().map(Into::into),
     })
 }
@@ -2734,18 +2657,95 @@ fn process_metrics() -> (Option<u64>, Option<u64>, Option<f32>) {
         .unwrap_or((None, None, None))
 }
 
-/// `GET /api/v1/logs` — the driver's `tracing` ring buffer, for the monitoring UI's
-/// Observability page.
+/// `?file=` on `GET /api/v1/logs` (§6).
+#[derive(Debug, Deserialize)]
+struct LogsParams {
+    /// `current`, or a `LogPeriod` in §6's grammar with an optional `.N` split. Absent keeps
+    /// today's answer: the in-memory ring.
+    file: Option<String>,
+}
+
+/// `GET /api/v1/logs` — the node's own exec log, for the monitoring UI's Observability page.
 ///
-/// Gated by the same shared token as `/api/status`, through the same code: this is the
-/// driver's own log, not monitoring decoration.
-async fn list_logs(State(state): State<RestState>, headers: header::HeaderMap) -> Response {
+/// Three answers, one route:
+///
+/// - no `?file=` — today's shape, `{"logs": [...]}` from the in-memory ring, **unchanged**
+///   except that each line now leads with an RFC-3339 UTC timestamp (§6);
+/// - `?file=current` — the live `oxidant.log` on disk;
+/// - `?file=<period>[.N]` — one rolled file, served from its `.parquet` if it has been
+///   converted and from its `.log` if it has not. The caller never names an extension: which
+///   one exists is §6's conversion state machine, not the caller's business.
+///
+/// Gated by the same shared token as `/api/status`, through the same code — restated here
+/// because it now matters more. The endpoint used to expose 1000 lines of ring buffer; it now
+/// exposes up to `OXIDANT_LOG_KEEP_DAYS` of every enabled `tracing` field value, and this router
+/// is served under a permissive CORS layer. Unset `OXIDANT_STATUS_TOKEN`, `404`: the route does
+/// not exist, exactly like `/api/status`.
+async fn list_logs(
+    State(state): State<RestState>,
+    Query(params): Query<LogsParams>,
+    headers: header::HeaderMap,
+) -> Response {
     if let Some(denied) =
         oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), &headers)
     {
         return denied;
     }
-    Json(json!({ "logs": state.log_buffer.lines() })).into_response()
+    let Some(requested) = params.file else {
+        // The ring is not deduped — dedup applies to the *file* (§6) — and this envelope
+        // deliberately keeps the exact shape it had before `?file=` existed.
+        return Json(json!({ "logs": state.log_buffer.lines() })).into_response();
+    };
+    let Some(dir) = state.logs.dir.as_deref() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "no rolled exec logs on this node (OXIDANT_LOG_ROLL=off, or OXIDANT_HISTORY=off)",
+        );
+    };
+    let (file, label) = if requested == "current" {
+        (crate::logging::resolve_current(dir), "current".to_string())
+    } else {
+        // Parsed into a typed `LogPeriod` and the filename *reconstructed* from it — never
+        // string-joined into a path. `..`, `/`, an extension and an absolute path all fail the
+        // grammar by construction, so no traversal shape ever reaches the join (§6, F12).
+        let Some((period, split)) = crate::logging::LogPeriod::parse(&requested) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid file: expected `current`, `YYYY-MM-DD`, `YYYY-MM-DD-HH` or `YYYY-Www`, \
+                 each with an optional `.N` split (2..999) and no extension",
+            );
+        };
+        // The label echoes what the caller asked for, in the grammar's own spelling — no
+        // extension, because the caller does not choose one.
+        (crate::logging::resolve(dir, period, split), {
+            let stem = period.stem();
+            if split <= 1 {
+                stem
+            } else {
+                format!("{stem}.{split}")
+            }
+        })
+    };
+    let Some(file) = file else {
+        return error_response(StatusCode::NOT_FOUND, "log file not found");
+    };
+    let format = file.format();
+    match file.read() {
+        Ok(logs) => Json(json!({
+            "file": label,
+            "format": format,
+            // The file is authoritative and it *is* deduped when the knob is on; the SSE tail
+            // PR4 adds marks itself `false`. Saying so in the envelope is what keeps an operator
+            // from reading a collapsed run as a gap (§6, F21).
+            "dedup": state.logs.dedup,
+            "logs": logs,
+        }))
+        .into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not read the log file: {e}"),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -2780,6 +2780,7 @@ mod tests {
             service: Arc::new(service),
             store: StatementStore::new(),
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         };
         (guard, state.clone(), app(state))
@@ -2799,6 +2800,7 @@ mod tests {
             service: Arc::new(OxidantService::new()),
             store: StatementStore::new(),
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         };
         (guard, state.clone(), app(state))
@@ -3411,6 +3413,7 @@ mod tests {
             service: Arc::clone(&service),
             store: service.statement_store().expect("attached").clone(),
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         };
         let (status, body) = get_json(&app(state), "/api/v1/statements").await;
@@ -3695,6 +3698,7 @@ mod tests {
             service: Arc::new(OxidantService::new()),
             store,
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         };
         let router = app(state);
@@ -3770,6 +3774,7 @@ mod tests {
             service: Arc::clone(&service),
             store,
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         };
         let router = app(state);
@@ -3981,6 +3986,7 @@ mod tests {
             service: Arc::new(OxidantService::new()),
             store,
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         }
     }

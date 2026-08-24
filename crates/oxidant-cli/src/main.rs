@@ -397,6 +397,11 @@ async fn run_worker(
     let port: u16 = flag(args, "--port")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| oxidant_common::Error::Io("worker requires --port".into()))?;
+    // A standalone worker builds no REST router, so before this it installed no `tracing`
+    // subscriber at all and its logs went nowhere — and worker OOMs are exactly what operators
+    // dig for (docs/query-history-durability.md §6c). Every node writes its own `logs/` under
+    // its own root; the driver federates *reads* over them (PR4) rather than ingesting them.
+    oxidant_connect::logging::init("worker", port);
     // Same catalog bootstrap as `oxidant spark server` so Glue/Hive tables resolve on workers.
     // Workers must see the same catalogs as the driver, or a distributed stage cannot resolve
     // the tables its plan references. Same precedence as the server: file first, flags on top.

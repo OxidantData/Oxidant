@@ -37,11 +37,23 @@
 //! `oxidant.log`), `dump-*.parquet` / `oxidant-*.parquet`, and `stmt-*.arrow` /
 //! `stmt-*.arrow.tmp`.
 //!
-//! PR2 writes nothing under `logs/` — the rolling writer is PR3 — but steps 1 and 2 are
-//! implemented and tested now, because the order is the contract and a sweeper that learns half
-//! of it later is a sweeper that prunes results while rolled logs sit on the disk.
+//! **Before any of that**, two subtree-local passes run unconditionally, because they are
+//! retention rather than pressure and they must happen whether or not the global budget is
+//! tight (§3, §6, §8):
+//!
+//! - [`prune_expired_logs`] deletes rolled logs whose **whole period** is older than
+//!   `OXIDANT_LOG_KEEP_DAYS`, and then trims the `logs/` subtree to `OXIDANT_LOG_MAX_TOTAL_BYTES`
+//!   oldest-first;
+//! - [`roll_event_log`] brings `event_log_dir` under the budget the way F16 asks for it — by
+//!   **rolling** `events.jsonl` to `events-<UTC-period>.jsonl` and pruning oldest-first, never by
+//!   deleting the live file other tools are reading.
 
 use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Utc};
+
+use super::config::HistoryConfig;
+use crate::logging::{LogPeriod, LogRoll};
 
 /// A file the sweeper may delete, with the mtime it is ordered by.
 #[derive(Debug, Clone)]
@@ -57,6 +69,16 @@ pub(crate) struct SweepReport {
     /// Bytes the engine owns under the root after the pass.
     pub used_bytes: u64,
     pub rolled_logs_removed: usize,
+    /// Rolled logs whose whole *period* fell out of `OXIDANT_LOG_KEEP_DAYS`. Retention, not
+    /// pressure: counted separately so a test can tell "the 30 days expired" from "the budget
+    /// was tight".
+    pub logs_expired: usize,
+    /// Rolled logs taken to bring `logs/` back under `OXIDANT_LOG_MAX_TOTAL_BYTES`.
+    pub logs_over_cap: usize,
+    /// Rolled `events-*.jsonl` files taken to hold `OXIDANT_EVENT_LOG_MAX_BYTES` (§8).
+    pub event_logs_pruned: usize,
+    /// The live `events.jsonl` was rolled this pass. Never deleted (§8, F16).
+    pub event_log_rolled: bool,
     pub dumps_removed: usize,
     pub orphan_results_removed: usize,
     pub statements_pruned: usize,
@@ -76,11 +98,15 @@ pub(crate) struct SweepReport {
 impl SweepReport {
     pub(crate) fn removed_anything(&self) -> bool {
         self.rolled_logs_removed
+            + self.logs_expired
+            + self.logs_over_cap
+            + self.event_logs_pruned
             + self.dumps_removed
             + self.orphan_results_removed
             + self.statements_pruned
             + self.live_results_removed
             > 0
+            || self.event_log_rolled
     }
 }
 
@@ -134,20 +160,39 @@ fn subtree_bytes_inner(dir: &Path) -> u64 {
     total
 }
 
-/// Is `name` a rolled exec log this engine wrote? `oxidant-<something>.log`, never the live
-/// `oxidant.log`.
+/// Is `name` a rolled exec log this engine wrote? `oxidant-<UTC-period>[.N].{log,parquet}`,
+/// never the live `oxidant.log`.
 ///
 /// `OXIDANT_LOG_DIR` is operator-set and validated only for `://`, so "every flat file in the
 /// directory except the live one" made `OXIDANT_LOG_DIR=/var/log` a command to delete other
 /// services' logs the first time the engine went over its disk budget. The sweeper unlinks files
-/// it can recognise as its own and nothing else.
+/// it can recognise as its own and nothing else — and as of PR3 "its own" is the *grammar*, not
+/// a prefix and a suffix, so `oxidant-something.log` no longer qualifies.
+///
+/// **Both extensions.** A rolled log spends most of its life as `.parquet`; matching only `.log`
+/// meant step 1 of the prune order silently skipped every converted file and the budget was paid
+/// for out of statement history instead.
 pub(crate) fn is_rolled_log(name: &str) -> bool {
-    name != LIVE_LOG && name.starts_with("oxidant-") && name.ends_with(".log")
+    if name == LIVE_LOG {
+        return false;
+    }
+    matches!(
+        crate::logging::parse_rolled_name(name),
+        Some((_, _, "log" | "parquet"))
+    )
 }
 
 /// Is `name` a support-bundle dump this engine wrote? `dump-*.parquet` (§6b), or the
 /// `oxidant-*.parquet` shape a bundle named after the process takes.
+///
+/// A name that parses as a rolled exec log is **not** a dump, even in the dump directory: with
+/// `OXIDANT_DUMP_DIR` and `OXIDANT_LOG_DIR` pointed at one path, both passes would otherwise
+/// select the same converted log and the second would log a failed-unlink warning for a file the
+/// first had already taken.
 pub(crate) fn is_dump(name: &str) -> bool {
+    if crate::logging::parse_rolled_name(name).is_some() {
+        return false;
+    }
     (name.starts_with("dump-") || name.starts_with("oxidant-")) && name.ends_with(".parquet")
 }
 
@@ -386,4 +431,254 @@ mod tests {
             "no mount match must be None, never 0 — 0 would read as a full volume"
         );
     }
+}
+
+/// The distinct subtrees the disk budget covers, deduped so nothing is billed twice.
+///
+/// `OXIDANT_HISTORY_DIR` / `OXIDANT_RESULT_DIR` / `OXIDANT_LOG_DIR` / `OXIDANT_DUMP_DIR` each win
+/// over the root and may point *outside* it, and §3 says an overridden subtree is still counted
+/// against the budget — so the candidates are measured as a set, with any path already contained
+/// in a shallower one dropped.
+///
+/// `event_log_dir` is in the set as of PR3 (§8/F16). PR2 left it out deliberately: F16's
+/// mechanism for it is a *roll*, the rolling writer was PR3, and counting a directory it could
+/// not prune would have pinned `disk: over_budget` on for every operator pointing
+/// `OXIDANT_EVENT_LOG_DIR` at a large Spark-history-server path. Now that [`roll_event_log`]
+/// exists, it counts.
+pub(crate) fn budget_roots(cfg: &HistoryConfig) -> Vec<PathBuf> {
+    let history_dir = cfg
+        .statements_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cfg.statements_dir.clone());
+    let mut candidates = vec![
+        cfg.root.clone(),
+        history_dir,
+        cfg.results_dir.clone(),
+        cfg.logs_dir.clone(),
+        cfg.dumps_dir.clone(),
+    ];
+    // Only when it is actually bounded: with `OXIDANT_EVENT_LOG_MAX_BYTES=0` the directory is
+    // unbounded by the operator's explicit choice, and billing an unprunable tree against the
+    // budget would make the sweeper delete statement history to pay for it.
+    if let (Some(dir), true) = (&cfg.event_log_dir, cfg.event_log_max_bytes > 0) {
+        candidates.push(dir.clone());
+    }
+    candidates.sort_by_key(|p| p.components().count());
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        if kept.iter().any(|k| candidate.starts_with(k)) {
+            continue;
+        }
+        kept.push(candidate);
+    }
+    kept
+}
+
+/// What one `logs/` retention pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct LogPruneReport {
+    /// Files whose whole period fell out of `OXIDANT_LOG_KEEP_DAYS`.
+    pub expired: usize,
+    /// Files taken to bring the subtree back under `OXIDANT_LOG_MAX_TOTAL_BYTES`.
+    pub over_cap: usize,
+    pub freed_bytes: u64,
+}
+
+/// Rolled logs and their converted siblings, oldest period first.
+///
+/// Ordered by **period**, not mtime: a rolled `.log` that failed to convert keeps being touched
+/// by retry passes, and ordering by mtime would make it look newer than the day after it.
+fn rolled_by_period(logs_dir: &Path) -> Vec<(LogPeriod, u32, Prunable)> {
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some((period, split, ext)) = crate::logging::parse_rolled_name(name) else {
+            continue;
+        };
+        if ext != "log" && ext != "parquet" {
+            continue;
+        }
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        out.push((
+            period,
+            split,
+            Prunable {
+                path: entry.path(),
+                bytes: meta.len(),
+                mtime: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+            },
+        ));
+    }
+    out.sort_by(|a, b| {
+        a.0.end()
+            .cmp(&b.0.end())
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.path.cmp(&b.2.path))
+    });
+    out
+}
+
+/// §3/§6 retention for `logs/`: period-based expiry, then the subtree cap.
+///
+/// `keep_days` is evaluated against the *period* a file covers, not its name parsed as a day:
+/// **a rolled file is deleted only when its whole period is older than `keep_days`.** Weekly
+/// therefore rounds up — a week file survives until its last day falls out of the window,
+/// retaining up to six extra days. That is the stated operator contract; deleting `W30` on day
+/// 30 would discard days that are inside retention.
+pub(crate) fn prune_expired_logs(
+    logs_dir: &Path,
+    keep_days: i64,
+    max_total_bytes: u64,
+    now: DateTime<Utc>,
+) -> LogPruneReport {
+    let mut report = LogPruneReport::default();
+    let mut files = rolled_by_period(logs_dir);
+    if keep_days > 0 {
+        let cutoff = now - chrono::Duration::days(keep_days);
+        files.retain(|(period, _, file)| {
+            // No parseable end means no evidence it expired; keep it and let the cap decide.
+            let expired = period.end().is_some_and(|end| end <= cutoff);
+            if expired {
+                if let Some(freed) = remove(file) {
+                    report.expired += 1;
+                    report.freed_bytes += freed;
+                    return false;
+                }
+            }
+            true
+        });
+    }
+    let mut total: u64 = files.iter().map(|(_, _, f)| f.bytes).sum();
+    for (_, _, file) in &files {
+        if total <= max_total_bytes {
+            break;
+        }
+        if let Some(freed) = remove(file) {
+            total = total.saturating_sub(freed);
+            report.over_cap += 1;
+            report.freed_bytes += freed;
+        }
+    }
+    report
+}
+
+/// The live Spark-history-server event log. Never deleted — it is rolled (§8, F16).
+pub(crate) const LIVE_EVENT_LOG: &str = "events.jsonl";
+/// Prefix of a rolled event log: `events-<UTC-period>[.N].jsonl`.
+const ROLLED_EVENT_PREFIX: &str = "events-";
+
+/// Is `name` a rolled event log this engine wrote?
+///
+/// Same discipline as [`is_rolled_log`]: `OXIDANT_EVENT_LOG_DIR` is an operator-set path that
+/// other tools read, so the sweeper unlinks only the shape it writes itself and never the live
+/// file.
+pub(crate) fn is_rolled_event_log(name: &str) -> bool {
+    name != LIVE_EVENT_LOG && name.starts_with(ROLLED_EVENT_PREFIX) && name.ends_with(".jsonl")
+}
+
+/// The name a rolled event log takes for `period`/`split` — §3's naming rules, with `events-`
+/// in place of `oxidant-`.
+pub(crate) fn rolled_event_log_name(period: LogPeriod, split: u32) -> String {
+    let stem = period.stem();
+    if split <= 1 {
+        format!("{ROLLED_EVENT_PREFIX}{stem}.jsonl")
+    } else {
+        format!("{ROLLED_EVENT_PREFIX}{stem}.{split}.jsonl")
+    }
+}
+
+/// Rolled event logs, oldest first.
+pub(crate) fn rolled_event_logs(dir: &Path) -> Vec<Prunable> {
+    flat_files(dir, is_rolled_event_log)
+}
+
+/// What one `event_log_dir` pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct EventLogReport {
+    /// The live `events.jsonl` was renamed to a periodised file.
+    pub rolled: bool,
+    pub pruned: usize,
+    pub freed_bytes: u64,
+}
+
+/// Bring `event_log_dir` under `OXIDANT_EVENT_LOG_MAX_BYTES` (§8, F16).
+///
+/// **The live file is rolled, never deleted.** `AppStateStore::emit` appends every execution
+/// event to a single `events.jsonl` that was never rolled and never pruned, and
+/// `load_event_log` read the whole file back with `fs::read_to_string` — the one existing path
+/// that genuinely fills a server. But an operator points this directory at a Spark-history-server
+/// path that *other tools read*, so the fix is a rename plus an oldest-first prune, not a
+/// truncate. `max_bytes == 0` restores today's unbounded behaviour exactly.
+///
+/// `emit` opens the path per event, so a rename between two of its opens is safe: the next
+/// append creates a fresh `events.jsonl`, and an event that raced the rename lands in the rolled
+/// file rather than being lost.
+pub(crate) fn roll_event_log(
+    dir: &Path,
+    max_bytes: u64,
+    roll: LogRoll,
+    now: DateTime<Utc>,
+) -> EventLogReport {
+    let mut report = EventLogReport::default();
+    if max_bytes == 0 {
+        return report;
+    }
+    let live = dir.join(LIVE_EVENT_LOG);
+    let live_bytes = live.metadata().map(|m| m.len()).unwrap_or(0);
+    if live_bytes > max_bytes {
+        // `LogRoll::Off` turns the *exec* log writer off; the event log still needs a period to
+        // name its roll after, and daily is the design's default.
+        let roll = if roll == LogRoll::Off {
+            LogRoll::Daily
+        } else {
+            roll
+        };
+        if let Some(period) = LogPeriod::of(now, roll) {
+            let mut split = 1;
+            while dir.join(rolled_event_log_name(period, split)).exists() && split < 999 {
+                split += 1;
+            }
+            let target = dir.join(rolled_event_log_name(period, split));
+            match super::fs_util::rename_durable(&live, &target, dir) {
+                Ok(()) => report.rolled = true,
+                Err(e) => tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "could not roll the event log; it stays unbounded until the next sweep"
+                ),
+            }
+        }
+    }
+    let mut total: u64 = subtree_bytes(dir);
+    for file in rolled_event_logs(dir) {
+        if total <= max_bytes {
+            break;
+        }
+        if let Some(freed) = remove(&file) {
+            total = total.saturating_sub(freed);
+            report.pruned += 1;
+            report.freed_bytes += freed;
+        }
+    }
+    if report.rolled || report.pruned > 0 {
+        tracing::info!(
+            dir = %dir.display(),
+            rolled = report.rolled,
+            pruned = report.pruned,
+            freed_bytes = report.freed_bytes,
+            max_bytes,
+            "event log rolled under OXIDANT_EVENT_LOG_MAX_BYTES"
+        );
+    }
+    report
 }
