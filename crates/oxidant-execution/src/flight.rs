@@ -220,13 +220,14 @@ pub const ACTION_LOGS: &str = "logs";
 /// Answers [`ACTION_LOGS`]. Installed by `oxidant_connect::logging::init`, because the code that
 /// can read this process's log files lives in `oxidant-connect` and this crate is *below* it in
 /// the dependency graph — the hook is the seam that keeps the arrow pointing one way.
-type LogQueryHandler = Box<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
+type LogQueryHandler =
+    Box<dyn Fn(&[u8]) -> std::result::Result<Vec<u8>, String> + Send + Sync>;
 static LOG_QUERY_HANDLER: OnceLock<LogQueryHandler> = OnceLock::new();
 
 /// Install the [`ACTION_LOGS`] handler. First call in a process wins, matching
 /// `logging::init`'s own idempotence.
 pub fn set_log_query_handler(
-    handler: impl Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync + 'static,
+    handler: impl Fn(&[u8]) -> std::result::Result<Vec<u8>, String> + Send + Sync + 'static,
 ) {
     let _ = LOG_QUERY_HANDLER.set(Box::new(handler));
 }

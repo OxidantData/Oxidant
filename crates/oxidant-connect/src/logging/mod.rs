@@ -25,8 +25,11 @@
 //! - [`line`] — one event's three forms (live tail string, text line, Parquet row);
 //! - [`writer`] — the live file, the two roll triggers, dedup, and the converter thread;
 //! - [`columnar`] — text → zstd Parquet, and reading either form back;
-//! - [`browse`] — PR4's filters, backward cursor, Parquet pushdown and file listing (§6b).
+//! - [`browse`] — PR4's filters, backward cursor, Parquet pushdown and file listing (§6b);
+//! - [`api`] — the one answer both the driver's HTTP route and the worker's Flight action
+//!   serve, so "the same filters everywhere" is a fact rather than a claim (§6b).
 
+mod api;
 mod browse;
 mod columnar;
 mod line;
@@ -253,6 +256,10 @@ fn run_sweep_hook() {
 pub fn init(role: &str, port: u16) {
     // Before the layer is installed, so `Capture::on_event` never has to create it on a hot path.
     let _ = TAIL.get_or_init(|| tokio::sync::broadcast::channel(TAIL_CAPACITY).0);
+    // §6b's federation, from the answering side. Installed for *every* role: the driver too,
+    // which costs nothing and keeps `oxidant driver`'s co-located worker from being the one node
+    // the browser cannot reach.
+    api::install_flight_handler();
     let buffer = LOG_BUFFER
         .get_or_init(|| LogBuffer::new(MAX_LOG_LINES))
         .clone();
@@ -456,7 +463,12 @@ impl LogView {
 pub(crate) use columnar::Page as LogPage;
 
 /// PR4's read path: the four filters, the backward cursor, and the file listing (§6b).
-pub(crate) use browse::{list_files, CursorPage, FileInfo, LogFilter};
+pub(crate) use browse::{list_files, CursorPage, ForwardPage, LogFilter};
+/// The line parser, for the SSE tail's per-line filter — the one place a filter is applied
+/// to a line that never came off a file.
+pub(crate) use line::parse_line as parse_for_filter;
+/// PR4's one answer, and the Flight federation around it (§6b).
+pub(crate) use api::{answer, decode_worker_answer, LogError, LogQuery, MAX_LOG_PAGE};
 
 /// One rolled (or live) log file, resolved from a `?file=` value.
 pub(crate) enum LogFile {
@@ -491,6 +503,20 @@ impl LogFile {
         match self {
             Self::Text(p) => browse::scan_text(p, filter, before, limit),
             Self::Parquet(p) => browse::scan_parquet(p, filter, before, limit),
+        }
+    }
+
+    /// One filtered page **forward** from a row index — the follow cursor `/api/v1/logs/tail`
+    /// resumes on, and the only mode that reads each row exactly once across repeated polls.
+    pub(crate) fn read_forward(
+        &self,
+        filter: &LogFilter,
+        after: u64,
+        limit: usize,
+    ) -> Result<ForwardPage, String> {
+        match self {
+            Self::Text(p) => browse::scan_text_forward(p, filter, after, limit),
+            Self::Parquet(p) => browse::scan_parquet_forward(p, filter, after, limit),
         }
     }
 }

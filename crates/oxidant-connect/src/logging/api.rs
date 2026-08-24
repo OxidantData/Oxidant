@@ -69,6 +69,14 @@ pub(crate) struct LogQuery {
     /// PR4's backward cursor: serve the lines *before* this row index, newest-first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<u64>,
+    /// The **follow** cursor: serve the matches at or after this row index, oldest-first, and
+    /// report where to resume. Wins over `before` when both are given — a follow is a follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
+    /// `desc` asks for §6b's newest-first page explicitly, for a caller that wants it without
+    /// passing a filter to imply it. Anything else is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
 }
 
 /// A refusal, carrying the HTTP status the driver answers with — including when the refusal came
@@ -125,7 +133,9 @@ pub(crate) fn answer(query: &LogQuery, view: &LogView) -> Result<Value, LogError
     // answered before this route grew filters. Two shapes on one route is the price of not
     // breaking a released contract, and which one you get is decided by what you asked for
     // rather than by a version flag.
-    let backward = query.before.is_some() || !filter.is_empty();
+    let backward = query.before.is_some()
+        || query.order.as_deref() == Some("desc")
+        || !filter.is_empty();
     let Some(requested) = query.file.clone() else {
         return Ok(ring(&filter, query, limit, backward));
     };
@@ -166,7 +176,18 @@ pub(crate) fn answer(query: &LogQuery, view: &LogView) -> Result<Value, LogError
         "dedup": view.dedup,
         "limit": limit,
     });
-    if backward {
+    if let Some(after) = query.after {
+        let page = file
+            .read_forward(&filter, after, limit)
+            .map_err(|e| LogError::new(500, format!("could not read the log file: {e}")))?;
+        body["after"] = json!(after);
+        // A scan position, not a match position: re-asking with it reads every row exactly once
+        // however selective the filter is. It going *backward* means the file rolled under the
+        // follow, and the caller restarts from 0 rather than waiting for the new file to grow
+        // past the old one's length.
+        body["next_after"] = json!(page.next_after);
+        body["logs"] = json!(page.lines);
+    } else if backward {
         let page = file
             .read_filtered(&filter, query.before, limit)
             .map_err(|e| LogError::new(500, format!("could not read the log file: {e}")))?;

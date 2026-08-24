@@ -264,6 +264,105 @@ impl Window {
     }
 }
 
+/// One forward page: the matches at or after a row index, and where to resume.
+///
+/// **`next_after` is a scan position, not a match position.** It is one past the last row the
+/// scan *examined*, whether or not that row matched, so a follow that re-asks with it reads each
+/// row exactly once however selective the filter is. A cursor built from the last *match* would
+/// re-read — and re-emit — every non-matching row after it on every poll.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ForwardPage {
+    pub lines: Vec<String>,
+    pub next_after: u64,
+}
+
+/// Scan a text log forward from a row index — the follow mode behind `/api/v1/logs/tail`.
+pub(crate) fn scan_text_forward(
+    path: &Path,
+    filter: &LogFilter,
+    after: u64,
+    limit: usize,
+) -> Result<ForwardPage, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut page = ForwardPage::default();
+    let mut buf = String::new();
+    let mut index = 0u64;
+    let mut bytes = 0usize;
+    loop {
+        buf.clear();
+        let read = reader
+            .read_line(&mut buf)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        index += 1;
+        if index <= after {
+            continue;
+        }
+        if page.lines.len() >= limit.max(1) || bytes >= MAX_PAGE_BYTES {
+            // Stop *before* consuming this row, so `next_after` names it and nothing is skipped.
+            index -= 1;
+            break;
+        }
+        let line = buf.trim_end_matches(['\n', '\r']);
+        if filter.is_empty() || filter.keeps(&parse_line(line), line) {
+            bytes += line.len();
+            page.lines.push(line.to_string());
+        }
+    }
+    page.next_after = index;
+    Ok(page)
+}
+
+/// Scan a rolled Parquet forward from a row index. Same contract as [`scan_text_forward`];
+/// `?file=current` is always text, so this exists for uniformity rather than for the tail.
+pub(crate) fn scan_parquet_forward(
+    path: &Path,
+    filter: &LogFilter,
+    after: u64,
+    limit: usize,
+) -> Result<ForwardPage, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+    let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let total = metadata.metadata().file_metadata().num_rows().max(0) as u64;
+    let mut page = ForwardPage {
+        next_after: total.min(after),
+        ..Default::default()
+    };
+    if after >= total {
+        return Ok(page);
+    }
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
+        .with_offset(after as usize)
+        .build()
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let mut index = after;
+    let mut bytes = 0usize;
+    'outer: for batch in reader {
+        let batch = batch.map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let cols = RowColumns::of(&batch)?;
+        for row in 0..batch.num_rows() {
+            if page.lines.len() >= limit.max(1) || bytes >= MAX_PAGE_BYTES {
+                break 'outer;
+            }
+            let line = render_row(&cols, row);
+            index += 1;
+            if filter.is_empty()
+                || filter.keeps_pushdown(cols.ts_ms(row), cols.level(row), cols.target(row))
+                    && filter.keeps_text(&line)
+            {
+                bytes += line.len();
+                page.lines.push(line);
+            }
+        }
+    }
+    page.next_after = index;
+    Ok(page)
+}
+
 /// Filter the in-memory ring (`GET /api/v1/logs` with no `?file=`), newest-first with a cursor.
 ///
 /// The ring is a `Vec<String>` the process already holds, so there is nothing to stream; the

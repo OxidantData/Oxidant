@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
+use axum::response::sse::{self, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -41,13 +42,14 @@ use oxidant_catalog::DEFAULT_CATALOG;
 use oxidant_loom::arrow::array::Array;
 use oxidant_loom::arrow::record_batch::RecordBatch;
 use oxidant_loom::Engine;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sysinfo::{Pid, System};
 use tokio::sync::{watch, Notify};
 use uuid::Uuid;
 
-use crate::logging::{LogBuffer, LogView, MAX_LOG_LINES};
+use crate::logging::{LogBuffer, LogView, MAX_LOG_LINES, MAX_LOG_PAGE};
 
 use crate::history::{
     disk, now_rfc3339, rfc3339_from_ms, FoldedStatement, HistoryConfig, HistoryRuntime,
@@ -2105,6 +2107,9 @@ fn app(state: RestState) -> Router {
         )
         .route("/api/v1/cluster/status", get(cluster_status))
         .route("/api/v1/logs", get(list_logs))
+        .route("/api/v1/logs/files", get(list_log_files))
+        .route("/api/v1/logs/tail", get(tail_logs))
+        .route("/api/v1/logs/workers", get(list_log_workers))
         .with_state(state)
 }
 
@@ -2667,7 +2672,8 @@ fn process_metrics() -> (Option<u64>, Option<u64>, Option<f32>) {
         .unwrap_or((None, None, None))
 }
 
-/// `?file=` on `GET /api/v1/logs` (§6).
+/// The log-browser query string (§6, §6b) — one struct for every log route, because they take
+/// the same filters and a caller must not have to remember which route learned which one.
 #[derive(Debug, Default, Deserialize)]
 struct LogsParams {
     /// `current`, or a `LogPeriod` in §6's grammar with an optional `.N` split. Absent keeps
@@ -2676,136 +2682,532 @@ struct LogsParams {
     /// Lines per page. Defaults to [`MAX_LOG_LINES`] — the same 1000 the ring serves — and is
     /// clamped to [`MAX_LOG_PAGE`].
     limit: Option<usize>,
-    /// Lines to skip from the start of the file.
+    /// PR3's oldest-first walk: lines to skip from the start of the file.
     offset: Option<usize>,
+    /// PR4's backward cursor: serve the lines *before* this row index, newest-first (§6b).
+    before: Option<u64>,
+    /// The follow cursor: the matches at or after this row index, oldest-first, with the
+    /// position to resume from. What `/api/v1/logs/tail` rides against a worker.
+    after: Option<u64>,
+    /// `desc` asks for the newest-first page without passing a filter to imply it.
+    order: Option<String>,
+    /// Severity floor: `warn` is "warn **and** error".
+    level: Option<String>,
+    /// Target prefix — `oxidant_execution` matches `oxidant_execution::plan`.
+    target: Option<String>,
+    /// Free text over the rendered line, case-insensitive.
+    q: Option<String>,
+    /// RFC-3339 bounds on `ts`, matched against the column §6's writer emits. Half-open.
+    from: Option<String>,
+    to: Option<String>,
+    /// Federation: read *that worker's* logs instead of this node's, over its own Flight surface
+    /// (§6b). Never a raw address — see [`resolve_worker`].
+    worker: Option<String>,
 }
 
-/// The largest page `?file=` will serve, however large a `?limit=` is asked for.
-///
-/// A rolled file may hold `OXIDANT_LOG_MAX_FILE_BYTES` (256 MiB, ~2M lines) and the read path had
-/// no cap at all: `?file=current` built a `Vec<String>` of every line and `serde_json` then
-/// serialised a second copy into the body — well over half a GiB transient on a driver whose whole
-/// *result* budget is 512 MiB, multiplied by every concurrent request, on an endpoint the
-/// Observability page polls every 5 s. `MAX_LOG_LINES` applied only to the in-memory ring.
-const MAX_LOG_PAGE: usize = 10_000;
+impl LogsParams {
+    /// The transport-independent query [`crate::logging::answer`] takes.
+    fn query(&self) -> crate::logging::LogQuery {
+        crate::logging::LogQuery {
+            op: None,
+            file: self.file.clone(),
+            level: self.level.clone(),
+            target: self.target.clone(),
+            q: self.q.clone(),
+            from: self.from.clone(),
+            to: self.to.clone(),
+            limit: self.limit,
+            offset: self.offset,
+            before: self.before,
+            after: self.after,
+            order: self.order.clone(),
+        }
+    }
+}
 
-/// `GET /api/v1/logs` — the node's own exec log, for the monitoring UI's Observability page.
+/// `GET /api/v1/logs` — one node's exec log, for the monitoring UI's Observability page.
 ///
-/// Three answers, one route:
+/// Four answers, one route:
 ///
 /// - no `?file=` — today's shape, `{"logs": [...]}` from the in-memory ring, **unchanged**
 ///   except that each line now leads with an RFC-3339 UTC timestamp (§6);
 /// - `?file=current` — the live `oxidant.log` on disk;
 /// - `?file=<period>[.N]` — one rolled file, served from its `.parquet` if it has been
 ///   converted and from its `.log` if it has not. The caller never names an extension: which
-///   one exists is §6's conversion state machine, not the caller's business.
+///   one exists is §6's conversion state machine, not the caller's business;
+/// - `?worker=<id>` — any of the above, from **that worker's own files**, proxied over its
+///   Flight surface (§6b). No worker log bytes reach this driver's disk on this path.
+///
+/// Filters (`level`, `target`, `q`, `from`, `to`) and the backward cursor (`before`) compose
+/// over all four. Passing any of them switches the answer to §6b's newest-first cursor page;
+/// passing none keeps PR3's oldest-first `?offset=` page byte-for-byte.
 ///
 /// Gated by the same shared token as `/api/status`, through the same code — restated here
 /// because it now matters more. The endpoint used to expose 1000 lines of ring buffer; it now
-/// exposes up to `OXIDANT_LOG_KEEP_DAYS` of every enabled `tracing` field value, and this router
-/// is served under a permissive CORS layer. Unset `OXIDANT_STATUS_TOKEN`, `404`: the route does
-/// not exist, exactly like `/api/status`.
+/// exposes up to `OXIDANT_LOG_KEEP_DAYS` of every enabled `tracing` field value, on every node
+/// in the cluster, and this router is served under a permissive CORS layer. Unset
+/// `OXIDANT_STATUS_TOKEN`, `404`: the route does not exist, exactly like `/api/status`.
 async fn list_logs(
     State(state): State<RestState>,
     headers: header::HeaderMap,
     uri: axum::http::Uri,
+) -> Response {
+    let Some(params) = gate_log_params(&state, &headers, &uri) else {
+        return log_gate_response(&state, &headers, &uri);
+    };
+    run_log_query(&state, &params, params.query()).await
+}
+
+/// `GET /api/v1/logs/files` — every log file this node still has, newest period first (§6b).
+///
+/// "The visible history is always honestly what exists": it is a directory read, so a file
+/// retention took is simply absent rather than offered and then `404`ing.
+async fn list_log_files(
+    State(state): State<RestState>,
+    headers: header::HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let Some(params) = gate_log_params(&state, &headers, &uri) else {
+        return log_gate_response(&state, &headers, &uri);
+    };
+    let mut query = params.query();
+    query.op = Some("files".to_string());
+    run_log_query(&state, &params, query).await
+}
+
+/// `GET /api/v1/logs/workers` — the worker picker's list: every worker this driver is configured
+/// with, and whether it answers (§6b).
+///
+/// **A worker that does not answer is listed `reachable: false` with the reason, never silently
+/// skipped.** A log browser that quietly drops a node is worse than one that has none: the
+/// operator reads "no errors on worker 2" when what happened is "worker 2 is dead", which is the
+/// error they were looking for.
+async fn list_log_workers(
+    State(state): State<RestState>,
+    headers: header::HeaderMap,
 ) -> Response {
     if let Some(denied) =
         oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), &headers)
     {
         return denied;
     }
-    // **Parsed after the gate, not by an extractor.** Axum runs extractors in declaration order
-    // and short-circuits on rejection, so a `Query<LogsParams>` parameter answered `400` for
-    // `?file=a&file=b` before `deny_unless_authorized` ever ran — and `400` is not what a
-    // nonexistent route answers. The endpoint's stated contract is "unset OXIDANT_STATUS_TOKEN,
-    // `404`: the route does not exist, exactly like `/api/status`", and a `400`-vs-`404` split
-    // tells an unauthenticated caller the route is there (L1).
-    let Ok(Query(params)) = Query::<LogsParams>::try_from_uri(&uri) else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid query: expected at most one each of `file`, `limit` and `offset`",
-        );
-    };
-    let offset = params.offset.unwrap_or(0);
-    let limit = params.limit.unwrap_or(MAX_LOG_LINES).min(MAX_LOG_PAGE);
-    let Some(requested) = params.file else {
-        // The ring is not deduped — dedup applies to the *file* (§6) — and this envelope
-        // deliberately keeps the exact shape it had before `?file=` existed.
-        return Json(json!({ "logs": state.log_buffer.lines() })).into_response();
-    };
-    let Some(dir) = state.logs.dir.as_deref() else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "no rolled exec logs on this node (OXIDANT_LOG_ROLL=off, or OXIDANT_HISTORY=off)",
-        );
-    };
-    let (file, label) = if requested == "current" {
-        (crate::logging::resolve_current(dir), "current".to_string())
-    } else {
-        // Parsed into a typed `LogPeriod` and the filename *reconstructed* from it — never
-        // string-joined into a path. `..`, `/`, an extension and an absolute path all fail the
-        // grammar by construction, so no traversal shape ever reaches the join (§6, F12).
-        let Some((period, split)) = crate::logging::LogPeriod::parse(&requested) else {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid file: expected `current`, `YYYY-MM-DD`, `YYYY-MM-DD-HH` or `YYYY-Www`, \
-                 each with an optional `.N` split (2..999) and no extension",
-            );
-        };
-        // The label echoes what the caller asked for, in the grammar's own spelling — no
-        // extension, because the caller does not choose one.
-        (crate::logging::resolve(dir, period, split), {
-            let stem = period.stem();
-            if split <= 1 {
-                stem
-            } else {
-                format!("{stem}.{split}")
-            }
-        })
-    };
-    let Some(file) = file else {
-        return error_response(StatusCode::NOT_FOUND, "log file not found");
-    };
-    let format = file.format();
-    // **`spawn_blocking`.** Reading a rolled log is `std::fs` I/O plus, for a converted file, a
-    // full Parquet decode. Doing that inline on a tokio worker parks a thread that is also
-    // serving `ExecutePlan`, for as long as the read takes.
-    let page = match tokio::task::spawn_blocking(move || file.read(offset, limit)).await {
-        Ok(Ok(page)) => page,
-        Ok(Err(e)) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("could not read the log file: {e}"),
+    let workers = state.service.workers_from_config();
+    let probes = workers.iter().map(|address| {
+        let address = address.clone();
+        async move {
+            let id = worker_id(&address);
+            // The existing liveness action, with a bound: an unreachable worker must not hold
+            // the picker open for a TCP timeout on every page load.
+            let probe = tokio::time::timeout(
+                WORKER_PROBE_TIMEOUT,
+                oxidant_execution::flight::health_check_worker(address.clone()),
             )
+            .await;
+            let (reachable, error) = match probe {
+                Ok(Ok(())) => (true, None),
+                Ok(Err(e)) => (false, Some(e.to_string())),
+                Err(_) => (false, Some("timed out".to_string())),
+            };
+            json!({
+                "worker_id": id,
+                "address": address,
+                "reachable": reachable,
+                "error": error,
+            })
         }
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("reading the log file panicked: {e}"),
-            )
-        }
-    };
-    let next_offset = page
-        .has_more
-        .then(|| offset.saturating_add(page.lines.len()));
-    Json(json!({
-        "file": label,
-        "format": format,
-        // The file is authoritative and it *is* deduped when the knob is on; the SSE tail
-        // PR4 adds marks itself `false`. Saying so in the envelope is what keeps an operator
-        // from reading a collapsed run as a gap (§6, F21).
-        "dedup": state.logs.dedup,
-        "offset": offset,
-        "limit": limit,
-        // `null` when this page reached the end of the file. A page may also be cut short of
-        // `limit` by the read path's byte budget, and then this is set even though fewer lines
-        // came back — so paging follows `next_offset` rather than counting.
-        "next_offset": next_offset,
-        "logs": page.lines,
-    }))
-    .into_response()
+    });
+    let mut rows = futures::future::join_all(probes).await;
+    // "driver" is a member of the picker, not a special case above it: the same filters read the
+    // same way whichever node is selected, which is the whole point of one `answer`.
+    rows.insert(
+        0,
+        json!({
+            "worker_id": "driver",
+            "address": Value::Null,
+            "reachable": true,
+            "error": Value::Null,
+        }),
+    );
+    Json(json!({ "workers": rows })).into_response()
 }
+
+/// How long a worker has to answer the liveness probe behind `GET /api/v1/logs/workers` before
+/// it is reported unreachable. Short on purpose: this runs once per page load, per worker.
+const WORKER_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `GET /api/v1/logs/tail` — SSE follow (§6b).
+///
+/// **The driver's tail rides `tracing` itself, not a file poll.** The rolling writer's queue,
+/// its dedup hold and its 5 s timer all sit between an event and the file, so a follow that
+/// re-read `oxidant.log` would lag by up to that timer and re-decode the tail every tick. The
+/// stream therefore marks itself `"dedup": false` — it is the *ring*'s view, and §6/F21 says the
+/// file is authoritative — which is the same statement `?file=current`'s `"dedup": true` makes
+/// from the other side.
+///
+/// **A worker's tail is a poll, and says so.** Flight's `do_action` returns a stream, but a
+/// long-lived one would pin a worker-side task to a browser tab; instead the driver re-asks the
+/// worker's `?file=current` on a timer and forwards what is new. The `mode` field on the first
+/// event is `"follow"` for the driver and `"poll"` for a worker, so a reader is never told a
+/// 2 s-granular feed is live.
+async fn tail_logs(
+    State(state): State<RestState>,
+    headers: header::HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let Some(params) = gate_log_params(&state, &headers, &uri) else {
+        return log_gate_response(&state, &headers, &uri);
+    };
+    let filter = match crate::logging::LogFilter::parse(
+        params.level.as_deref(),
+        params.target.as_deref(),
+        params.q.as_deref(),
+        params.from.as_deref(),
+        params.to.as_deref(),
+    ) {
+        Ok(f) => f,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    match &params.worker {
+        None => Sse::new(driver_tail(filter)).into_response(),
+        Some(requested) => {
+            let endpoint = match resolve_worker(&state, requested) {
+                Ok(endpoint) => endpoint,
+                Err(response) => return response,
+            };
+            Sse::new(worker_tail(endpoint, params)).into_response()
+        }
+    }
+}
+
+/// The driver's own follow: every `tracing` event, filtered, as it happens.
+fn driver_tail(
+    filter: crate::logging::LogFilter,
+) -> impl futures::Stream<Item = Result<sse::Event, std::convert::Infallible>> {
+    let rx = crate::logging::subscribe_tail();
+    let open = sse::Event::default().event("open").data(
+        json!({ "mode": "follow", "worker": "driver", "dedup": false }).to_string(),
+    );
+    futures::stream::once(async move { Ok(open) }).chain(futures::stream::unfold(
+        (rx, filter),
+        |(mut rx, filter)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(line) => {
+                        if filter.is_empty()
+                            || filter.keeps(&crate::logging::parse_for_filter(&line), &line)
+                        {
+                            let event = sse::Event::default().event("line").data(line);
+                            return Some((Ok(event), (rx, filter)));
+                        }
+                    }
+                    // **The gap is never silent.** A reader that falls behind the fan-out is
+                    // told exactly how many lines it lost, in its own stream, rather than
+                    // seeing a jump it cannot account for.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        let event = sse::Event::default()
+                            .event("dropped")
+                            .data(json!({ "dropped": n }).to_string());
+                        return Some((Ok(event), (rx, filter)));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    ))
+}
+
+/// How often a worker tail re-asks. Matches the Observability page's own poll: a follow that
+/// asked faster would cost a Flight round-trip per second per open tab and buy nothing a reader
+/// can see.
+const WORKER_TAIL_POLL: Duration = Duration::from_secs(2);
+
+/// A worker's tail: `?file=current` re-asked on a timer, forwarding only what is new.
+///
+/// "New" is the **follow cursor**, not a text comparison: two identical lines a second apart are
+/// two events, and comparing text would swallow the second. The cursor is a scan position rather
+/// than a match position, so a selective filter does not make the poll re-read the rows it
+/// already rejected. A cursor that comes back *smaller* than the one sent means the worker rolled
+/// its live file mid-follow, and the stream says so and restarts at row 0 rather than waiting for
+/// the new file to grow past the old one's length.
+fn worker_tail(
+    endpoint: String,
+    params: LogsParams,
+) -> impl futures::Stream<Item = Result<sse::Event, std::convert::Infallible>> {
+    let worker = params.worker.clone().unwrap_or_default();
+    let open = sse::Event::default().event("open").data(
+        json!({
+            "mode": "poll",
+            "worker": worker,
+            "dedup": true,
+            "poll_ms": WORKER_TAIL_POLL.as_millis() as u64,
+        })
+        .to_string(),
+    );
+    struct Follow {
+        endpoint: String,
+        params: LogsParams,
+        after: Option<u64>,
+    }
+    let start = Follow {
+        endpoint,
+        params,
+        after: None,
+    };
+    futures::stream::once(async move { Ok(open) }).chain(futures::stream::unfold(
+        start,
+        |mut st| async move {
+            loop {
+                let first = st.after.is_none();
+                if !first {
+                    tokio::time::sleep(WORKER_TAIL_POLL).await;
+                }
+                let mut query = st.params.query();
+                query.file = Some("current".to_string());
+                query.before = None;
+                query.offset = None;
+                query.order = None;
+                query.limit = Some(TAIL_PAGE);
+                // The first poll seeds the cursor at the end of the file rather than replaying
+                // the whole live log into a browser: a follow starts where the log *is*.
+                query.after = st.after;
+                if first {
+                    query.after = None;
+                    query.before = None;
+                    query.order = Some("desc".to_string());
+                    query.limit = Some(TAIL_SEED);
+                }
+                let value = match federate(&st.endpoint, &query).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // The follow does not end because one poll failed — a worker restart is
+                        // exactly when an operator is watching — but the failure is said out
+                        // loud rather than looking like a quiet worker.
+                        let event = sse::Event::default()
+                            .event("error")
+                            .data(json!({ "error": e.message, "status": e.status }).to_string());
+                        // Seed the cursor so a recovered worker resumes rather than replaying.
+                        st.after = st.after.or(Some(0));
+                        return Some((Ok(event), st));
+                    }
+                };
+                let lines: Vec<&str> = value
+                    .get("logs")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let rolled = match (st.after, value.get("next_after").and_then(Value::as_u64)) {
+                    (Some(sent), Some(next)) if next < sent => true,
+                    (_, Some(next)) => {
+                        st.after = Some(next);
+                        false
+                    }
+                    // The seeding poll answers a `before` page, which carries no `next_after`.
+                    // Its cursor is where that page *started*, plus what it returned.
+                    (_, None) => {
+                        let start = value
+                            .get("next_before")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        st.after = Some(start + lines.len() as u64);
+                        false
+                    }
+                };
+                if rolled {
+                    st.after = Some(0);
+                    let event = sse::Event::default()
+                        .event("rolled")
+                        .data(json!({ "worker": st.params.worker }).to_string());
+                    return Some((Ok(event), st));
+                }
+                if lines.is_empty() {
+                    continue;
+                }
+                let event = sse::Event::default()
+                    .event("lines")
+                    .data(json!(lines).to_string());
+                return Some((Ok(event), st));
+            }
+        },
+    ))
+}
+
+/// Lines the *first* worker poll seeds with, so a follow opens on recent context rather than on
+/// an empty pane — the same thing the driver's own pane shows from its ring.
+const TAIL_SEED: usize = 200;
+
+/// Lines a worker tail asks for per poll. Two seconds of a chatty worker, bounded.
+const TAIL_PAGE: usize = 500;
+
+/// Authorize, then parse — **in that order**, and never with an extractor.
+///
+/// Axum runs extractors in declaration order and short-circuits on rejection, so a
+/// `Query<LogsParams>` parameter answered `400` for `?file=a&file=b` before
+/// `deny_unless_authorized` ran — and with `OXIDANT_STATUS_TOKEN` unset these routes' contract
+/// is `404`, "the route does not exist, exactly like `/api/status`". A `400`-vs-`404` split
+/// tells an unauthenticated caller the route is there (L1).
+///
+/// `None` means "the caller gets [`log_gate_response`]'s answer instead", which is either the
+/// authorization refusal or the parse refusal, in that order.
+fn gate_log_params(
+    state: &RestState,
+    headers: &header::HeaderMap,
+    uri: &axum::http::Uri,
+) -> Option<LogsParams> {
+    if oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), headers)
+        .is_some()
+    {
+        return None;
+    }
+    Query::<LogsParams>::try_from_uri(uri).ok().map(|q| q.0)
+}
+
+fn log_gate_response(
+    state: &RestState,
+    headers: &header::HeaderMap,
+    uri: &axum::http::Uri,
+) -> Response {
+    if let Some(denied) =
+        oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), headers)
+    {
+        return denied;
+    }
+    let _ = uri;
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid query: expected at most one each of `file`, `limit`, `offset`, `before`, \
+         `level`, `target`, `q`, `from`, `to` and `worker`",
+    )
+}
+
+/// Run one query — locally, or against the named worker.
+async fn run_log_query(
+    state: &RestState,
+    params: &LogsParams,
+    query: crate::logging::LogQuery,
+) -> Response {
+    match &params.worker {
+        // "driver" is spelled out in the picker, so accept it here rather than making the UI
+        // strip it back off.
+        None => local_log_query(state, query).await,
+        Some(id) if id == "driver" => local_log_query(state, query).await,
+        Some(requested) => {
+            let endpoint = match resolve_worker(state, requested) {
+                Ok(endpoint) => endpoint,
+                Err(response) => return response,
+            };
+            match federate(&endpoint, &query).await {
+                Ok(mut value) => {
+                    // §6b: "labels the rows with their worker". The rows are the worker's; the
+                    // envelope says whose, so a UI concatenating two nodes cannot lose track.
+                    value["worker"] = json!(requested);
+                    Json(value).into_response()
+                }
+                Err(e) => log_error_response(&e),
+            }
+        }
+    }
+}
+
+async fn local_log_query(state: &RestState, query: crate::logging::LogQuery) -> Response {
+    let view = state.logs.clone();
+    // **`spawn_blocking`.** Reading a log is `std::fs` I/O plus, for a converted file, a full
+    // Parquet decode. Doing that inline on a tokio worker parks a thread that is also serving
+    // `ExecutePlan`, for as long as the read takes.
+    match tokio::task::spawn_blocking(move || crate::logging::answer(&query, &view)).await {
+        Ok(Ok(mut value)) => {
+            value["worker"] = json!("driver");
+            Json(value).into_response()
+        }
+        Ok(Err(e)) => log_error_response(&e),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("reading the log file panicked: {e}"),
+        ),
+    }
+}
+
+fn log_error_response(e: &crate::logging::LogError) -> Response {
+    error_response(
+        StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        &e.message,
+    )
+}
+
+/// The worker id a `?worker=` value must match: `host:port`, the address without its scheme —
+/// stable, meaningful, and the same string `/api/v1/cluster/status` already prints.
+fn worker_id(address: &str) -> String {
+    address
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Resolve a `?worker=` value to a dialable endpoint — **only** if it is one of this driver's
+/// configured workers.
+///
+/// This is the SSRF gate, and it is the reason the id is matched rather than the address used.
+/// `?worker=` is a query parameter on a route an operator's browser calls; letting it name an
+/// arbitrary host would turn the driver into a request forwarder for anything its network can
+/// reach, on an endpoint whose token an operator hands to a monitoring page.
+fn resolve_worker(state: &RestState, requested: &str) -> Result<String, Response> {
+    let workers = state.service.workers_from_config();
+    match workers.iter().find(|w| worker_id(w) == requested) {
+        Some(address) => Ok(address.clone()),
+        None if workers.is_empty() => Err(error_response(
+            StatusCode::NOT_FOUND,
+            "this driver has no workers configured (set OXIDANT_WORKERS or spark.oxidant.workers)",
+        )),
+        None => Err(error_response(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "unknown worker `{requested}`: expected `driver` or one of {}",
+                workers
+                    .iter()
+                    .map(|w| worker_id(w))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
+
+/// Ask one worker, over its own Flight surface, and hand back what it said.
+///
+/// **Nothing is written to this driver's disk.** The page is a `Value` in memory, forwarded to
+/// the caller and dropped — §6b's "federation, not shipping", and the reason the diagnostic dump
+/// is a separate, explicitly-named route.
+async fn federate(
+    endpoint: &str,
+    query: &crate::logging::LogQuery,
+) -> Result<Value, crate::logging::LogError> {
+    let body = serde_json::to_vec(query).map_err(|e| crate::logging::LogError {
+        status: 500,
+        message: format!("could not encode the log query: {e}"),
+    })?;
+    let call = oxidant_execution::flight::worker_logs(endpoint.to_string(), body);
+    match tokio::time::timeout(WORKER_QUERY_TIMEOUT, call).await {
+        Ok(Ok(bytes)) => crate::logging::decode_worker_answer(&bytes),
+        // **Honest, and named.** A worker that cannot be reached is reported as *that*, with the
+        // transport's own message — never an empty page, which reads as "this worker logged
+        // nothing" and is the one answer a log browser must never invent.
+        Ok(Err(e)) => Err(crate::logging::LogError {
+            status: 502,
+            message: format!("worker {endpoint} did not answer: {e}"),
+        }),
+        Err(_) => Err(crate::logging::LogError {
+            status: 504,
+            message: format!(
+                "worker {endpoint} did not answer within {}s",
+                WORKER_QUERY_TIMEOUT.as_secs()
+            ),
+        }),
+    }
+}
+
+/// A federated page's deadline. Longer than the liveness probe — a worker really is decoding a
+/// Parquet — and far short of the browser's own patience.
+const WORKER_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 #[allow(clippy::await_holding_lock)] // env_lock() serializes process-global env across async tests
@@ -3254,6 +3656,356 @@ mod tests {
         // `current` before the process has written one is the same.
         let (status, _) = get_logs(&app, "/api/v1/logs?file=current").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A router with `?file=` over a tempdir **and** workers configured, for the federation
+    /// tests. The workers need not be alive: half of what federation owes an operator is what it
+    /// says when one is not.
+    fn logs_state_with_workers(
+        dir: &std::path::Path,
+        workers: Vec<String>,
+    ) -> (MutexGuard<'static, ()>, Router) {
+        let guard = crate::distributed::env_lock();
+        let mut service = OxidantService::new();
+        service.workers = workers;
+        let state = RestState {
+            service: Arc::new(service),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.to_path_buf()),
+                dedup: true,
+            },
+            status_token: Some(LOGS_TOKEN.into()),
+        };
+        (guard, app(state))
+    }
+
+    /// Six lines over three targets and four levels — enough for every filter to have both a
+    /// match and a non-match, and one line the parser cannot decompose.
+    const BROWSE_LINES: [&str; 6] = [
+        "2026-08-23T14:00:00.000Z [INFO] oxidant_execution - message=stage 0 start",
+        "2026-08-23T14:00:01.000Z [WARN] oxidant_connect - message=pool exhausted",
+        "2026-08-23T14:00:02.000Z [ERROR] oxidant_execution::plan - message=stage 0 failed",
+        "2026-08-23T14:00:03.000Z [INFO] oxidant_connect - message=retrying",
+        "   at oxidant_execution::plan (a continuation line)",
+        "2026-08-23T14:00:04.000Z [DEBUG] oxidant_execution - message=stage 0 done",
+    ];
+
+    fn write_browse_log(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), format!("{}\n", BROWSE_LINES.join("\n"))).expect("write");
+    }
+
+    /// **§6b's filters, over the route.** Each one composes, each one answers the same over a
+    /// rolled `.log` and its converted `.parquet`, and passing any of them switches the envelope
+    /// to the newest-first cursor.
+    #[tokio::test]
+    async fn the_log_routes_filter_by_level_target_text_and_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant-2026-08-23.log");
+        write_browse_log(dir.path(), "oxidant-2026-08-24.log");
+        crate::logging::convert_for_test(&dir.path().join("oxidant-2026-08-24.log"))
+            .expect("convert");
+        let (_env, app) = logs_state(dir.path(), true);
+
+        for file in ["2026-08-23", "2026-08-24"] {
+            let (status, body) =
+                get_logs(&app, &format!("/api/v1/logs?file={file}&level=warn")).await;
+            assert_eq!(status, StatusCode::OK, "{file}: {body}");
+            assert_eq!(
+                body["logs"],
+                json!([BROWSE_LINES[1], BROWSE_LINES[2], BROWSE_LINES[4]]),
+                "{file}: a level floor keeps warn AND error, plus the line it cannot judge"
+            );
+            assert!(
+                body.get("offset").is_none(),
+                "{file}: a filter switches to the cursor envelope: {body}"
+            );
+            assert_eq!(body["next_before"], Value::Null, "{file}");
+
+            let (_, body) =
+                get_logs(&app, &format!("/api/v1/logs?file={file}&target=oxidant_connect")).await;
+            assert_eq!(
+                body["logs"],
+                json!([BROWSE_LINES[1], BROWSE_LINES[3]]),
+                "{file}: a target prefix, and the unjudgeable line is not in it"
+            );
+
+            let (_, body) = get_logs(&app, &format!("/api/v1/logs?file={file}&q=POOL")).await;
+            assert_eq!(
+                body["logs"],
+                json!([BROWSE_LINES[1]]),
+                "{file}: free text is case-insensitive"
+            );
+
+            let (_, body) = get_logs(
+                &app,
+                &format!(
+                    "/api/v1/logs?file={file}&from={}&to={}",
+                    urlencode("2026-08-23T14:00:01Z"),
+                    urlencode("2026-08-23T14:00:03Z")
+                ),
+            )
+            .await;
+            assert_eq!(
+                body["logs"],
+                json!([BROWSE_LINES[1], BROWSE_LINES[2], BROWSE_LINES[4]]),
+                "{file}: the range is half-open"
+            );
+
+            let (_, body) = get_logs(
+                &app,
+                &format!("/api/v1/logs?file={file}&level=error&target=oxidant_execution&q=failed"),
+            )
+            .await;
+            assert_eq!(
+                body["logs"],
+                json!([BROWSE_LINES[2]]),
+                "{file}: and they compose"
+            );
+        }
+    }
+
+    /// An invalid filter is a `400` that names the value. A filter that silently did nothing
+    /// would be read as "there were no errors" — the one answer a log browser must not invent.
+    #[tokio::test]
+    async fn an_invalid_filter_is_rejected_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant-2026-08-23.log");
+        let (_env, app) = logs_state(dir.path(), true);
+        for (query, needle) in [
+            ("level=loud", "loud"),
+            ("from=yesterday", "yesterday"),
+            ("to=nownow", "nownow"),
+        ] {
+            let (status, body) =
+                get_logs(&app, &format!("/api/v1/logs?file=2026-08-23&{query}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query} -> {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains(needle),
+                "{query} -> {body}"
+            );
+        }
+    }
+
+    /// The backward cursor pages a file exactly once, and `?offset=` still answers PR3's page —
+    /// the released contract is not broken by the route learning a second one.
+    #[tokio::test]
+    async fn the_cursor_pages_backward_and_offset_still_answers_the_old_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let line = |i: usize| {
+            format!("2026-08-23T14:00:00.500Z [INFO] oxidant_execution - message=line {i}")
+        };
+        let body: String = (0..25).map(|i| format!("{}\n", line(i))).collect();
+        std::fs::write(dir.path().join("oxidant-2026-08-23.log"), &body).expect("write");
+        let (_env, app) = logs_state(dir.path(), true);
+
+        // Old shape, untouched: no filter and no cursor is the oldest-first page.
+        let (status, page) = get_logs(&app, "/api/v1/logs?file=2026-08-23&limit=10").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["offset"], 0);
+        assert_eq!(page["next_offset"], 10);
+        assert_eq!(page["logs"][0], line(0));
+        assert!(page.get("next_before").is_none(), "{page}");
+
+        // New shape: `order=desc` asks for the newest page without implying it with a filter.
+        let mut seen: Vec<String> = Vec::new();
+        let mut uri = "/api/v1/logs?file=2026-08-23&limit=10&order=desc".to_string();
+        loop {
+            let (status, page) = get_logs(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            let mut head: Vec<String> = page["logs"]
+                .as_array()
+                .expect("logs")
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            head.extend(seen);
+            seen = head;
+            match page["next_before"].as_u64() {
+                Some(cursor) => {
+                    uri = format!(
+                        "/api/v1/logs?file=2026-08-23&limit=10&order=desc&before={cursor}"
+                    )
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen,
+            (0..25).map(line).collect::<Vec<_>>(),
+            "the pages reassemble the file exactly, with no gap and no repeat"
+        );
+    }
+
+    /// `GET /api/v1/logs/files` is a directory read: what it lists is what exists, and it is
+    /// ordered by `(period end, split)` rather than by name — `.2` sorts *before* the plain name
+    /// lexicographically while being the newer generation.
+    #[tokio::test]
+    async fn the_files_route_lists_what_is_on_disk_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant-2026-08-23.log");
+        write_browse_log(dir.path(), "oxidant-2026-08-23.2.log");
+        write_browse_log(dir.path(), "oxidant-2026-09-01.log");
+        write_browse_log(dir.path(), "oxidant.log");
+        crate::logging::convert_for_test(&dir.path().join("oxidant-2026-09-01.log"))
+            .expect("convert");
+        std::fs::write(dir.path().join("syslog"), b"not ours").expect("write");
+        let (_env, app) = logs_state(dir.path(), true);
+
+        let (status, body) = get_logs(&app, "/api/v1/logs/files").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let files = body["files"].as_array().expect("files");
+        assert_eq!(
+            files.iter().map(|f| &f["file"]).collect::<Vec<_>>(),
+            vec!["current", "2026-09-01", "2026-08-23.2", "2026-08-23"],
+        );
+        assert_eq!(files[0]["rolled"], false);
+        assert_eq!(files[1]["format"], "parquet", "the server picks the form");
+        assert_eq!(files[2]["format"], "text");
+        assert_eq!(files[1]["first_ts"], "2026-08-23T14:00:00.000Z");
+        assert_eq!(files[1]["last_ts"], "2026-08-23T14:00:04.000Z");
+        assert!(files[0]["size_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(body["worker"], "driver");
+    }
+
+    /// The listing and the tail inherit the same gate as `?file=`, for the same reason: they
+    /// reach the same 30 days of every enabled `tracing` field value.
+    #[tokio::test]
+    async fn every_log_route_inherits_the_status_token_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant.log");
+        let _env = crate::distributed::env_lock();
+        let ungated = app(RestState {
+            service: Arc::new(OxidantService::new()),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.path().to_path_buf()),
+                dedup: true,
+            },
+            status_token: None,
+        });
+        for route in [
+            "/api/v1/logs",
+            "/api/v1/logs/files",
+            "/api/v1/logs/tail",
+            "/api/v1/logs/workers",
+        ] {
+            assert_eq!(
+                get_json(&ungated, route).await.0,
+                StatusCode::NOT_FOUND,
+                "{route}: unset OXIDANT_STATUS_TOKEN means the route does not exist"
+            );
+        }
+    }
+
+    /// **The SSRF gate.** `?worker=` names an id from this driver's own configuration; it never
+    /// names an address. Letting it would turn the driver into a request forwarder for anything
+    /// its network can reach, on a route whose token an operator pastes into a monitoring page.
+    #[tokio::test]
+    async fn the_worker_parameter_only_accepts_configured_workers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant.log");
+        let (_env, app) = logs_state_with_workers(
+            dir.path(),
+            vec!["http://10.0.0.7:50051".to_string()],
+        );
+        for hostile in [
+            "169.254.169.254",
+            "127.0.0.1:1",
+            "http://evil.example.com",
+            "10.0.0.7:50052",
+        ] {
+            let (status, body) = get_logs(
+                &app,
+                &format!("/api/v1/logs?file=current&worker={}", urlencode(hostile)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{hostile} -> {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains("unknown worker"),
+                "{hostile} -> {body}"
+            );
+            // And it names the workers that *are* configured, so the caller can fix it.
+            assert!(
+                body["error"].as_str().unwrap().contains("10.0.0.7:50051"),
+                "{hostile} -> {body}"
+            );
+        }
+        // `driver` is a member of the picker, not a special case above it.
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=current&worker=driver").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["worker"], "driver");
+    }
+
+    /// **An unreachable worker is reported, never skipped** (§6b, §9). Silence would read as
+    /// "this worker logged nothing", which is exactly the opposite of what happened.
+    #[tokio::test]
+    async fn an_unreachable_worker_is_reported_with_its_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant.log");
+        // A port nothing is listening on — taken and released, so it is genuinely dead rather
+        // than someone else's service.
+        let dead = ephemeral_port();
+        let (_env, app) = logs_state_with_workers(
+            dir.path(),
+            vec![format!("http://127.0.0.1:{dead}")],
+        );
+
+        let (status, body) = get_logs(
+            &app,
+            &format!("/api/v1/logs?file=current&worker=127.0.0.1:{dead}"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "an unreachable worker is a named failure, not an empty page: {body}"
+        );
+        let error = body["error"].as_str().expect("a reason");
+        assert!(error.contains(&dead.to_string()), "{error}");
+        assert!(
+            body.get("logs").is_none(),
+            "and it never comes back as zero lines: {body}"
+        );
+
+        let (status, body) = get_logs(&app, "/api/v1/logs/workers").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let workers = body["workers"].as_array().expect("workers");
+        assert_eq!(workers[0]["worker_id"], "driver");
+        assert_eq!(workers[0]["reachable"], true);
+        assert_eq!(workers[1]["worker_id"], format!("127.0.0.1:{dead}"));
+        assert_eq!(
+            workers[1]["reachable"],
+            false,
+            "listed with reachable:false, not dropped from the picker: {body}"
+        );
+        assert!(
+            workers[1]["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "with a reason: {body}"
+        );
+    }
+
+    /// A driver with no workers says so, rather than answering `unknown worker` and leaving the
+    /// operator hunting for a typo in a list that does not exist.
+    #[tokio::test]
+    async fn a_driver_with_no_workers_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant.log");
+        let (_env, app) = logs_state(dir.path(), true);
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=current&worker=w1").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body["error"].as_str().unwrap().contains("no workers configured"),
+            "{body}"
+        );
+        let (_, body) = get_logs(&app, "/api/v1/logs/workers").await;
+        assert_eq!(
+            body["workers"].as_array().expect("workers").len(),
+            1,
+            "the driver is always in the picker: {body}"
+        );
     }
 
     /// `?file=` inherits the endpoint's gate unchanged — and it matters more than it did: the
