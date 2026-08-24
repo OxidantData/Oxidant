@@ -225,6 +225,15 @@ const DEFAULT_RESULT_MEMORY_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_DISK_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// `OXIDANT_DISK_MIN_FREE_BYTES` (§3) — the filesystem free-space floor.
 const DEFAULT_DISK_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+/// `OXIDANT_LOG_MAX_FILE_BYTES` (§3) — the live log rotates early at this size, mid-period.
+const DEFAULT_LOG_MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// `OXIDANT_LOG_MAX_TOTAL_BYTES` (§3) — the `logs/` subtree's own cap, inside the disk budget.
+const DEFAULT_LOG_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// `OXIDANT_EVENT_LOG_MAX_BYTES` (§8, F16) — `event_log_dir`'s cap. `0` restores today's
+/// unbounded `events.jsonl`.
+const DEFAULT_EVENT_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// `OXIDANT_LOG_KEEP_DAYS` (§3) — evaluated against the *period* a rolled file covers.
+const DEFAULT_LOG_KEEP_DAYS: i64 = 30;
 
 /// Resolved statement-history configuration.
 #[derive(Clone, Debug)]
@@ -253,9 +262,27 @@ pub(crate) struct HistoryConfig {
     pub segment_max_bytes: u64,
     /// `<history-dir>/results`, or `OXIDANT_RESULT_DIR` — spilled Arrow IPC results (§5).
     pub results_dir: PathBuf,
-    /// `<root>/logs`, or `OXIDANT_LOG_DIR`. PR2 does not *write* here (the rolling writer is
-    /// PR3); the disk sweeper prunes it, which is why the path is resolved now.
+    /// `<root>/logs`, or `OXIDANT_LOG_DIR` — the live `oxidant.log` and its rolled siblings.
     pub logs_dir: PathBuf,
+    /// `OXIDANT_LOG_ROLL` — which UTC boundary closes the live file (`off` disables the file
+    /// writer entirely).
+    pub log_roll: crate::logging::LogRoll,
+    /// `OXIDANT_LOG_MAX_FILE_BYTES` — the size that rolls the live file early, mid-period.
+    pub log_max_file_bytes: u64,
+    /// `OXIDANT_LOG_MAX_TOTAL_BYTES` — the `logs/` subtree cap, pruned oldest-rolled-first.
+    pub log_max_total_bytes: u64,
+    /// `OXIDANT_LOG_KEEP_DAYS` — retention, evaluated against a file's whole *period*.
+    pub log_keep_days: i64,
+    /// `OXIDANT_LOG_PARQUET` — `off` keeps rolled files as plain text (~10× larger).
+    pub log_parquet: bool,
+    /// `OXIDANT_LOG_DEDUP` — collapse a repeated identical line to `… repeated N times`.
+    pub log_dedup: bool,
+    /// `OXIDANT_EVENT_LOG_DIR` — the Spark-history-server compatibility surface (§8). Under the
+    /// disk budget as of PR3, rolled rather than deleted, with its own cap below.
+    pub event_log_dir: Option<PathBuf>,
+    /// `OXIDANT_EVENT_LOG_MAX_BYTES` — `event_log_dir`'s cap; `0` is today's unbounded
+    /// behaviour, and the runtime contract says what that costs.
+    pub event_log_max_bytes: u64,
     /// `<root>/dumps`, or `OXIDANT_DUMP_DIR` — §6b support bundles, swept like results.
     pub dumps_dir: PathBuf,
     pub result_persist: ResultPersist,
@@ -312,6 +339,9 @@ impl HistoryConfig {
         let results_dir =
             env_path("OXIDANT_RESULT_DIR")?.unwrap_or_else(|| history_dir.join("results"));
         let logs_dir = env_path("OXIDANT_LOG_DIR")?.unwrap_or_else(|| root.join("logs"));
+        // The one knob whose *directory* an operator points at a Spark-history-server path that
+        // other tools read; `AppStateStore` resolves it from the same variable.
+        let event_log_dir = env_path("OXIDANT_EVENT_LOG_DIR")?;
         let dumps_dir = env_path("OXIDANT_DUMP_DIR")?.unwrap_or_else(|| root.join("dumps"));
         Ok(Self {
             enabled,
@@ -331,6 +361,23 @@ impl HistoryConfig {
                 .max(1),
             results_dir,
             logs_dir,
+            log_roll: env_str("OXIDANT_LOG_ROLL")
+                .and_then(|v| crate::logging::LogRoll::parse(&v))
+                .unwrap_or_default(),
+            log_max_file_bytes: env_u64("OXIDANT_LOG_MAX_FILE_BYTES", DEFAULT_LOG_MAX_FILE_BYTES)
+                .max(1),
+            log_max_total_bytes: env_u64(
+                "OXIDANT_LOG_MAX_TOTAL_BYTES",
+                DEFAULT_LOG_MAX_TOTAL_BYTES,
+            ),
+            log_keep_days: env_u64("OXIDANT_LOG_KEEP_DAYS", DEFAULT_LOG_KEEP_DAYS as u64) as i64,
+            log_parquet: !env_off("OXIDANT_LOG_PARQUET"),
+            log_dedup: !env_off("OXIDANT_LOG_DEDUP"),
+            event_log_dir,
+            event_log_max_bytes: env_u64(
+                "OXIDANT_EVENT_LOG_MAX_BYTES",
+                DEFAULT_EVENT_LOG_MAX_BYTES,
+            ),
             dumps_dir,
             result_persist: env_str("OXIDANT_RESULT_PERSIST")
                 .and_then(|v| ResultPersist::parse(&v))
@@ -378,6 +425,17 @@ impl HistoryConfig {
             statements_dir,
             results_dir: history_dir.join("results"),
             logs_dir: root.join("logs"),
+            log_roll: crate::logging::LogRoll::default(),
+            log_max_file_bytes: DEFAULT_LOG_MAX_FILE_BYTES,
+            // Neutral log retention, opted into per test, for the same reason the disk guards
+            // above are neutral: a shipped 30-day/2 GiB default would make every unrelated
+            // history test's fixtures depend on what today's date happens to be.
+            log_max_total_bytes: u64::MAX,
+            log_keep_days: 0,
+            log_parquet: true,
+            log_dedup: true,
+            event_log_dir: None,
+            event_log_max_bytes: DEFAULT_EVENT_LOG_MAX_BYTES,
             dumps_dir: root.join("dumps"),
             result_persist: ResultPersist::default(),
             result_max_bytes: DEFAULT_RESULT_MAX_BYTES,
@@ -457,6 +515,19 @@ fn running_as_service() -> bool {
 
 fn env_str(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// Is this knob explicitly turned off? Used by the knobs that default to *on*
+/// (`OXIDANT_LOG_PARQUET`, `OXIDANT_LOG_DEDUP`), where an unset variable and `on` must agree.
+fn env_off(key: &str) -> bool {
+    matches!(
+        env_str(key)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "off" | "false" | "no"
+    )
 }
 
 fn env_flag(key: &str) -> bool {

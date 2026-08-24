@@ -81,7 +81,9 @@ static TMP_SERIAL: AtomicU64 = AtomicU64::new(0);
 /// The lockfile that guards a journal: `<statements-dir>/.lock`.
 ///
 /// Not `<root>/.lock`: the journal is what must be exclusive, and `OXIDANT_HISTORY_DIR` can put
-/// it anywhere (see the module docs).
+/// it anywhere (see the module docs). The exec log dir takes the same shape one directory over —
+/// `<logs-dir>/.lock` — for the reason on [`acquire_logs_dir`].
+#[cfg(test)]
 fn lock_path(cfg: &HistoryConfig) -> PathBuf {
     cfg.statements_dir.join(".lock")
 }
@@ -104,20 +106,49 @@ fn holder_body(pid: u32, cfg: &HistoryConfig) -> String {
 
 /// Take the exclusive lock on the effective statements dir, or explain exactly who holds it.
 pub(crate) fn acquire(cfg: &HistoryConfig) -> Result<JournalDirLock, String> {
-    let dir = cfg.statements_dir.clone();
-    fs_util::create_dir_secure(&dir).map_err(|e| {
-        format!(
-            "oxidant: cannot create the statement journal dir {}: {e}",
-            dir.display()
-        )
-    })?;
+    acquire_in(
+        &cfg.statements_dir,
+        "the statement journal dir",
+        &holder_body(std::process::id(), cfg),
+        &|holder| lock_error(cfg, holder),
+    )
+}
+
+/// Take the exclusive lock on `logs/` — **one rolling writer per log directory** (§3c).
+///
+/// A worker takes no journal lock (it runs no statements), so before this a driver and a
+/// co-located worker on the default root both `append_secure`d the same `logs/oxidant.log` and
+/// each ran its own roll logic. The driver's roll renames the live file and reopens a fresh one;
+/// the worker keeps appending to the fd it still holds, which now points at the *rolled* inode;
+/// either process's converter then finds that rolled file, converts it, and unlinks the text. From
+/// that instant every worker log line goes to a deleted inode, silently, until the worker's own
+/// roll trigger fires — and the worker's log is the thing operators dig through after an OOM.
+pub(crate) fn acquire_logs_dir(cfg: &HistoryConfig) -> Result<JournalDirLock, String> {
+    acquire_in(
+        &cfg.logs_dir,
+        "the exec log dir",
+        &holder_body(std::process::id(), cfg),
+        &|holder| logs_lock_error(cfg, holder),
+    )
+}
+
+/// The lock protocol itself, over any directory: publish, share if it is ours, refuse if it is a
+/// live stranger's, take over if it is a dead one's.
+fn acquire_in(
+    dir: &Path,
+    what: &str,
+    body: &str,
+    describe: &dyn Fn(&Holder) -> String,
+) -> Result<JournalDirLock, String> {
+    let dir = dir.to_path_buf();
+    fs_util::create_dir_secure(&dir)
+        .map_err(|e| format!("oxidant: cannot create {what} {}: {e}", dir.display()))?;
     sweep_abandoned_temporaries(&dir);
-    let path = lock_path(cfg);
-    let body = holder_body(std::process::id(), cfg);
+    let path = dir.join(".lock");
 
     // The uncontended path, and the overwhelmingly common one.
-    match publish(&path, &body, &dir) {
-        Ok(()) => return claim_verified(cfg, path),
+    match publish(&path, body, &dir) {
+        Ok(()) => return claim_verified(path, describe),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => {
             return Err(format!(
@@ -127,7 +158,7 @@ pub(crate) fn acquire(cfg: &HistoryConfig) -> Result<JournalDirLock, String> {
         }
     }
 
-    if let Some(shared) = re_entrant(&path, cfg)? {
+    if let Some(shared) = re_entrant(&path, describe)? {
         return Ok(shared);
     }
 
@@ -136,19 +167,19 @@ pub(crate) fn acquire(cfg: &HistoryConfig) -> Result<JournalDirLock, String> {
     // lock — two writers on one journal.
     let claim = Claim::take(&dir)?;
     // Re-read under the claim: whoever else was deciding has finished by now.
-    if let Some(shared) = re_entrant(&path, cfg)? {
+    if let Some(shared) = re_entrant(&path, describe)? {
         return Ok(shared);
     }
     let _ = std::fs::remove_file(&path);
     fs_util::fsync_dir(&dir);
-    publish(&path, &body, &dir).map_err(|e| {
+    publish(&path, body, &dir).map_err(|e| {
         format!(
             "oxidant: cannot take over the stale lockfile {}: {e}",
             path.display()
         )
     })?;
     drop(claim);
-    claim_verified(cfg, path)
+    claim_verified(path, describe)
 }
 
 /// Is the existing lock one we may share or must refuse? `None` means it is stale and takeable.
@@ -156,7 +187,10 @@ pub(crate) fn acquire(cfg: &HistoryConfig) -> Result<JournalDirLock, String> {
 /// `Ok(Some(_))` is the same-process case (a second server in one process — the in-process
 /// `local-cluster` shape, and every test that boots two services): share the directory rather
 /// than refusing to start against ourselves.
-fn re_entrant(path: &Path, cfg: &HistoryConfig) -> Result<Option<JournalDirLock>, String> {
+fn re_entrant(
+    path: &Path,
+    describe: &dyn Fn(&Holder) -> String,
+) -> Result<Option<JournalDirLock>, String> {
     let holder = read_holder(path);
     if holder.pid == std::process::id() {
         return Ok(Some(JournalDirLock {
@@ -165,7 +199,7 @@ fn re_entrant(path: &Path, cfg: &HistoryConfig) -> Result<Option<JournalDirLock>
         }));
     }
     if holder_is_held(&holder, path) {
-        return Err(lock_error(cfg, &holder));
+        return Err(describe(&holder));
     }
     Ok(None)
 }
@@ -174,12 +208,15 @@ fn re_entrant(path: &Path, cfg: &HistoryConfig) -> Result<Option<JournalDirLock>
 ///
 /// A process that lost a takeover race would otherwise report success while another process's
 /// record sits in the file — and would delete that process's lock on drop.
-fn claim_verified(cfg: &HistoryConfig, path: PathBuf) -> Result<JournalDirLock, String> {
+fn claim_verified(
+    path: PathBuf,
+    describe: &dyn Fn(&Holder) -> String,
+) -> Result<JournalDirLock, String> {
     let holder = read_holder(&path);
     if holder.pid == std::process::id() {
         return Ok(JournalDirLock { path, owned: true });
     }
-    Err(lock_error(cfg, &holder))
+    Err(describe(&holder))
 }
 
 /// Write `body` to a private temporary, fsync it, and `hard_link` it into `path`.
@@ -325,6 +362,34 @@ fn lock_error(cfg: &HistoryConfig, holder: &Holder) -> String {
     out
 }
 
+/// The second-writer error for `logs/`, in the same shape as [`lock_error`].
+///
+/// A worker takes no journal lock, so this is the *only* thing that stops a co-located driver and
+/// worker on one root from sharing a live log file and unlinking it out from under each other.
+/// Refusing costs this process its durable log; sharing costs it the same log silently, plus the
+/// peer's. The way out is one line of configuration and it is printed here.
+fn logs_lock_error(cfg: &HistoryConfig, holder: &Holder) -> String {
+    format!(
+        "oxidant: the exec log dir ({}) is in use by pid {} (role={}, role's data dir={}).\n         \
+         Two processes cannot share one logs/ directory: each rolls oxidant.log on its own \
+         schedule\n         \
+         and each converter unlinks a rolled file the other may still have open, so the second \
+         writer's\n         \
+         lines go to a deleted inode. This process keeps logging to stderr and to \
+         GET /api/v1/logs,\n         \
+         but writes no rolling exec log. Set OXIDANT_DATA_DIR_PER_PROCESS=1 to use \
+         {}/<role>-<port>/,\n         \
+         or point OXIDANT_LOG_DIR at a distinct path for this process, or set \
+         OXIDANT_LOG_ROLL=off to say\n         \
+         you meant stderr only.",
+        cfg.logs_dir.display(),
+        holder.pid,
+        holder.role,
+        holder.root_or_unknown(),
+        cfg.root.display(),
+    )
+}
+
 #[derive(Debug)]
 struct Holder {
     pid: u32,
@@ -415,6 +480,53 @@ mod tests {
         assert!(err.contains("is locked by pid 1"), "{err}");
         assert!(err.contains("role=driver, port=15002"), "{err}");
         assert!(err.contains("OXIDANT_DATA_DIR_PER_PROCESS=1"), "{err}");
+    }
+
+    /// **H3.** A worker takes no *journal* lock — it runs no statements — so before this
+    /// nothing stopped a co-located driver and worker on the default root from opening the same
+    /// `logs/oxidant.log`. Each rolls it on its own schedule, and either converter then unlinks a
+    /// rolled file the peer still has open: from that instant the loser's lines go to a deleted
+    /// inode, with no error, until its own roll trigger fires. The worker's log — the thing an
+    /// operator digs through after an OOM — can vanish for a whole roll period.
+    ///
+    /// The second writer is refused, loudly, with the one line of config that separates them.
+    #[test]
+    fn a_second_writer_on_one_logs_dir_is_refused_with_the_way_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = HistoryConfig::for_root(dir.path());
+        let _held = acquire_logs_dir(&cfg).expect("first writer");
+        // As if another live process held it (pid 1 always exists and is not us).
+        std::fs::write(
+            cfg.logs_dir.join(".lock"),
+            "{\"pid\":1,\"role\":\"driver\",\"port\":15002,\"root\":\"/srv/oxidant\"}",
+        )
+        .expect("write");
+        let err = acquire_logs_dir(&cfg).expect_err("must refuse a live holder");
+        assert!(err.contains("exec log dir"), "{err}");
+        assert!(err.contains("in use by pid 1"), "{err}");
+        assert!(err.contains("role=driver"), "{err}");
+        assert!(err.contains("OXIDANT_DATA_DIR_PER_PROCESS=1"), "{err}");
+        assert!(err.contains("OXIDANT_LOG_DIR"), "{err}");
+        assert!(err.contains("OXIDANT_LOG_ROLL=off"), "{err}");
+    }
+
+    /// The two locks are independent directories, so a driver's journal lock does not refuse its
+    /// own logs — and `OXIDANT_DATA_DIR_PER_PROCESS=1` (or `OXIDANT_LOG_DIR`) separates two
+    /// processes' logs exactly as the refusal message says it does.
+    #[test]
+    fn per_process_roots_take_two_distinct_log_locks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut driver = HistoryConfig::for_root(&dir.path().join("driver-50051"));
+        driver.role = "driver".to_string();
+        let mut worker = HistoryConfig::for_root(&dir.path().join("worker-50052"));
+        worker.role = "worker".to_string();
+        let a = acquire_logs_dir(&driver).expect("driver's logs");
+        let b = acquire_logs_dir(&worker).expect("worker's logs");
+        assert_ne!(a.path(), b.path());
+        assert!(driver.logs_dir.join(".lock").is_file());
+        assert!(worker.logs_dir.join(".lock").is_file());
+        // And the journal lock is a different file again, so one process takes both.
+        let _journal = acquire(&driver).expect("driver's journal");
     }
 
     /// The lock guards the journal, so it lives in the journal's own directory — not at

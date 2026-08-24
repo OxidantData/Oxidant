@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 use tokio::sync::broadcast;
 
@@ -126,6 +129,43 @@ fn stage_key(operation_id: &str, stage_id: i32) -> String {
     format!("{operation_id}:{stage_id}")
 }
 
+/// File mode for everything the engine writes under the data dir — F15's 0600.
+#[cfg(unix)]
+const FILE_MODE: u32 = 0o600;
+/// Directory mode — F15's 0700.
+#[cfg(unix)]
+const DIR_MODE: u32 = 0o700;
+
+/// `mkdir -p` at 0700 on every component this call creates.
+///
+/// A second copy of `oxidant-connect`'s `history::fs_util`, deliberately: `oxidant-connect`
+/// depends on *this* crate, so importing it back would be a cycle, and a third crate for two
+/// five-line functions buys nothing. **F15's rule is create-time** (`DirBuilder::mode`,
+/// `OpenOptions::mode`), never a chmod afterwards, so there is no window in which the event log
+/// is world-readable. `events.jsonl` carries operation ids, job descriptions and error text, and
+/// PR3 brought this directory under the engine's disk budget and started renaming files in it —
+/// `rename` preserves the mode, so getting it right at create time is enough for the rolled
+/// generations too.
+fn create_dir_secure(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(DIR_MODE);
+    builder.create(path)
+}
+
+/// Open for append, creating at 0600 if absent.
+fn append_secure(path: &Path) -> std::io::Result<fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    opts.mode(FILE_MODE);
+    opts.open(path)
+}
+
 impl AppStateStore {
     pub fn new() -> Self {
         Self::with_options(
@@ -200,9 +240,9 @@ impl AppStateStore {
         self.apply_event(&event);
         if let Some(dir) = &self.event_log_dir {
             if let Ok(json) = serde_json::to_string(&event) {
-                let _ = fs::create_dir_all(dir);
+                let _ = create_dir_secure(dir);
                 let path = dir.join("events.jsonl");
-                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+                if let Ok(mut f) = append_secure(&path) {
                     let _ = writeln!(f, "{json}");
                 }
             }
@@ -840,6 +880,19 @@ impl AppStateStore {
     }
 
     /// Load events from a JSONL event log directory (history server).
+    ///
+    /// Reads the **rolled** `events-<UTC-period>[.N].jsonl` files first, oldest name first, and
+    /// the live `events.jsonl` last. `OXIDANT_EVENT_LOG_MAX_BYTES` (default 2 GiB) rolls the
+    /// live file rather than deleting it (`docs/query-history-durability.md` §8, F16), and a
+    /// history server that read only `events.jsonl` would report a cluster's history as starting
+    /// at the last roll — which is precisely the data loss the roll exists to avoid.
+    ///
+    /// **The replay order is `(period end, split)`, never the file name.** `apply_event` is
+    /// last-write-wins and `JobStarted` overwrites the whole job — status `Running`, no completion
+    /// time, no error — so replaying a newer generation before an older one brings a finished job
+    /// back as running. And the names do *not* sort chronologically:
+    /// `events-2026-08-24.2.jsonl` sorts before `events-2026-08-24.jsonl` (`'2'` < `'j'`), and the
+    /// `.2` split is the *newer* of the two. See [`crate::event_log`].
     pub fn load_event_log(dir: &std::path::Path) -> Self {
         let store = Self::with_options(
             "oxidant-history",
@@ -847,8 +900,26 @@ impl AppStateStore {
             None,
             DEFAULT_MAX_QUERIES,
         );
-        let path = dir.join("events.jsonl");
-        if let Ok(content) = fs::read_to_string(path) {
+        let mut keyed: Vec<(crate::event_log::OrderKey, PathBuf)> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let key = crate::event_log::rolled_order_key(e.file_name().to_str()?)?;
+                Some((key, e.path()))
+            })
+            .collect();
+        // The path breaks ties so two generations that somehow share a key still replay
+        // deterministically — a replay whose result depends on directory order is untestable.
+        keyed.sort();
+        let mut rolled: Vec<PathBuf> = keyed.into_iter().map(|(_, path)| path).collect();
+        // The live file is the newest generation by construction: every rolled one was renamed
+        // out of it.
+        rolled.push(dir.join(crate::event_log::LIVE_EVENT_LOG));
+        for path in rolled {
+            let Ok(content) = fs::read_to_string(path) else {
+                continue;
+            };
             for line in content.lines() {
                 if let Ok(event) = serde_json::from_str::<ExecutionEvent>(line) {
                     store.apply_event(&event);
@@ -925,6 +996,149 @@ mod tests {
         ] {
             assert!(!is_secret_key(key), "{key} should not be redacted");
         }
+    }
+
+    /// `OXIDANT_EVENT_LOG_MAX_BYTES` rolls `events.jsonl` to `events-<UTC-period>[.N].jsonl`
+    /// rather than deleting it (`docs/query-history-durability.md` §8, F16). A history server
+    /// that read only the live file would report a cluster's history as starting at the last
+    /// roll — which is exactly the data loss the roll exists to avoid.
+    #[test]
+    fn load_event_log_reads_the_rolled_generations_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, ops: &[&str]| {
+            let body: String = ops
+                .iter()
+                .map(|op| {
+                    let event = ExecutionEvent::JobStarted {
+                        operation_id: (*op).into(),
+                        job_id: 0,
+                        description: "SELECT 1".into(),
+                        submission_time_ms: 0,
+                    };
+                    format!("{}\n", serde_json::to_string(&event).expect("json"))
+                })
+                .collect();
+            fs::write(dir.path().join(name), body).expect("write");
+        };
+        // Deliberately out of directory order, and with the `.N` split whose name sorts *before*
+        // the plain one: the replay order is the file order, and a fold that missed a generation
+        // would lose those operations entirely.
+        write("events-2026-08-23.jsonl", &["op-oldest"]);
+        write("events-2026-08-24.2.jsonl", &["op-middle"]);
+        write("events.jsonl", &["op-newest"]);
+        // Not ours: a Spark history server's own files live in this directory.
+        fs::write(dir.path().join("application_1_0001"), b"not jsonl").expect("write");
+
+        let store = AppStateStore::load_event_log(dir.path());
+        let mut ids: Vec<String> = store
+            .all_operation_states()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "op-middle".to_string(),
+                "op-newest".to_string(),
+                "op-oldest".to_string()
+            ],
+            "every rolled generation is replayed, not just the live file"
+        );
+    }
+
+    /// **L3.** F15's rule — every file 0600, every directory 0700, at create time — had a hole in
+    /// the one directory this crate writes. `fs::create_dir_all` + a plain `OpenOptions` let the
+    /// mode fall to umask, so `events.jsonl` was typically 0644 in a 0755 directory. It carries
+    /// operation ids, job descriptions and error text, and PR3 brought it under the engine's disk
+    /// budget and started renaming files in it — `rename` preserves the mode, so a 0644 live file
+    /// meant 0644 rolled generations for the whole retention window.
+    #[test]
+    #[cfg(unix)]
+    fn the_event_log_is_created_0600_in_a_0700_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        // A path that does not exist yet: the directory mode is set by *this* call, not inherited.
+        let dir = root.path().join("events").join("nested");
+        let store =
+            AppStateStore::with_options("app", "Oxidant", Some(dir.clone()), DEFAULT_MAX_QUERIES);
+        store.emit(ExecutionEvent::JobStarted {
+            operation_id: "op-1".into(),
+            job_id: 1,
+            description: "SELECT secret FROM t".into(),
+            submission_time_ms: 1,
+        });
+
+        let file = dir.join("events.jsonl");
+        assert!(file.is_file(), "the event log was written");
+        let mode = |p: &std::path::Path| {
+            std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&file), 0o600, "F15: 0600, not umask");
+        assert_eq!(
+            mode(&dir),
+            0o700,
+            "F15: 0700, and on every component created"
+        );
+        assert_eq!(
+            mode(&root.path().join("events")),
+            0o700,
+            "including the intermediate one `mkdir -p` created"
+        );
+    }
+
+    /// **A finished job stays finished.** `apply_event` is last-write-wins and `JobStarted`
+    /// overwrites the whole job — status `Running`, `completion_time_ms: None`, `error: None` — so
+    /// the replay order is a correctness property. A job that started in
+    /// `events-2026-08-24.jsonl` and finished in the `.2` split after a roll comes back `Running`,
+    /// with its completion time erased, under the lexicographic order this replaced: `'2'` (0x32)
+    /// sorts before `'j'` (0x6a), so the split replayed first and the plain file clobbered it.
+    #[test]
+    fn a_job_that_finished_in_a_later_split_is_not_resurrected_as_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, events: &[ExecutionEvent]| {
+            let body: String = events
+                .iter()
+                .map(|e| format!("{}\n", serde_json::to_string(e).expect("json")))
+                .collect();
+            fs::write(dir.path().join(name), body).expect("write");
+        };
+        let started = ExecutionEvent::JobStarted {
+            operation_id: "op-1".into(),
+            job_id: 7,
+            description: "SELECT 1".into(),
+            submission_time_ms: 1_000,
+        };
+        let finished = ExecutionEvent::JobFinished {
+            operation_id: "op-1".into(),
+            job_id: 7,
+            status: JobStatus::Succeeded,
+            completion_time_ms: 2_000,
+            error: None,
+        };
+        // The roll landed between the two events: the start is in the plain file of the period,
+        // the finish in the `.2` split that the roll created after it.
+        write("events-2026-08-24.jsonl", &[started]);
+        write("events-2026-08-24.2.jsonl", &[finished]);
+
+        let store = AppStateStore::load_event_log(dir.path());
+        assert_eq!(
+            store.all_operation_states(),
+            vec![("op-1".to_string(), OperationState::Succeeded)],
+            "the `.2` split is the newer generation and must be replayed last"
+        );
+        let job = store
+            .list_jobs(None)
+            .into_iter()
+            .find(|j| j.job_id == 7)
+            .expect("the job survives the replay");
+        assert_eq!(job.status, job_status_str(JobStatus::Succeeded));
+        assert!(
+            job.completion_time.is_some(),
+            "a resurrected job loses its completion time: {:?}",
+            job.completion_time
+        );
     }
 
     #[test]

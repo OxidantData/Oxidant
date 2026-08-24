@@ -45,11 +45,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sysinfo::{Pid, System};
 use tokio::sync::{watch, Notify};
-use tracing::Subscriber;
-use tracing_subscriber::layer::Context;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::Layer;
 use uuid::Uuid;
+
+use crate::logging::{LogBuffer, LogView, MAX_LOG_LINES};
 
 use crate::history::{
     disk, now_rfc3339, rfc3339_from_ms, FoldedStatement, HistoryConfig, HistoryRuntime,
@@ -69,114 +67,8 @@ const LIST_CAP: usize = 100;
 const DEFAULT_RESULT_LIMIT: usize = 10_000;
 /// Default `?wait=true` blocking timeout (seconds).
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 30;
-/// Max retained log lines served by `GET /api/v1/logs`.
-const MAX_LOG_LINES: usize = 1000;
 /// Minimum wall-clock gap between two full retention passes over the history tier.
 const SWEEP_INTERVAL_MS: i64 = 60_000;
-
-/// In-memory ring buffer of recent log lines shared by the tracing layer and the logs endpoint.
-#[derive(Clone)]
-pub struct LogBuffer {
-    inner: Arc<Mutex<Vec<String>>>,
-    cap: usize,
-}
-
-impl LogBuffer {
-    fn new(cap: usize) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Vec::with_capacity(cap))),
-            cap,
-        }
-    }
-
-    fn push(&self, line: String) {
-        let mut inner = self.inner.lock().expect("log buffer poisoned");
-        if inner.len() >= self.cap {
-            inner.remove(0);
-        }
-        inner.push(line);
-    }
-
-    fn lines(&self) -> Vec<String> {
-        self.inner.lock().expect("log buffer poisoned").clone()
-    }
-}
-
-impl<S: Subscriber> Layer<S> for LogBuffer {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        self.push(format_event(event));
-    }
-}
-
-fn format_event(event: &tracing::Event<'_>) -> String {
-    let mut visitor = LogVisitor(String::new());
-    event.record(&mut visitor);
-    let meta = event.metadata();
-    if visitor.0.is_empty() {
-        format!("[{}] {}", meta.level(), meta.target())
-    } else {
-        format!("[{}] {} - {}", meta.level(), meta.target(), visitor.0)
-    }
-}
-
-struct LogVisitor(String);
-
-impl LogVisitor {
-    fn push_field(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Display) {
-        if !self.0.is_empty() {
-            self.0.push_str(", ");
-        }
-        self.0.push_str(field.name());
-        self.0.push('=');
-        self.0.push_str(&value.to_string());
-    }
-}
-
-impl tracing::field::Visit for LogVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.push_field(field, &format!("{:?}", value));
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.push_field(field, &format!("{:?}", value));
-    }
-
-    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.push_field(field, &value);
-    }
-
-    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.push_field(field, &value);
-    }
-
-    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        self.push_field(field, &value);
-    }
-
-    fn record_error(
-        &mut self,
-        field: &tracing::field::Field,
-        value: &(dyn std::error::Error + 'static),
-    ) {
-        self.push_field(field, &value);
-    }
-}
-
-static LOG_BUFFER: OnceLock<LogBuffer> = OnceLock::new();
-
-/// Initialize process-wide log capture into an in-memory ring buffer and a compact
-/// `tracing` fmt subscriber. Idempotent: subsequent calls are ignored.
-pub fn init_logging() {
-    let buffer = LOG_BUFFER
-        .get_or_init(|| LogBuffer::new(MAX_LOG_LINES))
-        .clone();
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::INFO)
-        .finish()
-        .with(buffer)
-        .try_init();
-}
 
 /// Cached sysinfo `System` for process metrics. Kept in a `Mutex` so successive
 /// `refresh_process_specifics` calls can compute a meaningful CPU percentage.
@@ -665,8 +557,9 @@ impl StatementStore {
         };
         store.install_spill_sink();
         store.publish_status_counters();
+        store.install_roll_sweep_hook();
         store.sweep_history();
-        // §3: the sweeper runs at boot and every 5 minutes.
+        // §3: the sweeper runs at boot, at roll time, and every 5 minutes.
         store.sweep_disk();
         store.spawn_disk_sweeper();
         tracing::info!(
@@ -681,6 +574,41 @@ impl StatementStore {
             "statement history replayed"
         );
         Ok(store)
+    }
+
+    /// Teach the rolling log writer to sweep the disk when it rolls (§3: "The sweeper runs at
+    /// roll time, at boot, and every 5 minutes").
+    ///
+    /// A roll is the one moment the engine's own footprint jumps by a whole file, and it is also
+    /// the moment `OXIDANT_LOG_KEEP_DAYS` has a new file to consider — waiting up to five
+    /// minutes for the timer would let a chatty size-rolling driver run several files past its
+    /// budget.
+    ///
+    /// [`std::sync::Weak`], like the spill sink and the sweeper thread: the hook lives in a
+    /// process-global for the writer's whole life, and a strong reference would keep a test's
+    /// store — and its data-dir lock — alive past the end of the test.
+    fn install_roll_sweep_hook(&self) {
+        let Some(history) = self.history.as_ref() else {
+            return;
+        };
+        let inner = Arc::downgrade(&self.inner);
+        let history = Arc::downgrade(history);
+        let notify = Arc::downgrade(&self.notify);
+        let disk = Arc::clone(&self.disk);
+        crate::logging::set_sweep_hook(move || {
+            let (Some(inner), Some(history), Some(notify)) =
+                (inner.upgrade(), history.upgrade(), notify.upgrade())
+            else {
+                return;
+            };
+            StatementStore {
+                inner,
+                notify,
+                history: Some(history),
+                disk: Arc::clone(&disk),
+            }
+            .sweep_disk();
+        });
     }
 
     /// Teach the spill thread how to report back into the store.
@@ -1508,13 +1436,35 @@ impl StatementStore {
         history.results.drain_blocking();
 
         let cfg = &history.cfg;
-        let roots = budget_roots(cfg);
-        let measure = |roots: &[std::path::PathBuf]| -> u64 {
-            roots.iter().map(|r| disk::subtree_bytes(r)).sum()
-        };
+        let roots = disk::budget_roots(cfg);
 
         let mut report = disk::SweepReport::default();
-        let before = measure(&roots);
+        // Retention runs before the budget, and unconditionally: `OXIDANT_LOG_KEEP_DAYS` and
+        // `OXIDANT_LOG_MAX_TOTAL_BYTES` are the `logs/` subtree's own contract, and
+        // `OXIDANT_EVENT_LOG_MAX_BYTES` is `event_log_dir`'s. Both must hold whether or not the
+        // global budget is tight — a driver far under 8 GiB still may not keep 90 days of logs.
+        let now = chrono::Utc::now();
+        let logs = disk::prune_expired_logs(
+            &cfg.logs_dir,
+            cfg.log_keep_days,
+            cfg.log_max_total_bytes,
+            now,
+        );
+        report.logs_expired = logs.expired;
+        report.logs_over_cap = logs.over_cap;
+        // Retention's own bytes. They are freed *before* `before` is measured — which is the
+        // correct order for the prune loop, since it stops it from spending a second time what
+        // retention already reclaimed — so they have to be added back at the end or the line
+        // reads `logs_expired=2, event_logs_pruned=1, freed_bytes=0`, which looks like a bug in
+        // the sweeper (M3).
+        let mut retention_freed = logs.freed_bytes;
+        if let Some(dir) = &cfg.event_log_dir {
+            let events = disk::roll_event_log(dir, cfg.event_log_max_bytes, cfg.log_roll, now);
+            report.event_logs_pruned = events.pruned;
+            report.event_log_rolled = events.rolled;
+            retention_freed = retention_freed.saturating_add(events.freed_bytes);
+        }
+        let before = disk::measure_roots(&roots).billed;
         // The running total, decremented by what each unlink reports. The whole tree used to be
         // re-walked *per candidate* — pruning 10,000 statements meant 10,000 full recursive
         // directory walks interleaved with 10,000 lock/unlock cycles of the store mutex that
@@ -1575,8 +1525,12 @@ impl StatementStore {
 
         // One re-measure at the end: what the running total estimated is not what `/api/status`
         // reports.
-        report.used_bytes = measure(&roots);
-        report.freed_bytes = before.saturating_sub(report.used_bytes);
+        let usage = disk::measure_roots(&roots);
+        report.used_bytes = usage.billed;
+        report.foreign_bytes = usage.foreign;
+        report.freed_bytes = before
+            .saturating_sub(report.used_bytes)
+            .saturating_add(retention_freed);
         report.over_budget = report.used_bytes > cfg.disk_max_bytes;
 
         // The free-space floor, measured *after* the pruning it does not drive — nothing above
@@ -1588,11 +1542,11 @@ impl StatementStore {
         let mounts = mounts_for(cfg);
         let mut lowest: Option<(&std::path::Path, u64)> = None;
         for root in &roots {
-            let Some(free) = mounts.free_bytes(root) else {
+            let Some(free) = mounts.free_bytes(root.path()) else {
                 continue;
             };
             if lowest.map_or(true, |(_, seen)| free < seen) {
-                lowest = Some((root.as_path(), free));
+                lowest = Some((root.path(), free));
             }
         }
         report.free_bytes = lowest.map(|(_, free)| free);
@@ -1608,11 +1562,19 @@ impl StatementStore {
         if report.removed_anything() || report.over_budget || report.low_free {
             tracing::info!(
                 used_bytes = report.used_bytes,
+                // Bytes another tool wrote into `OXIDANT_EVENT_LOG_DIR`. Reported so an operator
+                // can see why the directory is large, never billed: the engine cannot prune one
+                // of them (H2/F16).
+                foreign_bytes = report.foreign_bytes,
                 freed_bytes = report.freed_bytes,
                 budget_bytes = cfg.disk_max_bytes,
                 free_bytes = report.free_bytes,
                 min_free_bytes = cfg.disk_min_free_bytes,
                 rolled_logs = report.rolled_logs_removed,
+                logs_expired = report.logs_expired,
+                logs_over_cap = report.logs_over_cap,
+                event_logs_pruned = report.event_logs_pruned,
+                event_log_rolled = report.event_log_rolled,
                 dumps = report.dumps_removed,
                 orphan_results = report.orphan_results_removed,
                 statements = report.statements_pruned,
@@ -1925,40 +1887,6 @@ pub(crate) struct DiskHealth {
     low_free: std::sync::atomic::AtomicBool,
 }
 
-/// The distinct subtrees the disk budget covers, deduped so nothing is billed twice.
-///
-/// `OXIDANT_HISTORY_DIR` / `OXIDANT_RESULT_DIR` / `OXIDANT_LOG_DIR` / `OXIDANT_DUMP_DIR` each win
-/// over the root and may point *outside* it, and §3 says an overridden subtree is still counted
-/// against the budget — so the candidates are measured as a set, with any path already contained
-/// in a shallower one dropped.
-///
-/// `event_log_dir` is deliberately absent: §8/F16 brings it under the budget by *rolling*
-/// `events.jsonl`, and that writer is PR3. Counting it here without being able to prune it would
-/// pin `disk: over_budget` on for anyone with a large Spark-history-server directory.
-fn budget_roots(cfg: &HistoryConfig) -> Vec<std::path::PathBuf> {
-    let history_dir = cfg
-        .statements_dir
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| cfg.statements_dir.clone());
-    let mut candidates = vec![
-        cfg.root.clone(),
-        history_dir,
-        cfg.results_dir.clone(),
-        cfg.logs_dir.clone(),
-        cfg.dumps_dir.clone(),
-    ];
-    candidates.sort_by_key(|p| p.components().count());
-    let mut kept: Vec<std::path::PathBuf> = Vec::new();
-    for candidate in candidates {
-        if kept.iter().any(|k| candidate.starts_with(k)) {
-            continue;
-        }
-        kept.push(candidate);
-    }
-    kept
-}
-
 /// What a set of retained batches costs the store's in-memory result budget.
 ///
 /// `get_array_memory_size` over-counts buffers two batches share, so this is an upper bound. That
@@ -2096,6 +2024,9 @@ struct RestState {
     service: Arc<OxidantService>,
     store: StatementStore,
     log_buffer: LogBuffer,
+    /// Where the rolled exec logs are, for `GET /api/v1/logs?file=`. `dir: None` — no rolling
+    /// writer in this process — makes every `?file=` answer `404`.
+    logs: LogView,
     /// Shared bearer token guarding `GET /api/v1/logs`. `None` — the default — makes that one
     /// route answer `404`; nothing else in this router is authenticated.
     status_token: Option<Arc<str>>,
@@ -2103,10 +2034,11 @@ struct RestState {
 
 /// Build the REST statement-execution router around a shared Spark Connect service.
 pub fn router(service: Arc<OxidantService>) -> Router {
-    init_logging();
-    let log_buffer = LOG_BUFFER
-        .get_or_init(|| LogBuffer::new(MAX_LOG_LINES))
-        .clone();
+    // Fallback for an embedded caller that builds this router directly: the Connect bootstrap
+    // and `run_worker` both call `logging::init(role, port)` first, and it is idempotent, so
+    // this only ever wins when nothing else initialized the process's logging.
+    crate::logging::init("driver", 0);
+    let log_buffer = crate::logging::buffer();
     // The statement store is attached to the service at boot ([`init_statement_store`]) so the
     // Connect path writes into the same history this router reads. A service that never had one
     // attached (an embedded caller building the router directly) gets today's volatile store.
@@ -2118,6 +2050,7 @@ pub fn router(service: Arc<OxidantService>) -> Router {
         service,
         store,
         log_buffer,
+        logs: LogView::process(),
         status_token: oxidant_ui_server::status::status_token_from_env().map(Into::into),
     })
 }
@@ -2734,18 +2667,144 @@ fn process_metrics() -> (Option<u64>, Option<u64>, Option<f32>) {
         .unwrap_or((None, None, None))
 }
 
-/// `GET /api/v1/logs` — the driver's `tracing` ring buffer, for the monitoring UI's
-/// Observability page.
+/// `?file=` on `GET /api/v1/logs` (§6).
+#[derive(Debug, Default, Deserialize)]
+struct LogsParams {
+    /// `current`, or a `LogPeriod` in §6's grammar with an optional `.N` split. Absent keeps
+    /// today's answer: the in-memory ring.
+    file: Option<String>,
+    /// Lines per page. Defaults to [`MAX_LOG_LINES`] — the same 1000 the ring serves — and is
+    /// clamped to [`MAX_LOG_PAGE`].
+    limit: Option<usize>,
+    /// Lines to skip from the start of the file.
+    offset: Option<usize>,
+}
+
+/// The largest page `?file=` will serve, however large a `?limit=` is asked for.
 ///
-/// Gated by the same shared token as `/api/status`, through the same code: this is the
-/// driver's own log, not monitoring decoration.
-async fn list_logs(State(state): State<RestState>, headers: header::HeaderMap) -> Response {
+/// A rolled file may hold `OXIDANT_LOG_MAX_FILE_BYTES` (256 MiB, ~2M lines) and the read path had
+/// no cap at all: `?file=current` built a `Vec<String>` of every line and `serde_json` then
+/// serialised a second copy into the body — well over half a GiB transient on a driver whose whole
+/// *result* budget is 512 MiB, multiplied by every concurrent request, on an endpoint the
+/// Observability page polls every 5 s. `MAX_LOG_LINES` applied only to the in-memory ring.
+const MAX_LOG_PAGE: usize = 10_000;
+
+/// `GET /api/v1/logs` — the node's own exec log, for the monitoring UI's Observability page.
+///
+/// Three answers, one route:
+///
+/// - no `?file=` — today's shape, `{"logs": [...]}` from the in-memory ring, **unchanged**
+///   except that each line now leads with an RFC-3339 UTC timestamp (§6);
+/// - `?file=current` — the live `oxidant.log` on disk;
+/// - `?file=<period>[.N]` — one rolled file, served from its `.parquet` if it has been
+///   converted and from its `.log` if it has not. The caller never names an extension: which
+///   one exists is §6's conversion state machine, not the caller's business.
+///
+/// Gated by the same shared token as `/api/status`, through the same code — restated here
+/// because it now matters more. The endpoint used to expose 1000 lines of ring buffer; it now
+/// exposes up to `OXIDANT_LOG_KEEP_DAYS` of every enabled `tracing` field value, and this router
+/// is served under a permissive CORS layer. Unset `OXIDANT_STATUS_TOKEN`, `404`: the route does
+/// not exist, exactly like `/api/status`.
+async fn list_logs(
+    State(state): State<RestState>,
+    headers: header::HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
     if let Some(denied) =
         oxidant_ui_server::status::deny_unless_authorized(state.status_token.as_deref(), &headers)
     {
         return denied;
     }
-    Json(json!({ "logs": state.log_buffer.lines() })).into_response()
+    // **Parsed after the gate, not by an extractor.** Axum runs extractors in declaration order
+    // and short-circuits on rejection, so a `Query<LogsParams>` parameter answered `400` for
+    // `?file=a&file=b` before `deny_unless_authorized` ever ran — and `400` is not what a
+    // nonexistent route answers. The endpoint's stated contract is "unset OXIDANT_STATUS_TOKEN,
+    // `404`: the route does not exist, exactly like `/api/status`", and a `400`-vs-`404` split
+    // tells an unauthenticated caller the route is there (L1).
+    let Ok(Query(params)) = Query::<LogsParams>::try_from_uri(&uri) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid query: expected at most one each of `file`, `limit` and `offset`",
+        );
+    };
+    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(MAX_LOG_LINES).min(MAX_LOG_PAGE);
+    let Some(requested) = params.file else {
+        // The ring is not deduped — dedup applies to the *file* (§6) — and this envelope
+        // deliberately keeps the exact shape it had before `?file=` existed.
+        return Json(json!({ "logs": state.log_buffer.lines() })).into_response();
+    };
+    let Some(dir) = state.logs.dir.as_deref() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "no rolled exec logs on this node (OXIDANT_LOG_ROLL=off, or OXIDANT_HISTORY=off)",
+        );
+    };
+    let (file, label) = if requested == "current" {
+        (crate::logging::resolve_current(dir), "current".to_string())
+    } else {
+        // Parsed into a typed `LogPeriod` and the filename *reconstructed* from it — never
+        // string-joined into a path. `..`, `/`, an extension and an absolute path all fail the
+        // grammar by construction, so no traversal shape ever reaches the join (§6, F12).
+        let Some((period, split)) = crate::logging::LogPeriod::parse(&requested) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid file: expected `current`, `YYYY-MM-DD`, `YYYY-MM-DD-HH` or `YYYY-Www`, \
+                 each with an optional `.N` split (2..999) and no extension",
+            );
+        };
+        // The label echoes what the caller asked for, in the grammar's own spelling — no
+        // extension, because the caller does not choose one.
+        (crate::logging::resolve(dir, period, split), {
+            let stem = period.stem();
+            if split <= 1 {
+                stem
+            } else {
+                format!("{stem}.{split}")
+            }
+        })
+    };
+    let Some(file) = file else {
+        return error_response(StatusCode::NOT_FOUND, "log file not found");
+    };
+    let format = file.format();
+    // **`spawn_blocking`.** Reading a rolled log is `std::fs` I/O plus, for a converted file, a
+    // full Parquet decode. Doing that inline on a tokio worker parks a thread that is also
+    // serving `ExecutePlan`, for as long as the read takes.
+    let page = match tokio::task::spawn_blocking(move || file.read(offset, limit)).await {
+        Ok(Ok(page)) => page,
+        Ok(Err(e)) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read the log file: {e}"),
+            )
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("reading the log file panicked: {e}"),
+            )
+        }
+    };
+    let next_offset = page
+        .has_more
+        .then(|| offset.saturating_add(page.lines.len()));
+    Json(json!({
+        "file": label,
+        "format": format,
+        // The file is authoritative and it *is* deduped when the knob is on; the SSE tail
+        // PR4 adds marks itself `false`. Saying so in the envelope is what keeps an operator
+        // from reading a collapsed run as a gap (§6, F21).
+        "dedup": state.logs.dedup,
+        "offset": offset,
+        "limit": limit,
+        // `null` when this page reached the end of the file. A page may also be cut short of
+        // `limit` by the read path's byte budget, and then this is set even though fewer lines
+        // came back — so paging follows `next_offset` rather than counting.
+        "next_offset": next_offset,
+        "logs": page.lines,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -2780,6 +2839,7 @@ mod tests {
             service: Arc::new(service),
             store: StatementStore::new(),
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         };
         (guard, state.clone(), app(state))
@@ -2799,6 +2859,7 @@ mod tests {
             service: Arc::new(OxidantService::new()),
             store: StatementStore::new(),
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         };
         (guard, state.clone(), app(state))
@@ -3046,6 +3107,342 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(body["logs"].is_array());
+    }
+
+    /// The token every `?file=` test carries: the endpoint 404s outright without one, so a
+    /// test that forgot it would be asserting the gate rather than the grammar.
+    const LOGS_TOKEN: &str = "s3cret-status-token";
+
+    /// A router whose `?file=` reads a tempdir of rolled files, gated exactly like the real one.
+    fn logs_state(dir: &std::path::Path, dedup: bool) -> (MutexGuard<'static, ()>, Router) {
+        let guard = crate::distributed::env_lock();
+        let state = RestState {
+            service: Arc::new(OxidantService::new()),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.to_path_buf()),
+                dedup,
+            },
+            status_token: Some(LOGS_TOKEN.into()),
+        };
+        (guard, app(state))
+    }
+
+    /// `get_json` with the logs bearer token attached.
+    async fn get_logs(app: &Router, uri: &str) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {LOGS_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    /// `?file=` serves a rolled file in whichever form it exists in — and the *server* picks
+    /// the extension, so a caller never has to know whether yesterday has been converted yet.
+    #[tokio::test]
+    async fn the_file_parameter_serves_rolled_logs_in_either_form() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let text = "2026-08-23T14:00:00.500Z [INFO] oxidant_execution - message=stage done, rows=7";
+        std::fs::write(
+            dir.path().join("oxidant-2026-08-23.log"),
+            format!("{text}\n"),
+        )
+        .expect("write");
+        // A second period, converted, plus a size split — three shapes, one grammar.
+        std::fs::write(
+            dir.path().join("oxidant-2026-08-24-09.2.log"),
+            "2026-08-24T09:30:00.000Z [WARN] oxidant_connect - message=pool exhausted\n",
+        )
+        .expect("write");
+        let converted =
+            crate::logging::convert_for_test(&dir.path().join("oxidant-2026-08-24-09.2.log"))
+                .expect("convert");
+        assert!(converted.ends_with("oxidant-2026-08-24-09.2.parquet"));
+        std::fs::write(dir.path().join("oxidant.log"), "live line\n").expect("write");
+
+        let (_env, app) = logs_state(dir.path(), true);
+
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=2026-08-23").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["file"], "2026-08-23");
+        assert_eq!(body["format"], "text");
+        assert_eq!(body["dedup"], true, "the file is deduped and says so (F21)");
+        assert_eq!(body["logs"], json!([text]));
+
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=2026-08-24-09.2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["file"], "2026-08-24-09.2");
+        assert_eq!(body["format"], "parquet", "the server chose the extension");
+        assert_eq!(
+            body["logs"],
+            json!(["2026-08-24T09:30:00.000Z [WARN] oxidant_connect - message=pool exhausted"]),
+            "a converted day reads back as the text it was"
+        );
+
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=current").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["file"], "current");
+        assert_eq!(body["format"], "text");
+        assert_eq!(body["logs"], json!(["live line"]));
+
+        // And with no `?file=` at all the answer is exactly what it was before PR3: the ring.
+        let (status, body) = get_logs(&app, "/api/v1/logs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["logs"].is_array());
+        assert!(
+            body.get("format").is_none(),
+            "the ring envelope is unchanged"
+        );
+        assert!(body.get("dedup").is_none());
+    }
+
+    /// The grammar is the security boundary: every traversal shape, every extension a caller
+    /// must not name, and every near-miss is a `400` — never a `404`, and never a path join.
+    #[tokio::test]
+    async fn the_file_grammar_refuses_traversal_and_404s_what_does_not_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "not a log").expect("write");
+        let (_env, app) = logs_state(dir.path(), false);
+
+        for bad in [
+            "..",
+            "../../etc/passwd",
+            "..%2F..%2Fetc%2Fpasswd",
+            "/etc/passwd",
+            "2026-08-23/../secret.txt",
+            "2026-08-23.log",
+            "2026-08-23.parquet",
+            "secret",
+            "oxidant.log",
+            "2026-8-23",
+            "2026-13-01",
+            "2026-08-23-24",
+            "2027-W53",
+            "2026-08-23.1",
+            "2026-08-23.1000",
+            "",
+        ] {
+            let uri = format!("/api/v1/logs?file={}", urlencode(bad));
+            let (status, body) = get_logs(&app, &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} -> {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains("invalid file"),
+                "{bad:?} -> {body}"
+            );
+        }
+        assert!(
+            secret.exists(),
+            "nothing here reads or removes another file"
+        );
+
+        // A well-formed period with no file on disk is the other answer: 404, not 400.
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=2019-01-01").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "log file not found");
+        // `current` before the process has written one is the same.
+        let (status, _) = get_logs(&app, "/api/v1/logs?file=current").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// `?file=` inherits the endpoint's gate unchanged — and it matters more than it did: the
+    /// route now reaches up to `OXIDANT_LOG_KEEP_DAYS` of every enabled `tracing` field value
+    /// rather than a 1000-line ring.
+    #[tokio::test]
+    async fn the_file_parameter_inherits_the_status_token_gate() {
+        const TOKEN: &str = "s3cret-status-token";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("oxidant-2026-08-23.log"), "line\n").expect("write");
+        let _env = crate::distributed::env_lock();
+        let mut state = RestState {
+            service: Arc::new(OxidantService::new()),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.path().to_path_buf()),
+                dedup: true,
+            },
+            status_token: None,
+        };
+        // Unset token: the whole endpoint 404s, `?file=` included.
+        assert_eq!(
+            get_json(&app(state.clone()), "/api/v1/logs?file=2026-08-23")
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        state.status_token = Some(TOKEN.into());
+        let gated = app(state);
+        let resp = gated
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/logs?file=2026-08-23")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = gated
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/logs?file=2026-08-23")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// **H4.** `?file=` is paged, and the page is bounded whatever the caller asks for.
+    ///
+    /// There was no line cap, no `limit` and no cursor: `MAX_LOG_LINES` applied only to the ring.
+    /// A full live log is `OXIDANT_LOG_MAX_FILE_BYTES` (256 MiB, ~2M lines), so one request built
+    /// a `Vec<String>` of every line and `serde_json` then serialised a second copy into the body
+    /// — over half a GiB transient on a driver whose whole *result* budget is 512 MiB, multiplied
+    /// by every concurrent request, on an endpoint the Observability page polls every 5 s.
+    #[tokio::test]
+    async fn the_file_parameter_pages_and_never_serves_a_whole_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A fixed millisecond: the point here is paging, and a per-line timestamp would only
+        // re-test the Parquet round trip's 3-digit rendering.
+        let line = |i: usize| {
+            format!("2026-08-23T14:00:00.500Z [INFO] oxidant_execution - message=line {i}")
+        };
+        let body: String = (0..2_500).map(|i| format!("{}\n", line(i))).collect();
+        std::fs::write(dir.path().join("oxidant-2026-08-23.log"), &body).expect("write");
+        std::fs::write(dir.path().join("oxidant.log"), &body).expect("write");
+        let (_env, app) = logs_state(dir.path(), true);
+
+        // The default page is the ring's 1000, not the file's 2500.
+        let (status, page) = get_logs(&app, "/api/v1/logs?file=2026-08-23").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["logs"].as_array().expect("logs").len(), 1_000);
+        assert_eq!(page["offset"], 0);
+        assert_eq!(page["limit"], 1_000);
+        assert_eq!(page["next_offset"], 1_000, "and it says where to continue");
+        assert_eq!(page["logs"][0], line(0));
+
+        // The cursor walks the file and stops honestly at the end.
+        let (_, page) = get_logs(&app, "/api/v1/logs?file=2026-08-23&offset=1000").await;
+        assert_eq!(page["logs"][0], line(1_000));
+        assert_eq!(page["next_offset"], 2_000);
+        let (_, page) = get_logs(&app, "/api/v1/logs?file=2026-08-23&offset=2000").await;
+        assert_eq!(page["logs"].as_array().expect("logs").len(), 500);
+        assert_eq!(
+            page["next_offset"],
+            Value::Null,
+            "the last page has no successor"
+        );
+        assert_eq!(page["logs"][499], line(2_499));
+
+        // A caller cannot ask for the whole file by asking for a huge page.
+        let (_, page) = get_logs(&app, "/api/v1/logs?file=current&limit=999999").await;
+        assert_eq!(page["limit"], 10_000, "clamped to MAX_LOG_PAGE");
+        assert_eq!(page["logs"].as_array().expect("logs").len(), 2_500);
+        assert_eq!(page["next_offset"], Value::Null);
+
+        // Same contract through the Parquet path, where an unbounded read is worse still.
+        crate::logging::convert_for_test(&dir.path().join("oxidant-2026-08-23.log"))
+            .expect("convert");
+        let (_, page) = get_logs(&app, "/api/v1/logs?file=2026-08-23&offset=2400&limit=10").await;
+        assert_eq!(page["format"], "parquet");
+        assert_eq!(
+            page["logs"],
+            Value::from((2_400..2_410).map(line).collect::<Vec<_>>())
+        );
+        assert_eq!(page["next_offset"], 2_410);
+    }
+
+    /// **L1.** Axum runs extractors in declaration order and short-circuits on rejection, so a
+    /// `Query<LogsParams>` parameter answered `400 Bad Request` for `?file=a&file=b` before
+    /// `deny_unless_authorized` ran — with the token unset, where the endpoint's stated contract
+    /// is "`404`: the route does not exist, exactly like `/api/status`". A `400`-vs-`404` split
+    /// tells an unauthenticated caller the route is there. The query is parsed after the gate.
+    #[tokio::test]
+    async fn a_malformed_query_answers_the_gate_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_env, app) = logs_state(dir.path(), true);
+        // Gated: a bad query is a bad query, once you are through the door.
+        let (status, _) = get_logs(&app, "/api/v1/logs?file=a&file=b").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = get_logs(&app, "/api/v1/logs?limit=lots").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Ungated: every shape is `404`, malformed or not — the route does not exist.
+        // (`logs_state` already holds the process-global env lock for this test.)
+        let ungated = app_with_no_token(dir.path());
+        for uri in [
+            "/api/v1/logs",
+            "/api/v1/logs?file=a&file=b",
+            "/api/v1/logs?limit=lots",
+            "/api/v1/logs?file=2026-08-23",
+        ] {
+            assert_eq!(
+                get_json(&ungated, uri).await.0,
+                StatusCode::NOT_FOUND,
+                "{uri} must not reveal that the route exists"
+            );
+        }
+    }
+
+    /// A router whose logs endpoint has no token — the `404`-for-everything shape.
+    fn app_with_no_token(dir: &std::path::Path) -> Router {
+        app(RestState {
+            service: Arc::new(OxidantService::new()),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.to_path_buf()),
+                dedup: true,
+            },
+            status_token: None,
+        })
+    }
+
+    /// A node with no rolling writer answers `404`, which is the honest answer: there are no
+    /// files. It must not 500, and it must not fall back to the ring and call it a file.
+    #[tokio::test]
+    async fn a_node_without_a_rolling_writer_has_no_files() {
+        let (_env, mut state, _) = test_state();
+        state.status_token = Some(LOGS_TOKEN.into());
+        let app = app(state);
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=2026-08-23").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("no rolled exec logs"),
+            "{body}"
+        );
+    }
+
+    /// Percent-encode a `?file=` value so a traversal attempt reaches the handler as the caller
+    /// typed it rather than being normalized away by the URI parser.
+    fn urlencode(raw: &str) -> String {
+        raw.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
     }
 
     #[test]
@@ -3411,6 +3808,7 @@ mod tests {
             service: Arc::clone(&service),
             store: service.statement_store().expect("attached").clone(),
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         };
         let (status, body) = get_json(&app(state), "/api/v1/statements").await;
@@ -3695,6 +4093,7 @@ mod tests {
             service: Arc::new(OxidantService::new()),
             store,
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         };
         let router = app(state);
@@ -3770,6 +4169,7 @@ mod tests {
             service: Arc::clone(&service),
             store,
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         };
         let router = app(state);
@@ -3981,6 +4381,7 @@ mod tests {
             service: Arc::new(OxidantService::new()),
             store,
             log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
             status_token: None,
         }
     }
@@ -4396,6 +4797,208 @@ mod tests {
         assert_eq!(report.live_results_removed, 0, "{report:?}");
         assert!(result_file.exists(), "results outlive everything cheaper");
         assert!(!report.over_budget, "and it fits again: {report:?}");
+        store.shutdown_for_test();
+    }
+
+    /// Log retention runs on every sweep, whether or not the global budget is tight: a driver
+    /// far under `OXIDANT_DISK_MAX_BYTES` still may not keep 90 days of logs.
+    ///
+    /// Driven through `sweep_disk` rather than through `prune_expired_logs` directly, because
+    /// the wiring is the part that was missing — the pass existed in PR2's module and nothing
+    /// called it.
+    #[tokio::test]
+    async fn the_sweep_expires_rolled_logs_by_period_with_the_budget_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            // A budget nothing here can breach: the only thing that may delete a log is
+            // retention.
+            c.disk_max_bytes = u64::MAX;
+            c.log_keep_days = 30;
+            c.log_max_total_bytes = u64::MAX;
+        });
+        let (id, _) = store.insert("SELECT 'kept'");
+        store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(0, 2)]));
+
+        let plant = |rel: &str| {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, vec![b'x'; 128]).expect("write");
+            path
+        };
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::days(90);
+        let recent = now - chrono::Duration::days(2);
+        let live = plant("logs/oxidant.log");
+        let expired = plant(&format!("logs/oxidant-{}.log", old.format("%Y-%m-%d")));
+        let expired_parquet = plant(&format!(
+            "logs/oxidant-{}.parquet",
+            (old + chrono::Duration::days(1)).format("%Y-%m-%d")
+        ));
+        let kept = plant(&format!("logs/oxidant-{}.log", recent.format("%Y-%m-%d")));
+
+        let report = store.sweep_disk();
+        assert_eq!(report.logs_expired, 2, "{report:?}");
+        assert_eq!(report.logs_over_cap, 0, "{report:?}");
+        assert_eq!(
+            report.rolled_logs_removed, 0,
+            "the budget step took nothing — this was retention: {report:?}"
+        );
+        assert!(!expired.exists() && !expired_parquet.exists());
+        assert!(kept.exists(), "two days old is inside the window");
+        assert!(live.exists(), "the live file is never a candidate");
+        assert_eq!(
+            store.snapshot(&id).expect("statement").status,
+            StatementStatus::Succeeded,
+            "no statement history is spent on log retention"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// **M3.** `freed_bytes` in the sweep line must count what *retention* freed too.
+    ///
+    /// The two retention passes run before `before` is measured — which is the right order for
+    /// the prune loop, since it stops it spending a second time what retention already reclaimed
+    /// — so their bytes fall outside `before - used_bytes`. Both passes report a `freed_bytes` and
+    /// both were being thrown away, so the operator-facing line said `logs_expired=2,
+    /// event_logs_pruned=1, freed_bytes=0`: files deleted, zero bytes freed. That reads as a bug
+    /// in the sweeper.
+    #[tokio::test]
+    async fn the_sweep_line_counts_the_bytes_retention_freed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = dir.path().join("spark-events");
+        std::fs::create_dir_all(&events).expect("mkdir");
+        let store = history_store_with(dir.path(), |c| {
+            // Nothing here can breach the budget: every byte freed is retention's.
+            c.disk_max_bytes = u64::MAX;
+            c.log_keep_days = 30;
+            c.log_max_total_bytes = u64::MAX;
+            c.event_log_dir = Some(events.clone());
+            c.event_log_max_bytes = 1_000;
+        });
+        let old = chrono::Utc::now() - chrono::Duration::days(90);
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        std::fs::write(
+            logs.join(format!("oxidant-{}.log", old.format("%Y-%m-%d"))),
+            vec![b'x'; 4_096],
+        )
+        .expect("write");
+        // Two generations already rolled, plus a live file over half the cap: the pass rolls the
+        // live one and then prunes every generation but that newest one.
+        for day in ["2020-01-01", "2020-01-02"] {
+            std::fs::write(
+                events.join(format!("events-{day}.jsonl")),
+                vec![b'{'; 2_048],
+            )
+            .expect("write");
+        }
+        std::fs::write(events.join("events.jsonl"), vec![b'{'; 800]).expect("write");
+
+        let report = store.sweep_disk();
+        assert_eq!(report.logs_expired, 1, "{report:?}");
+        assert_eq!(report.event_logs_pruned, 2, "{report:?}");
+        assert!(report.event_log_rolled, "{report:?}");
+        assert!(
+            report.freed_bytes >= 4_096 + 2 * 2_048,
+            "the expired log and both pruned generations are in freed_bytes: {report:?}"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// `event_log_dir` joins the budget in PR3 — by rolling, over the real sweep route.
+    #[tokio::test]
+    async fn the_sweep_rolls_the_event_log_and_counts_it_against_the_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = dir.path().join("spark-events");
+        std::fs::create_dir_all(&events).expect("mkdir");
+
+        let store = history_store_with(dir.path(), |c| {
+            c.disk_max_bytes = u64::MAX;
+            c.event_log_dir = Some(events.clone());
+            c.event_log_max_bytes = 1_000;
+        });
+        // Written *after* the boot sweep, so the pass under test is the explicit one below.
+        std::fs::write(events.join("events.jsonl"), vec![b'{'; 4_000]).expect("write");
+        // Somebody else's file in the same directory — an operator points this at a
+        // Spark-history-server path that other tools write.
+        std::fs::write(events.join("application_1_0001"), b"not ours").expect("write");
+
+        let report = store.sweep_disk();
+        assert!(report.event_log_rolled, "{report:?}");
+        assert!(
+            !events.join("events.jsonl").exists(),
+            "rolled, not deleted: the next emit recreates it"
+        );
+        let rolled: Vec<String> = std::fs::read_dir(&events)
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("events-"))
+            .collect();
+        assert_eq!(rolled.len(), 1, "{rolled:?}");
+        assert!(
+            events.join("application_1_0001").exists(),
+            "the sweeper unlinks only the shape it writes"
+        );
+        assert!(
+            report.used_bytes >= 4_000,
+            "the directory is billed to the budget now: {report:?}"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// **H2.** `OXIDANT_EVENT_LOG_DIR` exists to be pointed at a Spark-history-server path that
+    /// *other tools write*, and the engine can prune exactly one shape there: the
+    /// `events[-<period>].jsonl` files it rolled itself. Billing the rest to
+    /// `OXIDANT_DISK_MAX_BYTES` pins `used` over the budget for ever, so the sweep runs the whole
+    /// prune order to exhaustion — every rolled log, every dump, then `prune_oldest_statement()`
+    /// in a `while used > disk_max_bytes` loop until the journal is empty — every five minutes,
+    /// to pay for a co-tenant's bytes it can never reclaim.
+    ///
+    /// The co-tenant here is 5 MiB against a 1 MiB budget. Nothing may be deleted for it.
+    #[tokio::test]
+    async fn a_spark_history_co_tenant_does_not_cost_the_statement_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = dir.path().join("spark-events");
+        std::fs::create_dir_all(&events).expect("mkdir");
+
+        let store = history_store_with(dir.path(), |c| {
+            c.disk_max_bytes = 1_000_000;
+            c.disk_min_free_bytes = 0;
+            c.event_log_dir = Some(events.clone());
+            c.event_log_max_bytes = 1_000_000;
+        });
+        let (id, _) = store.insert("SELECT 'kept'");
+        store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(0, 2)]));
+        // Five times the whole budget, and not one byte of it prunable.
+        let foreign = events.join("application_1755_0001");
+        std::fs::write(&foreign, vec![b'x'; 5_000_000]).expect("write");
+
+        let report = store.sweep_disk();
+        assert_eq!(
+            report.statements_pruned, 0,
+            "the journal is not spent on a co-tenant's bytes: {report:?}"
+        );
+        assert_eq!(report.rolled_logs_removed, 0, "{report:?}");
+        assert_eq!(report.live_results_removed, 0, "{report:?}");
+        assert!(
+            !report.over_budget,
+            "the engine's own subtree is well inside its budget: {report:?}"
+        );
+        assert!(
+            report.used_bytes < 1_000_000,
+            "only the engine's own bytes are billed: {report:?}"
+        );
+        assert!(
+            report.foreign_bytes >= 5_000_000,
+            "…and the co-tenant's are reported, so a large directory stays explicable: {report:?}"
+        );
+        assert!(foreign.exists(), "and nothing of theirs is unlinked");
+        assert_eq!(
+            store.snapshot(&id).expect("statement").status,
+            StatementStatus::Succeeded,
+            "the statement history survives"
+        );
         store.shutdown_for_test();
     }
 

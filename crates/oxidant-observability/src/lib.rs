@@ -1,5 +1,6 @@
 //! Runtime observability for Oxidant: events, Spark-compatible REST models, and in-memory store.
 
+mod event_log;
 mod events;
 mod model;
 mod status;

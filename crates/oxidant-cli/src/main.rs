@@ -397,6 +397,14 @@ async fn run_worker(
     let port: u16 = flag(args, "--port")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| oxidant_common::Error::Io("worker requires --port".into()))?;
+    // A standalone worker builds no REST router, so before this it installed no `tracing`
+    // subscriber at all and its logs went nowhere — and worker OOMs are exactly what operators
+    // dig for (docs/query-history-durability.md §6c). Every node writes its own `logs/` under
+    // its own root; the driver federates *reads* over them (PR4) rather than ingesting them.
+    oxidant_connect::logging::init("worker", port);
+    // The worker half of §6's shutdown flush: a scaled-down worker gets SIGTERM, and the tail of
+    // its log is exactly what an operator reads afterwards.
+    oxidant_connect::logging::install_shutdown_flush();
     // Same catalog bootstrap as `oxidant spark server` so Glue/Hive tables resolve on workers.
     // Workers must see the same catalogs as the driver, or a distributed stage cannot resolve
     // the tables its plan references. Same precedence as the server: file first, flags on top.
@@ -421,6 +429,11 @@ async fn run_worker(
         eprintln!("registered `{table}` from {data}");
     }
     eprintln!("Oxidant worker listening on Flight 0.0.0.0:{port}");
+    // Durable, not just stderr: this is the last thing before the serve loop, so its presence in
+    // `logs/oxidant.log` is what proves the `tracing` layer is still attached after every other
+    // crate in the process has had its chance at `try_init` — the init line alone cannot say that.
+    // It is also the line an operator greps to answer "did this worker actually come up".
+    tracing::info!(role = "worker", port, "oxidant worker listening on Flight");
     serve_worker(port, engine).await
 }
 

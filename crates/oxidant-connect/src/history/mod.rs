@@ -4,8 +4,10 @@
 //! records, engine-minted ids, the data-dir lock, the fsync discipline), replay at boot, and the
 //! two-tier read model the REST statement store reads through. PR2 adds result spill
 //! (`results/<id>.arrow`), the disk read-back `/result` falls through to, result GC tied to the
-//! journal, and the disk guards `/api/status` reports. Rolling exec logs and the log browser are
-//! PR3/PR4 and are deliberately absent.
+//! journal, and the disk guards `/api/status` reports. PR3 adds the rolling exec-log writer
+//! ([`crate::logging`]), which shares this module's [`fs_util`], joins [`disk`]'s budget, and
+//! brings `event_log_dir` under it by rolling rather than deleting. The log browser and worker
+//! federation are PR4 and are deliberately absent.
 //!
 //! What lives where:
 //!
@@ -15,13 +17,15 @@
 //! - [`lock`] — one process per data dir;
 //! - [`results`] — the spill writer thread, the read-back, and result GC;
 //! - [`disk`] — the byte budget, the free-space floor, and the prune order;
-//! - [`fs_util`] — 0600/0700 at create time, and the directory fsync every rename needs.
+//! - [`fs_util`] — 0600/0700 at create time, and the directory fsync every rename needs; shared
+//!   with [`crate::logging`], whose rolled logs are under the same 0600 rule and whose roll is
+//!   the same durable rename.
 
 mod config;
 pub(crate) mod disk;
-mod fs_util;
+pub(crate) mod fs_util;
 mod journal;
-mod lock;
+pub(crate) mod lock;
 mod record;
 mod results;
 

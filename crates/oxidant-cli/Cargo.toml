@@ -30,6 +30,9 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # Rendering a reconcile schedule's next firing, in the same RFC 3339 shape it is stored in.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# One durable line per entry point: `run_worker` announces itself through `tracing` so the
+# announcement lands in `logs/oxidant.log` and not only on stderr (§6c).
+tracing = "0.1"
 # TODO(deps): clap = { version = "4", features = ["derive"] } for real subcommand parsing.
 
 [dev-dependencies]
