@@ -91,6 +91,30 @@ impl RecordKind {
     }
 }
 
+/// Where a statement's rows live on disk (§4a's `result` field).
+///
+/// `file` is a bare file name inside `results/`, never a path: the id it is built from is
+/// engine-minted `stmt-<uuid>` (§4b), and keeping the name relative is what makes a journal
+/// copied to another root still resolve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ResultPointer {
+    pub file: String,
+    pub bytes: u64,
+}
+
+impl ResultPointer {
+    pub(crate) fn file_name(id: &str) -> String {
+        format!("{id}.arrow")
+    }
+}
+
+/// Why a succeeded statement has no `result` pointer, when there is a reason worth journaling.
+///
+/// One value today: the Arrow IPC encoding was past `OXIDANT_RESULT_MAX_BYTES`. It is recorded
+/// *on the statement* so `GET /api/v1/statements/{id}` can say why the rows are not on disk,
+/// rather than leaving `/result`'s `410 result_expired` to imply they merely aged out.
+pub(crate) const RESULT_TOO_LARGE: &str = "result_too_large";
+
 /// One line of `seg-NNNNNN.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JournalRecord {
@@ -128,6 +152,14 @@ pub(crate) struct JournalRecord {
     pub submitted_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<i64>,
+    /// The spilled result file, once it is durable. Written only by the record the spill task
+    /// appends *after* the rename and the `results/` fsync (§5), so a pointer on disk always
+    /// names a file that was on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ResultPointer>,
+    /// Why there is no pointer — [`RESULT_TOO_LARGE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_refused: Option<String>,
     /// RFC-3339 UTC, human-facing only. All ordering and age arithmetic uses `seq` and
     /// `submitted_at_ms`, never this string.
     pub ts: String,
@@ -157,6 +189,8 @@ impl JournalRecord {
             rows: None,
             submitted_at_ms,
             duration_ms: None,
+            result: None,
+            result_refused: None,
             ts: now_rfc3339(),
         }
     }
@@ -192,6 +226,10 @@ pub(crate) struct FoldedStatement {
     pub rows: Option<u64>,
     pub submitted_at_ms: i64,
     pub duration_ms: Option<i64>,
+    /// The spilled result file, if this statement has one (§5).
+    pub result: Option<ResultPointer>,
+    /// Why it has none — [`RESULT_TOO_LARGE`].
+    pub result_refused: Option<String>,
     /// The statement's submit sequence — newest-first listing and oldest-first eviction.
     pub seq: u64,
     /// The write sequence of the newest event folded in; the fold's monotone key.
@@ -234,6 +272,18 @@ impl FoldedStatement {
         if self.duration_ms.is_none() {
             self.duration_ms = rec.duration_ms;
         }
+        // A `snapshot` carries the *complete* folded state (§4a), so once one has been folded
+        // its absent `result` means "no result on disk", not "unknown". Backfilling here would
+        // resurrect a pointer a later snapshot deliberately cleared — which is exactly what the
+        // disk sweeper's last prune step does when it unlinks a live result file.
+        if self.rank < RecordKind::Snapshot.rank() {
+            if self.result.is_none() {
+                self.result = rec.result;
+            }
+            if self.result_refused.is_none() {
+                self.result_refused = rec.result_refused;
+            }
+        }
     }
 
     /// The self-contained record compaction writes for this statement.
@@ -255,6 +305,8 @@ impl FoldedStatement {
             rows: self.rows,
             submitted_at_ms: self.submitted_at_ms,
             duration_ms: self.duration_ms,
+            result: self.result.clone(),
+            result_refused: self.result_refused.clone(),
             ts: rfc3339_from_ms(self.submitted_at_ms),
         }
     }
@@ -338,6 +390,19 @@ impl Fold {
                 if rec.duration_ms.is_some() {
                     existing.duration_ms = rec.duration_ms;
                 }
+                // Same rule as `backfill`, from the other side: a snapshot's absent pointer is
+                // authoritative, so it *clears* one an older record established.
+                if rec.kind == RecordKind::Snapshot {
+                    existing.result = rec.result;
+                    existing.result_refused = rec.result_refused;
+                } else {
+                    if rec.result.is_some() {
+                        existing.result = rec.result;
+                    }
+                    if rec.result_refused.is_some() {
+                        existing.result_refused = rec.result_refused;
+                    }
+                }
             }
             None => {
                 self.statements.insert(
@@ -359,6 +424,8 @@ impl Fold {
                         rows: rec.rows,
                         submitted_at_ms: rec.submitted_at_ms,
                         duration_ms: rec.duration_ms,
+                        result: rec.result,
+                        result_refused: rec.result_refused,
                         seq: rec.seq,
                         last_seq: key,
                         rank,
@@ -416,6 +483,8 @@ mod tests {
             rows: None,
             submitted_at_ms: 1_000,
             duration_ms: None,
+            result: None,
+            result_refused: None,
             ts: now_rfc3339(),
         }
     }
