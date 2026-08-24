@@ -1724,6 +1724,16 @@ impl StatementStore {
         let Some(history) = self.history.as_ref() else {
             return;
         };
+        // The seam is process-global by design — a production process boots exactly one store —
+        // so in a test binary every store would clobber every other one's counters and the
+        // end-to-end test would read whichever store booted last. The test that drives
+        // `/api/status` for real claims the seam on its own thread first; every other store —
+        // including one booted concurrently by another test — publishes nothing and those tests
+        // read their own counters through `status_counters()`.
+        #[cfg(test)]
+        if !tests::status_seam::is_owner() {
+            return;
+        }
         let history = Arc::downgrade(history);
         let disk = Arc::clone(&self.disk);
         oxidant_observability::set_history_status_source(move || match history.upgrade() {
@@ -4496,6 +4506,154 @@ mod tests {
             store.status_counters().map(|c| c.history_writes),
             Some(oxidant_observability::history_writes::OK.to_string()),
             "history_writes must flip back without a restart"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// Exclusive ownership of the process-global `/api/status` publish seam.
+    ///
+    /// [`StatementStore::publish_status_counters`] writes to a process-global slot. In a test
+    /// binary that means every store that boots clobbers every other one's counters, so the
+    /// store whose counters reach `/api/status` is whichever booted last. A test that wants to
+    /// read the endpoint claims the seam for its duration; stores booted by other tests
+    /// meanwhile publish nothing and are unaffected (they read `status_counters()` directly).
+    pub(super) mod status_seam {
+        use std::sync::{Mutex, MutexGuard};
+        use std::thread::ThreadId;
+
+        static LOCK: Mutex<()> = Mutex::new(());
+        static OWNER: Mutex<Option<ThreadId>> = Mutex::new(None);
+
+        pub(super) struct Claim(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+        /// Block until the seam is free, then own it until the returned guard drops.
+        pub(super) fn claim() -> Claim {
+            let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            oxidant_observability::clear_history_status_source();
+            set_owner(Some(std::thread::current().id()));
+            Claim(guard)
+        }
+
+        /// May the *calling* thread publish? Ownership is per thread, not global: another test
+        /// booting a store on another thread while the seam is claimed must not overwrite the
+        /// owner's counters.
+        pub(crate) fn is_owner() -> bool {
+            OWNER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|owner| owner == std::thread::current().id())
+        }
+
+        fn set_owner(id: Option<ThreadId>) {
+            *OWNER.lock().unwrap_or_else(|e| e.into_inner()) = id;
+        }
+
+        impl Drop for Claim {
+            fn drop(&mut self) {
+                set_owner(None);
+                oxidant_observability::clear_history_status_source();
+            }
+        }
+    }
+
+    /// L3: the durability counters go over the wire through `GET /api/status` — the real route,
+    /// the real published source, the real serde flattening — not through `status_counters()`.
+    ///
+    /// Every other test in this PR asserts the `#[cfg(test)]` seam, so the wiring that puts the
+    /// counters on the wire had no coverage at all, and `docs/query-history-durability.md` §9
+    /// promises exactly this endpoint's behaviour.
+    #[tokio::test]
+    async fn the_status_endpoint_carries_the_durability_counters_end_to_end() {
+        let _seam = status_seam::claim();
+        let ui_store: oxidant_observability::SharedStore =
+            Arc::new(oxidant_observability::AppStateStore::new());
+        let router = oxidant_ui_server::app_router_with(
+            Arc::clone(&ui_store),
+            Some("status-token".to_string()),
+            oxidant_ui_server::DashboardStore::in_memory(),
+        );
+        let status_json = |router: Router| async move {
+            let resp = router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/api/status")
+                        .header(header::AUTHORIZATION, "Bearer status-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        };
+
+        // Nothing published — the `OXIDANT_HISTORY=off` shape. §8 says `off` restores today's
+        // behaviour exactly, and today there are no such fields.
+        let (status, body) = status_json(router.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        let keys = body.as_object().expect("object");
+        for field in [
+            "history_writes",
+            "history_dropped_events",
+            "results_on_disk_bytes",
+            "result_writes",
+            "result_write_failures",
+            "disk",
+        ] {
+            assert!(
+                !keys.contains_key(field),
+                "with history off the endpoint must not carry {field}: {body}"
+            );
+        }
+
+        // Boot a durable store. Its counters now reach the endpoint through the published
+        // source, flattened into the same object.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let (spilled, _) = store.insert("SELECT n FROM t");
+        store.finish(&spilled, ExecOutcome::Succeeded(vec![rows_batch(0, 8)]));
+        store.drain_spills();
+
+        let (status, body) = status_json(router.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["history_writes"], "ok", "{body}");
+        assert_eq!(body["result_writes"], "ok", "{body}");
+        assert_eq!(body["result_write_failures"], 0, "{body}");
+        assert_eq!(body["history_dropped_events"], 0, "{body}");
+        assert_eq!(body["disk"], "ok", "{body}");
+        let counters = store.status_counters().expect("history is on");
+        assert!(counters.results_on_disk_bytes > 0);
+        assert_eq!(
+            body["results_on_disk_bytes"], counters.results_on_disk_bytes,
+            "the endpoint must report *this* store's bytes: {body}"
+        );
+        // And the non-durability half of the snapshot is untouched by the flattening.
+        assert!(body["version"].is_string(), "{body}");
+        assert!(body["queries"].is_array(), "{body}");
+
+        // Break the spill disk: the endpoint — not just the test seam — says so.
+        let (broken, _) = store.insert("SELECT 'broken'");
+        std::fs::create_dir_all(
+            dir.path()
+                .join("history/results")
+                .join(format!("{broken}.arrow.tmp")),
+        )
+        .expect("block the spill");
+        store.finish(&broken, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+
+        let (status, body) = status_json(router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result_writes"], "degraded", "{body}");
+        assert_eq!(body["result_write_failures"], 1, "{body}");
+        assert_eq!(
+            body["history_writes"], "degraded",
+            "the aggregate has to carry it over the wire too: {body}"
         );
         store.shutdown_for_test();
     }

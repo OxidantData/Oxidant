@@ -877,7 +877,8 @@ Guards and degradation:
   flips back to `ok` on the next successful append, with no restart; a failing *spill*
   writer is reported by `result_writes` / `result_write_failures` and is **not** cleared
   by a healthy journal append; with `OXIDANT_HISTORY=off` all six durability fields are
-  absent entirely *(shipped)*;
+  absent entirely. Asserted end to end, over the real `GET /api/status` route with its
+  bearer token, not through a test seam *(shipped)*;
 - two processes on one root: the second fails with the lock error; with
   `OXIDANT_DATA_DIR_PER_PROCESS=1` it starts in its own subdir;
 - an object-store URL in `OXIDANT_DATA_DIR` is rejected at boot;

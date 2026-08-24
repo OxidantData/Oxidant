@@ -88,19 +88,36 @@ pub mod disk_state {
 
 type HistoryStatusSource = Box<dyn Fn() -> HistoryStatus + Send + Sync>;
 
-static HISTORY_STATUS: std::sync::OnceLock<HistoryStatusSource> = std::sync::OnceLock::new();
+static HISTORY_STATUS: std::sync::RwLock<Option<HistoryStatusSource>> =
+    std::sync::RwLock::new(None);
 
-/// Publish the durability counters `/api/status` reads. Called once, at boot, by whoever booted
-/// the journal. With `OXIDANT_HISTORY=off` it is never called and the four fields are **absent**
-/// from the response — §8 says `off` restores today's behaviour exactly, and today there are no
-/// such fields.
+/// Publish the durability counters `/api/status` reads. Called at boot by whoever booted the
+/// journal. With `OXIDANT_HISTORY=off` it is never called and the durability fields are
+/// **absent** from the response — §8 says `off` restores today's behaviour exactly, and today
+/// there are no such fields.
+///
+/// **Last writer wins.** A `OnceLock` here meant the *first* store to boot in a process owned
+/// the endpoint forever: once that store dropped, `/api/status` reported the quiet
+/// `ok`/0/`ok` defaults for the life of the process no matter how many stores booted after it.
+/// A production process boots exactly one, so this only ever bit test binaries — which is
+/// precisely why the wiring had no end-to-end coverage.
 pub fn set_history_status_source(source: impl Fn() -> HistoryStatus + Send + Sync + 'static) {
-    let _ = HISTORY_STATUS.set(Box::new(source));
+    if let Ok(mut slot) = HISTORY_STATUS.write() {
+        *slot = Some(Box::new(source));
+    }
+}
+
+/// Stop publishing durability counters — `/api/status` goes back to having no such fields.
+/// Tests use this to restore the `OXIDANT_HISTORY=off` shape after booting a store.
+pub fn clear_history_status_source() {
+    if let Ok(mut slot) = HISTORY_STATUS.write() {
+        *slot = None;
+    }
 }
 
 /// The published counters, or `None` when history is off (or has not booted yet).
 pub fn history_status() -> Option<HistoryStatus> {
-    HISTORY_STATUS.get().map(|f| f())
+    HISTORY_STATUS.read().ok()?.as_ref().map(|f| f())
 }
 
 /// Driver status: `GET /api/status`.
@@ -123,8 +140,8 @@ pub struct StatusSnapshot {
     /// Most recent queries, newest first, capped by the caller's limit.
     pub queries: Vec<QueryStatus>,
     /// Durability counters, flattened into this object as `history_writes`,
-    /// `history_dropped_events`, `results_on_disk_bytes` and `disk`. Absent with
-    /// `OXIDANT_HISTORY=off`.
+    /// `history_dropped_events`, `results_on_disk_bytes`, `result_writes`,
+    /// `result_write_failures` and `disk`. Absent with `OXIDANT_HISTORY=off`.
     #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
     pub history: Option<HistoryStatus>,
 }
