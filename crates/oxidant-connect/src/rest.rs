@@ -375,7 +375,16 @@ struct StoreInner {
     statements: std::collections::HashMap<String, Statement>,
     /// History tier: folded snapshots off the journal. No batches, no cancel channel, and
     /// **never touched by TTL eviction** — replay that the first new submit deletes is not replay.
+    ///
+    /// Mutated only through [`StoreInner::history_insert`] / [`StoreInner::history_remove`], so
+    /// the two eviction indexes below cannot drift out of step with it.
     history: std::collections::HashMap<String, FoldedStatement>,
+    /// `(seq, id)` of every history-tier statement, oldest first — the global cap's eviction
+    /// order without an O(n) `min_by_key` per victim.
+    by_seq: std::collections::BTreeSet<(u64, String)>,
+    /// The same, partitioned by session, so the per-session share is checked with an O(1)
+    /// `len()` per session instead of rebuilding a map of the whole tier on every submit.
+    by_session: std::collections::HashMap<String, std::collections::BTreeSet<(u64, String)>>,
     /// `(session, client_op_id) → stmt-id`. The pair is the key: `client_op_id` alone would merge
     /// two sessions that both used `op-1`.
     alias: std::collections::HashMap<(String, String), String>,
@@ -389,6 +398,35 @@ struct StoreInner {
 }
 
 impl StoreInner {
+    /// Add a statement to the history tier, keeping the eviction indexes in step.
+    fn history_insert(&mut self, id: String, st: FoldedStatement) {
+        let key = (st.seq, id.clone());
+        if let Some(session) = &st.session {
+            self.by_session
+                .entry(session.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        self.by_seq.insert(key);
+        self.history.insert(id, st);
+    }
+
+    /// Take a statement out of the history tier, keeping the eviction indexes in step.
+    fn history_remove(&mut self, id: &str) -> Option<FoldedStatement> {
+        let st = self.history.remove(id)?;
+        let key = (st.seq, id.to_string());
+        self.by_seq.remove(&key);
+        if let Some(session) = &st.session {
+            if let Some(ids) = self.by_session.get_mut(session) {
+                ids.remove(&key);
+                if ids.is_empty() {
+                    self.by_session.remove(session);
+                }
+            }
+        }
+        Some(st)
+    }
+
     /// Drop hot entries older than the hot TTL.
     ///
     /// Age is wall-clock (`submitted_at_ms`), not `Instant`: a replayed statement has no
@@ -420,7 +458,7 @@ impl StoreInner {
         }
         let last_seq = st.seq;
         let folded = st.to_folded(id, self.sql_mode, last_seq);
-        self.history.insert(id.to_string(), folded);
+        self.history_insert(id.to_string(), folded);
     }
 
     /// Enforce the hot-tier count cap, oldest first.
@@ -485,7 +523,7 @@ impl StatementStore {
             if let (Some(session), Some(op)) = (st.session.clone(), st.client_op_id.clone()) {
                 inner.alias.insert((session, op), id.clone());
             }
-            inner.history.insert(id, st);
+            inner.history_insert(id, st);
         }
         let replayed = inner.history.len();
         let store = Self {
@@ -881,7 +919,11 @@ impl StatementStore {
             }
             let mut evicted: Vec<(String, i64)> = Vec::new();
             if due && inner.limits.retention_days > 0 {
-                let cutoff = now - inner.limits.retention_days * 86_400_000;
+                // `retention_days` is an operator-supplied `u64` widened to `i64`, so the
+                // multiplication is not obviously in range: saturate rather than panic in debug
+                // and wrap in release.
+                let span = inner.limits.retention_days.saturating_mul(86_400_000);
+                let cutoff = now.saturating_sub(span);
                 let stale: Vec<String> = inner
                     .history
                     .iter()
@@ -889,62 +931,81 @@ impl StatementStore {
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in stale {
-                    if let Some(st) = inner.history.remove(&id) {
+                    if let Some(st) = inner.history_remove(&id) {
                         evicted.push((id, st.submitted_at_ms));
                     }
                 }
             }
             // Per-session share first, so a noisy session evicts itself before it can push
             // another tenant's history out of the global cap.
+            //
+            // This runs on *every* submit — the caps, unlike the age scan above, are not
+            // throttled, because a throttled cap is a cap that a submit storm can overshoot by a
+            // whole sweep interval. That is affordable only because both passes read the
+            // `by_session` / `by_seq` indexes: no map of the whole tier is rebuilt, no id or
+            // session string is cloned, and nothing is sorted. Rebuilding it here is what made a
+            // 10,000-record tier cost an allocation and a sort per statement submitted, inside
+            // the mutex every list, status, result and cancel call also takes.
             let per_session = inner.limits.max_per_session;
             if per_session < usize::MAX {
-                let mut by_session: std::collections::HashMap<String, Vec<(u64, String)>> =
-                    std::collections::HashMap::new();
-                for (id, st) in inner.history.iter() {
-                    if let Some(session) = &st.session {
-                        if st.status.is_terminal() {
-                            by_session
-                                .entry(session.clone())
-                                .or_default()
-                                .push((st.seq, id.clone()));
+                let mut victims: Vec<String> = Vec::new();
+                {
+                    let StoreInner {
+                        history,
+                        by_session,
+                        ..
+                    } = &mut *inner;
+                    for ids in by_session.values() {
+                        // O(1) per session, and the tier is only walked for a session that is
+                        // actually over its share.
+                        let Some(mut excess) = ids.len().checked_sub(per_session) else {
+                            continue;
+                        };
+                        for (_, id) in ids.iter() {
+                            if excess == 0 {
+                                break;
+                            }
+                            // Oldest first (the set is keyed on `seq`), and never a statement
+                            // that is still running.
+                            if history.get(id).is_some_and(|st| st.status.is_terminal()) {
+                                victims.push(id.clone());
+                                excess -= 1;
+                            }
                         }
                     }
                 }
-                for (_, mut ids) in by_session {
-                    if ids.len() <= per_session {
-                        continue;
-                    }
-                    ids.sort_by_key(|(seq, _)| *seq);
-                    let excess = ids.len() - per_session;
-                    for (_, id) in ids.into_iter().take(excess) {
-                        if let Some(st) = inner.history.remove(&id) {
-                            evicted.push((id, st.submitted_at_ms));
-                        }
+                for id in victims {
+                    if let Some(st) = inner.history_remove(&id) {
+                        evicted.push((id, st.submitted_at_ms));
                     }
                 }
             }
             while inner.history.len() > inner.limits.max_records {
-                let oldest = inner
-                    .history
-                    .iter()
-                    .filter(|(_, st)| st.status.is_terminal())
-                    .min_by_key(|(_, st)| st.seq)
-                    .map(|(id, _)| id.clone());
+                let oldest = {
+                    let StoreInner {
+                        history, by_seq, ..
+                    } = &mut *inner;
+                    by_seq
+                        .iter()
+                        .find(|(_, id)| history.get(id).is_some_and(|st| st.status.is_terminal()))
+                        .map(|(_, id)| id.clone())
+                };
                 let Some(oldest) = oldest else {
                     // Everything left is non-terminal: running is never evicted, so the cap
                     // yields rather than the statement.
                     break;
                 };
-                if let Some(st) = inner.history.remove(&oldest) {
+                if let Some(st) = inner.history_remove(&oldest) {
                     evicted.push((oldest, st.submitted_at_ms));
                 }
             }
-            let gone: std::collections::HashSet<&str> =
-                evicted.iter().map(|(id, _)| id.as_str()).collect();
-            inner
-                .alias
-                .retain(|_, target| !gone.contains(target.as_str()));
-            drop(gone);
+            if !evicted.is_empty() {
+                let gone: std::collections::HashSet<&str> =
+                    evicted.iter().map(|(id, _)| id.as_str()).collect();
+                inner
+                    .alias
+                    .retain(|_, target| !gone.contains(target.as_str()));
+            }
             evicted
         };
         // Best-effort, like every other non-terminal write: a tombstone lost to backpressure
@@ -2747,6 +2808,96 @@ mod tests {
         assert!(
             inner.history.contains_key(&quiet),
             "the quiet session's history is untouched"
+        );
+    }
+
+    /// M4: the per-session and global caps are enforced on every submit, so they cannot be
+    /// throttled — which is affordable only if they read an index instead of rebuilding a map of
+    /// the whole history tier (an allocation, a clone per id and session, and a sort per
+    /// statement submitted, inside the mutex every read also takes).
+    ///
+    /// The index is only correct if it never drifts from `history`, so that is what this pins.
+    #[test]
+    fn the_eviction_indexes_track_the_history_tier_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.max_per_session = 3;
+            c.max_records = 6;
+            c.hot_ttl = Duration::from_millis(0);
+        });
+        for i in 0..12 {
+            let session = if i % 2 == 0 { "even" } else { "odd" };
+            let (id, _) =
+                store.insert_from(&format!("SELECT {i}"), Source::Connect, Some(session), None);
+            store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+        }
+        // A running statement, which no cap may evict.
+        let (live, _) = store.insert_from("SELECT 'live'", Source::Connect, Some("even"), None);
+        store.mark_running(&live);
+        store.insert("SELECT 'flush'");
+        store.sweep_history();
+
+        let inner = store.inner.lock().expect("lock");
+        // Every index entry names a statement that is really there, with the right seq...
+        for (seq, id) in inner.by_seq.iter() {
+            let st = inner
+                .history
+                .get(id)
+                .unwrap_or_else(|| panic!("by_seq names {id}, which is not in the tier"));
+            assert_eq!(st.seq, *seq);
+        }
+        // ...and every statement in the tier is in both indexes.
+        for (id, st) in inner.history.iter() {
+            assert!(
+                inner.by_seq.contains(&(st.seq, id.clone())),
+                "{id} is missing from by_seq"
+            );
+            let session = st
+                .session
+                .clone()
+                .expect("connect statements carry a session");
+            assert!(
+                inner.by_session[&session].contains(&(st.seq, id.clone())),
+                "{id} is missing from by_session[{session}]"
+            );
+        }
+        let indexed: usize = inner.by_session.values().map(|ids| ids.len()).sum();
+        assert_eq!(indexed, inner.history.len(), "no stale by_session entries");
+        assert_eq!(inner.by_seq.len(), inner.history.len());
+
+        // And the caps they drive still hold.
+        for session in ["even", "odd"] {
+            let n = inner
+                .history
+                .values()
+                .filter(|st| st.session.as_deref() == Some(session))
+                .count();
+            assert!(n <= 3, "{session} kept {n} statements, over its share of 3");
+        }
+        assert!(inner.history.len() <= 6, "global cap");
+    }
+
+    /// `retention_days` is an operator-supplied `u64` widened to `i64`, so
+    /// `retention_days * 86_400_000` overflowed — a panic in debug, a wrap in release, on a
+    /// value a config file can carry.
+    #[test]
+    fn an_absurd_retention_does_not_overflow_the_age_cutoff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.retention_days = i64::MAX / 1_000;
+            c.hot_ttl = Duration::from_millis(0);
+        });
+        let (id, _) = store.insert("SELECT 1");
+        store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+        store.insert("SELECT 2");
+        {
+            let mut inner = store.inner.lock().expect("lock");
+            inner.last_sweep_ms = 0;
+        }
+        store.sweep_history();
+        assert!(
+            store.snapshot(&id).is_some(),
+            "an unreachable cutoff prunes nothing, and above all does not panic"
         );
     }
 
