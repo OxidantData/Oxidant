@@ -470,10 +470,30 @@ fn env_flag(key: &str) -> bool {
     )
 }
 
+/// A byte/count/duration knob. An unparseable value is **warned about** and then defaults.
+///
+/// Silence was tolerable for `OXIDANT_HISTORY_SEGMENT_BYTES`; it is not for
+/// `OXIDANT_DISK_MAX_BYTES`, where `8GiB` (a plausible typo — this reads plain integers, not
+/// suffixed sizes) quietly becomes the 8 GiB default and `100GiB` quietly becomes 8 GiB too,
+/// after which the sweeper prunes history the operator thought they had budgeted for.
 fn env_u64(key: &str, default: u64) -> u64 {
-    env_str(key)
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(default)
+    let Some(raw) = env_str(key) else {
+        return default;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                key,
+                value = %raw,
+                error = %e,
+                default,
+                "ignoring an unparseable value and using the default; this knob takes a plain \
+                 integer, not a suffixed size like `8GiB`"
+            );
+            default
+        }
+    }
 }
 
 /// A path knob that must name a filesystem path.
@@ -533,6 +553,23 @@ mod tests {
             "digest+prefix must be bounded: {out}"
         );
         assert_eq!(SqlMode::Hash.encode(&sql), out, "digest is stable");
+    }
+
+    /// An unparseable size knob defaults *loudly*. `OXIDANT_DISK_MAX_BYTES=8GiB` silently
+    /// becoming the 8 GiB default is survivable; `100GiB` silently becoming 8 GiB is the sweeper
+    /// pruning history the operator thought they had budgeted for.
+    #[test]
+    fn an_unparseable_size_knob_falls_back_to_the_default() {
+        std::env::set_var("OXIDANT_TEST_SIZE_KNOB", "100GiB");
+        assert_eq!(env_u64("OXIDANT_TEST_SIZE_KNOB", 7), 7);
+        std::env::set_var("OXIDANT_TEST_SIZE_KNOB", " 4096 ");
+        assert_eq!(
+            env_u64("OXIDANT_TEST_SIZE_KNOB", 7),
+            4096,
+            "a plain integer, whitespace and all, is still honoured"
+        );
+        std::env::remove_var("OXIDANT_TEST_SIZE_KNOB");
+        assert_eq!(env_u64("OXIDANT_TEST_SIZE_KNOB", 7), 7);
     }
 
     #[test]

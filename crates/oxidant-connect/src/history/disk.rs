@@ -90,7 +90,8 @@ pub(crate) const LIVE_LOG: &str = "oxidant.log";
 /// Recursive byte total of `dir`, ignoring what it cannot read.
 ///
 /// Symlinks are not followed: `read_dir` + `symlink_metadata` means a link into another subtree
-/// is counted as the link, not as its target, so one file cannot be billed twice.
+/// is counted as the link, not as its target, so one file cannot be billed twice. [`flat_files`]
+/// uses the same rule, so what the sweeper measures and what it unlinks agree.
 pub(crate) fn subtree_bytes(dir: &Path) -> u64 {
     #[cfg(test)]
     SUBTREE_WALKS.with(|c| c.set(c.get() + 1));
@@ -173,7 +174,12 @@ fn flat_files(dir: &Path, owned: fn(&str) -> bool) -> Vec<Prunable> {
         if !owned(name) {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
+        // `symlink_metadata`, matching `subtree_bytes`: a symlink is not a file here, so it is
+        // neither measured as ~0 nor unlinked as if it were its target's size — `freed_bytes`
+        // would have been wrong in both directions.
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
         if !meta.is_file() {
             continue;
         }

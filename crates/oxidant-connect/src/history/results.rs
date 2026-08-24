@@ -266,7 +266,19 @@ impl ResultStore {
 
     /// Read a spilled result back. Blocking by construction — the caller wraps it in
     /// `spawn_blocking` so a 256 MiB decode never sits on a tokio worker.
-    pub(crate) fn read(&self, id: &str) -> io::Result<Vec<RecordBatch>> {
+    ///
+    /// `journaled` is the file name the statement's `result` pointer carries, when the caller
+    /// has one. The path is still **derived from the id** — a name off the journal is not a name
+    /// this joins onto `results/`, because that is a path-traversal primitive — but a pointer
+    /// that names something else is now *rejected* with a reason rather than silently ignored.
+    pub(crate) fn read(&self, id: &str, journaled: Option<&str>) -> io::Result<Vec<RecordBatch>> {
+        let expected = ResultPointer::file_name(id);
+        if let Some(named) = journaled.filter(|n| *n != expected) {
+            return Err(io_other(&format!(
+                "the journaled result pointer for {id} names {named}, not {expected}; refusing \
+                 to read a file this statement does not own"
+            )));
+        }
         let path = self.path_for(id);
         let file = std::fs::File::open(&path)?;
         let reader = StreamReader::try_new(std::io::BufReader::new(file), None)

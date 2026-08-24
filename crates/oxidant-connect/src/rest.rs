@@ -356,8 +356,10 @@ pub(crate) enum ExecOutcome {
 enum ResultSource {
     /// The hot tier still holds them.
     Memory(Vec<RecordBatch>),
-    /// `results/<id>.arrow` — read back off disk, possibly after a restart.
-    Disk,
+    /// `results/<id>.arrow` — read back off disk, possibly after a restart. Carries the file
+    /// name the journaled pointer names, so a pointer that disagrees with the id is rejected
+    /// rather than silently ignored.
+    Disk(Option<String>),
     /// The statement succeeded with no batches at all. There is nothing to read and nothing
     /// was lost: `200 {"rows": []}`, before and after a restart alike.
     Empty,
@@ -1236,8 +1238,8 @@ impl StatementStore {
         if let Some(st) = inner.statements.get(id) {
             let source = if st.rows_in_memory {
                 ResultSource::Memory(st.batches.clone())
-            } else if st.result_file.is_some() {
-                ResultSource::Disk
+            } else if let Some(pointer) = st.result_file.as_ref() {
+                ResultSource::Disk(Some(pointer.file.clone()))
             } else if empty(st.result_refused.as_ref()) {
                 ResultSource::Empty
             } else {
@@ -1246,8 +1248,8 @@ impl StatementStore {
             return Some((st.snapshot(id), source));
         }
         inner.history.get(id).map(|st| {
-            let source = if st.result.is_some() {
-                ResultSource::Disk
+            let source = if let Some(pointer) = st.result.as_ref() {
+                ResultSource::Disk(Some(pointer.file.clone()))
             } else if empty(st.result_refused.as_ref()) {
                 ResultSource::Empty
             } else {
@@ -1262,10 +1264,11 @@ impl StatementStore {
     /// `None` covers both "history is off" and "the file is not readable any more" — a sweep or
     /// an operator may have removed it between the snapshot and this read, and the honest answer
     /// to that race is the same `410 result_expired` as if it had never existed.
-    async fn read_spilled(&self, id: &str) -> Option<Vec<RecordBatch>> {
+    async fn read_spilled(&self, id: &str, journaled: Option<String>) -> Option<Vec<RecordBatch>> {
         let results = Arc::clone(&self.history.as_ref()?.results);
         let owned = id.to_string();
-        match tokio::task::spawn_blocking(move || results.read(&owned)).await {
+        match tokio::task::spawn_blocking(move || results.read(&owned, journaled.as_deref())).await
+        {
             Ok(Ok(batches)) => Some(batches),
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -1635,6 +1638,13 @@ impl StatementStore {
         let ordering = std::sync::atomic::Ordering::Relaxed;
         self.disk.over_budget.store(report.over_budget, ordering);
         self.disk.low_free.store(report.low_free, ordering);
+        if report.removed_anything() {
+            // A pruned statement is one a `?wait=true` caller may be parked on, and its answer
+            // is now "gone" rather than "still running". This reaches the background sweeper's
+            // callers only because that thread shares the store's `Notify` rather than
+            // rebuilding one per tick.
+            self.notify.notify_waiters();
+        }
         report
     }
 
@@ -1769,7 +1779,9 @@ impl StatementStore {
     /// necessarily a runtime to spawn onto, and the sweep is blocking filesystem work either way.
     /// It holds only weak references and ticks once a second so it notices a dropped store
     /// promptly instead of up to five minutes later — which is what keeps a test binary from
-    /// accumulating one sleeping thread per store it builds.
+    /// accumulating one sleeping thread per store it builds. The one thing it does **not**
+    /// rebuild per tick is the `Notify`: a sweep can prune a statement a `?wait=true` caller is
+    /// parked on, and a private channel would leave that caller blocked to its timeout.
     fn spawn_disk_sweeper(&self) {
         let Some(history) = self.history.as_ref() else {
             return;
@@ -2272,7 +2284,7 @@ async fn get_result(
     }
     let batches = match source {
         ResultSource::Memory(batches) => batches,
-        ResultSource::Disk => match state.store.read_spilled(&id).await {
+        ResultSource::Disk(journaled) => match state.store.read_spilled(&id, journaled).await {
             Some(batches) => batches,
             None => return error_response(StatusCode::GONE, "result_expired"),
         },
@@ -4507,6 +4519,74 @@ mod tests {
             Some(oxidant_observability::history_writes::OK.to_string()),
             "history_writes must flip back without a restart"
         );
+        store.shutdown_for_test();
+    }
+
+    /// L4: a sweep that removed statements wakes the store's waiters.
+    ///
+    /// `prune_oldest_statement` removes statements a `?wait=true` caller may be parked on. The
+    /// background sweeper rebuilds a `StatementStore` from weak handles every tick and used to
+    /// give it a **fresh** `Notify`, so anyone parked would have blocked to their timeout; it
+    /// now carries the store's own, which is what makes this wake-up reach them.
+    #[tokio::test]
+    async fn a_pruning_sweep_wakes_the_stores_waiters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            c.disk_max_bytes = 0; // nothing fits: the sweep prunes
+            c.disk_min_free_bytes = 0;
+        });
+        let (id, _) = store.insert("SELECT 1");
+        store.finish(&id, ExecOutcome::Succeeded(Vec::new()));
+
+        let notified = store.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let report = store.sweep_disk();
+        assert!(report.removed_anything(), "{report:?}");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), notified)
+                .await
+                .is_ok(),
+            "a waiter parked on a statement the sweep removed must be woken, not left to its \
+             timeout"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// L4: a journaled `result.file` that does not name this statement's own file is rejected
+    /// with a reason, not silently ignored — and never joined onto `results/`, which would be a
+    /// path-traversal primitive fed from a file on disk.
+    #[tokio::test]
+    async fn a_result_pointer_naming_another_file_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let (id, _) = store.insert("SELECT n FROM t");
+        store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        store.drain_spills();
+
+        // The honest pointer reads back.
+        let app = app(rest_state(store.clone()));
+        let (status, body) = get_json(&app, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result_values(&body), vec![0, 1, 2, 3]);
+
+        // Rewrite the pointer to name something else, exactly as a corrupted or hand-edited
+        // journal would.
+        {
+            let mut inner = store.inner.lock().expect("lock");
+            let st = inner.statements.get_mut(&id).expect("hot");
+            // Rows released, so `/result` falls through to the disk — the path the pointer is
+            // read on.
+            st.rows_in_memory = false;
+            st.batches = Vec::new();
+            st.result_file = Some(ResultPointer {
+                file: "../../etc/passwd".to_string(),
+                bytes: 1,
+            });
+        }
+        let (status, body) = get_json(&app, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+        assert_eq!(body["error"], "result_expired");
         store.shutdown_for_test();
     }
 
