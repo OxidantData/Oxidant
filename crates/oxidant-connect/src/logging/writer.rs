@@ -14,11 +14,28 @@
 //! the critical section re-enters this very layer on the same thread, and `std::sync::Mutex` is
 //! not reentrant — it would deadlock the process's logging, permanently. Messages are collected
 //! and emitted after the guard drops.
+//!
+//! **The `write(2)` is off the emitting thread.** Every `tracing` event used to take one
+//! process-global mutex and do a blocking `write_all` on whatever thread emitted it — a tokio
+//! worker, a Flight data-path thread, a rayon worker. On a slow or full volume that stalls the
+//! reactor, and a chatty distributed stage serialises every logging thread on one lock. So an
+//! event is now *rendered* on the emitting thread and handed to a bounded queue with
+//! [`std::sync::mpsc::SyncSender::try_send`]: never blocking, never allocating unboundedly, and
+//! never the caller's problem. One dedicated thread owns the file, the dedup state and both roll
+//! triggers; a second owns Parquet conversion and the sweep, because converting a 256 MiB file
+//! takes seconds and log lines must not queue behind it.
+//!
+//! **The two costs, stated.** A full queue *drops* lines rather than blocking — the count is
+//! kept and written into the log as its own `WARN` the moment there is room, so the gap is
+//! visible rather than silent. And `?file=current` can miss the last few microseconds of
+//! events; [`RollingWriter::drain`] is the barrier that closes that window, and shutdown takes
+//! it.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,6 +56,14 @@ const TICK: Duration = Duration::from_millis(500);
 /// A conversion that fails this many times is abandoned: the `.log` stays on disk permanently,
 /// one loud line is logged, and `?file=` serves it as text (§6).
 const MAX_CONVERSION_ATTEMPTS: u32 = 2;
+/// How many rendered events the writer queue holds before it starts dropping them.
+///
+/// The queue is what keeps the `write(2)` off the emitting thread, and it has to be bounded or a
+/// disk slower than the process's log rate becomes unbounded memory instead of a stall. 8192
+/// `LogLine`s is a few MiB at the sizes this tree emits, and a full queue means the writer thread
+/// is more than 8192 events behind — a state worth a `WARN` in the log itself, which is exactly
+/// what [`RollingWriter::note_drops`] writes.
+const QUEUE_DEPTH: usize = 8192;
 
 /// What the writer needs to know to decide whether a conversion fits (§3, "Conversion
 /// headroom"). Parquet conversion transiently holds both the text file and its output, so the
@@ -132,19 +157,49 @@ enum Job {
     Stop,
 }
 
-/// The live `oxidant.log`, its roll policy, and the background thread that converts and sweeps.
-pub(crate) struct RollingWriter {
+/// What the emitting thread hands to the writer thread.
+enum Entry {
+    /// One event, with the instant it was emitted — not the instant it is written, so a queued
+    /// line still rolls into the file its own timestamp belongs to.
+    Line(Box<LogLine>, DateTime<Utc>),
+    /// Everything queued before this is on disk. The reply is sent after the append, which is
+    /// what makes `drain` a barrier rather than a hint.
+    Barrier(Sender<()>),
+    /// Drain, flush the held repeat, `fsync`, and exit.
+    Stop,
+}
+
+/// Everything the writer thread needs to put a line on disk — and **nothing that owns a thread
+/// handle**, which is what lets that thread hold a strong `Arc` without making a cycle.
+///
+/// The converter thread holds a `Weak<RollingWriter>` instead, because it needs `on_roll` and
+/// `convert_pending`; it can afford to give up if the writer is gone, and the writer thread
+/// cannot — it owns the only path to the file, and a queued line still has to land.
+struct Shared {
     cfg: WriterConfig,
+    state: Mutex<WriterState>,
+    /// Events dropped because the queue was full, not yet accounted for in the file.
+    dropped: AtomicU64,
+    /// Tell the converter thread that something rolled.
+    jobs: Sender<Job>,
+}
+
+/// The live `oxidant.log`, its roll policy, the thread that writes it, and the thread that
+/// converts and sweeps.
+pub(crate) struct RollingWriter {
+    shared: Arc<Shared>,
     /// What a roll triggers besides conversion. `None` uses the process-global sweep hook the
     /// statement store publishes; a test passes its own so a sibling test booting a store
     /// cannot swap the global out from under it mid-assertion.
     on_roll: Option<Box<dyn Fn() + Send + Sync>>,
-    state: Mutex<WriterState>,
     /// Serializes [`Self::convert_pending`]. The worker thread runs it after every roll and a
     /// test may drive it directly; two concurrent passes would race on one `.parquet.tmp`.
     converting: Mutex<()>,
-    tx: Sender<Job>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The bounded hand-off to the writer thread. `try_send` on the hot path, so an emitting
+    /// thread never waits on a `write(2)`.
+    lines: SyncSender<Entry>,
+    scribe: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl RollingWriter {
@@ -201,18 +256,25 @@ impl RollingWriter {
             .map_err(|e| format!("opening {}: {e}", live.display()))?;
         let bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
         let (tx, rx) = std::sync::mpsc::channel();
-        let writer = Arc::new(Self {
+        let (lines, line_rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
+        let shared = Arc::new(Shared {
             state: Mutex::new(WriterState {
                 file,
                 bytes,
                 period: LogPeriod::of(now, cfg.roll),
                 held: None,
             }),
+            dropped: AtomicU64::new(0),
+            jobs: tx,
+            cfg,
+        });
+        let writer = Arc::new(Self {
+            shared: Arc::clone(&shared),
             converting: Mutex::new(()),
             on_roll,
-            cfg,
-            tx,
             worker: Mutex::new(None),
+            lines,
+            scribe: Mutex::new(None),
         });
         let worker = Arc::downgrade(&writer);
         let handle = std::thread::Builder::new()
@@ -220,33 +282,87 @@ impl RollingWriter {
             .spawn(move || background(worker, rx))
             .map_err(|e| format!("starting the log converter thread: {e}"))?;
         *writer.worker.lock().expect("log worker poisoned") = Some(handle);
+        let scribe = std::thread::Builder::new()
+            .name("oxidant-log-write".to_string())
+            .spawn(move || scribe(shared, line_rx))
+            .map_err(|e| format!("starting the log writer thread: {e}"))?;
+        *writer.scribe.lock().expect("log scribe poisoned") = Some(scribe);
         // Whatever a crash left: a boot-time pass over the directory, on the worker thread.
-        let _ = writer.tx.send(Job::Rolled);
+        let _ = writer.shared.jobs.send(Job::Rolled);
         Ok(writer)
     }
 
     pub(crate) fn dir(&self) -> &Path {
-        &self.cfg.dir
+        &self.shared.cfg.dir
     }
 
     pub(crate) fn dedup_enabled(&self) -> bool {
-        self.cfg.dedup
+        self.shared.cfg.dedup
     }
 
     pub(crate) fn roll(&self) -> LogRoll {
-        self.cfg.roll
+        self.shared.cfg.roll
     }
 
-    /// Append one event. Never blocks on conversion, never logs, never panics on a failed write:
-    /// a log line that cannot be written is not worth taking the process down for.
+    /// Append one event. **Never blocks**, never logs, never panics on a failed write: a log
+    /// line that cannot be written is not worth taking the process down for, and a `tracing`
+    /// event is emitted from tokio workers and the Flight data path, where a `write(2)` on a
+    /// slow volume would stall the reactor.
+    ///
+    /// The line is rendered on the caller's thread and handed to the writer thread through a
+    /// bounded queue. A full queue *drops* the line and counts it — [`Shared::note_drops`] writes
+    /// the count into the log itself as soon as there is room, so the gap is never silent.
     pub(crate) fn write(&self, line: LogLine) {
         self.write_at(line, Utc::now());
     }
 
     pub(crate) fn write_at(&self, line: LogLine, now: DateTime<Utc>) {
+        // The event's *own* instant travels with it, so a line that waited in the queue still
+        // rolls into the file its timestamp belongs to.
+        if let Err(TrySendError::Full(_)) = self.lines.try_send(Entry::Line(Box::new(line), now)) {
+            self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        // `Disconnected` means the writer thread has stopped — after `shutdown`, or because it
+        // panicked. Counting those as drops would write a growing number into a file nobody is
+        // writing any more, so they are simply ignored.
+    }
+
+    /// Block until everything queued before this call is on disk.
+    ///
+    /// The barrier the queue makes necessary. `?file=current` reads the file, not the queue, so
+    /// without this a caller can miss the last few microseconds of events; shutdown takes it, and
+    /// so does every test that asserts on file contents right after a write.
+    pub(crate) fn drain(&self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self.lines.send(Entry::Barrier(tx)).is_ok() {
+            let _ = rx.recv();
+        }
+    }
+
+    /// The 5 s timer half of §6's flush rule. The writer thread drives it from its idle tick;
+    /// a test drives it from an explicit clock, which is the only way to test a 5 s timer in
+    /// milliseconds.
+    #[cfg(test)]
+    fn flush_stale(&self, now: DateTime<Utc>) {
+        self.shared.flush_stale(now)
+    }
+
+    /// Force a roll now — the seam the size/clock tests drive, and the shape a future
+    /// operator-triggered rotate would take.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn roll_now(&self, now: DateTime<Utc>) -> Option<PathBuf> {
+        self.shared.roll_now(now)
+    }
+}
+
+impl Shared {
+    /// Apply one queued event: roll if due, dedup, append. **Writer thread only** — this is the
+    /// blocking `write(2)` that used to run on whatever thread emitted the event.
+    fn apply(&self, line: LogLine, now: DateTime<Utc>) {
         let rolled = {
             let mut st = self.state.lock().expect("log writer poisoned");
             let rolled = self.roll_if_due(&mut st, now);
+            self.note_drops(&mut st, now);
             let suppressed = self.cfg.dedup
                 && match st.held.as_mut() {
                     Some(held) if line.is_repeat_of(&held.line) => {
@@ -269,11 +385,37 @@ impl RollingWriter {
             rolled
         };
         if rolled.is_some() {
-            let _ = self.tx.send(Job::Rolled);
+            let _ = self.jobs.send(Job::Rolled);
         }
     }
 
-    /// The 5 s timer half of §6's flush rule, driven by the background thread.
+    /// Write the count of events the full queue dropped, as its own `WARN`, and reset it.
+    ///
+    /// Not a `tracing::warn!`: this runs with the writer lock held, and a `tracing` event from
+    /// in here re-enters the layer that feeds this very queue. The line is built directly and
+    /// appended, which is also the only way to guarantee it lands *next to* the gap it describes.
+    fn note_drops(&self, st: &mut WriterState, now: DateTime<Utc>) {
+        let missed = self.dropped.swap(0, Ordering::Relaxed);
+        if missed == 0 {
+            return;
+        }
+        // A drop notice is never itself deduped away: it ends the held run first, so the count
+        // it interrupts is written where it happened.
+        self.flush_held(st, now);
+        st.held = None;
+        let notice = LogLine {
+            ts: now.format(super::line::TS_FORMAT).to_string(),
+            level: "WARN",
+            target: "oxidant_connect::logging".to_string(),
+            fields: format!(
+                "message=the rolling exec log dropped events: the writer queue was full, \
+                 dropped={missed}, queue_depth={QUEUE_DEPTH}"
+            ),
+        };
+        self.append(st, &notice.render());
+    }
+
+    /// The 5 s timer half of §6's flush rule.
     fn flush_stale(&self, now: DateTime<Utc>) {
         let mut st = self.state.lock().expect("log writer poisoned");
         let stale = st.held.as_ref().is_some_and(|h| {
@@ -337,10 +479,7 @@ impl RollingWriter {
         rolled
     }
 
-    /// Force a roll now — the seam the size/clock tests drive, and the shape a future
-    /// operator-triggered rotate would take.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn roll_now(&self, now: DateTime<Utc>) -> Option<PathBuf> {
+    fn roll_now(&self, now: DateTime<Utc>) -> Option<PathBuf> {
         let rolled = {
             let mut st = self.state.lock().expect("log writer poisoned");
             let current = st.period?;
@@ -357,16 +496,28 @@ impl RollingWriter {
             rolled
         };
         if rolled.is_some() {
-            let _ = self.tx.send(Job::Rolled);
+            let _ = self.jobs.send(Job::Rolled);
         }
         rolled
     }
 
+    /// Flush the held repeat and `fsync`. The last thing the writer thread does.
+    fn close(&self, now: DateTime<Utc>) {
+        let mut st = self.state.lock().expect("log writer poisoned");
+        self.note_drops(&mut st, now);
+        self.flush_held(&mut st, now);
+        // Without this the tail sits in the page cache, and §6's "flushed … at shutdown" buys
+        // nothing on a host that goes down right after the process does.
+        let _ = st.file.sync_all();
+    }
+}
+
+impl RollingWriter {
     /// Convert every rolled `.log` with no `.parquet` sibling, and delete every `.parquet.tmp`.
-    /// Runs on the worker thread at boot and after every roll.
+    /// Runs on the converter thread at boot and after every roll.
     fn convert_pending(&self, attempts: &mut HashMap<PathBuf, u32>) {
         let _serialized = self.converting.lock().expect("log converter poisoned");
-        let Ok(entries) = std::fs::read_dir(&self.cfg.dir) else {
+        let Ok(entries) = std::fs::read_dir(&self.shared.cfg.dir) else {
             return;
         };
         let mut pending: Vec<PathBuf> = Vec::new();
@@ -385,6 +536,7 @@ impl RollingWriter {
                 continue;
             }
             if self
+                .shared
                 .cfg
                 .dir
                 .join(period.file_name(split, "parquet"))
@@ -397,7 +549,7 @@ impl RollingWriter {
             }
             pending.push(entry.path());
         }
-        if !self.cfg.parquet || pending.is_empty() {
+        if !self.shared.cfg.parquet || pending.is_empty() {
             return;
         }
         pending.sort();
@@ -405,7 +557,7 @@ impl RollingWriter {
             if attempts.get(&path).copied().unwrap_or(0) >= MAX_CONVERSION_ATTEMPTS {
                 continue;
             }
-            if let Err(reason) = self.cfg.headroom.check(&self.cfg.dir) {
+            if let Err(reason) = self.shared.cfg.headroom.check(&self.shared.cfg.dir) {
                 tracing::info!(
                     file = %path.display(),
                     reason = %reason,
@@ -455,15 +607,18 @@ impl RollingWriter {
     /// [`super::shutdown`]; this stays idempotent because a test also calls it directly to make
     /// the converter thread quiesce before asserting.
     pub(crate) fn shutdown(&self) {
-        {
-            let mut st = self.state.lock().expect("log writer poisoned");
-            let now = Utc::now();
-            self.flush_held(&mut st, now);
-            // Without this the tail sits in the page cache, and §6's "flushed … at shutdown"
-            // buys nothing on a host that goes down right after the process does.
-            let _ = st.file.sync_all();
+        // `Stop` goes down the *same* queue the lines do, so FIFO order alone guarantees
+        // everything already emitted is written before the flush — including the
+        // `rolling exec log closed` line `super::shutdown` emits just before calling this. A
+        // blocking `send` rather than `try_send`: this is the one place waiting is correct.
+        let _ = self.lines.send(Entry::Stop);
+        if let Some(handle) = self.scribe.lock().expect("log scribe poisoned").take() {
+            let _ = handle.join();
         }
-        let _ = self.tx.send(Job::Stop);
+        // A second call finds no thread to join, so do the flush here too — and after the join
+        // the writer thread is gone, which makes this the only thread that can.
+        self.shared.close(Utc::now());
+        let _ = self.shared.jobs.send(Job::Stop);
         if let Some(handle) = self.worker.lock().expect("log worker poisoned").take() {
             let _ = handle.join();
         }
@@ -510,13 +665,37 @@ fn next_split(dir: &Path, period: LogPeriod) -> u32 {
     highest + 1
 }
 
-/// The converter/sweeper thread: a rolled file to convert, a 5 s dedup timer, and the roll-time
-/// disk sweep.
+/// The writer thread: the *only* thread that touches the live file.
+///
+/// It owns the blocking `write(2)`, both roll triggers and the dedup state, and it holds a
+/// strong `Arc<Shared>` — a queued line has to land even if the last `RollingWriter` handle is
+/// being dropped, and `Shared` owns no thread handle, so there is no cycle to leak.
+///
+/// The idle tick is §6's 5 s dedup timer. It lives here rather than on the converter thread
+/// because a 256 MiB Parquet conversion takes seconds, and the summary of a run that has already
+/// gone quiet must not wait behind one.
+fn scribe(shared: Arc<Shared>, rx: Receiver<Entry>) {
+    loop {
+        match rx.recv_timeout(TICK) {
+            Ok(Entry::Line(line, now)) => shared.apply(*line, now),
+            Ok(Entry::Barrier(reply)) => {
+                let _ = reply.send(());
+            }
+            Ok(Entry::Stop) | Err(RecvTimeoutError::Disconnected) => {
+                shared.close(Utc::now());
+                return;
+            }
+            Err(RecvTimeoutError::Timeout) => shared.flush_stale(Utc::now()),
+        }
+    }
+}
+
+/// The converter/sweeper thread: a rolled file to convert, and the roll-time disk sweep.
 fn background(writer: std::sync::Weak<RollingWriter>, rx: Receiver<Job>) {
     let mut attempts: HashMap<PathBuf, u32> = HashMap::new();
     loop {
-        match rx.recv_timeout(TICK) {
-            Ok(Job::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+        match rx.recv() {
+            Ok(Job::Stop) | Err(_) => return,
             Ok(Job::Rolled) => {
                 let Some(writer) = writer.upgrade() else {
                     return;
@@ -536,12 +715,6 @@ fn background(writer: std::sync::Weak<RollingWriter>, rx: Receiver<Job>) {
                         super::run_sweep_hook();
                     }
                 }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                let Some(writer) = writer.upgrade() else {
-                    return;
-                };
-                writer.flush_stale(Utc::now());
             }
         }
     }
@@ -623,8 +796,10 @@ mod tests {
             let w = RollingWriter::open_at(cfg(dir.path(), roll, u64::MAX), before, None)
                 .expect("open");
             w.write_at(line("message=before"), before);
+            w.drain();
             assert_eq!(names(dir.path()), vec![LIVE_LOG.to_string()]);
             w.write_at(line("message=after"), after);
+            w.drain();
             assert_eq!(
                 names(dir.path()),
                 vec![expected.to_string(), LIVE_LOG.to_string()],
@@ -654,6 +829,7 @@ mod tests {
                 now,
             );
         }
+        w.drain();
         assert_eq!(
             names(dir.path()),
             vec![
@@ -666,6 +842,7 @@ mod tests {
         );
         // And the clock roll that follows takes the next free split, not the plain name again.
         w.write_at(line("message=tomorrow"), utc(2026, 8, 24, 0, 0));
+        w.drain();
         assert!(
             dir.path().join("oxidant-2026-08-23.4.log").exists(),
             "a clock roll after size splits must not overwrite: {:?}",
@@ -689,6 +866,7 @@ mod tests {
             RollingWriter::open_at(cfg(dir.path(), LogRoll::Daily, 32), now, None).expect("open");
         first.write_at(line("message=run one, padded well past the cap"), now);
         first.write_at(line("message=run one again, also padded past"), now);
+        // No `drain` here on purpose: `shutdown` is the barrier, and this is what proves it.
         first.shutdown();
         drop(first);
         assert!(dir.path().join(&plain).exists(), "{:?}", names(dir.path()));
@@ -784,6 +962,7 @@ mod tests {
         for _ in 0..10 {
             w.write_at(line("message=pool exhausted"), now);
         }
+        w.drain();
         // Nothing else arrives; only the clock moves past the flush interval.
         w.flush_stale(now + chrono::Duration::seconds(4));
         let body = std::fs::read_to_string(dir.path().join(LIVE_LOG)).expect("live");
@@ -797,9 +976,91 @@ mod tests {
             line("message=pool exhausted"),
             now + chrono::Duration::seconds(7),
         );
+        w.drain();
         w.flush_stale(now + chrono::Duration::seconds(20));
         let body = std::fs::read_to_string(dir.path().join(LIVE_LOG)).expect("live");
         assert!(body.contains("… repeated 1 times"), "{body}");
+        w.shutdown();
+    }
+
+    /// **L2.** Every `tracing` event used to take one process-global mutex and do a blocking
+    /// `write_all` on whatever thread emitted it — a tokio worker, a Flight data-path thread. On
+    /// a slow or full volume that stalls the reactor, and a chatty distributed stage serialises
+    /// every logging thread on one lock.
+    ///
+    /// Two halves, and this test needs both because either alone is easy to fake:
+    ///
+    /// - **The emitting thread does not wait for the file.** The test holds the very lock the
+    ///   writer thread needs for every append, and then emits. On the old code `write_at` took
+    ///   that lock itself and this deadlocked; the timing assertion is what turns that into a
+    ///   clean failure instead of a hang.
+    /// - **Nothing is lost silently.** The queue is bounded, so a writer thread that far behind
+    ///   *drops* — and the count of what it dropped is written into the log itself. Every line
+    ///   emitted is either in the file or in that count, exactly once.
+    #[test]
+    fn an_event_never_waits_on_the_file_and_a_full_queue_says_what_it_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = utc(2026, 8, 23, 14, 0);
+        let w = RollingWriter::open_at(cfg(dir.path(), LogRoll::Daily, u64::MAX), now, None)
+            .expect("open");
+
+        // Stall the writer thread: it cannot append without this lock.
+        let held = w.shared.state.lock().expect("state");
+        let total = QUEUE_DEPTH + 200;
+        let start = std::time::Instant::now();
+        for i in 0..total {
+            w.write_at(line(&format!("message=event {i}")), now);
+        }
+        let emitting = start.elapsed();
+        drop(held);
+        w.drain();
+        w.shutdown();
+
+        assert!(
+            emitting < Duration::from_secs(5),
+            "{total} events took {emitting:?} with the file lock held — the write is back on the \
+             emitting thread"
+        );
+
+        let body = std::fs::read_to_string(dir.path().join(LIVE_LOG)).expect("live");
+        let notices: Vec<&str> = body
+            .lines()
+            .filter(|l| l.contains("the rolling exec log dropped events"))
+            .collect();
+        assert_eq!(
+            notices.len(),
+            1,
+            "a full queue must say so, once, in the log it is dropping from: {}",
+            body.lines().take(3).collect::<Vec<_>>().join("\n")
+        );
+        let dropped: usize = notices[0]
+            .split("dropped=")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or_else(|| panic!("the notice must carry a count: {}", notices[0]));
+        assert!(dropped > 0, "the queue really did overflow: {}", notices[0]);
+        assert_eq!(
+            body.lines().count() - notices.len() + dropped,
+            total,
+            "every event is either in the file or in the dropped count — never neither"
+        );
+    }
+
+    /// `drain` is a barrier, not a hint: what it returns from is on disk. `?file=current` takes
+    /// it, because the queue means the file can lag the caller's own last event.
+    #[test]
+    fn drain_returns_only_once_the_queue_is_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = utc(2026, 8, 23, 14, 0);
+        let w = RollingWriter::open_at(cfg(dir.path(), LogRoll::Daily, u64::MAX), now, None)
+            .expect("open");
+        for i in 0..200 {
+            w.write_at(line(&format!("message=event {i}")), now);
+        }
+        w.drain();
+        let body = std::fs::read_to_string(dir.path().join(LIVE_LOG)).expect("live");
+        assert_eq!(body.lines().count(), 200, "{}", body.lines().count());
         w.shutdown();
     }
 
@@ -837,6 +1098,7 @@ mod tests {
         c.headroom.reserve_bytes = 256 * 1024 * 1024;
         let w = RollingWriter::open_at(c, now, None).expect("open");
         w.write_at(line("message=before"), now);
+        w.drain();
         w.roll_now(utc(2026, 8, 24, 0, 0));
         let mut attempts = HashMap::new();
         w.convert_pending(&mut attempts);
@@ -859,6 +1121,7 @@ mod tests {
         c.parquet = true;
         let w = RollingWriter::open_at(c, now, None).expect("open");
         w.write_at(line("message=before"), now);
+        w.drain();
         w.roll_now(utc(2026, 8, 24, 0, 0));
         let mut attempts = HashMap::new();
         w.convert_pending(&mut attempts);
@@ -916,6 +1179,7 @@ mod tests {
         let w = RollingWriter::open_at(cfg(dir.path(), LogRoll::Daily, u64::MAX), now, None)
             .expect("open");
         w.write_at(line("message=before"), now);
+        w.drain();
         w.roll_now(utc(2026, 8, 24, 0, 0));
         let mut attempts = HashMap::new();
         w.convert_pending(&mut attempts);
@@ -933,6 +1197,7 @@ mod tests {
         let w = RollingWriter::open_at(cfg(dir.path(), LogRoll::Off, 1), now, None).expect("open");
         w.write_at(line("message=one"), now);
         w.write_at(line("message=two"), utc(2027, 1, 1, 0, 0));
+        w.drain();
         assert_eq!(names(dir.path()), vec![LIVE_LOG.to_string()]);
         w.shutdown();
     }

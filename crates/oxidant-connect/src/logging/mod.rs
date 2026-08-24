@@ -451,7 +451,18 @@ pub(crate) fn convert_for_test(text: &Path) -> Result<String, String> {
 }
 
 /// The live `oxidant.log`, or `None` if it does not exist yet.
+///
+/// **Drains the writer queue first.** The `write(2)` runs on a dedicated thread now, so an event
+/// emitted a microsecond ago may still be in flight; `?file=current` reads the file, not the
+/// queue, and would otherwise answer a page that is missing the very lines the caller just
+/// triggered. The barrier costs one round-trip to a thread that is almost always idle, and it is
+/// taken only for `current` — a rolled file is closed and has nothing in flight.
 pub(crate) fn resolve_current(dir: &Path) -> Option<LogFile> {
+    if let Some(writer) = rolling() {
+        if writer.dir() == dir {
+            writer.drain();
+        }
+    }
     let live = dir.join(crate::history::disk::LIVE_LOG);
     live.is_file().then_some(LogFile::Text(live))
 }

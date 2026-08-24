@@ -719,6 +719,20 @@ init is `oxidant_connect::logging::init(role, port)`.
   `OXIDANT_LOG_PARQUET=off` keeps rolled files as plain text (subject to the same
   budget, and they will be roughly 10× larger), and `POST /api/v1/logs/dump` (§6b)
   produces a downloadable slice.
+- **The `write(2)` is off the emitting thread** *(PR3)*. Every `tracing` event used to take one
+  process-global mutex and do a blocking `write_all` on whatever thread emitted it — a tokio
+  worker, a Flight data-path thread. On a slow or full volume that stalls the reactor, and a
+  chatty distributed stage serialises every logging thread on one lock. The event is now
+  *rendered* on the emitting thread and handed to a **bounded queue** (8192 events); one
+  dedicated thread owns the file, the dedup state and both roll triggers, and a second owns
+  Parquet conversion and the sweep, because converting a 256 MiB file takes seconds and log
+  lines must not queue behind it. Two costs, both stated and both bounded:
+  - a **full queue drops** rather than blocking — the count is written into the log itself as
+    its own `WARN` (`dropped=N, queue_depth=8192`) the moment the writer catches up, so every
+    event is either in the file or in that count and the gap is never silent;
+  - `?file=current` could otherwise miss the last microseconds of events, so it takes a
+    **barrier** on the queue before it reads. A rolled file is closed and has nothing in flight,
+    so it pays nothing.
 - **Repeated-line suppression** (`OXIDANT_LOG_DEDUP`): an identical consecutive line is
   held and counted, and its `… repeated N times` summary is flushed on **any** of:
   a different line arriving, a 5 s timer (so a process that repeats one line and then
