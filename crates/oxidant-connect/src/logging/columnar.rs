@@ -33,8 +33,26 @@ use oxidant_loom::arrow::record_batch::RecordBatch;
 use super::line::{ordered_fields, parse_line, ParsedLine, TS_FORMAT};
 use crate::history::fs_util;
 
-/// Rows per Parquet row group written by the converter.
+/// Rows per Arrow `RecordBatch` handed to the writer — a memory knob, not a layout one.
+///
+/// `ArrowWriter::write` *appends* a batch into the row group it is currently building; it does
+/// not cut one. All this bounds is how many `ParsedLine`s the converter holds at once.
 const ROWS_PER_BATCH: usize = 8192;
+
+/// Rows per Parquet **row group** — the unit §6b's predicate pushdown can skip.
+///
+/// This is the number that has to be chosen deliberately, and it was not being set at all.
+/// parquet-rs defaults `max_row_group_row_count` to 1Mi rows; a full 256 MiB text log is roughly 2M
+/// lines, so the default gave a *maxed-out* file two row groups and a typical few-MiB daily log
+/// exactly one. A `ts` range or `level` predicate then prunes nothing and the reader decodes the
+/// whole file anyway — which is the cost §6 says conversion buys its way out of.
+///
+/// 8192 rows is ~1 MiB of raw log text, so a 5 MiB day still gets ~5 groups to prune between and
+/// a maxed-out one gets ~256. Groups are cut in write order, which is chronological, so the `ts`
+/// min/max are tight and a time window skips everything outside it. The footer costs five column
+/// chunks per group — negligible at these counts — and zstd is applied per *data page*, not per
+/// row group, so the compression ratio is unaffected (`conversion_compresses` holds it to that).
+const ROWS_PER_ROW_GROUP: usize = 8192;
 
 /// `(ts, level, target, message, fields_json)` — §6's schema, verbatim.
 ///
@@ -111,6 +129,7 @@ fn convert_inner(text: &Path, dir: &Path, tmp: &Path, target: &Path) -> Result<P
         fs_util::create_secure(tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_max_row_group_row_count(Some(ROWS_PER_ROW_GROUP))
         .build();
     let mut writer = ArrowWriter::try_new(out, schema(), Some(props))
         .map_err(|e| format!("opening a parquet writer on {}: {e}", tmp.display()))?;
@@ -125,7 +144,7 @@ fn convert_inner(text: &Path, dir: &Path, tmp: &Path, target: &Path) -> Result<P
         }
         writer
             .write(&batch(rows)?)
-            .map_err(|e| format!("writing a log row group: {e}"))?;
+            .map_err(|e| format!("writing a log batch: {e}"))?;
         rows.clear();
         Ok(())
     };
@@ -389,6 +408,63 @@ mod tests {
                 .len(),
             20_000
         );
+    }
+
+    /// **M4.** The converter must cut row groups at a size it chose, not at parquet-rs' 1Mi-row
+    /// default — otherwise a whole day is one or two row groups and §6b's `ts`/`level` pushdown
+    /// prunes nothing, which is the entire payoff §6 claims for converting.
+    ///
+    /// Reads the file's own row-group metadata, and checks the `ts` statistics are per-group and
+    /// ascending: groups are cut in write order, so a time window can skip the ones outside it.
+    #[test]
+    fn row_groups_are_cut_at_a_deliberate_size_so_a_time_window_can_skip_them() {
+        use datafusion::parquet::file::statistics::Statistics;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Two full groups and a short third, each line a distinct millisecond.
+        let count = ROWS_PER_ROW_GROUP * 2 + 500;
+        let body: Vec<String> = (0..count)
+            .map(|i| {
+                format!(
+                    "2026-08-23T00:00:{:02}.{:03}Z [INFO] oxidant_execution - message=stage done, i={i}",
+                    i / 1000,
+                    i % 1000
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+        let text = write(dir.path(), "oxidant-2026-08-29.log", &refs);
+        let parquet = convert(&text).expect("convert");
+
+        let file = std::fs::File::open(&parquet).expect("open");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("builder");
+        let md = builder.metadata().clone();
+        assert_eq!(
+            md.num_row_groups(),
+            3,
+            "{count} rows at {ROWS_PER_ROW_GROUP}/group is three groups; parquet-rs' default \
+             would have made one"
+        );
+        assert_eq!(md.row_group(0).num_rows(), ROWS_PER_ROW_GROUP as i64);
+        assert_eq!(md.row_group(1).num_rows(), ROWS_PER_ROW_GROUP as i64);
+        assert_eq!(md.row_group(2).num_rows(), 500);
+
+        // `ts` is column 0. Every group carries its own bounds, and they do not overlap.
+        let bounds: Vec<(i64, i64)> = (0..md.num_row_groups())
+            .map(|g| match md.row_group(g).column(0).statistics() {
+                Some(Statistics::Int64(s)) => (
+                    *s.min_opt().expect("a ts min"),
+                    *s.max_opt().expect("a ts max"),
+                ),
+                other => panic!("row group {g} has no ts statistics to prune on: {other:?}"),
+            })
+            .collect();
+        for pair in bounds.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "groups must be disjoint in time, else a window prunes nothing: {pair:?}"
+            );
+        }
     }
 
     /// A conversion that fails leaves the text file — the only complete copy — where it was.

@@ -706,6 +706,13 @@ init is `oxidant_connect::logging::init(role, port)`.
   is never removed before the footer reads back, and why a `.parquet.tmp` found at boot
   is simply deleted and the conversion redone. A conversion that fails twice leaves the
   `.log` in place permanently and logs one loud line; `?file=` serves it as text.
+- **Row groups are cut at a size the converter chose** *(PR3)*: 8192 rows, ~1 MiB of raw log
+  text. parquet-rs defaults `max_row_group_row_count` to 1Mi rows, which was never overridden,
+  so a *maxed-out* 256 MiB day (~2M lines) became two row groups and an ordinary few-MiB day
+  became one — and §6b's `ts`/`level` pushdown would have pruned nothing, decoding the whole
+  file to answer a five-minute window. Groups are cut in write order, which is chronological,
+  so their `ts` min/max are tight. (The Arrow batch size is a separate number: `write` appends
+  a batch into the row group it is building, it does not cut one.)
 - **The cost, stated:** once converted, an operator can no longer `tail`/`grep`
   yesterday's log with shell tools. That is a real loss and it is the price of ~10×
   compression plus predicate-pushdown browsing (§6b). Two outs, both documented:
