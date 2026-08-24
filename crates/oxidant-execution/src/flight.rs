@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -200,6 +200,36 @@ pub const ACTION_TASK_STATUS: &str = "task_status";
 /// stage id). Lets the driver sample shuffle sizes for AQE without pulling the buckets
 /// themselves (KAN-32).
 pub const ACTION_BUCKET_ROW_COUNTS: &str = "bucket_row_counts";
+/// Flight `do_action` type: one bounded page of this node's own exec log (body: a JSON query;
+/// response: a JSON page). The driver's log browser federates over this
+/// (docs/query-history-durability.md §6b).
+///
+/// **Why an action and not an HTTP surface on the worker.** A worker speaks Flight and nothing
+/// else; an HTTP listener would mean a second port to open, a second bind in every deployment
+/// template, and a second place to get the status-token gate right. This port already exists, is
+/// already the driver→worker interconnect, is already connection-pooled, and already carries
+/// actions of exactly this shape. It is also already a **trusted boundary** — it accepts
+/// arbitrary stage SQL from any peer that can reach it — so serving that same peer a page of
+/// this node's log is not a new privilege.
+///
+/// **No log bytes are copied by this action.** It answers one bounded page of rendered lines,
+/// which the driver forwards and does not keep; §6b's diagnostic dump is the one sanctioned
+/// exception and is a separate, explicitly-named path.
+pub const ACTION_LOGS: &str = "logs";
+
+/// Answers [`ACTION_LOGS`]. Installed by `oxidant_connect::logging::init`, because the code that
+/// can read this process's log files lives in `oxidant-connect` and this crate is *below* it in
+/// the dependency graph — the hook is the seam that keeps the arrow pointing one way.
+type LogQueryHandler = Box<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
+static LOG_QUERY_HANDLER: OnceLock<LogQueryHandler> = OnceLock::new();
+
+/// Install the [`ACTION_LOGS`] handler. First call in a process wins, matching
+/// `logging::init`'s own idempotence.
+pub fn set_log_query_handler(
+    handler: impl Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync + 'static,
+) {
+    let _ = LOG_QUERY_HANDLER.set(Box::new(handler));
+}
 
 /// Max gRPC message size for Arrow Flight (KAN-6).
 ///
@@ -1847,6 +1877,17 @@ impl FlightService for Worker {
                 }))
             }
             ACTION_HEARTBEAT => Ok(action_response(self.heartbeat_payload().into_bytes())),
+            ACTION_LOGS => match LOG_QUERY_HANDLER.get() {
+                Some(handler) => Ok(action_response(
+                    handler(&action.body).map_err(Status::internal)?,
+                )),
+                // A worker built without the logging init — an embedded caller, or a build that
+                // predates §6b. `unimplemented` is the honest code and it is what the driver
+                // turns into `reachable: true` plus a named reason, never a silent skip.
+                None => Err(Status::unimplemented(
+                    "this worker serves no logs API (oxidant_connect::logging::init was not called)",
+                )),
+            },
             ACTION_BUCKET_ROW_COUNTS => {
                 let body = String::from_utf8_lossy(&action.body);
                 let stage_id: u32 = body.trim().parse().map_err(|_| {
@@ -2249,6 +2290,18 @@ impl WorkerHeartbeat {
             _ => true,
         }
     }
+}
+
+/// Ask a worker for one bounded page of its own exec log (§6b federation).
+///
+/// The request and the answer are both JSON, opaque here on purpose: the shapes belong to
+/// `oxidant-connect`'s log browser, and this crate is only the transport.
+pub async fn worker_logs(endpoint: String, request: Vec<u8>) -> Result<Vec<u8>> {
+    let bodies = do_action_collect(endpoint, ACTION_LOGS, &request).await?;
+    bodies
+        .into_iter()
+        .next_back()
+        .ok_or_else(|| Error::Execution("logs: empty response".into()))
 }
 
 /// Heartbeat probe. New workers return slot metadata; older `ok`-only workers are accepted.
