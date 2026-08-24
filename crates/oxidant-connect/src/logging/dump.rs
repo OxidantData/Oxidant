@@ -720,7 +720,7 @@ mod tests {
                 entry.at_ms = old;
             }
         }
-        store.admit_and_begin().expect("admitted").len();
+        store.admit_and_begin().expect("admitted");
         let registry = store.state.lock().expect("registry");
         assert!(
             !registry.contains_key(&done),
