@@ -1293,6 +1293,16 @@ document or `docs/api.md` previously promised.
   of lines that are themselves outside the window; a `?file=` read of the same file still
   serves them, because there the caller named the file.
 
+- **F3 — the Parquet page fits its own byte budget.** `scan_parquet`'s second pass rendered
+  every matching row of a row group into a `Vec` before the page's byte budget was consulted,
+  while the text path over the same file pushed each match straight into a `Window` that evicts
+  on bytes. So one file served 8 MiB as `.log` and more than that as `.parquet`, and a row group
+  of fat lines — 8,192 rows, one `tracing` field able to carry a whole DataFusion plan — was
+  materialised in full on a driver whose entire result budget is 512 MiB. The rendered rows now
+  go into a window sized to what is *left* of the page, and with no `q` predicate the older hits
+  are not rendered at all. §6b's rule 3 is restated to say "never by a row group" as well as
+  "never by the file".
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |

@@ -27,9 +27,15 @@
 //!    format-tagged cursor would have let a caller's page change under them for a reason they
 //!    could not see — the same race M2 closed for the line strings themselves.
 //!
-//! 3. **Memory is bounded by the page, never by the file.** The text path is a forward scan
-//!    holding at most `limit` matched lines (and [`super::columnar::MAX_PAGE_BYTES`] of them);
-//!    the Parquet path holds one row group plus the page. Neither ever materialises a file.
+//! 3. **Memory is bounded by the page, never by the file — and never by a row group.** The
+//!    text path is a forward scan holding at most `limit` matched lines (and
+//!    [`super::columnar::MAX_PAGE_BYTES`] of them). The Parquet path holds the same page and,
+//!    while it is filling it, one *page-sized* buffer of the group it is reading — not the
+//!    group. It used to hold the group: every matching row of it, rendered, before a single
+//!    byte check ran. `ROWS_PER_ROW_GROUP` is 8192 and a line has no fixed size, which is the
+//!    premise the byte budget exists for, so the same file could serve three orders of
+//!    magnitude more driver memory as `.parquet` than as `.log` — a difference rule 2 says a
+//!    caller must not be able to see. Neither path ever materialises a file.
 //!
 //! **What pushdown does and does not buy, stated.** `ts` prunes whole row groups from the
 //! footer statistics — groups are cut in write order, so their bounds are tight and disjoint
@@ -209,16 +215,24 @@ struct Window {
     kept: VecDeque<(u64, String)>,
     bytes: usize,
     limit: usize,
+    /// The byte ceiling this window evicts against. [`MAX_PAGE_BYTES`] for a page; whatever is
+    /// *left* of it for the per-group buffer the Parquet walk fills first.
+    max_bytes: usize,
     /// A match was dropped off the front — there is older matching content behind this page.
     dropped: bool,
 }
 
 impl Window {
     fn new(limit: usize) -> Self {
+        Self::with_budget(limit, MAX_PAGE_BYTES)
+    }
+
+    fn with_budget(limit: usize, max_bytes: usize) -> Self {
         Self {
             kept: VecDeque::new(),
             bytes: 0,
             limit: limit.max(1),
+            max_bytes,
             dropped: false,
         }
     }
@@ -227,7 +241,7 @@ impl Window {
     fn push(&mut self, index: u64, line: String) {
         self.bytes = self.bytes.saturating_add(line.len());
         self.kept.push_back((index, line));
-        while self.kept.len() > self.limit || (self.kept.len() > 1 && self.bytes > MAX_PAGE_BYTES) {
+        while self.kept.len() > self.limit || (self.kept.len() > 1 && self.bytes > self.max_bytes) {
             if let Some((_, old)) = self.kept.pop_front() {
                 self.bytes = self.bytes.saturating_sub(old.len());
                 self.dropped = true;
@@ -243,7 +257,15 @@ impl Window {
     }
 
     fn full(&self) -> bool {
-        self.kept.len() >= self.limit || self.bytes > MAX_PAGE_BYTES
+        self.kept.len() >= self.limit || self.bytes >= self.max_bytes
+    }
+
+    fn len(&self) -> usize {
+        self.kept.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
     }
 
     fn finish(self) -> CursorPage {
@@ -575,7 +597,7 @@ pub(crate) fn scan_parquet(
 
         // Pass 1 — `ts`, `level`, `target` only. `message` and `fields_json` are the bytes worth
         // skipping, and this is the pass that decides which of their rows are ever read.
-        let hits = {
+        let mut hits = {
             let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
                 file.try_clone()
                     .map_err(|e| format!("reopening {}: {e}", path.display()))?,
@@ -604,6 +626,16 @@ pub(crate) fn scan_parquet(
         if hits.is_empty() {
             continue;
         }
+        // **Only the newest matches of this group are rendered.** With no free-text predicate
+        // every pushdown hit *is* a match, so the page can only ever hold the newest
+        // `remaining` of them and the older ones need not have `message`/`fields_json` decoded
+        // at all. `q` is the exception — it judges the rendered line, so every candidate has to
+        // be built — and there the per-group window below is what bounds the memory.
+        let remaining = limit.saturating_sub(window.len()).max(1);
+        if filter.q.is_none() && hits.len() > remaining {
+            hits.drain(..hits.len() - remaining);
+            more_before = true;
+        }
 
         // Pass 2 — the full row, for the surviving rows only.
         let selection = RowSelection::from(selectors(&hits, md.row_group(g).num_rows() as usize));
@@ -616,7 +648,15 @@ pub(crate) fn scan_parquet(
         .with_row_selection(selection)
         .build()
         .map_err(|e| format!("reading {}: {e}", path.display()))?;
-        let mut rendered: Vec<(u64, String)> = Vec::with_capacity(hits.len());
+        // **Rule 3, on this path too.** The rendered rows go into a window of their own, sized
+        // to what is *left* of the page, so it holds a page and not a row group. A plain `Vec`
+        // here accumulated every matching row of the group at full rendered size before a single
+        // byte check ran — 8,192 rows, and one `tracing` field can carry a whole DataFusion
+        // plan — while the text path over the same file stayed bounded. Rule 2's premise is that
+        // the two forms of one file are indistinguishable to a caller, and three orders of
+        // magnitude of driver memory is a distinction.
+        let mut newest =
+            Window::with_budget(remaining, MAX_PAGE_BYTES.saturating_sub(window.bytes()));
         let mut seen = 0usize;
         for batch in reader {
             let batch = batch.map_err(|e| format!("reading {}: {e}", path.display()))?;
@@ -628,13 +668,17 @@ pub(crate) fn scan_parquet(
                 seen += 1;
                 let line = render_row(&cols, i);
                 if filter.keeps_text(&line) {
-                    rendered.push((start + row as u64, line));
+                    newest.push(start + row as u64, line);
                 }
             }
         }
-        // Newest first into the window's front, so a full window stops before the older rows of
+        if newest.dropped {
+            // This group held matches older than the page could carry.
+            more_before = true;
+        }
+        // Newest first into the page's front, so a full page stops before the older rows of
         // this group are even considered.
-        for (index, line) in rendered.into_iter().rev() {
+        for (index, line) in newest.kept.into_iter().rev() {
             if window.full() {
                 more_before = true;
                 break;
@@ -1276,6 +1320,15 @@ mod tests {
 
     /// The page is bounded by bytes as well as by lines: one `tracing` field can carry a whole
     /// DataFusion plan, so `limit` alone bounds nothing.
+    ///
+    /// **And it is bounded on both forms, identically.** Every other test in this module runs
+    /// text-then-parquet; this one did not, and the Parquet path was the one that would have
+    /// failed it. It buffered every matching row of a row group at full rendered size before a
+    /// single byte check ran, so the same file served 8,389,088 bytes as `.parquet` and
+    /// 8,388,608 as `.log`, out of a page budget of 8 MiB — on a driver whose whole result
+    /// budget is 512 MiB, and from a group that can hold 8,192 rows. Rule 2's premise is that
+    /// the two forms of one file are indistinguishable to a caller, so the assertion is
+    /// equality rather than a bound on each.
     #[test]
     fn a_page_is_cut_short_by_its_byte_budget() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1287,15 +1340,39 @@ mod tests {
             .collect();
         let refs: Vec<&str> = body.iter().map(String::as_str).collect();
         let text = write(dir.path(), "oxidant-2026-08-30.log", &refs);
-        let page = scan_text(&text, &LogFilter::default(), None, 1000).expect("scan");
-        assert!(
-            page.lines.len() < 16,
-            "16 MiB of lines must not come back as one page: {}",
-            page.lines.len()
-        );
-        assert!(
-            page.next_before.is_some(),
-            "and the caller is told there is more"
+        let parquet_src = write(dir.path(), "oxidant-2026-08-30.2.log", &refs);
+        let parquet = super::super::columnar::convert(&parquet_src).expect("convert");
+
+        let mut pages = Vec::new();
+        for (label, path, read) in [
+            (
+                "text",
+                &text,
+                &scan_text
+                    as &dyn Fn(&Path, &LogFilter, Option<u64>, usize) -> Result<CursorPage, String>,
+            ),
+            ("parquet", &parquet, &scan_parquet),
+        ] {
+            let page = read(path, &LogFilter::default(), None, 1000).expect(label);
+            assert!(
+                page.lines.len() < 16,
+                "{label}: 16 MiB of lines must not come back as one page: {}",
+                page.lines.len()
+            );
+            let bytes: usize = page.lines.iter().map(String::len).sum();
+            assert!(
+                bytes <= MAX_PAGE_BYTES,
+                "{label}: a page must fit its own budget: {bytes} > {MAX_PAGE_BYTES}"
+            );
+            assert!(
+                page.next_before.is_some(),
+                "{label}: and the caller is told there is more"
+            );
+            pages.push(page);
+        }
+        assert_eq!(
+            pages[0], pages[1],
+            "the two forms of one file must answer the same page, byte budget included"
         );
     }
 
