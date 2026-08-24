@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 use tokio::sync::broadcast;
 
@@ -126,6 +129,43 @@ fn stage_key(operation_id: &str, stage_id: i32) -> String {
     format!("{operation_id}:{stage_id}")
 }
 
+/// File mode for everything the engine writes under the data dir — F15's 0600.
+#[cfg(unix)]
+const FILE_MODE: u32 = 0o600;
+/// Directory mode — F15's 0700.
+#[cfg(unix)]
+const DIR_MODE: u32 = 0o700;
+
+/// `mkdir -p` at 0700 on every component this call creates.
+///
+/// A second copy of `oxidant-connect`'s `history::fs_util`, deliberately: `oxidant-connect`
+/// depends on *this* crate, so importing it back would be a cycle, and a third crate for two
+/// five-line functions buys nothing. **F15's rule is create-time** (`DirBuilder::mode`,
+/// `OpenOptions::mode`), never a chmod afterwards, so there is no window in which the event log
+/// is world-readable. `events.jsonl` carries operation ids, job descriptions and error text, and
+/// PR3 brought this directory under the engine's disk budget and started renaming files in it —
+/// `rename` preserves the mode, so getting it right at create time is enough for the rolled
+/// generations too.
+fn create_dir_secure(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(DIR_MODE);
+    builder.create(path)
+}
+
+/// Open for append, creating at 0600 if absent.
+fn append_secure(path: &Path) -> std::io::Result<fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    opts.mode(FILE_MODE);
+    opts.open(path)
+}
+
 impl AppStateStore {
     pub fn new() -> Self {
         Self::with_options(
@@ -200,9 +240,9 @@ impl AppStateStore {
         self.apply_event(&event);
         if let Some(dir) = &self.event_log_dir {
             if let Ok(json) = serde_json::to_string(&event) {
-                let _ = fs::create_dir_all(dir);
+                let _ = create_dir_secure(dir);
                 let path = dir.join("events.jsonl");
-                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+                if let Ok(mut f) = append_secure(&path) {
                     let _ = writeln!(f, "{json}");
                 }
             }
@@ -1004,6 +1044,47 @@ mod tests {
                 "op-oldest".to_string()
             ],
             "every rolled generation is replayed, not just the live file"
+        );
+    }
+
+    /// **L3.** F15's rule — every file 0600, every directory 0700, at create time — had a hole in
+    /// the one directory this crate writes. `fs::create_dir_all` + a plain `OpenOptions` let the
+    /// mode fall to umask, so `events.jsonl` was typically 0644 in a 0755 directory. It carries
+    /// operation ids, job descriptions and error text, and PR3 brought it under the engine's disk
+    /// budget and started renaming files in it — `rename` preserves the mode, so a 0644 live file
+    /// meant 0644 rolled generations for the whole retention window.
+    #[test]
+    #[cfg(unix)]
+    fn the_event_log_is_created_0600_in_a_0700_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        // A path that does not exist yet: the directory mode is set by *this* call, not inherited.
+        let dir = root.path().join("events").join("nested");
+        let store =
+            AppStateStore::with_options("app", "Oxidant", Some(dir.clone()), DEFAULT_MAX_QUERIES);
+        store.emit(ExecutionEvent::JobStarted {
+            operation_id: "op-1".into(),
+            job_id: 1,
+            description: "SELECT secret FROM t".into(),
+            submission_time_ms: 1,
+        });
+
+        let file = dir.join("events.jsonl");
+        assert!(file.is_file(), "the event log was written");
+        let mode = |p: &std::path::Path| {
+            std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&file), 0o600, "F15: 0600, not umask");
+        assert_eq!(
+            mode(&dir),
+            0o700,
+            "F15: 0700, and on every component created"
+        );
+        assert_eq!(
+            mode(&root.path().join("events")),
+            0o700,
+            "including the intermediate one `mkdir -p` created"
         );
     }
 

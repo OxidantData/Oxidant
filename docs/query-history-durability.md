@@ -117,6 +117,15 @@ so:
 - Every file the engine creates under the root is mode **0600**; every directory it
   creates is **0700**. Both are set at create time (`OpenOptions::mode`), not chmod'd
   after, so there is no window.
+  *(PR3 closed the one hole: `oxidant-observability` wrote `events.jsonl` with a plain
+  `create_dir_all` + `OpenOptions`, so the mode fell to umask — typically 0644 in a 0755
+  directory. It carries operation ids, job descriptions and error text, and PR3 is what brought
+  the directory under the disk budget and started renaming files in it; `rename` preserves the
+  mode, so a 0644 live file meant 0644 rolled generations for the whole retention window.
+  `oxidant-connect` depends on `oxidant-observability`, so its `history::fs_util` cannot be
+  imported back without a cycle — the two helpers are a deliberate second copy, marked as such.
+  A file an **older build already created** keeps its old mode: F15's rule is create-time, and
+  chmod'ing someone else's file at boot is not this PR's call to make.)*
 - `OXIDANT_HISTORY_SQL=text|redacted|hash` (default **`text`** — off). `redacted`
   applies the existing `store.rs` credential-shaped-value redaction to the SQL string
   before it is journaled (which does catch the common leaks:
