@@ -62,9 +62,9 @@ free-space probe (§3). No hand-rolled civil-date arithmetic.
 
 ```
 $OXIDANT_DATA_DIR/                  # see "Root and precedence" below
-  .lock                             # exclusive lock; a second process fails loudly (§3c)
   history/
     statements/
+      .lock                         # exclusive lock on the journal; a second process fails loudly (§3c)
       seg-000042.jsonl              # append-only records, sealed at 64 MiB
       compacted/
         gen-000007.jsonl            # compaction output (snapshot records), atomically swapped
@@ -205,24 +205,51 @@ writes — a large `sql` line tears), and both would roll to the same next segme
 separate process and the Docker/EC2 topologies routinely start a driver and a worker
 from the same working directory.
 
-At boot the engine takes an **exclusive advisory lock** on `$OXIDANT_DATA_DIR/.lock`
+At boot the engine takes an **exclusive advisory lock** on the *effective statements
+directory* — `<history-dir>/statements/.lock`, **not** `$OXIDANT_DATA_DIR/.lock`
 (`flock(LOCK_EX|LOCK_NB)` via a small `libc`-free `fcntl` shim — `rustix`/`libc` is
 already in the tree through `sysinfo`; if it is not reachable, `O_CREAT|O_EXCL` on a
 pid-stamped lockfile with a boot-time staleness check is the fallback). The lockfile
-records pid, role (`driver|worker`), and port.
+records pid, role (`driver|worker`), port, **and the data dir the holder booted with**.
+
+The lock is on the journal rather than the root because `OXIDANT_HISTORY_DIR` is an
+independent knob and an explicit override *wins over the root* (see "Root and
+precedence"). Locking the root guards the wrong thing in both directions: two processes
+with distinct roots and one `OXIDANT_HISTORY_DIR` would take two different locks, both
+succeed, and interleave `O_APPEND` writes into one set of segments — precisely what this
+section exists to prevent — while two processes with one root and distinct history dirs
+would be refused for no reason. Recording the holder's root is what makes the first case
+diagnosable: the error names the data dir the holder booted with, so a collision routed
+through `OXIDANT_HISTORY_DIR` reads as one instead of as a phantom.
 
 If the lock is held, the engine **does not** silently share the directory. It fails
 with:
 
 ```
-oxidant: $OXIDANT_DATA_DIR (/var/lib/oxidant) is locked by pid 4711 (role=driver, port=15002).
-         History and logs are per-process. Set OXIDANT_DATA_DIR to a distinct path for
-         this process, or set OXIDANT_DATA_DIR_PER_PROCESS=1 to use /var/lib/oxidant/<role>-<port>/.
+oxidant: the statement journal (/var/lib/oxidant/history/statements) is locked by pid 4711 (role=driver, port=15002, data dir=/var/lib/oxidant).
+         History and logs are per-process. Set OXIDANT_DATA_DIR (or OXIDANT_HISTORY_DIR, which
+         moves only the journal) to a distinct path for this process, or set
+         OXIDANT_DATA_DIR_PER_PROCESS=1 to use /var/lib/oxidant/<role>-<port>/.
+```
+
+When the holder's data dir is *not* this process's, the two are colliding through
+`OXIDANT_HISTORY_DIR`, and the advice above cannot help — an explicit history dir wins
+over the root, so a distinct `OXIDANT_DATA_DIR` moves nothing. The error says so rather
+than sending an operator to a knob that does nothing:
+
+```
+oxidant: the statement journal (/srv/history/statements) is locked by pid 4711 (role=driver, port=15002, data dir=/var/lib/oxidant-a).
+         This process's data dir (/var/lib/oxidant-b) is not the holder's (/var/lib/oxidant-a), so the two are sharing one
+         journal through OXIDANT_HISTORY_DIR. An explicit history dir wins over the root:
+         set OXIDANT_HISTORY_DIR to a distinct path for this process. Changing OXIDANT_DATA_DIR,
+         including OXIDANT_DATA_DIR_PER_PROCESS=1, will not separate them while it is set.
 ```
 
 `OXIDANT_DATA_DIR_PER_PROCESS=1` (default off) makes the engine derive
 `<root>/<role>-<port>/` automatically instead of failing — the recommended setting for
-the container images, which is where co-located driver+worker actually happens.
+the container images, which is where co-located driver+worker actually happens. It
+separates two processes only when `OXIDANT_HISTORY_DIR` is unset, since the derived root
+is what the journal path is then built from.
 
 ### Runtime knobs (all runtime-contract documented)
 
@@ -814,7 +841,7 @@ Guards and degradation:
 | **F11** | Timezone/DST/ISO weeks | **Design change.** §3 pins all names to **UTC** and says so in the runtime contract; weekly is `%G-W%V` with a year-boundary test; `KEEP_DAYS` is defined against the file's *period* with weekly rounding up, stated as the operator contract. The chrono dependency note (workspace-internal, `features = ["std","clock"]`, `oxidant-loom`'s clockless pin) is in §2. |
 | **F12** | `?file=` grammar/validation/authz | **Design change.** §6 gives the full grammar including weekly and `.N`, parses it into a typed `LogPeriod` and reconstructs the filename (never string-joins), answers `400` otherwise, lets the server choose the extension, and restates the `deny_unless_authorized` gate for `?file=` and every §6b endpoint. The U+2011 hyphen is fixed. |
 | **F13** | Result files never GC'd against the journal | **Design change.** §5: pruning a statement unlinks its result in the same sweep, boot reconciles `results/` against the folded id set, and **the journal is named as the authority** — a result outlives its record by at most one sweep and never across a restart. |
-| **F14** | Two processes share one data dir | **Design change.** §3c adds the exclusive `.lock` (flock, pid/role/port recorded), the exact second-process error text, and `OXIDANT_DATA_DIR_PER_PROCESS=1` to derive `<root>/<role>-<port>/` instead of failing. |
+| **F14** | Two processes share one data dir | **Design change.** §3c adds the exclusive `.lock` (flock, pid/role/port/root recorded) on the *effective statements dir* — not the root, which `OXIDANT_HISTORY_DIR` can point away from — the exact second-process error text, its root-disagreement variant, and `OXIDANT_DATA_DIR_PER_PROCESS=1` to derive `<root>/<role>-<port>/` instead of failing. |
 | **F15** | 30 days of raw SQL and tracing fields, no mode or redaction | **Design change.** §3 "File modes and sensitivity": 0600 files / 0700 dirs set at create time, and `OXIDANT_HISTORY_SQL=text\|redacted\|hash` (default `text`, i.e. off) reusing the existing `store.rs` redaction, with the `hash` mode's API consequence stated rather than hidden. |
 | **F16** | Budget exempts `event_log_dir` | **Design change.** §3's budget covers it, and §8 replaces "stays untouched" with its own knob `OXIDANT_EVENT_LOG_MAX_BYTES` (2 GiB), rolling `events.jsonl` to periodised files rather than deleting the live one, with `0` restoring today's unbounded behaviour. |
 | **F17** | Durable exec logs cover the driver only | **Design change.** §6c hoists subscriber init out of `rest::router` into a process-level `logging::init(role)` that `run_worker` also calls; every node writes its own logs, **collection is per-node**, and the driver federates reads (§6b) rather than ingesting. Statement history stays driver-scoped and says so. |

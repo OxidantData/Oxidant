@@ -244,7 +244,14 @@ impl HistoryConfig {
     /// A config rooted at `root` with the shipped defaults — the seam tests build on.
     #[cfg(test)]
     pub(crate) fn for_root(root: &Path) -> Self {
-        let statements_dir = root.join("history").join("statements");
+        Self::for_root_with_history_dir(root, &root.join("history"))
+    }
+
+    /// `for_root`, with the `OXIDANT_HISTORY_DIR` override applied — the shape where the journal
+    /// does *not* live under the root, which is what the data-dir lock has to reckon with.
+    #[cfg(test)]
+    pub(crate) fn for_root_with_history_dir(root: &Path, history_dir: &Path) -> Self {
+        let statements_dir = history_dir.join("statements");
         Self {
             enabled: true,
             root: root.to_path_buf(),

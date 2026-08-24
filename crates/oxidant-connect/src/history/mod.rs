@@ -33,14 +33,15 @@ pub(crate) use record::{
 pub(crate) struct HistoryRuntime {
     pub(crate) cfg: HistoryConfig,
     pub(crate) journal: Arc<Journal>,
-    /// Held for the process's lifetime; dropping it releases the data dir.
-    _lock: lock::DataDirLock,
+    /// Held for the process's lifetime; dropping it releases the journal dir.
+    _lock: lock::JournalDirLock,
 }
 
 impl std::fmt::Debug for HistoryRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HistoryRuntime")
             .field("root", &self.cfg.root)
+            .field("statements_dir", &self.cfg.statements_dir)
             .finish()
     }
 }
