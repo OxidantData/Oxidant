@@ -49,7 +49,7 @@ use sysinfo::{Pid, System};
 use tokio::sync::{watch, Notify};
 use uuid::Uuid;
 
-use crate::logging::{LogBuffer, LogView, MAX_LOG_LINES};
+use crate::logging::{LogBuffer, LogView};
 
 
 use crate::history::{
@@ -2699,7 +2699,7 @@ struct LogsParams {
     /// `current`, or a `LogPeriod` in §6's grammar with an optional `.N` split. Absent keeps
     /// today's answer: the in-memory ring.
     file: Option<String>,
-    /// Lines per page. Defaults to [`MAX_LOG_LINES`] — the same 1000 the ring serves — and is
+    /// Lines per page. Defaults to `logging::MAX_LOG_LINES` — the same 1000 the ring serves — and is
     /// clamped to `logging::MAX_LOG_PAGE`.
     limit: Option<usize>,
     /// PR3's oldest-first walk: lines to skip from the start of the file.
@@ -3613,6 +3613,7 @@ mod tests {
     use std::sync::MutexGuard;
 
     use super::*;
+    use crate::logging::MAX_LOG_LINES;
     use axum::body::Body;
     use http_body_util::BodyExt;
     use oxidant_proto::spark::connect as sc;

@@ -33,7 +33,7 @@
 //! anything wrote a dump, and whose `is_dump` shape (`dump-*.parquet`) is what these names take.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use datafusion::parquet::arrow::ArrowWriter;
@@ -436,7 +436,7 @@ impl Drop for DumpWriter {
 mod tests {
     use super::*;
 
-    fn store(dir: &Path, max_bytes: u64, disk_max: u64) -> Arc<DumpStore> {
+    fn store(dir: &std::path::Path, max_bytes: u64, disk_max: u64) -> Arc<DumpStore> {
         Arc::new(DumpStore {
             dir: dir.to_path_buf(),
             max_bytes,
@@ -586,7 +586,7 @@ mod tests {
         roomy.admit().expect("admitted");
     }
 
-    fn store2(dir: &Path) -> Arc<DumpStore> {
+    fn store2(dir: &std::path::Path) -> Arc<DumpStore> {
         store(dir, 1 << 20, u64::MAX)
     }
 
