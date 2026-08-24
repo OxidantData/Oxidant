@@ -1,6 +1,7 @@
 # Durable query history and exec logs
 
-Status: **design** (2026-08-24, rev 2 after design review). Follow-up to issue #134
+Status: **PR1–PR3 built, PR4 designed** (2026-08-24, rev 2 after design review; §10 tracks
+what has shipped). Follow-up to issue #134
 (Connect executions must join the statements store) and the founder ask: *server exec
 logs durable, rolled daily/hourly/weekly, max lookback 30 days*.
 
@@ -146,9 +147,17 @@ oxidant-YYYY-Www[.N].{log,parquet}          # weekly, ISO year+week = chrono %G-
   for the highest existing split of the period at roll time, so a restart mid-period
   does not overwrite.
 - Weekly **must** use `%G-W%V` (ISO year + ISO week), not `%Y` + `%W`/`%U`.
-  2026-12-28..31 is ISO **2027**-W01 and must be written `oxidant-2027-W01`; the
-  `%Y%W` spelling writes `oxidant-2026-W01` and silently overwrites the week January
-  already produced. A unit test pins the four year-boundary dates.
+  2019-12-30 and 2019-12-31 are ISO **2020**-W01 and must be written
+  `oxidant-2020-W01`, together with 2020-01-01..05; the `%Y`+`%W` spelling files the
+  December days as `2019-W52` and the January ones as `2020-W01`, splitting one ISO
+  week across two names. The other direction is worse: 2021-01-01..03 is ISO
+  **2020**-W53, and `%Y`+`%W` writes it `2021-W00`, which the next January silently
+  overwrites. A unit test pins both boundaries.
+  *(Corrected in PR3.* Rev 2 illustrated this with "2026-12-28..31 is ISO 2027-W01".
+  It is not: 2026 begins on a Thursday, so it has 53 ISO weeks and those days are
+  2026-W53. The **rule** was right and is unchanged; only the worked example was
+  wrong, and `chrono`'s `%G-W%V` produces the correct answer either way — the first
+  run of the test caught the doc, not the code.)
 - Ordering is lexicographic-equals-chronological within a roll mode, which is what the
   prune and `/api/v1/logs/files` rely on.
 
@@ -175,6 +184,8 @@ engine deletes the oldest thing it owns before it lets the disk fill:
 | `OXIDANT_LOG_MAX_TOTAL_BYTES` | 2 GiB | `logs/` subtree cap — oldest rolled files deleted first |
 | `OXIDANT_EVENT_LOG_MAX_BYTES` | 2 GiB | `event_log_dir` cap (§8) |
 | `OXIDANT_LOG_DEDUP` | on | a repeated identical line collapses to `… repeated N times` (§6) |
+| `OXIDANT_LOG_PARQUET` | on | `off` keeps rolled files as plain text, ~10× larger, under the same budget (§6) |
+| `OXIDANT_LOG_ROLL` | `daily` | `daily\|hourly\|weekly\|off`. **`off` is a PR3 addition** to the three the table listed: the rolling writer is on by default and puts 30 days of every enabled `tracing` field value on disk, and an operator who wants stderr-only logs needed a way to say so that was not "turn statement history off too" |
 
 Free space is read via `sysinfo`'s `Disks` API (`available_space` per mount);
 `std` exposes no `statvfs`. The mount for a path is chosen by **longest-prefix match**
@@ -208,18 +219,33 @@ per **mount**, against every managed directory, so a subtree moved to another vo
 floored against that volume.
 
 **Built in PR2** (`crates/oxidant-connect/src/history/disk.rs` + `StatementStore::sweep_disk`),
-at boot and on a `OXIDANT_DISK_SWEEP_SECS` timer; the roll-time trigger arrives with the
-rolling writer in PR3. Two notes on what PR2's sweeper measures:
+at boot and on a `OXIDANT_DISK_SWEEP_SECS` timer. **PR3 completed it**: the roll-time
+trigger fires from the rolling writer's converter thread (`logging::set_sweep_hook`), and
+`event_log_dir` joined the budget — PR2's stated deviation from F16 is closed.
 
-- Steps 1 and 2 are implemented and tested even though PR2 writes nothing under `logs/`
-  or `dumps/`. The order *is* the contract, and a sweeper that learns half of it later
-  is one that spends a query's rows to save a rolled log.
-- **`event_log_dir` is not yet counted.** *Deviation from F16*, which brings it under
-  this budget. F16's mechanism is **rolling** `events.jsonl` to periodised files rather
-  than deleting the live one, and that writer is PR3 — counting the directory now,
-  with no way to prune it, would pin `disk: over_budget` on for every operator who
-  points `event_log_dir` at a large Spark-history-server path. It joins the budget in
-  PR3, with its own `OXIDANT_EVENT_LOG_MAX_BYTES` knob, as §8 describes.
+Three notes on what the sweeper measures:
+
+- Steps 1 and 2 were implemented and tested in PR2 even though it wrote nothing under
+  `logs/` or `dumps/`. The order *is* the contract, and a sweeper that learns half of it
+  later is one that spends a query's rows to save a rolled log.
+- **A rolled log is `oxidant-<period>[.N].{log,parquet}` — both extensions.** PR2's
+  ownership predicate matched only `.log`, which was harmless while nothing wrote there
+  and wrong the moment conversion landed: a rolled log spends most of its life as
+  `.parquet`, so step 1 would have skipped every file more than one sweep old and the
+  budget would have been paid for out of statement history. The predicate is now the
+  *grammar* rather than a prefix and a suffix, so `oxidant-nightly.log` in an operator's
+  `/var/log` is no longer claimed either.
+- Both prune lists order by **(period, split)**, not by mtime-then-name.
+  `oxidant-2026-08-23.2.log` sorts *before* `oxidant-2026-08-23.log` lexicographically
+  (`2` < `l`), so the name tiebreak put the newest split at the head of an oldest-first
+  list; and a rolled `.log` whose conversion keeps failing is re-touched by every retry
+  pass, which made mtime lie about its age.
+
+Two retention passes run **before** the budget on every sweep, because they are the
+`logs/` subtree's own contract and `event_log_dir`'s, and must hold whether or not the
+global budget is tight: `OXIDANT_LOG_KEEP_DAYS` + `OXIDANT_LOG_MAX_TOTAL_BYTES` over
+`logs/`, and `OXIDANT_EVENT_LOG_MAX_BYTES` over `event_log_dir` (§8). A driver far under
+8 GiB still may not keep 90 days of logs.
 
 The last step (**oldest live result files**) unlinks the file and journals a snapshot
 with the pointer cleared, so a restart answers `410 result_expired` from the fold
@@ -569,6 +595,11 @@ tiers:
 
 ## 6. Rolling exec logs, compressed
 
+*Built in PR3*: `crates/oxidant-connect/src/logging/` — `naming` (UTC names, the
+`?file=` grammar), `line` (one event's three forms), `writer` (the live file, both roll
+triggers, dedup, the converter thread) and `columnar` (text → zstd Parquet). Process-level
+init is `oxidant_connect::logging::init(role, port)`.
+
 - **The rolling writer is a `tracing` layer in its own right**, not a re-serializer of
   `LogBuffer` strings. `format_event` emits `[LEVEL] target - fields` with **no
   timestamp and no span**; converting that to a columnar log would yield a Parquet file
@@ -651,8 +682,13 @@ standalone `oxidant worker` therefore installs no subscriber and would get no du
 log — and worker OOMs are exactly what operators dig for.
 
 So: the subscriber init (`LogBuffer` + rolling writer + fmt layer) is **hoisted out of
-the REST router into a process-level `oxidant_connect::logging::init(role)`** that both
-the Connect server bootstrap and `run_worker` call. Every node writes its own
+the REST router into a process-level `oxidant_connect::logging::init(role, port)`** that
+both the Connect server bootstrap and `run_worker` call. (*Deviation from this section's
+`init(role)`.* `OXIDANT_DATA_DIR_PER_PROCESS=1` derives `<root>/<role>-<port>/`, and
+without the port the logging init would derive `<root>/driver/` while the journal derived
+`<root>/driver-15002/` — one process's logs and its own statement history in two different
+trees. `rest::router` still calls it with `("driver", 0)` as an idempotent fallback for an
+embedded caller that builds the router directly.) Every node writes its own
 `logs/` under its own root (§3c). **Collection stays per-node** — the driver does not
 ingest worker logs; it federates reads over them at query time (§6b), which is the
 same statement from the other side. Statement history remains driver-scoped: workers
@@ -804,6 +840,29 @@ exclusive. Concretely:
   rather than deleting the live file. Setting it to `0` restores today's unbounded
   behaviour, and the runtime contract says what that costs.
 
+  **Two deviations, both found by the test and both argued here** *(PR3)*:
+
+  1. **The roll fires at half the cap, not at the cap.** Rolling only once the live file
+     has reached the whole cap makes the very first prune pass delete the file it just
+     created: the directory then oscillates between one full file and none, and an
+     operator loses every event at each roll. Half the cap keeps the ceiling exactly and
+     lets a generation survive its own roll.
+  2. **The newest rolled generation is never pruned**, so the ceiling may be exceeded by
+     at most one generation. The sweep runs every five minutes and `emit` does not stop
+     between passes, so one generation can be larger than the whole cap; taking it would
+     end every roll with an empty directory. This is the same instinct as §3's "the live
+     log file is never deleted — it rotates instead", one file further along.
+
+  The split allocator is **highest-existing + 1**, never "the first free number". Splits
+  are pruned out from under it, so first-free hands out `1` again after `.1` has gone —
+  and the file just rolled then sorts as the oldest generation of its period and the very
+  next prune takes it, keeping the stale `.2`.
+
+  `AppStateStore::load_event_log` reads the rolled generations too, oldest name first,
+  then the live file. A history server that read only `events.jsonl` would report a
+  cluster's history as starting at the last roll, which is precisely the data loss the
+  roll exists to avoid.
+
 ## 9. Test plan
 
 Journal and fold:
@@ -871,7 +930,10 @@ Results *(shipped in PR2, in `rest.rs`'s test module unless noted)*:
   files referenced by no folded id; and a **running** statement's result survives every
   retention path there is.
 
-Logs:
+Logs *(shipped in PR3; the writer's own tests live beside it in
+`crates/oxidant-connect/src/logging/`, the retention and `event_log_dir` tests in
+`history/disk.rs` + `rest.rs`, and the two-entry-point test in
+`crates/oxidant-cli/tests/cli_rolling_logs.rs`)*:
 
 - log roll across a fake UTC clock at daily/hourly/weekly boundaries, 30-day
   period-based prune;
@@ -886,17 +948,20 @@ Logs:
   on the 5 s timer with no further input;
 - `?file=` grammar: every valid form resolves, `..`/`/`/extensions/absolute paths all
   answer `400`, and an unset `OXIDANT_STATUS_TOKEN` 404s the whole endpoint;
-- `run_worker` alone (no REST router) writes a rolling log, and the driver federates a
-  query over it; an unreachable worker is reported `reachable:false`, not skipped.
+- `run_worker` alone (no REST router) writes a rolling log *(shipped: a subprocess test,
+  because the bug it guards is a wiring bug and only the real binary can say whether the
+  init is reachable from both entry points)*, and the driver federates a query over it; an
+  unreachable worker is reported `reachable:false`, not skipped *(PR4)*.
 
 Guards and degradation:
 
 - the disk-budget sweeper prunes in the documented order, never touches the live
-  file, only ever unlinks files it can recognise as its own (`oxidant-*.log`,
-  `dump-*.parquet` / `oxidant-*.parquet`, `stmt-*.arrow`), measures the tree exactly
-  twice per pass however many statements it prunes, and reports `over_budget` only
-  after everything prunable is gone *(shipped in PR2; the `event_log_dir` half waits on
-  PR3 — see §3)*;
+  file, only ever unlinks files it can recognise as its own (`oxidant-<period>[.N].log`
+  *and* `.parquet`, `dump-*.parquet` / `oxidant-*.parquet`, `stmt-*.arrow`,
+  `events-<period>[.N].jsonl`), measures the tree exactly twice per pass however many
+  statements it prunes, and reports `over_budget` only after everything prunable is gone
+  *(shipped: PR2, with the `event_log_dir` half and the rolled-`.parquet` half in PR3 —
+  see §3)*;
 - a free-space shortfall the engine did not cause deletes **nothing**: with the engine
   far under `OXIDANT_DISK_MAX_BYTES` and the volume under
   `OXIDANT_DISK_MIN_FREE_BYTES`, one sweep prunes no statement, no result, no log and
@@ -941,9 +1006,25 @@ Guards and degradation:
    512 MiB rather than `OXIDANT_RESULT_MEM_BYTES` at 1 GiB — the old spelling is still
    accepted (§3, §5) — and `event_log_dir` joins the disk budget in PR3 rather than
    here, because F16's mechanism for it is a roll and the rolling writer is PR3 (§3).
-3. **PR3** — process-level logging init (driver *and* worker), rolling writer with
-   timestamps, UTC naming with size splits, Parquet-on-roll, dedup, the disk-budget
-   sweeper, and `?file=` on `/api/v1/logs`.
+3. **PR3** — *built* — process-level logging init (driver *and* worker), the rolling
+   writer as a `tracing` layer in its own right with RFC-3339 UTC timestamps, UTC naming
+   with `.N` size splits, Parquet-on-roll, dedup, the roll-time disk sweep plus `logs/`
+   retention, `event_log_dir` under the budget by rolling (closing PR2's stated F16
+   deviation), and `?file=` on `/api/v1/logs`. Lives in
+   `crates/oxidant-connect/src/logging/`. **Five deviations, each argued where it lands:**
+   `logging::init` takes `(role, port)` rather than §6c's `(role)`, so a process's logs
+   and its journal derive the same `<role>-<port>` root (§6c); `OXIDANT_LOG_ROLL` gains an
+   `off` value beside `daily|hourly|weekly`, so an operator can keep durable statement
+   history with stderr-only logs (§3); the event log rolls at **half**
+   `OXIDANT_EVENT_LOG_MAX_BYTES` rather than at the cap, and its **newest rolled
+   generation is never pruned**, because rolling at the cap makes the first prune delete
+   what it just created and the directory oscillates between one full file and none (§8);
+   and §3's worked ISO-week example was arithmetically wrong — 2026-12-28..31 is 2026-W53,
+   not 2027-W01 — so the example is corrected and the test pins 2019-12-30 → 2020-W01 and
+   2021-01-01 → 2020-W53 instead (§3). Two things the tests caught in the *code*: the
+   converter leaked a `.parquet.tmp` when the source failed partway through a read (macOS
+   opens a directory happily and fails at the first read), and both prune lists ordered
+   `.2` ahead of the plain name because `2` < `l` lexicographically.
 4. **PR4** — the driver log browser (filters/cursor/tail) + worker federation +
    the diagnostic dump, with the Observability screen's log UI.
 
@@ -956,19 +1037,19 @@ Guards and degradation:
 | **F3** | Client-controlled `operation_id` as filename and fold key | **Design change.** §4b: the id is always engine-minted `stmt-<uuid>` and is the only thing that reaches a path; the client string is a validated alias (`^[A-Za-z0-9._:-]{1,128}$`) keyed by `(session, client_op_id)` and never a fold key. Plus `OXIDANT_HISTORY_MAX_PER_SESSION` for the cap-eviction attack. |
 | **F4** | fsync trilemma | **Design change.** §7 opens with the single-sentence guarantee (terminal state durable before the client is told; intermediate events lossy up to the interval) and picks option (a): the *response* awaits a oneshot ack under `OXIDANT_HISTORY_ACK_TIMEOUT_MS`, degrading to `history: degraded` on timeout. Channel semantics restated to match: `running` dropped-and-counted, `submitted`/`snapshot` never dropped or coalesced. |
 | **F5** | Replay neutralized by `STATEMENT_TTL`; `Instant` not reconstructible | **Design change.** New §5b defines the hot/history two-tier model, states that replay populates the history tier and that `evict_expired` sweeps only the hot tier, and switches age arithmetic to the already-existing `submitted_at_ms`, keeping `Instant` only for live duration. Regression test added in §9. |
-| **F6** | Size-roll and clock-roll collide | **Design change.** §3 "Naming" defines `oxidant-YYYY-MM-DD[-HH][.N]` with `.N` as the size-split sequence, chosen by scanning for the highest existing split so a restart mid-period is safe. `?file=` accepts `.N` (§6). |
-| **F7** | Parquet-on-roll vs crash honesty; §3/§6 disagree | **Design change.** §6 rewritten: text is authoritative, conversion is a separate step *after* close+fsync+rename, the text file is unlinked only after the Parquet footer reads back, **a crash between roll and convert leaves the text file and the next boot converts it**, a `.parquet.tmp` is deleted and redone. §3 reserves conversion headroom against the budget and the free-space floor. §6 also makes the writer a real `tracing` layer with a `ts` column (the source lines had no timestamp) and states the lost-`grep` cost with the `OXIDANT_LOG_PARQUET=off` out. |
+| **F6** | Size-roll and clock-roll collide | **Design change**, **shipped in PR3.** §3 "Naming" defines `oxidant-YYYY-MM-DD[-HH][.N]` with `.N` as the size-split sequence, chosen by scanning for the highest existing split so a restart mid-period is safe. `?file=` accepts `.N` (§6). |
+| **F7** | Parquet-on-roll vs crash honesty; §3/§6 disagree | **Design change**, **shipped in PR3.** §6 rewritten: text is authoritative, conversion is a separate step *after* close+fsync+rename, the text file is unlinked only after the Parquet footer reads back, **a crash between roll and convert leaves the text file and the next boot converts it**, a `.parquet.tmp` is deleted and redone. §3 reserves conversion headroom against the budget and the free-space floor. §6 also makes the writer a real `tracing` layer with a `ts` column (the source lines had no timestamp) and states the lost-`grep` cost with the `OXIDANT_LOG_PARQUET=off` out. |
 | **F8** | Default `on_pressure` cannot deliver Goal 2 | **Design change, both halves** — and **partly reverted in PR2**. The second half shipped as written: `OXIDANT_RESULT_MEMORY_BUDGET_BYTES` (512 MiB) is a real in-memory byte budget that `on_pressure` triggers on, and spill runs on a dedicated writer thread, never under the store mutex. The first half did not: the shipped default is **`on_pressure`**, so that enabling history does not by itself start writing every query's rows to disk. `always` is implemented and tested and is one env var away; §5 states the trade rather than hiding it. |
 | **F9** | Event schema missing fields | **Design change.** §4a's schema carries `schema`, `error`, `submitted_at_ms`, `duration_ms`, `session`, `source`, `sql_encoding`, `seq`, `last_seq` and the result pointer. `seq` is defined as the writer-assigned submit sequence, stable across compaction. |
 | **F10** | Compaction races, non-atomic swap, undefined replay order, no dir fsync | **Design change.** §4d: seal-before-compact (the writer never shares an open segment), the five-step swap with a `.done` marker and boot recovery, and mandatory parent-directory fsync for every rename in the design, with the explicit note that `checkpoint.rs` offers no precedent. §4c defines replay order twice over — a deterministic numerically-sorted file order *and* a seq-monotone fold that makes order irrelevant and double-folds harmless. |
-| **F11** | Timezone/DST/ISO weeks | **Design change.** §3 pins all names to **UTC** and says so in the runtime contract; weekly is `%G-W%V` with a year-boundary test; `KEEP_DAYS` is defined against the file's *period* with weekly rounding up, stated as the operator contract. The chrono dependency note (workspace-internal, `features = ["std","clock"]`, `oxidant-loom`'s clockless pin) is in §2. |
-| **F12** | `?file=` grammar/validation/authz | **Design change.** §6 gives the full grammar including weekly and `.N`, parses it into a typed `LogPeriod` and reconstructs the filename (never string-joins), answers `400` otherwise, lets the server choose the extension, and restates the `deny_unless_authorized` gate for `?file=` and every §6b endpoint. The U+2011 hyphen is fixed. |
+| **F11** | Timezone/DST/ISO weeks | **Design change**, **shipped in PR3.** §3 pins all names to **UTC** and says so in the runtime contract; weekly is `%G-W%V` with a year-boundary test; `KEEP_DAYS` is defined against the file's *period* with weekly rounding up, stated as the operator contract. The chrono dependency note (workspace-internal, `features = ["std","clock"]`, `oxidant-loom`'s clockless pin) is in §2. |
+| **F12** | `?file=` grammar/validation/authz | **Design change**, **shipped in PR3.** §6 gives the full grammar including weekly and `.N`, parses it into a typed `LogPeriod` and reconstructs the filename (never string-joins), answers `400` otherwise, lets the server choose the extension, and restates the `deny_unless_authorized` gate for `?file=` and every §6b endpoint. The U+2011 hyphen is fixed. |
 | **F13** | Result files never GC'd against the journal | **Design change.** §5: pruning a statement unlinks its result in the same sweep, boot reconciles `results/` against the folded id set, and **the journal is named as the authority** — a result outlives its record by at most one sweep and never across a restart. |
 | **F14** | Two processes share one data dir | **Design change.** §3c adds the exclusive `.lock` (flock, pid/role/port/root recorded) on the *effective statements dir* — not the root, which `OXIDANT_HISTORY_DIR` can point away from — the exact second-process error text, its root-disagreement variant, and `OXIDANT_DATA_DIR_PER_PROCESS=1` to derive `<root>/<role>-<port>/` instead of failing. |
 | **F15** | 30 days of raw SQL and tracing fields, no mode or redaction | **Design change.** §3 "File modes and sensitivity": 0600 files / 0700 dirs set at create time, and `OXIDANT_HISTORY_SQL=text\|redacted\|hash` (default `text`, i.e. off) reusing the existing `store.rs` redaction, with the `hash` mode's API consequence stated rather than hidden. |
-| **F16** | Budget exempts `event_log_dir` | **Design change.** §3's budget covers it, and §8 replaces "stays untouched" with its own knob `OXIDANT_EVENT_LOG_MAX_BYTES` (2 GiB), rolling `events.jsonl` to periodised files rather than deleting the live one, with `0` restoring today's unbounded behaviour. |
-| **F17** | Durable exec logs cover the driver only | **Design change.** §6c hoists subscriber init out of `rest::router` into a process-level `logging::init(role)` that `run_worker` also calls; every node writes its own logs, **collection is per-node**, and the driver federates reads (§6b) rather than ingesting. Statement history stays driver-scoped and says so. |
+| **F16** | Budget exempts `event_log_dir` | **Design change**, deferred by PR2 and **shipped in PR3.** §3's budget covers it, and §8 replaces "stays untouched" with its own knob `OXIDANT_EVENT_LOG_MAX_BYTES` (2 GiB), rolling `events.jsonl` to periodised files rather than deleting the live one, with `0` restoring today's unbounded behaviour. The directory is billed to the budget **only while it is bounded**: under `=0` it is unprunable by the operator's own choice, and counting it would make the sweeper delete statement history to pay for it. Two implementation deviations (roll at half the cap; never prune the newest generation) are argued in §8. |
+| **F17** | Durable exec logs cover the driver only | **Design change**, **shipped in PR3.** §6c hoists subscriber init out of `rest::router` into a process-level `logging::init(role, port)` that `run_worker` also calls; every node writes its own logs, **collection is per-node**, and the driver federates reads (§6b) rather than ingesting. Statement history stays driver-scoped and says so. |
 | **F18** | Journal vocabulary diverges from the API | **Design change.** §4a uses the API's five values verbatim; §4e is the explicit mapping table. `finished`/`cancelled`/`state` are gone, and `interrupted` is **not** added as a status — a replayed non-terminal is `failed` + `error:"interrupted by restart"`, needing no contract change. |
 | **F19** | Two claims stated as no-ops | **Design change.** §5 announces `410 result_expired` as a **new** status code and error string with the `404`/`409`/`400` behaviour it sits beside. §8 makes `OXIDANT_HISTORY=off` revert the caps too (1000 / 1 h), renames the knob to `OXIDANT_HISTORY_MAX_RECORDS` to avoid the const collision, and **documents the 10,000-vs-1,000 divergence explicitly** as an announced behaviour change with the knob to undo it. |
 | **F20** | Layout notes fight existing conventions | **Design change.** §3 drops "next to checkpoints" entirely, defaults the root to `$XDG_DATA_HOME/oxidant` (or `/var/lib/oxidant` as a system service) with `OXIDANT_DATA_DIR` override, defines root-vs-subtree precedence for `OXIDANT_HISTORY_DIR`/`OXIDANT_LOG_DIR`/`OXIDANT_RESULT_DIR`, rejects object-store URLs loudly at boot, and states that `checkpoint.rs` is deliberately *not* this design's precedent because `PUT` gave it atomicity for free. |
-| **F21** | Dedup needs a flush rule; diverges from the live tail | **Design change.** §6 flushes the `… repeated N times` summary on a different line, a **5 s timer**, a roll, or shutdown; and states the divergence plainly — dedup is file-only, the file is authoritative, and both `?file=current` and the SSE tail advertise their `dedup` state in the response. |
+| **F21** | Dedup needs a flush rule; diverges from the live tail | **Design change**, **shipped in PR3.** §6 flushes the `… repeated N times` summary on a different line, a **5 s timer**, a roll, or shutdown; and states the divergence plainly — dedup is file-only, the file is authoritative, and both `?file=current` and the SSE tail advertise their `dedup` state in the response. |

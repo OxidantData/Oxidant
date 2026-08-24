@@ -3106,10 +3106,9 @@ mod tests {
             "2026-08-24T09:30:00.000Z [WARN] oxidant_connect - message=pool exhausted\n",
         )
         .expect("write");
-        let converted = crate::logging::convert_for_test(
-            &dir.path().join("oxidant-2026-08-24-09.2.log"),
-        )
-        .expect("convert");
+        let converted =
+            crate::logging::convert_for_test(&dir.path().join("oxidant-2026-08-24-09.2.log"))
+                .expect("convert");
         assert!(converted.ends_with("oxidant-2026-08-24-09.2.parquet"));
         std::fs::write(dir.path().join("oxidant.log"), "live line\n").expect("write");
 
@@ -3142,7 +3141,10 @@ mod tests {
         let (status, body) = get_logs(&app, "/api/v1/logs").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["logs"].is_array());
-        assert!(body.get("format").is_none(), "the ring envelope is unchanged");
+        assert!(
+            body.get("format").is_none(),
+            "the ring envelope is unchanged"
+        );
         assert!(body.get("dedup").is_none());
     }
 
@@ -3181,7 +3183,10 @@ mod tests {
                 "{bad:?} -> {body}"
             );
         }
-        assert!(secret.exists(), "nothing here reads or removes another file");
+        assert!(
+            secret.exists(),
+            "nothing here reads or removes another file"
+        );
 
         // A well-formed period with no file on disk is the other answer: 404, not 400.
         let (status, body) = get_logs(&app, "/api/v1/logs?file=2019-01-01").await;
@@ -4659,18 +4664,12 @@ mod tests {
         let old = now - chrono::Duration::days(90);
         let recent = now - chrono::Duration::days(2);
         let live = plant("logs/oxidant.log");
-        let expired = plant(&format!(
-            "logs/oxidant-{}.log",
-            old.format("%Y-%m-%d")
-        ));
+        let expired = plant(&format!("logs/oxidant-{}.log", old.format("%Y-%m-%d")));
         let expired_parquet = plant(&format!(
             "logs/oxidant-{}.parquet",
             (old + chrono::Duration::days(1)).format("%Y-%m-%d")
         ));
-        let kept = plant(&format!(
-            "logs/oxidant-{}.log",
-            recent.format("%Y-%m-%d")
-        ));
+        let kept = plant(&format!("logs/oxidant-{}.log", recent.format("%Y-%m-%d")));
 
         let report = store.sweep_disk();
         assert_eq!(report.logs_expired, 2, "{report:?}");

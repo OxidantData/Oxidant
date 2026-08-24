@@ -144,7 +144,7 @@ The **Observability** page is "what is this driver doing right now", on three su
 
 | Section | Source | Shows |
 |---------|--------|-------|
-| **Server logs** | [`/api/v1/logs`](api.md#driver-logs) | A tail of the driver's in-memory ring buffer (last 1000 lines) on the terminal surface. Level filter chips — `error` / `warn` / `info` / `debug`, matched on the line's `[LEVEL]` prefix — a **Pause** button, and a caption saying how many lines are on screen. Auto-refreshes every 5 s and stays pinned to the newest line unless you scroll up into it |
+| **Server logs** | [`/api/v1/logs`](api.md#driver-logs) | A tail of the driver's in-memory ring buffer (last 1000 lines) on the terminal surface, each line now led by an RFC-3339 UTC timestamp (the same one the [rolled files](api.md#rolled-files-file) carry, so a line on screen and a line in yesterday's log read alike). Level filter chips — `error` / `warn` / `info` / `debug`, matched on the line's `[LEVEL]` prefix — a **Pause** button, and a caption saying how many lines are on screen. Auto-refreshes every 5 s and stays pinned to the newest line unless you scroll up into it |
 | **Jobs & stages** | `/api/v1/applications/{app}/jobs` + `/stages` | One row per job — id, name, status, duration, stages done/total — expanding in place into its stages, with shuffle read/write where the stage reports any |
 | **SQL queries** | `/api/v1/applications/{app}/sql` | Every execution the store holds — Spark Connect sessions, the REST statement API, the Editor — with status, duration and a row count |
 

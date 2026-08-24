@@ -33,11 +33,11 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::Layer;
 
-pub use naming::{LogPeriod, LogRoll};
 /// `oxidant-<period>[.N].<ext>` → its parts, or `None` for anything this writer did not produce
 /// (the live `oxidant.log` included). The disk sweeper reads it to answer "what period does this
 /// file cover" and "is this mine to delete".
 pub(crate) use naming::parse_file_name as parse_rolled_name;
+pub use naming::{LogPeriod, LogRoll};
 pub(crate) use writer::RollingWriter;
 
 use crate::history::HistoryConfig;
@@ -445,7 +445,10 @@ mod tests {
 
         std::fs::write(dir.path().join("oxidant-2026-08-23.parquet"), b"x").expect("write");
         assert!(
-            matches!(resolve(dir.path(), period, split), Some(LogFile::Parquet(_))),
+            matches!(
+                resolve(dir.path(), period, split),
+                Some(LogFile::Parquet(_))
+            ),
             "a converted file wins over the text one still awaiting its unlink"
         );
     }

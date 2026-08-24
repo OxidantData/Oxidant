@@ -271,7 +271,11 @@ impl RollingWriter {
         let mut st = self.state.lock().expect("log writer poisoned");
         let stale = st.held.as_ref().is_some_and(|h| {
             h.count > 0
-                && now.signed_duration_since(h.since).to_std().unwrap_or_default() >= DEDUP_FLUSH
+                && now
+                    .signed_duration_since(h.since)
+                    .to_std()
+                    .unwrap_or_default()
+                    >= DEDUP_FLUSH
         });
         if stale {
             self.flush_held(&mut st, now);
@@ -332,9 +336,7 @@ impl RollingWriter {
     pub(crate) fn roll_now(&self, now: DateTime<Utc>) -> Option<PathBuf> {
         let rolled = {
             let mut st = self.state.lock().expect("log writer poisoned");
-            let Some(current) = st.period else {
-                return None;
-            };
+            let current = st.period?;
             self.flush_held(&mut st, now);
             st.held = None;
             let live = self.cfg.dir.join(LIVE_LOG);
@@ -611,7 +613,8 @@ mod tests {
             ),
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
-            let w = RollingWriter::open_at(cfg(dir.path(), roll, u64::MAX), before, None).expect("open");
+            let w = RollingWriter::open_at(cfg(dir.path(), roll, u64::MAX), before, None)
+                .expect("open");
             w.write_at(line("message=before"), before);
             assert_eq!(names(dir.path()), vec![LIVE_LOG.to_string()]);
             w.write_at(line("message=after"), after);
@@ -636,9 +639,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let now = utc(2026, 8, 23, 14, 0);
         // Small enough that every line trips the cap on the *next* write.
-        let w = RollingWriter::open_at(cfg(dir.path(), LogRoll::Daily, 32), now, None).expect("open");
+        let w =
+            RollingWriter::open_at(cfg(dir.path(), LogRoll::Daily, 32), now, None).expect("open");
         for i in 0..4 {
-            w.write_at(line(&format!("message=line {i} padded out past the cap")), now);
+            w.write_at(
+                line(&format!("message=line {i} padded out past the cap")),
+                now,
+            );
         }
         assert_eq!(
             names(dir.path()),
@@ -779,7 +786,10 @@ mod tests {
         assert_eq!(body.lines().count(), 2, "{body}");
         assert!(body.contains("… repeated 9 times"), "{body}");
         // A further repeat starts a new count rather than resuming the flushed one.
-        w.write_at(line("message=pool exhausted"), now + chrono::Duration::seconds(7));
+        w.write_at(
+            line("message=pool exhausted"),
+            now + chrono::Duration::seconds(7),
+        );
         w.flush_stale(now + chrono::Duration::seconds(20));
         let body = std::fs::read_to_string(dir.path().join(LIVE_LOG)).expect("live");
         assert!(body.contains("… repeated 1 times"), "{body}");
@@ -864,8 +874,11 @@ mod tests {
             "2026-08-20T10:00:00.000Z [INFO] oxidant_test - message=crashed before converting\n",
         )
         .expect("seed");
-        std::fs::write(dir.path().join("oxidant-2026-08-21.parquet.tmp"), b"not a footer")
-            .expect("seed");
+        std::fs::write(
+            dir.path().join("oxidant-2026-08-21.parquet.tmp"),
+            b"not a footer",
+        )
+        .expect("seed");
         let mut c = cfg(dir.path(), LogRoll::Daily, u64::MAX);
         c.parquet = true;
         let w = RollingWriter::open_at(c, utc(2026, 8, 23, 14, 0), None).expect("open");
@@ -879,7 +892,9 @@ mod tests {
         assert!(!dir.path().join("oxidant-2026-08-20.log").exists());
         assert_eq!(
             columnar::read_lines(&dir.path().join("oxidant-2026-08-20.parquet")).expect("read"),
-            vec!["2026-08-20T10:00:00.000Z [INFO] oxidant_test - message=crashed before converting"]
+            vec![
+                "2026-08-20T10:00:00.000Z [INFO] oxidant_test - message=crashed before converting"
+            ]
         );
         w.shutdown();
     }

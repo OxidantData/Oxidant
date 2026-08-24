@@ -469,19 +469,18 @@ mod tests {
     fn log_retention_expires_whole_periods_and_weekly_rounds_up() {
         let dir = tempfile::tempdir().expect("tempdir");
         let logs = dir.path().join("logs");
-        let now = chrono::Utc
-            .with_ymd_and_hms(2026, 9, 20, 12, 0, 0)
-            .unwrap();
+        let now = chrono::Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap();
         touch(&logs.join(LIVE_LOG), 10);
-        // 30 days back from 2026-09-20 is 2026-08-21.
-        touch(&logs.join("oxidant-2026-08-19.parquet"), 10); // ends 08-20 -> out
-        touch(&logs.join("oxidant-2026-08-20.parquet"), 10); // ends 08-21 -> exactly out
-        touch(&logs.join("oxidant-2026-08-21.log"), 10); //     ends 08-22 -> in
-        touch(&logs.join("oxidant-2026-09-19.log"), 10); //     in
+        // 30 days back from 2026-09-20 is 2026-08-21. A daily file's period ends the next day,
+        // so 08-19 and 08-20 are wholly outside the window and 08-21 is not.
+        touch(&logs.join("oxidant-2026-08-19.parquet"), 10);
+        touch(&logs.join("oxidant-2026-08-20.parquet"), 10);
+        touch(&logs.join("oxidant-2026-08-21.log"), 10);
+        touch(&logs.join("oxidant-2026-09-19.log"), 10);
         // ISO 2026-W34 is Mon 08-17 .. Sun 08-23; its period ends 08-24, inside the window, so
-        // it survives even though most of the week is older than 30 days.
+        // it survives even though most of the week is older than 30 days. W33 ends 08-17 and
+        // does not.
         touch(&logs.join("oxidant-2026-W34.parquet"), 10);
-        // ISO 2026-W33 ends 08-17 -> out.
         touch(&logs.join("oxidant-2026-W33.parquet"), 10);
 
         let report = prune_expired_logs(&logs, 30, u64::MAX, now);
@@ -846,19 +845,20 @@ pub(crate) fn rolled_event_log_name(period: LogPeriod, split: u32) -> String {
 /// *before* `events-2026-08-24.jsonl` lexicographically (`2` < `j`), so a name-tiebroken sort
 /// would prune the second-newest generation and keep the oldest.
 pub(crate) fn rolled_event_logs(dir: &Path) -> Vec<Prunable> {
-    let mut keyed: Vec<(Option<DateTime<Utc>>, u32, Prunable)> = flat_files(dir, is_rolled_event_log)
-        .into_iter()
-        .map(|file| {
-            let (end, split) = file
-                .path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(parse_rolled_event_log_name)
-                .map(|(period, split)| (period.end(), split))
-                .unwrap_or((None, 0));
-            (end, split, file)
-        })
-        .collect();
+    let mut keyed: Vec<(Option<DateTime<Utc>>, u32, Prunable)> =
+        flat_files(dir, is_rolled_event_log)
+            .into_iter()
+            .map(|file| {
+                let (end, split) = file
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(parse_rolled_event_log_name)
+                    .map(|(period, split)| (period.end(), split))
+                    .unwrap_or((None, 0));
+                (end, split, file)
+            })
+            .collect();
     keyed.sort_by(|a, b| {
         a.0.cmp(&b.0)
             .then_with(|| a.1.cmp(&b.1))
@@ -954,7 +954,10 @@ pub(crate) fn roll_event_log(
             // pruned out from under the allocator, so "first free" hands out `1` again after
             // `.1` has gone; the file just rolled would then sort as the *oldest* generation of
             // its period and the very next prune would take it, keeping the stale `.2`.
-            let target = dir.join(rolled_event_log_name(period, next_event_log_split(dir, period)));
+            let target = dir.join(rolled_event_log_name(
+                period,
+                next_event_log_split(dir, period),
+            ));
             match super::fs_util::rename_durable(&live, &target, dir) {
                 Ok(()) => report.rolled = true,
                 Err(e) => tracing::warn!(

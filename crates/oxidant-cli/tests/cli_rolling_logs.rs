@@ -172,5 +172,9 @@ fn log_roll_off_writes_no_file() {
     let _ = worker.wait();
 
     assert!(listening, "the worker never came up");
-    assert!(!existed, "OXIDANT_LOG_ROLL=off must write no {}", live.display());
+    assert!(
+        !existed,
+        "OXIDANT_LOG_ROLL=off must write no {}",
+        live.display()
+    );
 }

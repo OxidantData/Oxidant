@@ -65,10 +65,22 @@ impl LogRoll {
 /// fail the grammar by construction, so no traversal shape ever reaches a path join.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogPeriod {
-    Daily { year: i32, month: u32, day: u32 },
-    Hourly { year: i32, month: u32, day: u32, hour: u32 },
+    Daily {
+        year: i32,
+        month: u32,
+        day: u32,
+    },
+    Hourly {
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+    },
     /// ISO year + ISO week (`%G-W%V`).
-    Weekly { year: i32, week: u32 },
+    Weekly {
+        year: i32,
+        week: u32,
+    },
 }
 
 /// Filename prefix for every exec log this engine writes. The live file is exactly
@@ -216,7 +228,8 @@ impl LogPeriod {
                 day,
                 hour,
             } => {
-                let start = NaiveDate::from_ymd_opt(*year, *month, *day)?.and_hms_opt(*hour, 0, 0)?;
+                let start =
+                    NaiveDate::from_ymd_opt(*year, *month, *day)?.and_hms_opt(*hour, 0, 0)?;
                 start + chrono::Duration::hours(1)
             }
             Self::Weekly { year, week } => {
@@ -269,12 +282,7 @@ mod tests {
     #[test]
     fn iso_week_naming_pins_the_year_boundary() {
         // 2019-12-30 (Mon) opens ISO 2020-W01; so do 2019-12-31 and 2020-01-01..05.
-        for (y, m, d) in [
-            (2019, 12, 30),
-            (2019, 12, 31),
-            (2020, 1, 1),
-            (2020, 1, 5),
-        ] {
+        for (y, m, d) in [(2019, 12, 30), (2019, 12, 31), (2020, 1, 1), (2020, 1, 5)] {
             assert_eq!(
                 LogPeriod::of(utc(y, m, d, 12), LogRoll::Weekly)
                     .expect("weekly")

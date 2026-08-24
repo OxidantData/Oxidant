@@ -35,7 +35,10 @@ impl LogLine {
         if self.fields.is_empty() {
             format!("{} [{}] {}", self.ts, self.level, self.target)
         } else {
-            format!("{} [{}] {} - {}", self.ts, self.level, self.target, self.fields)
+            format!(
+                "{} [{}] {} - {}",
+                self.ts, self.level, self.target, self.fields
+            )
         }
     }
 

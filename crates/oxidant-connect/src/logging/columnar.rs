@@ -97,20 +97,18 @@ pub(crate) fn convert(text: &Path) -> Result<PathBuf, String> {
     // must leave the directory as it found it. An earlier spelling scattered `drop_tmp` calls
     // through the body and missed the one that matters most — a read error partway through the
     // source file, which is what a truncated or unreadable rolled log actually produces.
-    convert_inner(text, dir, &tmp, &target).inspect_err(|_| {
+    let outcome = convert_inner(text, dir, &tmp, &target);
+    if outcome.is_err() {
         let _ = std::fs::remove_file(&tmp);
-    })
+    }
+    outcome
 }
 
-fn convert_inner(
-    text: &Path,
-    dir: &Path,
-    tmp: &Path,
-    target: &Path,
-) -> Result<PathBuf, String> {
+fn convert_inner(text: &Path, dir: &Path, tmp: &Path, target: &Path) -> Result<PathBuf, String> {
     let source =
         std::fs::File::open(text).map_err(|e| format!("opening {}: {e}", text.display()))?;
-    let out = fs_util::create_secure(tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+    let out =
+        fs_util::create_secure(tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
         .build();
@@ -235,7 +233,10 @@ pub(crate) fn read_lines(path: &Path) -> Result<Vec<String>, String> {
                     serde_json::from_str::<serde_json::Value>(fields.value(row))
                 {
                     for (k, v) in map {
-                        let v = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                        let v = v
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| v.to_string());
                         fields_out.push(format!("{k}={v}"));
                     }
                 }
@@ -283,7 +284,10 @@ mod tests {
             ],
         );
         let parquet = convert(&text).expect("convert");
-        assert!(!text.exists(), "the text file goes only after the footer reads back");
+        assert!(
+            !text.exists(),
+            "the text file goes only after the footer reads back"
+        );
         assert_eq!(parquet.file_name().unwrap(), "oxidant-2026-08-23.parquet");
         assert_eq!(footer_rows(&parquet).expect("footer"), 2);
 

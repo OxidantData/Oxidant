@@ -28,7 +28,7 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/status` | Driver status for a control plane — **bearer token required** |
 | `GET` | `/api/v1/pipelines` | Streaming pipelines with a connector log on this driver — **bearer token required** |
 | `GET` | `/api/v1/pipelines/{name}/logs` | Tail of a streaming connector's JSONL log — **bearer token required** |
-| `GET` | `/api/v1/logs` | The driver's recent log lines — an in-memory ring buffer of the last 1000 — **bearer token required** |
+| `GET` | `/api/v1/logs` | The node's recent log lines — an in-memory ring buffer of the last 1000, or one rolled file with `?file=` — **bearer token required** |
 
 ## Submit a statement
 
@@ -401,8 +401,11 @@ curl -s http://localhost:4040/api/v1/logs -H "Authorization: Bearer $OXIDANT_STA
 ```
 
 ```json
-{"logs": ["[INFO] oxidant_connect::rest - listening on 0.0.0.0:4040"]}
+{"logs": ["2026-08-23T14:00:00.500Z [INFO] oxidant_connect::rest - message=listening on 0.0.0.0:4040"]}
 ```
+
+Every line leads with an **RFC-3339 UTC timestamp**. That is a change: the lines used to start
+at `[LEVEL]`, and a line with no time in it gives a rolled log no column to filter on.
 
 It is guarded by **the same bearer token as [`/api/status`](#driver-status)**, with the same
 three answers (`404` unset, `401` wrong, `200` right). The buffer captures every event at every
@@ -410,6 +413,57 @@ enabled level *including field values*, so it names hosts, slots, tables and que
 this port is served under a permissive CORS layer, which means an ungated buffer is readable
 cross-site by any origin an operator's browser visits. It is served by the engine's REST
 router, so a standalone history server has no buffer and answers `404` whatever the token says.
+
+### Rolled files: `?file=`
+
+The ring holds minutes. `?file=` reads the durable exec log the engine writes under
+`$OXIDANT_DATA_DIR/logs/` — `OXIDANT_LOG_KEEP_DAYS` of it, default 30 (see
+[the runtime contract](runtime-contract.md)). Same route, same token.
+
+```sh
+# the live file on disk, rather than the memory ring
+curl -s 'http://localhost:4040/api/v1/logs?file=current' -H "Authorization: Bearer $TOKEN"
+# one rolled UTC day
+curl -s 'http://localhost:4040/api/v1/logs?file=2026-08-23' -H "Authorization: Bearer $TOKEN"
+# the second size split of one UTC hour, under OXIDANT_LOG_ROLL=hourly
+curl -s 'http://localhost:4040/api/v1/logs?file=2026-08-23-14.2' -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"file": "2026-08-23", "format": "parquet", "dedup": true, "logs": ["…"]}
+```
+
+```text
+file := "current"
+      | YYYY "-" MM "-" DD          [ "." N ]        # daily
+      | YYYY "-" MM "-" DD "-" HH   [ "." N ]        # hourly
+      | YYYY "-W" ww                [ "." N ]        # weekly, ISO year + ISO week
+YYYY := 4DIGIT   MM,DD,HH,ww := 2DIGIT   N := 2..999
+```
+
+- **Names are UTC** and carry no offset; `ww` is the ISO week, so a week spanning New Year is
+  one file. `.N` is the size-split sequence and appears only on the second and later files of a
+  period.
+- **You never name an extension.** The server serves the `.parquet` if the conversion has run
+  and the `.log` if it has not, and reports which in `format`. Anything outside the grammar —
+  an extension, `..`, a `/`, an absolute path, `2026-8-23` — is `400 invalid file`, never a
+  `404`: the value is parsed into a typed period and the filename is *reconstructed* from it,
+  so no caller-supplied string ever reaches a path join. A well-formed period with no file on
+  disk is the `404`.
+- **`dedup`** says whether the file collapsed repeated lines (`OXIDANT_LOG_DEDUP`, on by
+  default) into `… repeated N times`. The memory ring does not dedup, so the same window can
+  read differently through the two; the file is authoritative. The no-`?file=` envelope has no
+  `dedup` key, and is otherwise byte-identical to what it was before.
+- A node with no rolling writer (`OXIDANT_LOG_ROLL=off`, or `OXIDANT_HISTORY=off`) answers
+  `404` with a reason, for every `?file=` value.
+
+**Workers write the same files**, under their own `$OXIDANT_DATA_DIR` — `oxidant worker` runs
+the same process-level logging init, which is the whole point of hoisting it out of the REST
+router a standalone worker never builds. They do not yet *serve* this route: a worker speaks
+Flight, not HTTP, and reading a worker's log through the driver (`?worker=<id>`, plus
+`/api/v1/logs/files` and an SSE tail) is the next piece of work. Collection stays per node
+either way — the driver will federate reads at query time rather than shipping worker log
+bytes onto its own disk.
 
 ## Full async flow (submit → poll → result → cancel)
 
