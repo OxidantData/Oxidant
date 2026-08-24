@@ -20,7 +20,7 @@ oxidant spark server --port 50051 --ui-port 4040
 >
 > The authenticated routes on this port are the operational ones —
 > [`GET /api/status`](api.md#driver-status), the [pipeline list and connector
-> logs](api.md#pipelines), and [the driver's log buffer](api.md#driver-logs). They share one
+> logs](api.md#pipelines), and the whole [log browser](api.md#driver-logs). They share one
 > token and stay off unless `OXIDANT_STATUS_TOKEN` is set.
 
 ## Two consoles
@@ -64,7 +64,7 @@ against those routes works too.
 | **Executors** | The driver plus any connected workers (see [workers.md](workers.md)) |
 | **Environment** | Runtime info, Spark/Oxidant properties, catalog config |
 | **Pipelines** | Streaming pipelines running right now — see [below](#pipelines). *Embedded console only* |
-| **Observability** | Driver logs, jobs expanded into their stages, and SQL executions on one screen — see [below](#observability). *Embedded console only* |
+| **Observability** | Any node's logs, jobs expanded into their stages, and SQL executions on one screen — see [below](#observability). *Embedded console only* |
 | **Dashboards** | Grids of SQL-backed widgets — see [below](#dashboards). *React app only* |
 
 ## Pipelines
