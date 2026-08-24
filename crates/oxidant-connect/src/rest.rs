@@ -4701,6 +4701,57 @@ mod tests {
         store.shutdown_for_test();
     }
 
+    /// **M3.** `freed_bytes` in the sweep line must count what *retention* freed too.
+    ///
+    /// The two retention passes run before `before` is measured — which is the right order for
+    /// the prune loop, since it stops it spending a second time what retention already reclaimed
+    /// — so their bytes fall outside `before - used_bytes`. Both passes report a `freed_bytes` and
+    /// both were being thrown away, so the operator-facing line said `logs_expired=2,
+    /// event_logs_pruned=1, freed_bytes=0`: files deleted, zero bytes freed. That reads as a bug
+    /// in the sweeper.
+    #[tokio::test]
+    async fn the_sweep_line_counts_the_bytes_retention_freed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = dir.path().join("spark-events");
+        std::fs::create_dir_all(&events).expect("mkdir");
+        let store = history_store_with(dir.path(), |c| {
+            // Nothing here can breach the budget: every byte freed is retention's.
+            c.disk_max_bytes = u64::MAX;
+            c.log_keep_days = 30;
+            c.log_max_total_bytes = u64::MAX;
+            c.event_log_dir = Some(events.clone());
+            c.event_log_max_bytes = 1_000;
+        });
+        let old = chrono::Utc::now() - chrono::Duration::days(90);
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        std::fs::write(
+            logs.join(format!("oxidant-{}.log", old.format("%Y-%m-%d"))),
+            vec![b'x'; 4_096],
+        )
+        .expect("write");
+        // Two generations already rolled, plus a live file over half the cap: the pass rolls the
+        // live one and then prunes every generation but that newest one.
+        for day in ["2020-01-01", "2020-01-02"] {
+            std::fs::write(
+                events.join(format!("events-{day}.jsonl")),
+                vec![b'{'; 2_048],
+            )
+            .expect("write");
+        }
+        std::fs::write(events.join("events.jsonl"), vec![b'{'; 800]).expect("write");
+
+        let report = store.sweep_disk();
+        assert_eq!(report.logs_expired, 1, "{report:?}");
+        assert_eq!(report.event_logs_pruned, 2, "{report:?}");
+        assert!(report.event_log_rolled, "{report:?}");
+        assert!(
+            report.freed_bytes >= 4_096 + 2 * 2_048,
+            "the expired log and both pruned generations are in freed_bytes: {report:?}"
+        );
+        store.shutdown_for_test();
+    }
+
     /// `event_log_dir` joins the budget in PR3 — by rolling, over the real sweep route.
     #[tokio::test]
     async fn the_sweep_rolls_the_event_log_and_counts_it_against_the_budget() {
