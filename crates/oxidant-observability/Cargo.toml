@@ -13,3 +13,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+# `load_event_log` reads a rolled directory; the test builds one in a tempdir.
+tempfile = "3"

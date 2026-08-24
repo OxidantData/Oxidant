@@ -3050,6 +3050,231 @@ mod tests {
         assert!(body["logs"].is_array());
     }
 
+    /// The token every `?file=` test carries: the endpoint 404s outright without one, so a
+    /// test that forgot it would be asserting the gate rather than the grammar.
+    const LOGS_TOKEN: &str = "s3cret-status-token";
+
+    /// A router whose `?file=` reads a tempdir of rolled files, gated exactly like the real one.
+    fn logs_state(dir: &std::path::Path, dedup: bool) -> (MutexGuard<'static, ()>, Router) {
+        let guard = crate::distributed::env_lock();
+        let state = RestState {
+            service: Arc::new(OxidantService::new()),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.to_path_buf()),
+                dedup,
+            },
+            status_token: Some(LOGS_TOKEN.into()),
+        };
+        (guard, app(state))
+    }
+
+    /// `get_json` with the logs bearer token attached.
+    async fn get_logs(app: &Router, uri: &str) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {LOGS_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    /// `?file=` serves a rolled file in whichever form it exists in — and the *server* picks
+    /// the extension, so a caller never has to know whether yesterday has been converted yet.
+    #[tokio::test]
+    async fn the_file_parameter_serves_rolled_logs_in_either_form() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let text = "2026-08-23T14:00:00.500Z [INFO] oxidant_execution - message=stage done, rows=7";
+        std::fs::write(
+            dir.path().join("oxidant-2026-08-23.log"),
+            format!("{text}\n"),
+        )
+        .expect("write");
+        // A second period, converted, plus a size split — three shapes, one grammar.
+        std::fs::write(
+            dir.path().join("oxidant-2026-08-24-09.2.log"),
+            "2026-08-24T09:30:00.000Z [WARN] oxidant_connect - message=pool exhausted\n",
+        )
+        .expect("write");
+        let converted = crate::logging::convert_for_test(
+            &dir.path().join("oxidant-2026-08-24-09.2.log"),
+        )
+        .expect("convert");
+        assert!(converted.ends_with("oxidant-2026-08-24-09.2.parquet"));
+        std::fs::write(dir.path().join("oxidant.log"), "live line\n").expect("write");
+
+        let (_env, app) = logs_state(dir.path(), true);
+
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=2026-08-23").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["file"], "2026-08-23");
+        assert_eq!(body["format"], "text");
+        assert_eq!(body["dedup"], true, "the file is deduped and says so (F21)");
+        assert_eq!(body["logs"], json!([text]));
+
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=2026-08-24-09.2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["file"], "2026-08-24-09.2");
+        assert_eq!(body["format"], "parquet", "the server chose the extension");
+        assert_eq!(
+            body["logs"],
+            json!(["2026-08-24T09:30:00.000Z [WARN] oxidant_connect - message=pool exhausted"]),
+            "a converted day reads back as the text it was"
+        );
+
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=current").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["file"], "current");
+        assert_eq!(body["format"], "text");
+        assert_eq!(body["logs"], json!(["live line"]));
+
+        // And with no `?file=` at all the answer is exactly what it was before PR3: the ring.
+        let (status, body) = get_logs(&app, "/api/v1/logs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["logs"].is_array());
+        assert!(body.get("format").is_none(), "the ring envelope is unchanged");
+        assert!(body.get("dedup").is_none());
+    }
+
+    /// The grammar is the security boundary: every traversal shape, every extension a caller
+    /// must not name, and every near-miss is a `400` — never a `404`, and never a path join.
+    #[tokio::test]
+    async fn the_file_grammar_refuses_traversal_and_404s_what_does_not_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "not a log").expect("write");
+        let (_env, app) = logs_state(dir.path(), false);
+
+        for bad in [
+            "..",
+            "../../etc/passwd",
+            "..%2F..%2Fetc%2Fpasswd",
+            "/etc/passwd",
+            "2026-08-23/../secret.txt",
+            "2026-08-23.log",
+            "2026-08-23.parquet",
+            "secret",
+            "oxidant.log",
+            "2026-8-23",
+            "2026-13-01",
+            "2026-08-23-24",
+            "2027-W53",
+            "2026-08-23.1",
+            "2026-08-23.1000",
+            "",
+        ] {
+            let uri = format!("/api/v1/logs?file={}", urlencode(bad));
+            let (status, body) = get_logs(&app, &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} -> {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains("invalid file"),
+                "{bad:?} -> {body}"
+            );
+        }
+        assert!(secret.exists(), "nothing here reads or removes another file");
+
+        // A well-formed period with no file on disk is the other answer: 404, not 400.
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=2019-01-01").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "log file not found");
+        // `current` before the process has written one is the same.
+        let (status, _) = get_logs(&app, "/api/v1/logs?file=current").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// `?file=` inherits the endpoint's gate unchanged — and it matters more than it did: the
+    /// route now reaches up to `OXIDANT_LOG_KEEP_DAYS` of every enabled `tracing` field value
+    /// rather than a 1000-line ring.
+    #[tokio::test]
+    async fn the_file_parameter_inherits_the_status_token_gate() {
+        const TOKEN: &str = "s3cret-status-token";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("oxidant-2026-08-23.log"), "line\n").expect("write");
+        let _env = crate::distributed::env_lock();
+        let mut state = RestState {
+            service: Arc::new(OxidantService::new()),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.path().to_path_buf()),
+                dedup: true,
+            },
+            status_token: None,
+        };
+        // Unset token: the whole endpoint 404s, `?file=` included.
+        assert_eq!(
+            get_json(&app(state.clone()), "/api/v1/logs?file=2026-08-23")
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        state.status_token = Some(TOKEN.into());
+        let gated = app(state);
+        let resp = gated
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/logs?file=2026-08-23")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = gated
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/logs?file=2026-08-23")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A node with no rolling writer answers `404`, which is the honest answer: there are no
+    /// files. It must not 500, and it must not fall back to the ring and call it a file.
+    #[tokio::test]
+    async fn a_node_without_a_rolling_writer_has_no_files() {
+        let (_env, mut state, _) = test_state();
+        state.status_token = Some(LOGS_TOKEN.into());
+        let app = app(state);
+        let (status, body) = get_logs(&app, "/api/v1/logs?file=2026-08-23").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("no rolled exec logs"),
+            "{body}"
+        );
+    }
+
+    /// Percent-encode a `?file=` value so a traversal attempt reaches the handler as the caller
+    /// typed it rather than being normalized away by the URI parser.
+    fn urlencode(raw: &str) -> String {
+        raw.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
     #[test]
     fn cluster_mode_classification() {
         assert_eq!(cluster_mode(&[]), "single-node");
@@ -4402,6 +4627,108 @@ mod tests {
         assert_eq!(report.live_results_removed, 0, "{report:?}");
         assert!(result_file.exists(), "results outlive everything cheaper");
         assert!(!report.over_budget, "and it fits again: {report:?}");
+        store.shutdown_for_test();
+    }
+
+    /// Log retention runs on every sweep, whether or not the global budget is tight: a driver
+    /// far under `OXIDANT_DISK_MAX_BYTES` still may not keep 90 days of logs.
+    ///
+    /// Driven through `sweep_disk` rather than through `prune_expired_logs` directly, because
+    /// the wiring is the part that was missing — the pass existed in PR2's module and nothing
+    /// called it.
+    #[tokio::test]
+    async fn the_sweep_expires_rolled_logs_by_period_with_the_budget_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| {
+            // A budget nothing here can breach: the only thing that may delete a log is
+            // retention.
+            c.disk_max_bytes = u64::MAX;
+            c.log_keep_days = 30;
+            c.log_max_total_bytes = u64::MAX;
+        });
+        let (id, _) = store.insert("SELECT 'kept'");
+        store.finish(&id, ExecOutcome::Succeeded(vec![rows_batch(0, 2)]));
+
+        let plant = |rel: &str| {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, vec![b'x'; 128]).expect("write");
+            path
+        };
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::days(90);
+        let recent = now - chrono::Duration::days(2);
+        let live = plant("logs/oxidant.log");
+        let expired = plant(&format!(
+            "logs/oxidant-{}.log",
+            old.format("%Y-%m-%d")
+        ));
+        let expired_parquet = plant(&format!(
+            "logs/oxidant-{}.parquet",
+            (old + chrono::Duration::days(1)).format("%Y-%m-%d")
+        ));
+        let kept = plant(&format!(
+            "logs/oxidant-{}.log",
+            recent.format("%Y-%m-%d")
+        ));
+
+        let report = store.sweep_disk();
+        assert_eq!(report.logs_expired, 2, "{report:?}");
+        assert_eq!(report.logs_over_cap, 0, "{report:?}");
+        assert_eq!(
+            report.rolled_logs_removed, 0,
+            "the budget step took nothing — this was retention: {report:?}"
+        );
+        assert!(!expired.exists() && !expired_parquet.exists());
+        assert!(kept.exists(), "two days old is inside the window");
+        assert!(live.exists(), "the live file is never a candidate");
+        assert_eq!(
+            store.snapshot(&id).expect("statement").status,
+            StatementStatus::Succeeded,
+            "no statement history is spent on log retention"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// `event_log_dir` joins the budget in PR3 — by rolling, over the real sweep route.
+    #[tokio::test]
+    async fn the_sweep_rolls_the_event_log_and_counts_it_against_the_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = dir.path().join("spark-events");
+        std::fs::create_dir_all(&events).expect("mkdir");
+
+        let store = history_store_with(dir.path(), |c| {
+            c.disk_max_bytes = u64::MAX;
+            c.event_log_dir = Some(events.clone());
+            c.event_log_max_bytes = 1_000;
+        });
+        // Written *after* the boot sweep, so the pass under test is the explicit one below.
+        std::fs::write(events.join("events.jsonl"), vec![b'{'; 4_000]).expect("write");
+        // Somebody else's file in the same directory — an operator points this at a
+        // Spark-history-server path that other tools write.
+        std::fs::write(events.join("application_1_0001"), b"not ours").expect("write");
+
+        let report = store.sweep_disk();
+        assert!(report.event_log_rolled, "{report:?}");
+        assert!(
+            !events.join("events.jsonl").exists(),
+            "rolled, not deleted: the next emit recreates it"
+        );
+        let rolled: Vec<String> = std::fs::read_dir(&events)
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("events-"))
+            .collect();
+        assert_eq!(rolled.len(), 1, "{rolled:?}");
+        assert!(
+            events.join("application_1_0001").exists(),
+            "the sweeper unlinks only the shape it writes"
+        );
+        assert!(
+            report.used_bytes >= 4_000,
+            "the directory is billed to the budget now: {report:?}"
+        );
         store.shutdown_for_test();
     }
 

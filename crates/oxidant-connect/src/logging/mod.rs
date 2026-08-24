@@ -340,6 +340,13 @@ pub(crate) fn resolve(dir: &Path, period: LogPeriod, split: u32) -> Option<LogFi
     None
 }
 
+/// Convert a rolled text log to Parquet — the seam `rest`'s `?file=` test uses to produce a
+/// converted file without booting a writer.
+#[cfg(test)]
+pub(crate) fn convert_for_test(text: &Path) -> Result<String, String> {
+    columnar::convert(text).map(|p| p.display().to_string())
+}
+
 /// The live `oxidant.log`, or `None` if it does not exist yet.
 pub(crate) fn resolve_current(dir: &Path) -> Option<LogFile> {
     let live = dir.join(crate::history::disk::LIVE_LOG);

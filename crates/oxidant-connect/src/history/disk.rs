@@ -737,12 +737,15 @@ fn rolled_by_period(logs_dir: &Path) -> Vec<(LogPeriod, u32, Prunable)> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some((period, split, ext)) = crate::logging::parse_rolled_name(name) else {
-            continue;
-        };
-        if ext != "log" && ext != "parquet" {
+        // One predicate for "is this file mine", shared with the budget's step-1 candidate list
+        // and with `is_dump`'s complement — so what the sweeper measures, what it orders and
+        // what it unlinks cannot disagree.
+        if !is_rolled_log(name) {
             continue;
         }
+        let Some((period, split, _)) = crate::logging::parse_rolled_name(name) else {
+            continue;
+        };
         let Ok(meta) = entry.path().symlink_metadata() else {
             continue;
         };

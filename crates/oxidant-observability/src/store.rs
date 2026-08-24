@@ -952,6 +952,55 @@ mod tests {
         }
     }
 
+    /// `OXIDANT_EVENT_LOG_MAX_BYTES` rolls `events.jsonl` to `events-<UTC-period>[.N].jsonl`
+    /// rather than deleting it (`docs/query-history-durability.md` §8, F16). A history server
+    /// that read only the live file would report a cluster's history as starting at the last
+    /// roll — which is exactly the data loss the roll exists to avoid.
+    #[test]
+    fn load_event_log_reads_the_rolled_generations_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, ops: &[&str]| {
+            let body: String = ops
+                .iter()
+                .map(|op| {
+                    let event = ExecutionEvent::JobStarted {
+                        operation_id: (*op).into(),
+                        job_id: 0,
+                        description: "SELECT 1".into(),
+                        submission_time_ms: 0,
+                    };
+                    format!("{}\n", serde_json::to_string(&event).expect("json"))
+                })
+                .collect();
+            fs::write(dir.path().join(name), body).expect("write");
+        };
+        // Deliberately out of directory order, and with the `.N` split whose name sorts *before*
+        // the plain one: the replay order is the file order, and a fold that missed a generation
+        // would lose those operations entirely.
+        write("events-2026-08-23.jsonl", &["op-oldest"]);
+        write("events-2026-08-24.2.jsonl", &["op-middle"]);
+        write("events.jsonl", &["op-newest"]);
+        // Not ours: a Spark history server's own files live in this directory.
+        fs::write(dir.path().join("application_1_0001"), b"not jsonl").expect("write");
+
+        let store = AppStateStore::load_event_log(dir.path());
+        let mut ids: Vec<String> = store
+            .all_operation_states()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "op-middle".to_string(),
+                "op-newest".to_string(),
+                "op-oldest".to_string()
+            ],
+            "every rolled generation is replayed, not just the live file"
+        );
+    }
+
     #[test]
     fn concurrent_stages_do_not_collide() {
         let store = AppStateStore::new();
