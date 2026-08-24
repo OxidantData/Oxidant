@@ -748,6 +748,10 @@ curl -s -o bundle.parquet -w '%{http_code}' \
   either is a `507`, and a dump that breaches the cap mid-write is abandoned and reports the
   `507` on collection. A smaller bundle would be carried to a support case in the belief that it
   held the window that was asked for.
+- **Dumps already assembling hold their headroom.** The check reserves the whole cap — the size
+  of a bundle is not knowable until the logs have been read — and every dump still `building`
+  counts as one such reservation, so N requests arriving together cannot each be admitted
+  against the same free space. The `507` says how many are in flight.
 - Bundles land in `$OXIDANT_DATA_DIR/dumps/` as `dump-<uuid>.parquet`, **expire after 24 h**,
   and are swept by the same prune pass that sweeps spilled results. The directory is resolved by
   the same code that resolves every other subtree under the data dir — so with

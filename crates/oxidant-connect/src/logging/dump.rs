@@ -110,7 +110,18 @@ pub(crate) struct DumpStore {
     disk_max_bytes: u64,
     disk_min_free_bytes: u64,
     mounts: Option<Vec<(PathBuf, u64)>>,
-    state: Mutex<HashMap<String, DumpState>>,
+    state: Mutex<HashMap<String, Dump>>,
+}
+
+/// One registry entry: what an id is doing, and when it was last said.
+///
+/// The timestamp is the pruner. Without it the map grew one entry per dump request for the
+/// process's lifetime — a `Ready` entry outlived the file the sweeper unlinked at 24 h, and a
+/// `Failed` one outlived everything.
+#[derive(Clone, Debug)]
+struct Dump {
+    at_ms: i64,
+    state: DumpState,
 }
 
 impl DumpStore {
@@ -144,76 +155,98 @@ impl DumpStore {
         &self.dir
     }
 
-    /// Would a dump of up to `max_bytes` breach §3? Checked **before** the id is minted, so a
-    /// refusal is a `507` on the `POST` rather than a `507` an operator only sees when they come
-    /// back for the file.
+    /// Mint an id, or refuse with a `507` — **one decision, under one lock**.
+    ///
+    /// Checked *before* the id exists, so a refusal is a `507` on the `POST` rather than a `507`
+    /// an operator only sees when they come back for the file.
     ///
     /// The reserve is the whole cap, not an estimate of the request: the request's size is not
     /// knowable until the logs have been read, and reserving less would let a dump be admitted
     /// and then abandoned — which is the outcome this check exists to avoid.
-    pub(crate) fn admit(&self) -> Result<(), LogError> {
+    ///
+    /// **And the reserve is recorded.** `measure_roots` reads what is on disk *right now*, so a
+    /// dump admitted 200 ms ago that has written nothing yet was invisible: five `POST`s
+    /// arriving together all measured the same tree, all passed `used + cap <= budget`, and all
+    /// five then wrote up to `cap` — `(N-1) x cap` past the ceiling this check exists to
+    /// enforce, and the **Dump** button re-enables the moment its `202` lands. Every id still
+    /// `Building` is counted as its own reservation, and the count and the insert happen under
+    /// the same lock so two callers cannot both see the same headroom.
+    pub(crate) fn admit_and_begin(&self) -> Result<String, LogError> {
+        // Measured outside the lock — it is a recursive directory walk — and only *reasoned*
+        // about inside it. Under-measuring here is safe: the in-flight reservations are what
+        // make two concurrent admissions disagree, and those are counted under the lock.
         let usage = disk::measure_roots(&self.roots);
-        if usage.billed.saturating_add(self.max_bytes) > self.disk_max_bytes {
-            return Err(LogError {
-                status: 507,
-                message: format!(
-                    "a dump needs up to {} bytes of headroom and the engine is already using {} \
-                     of OXIDANT_DISK_MAX_BYTES={}; raise the budget, lower \
-                     OXIDANT_LOG_DUMP_MAX_BYTES, or wait for the sweep",
-                    self.max_bytes, usage.billed, self.disk_max_bytes
-                ),
-            });
-        }
         let mounts = match &self.mounts {
             Some(entries) => disk::Mounts::from_entries(entries.clone()),
             None => disk::Mounts::probe(),
         };
-        if let Some(free) = mounts.free_bytes(&self.dir) {
-            if free < self.disk_min_free_bytes.saturating_add(self.max_bytes) {
+        let free = mounts.free_bytes(&self.dir);
+
+        let mut state = self.state.lock().expect("dump registry poisoned");
+        prune_registry(&mut state, chrono::Utc::now().timestamp_millis());
+        let in_flight = state
+            .values()
+            .filter(|d| matches!(d.state, DumpState::Building))
+            .count() as u64;
+        // This request's cap, plus every cap already promised to a dump still assembling.
+        let reserve = self.max_bytes.saturating_mul(in_flight.saturating_add(1));
+        if usage.billed.saturating_add(reserve) > self.disk_max_bytes {
+            return Err(LogError {
+                status: 507,
+                message: format!(
+                    "a dump needs up to {} bytes of headroom ({in_flight} already assembling) \
+                     and the engine is already using {} of OXIDANT_DISK_MAX_BYTES={}; raise the \
+                     budget, lower OXIDANT_LOG_DUMP_MAX_BYTES, or wait for the sweep",
+                    reserve, usage.billed, self.disk_max_bytes
+                ),
+            });
+        }
+        if let Some(free) = free {
+            if free < self.disk_min_free_bytes.saturating_add(reserve) {
                 return Err(LogError {
                     status: 507,
                     message: format!(
                         "the volume holding {} has {free} bytes free and a dump needs \
-                         OXIDANT_DISK_MIN_FREE_BYTES={} plus up to {} on top",
+                         OXIDANT_DISK_MIN_FREE_BYTES={} plus up to {reserve} on top \
+                         ({in_flight} already assembling)",
                         self.dir.display(),
                         self.disk_min_free_bytes,
-                        self.max_bytes
                     ),
                 });
             }
         }
-        Ok(())
-    }
-
-    /// Mint an id and mark it building.
-    pub(crate) fn begin(&self) -> String {
         let id = format!("{DUMP_PREFIX}{}", uuid::Uuid::new_v4());
-        self.state
-            .lock()
-            .expect("dump registry poisoned")
-            .insert(id.clone(), DumpState::Building);
-        id
+        state.insert(
+            id.clone(),
+            Dump {
+                at_ms: chrono::Utc::now().timestamp_millis(),
+                state: DumpState::Building,
+            },
+        );
+        Ok(id)
     }
 
+    /// Record what an id ended up doing. This is also what **releases its reservation**: an id
+    /// that is no longer `Building` no longer holds headroom against the next `admit_and_begin`.
     pub(crate) fn set(&self, id: &str, state: DumpState) {
-        self.state
-            .lock()
-            .expect("dump registry poisoned")
-            .insert(id.to_string(), state);
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut registry = self.state.lock().expect("dump registry poisoned");
+        registry.insert(id.to_string(), Dump { at_ms: now, state });
+        prune_registry(&mut registry, now);
     }
 
     /// What an id is doing — and, for one this process did not mint, whether the file is
     /// nonetheless on disk. A restart loses the registry; the bundle it wrote does not stop
     /// being downloadable because of that.
     pub(crate) fn get(&self, id: &str) -> Option<DumpState> {
-        if let Some(state) = self
+        if let Some(entry) = self
             .state
             .lock()
             .expect("dump registry poisoned")
             .get(id)
             .cloned()
         {
-            return Some(state);
+            return Some(entry.state);
         }
         let path = self.path_of(id)?;
         let meta = path.symlink_metadata().ok()?;
@@ -273,6 +306,18 @@ impl DumpStore {
             buf: Vec::with_capacity(ROWS_PER_BATCH),
         })
     }
+}
+
+/// Forget entries older than a bundle's own life.
+///
+/// A dump the sweeper unlinked at 24 h is no longer collectable, so remembering that it was
+/// `Ready` buys nothing; a `Failed` one has had a day for its `507` to be read. Without this the
+/// registry grew one entry per dump request for as long as the process ran. `Building` is
+/// exempt: an assembly that has run for a day is still holding its reservation, and forgetting
+/// it would hand that headroom out twice.
+fn prune_registry(registry: &mut HashMap<String, Dump>, now_ms: i64) {
+    let cutoff = now_ms.saturating_sub(DUMP_TTL_SECS.saturating_mul(1000));
+    registry.retain(|_, d| matches!(d.state, DumpState::Building) || d.at_ms >= cutoff);
 }
 
 /// One dump under construction. Dropping it without [`DumpWriter::finish`] removes the `.tmp`,
@@ -462,7 +507,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store(dir.path(), 1 << 30, u64::MAX);
-        let id = store.begin();
+        let id = store.admit_and_begin().expect("admitted");
         let mut writer = store.open(&id).expect("open");
         writer.note_node("driver", None);
         writer
@@ -556,7 +601,7 @@ mod tests {
     fn a_dump_past_its_cap_is_refused_and_leaves_nothing_behind() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store(dir.path(), 1024, u64::MAX);
-        let id = store.begin();
+        let id = store.admit_and_begin().expect("admitted");
         let mut writer = store.open(&id).expect("open");
         let mut err = None;
         for i in 0..200_000 {
@@ -590,21 +635,101 @@ mod tests {
 
     /// The §3 budget refuses a dump *before* the id is minted, so `507` lands on the request
     /// rather than on the collection.
+    ///
+    /// The complement is asserted on **the same store**, once the tree it measures shrinks — not
+    /// on a second store with `disk_max = u64::MAX`, which only asserts that an infinite budget
+    /// admits anything.
     #[test]
     fn a_dump_that_would_breach_the_disk_budget_is_refused_up_front() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("existing"), vec![0u8; 4096]).expect("write");
-        let store = store(dir.path(), 1 << 20, 8192);
-        let err = store.admit().expect_err("must refuse");
+        let existing = dir.path().join("existing");
+        std::fs::write(&existing, vec![0u8; 4096]).expect("write");
+        let store = store(dir.path(), 1 << 20, 1 << 20);
+        let err = store.admit_and_begin().expect_err("must refuse");
         assert_eq!(err.status, 507);
         assert!(err.message.contains("OXIDANT_DISK_MAX_BYTES"), "{err:?}");
-        // With room, it is admitted.
-        let roomy = store2(dir.path());
-        roomy.admit().expect("admitted");
+        // The same store, the same budget: it admits once the tree it measures shrinks.
+        std::fs::remove_file(&existing).expect("unlink");
+        store.admit_and_begin().expect("admitted");
     }
 
-    fn store2(dir: &std::path::Path) -> Arc<DumpStore> {
-        store(dir, 1 << 20, u64::MAX)
+    /// **A reservation that is not recorded is not a reservation.** `measure_roots` reads what
+    /// is on disk *now*, so a dump admitted a moment ago that has written nothing is invisible.
+    /// Five `POST`s arriving together — a monitoring script, or the **Dump** button, which
+    /// re-enables the instant its `202` lands — all measured the same tree, all passed
+    /// `used + cap <= budget`, and all five then wrote up to `cap`: `(N-1) x cap` past the
+    /// ceiling this check exists to enforce.
+    ///
+    /// Asserted at the seam `create_dump` calls rather than by firing concurrent requests,
+    /// because the answer must not depend on how fast the assembly task happens to finish.
+    #[test]
+    fn concurrent_dumps_do_not_each_reserve_the_same_headroom() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cap = 1 << 20;
+        // Room for exactly two dumps at the cap, and nothing on disk yet.
+        let store = store(dir.path(), cap, cap * 2);
+        let admitted: Vec<Result<String, LogError>> =
+            (0..5).map(|_| store.admit_and_begin()).collect();
+        let ok: Vec<&String> = admitted.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(
+            ok.len(),
+            2,
+            "the budget holds two dumps at the cap, so three of five must be refused: {admitted:?}"
+        );
+        for refused in admitted.iter().filter_map(|r| r.as_ref().err()) {
+            assert_eq!(refused.status, 507);
+            assert!(
+                refused.message.contains("already assembling"),
+                "the refusal names why the headroom is gone: {refused:?}"
+            );
+        }
+        // A reservation is released when its id stops building — and then the next one fits.
+        store.set(
+            ok[0],
+            DumpState::Failed(LogError {
+                status: 507,
+                message: "x".into(),
+            }),
+        );
+        store
+            .admit_and_begin()
+            .expect("the released reservation is available again");
+    }
+
+    /// A finished dump is forgotten once it is older than the bundle it describes, or the
+    /// registry grows one entry per request for the process's lifetime. An assembly still
+    /// running is exempt: it is holding a reservation.
+    #[test]
+    fn the_registry_forgets_entries_older_than_a_bundle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(dir.path(), 1 << 20, u64::MAX);
+        let building = store.admit_and_begin().expect("admitted");
+        let done = store.admit_and_begin().expect("admitted");
+        store.set(
+            &done,
+            DumpState::Failed(LogError {
+                status: 507,
+                message: "past the cap".to_string(),
+            }),
+        );
+        // Age both entries a day and a half.
+        {
+            let mut registry = store.state.lock().expect("registry");
+            let old = chrono::Utc::now().timestamp_millis() - 36 * 60 * 60 * 1000;
+            for entry in registry.values_mut() {
+                entry.at_ms = old;
+            }
+        }
+        store.admit_and_begin().expect("admitted").len();
+        let registry = store.state.lock().expect("registry");
+        assert!(
+            !registry.contains_key(&done),
+            "a terminal entry outlived the bundle the sweeper unlinked at 24 h"
+        );
+        assert!(
+            registry.contains_key(&building),
+            "but an assembly still running keeps its reservation however long it has run"
+        );
     }
 
     /// The id is validated and the filename **reconstructed** from it — the same discipline as
@@ -612,7 +737,7 @@ mod tests {
     #[test]
     fn a_dump_id_is_validated_not_joined() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = store2(dir.path());
+        let store = store(dir.path(), 1 << 20, u64::MAX);
         for hostile in [
             "dump-../../etc/passwd",
             "../../etc/passwd",
@@ -624,7 +749,7 @@ mod tests {
             assert!(store.path_of(hostile).is_none(), "{hostile:?}");
             assert!(store.get(hostile).is_none(), "{hostile:?}");
         }
-        let id = store.begin();
+        let id = store.admit_and_begin().expect("admitted");
         let path = store.path_of(&id).expect("a real id resolves");
         assert_eq!(path.parent(), Some(dir.path()));
     }
@@ -633,7 +758,7 @@ mod tests {
     #[test]
     fn a_dump_written_by_a_previous_process_is_still_collectable() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = store2(dir.path());
+        let store = store(dir.path(), 1 << 20, u64::MAX);
         let id = format!("{DUMP_PREFIX}{}", uuid::Uuid::new_v4());
         std::fs::write(store.path_of(&id).unwrap(), b"parquet-ish").expect("write");
         match store.get(&id) {

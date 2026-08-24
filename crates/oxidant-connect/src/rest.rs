@@ -3398,11 +3398,13 @@ async fn create_dump(
         Ok(nodes) => nodes,
         Err(response) => return response,
     };
-    // §3's guards, before the id exists: a refusal must land on the request.
-    if let Err(e) = dumps.admit() {
-        return log_error_response(&e);
-    }
-    let id = dumps.begin();
+    // §3's guards, before the id exists: a refusal must land on the request. Minting the id is
+    // the same step, under the same lock, because the id *is* the reservation — see
+    // [`DumpStore::admit_and_begin`].
+    let id = match dumps.admit_and_begin() {
+        Ok(id) => id,
+        Err(e) => return log_error_response(&e),
+    };
     let query = crate::logging::LogQuery {
         level: request.level.clone(),
         target: request.target.clone(),

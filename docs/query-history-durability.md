@@ -1345,6 +1345,17 @@ document or `docs/api.md` previously promised.
   itself, so a released page is re-fetched rather than skipped. Same class of defect as the SSE
   `dropped` event, on the scroll-back axis instead of the live one.
 
+- **F8 — an admitted dump's reservation is recorded.** `admit()` reserved the whole cap and
+  never wrote the reservation down, so `measure_roots` — which reads what is on disk *now* —
+  could not see a dump admitted 200 ms ago that had written nothing yet. Five `POST`s arriving
+  together (a monitoring script, or the **Dump** button, which re-enables the instant its `202`
+  lands) all measured the same tree, all passed, and all five then wrote up to the cap:
+  `(N-1) x cap` past `OXIDANT_DISK_MAX_BYTES`. Admission and minting are now one step under one
+  lock, every id still `Building` counts as a reservation, and a terminal state releases it.
+  The registry is also pruned at the bundle's own 24 h TTL — it grew one entry per request for
+  the process's lifetime — with `Building` exempt, since an assembly still running is still
+  holding headroom.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |
