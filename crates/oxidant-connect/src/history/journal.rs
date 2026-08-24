@@ -354,8 +354,14 @@ fn recover_swap(cfg: &HistoryConfig) {
 ///
 /// Files are read newest-first — live segments descending, then compacted generations descending
 /// — and reading stops once `max_records` statements are in hand, which is what bounds boot
-/// (Goal 5). Order does not affect the result: the fold is seq-monotone, so a compacted snapshot
-/// that is newer than a live event for the same id wins whichever file was read first.
+/// (Goal 5). Order does not affect the result: the fold is seq-monotone and older records only
+/// backfill fields a newer one left absent, so a compacted snapshot that is newer than a live
+/// event for the same id wins whichever file was read first.
+///
+/// The cap is checked *between* files, deliberately. Truncating a file mid-read would discard the
+/// newest records in it — within a file the lines are oldest-first — so the overshoot is at most
+/// one file: one segment (`OXIDANT_HISTORY_SEGMENT_BYTES`) or one generation, and
+/// [`enforce_retention`] is what keeps a generation from being the unbounded one.
 fn replay(cfg: &HistoryConfig) -> Fold {
     let mut fold = Fold::default();
     let mut files: Vec<PathBuf> = segments(&cfg.statements_dir)
@@ -650,6 +656,12 @@ fn compact_sealed(cfg: &HistoryConfig, open_segment: u64, force: bool) -> std::i
         read_into(path, &mut fold);
         inputs.push(file_name(path));
     }
+    // The generation is a *retained* view, not an archive of everything ever folded: without
+    // this the compacted file — and therefore boot memory and boot time — grows without limit,
+    // and `OXIDANT_HISTORY_MAX_RECORDS` stops bounding replay the way §9 pins it. Retention here
+    // also means the disk converges on its own, instead of depending on a tombstone burst
+    // surviving a full channel.
+    let pruned = enforce_retention(cfg, &mut fold);
     let surviving = fold.statements.len() as f64;
     let records = fold.records as f64;
     let superseded = if records > 0.0 {
@@ -659,6 +671,13 @@ fn compact_sealed(cfg: &HistoryConfig, open_segment: u64, force: bool) -> std::i
     };
     if !force && superseded < COMPACT_SUPERSEDED_RATIO {
         return Ok(false);
+    }
+    if pruned > 0 {
+        tracing::info!(
+            pruned,
+            surviving = fold.statements.len(),
+            "statement journal: compaction dropped records past retention"
+        );
     }
 
     let next_gen = gens.last().map(|(i, _)| i + 1).unwrap_or(0);
@@ -712,6 +731,37 @@ fn pop(
         .pop_front()
 }
 
+/// Apply the statement store's retention to a fold before it is written as a generation.
+///
+/// Exactly the rules `StatementStore::sweep_history` enforces in memory — age, then the global
+/// count cap, oldest-terminal-first — so the file on disk and the history tier converge on the
+/// same population. A non-terminal statement is never a victim: it is still running, and the cap
+/// yields rather than the statement (which is why replay is bounded at `max_records` *plus* what
+/// is in flight). Returns how many statements were dropped.
+fn enforce_retention(cfg: &HistoryConfig, fold: &mut Fold) -> usize {
+    let before = fold.statements.len();
+    if cfg.retention_days > 0 {
+        let span = cfg.retention_days.saturating_mul(86_400_000);
+        let cutoff = oxidant_observability::now_ms().saturating_sub(span);
+        fold.statements
+            .retain(|_, st| !st.status.is_terminal() || st.submitted_at_ms >= cutoff);
+    }
+    if fold.statements.len() > cfg.max_records {
+        let mut terminal: Vec<(u64, String)> = fold
+            .statements
+            .iter()
+            .filter(|(_, st)| st.status.is_terminal())
+            .map(|(id, st)| (st.seq, id.clone()))
+            .collect();
+        terminal.sort_by_key(|(seq, _)| *seq);
+        let excess = fold.statements.len() - cfg.max_records;
+        for (_, id) in terminal.into_iter().take(excess) {
+            fold.statements.remove(&id);
+        }
+    }
+    before - fold.statements.len()
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -733,6 +783,19 @@ mod tests {
         cfg
     }
 
+    /// A recent `submitted_at_ms`, distinct per `seq`.
+    ///
+    /// Records are stamped *now* rather than at a fixed 2023 instant because compaction applies
+    /// the shipped 30-day retention (H4): a fixture from 2023 is genuinely past it, and would be
+    /// pruned by the very pass these tests are checking.
+    fn recent_ms(seq: u64) -> i64 {
+        // One base per test binary, so two fixtures built for the same `seq` agree exactly —
+        // `submitted_at_ms` is set by whichever record creates the fold entry, and replay and
+        // compaction do not create it from the same one.
+        static BASE: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        *BASE.get_or_init(|| oxidant_observability::now_ms() - 60_000) + seq as i64
+    }
+
     fn folded(id: &str, seq: u64, status: StatementStatus) -> FoldedStatement {
         FoldedStatement {
             id: id.to_string(),
@@ -745,7 +808,7 @@ mod tests {
             error: None,
             schema: Some(vec![("n".to_string(), "Int64".to_string())]),
             rows: Some(1),
-            submitted_at_ms: 1_700_000_000_000 + seq as i64,
+            submitted_at_ms: recent_ms(seq),
             duration_ms: Some(7),
             seq,
             last_seq: seq,
@@ -769,7 +832,7 @@ mod tests {
             error: None,
             schema: None,
             rows: None,
-            submitted_at_ms: 1_700_000_000_000 + seq as i64,
+            submitted_at_ms: recent_ms(seq),
             duration_ms: None,
             ts: crate::history::record::now_rfc3339(),
         }
@@ -965,6 +1028,7 @@ mod tests {
         journal.sync_blocking();
         let mut snap = folded("stmt-x", 1, StatementStatus::Succeeded);
         snap.last_seq = 5;
+        let expected_ms = snap.submitted_at_ms;
         let ack = journal.append_durable(snap.to_snapshot()).expect("queued");
         futures::executor::block_on(ack).expect("acked");
         journal.compact_blocking();
@@ -987,8 +1051,113 @@ mod tests {
         assert_eq!(st.schema.as_ref().expect("schema")[0].0, "n");
         assert_eq!(st.rows, Some(1));
         assert_eq!(st.duration_ms, Some(7));
-        assert_eq!(st.submitted_at_ms, 1_700_000_000_001);
+        assert_eq!(st.submitted_at_ms, expected_ms);
         assert_eq!(st.seq, 1);
+        journal.shutdown();
+    }
+
+    /// H4: compaction had no retention at all, so the generation it published — and therefore
+    /// boot memory and boot time — grew without limit. `OXIDANT_HISTORY_MAX_RECORDS` bounded
+    /// `replay` only *between* files, so a single generation holding 300k statements was folded
+    /// whole, and the sweeper's answer (a tombstone per excess statement, on the droppable path)
+    /// mostly did not survive the burst. §9 pins replay at the cap; this is what makes it true
+    /// as the journal outgrows it.
+    #[test]
+    fn compaction_drops_records_past_the_retention_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = cfg_for(dir.path());
+        cfg.max_records = 5;
+        let terminal = cfg.max_records as u64 * 2;
+        let (journal, _) = Journal::open(&cfg).expect("open");
+        for seq in 0..terminal {
+            journal.append_retained(
+                folded(&format!("stmt-{seq}"), seq, StatementStatus::Succeeded).to_snapshot(),
+            );
+        }
+        // One statement still running: never a victim, so replay is bounded at the cap *plus*
+        // whatever is in flight.
+        journal.append_retained(submitted("stmt-live", 100));
+        journal.sync_blocking();
+        journal.compact_blocking();
+        journal.shutdown();
+
+        let gens = generations(&cfg.compacted_dir);
+        assert_eq!(gens.len(), 1, "one generation published");
+        let lines = std::fs::read_to_string(&gens[0].1)
+            .expect("generation")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert_eq!(
+            lines, cfg.max_records,
+            "the generation is bounded by max_records, exactly as `sweep_history` bounds the \
+             history tier"
+        );
+
+        let (journal, fold) = Journal::open(&cfg).expect("reopen");
+        assert_eq!(fold.statements.len(), cfg.max_records);
+        assert!(
+            fold.statements.contains_key("stmt-live"),
+            "a non-terminal statement is never compacted away"
+        );
+        assert!(
+            fold.statements
+                .contains_key(&format!("stmt-{}", terminal - 1)),
+            "and eviction is oldest-first, so the newest terminal statement survives"
+        );
+        assert!(
+            !fold.statements.contains_key("stmt-0"),
+            "while the oldest is gone"
+        );
+        journal.shutdown();
+    }
+
+    /// The cap yields to a running statement rather than evicting it — which is why replay is
+    /// bounded at `max_records` *plus* whatever was in flight, and not at `max_records` flat.
+    #[test]
+    fn compaction_never_evicts_a_running_statement_to_meet_the_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = cfg_for(dir.path());
+        cfg.max_records = 1;
+        let (journal, _) = Journal::open(&cfg).expect("open");
+        for seq in 0..4u64 {
+            journal.append_retained(submitted(&format!("stmt-live-{seq}"), seq));
+        }
+        journal.sync_blocking();
+        journal.compact_blocking();
+        journal.shutdown();
+
+        let (journal, fold) = Journal::open(&cfg).expect("reopen");
+        assert_eq!(
+            fold.statements.len(),
+            4,
+            "every non-terminal statement survives the cap"
+        );
+        journal.shutdown();
+    }
+
+    /// The other half of H4: age, not just count. A terminal statement past
+    /// `OXIDANT_HISTORY_RETENTION_DAYS` is dropped by the compaction pass itself, so the disk
+    /// converges without depending on a tombstone surviving backpressure.
+    #[test]
+    fn compaction_drops_records_past_the_retention_age() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_for(dir.path());
+        let (journal, _) = Journal::open(&cfg).expect("open");
+        let mut old = folded("stmt-ancient", 1, StatementStatus::Succeeded);
+        old.submitted_at_ms = oxidant_observability::now_ms() - 40 * 86_400_000;
+        journal.append_retained(old.to_snapshot());
+        journal.append_retained(folded("stmt-fresh", 2, StatementStatus::Succeeded).to_snapshot());
+        journal.sync_blocking();
+        journal.compact_blocking();
+        journal.shutdown();
+
+        let (journal, fold) = Journal::open(&cfg).expect("reopen");
+        assert!(
+            !fold.statements.contains_key("stmt-ancient"),
+            "past the 30-day retention the statement is pruned from the generation"
+        );
+        assert!(fold.statements.contains_key("stmt-fresh"));
         journal.shutdown();
     }
 
