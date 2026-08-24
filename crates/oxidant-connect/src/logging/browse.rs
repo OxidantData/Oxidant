@@ -319,8 +319,17 @@ pub(crate) fn scan_text_forward(
     Ok(page)
 }
 
-/// Scan a rolled Parquet forward from a row index. Same contract as [`scan_text_forward`];
-/// `?file=current` is always text, so this exists for uniformity rather than for the tail.
+/// Scan a rolled Parquet forward from a row index, with the same pruning and projection the
+/// backward walk has. Same contract as [`scan_text_forward`].
+///
+/// **The forward walk prunes too.** It used to be a plain `with_offset(after)` that called
+/// [`render_row`] — all five columns, `message` and `fields_json` included — on *every* row
+/// before the filter was consulted. That is the read path the diagnostic dump uses, so a
+/// one-hour bundle fully decoded up to `OXIDANT_LOG_KEEP_DAYS` of logs on every node to keep an
+/// hour of them. It now walks row groups: a group the window puts wholly outside is skipped on
+/// the footer statistics and the cursor moves past it, `level`/`target` are evaluated against
+/// the `(ts, level, target)` projection, and only the surviving rows are rendered — the same
+/// three passes [`scan_parquet`] makes, so the two directions cost the same over one file.
 pub(crate) fn scan_parquet_forward(
     path: &Path,
     filter: &LogFilter,
@@ -330,7 +339,8 @@ pub(crate) fn scan_parquet_forward(
     let file = std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
     let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
         .map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let total = metadata.metadata().file_metadata().num_rows().max(0) as u64;
+    let md = metadata.metadata().clone();
+    let total = md.file_metadata().num_rows().max(0) as u64;
     let mut page = ForwardPage {
         next_after: total.min(after),
         ..Default::default()
@@ -338,28 +348,111 @@ pub(crate) fn scan_parquet_forward(
     if after >= total {
         return Ok(page);
     }
-    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
-        .with_offset(after as usize)
-        .build()
-        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+
+    // Row-group boundaries, in file order. `starts[g]` is the global index of the group's row 0.
+    let mut starts: Vec<u64> = Vec::with_capacity(md.num_row_groups());
+    let mut at = 0u64;
+    for g in 0..md.num_row_groups() {
+        starts.push(at);
+        at = at.saturating_add(md.row_group(g).num_rows().max(0) as u64);
+    }
+
+    let mask_pushdown = ProjectionMask::leaves(md.file_metadata().schema_descr(), [0, 1, 2]);
+    let limit = limit.max(1);
     let mut index = after;
     let mut bytes = 0usize;
-    'outer: for batch in reader {
-        let batch = batch.map_err(|e| format!("reading {}: {e}", path.display()))?;
-        let cols = RowColumns::of(&batch)?;
-        for row in 0..batch.num_rows() {
-            if page.lines.len() >= limit.max(1) || bytes >= MAX_PAGE_BYTES {
-                break 'outer;
+    for g in 0..md.num_row_groups() {
+        let start = starts[g];
+        let group_rows = md.row_group(g).num_rows().max(0) as u64;
+        let end = start.saturating_add(group_rows);
+        if end <= index {
+            continue;
+        }
+        if page.lines.len() >= limit || bytes >= MAX_PAGE_BYTES {
+            // Stop *before* this group, so `next_after` names its first unexamined row.
+            break;
+        }
+        // The cursor can land inside a group; rows before it belong to a page already served.
+        index = index.max(start);
+        let first_in_group = (index - start) as usize;
+        // A group the window puts wholly outside is *examined and skipped* — the cursor moves
+        // past it without a data page being read. This is the whole payoff of converting.
+        if prunable(md.row_group(g), filter) {
+            index = end;
+            continue;
+        }
+
+        // Pass 1 — `ts`, `level`, `target` only, exactly as the backward walk does it.
+        let hits = {
+            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                file.try_clone()
+                    .map_err(|e| format!("reopening {}: {e}", path.display()))?,
+                metadata.clone(),
+            )
+            .with_row_groups(vec![g])
+            .with_projection(mask_pushdown.clone())
+            .build()
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+            let mut hits: Vec<usize> = Vec::new();
+            let mut row = 0usize;
+            for batch in reader {
+                let batch = batch.map_err(|e| format!("reading {}: {e}", path.display()))?;
+                let cols = Pushdown::of(&batch)?;
+                for i in 0..batch.num_rows() {
+                    if row >= first_in_group
+                        && filter.keeps_pushdown(cols.ts_ms(i), cols.level(i), cols.target(i))
+                    {
+                        hits.push(row);
+                    }
+                    row += 1;
+                }
             }
-            let line = render_row(&cols, row);
-            index += 1;
-            if filter.is_empty()
-                || filter.keeps_pushdown(cols.ts_ms(row), cols.level(row), cols.target(row))
-                    && filter.keeps_text(&line)
-            {
-                bytes += line.len();
-                page.lines.push(line);
+            hits
+        };
+        if hits.is_empty() {
+            // Every row of this group was examined against the three cheap columns and rejected.
+            index = end;
+            continue;
+        }
+
+        // Pass 2 — the full row, for the surviving rows only.
+        let selection = RowSelection::from(selectors(&hits, group_rows as usize));
+        let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+            file.try_clone()
+                .map_err(|e| format!("reopening {}: {e}", path.display()))?,
+            metadata.clone(),
+        )
+        .with_row_groups(vec![g])
+        .with_row_selection(selection)
+        .build()
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let mut seen = 0usize;
+        let mut stopped_at: Option<u64> = None;
+        'group: for batch in reader {
+            let batch = batch.map_err(|e| format!("reading {}: {e}", path.display()))?;
+            let cols = RowColumns::of(&batch)?;
+            for i in 0..batch.num_rows() {
+                // The selection was built from `hits` in order, so the nth row the reader hands
+                // back is `hits[n]` — that mapping is what makes the cursor exact.
+                let Some(&row) = hits.get(seen) else {
+                    break 'group;
+                };
+                seen += 1;
+                if page.lines.len() >= limit || bytes >= MAX_PAGE_BYTES {
+                    // Stop *before* consuming this row, so `next_after` names it.
+                    stopped_at = Some(start + row as u64);
+                    break 'group;
+                }
+                let line = render_row(&cols, i);
+                if filter.keeps_text(&line) {
+                    bytes += line.len();
+                    page.lines.push(line);
+                }
             }
+        }
+        index = stopped_at.unwrap_or(end);
+        if stopped_at.is_some() {
+            break;
         }
     }
     page.next_after = index;
@@ -1021,6 +1114,134 @@ mod tests {
         let page = scan_parquet(&parquet, &late, None, 10).expect("scan");
         assert_eq!(page.lines.len(), 10);
         assert_eq!(page.lines.last().unwrap(), body.last().unwrap());
+    }
+
+    /// **The forward walk prunes on the footer, and the proof is that it never opens the pages
+    /// it skips.** The two groups the window puts wholly outside have their `ts` column chunk
+    /// overwritten with garbage; a walk that decoded them would fail, and one that reads the
+    /// statistics and steps over them cannot.
+    ///
+    /// This is the read path the diagnostic dump uses. Before §6b's forward scan was given the
+    /// treatment its backward sibling already had, it was a plain `with_offset(after)` that
+    /// rendered all five columns of every row — so a one-hour bundle decoded the whole
+    /// retention on every node.
+    #[test]
+    fn the_forward_walk_steps_over_a_pruned_row_group_without_reading_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let count = ROWS_PER_ROW_GROUP * 2 + 100;
+        let body: Vec<String> = (0..count)
+            .map(|i| {
+                format!(
+                    "2026-08-23T{:02}:{:02}:{:02}.000Z [INFO] oxidant_execution - message=line {i}",
+                    i / 3600,
+                    (i / 60) % 60,
+                    i % 60
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+        let text = write(dir.path(), "oxidant-2026-09-03.log", &refs);
+        let parquet = super::super::columnar::convert(&text).expect("convert");
+
+        // Scribble over the first two groups' `ts` chunks. The footer — and every statistic the
+        // pruner reads — sits at the end of the file and is untouched.
+        {
+            let file = std::fs::File::open(&parquet).expect("open");
+            let metadata =
+                ArrowReaderMetadata::load(&file, ArrowReaderOptions::default()).expect("metadata");
+            let md = metadata.metadata();
+            assert_eq!(md.num_row_groups(), 3, "three groups to prune between");
+            let mut bytes = std::fs::read(&parquet).expect("read");
+            for g in 0..2 {
+                let (start, len) = md.row_group(g).column(0).byte_range();
+                for b in &mut bytes[start as usize..(start + len) as usize] {
+                    *b = 0x5a;
+                }
+            }
+            std::fs::write(&parquet, &bytes).expect("write");
+        }
+
+        // Unfiltered, the damage is real: the walk reaches those pages and says so.
+        assert!(
+            scan_parquet_forward(&parquet, &LogFilter::default(), 0, 10).is_err(),
+            "the corruption must be something a decode actually trips over"
+        );
+
+        // With a window that opens at the third group, neither damaged group is opened.
+        let late =
+            LogFilter::parse(None, None, None, Some("2026-08-23T04:33:04Z"), None).expect("filter");
+        let page = scan_parquet_forward(&parquet, &late, 0, 10).expect(
+            "the pruned groups are \
+            skipped on their footer statistics, not decoded",
+        );
+        assert_eq!(page.lines.len(), 10);
+        assert_eq!(page.lines[0], body[ROWS_PER_ROW_GROUP * 2]);
+        assert!(
+            page.next_after > (ROWS_PER_ROW_GROUP * 2) as u64,
+            "and the cursor stepped over both of them in one page: {}",
+            page.next_after
+        );
+    }
+
+    /// The forward cursor walks a filtered file exactly once, and both forms answer the same —
+    /// the same property [`the_cursor_pages_backward_without_gaps_or_repeats`] holds for the
+    /// backward one. It is the property the forward path's rewrite had to preserve.
+    #[test]
+    fn the_forward_cursor_walks_a_filtered_file_once_in_both_forms() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body: Vec<String> = (0..60)
+            .map(|i| {
+                let level = if i % 7 == 0 { "ERROR" } else { "INFO" };
+                format!(
+                    "2026-08-23T14:{:02}:{:02}.000Z [{level}] oxidant_execution - message=line {i}",
+                    i / 60,
+                    i % 60
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+        let text = write(dir.path(), "oxidant-2026-09-04.log", &refs);
+        let parquet_src = write(dir.path(), "oxidant-2026-09-05.log", &refs);
+        let parquet = super::super::columnar::convert(&parquet_src).expect("convert");
+        let errors: Vec<String> = body
+            .iter()
+            .filter(|l| l.contains("[ERROR]"))
+            .cloned()
+            .collect();
+
+        for (label, read) in [
+            (
+                "text",
+                &scan_text_forward
+                    as &dyn Fn(&Path, &LogFilter, u64, usize) -> Result<ForwardPage, String>,
+            ),
+            ("parquet", &scan_parquet_forward),
+        ] {
+            let path = if label == "text" { &text } else { &parquet };
+            let f = filter(Some("error"), None, None);
+            let mut seen: Vec<String> = Vec::new();
+            let mut after = 0u64;
+            for _ in 0..100 {
+                let page = read(path, &f, after, 3).expect(label);
+                assert!(
+                    page.lines.len() <= 3,
+                    "{label}: the page respects the limit"
+                );
+                seen.extend(page.lines);
+                if page.next_after <= after {
+                    break;
+                }
+                after = page.next_after;
+            }
+            assert_eq!(
+                seen, errors,
+                "{label}: every match once, in order, and nothing else"
+            );
+            assert_eq!(
+                after as usize, 60,
+                "{label}: the scan position is the end of the file, not the last match"
+            );
+        }
     }
 
     /// A group whose `ts` admits a null is never pruned, or the two forms would disagree about

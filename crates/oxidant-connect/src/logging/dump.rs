@@ -139,6 +139,7 @@ impl DumpStore {
 
     /// Where bundles land. Must be `cfg.dumps_dir` for the config the *sweeper* holds, or a
     /// bundle is written outside every tree the retention pass and the disk budget can see.
+    #[cfg(test)]
     pub(crate) fn dir(&self) -> &std::path::Path {
         &self.dir
     }

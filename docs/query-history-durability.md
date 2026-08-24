@@ -1278,6 +1278,21 @@ document or `docs/api.md` previously promised.
   asks `StatementStore::history_config()` for the config the store actually booted with, so
   `DumpStore.dir` is by construction the `cfg.dumps_dir` `sweep_disk` prunes.
 
+- **F2 — the window prunes what a dump *reads*, not only what it keeps.** The walk listed every
+  file in `logs/` regardless of the window and scanned each end to end with a forward scan that
+  did no row-group pruning and no projection — so the documented default (the last hour) fully
+  decoded up to `OXIDANT_LOG_KEEP_DAYS` of logs on every node. Three changes: the listing is
+  filtered by `[first_ts, last_ts]` against the window before a file is opened;
+  `scan_parquet_forward` gained the footer pruner, the `(ts, level, target)` projection and the
+  `RowSelection` its backward sibling already had, so both directions cost the same over one
+  file; and a page that comes back with **no lines ends that file's walk**, which is what stops
+  the walk of a *live* file from chasing its own growing tail on the busiest node in the
+  cluster. The file-level rule is deliberately coarser than the row filter: a rolled file whose
+  every parseable timestamp is outside the window is not opened, so the unjudgeable lines it
+  holds — which rule 1 would otherwise serve — are skipped with it. They are the continuations
+  of lines that are themselves outside the window; a `?file=` read of the same file still
+  serves them, because there the caller named the file.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |

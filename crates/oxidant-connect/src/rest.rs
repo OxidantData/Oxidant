@@ -3412,6 +3412,12 @@ async fn assemble_dump(
         Ok(w) => w,
         Err(e) => return dumps.set(&id, crate::logging::DumpState::Failed(e)),
     };
+    let instant = |raw: &Option<String>| -> Option<i64> {
+        raw.as_deref()
+            .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+            .map(|t| t.timestamp_millis())
+    };
+    let (from_ms, to_ms) = (instant(&query.from), instant(&query.to));
     for (node, endpoint) in &nodes {
         let files = {
             let mut listing = query.clone();
@@ -3424,10 +3430,16 @@ async fn assemble_dump(
                 }
             }
         };
+        // **The window prunes what is read, not only what is kept.** `FileInfo` already carries
+        // `first_ts`/`last_ts`, so a file the window puts wholly outside is never opened — the
+        // documented default is the last hour, and without this a one-hour bundle walked up to
+        // `OXIDANT_LOG_KEEP_DAYS` of every node's history, `DUMP_PAGE` rows at a time, to keep
+        // an hour of it.
         let names: Vec<String> = files["files"]
             .as_array()
             .map(|a| {
                 a.iter()
+                    .filter(|f| file_in_window(f, from_ms, to_ms))
                     .filter_map(|f| f["file"].as_str().map(str::to_string))
                     .collect()
             })
@@ -3461,6 +3473,15 @@ async fn assemble_dump(
                         // published.
                         return dumps.set(&id, crate::logging::DumpState::Failed(e));
                     }
+                }
+                // **An empty page ends the file.** A forward page stops only at `DUMP_PAGE`
+                // matches or at the end of the file, so no lines means the scan reached the end
+                // with nothing left to match. Without this the walk of a *live* file chases its
+                // own tail: `next_after` is the growing EOF, so `next <= after` never holds on
+                // a node logging faster than the dump reads — the busiest node in the cluster
+                // being the one whose dump never completes.
+                if value["logs"].as_array().map_or(true, |a| a.is_empty()) {
+                    break;
                 }
                 let next = value["next_after"].as_u64().unwrap_or(after);
                 if next <= after {
@@ -3502,6 +3523,46 @@ async fn assemble_dump(
             dumps.set(&id, crate::logging::DumpState::Failed(e))
         }
     }
+}
+
+/// Could this listing entry hold a line inside `[from, to)`? Decided from the bounds the
+/// listing already carries, so a file outside the window is never opened.
+///
+/// **This is coarser than the row filter, deliberately, and it is the one place the dump is.**
+/// `first_ts`/`last_ts` are the first and last *parseable* timestamps, so a rolled file every
+/// one of whose timestamps sits outside the window is skipped — including any unjudgeable line
+/// it holds, which the row filter would have served under rule 1. Those lines are the
+/// continuations of lines that are themselves outside the window, so skipping them keeps the
+/// bundle's window honest; a `?file=` read of the same file still serves them, because there
+/// the caller named the file.
+///
+/// Two asymmetries, each because of what a file can still become:
+/// - a file the writer holds open (`rolled: false`) only ever grows **newer**, so its recorded
+///   `last_ts` cannot rule it out of a window that is still open;
+/// - a file with no parseable bound at either end is unjudgeable and is read.
+fn file_in_window(file: &Value, from_ms: Option<i64>, to_ms: Option<i64>) -> bool {
+    let ts = |key: &str| {
+        file[key]
+            .as_str()
+            .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+            .map(|t| t.timestamp_millis())
+    };
+    // `rolled` absent is read as "rolled": a node too old to say is not a reason to re-read its
+    // whole history.
+    if file["rolled"].as_bool().unwrap_or(true) {
+        if let (Some(last), Some(from)) = (ts("last_ts"), from_ms) {
+            if last < from {
+                return false;
+            }
+        }
+    }
+    // `to` is exclusive, so a file whose oldest line is at or after it holds nothing.
+    if let (Some(first), Some(to)) = (ts("first_ts"), to_ms) {
+        if first >= to {
+            return false;
+        }
+    }
+    true
 }
 
 /// Lines per page while assembling. Larger than a browser page — nobody is waiting on one
@@ -4626,6 +4687,182 @@ mod tests {
             .collect();
         assert_eq!(names, vec![format!("{id}.parquet")]);
         assert!(crate::history::disk::is_dump(&names[0]), "{names:?}");
+    }
+
+    /// **A time-windowed dump must prune what it *reads*, not only what it keeps.**
+    ///
+    /// The walk used to list every file in `logs/` and scan each one end to end: the documented
+    /// default is the last hour, and `OXIDANT_LOG_KEEP_DAYS` is 30, so an empty-bodied
+    /// `POST /api/v1/logs/dump` fully decoded a month of every node's history — 5,000 rows a
+    /// round-trip, over Flight — to assemble an hour of it. No dump test had more history than
+    /// window, which is why it was invisible.
+    ///
+    /// Observable because of rule 1: a line with no parseable timestamp is *unjudgeable*, so the
+    /// row filter serves it whatever the window. A file that is never opened cannot contribute
+    /// one — which is exactly the coarser, file-level rule [`file_in_window`] documents.
+    #[tokio::test]
+    async fn a_windowed_dump_does_not_read_the_files_outside_its_window() {
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        // A month of retained history. Every day carries a continuation line with no timestamp
+        // of its own — the marker that says whether the file was opened.
+        for day in 1..=30 {
+            let name = format!("oxidant-2026-07-{day:02}.log");
+            std::fs::write(
+                logs.join(&name),
+                format!(
+                    "2026-07-{day:02}T09:00:00.000Z [INFO] oxidant_execution - message=day {day}\n\
+                        at oxidant_execution::plan (continuation of day {day})\n"
+                ),
+            )
+            .expect("write");
+        }
+        // The one day the window is about.
+        std::fs::write(
+            logs.join("oxidant-2026-08-23.log"),
+            "2026-08-23T13:30:00.000Z [ERROR] oxidant_execution - message=the incident\n   \
+             at oxidant_execution::plan (continuation of the incident)\n",
+        )
+        .expect("write");
+        let (_env, app) = dump_state(&logs, &dumps, Vec::new(), u64::MAX, 1 << 30);
+
+        let (status, body) = post_dump(
+            &app,
+            json!({
+                "worker": "driver",
+                "from": "2026-08-23T13:00:00Z",
+                "to": "2026-08-23T14:00:00Z",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["dumpId"].as_str().expect("a dump id").to_string();
+        let (status, _, bytes) = await_dump(&app, &id).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let downloaded = root.path().join("bundle.parquet");
+        std::fs::write(&downloaded, &bytes).expect("write");
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&downloaded).unwrap())
+                .expect("builder")
+                .build()
+                .expect("reader");
+        let mut messages: Vec<String> = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("batch");
+            let message = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<oxidant_loom::arrow::array::StringArray>()
+                .expect("message");
+            for i in 0..batch.num_rows() {
+                if message.is_valid(i) {
+                    messages.push(message.value(i).to_string());
+                }
+            }
+        }
+        assert!(
+            messages.iter().any(|m| m.contains("the incident")),
+            "the window's own rows are in the bundle: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("continuation of the incident")),
+            "including the unjudgeable continuation of a line inside the window: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("continuation of day")),
+            "but no line from a file the window puts wholly outside — those files are never \
+             opened: {messages:?}"
+        );
+    }
+
+    /// The listing carries `first_ts`/`last_ts`, and that is all the dump needs to decide
+    /// whether to open a file. The two asymmetries are the ones that matter: a live file only
+    /// grows *newer*, and a file with no parseable bound is unjudgeable and is read.
+    #[test]
+    fn a_file_is_read_only_when_the_window_could_reach_it() {
+        let from = chrono::DateTime::parse_from_rfc3339("2026-08-23T13:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let to = chrono::DateTime::parse_from_rfc3339("2026-08-23T14:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let rolled = |first: Value, last: Value| json!({"file": "x", "rolled": true, "first_ts": first, "last_ts": last});
+        let cases: Vec<(&str, Value, bool)> = vec![
+            (
+                "wholly before the window",
+                rolled(
+                    json!("2026-08-22T00:00:00.000Z"),
+                    json!("2026-08-22T23:59:59.000Z"),
+                ),
+                false,
+            ),
+            (
+                "wholly after the window — `to` is exclusive",
+                rolled(
+                    json!("2026-08-23T14:00:00.000Z"),
+                    json!("2026-08-23T15:00:00.000Z"),
+                ),
+                false,
+            ),
+            (
+                "overlapping at the low end",
+                rolled(
+                    json!("2026-08-23T12:00:00.000Z"),
+                    json!("2026-08-23T13:30:00.000Z"),
+                ),
+                true,
+            ),
+            (
+                "spanning the window",
+                rolled(
+                    json!("2026-08-01T00:00:00.000Z"),
+                    json!("2026-08-31T00:00:00.000Z"),
+                ),
+                true,
+            ),
+            (
+                "no parseable bound at either end is unjudgeable, and is read",
+                rolled(Value::Null, Value::Null),
+                true,
+            ),
+            (
+                "the live file only ever grows newer, so an old `last_ts` cannot rule it out",
+                json!({"file": "current", "rolled": false,
+                       "first_ts": "2026-08-20T00:00:00.000Z",
+                       "last_ts": "2026-08-22T00:00:00.000Z"}),
+                true,
+            ),
+            (
+                "but a live file that starts after the window still holds nothing",
+                json!({"file": "current", "rolled": false,
+                       "first_ts": "2026-08-24T00:00:00.000Z",
+                       "last_ts": "2026-08-24T01:00:00.000Z"}),
+                false,
+            ),
+        ];
+        for (label, file, expected) in cases {
+            assert_eq!(
+                file_in_window(&file, Some(from), Some(to)),
+                expected,
+                "{label}: {file}"
+            );
+        }
+        // An unbounded side never prunes.
+        assert!(file_in_window(
+            &rolled(
+                json!("2020-01-01T00:00:00.000Z"),
+                json!("2020-01-01T01:00:00.000Z")
+            ),
+            None,
+            Some(to)
+        ));
     }
 
     /// **A node that could not be reached is named in the bundle, and the dump completes.** A

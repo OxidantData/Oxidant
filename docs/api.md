@@ -707,6 +707,14 @@ curl -s -o bundle.parquet -w '%{http_code}' \
   instants absent means the last hour**, and the `202` echoes the window it used. With no
   default, an empty body would mean "every node, thirty days", which the cap would then refuse
   after minutes of Flight round-trips — a refusal that is correct and useless.
+- **The window decides which files are opened**, not just which rows are kept: a node's file
+  whose `first_ts`/`last_ts` (from [the listing](#the-file-listing-apiv1logsfiles)) put it
+  wholly outside the window is never read, and on a `.parquet` file the row groups the window
+  excludes are skipped on their footer statistics. So a one-hour bundle costs an hour, not the
+  whole retention. This file-level rule is *coarser* than the row filter, deliberately: a rolled
+  file whose every parseable timestamp is outside the window is skipped along with any
+  unjudgeable line it holds, which are the continuations of lines that are themselves outside
+  the window. A `?file=` read of that same file still serves them.
 - **It answers `202` and assembles on a task.** Six nodes and a day is minutes of round-trips,
   and a client that gave up halfway would leave a half-written file with nobody to finish it.
   Collection has four answers, each a distinct fact: `202` still assembling, `200` here it is,
