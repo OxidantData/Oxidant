@@ -34,10 +34,14 @@ impl Drop for ServerGuard {
 
 /// Spawn `oxidant spark server` (no workers) and wait until the statements API answers.
 /// Returns the base URL of the REST API on the UI port.
-async fn start_server(oxidant: &std::path::Path) -> (ServerGuard, String) {
+async fn start_server(oxidant: &std::path::Path) -> (ServerGuard, tempfile::TempDir, String) {
     let port = pick_port();
     let ui_port = pick_port();
+    // The history journal locks its data dir; a shared default makes a second
+    // test server exit 1 at startup (see `common::data_dir`).
+    let data_dir = common::data_dir();
     let server = Command::new(oxidant)
+        .env("OXIDANT_DATA_DIR", data_dir.path())
         .args([
             "spark",
             "server",
@@ -76,7 +80,7 @@ async fn start_server(oxidant: &std::path::Path) -> (ServerGuard, String) {
         }
     }
     assert!(up, "statements API never came up at {base_url}");
-    (server, base_url)
+    (server, data_dir, base_url)
 }
 
 #[tokio::test]
@@ -87,7 +91,7 @@ async fn cli_sql_runs_statement_and_prints_results() {
         "oxidant binary not found at {}; run `cargo build -p oxidant-cli` first",
         oxidant.display()
     );
-    let (_server, base_url) = start_server(&oxidant).await;
+    let (_server, _data_dir, base_url) = start_server(&oxidant).await;
 
     // Default table format: header + value + row-count line.
     let out = Command::new(&oxidant)
@@ -191,7 +195,7 @@ async fn cli_mcp_serves_initialize_and_run_sql_over_stdio() {
         "oxidant binary not found at {}; run `cargo build -p oxidant-cli` first",
         oxidant.display()
     );
-    let (_server, base_url) = start_server(&oxidant).await;
+    let (_server, _data_dir, base_url) = start_server(&oxidant).await;
 
     let mut child = tokio::process::Command::new(&oxidant)
         .args(["mcp", "--url", &base_url])
