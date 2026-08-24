@@ -290,8 +290,8 @@ impl Tier {
 pub(crate) struct StatementSnapshot {
     id: String,
     sql: String,
-    status: StatementStatus,
-    error: Option<String>,
+    pub(crate) status: StatementStatus,
+    pub(crate) error: Option<String>,
     schema: Option<Vec<(String, String)>>,
     row_count: Option<usize>,
     submitted_at_ms: i64,
@@ -466,7 +466,7 @@ impl StatementStore {
 
     /// Boot the durable store: lock the data dir, replay the journal into the history tier, and
     /// keep writing to it. `Err` fails the process's boot, loudly, with the reason.
-    fn with_history(cfg: HistoryConfig) -> Result<Self, String> {
+    pub(crate) fn with_history(cfg: HistoryConfig) -> Result<Self, String> {
         let (runtime, fold) = HistoryRuntime::boot(cfg)?;
         let limits = Limits {
             history_on: true,
