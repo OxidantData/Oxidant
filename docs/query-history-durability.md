@@ -1326,6 +1326,14 @@ document or `docs/api.md` previously promised.
   and returns nothing. The follow's state and its arithmetic moved out of the `unfold` closure
   into a `Follow` value, so both are reachable from a test.
 
+- **F6 — a failed poll leaves the follow's cursor where it is.** The error arm set
+  `st.after = st.after.or(Some(0))` under a comment promising the opposite of what it did:
+  `Some(0)` *is* the replay, and the arm is only reached when the cursor is unset — the **first**
+  poll, which is the one issued the instant a worker goes down or against one already down. A
+  recovered worker then walked its whole live file from the top, 500 rows per 2 s tick, while
+  the pane read "following". The cursor now does not move; the next successful poll re-seeds at
+  the end of the file, which is what F5's seed already does.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |

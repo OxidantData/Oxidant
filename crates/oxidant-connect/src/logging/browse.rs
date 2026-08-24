@@ -383,8 +383,7 @@ pub(crate) fn scan_parquet_forward(
     let limit = limit.max(1);
     let mut index = after;
     let mut bytes = 0usize;
-    for g in 0..md.num_row_groups() {
-        let start = starts[g];
+    for (g, &start) in starts.iter().enumerate() {
         let group_rows = md.row_group(g).num_rows().max(0) as u64;
         let end = start.saturating_add(group_rows);
         if end <= index {

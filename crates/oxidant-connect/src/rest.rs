@@ -3010,8 +3010,7 @@ fn worker_tail(
                         let event = sse::Event::default()
                             .event("error")
                             .data(json!({ "error": e.message, "status": e.status }).to_string());
-                        // Seed the cursor so a recovered worker resumes rather than replaying.
-                        st.after = st.after.or(Some(0));
+                        st.absorb_failure();
                         return Some((Ok(event), st));
                     }
                 };
@@ -3084,6 +3083,18 @@ impl Follow {
         query.after = Some(self.after.unwrap_or(u64::MAX));
         query
     }
+
+    /// Fold a *failed* poll into the cursor: it does not move, including when it is unset.
+    ///
+    /// This used to be `self.after = self.after.or(Some(0))`, under a comment saying a recovered
+    /// worker would resume rather than replay. `Some(0)` **is** the replay, and the arm is only
+    /// reached when the cursor is unset — i.e. when the *first* poll failed, which is the common
+    /// case: it is the poll issued the instant a worker goes down, or the first poll against one
+    /// already down. The worker would come back and the stream would walk its entire live file
+    /// from the top, `TAIL_PAGE` rows every 2 s — hours of ancient history under a caption
+    /// reading "following". Left unset, the next successful poll re-seeds at the end of the
+    /// file, which is all [`Follow::query`] ever needed.
+    fn absorb_failure(&mut self) {}
 
     /// Fold one node's answer into the cursor.
     fn absorb(&mut self, value: &Value) -> TailStep {
@@ -4474,6 +4485,73 @@ mod tests {
         let (status, body) = get_logs(&app, "/api/v1/logs?file=current&worker=driver").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["worker"], "driver");
+    }
+
+    /// **A failed poll leaves the cursor alone.** The arm that handles it used to say
+    /// `st.after = st.after.or(Some(0))` under the comment "seed the cursor so a recovered
+    /// worker resumes rather than replaying" — but it is only reached when the cursor is
+    /// *unset*, which is exactly the first poll, which is exactly the poll issued the moment a
+    /// worker goes down or against one already down. `Some(0)` is the replay: the recovered
+    /// worker's whole live file, 500 rows per 2 s tick, under a caption reading "following".
+    #[test]
+    fn a_worker_that_comes_back_resumes_at_the_end_of_its_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body: String = (0..5_000)
+            .map(|i| {
+                format!(
+                    "2026-08-23T14:00:00.000Z [INFO] oxidant_execution - message=old line {i}\n"
+                )
+            })
+            .collect();
+        std::fs::write(dir.path().join(crate::history::disk::LIVE_LOG), &body).expect("write");
+        let view = LogView {
+            dir: Some(dir.path().to_path_buf()),
+            dedup: true,
+        };
+        let ring = LogBuffer::new(MAX_LOG_LINES);
+
+        // The pane is opened against a worker that is already down, so the *first* poll fails.
+        let mut follow = Follow {
+            endpoint: "unused".to_string(),
+            params: LogsParams::default(),
+            after: None,
+            started: false,
+        };
+        follow.started = true;
+        follow.absorb_failure();
+        assert_eq!(
+            follow.after, None,
+            "a failed poll must not invent a cursor — least of all row 0"
+        );
+
+        // The worker comes back. The next poll is the seed, and it replays nothing.
+        let query = follow.query();
+        assert_eq!(query.after, Some(u64::MAX), "the retry re-seeds at the end");
+        let step = follow.absorb(&crate::logging::answer(&query, &view, &ring).expect("answer"));
+        assert_eq!(
+            step,
+            TailStep::Idle,
+            "no line of the 5,000 already on disk is replayed"
+        );
+        assert_eq!(
+            follow.after,
+            Some(5_000),
+            "and the follow resumes at the end of the file, not at row 0"
+        );
+
+        // What the old spelling did, for contrast: every one of those rows, a page at a time.
+        let mut replaying = Follow {
+            endpoint: "unused".to_string(),
+            params: LogsParams::default(),
+            after: Some(0),
+            started: true,
+        };
+        let step =
+            replaying.absorb(&crate::logging::answer(&replaying.query(), &view, &ring).unwrap());
+        assert!(
+            matches!(step, TailStep::Lines(lines) if lines.len() == TAIL_PAGE),
+            "a cursor of 0 walks the file from the top, which is what this test exists to stop"
+        );
     }
 
     /// **A followed worker never sees a line twice**, however selective the filter — the one

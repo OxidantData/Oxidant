@@ -671,7 +671,7 @@ data: {"dropped":37}
 | `lines` | a JSON array of rendered lines (worker) |
 | `dropped` | `{dropped: N}` — the fan-out fell behind this reader by N lines |
 | `rolled` | the followed worker rolled its live file; re-read the listing and the page |
-| `error` | `{error, status}` — a worker poll failed. **The stream stays open**: a worker restart is exactly when someone is watching |
+| `error` | `{error, status}` — a worker poll failed. **The stream stays open**: a worker restart is exactly when someone is watching, and the cursor does not move, so a worker that comes back resumes at the end of its file rather than replaying it |
 
 - **The driver's tail is `tracing` itself, not a file poll.** The rolling writer's queue, its
   dedup hold and its 5 s timer all sit between an event and the file, so a follow that re-read
