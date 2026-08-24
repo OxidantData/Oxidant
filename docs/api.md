@@ -621,6 +621,16 @@ curl -s 'http://localhost:4040/api/v1/logs?worker=10.0.0.7:50051&file=current&le
   `?worker=` that named an arbitrary host would turn the driver into a request forwarder for
   anything its network can reach. An unknown id is a `404` listing the ids that exist. `driver`
   (or no `?worker=` at all) is this node.
+- **"Configured" means the deployment, not the session.** The log routes —
+  `?worker=`, `/api/v1/logs/workers`, `/api/v1/logs/tail` and
+  `POST /api/v1/logs/dump {"worker":"all"}` — resolve against `OXIDANT_WORKERS` /
+  `OXIDANT_WORKER_SERVICE` (falling back to the boot `--workers` list), and deliberately **not**
+  against `spark.oxidant.workers`. That key is [per-session worker pinning](workers.md) for
+  *query routing*, it lives in one process-wide map, and the Spark Connect port that writes it
+  is unauthenticated — so honouring it here would let any client that can reach that port choose
+  an address the driver dials, and would silently drop the real nodes out of the picker and out
+  of a support bundle. Pin a session's workers all you like; the log browser still shows you the
+  cluster.
 - **A worker that does not answer is listed `reachable: false` with the reason, never silently
   skipped**, and a query against it is a `502` (or `504` past 30 s) naming the node — never an
   empty page. "No errors on worker 2" and "worker 2 is dead" must not read alike, because the

@@ -1303,6 +1303,17 @@ document or `docs/api.md` previously promised.
   are not rendered at all. §6b's rule 3 is restated to say "never by a row group" as well as
   "never by the file".
 
+- **F4 — `?worker=` resolves against the deployment, not the session config.** The gate itself
+  was right (it matches an id and dials the configured address, never the caller's string), but
+  the list it matched against was `workers_from_config()`, which lets `spark.oxidant.workers`
+  win. That key lives in one process-global map the Spark Connect `Config`/`Set` RPC writes into
+  unconditionally, on an unauthenticated port — so the gate was decorative: one `spark.conf.set`
+  and the driver would dial an address the caller chose, and the real workers would drop out of
+  the picker and out of `dump {"worker":"all"}`. The four log routes now use
+  `OxidantService::configured_workers()` — `OXIDANT_WORKERS`, then `OXIDANT_WORKER_SERVICE` DNS,
+  then the boot snapshot. Per-session pinning is untouched for query routing, which is what it
+  is for. `docs/api.md`'s "it is never an address you supply" now says what "configured" means.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |

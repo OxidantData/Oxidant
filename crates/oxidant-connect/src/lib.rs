@@ -361,6 +361,32 @@ impl OxidantService {
         })
     }
 
+    /// The workers a **log route** may dial: this driver's own deployment configuration, and
+    /// never the session config map.
+    ///
+    /// [`Self::workers_from_config`] lets `spark.oxidant.workers` win, which is how per-session
+    /// worker pinning works (`docs/workers.md`) — and that map is one *process-global*
+    /// `HashMap` any client reaching the unauthenticated Connect port can rewrite with
+    /// `spark.conf.set`. For query routing that is a feature. For `?worker=` it is a dial
+    /// primitive: a `Set` of `spark.oxidant.workers` would make the driver open a connection
+    /// from inside the VPC to an address the caller chose, the moment a token holder opened the
+    /// Observability page — and would quietly drop the *real* workers out of the picker and out
+    /// of `POST /api/v1/logs/dump {"worker":"all"}`, which is the "bundle that silently omits
+    /// the node the case is about" the dump's manifest exists to prevent.
+    ///
+    /// A log browser has no reason to follow a per-session pin, so it does not: `OXIDANT_WORKERS`,
+    /// then `OXIDANT_WORKER_SERVICE` DNS, then the boot snapshot. Re-resolved per call for the
+    /// same reason [`Self::workers_from_config`] is — workers can register in DNS after the
+    /// driver started.
+    pub(crate) fn configured_workers(&self) -> Vec<String> {
+        let live = distributed::parse_worker_list(None);
+        if !live.is_empty() {
+            live
+        } else {
+            self.workers.clone()
+        }
+    }
+
     /// Render the observability plan text OFF the query critical path: `Engine::explain`
     /// runs a full optimize + physical-plan pass whose output only the UI/tracker consumes,
     /// so it executes as a detached task that fills the tracker when done. The emitted

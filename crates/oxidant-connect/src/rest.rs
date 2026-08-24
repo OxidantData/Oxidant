@@ -2833,7 +2833,9 @@ async fn list_log_workers(State(state): State<RestState>, headers: header::Heade
     {
         return denied;
     }
-    let workers = state.service.workers_from_config();
+    // The same list `?worker=` resolves against, so the picker cannot offer an id the read
+    // route would then refuse — nor a node a `spark.conf.set` put there.
+    let workers = state.service.configured_workers();
     let probes = workers.iter().map(|address| {
         let address = address.clone();
         async move {
@@ -3194,12 +3196,16 @@ fn worker_id(address: &str) -> String {
 /// arbitrary host would turn the driver into a request forwarder for anything its network can
 /// reach, on an endpoint whose token an operator hands to a monitoring page.
 fn resolve_worker(state: &RestState, requested: &str) -> Result<String, Response> {
-    let workers = state.service.workers_from_config();
+    // **This driver's own configuration, not the session config map.** See
+    // [`OxidantService::configured_workers`]: `spark.oxidant.workers` is writable by any client
+    // that can reach the unauthenticated Connect port, so matching against it would make the
+    // id-not-address discipline below decorative.
+    let workers = state.service.configured_workers();
     match workers.iter().find(|w| worker_id(w) == requested) {
         Some(address) => Ok(address.clone()),
         None if workers.is_empty() => Err(error_response(
             StatusCode::NOT_FOUND,
-            "this driver has no workers configured (set OXIDANT_WORKERS or spark.oxidant.workers)",
+            "this driver has no workers configured (set OXIDANT_WORKERS or OXIDANT_WORKER_SERVICE)",
         )),
         None => Err(error_response(
             StatusCode::NOT_FOUND,
@@ -3380,7 +3386,9 @@ fn dump_nodes(
     state: &RestState,
     requested: Option<&str>,
 ) -> Result<Vec<(String, Option<String>)>, Response> {
-    let workers = state.service.workers_from_config();
+    // `all` means this driver's configured cluster. A session-config override would make a
+    // bundle silently cover a node nobody deployed and silently omit the ones they did.
+    let workers = state.service.configured_workers();
     match requested.unwrap_or("all") {
         "driver" => Ok(vec![("driver".to_string(), None)]),
         "all" => {
@@ -4426,6 +4434,86 @@ mod tests {
         let (status, body) = get_logs(&app, "/api/v1/logs?file=current&worker=driver").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["worker"], "driver");
+    }
+
+    /// **And the list it matches against is not settable by a Connect client.**
+    ///
+    /// `workers_from_config` lets `spark.oxidant.workers` win — that is how per-session worker
+    /// pinning works — and it reads one *process-global* map that the Spark Connect `Config`/`Set`
+    /// RPC writes into unconditionally, on an unauthenticated port. So the id-not-address
+    /// discipline above was gated behind a value any client could choose: one
+    /// `spark.conf.set("spark.oxidant.workers", "attacker.internal:80")` and the driver would
+    /// open an HTTP/2 connection from inside its own network the next time a token holder loaded
+    /// the Observability page — and the *real* workers would vanish from the picker and from
+    /// `POST /api/v1/logs/dump {"worker":"all"}`, which is precisely the bundle-that-omits-the-node
+    /// failure the manifest exists to prevent.
+    #[tokio::test]
+    async fn a_connect_client_cannot_add_a_worker_the_log_routes_will_dial() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_browse_log(dir.path(), "oxidant.log");
+        let guard = crate::distributed::env_lock();
+        std::env::remove_var("OXIDANT_WORKERS");
+        std::env::remove_var("OXIDANT_WORKER_SERVICE");
+        let mut service = OxidantService::new();
+        service.workers = vec!["http://10.0.0.7:50051".to_string()];
+        // What any client reaching the Connect port can do, verbatim.
+        service.config.lock().expect("config").insert(
+            "spark.oxidant.workers".to_string(),
+            "attacker.internal:80".to_string(),
+        );
+        let service = Arc::new(service);
+        let app = app(RestState {
+            service: service.clone(),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView {
+                dir: Some(dir.path().to_path_buf()),
+                dedup: true,
+            },
+            status_token: Some(LOGS_TOKEN.into()),
+            dumps: None,
+        });
+        assert_eq!(
+            service.workers_from_config(),
+            vec!["http://attacker.internal:80".to_string()],
+            "query routing still honours the session pin — that half is deliberate"
+        );
+
+        // The picker lists the deployment, not the pin.
+        let (status, body) = get_logs(&app, "/api/v1/logs/workers").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<String> = body["workers"]
+            .as_array()
+            .expect("workers")
+            .iter()
+            .map(|w| w["worker_id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["driver".to_string(), "10.0.0.7:50051".to_string()],
+            "the real worker is still there and the injected one is not: {body}"
+        );
+
+        // And the injected id is not dialable.
+        let (status, body) = get_logs(
+            &app,
+            "/api/v1/logs?file=current&worker=attacker.internal:80",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("unknown worker"),
+            "{body}"
+        );
+        // The real worker is still resolvable, so this is a filter and not a blanket refusal.
+        let (status, body) =
+            get_logs(&app, "/api/v1/logs?file=current&worker=10.0.0.7:50051").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "the configured worker is dialed and unreachable, which is a different answer: {body}"
+        );
+        drop(guard);
     }
 
     /// **An unreachable worker is reported, never skipped** (§6b, §9). Silence would read as
