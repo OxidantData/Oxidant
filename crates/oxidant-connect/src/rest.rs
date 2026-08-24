@@ -3403,33 +3403,47 @@ async fn create_dump(
     // The window, resolved *before* anything is minted, so a bad instant is a `400` on the
     // request rather than a failed dump an operator collects later.
     let now = chrono::Utc::now();
+    // Both instants are judged before either is defaulted, so a malformed value is reported as
+    // malformed rather than as whatever the pairing rule below would have said about it.
+    for (name, raw) in [("from", &request.from), ("to", &request.to)] {
+        if let Some(raw) = raw {
+            if chrono::DateTime::parse_from_rfc3339(raw).is_err() {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid {name} `{raw}`: expected an RFC-3339 instant"),
+                );
+            }
+        }
+    }
+    let stamp =
+        |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let (from, to) = match (&request.from, &request.to) {
         (None, None) => (
-            (now - chrono::Duration::from_std(DEFAULT_DUMP_WINDOW).unwrap_or_default())
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            stamp(now - chrono::Duration::from_std(DEFAULT_DUMP_WINDOW).unwrap_or_default()),
+            stamp(now),
         ),
-        (from, to) => {
-            for (name, raw) in [("from", from), ("to", to)] {
-                if let Some(raw) = raw {
-                    if chrono::DateTime::parse_from_rfc3339(raw).is_err() {
-                        return error_response(
-                            StatusCode::BAD_REQUEST,
-                            &format!("invalid {name} `{raw}`: expected an RFC-3339 instant"),
-                        );
-                    }
-                }
-            }
-            (
-                from.clone().unwrap_or_else(|| {
-                    chrono::DateTime::from_timestamp_millis(0)
-                        .unwrap_or(now)
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                }),
-                to.clone()
-                    .unwrap_or_else(|| now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
-            )
+        // **A one-sided upper bound is a refusal, not a default.** `to` alone fell through to
+        // `from = 1970-01-01`, so `{"to": "…"}` walked the *entire* retention on every node —
+        // precisely the "every node, thirty days" request `DEFAULT_DUMP_WINDOW` exists to keep
+        // an empty body from meaning, arrived at by supplying one field instead of none. It is
+        // also the expensive direction: a dump reads what its window names (F2), so the cost of
+        // the mistake is the whole retention decoded on every node before the 1 GiB cap refuses
+        // it — "a refusal that is correct and useless", which is the reasoning the default was
+        // given in the first place.
+        //
+        // `from` alone is a different shape and stays: its open end is `now`, so the window is
+        // bounded by the instant the caller did supply.
+        (None, Some(to)) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "`to` was given as `{to}` with no `from`, which would bundle everything \
+                     recorded before it — up to OXIDANT_LOG_KEEP_DAYS on every node. Supply \
+                     `from` as well, or omit both for the last hour"
+                ),
+            );
         }
+        (Some(from), to) => (from.clone(), to.clone().unwrap_or_else(|| stamp(now))),
     };
     // The nodes, resolved here so `?worker=` gets the same SSRF gate the browser's does.
     let nodes = match dump_nodes(&state, request.worker.as_deref()) {
@@ -4972,6 +4986,72 @@ mod tests {
             1,
             "the driver is always in the picker: {body}"
         );
+    }
+
+    /// **A one-sided upper bound is a refusal, not "since the epoch".**
+    ///
+    /// `to` alone fell through to `from = 1970-01-01`, so `{"to": "…"}` bundled the *entire*
+    /// retention on every node — which is exactly the request the last-hour default exists to
+    /// keep an empty body from making, reached by supplying one field instead of none. It is
+    /// also the expensive direction: a dump reads what its window names (F2), so the mistake
+    /// costs the whole retention decoded on every node before the 1 GiB cap refuses it — the
+    /// "correct and useless" refusal the default was introduced to avoid.
+    ///
+    /// `from` alone is a different shape and still works: its open end is `now`.
+    #[tokio::test]
+    async fn a_dump_window_with_only_an_upper_bound_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        let dumps = dir.path().join("dumps");
+        std::fs::create_dir_all(&logs).expect("logs");
+        std::fs::write(
+            logs.join(crate::history::disk::LIVE_LOG),
+            "2026-08-23T14:00:00.000Z [INFO] oxidant_execution - message=a line\n",
+        )
+        .expect("write");
+        let (_guard, app) = dump_state(&logs, &dumps, Vec::new(), 1 << 30, 1 << 20);
+
+        let (status, body) = post_dump(&app, json!({ "to": "2026-08-23T15:00:00Z" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let refusal = body["error"].as_str().unwrap_or_default();
+        assert!(
+            refusal.contains("`from`") && refusal.contains("last hour"),
+            "the refusal must name what to supply and what omitting both means: {refusal}"
+        );
+        assert!(
+            refusal.contains("OXIDANT_LOG_KEEP_DAYS"),
+            "and what it would otherwise have cost: {refusal}"
+        );
+
+        // A malformed `to` is still reported as malformed rather than as the pairing rule: the
+        // caller has two things wrong and the parse error is the one they can act on first.
+        let (status, body) = post_dump(&app, json!({ "to": "yesterday" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("RFC-3339"),
+            "{body}"
+        );
+
+        // `from` alone keeps working, and the `202` echoes the window it resolved to.
+        let (status, body) = post_dump(&app, json!({ "from": "2026-08-23T13:00:00Z" })).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["from"], "2026-08-23T13:00:00Z");
+        assert!(
+            body["to"].as_str().unwrap_or_default() > "2026-08-23T13:00:00Z",
+            "its open end is `now`, which is bounded by the instant supplied: {body}"
+        );
+
+        // And so does neither, which is the documented last hour.
+        let (status, body) = post_dump(&app, json!({})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let from = body["from"].as_str().expect("from").to_string();
+        let to = body["to"].as_str().expect("to").to_string();
+        let span = chrono::DateTime::parse_from_rfc3339(&to).expect("to")
+            - chrono::DateTime::parse_from_rfc3339(&from).expect("from");
+        assert_eq!(span.num_seconds(), DEFAULT_DUMP_WINDOW.as_secs() as i64);
     }
 
     /// A router with a real `dumps/` directory behind it — §6b's one sanctioned copy.
