@@ -14,11 +14,17 @@
 //! every deployment template, a second CORS decision, and a second place to get the status-token
 //! gate right. The Flight port already exists, is already the driver→worker interconnect, is
 //! already connection-pooled ([`connect_flight`]'s channel cache), and already carries actions
-//! with exactly this shape (`heartbeat`, `bucket_row_counts`). The trade is stated plainly in
-//! `docs/api.md`: the Flight interconnect is a **trusted network boundary** — it already accepts
-//! arbitrary stage SQL from anyone who can reach it, so serving that same peer a log page is not
-//! a new privilege — and it is the operator's job to keep it off the public internet, exactly as
-//! it was before this action existed.
+//! with exactly this shape (`heartbeat`, `bucket_row_counts`).
+//!
+//! **And it carries the same gate.** The action requires `OXIDANT_STATUS_TOKEN` as
+//! `authorization: Bearer <token>`, checked by the same `bearer_is_authorized` the driver's
+//! `GET /api/v1/logs` uses — see [`install_flight_handler`]. The Flight port is a **trusted
+//! network boundary** in the sense that `Ticket::Sql` accepts arbitrary stage SQL from anyone
+//! who can reach it; that is a reason to firewall it, not a licence to serve logs to the same
+//! peer. SQL reads the data this worker can reach; a log page reads every enabled `tracing`
+//! field value, which is where credentials live. Keeping the port off the public internet is
+//! still the operator's job, exactly as it was before this action existed — the gate only keeps
+//! this action from making that job harder.
 //!
 //! **No log bytes are copied.** The action returns one bounded page of rendered lines, the same
 //! page the worker's own `?file=` would have returned; the driver forwards it to its caller and
@@ -279,21 +285,43 @@ fn files(view: &LogView) -> Result<Value, LogError> {
 ///
 /// Called from [`super::init`], so **every** node that logs can be browsed — the driver too,
 /// which costs nothing and keeps `oxidant driver`'s in-process worker from being the one node
-/// whose logs the federation cannot reach.
+/// whose logs the federation cannot reach. That reach is exactly why the action is gated: on a
+/// deployment that co-locates a Flight worker in the driver process, an ungated action made the
+/// *driver's* own log readable with no `OXIDANT_STATUS_TOKEN` — the one gate the HTTP side is
+/// careful about, walked around by a port that was never meant to serve this.
+///
+/// **The token is resolved once, here, from the same env the HTTP routes read.** `rest.rs`
+/// builds its `RestState` the same way at startup, so a node cannot end up with one idea of the
+/// secret on its axum surface and another on its Flight one.
 pub(crate) fn install_flight_handler() {
-    oxidant_execution::flight::set_log_query_handler(|body| {
+    let expected = oxidant_ui_server::status::status_token_from_env();
+    oxidant_execution::flight::set_log_query_handler(move |body, credential| {
+        use oxidant_execution::flight::LogQueryRefusal;
+        // Authorize, then parse — the same order `rest::gate_log_params` takes, and for the same
+        // reason: a `400 invalid log query` answered before the credential is checked tells an
+        // unauthenticated caller that this worker has a logs API at all.
+        let Some(expected) = expected.as_deref() else {
+            return Err(LogQueryRefusal::NotConfigured);
+        };
+        if !oxidant_ui_server::status::bearer_is_authorized(expected, credential) {
+            return Err(LogQueryRefusal::Unauthenticated);
+        }
         let query: LogQuery = serde_json::from_slice(body)
             .map_err(|e| {
                 serde_json::to_vec(&LogError::new(400, format!("invalid log query: {e}")).to_json())
                     .unwrap_or_else(|_| e.to_string().into_bytes())
             })
-            .map_err(|bytes| String::from_utf8_lossy(&bytes).into_owned())?;
+            .map_err(|bytes| {
+                LogQueryRefusal::Failed(String::from_utf8_lossy(&bytes).into_owned())
+            })?;
         match answer(&query, &LogView::process(), &super::buffer()) {
-            Ok(v) => serde_json::to_vec(&v).map_err(|e| e.to_string()),
+            Ok(v) => serde_json::to_vec(&v).map_err(|e| LogQueryRefusal::Failed(e.to_string())),
             // A refusal travels as a *body*, not as a gRPC error: the driver must be able to
             // hand its caller the worker's own `400 invalid file` rather than flattening every
             // worker-side objection into one `502`.
-            Err(e) => serde_json::to_vec(&e.to_json()).map_err(|e| e.to_string()),
+            Err(e) => {
+                serde_json::to_vec(&e.to_json()).map_err(|e| LogQueryRefusal::Failed(e.to_string()))
+            }
         }
     });
 }

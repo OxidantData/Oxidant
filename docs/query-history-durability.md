@@ -1221,10 +1221,16 @@ Guards and degradation:
    - **Federation is a Flight action, not a small HTTP surface on the worker** (§6b left the
      choice open). A worker speaks Flight and nothing else; an HTTP listener would mean a second
      port to open, a second bind in every deployment template, a second CORS decision and a
-     second place to get the token gate right. The trade is stated in `docs/api.md`: the Flight
-     interconnect is a trusted network boundary that already accepts arbitrary stage SQL, so
-     serving that same peer a log page is not a new privilege. One `answer()` serves both
-     transports, so `level=warn` cannot come to mean two things.
+     second place to get the token gate right. One `answer()` serves both transports, so
+     `level=warn` cannot come to mean two things. The action carries the **same
+     `OXIDANT_STATUS_TOKEN`** the driver's HTTP log routes require, in Flight request metadata
+     and through the same `bearer_is_authorized` — so every worker must be given the driver's
+     token. The first draft called an ungated action "not a new privilege" because the port
+     already accepts arbitrary stage SQL; the premise is true and the conclusion is not. SQL
+     reads the data *this* worker can reach, while a log page reads every enabled `tracing` field
+     value — DSNs, object-store keys in table URIs, connector bearer tokens — which are reusable
+     **off** this worker. The residual is stated in `docs/api.md` and `docs/runtime-contract.md`:
+     `Ticket::Sql` is still ungated, so the Flight port must still be firewalled.
    - **A worker's tail is a 2 s poll, and says so** — `mode: "poll"` on the stream's first
      event, against `mode: "follow"` for the driver's, which rides `tracing` itself. A
      long-lived Flight stream would pin a worker-side task to a browser tab. A reader is never

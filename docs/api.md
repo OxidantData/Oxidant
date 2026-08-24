@@ -652,11 +652,25 @@ curl -s 'http://localhost:4040/api/v1/logs?worker=10.0.0.7:50051&file=current&le
   flattened into a `502`, so you can tell which node objected and to what.
 - **The transport is a Flight action**, not a second HTTP surface on the worker. A worker speaks
   Flight and nothing else; an HTTP listener would mean a second port to open, a second bind to
-  configure, a second CORS decision and a second place to get the token gate right. The Flight
-  interconnect is a **trusted network boundary** — it already accepts arbitrary stage SQL from
-  anyone who can reach it, so serving that same peer a log page is not a new privilege — and
-  keeping it off the public internet is the operator's job exactly as it was before. Driver and
+  configure, a second CORS decision and a second place to get the token gate right. Driver and
   worker run *one* implementation of the query, so `level=warn` cannot come to mean two things.
+- **The worker's `logs` action requires the same `OXIDANT_STATUS_TOKEN`** the driver's HTTP log
+  routes require, presented as `authorization: Bearer <token>` in the Flight request metadata and
+  checked by the same code. **Every worker must therefore be given the driver's token**, or the
+  driver federates nothing and the picker's nodes answer "this worker serves no logs API".
+
+  It was tempting to leave this ungated. The rest of the interconnect is a **trusted network
+  boundary** — a Flight `Ticket::Sql` accepts arbitrary stage SQL from anyone who can reach the
+  port — so a log page looks like no new privilege. It is not the same privilege. Arbitrary SQL
+  reads *the data this worker can reach*; a log page reads up to `OXIDANT_LOG_KEEP_DAYS` of every
+  enabled `tracing` field value, which is the category that contains **credentials** — DSNs,
+  object-store keys inside table URIs, bearer tokens in connector config, session query text.
+  Those are reusable **off** this worker, against systems it is not part of. The gate is what
+  keeps opening a log browser from widening the blast radius of the same reachable port.
+- **The residual is real: the Flight port must still be firewalled.** Gating the log action does
+  not make the interconnect safe to expose — `Ticket::Sql` is ungated and closing that is not
+  this feature's job. Keep the worker Flight port off the public internet exactly as before; what
+  changed is only that the log browser did not make that job harder.
 
 ### Tail-follow: `/api/v1/logs/tail`
 

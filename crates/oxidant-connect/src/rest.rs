@@ -2924,7 +2924,7 @@ async fn tail_logs(
                 Ok(endpoint) => endpoint,
                 Err(response) => return response,
             };
-            Sse::new(worker_tail(endpoint, params)).into_response()
+            Sse::new(worker_tail(endpoint, params, state.status_token.clone())).into_response()
         }
     }
 }
@@ -3011,6 +3011,7 @@ const WORKER_TAIL_POLL: Duration = Duration::from_secs(2);
 fn worker_tail(
     endpoint: String,
     params: LogsParams,
+    token: Option<Arc<str>>,
 ) -> impl futures::Stream<Item = Result<sse::Event, std::convert::Infallible>> {
     let worker = params.worker.clone().unwrap_or_default();
     let open = sse::Event::default().event("open").data(
@@ -3025,6 +3026,7 @@ fn worker_tail(
     let start = Follow {
         endpoint,
         params,
+        token,
         after: None,
         started: false,
     };
@@ -3036,7 +3038,7 @@ fn worker_tail(
                     tokio::time::sleep(WORKER_TAIL_POLL).await;
                 }
                 st.started = true;
-                let value = match federate(&st.endpoint, &st.query()).await {
+                let value = match federate(&st.endpoint, &st.query(), st.token.as_deref()).await {
                     Ok(v) => v,
                     Err(e) => {
                         // The follow does not end because one poll failed — a worker restart is
@@ -3076,6 +3078,11 @@ fn worker_tail(
 struct Follow {
     endpoint: String,
     params: LogsParams,
+    /// The credential this follow presents to the worker on every poll — the same bearer the
+    /// caller presented to open the stream (F16). Held for the life of the follow because a
+    /// tail re-asks forever, and re-reading the env per poll would let a stream outlive the
+    /// configuration it was authorized under.
+    token: Option<Arc<str>>,
     /// The forward cursor: a **scan** position in the worker's live file. `None` until a poll
     /// has named the end of that file.
     after: Option<u64>,
@@ -3228,7 +3235,7 @@ async fn run_log_query(
                 Ok(endpoint) => endpoint,
                 Err(response) => return response,
             };
-            match federate(&endpoint, &query).await {
+            match federate(&endpoint, &query, state.status_token.as_deref()).await {
                 Ok(mut value) => {
                     // §6b: "labels the rows with their worker". The rows are the worker's; the
                     // envelope says whose, so a UI concatenating two nodes cannot lose track.
@@ -3318,12 +3325,17 @@ fn resolve_worker(state: &RestState, requested: &str) -> Result<String, Response
 async fn federate(
     endpoint: &str,
     query: &crate::logging::LogQuery,
+    token: Option<&str>,
 ) -> Result<Value, crate::logging::LogError> {
     let body = serde_json::to_vec(query).map_err(|e| crate::logging::LogError {
         status: 500,
         message: format!("could not encode the log query: {e}"),
     })?;
-    let call = oxidant_execution::flight::worker_logs(endpoint.to_string(), body);
+    // The worker's `logs` action wants the same bearer this route already required of *its*
+    // caller (F16). Every path here is behind `deny_unless_authorized`, so a `None` at this
+    // point is not "an unauthenticated read got through" — it is unreachable — but it is sent
+    // as no credential rather than as a blank one, and the worker answers accordingly.
+    let call = oxidant_execution::flight::worker_logs(endpoint.to_string(), body, token);
     match tokio::time::timeout(WORKER_QUERY_TIMEOUT, call).await {
         Ok(Ok(bytes)) => crate::logging::decode_worker_answer(&bytes),
         // **Honest, and named.** A worker that cannot be reached is reported as *that*, with the
@@ -3689,7 +3701,7 @@ async fn ask_node(
     query: &crate::logging::LogQuery,
 ) -> Result<Value, crate::logging::LogError> {
     match endpoint {
-        Some(endpoint) => federate(endpoint, query).await,
+        Some(endpoint) => federate(endpoint, query, state.status_token.as_deref()).await,
         None => {
             let view = state.logs.clone();
             let ring = state.log_buffer.clone();
@@ -4637,6 +4649,7 @@ mod tests {
         // And the query the follow actually issues carries the caller's file rather than one of
         // its own choosing — the line that made the substitution possible.
         let follow = Follow {
+            token: None,
             endpoint: "unused".to_string(),
             params: LogsParams {
                 worker: Some("w1".to_string()),
@@ -4674,6 +4687,7 @@ mod tests {
 
         // The pane is opened against a worker that is already down, so the *first* poll fails.
         let mut follow = Follow {
+            token: None,
             endpoint: "unused".to_string(),
             // `file` is the caller's, not an override the follow applies for itself — see
             // `check_tail_source`, which is why every worker follow reaching here says
@@ -4709,6 +4723,7 @@ mod tests {
 
         // What the old spelling did, for contrast: every one of those rows, a page at a time.
         let mut replaying = Follow {
+            token: None,
             endpoint: "unused".to_string(),
             params: LogsParams {
                 file: Some("current".to_string()),
@@ -4766,6 +4781,7 @@ mod tests {
         };
 
         let mut follow = Follow {
+            token: None,
             endpoint: "unused".to_string(),
             params: LogsParams {
                 worker: Some("10.0.0.7:50051".to_string()),

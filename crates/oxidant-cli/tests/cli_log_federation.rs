@@ -86,6 +86,92 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// A real worker on `port`, sharing the driver's token, returned once it has said it is
+/// listening — so the assertions are about federation rather than about a bind race, and there
+/// is a line *later* than the init line for a query to find.
+fn spawn_worker(oxidant: &std::path::Path, root: &std::path::Path, port: u16) -> Child {
+    let child = Command::new(oxidant)
+        .args(["worker", "--port", &port.to_string()])
+        .env("OXIDANT_DATA_DIR", root)
+        .env("OXIDANT_STATUS_TOKEN", TOKEN)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn worker");
+    wait_for_text(
+        &root.join("logs").join("oxidant.log"),
+        "oxidant worker listening on Flight",
+        "the worker",
+    );
+    child
+}
+
+/// **The worker's `logs` action is a credential away, not a port away.**
+///
+/// It was justified by "this port already accepts arbitrary stage SQL, so a log page is not a
+/// new privilege". The premise is true and the conclusion does not follow: SQL reads the data
+/// *this* worker can reach, while a log page reads up to `OXIDANT_LOG_KEEP_DAYS` of every
+/// enabled `tracing` field value — DSNs, object-store keys inside table URIs, bearer tokens in
+/// connector config — which are reusable **off** this worker. So the action carries the same
+/// `OXIDANT_STATUS_TOKEN` that gates the identical bytes on the driver's `GET /api/v1/logs`.
+///
+/// Dialled directly, not through the driver: the driver always presents its token, so only a
+/// raw call can show what a stranger on the interconnect gets.
+#[test]
+fn the_worker_serves_its_log_only_to_a_caller_with_the_token() {
+    let oxidant = oxidant_bin();
+    let root = TempDir::new().expect("tempdir");
+    let port = pick_port();
+    let mut worker = spawn_worker(&oxidant, root.path(), port);
+
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let query = br#"{"file":"current","q":"listening on Flight","limit":50}"#.to_vec();
+    let ask = |token: Option<&'static str>| {
+        let endpoint = endpoint.clone();
+        let query = query.clone();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async move {
+                oxidant_execution::flight::worker_logs(endpoint, query, token).await
+            })
+    };
+
+    // No credential: refused, and the refusal names what to present.
+    let refusal = ask(None).expect_err("an uncredentialed logs action must be refused");
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains("OXIDANT_STATUS_TOKEN"),
+        "the refusal must name the credential it wants: {refusal}"
+    );
+    assert!(
+        !refusal.contains("oxidant worker listening"),
+        "and must not carry a log line with it: {refusal}"
+    );
+
+    // Wrong credential: refused the same way. A near-miss must not be more informative than a
+    // no-show.
+    let wrong = ask(Some("federation-status-token-x"))
+        .expect_err("a wrong credential must be refused")
+        .to_string();
+    assert_eq!(wrong, refusal, "a wrong token must not be told it is close");
+
+    // The right one serves — the same worker, the same query, one header apart.
+    let body = ask(Some(TOKEN)).expect("the token must serve");
+    let page: serde_json::Value = serde_json::from_slice(&body).expect("a JSON page");
+    let lines = page["logs"].as_array().expect("logs");
+    assert!(
+        lines.iter().any(|l| l
+            .as_str()
+            .unwrap_or_default()
+            .contains("listening on Flight")),
+        "the page must be this worker's own log: {page}"
+    );
+
+    stop(&mut worker);
+}
+
 /// The whole of §6b's federation, end to end over two real processes.
 #[test]
 fn the_driver_federates_a_log_query_over_a_real_worker_and_copies_nothing() {
@@ -94,20 +180,11 @@ fn the_driver_federates_a_log_query_over_a_real_worker_and_copies_nothing() {
     let driver_root = TempDir::new().expect("tempdir");
     let worker_port = pick_port();
 
-    let mut worker = Command::new(&oxidant)
-        .args(["worker", "--port", &worker_port.to_string()])
-        .env("OXIDANT_DATA_DIR", worker_root.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn worker");
-    let worker_log = worker_root.path().join("logs").join("oxidant.log");
-    // Wait for a line *later* than the init line, so there is something distinctive to federate.
-    wait_for_text(
-        &worker_log,
-        "oxidant worker listening on Flight",
-        "the worker",
-    );
+    // The worker needs the *same* `OXIDANT_STATUS_TOKEN` as the driver: its `logs` action is
+    // gated on it (F16), so a cluster whose workers do not share the driver's token federates
+    // nothing. That is the deployment cost of the gate and it is asserted here by the fact that
+    // the federation below works at all.
+    let mut worker = spawn_worker(&oxidant, worker_root.path(), worker_port);
 
     let connect_port = pick_port();
     let ui_port = pick_port();
