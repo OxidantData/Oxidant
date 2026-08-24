@@ -1207,7 +1207,24 @@ pub fn router(service: Arc<OxidantService>) -> Router {
 /// `ExecutePlan` record into it. `Err` is a boot failure with the reason already spelled out —
 /// a data dir another process holds, or a root that names an object store.
 pub fn init_statement_store(service: &OxidantService, role: &str, port: u16) -> Result<(), String> {
-    let store = StatementStore::from_env(role, port)?;
+    if service.statement_store().is_some() {
+        return Ok(());
+    }
+    // A second server in the same process shares the first's journal rather than opening a
+    // second writer on the same files — the lockfile is a cross-process guard, not an
+    // in-process one (the durable-history spec §4c). Several of the connect integration tests
+    // boot servers concurrently in one process; without this share, every boot after the
+    // first fails the lock and the server never comes up.
+    static PROCESS_STORE: Mutex<Option<StatementStore>> = Mutex::new(None);
+    let mut shared = PROCESS_STORE.lock().expect("statement store init poisoned");
+    let store = match shared.as_ref() {
+        Some(existing) => existing.clone(),
+        None => {
+            let built = StatementStore::from_env(role, port)?;
+            *shared = Some(built.clone());
+            built
+        }
+    };
     service.attach_statement_store(store);
     Ok(())
 }
