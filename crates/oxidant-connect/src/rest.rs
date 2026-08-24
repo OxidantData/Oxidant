@@ -1540,9 +1540,23 @@ impl StatementStore {
         report.freed_bytes = before.saturating_sub(report.used_bytes);
         report.over_budget = report.used_bytes > cfg.disk_max_bytes;
 
-        // The free-space floor, measured *after* the pruning it does not drive. Nothing above
-        // this line read it.
-        report.free_bytes = free_bytes_for(cfg, &cfg.root);
+        // The free-space floor, measured *after* the pruning it does not drive — nothing above
+        // this line read it — and measured against the mount of **every** managed directory, not
+        // just the root's (§3: "a subtree moved to another volume is floored against that
+        // volume"). Asking only about the root meant an `OXIDANT_RESULT_DIR` on a second volume
+        // was never checked, and a healthy results volume was reported short because the root's
+        // was. One mount-table probe answers all of them.
+        let mounts = mounts_for(cfg);
+        let mut lowest: Option<(&std::path::Path, u64)> = None;
+        for root in &roots {
+            let Some(free) = mounts.free_bytes(root) else {
+                continue;
+            };
+            if lowest.map_or(true, |(_, seen)| free < seen) {
+                lowest = Some((root.as_path(), free));
+            }
+        }
+        report.free_bytes = lowest.map(|(_, free)| free);
         report.low_free = report
             .free_bytes
             .is_some_and(|free| free < cfg.disk_min_free_bytes);
@@ -1572,6 +1586,7 @@ impl StatementStore {
         if report.low_free {
             tracing::warn!(
                 free_bytes = report.free_bytes,
+                directory = lowest.map(|(root, _)| root.display().to_string()),
                 min_free_bytes = cfg.disk_min_free_bytes,
                 used_bytes = report.used_bytes,
                 budget_bytes = cfg.disk_max_bytes,
@@ -1824,15 +1839,16 @@ fn counters_for(
     }
 }
 
-/// Free bytes on the volume holding `path`, honouring a test's fake reading.
+/// The mount table this sweep pass reads free space from — a test's synthetic one, or the host's.
 ///
 /// The floor is the one disk guard that cannot be exercised from a tempdir — it depends on how
-/// full the *host* volume is — and it is also the guard whose misbehaviour deleted the whole
-/// statement history, so it gets a seam rather than going untested.
-fn free_bytes_for(cfg: &HistoryConfig, path: &std::path::Path) -> Option<u64> {
-    match cfg.free_bytes_override() {
-        Some(fake) => Some(fake),
-        None => disk::free_bytes(path),
+/// full the *host* volume is, and on which volume each managed directory sits — and it is also
+/// the guard whose misbehaviour deleted the whole statement history, so it gets a seam rather
+/// than going untested.
+fn mounts_for(cfg: &HistoryConfig) -> disk::Mounts {
+    match cfg.mounts_override() {
+        Some(entries) => disk::Mounts::from_entries(entries),
+        None => disk::Mounts::probe(),
     }
 }
 
@@ -4441,6 +4457,63 @@ mod tests {
         store.shutdown_for_test();
     }
 
+    /// M3: the floor is measured against the mount of **every** managed directory, not just the
+    /// root's. `OXIDANT_RESULT_DIR` on a second volume was never checked, and a healthy results
+    /// volume was reported short because the root's volume was.
+    #[tokio::test]
+    async fn the_free_space_floor_covers_every_managed_directory_not_just_the_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let other_volume = tempfile::tempdir().expect("tempdir");
+        let root_mount = root.path().canonicalize().expect("canonicalize");
+        let other_mount = other_volume.path().canonicalize().expect("canonicalize");
+        let results_dir = other_volume.path().join("results");
+
+        // The root's volume is roomy; the one `OXIDANT_RESULT_DIR` was moved to is not.
+        let mounts = vec![(root_mount, 1 << 40), (other_mount.clone(), 1024)];
+        let store = history_store_with(root.path(), |c| {
+            c.results_dir = results_dir.clone();
+            c.disk_max_bytes = u64::MAX;
+            c.disk_min_free_bytes = 1 << 30;
+            c.mounts_override = Some(mounts.clone());
+        });
+        let report = store.sweep_disk();
+        assert!(
+            report.low_free,
+            "the results volume is 1 KiB free against a 1 GiB floor: {report:?}"
+        );
+        assert_eq!(
+            report.free_bytes,
+            Some(1024),
+            "and the report carries the *lowest* reading, not the root's: {report:?}"
+        );
+        assert_eq!(report.statements_pruned, 0, "still nothing is pruned");
+        assert_eq!(
+            store.status_counters().map(|c| c.disk),
+            Some(oxidant_observability::disk_state::LOW_FREE.to_string())
+        );
+        store.shutdown_for_test();
+        drop(store);
+
+        // Converse: a short *root* volume with a roomy results volume still trips, and a pair
+        // that are both roomy does not.
+        let store = history_store_with(root.path(), |c| {
+            c.results_dir = results_dir.clone();
+            c.disk_max_bytes = u64::MAX;
+            c.disk_min_free_bytes = 1 << 30;
+            c.mounts_override = Some(vec![
+                (other_mount, 1 << 40),
+                (std::path::PathBuf::from("/"), 1 << 40),
+            ]);
+        });
+        let report = store.sweep_disk();
+        assert!(!report.low_free, "both volumes are roomy: {report:?}");
+        assert_eq!(
+            store.status_counters().map(|c| c.disk),
+            Some(oxidant_observability::disk_state::OK.to_string())
+        );
+        store.shutdown_for_test();
+    }
+
     /// M2: the sweeper measures the tree **twice** per pass — once before, once after — however
     /// many statements it prunes.
     ///
@@ -4600,7 +4673,8 @@ mod tests {
             c.result_persist = ResultPersist::Always;
             c.disk_max_bytes = u64::MAX;
             c.disk_min_free_bytes = 8 * 1024 * 1024 * 1024;
-            c.free_bytes_override = Some(1024); // 1 KiB free on a volume wanting 8 GiB
+            // 1 KiB free on a volume wanting 8 GiB.
+            c.mounts_override = Some(vec![(std::path::PathBuf::from("/"), 1024)]);
         });
         let report = store.sweep_disk();
 
@@ -4660,7 +4734,7 @@ mod tests {
             // Nothing can satisfy this, so the sweeper walks the whole order.
             c.disk_max_bytes = 0;
             c.disk_min_free_bytes = u64::MAX;
-            c.free_bytes_override = Some(0);
+            c.mounts_override = Some(vec![(std::path::PathBuf::from("/"), 0)]);
         });
         let plant = |rel: &str, bytes: usize| {
             let path = dir.path().join(rel);

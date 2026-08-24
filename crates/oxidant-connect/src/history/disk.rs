@@ -166,28 +166,72 @@ fn flat_files(dir: &Path) -> Vec<Prunable> {
     out
 }
 
-/// Free bytes on the filesystem holding `path`, or `None` when it cannot be determined.
+/// The mount table, read once and then queried per directory.
 ///
-/// The mount is chosen by **longest-prefix match** of the mount point against the canonicalized
-/// path: the naive "first disk" answer is wrong the moment `OXIDANT_LOG_DIR` points at another
-/// volume, and `std` exposes no `statvfs`, so this goes through `sysinfo`'s `Disks`.
-pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
-    // The directory may not exist yet (a root configured but never written to), so walk up
-    // until an ancestor resolves: the mount is the same either way.
-    let target = path.ancestors().find_map(|p| p.canonicalize().ok())?;
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    let mut best: Option<(usize, u64)> = None;
-    for disk in disks.list() {
-        let mount = disk.mount_point();
-        if !target.starts_with(mount) {
-            continue;
-        }
-        let depth = mount.components().count();
-        if best.map(|(d, _)| depth > d).unwrap_or(true) {
-            best = Some((depth, disk.available_space()));
+/// Enumerating mounts means a `statfs` per mount; a 300-second sweeper does not need a fresh one
+/// per candidate file, and the free-space floor has to be asked about *every* managed directory
+/// (§3: a subtree moved to another volume is floored against that volume), so one probe answers
+/// all of them.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Mounts {
+    /// `(mount point, available bytes)`.
+    entries: Vec<(PathBuf, u64)>,
+}
+
+impl Mounts {
+    /// Read the mount table. One `sysinfo::Disks` enumeration, once per sweep pass.
+    pub(crate) fn probe() -> Self {
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        Self {
+            entries: disks
+                .list()
+                .iter()
+                .map(|d| (d.mount_point().to_path_buf(), d.available_space()))
+                .collect(),
         }
     }
-    best.map(|(_, free)| free)
+
+    /// A synthetic mount table — the seam that lets a test drive the free-space floor without
+    /// filling a volume, and the only way to exercise "a subtree on another volume is floored
+    /// against *that* volume" on one machine.
+    pub(crate) fn from_entries(entries: Vec<(PathBuf, u64)>) -> Self {
+        Self { entries }
+    }
+
+    /// Free bytes on the filesystem holding `path`, or `None` when no mount matches.
+    ///
+    /// The mount is chosen by **longest-prefix match** of the mount point against the
+    /// canonicalized path: the naive "first disk" answer is wrong the moment `OXIDANT_LOG_DIR`
+    /// points at another volume.
+    ///
+    /// Caveat worth naming: on macOS `canonicalize("/tmp/x")` yields `/private/tmp/x`, which
+    /// longest-prefix-matches `/` rather than `/System/Volumes/Data`. It gives the right *number*
+    /// (APFS shares the container's free space between them) but it is not the match this doc
+    /// describes.
+    pub(crate) fn free_bytes(&self, path: &Path) -> Option<u64> {
+        // The directory may not exist yet (a root configured but never written to), so walk up
+        // until an ancestor resolves: the mount is the same either way.
+        let target = path.ancestors().find_map(|p| p.canonicalize().ok())?;
+        let mut best: Option<(usize, u64)> = None;
+        for (mount, free) in &self.entries {
+            if !target.starts_with(mount) {
+                continue;
+            }
+            let depth = mount.components().count();
+            if best.map(|(d, _)| depth > d).unwrap_or(true) {
+                best = Some((depth, *free));
+            }
+        }
+        best.map(|(_, free)| free)
+    }
+}
+
+/// Free bytes on the filesystem holding `path`, reading the mount table for this one question.
+/// The sweeper does not use this — it probes once per pass and asks about every managed
+/// directory — but it is what proves a real directory resolves to a real mount at all.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
+    Mounts::probe().free_bytes(path)
 }
 
 /// Delete `file`, returning the bytes it freed. `None` is a *failed* unlink, which the caller
@@ -252,6 +296,29 @@ mod tests {
         assert!(
             free_bytes(dir.path()).is_some(),
             "the free-space floor cannot be enforced without a mount match"
+        );
+    }
+
+    /// The mount is chosen by longest-prefix match, not by "the first disk": a subtree moved to
+    /// another volume must be floored against that volume, not against the root's.
+    #[test]
+    fn a_mount_is_chosen_by_longest_prefix_not_by_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deep = dir.path().join("volume");
+        std::fs::create_dir_all(&deep).expect("mkdir");
+        let root = dir.path().canonicalize().expect("canonicalize");
+        let deep_canonical = deep.canonicalize().expect("canonicalize");
+        // The shallower mount is listed first, and holds far more free space.
+        let mounts =
+            Mounts::from_entries(vec![(root.clone(), 1_000_000), (deep_canonical.clone(), 7)]);
+        assert_eq!(mounts.free_bytes(&deep), Some(7), "the deeper mount wins");
+        assert_eq!(mounts.free_bytes(&root), Some(1_000_000));
+        // A path under no listed mount has no answer, which disables the floor for it rather
+        // than inventing one.
+        assert_eq!(
+            Mounts::from_entries(Vec::new()).free_bytes(&root),
+            None,
+            "no mount match must be None, never 0 — 0 would read as a full volume"
         );
     }
 }

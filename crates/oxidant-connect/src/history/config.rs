@@ -271,14 +271,14 @@ pub(crate) struct HistoryConfig {
     pub disk_min_free_bytes: u64,
     /// How often the disk-budget sweeper runs (§3: every 5 minutes, plus at boot).
     pub disk_sweep_interval: Duration,
-    /// A fake free-space reading for the whole tree (tests only).
+    /// A synthetic mount table — `(mount point, available bytes)` — for tests only.
     ///
-    /// The free-space floor is the one guard that cannot be driven from a tempdir — it depends
-    /// on how full the *host* volume is — and it is also the guard whose misbehaviour deleted
-    /// the entire statement history (H1). Read through [`Self::free_bytes_override`], which is
-    /// `None` in every non-test build.
+    /// The free-space floor is the one guard that cannot be driven from a tempdir: it depends on
+    /// how full the *host* volume is, and on which volume each managed directory sits. It is also
+    /// the guard whose misbehaviour deleted the entire statement history (H1). Read through
+    /// [`Self::mounts_override`], which is `None` in every non-test build.
     #[cfg(test)]
-    pub free_bytes_override: Option<u64>,
+    pub mounts_override: Option<Vec<(PathBuf, u64)>>,
     /// `driver` / `worker`, recorded in the lockfile.
     pub role: String,
     /// The process's port, recorded in the lockfile.
@@ -354,7 +354,7 @@ impl HistoryConfig {
                 env_u64("OXIDANT_DISK_SWEEP_SECS", 300).max(1),
             ),
             #[cfg(test)]
-            free_bytes_override: None,
+            mounts_override: None,
             role: role.to_string(),
             port,
         })
@@ -389,7 +389,7 @@ impl HistoryConfig {
             disk_max_bytes: u64::MAX,
             disk_min_free_bytes: 0,
             disk_sweep_interval: Duration::from_secs(300),
-            free_bytes_override: None,
+            mounts_override: None,
             flush_interval: Duration::from_millis(500),
             ack_timeout: Duration::from_millis(2000),
             hot_ttl: Duration::from_secs(3600),
@@ -405,11 +405,11 @@ impl HistoryConfig {
 }
 
 impl HistoryConfig {
-    /// The fake free-space reading a test installed, or `None` — always `None` outside tests.
-    pub(crate) fn free_bytes_override(&self) -> Option<u64> {
+    /// The synthetic mount table a test installed, or `None` — always `None` outside tests.
+    pub(crate) fn mounts_override(&self) -> Option<Vec<(PathBuf, u64)>> {
         #[cfg(test)]
         {
-            self.free_bytes_override
+            self.mounts_override.clone()
         }
         #[cfg(not(test))]
         {
