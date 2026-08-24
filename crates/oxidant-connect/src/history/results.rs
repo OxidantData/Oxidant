@@ -9,7 +9,12 @@
 //!   dedicated writer thread — the same shape as the journal's — and releases the lock.
 //! - **The pointer is journaled after the file is durable**, never before: write
 //!   `<id>.arrow.tmp`, fsync it, rename, fsync `results/`, *then* append the snapshot carrying
-//!   `result: {file, bytes}`. A pointer that replay reads therefore always named a real file.
+//!   `result: {file, bytes}`. A pointer that replay reads therefore always named a file that
+//!   reached the disk — though not necessarily one that is *still* there: a statement pruned
+//!   after its pointer was journaled unlinks the file and appends a tombstone, and `/result`
+//!   answers `410 result_expired` from the failed open if that tombstone is ever lost.
+//!   A spill that lands *after* its statement was evicted publishes nothing at all: the writer
+//!   re-asks whether either tier still knows the id, unlinks the file, and skips the append.
 //! - **The journal is the authority for GC** (§5/F13). Nothing here decides a result's lifetime;
 //!   [`ResultStore::reconcile`] deletes what the folded id set does not name, and
 //!   [`ResultStore::unlink`] is called by the statement's own eviction.
@@ -61,11 +66,20 @@ pub(crate) enum SpillOutcome {
     /// The disk refused the write. Nothing is on disk, nothing was journaled, and the rows stay
     /// in memory for as long as they would have anyway.
     Failed,
+    /// The statement was evicted while its rows were being written. The file (if it landed) is
+    /// unlinked and **no snapshot is journaled** — a snapshot carrying a result pointer, written
+    /// after the statement's tombstone, is a resurrection waiting for a compaction to drop the
+    /// tombstone out from under it.
+    Abandoned,
 }
 
 /// Told the outcome of every spill, on the spill thread. Installed by the statement store, which
 /// is what actually owns the in-memory rows this frees.
 type Sink = Box<dyn Fn(&str, &SpillOutcome) + Send + Sync>;
+
+/// "Does either tier still know this statement?" — asked on the spill thread, before the encode
+/// and again before the journal append (§5, L1).
+type Liveness = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 enum Msg {
     Spill(Box<SpillJob>),
@@ -105,6 +119,7 @@ pub(crate) struct ResultStore {
     /// (§3, H1).
     paused: Arc<AtomicBool>,
     sink: Arc<OnceLock<Sink>>,
+    live: Arc<OnceLock<Liveness>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -130,6 +145,7 @@ impl ResultStore {
         let (tx, rx) = sync_channel(SPILL_QUEUE);
         let on_disk_bytes = Arc::new(AtomicU64::new(scan_bytes(&cfg.results_dir)));
         let sink: Arc<OnceLock<Sink>> = Arc::new(OnceLock::new());
+        let live: Arc<OnceLock<Liveness>> = Arc::new(OnceLock::new());
         let degraded = Arc::new(AtomicBool::new(false));
         let write_failures = Arc::new(AtomicU64::new(0));
         let writer = SpillWriter {
@@ -140,6 +156,7 @@ impl ResultStore {
             degraded: Arc::clone(&degraded),
             write_failures: Arc::clone(&write_failures),
             sink: Arc::clone(&sink),
+            live: Arc::clone(&live),
         };
         let thread = std::thread::Builder::new()
             .name("oxidant-result-spill".to_string())
@@ -155,15 +172,18 @@ impl ResultStore {
             write_failures,
             paused: Arc::new(AtomicBool::new(false)),
             sink,
+            live,
             thread: Mutex::new(Some(thread)),
         }))
     }
 
-    /// Install the callback the writer thread reports every outcome to. Called once, by the
-    /// statement store, right after boot.
-    pub(crate) fn set_sink(&self, sink: Sink) {
+    /// Install the callbacks the writer thread reports through: the outcome sink, and the
+    /// liveness question it asks before publishing anything. Called once, by the statement store,
+    /// right after boot.
+    pub(crate) fn set_sink(&self, sink: Sink, live: Liveness) {
         // A second install would silently orphan the first store's rows; there is exactly one.
         let _ = self.sink.set(sink);
+        let _ = self.live.set(live);
     }
 
     pub(crate) fn persist(&self) -> ResultPersist {
@@ -371,6 +391,7 @@ struct SpillWriter {
     degraded: Arc<AtomicBool>,
     write_failures: Arc<AtomicU64>,
     sink: Arc<OnceLock<Sink>>,
+    live: Arc<OnceLock<Liveness>>,
 }
 
 impl SpillWriter {
@@ -393,9 +414,39 @@ impl SpillWriter {
         }
     }
 
+    /// Does either tier still know this statement? `true` when nothing installed a liveness
+    /// callback, which is the pre-store shape and never happens in a booted engine.
+    fn still_live(&self, id: &str) -> bool {
+        self.live.get().map(|f| f(id)).unwrap_or(true)
+    }
+
     fn handle(&self, job: SpillJob) {
+        // Cheap first check: a statement evicted before its job came off the queue costs no
+        // encode at all.
+        if !self.still_live(&job.id) {
+            self.report(&job.id, SpillOutcome::Abandoned);
+            return;
+        }
         let outcome = match self.write(&job.id, &job.batches) {
             Ok(Some(pointer)) => {
+                // And again now the file has landed: `sweep_history` or `prune_oldest_statement`
+                // may have tombstoned the statement while this write was in flight. Appending
+                // `snapshot(seq=M)` after `tombstone(seq=N<M)` is mostly harmless — `Fold::apply`
+                // rejects records for a tombstoned id — but `compact_sealed` does not carry
+                // tombstones into the new generation, so a roll between the two resurrects the
+                // statement with a live pointer at the next boot.
+                if !self.still_live(&job.id) {
+                    let path = self.dir.join(ResultPointer::file_name(&job.id));
+                    let _ = std::fs::remove_file(&path);
+                    fs_util::fsync_dir(&self.dir);
+                    tracing::debug!(
+                        statement = %job.id,
+                        "result spill completed for a statement that was evicted mid-write; \
+                         the file is unlinked and no pointer is journaled"
+                    );
+                    self.report(&job.id, SpillOutcome::Abandoned);
+                    return;
+                }
                 self.on_disk_bytes
                     .fetch_add(pointer.bytes, Ordering::Relaxed);
                 // The pointer is journaled only now — after the rename and the `results/` fsync
@@ -438,8 +489,12 @@ impl SpillWriter {
                 SpillOutcome::Failed
             }
         };
+        self.report(&job.id, outcome);
+    }
+
+    fn report(&self, id: &str, outcome: SpillOutcome) {
         if let Some(sink) = self.sink.get() {
-            sink(&job.id, &outcome);
+            sink(id, &outcome);
         }
     }
 

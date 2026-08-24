@@ -688,7 +688,18 @@ impl StatementStore {
             return;
         };
         let weak = Arc::downgrade(&self.inner);
-        history.results.set_sink(Box::new(move |id, outcome| {
+        // The liveness question §5's late-spill guard asks. A store that is gone answers "dead",
+        // which is the honest answer: nothing is left to own the file.
+        let live_weak = Arc::downgrade(&self.inner);
+        let live: Box<dyn Fn(&str) -> bool + Send + Sync> = Box::new(move |id: &str| {
+            let Some(inner) = live_weak.upgrade() else {
+                return false;
+            };
+            let inner = inner.lock().expect("statement store poisoned");
+            inner.statements.contains_key(id) || inner.history.contains_key(id)
+        });
+        history.results.set_sink(
+            Box::new(move |id, outcome| {
             let Some(inner) = weak.upgrade() else {
                 return;
             };
@@ -704,7 +715,7 @@ impl StatementStore {
                         SpillOutcome::TooLarge => {
                             st.result_refused = Some(RESULT_TOO_LARGE.to_string())
                         }
-                        SpillOutcome::Failed => {}
+                        SpillOutcome::Failed | SpillOutcome::Abandoned => {}
                     }
                 }
                 return;
@@ -738,7 +749,10 @@ impl StatementStore {
                         );
                         false
                     }
-                    SpillOutcome::Failed => {
+                    // The disk refused it, or it completed for a statement that had been
+                    // evicted (in which case this branch is unreachable — the id is in neither
+                    // tier by definition — but a flag left set is how H2 happened).
+                    SpillOutcome::Failed | SpillOutcome::Abandoned => {
                         st.release_on_spill = false;
                         false
                     }
@@ -747,7 +761,9 @@ impl StatementStore {
             if release {
                 inner.release_rows(id);
             }
-        }));
+            }),
+            live,
+        );
     }
 
     /// Build from the environment: the durable store, or today's volatile one under
@@ -1410,9 +1426,12 @@ impl StatementStore {
             }
             evicted
         };
-        // Best-effort, like every other non-terminal write: a tombstone lost to backpressure
-        // means the statement is folded again at the next boot and re-evicted by the next sweep
-        // — self-healing, and never a lost statement.
+        // Retained rather than droppable. A tombstone is not `running` chatter: the result file
+        // is unlinked in this same pass, so a tombstone lost to backpressure leaves the
+        // statement's *snapshot* — pointer and all — in the journal naming a file that no longer
+        // exists. `/result` degrades to `410` from the failed open, which is the right answer,
+        // but it is a worse one than not replaying the statement at all, and the overflow queue
+        // is 65,536 deep against a sweep that evicts at most `max_records`.
         //
         // The result file goes in the *same* sweep, before the tombstone is considered complete
         // (§5, F13). The journal is the authority: nothing here decides a result's lifetime, it
@@ -1423,7 +1442,7 @@ impl StatementStore {
             let seq = history.journal.next_seq();
             history
                 .journal
-                .append(JournalRecord::tombstone(&id, seq, submitted_at_ms));
+                .append_retained(JournalRecord::tombstone(&id, seq, submitted_at_ms));
         }
     }
 
@@ -1644,9 +1663,11 @@ impl StatementStore {
         let (id, submitted_at_ms) = victim?;
         let freed = history.results.unlink(&id).unwrap_or(0);
         let seq = history.journal.next_seq();
+        // Retained: the file is already gone, so a dropped tombstone would leave a pointer in
+        // the journal naming nothing. See `sweep_history` for the same reasoning.
         history
             .journal
-            .append(JournalRecord::tombstone(&id, seq, submitted_at_ms));
+            .append_retained(JournalRecord::tombstone(&id, seq, submitted_at_ms));
         Some(freed)
     }
 
@@ -4455,6 +4476,62 @@ mod tests {
             "history_writes must flip back without a restart"
         );
         store.shutdown_for_test();
+    }
+
+    /// L1: a spill that completes after its statement was evicted must publish nothing.
+    ///
+    /// `SpillWriter::handle` appended `folded.to_snapshot()` unconditionally, so a statement
+    /// tombstoned while its write was in flight left `tombstone(seq=N)` followed by
+    /// `snapshot(seq=M>N)` carrying a live result pointer. `Fold::apply` rejects records for a
+    /// tombstoned id, so replay ignored it — **unless** a segment roll and compaction fell
+    /// between the two, because `compact_sealed` does not carry tombstones into the new
+    /// generation. Then the next boot had no tombstone to reject it and the statement came back,
+    /// pointing at a file. This test builds exactly that window.
+    #[tokio::test]
+    async fn a_spill_that_lands_after_its_statement_was_evicted_publishes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        let history = Arc::clone(store.history.as_ref().expect("history"));
+
+        // Park the writer so the statement can be evicted mid-write.
+        let release = history.results.block_writer();
+        let (doomed, _) = store.insert("SELECT 'doomed'");
+        store.finish(&doomed, ExecOutcome::Succeeded(vec![rows_batch(0, 4)]));
+        assert!(
+            store.prune_oldest_statement().is_some(),
+            "the only terminal statement is evicted while its write is parked"
+        );
+        // Seal and compact, which drops the tombstone: from here the journal has no record that
+        // `doomed` ever died.
+        history.journal.sync_blocking();
+        history.journal.compact_blocking();
+
+        // Now let the write finish. Nothing may be published for a statement neither tier knows.
+        drop(release);
+        store.drain_spills();
+        let file = dir
+            .path()
+            .join("history/results")
+            .join(format!("{doomed}.arrow"));
+        assert!(
+            !file.exists(),
+            "a spill for an evicted statement must leave no file behind"
+        );
+        assert_eq!(
+            history.results.on_disk_bytes(),
+            0,
+            "and must not be counted against results_on_disk_bytes"
+        );
+
+        store.shutdown_for_test();
+        drop(history);
+        drop(store);
+        let replayed = history_store_with(dir.path(), |c| c.result_persist = ResultPersist::Always);
+        assert!(
+            replayed.snapshot(&doomed).is_none(),
+            "the evicted statement must not resurrect with a live result pointer"
+        );
+        replayed.shutdown_for_test();
     }
 
     /// M4: `OXIDANT_LOG_DIR`, `OXIDANT_DUMP_DIR` and `OXIDANT_RESULT_DIR` are operator-set paths
