@@ -30,6 +30,13 @@
 //! free-space floor satisfiable that loop ran until every terminal statement in both tiers was
 //! gone — every five minutes, for a shortfall a co-tenant caused.
 //!
+//! **The sweeper unlinks only files it can recognise as its own.** `OXIDANT_LOG_DIR`,
+//! `OXIDANT_DUMP_DIR` and `OXIDANT_RESULT_DIR` are operator-set paths validated only for `://`,
+//! so "every flat file in this directory" made `OXIDANT_LOG_DIR=/var/log` a command to delete
+//! other services' logs under disk pressure. The shapes are `oxidant-*.log` (never
+//! `oxidant.log`), `dump-*.parquet` / `oxidant-*.parquet`, and `stmt-*.arrow` /
+//! `stmt-*.arrow.tmp`.
+//!
 //! PR2 writes nothing under `logs/` — the rolling writer is PR3 — but steps 1 and 2 are
 //! implemented and tested now, because the order is the contract and a sweeper that learns half
 //! of it later is a sweeper that prunes results while rolled logs sit on the disk.
@@ -126,30 +133,46 @@ fn subtree_bytes_inner(dir: &Path) -> u64 {
     total
 }
 
-/// Rolled log files in `logs/`, oldest first. The live file is filtered out here rather than at
-/// the delete site, so no caller can forget.
+/// Is `name` a rolled exec log this engine wrote? `oxidant-<something>.log`, never the live
+/// `oxidant.log`.
+///
+/// `OXIDANT_LOG_DIR` is operator-set and validated only for `://`, so "every flat file in the
+/// directory except the live one" made `OXIDANT_LOG_DIR=/var/log` a command to delete other
+/// services' logs the first time the engine went over its disk budget. The sweeper unlinks files
+/// it can recognise as its own and nothing else.
+pub(crate) fn is_rolled_log(name: &str) -> bool {
+    name != LIVE_LOG && name.starts_with("oxidant-") && name.ends_with(".log")
+}
+
+/// Is `name` a support-bundle dump this engine wrote? `dump-*.parquet` (§6b), or the
+/// `oxidant-*.parquet` shape a bundle named after the process takes.
+pub(crate) fn is_dump(name: &str) -> bool {
+    (name.starts_with("dump-") || name.starts_with("oxidant-")) && name.ends_with(".parquet")
+}
+
+/// Rolled log files in `logs/`, oldest first. The live file, and anything the engine did not
+/// write, are filtered out here rather than at the delete site, so no caller can forget.
 pub(crate) fn rolled_logs(logs_dir: &Path) -> Vec<Prunable> {
-    let mut out = flat_files(logs_dir);
-    out.retain(|p| {
-        p.path
-            .file_name()
-            .map(|n| n != std::ffi::OsStr::new(LIVE_LOG))
-            .unwrap_or(false)
-    });
-    out
+    flat_files(logs_dir, is_rolled_log)
 }
 
 /// Support-bundle dumps (§6b), oldest first.
 pub(crate) fn dumps(dumps_dir: &Path) -> Vec<Prunable> {
-    flat_files(dumps_dir)
+    flat_files(dumps_dir, is_dump)
 }
 
-fn flat_files(dir: &Path) -> Vec<Prunable> {
+/// Flat files in `dir` whose name `owned` recognises, oldest first.
+fn flat_files(dir: &Path, owned: fn(&str) -> bool) -> Vec<Prunable> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out: Vec<Prunable> = Vec::new();
     for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !owned(name) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
             continue;
@@ -277,6 +300,42 @@ mod tests {
             .map(|p| p.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["oxidant-2026-08-22.log".to_string()]);
+    }
+
+    /// `OXIDANT_LOG_DIR` and `OXIDANT_DUMP_DIR` are operator-set paths that may well be shared
+    /// — `/var/log` is a plausible value. The sweeper prunes only what it can recognise as its
+    /// own, so a co-tenant's files survive a disk-pressure pass.
+    #[test]
+    fn the_sweeper_only_recognises_files_the_engine_wrote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        touch(&logs.join("oxidant-2026-08-22.log"), 10);
+        touch(&logs.join("syslog"), 10);
+        touch(&logs.join("nginx-access.log"), 10);
+        touch(&logs.join("oxidant-2026-08-22.log.gz"), 10);
+        let names: Vec<String> = rolled_logs(&logs)
+            .iter()
+            .map(|p| p.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["oxidant-2026-08-22.log".to_string()]);
+
+        let dumps_dir = dir.path().join("dumps");
+        touch(&dumps_dir.join("dump-1.parquet"), 10);
+        touch(&dumps_dir.join("oxidant-bundle.parquet"), 10);
+        touch(&dumps_dir.join("customer-facts.parquet"), 10);
+        touch(&dumps_dir.join("notes.txt"), 10);
+        let mut names: Vec<String> = dumps(&dumps_dir)
+            .iter()
+            .map(|p| p.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "dump-1.parquet".to_string(),
+                "oxidant-bundle.parquet".to_string()
+            ]
+        );
     }
 
     /// Every subtree under the root counts against one budget, nested directories included.

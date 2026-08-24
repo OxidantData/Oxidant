@@ -102,9 +102,32 @@ pub(crate) struct ResultPointer {
     pub bytes: u64,
 }
 
+/// Every engine-minted statement id starts with this (`stmt-<uuid-v4>`, §4b), which is what
+/// makes a result file recognisable as the engine's own.
+pub(crate) const STATEMENT_ID_PREFIX: &str = "stmt-";
+
 impl ResultPointer {
     pub(crate) fn file_name(id: &str) -> String {
         format!("{id}.arrow")
+    }
+
+    /// The statement id a `results/` entry belongs to, or `None` when the engine did not write
+    /// it.
+    ///
+    /// `OXIDANT_RESULT_DIR` is an operator-set path that may be shared, and boot both counts
+    /// every file there against the disk budget and *deletes* the ones no statement names — so
+    /// "ends with `.arrow`" is not a strong enough claim of ownership. Only `stmt-*.arrow` is.
+    pub(crate) fn statement_id(file_name: &str) -> Option<&str> {
+        file_name.strip_suffix(".arrow").filter(|id| {
+            id.starts_with(STATEMENT_ID_PREFIX) && id.len() > STATEMENT_ID_PREFIX.len()
+        })
+    }
+
+    /// Is `file_name` a spill that never reached its rename — `stmt-*.arrow.tmp`?
+    pub(crate) fn is_partial(file_name: &str) -> bool {
+        file_name
+            .strip_suffix(".tmp")
+            .is_some_and(|stem| Self::statement_id(stem).is_some())
     }
 }
 

@@ -4457,6 +4457,57 @@ mod tests {
         store.shutdown_for_test();
     }
 
+    /// M4: `OXIDANT_LOG_DIR`, `OXIDANT_DUMP_DIR` and `OXIDANT_RESULT_DIR` are operator-set paths
+    /// that may be shared — `/var/log` is a plausible value for the first. A sweep under disk
+    /// pressure must unlink only what the engine itself wrote.
+    #[tokio::test]
+    async fn the_sweeper_never_unlinks_a_file_the_engine_did_not_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plant = |rel: &str, bytes: usize| {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, vec![b'x'; bytes]).expect("write");
+            path
+        };
+        // Planted *before* boot, so `clear_tmp` and boot's `reconcile` see them too.
+        let foreign_result = plant("history/results/customer-export.arrow", 512);
+        let foreign_tmp = plant("history/results/postgres-restore.tmp", 512);
+        let store = history_store_with(dir.path(), |c| {
+            c.result_persist = ResultPersist::Always;
+            // A budget nothing can satisfy: the sweeper walks every step of the order.
+            c.disk_max_bytes = 0;
+            c.disk_min_free_bytes = 0;
+        });
+        // Planted after boot so the pass under test is the explicit one below, not the boot one.
+        let foreign_log = plant("logs/syslog", 4096);
+        let foreign_dump = plant("dumps/customer-facts.parquet", 4096);
+        let ours_log = plant("logs/oxidant-2026-08-20.log", 4096);
+        let ours_dump = plant("dumps/dump-1.parquet", 4096);
+        let report = store.sweep_disk();
+
+        assert!(!ours_log.exists(), "our rolled log goes: {report:?}");
+        assert!(!ours_dump.exists(), "our dump goes: {report:?}");
+        assert!(
+            foreign_log.exists(),
+            "a foreign file in the logs dir must survive: {report:?}"
+        );
+        assert!(
+            foreign_dump.exists(),
+            "and so must one in the dumps dir: {report:?}"
+        );
+        assert!(
+            foreign_result.exists(),
+            "and one in the results dir, which boot both counts and reconciles: {report:?}"
+        );
+        assert!(
+            foreign_tmp.exists(),
+            "clear_tmp takes stmt-*.arrow.tmp, not every *.tmp: {report:?}"
+        );
+        assert_eq!(report.rolled_logs_removed, 1, "{report:?}");
+        assert_eq!(report.dumps_removed, 1, "{report:?}");
+        store.shutdown_for_test();
+    }
+
     /// M3: the floor is measured against the mount of **every** managed directory, not just the
     /// root's. `OXIDANT_RESULT_DIR` on a second volume was never checked, and a healthy results
     /// volume was reported short because the root's volume was.

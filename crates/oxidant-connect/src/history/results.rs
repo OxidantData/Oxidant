@@ -317,15 +317,18 @@ impl ResultStore {
         let mut out: Vec<(String, u64, std::time::SystemTime)> = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let Some(id) = name.strip_suffix(".arrow") else {
+            // Only `stmt-*.arrow`: `OXIDANT_RESULT_DIR` is an operator-set path that may be
+            // shared, and everything this returns is a candidate for `reconcile` to unlink.
+            let Some(id) = ResultPointer::statement_id(&name) else {
                 continue;
             };
+            let id = id.to_string();
             let Ok(meta) = entry.metadata() else { continue };
             if !meta.is_file() {
                 continue;
             }
             let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-            out.push((id.to_string(), meta.len(), mtime));
+            out.push((id, meta.len(), mtime));
         }
         out.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
         out.into_iter().map(|(id, len, _)| (id, len)).collect()
@@ -533,26 +536,25 @@ fn scan_bytes(dir: &Path) -> u64 {
     };
     entries
         .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .to_string()
-                .ends_with(".arrow")
-        })
+        .filter(|e| ResultPointer::statement_id(&e.file_name().to_string_lossy()).is_some())
         .filter_map(|e| e.metadata().ok())
         .filter(|m| m.is_file())
         .map(|m| m.len())
         .sum()
 }
 
-/// Delete every `*.arrow.tmp` — a spill that never reached its rename.
+/// Delete every `stmt-*.arrow.tmp` — a spill that never reached its rename.
+///
+/// The `stmt-` shape is load-bearing, not decoration: this runs at boot against an operator-set
+/// `OXIDANT_RESULT_DIR`, and "every `*.tmp`" made pointing that knob at a shared directory
+/// destructive on the first start.
 fn clear_tmp(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let mut removed = false;
     for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().ends_with(".tmp") {
+        if ResultPointer::is_partial(&entry.file_name().to_string_lossy()) {
             removed |= std::fs::remove_file(entry.path()).is_ok();
         }
     }
