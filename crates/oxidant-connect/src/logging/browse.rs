@@ -1403,7 +1403,40 @@ mod tests {
         assert_eq!(at("error"), 2, "the error, plus the unjudgeable line");
         assert_eq!(at("warn"), 3);
         assert_eq!(at("info"), 5);
-        assert_eq!(at("debug"), 6, "everything");
+        // Everything *in this fixture*, which holds no `TRACE`. On a node running with
+        // `RUST_LOG=trace` it is not everything — see the test below, which is why the pane has
+        // a `trace` chip.
+        assert_eq!(at("debug"), 6);
+    }
+
+    /// **`debug` is a floor, not "everything".** `TRACE` has its own rank, deliberately — the
+    /// writer records what `tracing` emitted and collapsing two levels in the filter would make
+    /// `level=debug` and `level=trace` the same query on a file that distinguishes them. The
+    /// pane's chip row stopped at `debug`, so on a node running `RUST_LOG=trace` clicking the
+    /// chip labelled as the most permissive floor made lines *disappear*: no filter shows
+    /// `TRACE`, `level=debug` does not. Both halves are asserted, because the `debug` count
+    /// alone passes on a file with no trace line in it.
+    #[test]
+    fn the_debug_floor_is_not_everything_on_a_trace_enabled_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lines = [
+            "2026-08-23T14:00:00.000Z [DEBUG] oxidant_execution - message=stage 0 done",
+            "2026-08-23T14:00:01.000Z [TRACE] oxidant_execution - message=row 4194304",
+        ];
+        let text = write(dir.path(), "oxidant-2026-08-31.log", &lines);
+        let at = |level: Option<&str>| {
+            scan_text(&text, &filter(level, None, None), None, 100)
+                .expect("scan")
+                .lines
+                .len()
+        };
+        assert_eq!(at(None), 2, "no filter shows every level");
+        assert_eq!(
+            at(Some("debug")),
+            1,
+            "`debug` is a floor: it drops the rank below it"
+        );
+        assert_eq!(at(Some("trace")), 2, "which is what `trace` is for");
     }
 
     /// The listing is ordered by `(period end, split)` — the trap where `.2` sorts before the

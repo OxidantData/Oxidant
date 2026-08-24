@@ -262,6 +262,20 @@ mod tests {
                 "the log pane is missing {control}"
             );
         }
+        // **The chip row covers every level the API ranks.** It stopped at `debug` while
+        // `level_rank` gives `TRACE` a rank of its own, so on a node running `RUST_LOG=trace`
+        // the chip labelled as the most permissive floor *hid* lines the unfiltered view showed
+        // — a severity floor whose quietest value is not the quietest level.
+        assert!(
+            embedded_index()
+                .contains("const OBS_LEVELS = ['error', 'warn', 'info', 'debug', 'trace']"),
+            "a floor's quietest chip must be the quietest level the API accepts"
+        );
+        assert!(
+            !embedded_index().contains("lvl === 'trace' ? 'debug' : lvl"),
+            "and a `TRACE` line must not be painted as a `DEBUG` one now that both are filterable"
+        );
+
         // The level regex is unanchored, and pinned as the literal it is. PR3 moved `[LEVEL]`
         // off the start of the line behind an RFC-3339 timestamp; the old `^`-anchored form
         // then matched nothing, every line came back with a null level, and the chips

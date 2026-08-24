@@ -1383,6 +1383,20 @@ document or `docs/api.md` previously promised.
   (`obsCanFollow`), which disables the checkbox with the reason in its title and puts the
   worker-ring case in the caption rather than letting "following" quietly stop appearing.
 
+- **F11 — the quietest level chip is the quietest level.** `OBS_LEVELS` was
+  `['error','warn','info','debug']` while `level_rank` gives `TRACE` a rank of its own,
+  deliberately: the writer records what `tracing` emitted, and collapsing two levels in the
+  *filter* would make `level=debug` and `level=trace` the same query on a file that
+  distinguishes them. The default (no chip) sends no `level=` and shows every level including
+  `TRACE`; clicking **debug** sent `level=debug` and dropped rank 4. So on a node running
+  `RUST_LOG=trace`, the chip labelled as the most permissive floor made lines **disappear**, and
+  `obsLevelOf` folded `TRACE` into the `debug` colour bucket so nothing on screen hinted that a
+  distinct level existed. There is now a `trace` chip, the quietest chip's title says "every
+  level", and `obsLevelOf` returns the level the line actually carries. `browse.rs`'s floor test
+  no longer calls `at("debug")` "everything" — that was true of its fixture and not of a
+  trace-enabled node, and a second test pins both halves against a file that has a `TRACE` line
+  in it.
+
 ## 11. Review resolutions (F1–F21)
 
 | # | Finding | Resolution |
