@@ -2311,10 +2311,11 @@
       }
     }
 
-    /* A dotted filter is a path, and `/api/v1/catalogs/autocomplete` is the only thing that can
-       resolve one against levels this rail has not loaded. A bare word is not sent: the
-       endpoint matches by prefix and the box filters by substring, so it would answer a
-       different question than the one being asked. */
+    /* A dotted filter is a path, and the autocomplete route — `CAT.autocompleteUrl`, like every
+       other catalog URL on this page — is the only thing that can resolve one against levels
+       this rail has not loaded. A bare word is not sent: that endpoint matches by prefix and
+       the box filters by substring, so it would answer a different question than the one being
+       asked. */
     async function catFetchSuggestions() {
       const raw = catFilter.trim();
       if (!CAT.wantsSuggestions(raw)) {

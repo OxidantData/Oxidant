@@ -108,7 +108,9 @@ fn embedded_index() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{embedded_index, DERIVE_MARKER, EMBEDDED_TEMPLATE, PIPELINE_DERIVE_JS};
+    use super::{
+        embedded_index, CATALOG_MARKER, DERIVE_MARKER, EMBEDDED_TEMPLATE, PIPELINE_DERIVE_JS,
+    };
 
     /// The page is a single `include_str!` blob with no build step and no asset route, so the
     /// things that would silently break it are structural: a tab whose panel is missing, a
@@ -416,6 +418,201 @@ mod tests {
         }
         // And the page still consumes it.
         assert!(page.contains("} = __oxidantPipelines;"));
+    }
+
+    /// The catalog rail's splice, on the same terms as the derivation's: the marker is
+    /// replaced, the logic lands, and no copy of it survives inline in the template.
+    #[test]
+    fn the_catalog_rail_logic_is_spliced_into_the_served_page() {
+        assert!(
+            EMBEDDED_TEMPLATE.contains(CATALOG_MARKER),
+            "the page lost its `{CATALOG_MARKER}` splice point; the rail would never load"
+        );
+        let page = embedded_index();
+        assert!(
+            !page.contains(CATALOG_MARKER),
+            "the marker survived the splice — the page is serving a comment, not the rail"
+        );
+        assert!(
+            !EMBEDDED_TEMPLATE.contains("var __oxidantCatalog"),
+            "`__oxidantCatalog` is inline in the page again; it belongs in catalog_rail.js, \
+             where `ui/src/lib/catalogRail.test.ts` can evaluate it"
+        );
+        for symbol in [
+            "var __oxidantCatalog",
+            "function railRows",
+            "function pendingLoads",
+            "function insertAtCursor",
+            "function quoteIdent",
+            "function wantsSuggestions",
+        ] {
+            assert!(
+                page.contains(symbol),
+                "the served page is missing `{symbol}`"
+            );
+        }
+        // And the page consumes it rather than shadowing it.
+        assert!(page.contains("const CAT = __oxidantCatalog;"));
+
+        // **No NUL byte reaches the document.** `nodeKey` separates a node's coordinates with
+        // one, because a quoted identifier may contain anything else — and an HTML parser
+        // rewrites U+0000 inside an attribute value to U+FFFD, so a key that made the round
+        // trip through the DOM would come back matching nothing. It is written as an escape in
+        // the source and the row actions carry an index instead; this pins both.
+        assert!(
+            !page.contains('\0'),
+            "the served page carries a raw NUL byte; an attribute value holding one is rewritten \
+             by the parser"
+        );
+        assert!(
+            !page.contains("data-key="),
+            "a rail row must carry its index, not its node key: a key contains a NUL separator"
+        );
+        assert!(page.contains("data-act=\"toggle\" data-i="));
+    }
+
+    /// One rail, two mounts, and a layout it adds a column to rather than wraps.
+    #[test]
+    fn the_catalog_rail_is_mounted_on_both_query_pages() {
+        let page = embedded_index();
+
+        // The Editor and the Notebook render the *same* component against the same tree: the
+        // hazard a second copy introduces is not a second rail on screen, it is a second cache
+        // that disagrees with the first about what the warehouse holds.
+        for host in ["editor", "notebook"] {
+            assert!(
+                page.contains(&format!("catRailHtml('{host}')")),
+                "the {host} page does not mount the catalog rail"
+            );
+            assert!(
+                page.contains(&format!("mountCatalogRail('{host}')")),
+                "the {host} page never binds or paints its rail"
+            );
+            assert!(
+                page.contains(&format!("rail: 'cat-rail-{host}'")),
+                "the {host} host has no rail element to paint into"
+            );
+        }
+
+        // **Hiding the rail must restore the previous layout exactly, not approximately.**
+        // `.workbench` puts one column *in front of* the grid the Editor already had; the grid
+        // itself is untouched, so a collapsed rail hands its width straight back. A rail that
+        // had been built by editing `.editor-grid`'s own template would make "collapsed" a
+        // different layout rather than the old one.
+        assert!(
+            page.contains(
+                ".editor-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; \
+                 align-items: start; }"
+            ),
+            "the rail changed the Editor's own grid; it may only add a column beside it"
+        );
+        assert!(page.contains(".workbench { display: grid; grid-template-columns: 264px"));
+        assert!(
+            page.contains(".workbench[data-rail=\"closed\"] { grid-template-columns: 34px"),
+            "the rail must collapse to a strip, not disappear and reflow the page"
+        );
+        assert!(
+            page.contains(".workbench[data-rail=\"closed\"] .cat-body { display: none; }"),
+            "a collapsed rail still paints its tree; the strip is what hides it"
+        );
+
+        // The controls, as the classes and actions the delegated handler binds.
+        for control in [
+            "class=\"cat-q\"",
+            "class=\"cat-suggest\"",
+            "class=\"cat-tree\"",
+            "data-act=\"open\"",
+            "data-act=\"close\"",
+            "data-act=\"refresh\"",
+            "data-act=\"retry\"",
+            "data-act=\"insert\"",
+            "data-act=\"preview\"",
+            "data-act=\"suggest\"",
+        ] {
+            assert!(
+                page.contains(control),
+                "the catalog rail is missing {control}"
+            );
+        }
+
+        // Failure and emptiness use the platform's components, not prose in a div — the two
+        // consoles drifted apart the first time by rendering states any other way.
+        assert!(page.contains("return errorState(rows[0].message, rows[0].detail) +"));
+        assert!(page.contains("return emptyState('No catalogs',"));
+
+        // The remembered state, under the key `docs/web-ui.md` names.
+        assert!(page.contains("var CAT_PREFS_KEY = 'oxidant.catalogRail.v1';"));
+    }
+
+    /// The rail reaches the catalog API only through the module that is under test, runs its
+    /// preview through the one statement API, and asks for a level only when a row says so.
+    #[test]
+    fn the_catalog_rail_uses_the_tested_logic_rather_than_its_own_copy() {
+        let page = embedded_index();
+
+        // **Every catalog URL is built in `catalog_rail.js`.** `ui/src/lib/catalogRail.test.ts`
+        // pins that each segment is encoded — a namespace is a dot-joined query parameter and a
+        // table is a path segment a slash must not split — and a second spelling built inline
+        // would be the one the browser uses and the one no test ever evaluates.
+        assert!(
+            !EMBEDDED_TEMPLATE.contains("/api/v1/catalogs"),
+            "the page builds a catalog URL by hand; it must go through catalog_rail.js"
+        );
+        for call in [
+            "catJson(CAT.catalogsUrl())",
+            "catJson(CAT.childrenUrl(node))",
+            "catJson(CAT.autocompleteUrl(raw))",
+        ] {
+            assert!(page.contains(call), "the rail must fetch through `{call}`");
+        }
+
+        // **The rows are the request queue.** Expanding a node sets a bit and repaints;
+        // `pendingLoads` turns the placeholder rows that are now on screen into the requests.
+        // A `catToggle` that fetched directly would be a second path that could ask for a
+        // level the paint did not show — and would make the filter, which shares this code,
+        // able to crawl the warehouse.
+        assert!(page.contains("CAT.pendingLoads(catRows).forEach(catLoadChildren);"));
+        let toggle = page
+            .split_once("function catToggle(key) {")
+            .and_then(|(_, rest)| rest.split_once("\n    }"))
+            .map(|(body, _)| body.to_string())
+            .unwrap_or_default();
+        assert!(
+            !toggle.is_empty(),
+            "`catToggle` is gone; the tree cannot be opened"
+        );
+        assert!(
+            !toggle.contains("catLoadChildren") && !toggle.contains("fetch("),
+            "expanding a node must not fetch; painting its placeholder row is what asks: \
+             {toggle}"
+        );
+
+        // A preview is a statement like any other — same API as the Run button, so it lands in
+        // the recent-statements rail and on the SQL page instead of being invisible work.
+        assert!(page.contains("const doc = await runStatement(sql, host.onUpdate);"));
+        assert!(
+            page.contains("const sql = CAT.previewSql(node);"),
+            "the preview must use the pinned `SELECT * FROM … LIMIT n`, not its own string"
+        );
+
+        // **An insertion is spliced, and announced.** A Notebook cell persists itself from its
+        // textarea's `input` event, so an insertion that only assigned `.value` would be on
+        // screen and absent from localStorage the moment the page reloaded.
+        assert!(page.contains(
+            "const r = CAT.insertAtCursor(ta.value, ta.selectionStart, ta.selectionEnd, text);"
+        ));
+        assert!(
+            page.contains("ta.dispatchEvent(new Event('input', { bubbles: true }));"),
+            "an inserted name must fire `input`, or the Notebook never persists it"
+        );
+
+        // The filter box mirrors between the two mounts, and a repaint that lands mid-word must
+        // not move the caret out from under the typist.
+        assert!(
+            page.contains("if (q && q.value !== catFilter) q.value = catFilter;"),
+            "the filter box must be mirrored, never re-set: assigning the same value still \
+             collapses a selection"
+        );
     }
 
     /// The one drift this page cannot see: the connector writes an event kind the reducer does
