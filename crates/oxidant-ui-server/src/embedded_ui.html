@@ -2164,7 +2164,13 @@
         if (!rail) return;
         const wb = rail.parentElement;
         if (wb) wb.setAttribute('data-rail', catPrefs.open ? 'open' : 'closed');
-        rail.querySelector('.cat-tree').innerHTML = tree;
+        // The tree repaints wholesale — a level landing, a filter keystroke — and `innerHTML`
+        // resets the scroll to the top. Expanding a schema near the bottom of a long catalog
+        // would otherwise throw the reader back to the first row the moment its tables arrived.
+        const treeEl = rail.querySelector('.cat-tree');
+        const scroll = treeEl.scrollTop;
+        treeEl.innerHTML = tree;
+        treeEl.scrollTop = scroll;
         rail.querySelector('.cat-suggest').innerHTML = suggest;
         const q = rail.querySelector('.cat-q');
         // Mirrored, never re-set: assigning the same value would still collapse a selection.

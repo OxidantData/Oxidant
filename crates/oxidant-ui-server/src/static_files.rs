@@ -614,6 +614,12 @@ mod tests {
             "an inserted name must fire `input`, or the Notebook never persists it"
         );
 
+        // The tree repaints wholesale, so it has to put the reader back where they were —
+        // expanding a schema near the bottom of a long catalog must not scroll to the top the
+        // moment its tables land.
+        assert!(page.contains("const scroll = treeEl.scrollTop;"));
+        assert!(page.contains("treeEl.scrollTop = scroll;"));
+
         // The filter box mirrors between the two mounts, and a repaint that lands mid-word must
         // not move the caret out from under the typist.
         assert!(
