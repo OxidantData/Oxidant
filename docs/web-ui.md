@@ -310,8 +310,10 @@ any other query, and in the Editor the status chip tracks it and **Cancel** canc
 
 **The filter box narrows what is loaded.** Typing a word hides every row that does not match it
 or have a match underneath it, descending only into levels the rail already holds — so a filter
-can surface a column three levels down without a click, and can never start a request. What it
-therefore cannot do is find something that has never been loaded, so a filter containing a dot
+can surface a column three levels down without a click, and never opens a level you have not
+opened. (It is not that typing starts no requests at all: a level you had already expanded and
+that has not landed yet is still fetched, filtered or not.) What a filter therefore cannot do
+is find something that has never been loaded, so a filter containing a dot
 is read as a *path* and sent to `/api/v1/catalogs/autocomplete` instead: matches appear under
 the box, and clicking one inserts it and opens the tree to where it lives. A bare word is never
 sent there — that endpoint matches by prefix and the box filters by substring.

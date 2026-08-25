@@ -5,6 +5,28 @@ import { afterEach, vi } from "vitest";
 afterEach(() => cleanup());
 
 /**
+ * Node ≥ 22 defines an experimental global `localStorage` that SHADOWS jsdom's and
+ * is `undefined` unless the process was started with `--localstorage-file`. Any test
+ * touching localStorage then dies with "Cannot read properties of undefined". Give
+ * the suite a real in-memory Storage whenever the jsdom one is missing.
+ */
+if (typeof window !== "undefined" && typeof window.localStorage === "undefined") {
+  const store = new Map<string, string>();
+  const storage: Storage = {
+    get length() {
+      return store.size;
+    },
+    clear: () => store.clear(),
+    getItem: (key: string) => (store.has(key) ? store.get(key)! : null),
+    key: (index: number) => [...store.keys()][index] ?? null,
+    removeItem: (key: string) => void store.delete(key),
+    setItem: (key: string, value: string) => void store.set(key, String(value)),
+  };
+  Object.defineProperty(window, "localStorage", { configurable: true, value: storage });
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
+}
+
+/**
  * jsdom implements neither observer the grid depends on. `useContainerWidth` constructs a
  * ResizeObserver unconditionally, and the theme hook uses MutationObserver (which jsdom does
  * have). Stub the missing one rather than branching the component on `typeof` checks that

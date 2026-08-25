@@ -1974,7 +1974,10 @@
      * a node only marks it expanded; the repaint emits an `idle` placeholder row for its
      * children, and `pendingLoads` turns that row into the one request. So the rail fetches
      * exactly the levels that are on screen — and typing in the filter box, which descends only
-     * into levels already loaded, cannot start a request at all.
+     * into levels already loaded, never opens a level nobody opened. It is not that a filter
+     * can start no request at all: a level the user had already expanded and that has not
+     * landed still emits its placeholder, and a filter that matches that node by name keeps
+     * the row. Those are requests the unfiltered paint was making anyway.
      */
     const CAT = __oxidantCatalog;
 
@@ -2080,7 +2083,9 @@
       </aside>`;
     }
 
-    const CAT_BADGE = { catalog: 'C', namespace: 'S', table: 'T' };
+    // Null-prototype: `kind` is a server string, and a plain object would answer
+    // "constructor" or "toString" with a function instead of no badge.
+    const CAT_BADGE = Object.assign(Object.create(null), { catalog: 'C', namespace: 'S', table: 'T' });
 
     function catRowHtml(row, i) {
       const pad = 6 + row.depth * 12;

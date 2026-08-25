@@ -13,8 +13,14 @@
  * depth, and which placeholder stands in for a level that is loading, failed or empty. The
  * page paints what it returns and — crucially — *fetches what it returns*: a row for an
  * expanded level that is still `idle` is what kicks that level's request. That inversion is
- * why the filter can never start a fetch storm (see `railRows`: a filter descends only into
- * levels that are already `ready`).
+ * why typing cannot crawl the warehouse: a filter descends only into levels that are already
+ * `ready`, so it never opens a level nobody opened.
+ *
+ * Not quite "a filter starts no requests", which is the claim this file used to make. A level
+ * the user *had* expanded and that has not loaded still emits its `idle` placeholder, and if
+ * the filter matches that node by name the row stays on screen and `pendingLoads` asks for it.
+ * The bound is the honest one: a filter can only ask for levels the unfiltered paint was going
+ * to ask for anyway, and it usually asks for fewer.
  *
  * The shapes are the REST catalog API's — see `oxidant-connect/src/rest.rs`:
  *   GET /api/v1/catalogs                                    -> { catalogs: [{name, isCurrent}] }
