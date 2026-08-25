@@ -63,7 +63,13 @@ locals {
     var.architecture == "arm64" ? "t4g.large" : "t3.large"
   )
   # AL2023 naming: arm64 images use "al2023-ami-*-arm64", x86 use "*-x86_64".
-  ami_name_glob = "al2023-ami-*-${var.architecture}"
+  # The "2023." right after the prefix is load-bearing: it excludes
+  # "al2023-ami-minimal-*", which most_recent otherwise picks whenever the
+  # minimal variant is published last. The minimal image ships no
+  # amazon-ssm-agent, and Session Manager is the only way into a cluster node
+  # (the platform's security groups open 50051/50561 and nothing else) — so a
+  # plain "al2023-ami-*" glob silently bakes a driver no operator can debug.
+  ami_name_glob = "al2023-ami-2023.*-kernel-*-${var.architecture}"
 }
 
 source "amazon-ebs" "oxidant" {
@@ -121,7 +127,11 @@ build {
       "OXIDANT_BINARY_URL=${var.oxidant_binary_url}",
       "OXIDANT_ENGINE_VERSION=${var.engine_version}",
     ]
-    script          = "${path.root}/scripts/provision.sh"
-    execute_command = "chmod +x {{ .Path }}; sudo -E {{ .Path }}"
+    script = "${path.root}/scripts/provision.sh"
+    # {{ .Vars }} is what actually injects environment_vars above; without it
+    # packer runs the script with a bare environment and OXIDANT_ENGINE_VERSION
+    # silently falls back to "unknown", so the AMI cannot say which commit it
+    # came from. `sudo -E` alone preserves nothing that was never set.
+    execute_command = "chmod +x {{ .Path }}; sudo -E {{ .Vars }} {{ .Path }}"
   }
 }

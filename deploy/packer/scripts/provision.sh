@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # Packer provisioner: harden AL2023 and install Oxidant runtime bits.
+#
+# What lands on the image: the `oxidant` binary, the bootstrap script, the role
+# systemd units, and amazon-ssm-agent — the only shell into a cluster node,
+# since the platform's security groups open the Connect/Flight ports alone and
+# the driver runs with no operator key pair. The agent is not a phone-home: it
+# reaches the customer's own AWS SSM endpoints and nothing of ours.
 set -euo pipefail
 
 OXIDANT_UID=65532
@@ -33,6 +39,23 @@ if ! /usr/local/bin/aws --version 2>/dev/null | grep -q 'aws-cli/2'; then
   rm -rf /tmp/aws /tmp/awscli.zip
 fi
 /usr/local/bin/aws --version
+
+# SSM Session Manager. This is the ONLY shell into a driver or worker: the
+# platform launches them with no key pair, and the cluster security groups open
+# 50051/50561 and nothing else. The instance role already carries
+# AmazonSSMManagedInstanceCore. The full AL2023 image ships the agent, but the
+# base-AMI filter is a glob, so install it explicitly rather than inherit it —
+# a base image that quietly stops carrying it must not produce a node an
+# operator cannot read logs from. The agent talks only to the customer's own
+# AWS SSM endpoints, and only because the customer's role grants it.
+echo "[provision] installing amazon-ssm-agent"
+dnf -y install amazon-ssm-agent
+systemctl enable amazon-ssm-agent
+# Assert rather than trust: `dnf install` of an absent package would already
+# have failed the build, but an image that ships a masked or disabled unit
+# fails the same way for the operator and would not be caught otherwise.
+rpm -q amazon-ssm-agent
+systemctl is-enabled amazon-ssm-agent
 
 echo "[provision] creating oxidant user ${OXIDANT_UID}:${OXIDANT_GID}"
 groupadd -g "${OXIDANT_GID}" oxidant 2>/dev/null || true
@@ -98,7 +121,8 @@ EOF
 install -m 0644 /tmp/oxidant-files/QUICKSTART.md /usr/local/share/oxidant/QUICKSTART.md
 
 echo "[provision] hardening ssh / imds posture helpers"
-# Password auth off; AMI is intended for SSM Session Manager (no required KeyName).
+# Password auth off; the AMI reaches a shell over SSM Session Manager (the agent
+# is installed and enabled above), so no key pair is required.
 if [[ -f /etc/ssh/sshd_config ]]; then
   sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
   sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config

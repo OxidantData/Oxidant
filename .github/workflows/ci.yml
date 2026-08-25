@@ -59,6 +59,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - name: ASG membership bootstrap tests
         run: bash deploy/packer/tests/test_asg_membership.sh
+      - name: Session Manager contracts
+        run: bash deploy/packer/tests/test_ssm_agent.sh
 
   build-test:
     name: clippy + test
