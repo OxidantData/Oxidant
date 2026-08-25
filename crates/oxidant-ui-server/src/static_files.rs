@@ -638,6 +638,51 @@ mod tests {
         );
     }
 
+    /// **`Refresh` pressed while the root is in flight must not return what it interrupted.**
+    ///
+    /// The generation guard went on `catLoadChildren` and stopped one level short. Page mounts,
+    /// `/api/v1/catalogs` is out, the user presses **Refresh**: `catGen` is bumped and `byKey`
+    /// dropped, then `catLoadCatalogs(true)` returned immediately because the root said
+    /// `loading` — so the pre-Refresh response landed in the tree the button had just replaced,
+    /// with nothing on screen saying the catalogs were the old ones.
+    #[test]
+    fn refresh_reloads_the_root_it_interrupted_rather_than_waiting_on_it() {
+        let body = page_fn_body(embedded_index(), "async function catLoadCatalogs(force) {");
+        assert!(
+            !body.is_empty(),
+            "`catLoadCatalogs` is gone; the rail has no root"
+        );
+        // The in-flight bail is what `Refresh` has to get past: its own request is the one that
+        // is about to be discarded.
+        assert!(
+            body.contains(
+                "if (!force && (cur.state === 'loading' || cur.state === 'ready')) return;"
+            ),
+            "a forced reload must not be turned away by the request it is replacing: {body}"
+        );
+        // And the reason that is safe: the stale answer is dropped rather than written.
+        assert!(
+            body.contains("const gen = catGen;") && body.contains("if (gen !== catGen) return;"),
+            "the root needs the generation guard the levels below it have: {body}"
+        );
+        // The guard only guards if the write happens after it — an assignment inside the `try`
+        // would have already landed by the time the generation is compared.
+        let (_, after_guard) = body
+            .split_once("if (gen !== catGen) return;")
+            .expect("checked above");
+        assert!(
+            after_guard.contains("catCache.catalogs = next;"),
+            "the root's result must be written after the generation check, not inside the \
+             fetch: {body}"
+        );
+        assert_eq!(
+            body.matches("catCache.catalogs = ").count(),
+            2,
+            "exactly two writes to the root: the `loading` placeholder, and the guarded result \
+             — a third is a path around the guard: {body}"
+        );
+    }
+
     /// One rail, two mounts, and a layout it adds a column to rather than wraps.
     #[test]
     fn the_catalog_rail_is_mounted_on_both_query_pages() {
@@ -750,12 +795,15 @@ mod tests {
              {toggle}"
         );
 
-        // **`Refresh` must not be undone by the request it interrupted.** A level whose fetch
-        // was already out when the tree was dropped would otherwise write its stale answer into
-        // the new tree, and the button pressed to get rid of those rows would repaint them.
-        assert!(
-            page.contains("if (gen !== catGen) return;"),
-            "an in-flight level must not write back into a tree that `Refresh` replaced"
+        // **`Refresh` must not be undone by the request it interrupted.** A fetch that was
+        // already out when the tree was dropped would otherwise write its stale answer into the
+        // new tree, and the button pressed to get rid of those rows would repaint them. Every
+        // level, the root included — see the test below for the root's own half of this.
+        assert_eq!(
+            page.matches("if (gen !== catGen) return;").count(),
+            2,
+            "both `catLoadCatalogs` and `catLoadChildren` must refuse to write back into a tree \
+             that `Refresh` replaced"
         );
 
         // A preview is a statement like any other — same API as the Run button, so it lands in

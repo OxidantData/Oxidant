@@ -2214,19 +2214,29 @@
 
     async function catLoadCatalogs(force) {
       const cur = catCache.catalogs;
-      if (cur.state === 'loading') return;
-      if (cur.state === 'ready' && !force) return;
+      // A root already in flight is normally the whole reason not to ask again — but `force`
+      // is `Refresh`, which has just bumped the generation, so that request belongs to a tree
+      // that no longer exists and its answer is about to be thrown away. Bailing here is how
+      // the button pressed to get fresh catalogs returned the ones fetched before it was
+      // pressed.
+      if (!force && (cur.state === 'loading' || cur.state === 'ready')) return;
+      const gen = catGen;
       catCache.catalogs = { state: 'loading' };
       paintCatalogRail();
+      let next;
       try {
         const d = await catJson(CAT.catalogsUrl());
-        catCache.catalogs = {
+        next = {
           state: 'ready',
           items: (d.catalogs || []).map(c => CAT.makeCatalog(c.name, c.isCurrent)),
         };
       } catch (e) {
-        catCache.catalogs = { state: 'error', error: e.message, code: e.code || null };
+        next = { state: 'error', error: e.message, code: e.code || null };
       }
+      // Same guard the levels below have had since 6919144, for the same reason: a `Refresh`
+      // mid-flight must not be repainted with what it interrupted.
+      if (gen !== catGen) return;
+      catCache.catalogs = next;
       paintCatalogRail();
     }
 
