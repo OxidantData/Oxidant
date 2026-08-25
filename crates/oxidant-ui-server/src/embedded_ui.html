@@ -291,6 +291,172 @@
     .muted { color: var(--oxidant-text-muted); }
     .result-wrap { overflow-x: auto; }
 
+    /* ── Catalog rail ───────────────────────────────────────────────────────────────────
+     * The rail is a *sibling* of whatever the page already laid out, never a wrapper around
+     * its internals: `.workbench` puts one column in front of `.editor-grid` (or the notebook)
+     * and changes nothing inside it. Collapsed, that column is a 34px strip and the second
+     * column is everything else — which is why hiding the rail restores the previous layout
+     * exactly rather than approximately.
+     */
+    .workbench { display: grid; grid-template-columns: 264px minmax(0, 1fr); gap: 16px; align-items: start; }
+    .workbench[data-rail="closed"] { grid-template-columns: 34px minmax(0, 1fr); }
+    /* Under the same breakpoint `.editor-grid` already folds at: a 264px rail beside a
+       single-column editor leaves neither enough room. */
+    @media (max-width: 900px) {
+      .workbench, .workbench[data-rail="closed"] { grid-template-columns: 1fr; }
+      .cat-rail { position: static; max-height: 320px; }
+    }
+    .cat-rail {
+      background: var(--oxidant-surface);
+      border: 1px solid var(--oxidant-border);
+      border-radius: var(--oxidant-radius);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      /* The tree scrolls with the page until the header clears, then holds still while a long
+         result table scrolls past it. */
+      position: sticky;
+      top: 16px;
+      max-height: calc(100vh - 120px);
+    }
+    .workbench[data-rail="open"] .cat-strip { display: none; }
+    .workbench[data-rail="closed"] .cat-body { display: none; }
+    /* The collapsed strip: the word itself, set on its side. No glyph — the page has no icon
+       set and an invented one is a shape nobody has been taught. */
+    .cat-strip {
+      writing-mode: vertical-rl;
+      background: transparent;
+      border: none;
+      color: var(--oxidant-text-muted);
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      padding: 12px 0;
+      width: 100%;
+      transition: color 0.15s;
+    }
+    .cat-strip:hover { color: var(--oxidant-text); }
+    .cat-body { display: flex; flex-direction: column; min-height: 0; }
+    .cat-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 12px 12px 8px;
+    }
+    .cat-controls { padding: 0 12px 8px; }
+    .cat-controls input[type=text] { max-width: none; padding: 6px 10px; font-size: 12px; }
+    .cat-hint { color: var(--oxidant-text-muted); font-size: 11px; margin-top: 6px; }
+    .cat-suggest:not(:empty) {
+      border-top: 1px solid var(--oxidant-border);
+      padding: 6px 0;
+      max-height: 168px;
+      overflow-y: auto;
+    }
+    .cat-tree { border-top: 1px solid var(--oxidant-border); overflow-y: auto; padding: 6px 0 10px; min-height: 0; }
+    .cat-tree .error-state, .cat-tree .empty-state { margin: 8px 10px; }
+    .cat-row { display: flex; align-items: center; gap: 2px; padding-right: 6px; }
+    .cat-row:hover { background: var(--oxidant-bg-subtle); }
+    .cat-twist {
+      flex: none;
+      width: 16px;
+      height: 20px;
+      background: transparent;
+      border: none;
+      color: var(--oxidant-text-muted);
+      cursor: pointer;
+      font-size: 9px;
+      font-family: inherit;
+      padding: 0;
+      line-height: 1;
+    }
+    .cat-twist:hover { color: var(--oxidant-text); }
+    button.cat-label {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: transparent;
+      border: none;
+      color: var(--oxidant-text-secondary);
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 3px 0;
+      text-align: left;
+      transition: color 0.15s;
+    }
+    button.cat-label:hover { color: var(--oxidant-text); }
+    /* One-letter level badge — catalog, schema, table. A column has none: its type sits on the
+       right instead, and the pair would be two badges on one row. */
+    .cat-badge {
+      flex: none;
+      width: 15px;
+      border: 1px solid var(--oxidant-border);
+      border-radius: 3px;
+      color: var(--oxidant-text-muted);
+      font-family: var(--oxidant-font-mono);
+      font-size: 9px;
+      line-height: 14px;
+      text-align: center;
+    }
+    /* A column has no badge; it keeps the badge's width so its name lines up with its
+       siblings' rather than sliding left under the table's. */
+    .cat-spacer { flex: none; width: 15px; }
+    .cat-name { font-family: var(--oxidant-font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cat-type { flex: none; color: var(--oxidant-text-muted); font-family: var(--oxidant-font-mono); font-size: 10px; }
+    /* The rows a filter actually matched, against the ancestors it had to reveal to show them. */
+    .cat-hit .cat-name { color: var(--oxidant-text); font-weight: 500; }
+    .cat-current { color: var(--oxidant-text); }
+    /* Row actions stay out of the way until the row is pointed at — or focused, so the
+       keyboard reaches them at all. */
+    .cat-act {
+      flex: none;
+      opacity: 0;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: var(--oxidant-radius-sm);
+      color: var(--oxidant-text-muted);
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 10px;
+      padding: 1px 5px;
+      transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .cat-row:hover .cat-act, .cat-row:focus-within .cat-act { opacity: 1; }
+    .cat-act:hover { color: var(--oxidant-text); border-color: var(--oxidant-border); }
+    .cat-note { color: var(--oxidant-text-muted); font-size: 11px; padding: 3px 0; }
+    .cat-fail { padding: 4px 8px 6px 0; }
+    .cat-fail-line { display: flex; align-items: center; gap: 8px; color: var(--oxidant-danger); font-size: 11px; }
+    .cat-detail {
+      font-family: var(--oxidant-font-mono);
+      font-size: 10px;
+      color: var(--oxidant-text-muted);
+      margin-top: 3px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .cat-sug {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      width: 100%;
+      background: transparent;
+      border: none;
+      color: var(--oxidant-text-secondary);
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 3px 12px;
+      text-align: left;
+    }
+    .cat-sug:hover { background: var(--oxidant-bg-subtle); color: var(--oxidant-text); }
+    .cat-sug .cat-name { flex: 1; min-width: 0; }
+
     /* ── Statement history ──────────────────────────────────────────────────────────── */
     .stmt-item {
       padding: 8px 10px;
@@ -1789,13 +1955,529 @@
       return html;
     }
 
+    /*__CATALOG_RAIL_JS__*/
+
+    /* ---------- Catalog rail (Editor + Notebook) ----------
+     *
+     * One rail, two mounts. The Editor and the Notebook render the same component against the
+     * same tree, the same expansion and the same filter — expanding `sales` on one page and
+     * switching tabs must not re-collapse it, and must not re-fetch it. The only thing that
+     * differs per host is where a click lands: which textarea takes an inserted name, and which
+     * pane a `Preview` paints its rows into.
+     *
+     * The decision-making — which rows exist once a filter narrows a half-loaded tree, what a
+     * click on each kind inserts, how a name is quoted — is `catalog_rail.js`, spliced in above
+     * and pinned by `ui/src/lib/catalogRail.test.ts`. What is left here is the DOM: paint the
+     * rows it returns, and fetch the levels it says are unasked-for.
+     *
+     * Lazy loading falls out of that inversion rather than being wired up separately. Expanding
+     * a node only marks it expanded; the repaint emits an `idle` placeholder row for its
+     * children, and `pendingLoads` turns that row into the one request. So the rail fetches
+     * exactly the levels that are on screen — and typing in the filter box, which descends only
+     * into levels already loaded, never opens a level nobody opened. It is not that a filter
+     * can start no request at all: a level the user had already expanded and that has not
+     * landed still emits its placeholder, and a filter that matches that node by name keeps
+     * the row. Those are requests the unfiltered paint was making anyway.
+     */
+    const CAT = __oxidantCatalog;
+
+    function catStorage() {
+      try { return window.localStorage; } catch (e) { return null; }
+    }
+
+    /* The tree, shared by both mounts. `catalogs` is the root level; `byKey` holds one entry
+       per expanded node, keyed by `CAT.nodeKey`. An entry is
+       `{ state: 'idle'|'loading'|'ready'|'error', items?, error?, code? }`. */
+    const catCache = { catalogs: { state: 'idle' }, byKey: {} };
+    const catPrefs = CAT.loadRailPrefs(catStorage());
+    let catFilter = '';
+    /* Expansion the *filter* is responsible for, kept apart from the expansion the tree
+       remembers. A filter paints the path to a match open, so a chevron on one of those rows
+       has to be able to close it again — and that close is about the search, not about how the
+       user wants their tree to look tomorrow. Nothing in here is persisted, and it is dropped
+       whole the moment the box is empty. Values are three-valued (`true`/`false`/absent),
+       which is what lets a `false` outrank the filter's reveal in `railRows`. */
+    let catFilterExpanded = {};
+    let catFilterTimer = null;
+    let catSuggest = { state: 'idle', prefix: '', items: [] };
+    /* Autocomplete is typed against: a slow answer for `spark_c` must not land on top of the
+       answer for `spark_catalog.def`. Only the newest sequence may paint. */
+    let catSuggestSeq = 0;
+    /* The rows of the last paint, in order. Row actions carry their index rather than their
+       node key: a key contains a NUL separator, and an HTML parser rewrites that to U+FFFD
+       inside an attribute — so a key that made the round trip through the DOM would not match
+       the one in `catCache`. */
+    let catRows = [];
+    let nbPreviewBusy = false;
+    /* Bumped by `Refresh`. A level whose request was already in flight when the tree was
+       dropped must not write its answer into the new one: `Refresh` would then repaint the
+       stale tables it was pressed to get rid of, with nothing on screen saying so. */
+    let catGen = 0;
+
+    const CAT_HOSTS = {
+      editor: {
+        rail: 'cat-rail-editor',
+        target: () => document.getElementById('editor-sql'),
+        panes: () => ({
+          result: document.getElementById('editor-result'),
+          error: document.getElementById('editor-error'),
+        }),
+        // A preview is a statement like any other, so it takes the Editor's run controls with
+        // it: the status chip tracks it and `Cancel` cancels it.
+        begin: () => {
+          if (editorBusy) return false;
+          editorBusy = true;
+          setEditorRunning(true);
+          setEditorStatus(null);
+          return true;
+        },
+        onUpdate: (d) => { editorRunId = d.statementId; setEditorStatus(d); },
+        end: () => {
+          editorBusy = false;
+          editorRunId = null;
+          setEditorRunning(false);
+          loadEditorStatements();
+        },
+      },
+      notebook: {
+        rail: 'cat-rail-notebook',
+        target: () => nbInsertTarget(),
+        panes: () => ({
+          result: document.getElementById('nb-preview-result'),
+          error: document.getElementById('nb-preview-error'),
+        }),
+        begin: () => {
+          if (nbPreviewBusy) return false;
+          nbPreviewBusy = true;
+          return true;
+        },
+        onUpdate: () => {},
+        end: () => { nbPreviewBusy = false; },
+      },
+    };
+
+    /* The rail's markup, mounted by whichever panel is rendering. Only `.cat-tree` and
+       `.cat-suggest` are repainted afterwards — the filter box is not, so a repaint triggered
+       by a fetch that landed mid-word cannot move the caret out from under the typist. */
+    function catRailHtml(hostId) {
+      const id = CAT_HOSTS[hostId].rail;
+      return `<aside class="cat-rail" id="${id}">
+        <button class="cat-strip" type="button" data-act="open" title="Show the catalog" aria-label="Show the catalog">Catalog</button>
+        <div class="cat-body">
+          <div class="cat-head">
+            <span class="eyebrow">Catalog</span>
+            <span class="flex">
+              <button class="nb-btn" type="button" data-act="refresh" title="Reload the catalog from the engine">Refresh</button>
+              <button class="nb-btn" type="button" data-act="close" title="Collapse the rail" aria-label="Collapse the rail">&#8592;</button>
+            </span>
+          </div>
+          <div class="cat-controls">
+            <input type="text" class="cat-q" spellcheck="false" autocomplete="off"
+                   placeholder="Filter, or a catalog.schema.table path"
+                   aria-label="Filter the catalog" />
+            <div class="cat-hint">Click a name to insert it at the cursor.</div>
+          </div>
+          <div class="cat-suggest"></div>
+          <div class="cat-tree"></div>
+        </div>
+      </aside>`;
+    }
+
+    // Null-prototype: `kind` is a server string, and a plain object would answer
+    // "constructor" or "toString" with a function instead of no badge.
+    const CAT_BADGE = Object.assign(Object.create(null), { catalog: 'C', namespace: 'S', table: 'T' });
+
+    function catRowHtml(row, i) {
+      const pad = 6 + row.depth * 12;
+      if (row.type === 'loading') {
+        return `<div class="cat-note" style="padding-left:${pad}px">Loading&hellip;</div>`;
+      }
+      if (row.type === 'empty') {
+        return `<div class="cat-note" style="padding-left:${pad}px">${esc(row.message)}</div>`;
+      }
+      if (row.type === 'error') {
+        return `<div class="cat-fail" style="padding-left:${pad}px">
+          <div class="cat-fail-line">
+            <span>${esc(row.message)}${row.code ? ' &middot; HTTP ' + row.code : ''}</span>
+            <button class="nb-btn" type="button" data-act="retry" data-i="${i}">Retry</button>
+          </div>
+          ${row.detail ? `<div class="cat-detail">${esc(row.detail)}</div>` : ''}
+        </div>`;
+      }
+      const node = row.node;
+      const badge = CAT_BADGE[node.kind];
+      const twist = row.expandable
+        ? `<button class="cat-twist" type="button" data-act="toggle" data-i="${i}"
+                   aria-expanded="${row.expanded ? 'true' : 'false'}"
+                   aria-label="${row.expanded ? 'Collapse' : 'Expand'} ${esc(node.name)}">${row.expanded ? '&#9662;' : '&#9656;'}</button>`
+        : '<span class="cat-twist"></span>';
+      const insert = CAT.insertTextFor(node);
+      const cls = 'cat-row' + (row.match ? ' cat-hit' : '');
+      const name = `<span class="cat-name${node.isCurrent ? ' cat-current' : ''}">${esc(node.name)}</span>`;
+      const type = node.kind === 'column' && node.dataType
+        ? `<span class="cat-type">${esc(node.dataType)}</span>` : '';
+      const preview = node.kind === 'table'
+        ? `<button class="cat-act" type="button" data-act="preview" data-i="${i}"
+                   title="SELECT * FROM ${esc(insert)} LIMIT ${CAT.CAT_PREVIEW_ROWS}"
+                   aria-label="Preview ${esc(node.name)}">Preview</button>`
+        : '';
+      return `<div class="${cls}" style="padding-left:${pad}px">
+        ${twist}
+        ${badge ? `<span class="cat-badge" aria-hidden="true">${badge}</span>` : '<span class="cat-spacer" aria-hidden="true"></span>'}
+        <button class="cat-label" type="button" data-act="insert" data-i="${i}" title="Insert ${esc(insert)}">
+          ${name}${type}
+        </button>
+        ${preview}
+      </div>`;
+    }
+
+    /* The whole-rail states. A tree that could not be listed at all is an ErrorState with a
+       retry, not a row: the engine being unreachable is the loudest thing this pane can say,
+       and it is the one case where there is nothing else on screen to read. */
+    function catTreeHtml(rows) {
+      if (rows.length === 1 && rows[0].type === 'error' && !rows[0].key) {
+        return errorState(rows[0].message, rows[0].detail) +
+          '<div class="cat-fail" style="padding-left:10px"><div class="cat-fail-line">' +
+          '<button class="nb-btn" type="button" data-act="retry" data-i="0">Retry</button></div></div>';
+      }
+      if (rows.length === 1 && rows[0].type === 'empty' && rows[0].scope === 'catalogs') {
+        return emptyState('No catalogs', 'This engine has no catalog registered. Configure one in oxidant.yaml — see docs/catalogs.md.');
+      }
+      return rows.map(catRowHtml).join('');
+    }
+
+    function catSuggestHtml() {
+      if (!CAT.wantsSuggestions(catFilter)) return '';
+      if (catSuggest.state === 'loading') return '<div class="cat-note" style="padding-left:12px">Matching&hellip;</div>';
+      if (catSuggest.state === 'error') {
+        return `<div class="cat-fail" style="padding-left:12px"><div class="cat-fail-line">${esc(catSuggest.error || 'autocomplete failed')}</div></div>`;
+      }
+      if (catSuggest.state !== 'ready') return '';
+      if (!catSuggest.items.length) {
+        return `<div class="cat-note" style="padding-left:12px">No match for &ldquo;${esc(catSuggest.prefix)}&rdquo;</div>`;
+      }
+      return catSuggest.items.map((sg, i) => `<button class="cat-sug" type="button" data-act="suggest" data-s="${i}"
+          title="Insert ${esc(CAT.suggestionInsertText(sg))}">
+        <span class="cat-badge" aria-hidden="true">${CAT_BADGE[sg.kind] || ''}</span>
+        <span class="cat-name">${esc(sg.qualified || sg.name)}</span>
+        <span class="cat-type">${esc(sg.kind)}</span>
+      </button>`).join('');
+    }
+
+    /* Repaint every mounted rail from one row list, then ask for the levels that list says
+       nobody has asked for. Both mounts get identical markup, so a row's index means the same
+       thing in either — which is what lets a click carry an index instead of a key. */
+    /* What the tree remembers, with the filter's own opens and closes laid over it. Without a
+       filter there is no overlay and this is the persisted set unchanged. */
+    function catExpansion() {
+      if (!CAT.normalizeFilter(catFilter)) return catPrefs.expanded;
+      return Object.assign({}, catPrefs.expanded, catFilterExpanded);
+    }
+
+    function paintCatalogRail() {
+      catRows = CAT.railRows(catCache, catExpansion(), catFilter);
+      const tree = catTreeHtml(catRows);
+      const suggest = catSuggestHtml();
+      Object.keys(CAT_HOSTS).forEach((hostId) => {
+        const rail = document.getElementById(CAT_HOSTS[hostId].rail);
+        if (!rail) return;
+        const wb = rail.parentElement;
+        if (wb) wb.setAttribute('data-rail', catPrefs.open ? 'open' : 'closed');
+        // The tree repaints wholesale — a level landing, a filter keystroke — and `innerHTML`
+        // resets the scroll to the top. Expanding a schema near the bottom of a long catalog
+        // would otherwise throw the reader back to the first row the moment its tables arrived.
+        const treeEl = rail.querySelector('.cat-tree');
+        const scroll = treeEl.scrollTop;
+        treeEl.innerHTML = tree;
+        treeEl.scrollTop = scroll;
+        rail.querySelector('.cat-suggest').innerHTML = suggest;
+        const q = rail.querySelector('.cat-q');
+        // Mirrored, never re-set: assigning the same value would still collapse a selection.
+        if (q && q.value !== catFilter) q.value = catFilter;
+      });
+      CAT.pendingLoads(catRows).forEach(catLoadChildren);
+    }
+
+    /* One fetch shape for every catalog route. A rejected `fetch` is the engine being
+       unreachable — a restarting driver, a closed tunnel — and it has no status code, so it
+       says what actually happened instead of `HTTP undefined`. */
+    async function catJson(url) {
+      let r;
+      try {
+        r = await fetch(url);
+      } catch (e) {
+        throw new Error('The engine did not answer. It may be restarting, or the tab may have lost the tunnel.');
+      }
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const err = new Error(d.error || ('request failed with HTTP ' + r.status));
+        err.code = r.status;
+        throw err;
+      }
+      return d;
+    }
+
+    async function catLoadCatalogs(force) {
+      const cur = catCache.catalogs;
+      // A root already in flight is normally the whole reason not to ask again — but `force`
+      // is `Refresh`, which has just bumped the generation, so that request belongs to a tree
+      // that no longer exists and its answer is about to be thrown away. Bailing here is how
+      // the button pressed to get fresh catalogs returned the ones fetched before it was
+      // pressed.
+      if (!force && (cur.state === 'loading' || cur.state === 'ready')) return;
+      const gen = catGen;
+      catCache.catalogs = { state: 'loading' };
+      paintCatalogRail();
+      let next;
+      try {
+        const d = await catJson(CAT.catalogsUrl());
+        next = {
+          state: 'ready',
+          items: (d.catalogs || []).map(c => CAT.makeCatalog(c.name, c.isCurrent)),
+        };
+      } catch (e) {
+        next = { state: 'error', error: e.message, code: e.code || null };
+      }
+      // Same guard the levels below have had since 6919144, for the same reason: a `Refresh`
+      // mid-flight must not be repainted with what it interrupted.
+      if (gen !== catGen) return;
+      catCache.catalogs = next;
+      paintCatalogRail();
+    }
+
+    function catChildNodes(node, d) {
+      if (node.kind === 'catalog') {
+        return (d.namespaces || []).map(ns => CAT.makeNamespace(node.catalog, ns));
+      }
+      if (node.kind === 'namespace') {
+        return (d.tables || []).map(t => CAT.makeTable(node.catalog, node.namespace, t.name, t.type));
+      }
+      return (d.columns || []).map(c => CAT.makeColumn(node.catalog, node.namespace, node.table, c.name, c.type));
+    }
+
+    /* The parent of a pending level is always a row in the same paint, above its placeholder,
+       so the node is found by key without walking the tree. */
+    function catNodeByKey(key) {
+      for (const row of catRows) {
+        if (row.type === 'node' && row.key === key) return row.node;
+      }
+      return null;
+    }
+
+    async function catLoadChildren(key) {
+      const node = catNodeByKey(key);
+      if (!node) return;
+      const entry = catCache.byKey[key];
+      if (entry && (entry.state === 'loading' || entry.state === 'ready')) return;
+      const gen = catGen;
+      catCache.byKey[key] = { state: 'loading' };
+      let next;
+      try {
+        const d = await catJson(CAT.childrenUrl(node));
+        next = { state: 'ready', items: catChildNodes(node, d) };
+      } catch (e) {
+        next = { state: 'error', error: e.message, code: e.code || null };
+      }
+      // Dropped mid-flight by a `Refresh`. Nothing is written back — the tree it belonged to is
+      // gone, and the key is absent from the new one, so the next paint asks again.
+      if (gen !== catGen) return;
+      catCache.byKey[key] = next;
+      paintCatalogRail();
+    }
+
+    function catSetOpen(open) {
+      catPrefs.open = open;
+      CAT.saveRailPrefs(catStorage(), catPrefs);
+      paintCatalogRail();
+      if (open) catLoadCatalogs(false);
+    }
+
+    /* Flip what the row is *showing*, which under a filter is not the same as what the tree
+       remembers. `expanded` comes from the painted row rather than from the store: a row the
+       filter opened reads as open, and writing `!catPrefs.expanded[key]` there would set a bit
+       with no visible effect — the filter repaints it open on the next keystroke — while
+       quietly spending one of the 200 remembered keys and buying a re-fetch on the next page
+       load. So while the box has anything in it the toggle is filter-scoped and nothing is
+       saved; empty the box and the tree is exactly as the user left it. */
+    function catToggle(key, expanded) {
+      if (CAT.normalizeFilter(catFilter)) catFilterExpanded[key] = !expanded;
+      else {
+        if (expanded) delete catPrefs.expanded[key];
+        else catPrefs.expanded[key] = true;
+        CAT.saveRailPrefs(catStorage(), catPrefs);
+      }
+      paintCatalogRail();
+    }
+
+    /* Retry drops the failed entry back to `idle`; the repaint emits its placeholder again and
+       `pendingLoads` re-asks. A retry is never a second code path. */
+    function catRetry(key) {
+      if (!key) { catLoadCatalogs(true); return; }
+      delete catCache.byKey[key];
+      paintCatalogRail();
+    }
+
+    function catRefresh() {
+      catGen++;
+      catCache.byKey = {};
+      catSuggest = { state: 'idle', prefix: '', items: [] };
+      catLoadCatalogs(true);
+    }
+
+    /* Which textareas have actually had a caret in them.
+       A textarea nobody has clicked into reports `selectionStart === 0`, which is
+       indistinguishable from a caret deliberately parked at the front — so without this the
+       *first* click on a catalog name prepends it to the query. Membership rather than a flag
+       per host: the Notebook re-renders its cells, and a fresh element genuinely has no
+       caret, so it should get the end of the buffer too. */
+    const catCaretSeen = new WeakSet();
+    function catTrackCaret(ta) {
+      if (ta) ta.addEventListener('focus', () => catCaretSeen.add(ta));
+    }
+
+    /* Insert at the cursor of whichever textarea this host is pointing at — or at the end of
+       it, if it has never had one. The synthetic `input` event is not decoration: a Notebook
+       cell persists itself from that event, so without it the inserted name is on screen and
+       absent from localStorage. */
+    function catInsert(hostId, text) {
+      if (!text) return;
+      const ta = CAT_HOSTS[hostId].target();
+      if (!ta) return;
+      const seen = catCaretSeen.has(ta) || document.activeElement === ta;
+      const at = CAT.caretRange(seen, ta.selectionStart, ta.selectionEnd);
+      const r = CAT.insertAtCursor(ta.value, at.start, at.end, text);
+      ta.value = r.text;
+      ta.focus();
+      ta.setSelectionRange(r.cursor, r.cursor);
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    /* Preview: the same statement API the Run button uses, so a preview shows up in the
+       recent-statements rail and on the SQL page like anything else. */
+    async function catPreview(hostId, node) {
+      if (!node) return;
+      const host = CAT_HOSTS[hostId];
+      const panes = host.panes();
+      if (!panes.result) return;
+      if (!host.begin()) return;
+      const sql = CAT.previewSql(node);
+      const errorEl = panes.error || panes.result;
+      errorEl.innerHTML = '';
+      panes.result.innerHTML = `<div class="card"><span class="muted">Running </span><code>${esc(sql)}</code></div>`;
+      try {
+        const doc = await runStatement(sql, host.onUpdate);
+        await showStatementResult(doc, panes.result, errorEl);
+        // Say which statement these rows are, above them: the pane is shared with the Run
+        // button and an unlabelled table is indistinguishable from the last query's.
+        const head = document.createElement('div');
+        head.className = 'note';
+        head.innerHTML = '<code>' + esc(sql) + '</code>';
+        panes.result.insertBefore(head, panes.result.firstChild);
+      } catch (e) {
+        panes.result.innerHTML = '';
+        errorEl.innerHTML = errorState('Preview failed', e.message);
+      } finally {
+        host.end();
+      }
+    }
+
+    /* A dotted filter is a path, and the autocomplete route — `CAT.autocompleteUrl`, like every
+       other catalog URL on this page — is the only thing that can resolve one against levels
+       this rail has not loaded. A bare word is not sent: that endpoint matches by prefix and
+       the box filters by substring, so it would answer a different question than the one being
+       asked. */
+    async function catFetchSuggestions() {
+      const raw = catFilter.trim();
+      if (!CAT.wantsSuggestions(raw)) {
+        catSuggestSeq++;
+        catSuggest = { state: 'idle', prefix: '', items: [] };
+        paintCatalogRail();
+        return;
+      }
+      const seq = ++catSuggestSeq;
+      catSuggest = { state: 'loading', prefix: raw, items: [] };
+      paintCatalogRail();
+      try {
+        const d = await catJson(CAT.autocompleteUrl(raw));
+        if (seq !== catSuggestSeq) return;
+        catSuggest = {
+          state: 'ready',
+          prefix: raw,
+          items: (d.suggestions || []).slice(0, CAT.CAT_MAX_SUGGESTIONS),
+        };
+      } catch (e) {
+        if (seq !== catSuggestSeq) return;
+        catSuggest = { state: 'error', prefix: raw, items: [], error: e.message };
+      }
+      paintCatalogRail();
+    }
+
+    /* Clicking a suggestion inserts it *and* opens the tree to where it lives, so the rail is
+       left showing the thing that was just used rather than the filter that found it. */
+    function catUseSuggestion(hostId, index) {
+      const sg = catSuggest.items[index];
+      if (!sg) return;
+      catInsert(hostId, CAT.suggestionInsertText(sg));
+      // A suggestion is only ever clicked with a dotted path in the filter box, so a level
+      // the user collapsed while searching may be sitting in the overlay as `false` — and that
+      // would outrank the reveal this click is for. Asking to be shown where something lives
+      // outranks having closed the box it lives in.
+      CAT.revealTargets(sg).forEach(n => {
+        const key = CAT.nodeKey(n);
+        delete catFilterExpanded[key];
+        catPrefs.expanded[key] = true;
+      });
+      CAT.saveRailPrefs(catStorage(), catPrefs);
+      paintCatalogRail();
+    }
+
+    function catOnFilterInput(value) {
+      catFilter = value;
+      // An empty box is not a filter, so its opens and closes go with it rather than lying in
+      // wait to be re-applied by the next unrelated search.
+      if (!CAT.normalizeFilter(catFilter)) catFilterExpanded = {};
+      paintCatalogRail();
+      if (catFilterTimer) clearTimeout(catFilterTimer);
+      catFilterTimer = setTimeout(catFetchSuggestions, 200);
+    }
+
+    function bindCatalogRail(hostId) {
+      const rail = document.getElementById(CAT_HOSTS[hostId].rail);
+      if (!rail) return;
+      rail.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-act]');
+        if (!btn || !rail.contains(btn)) return;
+        const act = btn.dataset.act;
+        const row = btn.dataset.i != null ? catRows[+btn.dataset.i] : null;
+        if (act === 'open' || act === 'close') catSetOpen(act === 'open');
+        else if (act === 'refresh') catRefresh();
+        else if (act === 'retry') catRetry(row ? row.key : null);
+        else if (act === 'toggle' && row) catToggle(row.key, row.expanded);
+        else if (act === 'insert' && row) catInsert(hostId, CAT.insertTextFor(row.node));
+        else if (act === 'preview' && row) catPreview(hostId, row.node);
+        else if (act === 'suggest') catUseSuggestion(hostId, +btn.dataset.s);
+      });
+      const q = rail.querySelector('.cat-q');
+      q.addEventListener('input', () => catOnFilterInput(q.value));
+    }
+
+    function mountCatalogRail(hostId) {
+      bindCatalogRail(hostId);
+      paintCatalogRail();
+      catLoadCatalogs(false);
+    }
+
     /* ---------- Editor panel ---------- */
     let editorBusy = false;
     let editorRunId = null;
 
     function renderEditor() {
       const el = document.getElementById('panel-editor');
-      el.innerHTML = `<div class="editor-grid">
+      // The rail is a sibling column in front of the grid the page already had; nothing inside
+      // `.editor-grid` moves, and collapsing the rail hands its width straight back.
+      el.innerHTML = `<div class="workbench" data-rail="${catPrefs.open ? 'open' : 'closed'}">
+        ${catRailHtml('editor')}
+        <div class="editor-grid">
         <div>
           <div class="card">
             ${cardHead('Query', 'SQL editor')}
@@ -1817,6 +2499,7 @@
           </div>
           <div id="editor-statements"><span class="muted">Loading…</span></div>
         </div>
+        </div>
       </div>`;
       document.getElementById('editor-run').onclick = runEditor;
       document.getElementById('editor-cancel').onclick = cancelEditor;
@@ -1824,7 +2507,11 @@
       document.getElementById('editor-sql').addEventListener('keydown', (e) => {
         if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); runEditor(); }
       });
+      // Until this fires, an insertion goes to the end of the query rather than to the
+      // offset-0 "cursor" an untouched textarea reports.
+      catTrackCaret(document.getElementById('editor-sql'));
       loadEditorStatements();
+      mountCatalogRail('editor');
     }
 
     function setEditorRunning(running) {
@@ -1984,7 +2671,10 @@
 
     function renderNotebook() {
       const el = document.getElementById('panel-notebook');
-      el.innerHTML = `<div class="card">
+      el.innerHTML = `<div class="workbench" data-rail="${catPrefs.open ? 'open' : 'closed'}">
+        ${catRailHtml('notebook')}
+        <div>
+      <div class="card">
         ${cardHead('Query', 'Notebook')}
         <div class="flex" style="flex-wrap:wrap">
           <button class="btn" id="nb-add-sql">+ SQL cell</button>
@@ -1996,7 +2686,11 @@
           <span class="note" id="nb-status" style="margin:0"></span>
         </div>
       </div>
-      <div id="nb-cells"></div>`;
+      <div id="nb-preview-error"></div>
+      <div id="nb-preview-result"></div>
+      <div id="nb-cells"></div>
+        </div>
+      </div>`;
       document.getElementById('nb-add-sql').onclick = () => addNbCell('sql');
       document.getElementById('nb-add-md').onclick = () => addNbCell('md');
       document.getElementById('nb-run-all').onclick = runAllNbCells;
@@ -2008,6 +2702,21 @@
         e.target.value = '';
       };
       renderNbCells();
+      mountCatalogRail('notebook');
+    }
+
+    /* Which cell a rail insertion lands in: the one last focused, else the last SQL cell, and
+       a notebook with no SQL cell at all gets one rather than swallowing the click. */
+    let nbFocusedCell = null;
+
+    function nbInsertTarget() {
+      const sqlCells = () => notebook.cells.filter(c => c.type === 'sql');
+      if (!sqlCells().length) addNbCell('sql');
+      const focused = sqlCells().find(c => c.id === nbFocusedCell);
+      const cell = focused || sqlCells()[sqlCells().length - 1];
+      if (!cell) return null;
+      const root = document.querySelector('.nb-cell[data-id="' + cell.id + '"]');
+      return root ? root.querySelector('textarea') : null;
     }
 
     function addNbCell(type) {
@@ -2061,6 +2770,13 @@
       ta.addEventListener('keydown', (e) => {
         if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && c.type === 'sql') { e.preventDefault(); runNbCell(c.id); }
       });
+      // Where the catalog rail inserts. Tracked on focus rather than read at click time: by
+      // then the focus is on the rail's own button.
+      ta.addEventListener('focus', () => { nbFocusedCell = c.id; });
+      // …and *whether* this cell has a caret at all. The last SQL cell is the insertion target
+      // even when nobody has clicked into it, and a cell nobody has clicked into reports a
+      // cursor at offset 0.
+      catTrackCaret(ta);
       root.querySelectorAll('.nb-btn[data-act]').forEach(b => {
         b.onclick = () => {
           const act = b.dataset.act;

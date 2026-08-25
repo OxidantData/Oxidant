@@ -19,6 +19,11 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/v1/statements/{id}/result` | Result rows as JSON or CSV |
 | `POST` | `/api/v1/statements/{id}/cancel` | Cancel a pending/running statement |
 | `GET` | `/api/v1/cluster/status` | Cluster mode, workers, engine version |
+| `GET` | `/api/v1/catalogs` | Registered catalogs, and which one this session is in |
+| `GET` | `/api/v1/catalogs/{catalog}/namespaces` | Schemas in a catalog |
+| `GET` | `/api/v1/catalogs/{catalog}/tables` | Tables in `?namespace=` (default `default`) |
+| `GET` | `/api/v1/catalogs/{catalog}/tables/{table}/columns` | Columns and types of one table |
+| `GET` | `/api/v1/catalogs/autocomplete` | Identifier suggestions for a dotted `?prefix=` |
 | `GET` | `/api/dashboards` | Dashboards, newest-updated first |
 | `POST` | `/api/dashboards` | Create a dashboard |
 | `GET` | `/api/dashboards/{id}` | One dashboard document |
@@ -150,6 +155,59 @@ curl -s http://localhost:4040/api/v1/cluster/status
 
 `mode` is `single-node`, `local-cluster`, or `distributed`; `workers` lists the connected
 worker endpoints (see [workers.md](workers.md)).
+
+## Catalog browsing
+
+Four routes walk the warehouse one level at a time, which is what lets a client load only what
+it is showing — the embedded console's [catalog rail](web-ui.md#the-catalog-rail) is one such
+client.
+
+```sh
+curl -s http://localhost:4040/api/v1/catalogs
+curl -s http://localhost:4040/api/v1/catalogs/spark_catalog/namespaces
+curl -s "http://localhost:4040/api/v1/catalogs/spark_catalog/tables?namespace=sales"
+curl -s "http://localhost:4040/api/v1/catalogs/spark_catalog/tables/orders/columns?namespace=sales"
+```
+
+```json
+{ "catalogs": [ { "name": "spark_catalog", "isCurrent": true } ] }
+{ "namespaces": ["default", "sales"] }
+{ "tables": [ { "name": "orders", "type": "TABLE" } ] }
+{ "columns": [ { "name": "order_id", "type": "bigint" } ] }
+```
+
+- `isCurrent` is against the REST session's current catalog, not the caller's — these routes
+  hold no session of their own.
+- **A namespace is dot-joined in one query parameter**, never a path: `?namespace=a.b` is the
+  two-level namespace `a` → `b`. It defaults to `default` when omitted.
+- A column `type` is what `DESCRIBE TABLE` reports for that table, so it is the engine's own
+  spelling (`bigint`, `string`) rather than an Arrow one.
+- An unknown catalog is `404`. A table that cannot be described — because it does not exist, or
+  because its source is unreachable — is `500 describe table: unable to fetch columns`; there is
+  no `404` on that route to tell the two apart.
+
+### Autocomplete
+
+```sh
+curl -s "http://localhost:4040/api/v1/catalogs/autocomplete?prefix=sales.ord"
+```
+
+```json
+{
+  "suggestions": [
+    { "kind": "table", "name": "orders", "qualified": "spark_catalog.sales.orders" }
+  ]
+}
+```
+
+`prefix` is split on dots; the **last** token is matched as a case-insensitive *prefix*, and
+everything before it resolves the level to look in. A first token that is not a known catalog is
+read as a namespace in the session's current catalog, so `sales.ord` works without naming one.
+`kind` is `catalog`, `namespace`, `table` or `column`.
+
+**`qualified` is the path to the thing's container, not always to the thing.** For a column it
+is `catalog.namespace.column` — the table is not in it — so a client inserting an identifier
+should take `name` for a column and `qualified` for the rest.
 
 ## Dashboards
 

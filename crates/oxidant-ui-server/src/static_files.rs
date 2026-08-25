@@ -6,12 +6,15 @@
 //! is fine for the monitoring tables — and impossible for dashboards, which are a charting
 //! library, a grid engine and a query cache.
 //!
-//! One exception to "no build step": the Pipelines page's derivation — the reducer that turns
-//! a connector's JSONL log into what an operator is told about a running pipeline — lives in
-//! `pipeline_derive.js` and is spliced into the page at [`DERIVE_MARKER`] the first time the
-//! page is served. The served page is still one self-contained file that fetches nothing; the
-//! split exists so that ~250 lines of decision-making can be evaluated by a test
-//! (`ui/src/lib/pipelineDerive.test.ts`) instead of only being grepped for.
+//! Two exceptions to "no build step", on the same seam. The Pipelines page's derivation — the
+//! reducer that turns a connector's JSONL log into what an operator is told about a running
+//! pipeline — lives in `pipeline_derive.js`, and the catalog rail's tree logic — which rows a
+//! lazily-loaded catalog tree shows once a filter narrows it, and what a click on one inserts —
+//! lives in `catalog_rail.js`. Both are spliced into the page at their markers
+//! ([`DERIVE_MARKER`], [`CATALOG_MARKER`]) the first time the page is served. The served page is
+//! still one self-contained file that fetches nothing; the split exists so that decision-making
+//! can be evaluated by a test (`ui/src/lib/pipelineDerive.test.ts`,
+//! `ui/src/lib/catalogRail.test.ts`) instead of only being grepped for.
 //!
 //! So the richer app in `ui/` can be served instead: point `OXIDANT_UI_DIR` at its `npm run
 //! build` output (`ui/dist`) and the server hands out those files, with unknown paths falling
@@ -82,6 +85,11 @@ const PIPELINE_DERIVE_JS: &str = include_str!("pipeline_derive.js");
 /// Where the derivation goes. A JS block comment, so the template is still valid JavaScript
 /// on its own — an editor, a formatter or a browser opening the file directly all cope.
 const DERIVE_MARKER: &str = "/*__PIPELINE_DERIVE_JS__*/";
+/// The catalog rail's tree logic, on the same terms: it declares `__oxidantCatalog` and
+/// nothing else, and the Editor and Notebook panels are its only callers.
+const CATALOG_RAIL_JS: &str = include_str!("catalog_rail.js");
+/// Where the rail's logic goes.
+const CATALOG_MARKER: &str = "/*__CATALOG_RAIL_JS__*/";
 
 /// The page actually served: the template with the derivation spliced in, assembled once.
 ///
@@ -90,13 +98,45 @@ const DERIVE_MARKER: &str = "/*__PIPELINE_DERIVE_JS__*/";
 /// — a test that read the template instead could pass while the served page was broken.
 fn embedded_index() -> &'static str {
     static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PAGE.get_or_init(|| EMBEDDED_TEMPLATE.replace(DERIVE_MARKER, PIPELINE_DERIVE_JS))
-        .as_str()
+    PAGE.get_or_init(|| {
+        EMBEDDED_TEMPLATE
+            .replace(DERIVE_MARKER, PIPELINE_DERIVE_JS)
+            .replace(CATALOG_MARKER, CATALOG_RAIL_JS)
+    })
+    .as_str()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{embedded_index, DERIVE_MARKER, EMBEDDED_TEMPLATE, PIPELINE_DERIVE_JS};
+    use super::{
+        embedded_index, CATALOG_MARKER, CATALOG_RAIL_JS, DERIVE_MARKER, EMBEDDED_TEMPLATE,
+        PIPELINE_DERIVE_JS,
+    };
+
+    /// The source of one function in a spliced JS module: from its opening line to the first
+    /// `}` at the module's own two-space indentation. Deliberately crude — it is a grep with a
+    /// scope, so that "the rule is in `needsQuoting`" is a different assertion from "the rule
+    /// appears somewhere in the file". It fails loudly (an empty body, which every caller
+    /// asserts on) rather than quietly matching the wrong span.
+    fn js_fn_body(source: &str, header: &str) -> String {
+        source
+            .split_once(header)
+            .and_then(|(_, rest)| rest.split_once("\n  }"))
+            .map(|(body, _)| body.to_string())
+            .unwrap_or_default()
+    }
+
+    /// The same, for a function in the page's own `<script>` rather than in a spliced module:
+    /// its closing brace is at the script's four-space indentation. Separate from
+    /// [`js_fn_body`] because the indent *is* the scope — one that guessed would happily run
+    /// past the end of the function it was asked about.
+    fn page_fn_body(source: &str, header: &str) -> String {
+        source
+            .split_once(header)
+            .and_then(|(_, rest)| rest.split_once("\n    }"))
+            .map(|(body, _)| body.to_string())
+            .unwrap_or_default()
+    }
 
     /// The page is a single `include_str!` blob with no build step and no asset route, so the
     /// things that would silently break it are structural: a tab whose panel is missing, a
@@ -404,6 +444,398 @@ mod tests {
         }
         // And the page still consumes it.
         assert!(page.contains("} = __oxidantPipelines;"));
+    }
+
+    /// The catalog rail's splice, on the same terms as the derivation's: the marker is
+    /// replaced, the logic lands, and no copy of it survives inline in the template.
+    #[test]
+    fn the_catalog_rail_logic_is_spliced_into_the_served_page() {
+        assert!(
+            EMBEDDED_TEMPLATE.contains(CATALOG_MARKER),
+            "the page lost its `{CATALOG_MARKER}` splice point; the rail would never load"
+        );
+        let page = embedded_index();
+        assert!(
+            !page.contains(CATALOG_MARKER),
+            "the marker survived the splice — the page is serving a comment, not the rail"
+        );
+        assert!(
+            !EMBEDDED_TEMPLATE.contains("var __oxidantCatalog"),
+            "`__oxidantCatalog` is inline in the page again; it belongs in catalog_rail.js, \
+             where `ui/src/lib/catalogRail.test.ts` can evaluate it"
+        );
+        for symbol in [
+            "var __oxidantCatalog",
+            "function railRows",
+            "function pendingLoads",
+            "function insertAtCursor",
+            "function quoteIdent",
+            "function wantsSuggestions",
+        ] {
+            assert!(
+                page.contains(symbol),
+                "the served page is missing `{symbol}`"
+            );
+        }
+        // And the page consumes it rather than shadowing it.
+        assert!(page.contains("const CAT = __oxidantCatalog;"));
+
+        // **No NUL byte reaches the document.** `nodeKey` separates a node's coordinates with
+        // one, because a quoted identifier may contain anything else — and an HTML parser
+        // rewrites U+0000 inside an attribute value to U+FFFD, so a key that made the round
+        // trip through the DOM would come back matching nothing. It is written as an escape in
+        // the source and the row actions carry an index instead; this pins both.
+        assert!(
+            !page.contains('\0'),
+            "the served page carries a raw NUL byte; an attribute value holding one is rewritten \
+             by the parser"
+        );
+        assert!(
+            !page.contains("data-key="),
+            "a rail row must carry its index, not its node key: a key contains a NUL separator"
+        );
+        assert!(page.contains("data-act=\"toggle\" data-i="));
+    }
+
+    /// **A bare identifier does not survive the parser; the rail's names have to.**
+    ///
+    /// The engine leaves `sql_parser.enable_ident_normalization` at DataFusion's default of
+    /// `true`, so an unquoted identifier is lowercased at parse time — while the catalog routes
+    /// hand back the warehouse's real, case-preserved names. A table `Orders` in schema `Sales`
+    /// inserted bare therefore reaches the planner as `sales.orders`: a different table, or
+    /// none, and `Preview` turns that into a statement recorded as failed.
+    ///
+    /// The behaviour itself is evaluated by `ui/src/lib/catalogRail.test.ts`, which no CI job
+    /// runs. This is the gate that does.
+    #[test]
+    fn the_rail_quotes_a_mixed_case_name_rather_than_let_the_parser_lowercase_it() {
+        let rule = "if (s !== s.toLowerCase()) return true;";
+        let body = js_fn_body(CATALOG_RAIL_JS, "function needsQuoting(name) {");
+        assert!(
+            !body.is_empty(),
+            "`needsQuoting` is gone; every inserted name is now unquoted"
+        );
+        // In `needsQuoting` and not merely somewhere in the file: `insertTextFor`,
+        // `qualifiedName`, `previewSql` and `suggestionInsertText` all quote through it, and a
+        // rule bolted onto one caller would leave the other three inserting `Orders` bare.
+        assert!(
+            body.contains(rule),
+            "`needsQuoting` no longer quotes a mixed-case name, so `Orders` inserts bare and \
+             resolves to `orders`: {body}"
+        );
+        assert!(
+            embedded_index().contains(rule),
+            "the rule is in the module but not in the served page"
+        );
+    }
+
+    /// **An untouched textarea reports a cursor at offset 0, and it does not have one.**
+    ///
+    /// The first click on a catalog name is the likeliest first interaction with this rail, and
+    /// it lands in an editor nobody has typed in yet. Read `selectionStart` there and the name
+    /// is *prepended*: `spark_catalog.sales.orders SELECT 1 AS hello`. Both hosts have to say
+    /// whether their target has ever been focused, and both have to actually track it.
+    #[test]
+    fn an_insertion_into_a_textarea_with_no_caret_goes_to_the_end_of_it() {
+        let page = embedded_index();
+        assert!(
+            page.contains("const seen = catCaretSeen.has(ta) || document.activeElement === ta;"),
+            "`catInsert` reads the caret without asking whether there is one"
+        );
+        assert!(
+            page.contains("const at = CAT.caretRange(seen, ta.selectionStart, ta.selectionEnd);"),
+            "the caret fallback must go through `caretRange`, which the vitest suite pins"
+        );
+        assert!(
+            page.contains("function caretRange(hasCaret, selStart, selEnd) {"),
+            "`caretRange` is not in the served page"
+        );
+
+        // And that `caretRange` still answers "no caret" with an offset rather than with the
+        // zero it was handed. `insertAtCursor` reads `null` as end-of-buffer; a `caretRange`
+        // that passed `selStart` through would be the original bug with a function around it.
+        let body = js_fn_body(
+            CATALOG_RAIL_JS,
+            "function caretRange(hasCaret, selStart, selEnd) {",
+        );
+        assert!(
+            body.contains("if (!hasCaret) return { start: null, end: null };"),
+            "`caretRange` no longer sends an untouched textarea to the end of its buffer: {body}"
+        );
+
+        // A `WeakSet` nothing ever adds to is the same bug with more code: both the Editor's
+        // textarea and every Notebook cell have to register.
+        assert!(page.contains("catCaretSeen.add(ta)"));
+        assert_eq!(
+            page.matches("catTrackCaret(").count(),
+            3,
+            "the caret tracker is declared once, and registered by exactly the Editor and the \
+             Notebook cell renderer"
+        );
+        assert!(page.contains("catTrackCaret(document.getElementById('editor-sql'));"));
+    }
+
+    /// **A chevron the filter overrules is a button that does nothing, twice.**
+    ///
+    /// A filter paints the path to a match open whatever the tree remembers, so a `catToggle`
+    /// that only flipped `catPrefs.expanded[key]` could not collapse a filter-revealed row:
+    /// click once and the bit is set with no visual change, click again and it is cleared with
+    /// no visual change. Meanwhile each click spent one of the 200 remembered keys and bought a
+    /// re-fetch of that level on the next page load — expansions the user never asked for.
+    ///
+    /// So while the box has anything in it, expansion is filter-scoped: `railRows` gets the
+    /// remembered set with an overlay laid over it, and nothing is persisted.
+    #[test]
+    fn a_toggle_under_a_filter_is_display_only_and_never_reaches_local_storage() {
+        let page = embedded_index();
+
+        // The toggle flips what the *row* is showing, not what the store happens to hold: under
+        // a filter those are different, and the store's answer is the one with no effect.
+        assert!(
+            page.contains("else if (act === 'toggle' && row) catToggle(row.key, row.expanded);"),
+            "`catToggle` must be told what the row it was clicked on is currently showing"
+        );
+        let toggle = page_fn_body(page, "function catToggle(key, expanded) {");
+        assert!(
+            !toggle.is_empty(),
+            "`catToggle` is gone; the tree cannot be opened"
+        );
+        assert!(
+            toggle.contains(
+                "if (CAT.normalizeFilter(catFilter)) catFilterExpanded[key] = !expanded;"
+            ),
+            "a toggle under an active filter must go to the filter-scoped overlay: {toggle}"
+        );
+        // …and the persisted write must be inside the `else`. `saveRailPrefs` reached
+        // unconditionally is the whole bug, whatever the overlay does.
+        let (_, persisted) = toggle
+            .split_once("else {")
+            .expect("`catToggle` no longer has an unfiltered branch");
+        assert!(
+            persisted.contains("CAT.saveRailPrefs(catStorage(), catPrefs);"),
+            "the unfiltered branch must still remember what the user opened: {toggle}"
+        );
+        assert_eq!(
+            toggle.matches("saveRailPrefs").count(),
+            1,
+            "expansion is persisted from exactly one branch of `catToggle`: {toggle}"
+        );
+
+        // The overlay only exists while there is a filter to scope it to.
+        assert!(
+            page.contains("if (!CAT.normalizeFilter(catFilter)) catFilterExpanded = {};"),
+            "emptying the filter box must drop the expansion that box was responsible for"
+        );
+        let paint = page_fn_body(page, "function catExpansion() {");
+        assert!(
+            paint.contains("if (!CAT.normalizeFilter(catFilter)) return catPrefs.expanded;")
+                && paint.contains("Object.assign({}, catPrefs.expanded, catFilterExpanded)"),
+            "unfiltered, the tree is painted from the remembered set alone: {paint}"
+        );
+        assert!(
+            page.contains("catRows = CAT.railRows(catCache, catExpansion(), catFilter);"),
+            "the paint must read the overlay, or the toggle it writes does nothing"
+        );
+    }
+
+    /// **`Refresh` pressed while the root is in flight must not return what it interrupted.**
+    ///
+    /// The generation guard went on `catLoadChildren` and stopped one level short. Page mounts,
+    /// `/api/v1/catalogs` is out, the user presses **Refresh**: `catGen` is bumped and `byKey`
+    /// dropped, then `catLoadCatalogs(true)` returned immediately because the root said
+    /// `loading` — so the pre-Refresh response landed in the tree the button had just replaced,
+    /// with nothing on screen saying the catalogs were the old ones.
+    #[test]
+    fn refresh_reloads_the_root_it_interrupted_rather_than_waiting_on_it() {
+        let body = page_fn_body(embedded_index(), "async function catLoadCatalogs(force) {");
+        assert!(
+            !body.is_empty(),
+            "`catLoadCatalogs` is gone; the rail has no root"
+        );
+        // The in-flight bail is what `Refresh` has to get past: its own request is the one that
+        // is about to be discarded.
+        assert!(
+            body.contains(
+                "if (!force && (cur.state === 'loading' || cur.state === 'ready')) return;"
+            ),
+            "a forced reload must not be turned away by the request it is replacing: {body}"
+        );
+        // And the reason that is safe: the stale answer is dropped rather than written.
+        assert!(
+            body.contains("const gen = catGen;") && body.contains("if (gen !== catGen) return;"),
+            "the root needs the generation guard the levels below it have: {body}"
+        );
+        // The guard only guards if the write happens after it — an assignment inside the `try`
+        // would have already landed by the time the generation is compared.
+        let (_, after_guard) = body
+            .split_once("if (gen !== catGen) return;")
+            .expect("checked above");
+        assert!(
+            after_guard.contains("catCache.catalogs = next;"),
+            "the root's result must be written after the generation check, not inside the \
+             fetch: {body}"
+        );
+        assert_eq!(
+            body.matches("catCache.catalogs = ").count(),
+            2,
+            "exactly two writes to the root: the `loading` placeholder, and the guarded result \
+             — a third is a path around the guard: {body}"
+        );
+    }
+
+    /// One rail, two mounts, and a layout it adds a column to rather than wraps.
+    #[test]
+    fn the_catalog_rail_is_mounted_on_both_query_pages() {
+        let page = embedded_index();
+
+        // The Editor and the Notebook render the *same* component against the same tree: the
+        // hazard a second copy introduces is not a second rail on screen, it is a second cache
+        // that disagrees with the first about what the warehouse holds.
+        for host in ["editor", "notebook"] {
+            assert!(
+                page.contains(&format!("catRailHtml('{host}')")),
+                "the {host} page does not mount the catalog rail"
+            );
+            assert!(
+                page.contains(&format!("mountCatalogRail('{host}')")),
+                "the {host} page never binds or paints its rail"
+            );
+            assert!(
+                page.contains(&format!("rail: 'cat-rail-{host}'")),
+                "the {host} host has no rail element to paint into"
+            );
+        }
+
+        // **Hiding the rail must restore the previous layout exactly, not approximately.**
+        // `.workbench` puts one column *in front of* the grid the Editor already had; the grid
+        // itself is untouched, so a collapsed rail hands its width straight back. A rail that
+        // had been built by editing `.editor-grid`'s own template would make "collapsed" a
+        // different layout rather than the old one.
+        assert!(
+            page.contains(
+                ".editor-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; \
+                 align-items: start; }"
+            ),
+            "the rail changed the Editor's own grid; it may only add a column beside it"
+        );
+        assert!(page.contains(".workbench { display: grid; grid-template-columns: 264px"));
+        assert!(
+            page.contains(".workbench[data-rail=\"closed\"] { grid-template-columns: 34px"),
+            "the rail must collapse to a strip, not disappear and reflow the page"
+        );
+        assert!(
+            page.contains(".workbench[data-rail=\"closed\"] .cat-body { display: none; }"),
+            "a collapsed rail still paints its tree; the strip is what hides it"
+        );
+
+        // The controls, as the classes and actions the delegated handler binds.
+        for control in [
+            "class=\"cat-q\"",
+            "class=\"cat-suggest\"",
+            "class=\"cat-tree\"",
+            "data-act=\"open\"",
+            "data-act=\"close\"",
+            "data-act=\"refresh\"",
+            "data-act=\"retry\"",
+            "data-act=\"insert\"",
+            "data-act=\"preview\"",
+            "data-act=\"suggest\"",
+        ] {
+            assert!(
+                page.contains(control),
+                "the catalog rail is missing {control}"
+            );
+        }
+
+        // Failure and emptiness use the platform's components, not prose in a div — the two
+        // consoles drifted apart the first time by rendering states any other way.
+        assert!(page.contains("return errorState(rows[0].message, rows[0].detail) +"));
+        assert!(page.contains("return emptyState('No catalogs',"));
+
+        // The remembered state, under the key `docs/web-ui.md` names.
+        assert!(page.contains("var CAT_PREFS_KEY = 'oxidant.catalogRail.v1';"));
+    }
+
+    /// The rail reaches the catalog API only through the module that is under test, runs its
+    /// preview through the one statement API, and asks for a level only when a row says so.
+    #[test]
+    fn the_catalog_rail_uses_the_tested_logic_rather_than_its_own_copy() {
+        let page = embedded_index();
+
+        // **Every catalog URL is built in `catalog_rail.js`.** `ui/src/lib/catalogRail.test.ts`
+        // pins that each segment is encoded — a namespace is a dot-joined query parameter and a
+        // table is a path segment a slash must not split — and a second spelling built inline
+        // would be the one the browser uses and the one no test ever evaluates.
+        assert!(
+            !EMBEDDED_TEMPLATE.contains("/api/v1/catalogs"),
+            "the page builds a catalog URL by hand; it must go through catalog_rail.js"
+        );
+        for call in [
+            "catJson(CAT.catalogsUrl())",
+            "catJson(CAT.childrenUrl(node))",
+            "catJson(CAT.autocompleteUrl(raw))",
+        ] {
+            assert!(page.contains(call), "the rail must fetch through `{call}`");
+        }
+
+        // **The rows are the request queue.** Expanding a node sets a bit and repaints;
+        // `pendingLoads` turns the placeholder rows that are now on screen into the requests.
+        // A `catToggle` that fetched directly would be a second path that could ask for a
+        // level the paint did not show — and would make the filter, which shares this code,
+        // able to crawl the warehouse.
+        assert!(page.contains("CAT.pendingLoads(catRows).forEach(catLoadChildren);"));
+        let toggle = page_fn_body(page, "function catToggle(key, expanded) {");
+        assert!(
+            !toggle.is_empty(),
+            "`catToggle` is gone; the tree cannot be opened"
+        );
+        assert!(
+            !toggle.contains("catLoadChildren") && !toggle.contains("fetch("),
+            "expanding a node must not fetch; painting its placeholder row is what asks: \
+             {toggle}"
+        );
+
+        // **`Refresh` must not be undone by the request it interrupted.** A fetch that was
+        // already out when the tree was dropped would otherwise write its stale answer into the
+        // new tree, and the button pressed to get rid of those rows would repaint them. Every
+        // level, the root included — see the test below for the root's own half of this.
+        assert_eq!(
+            page.matches("if (gen !== catGen) return;").count(),
+            2,
+            "both `catLoadCatalogs` and `catLoadChildren` must refuse to write back into a tree \
+             that `Refresh` replaced"
+        );
+
+        // A preview is a statement like any other — same API as the Run button, so it lands in
+        // the recent-statements rail and on the SQL page instead of being invisible work.
+        assert!(page.contains("const doc = await runStatement(sql, host.onUpdate);"));
+        assert!(
+            page.contains("const sql = CAT.previewSql(node);"),
+            "the preview must use the pinned `SELECT * FROM … LIMIT n`, not its own string"
+        );
+
+        // **An insertion is spliced, and announced.** A Notebook cell persists itself from its
+        // textarea's `input` event, so an insertion that only assigned `.value` would be on
+        // screen and absent from localStorage the moment the page reloaded.
+        assert!(page.contains("const r = CAT.insertAtCursor(ta.value, at.start, at.end, text);"));
+        assert!(
+            page.contains("ta.dispatchEvent(new Event('input', { bubbles: true }));"),
+            "an inserted name must fire `input`, or the Notebook never persists it"
+        );
+
+        // The tree repaints wholesale, so it has to put the reader back where they were —
+        // expanding a schema near the bottom of a long catalog must not scroll to the top the
+        // moment its tables land.
+        assert!(page.contains("const scroll = treeEl.scrollTop;"));
+        assert!(page.contains("treeEl.scrollTop = scroll;"));
+
+        // The filter box mirrors between the two mounts, and a repaint that lands mid-word must
+        // not move the caret out from under the typist.
+        assert!(
+            page.contains("if (q && q.value !== catFilter) q.value = catFilter;"),
+            "the filter box must be mirrored, never re-set: assigning the same value still \
+             collapses a selection"
+        );
     }
 
     /// The one drift this page cannot see: the connector writes an event kind the reducer does

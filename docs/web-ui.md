@@ -29,7 +29,7 @@ There are two front ends on this port, and which one you get is a deployment cho
 
 | | Served when | Pages |
 |---|---|---|
-| **Embedded console** | The default — nothing to build, nothing to install | Everything in the table below, including **Pipelines** and **Observability** |
+| **Embedded console** | The default — nothing to build, nothing to install | Everything in the table below, including **Pipelines** and **Observability**; the Editor and Notebook carry the [catalog rail](#the-catalog-rail) |
 | **Dashboards app** (`ui/`) | `OXIDANT_UI_DIR` points at a built `ui/dist` | Jobs, Stages, SQL, Executors, Environment, Cluster, Catalog, Editor, Notebook, **Dashboards** |
 
 The embedded console is a single hand-written HTML file compiled into the binary
@@ -251,6 +251,8 @@ The **SQL Editor** page runs ad-hoc SQL over the REST statement API — no clien
 
 - Type SQL into the textarea, press **Cmd/Ctrl+Enter** (or the Run button).
 - Results render as a table under the editor.
+- The [**catalog rail**](#the-catalog-rail) down the left browses the warehouse and inserts
+  names at the cursor.
 - A **recent statements** list (newest first) shows status — `pending`, `running`,
   `succeeded`, `failed`, `canceled` — with the error message for failures; click one to
   re-inspect its result.
@@ -262,6 +264,78 @@ The **SQL Editor** page runs ad-hoc SQL over the REST statement API — no clien
   longer has its rows: fetching its result answers `410 result_expired`. `OXIDANT_HISTORY=off`
   restores the old volatile behaviour; see
   [runtime-contract.md](runtime-contract.md).
+
+### The catalog rail
+
+Both query pages — **SQL Editor** and **Notebook** — carry a collapsible catalog browser down
+their left edge: catalog → schema → table → columns, with each column's data type. It is one
+component with one tree behind both, so a schema you open in the Editor is still open when you
+switch to the Notebook, and switching does not re-fetch it. *Embedded console only* — the React
+app has a **Catalog** page of its own.
+
+Everything it shows comes from the catalog routes in [the REST API](api.md), one level at a
+time:
+
+| Level | Route |
+|-------|-------|
+| Catalogs | `GET /api/v1/catalogs` |
+| Schemas | `GET /api/v1/catalogs/{catalog}/namespaces` |
+| Tables | `GET /api/v1/catalogs/{catalog}/tables?namespace=…` |
+| Columns | `GET /api/v1/catalogs/{catalog}/tables/{table}/columns?namespace=…` |
+| Path matches | `GET /api/v1/catalogs/autocomplete?prefix=…` |
+
+**Loading is lazy and bounded by what is on screen.** Expanding a node is the only thing that
+asks the server for the level under it, and a level already in flight is never asked twice. A
+warehouse with thousands of tables costs one request for the schema you open, not a crawl.
+
+**Clicking a name inserts it at the cursor**, in whichever textarea you last typed in — the
+Editor's, or the Notebook cell you were last in (a notebook with no SQL cell gets one). What is
+inserted depends on the level:
+
+| Click | Inserts |
+|-------|---------|
+| Catalog | `catalog` |
+| Schema | `catalog.schema` |
+| Table | `catalog.schema.table` |
+| Column | `column` — bare, because the `FROM` beside it already names the table |
+
+Each part is quoted on its own, with backticks, and only when it needs to be: `default` and
+`orders` insert as themselves, `my-schema`, `2024` and `order` do not. Neither does anything
+with an upper-case letter in it — an unquoted identifier is lowercased at parse time, so
+`Sales.Orders` inserted bare would look for `sales.orders`, and backticks are what stop it.
+**Preview**, on a table
+row, runs `SELECT * FROM catalog.schema.table LIMIT 100` through the same statement API the Run
+button uses — so a preview shows up in the recent-statements rail and on the **SQL** page like
+any other query, and in the Editor the status chip tracks it and **Cancel** cancels it.
+
+**The filter box narrows what is loaded.** Typing a word hides every row that does not match it
+or have a match underneath it, descending only into levels the rail already holds — so a filter
+can surface a column three levels down without a click, and never opens a level you have not
+opened. (It is not that typing starts no requests at all: a level you had already expanded and
+that has not landed yet is still fetched, filtered or not.) What a filter therefore cannot do
+is find something that has never been loaded, so a filter containing a dot
+is read as a *path* and sent to `/api/v1/catalogs/autocomplete` instead: matches appear under
+the box, and clicking one inserts it and opens the tree to where it lives. A bare word is never
+sent there — that endpoint matches by prefix and the box filters by substring.
+
+A filter paints the path to what it found open, and the chevron on one of those rows closes it
+again. Those opens and closes belong to the search rather than to the tree: while the box has
+anything in it nothing is written to `localStorage`, and emptying it leaves the tree exactly as
+you left it.
+
+**Refresh** drops the whole cached tree and reloads it, re-fetching whatever is still expanded.
+
+Empty and failed levels say which level they are: *No schemas in this catalog*, *No tables in
+this schema*, *No columns* — never a blank box. A level that failed to load carries its own
+**Retry**; an engine that could not be reached at all (a restarting driver, a closed SSH
+tunnel) replaces the tree with the error and one Retry, and says so rather than showing an
+empty warehouse.
+
+The **←** button collapses the rail to a strip labelled *Catalog*; the strip brings it back.
+Whether it is open and which nodes are expanded persist in `localStorage` under
+`oxidant.catalogRail.v1` (the expansion set is capped). Collapsed, the rail hands its width
+back to the editor exactly — it is a column beside the existing layout, not a wrapper around
+it.
 
 ## Dashboards
 
@@ -357,6 +431,9 @@ the statement API.
 
 - **SQL cells** execute against the server; **Markdown cells** render documentation between
   queries.
+- The [**catalog rail**](#the-catalog-rail) is the same one the SQL Editor carries: a name
+  clicked there lands in the cell you were last typing in, and **Preview** paints its rows
+  above the cells.
 - Run cells individually, or **run all** top-to-bottom.
 - The notebook persists to browser **localStorage** automatically.
 - **Export/import** as JSON to share a notebook or move it between browsers/machines.

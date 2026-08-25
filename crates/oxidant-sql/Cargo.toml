@@ -14,3 +14,9 @@ oxidant-plan = { workspace = true }
 # so the version must stay pinned to the one `oxidant-loom` embeds — a second `sqlparser`
 # copy in the tree would make `Statement` a different type across the crate boundary.
 datafusion = "54"
+
+[dev-dependencies]
+# `tests/catalog_rail_reserved_words.rs` asks the Databricks dialect which words a bare
+# identifier cannot be. Same version as above, so it unifies with the dependency rather than
+# building a second copy.
+datafusion = "54"
