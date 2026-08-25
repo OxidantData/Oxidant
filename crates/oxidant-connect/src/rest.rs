@@ -6079,7 +6079,15 @@ mod tests {
         assert_eq!(quote_identifier("we`ird"), "`we``ird`");
         assert_eq!(quote_identifier("orders"), "`orders`");
 
-        for name in ["orders", "we`ird", "`", "``", "a`b`c", "sales.2024", "Mixed Case"] {
+        for name in [
+            "orders",
+            "we`ird",
+            "`",
+            "``",
+            "a`b`c",
+            "sales.2024",
+            "Mixed Case",
+        ] {
             let quoted = quote_identifier(name);
             let tokens = Tokenizer::new(&DatabricksDialect {}, &quoted)
                 .tokenize()
