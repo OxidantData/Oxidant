@@ -6,12 +6,15 @@
 //! is fine for the monitoring tables — and impossible for dashboards, which are a charting
 //! library, a grid engine and a query cache.
 //!
-//! One exception to "no build step": the Pipelines page's derivation — the reducer that turns
-//! a connector's JSONL log into what an operator is told about a running pipeline — lives in
-//! `pipeline_derive.js` and is spliced into the page at [`DERIVE_MARKER`] the first time the
-//! page is served. The served page is still one self-contained file that fetches nothing; the
-//! split exists so that ~250 lines of decision-making can be evaluated by a test
-//! (`ui/src/lib/pipelineDerive.test.ts`) instead of only being grepped for.
+//! Two exceptions to "no build step", on the same seam. The Pipelines page's derivation — the
+//! reducer that turns a connector's JSONL log into what an operator is told about a running
+//! pipeline — lives in `pipeline_derive.js`, and the catalog rail's tree logic — which rows a
+//! lazily-loaded catalog tree shows once a filter narrows it, and what a click on one inserts —
+//! lives in `catalog_rail.js`. Both are spliced into the page at their markers
+//! ([`DERIVE_MARKER`], [`CATALOG_MARKER`]) the first time the page is served. The served page is
+//! still one self-contained file that fetches nothing; the split exists so that decision-making
+//! can be evaluated by a test (`ui/src/lib/pipelineDerive.test.ts`,
+//! `ui/src/lib/catalogRail.test.ts`) instead of only being grepped for.
 //!
 //! So the richer app in `ui/` can be served instead: point `OXIDANT_UI_DIR` at its `npm run
 //! build` output (`ui/dist`) and the server hands out those files, with unknown paths falling
@@ -82,6 +85,11 @@ const PIPELINE_DERIVE_JS: &str = include_str!("pipeline_derive.js");
 /// Where the derivation goes. A JS block comment, so the template is still valid JavaScript
 /// on its own — an editor, a formatter or a browser opening the file directly all cope.
 const DERIVE_MARKER: &str = "/*__PIPELINE_DERIVE_JS__*/";
+/// The catalog rail's tree logic, on the same terms: it declares `__oxidantCatalog` and
+/// nothing else, and the Editor and Notebook panels are its only callers.
+const CATALOG_RAIL_JS: &str = include_str!("catalog_rail.js");
+/// Where the rail's logic goes.
+const CATALOG_MARKER: &str = "/*__CATALOG_RAIL_JS__*/";
 
 /// The page actually served: the template with the derivation spliced in, assembled once.
 ///
@@ -90,8 +98,12 @@ const DERIVE_MARKER: &str = "/*__PIPELINE_DERIVE_JS__*/";
 /// — a test that read the template instead could pass while the served page was broken.
 fn embedded_index() -> &'static str {
     static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PAGE.get_or_init(|| EMBEDDED_TEMPLATE.replace(DERIVE_MARKER, PIPELINE_DERIVE_JS))
-        .as_str()
+    PAGE.get_or_init(|| {
+        EMBEDDED_TEMPLATE
+            .replace(DERIVE_MARKER, PIPELINE_DERIVE_JS)
+            .replace(CATALOG_MARKER, CATALOG_RAIL_JS)
+    })
+    .as_str()
 }
 
 #[cfg(test)]
