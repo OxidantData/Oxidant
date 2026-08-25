@@ -587,6 +587,14 @@ mod tests {
              {toggle}"
         );
 
+        // **`Refresh` must not be undone by the request it interrupted.** A level whose fetch
+        // was already out when the tree was dropped would otherwise write its stale answer into
+        // the new tree, and the button pressed to get rid of those rows would repaint them.
+        assert!(
+            page.contains("if (gen !== catGen) return;"),
+            "an in-flight level must not write back into a tree that `Refresh` replaced"
+        );
+
         // A preview is a statement like any other — same API as the Run button, so it lands in
         // the recent-statements rail and on the SQL page instead of being invisible work.
         assert!(page.contains("const doc = await runStatement(sql, host.onUpdate);"));

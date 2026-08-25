@@ -1999,6 +1999,10 @@
        the one in `catCache`. */
     let catRows = [];
     let nbPreviewBusy = false;
+    /* Bumped by `Refresh`. A level whose request was already in flight when the tree was
+       dropped must not write its answer into the new one: `Refresh` would then repaint the
+       stale tables it was pressed to get rid of, with nothing on screen saying so. */
+    let catGen = 0;
 
     const CAT_HOSTS = {
       editor: {
@@ -2230,13 +2234,19 @@
       if (!node) return;
       const entry = catCache.byKey[key];
       if (entry && (entry.state === 'loading' || entry.state === 'ready')) return;
+      const gen = catGen;
       catCache.byKey[key] = { state: 'loading' };
+      let next;
       try {
         const d = await catJson(CAT.childrenUrl(node));
-        catCache.byKey[key] = { state: 'ready', items: catChildNodes(node, d) };
+        next = { state: 'ready', items: catChildNodes(node, d) };
       } catch (e) {
-        catCache.byKey[key] = { state: 'error', error: e.message, code: e.code || null };
+        next = { state: 'error', error: e.message, code: e.code || null };
       }
+      // Dropped mid-flight by a `Refresh`. Nothing is written back — the tree it belonged to is
+      // gone, and the key is absent from the new one, so the next paint asks again.
+      if (gen !== catGen) return;
+      catCache.byKey[key] = next;
       paintCatalogRail();
     }
 
@@ -2263,6 +2273,7 @@
     }
 
     function catRefresh() {
+      catGen++;
       catCache.byKey = {};
       catSuggest = { state: 'idle', prefix: '', items: [] };
       catLoadCatalogs(true);
