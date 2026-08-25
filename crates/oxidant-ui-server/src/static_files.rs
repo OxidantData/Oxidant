@@ -517,6 +517,52 @@ mod tests {
         );
     }
 
+    /// **An untouched textarea reports a cursor at offset 0, and it does not have one.**
+    ///
+    /// The first click on a catalog name is the likeliest first interaction with this rail, and
+    /// it lands in an editor nobody has typed in yet. Read `selectionStart` there and the name
+    /// is *prepended*: `spark_catalog.sales.orders SELECT 1 AS hello`. Both hosts have to say
+    /// whether their target has ever been focused, and both have to actually track it.
+    #[test]
+    fn an_insertion_into_a_textarea_with_no_caret_goes_to_the_end_of_it() {
+        let page = embedded_index();
+        assert!(
+            page.contains("const seen = catCaretSeen.has(ta) || document.activeElement === ta;"),
+            "`catInsert` reads the caret without asking whether there is one"
+        );
+        assert!(
+            page.contains("const at = CAT.caretRange(seen, ta.selectionStart, ta.selectionEnd);"),
+            "the caret fallback must go through `caretRange`, which the vitest suite pins"
+        );
+        assert!(
+            page.contains("function caretRange(hasCaret, selStart, selEnd) {"),
+            "`caretRange` is not in the served page"
+        );
+
+        // And that `caretRange` still answers "no caret" with an offset rather than with the
+        // zero it was handed. `insertAtCursor` reads `null` as end-of-buffer; a `caretRange`
+        // that passed `selStart` through would be the original bug with a function around it.
+        let body = js_fn_body(
+            CATALOG_RAIL_JS,
+            "function caretRange(hasCaret, selStart, selEnd) {",
+        );
+        assert!(
+            body.contains("if (!hasCaret) return { start: null, end: null };"),
+            "`caretRange` no longer sends an untouched textarea to the end of its buffer: {body}"
+        );
+
+        // A `WeakSet` nothing ever adds to is the same bug with more code: both the Editor's
+        // textarea and every Notebook cell have to register.
+        assert!(page.contains("catCaretSeen.add(ta)"));
+        assert_eq!(
+            page.matches("catTrackCaret(").count(),
+            3,
+            "the caret tracker is declared once, and registered by exactly the Editor and the \
+             Notebook cell renderer"
+        );
+        assert!(page.contains("catTrackCaret(document.getElementById('editor-sql'));"));
+    }
+
     /// One rail, two mounts, and a layout it adds a column to rather than wraps.
     #[test]
     fn the_catalog_rail_is_mounted_on_both_query_pages() {
@@ -652,9 +698,7 @@ mod tests {
         // **An insertion is spliced, and announced.** A Notebook cell persists itself from its
         // textarea's `input` event, so an insertion that only assigned `.value` would be on
         // screen and absent from localStorage the moment the page reloaded.
-        assert!(page.contains(
-            "const r = CAT.insertAtCursor(ta.value, ta.selectionStart, ta.selectionEnd, text);"
-        ));
+        assert!(page.contains("const r = CAT.insertAtCursor(ta.value, at.start, at.end, text);"));
         assert!(
             page.contains("ta.dispatchEvent(new Event('input', { bubbles: true }));"),
             "an inserted name must fire `input`, or the Notebook never persists it"

@@ -2285,14 +2285,28 @@
       catLoadCatalogs(true);
     }
 
-    /* Insert at the cursor of whichever textarea this host is pointing at. The synthetic
-       `input` event is not decoration: a Notebook cell persists itself from that event, so
-       without it the inserted name is on screen and absent from localStorage. */
+    /* Which textareas have actually had a caret in them.
+       A textarea nobody has clicked into reports `selectionStart === 0`, which is
+       indistinguishable from a caret deliberately parked at the front — so without this the
+       *first* click on a catalog name prepends it to the query. Membership rather than a flag
+       per host: the Notebook re-renders its cells, and a fresh element genuinely has no
+       caret, so it should get the end of the buffer too. */
+    const catCaretSeen = new WeakSet();
+    function catTrackCaret(ta) {
+      if (ta) ta.addEventListener('focus', () => catCaretSeen.add(ta));
+    }
+
+    /* Insert at the cursor of whichever textarea this host is pointing at — or at the end of
+       it, if it has never had one. The synthetic `input` event is not decoration: a Notebook
+       cell persists itself from that event, so without it the inserted name is on screen and
+       absent from localStorage. */
     function catInsert(hostId, text) {
       if (!text) return;
       const ta = CAT_HOSTS[hostId].target();
       if (!ta) return;
-      const r = CAT.insertAtCursor(ta.value, ta.selectionStart, ta.selectionEnd, text);
+      const seen = catCaretSeen.has(ta) || document.activeElement === ta;
+      const at = CAT.caretRange(seen, ta.selectionStart, ta.selectionEnd);
+      const r = CAT.insertAtCursor(ta.value, at.start, at.end, text);
       ta.value = r.text;
       ta.focus();
       ta.setSelectionRange(r.cursor, r.cursor);
@@ -2443,6 +2457,9 @@
       document.getElementById('editor-sql').addEventListener('keydown', (e) => {
         if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); runEditor(); }
       });
+      // Until this fires, an insertion goes to the end of the query rather than to the
+      // offset-0 "cursor" an untouched textarea reports.
+      catTrackCaret(document.getElementById('editor-sql'));
       loadEditorStatements();
       mountCatalogRail('editor');
     }
@@ -2706,6 +2723,10 @@
       // Where the catalog rail inserts. Tracked on focus rather than read at click time: by
       // then the focus is on the rail's own button.
       ta.addEventListener('focus', () => { nbFocusedCell = c.id; });
+      // …and *whether* this cell has a caret at all. The last SQL cell is the insertion target
+      // even when nobody has clicked into it, and a cell nobody has clicked into reports a
+      // cursor at offset 0.
+      catTrackCaret(ta);
       root.querySelectorAll('.nb-btn[data-act]').forEach(b => {
         b.onclick = () => {
           const act = b.dataset.act;

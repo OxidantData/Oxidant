@@ -249,6 +249,23 @@ var __oxidantCatalog = (function () {
     return { text: head + trail + after, cursor: head.length };
   }
 
+  /* Where `insertAtCursor` should splice, given whether the target actually has a caret.
+   *
+   * A `<textarea>` nobody has focused reports `selectionStart === 0`, which is the same number
+   * a caret deliberately parked in front of the query reports — the DOM has no way to tell
+   * them apart, so the page has to remember which textareas have been focused and say. Without
+   * that, the *first* click on a catalog name (the likeliest first interaction with the rail)
+   * prepends: `spark_catalog.sales.orders SELECT 1 AS hello`.
+   *
+   * `null` rather than a length, because "no caret" means the end of a buffer this function
+   * has not been handed — `insertAtCursor` already reads `null` as end-of-buffer, and it is
+   * the one that knows how long the text is.
+   */
+  function caretRange(hasCaret, selStart, selEnd) {
+    if (!hasCaret) return { start: null, end: null };
+    return { start: selStart, end: selEnd };
+  }
+
   /* ---------- filtering ---------- */
   function normalizeFilter(filter) {
     return String(filter == null ? '' : filter).trim().toLowerCase();
@@ -492,6 +509,7 @@ var __oxidantCatalog = (function () {
     insertTextFor: insertTextFor,
     previewSql: previewSql,
     insertAtCursor: insertAtCursor,
+    caretRange: caretRange,
     normalizeFilter: normalizeFilter,
     nameMatches: nameMatches,
     wantsSuggestions: wantsSuggestions,

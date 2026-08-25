@@ -365,6 +365,33 @@ describe("where an insertion lands", () => {
     // An inverted range is read as a caret, not as a reversed slice.
     expect(CR.insertAtCursor("abc", 2, 1, "x").text).toBe("ab x c");
   });
+
+  it("appends into a textarea that has never had a caret, rather than prepending", () => {
+    // A `<textarea>` nobody has clicked into reports `selectionStart === 0`, and so does one
+    // whose caret is parked in front of the query. Only the page can tell those apart, so it
+    // says which it has — and the first click on a catalog name, with the editor still holding
+    // its default `SELECT 1 AS hello`, is exactly the case that has no caret.
+    const noCaret = CR.caretRange(false, 0, 0);
+    expect(noCaret).toEqual({ start: null, end: null });
+    expect(
+      CR.insertAtCursor(
+        "SELECT 1 AS hello",
+        noCaret.start,
+        noCaret.end,
+        "spark_catalog.sales.orders",
+      ).text,
+    ).toBe("SELECT 1 AS hello spark_catalog.sales.orders");
+
+    // …and a real caret at 0 still means the front of the buffer.
+    const atZero = CR.caretRange(true, 0, 0);
+    expect(atZero).toEqual({ start: 0, end: 0 });
+    expect(CR.insertAtCursor("SELECT 1 AS hello", atZero.start, atZero.end, "orders").text).toBe(
+      "orders SELECT 1 AS hello",
+    );
+
+    // A selection is passed through untouched — the caret flag is about existence, not extent.
+    expect(CR.caretRange(true, 7, 10)).toEqual({ start: 7, end: 10 });
+  });
 });
 
 describe("the filter box doubles as a path box", () => {
