@@ -300,7 +300,10 @@ inserted depends on the level:
 | Column | `column` — bare, because the `FROM` beside it already names the table |
 
 Each part is quoted on its own, with backticks, and only when it needs to be: `default` and
-`orders` insert as themselves, `my-schema`, `2024` and `order` do not. **Preview**, on a table
+`orders` insert as themselves, `my-schema`, `2024` and `order` do not. Neither does anything
+with an upper-case letter in it — an unquoted identifier is lowercased at parse time, so
+`Sales.Orders` inserted bare would look for `sales.orders`, and backticks are what stop it.
+**Preview**, on a table
 row, runs `SELECT * FROM catalog.schema.table LIMIT 100` through the same statement API the Run
 button uses — so a preview shows up in the recent-statements rail and on the **SQL** page like
 any other query, and in the Editor the status chip tracks it and **Cancel** cancels it.

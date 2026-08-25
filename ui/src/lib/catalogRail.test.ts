@@ -251,7 +251,9 @@ describe("what a click inserts", () => {
     // `default` is what the standard namespace is called and Spark does not reserve it —
     // backticks there would be on nearly every name the rail ever inserts.
     expect(CR.quoteIdent("default")).toBe("default");
-    for (const bare of ["orders", "_x", "T9", "schema", "comment", "date"]) {
+    // All lower-case: an upper-case letter is itself a reason to quote — see the case rule
+    // below, and `T9` bare would reach the planner as `t9`.
+    for (const bare of ["orders", "_x", "t9", "schema", "comment", "date"]) {
       expect(CR.quoteIdent(bare)).toBe(bare);
     }
     // …and the ones that really would not parse.
@@ -262,6 +264,39 @@ describe("what a click inserts", () => {
     // A backtick inside a name is doubled, not dropped: the alternative ends the quote early
     // and the rest of the name becomes SQL.
     expect(CR.quoteIdent("we`ird")).toBe("`we``ird`");
+  });
+
+  it("quotes a mixed-case name, which bare would be lowercased into a different table", () => {
+    // The engine parses with `enable_ident_normalization` at DataFusion's default of `true`,
+    // so a bare `Orders` reaches the planner as `orders`. The catalog routes, meanwhile, hand
+    // back the warehouse's real names. Insert one bare and it resolves to something else or to
+    // nothing — and `Preview` makes that a recorded failed statement rather than a typo.
+    for (const mixed of ["Orders", "MyTable", "ORDERS", "orderID"]) {
+      expect(CR.quoteIdent(mixed)).toBe(`\`${mixed}\``);
+      expect(CR.needsQuoting(mixed)).toBe(true);
+    }
+    // Lower-case names round-trip through the parser unchanged and stay bare — the whole point
+    // of the rule is that it is about the round trip, not about the character class.
+    expect(CR.needsQuoting("orders")).toBe(false);
+
+    // Both paths a click takes: the insert, and the Preview statement.
+    const t = table("Sales", "Warehouse", "Orders");
+    expect(CR.insertTextFor(t)).toBe("`Sales`.`Warehouse`.`Orders`");
+    expect(CR.previewSql(t)).toBe(
+      "SELECT * FROM `Sales`.`Warehouse`.`Orders` LIMIT 100",
+    );
+    // A mixed-case column inserts bare-but-quoted for the same reason.
+    expect(CR.insertTextFor(column("Sales", "Warehouse", "Orders", "orderID", "bigint"))).toBe(
+      "`orderID`",
+    );
+    // …and so does a suggestion, which takes the same quoting path.
+    expect(
+      CR.suggestionInsertText({
+        kind: "table",
+        name: "Orders",
+        qualified: "Sales.Warehouse.Orders",
+      }),
+    ).toBe("`Sales`.`Warehouse`.`Orders`");
   });
 });
 

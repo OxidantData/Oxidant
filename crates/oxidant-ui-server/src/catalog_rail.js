@@ -142,10 +142,11 @@ var __oxidantCatalog = (function () {
   }
 
   /* ---------- identifiers ----------
-   * The rail inserts SQL, so it quotes like SQL. Anything that is not a bare identifier gets
-   * backticks (Spark's quote, which is what this engine's parser takes), and a backtick inside
-   * a name is doubled. Without this a schema called `my-schema` inserts as three tokens and a
-   * subtraction.
+   * The rail inserts SQL, so it quotes like SQL. Anything that would not come back out of the
+   * parser as the name that went in gets backticks (Spark's quote, which is what this engine's
+   * parser takes), and a backtick inside a name is doubled. Without this a schema called
+   * `my-schema` inserts as three tokens and a subtraction, and a table called `Orders` inserts
+   * as one that resolves to `orders`.
    */
   var PLAIN_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
   /* Keywords that are genuinely reserved — the ones a bare name lands on as a syntax error.
@@ -162,6 +163,15 @@ var __oxidantCatalog = (function () {
   function needsQuoting(name) {
     var s = String(name == null ? '' : name);
     if (!PLAIN_IDENT.test(s)) return true;
+    /* A *bare* identifier does not survive the parser unchanged: DataFusion lowercases it
+       (`sql_parser.enable_ident_normalization` defaults to true and nothing in this engine
+       overrides it), while the catalog routes hand back the warehouse's real, case-preserved
+       names. So `Orders` inserted bare arrives at the planner as `orders` — a different table,
+       or none — and `Preview` turns that into a recorded failed statement. The rule is
+       therefore not "is this a legal bare identifier" but "would the round trip be the
+       identity": anything with an upper-case letter in it gets backticks, which are not
+       normalized. */
+    if (s !== s.toLowerCase()) return true;
     return RESERVED.indexOf(s.toLowerCase()) >= 0;
   }
 

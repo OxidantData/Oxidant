@@ -109,8 +109,22 @@ fn embedded_index() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        embedded_index, CATALOG_MARKER, DERIVE_MARKER, EMBEDDED_TEMPLATE, PIPELINE_DERIVE_JS,
+        embedded_index, CATALOG_MARKER, CATALOG_RAIL_JS, DERIVE_MARKER, EMBEDDED_TEMPLATE,
+        PIPELINE_DERIVE_JS,
     };
+
+    /// The source of one function in a spliced JS module: from its opening line to the first
+    /// `}` at the module's own two-space indentation. Deliberately crude — it is a grep with a
+    /// scope, so that "the rule is in `needsQuoting`" is a different assertion from "the rule
+    /// appears somewhere in the file". It fails loudly (an empty body, which every caller
+    /// asserts on) rather than quietly matching the wrong span.
+    fn js_fn_body(source: &str, header: &str) -> String {
+        source
+            .split_once(header)
+            .and_then(|(_, rest)| rest.split_once("\n  }"))
+            .map(|(body, _)| body.to_string())
+            .unwrap_or_default()
+    }
 
     /// The page is a single `include_str!` blob with no build step and no asset route, so the
     /// things that would silently break it are structural: a tab whose panel is missing, a
@@ -469,6 +483,38 @@ mod tests {
             "a rail row must carry its index, not its node key: a key contains a NUL separator"
         );
         assert!(page.contains("data-act=\"toggle\" data-i="));
+    }
+
+    /// **A bare identifier does not survive the parser; the rail's names have to.**
+    ///
+    /// The engine leaves `sql_parser.enable_ident_normalization` at DataFusion's default of
+    /// `true`, so an unquoted identifier is lowercased at parse time — while the catalog routes
+    /// hand back the warehouse's real, case-preserved names. A table `Orders` in schema `Sales`
+    /// inserted bare therefore reaches the planner as `sales.orders`: a different table, or
+    /// none, and `Preview` turns that into a statement recorded as failed.
+    ///
+    /// The behaviour itself is evaluated by `ui/src/lib/catalogRail.test.ts`, which no CI job
+    /// runs. This is the gate that does.
+    #[test]
+    fn the_rail_quotes_a_mixed_case_name_rather_than_let_the_parser_lowercase_it() {
+        let rule = "if (s !== s.toLowerCase()) return true;";
+        let body = js_fn_body(CATALOG_RAIL_JS, "function needsQuoting(name) {");
+        assert!(
+            !body.is_empty(),
+            "`needsQuoting` is gone; every inserted name is now unquoted"
+        );
+        // In `needsQuoting` and not merely somewhere in the file: `insertTextFor`,
+        // `qualifiedName`, `previewSql` and `suggestionInsertText` all quote through it, and a
+        // rule bolted onto one caller would leave the other three inserting `Orders` bare.
+        assert!(
+            body.contains(rule),
+            "`needsQuoting` no longer quotes a mixed-case name, so `Orders` inserts bare and \
+             resolves to `orders`: {body}"
+        );
+        assert!(
+            embedded_index().contains(rule),
+            "the rule is in the module but not in the served page"
+        );
     }
 
     /// One rail, two mounts, and a layout it adds a column to rather than wraps.
