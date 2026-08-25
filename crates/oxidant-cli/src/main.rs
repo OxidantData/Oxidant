@@ -29,6 +29,7 @@ mod client;
 mod embedded;
 mod mcp;
 mod pipeline;
+mod portguard;
 #[cfg(test)]
 mod testutil;
 
@@ -145,6 +146,20 @@ async fn run_server(
         )
     };
     let ui_bind = ui_bind_addr(args);
+    // Before anything expensive (engine, catalogs, sample data) and before the "listening on"
+    // banner: if either listener's port is taken, say who has it and stop. `serve` binds gRPC on
+    // all interfaces and spawns the UI listener on `--ui-bind`, so those are the two addresses
+    // to probe — the REST statement API rides the UI listener and needs no probe of its own.
+    portguard::ensure_available(
+        std::net::SocketAddr::from((std::net::IpAddr::from([0, 0, 0, 0]), port)),
+        portguard::PortKind::SparkConnect,
+    );
+    if let Some(ui) = ui_port {
+        portguard::ensure_available(
+            std::net::SocketAddr::from((ui_bind, ui)),
+            portguard::PortKind::Ui,
+        );
+    }
     // The config file is the base layer; `--catalog-conf` / `OXIDANT_CATALOG_CONF` are applied
     // on top, so an explicit flag always beats the file — the same direction every other
     // override in this CLI runs.
@@ -310,6 +325,10 @@ async fn run_history_server(args: &[String]) -> oxidant_common::Result<()> {
                 "history-server requires --dir or OXIDANT_EVENT_LOG_DIR".into(),
             )
         })?;
+    portguard::ensure_available(
+        std::net::SocketAddr::from((std::net::IpAddr::from([0, 0, 0, 0]), port)),
+        portguard::PortKind::History,
+    );
     let store = Arc::new(AppStateStore::load_event_log(std::path::Path::new(&dir)));
     eprintln!("Oxidant history server on http://0.0.0.0:{port} (log: {dir})");
     serve_ui(UiServerConfig {
@@ -397,6 +416,12 @@ async fn run_worker(
     let port: u16 = flag(args, "--port")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| oxidant_common::Error::Io("worker requires --port".into()))?;
+    // Ahead of `logging::init` and the engine: a worker refused for a port conflict should not
+    // first open a log directory and build a catalog it is about to throw away.
+    portguard::ensure_available(
+        std::net::SocketAddr::from((std::net::IpAddr::from([0, 0, 0, 0]), port)),
+        portguard::PortKind::Flight,
+    );
     // A standalone worker builds no REST router, so before this it installed no `tracing`
     // subscriber at all and its logs went nowhere — and worker OOMs are exactly what operators
     // dig for (docs/query-history-durability.md §6c). Every node writes its own `logs/` under
