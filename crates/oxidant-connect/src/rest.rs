@@ -1936,14 +1936,29 @@ fn validate_alias(raw: &str) -> Option<String> {
         .then(|| raw.to_string())
 }
 
-/// Backtick-quote an identifier, stripping any existing backticks first so we
-/// do not double-quote. This is Spark SQL's identifier-quoting rule.
+/// Backtick-quote an identifier, **doubling** any backtick inside it.
+///
+/// This is the Databricks dialect's own escape — its backquoted-identifier rule is
+/// `` '`' ( ~'`' | '``' )* '`' ``, with no backslash escape — so doubling is both the complete
+/// way to keep a name from breaking out of its quotes and the only way to keep it *the same
+/// name*. Stripping the backticks instead (what this did) is equally safe against injection
+/// and quietly wrong: a table genuinely called `` we`ird `` was described as `weird`, so
+/// `DESCRIBE TABLE` found nothing and the rail's column expand answered `500` on a row whose
+/// **Preview** — which quotes by the same rule in `catalog_rail.js` — worked.
 fn quote_identifier(id: &str) -> String {
-    format!("`{}`", id.replace('`', ""))
+    format!("`{}`", id.replace('`', "``"))
 }
 
 /// Fetch column (name, type) pairs for a fully qualified table, or None if the
 /// table cannot be described.
+///
+/// **Known gap, one layer down.** The `DESCRIBE TABLE` built here now quotes the way the
+/// dialect escapes, but `oxidant-loom`'s `parse_qualified_name` unquotes by dropping every
+/// backtick it sees — so a table genuinely called `` we`ird `` is looked up as `weird` and this
+/// still answers `None`. `SELECT * FROM` on the same name works (DataFusion tokenizes it
+/// itself), which is why the catalog rail can preview such a table and not expand its columns.
+/// Fixing it means teaching the engine's own identifier unescaping and probe-SQL re-quoting
+/// about doubled backticks, which is not a change to these routes.
 async fn fetch_columns(
     engine: Arc<Engine>,
     catalog: &str,
@@ -6043,6 +6058,61 @@ mod tests {
         let columns = body["columns"].as_array().unwrap();
         assert!(columns.iter().any(|c| c["name"] == "a"));
         assert!(columns.iter().any(|c| c["name"] == "b"));
+    }
+
+    /// **The server and the browser must escape a backtick the same way.**
+    ///
+    /// `quote_identifier` used to *strip* backticks. That cannot break out of the quote, so it
+    /// was never an injection — it just named a **different table**. The catalog rail
+    /// (`catalog_rail.js`, pinned by `ui/src/lib/catalogRail.test.ts`) doubles them, which is
+    /// the Databricks dialect's own escape: its backquoted-identifier rule is
+    /// `` '`' ( ~'`' | '``' )* '`' ``, with no backslash escape. Two rules for one name is how
+    /// a table previews fine from the rail and answers `500` when its columns are expanded.
+    ///
+    /// Round trip through the engine's own tokenizer rather than against a literal, so a
+    /// dialect change is caught here instead of in a warehouse.
+    #[test]
+    fn quoting_an_identifier_doubles_a_backtick_so_it_round_trips() {
+        use datafusion::sql::sqlparser::dialect::DatabricksDialect;
+        use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
+
+        assert_eq!(quote_identifier("we`ird"), "`we``ird`");
+        assert_eq!(quote_identifier("orders"), "`orders`");
+
+        for name in ["orders", "we`ird", "`", "``", "a`b`c", "sales.2024", "Mixed Case"] {
+            let quoted = quote_identifier(name);
+            let tokens = Tokenizer::new(&DatabricksDialect {}, &quoted)
+                .tokenize()
+                .unwrap_or_else(|e| panic!("`{quoted}` does not tokenize: {e}"));
+            // One token, and the name that comes back out is the name that went in.
+            match tokens.as_slice() {
+                [Token::Word(w)] => {
+                    assert_eq!(w.quote_style, Some('`'), "{quoted} is not backquoted");
+                    assert_eq!(w.value, name, "`{name}` did not survive `{quoted}`");
+                }
+                other => panic!("`{quoted}` is not one identifier: {other:?}"),
+            }
+        }
+    }
+
+    /// The other half of the same finding: the browser that calls these routes has to escape a
+    /// backtick the way they do. `catalog_rail.js` is the rail's whole quoting implementation
+    /// and it is spliced into the served page verbatim, so this reads it — like
+    /// `oxidant-ui-server`'s connector-event test reads the connector, a missing sibling crate
+    /// skips rather than fails.
+    #[test]
+    fn the_rail_escapes_a_backtick_the_way_these_routes_do() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../oxidant-ui-server/src/catalog_rail.js");
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: {} is not in this checkout", path.display());
+            return;
+        };
+        assert!(
+            source.contains(r"s.replace(/`/g, '``')"),
+            "the rail no longer doubles a backtick; it and `quote_identifier` would build two \
+             different names for one table"
+        );
     }
 
     #[tokio::test]
