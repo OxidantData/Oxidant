@@ -149,16 +149,28 @@ var __oxidantCatalog = (function () {
    * as one that resolves to `orders`.
    */
   var PLAIN_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
-  /* Keywords that are genuinely reserved — the ones a bare name lands on as a syntax error.
-     Not the whole grammar: that list drifts against the parser, and everything Spark treats as
-     *non*-reserved (`schema`, `column`, `comment`, `date`, and `default`, which is what the
-     standard namespace is called) must stay bare, or the rail spends its life inserting
-     backticks around `default`. A false positive here is not free — it is what every inserted
-     name looks like. */
-  var RESERVED = ('all and as asc between by case create cross delete desc distinct drop else '
-    + 'end exists from full grant group having in inner insert into is join left like limit '
-    + 'not null offset on or order outer primary right select table then union update using '
-    + 'values when where with').split(' ');
+  /* Keywords that are genuinely reserved — the ones a bare name lands on as a syntax error or,
+     worse, is quietly read as part of the grammar.
+     This is the parser's own reserved sets, not the whole grammar: sqlparser's
+     `RESERVED_FOR_TABLE_ALIAS`, `RESERVED_FOR_COLUMN_ALIAS` and `RESERVED_FOR_IDENTIFIER`,
+     which are exactly the words that cannot appear where the rail puts a name. The rail
+     inserts into a query it does not control, so "where the rail puts a name" includes the
+     alias slot right after a table — `FROM orders except` is a set operator with a missing
+     right-hand side, not a table called `except`.
+     Everything the parser leaves alone stays bare, which is the other half of the rule:
+     `schema`, `column`, `comment`, `date` and `default` — the name of the standard namespace —
+     insert as themselves. A false positive here is not free, it is what every inserted name
+     looks like, so the list is derived rather than guessed:
+     `crates/oxidant-sql/tests/catalog_rail_reserved_words.rs` reads it back out of this file
+     and asks the Databricks dialect whether it is still both complete and minimal. */
+  var RESERVED = ('all analyze and anti array as asc asof between by case cluster connect '
+    + 'create cross delete desc distinct distribute drop else end except exclude exists '
+    + 'explain fetch for format from full global grant group having in inner insert intersect '
+    + 'interval into is join lateral left like limit match_condition match_recognize minus '
+    + 'natural not null offset on open or order outer output partition pivot prewhere primary '
+    + 'qualify returning right sample select semi set settings sort start struct table '
+    + 'tablesample then top trim union unpivot update using values view when where window '
+    + 'with').split(' ');
 
   function needsQuoting(name) {
     var s = String(name == null ? '' : name);

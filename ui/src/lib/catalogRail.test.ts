@@ -266,6 +266,40 @@ describe("what a click inserts", () => {
     expect(CR.quoteIdent("we`ird")).toBe("`we``ird`");
   });
 
+  it("quotes the set operators and join modifiers, not just the obvious keywords", () => {
+    // A schema called `minus` or a table called `anti` is not exotic, and bare it is not a
+    // name: `FROM orders except` is a set operator with nothing on its right-hand side. The
+    // list is the Databricks dialect's own reserved sets, and
+    // `crates/oxidant-sql/tests/catalog_rail_reserved_words.rs` asks the parser whether it is
+    // still complete — this pins the shape a reader would look for.
+    for (const kw of [
+      "except",
+      "intersect",
+      "minus",
+      "anti",
+      "semi",
+      "natural",
+      "lateral",
+      "window",
+      "qualify",
+      "pivot",
+      "interval",
+      "struct",
+    ]) {
+      expect(CR.quoteIdent(kw)).toBe(`\`${kw}\``);
+    }
+    // Through the paths a click takes, not just through `quoteIdent`.
+    expect(CR.insertTextFor(table("lake", "minus", "anti"))).toBe("lake.`minus`.`anti`");
+    expect(CR.previewSql(table("lake", "minus", "anti"))).toBe(
+      "SELECT * FROM lake.`minus`.`anti` LIMIT 100",
+    );
+    // …and the other half of the rule: a word the parser leaves alone stays bare, or every
+    // name the rail inserts wears backticks.
+    for (const bare of ["default", "schema", "column", "comment", "date"]) {
+      expect(CR.quoteIdent(bare)).toBe(bare);
+    }
+  });
+
   it("quotes a mixed-case name, which bare would be lowercased into a different table", () => {
     // The engine parses with `enable_ident_normalization` at DataFusion's default of `true`,
     // so a bare `Orders` reaches the planner as `orders`. The catalog routes, meanwhile, hand
