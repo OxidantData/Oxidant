@@ -1988,6 +1988,13 @@
     const catCache = { catalogs: { state: 'idle' }, byKey: {} };
     const catPrefs = CAT.loadRailPrefs(catStorage());
     let catFilter = '';
+    /* Expansion the *filter* is responsible for, kept apart from the expansion the tree
+       remembers. A filter paints the path to a match open, so a chevron on one of those rows
+       has to be able to close it again — and that close is about the search, not about how the
+       user wants their tree to look tomorrow. Nothing in here is persisted, and it is dropped
+       whole the moment the box is empty. Values are three-valued (`true`/`false`/absent),
+       which is what lets a `false` outrank the filter's reveal in `railRows`. */
+    let catFilterExpanded = {};
     let catFilterTimer = null;
     let catSuggest = { state: 'idle', prefix: '', items: [] };
     /* Autocomplete is typed against: a slow answer for `spark_c` must not land on top of the
@@ -2155,8 +2162,15 @@
     /* Repaint every mounted rail from one row list, then ask for the levels that list says
        nobody has asked for. Both mounts get identical markup, so a row's index means the same
        thing in either — which is what lets a click carry an index instead of a key. */
+    /* What the tree remembers, with the filter's own opens and closes laid over it. Without a
+       filter there is no overlay and this is the persisted set unchanged. */
+    function catExpansion() {
+      if (!CAT.normalizeFilter(catFilter)) return catPrefs.expanded;
+      return Object.assign({}, catPrefs.expanded, catFilterExpanded);
+    }
+
     function paintCatalogRail() {
-      catRows = CAT.railRows(catCache, catPrefs.expanded, catFilter);
+      catRows = CAT.railRows(catCache, catExpansion(), catFilter);
       const tree = catTreeHtml(catRows);
       const suggest = catSuggestHtml();
       Object.keys(CAT_HOSTS).forEach((hostId) => {
@@ -2263,10 +2277,20 @@
       if (open) catLoadCatalogs(false);
     }
 
-    function catToggle(key) {
-      if (catPrefs.expanded[key]) delete catPrefs.expanded[key];
-      else catPrefs.expanded[key] = true;
-      CAT.saveRailPrefs(catStorage(), catPrefs);
+    /* Flip what the row is *showing*, which under a filter is not the same as what the tree
+       remembers. `expanded` comes from the painted row rather than from the store: a row the
+       filter opened reads as open, and writing `!catPrefs.expanded[key]` there would set a bit
+       with no visible effect — the filter repaints it open on the next keystroke — while
+       quietly spending one of the 200 remembered keys and buying a re-fetch on the next page
+       load. So while the box has anything in it the toggle is filter-scoped and nothing is
+       saved; empty the box and the tree is exactly as the user left it. */
+    function catToggle(key, expanded) {
+      if (CAT.normalizeFilter(catFilter)) catFilterExpanded[key] = !expanded;
+      else {
+        if (expanded) delete catPrefs.expanded[key];
+        else catPrefs.expanded[key] = true;
+        CAT.saveRailPrefs(catStorage(), catPrefs);
+      }
       paintCatalogRail();
     }
 
@@ -2379,13 +2403,24 @@
       const sg = catSuggest.items[index];
       if (!sg) return;
       catInsert(hostId, CAT.suggestionInsertText(sg));
-      CAT.revealTargets(sg).forEach(n => { catPrefs.expanded[CAT.nodeKey(n)] = true; });
+      // A suggestion is only ever clicked with a dotted path in the filter box, so a level
+      // the user collapsed while searching may be sitting in the overlay as `false` — and that
+      // would outrank the reveal this click is for. Asking to be shown where something lives
+      // outranks having closed the box it lives in.
+      CAT.revealTargets(sg).forEach(n => {
+        const key = CAT.nodeKey(n);
+        delete catFilterExpanded[key];
+        catPrefs.expanded[key] = true;
+      });
       CAT.saveRailPrefs(catStorage(), catPrefs);
       paintCatalogRail();
     }
 
     function catOnFilterInput(value) {
       catFilter = value;
+      // An empty box is not a filter, so its opens and closes go with it rather than lying in
+      // wait to be re-applied by the next unrelated search.
+      if (!CAT.normalizeFilter(catFilter)) catFilterExpanded = {};
       paintCatalogRail();
       if (catFilterTimer) clearTimeout(catFilterTimer);
       catFilterTimer = setTimeout(catFetchSuggestions, 200);
@@ -2402,7 +2437,7 @@
         if (act === 'open' || act === 'close') catSetOpen(act === 'open');
         else if (act === 'refresh') catRefresh();
         else if (act === 'retry') catRetry(row ? row.key : null);
-        else if (act === 'toggle' && row) catToggle(row.key);
+        else if (act === 'toggle' && row) catToggle(row.key, row.expanded);
         else if (act === 'insert' && row) catInsert(hostId, CAT.insertTextFor(row.node));
         else if (act === 'preview' && row) catPreview(hostId, row.node);
         else if (act === 'suggest') catUseSuggestion(hostId, +btn.dataset.s);

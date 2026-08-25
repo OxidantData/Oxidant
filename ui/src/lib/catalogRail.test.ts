@@ -114,6 +114,42 @@ describe("a filter narrows what is loaded and asks the server for nothing", () =
     ]);
   });
 
+  it("lets a row the filter opened be closed again, which needs a third state", () => {
+    const { cache, nodes } = warehouse();
+    const spark = CR.nodeKey(nodes.spark);
+    // The filter reveals the path to `total`, and says so: these rows are open because of the
+    // search, not because anyone opened them.
+    const revealed = CR.railRows(cache, {}, "total");
+    expect(revealed[0].expanded).toBe(true);
+    expect(revealed[0].revealed).toBe(true);
+
+    // Setting the bit the way an expansion is stored is a no-op here — the filter paints it
+    // open again — which is why the chevron used to be inert while a filter was active. Only
+    // an explicit *closed* can outrank the reveal.
+    expect(CR.railRows(cache, { [spark]: true }, "total")[0].expanded).toBe(true);
+    const closed = CR.railRows(cache, { [spark]: false }, "total");
+    expect(closed[0].expanded).toBe(false);
+    expect(closed[0].revealed).toBe(false);
+
+    // Closed means closed: no children under it, and no placeholder to turn into a request.
+    expect(shape(closed)).toEqual(["0 catalog:spark_catalog"]);
+    expect(CR.pendingLoads(closed)).toEqual([]);
+    // But the row itself stays. It is only on screen because something under it matched, and a
+    // collapse that made the row vanish would be a worse answer than the one asked for.
+    expect(closed).toHaveLength(1);
+
+    // A row the *user* opened is not "revealed", so a click on it is an ordinary collapse the
+    // tree is allowed to remember.
+    const opened = CR.railRows(cache, { [spark]: true }, "");
+    expect(opened[0].expanded).toBe(true);
+    expect(opened[0].revealed).toBe(false);
+    // …and `false` unfiltered reads as plain closed, the same as absent.
+    expect(shape(CR.railRows(cache, { [spark]: false }, ""))).toEqual([
+      "0 catalog:spark_catalog",
+      "0 catalog:lake",
+    ]);
+  });
+
   it("matches on a substring, case-insensitively, and ignores surrounding space", () => {
     const { cache } = warehouse();
     for (const typed of ["ORDER_", "  order_  ", "der_i"]) {

@@ -366,17 +366,30 @@ var __oxidantCatalog = (function () {
    *  - **No filter.** Every node is kept, and its children exist only if the user expanded it.
    *  - **A filter.** Children are also computed for a level that is *already loaded*, so a
    *    match three levels down surfaces without a click — and a level that is not loaded is
-   *    left alone, so typing never starts a request. A node survives if it matches itself or
-   *    something under it did.
+   *    left alone, so typing never expands a level nobody opened. A node survives if it
+   *    matches itself or something under it did.
+   *
+   * `open[key]` is deliberately three-valued. `true` is the user's own expansion and `false`
+   * is "closed", which is not the same as absent: a filter paints the path to a match open
+   * whatever the tree remembers, so without a way to say *closed* the chevron on a
+   * filter-revealed row has nothing to write that the next paint would not immediately undo.
+   * The page keeps those `false`s in a filter-scoped overlay it throws away, which is why they
+   * never reach `saveRailPrefs`.
    */
   function subtree(cache, open, needle, node, depth) {
     var key = nodeKey(node);
     var kind = childKind(node.kind);
-    var isOpen = !!open[key];
+    var state = open[key];
+    var isOpen = state === true;
+    var isClosed = state === false;
     var entry = kind ? ((cache.byKey || {})[key] || { state: 'idle' }) : null;
     var selfMatch = nameMatches(node.name, needle);
 
     var childRows = [];
+    // A level pinned closed under a filter is still descended into: whether anything below it
+    // matched is what decides this row exists at all, and a match that took its own parent off
+    // the screen would be worse than the collapse the user asked for. The rows just are not
+    // rendered — see `expanded` below.
     var descend = kind && (isOpen || (needle && entry.state === 'ready'));
     if (descend && entry.state === 'ready') {
       (entry.items || []).forEach(function (child) {
@@ -388,15 +401,22 @@ var __oxidantCatalog = (function () {
     var keep = !needle || selfMatch || childRows.length > 0;
     if (!keep) return { keep: false, rows: [] };
 
+    // A filter that surfaced a descendant shows the path to it open, whatever the user's own
+    // expansion says — otherwise the match is a row with no visible parent. Closing the row is
+    // the one thing that outranks that, or the chevron on it is decoration.
+    var revealed = !isClosed && !isOpen && !!needle && childRows.length > 0;
+    var expanded = !isClosed && (isOpen || revealed);
+
     var rows = [{
       type: 'node',
       node: node,
       key: key,
       depth: depth,
       expandable: !!kind,
-      // A filter that surfaced a descendant shows the path to it open, whatever the user's
-      // own expansion says — otherwise the match is a row with no visible parent.
-      expanded: isOpen || (!!needle && childRows.length > 0),
+      expanded: expanded,
+      // Showing children the *filter* found, not children the user opened. The page reads this
+      // to keep a click on such a row out of the persisted expansion set.
+      revealed: revealed,
       match: !!needle && selfMatch,
     }];
 
@@ -410,7 +430,7 @@ var __oxidantCatalog = (function () {
         key: key,
         message: emptyChildMessage(node.kind),
       });
-    } else {
+    } else if (expanded) {
       rows.push.apply(rows, childRows);
     }
     return { keep: true, rows: rows };

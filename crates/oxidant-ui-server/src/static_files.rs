@@ -126,6 +126,18 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The same, for a function in the page's own `<script>` rather than in a spliced module:
+    /// its closing brace is at the script's four-space indentation. Separate from
+    /// [`js_fn_body`] because the indent *is* the scope — one that guessed would happily run
+    /// past the end of the function it was asked about.
+    fn page_fn_body(source: &str, header: &str) -> String {
+        source
+            .split_once(header)
+            .and_then(|(_, rest)| rest.split_once("\n    }"))
+            .map(|(body, _)| body.to_string())
+            .unwrap_or_default()
+    }
+
     /// The page is a single `include_str!` blob with no build step and no asset route, so the
     /// things that would silently break it are structural: a tab whose panel is missing, a
     /// theme token the CSS references but never declares, or an asset that has to be fetched.
@@ -563,6 +575,69 @@ mod tests {
         assert!(page.contains("catTrackCaret(document.getElementById('editor-sql'));"));
     }
 
+    /// **A chevron the filter overrules is a button that does nothing, twice.**
+    ///
+    /// A filter paints the path to a match open whatever the tree remembers, so a `catToggle`
+    /// that only flipped `catPrefs.expanded[key]` could not collapse a filter-revealed row:
+    /// click once and the bit is set with no visual change, click again and it is cleared with
+    /// no visual change. Meanwhile each click spent one of the 200 remembered keys and bought a
+    /// re-fetch of that level on the next page load — expansions the user never asked for.
+    ///
+    /// So while the box has anything in it, expansion is filter-scoped: `railRows` gets the
+    /// remembered set with an overlay laid over it, and nothing is persisted.
+    #[test]
+    fn a_toggle_under_a_filter_is_display_only_and_never_reaches_local_storage() {
+        let page = embedded_index();
+
+        // The toggle flips what the *row* is showing, not what the store happens to hold: under
+        // a filter those are different, and the store's answer is the one with no effect.
+        assert!(
+            page.contains("else if (act === 'toggle' && row) catToggle(row.key, row.expanded);"),
+            "`catToggle` must be told what the row it was clicked on is currently showing"
+        );
+        let toggle = page_fn_body(page, "function catToggle(key, expanded) {");
+        assert!(
+            !toggle.is_empty(),
+            "`catToggle` is gone; the tree cannot be opened"
+        );
+        assert!(
+            toggle.contains(
+                "if (CAT.normalizeFilter(catFilter)) catFilterExpanded[key] = !expanded;"
+            ),
+            "a toggle under an active filter must go to the filter-scoped overlay: {toggle}"
+        );
+        // …and the persisted write must be inside the `else`. `saveRailPrefs` reached
+        // unconditionally is the whole bug, whatever the overlay does.
+        let (_, persisted) = toggle
+            .split_once("else {")
+            .expect("`catToggle` no longer has an unfiltered branch");
+        assert!(
+            persisted.contains("CAT.saveRailPrefs(catStorage(), catPrefs);"),
+            "the unfiltered branch must still remember what the user opened: {toggle}"
+        );
+        assert_eq!(
+            toggle.matches("saveRailPrefs").count(),
+            1,
+            "expansion is persisted from exactly one branch of `catToggle`: {toggle}"
+        );
+
+        // The overlay only exists while there is a filter to scope it to.
+        assert!(
+            page.contains("if (!CAT.normalizeFilter(catFilter)) catFilterExpanded = {};"),
+            "emptying the filter box must drop the expansion that box was responsible for"
+        );
+        let paint = page_fn_body(page, "function catExpansion() {");
+        assert!(
+            paint.contains("if (!CAT.normalizeFilter(catFilter)) return catPrefs.expanded;")
+                && paint.contains("Object.assign({}, catPrefs.expanded, catFilterExpanded)"),
+            "unfiltered, the tree is painted from the remembered set alone: {paint}"
+        );
+        assert!(
+            page.contains("catRows = CAT.railRows(catCache, catExpansion(), catFilter);"),
+            "the paint must read the overlay, or the toggle it writes does nothing"
+        );
+    }
+
     /// One rail, two mounts, and a layout it adds a column to rather than wraps.
     #[test]
     fn the_catalog_rail_is_mounted_on_both_query_pages() {
@@ -664,11 +739,7 @@ mod tests {
         // level the paint did not show — and would make the filter, which shares this code,
         // able to crawl the warehouse.
         assert!(page.contains("CAT.pendingLoads(catRows).forEach(catLoadChildren);"));
-        let toggle = page
-            .split_once("function catToggle(key) {")
-            .and_then(|(_, rest)| rest.split_once("\n    }"))
-            .map(|(body, _)| body.to_string())
-            .unwrap_or_default();
+        let toggle = page_fn_body(page, "function catToggle(key, expanded) {");
         assert!(
             !toggle.is_empty(),
             "`catToggle` is gone; the tree cannot be opened"

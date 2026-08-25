@@ -316,6 +316,11 @@ is read as a *path* and sent to `/api/v1/catalogs/autocomplete` instead: matches
 the box, and clicking one inserts it and opens the tree to where it lives. A bare word is never
 sent there — that endpoint matches by prefix and the box filters by substring.
 
+A filter paints the path to what it found open, and the chevron on one of those rows closes it
+again. Those opens and closes belong to the search rather than to the tree: while the box has
+anything in it nothing is written to `localStorage`, and emptying it leaves the tree exactly as
+you left it.
+
 **Refresh** drops the whole cached tree and reloads it, re-fetching whatever is still expanded.
 
 Empty and failed levels say which level they are: *No schemas in this catalog*, *No tables in
