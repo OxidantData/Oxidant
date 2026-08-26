@@ -830,17 +830,41 @@ impl ChildGuard {
         self.armed = false;
     }
 
-    /// Kill the child and reap it, so no zombie is left behind either.
+    /// Stop the child and reap it, so no zombie is left behind either.
     ///
     /// Idempotent, and a no-op once the child has already exited on its own — which is the
     /// common case, since the usual reason a start fails is that the server died at boot.
+    ///
+    /// The escalation is `stop`'s: `SIGTERM`, [`DEFAULT_STOP_GRACE`], then `SIGKILL`. `std`'s
+    /// `Child::kill` is `SIGKILL` outright, and using it here skipped the flush the grace exists
+    /// to protect — `DEFAULT_STOP_GRACE`'s own doc calls it "a budget for a real flush, not a
+    /// formality". A server that boots slowly (a large `--sample-data` tree, a cold Glue or Hive
+    /// catalog, a loaded machine) crosses [`START_TIMEOUT`] and was killed mid-boot with no
+    /// chance to release its `statements/.lock` or `logs/.lock`, so the *next* start met the
+    /// lock-holder error rather than a clean retry.
+    ///
+    /// Costs nothing in the common case: a child that has already exited never gets signalled.
     fn reap(&mut self) {
         self.armed = false;
-        if let Ok(Some(_)) = self.child.try_wait() {
+        if self.exited() {
             return;
+        }
+        if signal(self.child.id(), SIGTERM).is_ok() {
+            let deadline = Instant::now() + DEFAULT_STOP_GRACE;
+            while Instant::now() < deadline {
+                if self.exited() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// Has the child exited? Reaps it if so, so this never leaves a zombie behind.
+    fn exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
     fn child_mut(&mut self) -> &mut std::process::Child {
@@ -1805,6 +1829,39 @@ mod tests {
         drop(ChildGuard::new(child));
         // `reap` waits, so by the time `drop` returns the process is gone, not merely signalled.
         assert!(!alive(pid), "pid {pid} outlived the guard that owned it");
+    }
+
+    /// And it stops the child the way `stop` does — SIGTERM first — rather than the SIGKILL
+    /// `std::process::Child::kill` sends. A server killed outright mid-boot never runs its
+    /// shutdown flush and never releases `statements/.lock`, so the next start meets a
+    /// lock-holder error instead of a clean retry.
+    ///
+    /// The trap is the assertion: a SIGKILLed shell cannot write anything.
+    #[test]
+    fn the_reap_gives_sigterm_first_so_the_child_can_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        let flushed = tmp.path().join("flushed");
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "trap 'echo flushed > {}; exit 0' TERM; while :; do sleep 0.1; done",
+                flushed.display()
+            ))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a child that flushes on SIGTERM");
+        let pid = child.id();
+        // Let `sh` install the trap before anything is signalled.
+        std::thread::sleep(Duration::from_millis(300));
+
+        drop(ChildGuard::new(child));
+
+        assert!(!alive(pid), "the child outlived its guard");
+        assert!(
+            flushed.exists(),
+            "the child was SIGKILLed: it never got to run its shutdown path"
+        );
     }
 
     /// ... and a disarmed one does not, because by then it is the pidfile's daemon.
