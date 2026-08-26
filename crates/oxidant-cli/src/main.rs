@@ -275,22 +275,72 @@ fn run_stop(args: &[String]) -> oxidant_common::Result<()> {
     daemon::stop(grace)
 }
 
+/// `restart`'s own control flags: read by `run_stop`, never the server's to replay.
+///
+/// `--timeout` is documented on `stop` (see `usage()`) and `run_restart` parses it by handing
+/// its argv straight to `run_stop`. Replaying it would spawn `oxidant spark server --timeout 30`
+/// — and, before the merge in `daemon::restart_flags`, would also have discarded every recorded
+/// server flag on the way there.
+const RESTART_CONTROL_FLAGS: [&str; 1] = ["--timeout"];
+
+/// The typed arguments with `restart`'s own control flags removed.
+fn restart_server_flags(typed: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < typed.len() {
+        let tok = &typed[i];
+        let name = tok.split('=').next().unwrap_or_default();
+        if RESTART_CONTROL_FLAGS.contains(&name) {
+            // `--timeout=30` carries its value; `--timeout 30` takes the next token with it.
+            if !tok.contains('=') && typed.get(i + 1).is_some_and(|n| !n.starts_with("--")) {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(tok.clone());
+        i += 1;
+    }
+    out
+}
+
 /// `oxidant restart [flags]` — stop, then start.
 ///
-/// The flags are read from the *running* daemon's pidfile before it is stopped, so a bare
-/// `oxidant restart` comes back on the ports it went down on. Flags typed on the restart
-/// override them wholesale, which is how you move a running server to a new port.
+/// The flags are read from the pidfile on disk before anything is stopped, so a bare
+/// `oxidant restart` comes back on the ports it went down on. Flags typed on the restart are
+/// laid *over* the recorded ones, so moving one port never resets the others.
 async fn run_restart(args: &[String]) -> oxidant_common::Result<()> {
     // Read the file, not the *state*: `daemon::running()` deletes the pidfile of a process that
     // is gone, which is precisely the case `restart` is run in — after a SIGKILL, an OOM kill or
     // a reboot. Reading the state first threw away the recorded ports and silently brought the
     // server back on 50051/4040, breaking every client pointed at the old ones.
     let recorded = daemon::recorded_pidfile();
-    let flags = daemon::restart_flags(&args[2..], recorded.as_ref());
-    run_stop(args)?;
+    let flags = daemon::restart_flags(&restart_server_flags(&args[2..]), recorded.as_ref());
     let mut argv = vec![args[0].clone(), "start".to_string()];
     argv.extend(flags.iter().cloned());
-    daemon::start(&flags, server_ports(&argv)).await
+    let ports = server_ports(&argv);
+
+    // `restart` is not atomic: it stops first, and any failure to start afterwards leaves the
+    // operator with nothing running at all. So a port we are *moving to* is checked while the
+    // old daemon is still up — the one moment the refusal costs nothing. A port we are keeping
+    // is held by the daemon we are about to stop, so there is nothing to check.
+    if recorded.as_ref().map(|p| p.port) != Some(ports.port) {
+        portguard::ensure_available(
+            std::net::SocketAddr::from((std::net::IpAddr::from([0, 0, 0, 0]), ports.port)),
+            portguard::PortKind::SparkConnect,
+        );
+    }
+    if let Some(ui) = ports.ui_port {
+        if recorded.as_ref().and_then(|p| p.ui_port) != Some(ui) {
+            portguard::ensure_available(
+                std::net::SocketAddr::from((ports.ui_bind, ui)),
+                portguard::PortKind::Ui,
+            );
+        }
+    }
+
+    run_stop(args)?;
+    daemon::start(&flags, ports).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -964,6 +1014,30 @@ mod tests {
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--timeout` is `stop`'s flag and `restart` hands its argv straight to `run_stop`. Left in
+    /// the replay set it became `oxidant spark server --timeout 30`, and — before the merge —
+    /// took every recorded server flag down with it, moving the daemon to the default ports.
+    #[test]
+    fn restart_never_replays_its_own_control_flags_to_the_server() {
+        assert_eq!(
+            restart_server_flags(&args(&["--timeout", "30"])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            restart_server_flags(&args(&["--timeout=30"])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            restart_server_flags(&args(&["--timeout", "30", "--ui-port", "4050"])),
+            args(&["--ui-port", "4050"])
+        );
+        // A server flag that merely *contains* the name is not the control flag.
+        assert_eq!(
+            restart_server_flags(&args(&["--timeout-ms", "30"])),
+            args(&["--timeout-ms", "30"])
+        );
     }
 
     #[test]

@@ -1147,16 +1147,76 @@ pub fn recorded_pidfile() -> Option<PidFile> {
     PidFile::read(&pid_path())
 }
 
-/// The flags a `restart` should replay: the ones just typed, or failing that the ones the
-/// running daemon was started with.
+/// The flags a `restart` should replay: the recorded ones, with anything typed laid over the top.
 ///
 /// "Same flags preserved" cuts both ways — a bare `oxidant restart` must come back on the same
-/// ports it went down on, and `oxidant restart --port 50052` must be able to change them.
+/// ports it went down on, and `oxidant restart --ui-port 4050` must be able to move the UI
+/// *without* dropping the `--port` the daemon has been serving on for a month.
+///
+/// Wholesale replacement got the second half wrong in the most dangerous direction: any typed
+/// argument at all silently reverted every flag it did not mention to its default, so
+/// `oxidant restart --ui-port 4050` moved a production server from 50452 to 50051 — and it did
+/// not even take a server flag to trigger, because `restart` passes its own `--timeout` through
+/// this function too.
+///
+/// Override is per flag *name*, and it removes every recorded occurrence of that name, so a
+/// repeatable flag (`--catalog-conf k=v --catalog-conf j=w`) is replaced as a set rather than
+/// appended to.
 pub fn restart_flags(typed: &[String], recorded: Option<&PidFile>) -> Vec<String> {
-    if !typed.is_empty() {
-        return typed.to_vec();
+    let recorded = recorded.map(|p| p.args.clone()).unwrap_or_default();
+    let mut overridden: std::collections::BTreeSet<String> = flag_entries(typed)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty())
+        .collect();
+    // Some flags do not merely shadow their recorded twin, they contradict it: `--no-ui` and
+    // `--ui-port` cannot both be what the operator meant, and leaving the recorded one in place
+    // would silently win. Whichever was typed decides.
+    for (a, b) in [("--no-ui", "--ui-port"), ("--no-ui", "--ui-bind")] {
+        if overridden.contains(a) {
+            overridden.insert(b.to_string());
+        }
+        if overridden.contains(b) {
+            overridden.insert(a.to_string());
+        }
     }
-    recorded.map(|p| p.args.clone()).unwrap_or_default()
+    let mut merged: Vec<String> = flag_entries(&recorded)
+        .into_iter()
+        .filter(|(name, _)| !overridden.contains(name))
+        .flat_map(|(_, tokens)| tokens)
+        .collect();
+    merged.extend(typed.iter().cloned());
+    merged
+}
+
+/// Split a flag list into `(name, tokens)` entries.
+///
+/// `--port 50051` and `--port=50051` are both one entry named `--port`; `--no-ui` is one entry
+/// with no value. A token that is not a flag and is not consumed as one's value keeps itself,
+/// under the empty name, so it is carried through and never treated as overridable.
+///
+/// The "next token is the value unless it starts with `--`" rule is the same one [`crate::flag`]
+/// reads with, which is what makes the merge agree with the parser it feeds.
+fn flag_entries(flags: &[String]) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut i = 0;
+    while i < flags.len() {
+        let tok = flags[i].clone();
+        let Some(rest) = tok.strip_prefix("--") else {
+            out.push((String::new(), vec![tok]));
+            i += 1;
+            continue;
+        };
+        let name = format!("--{}", rest.split('=').next().unwrap_or_default());
+        let mut tokens = vec![tok.clone()];
+        if !tok.contains('=') && flags.get(i + 1).is_some_and(|next| !next.starts_with("--")) {
+            tokens.push(flags[i + 1].clone());
+            i += 1;
+        }
+        i += 1;
+        out.push((name, tokens));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1507,16 +1567,95 @@ mod tests {
 
     // --- restart -----------------------------------------------------------------------------
 
+    fn strs(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn restart_replays_the_recorded_flags_unless_new_ones_were_typed() {
         let recorded = pidfile(1, "x", "y");
         assert_eq!(
             restart_flags(&[], Some(&recorded)),
-            vec!["--port".to_string(), "50051".to_string()]
+            strs(&["--port", "50051"])
         );
-        let typed = vec!["--port".to_string(), "50052".to_string()];
+        let typed = strs(&["--port", "50052"]);
         assert_eq!(restart_flags(&typed, Some(&recorded)), typed);
         assert!(restart_flags(&[], None).is_empty());
+    }
+
+    /// The finding: typing *any* argument used to revert every flag it did not mention to its
+    /// default. Moving the UI must not move the Spark Connect port with it.
+    #[test]
+    fn typed_flags_are_laid_over_the_recorded_ones_not_swapped_for_them() {
+        let mut recorded = pidfile(1, "x", "y");
+        recorded.args = strs(&[
+            "--port",
+            "50452",
+            "--ui-port",
+            "4452",
+            "--sample-data",
+            "/d",
+        ]);
+        assert_eq!(
+            restart_flags(&strs(&["--ui-port", "4050"]), Some(&recorded)),
+            strs(&[
+                "--port",
+                "50452",
+                "--sample-data",
+                "/d",
+                "--ui-port",
+                "4050"
+            ])
+        );
+        // `--port=50452` is the same entry as `--port 50452`, and is overridden the same way.
+        recorded.args = strs(&["--port=50452", "--ui-port", "4452"]);
+        assert_eq!(
+            restart_flags(&strs(&["--port", "50999"]), Some(&recorded)),
+            strs(&["--ui-port", "4452", "--port", "50999"])
+        );
+    }
+
+    /// A repeatable flag is replaced as a set: three recorded `--catalog-conf` entries and one
+    /// typed means one, not four (two of which the parser would silently shadow).
+    #[test]
+    fn a_repeated_flag_is_overridden_as_a_whole_set() {
+        let mut recorded = pidfile(1, "x", "y");
+        recorded.args = strs(&[
+            "--catalog-conf",
+            "a=1",
+            "--catalog-conf",
+            "b=2",
+            "--port",
+            "50452",
+        ]);
+        assert_eq!(
+            restart_flags(&strs(&["--catalog-conf", "c=3"]), Some(&recorded)),
+            strs(&["--port", "50452", "--catalog-conf", "c=3"])
+        );
+    }
+
+    /// `--no-ui` and `--ui-port` contradict each other, so the recorded one must not survive the
+    /// typed one and quietly win.
+    #[test]
+    fn typing_no_ui_drops_the_recorded_ui_port_and_the_reverse() {
+        let mut recorded = pidfile(1, "x", "y");
+        recorded.args = strs(&[
+            "--port",
+            "50452",
+            "--ui-port",
+            "4452",
+            "--ui-bind",
+            "127.0.0.1",
+        ]);
+        assert_eq!(
+            restart_flags(&strs(&["--no-ui"]), Some(&recorded)),
+            strs(&["--port", "50452", "--no-ui"])
+        );
+        recorded.args = strs(&["--port", "50452", "--no-ui"]);
+        assert_eq!(
+            restart_flags(&strs(&["--ui-port", "4050"]), Some(&recorded)),
+            strs(&["--port", "50452", "--ui-port", "4050"])
+        );
     }
 
     // --- ps parsing --------------------------------------------------------------------------

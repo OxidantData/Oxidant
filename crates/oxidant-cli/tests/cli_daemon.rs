@@ -403,6 +403,124 @@ fn servers_on(ports: &[u16]) -> Vec<u32> {
     found
 }
 
+/// `oxidant restart --timeout <n>` restarts. It used to stop the daemon and then fail to start
+/// it, leaving the operator with nothing running.
+///
+/// `--timeout` is `stop`'s flag, and `restart` parses it by handing its argv to `run_stop` — but
+/// the replay set treated *any* typed argument as a wholesale override of the recorded server
+/// flags. So `--timeout 30` discarded `--port`/`--ui-port` and was itself replayed to
+/// `oxidant spark server --timeout 30 --foreground`. On a machine where the defaults happened to
+/// be free it was worse than a failure: a silent move of a production server to 50051.
+#[test]
+fn restart_with_a_stop_timeout_keeps_the_server_on_its_own_ports() {
+    let mut d = Daemon::new();
+    d.started_ok();
+    let first = d.pid();
+
+    let restarted = d.run(&["restart", "--timeout", "20"]);
+    assert_eq!(
+        restarted.code(),
+        0,
+        "restart --timeout: {}",
+        restarted.all()
+    );
+    let second = d.pid();
+    assert_ne!(second, first, "restart reused the old pid");
+    wait_until_gone(first, Duration::from_secs(10));
+
+    let status = d.run(&["status"]);
+    assert_eq!(status.code(), 0, "{}", status.all());
+    let text = status.stdout();
+    assert!(
+        text.contains(&format!("sc://0.0.0.0:{}", d.port)),
+        "restart --timeout moved the server off its port: {text}"
+    );
+    assert!(
+        text.contains(&format!("http://127.0.0.1:{}", d.ui_port)),
+        "restart --timeout moved the UI off its port: {text}"
+    );
+    // And the flag was never handed to the server it started.
+    assert!(
+        !text.contains("--timeout"),
+        "`--timeout` is stop's flag and was replayed to the server: {text}"
+    );
+}
+
+/// `restart` is not atomic — it stops first — so a restart that *cannot* start must refuse
+/// before it stops anything. Otherwise the operator is left with nothing running, and on a
+/// crashed-node runbook that is the whole engine gone for the sake of a typo.
+#[test]
+fn a_restart_onto_a_taken_port_leaves_the_running_daemon_alone() {
+    let mut d = Daemon::new();
+    d.started_ok();
+    let running = d.pid();
+
+    // Bound on every interface, because that is what the server binds: macOS is happy to let
+    // `0.0.0.0:P` and `127.0.0.1:P` coexist, so a loopback blocker would not collide at all.
+    let blocker = TcpListener::bind("0.0.0.0:0").expect("bind a blocker");
+    let taken = blocker.local_addr().expect("local_addr").port();
+
+    let refused = d.run(&["restart", "--port", &taken.to_string()]);
+    assert_eq!(
+        refused.code(),
+        1,
+        "a restart onto a taken port must fail: {}",
+        refused.all()
+    );
+    assert!(
+        refused.stderr().contains("is already in use")
+            || refused
+                .stderr()
+                .contains("is already held by another oxidant process"),
+        "{}",
+        refused.all()
+    );
+    // The load-bearing assertion: the daemon that was running still is.
+    assert!(
+        alive(running),
+        "restart stopped the daemon it could not restart"
+    );
+    assert_eq!(d.pid(), running, "the pidfile no longer names it either");
+    let status = d.run(&["status"]);
+    assert_eq!(
+        status.code(),
+        0,
+        "the daemon must still be healthy on its original ports: {}",
+        status.all()
+    );
+    drop(blocker);
+}
+
+/// Moving one port must not reset the others — the same wholesale-override defect, in the form
+/// an operator meets it on purpose.
+#[test]
+fn restart_with_a_new_ui_port_keeps_the_recorded_connect_port() {
+    let mut d = Daemon::new();
+    d.started_ok();
+    let moved = pick_port();
+
+    let restarted = d.run(&["restart", "--ui-port", &moved.to_string()]);
+    assert_eq!(
+        restarted.code(),
+        0,
+        "restart --ui-port: {}",
+        restarted.all()
+    );
+
+    let status = d.run(&["status"]);
+    assert_eq!(status.code(), 0, "{}", status.all());
+    let text = status.stdout();
+    assert!(
+        text.contains(&format!("sc://0.0.0.0:{}", d.port)),
+        "moving the UI moved the connect port too: {text}"
+    );
+    assert!(
+        text.contains(&format!(":{moved}")),
+        "the UI did not move to the port that was asked for: {text}"
+    );
+    d.ui_port = moved;
+}
+
 /// **The crashed-node pin.** `restart` after a SIGKILL must come back on the ports the dead
 /// daemon held, not on the defaults.
 ///
