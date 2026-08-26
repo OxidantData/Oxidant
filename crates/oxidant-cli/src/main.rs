@@ -107,7 +107,9 @@ fn usage() {
     eprintln!(
         "  oxidant start [--port <PORT>] [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui] [--mode local|local-cluster] [--workers <N|host:port,...>] [--sample-data <DIR>]"
     );
-    eprintln!("  oxidant stop [--timeout <SECS>]");
+    eprintln!(
+        "  oxidant stop [--timeout <SECS>]      # 0..=86400; 0 means SIGKILL at once, no flush"
+    );
     eprintln!("  oxidant status");
     eprintln!("  oxidant restart [same flags as start]");
     eprintln!(
@@ -262,17 +264,38 @@ fn server_ports(args: &[String]) -> daemon::ServerPorts {
     }
 }
 
+/// The largest `--timeout` `stop` accepts, in seconds.
+///
+/// `wait_for_exit` computes `Instant::now() + within`, and `Instant` addition *panics* on
+/// overflow. So `oxidant stop --timeout 18446744073709551615` panicked with exit 101 — and did
+/// it **after** delivering SIGTERM, leaving the daemon dead, the pidfile in place, no success or
+/// failure line printed, and a Rust backtrace from a CLI that is otherwise careful about its
+/// exit codes. A fat-fingered value is the obvious trigger; so is any script doing arithmetic.
+///
+/// A day is already far past any real flush, so a larger value is a typo either way and gets the
+/// same refusal a non-numeric one already got — before the signal, not after it.
+const MAX_STOP_GRACE_SECS: u64 = 86_400;
+
+/// `--timeout <SECS>` for `stop`, validated before anything is signalled.
+fn stop_grace(args: &[String]) -> oxidant_common::Result<std::time::Duration> {
+    let Some(t) = flag(args, "--timeout") else {
+        return Ok(daemon::DEFAULT_STOP_GRACE);
+    };
+    let secs = t
+        .parse::<u64>()
+        .ok()
+        .filter(|s| *s <= MAX_STOP_GRACE_SECS)
+        .ok_or_else(|| {
+            oxidant_common::Error::Io(format!(
+                "invalid --timeout `{t}` (expected 0..={MAX_STOP_GRACE_SECS} seconds)"
+            ))
+        })?;
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 /// `oxidant stop [--timeout <SECS>]` — how long SIGTERM gets before SIGKILL.
 fn run_stop(args: &[String]) -> oxidant_common::Result<()> {
-    let grace = match flag(args, "--timeout") {
-        Some(t) => std::time::Duration::from_secs(t.parse::<u64>().map_err(|_| {
-            oxidant_common::Error::Io(format!(
-                "invalid --timeout `{t}` (expected a number of seconds)"
-            ))
-        })?),
-        None => daemon::DEFAULT_STOP_GRACE,
-    };
-    daemon::stop(grace)
+    daemon::stop(stop_grace(args)?)
 }
 
 /// `restart`'s own control flags: read by `run_stop`, never the server's to replay.
@@ -1014,6 +1037,42 @@ mod tests {
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--timeout` is parsed into `Instant::now() + within`, which panics on overflow — after
+    /// SIGTERM had already gone out. Out of range is refused where a non-numeric value already
+    /// was: before anything is signalled.
+    #[test]
+    fn an_out_of_range_stop_timeout_is_refused_rather_than_overflowing() {
+        assert_eq!(
+            stop_grace(&args(&["stop"])).unwrap(),
+            daemon::DEFAULT_STOP_GRACE
+        );
+        assert_eq!(
+            stop_grace(&args(&["stop", "--timeout", "30"])).unwrap(),
+            std::time::Duration::from_secs(30)
+        );
+        // The documented escape hatch: no grace at all.
+        assert_eq!(
+            stop_grace(&args(&["stop", "--timeout", "0"])).unwrap(),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            stop_grace(&args(&[
+                "stop",
+                "--timeout",
+                &MAX_STOP_GRACE_SECS.to_string()
+            ]))
+            .unwrap(),
+            std::time::Duration::from_secs(MAX_STOP_GRACE_SECS)
+        );
+        for bad in ["18446744073709551615", "86401", "-1", "soon", ""] {
+            let e = stop_grace(&args(&["stop", "--timeout", bad]))
+                .expect_err(&format!("--timeout {bad} must be refused"))
+                .to_string();
+            assert!(e.contains("invalid --timeout"), "{bad}: {e}");
+            assert!(e.contains("0..=86400"), "{bad}: {e}");
+        }
     }
 
     /// `--timeout` is `stop`'s flag and `restart` hands its argv straight to `run_stop`. Left in

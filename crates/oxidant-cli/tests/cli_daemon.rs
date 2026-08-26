@@ -450,6 +450,42 @@ fn restart_with_a_stop_timeout_keeps_the_server_on_its_own_ports() {
     );
 }
 
+/// A `--timeout` too large to add to an `Instant` must be refused, not panicked on — and above
+/// all not panicked on *after* the daemon has already been SIGTERMed.
+///
+/// The reproduced shape: `oxidant stop --timeout 18446744073709551615` delivered SIGTERM, then
+/// panicked in `wait_for_exit` with "overflow when adding duration to instant" and exit 101.
+/// The daemon was dead, the pidfile intact, and neither a success nor a failure line was
+/// printed. The order of operations is what makes this a data-loss bug rather than a cosmetic
+/// one: the refusal has to land before the signal.
+#[test]
+fn a_stop_timeout_that_cannot_be_added_to_an_instant_is_refused_before_sigterm() {
+    let mut d = Daemon::new();
+    d.started_ok();
+    let pid = d.pid();
+
+    let refused = d.run(&["stop", "--timeout", &u64::MAX.to_string()]);
+    assert_eq!(
+        refused.code(),
+        1,
+        "an out-of-range --timeout must be a refusal, not a panic (101): {}",
+        refused.all()
+    );
+    assert!(
+        refused.stderr().contains("invalid --timeout"),
+        "{}",
+        refused.all()
+    );
+    assert!(!refused.stderr().contains("panicked"), "{}", refused.all());
+    // The load-bearing half: nothing was signalled on the way to that refusal.
+    assert!(
+        alive(pid),
+        "the daemon was SIGTERMed before the --timeout was validated"
+    );
+    let status = d.run(&["status"]);
+    assert_eq!(status.code(), 0, "{}", status.all());
+}
+
 /// `restart` is not atomic — it stops first — so a restart that *cannot* start must refuse
 /// before it stops anything. Otherwise the operator is left with nothing running, and on a
 /// crashed-node runbook that is the whole engine gone for the sake of a typo.
