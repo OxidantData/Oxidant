@@ -299,6 +299,110 @@ fn restart_comes_back_on_the_same_ports_with_a_new_pid() {
     );
 }
 
+/// **The orphaned-engine pin.** Two concurrent `start`s against one data root must never leave
+/// a live server the pidfile does not name.
+///
+/// The reproduced incident: both `start`s read the pidfile, both saw "stopped", both spawned.
+/// The loser's pidfile write lost the rename race, returned through a bare `?` — and left a
+/// detached Spark Connect server holding its ports with `status` reporting "not running" and
+/// `stop` reporting "nothing to stop". `lsof` archaeology, restored.
+///
+/// Distinct ports on purpose: with a shared port the port guard would arbitrate and the daemon
+/// bookkeeping would never be tested. The assertion is a conservation law — the set of live
+/// `spark server` processes on our two ports is exactly what the pidfile claims, 0 or 1, never
+/// a mismatch.
+#[test]
+fn two_concurrent_starts_never_leave_an_engine_the_pidfile_does_not_name() {
+    let dir = common::data_dir();
+    let ports = [pick_port(), pick_port()];
+
+    let children: Vec<Child> = ports
+        .iter()
+        .map(|port| {
+            Command::new(oxidant_bin())
+                .env("OXIDANT_DATA_DIR", dir.path())
+                .args(["start", "--port", &port.to_string(), "--no-ui"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn oxidant start")
+        })
+        .collect();
+    let outs: Vec<Output> = children
+        .into_iter()
+        .map(|c| c.wait_with_output().expect("wait for start"))
+        .collect();
+    let transcript = outs
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            format!(
+                "start {i} (port {}) exit={:?}\nstdout:\n{}stderr:\n{}",
+                ports[i],
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        })
+        .collect::<String>();
+
+    let pid_path = dir.path().join("run/oxidant.pid");
+    let claimed: Option<u32> = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|doc| doc["pid"].as_u64())
+        .map(|p| p as u32);
+    let live = servers_on(&ports);
+
+    // Clean up before asserting: a leak is exactly the case where the assertion fires, and a
+    // panic here would leave the orphan behind for the rest of the suite to trip over.
+    for pid in &live {
+        if Some(*pid) != claimed {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        }
+    }
+    let _ = Command::new(oxidant_bin())
+        .env("OXIDANT_DATA_DIR", dir.path())
+        .arg("stop")
+        .output();
+
+    let expected: Vec<u32> = claimed.into_iter().collect();
+    assert_eq!(
+        live, expected,
+        "live `spark server` processes on ports {ports:?} do not match the pidfile \
+         (pidfile: {claimed:?}) — a start leaked a detached engine\n{transcript}"
+    );
+}
+
+/// The pids of every live `oxidant spark server` started on one of `ports`, ascending.
+///
+/// Read from the machine's process table rather than from the ports themselves: a leaked engine
+/// that has not finished binding yet is still a leaked engine.
+fn servers_on(ports: &[u16]) -> Vec<u32> {
+    let out = Command::new("ps")
+        .args(["-Ao", "pid=,args="])
+        .output()
+        .expect("ps -Ao pid=,args=");
+    let mut found: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            let pid: u32 = it.next()?.parse().ok()?;
+            let command: Vec<&str> = it.collect();
+            if !command.contains(&"server") {
+                return None;
+            }
+            let names_our_port = command
+                .windows(2)
+                .any(|w| w[0] == "--port" && w[1].parse::<u16>().is_ok_and(|p| ports.contains(&p)));
+            names_our_port.then_some(pid)
+        })
+        .collect();
+    found.sort_unstable();
+    found
+}
+
 // -------------------------------------------------------------------------------------------
 // The bare-invocation refusal
 // -------------------------------------------------------------------------------------------

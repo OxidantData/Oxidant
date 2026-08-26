@@ -17,6 +17,11 @@
 //!   daemon (or lose the machine) and the pidfile survives with a pid that is dead or has been
 //!   reused; `start` sees liveness+identity fail, drops the file and proceeds. This is what makes
 //!   `Restart=on-failure` and a plain reboot work.
+//! * **A failed start leaks nothing.** The window between `spawn` and a written pidfile is the
+//!   one in which a live, detached engine exists that nothing on disk names, so the child is
+//!   owned by a [`ChildGuard`] that reaps it on every path out — and the whole check-then-spawn
+//!   sequence runs under an exclusive `run/.lock`, so two concurrent `start`s cannot both
+//!   decide nothing is running.
 //! * **The guard never counts the starting process itself.** `start` spawns
 //!   `oxidant spark server … --foreground`, so at the moment the child boots there are two
 //!   oxidant processes in the tree by construction. Anything that scans for "another oxidant
@@ -50,6 +55,14 @@ const SIGKILL_GRACE: Duration = Duration::from_secs(5);
 /// How long `start` waits for the child to answer its health endpoint before giving up and
 /// reporting the tail of the log.
 const START_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long `start` waits for another `start` to release `run/.lock` before giving up.
+///
+/// The lock is held across a whole start, readiness wait included, so the wait has to outlast
+/// [`START_TIMEOUT`] or a concurrent `start` would report a lock timeout for a first start that
+/// is merely slow. Past that it is a real failure — a crashed `start` cannot hold the lock
+/// (the kernel drops `flock` with the fd), so what remains is a wedged one.
+const START_LOCK_WAIT: Duration = Duration::from_secs(100);
 
 /// Lines of `run/oxidant.log` shown when a start fails.
 const LOG_TAIL_LINES: usize = 20;
@@ -613,6 +626,139 @@ pub fn enforce_single_instance() {
 // start
 // ---------------------------------------------------------------------------------------------
 
+/// The spawned server, owned from `spawn` until the pidfile is authoritative.
+///
+/// Between those two moments the child is a live, `setsid`'d, un-pidfiled Spark Connect server —
+/// exactly the state this module exists to abolish. Every early return in that window used to
+/// leak it: a `?` on the pidfile write returned before the one `child.kill()` in the function,
+/// leaving a full engine holding its ports with `status` reporting "not running" and `stop`
+/// reporting "nothing to stop". So the child is owned by a guard that reaps it on drop, and only
+/// a recorded, ready daemon disarms that guard.
+struct ChildGuard {
+    child: std::process::Child,
+    /// `false` once the child is either the pidfile's daemon or already reaped.
+    armed: bool,
+}
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        ChildGuard { child, armed: true }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// This child is now the daemon the pidfile names. Stop owning it.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Kill the child and reap it, so no zombie is left behind either.
+    ///
+    /// Idempotent, and a no-op once the child has already exited on its own — which is the
+    /// common case, since the usual reason a start fails is that the server died at boot.
+    fn reap(&mut self) {
+        self.armed = false;
+        if let Ok(Some(_)) = self.child.try_wait() {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    fn child_mut(&mut self) -> &mut std::process::Child {
+        &mut self.child
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.reap();
+        }
+    }
+}
+
+/// Remove the pidfile only if it still names `pid`.
+///
+/// The same identity discipline `stop` applies before it *signals*, applied before it *unlinks*.
+/// A blind `remove_file` on a failed start deletes whatever is on disk — which, after a racing
+/// `start` won the file, is another live daemon's pidfile, orphaning it permanently.
+fn remove_pidfile_if_ours(path: &std::path::Path, pid: u32) {
+    if PidFile::read(path).is_some_and(|p| p.pid == pid) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// An exclusive `flock` on `$OXIDANT_DATA_DIR/run/.lock`, held for the whole of `start`.
+///
+/// `running()` → port guard → `spawn` → `write` is a check-then-act sequence, and two `start`s
+/// on distinct ports against one data root both used to observe `Stopped` and both proceed: two
+/// engines, one pidfile, one of them untrackable forever after. The engine already takes
+/// exclusive locks on its own state (`docs/runtime-contract.md`); this is the same discipline
+/// for the *daemon bookkeeping*, and it is what makes `start`'s idempotence promise true under
+/// concurrency rather than only in a quiet shell.
+///
+/// The lock lives on the fd, so it is released by the kernel however this process ends — a
+/// `SIGKILL`ed `start` cannot wedge the next one.
+struct StartLock {
+    /// Held only for its file descriptor: dropping the file releases the lock.
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+async fn lock_start() -> oxidant_common::Result<StartLock> {
+    use std::os::unix::io::AsRawFd;
+    let dir = run_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| oxidant_common::Error::Io(format!("create {}: {e}", dir.display())))?;
+    let path = dir.join(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| oxidant_common::Error::Io(format!("open {}: {e}", path.display())))?;
+    let deadline = Instant::now() + START_LOCK_WAIT;
+    loop {
+        // SAFETY: `flock` takes a file descriptor this process owns for the lifetime of `file`
+        // and an integer of flags; it touches no memory of ours.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(StartLock { _file: file });
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(oxidant_common::Error::Io(format!(
+                "lock {}: {e}",
+                path.display()
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(oxidant_common::Error::Io(format!(
+                "another `oxidant start` has held {} for {}s; it is stuck — check `oxidant status`",
+                path.display(),
+                START_LOCK_WAIT.as_secs()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Without `flock` there is nothing to serialize on, and `start` is unix-only anyway
+/// (`signal` returns `Unsupported` off unix).
+#[cfg(not(unix))]
+async fn lock_start() -> oxidant_common::Result<StartLock> {
+    let path = run_dir().join(".lock");
+    std::fs::create_dir_all(run_dir())
+        .map_err(|e| oxidant_common::Error::Io(format!("create {}: {e}", run_dir().display())))?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| oxidant_common::Error::Io(format!("open {}: {e}", path.display())))?;
+    Ok(StartLock { _file: file })
+}
+
 /// Everything `start` needs to know about the server it is about to spawn.
 pub struct ServerPorts {
     pub port: u16,
@@ -626,6 +772,9 @@ pub struct ServerPorts {
 /// `oxidant spark server … --foreground` and recorded in the pidfile so `restart` can repeat
 /// them.
 pub async fn start(flags: &[String], ports: ServerPorts) -> oxidant_common::Result<()> {
+    // Everything from here to the pidfile write is one critical section. Held first, before the
+    // state is even read: the race is between two `start`s *deciding* nothing is running.
+    let _lock = lock_start().await?;
     match running() {
         // Idempotent by contract: a second `start` reports the first and exits 0. Anything else
         // (a refusal, a second engine) turns `oxidant start` in a provisioning script from a
@@ -681,10 +830,12 @@ pub async fn start(flags: &[String], ports: ServerPorts) -> oxidant_common::Resu
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
     detach(&mut cmd);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| oxidant_common::Error::Io(format!("spawn {}: {e}", exe.display())))?;
-    let pid = child.id();
+    // Owned from here on. Every early return below reaps it — see [`ChildGuard`].
+    let mut child = ChildGuard::new(
+        cmd.spawn()
+            .map_err(|e| oxidant_common::Error::Io(format!("spawn {}: {e}", exe.display())))?,
+    );
+    let pid = child.pid();
 
     // Record before waiting for health, not after. A daemon that is still booting is already a
     // process someone may need to stop, and a `start` interrupted at second 40 of a 90-second
@@ -705,19 +856,21 @@ pub async fn start(flags: &[String], ports: ServerPorts) -> oxidant_common::Resu
         .write(&path)
         .map_err(|e| oxidant_common::Error::Io(format!("write {}: {e}", path.display())))?;
 
-    match await_ready(&mut child, &recorded).await {
+    match await_ready(child.child_mut(), &recorded).await {
         Ok(()) => {
+            // Recorded, ready, and now the pidfile's to manage: not ours to kill.
+            child.disarm();
             println!("oxidant started (pid {pid})");
             print_endpoints(&recorded);
             Ok(())
         }
         Err(why) => {
-            // The child is gone or wedged and the pidfile would outlive it as a lie. Clear it,
+            // The child is gone or wedged and the pidfile would outlive it as a lie. Reap it
+            // first so nothing survives this function, clear the file only if it is still ours,
             // and hand over the tail of the log — the message that explains the failure was
             // written there, not here.
-            let _ = std::fs::remove_file(&path);
-            let _ = child.kill();
-            let _ = child.wait();
+            child.reap();
+            remove_pidfile_if_ours(&path, pid);
             Err(oxidant_common::Error::Io(format!(
                 "{why}\n  log: {}\n{}",
                 log.display(),
@@ -1277,6 +1430,69 @@ mod tests {
         // Unreadable identity says so rather than leaving the line blank.
         let blind = stranger_report(&recorded, None);
         assert!(blind.contains("belongs to another user"), "{blind}");
+    }
+
+    // --- the spawned child is never abandoned -------------------------------------------------
+
+    /// The leak this guard exists to stop, reduced to its decision: a `ChildGuard` that goes out
+    /// of scope without being disarmed leaves nothing running. `start` used to return through a
+    /// bare `?` between `spawn` and the pidfile write, and the detached engine on the other side
+    /// of it was invisible to `status` and `stop` forever.
+    #[test]
+    fn a_child_guard_that_is_dropped_undisarmed_reaps_the_child() {
+        let child = Command::new("sleep")
+            .arg("300")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert!(alive(pid), "the test child did not start");
+        drop(ChildGuard::new(child));
+        // `reap` waits, so by the time `drop` returns the process is gone, not merely signalled.
+        assert!(!alive(pid), "pid {pid} outlived the guard that owned it");
+    }
+
+    /// ... and a disarmed one does not, because by then it is the pidfile's daemon.
+    #[test]
+    fn a_disarmed_child_guard_leaves_the_daemon_alone() {
+        let child = Command::new("sleep")
+            .arg("300")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut guard = ChildGuard::new(child);
+        guard.disarm();
+        drop(guard);
+        assert!(alive(pid), "a started daemon was killed by its own start");
+        let _ = signal(pid, SIGKILL);
+    }
+
+    /// A failed start clears *its own* pidfile and no one else's. The blind `remove_file` this
+    /// replaces would delete a racing daemon's file and orphan it.
+    #[test]
+    fn the_failure_path_only_removes_a_pidfile_that_still_names_us() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("oxidant.pid");
+
+        pidfile(4242, "/usr/local/bin/oxidant", "tok")
+            .write(&path)
+            .unwrap();
+        remove_pidfile_if_ours(&path, 4242);
+        assert!(!path.exists(), "our own pidfile must be cleaned up");
+
+        // The racing case: the file on disk belongs to the daemon that won.
+        pidfile(9999, "/usr/local/bin/oxidant", "tok")
+            .write(&path)
+            .unwrap();
+        remove_pidfile_if_ours(&path, 4242);
+        assert!(
+            path.exists(),
+            "another daemon's pidfile was deleted by our failure path"
+        );
+        assert_eq!(PidFile::read(&path).unwrap().pid, 9999);
     }
 
     // --- restart -----------------------------------------------------------------------------
