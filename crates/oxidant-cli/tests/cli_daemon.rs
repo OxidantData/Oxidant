@@ -898,6 +898,113 @@ fn stop_refuses_to_kill_a_pid_that_is_not_our_daemon() {
     let _ = std::fs::remove_file(d.pid_path());
 }
 
+/// A daemon that has died but not yet been reaped reads as **stopped**, not as a stranger.
+///
+/// A zombie answers `kill(pid, 0)` and `ps -o lstart=` still returns its real start token, so
+/// the only thing that says it is dead is `ps -o args=` — which prints `<defunct>`, not the
+/// empty string the identity guard was checking for. So `identity()` handed back
+/// `exe: "<defunct>"`, the executable comparison failed, and a corpse was classified as a live
+/// process that had hijacked our pid: exit 1, and `stop` refusing to clean up after a process
+/// that no longer exists.
+#[test]
+fn a_dead_but_unreaped_daemon_reads_as_stopped_not_as_a_stranger() {
+    let d = Daemon::new();
+    // `sleep 0` exits at once; `exec` replaces the shell, so the zombie's parent is a `sleep`
+    // that never calls wait() and the corpse persists for the whole test.
+    let mut parent = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 0 & echo $!; exec sleep 300")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the zombie's parent");
+    let zombie: u32 = {
+        use std::io::Read;
+        let mut buf = [0u8; 32];
+        let n = parent
+            .stdout
+            .as_mut()
+            .expect("stdout")
+            .read(&mut buf)
+            .expect("read the child pid");
+        String::from_utf8_lossy(&buf[..n])
+            .trim()
+            .parse()
+            .expect("a pid")
+    };
+
+    let is_defunct = |pid: u32| {
+        let out = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "args="])
+            .output()
+            .expect("ps args=");
+        String::from_utf8_lossy(&out.stdout).contains("<defunct>")
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !is_defunct(zombie) {
+        assert!(
+            Instant::now() < deadline,
+            "pid {zombie} never became a zombie"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The trap that made this a stranger: the corpse's start token is perfectly readable.
+    let lstart = String::from_utf8_lossy(
+        &Command::new("ps")
+            .args(["-p", &zombie.to_string(), "-o", "lstart="])
+            .output()
+            .expect("ps lstart")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        !lstart.is_empty(),
+        "a zombie's lstart is readable; that is the point"
+    );
+
+    std::fs::create_dir_all(d.data_dir.path().join("run")).expect("mkdir run");
+    std::fs::write(
+        d.pid_path(),
+        serde_json::to_vec(&serde_json::json!({
+            "pid": zombie,
+            "exe": "/usr/local/bin/oxidant",
+            "start_token": lstart,
+            "started_at": "2026-08-25T00:00:00Z",
+            "port": d.port,
+            "ui_port": d.ui_port,
+            "ui_bind": "127.0.0.1",
+            "args": [],
+            "log": "/tmp/oxidant.log",
+        }))
+        .expect("encode pidfile"),
+    )
+    .expect("write pidfile");
+
+    let status = d.run(&["status"]);
+    let stopped = d.run(&["stop"]);
+    let _ = parent.kill();
+    let _ = parent.wait();
+
+    assert_eq!(
+        status.code(),
+        3,
+        "a dead daemon is stopped, not a hijacked pid: {}",
+        status.all()
+    );
+    assert!(
+        !status.stderr().contains("is not this oxidant daemon"),
+        "{}",
+        status.all()
+    );
+    // And `stop` cleans up after it instead of refusing to.
+    assert_eq!(stopped.code(), 0, "stop: {}", stopped.all());
+    assert!(
+        !d.pid_path().exists(),
+        "the stale pidfile of a reaped daemon must be dropped"
+    );
+}
+
 /// `status` on the same stranger pidfile: neither "running" nor "stopped", because a script
 /// that read it as either would go on to do the wrong thing.
 #[test]

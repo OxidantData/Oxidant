@@ -266,12 +266,39 @@ fn ps_identity(pid: u32) -> Option<Identity> {
     let start_token = run("ps", &["-p", &pid.to_string(), "-o", "lstart="])?
         .trim()
         .to_string();
-    let args = run("ps", &["-p", &pid.to_string(), "-o", "args="])?;
-    let exe = args.split_whitespace().next()?.to_string();
-    if start_token.is_empty() || exe.is_empty() {
+    let exe = ps_exe(&run("ps", &["-p", &pid.to_string(), "-o", "args="])?)?;
+    if start_token.is_empty() {
         return None;
     }
     Some(Identity { exe, start_token })
+}
+
+/// argv[0] from a `ps -o args=` line, or `None` when the line describes no live executable.
+///
+/// The emptiness guard this replaces was right about the intent and wrong about the sentinel: a
+/// zombie is not an empty string. Measured on macOS, `ps -p <zombie> -o args=` exits 0 and
+/// prints `<defunct>`, while `-o lstart=` still returns the real start token. So `identity()`
+/// answered `Some(Identity { exe: "<defunct>", … })`, the token matched, the executable did not,
+/// and `running()` classified a daemon that had *died* as [`Daemon::Stranger`] — exit 1, "alive
+/// but is not this oxidant daemon", the pidfile deliberately left in place and `stop` refusing to
+/// clean up after it. For a corpse the honest answer is [`Daemon::Stopped`], and `None` here is
+/// what routes it to the dead-pid branch that drops the stale pidfile.
+///
+/// The window is the interval in which the corpse is unreaped — normally one 200 ms poll of
+/// `start`'s `await_ready`, but the whole `START_TIMEOUT` if that `start` is itself stopped. A
+/// concurrent `oxidant status` in a provisioning script is the realistic hit.
+///
+/// `[name]` (Linux's `[cmd] <defunct>`) and `(name)` are the other spellings `ps` uses when
+/// there is no argv to show.
+fn ps_exe(args: &str) -> Option<String> {
+    if args.contains("<defunct>") {
+        return None;
+    }
+    let exe = args.split_whitespace().next()?;
+    if exe.starts_with('(') || exe.starts_with('[') {
+        return None;
+    }
+    (!exe.is_empty()).then(|| exe.to_string())
 }
 
 fn run(program: &str, args: &[&str]) -> Option<String> {
@@ -310,6 +337,30 @@ fn real_pid(pid: u32) -> Option<libc::pid_t> {
 #[cfg(not(unix))]
 pub fn alive(_pid: u32) -> bool {
     false
+}
+
+/// Has `pid` exited without being reaped yet?
+///
+/// The other half of the `<defunct>` story (see [`ps_exe`]). A zombie still occupies a slot in
+/// the process table, so `kill(pid, 0)` succeeds and [`alive`] says `true` — but it holds no
+/// ports, runs no code, and cannot be signalled into doing anything. For every question this
+/// module asks, a corpse is *gone*, and its pidfile is exactly as stale as one whose pid the
+/// kernel has already handed back.
+///
+/// Deliberately not folded into [`alive`], which is the 100 ms poll in [`wait_for_exit`]: that
+/// loop is cheap precisely because it is one `kill(2)` and not a `ps`. This runs once, in
+/// [`running`].
+fn zombie(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // Fields resume after the last `)` at 3 (state), so the state letter is index 0 here.
+        return stat
+            .rfind(')')
+            .and_then(|i| stat[i + 1..].split_whitespace().next())
+            .is_some_and(|state| state.starts_with('Z'));
+    }
+    run("ps", &["-p", &pid.to_string(), "-o", "state="])
+        .is_some_and(|s| s.trim_start().starts_with('Z'))
 }
 
 /// Does the live process `pid` match what the pidfile recorded?
@@ -374,10 +425,15 @@ pub fn running() -> Daemon {
     if verify(&recorded, live.as_ref()) {
         return Daemon::Running(Box::new(recorded));
     }
-    if alive(recorded.pid) {
+    if alive(recorded.pid) && !zombie(recorded.pid) {
         // Alive but a stranger. Never silently reuse or clear this — a hand-written pidfile
         // pointing at someone else's process is exactly the case where deleting it and moving
         // on would look like success right up until `stop` killed the wrong thing.
+        //
+        // A zombie is excluded because it is not a stranger, it is our own corpse: it answers
+        // `kill(pid, 0)`, and its identity fails only because there is no executable left to
+        // read. Calling that a hijacked pid told the operator to investigate a process that had
+        // already died, and made `stop` refuse to clear the pidfile of one.
         return Daemon::Stranger(Box::new(recorded), live);
     }
     // Dead pid: the pidfile is a leftover from a SIGKILL, an OOM kill or a reboot. Drop it.
@@ -1084,8 +1140,11 @@ fn wait_for_exit(recorded: &PidFile, within: Duration) -> bool {
 /// first line with `oxidant: io error:` and leave the other three dangling.
 fn stranger_report(recorded: &PidFile, live: Option<&Identity>) -> String {
     let actual = match live {
+        // "unreadable", with no guess at the cause: `ps -p <other-user-pid> -o args=` returns the
+        // full command line on macOS (verified against pid 1), so "belongs to another user" was
+        // an inference the evidence does not support.
         Some(id) => id.exe.clone(),
-        None => "unreadable — the process belongs to another user".to_string(),
+        None => "unreadable".to_string(),
     };
     let path = pid_path();
     format!(
@@ -1346,6 +1405,24 @@ mod tests {
         assert!(!verify(&recorded, None));
     }
 
+    /// A corpse has no executable, whatever `ps` prints in the column. Reading `<defunct>` as
+    /// one turns a daemon that has *died* into a hijacked pid: exit 1, and `stop` refusing to
+    /// clear the pidfile of a process that no longer exists.
+    #[test]
+    fn a_defunct_process_has_no_readable_executable() {
+        assert_eq!(ps_exe("<defunct>"), None);
+        // Linux spells it with the old comm attached.
+        assert_eq!(ps_exe("[oxidant] <defunct>"), None);
+        assert_eq!(ps_exe("[kworker/2:1]"), None);
+        assert_eq!(ps_exe("(sd-pam)"), None);
+        assert_eq!(ps_exe(""), None);
+        assert_eq!(ps_exe("   \n"), None);
+        assert_eq!(
+            ps_exe("/usr/local/bin/oxidant spark server --port 50051\n").as_deref(),
+            Some("/usr/local/bin/oxidant")
+        );
+    }
+
     #[test]
     fn exe_comparison_tolerates_deleted_and_argv0_spellings() {
         // In-place upgrade: Linux appends " (deleted)" to /proc/<pid>/exe.
@@ -1555,9 +1632,11 @@ mod tests {
             report.contains("a recycled pid is never killed"),
             "{report}"
         );
-        // Unreadable identity says so rather than leaving the line blank.
+        // Unreadable identity says so rather than leaving the line blank — and does not guess
+        // at why, because `ps` reads another user's command line fine on macOS.
         let blind = stranger_report(&recorded, None);
-        assert!(blind.contains("belongs to another user"), "{blind}");
+        assert!(blind.contains("actual:   unreadable"), "{blind}");
+        assert!(!blind.contains("another user"), "{blind}");
     }
 
     // --- the spawned child is never abandoned -------------------------------------------------
