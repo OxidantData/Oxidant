@@ -41,9 +41,10 @@ pidfile would be a second copy of the liveness logic for systemd to get wrong.
 
 | Code | Meaning |
 |------|---------|
-| `0` | running, and `GET /api/v1/cluster/status` answered |
-| `3` | not running (no pidfile, or one describing a process that is gone) |
-| `4` | the process is alive but its HTTP endpoint did not answer; or the pidfile names a live process that is **not** this daemon |
+| `0` | running and healthy — `GET /api/v1/cluster/status` answered, or under `--no-ui` (no HTTP surface to probe) the gRPC listener accepted a connection |
+| `1` | the pidfile names a live process that is **not** this daemon. Neither "running" nor "stopped": something is wrong that a script must not read as either |
+| `3` | not running — no pidfile, or one describing a process that is gone (which `status` also deletes) |
+| `4` | the process is alive but did not answer its endpoint |
 
 The pidfile records the executable and an opaque per-OS process start token, not just a number,
 and both `start` and `stop` re-read that identity from the live process. That single check is what
