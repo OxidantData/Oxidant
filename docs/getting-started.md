@@ -119,7 +119,9 @@ oxidant restart    # same flags, new process
 ```
 
 `oxidant status` is written for scripts: it exits `0` when the server is running and healthy,
-`3` when it is not running, and `4` when the process is alive but not answering.
+`3` when it is not running, `4` when the process is alive but not answering, and `1` when the
+pidfile names a live process that is *not* this daemon — the one code that means "do not
+proceed either way".
 
 ```text
 oxidant is running

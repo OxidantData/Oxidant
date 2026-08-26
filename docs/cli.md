@@ -102,7 +102,7 @@ oxidant sql -f report.sql --format csv > report.csv
 
 | Command | What it does |
 |---|---|
-| `oxidant start` / `stop` / `status` / `restart` | Daemon control for the Spark Connect server (`sc://host:port`) plus the web UI. `start` is idempotent; `status` exits `0` running / `3` stopped / `4` alive-but-not-answering |
+| `oxidant start` / `stop` / `status` / `restart` | Daemon control for the Spark Connect server (`sc://host:port`) plus the web UI. `start` is idempotent; `status` exits `0` running / `3` stopped / `4` alive-but-not-answering / `1` the pidfile names a live process that is **not** this daemon (neither state — a script must not proceed either way) |
 | `oxidant spark server --foreground` | The same server in the foreground, for a supervisor that owns the process (systemd, Docker, CI). **Bare `oxidant spark server` is refused** — long-lived processes are daemons. A release build also refuses to be the *second* server on the machine; set `OXIDANT_SINGLE_INSTANCE=0` to allow it (or `=1` to enforce it in a debug build) |
 | `oxidant worker --foreground` / `oxidant driver` | A distributed Flight worker (supervised, same rule), and a two-stage distributed aggregation across workers (one-shot: it runs a query and exits) |
 | `oxidant history-server` | Serves completed application event logs |

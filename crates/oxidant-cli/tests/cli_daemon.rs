@@ -780,6 +780,35 @@ fn start_and_status_work_without_a_ui_port() {
     );
 }
 
+/// `usage()` must name every exit code `status` can produce — all four.
+///
+/// `1` is the one a script is most likely to mishandle, because it is the only code that means
+/// "do not proceed either way": neither running nor stopped. Documenting three of four is worse
+/// than documenting none, since a reader who checked the list will read the fourth as a crash.
+#[test]
+fn the_usage_text_names_every_status_exit_code() {
+    let d = Daemon::new();
+    let usage = d.run(&["--help"]);
+    let text = usage.all();
+    let line = text
+        .lines()
+        .position(|l| l.contains("`oxidant status` exits"))
+        .unwrap_or_else(|| panic!("usage names no status exit codes:\n{text}"));
+    let block: String = text
+        .lines()
+        .skip(line)
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    for code in ["0", "1", "3", "4"] {
+        assert!(
+            block.contains(&format!("{code} ")) || block.contains(&format!("or {code}")),
+            "exit code {code} is missing from the usage text: {block}"
+        );
+    }
+    assert!(block.contains("not this daemon"), "{block}");
+}
+
 // -------------------------------------------------------------------------------------------
 // The single-instance rule
 // -------------------------------------------------------------------------------------------

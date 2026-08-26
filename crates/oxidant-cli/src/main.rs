@@ -138,7 +138,12 @@ fn usage() {
         "  `status`/`stop`/`restart` drive it through $OXIDANT_DATA_DIR/run/oxidant.pid. Pass"
     );
     eprintln!("  --foreground to run a role in the foreground under your own supervisor instead.");
-    eprintln!("  `oxidant status` exits 0 (running), 3 (stopped) or 4 (alive but not answering).");
+    eprintln!(
+        "  `oxidant status` exits 0 (running), 3 (stopped), 4 (alive but not answering) or 1"
+    );
+    eprintln!(
+        "  (the pidfile names a live process that is not this daemon — do not proceed either way)."
+    );
     eprintln!();
     eprintln!(
         "  `oxidant sql` runs the statement IN-PROCESS by default — no server needed. Catalogs"
