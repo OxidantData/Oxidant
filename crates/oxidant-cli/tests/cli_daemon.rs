@@ -77,6 +77,15 @@ impl Daemon {
         }
     }
 
+    /// Re-draw both ports. `pick_port` only promises a port was free a moment ago, and under a
+    /// full `cargo test --workspace` something else on the machine can take it in between —
+    /// which shows up as a *port guard* refusal, not a daemon bug. `started_ok` retries through
+    /// that; the same three-attempt shape `cli_rolling_logs::spawn_with_retry` uses.
+    fn repick(&mut self) {
+        self.port = pick_port();
+        self.ui_port = pick_port();
+    }
+
     fn run(&self, args: &[&str]) -> Run {
         let out = Command::new(oxidant_bin())
             .env("OXIDANT_DATA_DIR", self.data_dir.path())
@@ -104,6 +113,32 @@ impl Daemon {
         let mut args = vec!["start".to_string()];
         args.extend(self.server_flags());
         self.run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    /// `start`, retried past a port another process grabbed between `pick_port` and the bind.
+    ///
+    /// Only a port conflict is retried, and it is identified by the guard's own words. Any other
+    /// non-zero exit is a real failure and is reported with both streams — an assertion here
+    /// with no message is one nobody can diagnose from a CI log.
+    fn started_ok(&mut self) -> Run {
+        for attempt in 0..3 {
+            let run = self.start();
+            if run.code() == 0 {
+                return run;
+            }
+            let stole_the_port = run.stderr().contains("is already in use")
+                || run
+                    .stderr()
+                    .contains("is already held by another oxidant process");
+            assert!(
+                stole_the_port,
+                "start failed for a reason that is not a port conflict:\n{}",
+                run.all()
+            );
+            eprintln!("attempt {attempt}: something took our ephemeral port, re-drawing");
+            self.repick();
+        }
+        panic!("could not hold an ephemeral port pair for three attempts");
     }
 
     fn pid_path(&self) -> std::path::PathBuf {
@@ -157,10 +192,9 @@ fn wait_until_gone(pid: u32, within: Duration) {
 /// failure in every `if oxidant status; then` anyone writes.
 #[test]
 fn start_status_start_again_stop_status() {
-    let d = Daemon::new();
+    let mut d = Daemon::new();
 
-    let started = d.start();
-    assert_eq!(started.code(), 0, "start failed: {}", started.all());
+    let started = d.started_ok();
     assert!(
         started.stdout().contains("oxidant started (pid "),
         "{}",
@@ -244,8 +278,8 @@ fn stopping_a_daemon_that_is_not_running_is_clean() {
 /// the same ports, which is the only thing that makes it usable in an ops runbook.
 #[test]
 fn restart_comes_back_on_the_same_ports_with_a_new_pid() {
-    let d = Daemon::new();
-    assert_eq!(d.start().code(), 0);
+    let mut d = Daemon::new();
+    d.started_ok();
     let first = d.pid();
 
     let restarted = d.run(&["restart"]);
@@ -405,8 +439,8 @@ fn start_and_status_work_without_a_ui_port() {
 /// process and blocks the next start is a node that never comes back.
 #[test]
 fn a_stale_pidfile_from_a_sigkilled_daemon_does_not_block_a_start() {
-    let d = Daemon::new();
-    assert_eq!(d.start().code(), 0);
+    let mut d = Daemon::new();
+    d.started_ok();
     let killed = d.pid();
 
     assert!(
