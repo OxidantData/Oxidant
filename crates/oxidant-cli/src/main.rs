@@ -1,10 +1,14 @@
 //! The `oxidant` command-line entry point.
 //!
 //! ```text
-//! oxidant spark server --port 50051         # Spark Connect server; point PySpark at sc://host:50051
-//! oxidant spark server --mode local-cluster --workers 2
-//! oxidant spark server --workers host1:50561,host2:50561   # attach remote Flight workers
-//! oxidant worker --port 50561 [--data hits.parquet --table t]   # a distributed Flight worker
+//! oxidant start --port 50051                # start the Spark Connect server as a DAEMON
+//! oxidant status                            # pid, uptime, ports, log path, health probe
+//! oxidant stop                              # SIGTERM -> grace -> SIGKILL, pidfile cleared
+//! oxidant restart                           # stop + start, same flags
+//! oxidant spark server --port 50051 --foreground   # supervisors only (systemd, CI harnesses)
+//! oxidant spark server --mode local-cluster --workers 2 --foreground
+//! oxidant spark server --workers host1:50561,host2:50561 --foreground   # remote Flight workers
+//! oxidant worker --port 50561 --foreground [--data hits.parquet --table t]   # a Flight worker
 //! oxidant driver --workers h:p,h:p \         # orchestrate a 2-stage distributed aggregation
 //!   --partial-sql "SELECT k, COUNT(*) c, SUM(v) s FROM t GROUP BY k" \
 //!   --final-sql   "SELECT k, SUM(c) c, SUM(s) s FROM shuffle_input GROUP BY k" \
@@ -26,6 +30,7 @@ use oxidant_execution::flight::serve_worker;
 use oxidant_loom::Engine;
 
 mod client;
+mod daemon;
 mod embedded;
 mod mcp;
 mod pipeline;
@@ -71,6 +76,12 @@ async fn async_main(args: Vec<String>, config: Option<oxidant_config::OxidantCon
     let cmd = args.get(1).map(String::as_str);
 
     let result = match cmd {
+        // Daemon control. These are the *only* way a human starts a long-running oxidant; the
+        // role subcommands below refuse to run attached to a terminal (see `daemon`).
+        Some("start") => daemon::start(&args[2..], server_ports(&args)).await,
+        Some("stop") => run_stop(&args),
+        Some("status") => daemon::status().await,
+        Some("restart") => run_restart(&args).await,
         Some("worker") => run_worker(&args, config).await,
         Some("driver") => run_driver(&args).await,
         Some("history-server") => run_history_server(&args).await,
@@ -94,10 +105,16 @@ fn usage() {
     eprintln!("oxidant {}", env!("CARGO_PKG_VERSION"));
     eprintln!("usage:");
     eprintln!(
-        "  oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui] [--mode local|local-cluster] [--workers <N|host:port,...>] [--sample-data <DIR>]"
+        "  oxidant start [--port <PORT>] [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui] [--mode local|local-cluster] [--workers <N|host:port,...>] [--sample-data <DIR>]"
+    );
+    eprintln!("  oxidant stop [--timeout <SECS>]");
+    eprintln!("  oxidant status");
+    eprintln!("  oxidant restart [same flags as start]");
+    eprintln!(
+        "  oxidant spark server --foreground [...]   # supervisors only (systemd, CI harnesses)"
     );
     eprintln!("  oxidant history-server --dir <LOG_DIR> [--port <PORT>]");
-    eprintln!("  oxidant worker --port <PORT> [--data <parquet> --table <name>]");
+    eprintln!("  oxidant worker --port <PORT> --foreground [--data <parquet> --table <name>]");
     eprintln!(
         "  oxidant driver --workers <h:p,h:p> --partial-sql <SQL> --final-sql <SQL> --hash-keys <c,c>"
     );
@@ -111,6 +128,15 @@ fn usage() {
     eprintln!(
         "  oxidant pipeline reconcile [--config <FILE>] [--table <NAME>]... [--sample <KEYS>] [--cron <EXPR>|off]"
     );
+    eprintln!();
+    eprintln!(
+        "  Long-running processes are daemons: `oxidant start` spawns the server detached, and"
+    );
+    eprintln!(
+        "  `status`/`stop`/`restart` drive it through $OXIDANT_DATA_DIR/run/oxidant.pid. Pass"
+    );
+    eprintln!("  --foreground to run a role in the foreground under your own supervisor instead.");
+    eprintln!("  `oxidant status` exits 0 (running), 3 (stopped) or 4 (alive but not answering).");
     eprintln!();
     eprintln!(
         "  `oxidant sql` runs the statement IN-PROCESS by default — no server needed. Catalogs"
@@ -132,24 +158,25 @@ async fn run_server(
     args: &[String],
     config: Option<oxidant_config::OxidantConfig>,
 ) -> oxidant_common::Result<()> {
+    // The first thing checked, before the mode is even parsed: a bare `oxidant spark server` is
+    // the habit this release breaks. Long-lived processes are daemons — `oxidant start` — and a
+    // supervisor that wants to own the process passes `--foreground`.
+    daemon::require_foreground(args, daemon::Role::Server);
+    // Release builds only; see `daemon::enforce_single_instance` for why debug must multiply.
+    daemon::enforce_single_instance();
     let mode = server_mode(args)?;
-    let port = flag(args, "--port")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50051);
-    let ui_port = if args.iter().any(|a| a == "--no-ui") {
-        None
-    } else {
-        Some(
-            flag(args, "--ui-port")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(4040),
-        )
-    };
-    let ui_bind = ui_bind_addr(args);
+    let daemon::ServerPorts {
+        port,
+        ui_port,
+        ui_bind,
+    } = server_ports(args);
     // Before anything expensive (engine, catalogs, sample data) and before the "listening on"
     // banner: if either listener's port is taken, say who has it and stop. `serve` binds gRPC on
     // all interfaces and spawns the UI listener on `--ui-bind`, so those are the two addresses
     // to probe — the REST statement API rides the UI listener and needs no probe of its own.
+    //
+    // `oxidant start` probes the same two addresses before it spawns us, so in the daemon path
+    // this is the second look. It stays: `--foreground` reaches here without one.
     portguard::ensure_available(
         std::net::SocketAddr::from((std::net::IpAddr::from([0, 0, 0, 0]), port)),
         portguard::PortKind::SparkConnect,
@@ -210,6 +237,59 @@ async fn run_server(
         config.workers = workers;
     }
     serve(config).await
+}
+
+/// The two listener addresses a `spark server` will bind, read off the flags.
+///
+/// Shared with `oxidant start`, which needs them *before* it spawns anything: it runs the port
+/// guard in the operator's terminal and records the ports in the pidfile so `status` can name
+/// them and probe the UI without re-parsing a command line.
+fn server_ports(args: &[String]) -> daemon::ServerPorts {
+    daemon::ServerPorts {
+        port: flag(args, "--port")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50051),
+        ui_port: if args.iter().any(|a| a == "--no-ui") {
+            None
+        } else {
+            Some(
+                flag(args, "--ui-port")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4040),
+            )
+        },
+        ui_bind: ui_bind_addr(args),
+    }
+}
+
+/// `oxidant stop [--timeout <SECS>]` — how long SIGTERM gets before SIGKILL.
+fn run_stop(args: &[String]) -> oxidant_common::Result<()> {
+    let grace = match flag(args, "--timeout") {
+        Some(t) => std::time::Duration::from_secs(t.parse::<u64>().map_err(|_| {
+            oxidant_common::Error::Io(format!(
+                "invalid --timeout `{t}` (expected a number of seconds)"
+            ))
+        })?),
+        None => daemon::DEFAULT_STOP_GRACE,
+    };
+    daemon::stop(grace)
+}
+
+/// `oxidant restart [flags]` — stop, then start.
+///
+/// The flags are read from the *running* daemon's pidfile before it is stopped, so a bare
+/// `oxidant restart` comes back on the ports it went down on. Flags typed on the restart
+/// override them wholesale, which is how you move a running server to a new port.
+async fn run_restart(args: &[String]) -> oxidant_common::Result<()> {
+    let recorded = match daemon::running() {
+        daemon::Daemon::Running(p) => Some(p),
+        _ => None,
+    };
+    let flags = daemon::restart_flags(&args[2..], recorded.as_deref());
+    run_stop(args)?;
+    let mut argv = vec![args[0].clone(), "start".to_string()];
+    argv.extend(flags.iter().cloned());
+    daemon::start(&flags, server_ports(&argv)).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +493,10 @@ async fn run_worker(
     args: &[String],
     config: Option<oxidant_config::OxidantConfig>,
 ) -> oxidant_common::Result<()> {
+    // A worker outlives the shell that started it just as surely as a server does, so it is
+    // held to the same rule. Unlike the server it has no `oxidant start` form — workers are
+    // started by a supervisor (systemd on the AMI), which passes `--foreground`.
+    daemon::require_foreground(args, daemon::Role::Worker);
     let port: u16 = flag(args, "--port")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| oxidant_common::Error::Io("worker requires --port".into()))?;

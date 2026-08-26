@@ -188,7 +188,7 @@ fn order_ports(ports: &[u16], conflicting: u16) -> Vec<u16> {
 /// positives — every test binary under `…/oxidant/target/debug/deps/` has "oxidant" in its
 /// path, and a plain `TcpListener` held by the test suite must read as a stranger, not as one
 /// of ours.
-fn is_oxidant_command(command: &str) -> bool {
+pub fn is_oxidant_command(command: &str) -> bool {
     let Some(argv0) = command.split_whitespace().next() else {
         return false;
     };
@@ -242,7 +242,7 @@ fn port_label(command: &str, port: u16) -> Option<&'static str> {
 ///
 /// For `/Users/…/target/debug/oxidant spark server --port 50051` the flags are the whole point
 /// and the install path is not, so argv[0] loses its directory before anything is truncated.
-fn elide(command: &str, max: usize) -> String {
+pub fn elide(command: &str, max: usize) -> String {
     if command.trim().is_empty() {
         return "unknown command".to_string();
     }
@@ -260,13 +260,13 @@ fn elide(command: &str, max: usize) -> String {
     format!("{}…", head.trim_end())
 }
 
-fn basename(path: &str) -> &str {
+pub fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 /// Coarse, human-scale uptime — "2 days" is the useful fact ("this is a leftover"), not
 /// "2 days, 7 hours, 15 minutes and 24 seconds".
-fn humanize(d: Duration) -> String {
+pub fn humanize(d: Duration) -> String {
     let secs = d.as_secs();
     let (n, unit) = match secs {
         0..=89 => (secs.max(1), "second"),
