@@ -8,8 +8,11 @@
 # connect-server image with a different default command — so the two stay
 # bit-for-bit identical and share every registry layer.
 #
-# The orchestrator (crates/oxidant-orchestrator/manifests.rs) runs the worker as:
-#     command: ["oxidant"]  args: ["worker","--foreground"]
+# The orchestrator (crates/oxidant-orchestrator/src/backend.rs, worker_deployment_yaml)
+# runs the worker as:
+#     args: ["worker","--port","<port>","--foreground"]
+# It overrides `args` only, never `command`, so the CMD below is NOT what a provisioned
+# pod runs — the manifest's own args are, and they carry --foreground themselves.
 # with the SAME hardened securityContext + emptyDir scratch as the driver, so the
 # inherited non-root / read-only-rootfs posture from the base image is exactly right.
 #

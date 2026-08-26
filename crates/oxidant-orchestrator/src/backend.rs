@@ -203,7 +203,7 @@ spec:
       containers:
       - name: worker
         image: {image}
-        args: ["worker", "--port", "{port}"]
+        args: ["worker", "--port", "{port}", "--foreground"]
 {memory_env}        ports:
         - containerPort: {port}
 ---
@@ -341,6 +341,26 @@ mod tests {
         assert!(yaml.contains("oxidant_pending_stage_tasks"));
         assert!(yaml.contains("cluster_id: abc"));
         assert!(!yaml.contains("averageUtilization"));
+    }
+
+    /// The Deployment overrides `args` only, never `command`, so the worker image's `CMD`
+    /// migration does not cover this manifest — its own `args` must carry `--foreground`.
+    /// Without it every provisioned pod hits `run_worker`'s refusal ("`oxidant worker` runs a
+    /// long-lived process, and those run as daemons"), exits 1, and CrashLoopBackOffs: the
+    /// control plane's paid surface, down, on every cluster it provisions.
+    #[test]
+    fn worker_manifest_runs_the_worker_in_the_foreground() {
+        let spec = ClusterSpec::local_demo("abc", 2);
+        let yaml = K8sBackend::worker_deployment_yaml(&spec);
+        let args = yaml
+            .lines()
+            .find(|l| l.trim_start().starts_with("args:"))
+            .expect("the worker container's args");
+        assert!(
+            args.contains("--foreground"),
+            "a worker pod without --foreground CrashLoopBackOffs: {args}"
+        );
+        assert!(args.contains("\"worker\""), "{args}");
     }
 
     #[test]
