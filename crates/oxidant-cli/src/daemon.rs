@@ -524,12 +524,26 @@ fn proc_table() -> Vec<ProcRow> {
 
 /// Is this command line an oxidant Spark Connect server?
 ///
-/// Both spellings the CLI accepts (`oxidant spark server …` and the bare `server` alias), and
-/// only when argv[0] really is the oxidant binary — [`portguard::is_oxidant_command`] exists
+/// Mirrors `async_main`'s dispatch exactly, and it has to: that function matches a *named*
+/// subcommand first and only then falls back to "any argument is `server`". Testing for the
+/// word alone would read `oxidant sql -e "SELECT * FROM server_events"` as a running engine and
+/// refuse to start the real one.
+///
+/// argv[0] must also really be the oxidant binary — [`portguard::is_oxidant_command`] exists
 /// because every test binary under `target/debug/deps/` has "oxidant" somewhere in its path.
 fn is_server_role(command: &str) -> bool {
-    portguard::is_oxidant_command(command)
-        && command.split_whitespace().skip(1).any(|t| t == "server")
+    if !portguard::is_oxidant_command(command) {
+        return false;
+    }
+    let toks: Vec<&str> = command.split_whitespace().collect();
+    match toks.get(1).copied() {
+        // Every subcommand `async_main` dispatches by name before the `server` fallback.
+        Some(
+            "worker" | "driver" | "history-server" | "pipeline" | "sql" | "mcp" | "start" | "stop"
+            | "status" | "restart",
+        ) => false,
+        _ => toks.iter().skip(1).any(|t| *t == "server"),
+    }
 }
 
 /// Another server-role oxidant on this machine, if there is one.
@@ -1151,6 +1165,14 @@ mod tests {
             "/usr/local/bin/oxidant worker --port 50561"
         ));
         assert!(!is_server_role("/usr/local/bin/oxidant sql -e 'SELECT 1'"));
+        // The word `server` inside a client subcommand's arguments is not a running engine.
+        // `async_main` dispatches `sql` by name long before its `any(== "server")` fallback.
+        assert!(!is_server_role(
+            "/usr/local/bin/oxidant sql -e SELECT * FROM server_events"
+        ));
+        assert!(!is_server_role(
+            "/usr/local/bin/oxidant pipeline run --table server"
+        ));
         assert!(!is_server_role("/usr/local/bin/oxidant start"));
         assert!(!is_server_role("/usr/local/bin/oxidant status"));
         // A test binary whose *path* contains "oxidant" is a stranger, not one of ours.
