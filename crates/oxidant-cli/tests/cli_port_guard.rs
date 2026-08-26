@@ -66,6 +66,7 @@ async fn start_server(oxidant: &std::path::Path) -> Running {
         .args([
             "spark",
             "server",
+            "--foreground",
             "--port",
             &port.to_string(),
             "--ui-port",
@@ -110,6 +111,10 @@ async fn start_server(oxidant: &std::path::Path) -> Running {
 }
 
 /// Run `oxidant` expecting it to refuse and exit. Returns its stderr.
+///
+/// Every invocation here passes `--foreground`: since the daemon rule landed, a bare
+/// `spark server` is refused *before* the port guard runs, and these tests would all pass for
+/// the wrong reason.
 ///
 /// The deadline *is* the "exits quickly" assertion: without the guard the process would sit in
 /// `serve` forever (or die much later, deep inside tonic).
@@ -163,6 +168,7 @@ async fn a_second_server_on_a_taken_grpc_port_names_the_first() {
         &[
             "spark",
             "server",
+            "--foreground",
             "--port",
             &first.port.to_string(),
             "--ui-port",
@@ -213,6 +219,7 @@ async fn a_ui_port_conflict_points_at_ui_port() {
         &[
             "spark",
             "server",
+            "--foreground",
             "--port",
             &pick_port().to_string(),
             "--ui-port",
@@ -268,7 +275,14 @@ fn a_non_oxidant_occupier_gets_a_clear_message() {
     let data_dir = common::data_dir();
 
     let stderr = refused(
-        &["spark", "server", "--port", &port.to_string(), "--no-ui"],
+        &[
+            "spark",
+            "server",
+            "--foreground",
+            "--port",
+            &port.to_string(),
+            "--no-ui",
+        ],
         data_dir.path(),
     );
 
@@ -294,7 +308,10 @@ fn a_worker_on_a_taken_port_is_refused() {
     let _held = TcpListener::bind(("0.0.0.0", port)).expect("hold the port");
     let data_dir = common::data_dir();
 
-    let stderr = refused(&["worker", "--port", &port.to_string()], data_dir.path());
+    let stderr = refused(
+        &["worker", "--foreground", "--port", &port.to_string()],
+        data_dir.path(),
+    );
 
     assert!(
         stderr.contains(&format!("error: port {port} is already in use")),

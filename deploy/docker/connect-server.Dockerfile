@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 ###############################################################################
-# Oxidant Spark Connect server  —  `oxidant spark server --port 50051`
+# Oxidant Spark Connect server  —  `oxidant spark server --port 50051 --foreground`
 #
 # This is the per-user "cluster" driver pod image. The control plane materializes
 # it via crates/oxidant-orchestrator (see manifests.rs): the container runs
-#     command: ["oxidant"]  args: ["spark","server","--port","50051"]
+#     command: ["oxidant"]  args: ["spark","server","--port","50051","--foreground"]
 # under PodSecurity `restricted` admission — runAsNonRoot, readOnlyRootFilesystem,
 # drop ALL capabilities, seccomp=RuntimeDefault, no auto-mounted ServiceAccount token.
 #
@@ -118,7 +118,9 @@ COPY --chown=65532:65532 sample-data/ /opt/oxidant/sample-data/
 # Default command; the orchestrator overrides command/args per cluster but keeps
 # this exact invocation.
 ENTRYPOINT ["/usr/local/bin/oxidant"]
-CMD ["spark", "server", "--port", "50051"]
+# --foreground: the container runtime (docker, kubelet) is the supervisor, so PID 1 has to
+# BE the server. `oxidant start` would fork away and the container would exit immediately.
+CMD ["spark", "server", "--port", "50051", "--foreground"]
 
 ###############################################################################
 # Read-only rootfs — required writable mounts (provided by the orchestrator):

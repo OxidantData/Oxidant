@@ -77,7 +77,8 @@ else
 fi
 
 log "Starting the Oxidant Connect server with the Glue catalog"
-"${here}/target/release/oxidant" spark server --port "$OXIDANT_PORT" \
+# --foreground: this script owns the pid and kills it in its own trap.
+"${here}/target/release/oxidant" spark server --port "$OXIDANT_PORT" --foreground \
   --catalog-conf "spark.sql.catalog.glue.type=glue" \
   --catalog-conf "spark.sql.catalog.glue.region=${AWS_REGION}" \
   --catalog-conf "spark.sql.catalog.glue.warehouse=${S3_WAREHOUSE}" \

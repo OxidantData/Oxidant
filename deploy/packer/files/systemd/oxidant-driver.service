@@ -16,7 +16,11 @@ User=oxidant
 Group=oxidant
 EnvironmentFile=-/etc/oxidant/oxidant.env
 WorkingDirectory=/var/lib/oxidant
-ExecStart=/usr/local/bin/oxidant spark server --port 50051
+# --foreground, and Type=simple: systemd is the supervisor here, so it wants the process it
+# started to *be* the server. `oxidant start` (the daemon path for humans) would fork away
+# and leave systemd supervising an exited parent — Type=forking + a pidfile is the other way
+# to spell this and buys nothing over letting systemd own the process directly.
+ExecStart=/usr/local/bin/oxidant spark server --port 50051 --foreground
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576

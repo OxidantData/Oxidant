@@ -16,7 +16,8 @@ User=oxidant
 Group=oxidant
 EnvironmentFile=-/etc/oxidant/oxidant.env
 WorkingDirectory=/var/lib/oxidant
-ExecStart=/usr/local/bin/oxidant worker --port 50561
+# --foreground: systemd supervises this process directly (see oxidant-driver.service).
+ExecStart=/usr/local/bin/oxidant worker --port 50561 --foreground
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576

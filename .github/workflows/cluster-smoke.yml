@@ -40,7 +40,7 @@ jobs:
           docker pull "${{ inputs.image }}"
           for w in worker1 worker2; do
             docker run --rm -d --network oxidant-smoke --name "$w" "${{ inputs.image }}" \
-              worker --port 50561 \
+              worker --port 50561 --foreground \
               --data /opt/oxidant/sample-data/parquet/tpch_lineitem.parquet \
               --table lineitem
           done
@@ -50,7 +50,7 @@ jobs:
           # here; distribution is proven from worker stage summaries instead.
           docker run --rm -d --network oxidant-smoke --name driver -p 4040:4040 \
             "${{ inputs.image }}" \
-            spark server --workers worker1:50561,worker2:50561
+            spark server --workers worker1:50561,worker2:50561 --foreground
 
       - name: Assert cluster status is distributed with both workers
         run: |
