@@ -148,9 +148,17 @@ fn conflict_report(port: u16, kind: PortKind, occupant: Option<&Occupant>) -> St
     if !occ.ports.is_empty() {
         let listed = order_ports(&occ.ports, port)
             .iter()
-            .map(|p| match port_label(&occ.command, *p) {
-                Some(what) => format!("{p} ({what})"),
-                None => p.to_string(),
+            .map(|p| {
+                // Only an oxidant command line may be read for oxidant roles. `port_label`
+                // falls back to *our* defaults for a port its flags do not explain, so on a
+                // stranger it invents: an `ssh` multiplexer forwarding 50051 and 4040 was
+                // reported as running a Spark Connect server and an Oxidant UI. The headline
+                // above is already neutral for a stranger, which made the contradiction worse —
+                // the labelled `ports:` line is the more specific-looking claim of the two.
+                match oxidant.then(|| port_label(&occ.command, *p)).flatten() {
+                    Some(what) => format!("{p} ({what})"),
+                    None => p.to_string(),
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -201,6 +209,10 @@ pub fn is_oxidant_command(command: &str) -> bool {
 ///
 /// Returns `None` when the flags do not explain the port — an unlabeled number is honest, a
 /// guessed label is not.
+///
+/// **Only ever called on a command line [`is_oxidant_command`] has accepted.** The default
+/// branch below applies oxidant's own defaults to a command line that did not mention a port,
+/// which is only a reading of the flags when the flags are ours to read.
 fn port_label(command: &str, port: u16) -> Option<&'static str> {
     let toks: Vec<&str> = command.split_whitespace().collect();
     let value = |name: &str| -> Option<u16> {
@@ -613,6 +625,26 @@ mod tests {
         assert!(report.starts_with("error: port 50051 is already in use\n"));
         assert!(!report.contains("oxidant process"));
         assert!(report.contains("stop that process with `kill 41219`"));
+    }
+
+    /// ... and neither are a stranger's *ports*. Reproduced on the reviewer's machine, where an
+    /// `ssh` multiplexer forwards both of oxidant's defaults: the report told the operator that
+    /// an SSH tunnel was running a Spark Connect server and an Oxidant UI. `port_label` reads
+    /// oxidant's defaults off a command line that never mentioned a port, so on anything but
+    /// oxidant it is not reading, it is guessing.
+    #[test]
+    fn a_strangers_ports_are_never_given_oxidant_roles() {
+        let occ = occupant(
+            "ssh: /Users/vamsi/.colima/_lima/colima/ssh.sock [mux]",
+            &[50051, 4040, 5500, 55432],
+        );
+        let report = conflict_report(50051, PortKind::SparkConnect, Some(&occ));
+        assert!(
+            report.contains("  ports:    50051, 4040, 5500, 55432\n"),
+            "a stranger's ports must be bare numbers: {report}"
+        );
+        assert!(!report.contains("spark connect"), "{report}");
+        assert!(!report.contains("ui + rest"), "{report}");
     }
 
     /// Detection is an enhancement, never a blocker: with no occupier at all the user still
