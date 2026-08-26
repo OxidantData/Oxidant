@@ -141,7 +141,14 @@ fn the_driver_writes_a_rolling_log_under_its_own_root() {
     let root = TempDir::new().expect("tempdir");
     let port = pick_port();
     let mut server = Command::new(&oxidant)
-        .args(["spark", "server", "--foreground", "--port", &port.to_string(), "--no-ui"])
+        .args([
+            "spark",
+            "server",
+            "--foreground",
+            "--port",
+            &port.to_string(),
+            "--no-ui",
+        ])
         .env("OXIDANT_DATA_DIR", root.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -308,10 +315,17 @@ fn a_worker_sharing_the_driver_s_root_refuses_to_open_a_second_log_writer() {
 
     let (mut server, _) = spawn_with_retry(|port| {
         let mut cmd = Command::new(&oxidant);
-        cmd.args(["spark", "server", "--foreground", "--port", &port.to_string(), "--no-ui"])
-            .env("OXIDANT_DATA_DIR", root.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        cmd.args([
+            "spark",
+            "server",
+            "--foreground",
+            "--port",
+            &port.to_string(),
+            "--no-ui",
+        ])
+        .env("OXIDANT_DATA_DIR", root.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
         cmd
     });
     let driver_log = wait_for_log(root.path(), &mut server, "the driver");
