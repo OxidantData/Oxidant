@@ -16,7 +16,7 @@ stories KAN-89..KAN-108, plus follow-on tickets KAN-110..KAN-118 filed from this
 |--|--|
 | Engine commit | `b3f3f2e` (`chore: release v0.1.2`), the `main` this branch is based on |
 | Build | `cargo build -p oxidant-cli` (dev profile) |
-| Server | `./target/debug/oxidant spark server --port 50051 --sample-data sample-data` |
+| Server | `./target/debug/oxidant start --port 50051 --sample-data sample-data` |
 | Probe transport | `POST /api/v1/statements?wait=true` (the [REST API](api.md) that `oxidant sql` drives) |
 | Probes run | 578 statements over three passes (508 first pass = 505 scored across the four axes below + 3 setup/DDL warm-ups not attributed to an axis, 55 follow-ups, 15 semantic checks). Reconstructible statement probes are listed in [`parity/databricks-probes.md`](../parity/databricks-probes.md); function-category ratios are category aggregates (see that file). |
 | Date | 2026-08-09 |
@@ -460,7 +460,7 @@ Listed rather than guessed:
 
 ```sh
 cargo build -p oxidant-cli
-./target/debug/oxidant spark server --port 50051 --sample-data sample-data &
+./target/debug/oxidant spark server --port 50051 --sample-data sample-data --foreground &
 
 # Any row's Evidence column is a statement you can replay:
 ./target/debug/oxidant sql -e "SELECT 'abc' LIKE ANY ('a%','z%') AS v"

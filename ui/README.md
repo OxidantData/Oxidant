@@ -4,7 +4,7 @@ Live Spark-like dashboard served by `oxidant spark server` on port **4040** (def
 
 ## Development
 
-With the Oxidant server running (`cargo run -p oxidant-cli -- spark server --port 50051`):
+With the Oxidant server running (`cargo run -p oxidant-cli -- spark server --port 50051 --foreground`):
 
 ```bash
 npm install
@@ -23,7 +23,7 @@ build of it:
 
 ```bash
 npm run build
-OXIDANT_UI_DIR=$PWD/dist oxidant spark server --port 50051 --ui-port 4040
+OXIDANT_UI_DIR=$PWD/dist oxidant start --port 50051 --ui-port 4040
 ```
 
 ## Theme
@@ -61,6 +61,6 @@ setting `OXIDANT_UI_DIR` to serve this app swaps that console out. See
 ## History server
 
 ```bash
-OXIDANT_EVENT_LOG_DIR=/tmp/oxidant-events cargo run -p oxidant-cli -- spark server --no-ui
+OXIDANT_EVENT_LOG_DIR=/tmp/oxidant-events cargo run -p oxidant-cli -- spark server --no-ui --foreground
 cargo run -p oxidant-cli -- history-server --dir /tmp/oxidant-events --port 18080
 ```

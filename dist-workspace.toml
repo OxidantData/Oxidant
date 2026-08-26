@@ -40,7 +40,7 @@ hosting = ["github"]
 # Build just the shippable package, not --workspace (24 crates incl. bench/parity)
 precise-builds = true
 # Message printed by the shell installer on success
-install-success-msg = "oxidant installed — start a server with: oxidant spark server --port 50051"
+install-success-msg = "oxidant installed — start a server with: oxidant start --port 50051"
 # dist normally generates .github/workflows/release.yml and keeps it in sync.
 # That filename is taken by our manual semver-bump workflow, so the generated
 # pipeline lives at .github/workflows/binaries.yml with hand edits (tag filter

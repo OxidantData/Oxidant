@@ -271,7 +271,7 @@ as a bearer credential:
 The token is compared in constant time. Restart the server to change it.
 
 ```sh
-OXIDANT_STATUS_TOKEN=$(openssl rand -hex 32) oxidant spark server --port 50051
+OXIDANT_STATUS_TOKEN=$(openssl rand -hex 32) oxidant start --port 50051
 curl -s http://localhost:4040/api/status -H "Authorization: Bearer $OXIDANT_STATUS_TOKEN"
 ```
 

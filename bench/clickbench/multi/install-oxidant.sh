@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Oxidant — build the `oxidant` binary (oxidant-cli) in release mode; it serves Spark Connect via
-# `oxidant spark server --port 50051`. A stock PySpark client drives it like any other engine.
+# `oxidant spark server --port 50051 --foreground` (run-engine.sh is the supervisor). A stock
+# PySpark client drives it like any other engine.
 # oxidant-proto targets Spark 4.x, so the client venv pins PySpark 4.0 to match the protocol.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

@@ -82,7 +82,7 @@ principal, so this is a plumbing change rather than a redesign.
 ## Configure
 
 ```sh
-oxidant spark server --port 50051 \
+oxidant start --port 50051 \
   --catalog-conf spark.sql.catalog.glue.type=glue \
   --catalog-conf spark.sql.catalog.glue.region=us-west-2 \
   --catalog-conf spark.sql.catalog.glue.lakeformation=true \

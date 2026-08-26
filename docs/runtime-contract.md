@@ -7,8 +7,53 @@ This document defines the environment contract between the **OSS engine images**
 
 | Image | Entrypoint | Role |
 |-------|------------|------|
-| `connect-server` | `oxidant spark server --port 50051` | Spark Connect driver |
-| `worker` | `oxidant worker --port 50561` | Arrow Flight worker |
+| `connect-server` | `oxidant spark server --port 50051 --foreground` | Spark Connect driver |
+| `worker` | `oxidant worker --port 50561 --foreground` | Arrow Flight worker |
+
+`--foreground` is **required** for both, and this is the one place in the product where that is
+true rather than optional — see [Daemon control](#daemon-control) below. A container's PID 1 must
+*be* the server; the daemon path would fork away and the container would exit at once.
+
+## Daemon control
+
+Every long-running oxidant role — `spark server`, `worker` — refuses to run attached to a
+terminal:
+
+```text
+error: `oxidant spark server` runs a long-lived process, and those run as daemons
+  run it as a daemon:  oxidant start
+  or supervise it yourself:  oxidant spark server … --foreground
+```
+
+Two doors, and which one you take depends on whether something else is already supervising the
+process.
+
+| You are… | Use | Why |
+|----------|-----|-----|
+| a human at a prompt | `oxidant start` / `stop` / `status` / `restart` | the daemon setsid's away, records a pidfile and captures its stdio; `status` answers "is it up, on what ports, is it healthy" |
+| systemd, docker, kubelet, a CI harness, a test | `… --foreground` | the supervisor already owns the pid and expects the process it started to be the server |
+
+**Platform images and the AMI units take the second door.** The systemd units stay
+`Type=simple`: systemd supervising the foreground process is the point, and `Type=forking` plus a
+pidfile would be a second copy of the liveness logic for systemd to get wrong.
+
+`oxidant status` is scriptable — the exit code is the answer:
+
+| Code | Meaning |
+|------|---------|
+| `0` | running, and `GET /api/v1/cluster/status` answered |
+| `3` | not running (no pidfile, or one describing a process that is gone) |
+| `4` | the process is alive but its HTTP endpoint did not answer; or the pidfile names a live process that is **not** this daemon |
+
+The pidfile records the executable and an opaque per-OS process start token, not just a number,
+and both `start` and `stop` re-read that identity from the live process. That single check is what
+makes the two failure modes safe: a **recycled pid is never signalled** (`stop` refuses, names both
+executables and leaves the pidfile as evidence), and a **stale pidfile never blocks a start** — so
+`Restart=on-failure` and a plain reboot work after a `SIGKILL` or an OOM kill.
+
+Single-instance enforcement (a second server-role process on the machine refuses, naming the
+running one) is **release builds only**. Debug builds multiply freely; the test suite and
+`--mode local-cluster` depend on it.
 
 ## Driver (connect-server pod)
 
@@ -41,6 +86,8 @@ This document defines the environment contract between the **OSS engine images**
 | `OXIDANT_SAMPLE_DATA_DIR` | Optional | Sample-data directory to register as the `samples` schema at startup (same as `--sample-data <DIR>`; the flag wins). Set to `/opt/oxidant/sample-data` in the OSS image, where the bundled TPC-H SF 0.01 tree (parquet/csv/delta/iceberg) is baked in. Best-effort: missing dirs or unreadable tables are logged and skipped, never a boot failure. Unset/empty ⇒ no `samples` schema. |
 | `OXIDANT_CATALOG_CACHE_TTL_MS` | Optional | External-catalog table cache TTL (default `60000`; `0` revalidates every resolution). Past the TTL, a cached non-lakehouse table's metadata is re-read from the metastore and compared by fingerprint (location + format + schema + partition columns): unchanged keeps the provider, changed rebuilds it and bumps the catalog version (invalidating cached stage plans), and a revalidation error serves the cached provider rather than failing the query. `spark.catalog.refreshTable` evicts immediately but only reaches the driver — this TTL is what converges workers after an out-of-band metastore change (e.g. re-typed Glue tables). |
 | `OXIDANT_DATA_DIR` | Optional | Root of everything the engine writes for itself: the statement journal, spilled statement results, and the rolled exec logs under `logs/`. Default `$XDG_DATA_HOME/oxidant`, else `~/.local/share/oxidant`; a system service (euid 0, or `OXIDANT_SYSTEM=1`) defaults to `/var/lib/oxidant`. **Must be a filesystem path** — a value containing `://` (`s3://…`, `gs://…`) is refused at boot rather than silently creating a directory literally named `s3:`. The engine takes an exclusive `.lock` on it at boot and **fails to start if another process holds it**, naming the holder's pid/role/port; history is per-process and two processes appending to one journal tear each other's records. |
+| `OXIDANT_DATA_DIR/run/oxidant.pid` | *(file)* | The daemon pidfile written by `oxidant start`: pid, executable, process start token, ports, `--ui-bind`, start time, the flags to replay on `restart`, and the log path. One per root — which is what lets several test servers with distinct `OXIDANT_DATA_DIR`s coexist. Removed by `stop`, and by any `start`/`status` that finds the recorded process gone. **Not** split by `OXIDANT_DATA_DIR_PER_PROCESS`: that knob separates colocated engines' journals, while the pidfile is per root. Irrelevant under `--foreground` — a supervised process writes none. |
+| `OXIDANT_DATA_DIR/run/oxidant.log` | *(file)* | The daemon's captured stdout and stderr, appended (never truncated — the log of the run that failed to start is what you read after the next attempt). Distinct from `logs/oxidant.log`: this catches everything written to the file descriptors, including the boot banner, a config error printed before any subscriber exists, and a panic. `oxidant start` prints its tail when a start fails. |
 | `OXIDANT_DATA_DIR_PER_PROCESS` | Optional | `1` derives `<root>/<role>-<port>/` instead of failing when the root is already locked — the recommended setting for container images that co-locate a driver and a worker in one working directory. **Two locks, not one:** the statement journal locks `<history-dir>/statements/.lock` and the rolling exec log locks `<logs-dir>/.lock`. A worker takes no journal lock (it runs no statements), so the log lock is the only thing that stops a co-located driver and worker on one root from sharing `logs/oxidant.log` — where each rolls it on its own schedule and each converter unlinks a rolled file the other still has open, sending the loser's lines to a deleted inode. The second writer is refused loudly and keeps stderr and `GET /api/v1/logs`; set this to `1`, or point `OXIDANT_LOG_DIR` elsewhere, or set `OXIDANT_LOG_ROLL=off` if you meant stderr only. |
 | `OXIDANT_HISTORY_DIR` | Optional | Override for the `history/` subtree alone. An explicit override wins over `OXIDANT_DATA_DIR`. Same object-store-URL refusal. |
 | `OXIDANT_HISTORY` | Optional | Default **on**. `off` restores the previous behaviour exactly: statements live in memory only, capped at 1000 with a 1 h TTL, nothing is written to disk, and nothing is replayed at boot. |
@@ -106,7 +153,9 @@ For single-host development and parity testing, the connect-server binary can em
 cluster:
 
 ```bash
-oxidant spark server --mode local-cluster --workers 4 --port 50051
+oxidant start --mode local-cluster --workers 4 --port 50051
+# ... or, under your own supervisor:
+oxidant spark server --mode local-cluster --workers 4 --port 50051 --foreground
 ```
 
 `local-cluster` starts `N` in-process Arrow Flight workers on ephemeral `127.0.0.1` ports, then

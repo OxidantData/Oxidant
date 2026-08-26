@@ -15,7 +15,7 @@ description: |
   Drop-in Apache Spark replacement on a vectorized CPU core (Loom).
   Speaks the Spark Connect gRPC protocol, so unmodified PySpark / Spark SQL
   clients connect with a one-line URL change — no JVM. Ships the `oxidant`
-  binary: `oxidant spark server --port 50051` starts the engine (Spark
+  binary: `oxidant start --port 50051` starts the engine (Spark
   Connect on 50051, Web UI + REST API on 4040).
   No runtime dependencies. AWS Glue Data Catalogs are read in-process via
   aws-sdk-glue with the standard AWS credential chain (env, shared config,

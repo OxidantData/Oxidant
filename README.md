@@ -52,7 +52,7 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 # or: brew install oxidantdata/tap/oxidant · or: docker pull ghcr.io/oxidantdata/oxidant
 
 # 2. Start the engine (gRPC on 50051, Web UI + REST on 4040)
-oxidant spark server --port 50051
+oxidant start --port 50051
 ```
 
 ```python

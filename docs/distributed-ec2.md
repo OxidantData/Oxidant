@@ -57,7 +57,7 @@ their **private** IPs, and pins `OXIDANT_WORKERS=ip:50561,…` before Connect st
 | Piece | Implementation |
 |-------|----------------|
 | AMI | Packer AL2023 image (`deploy/packer/`) with `oxidant`, AWS CLI v2, hardened `oxidant` user (uid 65532), systemd units |
-| Driver | ASG `Min=Max=Desired=1`, `oxidant spark server --port 50051` |
+| Driver | ASG `Min=Max=Desired=1`, `oxidant spark server --port 50051 --foreground` (systemd is the supervisor — see [runtime-contract.md](runtime-contract.md#daemon-control)) |
 | Workers | ASG `Min=Max=Desired=WorkerCount` (pinned — no scale policies) |
 | Discovery | Driver bootstrap: ASG InService instance IDs → EC2 private IPs → `OXIDANT_WORKERS` |
 | Sharding | Boot assigns `OXIDANT_SHARD_INDEX` = position in sorted InService instance IDs |
@@ -400,7 +400,7 @@ driver and workers must know the catalog — prefer stack `CatalogConf` (section
 
 Pass `--catalog-conf` / `CatalogConf` at deploy time (shown above). Bootstrap writes
 `OXIDANT_CATALOG_CONF` into `/etc/oxidant/oxidant.env` for every instance. The CLI reads that env
-at process start (`oxidant spark server` and `oxidant worker`).
+at process start (`oxidant spark server --foreground` and `oxidant worker --foreground`).
 
 After changing `CatalogConf`, update the stack and **instance-refresh / replace**
 instances so bootstrap re-runs (launch template tag change alone does not restart

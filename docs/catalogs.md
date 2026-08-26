@@ -33,7 +33,7 @@ spark.catalog.tableExists("prod.sales.orders")
 At server start instead:
 
 ```
-oxidant spark server --port 50051 \
+oxidant start --port 50051 \
   --catalog-conf spark.sql.catalog.prod.type=hive \
   --catalog-conf spark.sql.catalog.prod.uri=thrift://hms.internal:9083
 # or: OXIDANT_CATALOG_CONF="spark.sql.catalog.prod.type=hive;spark.sql.catalog.prod.uri=thrift://hms:9083"

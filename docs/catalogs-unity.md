@@ -60,7 +60,7 @@ Iceberg REST server (Polaris, Nessie, Tabular, …) is unaffected.
 ```console
 $ docker run -d --name uc-oss -p 18080:8080 unitycatalog/unitycatalog:latest
 
-$ ./target/debug/oxidant spark server --no-ui --port 50077 \
+$ ./target/debug/oxidant start --no-ui --port 50077 \
     --catalog-conf spark.sql.catalog.uc.type=unity \
     --catalog-conf spark.sql.catalog.uc.uri=http://localhost:18080/api/2.1/unity-catalog/iceberg \
     --catalog-conf spark.sql.catalog.uc.warehouse=unity \
@@ -110,7 +110,7 @@ that limitation.)
 ### Verified: an undeclared default catalog is refused at startup
 
 ```console
-$ ./target/debug/oxidant spark server --no-ui --port 50078 \
+$ ./target/debug/oxidant start --no-ui --port 50078 \
     --catalog-conf spark.sql.catalog.uc.type=unity \
     --catalog-conf spark.sql.catalog.uc.uri=http://x \
     --catalog-conf spark.sql.defaultCatalog=ucc
