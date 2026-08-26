@@ -5,14 +5,14 @@ HTTP port serves the monitoring pages, the SQL editor, notebooks, and the
 [REST API](api.md).
 
 ```sh
-oxidant spark server --port 50051 --ui-port 4040
+oxidant start --port 50051 --ui-port 4040
 ```
 
 > **No auth.** The UI and REST API have no authentication or authorization. On shared or
 > reachable hosts, bind loopback and tunnel instead:
 >
 > ```sh
-> oxidant spark server --port 50051 --ui-bind 127.0.0.1
+> oxidant start --port 50051 --ui-bind 127.0.0.1
 > ssh -L 4040:localhost:4040 user@host
 > ```
 >
@@ -419,7 +419,7 @@ charting library or a grid engine. Dashboards therefore live in the React app un
 
 ```sh
 cd ui && npm install && npm run build
-OXIDANT_UI_DIR=$PWD/dist oxidant spark server --port 50051 --ui-port 4040
+OXIDANT_UI_DIR=$PWD/dist oxidant start --port 50051 --ui-port 4040
 ```
 
 Unset, nothing changes and the embedded monitoring page is served as before.

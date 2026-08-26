@@ -10,8 +10,8 @@ The multi-arch image is published to GHCR as `ghcr.io/oxidantdata/oxidant` (see
 
 | File | Image | Binary / crate | Entry | Port |
 |------|-------|----------------|-------|------|
-| `connect-server.Dockerfile` | `connect-server` | `oxidant` (crate `oxidant-cli`) | `oxidant spark server --port 50051` | 50051 (gRPC), 4040 (HTTP: UI + REST API) |
-| `worker.Dockerfile` | `worker` | `oxidant` (same binary, rebased on `connect-server`) | `oxidant worker` | 50561 (Flight) |
+| `connect-server.Dockerfile` | `connect-server` | `oxidant` (crate `oxidant-cli`) | `oxidant spark server --port 50051 --foreground` | 50051 (gRPC), 4040 (HTTP: UI + REST API) |
+| `worker.Dockerfile` | `worker` | `oxidant` (same binary, rebased on `connect-server`) | `oxidant worker --port 50561 --foreground` | 50561 (Flight) |
 | `gateway.Dockerfile` | `gateway` *(not in tree yet)* | `oxidant-gateway` + kubectl + SPA | `oxidant-gateway` | 8080 |
 
 > The `worker` and `connect-server` images are the **same `oxidant` binary** — `worker`

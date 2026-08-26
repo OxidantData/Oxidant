@@ -10,10 +10,10 @@ Every install path (curl installer, brew, deb/rpm, Docker, source) ships the sam
 binary, and the driver is simply the Spark Connect server:
 
 ```sh
-oxidant spark server --port 50051
+oxidant start --port 50051
 ```
 
-(From a source build: `./target/debug/oxidant spark server --port 50051`.)
+(From a source build: `./target/debug/oxidant start --port 50051`.)
 
 This starts Spark Connect gRPC on `50051` plus the Web UI / REST API on `4040`. With no
 workers registered it executes every query itself — there is nothing else to set up.
@@ -33,7 +33,7 @@ curl -s http://localhost:4040/api/v1/cluster/status
 For single-host scale-out, the server can embed N Arrow Flight workers in the same process:
 
 ```sh
-oxidant spark server --port 50051 --mode local-cluster --workers 4
+oxidant start --port 50051 --mode local-cluster --workers 4
 ```
 
 Each worker listens on an ephemeral `127.0.0.1` port and the driver routes distributable
@@ -52,14 +52,17 @@ On every worker host (use a unique shard index when you shard scans across machi
 ```sh
 export OXIDANT_SHARD_INDEX=0   # 0 .. N-1, distinct per worker
 export OXIDANT_WORKER_COUNT=2
-oxidant worker --port 50561
+# A worker is long-running, so it runs under a supervisor that passes --foreground
+# (systemd on the AMI, the container runtime in Docker). There is no `oxidant start
+# worker` — see runtime-contract.md § Daemon control.
+oxidant worker --port 50561 --foreground
 ```
 
 On the driver host, pass the static worker list (private/LAN IPs preferred):
 
 ```sh
 export OXIDANT_DISTRIBUTED_STRICT=1   # fail closed if workers are unreachable
-oxidant spark server --port 50051 --workers 10.0.0.11:50561,10.0.0.12:50561
+oxidant start --port 50051 --workers 10.0.0.11:50561,10.0.0.12:50561
 ```
 
 The startup log confirms registration (`Oxidant static workers: http://10.0.0.11:50561,...`),
@@ -97,7 +100,7 @@ The published image is the same `oxidant` binary for both roles — override the
 docker run -p 50051:50051 -p 4040:4040 ghcr.io/oxidantdata/oxidant
 
 # worker (on each worker host)
-docker run ghcr.io/oxidantdata/oxidant worker --port 50561
+docker run ghcr.io/oxidantdata/oxidant worker --port 50561 --foreground
 ```
 
 Then start the driver with `--workers <host>:50561,...` as above. Image details, read-only

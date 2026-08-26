@@ -4,7 +4,7 @@
 #
 #   oxidant sql -c examples/oxidant.yaml -e "SELECT count(*) FROM local.samples.nation_delta"
 #   oxidant pipeline validate -c examples/oxidant.yaml
-#   oxidant spark server -c examples/oxidant.yaml --port 50051
+#   oxidant start -c examples/oxidant.yaml --port 50051
 #
 # The catalog section needs no broker, no metastore, and no AWS: it points at the
 # `sample-data/` tree committed in this repo. Reference: docs/config.md.

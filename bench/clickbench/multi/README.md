@@ -10,7 +10,7 @@ answer the exact same Spark SQL a real Spark cluster does.
 
 | Engine | Server | Port | Client | Notes |
 |--------|--------|-----:|--------|-------|
-| **Oxidant** | `oxidant spark server` (this repo, release build) | 50051 | PySpark Connect | the engine under test |
+| **Oxidant** | `oxidant spark server --foreground` (this repo, release build) | 50051 | PySpark Connect | the engine under test |
 | **Sail** | `pysail` (LakeSail OSS, Rust) | 50052 | PySpark Connect | the published baseline, re-measured fresh |
 | **Spark** | Apache Spark 3.5 Connect server | 15002 | PySpark Connect | vanilla JVM baseline |
 | **Spark + Gluten/Velox** | Spark 3.5 + Gluten bundle JAR | 15002 | PySpark Connect | Spark with a native vectorized backend |

@@ -31,6 +31,7 @@ mod results;
 
 use std::sync::Arc;
 
+pub use config::data_root;
 pub(crate) use config::{HistoryConfig, ResultPersist, SqlMode};
 pub(crate) use journal::Journal;
 use record::Fold;

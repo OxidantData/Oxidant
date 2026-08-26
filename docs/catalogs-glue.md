@@ -43,7 +43,7 @@ region for the S3 object store and the Lake Formation client, so all three agree
 At server start, with repeated `--catalog-conf` flags:
 
 ```sh
-oxidant spark server --port 50051 \
+oxidant start --port 50051 \
   --catalog-conf spark.sql.catalog.glue.type=glue \
   --catalog-conf spark.sql.catalog.glue.region=us-east-1 \
   --catalog-conf spark.sql.catalog.glue.warehouse=s3://bucket/prefix
@@ -53,7 +53,7 @@ Or with one env var (`;`-separated):
 
 ```sh
 export OXIDANT_CATALOG_CONF="spark.sql.catalog.glue.type=glue;spark.sql.catalog.glue.region=us-east-1;spark.sql.catalog.glue.warehouse=s3://bucket/prefix"
-oxidant spark server --port 50051
+oxidant start --port 50051
 ```
 
 Or per session, from a Spark Connect client:

@@ -64,6 +64,7 @@ impl WorkerHandle {
         let mut cmd = Command::new(oxidant);
         cmd.args([
             "worker",
+            "--foreground",
             "--port",
             &port.to_string(),
             "--data",
@@ -105,6 +106,7 @@ impl WorkerHandle {
         let mut cmd = Command::new(oxidant);
         cmd.args([
             "worker",
+            "--foreground",
             "--port",
             &self.port.to_string(),
             "--data",

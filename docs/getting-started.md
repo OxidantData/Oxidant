@@ -74,7 +74,7 @@ git clone https://github.com/OxidantData/Oxidant.git
 cd Oxidant
 cargo build -p oxidant-cli        # binary at ./target/debug/oxidant
 
-./target/debug/oxidant spark server --port 50051 --sample-data sample-data
+./target/debug/oxidant start --port 50051 --sample-data sample-data
 ```
 
 `--sample-data sample-data` points at the committed sample tables in the repo (same contents
@@ -93,24 +93,60 @@ CloudFormation are documented in [distributed-ec2.md](distributed-ec2.md).
 ## Run the server
 
 ```sh
-oxidant spark server --port 50051
+oxidant start --port 50051
 ```
 
-(From a source build: `./target/debug/oxidant spark server --port 50051`.)
+(From a source build: `./target/debug/oxidant start --port 50051`.)
 
-The server starts Spark Connect gRPC on `50051` and the HTTP UI + REST API on `4040`:
+The server is a **daemon**: `start` spawns it detached, waits until it answers, and prints
+where it went.
 
 ```text
-Oxidant Spark Connect server listening on sc://0.0.0.0:50051
-Oxidant UI at http://0.0.0.0:4040
+oxidant started (pid 57235)
+  spark connect:  sc://0.0.0.0:50051
+  ui + rest:      http://0.0.0.0:4040  (all interfaces; local http://127.0.0.1:4040)
+  log:            ~/.local/share/oxidant/run/oxidant.log
+  pidfile:        ~/.local/share/oxidant/run/oxidant.pid
 ```
 
-Useful server flags (full text: `oxidant` with no args):
+Three more commands drive it, and starting twice is safe — it reports the running one and
+spawns nothing:
+
+```sh
+oxidant status     # pid, uptime, ports, log path, health probe
+oxidant stop       # SIGTERM, then SIGKILL if it will not go
+oxidant restart    # same flags, new process
+```
+
+`oxidant status` is written for scripts: it exits `0` when the server is running and healthy,
+`3` when it is not running, `4` when the process is alive but not answering, and `1` when the
+pidfile names a live process that is *not* this daemon — the one code that means "do not
+proceed either way".
 
 ```text
-oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui]
-                     [--mode local|local-cluster] [--workers <N|host:port,...>]
-                     [--sample-data <DIR>] [--catalog-conf key=value]...
+oxidant is running
+  pid:            57235
+  uptime:         2 hours
+  spark connect:  sc://0.0.0.0:50051
+  ui + rest:      http://0.0.0.0:4040  (all interfaces; local http://127.0.0.1:4040)
+  health:         ok (single-node, version 0.2.0)
+  log:            ~/.local/share/oxidant/run/oxidant.log
+  pidfile:        ~/.local/share/oxidant/run/oxidant.pid
+  flags:          --port 50051
+```
+
+> **Running under a supervisor?** systemd, Docker and CI harnesses already own the process, so
+> they take the other door: `oxidant spark server … --foreground` runs in the foreground and
+> writes no pidfile. A bare `oxidant spark server` with neither is refused, because that is how
+> orphaned engines accumulate. Same for `oxidant worker --foreground`.
+
+Useful server flags — they are the same for `start` and for `spark server --foreground`
+(full text: `oxidant` with no args):
+
+```text
+oxidant start --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui]
+              [--mode local|local-cluster] [--workers <N|host:port,...>]
+              [--sample-data <DIR>] [--catalog-conf key=value]...
 ```
 
 - `--ui-port` — HTTP port for the UI + REST API (default `4040`).

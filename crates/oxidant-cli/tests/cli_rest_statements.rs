@@ -48,6 +48,7 @@ async fn rest_statement_executes_locally_without_workers() {
         .args([
             "spark",
             "server",
+            "--foreground",
             "--port",
             &port.to_string(),
             "--ui-port",

@@ -52,7 +52,9 @@ CREATE EXTERNAL TABLE hits_raw STORED AS PARQUET LOCATION '$DATA' OPTIONS ('bina
 CREATE VIEW hits AS SELECT * EXCEPT ("EventTime", "EventDate"), to_timestamp_seconds("EventTime") AS "EventTime", CAST(CAST("EventDate" AS INTEGER) AS DATE) AS "EventDate" FROM hits_raw
 SQL
     echo "[run] starting oxidant server …"
-    "$REPO/target/release/oxidant" spark server --port 50051 >"$LOGS/oxidant.log" 2>&1 &
+    # --foreground: this harness backgrounds every engine the same way and reaps them all
+    # from one trap, so it is the supervisor for oxidant exactly as it is for sail/spark.
+    "$REPO/target/release/oxidant" spark server --port 50051 --foreground >"$LOGS/oxidant.log" 2>&1 &
     SERVER_PID=$!
     ;;
   sail)

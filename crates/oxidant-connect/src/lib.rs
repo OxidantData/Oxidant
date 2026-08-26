@@ -49,6 +49,7 @@ mod udf;
 
 pub use catalog::validate_default_catalog;
 pub use distributed::parse_worker_list;
+pub use history::data_root;
 
 /// Max gRPC message size (Spark Connect defaults to 128 MB; we allow 256 MB headroom).
 const MAX_MSG: usize = 256 * 1024 * 1024;

@@ -1,10 +1,14 @@
 //! The `oxidant` command-line entry point.
 //!
 //! ```text
-//! oxidant spark server --port 50051         # Spark Connect server; point PySpark at sc://host:50051
-//! oxidant spark server --mode local-cluster --workers 2
-//! oxidant spark server --workers host1:50561,host2:50561   # attach remote Flight workers
-//! oxidant worker --port 50561 [--data hits.parquet --table t]   # a distributed Flight worker
+//! oxidant start --port 50051                # start the Spark Connect server as a DAEMON
+//! oxidant status                            # pid, uptime, ports, log path, health probe
+//! oxidant stop                              # SIGTERM -> grace -> SIGKILL, pidfile cleared
+//! oxidant restart                           # stop + start, same flags
+//! oxidant spark server --port 50051 --foreground   # supervisors only (systemd, CI harnesses)
+//! oxidant spark server --mode local-cluster --workers 2 --foreground
+//! oxidant spark server --workers host1:50561,host2:50561 --foreground   # remote Flight workers
+//! oxidant worker --port 50561 --foreground [--data hits.parquet --table t]   # a Flight worker
 //! oxidant driver --workers h:p,h:p \         # orchestrate a 2-stage distributed aggregation
 //!   --partial-sql "SELECT k, COUNT(*) c, SUM(v) s FROM t GROUP BY k" \
 //!   --final-sql   "SELECT k, SUM(c) c, SUM(s) s FROM shuffle_input GROUP BY k" \
@@ -26,9 +30,11 @@ use oxidant_execution::flight::serve_worker;
 use oxidant_loom::Engine;
 
 mod client;
+mod daemon;
 mod embedded;
 mod mcp;
 mod pipeline;
+mod portguard;
 #[cfg(test)]
 mod testutil;
 
@@ -70,6 +76,12 @@ async fn async_main(args: Vec<String>, config: Option<oxidant_config::OxidantCon
     let cmd = args.get(1).map(String::as_str);
 
     let result = match cmd {
+        // Daemon control. These are the *only* way a human starts a long-running oxidant; the
+        // role subcommands below refuse to run attached to a terminal (see `daemon`).
+        Some("start") => daemon::start(&args[2..], server_ports(&args)).await,
+        Some("stop") => run_stop(&args),
+        Some("status") => daemon::status().await,
+        Some("restart") => run_restart(&args).await,
         Some("worker") => run_worker(&args, config).await,
         Some("driver") => run_driver(&args).await,
         Some("history-server") => run_history_server(&args).await,
@@ -93,10 +105,18 @@ fn usage() {
     eprintln!("oxidant {}", env!("CARGO_PKG_VERSION"));
     eprintln!("usage:");
     eprintln!(
-        "  oxidant spark server --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui] [--mode local|local-cluster] [--workers <N|host:port,...>] [--sample-data <DIR>]"
+        "  oxidant start [--port <PORT>] [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui] [--mode local|local-cluster] [--workers <N|host:port,...>] [--sample-data <DIR>]"
+    );
+    eprintln!(
+        "  oxidant stop [--timeout <SECS>]      # 0..=86400; 0 means SIGKILL at once, no flush"
+    );
+    eprintln!("  oxidant status");
+    eprintln!("  oxidant restart [same flags as start]");
+    eprintln!(
+        "  oxidant spark server --foreground [...]   # supervisors only (systemd, CI harnesses)"
     );
     eprintln!("  oxidant history-server --dir <LOG_DIR> [--port <PORT>]");
-    eprintln!("  oxidant worker --port <PORT> [--data <parquet> --table <name>]");
+    eprintln!("  oxidant worker --port <PORT> --foreground [--data <parquet> --table <name>]");
     eprintln!(
         "  oxidant driver --workers <h:p,h:p> --partial-sql <SQL> --final-sql <SQL> --hash-keys <c,c>"
     );
@@ -109,6 +129,20 @@ fn usage() {
     );
     eprintln!(
         "  oxidant pipeline reconcile [--config <FILE>] [--table <NAME>]... [--sample <KEYS>] [--cron <EXPR>|off]"
+    );
+    eprintln!();
+    eprintln!(
+        "  Long-running processes are daemons: `oxidant start` spawns the server detached, and"
+    );
+    eprintln!(
+        "  `status`/`stop`/`restart` drive it through $OXIDANT_DATA_DIR/run/oxidant.pid. Pass"
+    );
+    eprintln!("  --foreground to run a role in the foreground under your own supervisor instead.");
+    eprintln!(
+        "  `oxidant status` exits 0 (running), 3 (stopped), 4 (alive but not answering) or 1"
+    );
+    eprintln!(
+        "  (the pidfile names a live process that is not this daemon — do not proceed either way)."
     );
     eprintln!();
     eprintln!(
@@ -131,20 +165,35 @@ async fn run_server(
     args: &[String],
     config: Option<oxidant_config::OxidantConfig>,
 ) -> oxidant_common::Result<()> {
+    // The first thing checked, before the mode is even parsed: a bare `oxidant spark server` is
+    // the habit this release breaks. Long-lived processes are daemons — `oxidant start` — and a
+    // supervisor that wants to own the process passes `--foreground`.
+    daemon::require_foreground(args, daemon::Role::Server);
+    // Release builds only; see `daemon::enforce_single_instance` for why debug must multiply.
+    daemon::enforce_single_instance();
     let mode = server_mode(args)?;
-    let port = flag(args, "--port")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50051);
-    let ui_port = if args.iter().any(|a| a == "--no-ui") {
-        None
-    } else {
-        Some(
-            flag(args, "--ui-port")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(4040),
-        )
-    };
-    let ui_bind = ui_bind_addr(args);
+    let daemon::ServerPorts {
+        port,
+        ui_port,
+        ui_bind,
+    } = server_ports(args);
+    // Before anything expensive (engine, catalogs, sample data) and before the "listening on"
+    // banner: if either listener's port is taken, say who has it and stop. `serve` binds gRPC on
+    // all interfaces and spawns the UI listener on `--ui-bind`, so those are the two addresses
+    // to probe — the REST statement API rides the UI listener and needs no probe of its own.
+    //
+    // `oxidant start` probes the same two addresses before it spawns us, so in the daemon path
+    // this is the second look. It stays: `--foreground` reaches here without one.
+    portguard::ensure_available(
+        std::net::SocketAddr::from((std::net::IpAddr::from([0, 0, 0, 0]), port)),
+        portguard::PortKind::SparkConnect,
+    );
+    if let Some(ui) = ui_port {
+        portguard::ensure_available(
+            std::net::SocketAddr::from((ui_bind, ui)),
+            portguard::PortKind::Ui,
+        );
+    }
     // The config file is the base layer; `--catalog-conf` / `OXIDANT_CATALOG_CONF` are applied
     // on top, so an explicit flag always beats the file — the same direction every other
     // override in this CLI runs.
@@ -195,6 +244,131 @@ async fn run_server(
         config.workers = workers;
     }
     serve(config).await
+}
+
+/// The two listener addresses a `spark server` will bind, read off the flags.
+///
+/// Shared with `oxidant start`, which needs them *before* it spawns anything: it runs the port
+/// guard in the operator's terminal and records the ports in the pidfile so `status` can name
+/// them and probe the UI without re-parsing a command line.
+fn server_ports(args: &[String]) -> daemon::ServerPorts {
+    daemon::ServerPorts {
+        port: flag(args, "--port")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50051),
+        ui_port: if args.iter().any(|a| a == "--no-ui") {
+            None
+        } else {
+            Some(
+                flag(args, "--ui-port")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4040),
+            )
+        },
+        ui_bind: ui_bind_addr(args),
+    }
+}
+
+/// The largest `--timeout` `stop` accepts, in seconds.
+///
+/// `wait_for_exit` computes `Instant::now() + within`, and `Instant` addition *panics* on
+/// overflow. So `oxidant stop --timeout 18446744073709551615` panicked with exit 101 — and did
+/// it **after** delivering SIGTERM, leaving the daemon dead, the pidfile in place, no success or
+/// failure line printed, and a Rust backtrace from a CLI that is otherwise careful about its
+/// exit codes. A fat-fingered value is the obvious trigger; so is any script doing arithmetic.
+///
+/// A day is already far past any real flush, so a larger value is a typo either way and gets the
+/// same refusal a non-numeric one already got — before the signal, not after it.
+const MAX_STOP_GRACE_SECS: u64 = 86_400;
+
+/// `--timeout <SECS>` for `stop`, validated before anything is signalled.
+fn stop_grace(args: &[String]) -> oxidant_common::Result<std::time::Duration> {
+    let Some(t) = flag(args, "--timeout") else {
+        return Ok(daemon::DEFAULT_STOP_GRACE);
+    };
+    let secs = t
+        .parse::<u64>()
+        .ok()
+        .filter(|s| *s <= MAX_STOP_GRACE_SECS)
+        .ok_or_else(|| {
+            oxidant_common::Error::Io(format!(
+                "invalid --timeout `{t}` (expected 0..={MAX_STOP_GRACE_SECS} seconds)"
+            ))
+        })?;
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+/// `oxidant stop [--timeout <SECS>]` — how long SIGTERM gets before SIGKILL.
+fn run_stop(args: &[String]) -> oxidant_common::Result<()> {
+    daemon::stop(stop_grace(args)?)
+}
+
+/// `restart`'s own control flags: read by `run_stop`, never the server's to replay.
+///
+/// `--timeout` is documented on `stop` (see `usage()`) and `run_restart` parses it by handing
+/// its argv straight to `run_stop`. Replaying it would spawn `oxidant spark server --timeout 30`
+/// — and, before the merge in `daemon::restart_flags`, would also have discarded every recorded
+/// server flag on the way there.
+const RESTART_CONTROL_FLAGS: [&str; 1] = ["--timeout"];
+
+/// The typed arguments with `restart`'s own control flags removed.
+fn restart_server_flags(typed: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < typed.len() {
+        let tok = &typed[i];
+        let name = tok.split('=').next().unwrap_or_default();
+        if RESTART_CONTROL_FLAGS.contains(&name) {
+            // `--timeout=30` carries its value; `--timeout 30` takes the next token with it.
+            if !tok.contains('=') && typed.get(i + 1).is_some_and(|n| !n.starts_with("--")) {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(tok.clone());
+        i += 1;
+    }
+    out
+}
+
+/// `oxidant restart [flags]` — stop, then start.
+///
+/// The flags are read from the pidfile on disk before anything is stopped, so a bare
+/// `oxidant restart` comes back on the ports it went down on. Flags typed on the restart are
+/// laid *over* the recorded ones, so moving one port never resets the others.
+async fn run_restart(args: &[String]) -> oxidant_common::Result<()> {
+    // Read the file, not the *state*: `daemon::running()` deletes the pidfile of a process that
+    // is gone, which is precisely the case `restart` is run in — after a SIGKILL, an OOM kill or
+    // a reboot. Reading the state first threw away the recorded ports and silently brought the
+    // server back on 50051/4040, breaking every client pointed at the old ones.
+    let recorded = daemon::recorded_pidfile();
+    let flags = daemon::restart_flags(&restart_server_flags(&args[2..]), recorded.as_ref());
+    let mut argv = vec![args[0].clone(), "start".to_string()];
+    argv.extend(flags.iter().cloned());
+    let ports = server_ports(&argv);
+
+    // `restart` is not atomic: it stops first, and any failure to start afterwards leaves the
+    // operator with nothing running at all. So a port we are *moving to* is checked while the
+    // old daemon is still up — the one moment the refusal costs nothing. A port we are keeping
+    // is held by the daemon we are about to stop, so there is nothing to check.
+    if recorded.as_ref().map(|p| p.port) != Some(ports.port) {
+        portguard::ensure_available(
+            std::net::SocketAddr::from((std::net::IpAddr::from([0, 0, 0, 0]), ports.port)),
+            portguard::PortKind::SparkConnect,
+        );
+    }
+    if let Some(ui) = ports.ui_port {
+        if recorded.as_ref().and_then(|p| p.ui_port) != Some(ui) {
+            portguard::ensure_available(
+                std::net::SocketAddr::from((ports.ui_bind, ui)),
+                portguard::PortKind::Ui,
+            );
+        }
+    }
+
+    run_stop(args)?;
+    daemon::start(&flags, ports).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +484,10 @@ async fn run_history_server(args: &[String]) -> oxidant_common::Result<()> {
                 "history-server requires --dir or OXIDANT_EVENT_LOG_DIR".into(),
             )
         })?;
+    portguard::ensure_available(
+        std::net::SocketAddr::from((std::net::IpAddr::from([0, 0, 0, 0]), port)),
+        portguard::PortKind::History,
+    );
     let store = Arc::new(AppStateStore::load_event_log(std::path::Path::new(&dir)));
     eprintln!("Oxidant history server on http://0.0.0.0:{port} (log: {dir})");
     serve_ui(UiServerConfig {
@@ -394,9 +572,19 @@ async fn run_worker(
     args: &[String],
     config: Option<oxidant_config::OxidantConfig>,
 ) -> oxidant_common::Result<()> {
+    // A worker outlives the shell that started it just as surely as a server does, so it is
+    // held to the same rule. Unlike the server it has no `oxidant start` form — workers are
+    // started by a supervisor (systemd on the AMI), which passes `--foreground`.
+    daemon::require_foreground(args, daemon::Role::Worker);
     let port: u16 = flag(args, "--port")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| oxidant_common::Error::Io("worker requires --port".into()))?;
+    // Ahead of `logging::init` and the engine: a worker refused for a port conflict should not
+    // first open a log directory and build a catalog it is about to throw away.
+    portguard::ensure_available(
+        std::net::SocketAddr::from((std::net::IpAddr::from([0, 0, 0, 0]), port)),
+        portguard::PortKind::Flight,
+    );
     // A standalone worker builds no REST router, so before this it installed no `tracing`
     // subscriber at all and its logs went nowhere — and worker OOMs are exactly what operators
     // dig for (docs/query-history-durability.md §6c). Every node writes its own `logs/` under
@@ -854,6 +1042,66 @@ mod tests {
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--timeout` is parsed into `Instant::now() + within`, which panics on overflow — after
+    /// SIGTERM had already gone out. Out of range is refused where a non-numeric value already
+    /// was: before anything is signalled.
+    #[test]
+    fn an_out_of_range_stop_timeout_is_refused_rather_than_overflowing() {
+        assert_eq!(
+            stop_grace(&args(&["stop"])).unwrap(),
+            daemon::DEFAULT_STOP_GRACE
+        );
+        assert_eq!(
+            stop_grace(&args(&["stop", "--timeout", "30"])).unwrap(),
+            std::time::Duration::from_secs(30)
+        );
+        // The documented escape hatch: no grace at all.
+        assert_eq!(
+            stop_grace(&args(&["stop", "--timeout", "0"])).unwrap(),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            stop_grace(&args(&[
+                "stop",
+                "--timeout",
+                &MAX_STOP_GRACE_SECS.to_string()
+            ]))
+            .unwrap(),
+            std::time::Duration::from_secs(MAX_STOP_GRACE_SECS)
+        );
+        for bad in ["18446744073709551615", "86401", "-1", "soon", ""] {
+            let e = stop_grace(&args(&["stop", "--timeout", bad]))
+                .expect_err(&format!("--timeout {bad} must be refused"))
+                .to_string();
+            assert!(e.contains("invalid --timeout"), "{bad}: {e}");
+            assert!(e.contains("0..=86400"), "{bad}: {e}");
+        }
+    }
+
+    /// `--timeout` is `stop`'s flag and `restart` hands its argv straight to `run_stop`. Left in
+    /// the replay set it became `oxidant spark server --timeout 30`, and — before the merge —
+    /// took every recorded server flag down with it, moving the daemon to the default ports.
+    #[test]
+    fn restart_never_replays_its_own_control_flags_to_the_server() {
+        assert_eq!(
+            restart_server_flags(&args(&["--timeout", "30"])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            restart_server_flags(&args(&["--timeout=30"])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            restart_server_flags(&args(&["--timeout", "30", "--ui-port", "4050"])),
+            args(&["--ui-port", "4050"])
+        );
+        // A server flag that merely *contains* the name is not the control flag.
+        assert_eq!(
+            restart_server_flags(&args(&["--timeout-ms", "30"])),
+            args(&["--timeout-ms", "30"])
+        );
     }
 
     #[test]

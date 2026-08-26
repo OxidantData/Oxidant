@@ -10,7 +10,7 @@ oxidant mcp [--url http://localhost:4040]
 ```
 
 The server URL comes from `--url` or the `OXIDANT_URL` environment variable (default
-`http://localhost:4040`). Start the engine first (`oxidant spark server --port 50051`), then
+`http://localhost:4040`). Start the engine first (`oxidant start --port 50051`), then
 register `oxidant mcp` with your MCP client — the client launches it as a subprocess and talks
 to it over stdio.
 

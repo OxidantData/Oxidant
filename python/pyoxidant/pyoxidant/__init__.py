@@ -38,7 +38,10 @@ class SparkConnectServer:
                 "`cargo build --release --bin oxidant`"
             )
         self._proc = subprocess.Popen(
-            [binary, "spark", "server", "--port", str(self.port)]
+            # --foreground: this class is the supervisor — it holds the Popen handle and
+            # terminates it in `stop()`. The daemon path (`oxidant start`) would fork away
+            # and hand back a pid that exits at once.
+            [binary, "spark", "server", "--port", str(self.port), "--foreground"]
         )
         return self
 

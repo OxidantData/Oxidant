@@ -91,7 +91,7 @@ fn stop(child: &mut Child) {
 /// is a line *later* than the init line for a query to find.
 fn spawn_worker(oxidant: &std::path::Path, root: &std::path::Path, port: u16) -> Child {
     let child = Command::new(oxidant)
-        .args(["worker", "--port", &port.to_string()])
+        .args(["worker", "--foreground", "--port", &port.to_string()])
         .env("OXIDANT_DATA_DIR", root)
         .env("OXIDANT_STATUS_TOKEN", TOKEN)
         .stdout(Stdio::null())
@@ -192,6 +192,7 @@ fn the_driver_federates_a_log_query_over_a_real_worker_and_copies_nothing() {
         .args([
             "spark",
             "server",
+            "--foreground",
             "--port",
             &connect_port.to_string(),
             "--ui-port",

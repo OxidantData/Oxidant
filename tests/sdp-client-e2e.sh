@@ -48,7 +48,9 @@ cargo build -p oxidant-cli
 mkdir -p "${OXIDANT_WAREHOUSE}" "${OXIDANT_CHECKPOINTS}"
 
 log "Starting oxidant spark server on port ${OXIDANT_PORT}"
-./target/debug/oxidant spark server --no-ui --port "${OXIDANT_PORT}" \
+# --foreground: this script backgrounds the process itself and keeps its pid for the trap,
+# so it is the supervisor. `oxidant start` would hand it a pid that exits immediately.
+./target/debug/oxidant spark server --no-ui --port "${OXIDANT_PORT}" --foreground \
   --catalog-conf "spark.sql.catalog.local.type=local" \
   --catalog-conf "spark.sql.catalog.local.warehouse=${OXIDANT_WAREHOUSE}" \
   --catalog-conf "spark.sql.defaultCatalog=local" \

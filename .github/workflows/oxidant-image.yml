@@ -6,8 +6,8 @@ name: oxidant-image
 # This is the `oxidant` binary (crate oxidant-cli) in a hardened distroless image. The
 # control-plane gateway provisions per-user compute pods from THIS one image,
 # overriding the command per role:
-#     oxidant spark server --port 50051   -> Spark Connect driver  ("cluster")
-#     oxidant worker       --port 50561   -> Arrow Flight worker    (same image, diff args)
+#     oxidant spark server --port 50051 --foreground   -> Spark Connect driver ("cluster")
+#     oxidant worker --port 50561 --foreground         -> Arrow Flight worker (same image)
 # so a single `ghcr.io/oxidantdata/oxidant` image covers both; no separate worker image
 # is needed.
 #

@@ -87,6 +87,7 @@ async fn cli_driver_worker_matches_single_node() {
     let mut w0 = Command::new(&oxidant)
         .args([
             "worker",
+            "--foreground",
             "--port",
             &p0.to_string(),
             "--data",
@@ -101,6 +102,7 @@ async fn cli_driver_worker_matches_single_node() {
     let mut w1 = Command::new(&oxidant)
         .args([
             "worker",
+            "--foreground",
             "--port",
             &p1.to_string(),
             "--data",

@@ -336,6 +336,7 @@ impl HistoryConfig {
             Some(p) => p,
             None => default_root(),
         };
+        // `data_root()` below is the same answer, minus the error path — keep the two in step.
         if env_flag("OXIDANT_DATA_DIR_PER_PROCESS") {
             root = root.join(format!("{role}-{port}"));
         }
@@ -484,6 +485,27 @@ impl HistoryConfig {
             None
         }
     }
+}
+
+/// The engine's data root: `$OXIDANT_DATA_DIR`, else [`default_root`].
+///
+/// Re-exported as `oxidant_connect::data_root` so the CLI's daemon-control files
+/// (`run/oxidant.pid`, `run/oxidant.log`) land beside the engine's own `history/` and `logs/`
+/// under one root, resolved by one implementation rather than a second copy in the CLI.
+///
+/// Deliberately *before* `OXIDANT_DATA_DIR_PER_PROCESS` splits the root per `<role>-<port>`:
+/// that knob exists so several colocated engines can keep separate journals, while the daemon
+/// pidfile is per *root* — one `oxidant start` per data dir, whatever it ends up running.
+///
+/// Unlike [`HistoryConfig::from_env`] this cannot fail. An `OXIDANT_DATA_DIR` that is an
+/// object-store URL is still a boot error, but it is the *engine's* error to report with its
+/// full explanation; the daemon wrapper falls back to the default root so it can spawn the
+/// child that prints it.
+pub fn data_root() -> PathBuf {
+    env_path("OXIDANT_DATA_DIR")
+        .ok()
+        .flatten()
+        .unwrap_or_else(default_root)
 }
 
 /// `$XDG_DATA_HOME/oxidant`, `~/.local/share/oxidant`, or `/var/lib/oxidant` for a service.

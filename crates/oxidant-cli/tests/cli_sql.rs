@@ -45,6 +45,7 @@ async fn start_server(oxidant: &std::path::Path) -> (ServerGuard, tempfile::Temp
         .args([
             "spark",
             "server",
+            "--foreground",
             "--port",
             &port.to_string(),
             "--ui-port",

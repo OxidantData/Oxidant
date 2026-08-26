@@ -7,7 +7,7 @@ pairs — without removing any of them.
 
 ```sh
 oxidant sql -c oxidant.yaml -e "SELECT count(*) FROM local.live.orders"
-oxidant spark server -c oxidant.yaml --port 50051
+oxidant start -c oxidant.yaml --port 50051
 oxidant pipeline run -c oxidant.yaml
 ```
 

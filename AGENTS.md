@@ -57,7 +57,9 @@ pulls in real DataFusion/Arrow/tonic and the engine executes SQL end-to-end.
   `./target/debug/oxidant-parity ratchet --baseline parity/baseline.json --out-dir parity`.
 
 ### Running the engine + a hello-world query
-- Start the server: `./target/debug/oxidant spark server --port 50051`
+- Start the server: `./target/debug/oxidant start --port 50051` (a **daemon** — `oxidant
+  status` / `stop` / `restart` drive it; `oxidant spark server … --foreground` is the
+  supervisor form, and the bare `spark server` is refused)
   (build first with `cargo build -p oxidant-cli`). It listens on `sc://0.0.0.0:50051`.
 - To drive it with a real client, install the stock PySpark Connect client:
   `pip install "pyspark-client>=4.0"` (pure-Python, no JVM needed), then:
@@ -72,7 +74,9 @@ pulls in real DataFusion/Arrow/tonic and the engine executes SQL end-to-end.
 
 ### Distributed mode (optional)
 The `oxidant` binary also has `worker` and `driver` subcommands for a Flight-based
-driver/worker cluster (`oxidant worker --port ...`, `oxidant driver --workers h:p,... --partial-sql ... --final-sql ...`).
+driver/worker cluster (`oxidant worker --port ... --foreground`, `oxidant driver --workers h:p,... --partial-sql ... --final-sql ...`).
+A worker is long-running and so takes `--foreground` under whatever supervises it; `driver` is a
+one-shot query that binds nothing and exits, so it needs no flag.
 Not needed for the basic single-server flow.
 
 For **EC2 / CloudFormation + ASG** (Packer AMI, fixed worker count, ASG private-IP

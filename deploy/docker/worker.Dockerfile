@@ -8,8 +8,11 @@
 # connect-server image with a different default command — so the two stay
 # bit-for-bit identical and share every registry layer.
 #
-# The orchestrator (crates/oxidant-orchestrator/manifests.rs) runs the worker as:
-#     command: ["oxidant"]  args: ["worker"]
+# The orchestrator (crates/oxidant-orchestrator/src/backend.rs, worker_deployment_yaml)
+# runs the worker as:
+#     args: ["worker","--port","<port>","--foreground"]
+# It overrides `args` only, never `command`, so the CMD below is NOT what a provisioned
+# pod runs — the manifest's own args are, and they carry --foreground themselves.
 # with the SAME hardened securityContext + emptyDir scratch as the driver, so the
 # inherited non-root / read-only-rootfs posture from the base image is exactly right.
 #
@@ -19,7 +22,7 @@
 #     --build-arg CONNECT_IMAGE=oxidant/connect-server:<tag> -t oxidant/worker:<tag> .
 #
 # Prefer no second image at all? Drop this file and run the connect-server image
-# with `command: ["oxidant"]  args: ["worker"]`. The
+# with `command: ["oxidant"]  args: ["worker","--foreground"]`. The
 # orchestrator already does exactly that via OXIDANT_WORKER_IMAGE.
 ###############################################################################
 ARG CONNECT_IMAGE=oxidant/connect-server:latest
@@ -29,7 +32,8 @@ LABEL org.opencontainers.image.title="oxidant-worker" \
       org.opencontainers.image.description="Oxidant Arrow Flight worker (same oxidant binary as connect-server)"
 
 # Default Flight worker port (the orchestrator's StatefulSet supplies its own args).
-# Note: `oxidant worker` requires --port, so the standalone default includes it.
+# Note: `oxidant worker` requires --port, so the standalone default includes it. --foreground
+# because the container runtime is the supervisor and PID 1 must be the worker itself.
 EXPOSE 50561
 
 # Inherits from the connect-server base:
@@ -37,4 +41,4 @@ EXPOSE 50561
 #   and the read-only-rootfs posture. Deployments should set TMPDIR to the spill volume and
 #   OXIDANT_SHUFFLE_SPILL_BYTES for threshold spill (OXIDANT_SHUFFLE_SPILL_DIR is
 #   force-spill / debug-only; OXIDANT_SPILL_DIR is unused legacy).
-CMD ["worker", "--port", "50561"]
+CMD ["worker", "--port", "50561", "--foreground"]

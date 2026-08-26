@@ -96,7 +96,7 @@ fn a_standalone_worker_writes_a_rolling_log() {
     let root = TempDir::new().expect("tempdir");
     let port = pick_port();
     let mut worker = Command::new(&oxidant)
-        .args(["worker", "--port", &port.to_string()])
+        .args(["worker", "--foreground", "--port", &port.to_string()])
         .env("OXIDANT_DATA_DIR", root.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -141,7 +141,14 @@ fn the_driver_writes_a_rolling_log_under_its_own_root() {
     let root = TempDir::new().expect("tempdir");
     let port = pick_port();
     let mut server = Command::new(&oxidant)
-        .args(["spark", "server", "--port", &port.to_string(), "--no-ui"])
+        .args([
+            "spark",
+            "server",
+            "--foreground",
+            "--port",
+            &port.to_string(),
+            "--no-ui",
+        ])
         .env("OXIDANT_DATA_DIR", root.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -176,7 +183,7 @@ fn log_roll_off_writes_no_file() {
     let root = TempDir::new().expect("tempdir");
     let port = pick_port();
     let mut worker = Command::new(&oxidant)
-        .args(["worker", "--port", &port.to_string()])
+        .args(["worker", "--foreground", "--port", &port.to_string()])
         .env("OXIDANT_DATA_DIR", root.path())
         .env("OXIDANT_LOG_ROLL", "off")
         .stdout(Stdio::null())
@@ -233,7 +240,7 @@ fn boot_sweeps_an_orphan_parquet_tmp_even_with_the_writer_off() {
 
     let (mut worker, port) = spawn_with_retry(|port| {
         let mut cmd = Command::new(&oxidant);
-        cmd.args(["worker", "--port", &port.to_string()])
+        cmd.args(["worker", "--foreground", "--port", &port.to_string()])
             .env("OXIDANT_DATA_DIR", root.path())
             .env("OXIDANT_LOG_ROLL", "off")
             .stdout(Stdio::null())
@@ -308,10 +315,17 @@ fn a_worker_sharing_the_driver_s_root_refuses_to_open_a_second_log_writer() {
 
     let (mut server, _) = spawn_with_retry(|port| {
         let mut cmd = Command::new(&oxidant);
-        cmd.args(["spark", "server", "--port", &port.to_string(), "--no-ui"])
-            .env("OXIDANT_DATA_DIR", root.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        cmd.args([
+            "spark",
+            "server",
+            "--foreground",
+            "--port",
+            &port.to_string(),
+            "--no-ui",
+        ])
+        .env("OXIDANT_DATA_DIR", root.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
         cmd
     });
     let driver_log = wait_for_log(root.path(), &mut server, "the driver");
@@ -321,7 +335,7 @@ fn a_worker_sharing_the_driver_s_root_refuses_to_open_a_second_log_writer() {
     let worker_err = root.path().join("worker.err");
     let (mut worker, _) = spawn_with_retry(|port| {
         let mut cmd = Command::new(&oxidant);
-        cmd.args(["worker", "--port", &port.to_string()])
+        cmd.args(["worker", "--foreground", "--port", &port.to_string()])
             .env("OXIDANT_DATA_DIR", root.path())
             .stdout(Stdio::null())
             .stderr(Stdio::from(
@@ -382,8 +396,8 @@ fn per_process_roots_give_a_co_located_driver_and_worker_two_logs() {
     let mut children: Vec<Child> = Vec::new();
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
     for (role, args) in [
-        ("driver", vec!["spark", "server", "--no-ui"]),
-        ("worker", vec!["worker"]),
+        ("driver", vec!["spark", "server", "--no-ui", "--foreground"]),
+        ("worker", vec!["worker", "--foreground"]),
     ] {
         let (child, port) = spawn_with_retry(|port| {
             let mut cmd = Command::new(&oxidant);
@@ -443,7 +457,7 @@ fn sigterm_flushes_and_closes_the_rolling_log() {
         let root = TempDir::new().expect("tempdir");
         let (mut worker, _) = spawn_with_retry(|port| {
             let mut cmd = Command::new(&oxidant);
-            cmd.args(["worker", "--port", &port.to_string()])
+            cmd.args(["worker", "--foreground", "--port", &port.to_string()])
                 .env("OXIDANT_DATA_DIR", root.path())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
