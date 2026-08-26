@@ -66,6 +66,9 @@ struct Daemon {
     data_dir: tempfile::TempDir,
     port: u16,
     ui_port: u16,
+    /// `--ui-bind`. Loopback by default so a conflict collides on the *same* address; a test
+    /// that cares what the UI is bound to sets it before starting.
+    ui_bind: String,
 }
 
 impl Daemon {
@@ -74,6 +77,7 @@ impl Daemon {
             data_dir: common::data_dir(),
             port: pick_port(),
             ui_port: pick_port(),
+            ui_bind: "127.0.0.1".to_string(),
         }
     }
 
@@ -105,7 +109,7 @@ impl Daemon {
             "--ui-port".into(),
             self.ui_port.to_string(),
             "--ui-bind".into(),
-            "127.0.0.1".into(),
+            self.ui_bind.clone(),
         ]
     }
 
@@ -567,6 +571,48 @@ fn restart_after_a_crash_replays_the_dead_daemons_ports() {
         "restart moved the crashed server's UI off its port: {}",
         status.all()
     );
+}
+
+/// `start` and `status` must name the interface the UI is actually bound to.
+///
+/// `--ui-bind` defaults to `0.0.0.0`, and both commands printed the *probe* URL — the one
+/// rewritten to loopback because `0.0.0.0` is not a destination address. So a UI reachable from
+/// the whole network was reported as `http://127.0.0.1:4451`, one line under an honest
+/// `sc://0.0.0.0:50451`. `docs/web-ui.md` warns the UI has no auth and to bind loopback on
+/// reachable hosts; this line told the operator they had.
+#[test]
+fn start_and_status_name_the_interface_the_ui_is_bound_to() {
+    let mut d = Daemon::new();
+    d.ui_bind = "0.0.0.0".to_string();
+    let started = d.started_ok();
+    let wildcard = format!("http://0.0.0.0:{}", d.ui_port);
+    let loopback = format!("http://127.0.0.1:{}", d.ui_port);
+
+    for (what, text) in [
+        ("start", started.stdout()),
+        ("status", d.run(&["status"]).stdout()),
+    ] {
+        let ui = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("ui + rest:"))
+            .unwrap_or_else(|| panic!("{what} printed no ui line:\n{text}"))
+            .to_string();
+        assert!(
+            ui.contains(&wildcard),
+            "{what} must name the address that was bound: {ui}"
+        );
+        // The loopback URL is still there — as the way to reach it locally, not as the claim
+        // about what is exposed.
+        assert!(
+            ui.contains(&loopback) && ui.contains("all interfaces"),
+            "{what} must not drop the local URL: {ui}"
+        );
+        assert!(
+            !ui.trim()
+                .starts_with(&format!("ui + rest:      {loopback}")),
+            "{what} still reports a wildcard bind as loopback-only: {ui}"
+        );
+    }
 }
 
 // -------------------------------------------------------------------------------------------

@@ -104,7 +104,7 @@ where it went.
 ```text
 oxidant started (pid 57235)
   spark connect:  sc://0.0.0.0:50051
-  ui + rest:      http://127.0.0.1:4040
+  ui + rest:      http://0.0.0.0:4040  (all interfaces; local http://127.0.0.1:4040)
   log:            ~/.local/share/oxidant/run/oxidant.log
   pidfile:        ~/.local/share/oxidant/run/oxidant.pid
 ```
@@ -126,7 +126,7 @@ oxidant is running
   pid:            57235
   uptime:         2 hours
   spark connect:  sc://0.0.0.0:50051
-  ui + rest:      http://127.0.0.1:4040
+  ui + rest:      http://0.0.0.0:4040  (all interfaces; local http://127.0.0.1:4040)
   health:         ok (single-node, version 0.2.0)
   log:            ~/.local/share/oxidant/run/oxidant.log
   pidfile:        ~/.local/share/oxidant/run/oxidant.pid

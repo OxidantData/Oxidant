@@ -169,6 +169,39 @@ impl PidFile {
         Some(format!("http://{host}:{ui}"))
     }
 
+    /// The UI endpoint as an operator should read it, or `None` under `--no-ui`.
+    ///
+    /// Deliberately not [`PidFile::http_base`]. That one exists to *probe*, and rewrites a
+    /// wildcard bind to loopback because `0.0.0.0` is not a destination address — correct for a
+    /// health check and a lie in a terminal. `--ui-bind` defaults to `0.0.0.0`, so `start` and
+    /// `status` printed `http://127.0.0.1:4451` for a UI listening on every interface, directly
+    /// under an honest `sc://0.0.0.0:50451`. The misleading half is the security-relevant one:
+    /// `docs/web-ui.md` warns the UI has no auth and should be bound to loopback on reachable
+    /// hosts, and this line told the operator they already had.
+    ///
+    /// So: name the address that was actually bound, and carry the loopback URL alongside it
+    /// rather than in place of it.
+    fn ui_endpoint(&self) -> Option<String> {
+        let ui = self.ui_port?;
+        let bind = if self.ui_bind.is_empty() {
+            "0.0.0.0"
+        } else {
+            self.ui_bind.as_str()
+        };
+        let host = if bind.contains(':') {
+            format!("[{bind}]")
+        } else {
+            bind.to_string()
+        };
+        match bind {
+            "0.0.0.0" | "::" => Some(format!(
+                "http://{host}:{ui}  (all interfaces; local {})",
+                self.http_base()?
+            )),
+            _ => Some(format!("http://{host}:{ui}")),
+        }
+    }
+
     /// Uptime derived from `started_at`, for display.
     fn uptime(&self) -> Option<Duration> {
         let started = chrono::DateTime::parse_from_rfc3339(&self.started_at).ok()?;
@@ -941,7 +974,7 @@ fn grpc_reachable(recorded: &PidFile) -> bool {
 
 fn print_endpoints(p: &PidFile) {
     println!("  spark connect:  sc://0.0.0.0:{}", p.port);
-    match p.http_base() {
+    match p.ui_endpoint() {
         Some(base) => println!("  ui + rest:      {base}"),
         None => println!("  ui + rest:      disabled (--no-ui)"),
     }
@@ -1095,7 +1128,7 @@ pub async fn status() -> ! {
         println!("  uptime:         {}", portguard::humanize(up));
     }
     println!("  spark connect:  sc://0.0.0.0:{}", recorded.port);
-    match recorded.http_base() {
+    match recorded.ui_endpoint() {
         Some(base) => println!("  ui + rest:      {base}"),
         None => println!("  ui + rest:      disabled (--no-ui)"),
     }
@@ -1477,6 +1510,31 @@ mod tests {
         assert_eq!(p.http_base().as_deref(), Some("http://[::1]:4040"));
         p.ui_port = None;
         assert_eq!(p.http_base(), None);
+    }
+
+    /// ... and what is *printed* is the address that was bound, not the probe target. A UI on
+    /// every interface reported as `http://127.0.0.1:4040` reads as loopback-only, which is the
+    /// one thing `docs/web-ui.md` tells an operator to check before trusting an unauthenticated
+    /// UI on a reachable host.
+    #[test]
+    fn the_printed_ui_endpoint_names_the_interface_it_is_bound_to() {
+        let mut p = pidfile(1, "x", "y");
+        assert_eq!(
+            p.ui_endpoint().as_deref(),
+            Some("http://0.0.0.0:4040  (all interfaces; local http://127.0.0.1:4040)")
+        );
+        p.ui_bind = "::".into();
+        assert_eq!(
+            p.ui_endpoint().as_deref(),
+            Some("http://[::]:4040  (all interfaces; local http://127.0.0.1:4040)")
+        );
+        // A real address is already the truth and gets no parenthetical.
+        p.ui_bind = "127.0.0.1".into();
+        assert_eq!(p.ui_endpoint().as_deref(), Some("http://127.0.0.1:4040"));
+        p.ui_bind = "10.0.0.4".into();
+        assert_eq!(p.ui_endpoint().as_deref(), Some("http://10.0.0.4:4040"));
+        p.ui_port = None;
+        assert_eq!(p.ui_endpoint(), None);
     }
 
     #[test]
