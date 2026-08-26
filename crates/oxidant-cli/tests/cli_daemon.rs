@@ -403,6 +403,54 @@ fn servers_on(ports: &[u16]) -> Vec<u32> {
     found
 }
 
+/// **The crashed-node pin.** `restart` after a SIGKILL must come back on the ports the dead
+/// daemon held, not on the defaults.
+///
+/// A crashed node is the single most likely time anyone runs `oxidant restart`, and it used to
+/// be the one time the flags were lost: `restart` asked `daemon::running()` for them, and
+/// `running()` deletes the pidfile of a process that is gone before returning "stopped". The
+/// flags were on disk a moment earlier and were thrown away by the read meant to recover them,
+/// so the server silently came back on 50051/4040 — reporting itself healthy while every client
+/// pointed at the old port was broken.
+#[test]
+fn restart_after_a_crash_replays_the_dead_daemons_ports() {
+    let mut d = Daemon::new();
+    d.started_ok();
+    let killed = d.pid();
+
+    assert!(
+        Command::new("kill")
+            .args(["-9", &killed.to_string()])
+            .status()
+            .expect("kill -9")
+            .success(),
+        "could not SIGKILL pid {killed}"
+    );
+    wait_until_gone(killed, Duration::from_secs(10));
+
+    // No flags: everything `restart` knows now comes from the pidfile the corpse left behind.
+    let restarted = d.run(&["restart"]);
+    assert_eq!(restarted.code(), 0, "restart: {}", restarted.all());
+    assert_ne!(d.pid(), killed, "the pidfile still names the dead process");
+
+    let status = d.run(&["status"]);
+    assert_eq!(status.code(), 0, "{}", status.all());
+    assert!(
+        status
+            .stdout()
+            .contains(&format!("sc://0.0.0.0:{}", d.port)),
+        "restart moved the crashed server off its port: {}",
+        status.all()
+    );
+    assert!(
+        status
+            .stdout()
+            .contains(&format!("http://127.0.0.1:{}", d.ui_port)),
+        "restart moved the crashed server's UI off its port: {}",
+        status.all()
+    );
+}
+
 // -------------------------------------------------------------------------------------------
 // The bare-invocation refusal
 // -------------------------------------------------------------------------------------------

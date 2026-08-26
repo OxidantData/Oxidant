@@ -1137,6 +1137,16 @@ pub async fn status() -> ! {
     });
 }
 
+/// The pidfile exactly as it sits on disk, whatever state it describes.
+///
+/// [`running()`] is the wrong reader for `restart`. It *deletes* a pidfile whose process is gone
+/// — the stale-pidfile path every other caller wants — so on a crashed node the flags an
+/// operator most needs replayed are thrown away by the read that was supposed to recover them.
+/// `restart` reads the file first and lets `stop` do the deleting.
+pub fn recorded_pidfile() -> Option<PidFile> {
+    PidFile::read(&pid_path())
+}
+
 /// The flags a `restart` should replay: the ones just typed, or failing that the ones the
 /// running daemon was started with.
 ///

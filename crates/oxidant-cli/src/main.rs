@@ -281,11 +281,12 @@ fn run_stop(args: &[String]) -> oxidant_common::Result<()> {
 /// `oxidant restart` comes back on the ports it went down on. Flags typed on the restart
 /// override them wholesale, which is how you move a running server to a new port.
 async fn run_restart(args: &[String]) -> oxidant_common::Result<()> {
-    let recorded = match daemon::running() {
-        daemon::Daemon::Running(p) => Some(p),
-        _ => None,
-    };
-    let flags = daemon::restart_flags(&args[2..], recorded.as_deref());
+    // Read the file, not the *state*: `daemon::running()` deletes the pidfile of a process that
+    // is gone, which is precisely the case `restart` is run in — after a SIGKILL, an OOM kill or
+    // a reboot. Reading the state first threw away the recorded ports and silently brought the
+    // server back on 50051/4040, breaking every client pointed at the old ones.
+    let recorded = daemon::recorded_pidfile();
+    let flags = daemon::restart_flags(&args[2..], recorded.as_ref());
     run_stop(args)?;
     let mut argv = vec![args[0].clone(), "start".to_string()];
     argv.extend(flags.iter().cloned());
