@@ -53,8 +53,17 @@ executables and leaves the pidfile as evidence), and a **stale pidfile never blo
 `Restart=on-failure` and a plain reboot work after a `SIGKILL` or an OOM kill.
 
 Single-instance enforcement (a second server-role process on the machine refuses, naming the
-running one) is **release builds only**. Debug builds multiply freely; the test suite and
-`--mode local-cluster` depend on it.
+running one) is **on in release builds, off in debug ones** — the test suite runs half a dozen
+servers at once on ephemeral ports and depends on it. (`--mode local-cluster` does not: its
+workers are in-process, so they are not separate rows and would never trip the guard.)
+`OXIDANT_SINGLE_INSTANCE=1` forces it on, `=0` forces it off, and either overrides the build
+profile. `1` is how the CLI test suite exercises the rule against a real running server in a
+debug build; `0` is the escape hatch on a shared host, where the conflicting server may belong
+to another user and neither `oxidant stop` nor `kill` can reach it.
+
+The scan is per **process namespace**, not per machine: in a container `ps -A` and `/proc` are
+namespaced, and neither `deploy/docker/*` nor the orchestrator manifests set `hostPID` or
+`shareProcessNamespace`. Setting either would turn one server per pod into one server per node.
 
 ## Driver (connect-server pod)
 

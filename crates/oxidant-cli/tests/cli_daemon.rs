@@ -781,6 +781,91 @@ fn start_and_status_work_without_a_ui_port() {
 }
 
 // -------------------------------------------------------------------------------------------
+// The single-instance rule
+// -------------------------------------------------------------------------------------------
+
+/// The release-only single-instance rule, exercised end to end against a *real* running server.
+///
+/// `single_instance_conflict` was always unit-tested, but everything around it — `process_table()`,
+/// this platform's real `ps` output, `is_server_role` on a real command line, the report — ran on
+/// no path any test could reach, because the call site was `if cfg!(debug_assertions) { return }`
+/// and every test binary is a debug build. A release-only guarantee with zero release-path
+/// coverage is one `ps` format change away from silently never firing.
+///
+/// So the gate is `OXIDANT_SINGLE_INSTANCE` with the *default* still keyed to the build profile:
+/// release on, debug off, so the suite keeps running half a dozen servers at once. Setting it to
+/// `1` for one invocation runs the whole chain here.
+#[test]
+fn a_second_server_is_refused_when_the_single_instance_rule_is_in_force() {
+    let mut d = Daemon::new();
+    d.started_ok();
+    let running = d.pid();
+
+    let second = Daemon::new();
+    let refused = Command::new(oxidant_bin())
+        .env("OXIDANT_DATA_DIR", second.data_dir.path())
+        .env("OXIDANT_SINGLE_INSTANCE", "1")
+        .args([
+            "spark",
+            "server",
+            "--foreground",
+            "--port",
+            &second.port.to_string(),
+            "--no-ui",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run a second server");
+    let err = String::from_utf8_lossy(&refused.stderr).into_owned();
+
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "a second server must be refused: {err}"
+    );
+    assert!(
+        err.contains("error: another oxidant server is already running on this machine"),
+        "{err}"
+    );
+    // It found a real row in a real process table and read a real command line off it.
+    assert!(
+        err.contains("spark server"),
+        "the pid line names what it found: {err}"
+    );
+    assert!(
+        err.contains("oxidant stop") || err.contains("another user"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("listening on"),
+        "the refusal must land before the boot work: {err}"
+    );
+    // And it refused rather than merely failing to bind: the ports were free.
+    assert!(!err.contains("is already in use"), "{err}");
+
+    // The rule is machine-wide, so the daemon it found may belong to a concurrent test rather
+    // than to us — but ours must still be up and untouched either way.
+    assert!(alive(running), "the running daemon was disturbed");
+}
+
+/// The other half of the same gate: the default in a debug build is *off*, or this repo's own
+/// suite could not run two servers at once. A test that only proved the refusal would pass
+/// just as well if the rule fired always.
+#[test]
+fn a_second_server_starts_freely_when_the_rule_is_not_in_force() {
+    let mut first = Daemon::new();
+    first.started_ok();
+    let mut second = Daemon::new();
+    let started = second.started_ok();
+    assert!(
+        started.stdout().contains("oxidant started (pid "),
+        "{}",
+        started.all()
+    );
+    assert!(alive(first.pid()) && alive(second.pid()));
+}
+
+// -------------------------------------------------------------------------------------------
 // Stale and stranger pidfiles
 // -------------------------------------------------------------------------------------------
 

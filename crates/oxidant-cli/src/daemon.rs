@@ -573,11 +573,20 @@ pub struct ProcRow {
 }
 
 /// Every process on the machine we can see, or an empty list when we cannot tell.
-fn process_table() -> Vec<ProcRow> {
-    match run("ps", &["-Ao", "pid=,ppid=,args="]) {
-        Some(out) => parse_ps_table(&out),
-        None => proc_table(),
+///
+/// The `/proc` fallback is reached on an unparseable `ps` as well as a missing one. A BusyBox
+/// `ps` (Alpine) exits 0 while ignoring `-Ao`, and its rows' second field is a username rather
+/// than a ppid, so every row is dropped by the parse and the table comes back empty — the guard
+/// silently disabling itself on exactly the images the `/proc` path was written for. Failing
+/// open is the right *direction* for this feature, but only after the fallback has been tried.
+pub fn process_table() -> Vec<ProcRow> {
+    if let Some(out) = run("ps", &["-Ao", "pid=,ppid=,args="]) {
+        let rows = parse_ps_table(&out);
+        if !rows.is_empty() {
+            return rows;
+        }
     }
+    proc_table()
 }
 
 fn parse_ps_table(stdout: &str) -> Vec<ProcRow> {
@@ -683,30 +692,108 @@ pub fn single_instance_conflict(table: &[ProcRow], me: u32) -> Option<&ProcRow> 
         .find(|r| !excluded.contains(&r.pid) && is_server_role(&r.command))
 }
 
+/// Is the single-instance rule in force for this process?
+///
+/// **Release builds: yes. Debug builds: only when `OXIDANT_SINGLE_INSTANCE=1`.** Debug builds
+/// must multiply freely — this repo's own test suite runs half a dozen servers at once on
+/// ephemeral ports (`cli_port_guard`, `cli_sql`, `cli_rest_statements`) — so the rule is a
+/// production-deployment guarantee rather than an invariant of the binary.
+///
+/// The variable is what makes the rule *testable*. The decision function
+/// ([`single_instance_conflict`]) was always unit-testable, but the composition around it —
+/// `process_table()` → this platform's real `ps` output → [`is_server_role`] → the report — ran
+/// on no path any test could reach, because every test binary is a debug build. That is one `ps`
+/// format change away from a guarantee that silently never fires. With the gate on an env var
+/// instead of on `cfg!` alone, `cli_daemon` starts a real server and asserts a second one is
+/// refused, exercising the whole chain.
+///
+/// `OXIDANT_SINGLE_INSTANCE=0` turns it off in a release build too, which is the escape hatch
+/// for the one case the remediation below cannot help with: a second *user's* server on a shared
+/// host.
+fn single_instance_enabled() -> bool {
+    match std::env::var("OXIDANT_SINGLE_INSTANCE").ok().as_deref() {
+        Some("1" | "true") => true,
+        Some("0" | "false") => false,
+        _ => !cfg!(debug_assertions),
+    }
+}
+
+/// Can we signal `pid` at all?
+///
+/// `ps -Ao` returns the whole machine's table across users, so on a shared host — a CI runner, a
+/// bastion, a box where the systemd unit runs as its own uid — the conflict found may belong to
+/// somebody else. `kill(pid, 0)` answering `EPERM` is how we know, and it changes the whole
+/// remediation: `oxidant status` and `oxidant stop` read *your* `$OXIDANT_DATA_DIR` and will
+/// report nothing, and `kill` returns `EPERM` too.
+#[cfg(unix)]
+fn foreign_owner(pid: u32) -> bool {
+    let Some(pid) = real_pid(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 sends nothing; it performs only the existence and permission check.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn foreign_owner(_pid: u32) -> bool {
+    false
+}
+
+/// The refusal text. Pure so its exact shape — and which remediation it offers — is unit-tested.
+fn single_instance_report(other: &ProcRow, foreign: bool) -> String {
+    let mut out = format!(
+        "error: another oxidant server is already running on this machine
+  pid:      {} ({})
+",
+        other.pid,
+        portguard::elide(&other.command, 96)
+    );
+    if foreign {
+        // Not ours to stop, and none of the three commands below would work: `status`/`stop`
+        // read this user's own data root and see nothing, and `kill` returns EPERM.
+        out.push_str("  owner:    another user — `oxidant status` and `oxidant stop` read your own $OXIDANT_DATA_DIR and will not see it
+");
+        out.push_str(
+            "ask its owner to stop it, or set OXIDANT_SINGLE_INSTANCE=0 to run a second server anyway
+",
+        );
+    } else {
+        out.push_str(
+            "  status:   oxidant status
+",
+        );
+        out.push_str(&format!(
+            "  stop it:  oxidant stop   (or `kill {}`)
+",
+            other.pid
+        ));
+    }
+    out
+}
+
 /// Refuse to be the second Spark Connect server on this machine.
 ///
-/// **Release builds only.** Debug builds must multiply freely: this repo's own test suite runs
-/// half a dozen servers at once on ephemeral ports (`cli_port_guard`, `cli_sql`,
-/// `cli_rest_statements`), and `--mode local-cluster` is a supported topology. The rule is a
-/// production-deployment guarantee, not an invariant of the binary — so the *decision* lives in
-/// [`single_instance_conflict`], which is unit-tested in debug, and only the call site is gated.
+/// Gated by [`single_instance_enabled`]; the *decision* lives in [`single_instance_conflict`] so
+/// both halves are testable independently.
+///
+/// In a container this is per-pod, not per-machine: `ps -A` and `/proc` are namespaced, and
+/// neither `deploy/docker/*` nor the orchestrator manifests set `hostPID` or
+/// `shareProcessNamespace`. Setting either would silently turn this into a cluster-wide outage —
+/// one pod's server would refuse because another pod's is visible.
 pub fn enforce_single_instance() {
-    // `if cfg!` and not `#[cfg]`: the gate is on the *behaviour*, so the code below still
-    // compiles and is still borrow-checked in a debug build. A `#[cfg]` block would let this
-    // path rot unnoticed until someone cut a release.
-    if cfg!(debug_assertions) {
+    // `if !…` and not `#[cfg]`: the gate is on the *behaviour*, so the code below still compiles
+    // and is still borrow-checked in a debug build. A `#[cfg]` block would let this path rot
+    // unnoticed until someone cut a release.
+    if !single_instance_enabled() {
         return;
     }
     let table = process_table();
     if let Some(other) = single_instance_conflict(&table, std::process::id()) {
-        eprintln!("error: another oxidant server is already running on this machine");
-        eprintln!(
-            "  pid:      {} ({})",
-            other.pid,
-            portguard::elide(&other.command, 96)
+        eprint!(
+            "{}",
+            single_instance_report(other, foreign_owner(other.pid))
         );
-        eprintln!("  status:   oxidant status");
-        eprintln!("  stop it:  oxidant stop   (or `kill {}`)", other.pid);
         std::process::exit(1);
     }
 }
@@ -879,6 +966,12 @@ pub async fn start(flags: &[String], ports: ServerPorts) -> oxidant_common::Resu
         Daemon::Stranger(recorded, live) => refuse_stranger(&recorded, live.as_ref()),
         Daemon::Stopped => {}
     }
+
+    // Same reasoning as the port guard immediately below, for the other refusal the child can
+    // hit: without this, a release-build `start` on a machine that already has a server spawns a
+    // child that refuses, and the operator gets the generic "oxidant exited during startup with
+    // exit status: 1" wrapper plus a log tail instead of the crisp message.
+    enforce_single_instance();
 
     // Before spawning anything: if a port is taken, the rich who-owns-it report belongs here,
     // in the terminal the operator is looking at. The child would print the same block — into
@@ -1547,6 +1640,60 @@ mod tests {
         assert!(is_server_role("/usr/local/bin/oxidant spark server"));
         // The bare `server` alias `async_main` still accepts.
         assert!(is_server_role("/usr/local/bin/oxidant server --port 50051"));
+    }
+
+    /// The remediation has to match who owns the conflict. `ps -Ao` returns the whole machine
+    /// across users, so on a shared host the server found may be someone else's — and then all
+    /// three lines we would otherwise print are wrong: `status`/`stop` read *this* user's
+    /// `$OXIDANT_DATA_DIR` and report nothing, and `kill` returns EPERM.
+    #[test]
+    fn the_single_instance_report_offers_a_remediation_that_can_actually_work() {
+        let other = row(12345, 1, "/usr/local/bin/oxidant spark server --port 50051");
+
+        let ours = single_instance_report(&other, false);
+        assert_eq!(
+            ours,
+            "error: another oxidant server is already running on this machine\n\
+             \x20 pid:      12345 (/usr/local/bin/oxidant spark server --port 50051)\n\
+             \x20 status:   oxidant status\n\
+             \x20 stop it:  oxidant stop   (or `kill 12345`)\n"
+        );
+
+        let theirs = single_instance_report(&other, true);
+        assert!(theirs.contains("another user"), "{theirs}");
+        assert!(
+            !theirs.contains("oxidant stop   (or `kill"),
+            "a command that returns EPERM is not a remediation: {theirs}"
+        );
+        assert!(theirs.contains("OXIDANT_SINGLE_INSTANCE=0"), "{theirs}");
+    }
+
+    /// The gate is an env var and not `cfg!` alone, so the *composition* — real `ps`, real
+    /// classification, real report — has a path a debug-built test can reach. Without that, a
+    /// release-only guarantee has release-only coverage, which is to say none.
+    #[test]
+    fn the_single_instance_gate_is_reachable_from_a_debug_build() {
+        // Not `set_var`: this crate's tests run threaded and `main` documents why that is
+        // unsound. The default for a debug build is what matters here.
+        assert!(!single_instance_enabled(), "debug builds must multiply");
+    }
+
+    /// A `ps` that exits 0 while ignoring `-Ao` — BusyBox on Alpine — yields rows whose second
+    /// field is a username, so every row is dropped and the table comes back empty. That must
+    /// fall through to `/proc`, not silently disable the guard.
+    #[test]
+    fn a_busybox_ps_parses_to_nothing_and_must_not_be_the_final_answer() {
+        let busybox = "    1 root      0:00 /sbin/init\n  742 oxidant   0:12 /usr/local/bin/oxidant spark server\n";
+        assert!(
+            parse_ps_table(busybox).is_empty(),
+            "the shape that triggers the fallback"
+        );
+        // `process_table` is what must not return it. On a platform with no `/proc` there is
+        // nothing to fall back *to*, so the assertion is on the real one either way.
+        assert!(
+            !process_table().is_empty(),
+            "the real table is readable here"
+        );
     }
 
     #[test]
