@@ -40,6 +40,13 @@ use crate::portguard;
 /// (`logging::install_shutdown_flush`), so this is a budget for a real flush, not a formality.
 pub const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(15);
 
+/// How long `stop` waits for `SIGKILL` to land before reporting the process unkillable.
+///
+/// SIGKILL is not instant: the kernel still has to unwind a process that may be mid-syscall,
+/// and one stuck in uninterruptible I/O never unwinds at all. Without this the escalation path
+/// would signal and immediately declare failure, having given the kernel no time.
+const SIGKILL_GRACE: Duration = Duration::from_secs(5);
+
 /// How long `start` waits for the child to answer its health endpoint before giving up and
 /// reporting the tail of the log.
 const START_TIMEOUT: Duration = Duration::from_secs(90);
@@ -731,7 +738,14 @@ async fn await_ready(child: &mut std::process::Child, recorded: &PidFile) -> Res
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!("oxidant exited during startup with {status}"));
         }
-        if health(&client, recorded).await.is_some() {
+        // Under `--no-ui` there is no HTTP surface at all, so the strongest available claim is
+        // that the gRPC listener accepts a connection. Without this branch a `--no-ui` start
+        // would poll an endpoint that can never answer and fail after the full timeout.
+        let ready = match recorded.http_base() {
+            Some(_) => health(&client, recorded).await.is_some(),
+            None => grpc_reachable(recorded),
+        };
+        if ready {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -816,31 +830,21 @@ pub fn stop(grace: Duration) -> oxidant_common::Result<()> {
             signal(pid, SIGTERM).map_err(|e| {
                 oxidant_common::Error::Io(format!("signal oxidant (pid {pid}): {e}"))
             })?;
-            let deadline = Instant::now() + grace;
-            let mut escalated = false;
-            loop {
-                // Re-verify identity on every poll, not just liveness: if the daemon exits and
-                // the kernel hands its pid straight to something else, "the pid is alive" would
-                // keep us waiting and then SIGKILL a bystander.
-                if !verify(&recorded, identity(pid).as_ref()) {
-                    break;
+            let escalated = if wait_for_exit(&recorded, grace) {
+                false
+            } else {
+                signal(pid, SIGKILL).map_err(|e| {
+                    oxidant_common::Error::Io(format!("SIGKILL oxidant (pid {pid}): {e}"))
+                })?;
+                if !wait_for_exit(&recorded, SIGKILL_GRACE) {
+                    return Err(oxidant_common::Error::Io(format!(
+                        "oxidant (pid {pid}) survived SIGKILL; it is probably stuck in \
+                         uninterruptible I/O — the pidfile at {} is left in place",
+                        path.display()
+                    )));
                 }
-                if Instant::now() >= deadline {
-                    if escalated {
-                        return Err(oxidant_common::Error::Io(format!(
-                            "oxidant (pid {pid}) survived SIGKILL; it is probably stuck in \
-                             uninterruptible I/O — the pidfile at {} is left in place",
-                            path.display()
-                        )));
-                    }
-                    escalated = true;
-                    signal(pid, SIGKILL).map_err(|e| {
-                        oxidant_common::Error::Io(format!("SIGKILL oxidant (pid {pid}): {e}"))
-                    })?;
-                    continue;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+                true
+            };
             let _ = std::fs::remove_file(&path);
             if escalated {
                 println!(
@@ -852,6 +856,34 @@ pub fn stop(grace: Duration) -> oxidant_common::Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+/// Poll until the recorded daemon is gone, or `within` elapses. `true` if it went.
+///
+/// The loop spins on liveness, which is a single `kill(pid, 0)`; the full identity check runs
+/// once, at the deadline. That ordering is deliberate on both counts. Identity is what decides
+/// whether the *next* signal is safe — if the daemon exited during the wait and the kernel
+/// handed its number straight to something else, the pid is alive but there is nothing left to
+/// kill, and this returns `true` so the caller escalates to nothing. And it is expensive:
+/// reading identity on macOS is two `ps` invocations, so checking it every 100ms would spawn
+/// three hundred processes across a 15-second grace to answer a question that only matters at
+/// the end of it.
+///
+/// A hair of TOCTOU survives between that check and the caller's `kill`, as it must without
+/// `pidfd_send_signal`. The window is microseconds against a pid space the kernel walks
+/// sequentially; the check that matters — the one before the *first* signal — happens in
+/// `running()` before anything is sent at all.
+fn wait_for_exit(recorded: &PidFile, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if !alive(recorded.pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return !verify(recorded, identity(recorded.pid).as_ref());
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

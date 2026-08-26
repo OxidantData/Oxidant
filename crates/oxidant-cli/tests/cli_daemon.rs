@@ -365,6 +365,35 @@ fn foreground_still_serves() {
     );
 }
 
+/// `--no-ui` has no HTTP surface, so `start` has nothing to poll and `status` has nothing to
+/// probe. Both must fall back to the gRPC listener rather than wait out the full start timeout
+/// and then report a healthy server as unreachable.
+///
+/// Not hypothetical: `docs/catalogs-unity.md` starts the engine exactly this way.
+#[test]
+fn start_and_status_work_without_a_ui_port() {
+    let d = Daemon::new();
+    let started = d.run(&["start", "--port", &d.port.to_string(), "--no-ui"]);
+    assert_eq!(started.code(), 0, "--no-ui start: {}", started.all());
+    assert!(
+        started
+            .stdout()
+            .contains("ui + rest:      disabled (--no-ui)"),
+        "{}",
+        started.all()
+    );
+
+    let status = d.run(&["status"]);
+    assert_eq!(status.code(), 0, "--no-ui status: {}", status.all());
+    assert!(
+        status
+            .stdout()
+            .contains("health:         ok (grpc connect; no ui to probe)"),
+        "the health line must say what it actually checked: {}",
+        status.all()
+    );
+}
+
 // -------------------------------------------------------------------------------------------
 // Stale and stranger pidfiles
 // -------------------------------------------------------------------------------------------
