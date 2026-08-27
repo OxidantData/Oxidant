@@ -21,6 +21,11 @@ pub use output_write::{
     flow_queries, parse_output_schema, split_table_properties, union_flow_sql,
     validate_external_sink_format, validate_output_format, FlowQuery,
 };
+/// Re-exported so a caller that has a `pipeline.checkpoints` string resolves it through the same
+/// function the runner does. There is exactly one resolver for a checkpoint root, and a second
+/// one is how the CLI and the running pipeline end up disagreeing about which bucket the
+/// schedule is in.
+pub use oxidant_streaming::{checkpoint_store, CheckpointStore};
 pub use reconcile::{
     diff_keys, reconcile, set_schedule, KeyDiff, KeyRow, KeyWindow, ReconcileOptions,
     ReconcileReport, ReconcileSchedule, TableReport, DEFAULT_SAMPLE, EXIT_DRIFT, EXIT_FAILED,

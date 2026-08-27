@@ -26,7 +26,7 @@ mod source;
 mod state;
 mod watermark;
 
-pub use checkpoint::{CheckpointState, CheckpointStore};
+pub use checkpoint::{checkpoint_store, CheckpointObject, CheckpointState, CheckpointStore};
 pub use config::{
     ExpectationAction, SinkDestination, StreamExpectation, StreamQueryConfig,
     DEFAULT_ICEBERG_SUFFIX,

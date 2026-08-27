@@ -200,7 +200,7 @@ async fn an_update_that_moves_the_primary_key_leaves_no_orphan_in_the_target() {
         .expect("seeds a row");
 
     let engine = Engine::new();
-    let mut source = PostgresCdcSource::from_options(&options(&connect)).expect("builds");
+    let mut source = PostgresCdcSource::from_options(None, &options(&connect)).expect("builds");
     let merge = CdcMerge::new(&cdc_config(), &source.schema(), TABLE).expect("plans the merge");
 
     let target = drain_into(&mut source, &merge, &engine, Vec::new()).await;

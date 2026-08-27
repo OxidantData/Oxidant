@@ -161,14 +161,15 @@ impl Fixture {
     }
 
     fn source(&self) -> PostgresCdcSource {
-        PostgresCdcSource::from_options(&self.options()).expect("the source validates and builds")
+        PostgresCdcSource::from_options(None, &self.options())
+            .expect("the source validates and builds")
     }
 }
 
 /// The message a source that refuses to build produces. Written out rather than `expect_err`
 /// because the source itself is not `Debug` — it owns a live connection, not a value.
 fn build_err(options: &HashMap<String, String>, why: &str) -> String {
-    match PostgresCdcSource::from_options(options) {
+    match PostgresCdcSource::from_options(None, options) {
         Ok(_) => panic!("expected a failure: {why}"),
         Err(e) => e.to_string(),
     }
@@ -390,7 +391,7 @@ async fn an_added_column_is_reported_and_the_stream_keeps_running() {
         logs.path().to_string_lossy().into_owned(),
     );
     options.insert("oxidant.connector.name".into(), "addcol".into());
-    let mut source = PostgresCdcSource::from_options(&options).expect("builds");
+    let mut source = PostgresCdcSource::from_options(None, &options).expect("builds");
     drain(&mut source, &engine).await;
 
     // An additive change on the publisher, then a row that carries it.
@@ -417,7 +418,7 @@ async fn an_added_column_is_reported_and_the_stream_keeps_running() {
 
     // Restarting is what propagates it: the source re-introspects at construction.
     drop(source);
-    let restarted = PostgresCdcSource::from_options(&options).expect("builds");
+    let restarted = PostgresCdcSource::from_options(None, &options).expect("builds");
     assert!(
         restarted.schema().index_of("region").is_ok(),
         "the new column is in the schema after a restart"
@@ -447,7 +448,7 @@ async fn the_connector_log_records_the_snapshot_the_batches_and_the_slot() {
         logs.path().to_string_lossy().into_owned(),
     );
     options.insert("oxidant.connector.name".into(), "ox_cdc_log".into());
-    let mut source = PostgresCdcSource::from_options(&options).expect("builds");
+    let mut source = PostgresCdcSource::from_options(None, &options).expect("builds");
     drain(&mut source, &engine).await;
     fixture
         .sql("INSERT INTO public.ox_cdc_log VALUES (2, 'b')")
@@ -622,7 +623,8 @@ async fn a_source_column_may_not_be_named_like_a_metadata_column() {
     // Excluding it is the way out, and then the table replicates.
     let mut options = fixture.options();
     options.insert("exclude_columns".into(), "__oxidant_lsn".into());
-    let source = PostgresCdcSource::from_options(&options).expect("builds once the column is out");
+    let source =
+        PostgresCdcSource::from_options(None, &options).expect("builds once the column is out");
     assert_eq!(source.schema().fields().len(), 4, "id plus the three");
     drop(source);
 
@@ -734,7 +736,7 @@ async fn a_whole_schema_resolves_a_partitioned_table_once_and_not_once_per_parti
     .collect();
 
     let engine = Engine::new();
-    let mut source = PostgresCdcSource::from_options(&options).expect("builds");
+    let mut source = PostgresCdcSource::from_options(None, &options).expect("builds");
     assert!(
         source.description().contains("ox_cdc_parts.sales@"),
         "the parent is the replication unit: {}",
@@ -794,7 +796,7 @@ async fn an_excluded_column_does_not_raise_a_schema_change_alarm() {
         logs.path().to_string_lossy().into_owned(),
     );
     options.insert("oxidant.connector.name".into(), "excluded".into());
-    let mut source = PostgresCdcSource::from_options(&options).expect("builds");
+    let mut source = PostgresCdcSource::from_options(None, &options).expect("builds");
     drain(&mut source, &engine).await;
 
     // A change on the stream is what makes the publisher send a `Relation` message at all.
@@ -931,7 +933,7 @@ async fn the_thousand_row_fixture_snapshots_every_row_exactly_once() {
     .collect();
 
     let engine = Engine::new();
-    let mut source = PostgresCdcSource::from_options(&options).expect("builds");
+    let mut source = PostgresCdcSource::from_options(None, &options).expect("builds");
     // `exclude_columns` keeps a column out of the stream entirely.
     assert!(source.schema().index_of("city").is_err());
     assert!(source.schema().index_of("supplierid").is_ok());

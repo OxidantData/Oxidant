@@ -1,7 +1,6 @@
 //! Pipeline execution: plan the DAG, drive streaming and derived tables, persist state.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -11,8 +10,9 @@ use oxidant_config::{
 };
 use oxidant_loom::Engine;
 use oxidant_streaming::{
-    LakeSink, LakeSinkOptions, LakeTarget, MicroBatchInput, MicroBatchPipeline, StartOptions,
-    StreamQueryConfig, StreamingQueryManager, Trigger as StreamTrigger,
+    checkpoint_store, CheckpointStore, LakeSink, LakeSinkOptions, LakeTarget, MicroBatchInput,
+    MicroBatchPipeline, StartOptions, StreamQueryConfig, StreamingQueryManager,
+    Trigger as StreamTrigger,
 };
 
 use crate::auto_cdc::CdcMerge;
@@ -222,8 +222,16 @@ impl<'a> Plan<'a> {
 }
 
 /// Drop persisted pipeline-state entries so the next pass recomputes affected tables.
-pub fn clear_pipeline_state(checkpoints: &str, tables: &[String]) -> Result<()> {
-    let mut state = PipelineState::load(checkpoints);
+///
+/// `engine` resolves the checkpoint root, which may be an `s3://` URL — see
+/// [`oxidant_streaming::checkpoint_store`].
+pub async fn clear_pipeline_state(
+    engine: &Engine,
+    checkpoints: &str,
+    tables: &[String],
+) -> Result<()> {
+    let store = checkpoint_store(engine, checkpoints)?;
+    let mut state = PipelineState::load(&store).await;
     if tables.is_empty() {
         state.tables.clear();
         state.once_completed.clear();
@@ -233,7 +241,7 @@ pub fn clear_pipeline_state(checkpoints: &str, tables: &[String]) -> Result<()> 
             state.once_completed.remove(name);
         }
     }
-    state.save(checkpoints)
+    state.save(&store).await
 }
 
 /// Run the pipeline subgraph, emitting events through `on_event`.
@@ -264,8 +272,14 @@ where
         plan.pipeline.trigger.clone()
     };
 
+    // Resolved and probed before a single table starts. The checkpoint root is where every
+    // table's replay position lives; a root that is not writable is a pipeline that re-snapshots
+    // on every restart, and an operator has to learn that here rather than an hour in.
+    let checkpoints = checkpoint_store(engine, &plan.pipeline.checkpoints)?;
+    checkpoints.probe().await?;
+
     let mut streams = StreamState::start(engine, plan, &nodes).await?;
-    let mut state = PipelineState::load(&plan.pipeline.checkpoints);
+    let mut state = PipelineState::load(&checkpoints).await;
     emit(
         on_event,
         RunEventKind::PipelineStarted {
@@ -311,7 +325,7 @@ where
                 on_event,
             )
             .await;
-            if let Err(e) = state.save(&plan.pipeline.checkpoints) {
+            if let Err(e) = state.save(&checkpoints).await {
                 emit(
                     on_event,
                     RunEventKind::StatePersistFailed {
@@ -347,7 +361,7 @@ where
                     on_event,
                 )
                 .await;
-                if let Err(e) = state.save(&plan.pipeline.checkpoints) {
+                if let Err(e) = state.save(&checkpoints).await {
                     emit(
                         on_event,
                         RunEventKind::StatePersistFailed {
@@ -358,7 +372,7 @@ where
                 emit_pass_outcomes(&outcomes, on_event);
                 // Between triggers, never inside one: a reconcile that interleaved a micro-batch
                 // would compare a target mid-write and report drift that the next commit closes.
-                reconcile_tick(engine, plan, &mut reconciled_at, on_event).await;
+                reconcile_tick(engine, plan, &checkpoints, &mut reconciled_at, on_event).await;
             }
         }
     }
@@ -375,13 +389,13 @@ where
 async fn reconcile_tick<F>(
     engine: &Engine,
     plan: &Plan<'_>,
+    checkpoints: &CheckpointStore,
     reconciled_at: &mut Option<chrono::DateTime<chrono::Utc>>,
     on_event: &mut F,
 ) where
     F: FnMut(RunEvent) + Send,
 {
-    let checkpoints = plan.pipeline.checkpoints.clone();
-    let Some(mut schedule) = crate::reconcile::ReconcileSchedule::load(&checkpoints) else {
+    let Some(mut schedule) = crate::reconcile::ReconcileSchedule::load(checkpoints).await else {
         return;
     };
     let started = chrono::Utc::now();
@@ -433,7 +447,7 @@ async fn reconcile_tick<F>(
             );
         }
     }
-    if let Err(e) = schedule.save(&checkpoints) {
+    if let Err(e) = schedule.save(checkpoints).await {
         // Reported, not fatal — and not a reason to re-run: `reconciled_at` above is what the
         // next tick measures from when this file could not take the stamp.
         emit(
@@ -539,7 +553,7 @@ async fn start_stream(
     if source.format.trim().eq_ignore_ascii_case("postgres_cdc") {
         oxidant_streaming::postgres_cdc_pipeline_options(
             &mut source_options,
-            std::path::Path::new(plan.pipeline.checkpoints.trim_end_matches('/')),
+            &plan.pipeline.checkpoints,
             name,
         );
     }
@@ -589,7 +603,7 @@ async fn start_stream(
     };
     let needs_stream_plan = has_flows || synthesized_sql.is_some();
     let stream_input = if needs_stream_plan {
-        let schema = oxidant_streaming::source_schema(&config)?;
+        let schema = oxidant_streaming::source_schema(Some(engine), &config)?;
         let input = Arc::new(MicroBatchInput::new(STREAM_ALIAS, schema)?);
         engine
             .ctx()
@@ -651,7 +665,7 @@ async fn start_stream(
         let batch_schema = if let Some(p) = &start_options.pipeline {
             Arc::new(p.plan.schema().as_arrow().clone())
         } else {
-            oxidant_streaming::source_schema(&config)?
+            oxidant_streaming::source_schema(Some(engine), &config)?
         };
         let merge = CdcMerge::new(cdc, &batch_schema, name)?;
         let sink_schema = merge.schema();
@@ -983,30 +997,33 @@ struct TableState {
 }
 
 impl PipelineState {
-    fn path(checkpoints: &str) -> PathBuf {
-        Path::new(checkpoints).join("_pipeline-state.json")
-    }
+    /// The per-table epochs, relative to the checkpoint root.
+    const KEY: &'static str = "_pipeline-state.json";
 
-    fn load(checkpoints: &str) -> Self {
-        std::fs::read(Self::path(checkpoints))
+    /// The state, or a fresh one — an unreadable or corrupt object reads as fresh, which is what
+    /// makes a first run and a torn write behave the same way: rebuild.
+    async fn load(checkpoints: &CheckpointStore) -> Self {
+        checkpoints
+            .read(Self::KEY)
+            .await
             .ok()
+            .flatten()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
     }
 
-    fn save(&self, checkpoints: &str) -> Result<()> {
-        let path = Self::path(checkpoints);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::Io(format!("creating `{}`: {e}", parent.display())))?;
-        }
+    /// Replace the state.
+    ///
+    /// No staged temporary file: this goes through the checkpoint's object store, where a `PUT`
+    /// is atomic — a reader sees the whole old object or the whole new one. That is the same
+    /// reason `CheckpointStore::save` dropped its own staging file.
+    async fn save(&self, checkpoints: &CheckpointStore) -> Result<()> {
         let text = serde_json::to_vec_pretty(self)
             .map_err(|e| Error::Io(format!("serializing pipeline state: {e}")))?;
-        let staging = path.with_extension("json.tmp");
-        std::fs::write(&staging, text)
-            .map_err(|e| Error::Io(format!("writing `{}`: {e}", staging.display())))?;
-        std::fs::rename(&staging, &path)
-            .map_err(|e| Error::Io(format!("writing `{}`: {e}", path.display())))?;
+        checkpoints
+            .write(Self::KEY, text)
+            .await
+            .map_err(|e| Error::Io(format!("writing `{}`: {e}", checkpoints.uri(Self::KEY))))?;
         Ok(())
     }
 
@@ -1146,13 +1163,14 @@ tables:
             last_run: None,
             last_result: None,
         };
-        schedule.save(&checkpoints).expect("writes the schedule");
-        let path = crate::reconcile::ReconcileSchedule::path_in(&checkpoints);
+        let engine = Engine::new();
+        let store = checkpoint_store(&engine, &checkpoints).expect("resolves");
+        schedule.save(&store).await.expect("writes the schedule");
+        let path = dir.path().join(crate::reconcile::ReconcileSchedule::KEY);
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
         permissions.set_readonly(true);
         std::fs::set_permissions(&path, permissions).expect("makes the anchor unwritable");
 
-        let engine = Engine::new();
         let mut reconciled_at = None;
         let (mut ran, mut persist_failed) = (0, 0);
         let mut on_event = |event: RunEvent| match event.kind {
@@ -1163,7 +1181,7 @@ tables:
             _ => {}
         };
         for _ in 0..3 {
-            reconcile_tick(&engine, &plan, &mut reconciled_at, &mut on_event).await;
+            reconcile_tick(&engine, &plan, &store, &mut reconciled_at, &mut on_event).await;
         }
 
         assert_eq!(

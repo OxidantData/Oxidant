@@ -487,15 +487,25 @@ async fn a_registered_cron_schedule_fires_between_triggers_and_records_what_it_f
     .expect("the fixture config parses");
     let engine = engine_for(root.path()).await;
     let plan = Plan::build(&config).expect("plans");
+    let checkpoints = oxidant_pipelines::checkpoint_store(&engine, &plan.pipeline.checkpoints)
+        .expect("resolves the checkpoint root");
 
     // Every minute, anchored in the past, so it is due on the first pass rather than in an hour.
-    let schedule = set_schedule(&plan, "* * * * *", None, &ReconcileOptions::default())
-        .expect("registers the schedule");
+    let schedule = set_schedule(
+        &engine,
+        &plan,
+        "* * * * *",
+        None,
+        &ReconcileOptions::default(),
+    )
+    .await
+    .expect("registers the schedule");
     assert_eq!(schedule.cron, "* * * * *");
     let mut backdated = schedule;
     backdated.created = "2020-01-01T00:00:00Z".into();
     backdated
-        .save(&plan.pipeline.checkpoints)
+        .save(&checkpoints)
+        .await
         .expect("backdates the anchor");
 
     // A shared counter rather than a captured local: the run loop holds `&mut` on the callback
@@ -518,7 +528,9 @@ async fn a_registered_cron_schedule_fires_between_triggers_and_records_what_it_f
         "the schedule should have fired at least once"
     );
 
-    let recorded = ReconcileSchedule::load(&plan.pipeline.checkpoints).expect("the file survives");
+    let recorded = ReconcileSchedule::load(&checkpoints)
+        .await
+        .expect("the schedule survives");
     assert_eq!(
         recorded.last_result.as_deref(),
         Some("in_sync"),

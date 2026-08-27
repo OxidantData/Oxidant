@@ -1111,11 +1111,16 @@ pub fn streaming_read_spec(r: &sc::Read) -> Result<StreamingReadSpec, Status> {
 /// translator and the `WriteStreamOperationStart` handler independently land on the same one.
 async fn streaming_read(ctx: &SessionContext, r: &sc::Read) -> Result<LogicalPlan, Status> {
     let (format, options) = streaming_read_spec(r)?;
-    let schema = oxidant_streaming::source_schema(&oxidant_streaming::StreamQueryConfig {
-        source_format: format.clone(),
-        source_options: options.clone(),
-        ..Default::default()
-    })
+    // No engine: a Connect `readStream` has no pipeline checkpoint root, so there is no
+    // object-store location for a connector to resolve.
+    let schema = oxidant_streaming::source_schema(
+        None,
+        &oxidant_streaming::StreamQueryConfig {
+            source_format: format.clone(),
+            source_options: options.clone(),
+            ..Default::default()
+        },
+    )
     .map_err(|e| inval(format!("readStream.format(`{format}`): {e}")))?;
 
     let input = oxidant_streaming::stream_input(&format, &options, schema)

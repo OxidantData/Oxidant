@@ -33,7 +33,7 @@
 //! only reads. See the "Reconciliation" section of that document.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use oxidant_common::{Error, Result};
@@ -48,7 +48,10 @@ use oxidant_streaming::pg_replication::{quote_identifier, ControlConnection};
 use oxidant_streaming::postgres_cdc::{
     introspect_read_only, text_column_to_arrow, ColumnSchema, TableSchema, SOURCE_NAME,
 };
-use oxidant_streaming::{postgres_cdc_pipeline_options, ConnectorLog, PostgresCdcOptions};
+use oxidant_streaming::{
+    checkpoint_store, postgres_cdc_pipeline_options, CheckpointStore, ConnectorLog,
+    PostgresCdcOptions,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -560,9 +563,9 @@ impl ReconcileReport {
     /// `docs/postgres-cdc.md` §6 lists `reconcile` among the events an operator reads after the
     /// fact, and the platform console reads the same file — so a scheduled run leaves a record
     /// where the rest of the connector's history is, not only on whatever terminal it ran from.
-    fn log_events(&self, plan: &Plan<'_>) {
+    fn log_events(&self, engine: &Engine, plan: &Plan<'_>) {
         for table in &self.tables {
-            connector_log(plan, &table.table).event(
+            connector_log(engine, plan, &table.table).event(
                 "reconcile",
                 json!({
                     "verdict": table.verdicts().join(","),
@@ -585,18 +588,18 @@ impl ReconcileReport {
 ///
 /// Goes through [`postgres_cdc_pipeline_options`] rather than joining `logs/` here, so reconcile
 /// can never write beside the file the running pipeline writes.
-fn connector_log(plan: &Plan<'_>, table: &str) -> ConnectorLog {
+fn connector_log(engine: &Engine, plan: &Plan<'_>, table: &str) -> ConnectorLog {
     let mut options: BTreeMap<String, String> = plan
         .table(table)
         .and_then(|t| t.source.as_ref())
         .map(|s| s.options.clone())
         .unwrap_or_default();
-    postgres_cdc_pipeline_options(
-        &mut options,
-        Path::new(plan.pipeline.checkpoints.trim_end_matches('/')),
+    postgres_cdc_pipeline_options(&mut options, &plan.pipeline.checkpoints, table);
+    ConnectorLog::open(
+        Some(engine),
+        options.get(LOG_DIR_OPTION).map(String::as_str),
         table,
-    );
-    ConnectorLog::new(options.get(LOG_DIR_OPTION).map(Path::new), table)
+    )
 }
 
 /// Where [`postgres_cdc_pipeline_options`] puts the log directory it injects.
@@ -693,11 +696,7 @@ pub async fn reconcile(
         // The source's own config block, resolved exactly as `run` resolves it — including
         // `password_env`, which reads the variable and fails by name when it is unset.
         let mut raw: BTreeMap<String, String> = source.options.clone();
-        postgres_cdc_pipeline_options(
-            &mut raw,
-            Path::new(plan.pipeline.checkpoints.trim_end_matches('/')),
-            &name,
-        );
+        postgres_cdc_pipeline_options(&mut raw, &plan.pipeline.checkpoints, &name);
         let pg: HashMap<String, String> = raw.into_iter().collect();
         known.insert(name.clone());
         // `--table` entries naming the pipeline table are settled from the config, so they stay
@@ -790,7 +789,7 @@ pub async fn reconcile(
         pipeline: plan.pipeline.name.clone(),
         tables: reports,
     };
-    report.log_events(plan);
+    report.log_events(engine, plan);
     Ok(report)
 }
 
@@ -1568,37 +1567,37 @@ fn default_sample() -> usize {
 }
 
 impl ReconcileSchedule {
-    pub fn path_in(checkpoints: &str) -> PathBuf {
-        Path::new(checkpoints.trim_end_matches('/')).join("reconcile.json")
+    /// The schedule's key under the checkpoint root.
+    pub const KEY: &'static str = "reconcile.json";
+
+    /// Where the schedule is, as an operator would type it. `s3://bucket/ckpt/reconcile.json`
+    /// when the root is a bucket — the point of printing it is that someone can go and look.
+    pub fn path_in(checkpoints: &CheckpointStore) -> String {
+        checkpoints.uri(Self::KEY)
     }
 
-    /// The schedule, or `None` when there is none — an unreadable or corrupt file reads as none
-    /// so a bad write can never stop a pipeline from running.
-    pub fn load(checkpoints: &str) -> Option<Self> {
-        let text = std::fs::read_to_string(Self::path_in(checkpoints)).ok()?;
-        serde_json::from_str(&text).ok()
+    /// The schedule, or `None` when there is none — an unreadable or corrupt object reads as
+    /// none so a bad write can never stop a pipeline from running.
+    pub async fn load(checkpoints: &CheckpointStore) -> Option<Self> {
+        let bytes = checkpoints.read(Self::KEY).await.ok().flatten()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
-    pub fn save(&self, checkpoints: &str) -> Result<()> {
-        let path = Self::path_in(checkpoints);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::Io(format!("create `{}`: {e}", parent.display())))?;
-        }
-        let text = serde_json::to_string_pretty(self)
+    pub async fn save(&self, checkpoints: &CheckpointStore) -> Result<()> {
+        let text = serde_json::to_vec_pretty(self)
             .map_err(|e| Error::Io(format!("encode the reconcile schedule: {e}")))?;
-        std::fs::write(&path, text)
-            .map_err(|e| Error::Io(format!("write `{}`: {e}", path.display())))
+        checkpoints
+            .write(Self::KEY, text)
+            .await
+            .map_err(|e| Error::Io(format!("write `{}`: {e}", Self::path_in(checkpoints))))
     }
 
     /// Remove the schedule, reporting whether there was one.
-    pub fn remove(checkpoints: &str) -> Result<bool> {
-        let path = Self::path_in(checkpoints);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(Error::Io(format!("remove `{}`: {e}", path.display()))),
-        }
+    pub async fn remove(checkpoints: &CheckpointStore) -> Result<bool> {
+        checkpoints
+            .remove(Self::KEY)
+            .await
+            .map_err(|e| Error::Io(format!("remove `{}`: {e}", Self::path_in(checkpoints))))
     }
 
     /// When the next firing is measured from: the last run, or registration before there is one.
@@ -1675,17 +1674,18 @@ fn parse_time(text: &str) -> Option<DateTime<Utc>> {
 /// The schedule also goes into every `postgres_cdc` connector's log as a `reconcile` event, so
 /// the file an operator already reads for this connector says when it is next going to be
 /// checked — otherwise the only record of a schedule is a JSON file nobody thought to look for.
-pub fn set_schedule(
+pub async fn set_schedule(
+    engine: &Engine,
     plan: &Plan<'_>,
     cron: &str,
     config_path: Option<&Path>,
     options: &ReconcileOptions,
 ) -> Result<ReconcileSchedule> {
-    let checkpoints = plan.pipeline.checkpoints.as_str();
+    let checkpoints = checkpoint_store(engine, &plan.pipeline.checkpoints)?;
     let parsed = Cron::parse(cron)?;
     // Keep whatever the previous schedule learned: changing the expression does not un-run the
     // last reconcile, and losing its verdict would make `pipeline show` claim it never ran.
-    let previous = ReconcileSchedule::load(checkpoints);
+    let previous = ReconcileSchedule::load(&checkpoints).await;
     let schedule = ReconcileSchedule {
         path: config_path
             .map(|p| p.display().to_string())
@@ -1700,9 +1700,9 @@ pub fn set_schedule(
         last_run: previous.as_ref().and_then(|p| p.last_run.clone()),
         last_result: previous.as_ref().and_then(|p| p.last_result.clone()),
     };
-    schedule.save(checkpoints)?;
+    schedule.save(&checkpoints).await?;
     for table in cdc_table_names(plan) {
-        connector_log(plan, &table).event(
+        connector_log(engine, plan, &table).event(
             "reconcile",
             json!({
                 "scheduled": schedule.cron,
@@ -2607,11 +2607,17 @@ tables:
         .expect("the fixture config parses")
     }
 
-    #[test]
-    fn a_schedule_round_trips_through_the_checkpoint_directory() {
+    /// The checkpoint store for a temp directory, resolved exactly as a running pipeline does.
+    fn store_at(dir: &tempfile::TempDir) -> CheckpointStore {
+        checkpoint_store(&Engine::default(), &dir.path().to_string_lossy()).expect("resolves")
+    }
+
+    #[tokio::test]
+    async fn a_schedule_round_trips_through_the_checkpoint_directory() {
         let dir = tempfile::TempDir::new().unwrap();
         let checkpoints = dir.path().to_string_lossy().into_owned();
-        assert!(ReconcileSchedule::load(&checkpoints).is_none());
+        let store = store_at(&dir);
+        assert!(ReconcileSchedule::load(&store).await.is_none());
 
         let options = ReconcileOptions {
             tables: vec!["public.sales_suppliers".into()],
@@ -2620,35 +2626,45 @@ tables:
         let config = config_with_cdc_table(&checkpoints);
         let plan = Plan::build(&config).expect("plans");
         let saved = set_schedule(
+            &Engine::default(),
             &plan,
             "  0   6 * * *  ",
             Some(Path::new("/srv/oxidant.yaml")),
             &options,
         )
+        .await
         .expect("registers");
         assert_eq!(saved.cron, "0 6 * * *", "the expression is normalized");
         assert_eq!(saved.path.as_deref(), Some("/srv/oxidant.yaml"));
 
-        let loaded = ReconcileSchedule::load(&checkpoints).expect("reads back");
+        let loaded = ReconcileSchedule::load(&store).await.expect("reads back");
         assert_eq!(loaded, saved);
         assert_eq!(loaded.tables, vec!["public.sales_suppliers".to_string()]);
         assert_eq!(loaded.sample, 5000);
         assert!(loaded.last_run.is_none());
 
-        assert!(ReconcileSchedule::remove(&checkpoints).expect("removes"));
-        assert!(!ReconcileSchedule::remove(&checkpoints).expect("idempotent"));
-        assert!(ReconcileSchedule::load(&checkpoints).is_none());
+        assert!(ReconcileSchedule::remove(&store).await.expect("removes"));
+        assert!(!ReconcileSchedule::remove(&store).await.expect("idempotent"));
+        assert!(ReconcileSchedule::load(&store).await.is_none());
     }
 
-    #[test]
-    fn registering_a_schedule_leaves_a_line_in_the_connector_log() {
+    #[tokio::test]
+    async fn registering_a_schedule_leaves_a_line_in_the_connector_log() {
         // The JSON file is where the scheduler reads it; the connector log is where an operator
         // — and the platform console, which parses this file — will look.
         let dir = tempfile::TempDir::new().unwrap();
         let checkpoints = dir.path().to_string_lossy().into_owned();
         let config = config_with_cdc_table(&checkpoints);
         let plan = Plan::build(&config).expect("plans");
-        set_schedule(&plan, "0 6 * * *", None, &ReconcileOptions::default()).expect("registers");
+        set_schedule(
+            &Engine::default(),
+            &plan,
+            "0 6 * * *",
+            None,
+            &ReconcileOptions::default(),
+        )
+        .await
+        .expect("registers");
 
         let log = dir.path().join("logs").join("sales_suppliers.jsonl");
         let text =
@@ -2666,26 +2682,41 @@ tables:
         );
     }
 
-    #[test]
-    fn re_registering_keeps_what_the_last_run_found() {
+    #[tokio::test]
+    async fn re_registering_keeps_what_the_last_run_found() {
         // Changing the expression does not un-run the last reconcile; dropping its verdict would
         // make `pipeline show` claim it never ran.
         let dir = tempfile::TempDir::new().unwrap();
         let checkpoints = dir.path().to_string_lossy().into_owned();
         let config = config_with_cdc_table(&checkpoints);
         let plan = Plan::build(&config).expect("plans");
-        let mut first =
-            set_schedule(&plan, "0 6 * * *", None, &ReconcileOptions::default()).unwrap();
+        let store = store_at(&dir);
+        let mut first = set_schedule(
+            &Engine::default(),
+            &plan,
+            "0 6 * * *",
+            None,
+            &ReconcileOptions::default(),
+        )
+        .await
+        .unwrap();
         first.record(
             DateTime::parse_from_rfc3339("2026-08-23T06:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
             "in_sync".into(),
         );
-        first.save(&checkpoints).unwrap();
+        first.save(&store).await.unwrap();
 
-        let second =
-            set_schedule(&plan, "0 */6 * * *", None, &ReconcileOptions::default()).unwrap();
+        let second = set_schedule(
+            &Engine::default(),
+            &plan,
+            "0 */6 * * *",
+            None,
+            &ReconcileOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(second.cron, "0 */6 * * *");
         assert_eq!(second.last_result.as_deref(), Some("in_sync"));
         assert_eq!(second.last_run.as_deref(), Some("2026-08-23T06:00:00Z"));
@@ -2695,18 +2726,25 @@ tables:
         );
     }
 
-    #[test]
-    fn an_unparseable_expression_is_refused_before_anything_is_written() {
+    #[tokio::test]
+    async fn an_unparseable_expression_is_refused_before_anything_is_written() {
         let dir = tempfile::TempDir::new().unwrap();
         let checkpoints = dir.path().to_string_lossy().into_owned();
         let config = config_with_cdc_table(&checkpoints);
         let plan = Plan::build(&config).expect("plans");
-        let err = set_schedule(&plan, "every morning", None, &ReconcileOptions::default())
-            .expect_err("refused");
+        let err = set_schedule(
+            &Engine::default(),
+            &plan,
+            "every morning",
+            None,
+            &ReconcileOptions::default(),
+        )
+        .await
+        .expect_err("refused");
         assert!(err.to_string().contains("5 fields"), "got: {err}");
         assert!(
-            !ReconcileSchedule::path_in(&checkpoints).exists(),
-            "a refused expression must not leave a file behind"
+            ReconcileSchedule::load(&store_at(&dir)).await.is_none(),
+            "a refused expression must not leave a schedule behind"
         );
     }
 
@@ -2790,12 +2828,15 @@ tables:
         assert!(!saved.is_due_since(Some(ran_at), at("2026-08-24T06:00:01Z")));
     }
 
-    #[test]
-    fn a_corrupt_or_hand_edited_schedule_never_stops_a_pipeline() {
+    #[tokio::test]
+    async fn a_corrupt_or_hand_edited_schedule_never_stops_a_pipeline() {
         let dir = tempfile::TempDir::new().unwrap();
-        let checkpoints = dir.path().to_string_lossy().into_owned();
-        std::fs::write(ReconcileSchedule::path_in(&checkpoints), "{ not json").unwrap();
-        assert!(ReconcileSchedule::load(&checkpoints).is_none());
+        let store = store_at(&dir);
+        store
+            .write(ReconcileSchedule::KEY, b"{ not json".to_vec())
+            .await
+            .unwrap();
+        assert!(ReconcileSchedule::load(&store).await.is_none());
 
         let hand_edited = ReconcileSchedule {
             path: None,
