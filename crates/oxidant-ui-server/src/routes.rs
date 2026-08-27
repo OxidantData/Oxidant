@@ -27,9 +27,11 @@ pub struct AppState {
     /// and the connector-log tail). `None` disables all three; nothing else on this server is
     /// authenticated. See [`crate::status`].
     pub status_token: Option<std::sync::Arc<str>>,
-    /// Pipeline checkpoint root ([`pipelines::CHECKPOINT_DIR_ENV`]), under which connector
-    /// logs live. `None` — the default — makes both pipeline routes answer 404.
-    pub checkpoint_dir: Option<std::sync::Arc<std::path::Path>>,
+    /// Where connector logs are read from, resolved once from the pipeline checkpoint root
+    /// ([`pipelines::CHECKPOINT_DIR_ENV`]) — a directory on the driver, or a prefix in the
+    /// object store the pipeline checkpoints to. `None` — the default, and also an unresolvable
+    /// root — makes both pipeline routes answer 404.
+    pub logs: Option<pipelines::LogStore>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,24 +72,30 @@ pub fn app_router_with(
         status_token,
         dashboard_store,
         static_files::spa_dir(),
-        pipelines::checkpoint_dir_from_env(),
+        pipelines::checkpoint_root_from_env(),
     )
 }
 
 /// As [`app_router_with`], with the SPA directory and the pipeline checkpoint root passed in
 /// rather than read from the environment — the form tests use to exercise both static-file
 /// paths and the connector-log route.
+///
+/// `checkpoint_root` is a filesystem path or an object-store URL, and is resolved once here
+/// rather than per request: resolving an `s3://` root builds a client, and doing that on every
+/// poll of the Pipelines page would make the cheapest route on this server the most expensive.
 pub fn app_router_with_spa(
     store: SharedStore,
     status_token: Option<String>,
     dashboard_store: DashboardStore,
     spa_dir: Option<std::path::PathBuf>,
-    checkpoint_dir: Option<std::path::PathBuf>,
+    checkpoint_root: Option<String>,
 ) -> Router {
     let state = AppState {
         store,
         status_token: status::normalize_token(status_token).map(Into::into),
-        checkpoint_dir: checkpoint_dir.map(Into::into),
+        logs: checkpoint_root
+            .as_deref()
+            .and_then(pipelines::LogStore::resolve),
     };
     let router = Router::new()
         .route("/api/status", get(status::status))

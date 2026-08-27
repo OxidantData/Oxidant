@@ -1061,9 +1061,12 @@ impl OxidantService {
 
         if !dry {
             if full_refresh {
-                clear_pipeline_state(&storage, &[]).map_err(crate::err_to_status)?;
+                clear_pipeline_state(engine, &storage, &[])
+                    .await
+                    .map_err(crate::err_to_status)?;
             } else if !full_refresh_tables.is_empty() {
-                clear_pipeline_state(&storage, &full_refresh_tables)
+                clear_pipeline_state(engine, &storage, &full_refresh_tables)
+                    .await
                     .map_err(crate::err_to_status)?;
             } else if !graph_refreshes.is_empty() {
                 let tables: Vec<String> = graph_refreshes
@@ -1077,7 +1080,9 @@ impl OxidantService {
                         .table_name
                     })
                     .collect();
-                clear_pipeline_state(&storage, &tables).map_err(crate::err_to_status)?;
+                clear_pipeline_state(engine, &storage, &tables)
+                    .await
+                    .map_err(crate::err_to_status)?;
             }
         }
 

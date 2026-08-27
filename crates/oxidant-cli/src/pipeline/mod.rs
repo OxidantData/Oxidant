@@ -2,9 +2,10 @@
 
 use oxidant_common::{Error, Result};
 use oxidant_config::{OxidantConfig, TableKind};
+use oxidant_loom::Engine;
 use oxidant_pipelines::{
-    run_pipeline, set_schedule, Plan, ReconcileOptions, ReconcileSchedule, RunEvent, RunEventKind,
-    DEFAULT_SAMPLE,
+    checkpoint_store, run_pipeline, set_schedule, Plan, ReconcileOptions, ReconcileSchedule,
+    RunEvent, RunEventKind, DEFAULT_SAMPLE,
 };
 
 /// What `oxidant pipeline` was asked to do.
@@ -208,7 +209,7 @@ pub async fn run(config: Option<OxidantConfig>, command: Command) -> Result<()> 
             Ok(())
         }
         Command::Show => {
-            print_graph(&plan);
+            print_graph(&plan).await;
             Ok(())
         }
         Command::Run { tables, once } => {
@@ -231,7 +232,8 @@ pub async fn run(config: Option<OxidantConfig>, command: Command) -> Result<()> 
         } => {
             let options = ReconcileOptions { tables, sample };
             if let Some(cron) = cron {
-                return register_schedule(&plan, &cron, config.source_path.as_deref(), &options);
+                return register_schedule(&plan, &cron, config.source_path.as_deref(), &options)
+                    .await;
             }
             // Every exit from here carries a status code the docs name, so an error out of the
             // reconcile itself must not fall through to the generic handler in `main` — that
@@ -269,18 +271,25 @@ fn reconcile_failed(error: &Error) -> ! {
 }
 
 /// `reconcile --cron <EXPR>`: persist the schedule (or clear it) and say what changed.
-fn register_schedule(
+///
+/// The engine is a default one rather than the configured stack: registering a schedule reads
+/// and writes exactly one object under the checkpoint root, and building the catalogs to do it
+/// would make `--cron off` fail whenever a metastore happens to be down. It is still the same
+/// [`oxidant_streaming::checkpoint_store`] the running pipeline resolves through, so an `s3://`
+/// root lands in the bucket the pipeline reads and not in a `s3:` directory beside the shell.
+async fn register_schedule(
     plan: &Plan<'_>,
     cron: &str,
     config_path: Option<&std::path::Path>,
     options: &ReconcileOptions,
 ) -> Result<()> {
-    let checkpoints = plan.pipeline.checkpoints.as_str();
+    let engine = Engine::default();
+    let checkpoints = checkpoint_store(&engine, &plan.pipeline.checkpoints)?;
     if CRON_OFF.contains(&cron.trim().to_ascii_lowercase().as_str()) {
-        if ReconcileSchedule::remove(checkpoints)? {
+        if ReconcileSchedule::remove(&checkpoints).await? {
             println!(
                 "reconcile schedule removed from {}",
-                ReconcileSchedule::path_in(checkpoints).display()
+                ReconcileSchedule::path_in(&checkpoints)
             );
         } else {
             println!(
@@ -290,15 +299,12 @@ fn register_schedule(
         }
         return Ok(());
     }
-    let schedule = set_schedule(plan, cron, config_path, options)?;
+    let schedule = set_schedule(&engine, plan, cron, config_path, options).await?;
     println!(
         "reconcile scheduled for pipeline `{}`: `{}`",
         plan.pipeline.name, schedule.cron
     );
-    println!(
-        "  written to {}",
-        ReconcileSchedule::path_in(checkpoints).display()
-    );
+    println!("  written to {}", ReconcileSchedule::path_in(&checkpoints));
     println!(
         "  next: {}",
         oxidant_pipelines::Cron::parse(&schedule.cron)
@@ -316,7 +322,7 @@ fn register_schedule(
     Ok(())
 }
 
-fn print_graph(plan: &Plan<'_>) {
+async fn print_graph(plan: &Plan<'_>) {
     println!("pipeline: {}", plan.pipeline.name);
     println!(
         "target:   {}.{}",
@@ -350,7 +356,7 @@ fn print_graph(plan: &Plan<'_>) {
             );
         }
     }
-    print_schedule(plan);
+    print_schedule(plan).await;
 }
 
 /// The registered `reconcile --cron` schedule, when there is one.
@@ -358,9 +364,13 @@ fn print_graph(plan: &Plan<'_>) {
 /// Printed by `show` because the schedule lives in the checkpoint directory rather than in the
 /// config file: without this, the only way to find out whether a pipeline reconciles itself is to
 /// go looking for a JSON file, and "I thought it was scheduled" is the failure that matters.
-fn print_schedule(plan: &Plan<'_>) {
-    let checkpoints = plan.pipeline.checkpoints.as_str();
-    let Some(schedule) = ReconcileSchedule::load(checkpoints) else {
+async fn print_schedule(plan: &Plan<'_>) {
+    // A default engine, for the same reason [`register_schedule`] uses one: reading one object
+    // must not depend on every catalog in the config being reachable.
+    let Ok(checkpoints) = checkpoint_store(&Engine::default(), &plan.pipeline.checkpoints) else {
+        return;
+    };
+    let Some(schedule) = ReconcileSchedule::load(&checkpoints).await else {
         return;
     };
     println!();
@@ -385,10 +395,7 @@ fn print_schedule(plan: &Plan<'_>) {
             .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_else(|| "never — the expression no longer parses".into())
     );
-    println!(
-        "      from:   {}",
-        ReconcileSchedule::path_in(checkpoints).display()
-    );
+    println!("      from:   {}", ReconcileSchedule::path_in(&checkpoints));
 }
 
 /// Render pipeline events to stderr — byte-identical to the pre-extraction runner.

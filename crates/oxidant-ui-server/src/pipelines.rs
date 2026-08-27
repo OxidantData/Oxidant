@@ -31,9 +31,18 @@
 //!
 //! ## Where the file comes from
 //!
-//! [`CHECKPOINT_DIR_ENV`] names the pipeline checkpoint root — the same directory
-//! `pipeline.checkpoints` points at in `oxidant.yaml`. Logs are one subdirectory below it.
-//! Nothing here writes: this endpoint only reads what a connector left behind.
+//! [`CHECKPOINT_DIR_ENV`] names the pipeline checkpoint root — the same location
+//! `pipeline.checkpoints` points at in `oxidant.yaml`. Logs are one prefix below it. Nothing
+//! here writes: these endpoints only read what a connector left behind.
+//!
+//! That root may be an **object-store URL**, and on any deployment where the driver is
+//! replaceable it should be: a checkpoint root on the driver's disk takes the pipeline's replay
+//! position and the record of why it last stopped with the instance. When it is a URL the
+//! routes read the objects and answer exactly as before, so the platform's read path
+//! (`GET /api/v1/pipelines/{name}/logs`) does not change — the driver proxies the bucket rather
+//! than the console learning to read it. Resolution goes through
+//! [`oxidant_streaming::checkpoint_store`], the same function the pipeline writes through, so
+//! the reader and the writer cannot disagree about which bucket is meant.
 //!
 //! ## When it answers 404
 //!
@@ -55,6 +64,8 @@
 //!
 //! ## Symlinks
 //!
+//! A filesystem concern only — an object store has no symlinks, and a key is a literal.
+//!
 //! A name chooses a file *in* `<checkpoints>/logs`, and the filesystem must not be able to
 //! turn that into a file somewhere else. Both routes resolve through
 //! [`resolve_log_file`]: the entry itself must be a regular file by `symlink_metadata` (a
@@ -75,6 +86,7 @@
 //! set of pipelines a driver is running is itself operational.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path as UrlPath, Query, State},
@@ -82,13 +94,15 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use oxidant_streaming::{checkpoint_store, CheckpointStore};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{routes::AppState, status};
 
-/// Env var naming the pipeline checkpoint root. Set it to the same absolute path as
-/// `pipeline.checkpoints` in `oxidant.yaml`; unset, this endpoint is absent.
+/// Env var naming the pipeline checkpoint root. Set it to the same value as
+/// `pipeline.checkpoints` in `oxidant.yaml` — an absolute path, or an object-store URL
+/// (`s3://bucket/prefix`). Unset, these endpoints are absent.
 pub const CHECKPOINT_DIR_ENV: &str = "OXIDANT_CHECKPOINT_DIR";
 
 /// Connector logs live in one subdirectory of the checkpoint root.
@@ -113,12 +127,48 @@ const MAX_PIPELINES: usize = 200;
 
 /// The configured checkpoint root, if set to something non-blank.
 ///
-/// Existence is **not** checked here: the logs directory appears when the first connector
-/// starts, which is usually after this router was built. Resolution happens per request.
-pub fn checkpoint_dir_from_env() -> Option<PathBuf> {
+/// Existence is **not** checked here: the logs prefix appears when the first connector starts,
+/// which is usually after this router was built. Resolution happens per request.
+pub fn checkpoint_root_from_env() -> Option<String> {
     let raw = std::env::var(CHECKPOINT_DIR_ENV).ok()?;
     let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Where this server reads connector logs from.
+///
+/// Two variants because reading a directory and reading a prefix are genuinely different
+/// operations, not because the root is configured twice: [`LogStore::resolve`] picks between
+/// them from the one value [`CHECKPOINT_DIR_ENV`] carries.
+#[derive(Clone, Debug)]
+pub enum LogStore {
+    /// `<checkpoints>/logs` on the driver's disk.
+    Dir(Arc<Path>),
+    /// The `logs/` prefix under an object-store checkpoint root.
+    Objects(CheckpointStore),
+}
+
+impl LogStore {
+    /// The log store for a checkpoint root, or `None` when the root will not resolve.
+    ///
+    /// A root that will not resolve makes both routes answer 404, like every other absence here:
+    /// this server reports what a pipeline left behind and is not the place an operator finds
+    /// out that their bucket name is wrong — the pipeline refuses to start for that.
+    pub fn resolve(root: &str) -> Option<Self> {
+        let root = root.trim();
+        if root.is_empty() {
+            return None;
+        }
+        if !root.contains("://") {
+            return Some(Self::Dir(Arc::from(Path::new(root).join(LOGS_SUBDIR))));
+        }
+        // A default engine: this is a reader configured from the environment, and the location
+        // is resolved by the same function the writer uses.
+        match checkpoint_store(&oxidant_streaming::Engine::default(), root) {
+            Ok(store) => Some(Self::Objects(store.child(LOGS_SUBDIR))),
+            Err(_) => None,
+        }
+    }
 }
 
 /// One entry of `GET /api/v1/pipelines`.
@@ -147,21 +197,27 @@ pub async fn list_pipelines(State(state): State<AppState>, headers: HeaderMap) -
     if let Some(denied) = status::denied(&state, &headers) {
         return denied;
     }
-    let Some(root) = state.checkpoint_dir.as_deref() else {
+    let Some(logs) = state.logs.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let logs_dir = root.join(LOGS_SUBDIR);
-    if !logs_dir.is_dir() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
-    let read = tokio::task::spawn_blocking(move || read_pipelines(&logs_dir)).await;
+    let read = match logs {
+        LogStore::Dir(dir) => {
+            if !dir.is_dir() {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            let dir = dir.clone();
+            match tokio::task::spawn_blocking(move || read_pipelines(&dir)).await {
+                Ok(read) => read,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+        LogStore::Objects(store) => read_pipeline_objects(store).await,
+    };
     let mut entries = match read {
-        Ok(Ok(entries)) => entries,
-        // The directory was there a moment ago and cannot be read now: same "nothing here" the
+        Ok(entries) => entries,
+        // The prefix was there a moment ago and cannot be read now: same "nothing here" the
         // per-name route answers, rather than a 500 the UI would have to render differently.
-        Ok(Err(_)) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
     // Newest write first: the pipeline that just committed a batch is the one being looked for.
     entries.sort_by(|a, b| {
@@ -219,6 +275,65 @@ fn read_pipelines(dir: &Path) -> std::io::Result<Vec<PipelineEntry>> {
     Ok(out)
 }
 
+/// [`read_pipelines`] over an object-store prefix.
+///
+/// The same rules as the directory walk: only `<name>.jsonl`, only names the per-name route
+/// would accept, and only objects sitting directly under the prefix — a key with a `/` left in
+/// it is something else's, not a pipeline. There are no symlinks to defend against here; a key
+/// is a literal.
+async fn read_pipeline_objects(store: &CheckpointStore) -> std::io::Result<Vec<PipelineEntry>> {
+    let mut out = Vec::new();
+    for object in store.list("").await? {
+        if object.name.contains('/') {
+            continue;
+        }
+        let Some(name) = object.name.strip_suffix(&format!(".{LOG_EXT}")) else {
+            continue;
+        };
+        if !is_plain_name(name) {
+            continue;
+        }
+        out.push(PipelineEntry {
+            name: name.to_string(),
+            size_bytes: object.size_bytes,
+            modified_ms: object.modified_ms,
+        });
+    }
+    Ok(out)
+}
+
+/// [`read_tail`] over an object-store prefix: a ranged `GET` on the end of the object, so the
+/// tail costs the same whether the log is 2 KiB or 2 GiB.
+///
+/// `Ok(None)` when there is no such object — the 404 every other absence on this route answers.
+async fn read_object_tail(
+    store: &CheckpointStore,
+    name: &str,
+    tail: usize,
+) -> std::io::Result<Option<(Vec<String>, bool)>> {
+    let key = format!("{name}.{LOG_EXT}");
+    let Some((bytes, truncated)) = store.read_tail(&key, MAX_TAIL_BYTES).await? else {
+        return Ok(None);
+    };
+    Ok(Some(last_lines(&bytes, tail, truncated)))
+}
+
+/// The last `tail` whole lines of `buf`, dropping the leading fragment when the window started
+/// mid-object. Shared by both backends so a tail reads the same wherever the log lives.
+fn last_lines(buf: &[u8], tail: usize, truncated: bool) -> (Vec<String>, bool) {
+    let text = String::from_utf8_lossy(buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // A window that starts mid-object starts mid-line; that fragment is not a record.
+    if truncated && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let from = lines.len().saturating_sub(tail);
+    (
+        lines[from..].iter().map(|l| (*l).to_string()).collect(),
+        truncated,
+    )
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LogsParams {
     /// How many trailing events to return (default 100, capped at 1000).
@@ -248,25 +363,30 @@ pub async fn pipeline_logs(
             .into_response();
     }
 
-    let Some(root) = state.checkpoint_dir.as_deref() else {
+    let Some(logs) = state.logs.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let logs_dir = root.join(LOGS_SUBDIR);
-    if !logs_dir.is_dir() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let Some(path) = resolve_log_file(&logs_dir, &name) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
     let tail = params.tail.unwrap_or(DEFAULT_TAIL).clamp(1, MAX_TAIL);
-    let read = tokio::task::spawn_blocking(move || read_tail(&path, tail)).await;
+    let read = match logs {
+        LogStore::Dir(dir) => {
+            if !dir.is_dir() {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            let Some(path) = resolve_log_file(dir, &name) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            match tokio::task::spawn_blocking(move || read_tail(&path, tail)).await {
+                Ok(read) => read.map(Some),
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+        LogStore::Objects(store) => read_object_tail(store, &name, tail).await,
+    };
     let (lines, truncated) = match read {
-        Ok(Ok(v)) => v,
-        // The file was there a moment ago and is not readable now (rotated, or permissions):
+        Ok(Some(v)) => v,
+        // The object was there a moment ago and is not readable now (rotated, or permissions):
         // that is the same "nothing to show" the UI already handles.
-        Ok(Err(_)) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(None) | Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
     // A half-written last line is normal for a log being appended to right now. Count those
@@ -343,17 +463,7 @@ fn read_tail(path: &Path, tail: usize) -> std::io::Result<(Vec<String>, bool)> {
     let mut buf = Vec::with_capacity((len - start).min(MAX_TAIL_BYTES) as usize);
     file.read_to_end(&mut buf)?;
 
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines: Vec<&str> = text.lines().collect();
-    // A window that starts mid-file starts mid-line; that fragment is not a record.
-    if truncated && !lines.is_empty() {
-        lines.remove(0);
-    }
-    let from = lines.len().saturating_sub(tail);
-    Ok((
-        lines[from..].iter().map(|l| (*l).to_string()).collect(),
-        truncated,
-    ))
+    Ok(last_lines(&buf, tail, truncated))
 }
 
 #[cfg(test)]
@@ -392,7 +502,7 @@ mod tests {
             token.map(str::to_string),
             DashboardStore::in_memory(),
             None,
-            checkpoint_dir,
+            checkpoint_dir.map(|d| d.display().to_string()),
         )
     }
 
@@ -820,10 +930,17 @@ mod tests {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(CHECKPOINT_DIR_ENV, "   ");
-        assert_eq!(checkpoint_dir_from_env(), None);
+        assert_eq!(checkpoint_root_from_env(), None);
         std::env::set_var(CHECKPOINT_DIR_ENV, " /srv/ckpt ");
-        assert_eq!(checkpoint_dir_from_env(), Some(PathBuf::from("/srv/ckpt")));
+        assert_eq!(checkpoint_root_from_env().as_deref(), Some("/srv/ckpt"));
+        // An object-store root passes through as written — a `PathBuf` here is what used to
+        // turn `s3://bucket/ckpt` into a relative path whose first component is `s3:`.
+        std::env::set_var(CHECKPOINT_DIR_ENV, " s3://bucket/ckpt ");
+        assert_eq!(
+            checkpoint_root_from_env().as_deref(),
+            Some("s3://bucket/ckpt")
+        );
         std::env::remove_var(CHECKPOINT_DIR_ENV);
-        assert_eq!(checkpoint_dir_from_env(), None);
+        assert_eq!(checkpoint_root_from_env(), None);
     }
 }

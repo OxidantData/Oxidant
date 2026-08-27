@@ -1,9 +1,13 @@
 //! Checkpoint metadata persistence (offsets, batch id, sink commits).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
+use oxidant_common::{Error, Result};
+use oxidant_loom::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::query::StreamingQueryId;
@@ -252,6 +256,269 @@ impl CheckpointStore {
 /// from an old watermark catches up over the batches that follow.
 const PRUNE_BATCH: usize = 8;
 
+/// One object under a checkpoint root, as the log-serving endpoints see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointObject {
+    /// Path relative to the root the listing was rooted at, `/`-separated.
+    pub name: String,
+    pub size_bytes: u64,
+    /// Last-write time in epoch milliseconds, or `None` where the store reports none.
+    pub modified_ms: Option<u64>,
+}
+
+/// Generic object access under the checkpoint root.
+///
+/// Everything a pipeline keeps beside its offsets — the pipeline's per-table epochs, the
+/// `reconcile.json` schedule, the connector logs the console tails — used to go through
+/// `std::fs` while the offsets went through this store. That split is invisible until the root
+/// is an `s3://` URL, at which point the offsets land in the bucket and everything else lands
+/// in a local directory named `s3:` under the driver's working directory. The driver then looks
+/// healthy right up to the moment it is replaced, and the replacement re-snapshots.
+impl CheckpointStore {
+    /// A store rooted at `segment` (which may contain `/`) under this one.
+    pub fn child(&self, segment: &str) -> Self {
+        Self {
+            store: self.store.clone(),
+            root: join_rel(&self.root, segment),
+            location: format!("{}/{segment}", self.location.trim_end_matches('/')),
+        }
+    }
+
+    /// The object-store path of `rel` under this root.
+    pub fn object_path(&self, rel: &str) -> ObjectPath {
+        join_rel(&self.root, rel)
+    }
+
+    /// `rel` as an operator would type it — the configured location plus the relative key.
+    pub fn uri(&self, rel: &str) -> String {
+        if rel.is_empty() {
+            self.location.clone()
+        } else {
+            format!("{}/{rel}", self.location.trim_end_matches('/'))
+        }
+    }
+
+    /// The bytes of `rel`, or `None` when there is no such object.
+    pub async fn read(&self, rel: &str) -> std::io::Result<Option<Vec<u8>>> {
+        match self.store.get(&self.object_path(rel)).await {
+            Ok(result) => Ok(Some(result.bytes().await.map_err(io_err)?.to_vec())),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    /// Replace `rel` with `bytes`. A `PUT` is atomic, so no staged temporary file is needed —
+    /// see [`CheckpointStore::save`].
+    pub async fn write(&self, rel: &str, bytes: Vec<u8>) -> std::io::Result<()> {
+        self.store
+            .put(&self.object_path(rel), bytes.into())
+            .await
+            .map_err(io_err)?;
+        Ok(())
+    }
+
+    /// Delete `rel`, reporting whether there was anything there.
+    ///
+    /// The `head` is not redundant. S3 answers a `DELETE` of a key that is not there with `204`,
+    /// exactly as it answers one that was — the delete alone cannot tell "removed it" from
+    /// "there was nothing to remove", and the caller that asks is
+    /// `oxidant pipeline reconcile --cron off`, which reports one of those two things to an
+    /// operator. On a local root the difference showed up for free; on a bucket it silently did
+    /// not. One extra round trip, on an operation that runs when someone types a command.
+    pub async fn remove(&self, rel: &str) -> std::io::Result<bool> {
+        let path = self.object_path(rel);
+        let existed = match self.store.head(&path).await {
+            Ok(_) => true,
+            Err(object_store::Error::NotFound { .. }) => false,
+            Err(e) => return Err(io_err(e)),
+        };
+        match self.store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(existed),
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    /// Move `from` to `to`, both relative to this root.
+    ///
+    /// Copy-then-delete, not `ObjectStore::rename`: S3 has no rename, and the trait's default
+    /// implementation is exactly this pair under a name that reads as if it were atomic. A
+    /// missing source is not an error — the callers are rotating a generation that may never
+    /// have been written.
+    pub async fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        let (from, to) = (self.object_path(from), self.object_path(to));
+        match self.store.copy(&from, &to).await {
+            Ok(()) => {}
+            Err(object_store::Error::NotFound { .. }) => return Ok(()),
+            Err(e) => return Err(io_err(e)),
+        }
+        match self.store.delete(&from).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    /// The last `max_bytes` of `rel`, plus whether the window started mid-object.
+    ///
+    /// A ranged `GET`, not a whole read: a connector log grows without bound, and a tail has to
+    /// cost the same whether the object is 2 KiB or 2 GiB. `None` when there is no such object.
+    pub async fn read_tail(
+        &self,
+        rel: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+        let path = self.object_path(rel);
+        let size = match self.store.head(&path).await {
+            Ok(meta) => meta.size,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(io_err(e)),
+        };
+        if size == 0 {
+            return Ok(Some((Vec::new(), false)));
+        }
+        let start = size.saturating_sub(max_bytes);
+        let bytes = self
+            .store
+            .get_range(&path, start..size)
+            .await
+            .map_err(io_err)?;
+        Ok(Some((bytes.to_vec(), start > 0)))
+    }
+
+    /// Every object directly or transitively under `rel`, named relative to `rel`.
+    ///
+    /// An empty listing is not an error: an object store has no directories, so "the prefix does
+    /// not exist" and "nothing has been written under it yet" are the same fact.
+    pub async fn list(&self, rel: &str) -> std::io::Result<Vec<CheckpointObject>> {
+        let prefix = self.object_path(rel);
+        let mut stream = self.store.list(Some(&prefix));
+        let mut out = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(io_err)?;
+            let Some(rest) = meta.location.prefix_match(&prefix) else {
+                continue;
+            };
+            let name = rest
+                .map(|part| part.as_ref().to_string())
+                .collect::<Vec<_>>()
+                .join("/");
+            if name.is_empty() {
+                continue;
+            }
+            out.push(CheckpointObject {
+                name,
+                size_bytes: meta.size,
+                modified_ms: u64::try_from(meta.last_modified.timestamp_millis()).ok(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fail now if this root cannot be reached, naming the location.
+    ///
+    /// Called once at pipeline start. Without it a bogus bucket surfaces as whatever the first
+    /// checkpoint write happens to be — an `error` line inside the connector log the same bucket
+    /// was supposed to hold, which nobody can read. A single `list` is enough: S3 answers
+    /// `NoSuchBucket` for a bucket that is not there and `403` for one this process cannot see,
+    /// and both are things an operator must hear at boot rather than an hour in.
+    pub async fn probe(&self) -> Result<()> {
+        self.store
+            .list(Some(&self.root))
+            .next()
+            .await
+            .transpose()
+            .map(|_| ())
+            .map_err(|e| {
+                Error::Io(format!(
+                    "checkpoint root `{}` is not reachable: {e}. Checkpoints are the pipeline's \
+                     replay position — a root that cannot be written is a pipeline that \
+                     re-snapshots on every restart, so this is refused at start rather than \
+                     discovered later.",
+                    self.location
+                ))
+            })
+    }
+}
+
+/// Split a `/`-separated relative key into object-store path parts.
+///
+/// `ObjectPath::join` takes one part and percent-encodes a `/` inside it, so a key like
+/// `logs/orders.jsonl` handed over whole becomes a single object literally named
+/// `logs%2Forders.jsonl` — which lists, reads and writes perfectly and is invisible to anything
+/// looking for `logs/`.
+fn join_rel(root: &ObjectPath, rel: &str) -> ObjectPath {
+    let mut path = root.clone();
+    for part in rel.split('/').filter(|p| !p.is_empty() && *p != ".") {
+        path = path.join(part);
+    }
+    path
+}
+
+/// Resolve a checkpoint root to a store and a prefix within it.
+///
+/// The **one** place a checkpoint location becomes an object store. Goes through the engine's
+/// own resolver, so a checkpoint on S3 uses exactly the credentials, endpoint, and assumed role
+/// the table write uses — one auth path, not two. A bare filesystem path is normalized to a
+/// `file://` URL first; without that, `s3://bucket/x` and `/tmp/x` are indistinguishable to the
+/// URL parser and the object store, and the S3 one silently lands in a local directory named
+/// `s3:`.
+///
+/// Callers with no engine of their own (the one-shot CLI paths — `pipeline show`,
+/// `reconcile --cron`) pass a default [`Engine`], which is a cheap in-process constructor and
+/// resolves `s3://` from the ambient AWS environment. That is deliberately the same function
+/// rather than a second resolver: a second one is how the CLI and the runner end up disagreeing
+/// about which bucket the schedule is in.
+pub fn checkpoint_store(engine: &Engine, location: &str) -> Result<CheckpointStore> {
+    let trimmed = location.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Plan(
+            "checkpoint location is empty — it is the source of truth for replay".into(),
+        ));
+    }
+    let url = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        let absolute = std::path::Path::new(trimmed);
+        let absolute = if absolute.is_absolute() {
+            absolute.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| Error::Io(format!("resolving `{trimmed}`: {e}")))?
+                .join(absolute)
+        };
+        // The directory has to exist before it can be addressed as a store prefix. Only for a
+        // filesystem root: an object store has no directories to create.
+        std::fs::create_dir_all(&absolute)
+            .map_err(|e| Error::Io(format!("creating checkpoint `{}`: {e}", absolute.display())))?;
+        format!("file://{}", absolute.display())
+    };
+
+    let store = engine.object_store_for(&url, &HashMap::new())?;
+    let parsed = url::Url::parse(&url)
+        .map_err(|e| Error::Plan(format!("bad checkpoint location `{location}`: {e}")))?;
+    let root = ObjectPath::from(percent_decode(parsed.path()).trim_start_matches('/'));
+    Ok(CheckpointStore::new(store, root, trimmed))
+}
+
+/// Undo the percent-encoding `Url::parse` applies to a path, so a prefix with a space in it
+/// addresses the same object the operator wrote rather than one named `%20`.
+fn percent_decode(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&path[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| path.to_string())
+}
+
 fn io_err(e: object_store::Error) -> std::io::Error {
     // Not `Error::other`, which is stable since 1.74 and this crate's MSRV is 1.72.
     std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -379,6 +646,79 @@ mod tests {
         let loaded = store.load().await.unwrap();
         assert_eq!(loaded.batch_id, 3);
         assert_eq!(loaded.source_offsets, state.source_offsets);
+    }
+
+    #[tokio::test]
+    async fn an_s3_location_never_becomes_a_local_directory_named_s3() {
+        // The trap this whole module exists to avoid: `Path::new("s3://bucket/ckpt")` is a
+        // *relative* path whose first component is `s3:`, so a checkpoint root resolved through
+        // the filesystem lands under the driver's working directory. The query then runs, and
+        // its restart-resume story is fiction.
+        let engine = Engine::new();
+        let store =
+            checkpoint_store(&engine, "s3://oxidant-test/pipelines/orders").expect("resolves");
+        assert_eq!(store.location(), "s3://oxidant-test/pipelines/orders");
+        assert_eq!(
+            store.object_path("offsets.json").to_string(),
+            "pipelines/orders/offsets.json",
+            "the bucket is the store, and the key is the path inside it"
+        );
+        assert_eq!(
+            store.uri("logs/orders.jsonl"),
+            "s3://oxidant-test/pipelines/orders/logs/orders.jsonl"
+        );
+        assert!(
+            !std::path::Path::new("s3:").exists(),
+            "resolving an s3:// root must not create a local `s3:` directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relative_key_addresses_a_prefix_and_not_an_escaped_name() {
+        // `ObjectPath::join` percent-encodes a `/` inside one part, so a key handed over whole
+        // becomes a single object named `logs%2Forders.jsonl` — which reads and writes perfectly
+        // and is invisible to anything listing `logs/`.
+        let dir = TempDir::new().unwrap();
+        let store = local_store(&dir);
+        store
+            .write("logs/orders.jsonl", b"{}\n".to_vec())
+            .await
+            .unwrap();
+        assert!(dir.path().join("logs").join("orders.jsonl").is_file());
+
+        let listed = store.list("logs").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "orders.jsonl");
+        assert_eq!(listed[0].size_bytes, 3);
+
+        assert_eq!(
+            store.read("logs/orders.jsonl").await.unwrap().as_deref(),
+            Some(&b"{}\n"[..])
+        );
+        assert!(store.remove("logs/orders.jsonl").await.unwrap());
+        assert!(!store.remove("logs/orders.jsonl").await.unwrap());
+        assert!(store.list("logs").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_child_store_is_the_same_store_one_prefix_down() {
+        let dir = TempDir::new().unwrap();
+        let logs = local_store(&dir).child("logs");
+        logs.write("orders.jsonl", b"{}\n".to_vec()).await.unwrap();
+        assert!(dir.path().join("logs").join("orders.jsonl").is_file());
+        assert!(logs.location().ends_with("/logs"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_location_is_refused_rather_than_resolved_to_the_working_directory() {
+        // The unreachable-bucket case needs a real endpoint to be honest about, and lives in
+        // `tests/minio_checkpoints.rs` against MinIO. This is the half that needs no network.
+        let engine = Engine::new();
+        let err = checkpoint_store(&engine, "   ").expect_err("refused");
+        assert!(
+            err.to_string().contains("source of truth for replay"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

@@ -34,7 +34,7 @@
 //! LSN, so no change is both in the snapshot and in the stream, and none falls between them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -244,8 +244,11 @@ pub struct PostgresCdcOptions {
     pub transaction_warn_bytes: usize,
     /// How long recreating a slot waits for whoever holds it to let go before giving up.
     pub slot_wait: Duration,
-    /// Where the connector's JSONL log goes, injected by the pipeline runner.
-    pub log_dir: Option<PathBuf>,
+    /// Where the connector's JSONL log goes, injected by the pipeline runner. A filesystem
+    /// path or an object-store URL — a string rather than a `PathBuf` because
+    /// `Path::new("s3://b/x")` is a *relative* path whose first component is `s3:`, which is
+    /// exactly how a checkpoint root on S3 turns into a directory under the driver's cwd.
+    pub log_dir: Option<String>,
     /// The pipeline table this source feeds, used to name the log file.
     pub name: String,
 }
@@ -426,7 +429,7 @@ impl PostgresCdcOptions {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(DEFAULT_SLOT_WAIT_MS),
             ),
-            log_dir: options.get(LOG_DIR_OPTION).map(PathBuf::from),
+            log_dir: options.get(LOG_DIR_OPTION).cloned(),
             name: options
                 .get(NAME_OPTION)
                 .cloned()
@@ -1293,9 +1296,12 @@ impl PostgresCdcSource {
     /// answer only exists after a round trip to the publisher. One connection at query start is
     /// worth paying to have `wal_level`, privileges, the publication and every REPLICA IDENTITY
     /// checked before a pipeline claims to be replicating.
-    pub fn from_options(options: &HashMap<String, String>) -> Result<Self> {
+    pub fn from_options(
+        engine: Option<&Engine>,
+        options: &HashMap<String, String>,
+    ) -> Result<Self> {
         let parsed = PostgresCdcOptions::from_options(options)?;
-        let log = ConnectorLog::new(parsed.log_dir.as_deref(), &parsed.name);
+        let log = ConnectorLog::open(engine, parsed.log_dir.as_deref(), &parsed.name);
         let tables = match bootstrap_blocking(&parsed) {
             Ok(tables) => tables,
             Err(e) => {
@@ -2864,12 +2870,15 @@ fn schema_warnings(tables: &[TableSchema]) -> Vec<String> {
 /// log at another's file.
 pub fn postgres_cdc_pipeline_options(
     options: &mut BTreeMap<String, String>,
-    checkpoints: &Path,
+    checkpoints: &str,
     name: &str,
 ) {
+    // String concatenation, not `Path::join`: the checkpoint root may be `s3://bucket/ckpt`, and
+    // pushing that through `Path` is how an object-store URL becomes a local directory named
+    // `s3:` under whatever the driver's working directory happened to be.
     options.insert(
         LOG_DIR_OPTION.to_string(),
-        checkpoints.join("logs").to_string_lossy().into_owned(),
+        format!("{}/logs", checkpoints.trim_end_matches('/')),
     );
     options.insert(NAME_OPTION.to_string(), name.to_string());
 }
@@ -3360,7 +3369,7 @@ mod tests {
         assert_eq!(options.connect.tls, TlsMode::VerifyCa);
         assert_eq!(
             options.connect.tls_ca.as_deref(),
-            Some(Path::new("/etc/oxidant/pg-ca.pem"))
+            Some(std::path::Path::new("/etc/oxidant/pg-ca.pem"))
         );
         assert_eq!(options.tables, vec!["public.sales_suppliers".to_string()]);
         // Excluded columns are matched case-insensitively, because Postgres folds the names.
@@ -4892,11 +4901,7 @@ mod tests {
     #[test]
     fn the_pipeline_context_options_are_derived_and_not_settable_in_yaml() {
         let mut options: BTreeMap<String, String> = BTreeMap::new();
-        postgres_cdc_pipeline_options(
-            &mut options,
-            Path::new("/srv/checkpoints"),
-            "sales_suppliers",
-        );
+        postgres_cdc_pipeline_options(&mut options, "/srv/checkpoints", "sales_suppliers");
         assert_eq!(options[LOG_DIR_OPTION], "/srv/checkpoints/logs");
         assert_eq!(options[NAME_OPTION], "sales_suppliers");
         // They start with `oxidant.`, which is the one prefix option parsing lets through — so a

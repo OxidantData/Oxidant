@@ -12,7 +12,7 @@ use oxidant_loom::arrow::record_batch::RecordBatch;
 use oxidant_loom::Engine;
 use tokio::sync::RwLock;
 
-use crate::checkpoint::CheckpointStore;
+use crate::checkpoint::{checkpoint_store, CheckpointStore};
 use crate::config::{ExpectationAction, StreamExpectation, StreamQueryConfig};
 use crate::input::MicroBatchInput;
 use crate::kafka::KafkaSource;
@@ -183,8 +183,13 @@ impl StreamingQueryManager {
         let q = StreamingQuery::new(name.clone(), checkpoint_location.clone());
         let id = q.query_id.clone();
         let checkpoint = checkpoint_store(engine, &checkpoint_location)?;
+        // Before the source is built, and so before the connector opens a replication slot: a
+        // checkpoint root that cannot be reached is a query with no replay position, and the
+        // operator has to hear that at `start` rather than from a log inside the bucket that is
+        // not there. Same reason the sink is resolved here.
+        checkpoint.probe().await?;
 
-        let mut source = build_source(&config)?;
+        let mut source = build_source(Some(engine), &config)?;
         // Resume before the first poll: a restarted query must continue from the last committed
         // batch, not replay from `startingOffsets`.
         let restored = recover_from_log(&checkpoint).await?;
@@ -767,38 +772,6 @@ async fn recover_from_log(
     Ok(state)
 }
 
-/// Resolve `checkpointLocation` to a store and a prefix within it.
-///
-/// Goes through the engine's own resolver, so a checkpoint on S3 uses exactly the credentials,
-/// endpoint, and assumed role the table write uses — one auth path, not two. A bare filesystem
-/// path is normalized to a `file://` URL first; without that, `s3://bucket/x` and `/tmp/x` are
-/// indistinguishable to the URL parser and the object store, and the S3 one silently lands in a
-/// local directory named `s3:`.
-fn checkpoint_store(engine: &Engine, location: &str) -> Result<CheckpointStore> {
-    let url = if location.contains("://") {
-        location.to_string()
-    } else {
-        let absolute = std::path::Path::new(location);
-        let absolute = if absolute.is_absolute() {
-            absolute.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|e| Error::Io(format!("resolving `{location}`: {e}")))?
-                .join(absolute)
-        };
-        // The directory has to exist before it can be addressed as a store prefix.
-        std::fs::create_dir_all(&absolute)
-            .map_err(|e| Error::Io(format!("creating checkpoint `{}`: {e}", absolute.display())))?;
-        format!("file://{}", absolute.display())
-    };
-
-    let store = engine.object_store_for(&url, &HashMap::new())?;
-    let parsed = url::Url::parse(&url)
-        .map_err(|e| Error::Plan(format!("bad checkpointLocation `{location}`: {e}")))?;
-    let root = object_store::path::Path::from(parsed.path().trim_start_matches('/'));
-    Ok(CheckpointStore::new(store, root, location))
-}
-
 /// A source position as the JSON string Spark's progress carries. `{}` when the source has no
 /// replayable position, which is what Spark reports for a source with no offsets.
 fn offsets_json(offsets: Option<&SourceOffsets>) -> String {
@@ -815,7 +788,15 @@ fn now_iso8601() -> String {
 }
 
 /// Build the source for a `readStream.format(...)`.
-pub fn build_source(config: &StreamQueryConfig) -> Result<Box<dyn Source>> {
+///
+/// `engine` is what resolves an object-store checkpoint root — a `postgres_cdc` source started
+/// by the pipeline runner writes its operator log beside the checkpoints, and on `s3://` that
+/// needs the same store the offsets use. `None` is the Spark Connect `readStream` path, which
+/// has no checkpoint root at all and so has nothing to resolve.
+pub fn build_source(
+    engine: Option<&Engine>,
+    config: &StreamQueryConfig,
+) -> Result<Box<dyn Source>> {
     let options: HashMap<String, String> = config
         .source_options
         .iter()
@@ -835,7 +816,7 @@ pub fn build_source(config: &StreamQueryConfig) -> Result<Box<dyn Source>> {
         // a pipeline that starts before those checks would fail on its first batch instead of at
         // `start`.
         "postgres_cdc" => Box::new(crate::postgres_cdc::PostgresCdcSource::from_options(
-            &options,
+            engine, &options,
         )?),
         "rate" => {
             let rows = options
@@ -856,8 +837,8 @@ pub fn build_source(config: &StreamQueryConfig) -> Result<Box<dyn Source>> {
 
 /// The schema a source emits, known before the query runs. Used by the Connect translator to
 /// plan the streaming DataFrame.
-pub fn source_schema(config: &StreamQueryConfig) -> Result<SchemaRef> {
-    Ok(build_source(config)?.schema())
+pub fn source_schema(engine: Option<&Engine>, config: &StreamQueryConfig) -> Result<SchemaRef> {
+    Ok(build_source(engine, config)?.schema())
 }
 
 async fn build_sink(
