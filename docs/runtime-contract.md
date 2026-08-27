@@ -127,7 +127,54 @@ namespaced, and neither `deploy/docker/*` nor the orchestrator manifests set `ho
 | `OXIDANT_DUMP_DIR` | Optional | Override for the `dumps/` subtree (support bundles). Counted against and pruned by the disk budget. |
 | `OXIDANT_LOG_DUMP_MAX_BYTES` | Optional | Ceiling on **one** [diagnostic dump](api.md#diagnostic-dumps) (default `1073741824` = 1 GiB). A dump is refused with `507` rather than truncated — both up front, when the budget or the free-space floor already says no, and mid-write, when the bundle passes this cap: a smaller bundle would be carried to a support case in the belief that it held the window that was asked for. Bundles land in `dumps/` as `dump-<uuid>.parquet`, expire after **24 h**, and are swept by the same prune pass that sweeps spilled results. |
 | `OXIDANT_DISK_SWEEP_SECS` | Optional | How often the disk sweeper runs (default `300`). It also runs once at boot. Advanced; mainly a test knob. |
+| `OXIDANT_CHECKPOINT_DIR` | Recommended (pipelines) | The pipeline checkpoint root the driver serves connector logs out of — set it to the same value as `pipeline.checkpoints` in `oxidant.yaml` (the platform's `connectors.checkpoint_root`). **May be an object-store URL** (`s3://bucket/prefix`), and on a replaceable driver it should be: see [Checkpoint root](#checkpoint-root) below. Unset ⇒ `GET /api/v1/pipelines` and `/{name}/logs` answer `404` and the console's Pipelines page says this driver serves no connector logs. Named `_DIR` for the on-disk case it started as; the value is a *location*, not necessarily a directory. |
 | `OXIDANT_PG_CDC_IDLE_MS` | Optional | Milliseconds a `postgres_cdc` micro-batch waits for more WAL before deciding the publisher is caught up (default `500`). Only paid while a batch has not yet covered the flush LSN it was planned against, so a caught-up stream never waits. Raise it on a link with high publisher latency; lower it to shorten the tail of a `trigger: once` drain. See [docs/postgres-cdc.md](postgres-cdc.md). |
+
+## Checkpoint root
+
+`pipeline.checkpoints` — and the `OXIDANT_CHECKPOINT_DIR` the driver serves logs from — is a
+**location**, not a directory. It may be a filesystem path, or an object-store URL:
+
+```yaml
+pipeline:
+  checkpoints: s3://acme-lake/oxidant/checkpoints
+```
+
+Everything the pipeline keeps under that root goes to the same store: the per-table
+`offsets.json` / `offsets/` / `commits/` logs, `_pipeline-state.json` (which tables are built and
+at what epoch), `reconcile.json` (the registered `reconcile --cron` schedule), and
+`logs/<table>.jsonl` (the connector's operator log). One resolver, the same credentials, endpoint
+and assumed role the table writes use.
+
+**What an object-store root buys.** The checkpoint is the pipeline's replay position, and a CDC
+pipeline's replay position is expensive to lose: without it a restarted connector re-snapshots
+every published table from scratch. On a local path that position lives and dies with the driver's
+disk, so replacing the driver — a scale-down, a spot reclaim, a rolling image update, a node
+failure — means a full re-snapshot and, for the window it takes, a table that disagrees with its
+source. On an object-store root the replacement driver reads the same `offsets.json` the previous
+one committed and resumes from that LSN. The record of *why* the last pipeline stopped
+(`logs/<table>.jsonl`) survives with it, which is the difference between diagnosing an incident
+and finding out the instance that knew is gone.
+
+**What it costs.** An object store has no append and no rename, so the connector log is held in
+memory and re-`PUT` whole; it rotates at 256 KiB rather than the 10 MiB an on-disk log uses, and
+writes are coalesced with a 250 ms floor. An unclean kill can lose the last quarter-second of
+*log lines* — never checkpoint state, which is written synchronously on the commit path.
+
+**Failure is loud.** A root that cannot be reached — a bucket that does not exist, credentials
+that cannot see it — fails the pipeline at start, naming the root. It is deliberately not
+survivable: a pipeline whose checkpoints cannot be written is a pipeline that re-snapshots on
+every restart, and that is not something to discover an hour in from an error line inside the
+bucket that is missing.
+
+**The console's read path does not change.** `GET /api/v1/pipelines` and
+`GET /api/v1/pipelines/{name}/logs` answer exactly as they do on a local root — the driver reads
+the objects on the console's behalf rather than the platform learning to read S3. The tail stays a
+ranged read on the end of the object, so it costs the same at 2 KiB and at 2 GiB.
+
+Distinct from `OXIDANT_DATA_DIR`, which is the engine's *own* scratch (statement journal, spilled
+results, rolled exec logs) and **must** be a filesystem path — it needs an exclusive lock and
+byte-range appends, neither of which an object store has.
 
 ## Worker pod
 

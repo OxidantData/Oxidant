@@ -211,6 +211,14 @@ would sit inert until the next batch happened to arrive.
 
 State lives in `{pipeline.checkpoints}/_pipeline-state.json`. Delete it to force a full rebuild.
 
+`pipeline.checkpoints` is a **location, not a directory**: it may be an object-store URL
+(`s3://bucket/prefix`), and on a driver that can be replaced it should be. Everything the pipeline
+keeps under it goes to the same store — the per-table offsets, `_pipeline-state.json`,
+`reconcile.json`, and the `logs/<table>.jsonl` the console tails — so a replacement driver reads
+the epochs and the LSN the previous one committed instead of re-snapshotting every published
+table. A root it cannot reach fails the pipeline at start, naming the root. See
+[runtime-contract.md](runtime-contract.md#checkpoint-root).
+
 ### Full recompute is a real cost
 
 A derived table is rebuilt from scratch every update. That is always correct and needs no

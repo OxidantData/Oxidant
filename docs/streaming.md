@@ -321,6 +321,18 @@ The checkpoint is written through the same object store as the table, so `s3://`
 driver that restarts on another host resumes from where the last one committed. A bare filesystem
 path still works and is fine for a single-host deployment.
 
+**Everything under the root goes to the same store**, not just `offsets.json`: the planned/commit
+logs, and — for a `pipeline:` config — `_pipeline-state.json`, `reconcile.json`, and the
+`logs/<table>.jsonl` a connector writes. One resolver turns the root into a store, so all of it
+uses the credentials, endpoint and assumed role the table writes already use, and a checkpoint on
+S3 cannot half-happen with the offsets in the bucket and the state beside the driver's shell.
+
+**A root that cannot be reached fails the query at `start`, naming the root.** It is deliberately
+not survivable. A query whose checkpoints cannot be written is a query that replays from
+`startingOffsets` on every restart, and for a CDC pipeline that means a full re-snapshot of every
+published table — not something to discover an hour later from an error line written *into* the
+bucket that is missing.
+
 The single write is the atomicity story: an object-store `PUT` is atomic, so a reader sees either
 the whole previous checkpoint or the whole new one, never a truncated one that would parse as "no
 committed offsets" and silently replay (or, with `startingOffsets=latest`, skip) a run's worth of
