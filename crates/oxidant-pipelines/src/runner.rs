@@ -1166,10 +1166,15 @@ tables:
         let engine = Engine::new();
         let store = checkpoint_store(&engine, &checkpoints).expect("resolves");
         schedule.save(&store).await.expect("writes the schedule");
-        let path = dir.path().join(crate::reconcile::ReconcileSchedule::KEY);
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&path, permissions).expect("makes the anchor unwritable");
+        // The anchor must be genuinely unwritable — and a read-only FILE is
+        // not enough, because the checkpoint store writes atomically
+        // (temp-file + rename), and a rename needs write permission on the
+        // DIRECTORY, not the file. The read-only directory is the honest
+        // "checkpoint volume went bad" fixture.
+        let mut dir_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+        dir_permissions.set_readonly(true);
+        std::fs::set_permissions(dir.path(), dir_permissions)
+            .expect("makes the checkpoint directory unwritable");
 
         let mut reconciled_at = None;
         let (mut ran, mut persist_failed) = (0, 0);
