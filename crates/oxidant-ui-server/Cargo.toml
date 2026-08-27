@@ -10,6 +10,12 @@ rust-version.workspace = true
 [dependencies]
 oxidant-common = { workspace = true }
 oxidant-observability = { workspace = true }
+# The connector-log routes read what the streaming engine wrote. Taken as a dependency rather
+# than reimplemented so the checkpoint root is resolved by the *same* function the pipeline
+# resolves it with (`oxidant_streaming::checkpoint_store`) and the log's key layout has one
+# definition: a server that resolved `s3://` its own way is a server that reads a different
+# bucket than the driver writes.
+oxidant-streaming = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

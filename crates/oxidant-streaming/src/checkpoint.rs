@@ -345,6 +345,33 @@ impl CheckpointStore {
         }
     }
 
+    /// The last `max_bytes` of `rel`, plus whether the window started mid-object.
+    ///
+    /// A ranged `GET`, not a whole read: a connector log grows without bound, and a tail has to
+    /// cost the same whether the object is 2 KiB or 2 GiB. `None` when there is no such object.
+    pub async fn read_tail(
+        &self,
+        rel: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+        let path = self.object_path(rel);
+        let size = match self.store.head(&path).await {
+            Ok(meta) => meta.size,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(io_err(e)),
+        };
+        if size == 0 {
+            return Ok(Some((Vec::new(), false)));
+        }
+        let start = size.saturating_sub(max_bytes);
+        let bytes = self
+            .store
+            .get_range(&path, start..size)
+            .await
+            .map_err(io_err)?;
+        Ok(Some((bytes.to_vec(), start > 0)))
+    }
+
     /// Every object directly or transitively under `rel`, named relative to `rel`.
     ///
     /// An empty listing is not an error: an object store has no directories, so "the prefix does

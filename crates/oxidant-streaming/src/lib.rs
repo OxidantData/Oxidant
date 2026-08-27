@@ -52,3 +52,6 @@ pub use state::DedupState;
 // datasource crate just to name the default.
 pub use oxidant_datasource::delta_write::DEFAULT_CHECKPOINT_INTERVAL;
 pub use watermark::WatermarkConfig;
+// Re-exported so a caller resolving a checkpoint location does not need its own dependency on
+// `oxidant-loom` just to name the resolver's first argument.
+pub use oxidant_loom::Engine;
