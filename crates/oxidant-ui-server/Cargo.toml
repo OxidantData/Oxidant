@@ -34,3 +34,6 @@ axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 http-body-util = "0.1"
 tower = "0.5"
+# `tests/minio_pipeline_logs.rs` writes the log objects the routes then read back.
+serde_json = "1"
+oxidant-observability = { workspace = true }

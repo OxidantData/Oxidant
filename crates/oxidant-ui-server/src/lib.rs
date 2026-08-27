@@ -14,7 +14,11 @@ use oxidant_observability::SharedStore;
 use tower_http::cors::{Any, CorsLayer};
 
 pub use dashboards::DashboardStore;
-pub use routes::{app_router, app_router_with, app_router_with_status_token};
+// `app_router_with_spa` is the env-free form: everything the router reads from the environment
+// — the SPA directory and the pipeline checkpoint root — is passed in instead. Exported so an
+// integration test can point the connector-log routes at a bucket without setting process-wide
+// environment that every other test in the binary would see.
+pub use routes::{app_router, app_router_with, app_router_with_spa, app_router_with_status_token};
 
 /// Configuration for the monitoring UI HTTP server.
 #[derive(Clone)]

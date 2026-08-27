@@ -318,10 +318,22 @@ impl CheckpointStore {
     }
 
     /// Delete `rel`, reporting whether there was anything there.
+    ///
+    /// The `head` is not redundant. S3 answers a `DELETE` of a key that is not there with `204`,
+    /// exactly as it answers one that was — the delete alone cannot tell "removed it" from
+    /// "there was nothing to remove", and the caller that asks is
+    /// `oxidant pipeline reconcile --cron off`, which reports one of those two things to an
+    /// operator. On a local root the difference showed up for free; on a bucket it silently did
+    /// not. One extra round trip, on an operation that runs when someone types a command.
     pub async fn remove(&self, rel: &str) -> std::io::Result<bool> {
-        match self.store.delete(&self.object_path(rel)).await {
-            Ok(()) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
+        let path = self.object_path(rel);
+        let existed = match self.store.head(&path).await {
+            Ok(_) => true,
+            Err(object_store::Error::NotFound { .. }) => false,
+            Err(e) => return Err(io_err(e)),
+        };
+        match self.store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(existed),
             Err(e) => Err(io_err(e)),
         }
     }
