@@ -496,25 +496,50 @@ The unit is **found**, not assumed: this route reads every `*.service` file unde
 `config_path`, so it works whatever a unit happens to be named (the demo convention is
 `oxidant-connector-<name>.service`, but nothing here depends on that).
 
+That freedom is real for **discovery**, but not for **authorization**. The polkit rule this
+route depends on to actually run `systemctl`
+(`deploy/packer/files/polkit/49-oxidant-connector-lifecycle.rules`) only authorizes unit names
+matching `oxidant-connector-*.service` — discovery is name-agnostic, authorization is not. A
+pipeline whose unit is named outside that convention is *found* here (its `ExecStart=` still
+matches) and then *denied* by polkit, surfaced as a `502` from the `systemctl` call. An operator
+using a different naming scheme has to add a polkit rule of their own scoped to it before this
+route can drive that unit — see the rule file for the shape.
+
 | Response | Meaning |
 |---|---|
 | `200` | `{"unit", "command", "action", "checkpointsDeleted"}` — `action` is `started`, `stopped`, or `restarted`; `checkpointsDeleted` is the object count, present only for `resnapshot` |
 | `400` | Malformed body |
 | `403` | A validation refusal: `config_path` resolves outside the connectors directory, a table name is not `[A-Za-z0-9_]+`, a table is not declared by this pipeline, or `checkpoint_root` does not match the pipeline's own |
-| `404` | No token configured (route absent, same as [`/api/status`](#driver-status)); or `config_path` does not load; or no unit's `ExecStart=` matches it |
+| `404` | Only that there is nothing here: no token configured (route absent, same as [`/api/status`](#driver-status)), or `config_path` does not load |
+| `409` | The config loaded but no installed unit's `ExecStart=` matches it — the route exists and the config is real, but nothing runs it. Kept distinct from `404` because the platform's driver client treats `404` as "this engine build has no lifecycle route at all" and degrades to a copy-paste `systemctl` instruction; that fallback is wrong here, since the actual fix is installing (or correcting) the unit, not running an older workaround |
 | `401` | Wrong or missing bearer token |
-| `502` | `systemctl` failed, or (for `resnapshot`) checkpoint deletion failed. On a `resnapshot` where deletion succeeded and only the restart failed, the message says exactly that — the operator needs "checkpoints are gone, the unit did not come back", not a guess at which half landed |
+| `502` | `systemctl` failed (including a polkit denial — see the naming-scheme note above), or (for `resnapshot`) checkpoint deletion or pipeline-state clearing failed. Every failure message says exactly how far the operation got — e.g. "the unit is stopped and was not restarted" — never a guess at which part landed |
 
 **Privilege.** The driver runs as the unprivileged `oxidant` user with `NoNewPrivileges=true`
 (see `deploy/packer/files/systemd/oxidant-driver.service`), which rules out `sudo` outright —
 `sudo` elevates via a setuid binary, exactly what `NoNewPrivileges` blocks. This route instead
 calls the plain `systemctl` binary, which asks PID 1 to act over the system D-Bus; the
 privileged part happens inside `systemd` on the caller's behalf, authorized by a **polkit**
-rule scoped to the `oxidant` user and to `oxidant-connector-*.service` unit names
+rule scoped to the `oxidant` user, to `oxidant-connector-*.service` unit names, and to the
+`start`/`stop`/`restart` verbs — not the whole of
+`org.freedesktop.systemd1.manage-units`, which also covers `KillUnit`, `FreezeUnit`/`ThawUnit`,
+`SetUnitProperties` and `ResetFailed`
 (`deploy/packer/files/polkit/49-oxidant-connector-lifecycle.rules`, installed by
 `deploy/packer/scripts/provision.sh`). `NoNewPrivileges` does not apply to that: it constrains
 this process gaining privileges itself, not an already-privileged daemon acting on an
 authorized IPC request.
+
+The mechanism's shape is proven by `deploy/packer/tests/test_connector_lifecycle_privilege.sh`
+(static: the rule file, the driver unit's hardening, `provision.sh`), and end to end — a real
+unprivileged `runuser -u oxidant -- systemctl start|stop|restart` against a real connector
+unit, under real systemd and real polkit — by
+`deploy/local/verify_connector_lifecycle_privilege.sh`. The latter needs a Linux host with
+systemd, polkit and root (to install the rule and a throwaway unit); it skips rather than fails
+where those aren't available, which is every environment this route's tests otherwise run in.
+That is the residual risk this route ships with: the mechanism is proven when the script is run
+by hand on a real box (or the AMI itself, pre-bake), but nothing in `cargo test` or the packer
+static suite exercises the real D-Bus/polkit path today, so a change to a future systemd or
+polkit version could regress it silently between runs.
 
 ## Driver logs
 
