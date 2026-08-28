@@ -1,6 +1,7 @@
 //! HTTP server for the Oxidant monitoring UI: Spark-compatible `/api/v1` REST, SSE, and static SPA.
 
 pub mod dashboards;
+pub mod lifecycle;
 pub mod pipelines;
 mod routes;
 mod static_files;
@@ -63,6 +64,23 @@ pub async fn serve(config: UiServerConfig) -> Result<()> {
 pub fn router(store: SharedStore) -> Router {
     app_router(store)
 }
+
+/// Serializes every test in this crate that mutates process-wide environment
+/// (`OXIDANT_CONNECTOR_CONFIG_DIR`, `OXIDANT_SYSTEMD_UNIT_DIR`, `OXIDANT_SYSTEMCTL_BIN` in
+/// `lifecycle.rs`; `OXIDANT_CHECKPOINT_DIR` in `pipelines.rs`; `OXIDANT_UI_DIR` in
+/// `static_files.rs`, exercised through `routes.rs`'s tests; `OXIDANT_STATUS_TOKEN` in
+/// `status.rs`, which also reads the whole environ table back through `/environment`) against
+/// every other one.
+///
+/// One lock, not one per module: `std::env::set_var` racing `std::env::var` (or another
+/// `set_var`) from a *different* module's test, on a different thread, is a data race on the
+/// process environ table (glibc `putenv`/`realloc`), not merely a logical one — crate unit
+/// tests all compile into one binary and run on parallel threads by default, so two
+/// module-private `static` mutexes with the same name cannot exclude each other; only a lock
+/// every mutator actually shares can. `#[cfg(test)]`: nothing outside a test build should ever
+/// touch this.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {

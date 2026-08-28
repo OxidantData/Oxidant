@@ -17,6 +17,16 @@ metadata published over it. This is a second door into it, not a second implemen
 Runnable example, needing neither a broker nor AWS:
 [`examples/oxidant.yaml`](../examples/oxidant.yaml).
 
+## Driver control
+
+`oxidant pipeline run` has no server of its own — the process running a pipeline listens on no
+socket. In production it runs as a systemd unit (`oxidant-connector-<name>.service` on the AMI),
+and a control plane that wants to start, pause, resume, or re-snapshot one does so through the
+**driver's** `POST /api/v1/pipelines/lifecycle` — see [`api.md`](api.md#pipeline-lifecycle) for
+the request shape, the unit-discovery rule, and how a re-snapshot deletes checkpoints through the
+same [`checkpoint_store`](../crates/oxidant-streaming/src/checkpoint.rs) resolver the pipeline
+itself uses, never a shell `rm -rf`.
+
 ## Spark Declarative Pipelines (Connect)
 
 Stock Spark 4.x clients can define and run pipelines over `oxidant spark server` without a

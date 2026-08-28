@@ -32,6 +32,7 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/status` | Driver status for a control plane — **bearer token required** |
 | `GET` | `/api/v1/pipelines` | Streaming pipelines with a connector log on this driver — **bearer token required** |
 | `GET` | `/api/v1/pipelines/{name}/logs` | Tail of a streaming connector's JSONL log — **bearer token required** |
+| `POST` | `/api/v1/pipelines/lifecycle` | Start, pause, resume, or re-snapshot a file-defined pipeline — **bearer token required** |
 | `GET` | `/api/v1/logs` | One page of a node's logs — the memory ring, or a file with `?file=`, filtered by `?level=`/`?target=`/`?q=`/`?from=`/`?to=` and paged by `?before=` — **bearer token required** |
 | `GET` | `/api/v1/logs/files` | Every log file a node still has, newest period first — **bearer token required** |
 | `GET` | `/api/v1/logs/workers` | The nodes that can be browsed, and which are answering — **bearer token required** |
@@ -340,8 +341,12 @@ endpoint:
 The token itself is redacted from `/api/v1/applications/{id}/environment`, which otherwise
 echoes every `OXIDANT_*` variable.
 
-The same token gates [the pipeline list](#pipelines), [connector logs](#connector-logs) and
-[the driver's log buffer](#driver-logs); a leak is a leak of all four.
+The same token gates [the pipeline list](#pipelines), [connector logs](#connector-logs),
+[pipeline lifecycle control](#pipeline-lifecycle) and [the driver's log buffer](#driver-logs); a
+leak is a leak of all five — and for the lifecycle route specifically, a leak is a leak of
+`systemctl start/stop/restart` on the connector units it can reach and delete access to their
+checkpoints. Guard the driver's HTTP port the same way regardless: a private subnet or a
+security group that admits only the control plane.
 
 ## Pipelines
 
@@ -452,6 +457,100 @@ checked against the resolved logs directory. The listing applies the same rule, 
 `GET /api/v1/pipelines` offers is tailable and nothing else is. A `logs` directory that is
 itself a symlink is fine: that is the operator's own configuration, and it becomes the
 boundary.
+
+## Pipeline lifecycle
+
+`POST /api/v1/pipelines/lifecycle` starts, stops, or re-snapshots the systemd unit that runs a
+file-defined pipeline's config — the control a driver had no route for before this: a pipeline
+process listens on no socket, so the only prior option was an operator running a printed
+`systemctl` / `rm -rf` command by hand (see [`pipelines.md`](pipelines.md) and the platform's
+`docs/connectors.md`).
+
+```sh
+curl -s -X POST http://localhost:4040/api/v1/pipelines/lifecycle \
+  -H "Authorization: Bearer $OXIDANT_STATUS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "command": "resnapshot",
+    "name": "orders",
+    "config_path": "/etc/oxidant/connectors/orders.yaml",
+    "tables": ["orders", "line_items"]
+  }'
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `command` | yes | One of `start`, `pause`, `resume`, `resnapshot` |
+| `name` | no | The connector's name — echoed in error messages only; the config is what everything is checked against |
+| `config_path` | yes | Must canonicalize to a path under `/etc/oxidant/connectors/` |
+| `checkpoint_root` | no | Checked only for `resnapshot`, against the pipeline's own `pipeline.checkpoints`, read fresh off `config_path` — never substituted for it. A mismatch is refused, `403`. Ignored for `start`/`pause`/`resume`, which never touch a checkpoint |
+| `tables` | no | For `resnapshot`: which tables to re-snapshot. Empty means **every** table the pipeline declares, not just the first — see the note on every-table honesty below. Each name must match `[A-Za-z0-9_]+` and be a table the pipeline actually declares |
+
+`start` and `resume` both `systemctl start` the unit; `pause` stops it. `resnapshot` runs, in
+order: `systemctl stop` the unit; delete `{checkpoints}/{table}` for every requested table
+through the same [`checkpoint_store`](pipelines.md) resolver the pipeline itself checkpoints
+through — never a shell `rm -rf`; clear those same tables' entries from
+`{checkpoints}/_pipeline-state.json` (`built_as`), so a derived table is not skipped as
+"unchanged" on the next pass just because its definition did not change; then `systemctl start`
+the unit back up. Never delete-then-restart: stopping first means nothing can re-create a
+checkpoint out from under the delete, and clearing the state file is what makes the reset
+actually visible to the pipeline's own change-detection.
+
+The unit is **found**, not assumed: this route reads every `*.service` file under
+`/etc/systemd/system` and matches the `--config` argument of its `ExecStart=` against
+`config_path`, so it works whatever a unit happens to be named (the demo convention is
+`oxidant-connector-<name>.service`, but nothing here depends on that).
+
+That freedom is real for **discovery**, but not for **authorization**. The polkit rule this
+route depends on to actually run `systemctl`
+(`deploy/packer/files/polkit/49-oxidant-connector-lifecycle.rules`) only authorizes unit names
+matching `oxidant-connector-*.service` — discovery is name-agnostic, authorization is not. A
+pipeline whose unit is named outside that convention is *found* here (its `ExecStart=` still
+matches) and then *denied* by polkit, surfaced as a `502` from the `systemctl` call. An operator
+using a different naming scheme has to add a polkit rule of their own scoped to it before this
+route can drive that unit — see the rule file for the shape.
+
+| Response | Meaning |
+|---|---|
+| `200` | `{"unit", "command", "action", "checkpointsDeleted"}` — `action` is `started`, `stopped`, or `restarted`; `checkpointsDeleted` is the object count, present only for `resnapshot` |
+| `400` | Malformed body |
+| `403` | A validation refusal: `config_path` resolves outside the connectors directory, a table name is not `[A-Za-z0-9_]+`, a table is not declared by this pipeline, or `checkpoint_root` does not match the pipeline's own |
+| `404` | Only that there is nothing here: no token configured (route absent, same as [`/api/status`](#driver-status)), or `config_path` does not load |
+| `409` | The config loaded but no installed unit's `ExecStart=` matches it — the route exists and the config is real, but nothing runs it. Kept distinct from `404` because the platform's driver client treats `404` as "this engine build has no lifecycle route at all" and degrades to a copy-paste `systemctl` instruction; that fallback is wrong here, since the actual fix is installing (or correcting) the unit, not running an older workaround |
+| `401` | Wrong or missing bearer token |
+| `502` | `systemctl` failed (including a polkit denial — see the naming-scheme note above), or (for `resnapshot`) checkpoint deletion or pipeline-state clearing failed. Every failure message says exactly how far the operation got — e.g. "the unit is stopped and was not restarted" — never a guess at which part landed |
+
+**Privilege.** The driver runs as the unprivileged `oxidant` user with `NoNewPrivileges=true`
+(see `deploy/packer/files/systemd/oxidant-driver.service`), which rules out `sudo` outright —
+`sudo` elevates via a setuid binary, exactly what `NoNewPrivileges` blocks. This route instead
+calls the plain `systemctl` binary, which asks PID 1 to act over the system D-Bus; the
+privileged part happens inside `systemd` on the caller's behalf, authorized by a **polkit**
+rule scoped to the `oxidant` user, to `oxidant-connector-*.service` unit names, and to the
+`start`/`stop`/`restart` verbs — not the whole of
+`org.freedesktop.systemd1.manage-units`, which also covers `KillUnit`, `FreezeUnit`/`ThawUnit`,
+`SetUnitProperties` and `ResetFailed`
+(`deploy/packer/files/polkit/49-oxidant-connector-lifecycle.rules`, installed by
+`deploy/packer/scripts/provision.sh`). This route itself only ever calls `start` and `stop` —
+`resnapshot` composes those two rather than calling `restart`, see "Pipeline lifecycle" above —
+but `restart` stays in the polkit rule regardless, for an operator's own manual `systemctl
+restart` on a connector unit. `NoNewPrivileges` does not apply to any of this: it constrains
+this process gaining privileges itself, not an already-privileged daemon acting on an
+authorized IPC request.
+
+The mechanism's shape is proven by `deploy/packer/tests/test_connector_lifecycle_privilege.sh`
+(static: the rule file, the driver unit's hardening, `provision.sh`), and end to end — real
+`systemctl start|stop|restart` against a real connector unit, under real systemd and real
+polkit, run as `oxidant` via `systemd-run --uid=oxidant` with the same `NoNewPrivileges=true`
+and `ProtectSystem=strict` sandbox properties the driver unit sets, rather than a bare
+`runuser -u oxidant`, since a bare `runuser` would prove the polkit rule but not the sandbox
+interaction — by `deploy/local/verify_connector_lifecycle_privilege.sh`. The latter needs a
+Linux host with systemd, polkit and root (to install the rule and a throwaway unit); it skips
+rather than fails
+where those aren't available, which is every environment this route's tests otherwise run in.
+That is the residual risk this route ships with: the mechanism is proven when the script is run
+by hand on a real box (or the AMI itself, pre-bake), but nothing in `cargo test` or the packer
+static suite exercises the real D-Bus/polkit path today, so a change to a future systemd or
+polkit version could regress it silently between runs.
 
 ## Driver logs
 

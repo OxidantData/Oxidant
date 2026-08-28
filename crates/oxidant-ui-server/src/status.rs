@@ -340,12 +340,13 @@ mod tests {
     /// — the wiring `serve()` depends on — and must not then leak out of the
     /// *unauthenticated* `/environment` endpoint, which dumps every `OXIDANT_*` var.
     #[tokio::test]
-    // ENV_LOCK serializes this test's process-global env mutation against any sibling that
-    // grows one; the guard must therefore span the awaits it protects.
+    // crate::ENV_LOCK serializes this test's process-global env mutation against every other
+    // module's env-mutating tests; the guard must therefore span the awaits it protects. This is
+    // the module that reads the whole environ via `/environment`, so it is the one most exposed
+    // to a sibling module writing vars concurrently.
     #[allow(clippy::await_holding_lock)]
     async fn env_token_enables_the_endpoint_without_leaking_through_environment() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("OXIDANT_STATUS_TOKEN", TOKEN);
 
         let store = store();
