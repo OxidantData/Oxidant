@@ -12,11 +12,16 @@
 // has no say over that — it constrains what *this* process can execve, not what an
 // already-privileged daemon does after checking a polkit rule.
 //
-// Scope is deliberately narrow in two dimensions: the calling user (`oxidant`, and only that
-// user — nothing here authorizes any other local account) and the unit name (only
+// Scope is deliberately narrow in three dimensions: the calling user (`oxidant`, and only that
+// user — nothing here authorizes any other local account), the unit name (only
 // `oxidant-connector-*.service` — never the driver's own unit, a worker's, or anything else on
-// the box). See crates/oxidant-ui-server/src/lifecycle.rs and docs/api.md ("Pipeline lifecycle")
-// for the route this backs, and deploy/packer/scripts/provision.sh for how this file reaches
+// the box), and the verb (only `start`, `stop`, `restart` — never `kill`, `freeze`/`thaw`,
+// `set-property`, or `reset-failed`; `org.freedesktop.systemd1.manage-units` covers all of
+// those, and an unguarded `unit` check would grant every one of them on a connector unit). The
+// `unit` check on its own also happens to exclude `StartTransientUnit`, which carries no `unit`
+// detail — that stays true with the verb guard added. See
+// crates/oxidant-ui-server/src/lifecycle.rs and docs/api.md ("Pipeline lifecycle") for the
+// route this backs, and deploy/packer/scripts/provision.sh for how this file reaches
 // /etc/polkit-1/rules.d on a built AMI.
 polkit.addRule(function(action, subject) {
     if (action.id != "org.freedesktop.systemd1.manage-units") {
@@ -26,7 +31,12 @@ polkit.addRule(function(action, subject) {
         return polkit.Result.NOT_HANDLED;
     }
     var unit = action.lookup("unit");
-    if (unit && /^oxidant-connector-[A-Za-z0-9_-]+\.service$/.test(unit)) {
+    var verb = action.lookup("verb");
+    if (
+        unit &&
+        /^oxidant-connector-[A-Za-z0-9_-]+\.service$/.test(unit) &&
+        (verb == "start" || verb == "stop" || verb == "restart")
+    ) {
         return polkit.Result.YES;
     }
     return polkit.Result.NOT_HANDLED;

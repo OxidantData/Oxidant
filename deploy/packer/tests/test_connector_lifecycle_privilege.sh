@@ -111,13 +111,67 @@ else
     not_ok "the rule scopes to oxidant-connector-*.service unit names"
   fi
 
+  # The rule must also scope to the *verb* — org.freedesktop.systemd1.manage-units is not just
+  # start/stop/restart, it also covers KillUnit, FreezeUnit/ThawUnit, SetUnitProperties and
+  # ResetFailed. A unit-name-only guard grants all of those on a connector unit; the header
+  # comment and docs/api.md both claim "start/stop/restart only", so the rule must enforce that
+  # itself rather than relying on nothing else ever calling those verbs.
+  if grep -qE 'action\.lookup\([\x27"]verb[\x27"]\)' "${RULES_FILE}"; then
+    ok "the rule reads action.lookup('verb')"
+  else
+    not_ok "the rule reads action.lookup('verb')" \
+      "without this, KillUnit/FreezeUnit/SetUnitProperties/ResetFailed are all granted on any \
+oxidant-connector-*.service unit, not just start/stop/restart"
+  fi
+
+  if grep -qE '\bverb\b.*==.*"start"' "${RULES_FILE}" \
+    && grep -qE '\bverb\b.*==.*"stop"' "${RULES_FILE}" \
+    && grep -qE '\bverb\b.*==.*"restart"' "${RULES_FILE}"; then
+    ok "the verb guard allows exactly start, stop, and restart"
+  else
+    not_ok "the verb guard allows exactly start, stop, and restart" \
+      "expected an explicit verb == \"start\" / \"stop\" / \"restart\" comparison"
+  fi
+
+  # The verb guard must live in the *same* branch as the unit-name guard, not a second
+  # independent `if` — otherwise a unit match with no verb check (or a verb match with no unit
+  # check) could still reach YES on its own. Find the `if (...)  { ... YES ... }` block (the
+  # only `if` whose condition mentions the connector-unit regex) and require its condition to
+  # mention both `unit` and `verb`.
+  GUARD_COND="$(awk '
+    /if \(/ { blk=""; capturing=1 }
+    capturing { blk = blk "\n" $0 }
+    /\{/ {
+      if (capturing && blk ~ /oxidant-connector-/) { print blk; exit }
+      capturing = 0
+    }
+  ' "${RULES_FILE}")"
+  if [[ -n "${GUARD_COND}" ]] && echo "${GUARD_COND}" | grep -q 'unit' && echo "${GUARD_COND}" | grep -q 'verb'; then
+    ok "the unit and verb guards are combined in one condition (unit && ... && verb)"
+  else
+    not_ok "the unit and verb guards are combined in one condition (unit && ... && verb)" \
+      "a separate 'if (verb...)' that returns YES on its own would drop the unit-name scoping"
+  fi
+
+  # `unit` is checked truthy before the regex/verb comparisons run — this is what excludes
+  # `StartTransientUnit`, which carries no `unit` detail in its action lookup at all, so it can
+  # never satisfy `unit && ...` regardless of subject or verb. Collapse the guard condition's
+  # whitespace so this matches whether `unit &&` sits on the `if (` line or its own line.
+  GUARD_COND_FLAT="$(echo "${GUARD_COND}" | tr -d '[:space:]')"
+  if echo "${GUARD_COND_FLAT}" | grep -qE '^if\(unit&&'; then
+    ok "the unit truthiness check gates the match, excluding StartTransientUnit (no unit detail)"
+  else
+    not_ok "the unit truthiness check gates the match, excluding StartTransientUnit (no unit detail)" \
+      "expected the guard's leading term to be 'unit &&' — found: ${GUARD_COND_FLAT}"
+  fi
+
   # No wildcard `YES` for anything else — every path through the rule that is not the narrow
   # match above must fall through to NOT_HANDLED, never grant blindly.
   YES_COUNT="$(grep -cE 'polkit\.Result\.YES' "${RULES_FILE}")"
   if [[ "${YES_COUNT}" -eq 1 ]]; then
-    ok "the rule grants YES from exactly one, narrowly-guarded, branch"
+    ok "the rule grants YES from exactly one branch"
   else
-    not_ok "the rule grants YES from exactly one, narrowly-guarded, branch" "found ${YES_COUNT}"
+    not_ok "the rule grants YES from exactly one branch" "found ${YES_COUNT}"
   fi
 fi
 
