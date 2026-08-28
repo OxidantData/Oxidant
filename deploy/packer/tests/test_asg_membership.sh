@@ -181,6 +181,13 @@ assert_ok "bootstrap references ASG private-IP helpers" \
 assert_ok "bootstrap references CSV pin helper" \
   grep -q 'private_ips_to_workers_csv' "${BOOTSTRAP}"
 
+# W24 single-node: the driver ASG peer wait/pin block in oxidant_bootstrap_main must be
+# skipped entirely when worker-count=0 (DRIVER_WORKERS_CSV stays "" — the single-node
+# signal render_env reads downstream). This guard is inline in main() (IMDS-gated), so
+# it is checked structurally here rather than invoked directly.
+assert_ok "driver ASG wait is skipped when worker-count=0" \
+  grep -q 'ROLE}" == "driver" && "${WORKER_COUNT}" != "0"' "${BOOTSTRAP}"
+
 echo
 echo "${PASS} passed, ${FAIL} failed"
 [[ "${FAIL}" -eq 0 ]]

@@ -171,8 +171,15 @@ assert_eq "worker-count passes through for workers" \
 assert_fail "empty worker-count tag fails closed (driver)" worker_count_or_fail driver ""
 assert_fail "None worker-count tag fails closed (driver)" worker_count_or_fail driver None
 assert_fail "garbage worker-count tag fails closed (worker)" worker_count_or_fail worker abc
-assert_fail "zero worker-count fails closed" worker_count_or_fail driver 0
 assert_eq "standalone keeps the 1 default" "$(worker_count_or_fail standalone "")" "1"
+
+# W24 single-node: a driver legitimately carries worker-count 0 (driver-local boot);
+# a worker never does. Empty/garbage still fails closed for both roles (KAN-139 regression).
+assert_eq "driver worker-count 0 is accepted (single-node)" \
+  "$(worker_count_or_fail driver 0)" "0"
+assert_fail "worker worker-count 0 is refused" worker_count_or_fail worker 0
+assert_fail "empty worker-count tag still fails closed (driver)" worker_count_or_fail driver ""
+assert_fail "garbage worker-count tag still fails closed (driver)" worker_count_or_fail driver abc
 
 # Driver env still pins membership and stamps the count it was given.
 out="$(driver_env)"
@@ -181,9 +188,31 @@ assert_eq "driver env stamps OXIDANT_WORKER_COUNT" \
 assert_eq "driver env pins OXIDANT_WORKERS" \
   "$(grep -c '^OXIDANT_WORKERS=10.0.0.1:50561,10.0.0.2:50561$' <<<"${out}" || true)" "1"
 
-# A driver without a worker list still fails (no silent local fallback).
+# A driver without a worker list still fails (no silent local fallback) — the SF100
+# driver-local regression this guard caught. Explicit about WORKER_COUNT staying
+# nonzero here, since that's the branch the guard must still refuse.
+WORKER_COUNT=2
 DRIVER_WORKERS_CSV=""
-assert_fail "driver with empty worker list refuses env" render_env driver
+assert_fail "driver with empty worker list and nonzero worker-count still fails" render_env driver
+DRIVER_WORKERS_CSV="10.0.0.1:50561,10.0.0.2:50561"
+
+# --- W24 single-node driver: worker-count=0, no OXIDANT_WORKERS pinned ----------
+
+WORKER_COUNT=0
+DRIVER_WORKERS_CSV=""
+assert_ok "single-node driver (worker-count=0) render_env succeeds" render_env driver
+out="$(render_env driver 2>/tmp/oxidant-env-test.err)"
+if grep -q '^OXIDANT_WORKERS=' <<<"${out}"; then
+  assert_eq "single-node driver emits no OXIDANT_WORKERS" "stamped" ""
+else
+  assert_eq "single-node driver emits no OXIDANT_WORKERS" "" ""
+fi
+assert_eq "single-node driver stamps OXIDANT_WORKER_COUNT=0" \
+  "$(grep -c '^OXIDANT_WORKER_COUNT=0$' <<<"${out}" || true)" "1"
+err="$(cat /tmp/oxidant-env-test.err)"
+assert_eq "single-node driver logs the driver-local line" \
+  "$(grep -c 'single-node driver (worker-count=0): no OXIDANT_WORKERS pinned, driver-local' <<<"${err}" || true)" "1"
+WORKER_COUNT=2
 DRIVER_WORKERS_CSV="10.0.0.1:50561,10.0.0.2:50561"
 
 echo

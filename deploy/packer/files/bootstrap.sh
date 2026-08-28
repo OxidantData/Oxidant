@@ -414,6 +414,8 @@ EOF
     if [[ -n "${DRIVER_WORKERS_CSV:-}" ]]; then
       echo "OXIDANT_WORKERS=${DRIVER_WORKERS_CSV}"
       log "pinned OXIDANT_WORKERS=${DRIVER_WORKERS_CSV}" >&2
+    elif [[ "${WORKER_COUNT:-}" == "0" ]]; then
+      log "single-node driver (worker-count=0): no OXIDANT_WORKERS pinned, driver-local" >&2
     else
       log "ERROR: driver has empty worker IP list — refusing silent local fallback" >&2
       return 1
@@ -453,7 +455,9 @@ EOF
 worker_count_or_fail() {
   local role="$1" value="$2"
   if [[ "${role}" == "driver" || "${role}" == "worker" ]]; then
-    if [[ ! "${value}" =~ ^[0-9]+$ || "${value}" == "0" ]]; then
+    # W24 single-node: a driver may legitimately carry worker-count 0 (driver-local);
+    # a worker may not. Empty/garbage stays fail-closed for both roles (KAN-139).
+    if [[ ! "${value}" =~ ^[0-9]+$ ]] || { [[ "${role}" == "worker" ]] && [[ "${value}" == "0" ]]; }; then
       log "ERROR: oxidant:worker-count tag is empty/invalid ('${value}') for role=${role}; refusing to guess the cluster size"
       return 1
     fi
@@ -597,7 +601,7 @@ oxidant_bootstrap_main() {
   # Driver: wait for full InService set, pin private IPs into OXIDANT_WORKERS (Spark
   # "executors registered" gate — not DNS / Route53).
   DRIVER_WORKERS_CSV=""
-  if [[ "${ROLE}" == "driver" ]]; then
+  if [[ "${ROLE}" == "driver" && "${WORKER_COUNT}" != "0" ]]; then
     if [[ -z "${WORKER_ASG}" || "${WORKER_ASG}" == "None" ]]; then
       log "ERROR: oxidant:worker-asg tag missing on driver; cannot discover workers"
       return 1
