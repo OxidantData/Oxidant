@@ -181,6 +181,21 @@ assert_fail "worker worker-count 0 is refused" worker_count_or_fail worker 0
 assert_fail "empty worker-count tag still fails closed (driver)" worker_count_or_fail driver ""
 assert_fail "garbage worker-count tag still fails closed (driver)" worker_count_or_fail driver abc
 
+# Review nit: the worker-0 refusal must say it's disallowed for the role, not that the
+# tag is empty/invalid (0 is neither).
+worker_zero_err="$(worker_count_or_fail worker 0 2>&1 >/dev/null || true)"
+assert_eq "worker worker-count 0 error does not claim empty/invalid" \
+  "$(grep -c 'empty/invalid' <<<"${worker_zero_err}" || true)" "0"
+assert_eq "worker worker-count 0 error names the real reason" \
+  "$(grep -c 'worker-count 0 is only valid on a driver' <<<"${worker_zero_err}" || true)" "1"
+
+# Review nit: string "0" comparisons take a confusing path on a leading-zero value like
+# '00' ('00' != "0" but is arithmetically zero). Normalized to arithmetic (10# prefixed
+# to dodge bash's octal trap), so a worker with worker-count=00 fails closed exactly like
+# worker-count=0, instead of falling through to the ASG-wait/timeout path.
+assert_fail "worker worker-count '00' is refused (normalized, not stringly '0')" \
+  worker_count_or_fail worker 00
+
 # Driver env still pins membership and stamps the count it was given.
 out="$(driver_env)"
 assert_eq "driver env stamps OXIDANT_WORKER_COUNT" \
@@ -212,6 +227,46 @@ assert_eq "single-node driver stamps OXIDANT_WORKER_COUNT=0" \
 err="$(cat /tmp/oxidant-env-test.err)"
 assert_eq "single-node driver logs the driver-local line" \
   "$(grep -c 'single-node driver (worker-count=0): no OXIDANT_WORKERS pinned, driver-local' <<<"${err}" || true)" "1"
+WORKER_COUNT=2
+DRIVER_WORKERS_CSV="10.0.0.1:50561,10.0.0.2:50561"
+
+# --- distributed-strict × worker-count=0 (review Finding 1) ---------------------
+# strict promises "local fallback becomes an error instead of silently single-node
+# executing" — worker-count=0 IS driver-local execution, so the combination is
+# contradictory by construction and must refuse to boot rather than silently stamp
+# strict=1 onto a driver that then runs every stage locally anyway.
+
+WORKER_COUNT=0
+DRIVER_WORKERS_CSV=""
+
+DISTRIBUTED_STRICT="true"
+assert_fail "strict=true + worker-count=0 refuses to boot" render_env driver
+strict_zero_err="$(driver_err)"
+assert_eq "strict+0 error names the contradiction" \
+  "$(grep -c 'distributed-strict=true with oxidant:worker-count=0' <<<"${strict_zero_err}" || true)" "1"
+
+DISTRIBUTED_STRICT="1"
+assert_fail "strict='1' + worker-count=0 refuses to boot" render_env driver
+
+# strict unset/false + worker-count=0 must keep booting driver-local (the W24 behavior
+# this PR adds) — the new guard must not regress the non-strict single-node path.
+DISTRIBUTED_STRICT="false"
+assert_ok "strict=false + worker-count=0 still boots driver-local" render_env driver
+DISTRIBUTED_STRICT=""
+assert_ok "strict unset + worker-count=0 still boots driver-local" render_env driver
+
+# strict + a real worker count (nonzero, OXIDANT_WORKERS pinned) is unaffected — the new
+# guard only triggers on the worker-count=0 branch.
+WORKER_COUNT=2
+DRIVER_WORKERS_CSV="10.0.0.1:50561,10.0.0.2:50561"
+DISTRIBUTED_STRICT="true"
+out="$(driver_env)"
+assert_eq "strict=true + worker-count=2 still stamps OXIDANT_DISTRIBUTED_STRICT=1" \
+  "$(grep -c '^OXIDANT_DISTRIBUTED_STRICT=1$' <<<"${out}" || true)" "1"
+assert_eq "strict=true + worker-count=2 still pins OXIDANT_WORKERS" \
+  "$(grep -c '^OXIDANT_WORKERS=10.0.0.1:50561,10.0.0.2:50561$' <<<"${out}" || true)" "1"
+
+DISTRIBUTED_STRICT="false"
 WORKER_COUNT=2
 DRIVER_WORKERS_CSV="10.0.0.1:50561,10.0.0.2:50561"
 
