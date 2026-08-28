@@ -39,6 +39,13 @@ RULES_FILE="${ROOT}/deploy/packer/files/polkit/49-oxidant-connector-lifecycle.ru
 RULES_DEST="/etc/polkit-1/rules.d/49-oxidant-connector-lifecycle.rules"
 TEST_UNIT="oxidant-connector-selftest.service"
 TEST_UNIT_PATH="/etc/systemd/system/${TEST_UNIT}"
+# Named outside the oxidant-connector-* pattern the rule authorizes, but real — installed and
+# loaded, same as TEST_UNIT — so the negative control below is refused by the polkit rule's unit
+# regex, not by systemd never having heard of the unit at all (NoSuchUnit short-circuits before
+# polkit is even consulted, which would let the control pass against a rule far broader than
+# docs/api.md claims).
+OTHER_UNIT="oxidant-lifecycle-selftest-other.service"
+OTHER_UNIT_PATH="/etc/systemd/system/${OTHER_UNIT}"
 TEST_USER="oxidant"
 CREATED_USER=0
 INSTALLED_RULE=0
@@ -46,6 +53,7 @@ INSTALLED_RULE=0
 cleanup() {
   systemctl stop "${TEST_UNIT}" >/dev/null 2>&1 || true
   rm -f "${TEST_UNIT_PATH}"
+  rm -f "${OTHER_UNIT_PATH}"
   if [[ "${INSTALLED_RULE}" -eq 1 ]]; then
     rm -f "${RULES_DEST}"
   fi
@@ -98,8 +106,28 @@ ExecStart=/bin/true
 ExecStop=/bin/true
 UNIT
 
-install -m 0644 "${RULES_FILE}" "${RULES_DEST}"
-INSTALLED_RULE=1
+# A second real unit, loaded the same way, whose name the rule does not match — see the
+# OTHER_UNIT comment above for why this has to actually exist.
+cat >"${OTHER_UNIT_PATH}" <<'UNIT'
+[Unit]
+Description=oxidant lifecycle privilege self-test negative control (harmless, deleted on exit)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/bin/true
+UNIT
+
+# Only install the rule if it is not already there, and only remove what we installed — the
+# documented primary use for this script is the AMI itself, post-provision and pre-bake, where
+# `provision.sh` has already installed the real rule. An unconditional install + unconditional
+# `rm -f` on exit would delete that rule out from under a bake that never had anything to clean
+# up, leaving the AMI unable to do the thing this script exists to prove works.
+if [[ ! -e "${RULES_DEST}" ]]; then
+  install -m 0644 "${RULES_FILE}" "${RULES_DEST}"
+  INSTALLED_RULE=1
+fi
 systemctl daemon-reload
 
 # --- the proof: the same call this route makes, wrapped in the driver's own sandbox properties
@@ -127,12 +155,20 @@ for verb in start stop restart; do
 done
 
 # --- negative control: a unit name the rule does NOT authorize must be refused ----------------
-OTHER_UNIT="oxidant-driver.service"
-if systemd-run --quiet --pipe --wait --uid="${TEST_USER}" \
+# OTHER_UNIT is a real, loaded unit (not e.g. oxidant-driver.service, which does not exist on a
+# disposable box and would fail with NoSuchUnit before polkit is even asked) so a pass here means
+# the rule's unit-name regex actually did the refusing, not that systemd never heard of the unit.
+OTHER_STDERR="$(systemd-run --quiet --pipe --wait --uid="${TEST_USER}" \
   --property=NoNewPrivileges=yes --property=ProtectSystem=strict --property=CapabilityBoundingSet= \
-  -- systemctl stop "${OTHER_UNIT}" >/dev/null 2>&1; then
+  -- systemctl stop "${OTHER_UNIT}" 2>&1 >/dev/null)"
+OTHER_STATUS=$?
+if [[ ${OTHER_STATUS} -eq 0 ]]; then
   not_ok "the rule does NOT authorize a non-connector unit (${OTHER_UNIT})" \
     "systemctl stop succeeded — the polkit rule is broader than docs/api.md claims"
+elif ! grep -qE 'Access denied|Interactive authentication required' <<<"${OTHER_STDERR}"; then
+  not_ok "the rule does NOT authorize a non-connector unit (${OTHER_UNIT})" \
+    "refused, but not by polkit — stderr: ${OTHER_STDERR}" \
+    "expected a polkit denial (Access denied / Interactive authentication required), not e.g. NoSuchUnit"
 else
   ok "the rule does NOT authorize a non-connector unit (${OTHER_UNIT}) — refused as expected"
 fi

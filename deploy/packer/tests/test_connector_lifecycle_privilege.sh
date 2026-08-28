@@ -124,13 +124,18 @@ else
 oxidant-connector-*.service unit, not just start/stop/restart"
   fi
 
-  if grep -qE '\bverb\b.*==.*"start"' "${RULES_FILE}" \
-    && grep -qE '\bverb\b.*==.*"stop"' "${RULES_FILE}" \
-    && grep -qE '\bverb\b.*==.*"restart"' "${RULES_FILE}"; then
-    ok "the verb guard allows exactly start, stop, and restart"
+  # A three-way `&&` of `grep -q` checks can only prove the three expected verbs are present —
+  # it is blind to a fourth `verb == "..."` added alongside them (e.g. a future `verb ==
+  # "kill"` widening the rule would still pass). Extract every verb this rule actually compares
+  # against and assert the set is exactly {start, stop, restart}, not merely a superset of it.
+  VERB_MATCHES="$(grep -oE 'verb[[:space:]]*==[[:space:]]*"[A-Za-z_-]+"' "${RULES_FILE}" \
+    | grep -oE '"[A-Za-z_-]+"' | tr -d '"' | sort -u)"
+  EXPECTED_VERBS="$(printf 'restart\nstart\nstop')"
+  if [[ "${VERB_MATCHES}" == "${EXPECTED_VERBS}" ]]; then
+    ok "the verb guard allows exactly start, stop, and restart — no fourth verb"
   else
-    not_ok "the verb guard allows exactly start, stop, and restart" \
-      "expected an explicit verb == \"start\" / \"stop\" / \"restart\" comparison"
+    not_ok "the verb guard allows exactly start, stop, and restart — no fourth verb" \
+      "found: $(echo "${VERB_MATCHES}" | tr '\n' ' ')" "expected: start stop restart"
   fi
 
   # The verb guard must live in the *same* branch as the unit-name guard, not a second

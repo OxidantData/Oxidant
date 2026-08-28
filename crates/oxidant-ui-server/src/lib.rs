@@ -68,7 +68,9 @@ pub fn router(store: SharedStore) -> Router {
 /// Serializes every test in this crate that mutates process-wide environment
 /// (`OXIDANT_CONNECTOR_CONFIG_DIR`, `OXIDANT_SYSTEMD_UNIT_DIR`, `OXIDANT_SYSTEMCTL_BIN` in
 /// `lifecycle.rs`; `OXIDANT_CHECKPOINT_DIR` in `pipelines.rs`; `OXIDANT_UI_DIR` in
-/// `static_files.rs`, exercised through `routes.rs`'s tests) against every other one.
+/// `static_files.rs`, exercised through `routes.rs`'s tests; `OXIDANT_STATUS_TOKEN` in
+/// `status.rs`, which also reads the whole environ table back through `/environment`) against
+/// every other one.
 ///
 /// One lock, not one per module: `std::env::set_var` racing `std::env::var` (or another
 /// `set_var`) from a *different* module's test, on a different thread, is a data race on the
