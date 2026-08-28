@@ -414,6 +414,19 @@ EOF
     if [[ -n "${DRIVER_WORKERS_CSV:-}" ]]; then
       echo "OXIDANT_WORKERS=${DRIVER_WORKERS_CSV}"
       log "pinned OXIDANT_WORKERS=${DRIVER_WORKERS_CSV}" >&2
+    elif (( 10#${WORKER_COUNT:-1} == 0 )); then
+      # distributed-strict and worker-count=0 are contradictory by construction: strict
+      # exists to turn driver-local execution into a hard error, and worker-count=0 IS
+      # driver-local execution. Refuse the combination instead of silently honoring
+      # neither promise (the strict gates below all short-circuit on an empty
+      # OXIDANT_WORKERS, so without this check strict would boot and then do nothing).
+      if [[ "${DISTRIBUTED_STRICT}" == "true" || "${DISTRIBUTED_STRICT}" == "1" ]]; then
+        log "ERROR: oxidant:distributed-strict=true with oxidant:worker-count=0 —" \
+          "strict forbids the driver-local execution that single-node requires;" \
+          "set one or the other" >&2
+        return 1
+      fi
+      log "single-node driver (worker-count=0): no OXIDANT_WORKERS pinned, driver-local" >&2
     else
       log "ERROR: driver has empty worker IP list — refusing silent local fallback" >&2
       return 1
@@ -453,14 +466,30 @@ EOF
 worker_count_or_fail() {
   local role="$1" value="$2"
   if [[ "${role}" == "driver" || "${role}" == "worker" ]]; then
-    if [[ ! "${value}" =~ ^[0-9]+$ || "${value}" == "0" ]]; then
+    # W24 single-node: a driver may legitimately carry worker-count 0 (driver-local);
+    # a worker may not. Empty/garbage stays fail-closed for both roles (KAN-139).
+    if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
       log "ERROR: oxidant:worker-count tag is empty/invalid ('${value}') for role=${role}; refusing to guess the cluster size"
+      return 1
+    fi
+    # ^ regex above guarantees digits-only, so 10# (explicit base 10) is safe here and
+    # avoids bash's octal-arithmetic trap on a leading-zero value like '08'.
+    if [[ "${role}" == "worker" ]] && (( 10#${value} == 0 )); then
+      log "ERROR: oxidant:worker-count tag is 0 for role=worker; worker-count 0 is only valid on a driver (single-node)"
       return 1
     fi
     printf '%s' "${value}"
   else
     printf '%s' "${value:-1}"
   fi
+}
+
+# W24 single-node: a driver only needs to discover/wait for ASG peers when it actually
+# has workers to wait for. worker-count is pre-validated digits-only by
+# worker_count_or_fail by the time this runs, so 10# (explicit base 10) is safe here too.
+driver_needs_peer_wait() {
+  local role="$1" worker_count="$2"
+  [[ "${role}" == "driver" ]] && (( 10#${worker_count} != 0 ))
 }
 
 write_env() {
@@ -597,7 +626,7 @@ oxidant_bootstrap_main() {
   # Driver: wait for full InService set, pin private IPs into OXIDANT_WORKERS (Spark
   # "executors registered" gate — not DNS / Route53).
   DRIVER_WORKERS_CSV=""
-  if [[ "${ROLE}" == "driver" ]]; then
+  if driver_needs_peer_wait "${ROLE}" "${WORKER_COUNT}"; then
     if [[ -z "${WORKER_ASG}" || "${WORKER_ASG}" == "None" ]]; then
       log "ERROR: oxidant:worker-asg tag missing on driver; cannot discover workers"
       return 1
