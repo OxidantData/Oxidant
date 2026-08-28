@@ -347,8 +347,14 @@ mod tests {
     }
 
     /// A mistyped path must not take the UI down — it degrades to the embedded page.
+    ///
+    /// Uses the crate-wide [`crate::ENV_LOCK`]: this mutates `OXIDANT_UI_DIR`, process-wide
+    /// environment that `lifecycle.rs` and `pipelines.rs` tests also touch under different var
+    /// names — one shared mutex is what actually serializes `std::env::set_var`/`var` across
+    /// all of them; a module-private one only excludes tests in this same file.
     #[test]
     fn a_spa_dir_without_an_index_is_ignored() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("oxidant-spa-empty-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var(static_files::UI_DIR_ENV, &dir);

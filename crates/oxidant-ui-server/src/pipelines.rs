@@ -925,10 +925,13 @@ mod tests {
 
     /// A blank env var is unset — otherwise the endpoint would resolve logs against the
     /// process working directory.
+    ///
+    /// Uses the crate-wide [`crate::ENV_LOCK`], not a module-private one: every crate test that
+    /// mutates process environment shares this single mutex, because a module-private `static`
+    /// with the same name as a sibling's cannot actually exclude it — see that doc comment.
     #[test]
     fn blank_checkpoint_dir_is_treated_as_unset() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(CHECKPOINT_DIR_ENV, "   ");
         assert_eq!(checkpoint_root_from_env(), None);
         std::env::set_var(CHECKPOINT_DIR_ENV, " /srv/ckpt ");

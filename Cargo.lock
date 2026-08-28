@@ -4749,6 +4749,7 @@ dependencies = [
  "oxidant-common",
  "oxidant-config",
  "oxidant-observability",
+ "oxidant-pipelines",
  "oxidant-streaming",
  "serde",
  "serde_json",

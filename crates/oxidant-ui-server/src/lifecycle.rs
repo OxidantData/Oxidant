@@ -25,6 +25,12 @@
 //! under [`UNIT_DIR`] and matching the `--config` argument of its `ExecStart=` line against the
 //! (canonicalized) `config_path` the caller asked about — see [`discover_unit`].
 //!
+//! That freedom is real for *discovery*, but not (yet) for *authorization*: the polkit rule
+//! this route depends on to actually run `systemctl` (see "Privilege" below) only authorizes
+//! `oxidant-connector-*.service` unit names. A custom-named unit is found here and then denied
+//! by polkit — see `docs/api.md` ("Pipeline lifecycle") for the one-line rule an operator adds
+//! to cover a different naming scheme.
+//!
 //! ## Security
 //!
 //! This route executes process-level actions (`systemctl start/stop/restart`) and deletes
@@ -43,6 +49,25 @@
 //! - Every process invocation goes through [`std::process::Command`] with an argv array
 //!   (`systemctl`, one action, one unit name) — never a shell string, so there is no quoting
 //!   layer for a crafted unit name or config path to escape.
+//!
+//! ## Resnapshot order
+//!
+//! A resnapshot **stops the unit first**, then deletes checkpoints, then clears the pipeline's
+//! own derived-table state, then starts it back up — never delete-then-restart. The pipeline
+//! process checkpoints after every batch (`oxidant-streaming/src/scheduler.rs`) to exactly the
+//! prefix this route deletes; deleting while the process is still alive and only then
+//! restarting it lets the running process re-create the checkpoint from memory before the
+//! restart lands, silently no-op'ing the whole operation. Between the stop and the delete,
+//! nothing is running that could race the delete.
+//!
+//! Deleting checkpoint objects is also not enough on its own: `_pipeline-state.json` at the
+//! checkpoint root records, per derived table, whether it was already built from the current
+//! definition (`oxidant_pipelines::runner`'s `built_as`). Left alone, every derived table is
+//! skipped as "unchanged" on the next pass regardless of the checkpoint reset — re-snapshotting
+//! is precisely the case where the table's *definition* did not change, so that fingerprint is
+//! still valid and the skip still fires. [`clear_pipeline_state`] drops it for the same tables
+//! the checkpoint delete touched, which is what the Connect full-refresh path
+//! (`oxidant-connect/src/pipelines.rs`) already calls for the same reason.
 //!
 //! ## Auth
 //!
@@ -79,6 +104,7 @@ use axum::{
     Json,
 };
 use oxidant_config::OxidantConfig;
+use oxidant_pipelines::clear_pipeline_state;
 use oxidant_streaming::{checkpoint_store, Engine};
 use serde::Deserialize;
 use serde_json::json;
@@ -104,12 +130,25 @@ pub const UNIT_DIR: &str = "/etc/systemd/system";
 /// something to pass it when driven through the router rather than called directly.
 pub const UNIT_DIR_ENV: &str = "OXIDANT_SYSTEMD_UNIT_DIR";
 
+/// The `systemctl` binary [`run_systemctl`] invokes, in production always the one on `PATH`.
+pub const SYSTEMCTL_BIN: &str = "systemctl";
+
+/// Overrides [`SYSTEMCTL_BIN`] — unset in production. Same reasoning as [`CONFIG_DIR_ENV`] and
+/// [`UNIT_DIR_ENV`]: [`run_systemctl`] has no way to take the binary as a parameter without
+/// threading it through every caller, so a test points this at a fake `systemctl` on disk that
+/// records its argv instead of driving the real thing.
+pub const SYSTEMCTL_BIN_ENV: &str = "OXIDANT_SYSTEMCTL_BIN";
+
 fn config_dir() -> PathBuf {
     env_dir(CONFIG_DIR_ENV).unwrap_or_else(|| PathBuf::from(CONFIG_DIR))
 }
 
 fn unit_dir() -> PathBuf {
     env_dir(UNIT_DIR_ENV).unwrap_or_else(|| PathBuf::from(UNIT_DIR))
+}
+
+fn systemctl_bin() -> PathBuf {
+    env_dir(SYSTEMCTL_BIN_ENV).unwrap_or_else(|| PathBuf::from(SYSTEMCTL_BIN))
 }
 
 fn env_dir(var: &str) -> Option<PathBuf> {
@@ -246,14 +285,21 @@ pub async fn pipeline_lifecycle(
     {
         Ok(Ok(Some(unit))) => unit,
         Ok(Ok(None)) => {
+            // Deliberately not `404`: the platform side (`server/src/connectors/driver.rs`)
+            // treats `404`/`501` as "this engine build has no lifecycle route at all" and falls
+            // back to a copy-paste instruction for the operator to run by hand. That fallback
+            // is wrong here — the route exists, the config loaded, and the fact is narrower:
+            // no installed unit's `ExecStart=` runs this config. `409` keeps `404` meaning only
+            // "there is nothing here" (no token, config didn't load) — see `docs/api.md`.
             return error_response(
-                StatusCode::NOT_FOUND,
+                StatusCode::CONFLICT,
                 format!(
-                    "no systemd unit under {} runs `{}`",
+                    "no systemd unit under {} runs `{}` — its ExecStart= does not match any \
+                     installed unit; the config exists and loaded, but nothing runs it",
                     unit_dir().display(),
                     config_path.display()
                 ),
-            )
+            );
         }
         Ok(Err(e)) => {
             return error_response(
@@ -276,30 +322,67 @@ pub async fn pipeline_lifecycle(
             Err(e) => error_response(StatusCode::BAD_GATEWAY, e),
         },
         LifecycleCommand::Resnapshot => {
+            // Order matters: stop first, *then* delete, *then* clear derived-table state,
+            // *then* start. The pipeline checkpoints after every batch
+            // (`oxidant-streaming/src/scheduler.rs`) to exactly the prefix deleted below — a
+            // delete-then-restart lets the still-running process re-create the checkpoint from
+            // memory before the restart lands, silently no-op'ing the whole operation. See the
+            // module docs ("Resnapshot order").
+            if let Err(e) = run_systemctl("stop", &unit).await {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "stopping {unit} before resnapshot: {e} — nothing was deleted; the unit \
+                         was not stopped, so the checkpoint and pipeline state were left alone"
+                    ),
+                );
+            }
+
             let deleted = match delete_checkpoints(&pipeline.checkpoints, &tables).await {
                 Ok(n) => n,
                 Err(e) => {
                     return error_response(
                         StatusCode::BAD_GATEWAY,
                         format!(
-                            "deleting checkpoints under `{}` for {}: {e}",
+                            "{unit} stopped, but deleting checkpoints under `{}` for {}: {e} — \
+                             the unit is stopped and was not restarted; resolve the checkpoint \
+                             issue and start it by hand",
                             pipeline.checkpoints,
                             tables.join(", ")
                         ),
                     )
                 }
             };
-            // `delete_checkpoints` only returns `Ok` once every requested table's prefix is
-            // gone, so a restart failure here is strictly "the delete finished, the restart
-            // didn't" — the operator needs exactly that sentence, not a guess at which half of
-            // the operation landed.
-            match run_systemctl("restart", &unit).await {
+
+            if let Err(e) =
+                clear_pipeline_state(&Engine::default(), &pipeline.checkpoints, &tables).await
+            {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "{unit} stopped and checkpoints deleted for all {} requested table{} \
+                         ({deleted} object{} removed), but clearing pipeline state under `{}` \
+                         failed: {e} — the unit is stopped and was not restarted; every derived \
+                         table would be skipped as unchanged if it started without this landing",
+                        tables.len(),
+                        if tables.len() == 1 { "" } else { "s" },
+                        if deleted == 1 { "" } else { "s" },
+                        pipeline.checkpoints,
+                    ),
+                );
+            }
+
+            // Everything up to here only returns `Ok` once it fully lands, so a start failure
+            // now is strictly "the delete and the state clear finished, the start didn't" — the
+            // operator needs exactly that sentence, not a guess at which part landed.
+            match run_systemctl("start", &unit).await {
                 Ok(()) => success(&unit, request.command, "restarted", Some(deleted)),
                 Err(e) => error_response(
                     StatusCode::BAD_GATEWAY,
                     format!(
-                        "checkpoints deleted for all {} requested table{} ({deleted} object{} \
-                         removed), but restarting {unit} failed: {e}",
+                        "{unit} stopped, checkpoints deleted for all {} requested table{} \
+                         ({deleted} object{} removed), and pipeline state cleared, but starting \
+                         {unit} failed: {e}",
                         tables.len(),
                         if tables.len() == 1 { "" } else { "s" },
                         if deleted == 1 { "" } else { "s" },
@@ -440,20 +523,25 @@ fn paths_match(a: &Path, b: &Path) -> bool {
 
 /// `systemctl <action> <unit>` — an argv array, never a shell string. Runs on a blocking
 /// thread: this is a synchronous child-process call inside an async handler.
+///
+/// The binary is [`systemctl_bin`], not a literal `"systemctl"` — [`SYSTEMCTL_BIN_ENV`] lets a
+/// test point this at a fake binary that records its argv instead of driving the real thing.
 async fn run_systemctl(action: &'static str, unit: &str) -> Result<(), String> {
     let unit = unit.to_string();
     let unit_for_panic_msg = unit.clone();
     tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("systemctl")
+        let bin = systemctl_bin();
+        let output = std::process::Command::new(&bin)
             .arg(action)
             .arg(&unit)
             .output()
-            .map_err(|e| format!("invoking systemctl {action} {unit}: {e}"))?;
+            .map_err(|e| format!("invoking {} {action} {unit}: {e}", bin.display()))?;
         if output.status.success() {
             Ok(())
         } else {
             Err(format!(
-                "systemctl {action} {unit} exited {}: {}",
+                "{} {action} {unit} exited {}: {}",
+                bin.display(),
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
             ))
@@ -691,10 +779,13 @@ mod tests {
 
     const TOKEN: &str = "s3cret-status-token";
 
-    /// Serializes every test that points [`CONFIG_DIR_ENV`] / [`UNIT_DIR_ENV`] at a fixture —
-    /// they mutate process-wide environment, same rule as the sibling `ENV_LOCK`s in
-    /// `pipelines.rs` and `status.rs`.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Every test below that points [`CONFIG_DIR_ENV`] / [`UNIT_DIR_ENV`] / [`SYSTEMCTL_BIN_ENV`]
+    /// at a fixture locks [`crate::ENV_LOCK`] — the single crate-wide mutex every module that
+    /// mutates process environment in its tests shares, so `pipelines.rs` and `routes.rs`
+    /// cannot race this file's `std::env::set_var` calls. A module-private `static` here would
+    /// have the same name as those modules' but be a genuinely different mutex, unable to
+    /// exclude anything outside this file — see the doc comment on [`crate::ENV_LOCK`] itself.
+    use crate::ENV_LOCK;
 
     fn router(token: Option<&str>) -> Router {
         let state = AppState {
@@ -774,6 +865,68 @@ mod tests {
     fn clear_dirs() {
         std::env::remove_var(CONFIG_DIR_ENV);
         std::env::remove_var(UNIT_DIR_ENV);
+        std::env::remove_var(SYSTEMCTL_BIN_ENV);
+    }
+
+    /// Writes a fake `systemctl` that appends `"<action> <unit>"` to `call_log` for every
+    /// invocation, and — only when invoked with `start` — refuses (exit `1`) unless every path
+    /// in `must_be_absent_on_start` is already gone and every `(file, needle)` pair in
+    /// `must_not_contain_on_start` no longer contains `needle`.
+    ///
+    /// This is what makes the resnapshot ordering tests below a runtime proof rather than a
+    /// reading of the source: the fake binary inspects real filesystem state *at the moment the
+    /// real code path invokes `start`*, so a regression back to delete-then-restart (or a
+    /// dropped `clear_pipeline_state` call) fails the request with `ORDER VIOLATION`, not just
+    /// a code-review nit.
+    fn write_fake_systemctl(
+        bin_dir: &Path,
+        call_log: &Path,
+        must_be_absent_on_start: &[PathBuf],
+        must_not_contain_on_start: &[(PathBuf, &str)],
+    ) -> PathBuf {
+        std::fs::create_dir_all(bin_dir).unwrap();
+        let mut script = String::from("#!/bin/sh\nset -eu\naction=\"$1\"\nunit=\"$2\"\n");
+        script.push_str(&format!(
+            "printf '%s %s\\n' \"$action\" \"$unit\" >> '{}'\n",
+            call_log.display()
+        ));
+        // `:` is a no-op but keeps the `if` body non-empty when both guard lists are empty —
+        // `if ...; then\nfi` is a POSIX shell syntax error, not simply "no checks run".
+        script.push_str("if [ \"$action\" = start ]; then\n  :\n");
+        for p in must_be_absent_on_start {
+            script.push_str(&format!(
+                "  if [ -e '{}' ]; then echo 'ORDER VIOLATION: {} still present at start' >&2; exit 1; fi\n",
+                p.display(),
+                p.display()
+            ));
+        }
+        for (p, needle) in must_not_contain_on_start {
+            script.push_str(&format!(
+                "  if [ -f '{}' ] && grep -q '{}' '{}'; then echo 'ORDER VIOLATION: {} still mentions {} at start' >&2; exit 1; fi\n",
+                p.display(),
+                needle,
+                p.display(),
+                p.display(),
+                needle,
+            ));
+        }
+        script.push_str("fi\nexit 0\n");
+
+        let path = bin_dir.join("systemctl");
+        std::fs::write(&path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn read_call_log(call_log: &Path) -> Vec<String> {
+        std::fs::read_to_string(call_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     /// Same posture as `/api/v1/pipelines` and `/api/status`: no token, no route.
@@ -948,7 +1101,7 @@ mod tests {
     // ENV_LOCK serializes this test's process-global env mutation against any sibling that
     // grows one; the guard must therefore span the awaits it protects.
     #[allow(clippy::await_holding_lock)]
-    async fn answers_404_when_no_unit_runs_this_config() {
+    async fn answers_409_when_no_unit_runs_this_config() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let checkpoints =
             std::env::temp_dir().join(format!("oxidant-lc-ckpt-{}", uuid::Uuid::new_v4()));
@@ -965,7 +1118,9 @@ mod tests {
             Some(&bearer()),
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Not `404`: the config loaded fine, so this must be distinguishable from "there is
+        // nothing here" — see the module docs and docs/api.md ("Pipeline lifecycle").
+        assert_eq!(status, StatusCode::CONFLICT);
         assert!(body["error"].as_str().unwrap().contains("no systemd unit"));
 
         clear_dirs();
@@ -973,17 +1128,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&checkpoints);
     }
 
-    /// Every-table honesty end to end: an empty `tables` on a resnapshot deletes *every*
-    /// declared table's checkpoint prefix, not just the first one. The final `systemctl
-    /// restart` fails (there is no such unit on the machine running this test — see the module
-    /// docs), which is the expected, and separately asserted, partial-failure sentence: the
-    /// checkpoints are provably gone by the time that failure is reported.
+    /// The success path `docs/api.md` documents for `start`/`resume`/`pause`: a `200` with
+    /// `{"unit","command","action","checkpointsDeleted"}`, `run_systemctl` invoked with exactly
+    /// the verb the command maps to, and nothing else. Regressing `Pause`'s arm from `stop` to
+    /// `start` (or vice versa for `Start`/`Resume`) would pass every other test in this file —
+    /// this is the one that actually calls the fake binary and reads its argv back.
     #[tokio::test]
-    // ENV_LOCK serializes this test's process-global env mutation against any sibling that
-    // grows one; the guard must therefore span the awaits it protects.
     #[allow(clippy::await_holding_lock)]
-    async fn resnapshot_with_no_tables_deletes_every_declared_table_then_reports_the_restart_failure(
-    ) {
+    async fn start_pause_resume_each_call_the_verb_they_document() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let checkpoints =
+            std::env::temp_dir().join(format!("oxidant-lc-ckpt-{}", uuid::Uuid::new_v4()));
+        let (base, config_dir, unit_dir, config_path) = fixture(&["orders"], &checkpoints);
+        std::fs::write(
+            unit_dir.join("oxidant-connector-orders.service"),
+            format!(
+                "[Service]\nExecStart=/usr/local/bin/oxidant pipeline run --config {}\n",
+                config_path.display()
+            ),
+        )
+        .unwrap();
+        let bin_dir = std::env::temp_dir().join(format!("oxidant-lc-bin-{}", uuid::Uuid::new_v4()));
+
+        for (command, expected_verb, expected_action) in [
+            ("start", "start", "started"),
+            ("resume", "start", "started"),
+            ("pause", "stop", "stopped"),
+        ] {
+            let call_log = bin_dir.join(format!("calls-{command}.log"));
+            let bin = write_fake_systemctl(&bin_dir, &call_log, &[], &[]);
+            set_dirs(&config_dir, &unit_dir);
+            std::env::set_var(SYSTEMCTL_BIN_ENV, &bin);
+
+            let (status, body) = post(
+                router(Some(TOKEN)),
+                json!({
+                    "command": command,
+                    "name": "orders",
+                    "config_path": config_path.to_str().unwrap(),
+                }),
+                Some(&bearer()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{command}: {body}");
+            assert_eq!(body["unit"], "oxidant-connector-orders.service");
+            assert_eq!(body["command"], command);
+            assert_eq!(body["action"], expected_action);
+            assert!(body["checkpointsDeleted"].is_null(), "{command}: {body}");
+
+            let calls = read_call_log(&call_log);
+            assert_eq!(
+                calls,
+                vec![format!("{expected_verb} oxidant-connector-orders.service")],
+                "{command} should call systemctl {expected_verb} exactly once"
+            );
+        }
+
+        clear_dirs();
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&checkpoints);
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    /// Every-table honesty end to end, plus the order this whole route exists to get right:
+    /// `stop` lands, then every declared table's checkpoint prefix is deleted, then
+    /// `_pipeline-state.json`'s `built_as` fingerprint for those same tables is cleared, and
+    /// only then does `start` run — proved at runtime, not by reading the source. The fake
+    /// `systemctl` refuses `start` (`ORDER VIOLATION`, nonzero exit) unless both checkpoint
+    /// files are already gone and the pipeline-state file no longer mentions either table's
+    /// definition marker, so a regression back to delete-then-restart, or a dropped
+    /// `clear_pipeline_state` call, fails this test with that message rather than a passing
+    /// green run that happens to be wrong.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn resnapshot_stops_deletes_clears_state_then_starts_in_that_order() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let checkpoints =
             std::env::temp_dir().join(format!("oxidant-lc-ckpt-{}", uuid::Uuid::new_v4()));
@@ -994,8 +1212,15 @@ mod tests {
         std::fs::write(checkpoints.join("orders/offsets.json"), "{}").unwrap();
         std::fs::create_dir_all(checkpoints.join("clicks")).unwrap();
         std::fs::write(checkpoints.join("clicks/offsets.json"), "{}").unwrap();
-        // A real unit whose ExecStart points at this config, so discovery succeeds; systemctl
-        // itself will still fail because no such unit is actually loaded.
+        // Seeds the same state shape `oxidant_pipelines::runner::PipelineState` writes: a
+        // `built_as` fingerprint per table. `clear_pipeline_state` must drop both entries
+        // before `start` runs, or the next real pass would skip both tables as "unchanged".
+        std::fs::write(
+            checkpoints.join("_pipeline-state.json"),
+            r#"{"tables":{"orders":{"epoch":3,"built":true,"definition":"orders-def-marker"},"clicks":{"epoch":5,"built":true,"definition":"clicks-def-marker"}},"once_completed":[]}"#,
+        )
+        .unwrap();
+        // A real unit whose ExecStart points at this config, so discovery succeeds.
         std::fs::write(
             unit_dir.join("oxidant-connector-orders.service"),
             format!(
@@ -1004,7 +1229,100 @@ mod tests {
             ),
         )
         .unwrap();
+        let bin_dir = std::env::temp_dir().join(format!("oxidant-lc-bin-{}", uuid::Uuid::new_v4()));
+        let call_log = bin_dir.join("calls.log");
+        let bin = write_fake_systemctl(
+            &bin_dir,
+            &call_log,
+            &[
+                checkpoints.join("orders/offsets.json"),
+                checkpoints.join("clicks/offsets.json"),
+            ],
+            &[
+                (
+                    checkpoints.join("_pipeline-state.json"),
+                    "orders-def-marker",
+                ),
+                (
+                    checkpoints.join("_pipeline-state.json"),
+                    "clicks-def-marker",
+                ),
+            ],
+        );
         set_dirs(&config_dir, &unit_dir);
+        std::env::set_var(SYSTEMCTL_BIN_ENV, &bin);
+
+        let (status, body) = post(
+            router(Some(TOKEN)),
+            json!({
+                "command": "resnapshot",
+                "name": "orders",
+                "config_path": config_path.to_str().unwrap(),
+            }),
+            Some(&bearer()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["unit"], "oxidant-connector-orders.service");
+        assert_eq!(body["command"], "resnapshot");
+        assert_eq!(body["action"], "restarted");
+        assert_eq!(body["checkpointsDeleted"], 2);
+
+        // The order actually observed: stop before start, nothing else — the delete and the
+        // state clear happen in-process between them, never through `systemctl`.
+        assert_eq!(
+            read_call_log(&call_log),
+            vec![
+                "stop oxidant-connector-orders.service".to_string(),
+                "start oxidant-connector-orders.service".to_string(),
+            ]
+        );
+        assert!(!checkpoints.join("orders/offsets.json").exists());
+        assert!(!checkpoints.join("clicks/offsets.json").exists());
+        // Not a declared table's checkpoint — never touched, and never should be by anything
+        // named `_offsets.json` at the root either.
+        assert!(checkpoints.join("orders_offsets.json").exists());
+        let state = std::fs::read_to_string(checkpoints.join("_pipeline-state.json")).unwrap();
+        assert!(!state.contains("orders-def-marker"), "{state}");
+        assert!(!state.contains("clicks-def-marker"), "{state}");
+
+        clear_dirs();
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&checkpoints);
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    /// The other end of the ordering guarantee: if `stop` itself fails, nothing is deleted and
+    /// nothing is cleared — the operator gets "the unit was not stopped" and every checkpoint
+    /// and state entry is exactly as it was.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn resnapshot_deletes_nothing_when_stop_fails() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let checkpoints =
+            std::env::temp_dir().join(format!("oxidant-lc-ckpt-{}", uuid::Uuid::new_v4()));
+        let (base, config_dir, unit_dir, config_path) = fixture(&["orders"], &checkpoints);
+        std::fs::create_dir_all(checkpoints.join("orders")).unwrap();
+        std::fs::write(checkpoints.join("orders/offsets.json"), "{}").unwrap();
+        std::fs::write(
+            unit_dir.join("oxidant-connector-orders.service"),
+            format!(
+                "[Service]\nExecStart=/usr/local/bin/oxidant pipeline run --config {}\n",
+                config_path.display()
+            ),
+        )
+        .unwrap();
+        let bin_dir = std::env::temp_dir().join(format!("oxidant-lc-bin-{}", uuid::Uuid::new_v4()));
+        // A fake systemctl that fails unconditionally, on every action including `stop`.
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("systemctl");
+        std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        set_dirs(&config_dir, &unit_dir);
+        std::env::set_var(SYSTEMCTL_BIN_ENV, &bin);
 
         let (status, body) = post(
             router(Some(TOKEN)),
@@ -1018,23 +1336,13 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
         let message = body["error"].as_str().unwrap();
-        assert!(
-            message.contains("checkpoints deleted for all 2 requested tables (2 objects removed)"),
-            "{message}"
-        );
-        assert!(
-            message.contains("restarting oxidant-connector-orders.service failed"),
-            "{message}"
-        );
-
-        assert!(!checkpoints.join("orders/offsets.json").exists());
-        assert!(!checkpoints.join("clicks/offsets.json").exists());
-        // Not a declared table's checkpoint — never touched, and never should be by anything
-        // named `_offsets.json` at the root either.
-        assert!(checkpoints.join("orders_offsets.json").exists());
+        assert!(message.contains("stopping"), "{message}");
+        assert!(message.contains("nothing was deleted"), "{message}");
+        assert!(checkpoints.join("orders/offsets.json").exists());
 
         clear_dirs();
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&checkpoints);
+        let _ = std::fs::remove_dir_all(&bin_dir);
     }
 }
