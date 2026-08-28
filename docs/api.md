@@ -32,6 +32,7 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/status` | Driver status for a control plane — **bearer token required** |
 | `GET` | `/api/v1/pipelines` | Streaming pipelines with a connector log on this driver — **bearer token required** |
 | `GET` | `/api/v1/pipelines/{name}/logs` | Tail of a streaming connector's JSONL log — **bearer token required** |
+| `POST` | `/api/v1/pipelines/lifecycle` | Start, pause, resume, or re-snapshot a file-defined pipeline — **bearer token required** |
 | `GET` | `/api/v1/logs` | One page of a node's logs — the memory ring, or a file with `?file=`, filtered by `?level=`/`?target=`/`?q=`/`?from=`/`?to=` and paged by `?before=` — **bearer token required** |
 | `GET` | `/api/v1/logs/files` | Every log file a node still has, newest period first — **bearer token required** |
 | `GET` | `/api/v1/logs/workers` | The nodes that can be browsed, and which are answering — **bearer token required** |
@@ -340,8 +341,12 @@ endpoint:
 The token itself is redacted from `/api/v1/applications/{id}/environment`, which otherwise
 echoes every `OXIDANT_*` variable.
 
-The same token gates [the pipeline list](#pipelines), [connector logs](#connector-logs) and
-[the driver's log buffer](#driver-logs); a leak is a leak of all four.
+The same token gates [the pipeline list](#pipelines), [connector logs](#connector-logs),
+[pipeline lifecycle control](#pipeline-lifecycle) and [the driver's log buffer](#driver-logs); a
+leak is a leak of all five — and for the lifecycle route specifically, a leak is a leak of
+`systemctl start/stop/restart` on the connector units it can reach and delete access to their
+checkpoints. Guard the driver's HTTP port the same way regardless: a private subnet or a
+security group that admits only the control plane.
 
 ## Pipelines
 
@@ -452,6 +457,64 @@ checked against the resolved logs directory. The listing applies the same rule, 
 `GET /api/v1/pipelines` offers is tailable and nothing else is. A `logs` directory that is
 itself a symlink is fine: that is the operator's own configuration, and it becomes the
 boundary.
+
+## Pipeline lifecycle
+
+`POST /api/v1/pipelines/lifecycle` starts, stops, or re-snapshots the systemd unit that runs a
+file-defined pipeline's config — the control a driver had no route for before this: a pipeline
+process listens on no socket, so the only prior option was an operator running a printed
+`systemctl` / `rm -rf` command by hand (see [`pipelines.md`](pipelines.md) and the platform's
+`docs/connectors.md`).
+
+```sh
+curl -s -X POST http://localhost:4040/api/v1/pipelines/lifecycle \
+  -H "Authorization: Bearer $OXIDANT_STATUS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "command": "resnapshot",
+    "name": "orders",
+    "config_path": "/etc/oxidant/connectors/orders.yaml",
+    "tables": ["orders", "line_items"]
+  }'
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `command` | yes | One of `start`, `pause`, `resume`, `resnapshot` |
+| `name` | no | The connector's name — echoed in error messages only; the config is what everything is checked against |
+| `config_path` | yes | Must canonicalize to a path under `/etc/oxidant/connectors/` |
+| `checkpoint_root` | no | Checked against the pipeline's own `pipeline.checkpoints`, read fresh off `config_path` — never substituted for it. A mismatch is refused, `403` |
+| `tables` | no | For `resnapshot`: which tables to re-snapshot. Empty means **every** table the pipeline declares, not just the first — see the note on every-table honesty below. Each name must match `[A-Za-z0-9_]+` and be a table the pipeline actually declares |
+
+`start` and `resume` both `systemctl start` the unit; `pause` stops it. `resnapshot` deletes
+`{checkpoints}/{table}` for every requested table through the same
+[`checkpoint_store`](pipelines.md) resolver the pipeline itself checkpoints through — never a
+shell `rm -rf` — and then `systemctl restart`s the unit.
+
+The unit is **found**, not assumed: this route reads every `*.service` file under
+`/etc/systemd/system` and matches the `--config` argument of its `ExecStart=` against
+`config_path`, so it works whatever a unit happens to be named (the demo convention is
+`oxidant-connector-<name>.service`, but nothing here depends on that).
+
+| Response | Meaning |
+|---|---|
+| `200` | `{"unit", "command", "action", "checkpointsDeleted"}` — `action` is `started`, `stopped`, or `restarted`; `checkpointsDeleted` is the object count, present only for `resnapshot` |
+| `400` | Malformed body |
+| `403` | A validation refusal: `config_path` resolves outside the connectors directory, a table name is not `[A-Za-z0-9_]+`, a table is not declared by this pipeline, or `checkpoint_root` does not match the pipeline's own |
+| `404` | No token configured (route absent, same as [`/api/status`](#driver-status)); or `config_path` does not load; or no unit's `ExecStart=` matches it |
+| `401` | Wrong or missing bearer token |
+| `502` | `systemctl` failed, or (for `resnapshot`) checkpoint deletion failed. On a `resnapshot` where deletion succeeded and only the restart failed, the message says exactly that — the operator needs "checkpoints are gone, the unit did not come back", not a guess at which half landed |
+
+**Privilege.** The driver runs as the unprivileged `oxidant` user with `NoNewPrivileges=true`
+(see `deploy/packer/files/systemd/oxidant-driver.service`), which rules out `sudo` outright —
+`sudo` elevates via a setuid binary, exactly what `NoNewPrivileges` blocks. This route instead
+calls the plain `systemctl` binary, which asks PID 1 to act over the system D-Bus; the
+privileged part happens inside `systemd` on the caller's behalf, authorized by a **polkit**
+rule scoped to the `oxidant` user and to `oxidant-connector-*.service` unit names
+(`deploy/packer/files/polkit/49-oxidant-connector-lifecycle.rules`, installed by
+`deploy/packer/scripts/provision.sh`). `NoNewPrivileges` does not apply to that: it constrains
+this process gaining privileges itself, not an already-privileged daemon acting on an
+authorized IPC request.
 
 ## Driver logs
 

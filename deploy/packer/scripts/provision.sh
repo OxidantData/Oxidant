@@ -60,7 +60,11 @@ systemctl is-enabled amazon-ssm-agent
 echo "[provision] creating oxidant user ${OXIDANT_UID}:${OXIDANT_GID}"
 groupadd -g "${OXIDANT_GID}" oxidant 2>/dev/null || true
 useradd -u "${OXIDANT_UID}" -g "${OXIDANT_GID}" -m -d /var/lib/oxidant -s /sbin/nologin oxidant 2>/dev/null || true
-mkdir -p /var/lib/oxidant/spill /etc/oxidant /usr/local/lib/oxidant
+# /etc/oxidant/connectors: where the platform renders one YAML per connector, and the only
+# directory `POST /api/v1/pipelines/lifecycle` (crates/oxidant-ui-server/src/lifecycle.rs) will
+# act on a `config_path` under. Left world-readable (the default /etc mode) — the driver reads
+# it as `oxidant`, and nothing here is a secret; connector credentials live elsewhere.
+mkdir -p /var/lib/oxidant/spill /etc/oxidant /etc/oxidant/connectors /usr/local/lib/oxidant
 chown -R oxidant:oxidant /var/lib/oxidant
 chmod 755 /var/lib/oxidant /var/lib/oxidant/spill
 
@@ -78,6 +82,19 @@ fi
 test -x /usr/local/bin/oxidant
 # Do not leave the staged upload in /tmp for the AMI.
 rm -f "${STAGED_BINARY}"
+
+echo "[provision] installing polkit rule for connector lifecycle control"
+# Authorizes the unprivileged `oxidant` user to `systemctl start/stop/restart` only
+# `oxidant-connector-*.service` units, over D-Bus, without `sudo` — see the rule file and
+# crates/oxidant-ui-server/src/lifecycle.rs (POST /api/v1/pipelines/lifecycle) for why: the
+# driver unit sets `NoNewPrivileges=true`, which rules out a sudoers-based mechanism outright.
+dnf -y install polkit
+rpm -q polkit
+mkdir -p /etc/polkit-1/rules.d
+install -m 0644 /tmp/oxidant-files/polkit/49-oxidant-connector-lifecycle.rules \
+  /etc/polkit-1/rules.d/49-oxidant-connector-lifecycle.rules
+systemctl enable --now polkit
+systemctl is-active polkit
 
 echo "[provision] installing bootstrap + systemd units"
 install -m 0755 /tmp/oxidant-files/bootstrap.sh /usr/local/lib/oxidant/bootstrap.sh

@@ -63,6 +63,8 @@ jobs:
         run: bash deploy/packer/tests/test_ssm_agent.sh
       - name: Env stamping / worker-count bootstrap tests
         run: bash deploy/packer/tests/test_env_stamping.sh
+      - name: Connector lifecycle privilege contracts
+        run: bash deploy/packer/tests/test_connector_lifecycle_privilege.sh
 
   build-test:
     name: clippy + test

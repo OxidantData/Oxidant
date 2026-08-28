@@ -5,7 +5,7 @@ use axum::{
         sse::{Event, KeepAlive},
         Sse,
     },
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures::StreamExt;
@@ -17,7 +17,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
     dashboards::{self, DashboardStore},
-    pipelines, static_files, status,
+    lifecycle, pipelines, static_files, status,
 };
 
 #[derive(Clone)]
@@ -120,6 +120,10 @@ pub fn app_router_with_spa(
         .route(
             "/api/v1/pipelines/{name}/logs",
             get(pipelines::pipeline_logs),
+        )
+        .route(
+            "/api/v1/pipelines/lifecycle",
+            post(lifecycle::pipeline_lifecycle),
         )
         .route("/api/v1/events/stream", get(events_stream))
         .route("/health", get(|| async { "ok" }));

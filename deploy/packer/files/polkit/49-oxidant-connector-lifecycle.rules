@@ -1,0 +1,33 @@
+// Authorizes the unprivileged `oxidant` user to start/stop/restart *only* the
+// `oxidant-connector-*.service` units, over the systemd D-Bus API, with no `sudo` and no
+// privilege escalation of the calling process.
+//
+// Why this exists, instead of a sudoers drop-in: the driver unit
+// (deploy/packer/files/systemd/oxidant-driver.service) sets `NoNewPrivileges=true`, which blocks
+// `execve` of any setuid binary — including `sudo` — unconditionally, for any command. Loosening
+// that flag to make `sudo` work would trade away hardening on the process that terminates a
+// customer's inbound SQL, for the sake of a route that only ever needs to touch a *different*
+// unit. `systemctl start|stop|restart` does not need new privileges from this process at all:
+// it asks PID 1 (already root) to act on its behalf over the system bus, and `NoNewPrivileges`
+// has no say over that — it constrains what *this* process can execve, not what an
+// already-privileged daemon does after checking a polkit rule.
+//
+// Scope is deliberately narrow in two dimensions: the calling user (`oxidant`, and only that
+// user — nothing here authorizes any other local account) and the unit name (only
+// `oxidant-connector-*.service` — never the driver's own unit, a worker's, or anything else on
+// the box). See crates/oxidant-ui-server/src/lifecycle.rs and docs/api.md ("Pipeline lifecycle")
+// for the route this backs, and deploy/packer/scripts/provision.sh for how this file reaches
+// /etc/polkit-1/rules.d on a built AMI.
+polkit.addRule(function(action, subject) {
+    if (action.id != "org.freedesktop.systemd1.manage-units") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (subject.user != "oxidant") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    if (unit && /^oxidant-connector-[A-Za-z0-9_-]+\.service$/.test(unit)) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

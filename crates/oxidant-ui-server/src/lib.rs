@@ -1,6 +1,7 @@
 //! HTTP server for the Oxidant monitoring UI: Spark-compatible `/api/v1` REST, SSE, and static SPA.
 
 pub mod dashboards;
+pub mod lifecycle;
 pub mod pipelines;
 mod routes;
 mod static_files;
