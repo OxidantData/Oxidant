@@ -280,7 +280,7 @@ rather than as SQL `GRANT` statements.
 > `oxidant-parity functions --markdown`. Read that file for the current number; the rows here are
 > kept for their per-function detail and their probe evidence, and are marked where they are stale.
 >
-> Current exact coverage: **325 / 440 in-scope functions (73.9%)**. The 166 out-of-scope names, and
+> Current exact coverage: **324 / 440 in-scope functions (73.6%)**. The 166 out-of-scope names, and
 > why each is excluded, are enumerated in that file and in
 > `crates/oxidant-spark-compat/databricks-functions.json`.
 

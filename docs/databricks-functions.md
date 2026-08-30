@@ -17,9 +17,9 @@ Oxidant's side is the live function registry — the same union that answers `SH
 |---|---:|
 | Documented Databricks functions | 606 |
 | In scope for Oxidant | 440 |
-| **Registered today** | **325 (73.9%)** |
-| Missing | 115 |
-| Engine registry size (incl. non-Databricks names) | 458 |
+| **Registered today** | **324 (73.6%)** |
+| Missing | 116 |
+| Engine registry size (incl. non-Databricks names) | 457 |
 
 ### Out of scope
 
@@ -45,7 +45,7 @@ Oxidant's side is the live function registry — the same union that answers `SH
 | JSON functions | 5 | 9 | `json_tuple`, `parse_json`, `schema_of_json`, `schema_of_json_agg` |
 | Map functions | 8 | 18 | `explode`, `explode_outer`, `map_concat`, `map_filter`, `map_from_arrays`, `map_from_entries`, `map_zip_with`, `str_to_map`, `transform_keys`, `transform_values` |
 | Miscellaneous functions | 24 | 38 | `current_user`, `hash`, `input_file_block_length`, `input_file_block_start`, `input_file_name`, `luhn_check`, `monotonically_increasing_id`, `raise_error`, `session_user`, `spark_partition_id`, `stack`, `user`, `window`, `xxhash64` |
-| Numeric scalar functions | 125 | 139 | `approx_percentile`, `collect_list`, `collect_set`, `histogram_numeric`, `kurtosis`, `listagg`, `max_by`, `min_by`, `percentile_approx`, `percentile_disc`, `randn`, `schema_of_json_agg`, `schema_of_variant_agg`, `uniform` |
+| Numeric scalar functions | 124 | 139 | `approx_percentile`, `ceiling`, `collect_list`, `collect_set`, `histogram_numeric`, `kurtosis`, `listagg`, `max_by`, `min_by`, `percentile_approx`, `percentile_disc`, `randn`, `schema_of_json_agg`, `schema_of_variant_agg`, `uniform` |
 | Operators and predicates | 6 | 7 | `exists` |
 | Ranking window functions | 5 | 5 | — |
 | String and binary functions | 73 | 91 | `aes_decrypt`, `aes_encrypt`, `base64`, `charindex`, `collate`, `collation`, `format_number`, `locate`, `printf`, `randstr`, `sentences`, `soundex`, `space`, `try_aes_decrypt`, `try_zstd_decompress`, `unbase64`, `zstd_compress`, `zstd_decompress` |
@@ -117,7 +117,7 @@ Oxidant's side is the live function registry — the same union that answers `SH
 | `cardinality` | registered | datafusion | Array functions; Map functions |
 | `cbrt` | registered | datafusion | Numeric scalar functions |
 | `ceil` | registered | datafusion | Numeric scalar functions |
-| `ceiling` | registered | oxidant | Numeric scalar functions |
+| `ceiling` | **missing** | — | Numeric scalar functions |
 | `char` | registered | oxidant | String and binary functions |
 | `char_length` | registered | datafusion | String and binary functions |
 | `character_length` | registered | datafusion | String and binary functions |
