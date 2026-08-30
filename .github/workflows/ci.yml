@@ -5,7 +5,8 @@ name: CI
 # `ubuntu-latest` as a fast canary that also proves hosted runners still work.
 # Per-run tiers:
 #   - every PR/push: rustfmt, clippy+test (the Spark-SQL parity ratchet is folded into it
-#     as steps — fails anything that drops parity below parity/baseline.json), coverage gates
+#     as steps — fails anything that drops parity below parity/baseline.json), coverage gates,
+#     line coverage (blocking: fails below the coverage-floor.json ratchet)
 #   - main pushes, PRs labeled `full-gates`, manual dispatch: query-gates (official TPC
 #     dbgen/dsdgen at SF1 — TPC-H/TPC-DS/distributed suites) — skipped on routine PRs
 # Heavier gates live elsewhere:
@@ -220,14 +221,15 @@ jobs:
 
   # Informational llvm-cov line-coverage report on every PR and main push. Mirrors the
   # nightly job in coverage-nightly.yml so coverage deltas are visible on the PR itself.
-  # NON-BLOCKING by design (continue-on-error: true): it must never gate a merge — do not
-  # add it to required status checks. Gotchas (AGENTS.md): separate target dir
-  # target/llvm-cov-target, build oxidant-cli into it first, `--html` without
-  # `--output-path`, artifact lives at target/llvm-cov/html.
+  # BLOCKING: this job gates the merge. It fails if total line coverage falls below the
+  # floor committed in `coverage-floor.json` (minus a small tolerance), so a PR cannot quietly
+  # dilute coverage by adding untested code. Raise the floor when coverage improves — same
+  # ratchet discipline as parity/baseline.json.
+  # Gotchas (AGENTS.md): separate target dir target/llvm-cov-target, build oxidant-cli into it
+  # first, `--html` without `--output-path`, artifact lives at target/llvm-cov/html.
   line-coverage:
-    name: line coverage (informational, non-blocking)
+    name: line coverage
     runs-on: ubuntu-latest
-    continue-on-error: true
     # Cold-cache runs compile the whole workspace twice (oxidant-cli prebuild, then
     # instrumented `cargo test --workspace`). ~45–60 min is a projection, not a measurement:
     # this job has never completed a run — every attempt so far died inside the build, so
@@ -275,8 +277,28 @@ jobs:
       # constraint (runner disk — see the reclaim step above), it only makes the job
       # slower. Reinstate `--jobs 2` if a future failure actually shows memory pressure
       # rather than the ENOSPC/SIGBUS linker signature.
+      #
+      # Split build+run from report generation so the stale-object purge below can sit between
+      # them. `--no-report` collects the .profraw data without exporting.
+      - name: Collect coverage (build + run instrumented tests)
+        run: cargo llvm-cov --workspace --no-report
+      # THE reason this job never once went green. `cargo llvm-cov report` passes every file in
+      # debug/deps as an `-object` to `llvm-cov export`. A build that is killed mid-link leaves
+      # its partial linker output behind as `<binary>-<hash>.tmpXXXXXX`, and rust-cache faithfully
+      # restores that corpse into the next run, where export dies on it:
+      #
+      #   error: failed to load coverage: '…/deps/distributed_lakehouse-….tmpa296660':
+      #   malformed instrumentation profile data: symbol name is empty
+      #
+      # It is not the disk/ENOSPC problem the comments above describe — that was an older
+      # failure mode. Purging after the build (so nothing recreates them) and before the export
+      # is what makes the report reproducible.
+      - name: Purge partial linker artifacts before export
+        run: |
+          found=$(find target/llvm-cov-target -name '*.tmp*' -type f -print -delete | wc -l)
+          echo "purged $found partial linker artifact(s)"
       - name: Generate HTML coverage report
-        run: cargo llvm-cov --workspace --html
+        run: cargo llvm-cov report --html
       - name: Disk free after coverage
         if: always()
         run: df -h /
@@ -314,7 +336,48 @@ jobs:
           EOF
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+      # The gate. Runs after the summary so the numbers are visible in the job summary even on
+      # a failure, and reads the same /tmp/cov-summary.json that step produced.
+      - name: Coverage floor gate
+        run: |
+          python3 - <<'EOF'
+          import json, sys, pathlib
+
+          floor_path = pathlib.Path("coverage-floor.json")
+          summary_path = pathlib.Path("/tmp/cov-summary.json")
+          if not summary_path.is_file() or summary_path.stat().st_size == 0:
+              sys.exit("coverage summary missing — the report step did not produce one")
+
+          floor = json.loads(floor_path.read_text())
+          data = json.loads(summary_path.read_text())
+          tot = data["data"][0]["totals"]["lines"]
+          pct = 100.0 * tot["covered"] / tot["count"] if tot["count"] else 0.0
+
+          # Bootstrap: the floor can only be set from a real run of this job, and this job had
+          # never produced one. Report the number loudly and do not gate until it is committed —
+          # a floor of 0.0 would be a green light that means nothing.
+          if floor.get("measured_on") == "PENDING":
+              print(f"::warning::coverage floor is UNSET. Measured {pct:.2f}% "
+                    f"({tot['covered']}/{tot['count']}). Set line_pct to this value and "
+                    f"measured_on to today's date in coverage-floor.json to arm the gate.")
+              sys.exit(0)
+
+          minimum = floor["line_pct"] - floor["tolerance_pct"]
+          print(f"line coverage {pct:.2f}% "
+                f"({tot['covered']}/{tot['count']}), "
+                f"floor {floor['line_pct']:.2f}% - {floor['tolerance_pct']:.2f}% "
+                f"tolerance = {minimum:.2f}%")
+          if pct < minimum:
+              sys.exit(
+                  f"::error::line coverage {pct:.2f}% is below the floor {minimum:.2f}%. "
+                  "Add tests, or raise/lower coverage-floor.json deliberately with a reason."
+              )
+          if pct > floor["line_pct"] + floor["tolerance_pct"]:
+              print(f"::notice::coverage rose to {pct:.2f}% — consider raising the floor "
+                    f"in coverage-floor.json from {floor['line_pct']:.2f}%.")
+          EOF
       - name: Upload coverage HTML
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: llvm-cov-html

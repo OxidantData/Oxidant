@@ -68,8 +68,20 @@ jobs:
       # No `--jobs` cap: throttling build parallelism does not address the binding
       # constraint (runner disk — see the reclaim step above). Reinstate `--jobs 2` if a
       # future failure actually shows memory pressure rather than ENOSPC/SIGBUS.
+      # Split build+run from export so the purge below sits between them — see the same
+      # comment in ci.yml. A build killed mid-link leaves `<binary>-<hash>.tmpXXXXXX` in
+      # debug/deps, rust-cache restores it, and `llvm-cov export` then fails with
+      # "malformed instrumentation profile data: symbol name is empty". This is why every
+      # run of this job so far ended in `failure` despite the workflow reporting success —
+      # `continue-on-error: true` was masking it.
+      - name: Collect coverage (build + run instrumented tests)
+        run: cargo llvm-cov --workspace --no-report
+      - name: Purge partial linker artifacts before export
+        run: |
+          found=$(find target/llvm-cov-target -name '*.tmp*' -type f -print -delete | wc -l)
+          echo "purged $found partial linker artifact(s)"
       - name: Generate HTML coverage report
-        run: cargo llvm-cov --workspace --html
+        run: cargo llvm-cov report --html
       - name: Disk free after coverage
         if: always()
         run: df -h /

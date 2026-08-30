@@ -164,7 +164,7 @@ build orphan binaries, so `CARGO_BIN_EXE_oxidant` is unset unless you built it e
 
 #### `cargo llvm-cov` uses a separate target directory
 
-The informational `line-coverage` job runs `cargo llvm-cov --workspace --html`, which
+The **blocking** `line-coverage` job runs `cargo llvm-cov` over the workspace, which
 re-runs the full test suite under `target/llvm-cov-target/` (not `target/debug/`).
 
 - **Symptom:** same `oxidant binary not found` failure, but only in the `line-coverage` job
@@ -182,13 +182,23 @@ re-runs the full test suite under `target/llvm-cov-target/` (not `target/debug/`
   `build-test`/`oxidant-image.yml`; buys ~25 GB), plus `df -h /` probes around the coverage
   step for diagnosability. Do **not** reach for `--jobs 2`: capping link parallelism only
   slows the build and leaves the disk ceiling where it was. Reinstate it only if a failure
-  actually shows memory pressure. Job timeout is 180 min for cold-cache compiles; the
-  ~45–60 min figure quoted in the workflow is a **projection** — the job has not yet
-  completed a run.
+  actually shows memory pressure. Job timeout is 180 min for cold-cache compiles; observed
+  wall clock from the nightly runs is **44–54 min**.
+- **Stale `.tmp*` objects break the export — this is what kept the job red.** `cargo llvm-cov
+  report` hands every file in `debug/deps/` to `llvm-cov export` as an `-object`. A build killed
+  mid-link leaves its partial output as `<binary>-<hash>.tmpXXXXXX`, rust-cache restores it into
+  the next run, and export dies with `malformed instrumentation profile data: symbol name is
+  empty`. That is **not** the ENOSPC/SIGBUS problem above; it survives any amount of free disk.
+  The job therefore splits `cargo llvm-cov --workspace --no-report` (build + run) from
+  `cargo llvm-cov report --html`, and purges `*.tmp*` in between — after the last build that
+  could create one, before the export that would choke on it.
 - **Flag gotcha:** do **not** pass `--output-path coverage/` together with `--html` —
   `cargo-llvm-cov` rejects incompatible flags. Use `--html` alone.
-- **Job is non-blocking** (`continue-on-error: true`) but should still be kept green for
-  trending artifacts. Nightly uses the same recipe (`coverage-nightly.yml`).
+- **Job is blocking.** It fails when total line coverage drops below `coverage-floor.json`
+  (`line_pct` minus `tolerance_pct`), so a change cannot dilute coverage by adding untested
+  code. When coverage genuinely improves, raise `line_pct` in the same PR — the job prints a
+  `::notice::` telling you to. Lowering it needs a stated reason in the PR description.
+  Nightly (`coverage-nightly.yml`) uses the same recipe for trending artifacts.
 
 #### `tpch-distributed` auto-splitter SQL must re-parse on workers
 
@@ -217,5 +227,5 @@ Databricks dialect. Some Unparser output is **invalid on round-trip**:
 | query-gates (main / `full-gates`) | yes | official TPC kits + `tpch`/`tpcds`/`*-distributed` at **SF1** |
 | coverage gates | yes | clickbench, clickbench-grpc, correctness |
 | Spark SQL parity ratchet | yes | `oxidant-parity ratchet --baseline parity/baseline.json` |
-| line coverage | no (informational) | disk reclaim + `CARGO_PROFILE_*_DEBUG=1` + `cargo llvm-cov --workspace --html` |
+| line coverage | yes | disk reclaim + `CARGO_PROFILE_*_DEBUG=1` + `cargo llvm-cov --workspace --no-report`, purge `*.tmp*`, `report --html`, floor gate vs `coverage-floor.json` |
 

@@ -1,0 +1,7 @@
+{
+  "_comment": "Coverage ratchet for the blocking `line coverage` CI job (.github/workflows/ci.yml). The job fails when total line coverage drops below `line_pct - tolerance_pct`. Raise `line_pct` when coverage genuinely improves — the job prints a ::notice:: when it does. Lowering it requires a stated reason in the PR description. Same discipline as parity/baseline.json.",
+  "line_pct": 0.0,
+  "tolerance_pct": 0.5,
+  "measured_on": "PENDING",
+  "measured_by": "cargo llvm-cov --workspace --no-report && cargo llvm-cov report --summary-only --json"
+}
