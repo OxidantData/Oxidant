@@ -36,14 +36,23 @@ pub(crate) mod spark_divide;
 // `pub(crate)` (like `spark_divide`): `SparkDividePlanner` in `lib.rs` embeds the
 // `spark_nonzero_divisor` guard UDF directly via `spark_nonzero_divisor::udf()` when lowering a
 // decimal `/` or `%` so a zero decimal divisor raises Spark's ANSI DIVIDE_BY_ZERO.
+mod spark_conditional;
 mod spark_datetime2;
 mod spark_datetime3;
+// `spark_datetime4` (field extraction) and `spark_datetime5` (calendar arithmetic) reuse
+// `spark_datetime3`'s proleptic-Gregorian civil-date helpers, exported `pub(super)`, rather than
+// carrying a second copy of the calendar arithmetic.
+mod spark_datetime4;
+mod spark_datetime5;
 mod spark_encoding;
 mod spark_from_json;
+mod spark_hash;
+mod spark_timezone;
 pub use spark_from_json::parse_spark_schema;
 mod spark_if;
 mod spark_json;
 mod spark_math;
+mod spark_math2;
 mod spark_misc;
 pub(crate) mod spark_nonzero_divisor;
 mod spark_regex_misc;
@@ -67,6 +76,11 @@ pub fn register(ctx: &SessionContext) {
     spark_regex_misc::register(ctx);
     spark_datetime2::register(ctx);
     spark_datetime3::register(ctx);
+    spark_datetime4::register(ctx);
+    spark_datetime5::register(ctx);
+    spark_timezone::register(ctx);
+    spark_hash::register(ctx);
+    spark_conditional::register(ctx);
     spark_json::register(ctx);
     spark_from_json::register(ctx);
     spark_if::register(ctx);
@@ -74,6 +88,7 @@ pub fn register(ctx: &SessionContext) {
     spark_nonzero_divisor::register(ctx);
     spark_checked_mul::register(ctx);
     spark_math::register(ctx);
+    spark_math2::register(ctx);
     spark_misc::register(ctx);
     spark_array::register(ctx);
     spark_aggregates::register(ctx);
