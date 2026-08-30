@@ -47,10 +47,27 @@ jobs:
         contains(github.event.pull_request.labels.*.name, 'major')))
     runs-on: ubuntu-latest
     steps:
+      # `main` requires status checks (rustfmt / clippy + test / coverage gates /
+      # line coverage). Those apply to direct pushes, not just merges, and the release
+      # commit is made with `[skip ci]`, so it never has any — GITHUB_TOKEN's push to
+      # main is rejected. Only an admin bypasses (branch protection sets
+      # enforce_admins: false), and GitHub Actions cannot be granted a bypass: ruleset
+      # bypass actors must be installed GitHub Apps, and Actions is built in, not
+      # installed. So this needs RELEASE_TOKEN — a PAT (contents: write) belonging to a
+      # repo admin.
+      - name: Require the release token
+        run: |
+          if [ -z "${{ secrets.RELEASE_TOKEN }}" ]; then
+            echo "::error::RELEASE_TOKEN is not set. main requires status checks, and the" \
+                 "release commit is pushed directly with [skip ci], so it has none —" \
+                 "GITHUB_TOKEN's push would be rejected after the version bump was already" \
+                 "committed locally. Add a repo secret RELEASE_TOKEN: a PAT with" \
+                 "contents: write owned by a repo admin (admins bypass required checks)."
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
-          # GITHUB_TOKEN with contents:write can push to main on public repos.
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_TOKEN }}
           ref: main
           fetch-depth: 0
 
