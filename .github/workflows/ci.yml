@@ -274,26 +274,47 @@ jobs:
     # cache invalidation.
     timeout-minutes: 180
     env:
-      # Same switch as build-test: limited debug info (debug = 1). With the profiles' full
-      # debuginfo each oxidant-execution integration binary is ~1–2 GB at link time, and
-      # linking ~56 of them under `-C instrument-coverage` exhausts the free disk on a
-      # public-repo `ubuntu-latest` runner (4 vCPU / 16 GB RAM / ~14 GB free SSD). `ld`
-      # mmaps its output file, so that ENOSPC surfaces as `collect2: ld terminated with
-      # signal 7 [Bus error]` — the failure PR #96's line-coverage job hit. Disk, not
-      # memory, is the binding constraint; see the disk-reclaim step below.
-      CARGO_PROFILE_TEST_DEBUG: "1"
-      CARGO_PROFILE_DEV_DEBUG: "1"
+      # debug = 0, not the 1 that build-test uses. Measured on run 33284678644: the
+      # instrumented build ran the runner from 104 GB free to 1.6 GB and died with
+      # `rustc-LLVM ERROR: IO failure on output stream: No space left on device`, having
+      # never reached the link of the last test binary. Disk is the binding constraint.
+      #
+      # Why debug info is what costs, and why only here: on Linux the linker copies DWARF
+      # into every output binary, and `cargo llvm-cov --workspace` links ~160 statically
+      # linked test binaries that each pull in the whole of DataFusion. The same run on
+      # macOS fits in 54 GB because Mach-O leaves DWARF in the `.o` files and links a debug
+      # map instead — same objects, ~2x less total bytes.
+      #
+      # Dropping it is safe for coverage specifically: `-C instrument-coverage` writes its
+      # region/filename tables into the `__llvm_covmap` / `__llvm_prf_names` sections, which
+      # are emitted independently of `-C debuginfo`. Verified before this change by running
+      # collect / `report --html` / `report --summary-only --json` — the exact three-step
+      # pipeline used below — against a probe crate at debug = 0: line, region and function
+      # counts were all correct, including an uncalled function reported as missed.
+      #
+      # The cost is unreadable backtraces if an instrumented test panics. Reproduce such a
+      # failure under `clippy + test`, which keeps debug = 1.
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
-      # Same reclaim as build-test (and oxidant-image.yml): a standard `ubuntu-latest`
-      # runner leaves only ~14 GB free, and the instrumented build writes a second full
-      # target dir (target/llvm-cov-target) on top of the workspace's. Dropping the
-      # preinstalled SDKs buys ~25 GB, which is what keeps `ld` off ENOSPC/SIGBUS.
+      # Goes further than build-test's reclaim, because this job writes a second full
+      # target dir (target/llvm-cov-target) on top of the workspace's. Measured on run
+      # 33284678644: 86 GB free at job start, 111 GB after this step — the preinstalled
+      # SDKs are worth ~25 GB. The extra removals below (Swift, PowerShell, miniconda,
+      # the preloaded Docker images) are headroom on top of that; each is `|| true` so a
+      # runner image that stops shipping one of them does not fail the job.
+      #
+      # Reclaim alone was never going to be enough — that run still exhausted 104 GB. The
+      # fix is debug = 0 in this job's env; this step just keeps the margin comfortable.
       - name: Reclaim runner disk
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/share/swift /usr/local/share/powershell \
+            /usr/share/miniconda /usr/local/lib/node_modules || true
+          sudo docker image prune -a -f >/dev/null 2>&1 || true
           df -h /
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
@@ -302,7 +323,11 @@ jobs:
           rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
         with:
-          key: llvm-cov # instrumented artifacts must not pollute the shared CI cache
+          # Bumped from `llvm-cov` when this job moved to debug = 0. rust-cache keys on the
+          # toolchain and Cargo.lock, not on CARGO_PROFILE_*, so the old key would restore
+          # debug = 1 artifacts that this build cannot reuse and must still store — the one
+          # thing this job has no room for. Bump again on any future profile change here.
+          key: llvm-cov-debug0 # instrumented artifacts must not pollute the shared CI cache
       # Prebuilt binary. `cargo install cargo-llvm-cov --locked` compiled it from source
       # on every run, which cost more than the coverage pass itself.
       - uses: taiki-e/install-action@cargo-llvm-cov
@@ -327,9 +352,12 @@ jobs:
       #   error: failed to load coverage: '…/deps/distributed_lakehouse-….tmpa296660':
       #   malformed instrumentation profile data: symbol name is empty
       #
-      # It is not the disk/ENOSPC problem the comments above describe — that was an older
-      # failure mode. Purging after the build (so nothing recreates them) and before the export
-      # is what makes the report reproducible.
+      # This is a separate failure from the ENOSPC the env block above addresses, and both are
+      # live: run 33284678644 ran out of disk during the build, and earlier runs that survived
+      # the build died here on a restored `.tmp*` corpse. They also feed each other — a build
+      # killed by ENOSPC is exactly what leaves one behind for the next run to choke on.
+      # Purging after the build (so nothing recreates them) and before the export is what makes
+      # the report reproducible.
       - name: Purge partial linker artifacts before export
         run: |
           # `|| true`: find exits non-zero if the tree is missing, and the step runs under

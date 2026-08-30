@@ -35,22 +35,26 @@ jobs:
     # every attempt so far died inside the build. 180 matches build-test's headroom.
     timeout-minutes: 180
     env:
-      # Keep in sync with ci.yml line-coverage — limited debug info (debug = 1), which keeps
-      # the ~56 instrumented oxidant-execution test binaries off the runner's free disk.
-      # See build-test's CARGO_PROFILE_*_DEBUG notes and the disk-reclaim step below.
-      CARGO_PROFILE_TEST_DEBUG: "1"
-      CARGO_PROFILE_DEV_DEBUG: "1"
+      # Keep in sync with ci.yml line-coverage, including the reasoning recorded there:
+      # debug = 0, because on Linux the linker copies DWARF into each of the ~160
+      # instrumented test binaries and that — not memory — is what exhausts the runner
+      # disk. Coverage does not need it; `-C instrument-coverage` emits its region and
+      # filename tables independently of `-C debuginfo`.
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
-      # Same reclaim as build-test (and oxidant-image.yml): a standard `ubuntu-latest`
-      # runner leaves only ~14 GB free, and the instrumented build writes a second full
-      # target dir (target/llvm-cov-target) on top of the workspace's. Dropping the
-      # preinstalled SDKs buys ~25 GB, which is what keeps `ld` off ENOSPC/SIGBUS.
+      # Keep in sync with ci.yml line-coverage. The preinstalled SDKs are worth ~25 GB
+      # (measured: 86 GB free -> 111 GB); the rest is headroom, each `|| true` so a runner
+      # image that stops shipping one of them does not fail the job.
       - name: Reclaim runner disk
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/share/swift /usr/local/share/powershell \
+            /usr/share/miniconda /usr/local/lib/node_modules || true
+          sudo docker image prune -a -f >/dev/null 2>&1 || true
           df -h /
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
@@ -59,7 +63,11 @@ jobs:
           rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
         with:
-          key: llvm-cov # instrumented artifacts must not pollute the shared CI cache
+          # Bumped from `llvm-cov` when this job moved to debug = 0. rust-cache keys on the
+          # toolchain and Cargo.lock, not on CARGO_PROFILE_*, so the old key would restore
+          # debug = 1 artifacts that this build cannot reuse and must still store — the one
+          # thing this job has no room for. Bump again on any future profile change here.
+          key: llvm-cov-debug0 # instrumented artifacts must not pollute the shared CI cache
       # Prebuilt binary. `cargo install cargo-llvm-cov --locked` compiled it from source
       # on every run, which cost more than the coverage pass itself.
       - uses: taiki-e/install-action@cargo-llvm-cov
