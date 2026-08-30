@@ -220,8 +220,15 @@ Databricks dialect. Some Unparser output is **invalid on round-trip**:
 
 #### CI job map (quick reference)
 
+All PR jobs below are gated on a cheap `detect code changes` job: a docs-only PR skips them
+in seconds instead of burning ~50 minutes on an instrumented coverage run. `ci.yml` has **no**
+`paths-ignore` on `pull_request`, deliberately — these are required status checks, and a
+workflow that never triggers never reports, which would leave a docs-only PR permanently
+unmergeable. A *skipped* job satisfies a required check; an *absent* one does not.
+
 | Job | Blocking? | Key command |
 |-----|-----------|-------------|
+| detect code changes | — | `git diff --name-only <base>...HEAD`, sets `code=true/false` |
 | rustfmt | yes | `cargo fmt --all -- --check` |
 | clippy + test | yes | `cargo build -p oxidant-cli` then clippy/test |
 | query-gates (main / `full-gates`) | yes | official TPC kits + `tpch`/`tpcds`/`*-distributed` at **SF1** |
