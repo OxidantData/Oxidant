@@ -1,12 +1,15 @@
 name: line coverage (nightly)
 
-# Informational llvm-cov line-coverage report, uploaded as an HTML artifact for trending.
+# llvm-cov line-coverage trend line for `main`, uploaded as an HTML artifact.
 #
-# This used to run on every PR as a `continue-on-error` job in ci.yml. It never gated
-# anything, but it built the whole workspace a second time under a separate target dir
-# and then instrumented and re-ran it — so it occupied a runner and a cache slot on every
-# push for a number nobody blocks on. Nightly gives the same trend line for a fraction of
-# the cost. Trigger it by hand from the Actions tab when you want a fresh report.
+# The *gate* lives in ci.yml's `line coverage` job, which runs on every PR and fails below
+# the `coverage-floor.json` ratchet. This workflow is the unbroken daily series for `main`,
+# where a PR-triggered job gives you nothing. Trigger it by hand from the Actions tab when
+# you want a fresh report.
+#
+# NOT `continue-on-error`, deliberately. It was, and that masked the truth for weeks: every
+# run reported "success" at the workflow level while the job itself concluded `failure` on
+# the export step. A trend job whose failures are invisible produces no trend.
 on:
   schedule:
     - cron: "0 6 * * *" # 06:00 UTC daily
@@ -26,9 +29,8 @@ env:
 
 jobs:
   line-coverage:
-    name: line coverage (informational)
+    name: line coverage (nightly trend)
     runs-on: ubuntu-latest
-    continue-on-error: true
     # ~45–60 min is a projection, not a measurement: this job has never completed a run —
     # every attempt so far died inside the build. 180 matches build-test's headroom.
     timeout-minutes: 180
@@ -78,8 +80,10 @@ jobs:
         run: cargo llvm-cov --workspace --no-report
       - name: Purge partial linker artifacts before export
         run: |
-          found=$(find target/llvm-cov-target -name '*.tmp*' -type f -print -delete | wc -l)
-          echo "purged $found partial linker artifact(s)"
+          # `|| true`: find exits non-zero if the tree is missing, and the step runs under
+          # `bash -e`. Nothing to purge is a success, not a failure.
+          found=$(find target/llvm-cov-target -name '*.tmp*' -type f -print -delete 2>/dev/null | wc -l || true)
+          echo "purged ${found// /} partial linker artifact(s)"
       - name: Generate HTML coverage report
         run: cargo llvm-cov report --html
       - name: Disk free after coverage

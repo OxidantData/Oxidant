@@ -295,8 +295,10 @@ jobs:
       # is what makes the report reproducible.
       - name: Purge partial linker artifacts before export
         run: |
-          found=$(find target/llvm-cov-target -name '*.tmp*' -type f -print -delete | wc -l)
-          echo "purged $found partial linker artifact(s)"
+          # `|| true`: find exits non-zero if the tree is missing, and the step runs under
+          # `bash -e`. Nothing to purge is a success, not a failure.
+          found=$(find target/llvm-cov-target -name '*.tmp*' -type f -print -delete 2>/dev/null | wc -l || true)
+          echo "purged ${found// /} partial linker artifact(s)"
       - name: Generate HTML coverage report
         run: cargo llvm-cov report --html
       - name: Disk free after coverage
