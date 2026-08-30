@@ -19,7 +19,9 @@
 //!
 //! All three hash the argument's **bytes**: a `STRING` contributes its UTF-8 encoding and a
 //! `BINARY` its raw bytes, so `sha1('abc')` and `sha1(CAST('abc' AS BINARY))` agree. NULL in,
-//! NULL out.
+//! NULL out. There is no third case — a numeric argument is **rejected at planning time**, as
+//! Spark rejects it, because casting one to binary would silently hash its raw little-endian
+//! bytes (`crc32(123)` hashing `[123,0,0,0]`) and no caller could tell that from a real digest.
 //!
 //! ## Not implemented here, deliberately
 //!
@@ -35,7 +37,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, BinaryArray, Int64Array, StringBuilder};
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{plan_err, DataFusionError, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
@@ -51,6 +53,33 @@ pub fn register(ctx: &SessionContext) {
 
 fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
     DataFusionError::ArrowError(Box::new(e), None)
+}
+
+/// Accept only what Spark's digest functions accept.
+///
+/// Spark's `Sha1`/`Sha2`/`Crc32` declare `BinaryType` and implicitly accept `STRING`; an INT is
+/// **not** castable to binary, so Spark raises at analysis time. Leaving the argument open was a
+/// silent-wrong-answer trap: [`to_bytes`] would cast an INT to `Binary`, hashing its four raw
+/// little-endian bytes, so `crc32(123)` returned the CRC of `[123,0,0,0]` rather than either
+/// erroring or hashing `"123"`. A caller cannot tell that apart from a correct answer.
+fn coerce_hashable(name: &str, arg_types: &[DataType]) -> Result<DataType> {
+    let Some(a) = arg_types.first() else {
+        return plan_err!("{name} expects at least 1 argument");
+    };
+    match a {
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_)
+        | DataType::Null => Ok(a.clone()),
+        other => plan_err!(
+            "[DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] the first parameter of `{name}` requires \
+             the BINARY or STRING type, however it has the type {other}"
+        ),
+    }
 }
 
 /// View any argument as raw bytes: a string contributes its UTF-8 encoding, binary its own bytes.
@@ -91,7 +120,8 @@ impl Sha1Udf {
     fn new(name: &'static str) -> Self {
         Self {
             name,
-            signature: Signature::any(1, Volatility::Immutable),
+            // `user_defined` so `coerce_types` can reject numerics — see `coerce_hashable`.
+            signature: Signature::user_defined(Volatility::Immutable),
         }
     }
 }
@@ -102,6 +132,9 @@ impl ScalarUDFImpl for Sha1Udf {
     }
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        Ok(vec![coerce_hashable(self.name, arg_types)?])
     }
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
@@ -135,7 +168,7 @@ struct Sha2Udf {
 impl Sha2Udf {
     fn new() -> Self {
         Self {
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: Signature::user_defined(Volatility::Immutable),
         }
     }
 }
@@ -146,6 +179,14 @@ impl ScalarUDFImpl for Sha2Udf {
     }
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        let [_, bits] = arg_types else {
+            return plan_err!("sha2 expects exactly 2 arguments");
+        };
+        // Only the hashed value is type-restricted; `numBits` keeps its own coercion to int,
+        // which is what the `sha2(a, a)` CAST_INVALID_INPUT golden exercises.
+        Ok(vec![coerce_hashable("sha2", arg_types)?, bits.clone()])
     }
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
@@ -204,7 +245,7 @@ struct Crc32Udf {
 impl Crc32Udf {
     fn new() -> Self {
         Self {
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: Signature::user_defined(Volatility::Immutable),
         }
     }
 }
@@ -215,6 +256,9 @@ impl ScalarUDFImpl for Crc32Udf {
     }
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        Ok(vec![coerce_hashable("crc32", arg_types)?])
     }
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Int64)

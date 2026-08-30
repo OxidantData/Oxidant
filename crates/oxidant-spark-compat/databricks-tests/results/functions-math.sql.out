@@ -43,11 +43,11 @@ struct<a:int,b:int,c:int,d:int>
 
 
 -- !query
-SELECT negative(1) AS a, negative(-1) AS b, ceiling(CAST(1.2 AS DOUBLE)) AS c
+SELECT negative(1) AS a, negative(-1) AS b, negative('-1.11') AS c
 -- !query schema
 struct<a:int,b:int,c:double>
 -- !query output
--1	1	2.0
+-1	1	1.11
 
 
 -- !query

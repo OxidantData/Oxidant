@@ -344,6 +344,68 @@ mod tests {
         }
     }
 
+    /// The rendered artifacts are the product here — `docs/databricks-functions.md` is generated
+    /// by `to_markdown`, so a panic or a malformed table in it is a broken doc, not a test-only
+    /// concern.
+    #[tokio::test]
+    async fn renders_markdown_and_json() {
+        let r = run().await;
+
+        let md = r.to_markdown();
+        assert!(md.starts_with("# Databricks SQL builtin-function coverage"));
+        // Headline, the per-category rollup, and the per-function table must all be present.
+        for want in [
+            "| Documented Databricks functions |",
+            "| **Registered today** |",
+            "### Out of scope",
+            "## By manual category",
+            "## Every in-scope function",
+            "| `upper` | registered | datafusion |",
+        ] {
+            assert!(md.contains(want), "markdown missing {want:?}");
+        }
+        // Out-of-scope functions must never appear in the in-scope table.
+        assert!(!md.contains("| `ai_query` |"), "out-of-scope row leaked in");
+        // Every in-scope function gets exactly one row.
+        let rows = md.matches("\n| `").count();
+        assert!(
+            rows >= r.in_scope,
+            "{rows} rows for {} functions",
+            r.in_scope
+        );
+
+        // The JSON must round-trip and agree with the report it came from.
+        let json = r.to_json();
+        let back: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(back["in_scope"], r.in_scope);
+        assert_eq!(back["registered"], r.registered);
+        assert_eq!(back["missing"], r.missing);
+        assert_eq!(back["functions"].as_array().unwrap().len(), r.documented);
+    }
+
+    /// Coverage percentage is the headline number; guard its edges rather than trusting the
+    /// happy path.
+    #[test]
+    fn coverage_pct_is_a_share_of_the_in_scope_set() {
+        let mut r = FunctionsReport {
+            source: String::new(),
+            scraped: String::new(),
+            documented: 0,
+            in_scope: 0,
+            registered: 0,
+            missing: 0,
+            engine_registry_size: 0,
+            excluded: BTreeMap::new(),
+            categories: Vec::new(),
+            functions: Vec::new(),
+        };
+        // No in-scope functions must not divide by zero.
+        assert_eq!(r.coverage_pct(), 0.0);
+        r.in_scope = 400;
+        r.registered = 300;
+        assert!((r.coverage_pct() - 75.0).abs() < 1e-9);
+    }
+
     /// The report must reflect the live registry, not the catalog's wishes.
     #[tokio::test]
     async fn report_reflects_the_live_registry() {

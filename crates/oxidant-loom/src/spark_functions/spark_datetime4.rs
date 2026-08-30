@@ -29,12 +29,16 @@
 //! as midnight, so `hour(DATE'2024-01-01')` is `0`), and an unparseable string is a *cast error*,
 //! not a silent NULL — Spark raises `CAST_INVALID_INPUT` for `year('xx')` under ANSI. NULL in,
 //! NULL out.
+//!
+//! Numeric input is **rejected at planning time**, as Spark rejects it. This matters more than it
+//! looks: the body casts its argument to a timestamp, so an accepted integer would be read as
+//! epoch microseconds and `year(20240305)` would confidently answer `1970`.
 
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int32Array, Int64Array, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{plan_err, DataFusionError, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
@@ -150,7 +154,8 @@ impl DatePart {
     fn new(part: Part) -> Self {
         Self {
             part,
-            signature: Signature::any(1, Volatility::Immutable),
+            // `user_defined` so `coerce_types` can *reject* numerics. See the note there.
+            signature: Signature::user_defined(Volatility::Immutable),
         }
     }
 }
@@ -161,6 +166,30 @@ impl ScalarUDFImpl for DatePart {
     }
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+    /// Accept only what Spark accepts. A permissive `Signature::any(1)` was a silent-wrong-answer
+    /// trap: the body casts its argument to a timestamp, so an integer was read as **epoch
+    /// microseconds** and `year(20240305)` answered `1970` instead of failing. Spark's `Year`
+    /// takes `DateType`/`TimestampType` and an INT is not implicitly castable to either, so it
+    /// raises at analysis time. A missing answer is always better than a confident wrong one.
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        let [a] = arg_types else {
+            return plan_err!("{} expects exactly 1 argument", self.part.name());
+        };
+        match a {
+            DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Null => Ok(vec![a.clone()]),
+            other => plan_err!(
+                "[DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] the first parameter of `{}` requires \
+                 the DATE, TIMESTAMP or STRING type, however it has the type {other}",
+                self.part.name()
+            ),
+        }
     }
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(self.part.return_type())

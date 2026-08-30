@@ -76,7 +76,18 @@ impl FileReport {
         let mut strict_pass = 0;
         let mut semantic_pass = 0;
         let mut failures = Vec::new();
-        const FAILURE_CAP: usize = 20;
+        // Per-file sample of actionable failures kept in the report. Capped so `parity.json`
+        // (the committed baseline) stays a reviewable size — the per-file *bucket tallies* beside
+        // it are uncapped, so no count is lost, only the examples.
+        //
+        // Raise it with `OXIDANT_PARITY_FAILURE_CAP` when auditing a re-baseline: with the default
+        // 20, a file that gains failures past the cap shows the new rows only as a bucket delta,
+        // with no SQL to inspect — which is exactly the position a reviewer is left in when asked
+        // whether a rise is honest unmasking or a real regression.
+        let failure_cap: usize = std::env::var("OXIDANT_PARITY_FAILURE_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
 
         for (sql, v) in verdicts {
             *buckets.entry(bucket_key(v.bucket).to_string()).or_default() += 1;
@@ -96,7 +107,7 @@ impl FileReport {
                         | crate::classify::Bucket::Nondeterministic
                         | crate::classify::Bucket::RequiresUdfRegistration
                 );
-            if actionable && failures.len() < FAILURE_CAP {
+            if actionable && failures.len() < failure_cap {
                 failures.push(Failure {
                     bucket: bucket_key(v.bucket).to_string(),
                     sql: sql.chars().take(160).collect(),

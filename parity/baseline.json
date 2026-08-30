@@ -3,26 +3,26 @@
   "files_total": 303,
   "files_skipped": 25,
   "blocks_total": 14706,
-  "strict_pass": 2949,
-  "semantic_pass": 8028,
+  "strict_pass": 2952,
+  "semantic_pass": 8043,
   "buckets": {
-    "correctness": 712,
+    "correctness": 707,
     "datetime": 32,
-    "decimal-precision": 230,
+    "decimal-precision": 229,
     "engine-panic": 3,
-    "error-parity": 2853,
-    "exec-error": 1962,
+    "error-parity": 2854,
+    "exec-error": 1952,
     "feature-unsupported": 549,
-    "function-missing": 664,
-    "missing-error": 164,
+    "function-missing": 670,
+    "missing-error": 163,
     "missing-relation": 955,
     "nondeterministic": 6,
-    "null-semantics": 100,
+    "null-semantics": 96,
     "ordering": 15,
     "parser-unsupported": 1214,
-    "pass": 2949,
+    "pass": 2952,
     "requires-udf-registration": 87,
-    "schema-only": 2211
+    "schema-only": 2222
   },
   "files": [
     {
@@ -2888,12 +2888,12 @@
       "file": "decimalArithmeticOperations.sql",
       "total": 55,
       "strict_pass": 3,
-      "semantic_pass": 24,
+      "semantic_pass": 25,
       "buckets": {
         "decimal-precision": 15,
-        "error-parity": 14,
+        "error-parity": 15,
         "exec-error": 3,
-        "missing-error": 7,
+        "missing-error": 6,
         "parser-unsupported": 6,
         "pass": 3,
         "schema-only": 7
@@ -2903,11 +2903,6 @@
           "bucket": "exec-error",
           "sql": "CREATE TEMPORARY VIEW t AS SELECT 1.0 as a, 0.0 as b",
           "detail": "plan error: Execution error: Table 't' already exists"
-        },
-        {
-          "bucket": "missing-error",
-          "sql": "select pmod(a, b) from t",
-          "detail": "oxidant accepted a query Spark rejects"
         },
         {
           "bucket": "exec-error",
@@ -2998,6 +2993,11 @@
           "bucket": "schema-only",
           "sql": "SELECT CAST(20 AS DECIMAL(4, 1))\nUNION ALL\nSELECT pmod(CAST(10 AS DECIMAL(10, 2)), CAST(3 AS DECIMAL(5, 1)))",
           "detail": "schema: golden `struct<CAST(20 AS DECIMAL(4,1)):decimal(6,2)>` vs oxidant `struct<Int64(20):decimal(10,2)>`"
+        },
+        {
+          "bucket": "parser-unsupported",
+          "sql": "SELECT CAST(20 AS DECIMAL(4, 1))\nUNION ALL\nSELECT CAST(10 AS DECIMAL(10, 2)) div CAST(3 AS DECIMAL(5, 1))",
+          "detail": "plan error: SQL error: ParserError(\"No infix parser for token Word(Word { value: \\\"div\\\", quote_style: None, keyword: DIV }) at Line: 3, Column: 35\")"
         }
       ]
     },
@@ -7502,8 +7502,8 @@
       "semantic_pass": 10,
       "buckets": {
         "decimal-precision": 15,
-        "exec-error": 6,
-        "null-semantics": 7,
+        "exec-error": 7,
+        "null-semantics": 6,
         "parser-unsupported": 17,
         "pass": 3,
         "schema-only": 7
@@ -7525,9 +7525,9 @@
           "detail": "execution error: Execution error: [DIVIDE_BY_ZERO] Division by zero. Use try_divide to tolerate a 0 divisor and return NULL instead. SQLSTATE: 22012"
         },
         {
-          "bucket": "null-semantics",
+          "bucket": "exec-error",
           "sql": "select pmod(a, b) from t",
-          "detail": "golden[1r] vs oxidant[1r]"
+          "detail": "execution error: Execution error: [DIVIDE_BY_ZERO] Division by zero. Use try_divide to tolerate a 0 divisor and return NULL instead. SQLSTATE: 22012"
         },
         {
           "bucket": "exec-error",
@@ -8917,19 +8917,17 @@
     {
       "file": "operators.sql",
       "total": 77,
-      "strict_pass": 21,
-      "semantic_pass": 46,
+      "strict_pass": 24,
+      "semantic_pass": 50,
       "buckets": {
-        "correctness": 11,
+        "correctness": 7,
         "decimal-precision": 2,
         "error-parity": 6,
-        "exec-error": 2,
-        "function-missing": 1,
+        "function-missing": 5,
         "missing-relation": 7,
-        "null-semantics": 2,
         "parser-unsupported": 6,
-        "pass": 21,
-        "schema-only": 19
+        "pass": 24,
+        "schema-only": 20
       },
       "failures": [
         {
@@ -10735,11 +10733,12 @@
       "strict_pass": 29,
       "semantic_pass": 62,
       "buckets": {
-        "correctness": 5,
+        "correctness": 4,
         "decimal-precision": 14,
         "error-parity": 5,
         "exec-error": 11,
         "feature-unsupported": 1,
+        "function-missing": 1,
         "missing-relation": 2,
         "pass": 29,
         "schema-only": 28
@@ -10841,9 +10840,9 @@
           "detail": "golden[5r] vs oxidant[9r]"
         },
         {
-          "bucket": "correctness",
+          "bucket": "function-missing",
           "sql": "select ceiling(f1) as ceiling_f1 from float8_tbl f",
-          "detail": "golden[5r] vs oxidant[9r]"
+          "detail": "plan error: Error during planning: Invalid function 'ceiling'."
         }
       ]
     },
@@ -11593,18 +11592,17 @@
       "file": "postgreSQL/numeric.sql",
       "total": 606,
       "strict_pass": 493,
-      "semantic_pass": 510,
+      "semantic_pass": 520,
       "buckets": {
         "correctness": 10,
-        "decimal-precision": 23,
+        "decimal-precision": 22,
         "error-parity": 4,
-        "exec-error": 44,
+        "exec-error": 35,
         "feature-unsupported": 12,
-        "function-missing": 4,
+        "function-missing": 5,
         "missing-error": 2,
-        "null-semantics": 1,
         "pass": 493,
-        "schema-only": 13
+        "schema-only": 23
       },
       "failures": [
         {
@@ -13684,12 +13682,12 @@
         {
           "bucket": "correctness",
           "sql": "SHOW TABLES 'show_t*'",
-          "detail": "golden[3r] vs oxidant[0r]"
+          "detail": "golden[3r] vs oxidant[3r]"
         },
         {
           "bucket": "correctness",
           "sql": "SHOW TABLES LIKE 'show_t1*|show_t2*'",
-          "detail": "golden[2r] vs oxidant[0r]"
+          "detail": "golden[2r] vs oxidant[2r]"
         },
         {
           "bucket": "correctness",
@@ -13704,7 +13702,7 @@
         {
           "bucket": "correctness",
           "sql": "SHOW TABLE EXTENDED LIKE 'show_t*'",
-          "detail": "golden[36r] vs oxidant[0r]"
+          "detail": "golden[36r] vs oxidant[15r]"
         },
         {
           "bucket": "parser-unsupported",
@@ -13835,12 +13833,12 @@
         {
           "bucket": "correctness",
           "sql": "SHOW VIEWS 'view_*'",
-          "detail": "golden[3r] vs oxidant[0r]"
+          "detail": "golden[3r] vs oxidant[3r]"
         },
         {
           "bucket": "correctness",
           "sql": "SHOW VIEWS LIKE 'view_1*|view_2*'",
-          "detail": "golden[2r] vs oxidant[0r]"
+          "detail": "golden[2r] vs oxidant[2r]"
         },
         {
           "bucket": "correctness",

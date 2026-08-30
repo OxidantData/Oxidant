@@ -22,7 +22,11 @@
 //! **`width_bucket(value, min, max, numBuckets)`** returns the 1-based bucket of an equi-width
 //! histogram over `[min, max)`, as `bigint`, with Spark's out-of-range conventions: `0` below the
 //! range, `numBuckets + 1` at or above it, and a reversed (`min > max`) range counting downward.
-//! `numBuckets <= 0`, or a NaN/infinite bound, is an error in Spark rather than a NULL.
+//! Every degenerate input is **NULL, never an error** — `numBuckets` truncating to `<= 0` or to
+//! `Long.MaxValue`, `min == max`, a NaN `value`, or a NaN/infinite bound. `numBuckets` is read as
+//! a LONG, not via a double, so `Long.MaxValue - 1` stays distinct from `Long.MaxValue`. That is Spark's
+//! `WidthBucket.computeBucketNumber`, and `spark-tests/results/operators.sql.out` pins all of it,
+//! including `width_bucket(5.35, 0.024, 10.06, 0.5)` → NULL (the `0.5` truncates to zero buckets).
 
 use std::sync::Arc;
 
@@ -189,7 +193,8 @@ fn rint(x: f64) -> f64 {
 // negative
 // ---------------------------------------------------------------------------
 
-/// `negative(x)` — Spark's `UnaryMinus`. Type-preserving, the mirror of the existing `positive`.
+/// `negative(x)` — Spark's `UnaryMinus`. Type-preserving for numerics, and (like Spark) it
+/// evaluates a string argument as a double. The mirror of the existing `positive`.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct Negative {
     signature: Signature,
@@ -198,7 +203,9 @@ struct Negative {
 impl Negative {
     fn new() -> Self {
         Self {
-            signature: Signature::any(1, Volatility::Immutable),
+            // `user_defined` so `coerce_types` can widen a string argument before `Expr::Negative`
+            // sees it — that expression only supports numeric/interval/timestamp.
+            signature: Signature::user_defined(Volatility::Immutable),
         }
     }
 }
@@ -209,6 +216,20 @@ impl ScalarUDFImpl for Negative {
     }
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        let [a] = arg_types else {
+            return plan_err!("negative expects exactly 1 argument");
+        };
+        // Spark's `UnaryMinus` accepts a string and evaluates it as a double:
+        // `spark-tests/results/operators.sql.out` pins `negative('-1.11')` → `1.11`. Without this
+        // the rewrite to `Expr::Negative` failed with "Negation only supports numeric, interval
+        // and timestamp types", while the sibling `positive('-1.11')` worked — an asymmetry Spark
+        // does not have.
+        Ok(vec![match a {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => DataType::Float64,
+            other => other.clone(),
+        }])
     }
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         Ok(arg_types[0].clone())
@@ -334,7 +355,17 @@ impl ScalarUDFImpl for Modulo {
         let [a, b] = arg_types else {
             return plan_err!("{} expects exactly 2 arguments", self.name);
         };
-        match binary_numeric_coercion(a, b) {
+        // An untyped `NULL` literal arrives as `DataType::Null`, which
+        // `binary_numeric_coercion` has no rule for — it returns `None`, and erroring there
+        // rejected `mod(7, null)` outright where Spark simply answers NULL. Resolve a NULL side
+        // to the other operand's type (and two NULLs to Int64, Spark's integral default) so the
+        // null flows through the arithmetic instead of failing to plan.
+        let common = match (a, b) {
+            (DataType::Null, DataType::Null) => Some(DataType::Int64),
+            (DataType::Null, other) | (other, DataType::Null) => Some(other.clone()),
+            _ => binary_numeric_coercion(a, b),
+        };
+        match common {
             Some(common) => Ok(vec![common.clone(), common]),
             None => plan_err!("{}: non-numeric operand types ({a} and {b})", self.name),
         }
@@ -342,11 +373,39 @@ impl ScalarUDFImpl for Modulo {
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         Ok(arg_types[0].clone())
     }
-    fn simplify(&self, args: Vec<Expr>, _info: &SimplifyContext) -> Result<ExprSimplifyResult> {
+    fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> Result<ExprSimplifyResult> {
         let mut it = args.into_iter();
         let (Some(a), Some(b), None) = (it.next(), it.next(), it.next()) else {
             return plan_err!("{} expects exactly 2 arguments", self.name);
         };
+        // Spark's ANSI `%` raises DIVIDE_BY_ZERO on a zero decimal/float divisor, where
+        // DataFusion's native modulo quietly yields null/NaN. `SparkDividePlanner` installs the
+        // `spark_nonzero_divisor` guard for source-level `%`, but it is an `ExprPlanner` hooked on
+        // `plan_binary_op` — it never sees a `BinaryExpr` this `simplify` builds afterwards. So
+        // `1.0 % 0.0` raised while `mod(1.0, 0.0)` returned null, and `pmod` on decimals leaked a
+        // raw Arrow "Divide by zero error". Apply the same guard here, on the same types the
+        // planner guards, so the function spellings and the operator agree.
+        let guard = |e: Expr| -> Expr {
+            let ty = info.get_data_type(&e).unwrap_or(DataType::Null);
+            if matches!(
+                ty,
+                DataType::Decimal128(_, _)
+                    | DataType::Decimal256(_, _)
+                    | DataType::Float16
+                    | DataType::Float32
+                    | DataType::Float64
+            ) {
+                Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                    super::spark_nonzero_divisor::udf(),
+                    vec![e],
+                ))
+            } else {
+                // Integral modulo by zero already raises DIVIDE_BY_ZERO in DataFusion, exactly as
+                // Spark does, so the guard would be redundant.
+                e
+            }
+        };
+        let b = guard(b);
         let rem = |l: Expr, r: Expr| {
             Expr::BinaryExpr(BinaryExpr::new(Box::new(l), Operator::Modulo, Box::new(r)))
         };
@@ -407,7 +466,21 @@ impl ScalarUDFImpl for WidthBucket {
         let value = to_f64(&args.args[0], n)?;
         let min = to_f64(&args.args[1], n)?;
         let max = to_f64(&args.args[2], n)?;
-        let buckets = to_f64(&args.args[3], n)?;
+        // `numBuckets` is a LONG in Spark, and it must be read as one. Routing it through f64
+        // loses precision at the top of the range: `Long.MaxValue - 1` rounds to `Long.MaxValue`
+        // in a double, which would trip the `== i64::MAX` rejection below and null out a row the
+        // golden says computes (`operators.sql.out` expects 4894746858139549697). Casting to
+        // Int64 also truncates a fractional argument the way Spark does, so `0.5` still becomes
+        // zero buckets.
+        let buckets = {
+            let arr = args.args[3].clone().into_array(n)?;
+            datafusion::arrow::compute::cast(&arr, &DataType::Int64)
+                .map_err(arrow_err)?
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("cast to Int64 yields Int64Array")
+                .clone()
+        };
 
         let mut out = Int64Array::builder(n);
         for i in 0..n {
@@ -415,37 +488,31 @@ impl ScalarUDFImpl for WidthBucket {
                 out.append_null();
                 continue;
             }
-            let (v, lo, hi, nb) = (value.value(i), min.value(i), max.value(i), buckets.value(i));
-            if nb <= 0.0 || nb.is_nan() || nb.is_infinite() {
-                return exec_err!(
-                    "[INVALID_PARAMETER_VALUE] width_bucket: numBuckets must be a positive \
-                     finite value, got {nb}"
-                );
+            let (v, lo, hi, nb_i) = (value.value(i), min.value(i), max.value(i), buckets.value(i));
+            // Every degenerate case is NULL, matching `WidthBucket.computeBucketNumber`. None of
+            // them is an error: Spark returns a null row and keeps going. `numBuckets` truncating
+            // to zero (`0.5`) or negative, and `Long.MaxValue` itself, are all in this set.
+            if nb_i <= 0
+                || nb_i == i64::MAX
+                || v.is_nan()
+                || lo == hi
+                || lo.is_nan()
+                || hi.is_nan()
+                || lo.is_infinite()
+                || hi.is_infinite()
+            {
+                out.append_null();
+                continue;
             }
-            if lo.is_nan() || hi.is_nan() || lo.is_infinite() || hi.is_infinite() {
-                return exec_err!(
-                    "[INVALID_PARAMETER_VALUE] width_bucket: the range bounds must be finite, \
-                     got [{lo}, {hi}]"
-                );
-            }
-            if lo == hi {
-                return exec_err!(
-                    "[INVALID_PARAMETER_VALUE] width_bucket: the range bounds must differ, \
-                     got [{lo}, {hi}]"
-                );
-            }
-            let nb = nb.trunc();
+            let nb = nb_i as f64;
             // A reversed range (min > max) counts downward — the same formula with the comparisons
             // flipped, which is what Spark's `WidthBucket` does.
             let below = if lo < hi { v < lo } else { v > lo };
             let above = if lo < hi { v >= hi } else { v <= hi };
-            let bucket = if v.is_nan() {
-                // Spark puts NaN above the range.
-                nb as i64 + 1
-            } else if below {
+            let bucket = if below {
                 0
             } else if above {
-                nb as i64 + 1
+                nb_i + 1
             } else {
                 ((v - lo) / (hi - lo) * nb).floor() as i64 + 1
             };
@@ -566,23 +633,82 @@ mod tests {
             // A reversed range counts downward.
             ("SELECT width_bucket(5.0, 10.0, 0.0, 5) AS x", "3"),
             ("SELECT width_bucket(11.0, 10.0, 0.0, 5) AS x", "0"),
+            // `Long.MaxValue - 1` must stay distinct from `Long.MaxValue`: reading numBuckets
+            // through an f64 rounds them together and nulls this row, where the golden
+            // (`operators.sql.out`) computes a value.
+            (
+                "SELECT width_bucket(5.35, 0.024, 10.06, 9223372036854775806) AS x",
+                "4894746858139549697",
+            ),
         ] {
             let got = row(q).await;
             assert!(got.contains(want), "{q} -> want {want}, got:\n{got}");
         }
     }
 
+    /// Every degenerate input is NULL, not an error — Spark's `WidthBucket` returns a null row
+    /// and keeps going. Pinned to `spark-tests/results/operators.sql.out`.
     #[tokio::test]
-    async fn width_bucket_rejects_a_degenerate_range() {
+    async fn width_bucket_nulls_degenerate_inputs() {
         let engine = crate::Engine::new();
         for q in [
-            "SELECT width_bucket(5.0, 0.0, 10.0, 0) AS x",
+            // `0.5` truncates to zero buckets *before* the range check.
+            "SELECT width_bucket(5.35, 0.024, 10.06, 0.5) AS x",
+            "SELECT width_bucket(5.35, 0.024, 10.06, -5) AS x",
+            // Long.MaxValue is rejected outright by Spark.
+            "SELECT width_bucket(5.35, 0.024, 10.06, 9223372036854775807) AS x",
             "SELECT width_bucket(5.0, 3.0, 3.0, 5) AS x",
+            "SELECT width_bucket(5.0, 0.0, 10.0, 0) AS x",
         ] {
-            let err = engine.sql(q).await.expect_err("must reject");
+            let batches = engine
+                .sql(q)
+                .await
+                .unwrap_or_else(|e| panic!("{q} must return NULL, not error: {e}"));
+            assert_eq!(batches[0].column(0).null_count(), 1, "{q}");
+        }
+    }
+
+    /// An untyped `NULL` literal must plan. `binary_numeric_coercion` has no rule for
+    /// `DataType::Null`, so erroring on it rejected `mod(7, null)` where Spark answers NULL.
+    #[tokio::test]
+    async fn mod_and_pmod_accept_untyped_nulls() {
+        let engine = crate::Engine::new();
+        for q in [
+            "SELECT mod(7, null) AS x",
+            "SELECT mod(null, 2) AS x",
+            "SELECT mod(null, null) AS x",
+            "SELECT pmod(7, null) AS x",
+            "SELECT pmod(null, 2) AS x",
+            "SELECT pmod(null, null) AS x",
+        ] {
+            let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(batches[0].column(0).null_count(), 1, "{q}");
+        }
+    }
+
+    /// The function spellings must raise on a zero divisor exactly where the `%` operator does.
+    /// `SparkDividePlanner` only guards source-level `%`, so a `BinaryExpr` built in `simplify`
+    /// needs the `spark_nonzero_divisor` guard applied explicitly — without it `mod(1.0, 0.0)`
+    /// returned null while `1.0 % 0.0` raised.
+    #[tokio::test]
+    async fn mod_and_pmod_raise_on_a_zero_divisor_like_the_operator() {
+        let engine = crate::Engine::new();
+        for q in [
+            "SELECT 1.0 % 0.0 AS x",
+            "SELECT mod(1.0, 0.0) AS x",
+            "SELECT pmod(1.0, 0.0) AS x",
+            "SELECT mod(7, 0) AS x",
+            "SELECT pmod(7, 0) AS x",
+        ] {
+            let err = engine
+                .sql(q)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{q} must raise on a zero divisor"));
+            let msg = format!("{err}").to_ascii_uppercase();
             assert!(
-                format!("{err}").contains("INVALID_PARAMETER_VALUE"),
-                "{q}: {err}"
+                msg.contains("DIVIDE") && msg.contains("ZERO"),
+                "{q} -> {err}"
             );
         }
     }

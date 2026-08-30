@@ -20,7 +20,9 @@
 //!   `convert_timezone(current_timezone(), …)`, confirming Spark resolves it the same way).
 //!
 //! Zone names resolve through the IANA database (`chrono-tz`); an unknown name is an error, not a
-//! silent NULL, matching Spark's `INVALID_TIMEZONE`.
+//! silent NULL, matching Spark's `INVALID_TIMEZONE`. **Only region-based IDs** are accepted —
+//! Spark additionally takes fixed offsets (`+08:00`, `GMT+8`, `UTC+05:30`), which `chrono_tz`
+//! cannot parse; the error message says so rather than implying broader support.
 //!
 //! ## Ambiguous and non-existent local times
 //!
@@ -61,11 +63,17 @@ fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
     DataFusionError::ArrowError(Box::new(e), None)
 }
 
+/// Resolve an IANA region name (`Europe/Paris`, `UTC`).
+///
+/// Spark also accepts fixed offsets — `+08:00`, `GMT+8`, `UTC+05:30` — which `chrono_tz` does not
+/// parse. Rather than advertise support that does not exist, the error names exactly what this
+/// implementation takes; supporting offsets is tracked as follow-on work.
 fn parse_zone(name: &str) -> Result<Tz> {
     Tz::from_str(name).map_err(|_| {
         DataFusionError::Execution(format!(
-            "[INVALID_TIMEZONE] The timezone: {name} is invalid. The timezone must be either a \
-             region-based zone ID or a zone offset."
+            "[INVALID_TIMEZONE] The timezone: {name} is invalid. Oxidant resolves region-based \
+             IANA zone IDs (for example 'Europe/Paris' or 'UTC'); fixed-offset forms such as \
+             '+08:00' or 'GMT+8' are not supported yet."
         ))
     })
 }

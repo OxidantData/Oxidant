@@ -15,7 +15,7 @@ SELECT mod(7, 3) AS a, mod(-7, 3) AS b, mod(7, -3) AS c;
 
 SELECT pmod(7, 3) AS a, pmod(-7, 3) AS b, pmod(7, -3) AS c, pmod(-7, -3) AS d;
 
-SELECT negative(1) AS a, negative(-1) AS b, ceiling(CAST(1.2 AS DOUBLE)) AS c;
+SELECT negative(1) AS a, negative(-1) AS b, negative('-1.11') AS c;
 
 SELECT bit_reverse(CAST(1 AS TINYINT)) AS a, bit_reverse(CAST(1 AS INT)) AS b,
        bit_reverse(CAST(-1 AS INT)) AS c;
