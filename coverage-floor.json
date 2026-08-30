@@ -1,7 +1,8 @@
 {
-  "_comment": "Coverage ratchet for the blocking `line coverage` CI job (.github/workflows/ci.yml). The job fails when total line coverage drops below `line_pct - tolerance_pct`. Raise `line_pct` when coverage genuinely improves — the job prints a ::notice:: when it does. Lowering it requires a stated reason in the PR description. Same discipline as parity/baseline.json.",
-  "line_pct": 0.0,
+  "_comment": "Coverage ratchet for the blocking `line coverage` CI job (.github/workflows/ci.yml). The job fails when total line coverage drops below `line_pct - tolerance_pct`. Raise `line_pct` when coverage genuinely improves \u2014 the job prints a ::notice:: when it does. Lowering it requires a stated reason in the PR description. Same discipline as parity/baseline.json. `line_pct` must come from a real run of that job, never a local `cargo llvm-cov`: for this same commit CI measured 83.54% of 126086 lines while macOS measured 82.79% of 125721. The denominators differ because the two platforms compile different cfg'd code, so the two numbers are not comparable and a local one would set the floor wrong.",
+  "line_pct": 83.54,
   "tolerance_pct": 0.5,
-  "measured_on": "PENDING",
-  "measured_by": "cargo llvm-cov --workspace --no-report && cargo llvm-cov report --summary-only --json"
+  "measured_on": "2026-08-30",
+  "measured_by": "cargo llvm-cov --workspace --no-report && cargo llvm-cov report --summary-only --json",
+  "measured_run": "https://github.com/OxidantData/Oxidant/actions/runs/33286523684"
 }
