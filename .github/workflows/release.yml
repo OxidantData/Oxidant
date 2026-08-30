@@ -1,21 +1,41 @@
 name: release
 
-# Semver release: bumps Cargo.toml workspace version, commits, tags (annotated),
-# pushes, then explicitly dispatches the two release pipelines: binaries.yml
-# (GitHub Release: tarballs, curl installer, Homebrew formula, .deb/.rpm) and
-# oxidant-image.yml (GHCR manifest ghcr.io/oxidantdata/oxidant :X.Y.Z, :X.Y, :X).
+# Semver release in two halves, because `main` is protected.
+#
+#   propose  — opens a PR that bumps the workspace version in Cargo.toml/Cargo.lock.
+#   tag      — fires when that PR is merged: tags the new version (annotated) and
+#              dispatches binaries.yml (GitHub Release: tarballs, curl installer,
+#              Homebrew formula, .deb/.rpm) and oxidant-image.yml (GHCR manifest
+#              ghcr.io/oxidantdata/oxidant :X.Y.Z, :X.Y, :X).
+#
+# Why a PR and not a direct push. `main` requires status checks (detect code changes,
+# rustfmt, clippy + test, coverage gates, line coverage). Required checks apply to
+# pushes, not only to merges, so the old `git push origin main` of a `[skip ci]` bump
+# commit is rejected — and it was rejected *after* the bump was committed and tagged
+# locally, which is the worst place to fail. Only an admin credential bypasses, and
+# GitHub Actions cannot be granted a bypass: ruleset bypass actors must be installed
+# GitHub Apps and Actions is built in, not installed. Routing the bump through a PR
+# needs no long-lived token at all.
+#
+# Why a human merges the release PR. Auto-merge would have to be enabled by
+# GITHUB_TOKEN, and a merge attributed to that token does not cascade — the `push`
+# trigger below would never fire and nothing would ever be tagged. The same
+# suppression is why tag pushes are not relied on for the pipelines (see `tag`).
+#
 # Tag pushes are NOT relied upon: GITHUB_TOKEN pushes don't cascade to other
 # workflows, and tag-push triggers have proven unreliable in this repo —
 # workflow_dispatch via the API always lands.
 #
 # How to release:
-#   1. Label the PR `patch`, `minor`, or `major` before merging to main — the
-#      merge triggers this workflow automatically. If several labels are present,
-#      precedence is major > minor > patch.
-#   2. Or: Actions → release → Run workflow → choose patch / minor / major.
+#   1. Label the PR `patch`, `minor`, or `major` before merging to main — the merge
+#      opens the release PR automatically. If several labels are present, precedence
+#      is major > minor > patch.
+#      Or: Actions → release → Run workflow → choose patch / minor / major.
+#   2. Merge the release PR it opens (it must go green like any other PR).
+#   3. That merge tags the version and dispatches the two release pipelines.
 #
-# Ordinary merges (no release label) do NOT release. The version bump commit
-# carries [skip ci] so only the dispatched tag builds run the expensive pipelines.
+# Ordinary merges (no release label) do NOT release. The bump commit deliberately does
+# NOT carry [skip ci] any more: its PR has to pass the required checks to be mergeable.
 
 on:
   workflow_dispatch:
@@ -28,6 +48,8 @@ on:
   pull_request:
     types: [closed]
     branches: [main]
+  push:
+    branches: [main]
 
 permissions:
   contents: write
@@ -35,39 +57,28 @@ permissions:
   # without it the bumper's final step 403s ("Resource not accessible by
   # integration") after the tag is already pushed (bit v0.1.1's release run).
   actions: write
-  pull-requests: read
+  # `write`, not `read`: `propose` opens the release PR. This alone is not enough —
+  # the repo/org setting "Allow GitHub Actions to create and approve pull requests"
+  # must also be on, or `gh pr create` 403s.
+  pull-requests: write
 
 jobs:
-  release:
+  propose:
+    name: open the release PR
+    # Never re-enters on the release PR's own merge: that PR carries no release label,
+    # and the head-ref guard is a second layer in case someone labels it by hand.
     if: |
       github.event_name == 'workflow_dispatch' ||
-      (github.event.pull_request.merged == true &&
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged == true &&
+       !startsWith(github.event.pull_request.head.ref, 'release/') &&
        (contains(github.event.pull_request.labels.*.name, 'patch') ||
         contains(github.event.pull_request.labels.*.name, 'minor') ||
         contains(github.event.pull_request.labels.*.name, 'major')))
     runs-on: ubuntu-latest
     steps:
-      # `main` requires status checks (rustfmt / clippy + test / coverage gates /
-      # line coverage). Those apply to direct pushes, not just merges, and the release
-      # commit is made with `[skip ci]`, so it never has any — GITHUB_TOKEN's push to
-      # main is rejected. Only an admin bypasses (branch protection sets
-      # enforce_admins: false), and GitHub Actions cannot be granted a bypass: ruleset
-      # bypass actors must be installed GitHub Apps, and Actions is built in, not
-      # installed. So this needs RELEASE_TOKEN — a PAT (contents: write) belonging to a
-      # repo admin.
-      - name: Require the release token
-        run: |
-          if [ -z "${{ secrets.RELEASE_TOKEN }}" ]; then
-            echo "::error::RELEASE_TOKEN is not set. main requires status checks, and the" \
-                 "release commit is pushed directly with [skip ci], so it has none —" \
-                 "GITHUB_TOKEN's push would be rejected after the version bump was already" \
-                 "committed locally. Add a repo secret RELEASE_TOKEN: a PAT with" \
-                 "contents: write owned by a repo admin (admins bypass required checks)."
-            exit 1
-          fi
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.RELEASE_TOKEN }}
           ref: main
           fetch-depth: 0
 
@@ -110,45 +121,173 @@ jobs:
           echo "old=${CURRENT}" >> "$GITHUB_OUTPUT"
           echo "version=${NEW}"  >> "$GITHUB_OUTPUT"
           echo "tag=v${NEW}"     >> "$GITHUB_OUTPUT"
+          echo "branch=release/v${NEW}" >> "$GITHUB_OUTPUT"
 
-      - name: Commit, tag, push
+      - name: Refuse to re-release an existing version
+        run: |
+          if git rev-parse -q --verify "refs/tags/${{ steps.ver.outputs.tag }}" >/dev/null; then
+            echo "::error::tag ${{ steps.ver.outputs.tag }} already exists — main's Cargo.toml" \
+                 "is at ${{ steps.ver.outputs.old }} but that release was already cut." \
+                 "Check whether a release PR is still open and unmerged."
+            exit 1
+          fi
+
+      - name: Push the release branch
         run: |
           # Sync Cargo.lock with the new workspace version — `cargo metadata
           # --no-deps` does NOT rewrite member versions, `cargo tree` does
           # (the Dockerfile builds with `--locked`; v0.1.0's image build died
           # on the stale lock).
           cargo tree --depth 0 -p oxidant-cli > /dev/null
+          git checkout -b "${{ steps.ver.outputs.branch }}"
           git add Cargo.toml Cargo.lock
-          git commit -m "chore: release ${{ steps.ver.outputs.tag }} [skip ci]"
-          git tag -a "${{ steps.ver.outputs.tag }}" -m "release ${{ steps.ver.outputs.tag }}"
-          git push origin main
-          git push origin "refs/tags/${{ steps.ver.outputs.tag }}"
+          git commit -m "chore: release ${{ steps.ver.outputs.tag }}"
+          # --force: a previous attempt that pushed the branch but failed to open the
+          # PR would otherwise wedge every retry.
+          git push --force origin "${{ steps.ver.outputs.branch }}"
 
-      - name: Dispatch release pipelines
+      - name: Open the release PR
+        id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # workflow_dispatch is exempt from the GITHUB_TOKEN cascade suppression
-          # (and tag-push triggers are unreliable in this repo), so fire both
-          # release pipelines explicitly on the new tag.
-          gh workflow run binaries.yml --ref "${{ steps.ver.outputs.tag }}"
-          gh workflow run oxidant-image.yml --ref "${{ steps.ver.outputs.tag }}"
+          # Two labelled PRs merged back to back both compute the same next version,
+          # because main's Cargo.toml does not move until the release PR lands. Reuse
+          # the open PR instead of failing on "already exists" — the branch was just
+          # force-pushed, so it already carries the newer main.
+          existing=$(gh pr list --head "${{ steps.ver.outputs.branch }}" --state open \
+                       --json url --jq '.[0].url // empty')
+          if [ -n "$existing" ]; then
+            echo "url=$existing" >> "$GITHUB_OUTPUT"
+            echo "::notice::release PR for ${{ steps.ver.outputs.tag }} is already open: $existing"
+            exit 0
+          fi
+          if url=$(gh pr create \
+              --base main \
+              --head "${{ steps.ver.outputs.branch }}" \
+              --title "chore: release ${{ steps.ver.outputs.tag }}" \
+              --body "Version bump \`${{ steps.ver.outputs.old }}\` → \`${{ steps.ver.outputs.version }}\` (\`${{ steps.bump.outputs.kind }}\`), opened by the release workflow.
+
+          Merging this PR tags \`${{ steps.ver.outputs.tag }}\` and dispatches the binaries and image pipelines. Nothing is published until then.
+
+          Do not add a \`patch\`/\`minor\`/\`major\` label to this PR — those labels are what open a release PR, and labelling this one would open another." 2>&1); then
+            echo "url=$url" >> "$GITHUB_OUTPUT"
+            echo "opened $url"
+          else
+            # Not a failure: the branch is pushed, which is the part that needed the
+            # workflow. Opening the PR is one click. This org currently sets
+            # "Allow GitHub Actions to create and approve pull requests" to off, and a
+            # repo-level setting cannot override an org policy (the REST call 409s), so
+            # this is the expected path until an org owner turns it on.
+            echo "$url"
+            echo "url=https://github.com/${{ github.repository }}/compare/main...${{ steps.ver.outputs.branch }}?expand=1" >> "$GITHUB_OUTPUT"
+            echo "manual=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::could not open the release PR automatically (see the error" \
+                 "above; most likely the org forbids Actions from creating PRs). The branch" \
+                 "\`${{ steps.ver.outputs.branch }}\` is pushed — open and merge the PR from" \
+                 "the link in this job's summary to finish the release."
+          fi
 
       - name: Job summary
         run: |
           {
-            echo "### Released \`${{ steps.ver.outputs.tag }}\`"
+            echo "### Release PR opened for \`${{ steps.ver.outputs.tag }}\`"
             echo ""
             echo "| | |"
             echo "|---|---|"
             echo "| Previous version | \`${{ steps.ver.outputs.old }}\` |"
             echo "| New version | \`${{ steps.ver.outputs.version }}\` |"
             echo "| Bump | \`${{ steps.bump.outputs.kind }}\` |"
-            echo "| Git tag | \`${{ steps.ver.outputs.tag }}\` |"
+            if [ "${{ steps.pr.outputs.manual }}" = "true" ]; then
+              echo "| Open the PR | [**click here**](${{ steps.pr.outputs.url }}) |"
+              echo ""
+              echo "**Action needed:** this org does not let GitHub Actions open pull"
+              echo "requests, so the branch was pushed but the PR was not created."
+              echo "Open it with the link above and merge it."
+            else
+              echo "| Release PR | ${{ steps.pr.outputs.url }} |"
+              echo ""
+            fi
+            echo "**Nothing is tagged or published yet.** Merge that PR — it has to go"
+            echo "green like any other — and the \`tag\` job will cut"
+            echo "\`${{ steps.ver.outputs.tag }}\` and dispatch the release pipelines."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tag:
+    name: tag and dispatch
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Detects the release by what actually changed, not by the commit subject: squash,
+      # merge-commit and rebase merges all produce different subjects on main, and the
+      # version in Cargo.toml is the thing that decides what gets tagged. Requires both
+      # "the version changed in this push" and "no such tag yet", so ordinary pushes and
+      # re-runs are no-ops.
+      - name: Decide whether this push is a release
+        id: check
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          if ! git rev-parse -q --verify HEAD^ >/dev/null 2>&1; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "no parent commit — not a release push"
+            exit 0
+          fi
+          # First-parent diff, so a merge commit is compared against the previous main.
+          if ! git diff HEAD^ HEAD -- Cargo.toml | grep -qE '^\+version = '; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "workspace version unchanged in this push — nothing to tag"
+            exit 0
+          fi
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${TAG} already exists — not re-tagging"
+            exit 0
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "will tag ${TAG}"
+
+      - name: Tag the release
+        if: steps.check.outputs.release == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.check.outputs.tag }}" -m "release ${{ steps.check.outputs.tag }}"
+          # Tags are not the protected ref, so GITHUB_TOKEN can push this.
+          git push origin "refs/tags/${{ steps.check.outputs.tag }}"
+
+      - name: Dispatch release pipelines
+        if: steps.check.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # workflow_dispatch is exempt from the GITHUB_TOKEN cascade suppression
+          # (and tag-push triggers are unreliable in this repo), so fire both
+          # release pipelines explicitly on the new tag.
+          gh workflow run binaries.yml --ref "${{ steps.check.outputs.tag }}"
+          gh workflow run oxidant-image.yml --ref "${{ steps.check.outputs.tag }}"
+
+      - name: Job summary
+        if: steps.check.outputs.release == 'true'
+        run: |
+          {
+            echo "### Released \`${{ steps.check.outputs.tag }}\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`${{ steps.check.outputs.version }}\` |"
+            echo "| Git tag | \`${{ steps.check.outputs.tag }}\` |"
             echo ""
             echo "Dispatched **binaries** (GitHub Release: tarballs, curl installer,"
             echo "Homebrew formula, .deb/.rpm) and **oxidant-image**, publishing:"
-            echo "- \`ghcr.io/oxidantdata/oxidant:${{ steps.ver.outputs.version }}\`"
-            echo "- \`ghcr.io/oxidantdata/oxidant:$(echo ${{ steps.ver.outputs.version }} | cut -d. -f1,2)\`"
-            echo "- \`ghcr.io/oxidantdata/oxidant:$(echo ${{ steps.ver.outputs.version }} | cut -d. -f1)\`"
+            echo "- \`ghcr.io/oxidantdata/oxidant:${{ steps.check.outputs.version }}\`"
+            echo "- \`ghcr.io/oxidantdata/oxidant:$(echo ${{ steps.check.outputs.version }} | cut -d. -f1,2)\`"
+            echo "- \`ghcr.io/oxidantdata/oxidant:$(echo ${{ steps.check.outputs.version }} | cut -d. -f1)\`"
           } >> "$GITHUB_STEP_SUMMARY"
