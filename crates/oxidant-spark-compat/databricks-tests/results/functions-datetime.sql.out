@@ -1,0 +1,117 @@
+-- Authored golden (Databricks SQL language manual: date and timestamp functions).
+-- !query
+SELECT year(DATE'2024-03-05') AS a, month(DATE'2024-03-05') AS b,
+       day(DATE'2024-03-05') AS c, dayofmonth(DATE'2024-03-05') AS d,
+       quarter(DATE'2024-03-05') AS e
+-- !query schema
+struct<a:int,b:int,c:int,d:int,e:int>
+-- !query output
+2024	3	5	5	1
+
+
+-- !query
+SELECT dayofweek(DATE'2007-02-03') AS a, weekday(DATE'2007-02-03') AS b,
+       dayofweek(DATE'2009-07-30') AS c, weekday(DATE'2009-07-30') AS d
+-- !query schema
+struct<a:int,b:int,c:int,d:int>
+-- !query output
+7	5	5	3
+
+
+-- !query
+SELECT dayofyear(DATE'2024-03-05') AS a, dayofyear(DATE'2023-03-05') AS b,
+       weekofyear(DATE'2016-01-01') AS c, weekofyear(DATE'2018-01-01') AS d
+-- !query schema
+struct<a:int,b:int,c:int,d:int>
+-- !query output
+65	64	53	1
+
+
+-- !query
+SELECT dayname(DATE'2009-07-30') AS a
+-- !query schema
+struct<a:string>
+-- !query output
+Thu
+
+
+-- !query
+SELECT hour(TIMESTAMP'2024-03-05 13:45:59') AS a,
+       minute(TIMESTAMP'2024-03-05 13:45:59') AS b,
+       second(TIMESTAMP'2024-03-05 13:45:59') AS c,
+       hour(DATE'2024-03-05') AS d
+-- !query schema
+struct<a:int,b:int,c:int,d:int>
+-- !query output
+13	45	59	0
+
+
+-- !query
+SELECT datediff(DATE'2024-03-05', DATE'2024-03-01') AS a,
+       date_diff(DATE'2024-03-01', DATE'2024-03-05') AS b,
+       datediff(DATE'2024-03-01', DATE'2024-02-28') AS c,
+       datediff(DATE'2023-03-01', DATE'2023-02-28') AS d
+-- !query schema
+struct<a:int,b:int,c:int,d:int>
+-- !query output
+4	-4	2	1
+
+
+-- !query
+SELECT add_months(DATE'2024-01-31', 1) AS a, add_months(DATE'2023-01-31', 1) AS b,
+       last_day(DATE'2024-02-05') AS c, last_day(DATE'2023-02-05') AS d
+-- !query schema
+struct<a:date,b:date,c:date,d:date>
+-- !query output
+2024-02-29	2023-02-28	2024-02-29	2023-02-28
+
+
+-- !query
+SELECT months_between(DATE'2024-03-15', DATE'2024-01-15') AS a,
+       months_between(DATE'2024-03-20', DATE'2024-02-15') AS b
+-- !query schema
+struct<a:double,b:double>
+-- !query output
+2.0	1.16129032
+
+
+-- !query
+SELECT current_timezone() AS a
+-- !query schema
+struct<a:string>
+-- !query output
+UTC
+
+
+-- !query
+SELECT from_utc_timestamp(TIMESTAMP'2024-01-15 12:00:00', 'America/New_York') AS a,
+       from_utc_timestamp(TIMESTAMP'2024-07-15 12:00:00', 'America/New_York') AS b,
+       from_utc_timestamp(TIMESTAMP'2024-01-15 12:00:00', 'Asia/Kolkata') AS c
+-- !query schema
+struct<a:timestamp_ntz,b:timestamp_ntz,c:timestamp_ntz>
+-- !query output
+2024-01-15 07:00:00	2024-07-15 08:00:00	2024-01-15 17:30:00
+
+
+-- !query
+SELECT to_utc_timestamp(TIMESTAMP'2024-01-15 07:00:00', 'America/New_York') AS a
+-- !query schema
+struct<a:timestamp_ntz>
+-- !query output
+2024-01-15 12:00:00
+
+
+-- !query
+SELECT convert_timezone('Europe/Moscow', 'America/Los_Angeles', TIMESTAMP'2022-01-01 00:00:00') AS a
+-- !query schema
+struct<a:timestamp_ntz>
+-- !query output
+2021-12-31 13:00:00
+
+
+-- !query
+SELECT unix_micros(TIMESTAMP'2020-12-01 06:30:08.999999') AS a
+-- !query schema
+struct<a:bigint>
+-- !query output
+1606804208999999

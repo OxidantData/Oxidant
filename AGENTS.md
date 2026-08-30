@@ -24,6 +24,7 @@
 | [docs/catalogs.md](docs/catalogs.md) | External catalog SPI (Hive / Glue / REST) |
 | [docs/runtime-contract.md](docs/runtime-contract.md) | Engine image env contract |
 | [docs/databricks-coverage.md](docs/databricks-coverage.md) | Databricks SQL coverage matrix (what works today + owning ticket) |
+| [docs/databricks-functions.md](docs/databricks-functions.md) | Databricks builtin-function coverage — generated, do not hand-edit (`oxidant-parity functions --markdown`) |
 | [docs/databricks-parity-plan.md](docs/databricks-parity-plan.md) | Databricks parity plan (Glue + Lake Formation epic) |
 
 Deployment options: the free Community AMI on AWS Marketplace (listing in progress) or

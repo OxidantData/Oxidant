@@ -67,4 +67,11 @@ echo "==> parity ratchet"
 cargo build -p oxidant-spark-compat --bin oxidant-parity
 ./target/debug/oxidant-parity ratchet --baseline parity/baseline.json --out-dir parity
 
+echo "==> databricks parity ratchet"
+./target/debug/oxidant-parity ratchet --corpus databricks \
+  --baseline parity/baseline-databricks.json --out-dir parity/databricks
+
+echo "==> databricks function coverage"
+./target/debug/oxidant-parity functions
+
 echo "All local CI gates passed."

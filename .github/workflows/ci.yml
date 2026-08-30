@@ -165,6 +165,21 @@ jobs:
         run: |
           set -o pipefail
           ./target/debug/oxidant-parity ratchet --baseline parity/baseline.json --out-dir parity | tee parity-run.log
+      # Databricks corpus ratchet (KAN-107). Same binary, same pipeline, its own baseline —
+      # the authored Databricks corpus is what gates the function work that the vendored Spark
+      # goldens do not exercise (`months_between`, `sha2`, `width_bucket`, the timezone shifts).
+      - name: Databricks parity ratchet (vs parity/baseline-databricks.json)
+        run: |
+          set -o pipefail
+          ./target/debug/oxidant-parity ratchet --corpus databricks \
+            --baseline parity/baseline-databricks.json --out-dir parity/databricks \
+            | tee databricks-parity-run.log
+      # Coverage of the Databricks builtin-function surface. Reported, not gated: it reads the
+      # live registry and prints the headline into the job summary so a wave's effect is visible
+      # on the PR without anyone re-running it locally.
+      - name: Databricks function coverage
+        if: always()
+        run: ./target/debug/oxidant-parity functions | tee function-coverage.log
       - name: Publish parity headline to job summary
         if: always()
         run: |
@@ -173,6 +188,18 @@ jobs:
             echo ""
             echo '```'
             grep -E '^(parity:|✓|✗)' parity-run.log 2>/dev/null || echo "(no headline — see logs)"
+            echo '```'
+            echo ""
+            echo "## Databricks parity gate"
+            echo ""
+            echo '```'
+            grep -E '^(parity:|✓|✗)' databricks-parity-run.log 2>/dev/null || echo "(no headline — see logs)"
+            echo '```'
+            echo ""
+            echo "## Databricks function coverage"
+            echo ""
+            echo '```'
+            grep -E '^(in scope|surface)' function-coverage.log 2>/dev/null || echo "(no headline — see logs)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload parity scoreboard
@@ -185,6 +212,9 @@ jobs:
             parity/report.md
             parity/parity.html
             parity/scoreboard.json
+            parity/databricks/parity.json
+            parity/databricks/report.md
+            parity/databricks/scoreboard.json
           retention-days: 30
           if-no-files-found: ignore
 

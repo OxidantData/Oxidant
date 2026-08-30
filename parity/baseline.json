@@ -3,42 +3,42 @@
   "files_total": 303,
   "files_skipped": 25,
   "blocks_total": 14706,
-  "strict_pass": 2933,
-  "semantic_pass": 7953,
+  "strict_pass": 2949,
+  "semantic_pass": 8028,
   "buckets": {
-    "correctness": 702,
+    "correctness": 712,
     "datetime": 32,
-    "decimal-precision": 212,
+    "decimal-precision": 230,
     "engine-panic": 3,
-    "error-parity": 2854,
-    "exec-error": 1903,
-    "feature-unsupported": 540,
-    "function-missing": 844,
-    "missing-error": 163,
+    "error-parity": 2853,
+    "exec-error": 1962,
+    "feature-unsupported": 549,
+    "function-missing": 664,
+    "missing-error": 164,
     "missing-relation": 955,
     "nondeterministic": 6,
-    "null-semantics": 94,
+    "null-semantics": 100,
     "ordering": 15,
-    "parser-unsupported": 1212,
-    "pass": 2933,
+    "parser-unsupported": 1214,
+    "pass": 2949,
     "requires-udf-registration": 87,
-    "schema-only": 2151
+    "schema-only": 2211
   },
   "files": [
     {
       "file": "array.sql",
       "total": 80,
       "strict_pass": 17,
-      "semantic_pass": 33,
+      "semantic_pass": 35,
       "buckets": {
-        "correctness": 4,
+        "correctness": 5,
         "error-parity": 8,
         "exec-error": 4,
-        "function-missing": 30,
+        "function-missing": 27,
         "missing-error": 5,
         "null-semantics": 4,
         "pass": 17,
-        "schema-only": 8
+        "schema-only": 10
       },
       "failures": [
         {
@@ -137,9 +137,9 @@
           "detail": "plan error: Error during planning: Invalid function 'size'."
         },
         {
-          "bucket": "function-missing",
+          "bucket": "schema-only",
           "sql": "select isnotnull(arrays_zip(array(), array(4), array(7, 8, 9, 10)))",
-          "detail": "plan error: Error during planning: Invalid function 'isnotnull'."
+          "detail": "schema: golden `struct<(arrays_zip(array(), array(4), array(7, 8, 9, 10)) IS NOT NULL):boolean>` vs oxidant `struct<isnotnull(arrays_zip(array(), array(4), array(7, 8, 9, 10))):boolean>`"
         }
       ]
     },
@@ -752,9 +752,9 @@
         "error-parity": 2,
         "exec-error": 6,
         "feature-unsupported": 1,
-        "function-missing": 4,
+        "function-missing": 2,
         "missing-relation": 9,
-        "null-semantics": 16,
+        "null-semantics": 18,
         "parser-unsupported": 20,
         "pass": 7,
         "schema-only": 3
@@ -2150,9 +2150,8 @@
       "buckets": {
         "correctness": 1,
         "error-parity": 27,
-        "exec-error": 15,
+        "exec-error": 30,
         "feature-unsupported": 1,
-        "function-missing": 15,
         "parser-unsupported": 11,
         "pass": 22,
         "schema-only": 10
@@ -2499,17 +2498,17 @@
       "file": "datetime-legacy.sql",
       "total": 210,
       "strict_pass": 23,
-      "semantic_pass": 114,
+      "semantic_pass": 115,
       "buckets": {
         "correctness": 5,
         "datetime": 4,
         "error-parity": 69,
-        "exec-error": 41,
+        "exec-error": 56,
         "feature-unsupported": 3,
-        "function-missing": 32,
+        "function-missing": 16,
         "parser-unsupported": 11,
         "pass": 23,
-        "schema-only": 22
+        "schema-only": 23
       },
       "failures": [
         {
@@ -2892,19 +2891,23 @@
       "semantic_pass": 24,
       "buckets": {
         "decimal-precision": 15,
-        "error-parity": 15,
+        "error-parity": 14,
         "exec-error": 3,
-        "function-missing": 1,
-        "missing-error": 6,
+        "missing-error": 7,
         "parser-unsupported": 6,
         "pass": 3,
-        "schema-only": 6
+        "schema-only": 7
       },
       "failures": [
         {
           "bucket": "exec-error",
           "sql": "CREATE TEMPORARY VIEW t AS SELECT 1.0 as a, 0.0 as b",
           "detail": "plan error: Execution error: Table 't' already exists"
+        },
+        {
+          "bucket": "missing-error",
+          "sql": "select pmod(a, b) from t",
+          "detail": "oxidant accepted a query Spark rejects"
         },
         {
           "bucket": "exec-error",
@@ -2992,14 +2995,9 @@
           "detail": "schema: golden `struct<CAST(20 AS DECIMAL(4,1)):decimal(6,2)>` vs oxidant `struct<Int64(20):decimal(6,2)>`"
         },
         {
-          "bucket": "function-missing",
+          "bucket": "schema-only",
           "sql": "SELECT CAST(20 AS DECIMAL(4, 1))\nUNION ALL\nSELECT pmod(CAST(10 AS DECIMAL(10, 2)), CAST(3 AS DECIMAL(5, 1)))",
-          "detail": "plan error: Error during planning: Invalid function 'pmod'."
-        },
-        {
-          "bucket": "parser-unsupported",
-          "sql": "SELECT CAST(20 AS DECIMAL(4, 1))\nUNION ALL\nSELECT CAST(10 AS DECIMAL(10, 2)) div CAST(3 AS DECIMAL(5, 1))",
-          "detail": "plan error: SQL error: ParserError(\"No infix parser for token Word(Word { value: \\\"div\\\", quote_style: None, keyword: DIV }) at Line: 3, Column: 35\")"
+          "detail": "schema: golden `struct<CAST(20 AS DECIMAL(4,1)):decimal(6,2)>` vs oxidant `struct<Int64(20):decimal(10,2)>`"
         }
       ]
     },
@@ -5126,11 +5124,11 @@
     {
       "file": "ilike.sql",
       "total": 26,
-      "strict_pass": 0,
-      "semantic_pass": 20,
+      "strict_pass": 2,
+      "semantic_pass": 22,
       "buckets": {
         "exec-error": 4,
-        "function-missing": 2,
+        "pass": 2,
         "schema-only": 20
       },
       "failures": [
@@ -5210,16 +5208,6 @@
           "detail": "schema: golden `struct<ilike(, a):boolean>` vs oxidant `struct<Utf8(\"\") ILIKE Utf8(\"a\"):boolean>`"
         },
         {
-          "bucket": "function-missing",
-          "sql": "select ilike('\\__', '\\\\\\__')",
-          "detail": "plan error: Error during planning: Invalid function 'ilike'."
-        },
-        {
-          "bucket": "function-missing",
-          "sql": "select ilike('\\\\\\__', '%\\\\%\\%')",
-          "detail": "plan error: Error during planning: Invalid function 'ilike'."
-        },
-        {
           "bucket": "schema-only",
           "sql": "select 'a\\u20ACA' ilike '_\\u20AC_'",
           "detail": "schema: golden `struct<ilike(a€A, _€_):boolean>` vs oxidant `struct<Utf8(\"a€A\") ILIKE Utf8(\"_€_\"):boolean>`"
@@ -5233,6 +5221,16 @@
           "bucket": "schema-only",
           "sql": "select 'a€AA' ilike '_\\u20AC_a'",
           "detail": "schema: golden `struct<ilike(a€AA, _€_a):boolean>` vs oxidant `struct<Utf8(\"a€AA\") ILIKE Utf8(\"_€_a\"):boolean>`"
+        },
+        {
+          "bucket": "schema-only",
+          "sql": "select 'a\\u20ACaz' ilike '_€_Z'",
+          "detail": "schema: golden `struct<ilike(a€az, _€_Z):boolean>` vs oxidant `struct<Utf8(\"a€az\") ILIKE Utf8(\"_€_Z\"):boolean>`"
+        },
+        {
+          "bucket": "schema-only",
+          "sql": "select 'ЀЁЂѺΏỀ' ilike 'ѐёђѻώề'",
+          "detail": "schema: golden `struct<ilike(ЀЁЂѺΏỀ, ѐёђѻώề):boolean>` vs oxidant `struct<Utf8(\"ЀЁЂѺΏỀ\") ILIKE Utf8(\"ѐёђѻώề\"):boolean>`"
         }
       ]
     },
@@ -5412,8 +5410,8 @@
         "correctness": 31,
         "error-parity": 113,
         "exec-error": 35,
-        "feature-unsupported": 46,
-        "function-missing": 31,
+        "feature-unsupported": 50,
+        "function-missing": 27,
         "missing-error": 6,
         "parser-unsupported": 18,
         "schema-only": 5
@@ -6956,15 +6954,15 @@
       "file": "nonansi/array.sql",
       "total": 80,
       "strict_pass": 20,
-      "semantic_pass": 35,
+      "semantic_pass": 37,
       "buckets": {
-        "correctness": 4,
+        "correctness": 5,
         "error-parity": 6,
         "exec-error": 4,
-        "function-missing": 32,
+        "function-missing": 29,
         "null-semantics": 5,
         "pass": 20,
-        "schema-only": 9
+        "schema-only": 11
       },
       "failures": [
         {
@@ -7058,14 +7056,14 @@
           "detail": "plan error: Error during planning: Invalid function 'size'."
         },
         {
-          "bucket": "function-missing",
+          "bucket": "schema-only",
           "sql": "select isnotnull(arrays_zip(array(), array(4), array(7, 8, 9, 10)))",
-          "detail": "plan error: Error during planning: Invalid function 'isnotnull'."
+          "detail": "schema: golden `struct<(arrays_zip(array(), array(4), array(7, 8, 9, 10)) IS NOT NULL):boolean>` vs oxidant `struct<isnotnull(arrays_zip(array(), array(4), array(7, 8, 9, 10))):boolean>`"
         },
         {
-          "bucket": "function-missing",
+          "bucket": "schema-only",
           "sql": "select isnotnull(arrays_zip(array(1, 2, 3), array(4), array(7, 8, 9, 10)))",
-          "detail": "plan error: Error during planning: Invalid function 'isnotnull'."
+          "detail": "schema: golden `struct<(arrays_zip(array(1, 2, 3), array(4), array(7, 8, 9, 10)) IS NOT NULL):boolean>` vs oxidant `struct<isnotnull(arrays_zip(array(1, 2, 3), array(4), array(7, 8, 9, 10))):boolean>`"
         }
       ]
     },
@@ -7242,9 +7240,8 @@
       "buckets": {
         "correctness": 1,
         "error-parity": 24,
-        "exec-error": 18,
+        "exec-error": 33,
         "feature-unsupported": 1,
-        "function-missing": 15,
         "missing-error": 2,
         "parser-unsupported": 11,
         "pass": 20,
@@ -7502,15 +7499,14 @@
       "file": "nonansi/decimalArithmeticOperations.sql",
       "total": 55,
       "strict_pass": 3,
-      "semantic_pass": 9,
+      "semantic_pass": 10,
       "buckets": {
         "decimal-precision": 15,
         "exec-error": 6,
-        "function-missing": 2,
-        "null-semantics": 6,
+        "null-semantics": 7,
         "parser-unsupported": 17,
         "pass": 3,
-        "schema-only": 6
+        "schema-only": 7
       },
       "failures": [
         {
@@ -7529,9 +7525,9 @@
           "detail": "execution error: Execution error: [DIVIDE_BY_ZERO] Division by zero. Use try_divide to tolerate a 0 divisor and return NULL instead. SQLSTATE: 22012"
         },
         {
-          "bucket": "function-missing",
+          "bucket": "null-semantics",
           "sql": "select pmod(a, b) from t",
-          "detail": "plan error: Error during planning: Invalid function 'pmod'."
+          "detail": "golden[1r] vs oxidant[1r]"
         },
         {
           "bucket": "exec-error",
@@ -7800,8 +7796,8 @@
         "correctness": 31,
         "error-parity": 102,
         "exec-error": 41,
-        "feature-unsupported": 50,
-        "function-missing": 32,
+        "feature-unsupported": 54,
+        "function-missing": 28,
         "missing-error": 6,
         "parser-unsupported": 18,
         "schema-only": 5
@@ -8359,16 +8355,16 @@
       "file": "nonansi/timestamp.sql",
       "total": 108,
       "strict_pass": 1,
-      "semantic_pass": 41,
+      "semantic_pass": 42,
       "buckets": {
         "correctness": 4,
         "datetime": 4,
         "error-parity": 28,
         "exec-error": 42,
         "feature-unsupported": 2,
-        "function-missing": 15,
+        "function-missing": 14,
         "pass": 1,
-        "schema-only": 12
+        "schema-only": 13
       },
       "failures": [
         {
@@ -8780,9 +8776,8 @@
       "strict_pass": 11,
       "semantic_pass": 11,
       "buckets": {
-        "correctness": 18,
+        "correctness": 19,
         "decimal-precision": 1,
-        "function-missing": 1,
         "pass": 11
       },
       "failures": [
@@ -8882,9 +8877,9 @@
           "detail": "golden[3r] vs oxidant[6r]"
         },
         {
-          "bucket": "function-missing",
+          "bucket": "correctness",
           "sql": "select b, c, equal_null(b, c), equal_null(c, b) from t1",
-          "detail": "plan error: Error during planning: Invalid function 'equal_null'."
+          "detail": "golden[7r] vs oxidant[14r]"
         }
       ]
     },
@@ -8922,17 +8917,19 @@
     {
       "file": "operators.sql",
       "total": 77,
-      "strict_pass": 11,
-      "semantic_pass": 28,
+      "strict_pass": 21,
+      "semantic_pass": 46,
       "buckets": {
-        "correctness": 7,
+        "correctness": 11,
         "decimal-precision": 2,
         "error-parity": 6,
-        "function-missing": 27,
+        "exec-error": 2,
+        "function-missing": 1,
         "missing-relation": 7,
+        "null-semantics": 2,
         "parser-unsupported": 6,
-        "pass": 11,
-        "schema-only": 11
+        "pass": 21,
+        "schema-only": 19
       },
       "failures": [
         {
@@ -10738,12 +10735,11 @@
       "strict_pass": 29,
       "semantic_pass": 62,
       "buckets": {
-        "correctness": 4,
+        "correctness": 5,
         "decimal-precision": 14,
         "error-parity": 5,
         "exec-error": 11,
         "feature-unsupported": 1,
-        "function-missing": 1,
         "missing-relation": 2,
         "pass": 29,
         "schema-only": 28
@@ -10845,9 +10841,9 @@
           "detail": "golden[5r] vs oxidant[9r]"
         },
         {
-          "bucket": "function-missing",
+          "bucket": "correctness",
           "sql": "select ceiling(f1) as ceiling_f1 from float8_tbl f",
-          "detail": "plan error: Error during planning: Invalid function 'ceiling'."
+          "detail": "golden[5r] vs oxidant[9r]"
         }
       ]
     },
@@ -11596,18 +11592,19 @@
     {
       "file": "postgreSQL/numeric.sql",
       "total": 606,
-      "strict_pass": 492,
-      "semantic_pass": 508,
+      "strict_pass": 493,
+      "semantic_pass": 510,
       "buckets": {
-        "correctness": 8,
-        "decimal-precision": 21,
+        "correctness": 10,
+        "decimal-precision": 23,
         "error-parity": 4,
-        "exec-error": 35,
+        "exec-error": 44,
         "feature-unsupported": 12,
-        "function-missing": 20,
+        "function-missing": 4,
         "missing-error": 2,
-        "pass": 492,
-        "schema-only": 12
+        "null-semantics": 1,
+        "pass": 493,
+        "schema-only": 13
       },
       "failures": [
         {
@@ -14543,8 +14540,7 @@
       "strict_pass": 2,
       "semantic_pass": 2,
       "buckets": {
-        "feature-unsupported": 7,
-        "function-missing": 1,
+        "feature-unsupported": 8,
         "pass": 2
       },
       "failures": [
@@ -14559,9 +14555,9 @@
           "detail": "plan error: This feature is not implemented: Dot access not supported for non-string expr: Identifier(Ident { value: \"a\", quote_style: None, span: Span(Location(1,50)..Location(1,51)) })"
         },
         {
-          "bucket": "function-missing",
+          "bucket": "feature-unsupported",
           "sql": "SELECT if(isnull(from_json(a, 'struct<a:int,b:string>').a), from_json(b, 'array<struct<a:int,b:int>>')[0].b + 1, from_json(b, 'array<struct<a:int,b:int>>')[0].b",
-          "detail": "plan error: Error during planning: Invalid function 'isnull'."
+          "detail": "plan error: This feature is not implemented: Dot access not supported for non-string expr: Identifier(Ident { value: \"a\", quote_style: None, span: Span(Location(1,57)..Location(1,58)) })"
         },
         {
           "bucket": "feature-unsupported",
@@ -17883,9 +17879,9 @@
       "buckets": {
         "error-parity": 2,
         "exec-error": 1,
-        "function-missing": 6,
+        "function-missing": 4,
         "missing-relation": 3,
-        "parser-unsupported": 9,
+        "parser-unsupported": 11,
         "pass": 3
       },
       "failures": [
@@ -17900,14 +17896,14 @@
           "detail": "plan error: Error during planning: Invalid function 'to_timestamp_ltz'."
         },
         {
-          "bucket": "function-missing",
+          "bucket": "parser-unsupported",
           "sql": "SELECT convert_timezone('Europe/Moscow', 'America/Los_Angeles', timestamp_ntz'2022-01-01 00:00:00')",
-          "detail": "plan error: Error during planning: Invalid function 'convert_timezone'."
+          "detail": "plan error: This feature is not implemented: Unsupported SQL type TIMESTAMP_NTZ"
         },
         {
-          "bucket": "function-missing",
+          "bucket": "parser-unsupported",
           "sql": "SELECT convert_timezone('Europe/Brussels', timestamp_ntz'2022-03-23 00:00:00')",
-          "detail": "plan error: Error during planning: Invalid function 'convert_timezone'."
+          "detail": "plan error: This feature is not implemented: Unsupported SQL type TIMESTAMP_NTZ"
         },
         {
           "bucket": "function-missing",
@@ -17990,16 +17986,16 @@
       "file": "timestamp.sql",
       "total": 108,
       "strict_pass": 1,
-      "semantic_pass": 47,
+      "semantic_pass": 48,
       "buckets": {
         "correctness": 4,
         "datetime": 4,
         "error-parity": 34,
         "exec-error": 36,
         "feature-unsupported": 2,
-        "function-missing": 15,
+        "function-missing": 14,
         "pass": 1,
-        "schema-only": 12
+        "schema-only": 13
       },
       "failures": [
         {
@@ -18172,17 +18168,17 @@
       "file": "timestampNTZ/timestamp-ansi.sql",
       "total": 108,
       "strict_pass": 6,
-      "semantic_pass": 45,
+      "semantic_pass": 46,
       "buckets": {
         "correctness": 4,
         "datetime": 3,
         "error-parity": 32,
         "exec-error": 37,
         "feature-unsupported": 2,
-        "function-missing": 16,
+        "function-missing": 15,
         "missing-error": 1,
         "pass": 6,
-        "schema-only": 7
+        "schema-only": 8
       },
       "failures": [
         {
@@ -18266,9 +18262,9 @@
           "detail": "schema: golden `struct<unix_millis(TIMESTAMP '2020-12-01 06:30:08'):bigint,unix_millis(TIMESTAMP '2020-12-01 06:30:08.999999'):bigint,unix_millis(NULL):bigint>` vs oxidant `struct<unix_millis(2020-12-01 14:30:08Z):bigint,unix_millis(2020-12-01 14:30:08.999999Z):bigint,unix_millis(NULL):bigint>`"
         },
         {
-          "bucket": "function-missing",
+          "bucket": "schema-only",
           "sql": "select UNIX_MICROS(timestamp'2020-12-01 14:30:08Z'), UNIX_MICROS(timestamp'2020-12-01 14:30:08.999999Z'), UNIX_MICROS(null)",
-          "detail": "plan error: Error during planning: Invalid function 'unix_micros'."
+          "detail": "schema: golden `struct<unix_micros(TIMESTAMP '2020-12-01 06:30:08'):bigint,unix_micros(TIMESTAMP '2020-12-01 06:30:08.999999'):bigint,unix_micros(NULL):bigint>` vs oxidant `struct<unix_micros(2020-12-01 14:30:08Z):bigint,unix_micros(2020-12-01 14:30:08.999999Z):bigint,unix_micros(NULL):bigint>`"
         },
         {
           "bucket": "exec-error",
@@ -18291,17 +18287,17 @@
       "file": "timestampNTZ/timestamp.sql",
       "total": 108,
       "strict_pass": 6,
-      "semantic_pass": 39,
+      "semantic_pass": 40,
       "buckets": {
         "correctness": 4,
         "datetime": 3,
         "error-parity": 26,
         "exec-error": 43,
         "feature-unsupported": 2,
-        "function-missing": 16,
+        "function-missing": 15,
         "null-semantics": 1,
         "pass": 6,
-        "schema-only": 7
+        "schema-only": 8
       },
       "failures": [
         {
@@ -19633,13 +19629,13 @@
       "file": "typeCoercion/native/decimalPrecision.sql",
       "total": 1145,
       "strict_pass": 0,
-      "semantic_pass": 1024,
+      "semantic_pass": 1064,
       "buckets": {
-        "decimal-precision": 40,
+        "decimal-precision": 56,
         "error-parity": 364,
         "exec-error": 21,
-        "function-missing": 60,
-        "schema-only": 660
+        "function-missing": 4,
+        "schema-only": 700
       },
       "failures": [
         {
@@ -20017,12 +20013,12 @@
     {
       "file": "typeCoercion/native/implicitTypeCasts.sql",
       "total": 44,
-      "strict_pass": 0,
-      "semantic_pass": 18,
+      "strict_pass": 3,
+      "semantic_pass": 21,
       "buckets": {
         "correctness": 2,
-        "exec-error": 18,
-        "function-missing": 6,
+        "exec-error": 21,
+        "pass": 3,
         "schema-only": 18
       },
       "failures": [
