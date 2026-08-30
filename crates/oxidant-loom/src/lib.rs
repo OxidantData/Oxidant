@@ -1268,6 +1268,11 @@ fn register_spark_function_aliases(ctx: &SessionContext) {
     use datafusion::execution::FunctionRegistry;
 
     // (Spark name, DataFusion builtin with identical semantics).
+    //
+    // Targets must be **DataFusion built-ins**: this runs before `spark_functions::register`, so an
+    // oxidant-defined target is not in the registry yet and the alias would be silently skipped by
+    // the `if let Ok(...)` below. Alias an oxidant UDF onto a second Spark name with
+    // `.with_aliases([...])` at its own registration site instead (see `spark_encoding::register`).
     const SCALAR_ALIASES: &[(&str, &str)] = &[
         ("startswith", "starts_with"),
         ("endswith", "ends_with"),
@@ -1278,6 +1283,13 @@ fn register_spark_function_aliases(ctx: &SessionContext) {
         ("char", "chr"),
         // Spark `array(e1, …)` constructs an array — identical to DataFusion's `make_array`.
         ("array", "make_array"),
+        // Databricks spells DataFusion's `ceil` as `ceiling` too.
+        ("ceiling", "ceil"),
+        // Spark's `curdate()` and Databricks' `getdate()` are `current_date()`. Spark itself
+        // renders `curdate()` in a result-column name as `current_date()`, so aliasing (rather
+        // than a distinct UDF) also reproduces the output naming.
+        ("curdate", "current_date"),
+        ("getdate", "current_date"),
     ];
     const AGG_ALIASES: &[(&str, &str)] = &[
         ("variance", "var_samp"),
@@ -1285,6 +1297,13 @@ fn register_spark_function_aliases(ctx: &SessionContext) {
         ("any", "bool_or"),
         ("some", "bool_or"),
         ("every", "bool_and"),
+        // Spark's `std` is sample standard deviation, which is what DataFusion's `stddev` is.
+        ("std", "stddev"),
+        // Spark's single-argument `first`/`last`. The two-argument `ignoreNulls` overload is a
+        // different function and is NOT covered by these aliases — it fails on arity, which is
+        // honest, rather than silently ignoring the flag.
+        ("first", "first_value"),
+        ("last", "last_value"),
     ];
 
     let state = ctx.state();
@@ -5738,6 +5757,39 @@ impl Engine {
     /// `Partitions`); a single-table lookup that can't resolve (`Columns`/`TblProperties`/
     /// `CreateTable`) returns a `TABLE_OR_VIEW_NOT_FOUND`-style [`Error::Plan`] instead, matching
     /// Spark's own analysis error for those forms.
+    /// Every function name this engine can resolve, sorted and deduplicated.
+    ///
+    /// The union of four sources, which is exactly what makes a `SELECT f(…)` plan rather than
+    /// fail with `Invalid function 'f'`:
+    /// - DataFusion's scalar functions (its whole built-in set, registered wholesale by
+    ///   `SessionStateBuilder::with_default_features()`, plus oxidant's Spark UDFs and the Spark
+    ///   name aliases layered on by [`register_spark_function_aliases`] and
+    ///   [`spark_functions::register`]);
+    /// - DataFusion's aggregate functions (same three origins);
+    /// - DataFusion's window functions;
+    /// - session-scoped SQL UDFs created by `CREATE FUNCTION` ([`udf_registry`]).
+    ///
+    /// The registry keys include every alias, so `startswith` and `starts_with` both appear.
+    ///
+    /// This backs both `SHOW FUNCTIONS` and the `oxidant-parity functions` gap report, so the two
+    /// can never disagree about what is registered.
+    pub fn registered_function_names(&self) -> Vec<String> {
+        let mut names: HashSet<String> = self
+            .udf_registry
+            .lock()
+            .expect("udf_registry poisoned")
+            .names()
+            .into_iter()
+            .collect();
+        let state = self.ctx.state();
+        names.extend(state.scalar_functions().keys().cloned());
+        names.extend(state.aggregate_functions().keys().cloned());
+        names.extend(state.window_functions().keys().cloned());
+        let mut list: Vec<String> = names.into_iter().collect();
+        list.sort();
+        list
+    }
+
     async fn run_show(&self, show: &ShowStmt) -> Result<Vec<RecordBatch>> {
         match show {
             ShowStmt::Catalogs => {
@@ -6058,22 +6110,11 @@ impl Engine {
                 Ok(vec![single_col_batch("partition", parts)?])
             }
             ShowStmt::Functions { like } => {
-                let mut names: HashSet<String> = self
-                    .udf_registry
-                    .lock()
-                    .expect("udf_registry poisoned")
-                    .names()
-                    .into_iter()
-                    .collect();
-                let state = self.ctx.state();
-                names.extend(state.scalar_functions().keys().cloned());
-                names.extend(state.aggregate_functions().keys().cloned());
-                names.extend(state.window_functions().keys().cloned());
-                let mut list: Vec<String> = names.into_iter().collect();
+                let mut list = self.registered_function_names();
                 if let Some(pat) = like {
-                    list.retain(|n| sql_like_match(pat, n));
+                    // Spark's `SHOW FUNCTIONS LIKE` pattern is a `*` glob, NOT SQL `%`/`_`.
+                    list.retain(|n| spark_show_pattern_match(pat, n));
                 }
-                list.sort();
                 Ok(vec![single_col_batch("function", list)?])
             }
         }
@@ -7555,10 +7596,36 @@ fn take_trailing_like<'a>(rest: &'a [&'a str]) -> (Option<String>, &'a [&'a str]
     }
 }
 
+/// `SHOW FUNCTIONS LIKE '<pattern>'` match — Spark's pattern language, which is **not** SQL `LIKE`.
+///
+/// Databricks/Spark document this clause's argument as a `regex_pattern` where "`*` alone matches 0
+/// or more characters and `|` is used to separate multiple different regexes, any of which can
+/// match". Spark implements it in `StringUtils.filterPattern`: split on `|`, replace every `*` with
+/// `.*`, compile case-insensitively, and require a **full** match; a sub-pattern that fails to
+/// compile is silently skipped rather than raising.
+///
+/// Routing this clause through [`sql_like_match`] instead was a real bug: `SHOW FUNCTIONS LIKE
+/// 'up*'` returned zero rows even though `upper` is registered, because SQL `LIKE` reads `*` as a
+/// literal asterisk. The other SHOW listings (`TABLES`/`VIEWS`/`PARTITIONS`) keep `sql_like_match`.
+fn spark_show_pattern_match(pattern: &str, s: &str) -> bool {
+    pattern.trim().split('|').any(|sub| {
+        // `*` is the only metacharacter Spark rewrites; everything else is passed to the regex
+        // engine as-is, so `SHOW FUNCTIONS LIKE 'up.*'` also works exactly as it does on Spark.
+        let expanded = sub.replace('*', ".*");
+        match regex::Regex::new(&format!("(?i)^(?:{expanded})$")) {
+            Ok(re) => re.is_match(s),
+            // Spark swallows PatternSyntaxException per sub-pattern; an uncompilable one simply
+            // contributes no matches.
+            Err(_) => false,
+        }
+    })
+}
+
 /// SQL `LIKE` glob match (`%` = any run of chars, `_` = exactly one char), case-sensitive — the
-/// filter every SHOW `LIKE '<pattern>'` clause applies to table/view/function names (see
-/// [`ShowStmt::Tables`]/[`ShowStmt::Views`]/[`ShowStmt::Functions`]). Classic two-pointer wildcard
+/// filter the SHOW `LIKE '<pattern>'` clauses apply to table/view names (see
+/// [`ShowStmt::Tables`]/[`ShowStmt::Views`]). Classic two-pointer wildcard
 /// matching with backtracking on `%`, operating on `char`s so multi-byte names aren't corrupted.
+/// `SHOW FUNCTIONS` does NOT use this — see [`spark_show_pattern_match`].
 fn sql_like_match(pattern: &str, s: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = s.chars().collect();
@@ -10253,6 +10320,59 @@ mod tests {
         assert!(sql_like_match("a_c", "abc"));
         assert!(!sql_like_match("a_c", "abbc"));
         assert!(sql_like_match("%", "anything"));
+    }
+
+    /// `SHOW FUNCTIONS LIKE` takes Spark's `*`/`|` regex pattern, not SQL `LIKE`. The `'up*'` case
+    /// is the regression that made this function exist: it returned zero rows while `upper` was
+    /// registered.
+    #[test]
+    fn spark_show_pattern_matches_star_and_alternation() {
+        assert!(spark_show_pattern_match("up*", "upper"));
+        assert!(spark_show_pattern_match("*per", "upper"));
+        assert!(spark_show_pattern_match("*ppe*", "upper"));
+        assert!(!spark_show_pattern_match("up*", "lower"));
+        // Bare `*` matches everything; an exact name matches only itself.
+        assert!(spark_show_pattern_match("*", "anything"));
+        assert!(spark_show_pattern_match("upper", "upper"));
+        assert!(!spark_show_pattern_match("upp", "upper"));
+        // Case-insensitive, like Spark's `(?i)` prefix.
+        assert!(spark_show_pattern_match("UP*", "upper"));
+        // `|` separates alternatives; either side may match.
+        assert!(spark_show_pattern_match("up*|low*", "lower"));
+        assert!(spark_show_pattern_match("up*|low*", "upper"));
+        assert!(!spark_show_pattern_match("up*|low*", "concat"));
+        // An uncompilable sub-pattern contributes nothing instead of raising.
+        assert!(spark_show_pattern_match("up*|[", "upper"));
+        assert!(!spark_show_pattern_match("[", "upper"));
+    }
+
+    /// The `SHOW FUNCTIONS` result must be exactly the registry [`Engine::registered_function_names`]
+    /// reports, so the `oxidant-parity functions` gap report can never disagree with the engine.
+    #[tokio::test]
+    async fn show_functions_matches_registered_function_names() {
+        let engine = Engine::new();
+        let names = engine.registered_function_names();
+        assert!(names.contains(&"upper".to_string()), "{names:?}");
+        assert!(names.iter().any(|n| n == "typeof"), "spark UDFs missing");
+        assert!(names.iter().any(|n| n == "startswith"), "aliases missing");
+        assert!(
+            names.iter().any(|n| n == "row_number"),
+            "window fns missing"
+        );
+        assert!(names.windows(2).all(|w| w[0] <= w[1]), "not sorted");
+
+        let batches = engine.sql("SHOW FUNCTIONS").await.expect("SHOW FUNCTIONS");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, names.len());
+
+        let batches = engine
+            .sql("SHOW FUNCTIONS LIKE 'up*'")
+            .await
+            .expect("SHOW FUNCTIONS LIKE");
+        let got = crate::arrow::util::pretty::pretty_format_batches(&batches)
+            .unwrap()
+            .to_string();
+        assert!(got.contains("upper"), "want `upper`, got:\n{got}");
     }
 
     /// `CREATE TABLE … USING <fmt>` must lower to real, format-backed storage that round-trips

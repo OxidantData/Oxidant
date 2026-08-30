@@ -1,0 +1,7088 @@
+{
+  "_comment": "Databricks SQL builtin-function surface, scraped from the language manual. One entry per distinct function name: overload pages (date_add/date_add3, decode/decode_cs) are merged, and the name comes from the rendered signature, not the URL slug. `in_scope` marks what Oxidant intends to implement; excluded entries name why. See docs/databricks-functions.md for how to regenerate.",
+  "source": "https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-functions-builtin",
+  "scraped": "2026-08-29",
+  "total": 606,
+  "counts": {
+    "in_scope": 440,
+    "workspace": 17,
+    "ai-vector": 23,
+    "syntax": 41,
+    "datasketches": 61,
+    "match-recognize": 6,
+    "platform-source": 12,
+    "file": 6
+  },
+  "functions": [
+    {
+      "name": "abs",
+      "categories": [
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "abs"
+      ],
+      "signature": "abs(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "acos",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "acos"
+      ],
+      "signature": "acos(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "acosh",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "acosh"
+      ],
+      "signature": "acosh(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "add_months",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "add_months"
+      ],
+      "signature": "add_months(startDate,numMonths)",
+      "in_scope": true
+    },
+    {
+      "name": "aes_decrypt",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "aes_decrypt"
+      ],
+      "signature": "aes_decrypt(expr, key[, mode[, padding[, aad]]])",
+      "in_scope": true
+    },
+    {
+      "name": "aes_encrypt",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "aes_encrypt"
+      ],
+      "signature": "aes_encrypt(expr, key[, mode[, padding[, iv[, aad]]]])",
+      "in_scope": true
+    },
+    {
+      "name": "agg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "agg"
+      ],
+      "signature": "agg(measure_column)",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "aggregate",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "aggregate"
+      ],
+      "signature": "aggregate(expr,start,merge[,finish])",
+      "in_scope": true
+    },
+    {
+      "name": "ai_analyze_sentiment",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_analyze_sentiment"
+      ],
+      "signature": "ai_analyze_sentiment(content)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_classify",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_classify"
+      ],
+      "signature": "ai_classify(content, labels)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_extract",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_extract"
+      ],
+      "signature": "ai_extract(content, labels)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_fix_grammar",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_fix_grammar"
+      ],
+      "signature": "ai_fix_grammar(content)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_forecast",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_forecast"
+      ],
+      "signature": "ai_forecast(observed, time_col)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_gen",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_gen"
+      ],
+      "signature": "ai_gen(content)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_generate_text",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_generate_text"
+      ],
+      "signature": "ai_generate_text(prompt, modelName[, param1, value1] [\u2026])",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_mask",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_mask"
+      ],
+      "signature": "ai_mask(content, labels)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_parse_document",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_parse_document"
+      ],
+      "signature": "ai_parse_document(content)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_prep_search",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_prep_search"
+      ],
+      "signature": "ai_prep_search(parsed)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_query",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_query"
+      ],
+      "signature": "ai_query(endpointName, request, returnType)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_search",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_search"
+      ],
+      "signature": "ai_search(query, knowledge_sources)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_similarity",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_similarity"
+      ],
+      "signature": "ai_similarity(strExpr1, strExpr2)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_summarize",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_summarize"
+      ],
+      "signature": "ai_summarize(content[, max_words])",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ai_translate",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "ai_translate"
+      ],
+      "signature": "ai_translate(content, to_lang)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "ampersandsign",
+      "categories": [
+        "Operators and predicates",
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "ampersandsign"
+      ],
+      "signature": "&",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`&`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "and",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "and"
+      ],
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`and`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "any",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "any"
+      ],
+      "signature": "any(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "any_value",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "any_value"
+      ],
+      "signature": "any_value(expr[,ignoreNull])",
+      "in_scope": true
+    },
+    {
+      "name": "approx_count_distinct",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "approx_count_distinct"
+      ],
+      "signature": "approx_count_distinct(expr[,relativeSD])",
+      "in_scope": true
+    },
+    {
+      "name": "approx_percentile",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "approx_percentile"
+      ],
+      "signature": "approx_percentile(expr,percentage[,accuracy])",
+      "in_scope": true
+    },
+    {
+      "name": "approx_top_k",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "approx_top_k"
+      ],
+      "signature": "approx_top_k(expr[,k[,maxItemsTracked]])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "approx_top_k_accumulate",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "approx_top_k_accumulate"
+      ],
+      "signature": "approx_top_k_accumulate(expr [, maxItemsTracked ])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "approx_top_k_combine",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "approx_top_k_combine"
+      ],
+      "signature": "approx_top_k_combine(state [, maxItemsTracked ])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "approx_top_k_estimate",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "approx_top_k_estimate"
+      ],
+      "signature": "approx_top_k_estimate(state [, k ])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "array",
+      "categories": [
+        "Array functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "array"
+      ],
+      "signature": "array([expr [, \u2026]])",
+      "in_scope": true
+    },
+    {
+      "name": "array_agg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "array_agg"
+      ],
+      "signature": "array_agg(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "array_append",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_append"
+      ],
+      "signature": "array_append(array, elem)",
+      "in_scope": true
+    },
+    {
+      "name": "array_compact",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_compact"
+      ],
+      "signature": "array_compact(array)",
+      "in_scope": true
+    },
+    {
+      "name": "array_contains",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_contains"
+      ],
+      "signature": "array_contains(array,value)",
+      "in_scope": true
+    },
+    {
+      "name": "array_distinct",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_distinct"
+      ],
+      "signature": "array_distinct(array)",
+      "in_scope": true
+    },
+    {
+      "name": "array_except",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_except"
+      ],
+      "signature": "array_except(array1,array2)",
+      "in_scope": true
+    },
+    {
+      "name": "array_insert",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_insert"
+      ],
+      "signature": "array_insert(array, index, elem)",
+      "in_scope": true
+    },
+    {
+      "name": "array_intersect",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_intersect"
+      ],
+      "signature": "array_intersect(array1,array2)",
+      "in_scope": true
+    },
+    {
+      "name": "array_join",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_join"
+      ],
+      "signature": "array_join(array,delimiter[,nullReplacement])",
+      "in_scope": true
+    },
+    {
+      "name": "array_max",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_max"
+      ],
+      "signature": "array_max(array)",
+      "in_scope": true
+    },
+    {
+      "name": "array_min",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_min"
+      ],
+      "signature": "array_min(array)",
+      "in_scope": true
+    },
+    {
+      "name": "array_position",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_position"
+      ],
+      "signature": "array_position(array,element)",
+      "in_scope": true
+    },
+    {
+      "name": "array_prepend",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_prepend"
+      ],
+      "signature": "array_prepend(array, elem)",
+      "in_scope": true
+    },
+    {
+      "name": "array_remove",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_remove"
+      ],
+      "signature": "array_remove(array,element)",
+      "in_scope": true
+    },
+    {
+      "name": "array_repeat",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_repeat"
+      ],
+      "signature": "array_repeat(element,count)",
+      "in_scope": true
+    },
+    {
+      "name": "array_size",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_size"
+      ],
+      "signature": "array_size(array)",
+      "in_scope": true
+    },
+    {
+      "name": "array_sort",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_sort"
+      ],
+      "signature": "array_sort(array,func)",
+      "in_scope": true
+    },
+    {
+      "name": "array_union",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "array_union"
+      ],
+      "signature": "array_union(array1,array2)",
+      "in_scope": true
+    },
+    {
+      "name": "arrays_overlap",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "arrays_overlap"
+      ],
+      "signature": "arrays_overlap(array1, array2)",
+      "in_scope": true
+    },
+    {
+      "name": "arrays_zip",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "arrays_zip"
+      ],
+      "signature": "arrays_zip(array1 [, \u2026])",
+      "in_scope": true
+    },
+    {
+      "name": "ascii",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "ascii"
+      ],
+      "signature": "ascii(str)",
+      "in_scope": true
+    },
+    {
+      "name": "asin",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "asin"
+      ],
+      "signature": "asin(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "asinh",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "asinh"
+      ],
+      "signature": "asinh(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "assert_true",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "assert_true"
+      ],
+      "signature": "assert_true(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "asterisksign",
+      "categories": [
+        "Operators and predicates",
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "asterisksign"
+      ],
+      "signature": "*",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`*`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "atan",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "atan"
+      ],
+      "signature": "atan(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "atan2",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "atan2"
+      ],
+      "signature": "atan2(exprY, exprX)",
+      "in_scope": true
+    },
+    {
+      "name": "atanh",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "atanh"
+      ],
+      "signature": "atanh(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "avg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "avg"
+      ],
+      "signature": "avg(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "bangeqsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "bangeqsign"
+      ],
+      "signature": "!=",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`!=`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "bangsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "bangsign"
+      ],
+      "signature": "!",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`!`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "base64",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "base64"
+      ],
+      "signature": "base64(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "between",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "between"
+      ],
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`between`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "bigint",
+      "categories": [
+        "Numeric scalar functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "bigint"
+      ],
+      "signature": "bigint(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "bin",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "bin"
+      ],
+      "signature": "bin(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "binary",
+      "categories": [
+        "String and binary functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "binary"
+      ],
+      "signature": "binary(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "bit_and",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bit_and"
+      ],
+      "signature": "bit_and(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "bit_count",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bit_count"
+      ],
+      "signature": "bit_count(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "bit_get",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bit_get"
+      ],
+      "signature": "bit_get(expr, pos)",
+      "in_scope": true
+    },
+    {
+      "name": "bit_length",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "bit_length"
+      ],
+      "signature": "bit_length(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "bit_or",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bit_or"
+      ],
+      "signature": "bit_or(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "bit_reverse",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bit_reverse"
+      ],
+      "signature": "bit_reverse(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "bit_xor",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bit_xor"
+      ],
+      "signature": "bit_xor(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "bitmap_and_agg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bitmap_and_agg"
+      ],
+      "signature": "bitmap_and_agg(expr)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "bitmap_bit_position",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bitmap_bit_position"
+      ],
+      "signature": "bitmap_bit_position(expr)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "bitmap_bucket_number",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bitmap_bucket_number"
+      ],
+      "signature": "bitmap_bucket_number(expr)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "bitmap_construct_agg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bitmap_construct_agg"
+      ],
+      "signature": "bitmap_construct_agg(expr)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "bitmap_count",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "bitmap_count"
+      ],
+      "signature": "bitmap_count(expr)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "bitmap_or_agg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bitmap_or_agg"
+      ],
+      "signature": "bitmap_or_agg(expr)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "bool_and",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bool_and"
+      ],
+      "signature": "bool_and(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "bool_or",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bool_or"
+      ],
+      "signature": "bool_or(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "boolean",
+      "categories": [
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "boolean"
+      ],
+      "signature": "boolean(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "bracketsign",
+      "categories": [
+        "Operators and predicates",
+        "Array functions",
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "bracketsign"
+      ],
+      "signature": "[]",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`[]`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "bround",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "bround"
+      ],
+      "signature": "bround(expr[,targetScale])",
+      "in_scope": true
+    },
+    {
+      "name": "btrim",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "btrim"
+      ],
+      "signature": "btrim(str [, trimStr])",
+      "in_scope": true
+    },
+    {
+      "name": "cardinality",
+      "categories": [
+        "Array functions",
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "cardinality"
+      ],
+      "signature": "cardinality(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "caretsign",
+      "categories": [
+        "Operators and predicates",
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "caretsign"
+      ],
+      "signature": "^",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`^`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "case",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "case"
+      ],
+      "signature": "CASE expr { WHEN opt1 THEN res1 } [\u2026] [ELSE def] END",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`CASE expr { WHEN opt1 THEN res1 } [\u2026] [ELSE def] END`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "cast",
+      "categories": [
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "cast"
+      ],
+      "signature": "cast(expr AS type)",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`cast(expr AS type)`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "cbrt",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "cbrt"
+      ],
+      "signature": "cbrt(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "ceil",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "ceil"
+      ],
+      "signature": "ceil(expr[,targetScale])",
+      "in_scope": true
+    },
+    {
+      "name": "ceiling",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "ceiling"
+      ],
+      "signature": "ceiling(expr[,targetScale])",
+      "in_scope": true
+    },
+    {
+      "name": "char",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "char"
+      ],
+      "signature": "char(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "char_length",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "char_length"
+      ],
+      "signature": "char_length(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "character_length",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "character_length"
+      ],
+      "signature": "character_length(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "charindex",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "charindex"
+      ],
+      "signature": "charindex(substr, str[, pos])",
+      "in_scope": true
+    },
+    {
+      "name": "chr",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "chr"
+      ],
+      "signature": "chr(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "classifier",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "classifier"
+      ],
+      "signature": "classifier()",
+      "in_scope": false,
+      "excluded_reason": "match-recognize",
+      "excluded_detail": "Belongs to the MATCH_RECOGNIZE clause project, not the function registry."
+    },
+    {
+      "name": "cloud_files_state",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "cloud_files_state"
+      ],
+      "signature": "cloud_files_state( { TABLE(table) | checkpoint } )",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "coalesce",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "coalesce"
+      ],
+      "signature": "coalesce(expr1, expr2 [, \u2026])",
+      "in_scope": true
+    },
+    {
+      "name": "collate",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "collate"
+      ],
+      "signature": "collate(\u2026)",
+      "in_scope": true
+    },
+    {
+      "name": "collation",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "collation"
+      ],
+      "signature": "collation(\u2026)",
+      "in_scope": true
+    },
+    {
+      "name": "collations",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "collations"
+      ],
+      "signature": "collations()",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "collect_list",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "collect_list"
+      ],
+      "signature": "collect_list(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "collect_set",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "collect_set"
+      ],
+      "signature": "collect_set(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "coloncolonsign",
+      "categories": [
+        "Operators and predicates",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "coloncolonsign"
+      ],
+      "signature": "::",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`::`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "colonsign",
+      "categories": [
+        "Operators and predicates",
+        "JSON functions",
+        "VARIANT functions"
+      ],
+      "doc_slugs": [
+        "colonsign"
+      ],
+      "signature": ":",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`:`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "concat",
+      "categories": [
+        "String and binary functions",
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "concat"
+      ],
+      "signature": "concat(expr1, expr2[, \u2026])",
+      "in_scope": true
+    },
+    {
+      "name": "concat_ws",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "concat_ws"
+      ],
+      "signature": "concat_ws(sep[, expr1[, \u2026]])",
+      "in_scope": true
+    },
+    {
+      "name": "contains",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "contains"
+      ],
+      "signature": "contains(expr, subExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "conv",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "conv"
+      ],
+      "signature": "conv(num, fromBase, toBase)",
+      "in_scope": true
+    },
+    {
+      "name": "convert_timezone",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "convert_timezone"
+      ],
+      "signature": "convert_timezone([sourceTz, ]targetTz, sourceTs)",
+      "in_scope": true
+    },
+    {
+      "name": "copy_file",
+      "categories": [
+        "File functions"
+      ],
+      "doc_slugs": [
+        "copy_file"
+      ],
+      "signature": "copy_file(file => file [, \u2026])",
+      "in_scope": false,
+      "excluded_reason": "file",
+      "excluded_detail": "Requires Unity Catalog volumes."
+    },
+    {
+      "name": "corr",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "corr"
+      ],
+      "signature": "corr(expr1,expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "cos",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "cos"
+      ],
+      "signature": "cos(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "cosh",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "cosh"
+      ],
+      "signature": "cosh(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "cot",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "cot"
+      ],
+      "signature": "cot(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "count",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "count"
+      ],
+      "signature": "count(*)",
+      "in_scope": true
+    },
+    {
+      "name": "count_if",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "count_if"
+      ],
+      "signature": "count_if(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "count_min_sketch",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "count_min_sketch"
+      ],
+      "signature": "count_min_sketch(column,epsilon,confidence,seed)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "covar_pop",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "covar_pop"
+      ],
+      "signature": "covar_pop(expr1,expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "covar_samp",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "covar_samp"
+      ],
+      "signature": "covar_samp(expr1,expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "crc32",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "crc32"
+      ],
+      "signature": "crc32(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "create_file",
+      "categories": [
+        "File functions"
+      ],
+      "doc_slugs": [
+        "create_file"
+      ],
+      "signature": "create_file(content => content [, \u2026])",
+      "in_scope": false,
+      "excluded_reason": "file",
+      "excluded_detail": "Requires Unity Catalog volumes."
+    },
+    {
+      "name": "csc",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "csc"
+      ],
+      "signature": "csc(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "cube",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "cube"
+      ],
+      "signature": "cube (expr1 [, \u2026])",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`cube (expr1 [, \u2026])`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "cume_dist",
+      "categories": [
+        "Analytic window functions"
+      ],
+      "doc_slugs": [
+        "cume_dist"
+      ],
+      "signature": "cume_dist()",
+      "in_scope": true
+    },
+    {
+      "name": "curdate",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "curdate"
+      ],
+      "signature": "curdate()",
+      "in_scope": true
+    },
+    {
+      "name": "current_catalog",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "current_catalog"
+      ],
+      "signature": "current_catalog()",
+      "in_scope": true
+    },
+    {
+      "name": "current_database",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "current_database"
+      ],
+      "signature": "current_database()",
+      "in_scope": true
+    },
+    {
+      "name": "current_date",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "current_date"
+      ],
+      "signature": "current_date()",
+      "in_scope": true
+    },
+    {
+      "name": "current_metastore",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "current_metastore"
+      ],
+      "signature": "current_metastore()",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "current_recipient",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "current_recipient"
+      ],
+      "signature": "current_recipient(key)",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "current_schema",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "current_schema"
+      ],
+      "signature": "current_schema()",
+      "in_scope": true
+    },
+    {
+      "name": "current_time",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "current_time"
+      ],
+      "signature": "current_time([precision])",
+      "in_scope": true
+    },
+    {
+      "name": "current_timestamp",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "current_timestamp"
+      ],
+      "signature": "current_timestamp()",
+      "in_scope": true
+    },
+    {
+      "name": "current_timezone",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "current_timezone"
+      ],
+      "signature": "current_timezone()",
+      "in_scope": true
+    },
+    {
+      "name": "current_user",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "current_user"
+      ],
+      "signature": "current_user()",
+      "in_scope": true
+    },
+    {
+      "name": "current_version",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "current_version"
+      ],
+      "signature": "current_version()",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "date",
+      "categories": [
+        "Date, timestamp, and interval functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "date"
+      ],
+      "signature": "date(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "date_add",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "date_add",
+        "date_add3"
+      ],
+      "signature": "date_add(startDate,numDays)",
+      "in_scope": true
+    },
+    {
+      "name": "date_diff",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "date_diff"
+      ],
+      "signature": "date_diff(unit, start, stop)",
+      "in_scope": true
+    },
+    {
+      "name": "date_format",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "date_format"
+      ],
+      "signature": "date_format(expr,fmt)",
+      "in_scope": true
+    },
+    {
+      "name": "date_from_unix_date",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "date_from_unix_date"
+      ],
+      "signature": "date_from_unix_date(days)",
+      "in_scope": true
+    },
+    {
+      "name": "date_part",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "date_part"
+      ],
+      "signature": "date_part(field,expr)",
+      "in_scope": true
+    },
+    {
+      "name": "date_sub",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "date_sub"
+      ],
+      "signature": "date_sub(startDate,numDays)",
+      "in_scope": true
+    },
+    {
+      "name": "date_trunc",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "date_trunc"
+      ],
+      "signature": "date_trunc(unit,expr)",
+      "in_scope": true
+    },
+    {
+      "name": "dateadd",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "dateadd",
+        "dateadd2"
+      ],
+      "signature": "dateadd(unit, value, expr)",
+      "in_scope": true
+    },
+    {
+      "name": "datediff",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "datediff",
+        "datediff3"
+      ],
+      "signature": "datediff(endDate,startDate)",
+      "in_scope": true
+    },
+    {
+      "name": "day",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "day"
+      ],
+      "signature": "day(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "dayname",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "dayname"
+      ],
+      "signature": "dayname(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "dayofmonth",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "dayofmonth"
+      ],
+      "signature": "dayofmonth(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "dayofweek",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "dayofweek"
+      ],
+      "signature": "dayofweek(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "dayofyear",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "dayofyear"
+      ],
+      "signature": "dayofyear(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "decimal",
+      "categories": [
+        "Numeric scalar functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "decimal"
+      ],
+      "signature": "decimal(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "decode",
+      "categories": [
+        "Miscellaneous functions",
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "decode",
+        "decode_cs"
+      ],
+      "signature": "decode(expr, { key, value } [, \u2026] [,defValue])",
+      "in_scope": true
+    },
+    {
+      "name": "degrees",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "degrees"
+      ],
+      "signature": "degrees(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "dense_rank",
+      "categories": [
+        "Ranking window functions"
+      ],
+      "doc_slugs": [
+        "dense_rank"
+      ],
+      "signature": "dense_rank()",
+      "in_scope": true
+    },
+    {
+      "name": "div",
+      "categories": [
+        "Operators and predicates",
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "div"
+      ],
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`div`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "dotsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "dotsign"
+      ],
+      "signature": ".",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`.`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "double",
+      "categories": [
+        "Numeric scalar functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "double"
+      ],
+      "signature": "double(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "e",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "e"
+      ],
+      "signature": "e()",
+      "in_scope": true
+    },
+    {
+      "name": "element_at",
+      "categories": [
+        "Array functions",
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "element_at"
+      ],
+      "signature": "element_at(arrayExpr, index)",
+      "in_scope": true
+    },
+    {
+      "name": "elt",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "elt"
+      ],
+      "signature": "elt(index, expr1 [, \u2026] )",
+      "in_scope": true
+    },
+    {
+      "name": "encode",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "encode"
+      ],
+      "signature": "encode(expr, charSet)",
+      "in_scope": true
+    },
+    {
+      "name": "endswith",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "endswith"
+      ],
+      "signature": "endswith(expr, endExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "eqeqsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "eqeqsign"
+      ],
+      "signature": "==",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`==`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "eqsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "eqsign"
+      ],
+      "signature": "=",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`=`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "equal_null",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "equal_null"
+      ],
+      "signature": "equal_null(expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "event_log",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "event_log"
+      ],
+      "signature": "event_log( { TABLE(table) | pipeline_id } )",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "every",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "every"
+      ],
+      "signature": "every(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "exists",
+      "categories": [
+        "Operators and predicates",
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "exists"
+      ],
+      "signature": "exists(expr, pred)",
+      "in_scope": true
+    },
+    {
+      "name": "exp",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "exp"
+      ],
+      "signature": "exp(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "explode",
+      "categories": [
+        "Array functions",
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "explode"
+      ],
+      "signature": "explode(collection)",
+      "in_scope": true
+    },
+    {
+      "name": "explode_outer",
+      "categories": [
+        "Array functions",
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "explode_outer"
+      ],
+      "signature": "explode_outer(collection)",
+      "in_scope": true
+    },
+    {
+      "name": "expm1",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "expm1"
+      ],
+      "signature": "expm1(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "extract",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "extract"
+      ],
+      "signature": "extract(field FROM source)",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`extract(field FROM source)`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "factorial",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "factorial"
+      ],
+      "signature": "factorial(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "filter",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "filter"
+      ],
+      "signature": "filter(expr,func)",
+      "in_scope": true
+    },
+    {
+      "name": "find_in_set",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "find_in_set"
+      ],
+      "signature": "find_in_set(searchExpr, sourceExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "first",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "first"
+      ],
+      "signature": "first(expr[,ignoreNull])",
+      "in_scope": true
+    },
+    {
+      "name": "first_value",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "first_value"
+      ],
+      "signature": "first_value(expr[,ignoreNull])",
+      "in_scope": true
+    },
+    {
+      "name": "flatten",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "flatten"
+      ],
+      "signature": "flatten(arrayOfArrays)",
+      "in_scope": true
+    },
+    {
+      "name": "float",
+      "categories": [
+        "Numeric scalar functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "float"
+      ],
+      "signature": "float(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "floor",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "floor"
+      ],
+      "signature": "floor(expr[,targetScale])",
+      "in_scope": true
+    },
+    {
+      "name": "forall",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "forall"
+      ],
+      "signature": "forall(expr, predFunc)",
+      "in_scope": true
+    },
+    {
+      "name": "format_number",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "format_number"
+      ],
+      "signature": "format_number(expr, scale)",
+      "in_scope": true
+    },
+    {
+      "name": "format_string",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "format_string"
+      ],
+      "signature": "format_string(strfmt[, obj1 [, \u2026]])",
+      "in_scope": true
+    },
+    {
+      "name": "from_avro",
+      "categories": [
+        "CSV and Avro functions"
+      ],
+      "doc_slugs": [
+        "from_avro"
+      ],
+      "signature": "from_avro(avroBin, jsonSchema[, options])",
+      "in_scope": true
+    },
+    {
+      "name": "from_csv",
+      "categories": [
+        "CSV and Avro functions"
+      ],
+      "doc_slugs": [
+        "from_csv"
+      ],
+      "signature": "from_csv(csvStr, schema[, options])",
+      "in_scope": true
+    },
+    {
+      "name": "from_json",
+      "categories": [
+        "JSON functions"
+      ],
+      "doc_slugs": [
+        "from_json"
+      ],
+      "signature": "from_json(jsonStr, schema[, options])",
+      "in_scope": true
+    },
+    {
+      "name": "from_unixtime",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "from_unixtime"
+      ],
+      "signature": "from_unixtime(unixTime,fmt)",
+      "in_scope": true
+    },
+    {
+      "name": "from_utc_timestamp",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "from_utc_timestamp"
+      ],
+      "signature": "from_utc_timestamp(expr,timezone)",
+      "in_scope": true
+    },
+    {
+      "name": "from_xml",
+      "categories": [
+        "XPath and XML functions"
+      ],
+      "doc_slugs": [
+        "from_xml"
+      ],
+      "signature": "from_xml(xmlStr, schema[, options])",
+      "in_scope": true
+    },
+    {
+      "name": "get",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "get"
+      ],
+      "signature": "get(arrayExpr, index)",
+      "in_scope": true
+    },
+    {
+      "name": "get_json_object",
+      "categories": [
+        "JSON functions"
+      ],
+      "doc_slugs": [
+        "get_json_object"
+      ],
+      "signature": "get_json_object(expr, path)",
+      "in_scope": true
+    },
+    {
+      "name": "getbit",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "getbit"
+      ],
+      "signature": "getbit(expr, pos)",
+      "in_scope": true
+    },
+    {
+      "name": "getdate",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "getdate"
+      ],
+      "signature": "getdate()",
+      "in_scope": true
+    },
+    {
+      "name": "greatest",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "greatest"
+      ],
+      "signature": "greatest(expr1, expr2 [, \u2026])",
+      "in_scope": true
+    },
+    {
+      "name": "grouping",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "grouping"
+      ],
+      "signature": "grouping(col)",
+      "in_scope": true
+    },
+    {
+      "name": "grouping_id",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "grouping_id"
+      ],
+      "signature": "grouping_id([col1 [, \u2026]])",
+      "in_scope": true
+    },
+    {
+      "name": "gteqsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "gteqsign"
+      ],
+      "signature": ">=",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`>=`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "gtsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "gtsign"
+      ],
+      "signature": ">",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`>`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "hash",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "hash"
+      ],
+      "signature": "hash(expr1 [, \u2026])",
+      "in_scope": true
+    },
+    {
+      "name": "hex",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "hex"
+      ],
+      "signature": "hex(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "histogram_numeric",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "histogram_numeric"
+      ],
+      "signature": "histogram_numeric(expr,numBins)",
+      "in_scope": true
+    },
+    {
+      "name": "hll_sketch_agg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "hll_sketch_agg"
+      ],
+      "signature": "hll_sketch_agg(expr[,lgConfigK])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "hll_sketch_estimate",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "hll_sketch_estimate"
+      ],
+      "signature": "hll_sketch_estimate(expr)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "hll_union",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "hll_union"
+      ],
+      "signature": "hll_union(expr1, expr2 [,allowDifferentLgConfigK])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "hll_union_agg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "hll_union_agg"
+      ],
+      "signature": "hll_union_agg(expr[,allowDifferentLgConfigK])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "hour",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "hour"
+      ],
+      "signature": "hour(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "http_request",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "http_request"
+      ],
+      "signature": "http_request({parm => expr} [, \u2026])",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "hypot",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "hypot"
+      ],
+      "signature": "hypot(expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "if",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "if"
+      ],
+      "signature": "if(cond, expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "iff",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "iff"
+      ],
+      "signature": "iff(cond, expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "ifnull",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "ifnull"
+      ],
+      "signature": "ifnull(expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "ilike",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "ilike"
+      ],
+      "signature": "ilike(\u2026)",
+      "in_scope": true
+    },
+    {
+      "name": "in",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "in"
+      ],
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`in`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "initcap",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "initcap"
+      ],
+      "signature": "initcap(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "inline",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "inline"
+      ],
+      "signature": "inline(input)",
+      "in_scope": true
+    },
+    {
+      "name": "inline_outer",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "inline_outer"
+      ],
+      "signature": "inline_outer(input)",
+      "in_scope": true
+    },
+    {
+      "name": "input_file_block_length",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "input_file_block_length"
+      ],
+      "signature": "input_file_block_length()",
+      "in_scope": true
+    },
+    {
+      "name": "input_file_block_start",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "input_file_block_start"
+      ],
+      "signature": "input_file_block_start()",
+      "in_scope": true
+    },
+    {
+      "name": "input_file_name",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "input_file_name"
+      ],
+      "signature": "input_file_name()",
+      "in_scope": true
+    },
+    {
+      "name": "instr",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "instr"
+      ],
+      "signature": "instr(str, substr)",
+      "in_scope": true
+    },
+    {
+      "name": "int",
+      "categories": [
+        "Numeric scalar functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "int"
+      ],
+      "signature": "int(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "is_account_group_member",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "is_account_group_member"
+      ],
+      "signature": "is_account_group_member(group)",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "is_member",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "is_member"
+      ],
+      "signature": "is_member(group)",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "is_variant_null",
+      "categories": [
+        "VARIANT functions"
+      ],
+      "doc_slugs": [
+        "is_variant_null"
+      ],
+      "signature": "is_variant_null(variantExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "isdistinct",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "isdistinct"
+      ],
+      "signature": "is distinct",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`is distinct`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "isearch",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "isearch"
+      ],
+      "signature": "isearch(col[, ...], pattern[, mode => mode])",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "isfalse",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "isfalse"
+      ],
+      "signature": "is false",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`is false`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "isnan",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "isnan"
+      ],
+      "signature": "isnan(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "isnotnull",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "isnotnull"
+      ],
+      "signature": "isnotnull(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "isnull",
+      "categories": [
+        "Operators and predicates",
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "isnull"
+      ],
+      "signature": "isnull(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "istrue",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "istrue"
+      ],
+      "signature": "is true",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`is true`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "java_method",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "java_method"
+      ],
+      "signature": "java_method(class, method[, arg1 [, \u2026]])",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "json_array_length",
+      "categories": [
+        "JSON functions"
+      ],
+      "doc_slugs": [
+        "json_array_length"
+      ],
+      "signature": "json_array_length(jsonArray)",
+      "in_scope": true
+    },
+    {
+      "name": "json_object_keys",
+      "categories": [
+        "JSON functions"
+      ],
+      "doc_slugs": [
+        "json_object_keys"
+      ],
+      "signature": "json_object_keys(jsonObject)",
+      "in_scope": true
+    },
+    {
+      "name": "json_tuple",
+      "categories": [
+        "JSON functions"
+      ],
+      "doc_slugs": [
+        "json_tuple"
+      ],
+      "signature": "json_tuple(jsonStr, path1 [, \u2026])",
+      "in_scope": true
+    },
+    {
+      "name": "kll_merge_agg_bigint",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_merge_agg_bigint"
+      ],
+      "signature": "kll_merge_agg_bigint(sketch[, k])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_merge_agg_double",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_merge_agg_double"
+      ],
+      "signature": "kll_merge_agg_double(sketch[, k])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_merge_agg_float",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_merge_agg_float"
+      ],
+      "signature": "kll_merge_agg_float(sketch[, k])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_agg_bigint",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_agg_bigint"
+      ],
+      "signature": "kll_sketch_agg_bigint(expr[, k])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_agg_double",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_agg_double"
+      ],
+      "signature": "kll_sketch_agg_double(expr[, k])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_agg_float",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_agg_float"
+      ],
+      "signature": "kll_sketch_agg_float(expr[, k])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_get_n_bigint",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_get_n_bigint"
+      ],
+      "signature": "kll_sketch_get_n_bigint(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_get_n_double",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_get_n_double"
+      ],
+      "signature": "kll_sketch_get_n_double(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_get_n_float",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_get_n_float"
+      ],
+      "signature": "kll_sketch_get_n_float(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_get_quantile_bigint",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_get_quantile_bigint"
+      ],
+      "signature": "kll_sketch_get_quantile_bigint(sketch, rank)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_get_quantile_double",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_get_quantile_double"
+      ],
+      "signature": "kll_sketch_get_quantile_double(sketch, rank)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_get_quantile_float",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_get_quantile_float"
+      ],
+      "signature": "kll_sketch_get_quantile_float(sketch, rank)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_get_rank_bigint",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_get_rank_bigint"
+      ],
+      "signature": "kll_sketch_get_rank_bigint(sketch, value)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_get_rank_double",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_get_rank_double"
+      ],
+      "signature": "kll_sketch_get_rank_double(sketch, value)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_get_rank_float",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_get_rank_float"
+      ],
+      "signature": "kll_sketch_get_rank_float(sketch, value)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_merge_bigint",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_merge_bigint"
+      ],
+      "signature": "kll_sketch_merge_bigint(sketch1, sketch2)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_merge_double",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_merge_double"
+      ],
+      "signature": "kll_sketch_merge_double(sketch1, sketch2)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_merge_float",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_merge_float"
+      ],
+      "signature": "kll_sketch_merge_float(sketch1, sketch2)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_to_string_bigint",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_to_string_bigint"
+      ],
+      "signature": "kll_sketch_to_string_bigint(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_to_string_double",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_to_string_double"
+      ],
+      "signature": "kll_sketch_to_string_double(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kll_sketch_to_string_float",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kll_sketch_to_string_float"
+      ],
+      "signature": "kll_sketch_to_string_float(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "kurtosis",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "kurtosis"
+      ],
+      "signature": "kurtosis(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "lag",
+      "categories": [
+        "Analytic window functions"
+      ],
+      "doc_slugs": [
+        "lag"
+      ],
+      "signature": "lag(expr[,offset[,default]])",
+      "in_scope": true
+    },
+    {
+      "name": "last",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "last"
+      ],
+      "signature": "last(expr[,ignoreNull])",
+      "in_scope": true
+    },
+    {
+      "name": "last_day",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "last_day"
+      ],
+      "signature": "last_day(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "last_value",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "last_value"
+      ],
+      "signature": "last_value(expr[,ignoreNull])",
+      "in_scope": true
+    },
+    {
+      "name": "lcase",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "lcase"
+      ],
+      "signature": "lcase(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "lead",
+      "categories": [
+        "Analytic window functions"
+      ],
+      "doc_slugs": [
+        "lead"
+      ],
+      "signature": "lead(expr[,offset[,default]])",
+      "in_scope": true
+    },
+    {
+      "name": "least",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "least"
+      ],
+      "signature": "least(expr1, expr2 [, \u2026])",
+      "in_scope": true
+    },
+    {
+      "name": "left",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "left"
+      ],
+      "signature": "left(str, len)",
+      "in_scope": true
+    },
+    {
+      "name": "len",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "len"
+      ],
+      "signature": "len(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "length",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "length"
+      ],
+      "signature": "length(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "levenshtein",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "levenshtein"
+      ],
+      "signature": "levenshtein(str1, str2)",
+      "in_scope": true
+    },
+    {
+      "name": "like",
+      "categories": [
+        "Operators and predicates",
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "like"
+      ],
+      "signature": "like(\u2026)",
+      "in_scope": true
+    },
+    {
+      "name": "list_files",
+      "categories": [
+        "File functions"
+      ],
+      "doc_slugs": [
+        "list_files"
+      ],
+      "signature": "list_files(path [, connection => connection] [, recursive => recursive])",
+      "in_scope": false,
+      "excluded_reason": "file",
+      "excluded_detail": "Requires Unity Catalog volumes."
+    },
+    {
+      "name": "list_secrets",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "list_secrets"
+      ],
+      "signature": "list_secrets([scopeStr])",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "listagg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "listagg"
+      ],
+      "signature": "listagg(expr[,delim]) [WITHIN GROUP (ORDER BY key [,...])]",
+      "in_scope": true
+    },
+    {
+      "name": "ln",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "ln"
+      ],
+      "signature": "ln(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "locate",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "locate"
+      ],
+      "signature": "locate(substr, str[, pos])",
+      "in_scope": true
+    },
+    {
+      "name": "log",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "log"
+      ],
+      "signature": "log([base,] expr)",
+      "in_scope": true
+    },
+    {
+      "name": "log10",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "log10"
+      ],
+      "signature": "log10(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "log1p",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "log1p"
+      ],
+      "signature": "log1p(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "log2",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "log2"
+      ],
+      "signature": "log2(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "lower",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "lower"
+      ],
+      "signature": "lower(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "lpad",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "lpad"
+      ],
+      "signature": "lpad(expr, len[, pad])",
+      "in_scope": true
+    },
+    {
+      "name": "lteqgtsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "lteqgtsign"
+      ],
+      "signature": "<=>",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`<=>`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "lteqsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "lteqsign"
+      ],
+      "signature": "<=",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`<=`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "ltgtsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "ltgtsign"
+      ],
+      "signature": "<>",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`<>`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "ltrim",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "ltrim"
+      ],
+      "signature": "ltrim([trimstr,] str)",
+      "in_scope": true
+    },
+    {
+      "name": "ltsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "ltsign"
+      ],
+      "signature": "<",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`<`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "luhn_check",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "luhn_check"
+      ],
+      "signature": "luhn_check(numStr)",
+      "in_scope": true
+    },
+    {
+      "name": "make_date",
+      "categories": [
+        "Date, timestamp, and interval functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "make_date"
+      ],
+      "signature": "make_date(year,month,day)",
+      "in_scope": true
+    },
+    {
+      "name": "make_dt_interval",
+      "categories": [
+        "Date, timestamp, and interval functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "make_dt_interval"
+      ],
+      "signature": "make_dt_interval([days[, hours[, mins[, secs]]]])",
+      "in_scope": true
+    },
+    {
+      "name": "make_interval",
+      "categories": [
+        "Date, timestamp, and interval functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "make_interval"
+      ],
+      "signature": "make_interval(years, months, weeks, days, hours, mins, secs)",
+      "in_scope": true
+    },
+    {
+      "name": "make_time",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "make_time"
+      ],
+      "signature": "make_time(hour, minute, second)",
+      "in_scope": true
+    },
+    {
+      "name": "make_timestamp",
+      "categories": [
+        "Date, timestamp, and interval functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "make_timestamp"
+      ],
+      "signature": "make_timestamp(year,month,day,hour,min,sec[,timezone])",
+      "in_scope": true
+    },
+    {
+      "name": "make_ym_interval",
+      "categories": [
+        "Date, timestamp, and interval functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "make_ym_interval"
+      ],
+      "signature": "make_ym_interval([years[, months]])",
+      "in_scope": true
+    },
+    {
+      "name": "map",
+      "categories": [
+        "Map functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "map"
+      ],
+      "signature": "map([{key1, value1}[, \u2026]])",
+      "in_scope": true
+    },
+    {
+      "name": "map_concat",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "map_concat"
+      ],
+      "signature": "map_concat([expr1 [, \u2026]])",
+      "in_scope": true
+    },
+    {
+      "name": "map_contains_key",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "map_contains_key"
+      ],
+      "signature": "map_contains_key(map, key)",
+      "in_scope": true
+    },
+    {
+      "name": "map_entries",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "map_entries"
+      ],
+      "signature": "map_entries(map)",
+      "in_scope": true
+    },
+    {
+      "name": "map_filter",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "map_filter"
+      ],
+      "signature": "map_filter(expr, func)",
+      "in_scope": true
+    },
+    {
+      "name": "map_from_arrays",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "map_from_arrays"
+      ],
+      "signature": "map_from_arrays(keys, values)",
+      "in_scope": true
+    },
+    {
+      "name": "map_from_entries",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "map_from_entries"
+      ],
+      "signature": "map_from_entries(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "map_keys",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "map_keys"
+      ],
+      "signature": "map_keys(map)",
+      "in_scope": true
+    },
+    {
+      "name": "map_values",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "map_values"
+      ],
+      "signature": "map_values(map)",
+      "in_scope": true
+    },
+    {
+      "name": "map_zip_with",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "map_zip_with"
+      ],
+      "signature": "map_zip_with(map1, map2, func)",
+      "in_scope": true
+    },
+    {
+      "name": "mask",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "mask"
+      ],
+      "signature": "mask(str[, upperChar[, lowerChar[, digitChar[, otherChar]]]])",
+      "in_scope": true
+    },
+    {
+      "name": "match_number",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "match_number"
+      ],
+      "signature": "match_number()",
+      "in_scope": false,
+      "excluded_reason": "match-recognize",
+      "excluded_detail": "Belongs to the MATCH_RECOGNIZE clause project, not the function registry."
+    },
+    {
+      "name": "match_recognize_first",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "match_recognize_first"
+      ],
+      "signature": "first(colName [, offset])",
+      "in_scope": false,
+      "excluded_reason": "match-recognize",
+      "excluded_detail": "Belongs to the MATCH_RECOGNIZE clause project, not the function registry."
+    },
+    {
+      "name": "match_recognize_last",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "match_recognize_last"
+      ],
+      "signature": "last(colName [, offset])",
+      "in_scope": false,
+      "excluded_reason": "match-recognize",
+      "excluded_detail": "Belongs to the MATCH_RECOGNIZE clause project, not the function registry."
+    },
+    {
+      "name": "match_recognize_next",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "match_recognize_next"
+      ],
+      "signature": "next(colName [, offset])",
+      "in_scope": false,
+      "excluded_reason": "match-recognize",
+      "excluded_detail": "Belongs to the MATCH_RECOGNIZE clause project, not the function registry."
+    },
+    {
+      "name": "match_recognize_prev",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "match_recognize_prev"
+      ],
+      "signature": "prev(colName [, offset])",
+      "in_scope": false,
+      "excluded_reason": "match-recognize",
+      "excluded_detail": "Belongs to the MATCH_RECOGNIZE clause project, not the function registry."
+    },
+    {
+      "name": "max",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "max"
+      ],
+      "signature": "max(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "max_by",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "max_by"
+      ],
+      "signature": "max_by(expr, ordExpr [, limit ])",
+      "in_scope": true
+    },
+    {
+      "name": "md5",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "md5"
+      ],
+      "signature": "md5(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "mean",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "mean"
+      ],
+      "signature": "mean(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "measure",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "measure"
+      ],
+      "signature": "measure(measure_column)",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "median",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "median"
+      ],
+      "signature": "median(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "min",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "min"
+      ],
+      "signature": "min(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "min_by",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "min_by"
+      ],
+      "signature": "min_by(expr, ordExpr [, limit ])",
+      "in_scope": true
+    },
+    {
+      "name": "minussign",
+      "categories": [
+        "Operators and predicates",
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "minussign"
+      ],
+      "signature": "-",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`-`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "minussignunary",
+      "categories": [
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "minussignunary"
+      ],
+      "signature": "- expr",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`- expr`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "minute",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "minute"
+      ],
+      "signature": "minute(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "mod",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "mod"
+      ],
+      "signature": "mod(dividend, divisor)",
+      "in_scope": true
+    },
+    {
+      "name": "mode",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "mode"
+      ],
+      "signature": "mode(expr [,deterministic])",
+      "in_scope": true
+    },
+    {
+      "name": "monotonically_increasing_id",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "monotonically_increasing_id"
+      ],
+      "signature": "monotonically_increasing_id()",
+      "in_scope": true
+    },
+    {
+      "name": "month",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "month"
+      ],
+      "signature": "month(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "months_between",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "months_between"
+      ],
+      "signature": "months_between(expr1,expr2[,roundOff])",
+      "in_scope": true
+    },
+    {
+      "name": "named_struct",
+      "categories": [
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "named_struct"
+      ],
+      "signature": "named_struct({name1, val1} [, \u2026])",
+      "in_scope": true
+    },
+    {
+      "name": "nanvl",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "nanvl"
+      ],
+      "signature": "nanvl(expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "negative",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "negative"
+      ],
+      "signature": "negative(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "next_day",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "next_day"
+      ],
+      "signature": "next_day(expr,dayOfWeek)",
+      "in_scope": true
+    },
+    {
+      "name": "not",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "not"
+      ],
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`not`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "now",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "now"
+      ],
+      "signature": "now()",
+      "in_scope": true
+    },
+    {
+      "name": "nth_value",
+      "categories": [
+        "Analytic window functions"
+      ],
+      "doc_slugs": [
+        "nth_value"
+      ],
+      "signature": "nth_value(expr, offset[, ignoreNulls])",
+      "in_scope": true
+    },
+    {
+      "name": "ntile",
+      "categories": [
+        "Ranking window functions"
+      ],
+      "doc_slugs": [
+        "ntile"
+      ],
+      "signature": "ntile(n)",
+      "in_scope": true
+    },
+    {
+      "name": "nullif",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "nullif"
+      ],
+      "signature": "nullif(expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "nullifzero",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "nullifzero"
+      ],
+      "signature": "nullifzero(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "nvl",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "nvl"
+      ],
+      "signature": "nvl(expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "nvl2",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "nvl2"
+      ],
+      "signature": "nvl2(expr1, expr2, expr3)",
+      "in_scope": true
+    },
+    {
+      "name": "octet_length",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "octet_length"
+      ],
+      "signature": "octet_length(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "or",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "or"
+      ],
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`or`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "overlay",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "overlay"
+      ],
+      "signature": "overlay(input PLACING replace FROM pos [FOR len])",
+      "in_scope": true
+    },
+    {
+      "name": "parse_json",
+      "categories": [
+        "JSON functions",
+        "VARIANT functions"
+      ],
+      "doc_slugs": [
+        "parse_json"
+      ],
+      "signature": "parse_json(jsonStr)",
+      "in_scope": true
+    },
+    {
+      "name": "parse_timestamp",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "parse_timestamp"
+      ],
+      "signature": "parse_timestamp(expr [, pattern [, ...] ])",
+      "in_scope": true
+    },
+    {
+      "name": "parse_url",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "parse_url"
+      ],
+      "signature": "parse_url(url, partToExtract[, key])",
+      "in_scope": true
+    },
+    {
+      "name": "percent_rank",
+      "categories": [
+        "Ranking window functions"
+      ],
+      "doc_slugs": [
+        "percent_rank"
+      ],
+      "signature": "percent_rank()",
+      "in_scope": true
+    },
+    {
+      "name": "percentile",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "percentile"
+      ],
+      "signature": "percentile(expr, percentage [,frequency])",
+      "in_scope": true
+    },
+    {
+      "name": "percentile_approx",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "percentile_approx"
+      ],
+      "signature": "percentile_approx(expr,percentage[,accuracy])",
+      "in_scope": true
+    },
+    {
+      "name": "percentile_cont",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "percentile_cont"
+      ],
+      "signature": "percentile_cont(pct) WITHIN GROUP (ORDER BY key)",
+      "in_scope": true
+    },
+    {
+      "name": "percentile_disc",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "percentile_disc"
+      ],
+      "signature": "percentile_disc(pct) WITHIN GROUP (ORDER BY key)",
+      "in_scope": true
+    },
+    {
+      "name": "percentsign",
+      "categories": [
+        "Operators and predicates",
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "percentsign"
+      ],
+      "signature": "%",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`%`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "pi",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "pi"
+      ],
+      "signature": "pi()",
+      "in_scope": true
+    },
+    {
+      "name": "pipepipesign",
+      "categories": [
+        "Operators and predicates",
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "pipepipesign"
+      ],
+      "signature": "||",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`||`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "pipesign",
+      "categories": [
+        "Operators and predicates",
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "pipesign"
+      ],
+      "signature": "|",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`|`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "plussign",
+      "categories": [
+        "Operators and predicates",
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "plussign"
+      ],
+      "signature": "+",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`+`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "plussignunary",
+      "categories": [
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "plussignunary"
+      ],
+      "signature": "+ expr",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`+ expr`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "pmod",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "pmod"
+      ],
+      "signature": "pmod(dividend, divisor)",
+      "in_scope": true
+    },
+    {
+      "name": "posexplode",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "posexplode"
+      ],
+      "signature": "posexplode(collection)",
+      "in_scope": true
+    },
+    {
+      "name": "posexplode_outer",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "posexplode_outer"
+      ],
+      "signature": "posexplode_outer(collection)",
+      "in_scope": true
+    },
+    {
+      "name": "position",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "position"
+      ],
+      "signature": "position(substr, str[, pos])",
+      "in_scope": true
+    },
+    {
+      "name": "positive",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "positive"
+      ],
+      "signature": "positive(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "pow",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "pow"
+      ],
+      "signature": "pow(expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "power",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "power"
+      ],
+      "signature": "power(expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "printf",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "printf"
+      ],
+      "signature": "printf(strfmt[, obj1 [, \u2026]])",
+      "in_scope": true
+    },
+    {
+      "name": "quarter",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "quarter"
+      ],
+      "signature": "quarter(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "questiondoublecolonsign",
+      "categories": [
+        "Operators and predicates"
+      ],
+      "doc_slugs": [
+        "questiondoublecolonsign"
+      ],
+      "signature": "?::",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`?::`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "radians",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "radians"
+      ],
+      "signature": "radians(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "raise_error",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "raise_error"
+      ],
+      "signature": "raise_error(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "rand",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "rand"
+      ],
+      "signature": "rand([seed])",
+      "in_scope": true
+    },
+    {
+      "name": "randn",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "randn"
+      ],
+      "signature": "randn([seed])",
+      "in_scope": true
+    },
+    {
+      "name": "random",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "random"
+      ],
+      "signature": "random([seed])",
+      "in_scope": true
+    },
+    {
+      "name": "randstr",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "randstr"
+      ],
+      "signature": "randstr(length)",
+      "in_scope": true
+    },
+    {
+      "name": "range",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "range"
+      ],
+      "signature": "range(end)",
+      "in_scope": true
+    },
+    {
+      "name": "rank",
+      "categories": [
+        "Ranking window functions"
+      ],
+      "doc_slugs": [
+        "rank"
+      ],
+      "signature": "rank()",
+      "in_scope": true
+    },
+    {
+      "name": "read_files",
+      "categories": [
+        "Read functions"
+      ],
+      "doc_slugs": [
+        "read_files"
+      ],
+      "signature": "read_files(path, [optionKey => optionValue] [, \u2026])",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "read_kafka",
+      "categories": [
+        "Read functions"
+      ],
+      "doc_slugs": [
+        "read_kafka"
+      ],
+      "signature": "read_kafka([optionKey => optionValue] [, \u2026])",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "read_kinesis",
+      "categories": [
+        "Read functions"
+      ],
+      "doc_slugs": [
+        "read_kinesis"
+      ],
+      "signature": "read_kinesis({parameter => value} [, \u2026])",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "read_pubsub",
+      "categories": [
+        "Read functions"
+      ],
+      "doc_slugs": [
+        "read_pubsub"
+      ],
+      "signature": "read_pubsub([parameter => value] [, \u2026])",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "read_pulsar",
+      "categories": [
+        "Read functions"
+      ],
+      "doc_slugs": [
+        "read_pulsar"
+      ],
+      "signature": "read_pulsar({optionKey => optionValue} [, \u2026])",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "read_state_metadata",
+      "categories": [
+        "Read functions"
+      ],
+      "doc_slugs": [
+        "read_state_metadata"
+      ],
+      "signature": "read_state_metadata(path)",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "read_statestore",
+      "categories": [
+        "Read functions"
+      ],
+      "doc_slugs": [
+        "read_statestore"
+      ],
+      "signature": "read_statestore(path [, option_key => option_value] [\u2026])",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "reduce",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "reduce"
+      ],
+      "signature": "reduce(expr,start,merge[,finish])",
+      "in_scope": true
+    },
+    {
+      "name": "reflect",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "reflect"
+      ],
+      "signature": "reflect(class, method[, arg1 [, \u2026]])",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "regexp",
+      "categories": [
+        "Operators and predicates",
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "regexp"
+      ],
+      "signature": "regexp(\u2026)",
+      "in_scope": true
+    },
+    {
+      "name": "regexp_count",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "regexp_count"
+      ],
+      "signature": "regexp_count(str, regexp)",
+      "in_scope": true
+    },
+    {
+      "name": "regexp_extract",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "regexp_extract"
+      ],
+      "signature": "regexp_extract(str, regexp[, idx])",
+      "in_scope": true
+    },
+    {
+      "name": "regexp_extract_all",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "regexp_extract_all"
+      ],
+      "signature": "regexp_extract_all(str, regexp[, idx])",
+      "in_scope": true
+    },
+    {
+      "name": "regexp_instr",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "regexp_instr"
+      ],
+      "signature": "regexp_instr(str, regexp)",
+      "in_scope": true
+    },
+    {
+      "name": "regexp_like",
+      "categories": [
+        "Operators and predicates",
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "regexp_like"
+      ],
+      "signature": "regexp_like(\u2026)",
+      "in_scope": true
+    },
+    {
+      "name": "regexp_replace",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "regexp_replace"
+      ],
+      "signature": "regexp_replace(str, regexp, rep[, position])",
+      "in_scope": true
+    },
+    {
+      "name": "regexp_substr",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "regexp_substr"
+      ],
+      "signature": "regexp_substr(str, regexp)",
+      "in_scope": true
+    },
+    {
+      "name": "regr_avgx",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "regr_avgx"
+      ],
+      "signature": "regr_avgx(yExpr, xExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "regr_avgy",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "regr_avgy"
+      ],
+      "signature": "regr_avgy(yExpr, xExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "regr_count",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "regr_count"
+      ],
+      "signature": "regr_count(yExpr, xExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "regr_intercept",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "regr_intercept"
+      ],
+      "signature": "regr_intercept(yExpr, xExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "regr_r2",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "regr_r2"
+      ],
+      "signature": "regr_r2(yExpr, xExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "regr_slope",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "regr_slope"
+      ],
+      "signature": "regr_slope(yExpr, xExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "regr_sxx",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "regr_sxx"
+      ],
+      "signature": "regr_sxx(yExpr, xExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "regr_sxy",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "regr_sxy"
+      ],
+      "signature": "regr_sxy(yExpr, xExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "regr_syy",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "regr_syy"
+      ],
+      "signature": "regr_syy(yExpr, xExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "remote_query",
+      "categories": [
+        "Read functions"
+      ],
+      "doc_slugs": [
+        "remote_query"
+      ],
+      "signature": "remote_query(connectionName [, connectorOptionKey => connectorOptionValue] [\u2026])",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "repeat",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "repeat"
+      ],
+      "signature": "repeat(expr, n)",
+      "in_scope": true
+    },
+    {
+      "name": "replace",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "replace"
+      ],
+      "signature": "replace(str, search [, replace])",
+      "in_scope": true
+    },
+    {
+      "name": "reverse",
+      "categories": [
+        "String and binary functions",
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "reverse"
+      ],
+      "signature": "reverse(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "right",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "right"
+      ],
+      "signature": "right(str, len)",
+      "in_scope": true
+    },
+    {
+      "name": "rint",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "rint"
+      ],
+      "signature": "rint(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "rlike",
+      "categories": [
+        "Operators and predicates",
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "rlike"
+      ],
+      "signature": "rlike(\u2026)",
+      "in_scope": true
+    },
+    {
+      "name": "round",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "round"
+      ],
+      "signature": "round(expr[,targetScale])",
+      "in_scope": true
+    },
+    {
+      "name": "row_number",
+      "categories": [
+        "Ranking window functions"
+      ],
+      "doc_slugs": [
+        "row_number"
+      ],
+      "signature": "row_number()",
+      "in_scope": true
+    },
+    {
+      "name": "rpad",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "rpad"
+      ],
+      "signature": "rpad(expr, len[, pad])",
+      "in_scope": true
+    },
+    {
+      "name": "rtrim",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "rtrim"
+      ],
+      "signature": "rtrim([trimStr,] str)",
+      "in_scope": true
+    },
+    {
+      "name": "schema_of_csv",
+      "categories": [
+        "CSV and Avro functions"
+      ],
+      "doc_slugs": [
+        "schema_of_csv"
+      ],
+      "signature": "schema_of_csv(csv[, options])",
+      "in_scope": true
+    },
+    {
+      "name": "schema_of_json",
+      "categories": [
+        "JSON functions"
+      ],
+      "doc_slugs": [
+        "schema_of_json"
+      ],
+      "signature": "schema_of_json(jsonStr[, options])",
+      "in_scope": true
+    },
+    {
+      "name": "schema_of_json_agg",
+      "categories": [
+        "Numeric scalar functions",
+        "JSON functions"
+      ],
+      "doc_slugs": [
+        "schema_of_json_agg"
+      ],
+      "signature": "schema_of_json_agg(json[, options])",
+      "in_scope": true
+    },
+    {
+      "name": "schema_of_variant_agg",
+      "categories": [
+        "Numeric scalar functions",
+        "VARIANT functions"
+      ],
+      "doc_slugs": [
+        "schema_of_variant",
+        "schema_of_variant_agg"
+      ],
+      "signature": "schema_of_variant_agg(variantExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "schema_of_xml",
+      "categories": [
+        "XPath and XML functions"
+      ],
+      "doc_slugs": [
+        "schema_of_xml"
+      ],
+      "signature": "schema_of_xml(xmlStr[, options])",
+      "in_scope": true
+    },
+    {
+      "name": "search",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "search"
+      ],
+      "signature": "search(col[, ...], pattern[, mode => mode])",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "sec",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "sec"
+      ],
+      "signature": "sec(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "second",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "second"
+      ],
+      "signature": "second(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "secret",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "secret"
+      ],
+      "signature": "secret(scope, key)",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "sentences",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "sentences"
+      ],
+      "signature": "sentences(str[, lang, country])",
+      "in_scope": true
+    },
+    {
+      "name": "sequence",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "sequence"
+      ],
+      "signature": "sequence(start,stop,step)",
+      "in_scope": true
+    },
+    {
+      "name": "session_user",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "session_user"
+      ],
+      "signature": "session_user()",
+      "in_scope": true
+    },
+    {
+      "name": "session_window",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "session_window"
+      ],
+      "signature": "session_window(expr, gpDuration)",
+      "in_scope": true
+    },
+    {
+      "name": "sha",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "sha"
+      ],
+      "signature": "sha(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "sha1",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "sha1"
+      ],
+      "signature": "sha1(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "sha2",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "sha2"
+      ],
+      "signature": "sha2(expr, bitLength)",
+      "in_scope": true
+    },
+    {
+      "name": "shiftleft",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "shiftleft"
+      ],
+      "signature": "shiftleft(expr, n)",
+      "in_scope": true
+    },
+    {
+      "name": "shiftright",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "shiftright"
+      ],
+      "signature": "shiftright(expr, n)",
+      "in_scope": true
+    },
+    {
+      "name": "shiftrightunsigned",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "shiftrightunsigned"
+      ],
+      "signature": "shiftrightunsigned(expr, n)",
+      "in_scope": true
+    },
+    {
+      "name": "shuffle",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "shuffle"
+      ],
+      "signature": "shuffle(array)",
+      "in_scope": true
+    },
+    {
+      "name": "sign",
+      "categories": [
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "sign"
+      ],
+      "signature": "sign(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "signum",
+      "categories": [
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "signum"
+      ],
+      "signature": "signum(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "sin",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "sin"
+      ],
+      "signature": "sin(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "sinh",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "sinh"
+      ],
+      "signature": "sinh(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "skewness",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "skewness"
+      ],
+      "signature": "skewness(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "slashsign",
+      "categories": [
+        "Operators and predicates",
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "slashsign"
+      ],
+      "signature": "/",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`/`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "slice",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "slice"
+      ],
+      "signature": "slice(expr,start,length)",
+      "in_scope": true
+    },
+    {
+      "name": "smallint",
+      "categories": [
+        "Numeric scalar functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "smallint"
+      ],
+      "signature": "smallint(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "some",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "some"
+      ],
+      "signature": "some(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "sort_array",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "sort_array"
+      ],
+      "signature": "sort_array(expr[,ascendingOrder])",
+      "in_scope": true
+    },
+    {
+      "name": "soundex",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "soundex"
+      ],
+      "signature": "soundex(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "space",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "space"
+      ],
+      "signature": "space(n)",
+      "in_scope": true
+    },
+    {
+      "name": "spark_partition_id",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "spark_partition"
+      ],
+      "signature": "spark_partition_id()",
+      "in_scope": true
+    },
+    {
+      "name": "split",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "split"
+      ],
+      "signature": "split(str, regex[, limit])",
+      "in_scope": true
+    },
+    {
+      "name": "split_part",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "split_part"
+      ],
+      "signature": "split_part(str, delim, partNum)",
+      "in_scope": true
+    },
+    {
+      "name": "sql_keywords",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "sql_keywords"
+      ],
+      "signature": "sql_keywords()",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "sqrt",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "sqrt"
+      ],
+      "signature": "sqrt(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "stack",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "stack"
+      ],
+      "signature": "stack(numRows, expr1 [, \u2026])",
+      "in_scope": true
+    },
+    {
+      "name": "startswith",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "startswith"
+      ],
+      "signature": "startswith(expr, startExpr)",
+      "in_scope": true
+    },
+    {
+      "name": "std",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "std"
+      ],
+      "signature": "std(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "stddev",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "stddev"
+      ],
+      "signature": "stddev(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "stddev_pop",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "stddev_pop"
+      ],
+      "signature": "stddev_pop(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "stddev_samp",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "stddev_samp"
+      ],
+      "signature": "stddev_samp(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "str_to_map",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "str_to_map"
+      ],
+      "signature": "str_to_map(expr[,pairDelim[,keyValueDelim]])",
+      "in_scope": true
+    },
+    {
+      "name": "string",
+      "categories": [
+        "String and binary functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "string"
+      ],
+      "signature": "string(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "string_agg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "string_agg"
+      ],
+      "signature": "string_agg(expr[,delim]) [WITHIN GROUP (ORDER BY key [,...])]",
+      "in_scope": true
+    },
+    {
+      "name": "struct",
+      "categories": [
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "struct"
+      ],
+      "signature": "struct(expr1 [, \u2026])",
+      "in_scope": true
+    },
+    {
+      "name": "substr",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "substr"
+      ],
+      "signature": "substr(expr, pos[, len])",
+      "in_scope": true
+    },
+    {
+      "name": "substring",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "substring"
+      ],
+      "signature": "substring(expr, pos[, len])",
+      "in_scope": true
+    },
+    {
+      "name": "substring_index",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "substring_index"
+      ],
+      "signature": "substring_index(expr, delim, count)",
+      "in_scope": true
+    },
+    {
+      "name": "sum",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "sum"
+      ],
+      "signature": "sum(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "table_changes",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "table_changes"
+      ],
+      "signature": "table_changes(table_str, start [, end])",
+      "in_scope": false,
+      "excluded_reason": "platform-source",
+      "excluded_detail": "Requires the Databricks control plane or an external service."
+    },
+    {
+      "name": "tan",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "tan"
+      ],
+      "signature": "tan(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "tanh",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "tanh"
+      ],
+      "signature": "tanh(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "theta_difference",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "theta_difference"
+      ],
+      "signature": "theta_difference(first, second)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "theta_intersection",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "theta_intersection"
+      ],
+      "signature": "theta_intersection(first, second)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "theta_intersection_agg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "theta_intersection_agg"
+      ],
+      "signature": "theta_intersection_agg(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "theta_sketch_agg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "theta_sketch_agg"
+      ],
+      "signature": "theta_sketch_agg(expr[,lgNomEntries])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "theta_sketch_estimate",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "theta_sketch_estimate"
+      ],
+      "signature": "theta_sketch_estimate(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "theta_union",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "theta_union"
+      ],
+      "signature": "theta_union(first, second [,lgNomEntries])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "theta_union_agg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "theta_union_agg"
+      ],
+      "signature": "theta_union_agg(sketch[,lgNomEntries])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tildesign",
+      "categories": [
+        "Operators and predicates",
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "tildesign"
+      ],
+      "signature": "~",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`~`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "time_diff",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "time_diff"
+      ],
+      "signature": "time_diff(unit, start, stop)",
+      "in_scope": true
+    },
+    {
+      "name": "time_from_micros",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "time_from_micros"
+      ],
+      "signature": "time_from_micros(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "time_from_millis",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "time_from_millis"
+      ],
+      "signature": "time_from_millis(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "time_from_seconds",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "time_from_seconds"
+      ],
+      "signature": "time_from_seconds(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "time_to_micros",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "time_to_micros"
+      ],
+      "signature": "time_to_micros(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "time_to_millis",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "time_to_millis"
+      ],
+      "signature": "time_to_millis(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "time_to_seconds",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "time_to_seconds"
+      ],
+      "signature": "time_to_seconds(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "time_trunc",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "time_trunc"
+      ],
+      "signature": "time_trunc(unit, expr)",
+      "in_scope": true
+    },
+    {
+      "name": "timediff",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "timediff"
+      ],
+      "signature": "timediff(unit, start, stop)",
+      "in_scope": true
+    },
+    {
+      "name": "timestamp",
+      "categories": [
+        "Date, timestamp, and interval functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "timestamp"
+      ],
+      "signature": "timestamp(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "timestamp_micros",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "timestamp_micros"
+      ],
+      "signature": "timestamp_micros(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "timestamp_millis",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "timestamp_millis"
+      ],
+      "signature": "timestamp_millis(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "timestamp_seconds",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "timestamp_seconds"
+      ],
+      "signature": "timestamp_seconds(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "timestampadd",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "timestampadd"
+      ],
+      "signature": "timestampadd(unit, value, expr)",
+      "in_scope": true
+    },
+    {
+      "name": "timestampdiff",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "timestampdiff"
+      ],
+      "signature": "timestampdiff(unit, start, stop)",
+      "in_scope": true
+    },
+    {
+      "name": "tinyint",
+      "categories": [
+        "Numeric scalar functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "tinyint"
+      ],
+      "signature": "tinyint(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "to_avro",
+      "categories": [
+        "CSV and Avro functions"
+      ],
+      "doc_slugs": [
+        "to_avro"
+      ],
+      "signature": "to_avro(expr[, options])",
+      "in_scope": true
+    },
+    {
+      "name": "to_binary",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "to_binary"
+      ],
+      "signature": "to_binary(expr[, fmt])",
+      "in_scope": true
+    },
+    {
+      "name": "to_char",
+      "categories": [
+        "String and binary functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "to_char"
+      ],
+      "signature": "to_char(numExpr, fmt)",
+      "in_scope": true
+    },
+    {
+      "name": "to_csv",
+      "categories": [
+        "CSV and Avro functions"
+      ],
+      "doc_slugs": [
+        "to_csv"
+      ],
+      "signature": "to_csv(expr[, options])",
+      "in_scope": true
+    },
+    {
+      "name": "to_date",
+      "categories": [
+        "Date, timestamp, and interval functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "to_date"
+      ],
+      "signature": "to_date(expr[,fmt])",
+      "in_scope": true
+    },
+    {
+      "name": "to_file",
+      "categories": [
+        "File functions"
+      ],
+      "doc_slugs": [
+        "to_file"
+      ],
+      "signature": "to_file(path)",
+      "in_scope": false,
+      "excluded_reason": "file",
+      "excluded_detail": "Requires Unity Catalog volumes."
+    },
+    {
+      "name": "to_json",
+      "categories": [
+        "JSON functions",
+        "VARIANT functions"
+      ],
+      "doc_slugs": [
+        "to_json"
+      ],
+      "signature": "to_json(expr[, options])",
+      "in_scope": true
+    },
+    {
+      "name": "to_number",
+      "categories": [
+        "Numeric scalar functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "to_number"
+      ],
+      "signature": "to_number(expr, fmt )",
+      "in_scope": true
+    },
+    {
+      "name": "to_time",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "to_time"
+      ],
+      "signature": "to_time(expr[,fmt])",
+      "in_scope": true
+    },
+    {
+      "name": "to_timestamp",
+      "categories": [
+        "Date, timestamp, and interval functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "to_timestamp"
+      ],
+      "signature": "to_timestamp(expr[,fmt])",
+      "in_scope": true
+    },
+    {
+      "name": "to_unix_timestamp",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "to_unix_timestamp"
+      ],
+      "signature": "to_unix_timestamp(expr[,fmt])",
+      "in_scope": true
+    },
+    {
+      "name": "to_utc_timestamp",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "to_utc_timestamp"
+      ],
+      "signature": "to_utc_timestamp(expr,timezone)",
+      "in_scope": true
+    },
+    {
+      "name": "to_varchar",
+      "categories": [
+        "String and binary functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "to_varchar"
+      ],
+      "signature": "to_varchar(numExpr, fmt)",
+      "in_scope": true
+    },
+    {
+      "name": "to_variant_object",
+      "categories": [
+        "VARIANT functions"
+      ],
+      "doc_slugs": [
+        "to_variant_object"
+      ],
+      "signature": "to_variant_object(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "transform",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "transform"
+      ],
+      "signature": "transform(expr, func)",
+      "in_scope": true
+    },
+    {
+      "name": "transform_keys",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "transform_keys"
+      ],
+      "signature": "transform_keys(expr, func)",
+      "in_scope": true
+    },
+    {
+      "name": "transform_values",
+      "categories": [
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "transform_values"
+      ],
+      "signature": "transform_values(expr, func)",
+      "in_scope": true
+    },
+    {
+      "name": "translate",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "translate"
+      ],
+      "signature": "translate(expr, from, to)",
+      "in_scope": true
+    },
+    {
+      "name": "trim",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "trim"
+      ],
+      "signature": "trim([[BOTH | LEADING | TRAILING] [trimStr] FROM] str)",
+      "in_scope": true
+    },
+    {
+      "name": "trunc",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "trunc"
+      ],
+      "signature": "trunc(expr, fmt)",
+      "in_scope": true
+    },
+    {
+      "name": "try_add",
+      "categories": [
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "try_add"
+      ],
+      "signature": "try_add(expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "try_aes_decrypt",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "try_aes_decrypt"
+      ],
+      "signature": "try_aes_decrypt(expr, key[, mode[, padding[, aad]]])",
+      "in_scope": true
+    },
+    {
+      "name": "try_avg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "try_avg"
+      ],
+      "signature": "try_avg(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "try_cast",
+      "categories": [
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "try_cast"
+      ],
+      "signature": "try_cast(expr AS type)",
+      "in_scope": false,
+      "excluded_reason": "syntax",
+      "excluded_detail": "Operator or clause syntax (`try_cast(expr AS type)`), not a function-registry entry \u2014 parser surface."
+    },
+    {
+      "name": "try_copy_file",
+      "categories": [
+        "File functions"
+      ],
+      "doc_slugs": [
+        "try_copy_file"
+      ],
+      "signature": "try_copy_file(file => file [, \u2026])",
+      "in_scope": false,
+      "excluded_reason": "file",
+      "excluded_detail": "Requires Unity Catalog volumes."
+    },
+    {
+      "name": "try_divide",
+      "categories": [
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "try_divide"
+      ],
+      "signature": "try_divide(dividend, divisor)",
+      "in_scope": true
+    },
+    {
+      "name": "try_element_at",
+      "categories": [
+        "Array functions",
+        "Map functions"
+      ],
+      "doc_slugs": [
+        "try_element_at"
+      ],
+      "signature": "try_element_at(arrayExpr, index)",
+      "in_scope": true
+    },
+    {
+      "name": "try_mod",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "try_mod"
+      ],
+      "signature": "try_mod(dividend, divisor)",
+      "in_scope": true
+    },
+    {
+      "name": "try_multiply",
+      "categories": [
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "try_multiply"
+      ],
+      "signature": "try_multiply(multiplier, multiplicand)",
+      "in_scope": true
+    },
+    {
+      "name": "try_parse_json",
+      "categories": [
+        "VARIANT functions"
+      ],
+      "doc_slugs": [
+        "try_parse_json"
+      ],
+      "signature": "try_parse_json(jsonStr)",
+      "in_scope": true
+    },
+    {
+      "name": "try_parse_timestamp",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "try_parse_timestamp"
+      ],
+      "signature": "try_parse_timestamp(expr [, pattern [, ...] ])",
+      "in_scope": true
+    },
+    {
+      "name": "try_reflect",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "try_reflect"
+      ],
+      "signature": "try_reflect(class, method[, arg1 [, \u2026]])",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "try_secret",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "try_secret"
+      ],
+      "signature": "try_secret(scope, key)",
+      "in_scope": false,
+      "excluded_reason": "workspace",
+      "excluded_detail": "Bound to Databricks workspace identity, secrets, metric views, or JVM reflection."
+    },
+    {
+      "name": "try_subtract",
+      "categories": [
+        "Numeric scalar functions",
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "try_subtract"
+      ],
+      "signature": "try_subtract(expr1, expr2)",
+      "in_scope": true
+    },
+    {
+      "name": "try_sum",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "try_sum"
+      ],
+      "signature": "try_sum(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "try_to_binary",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "try_to_binary"
+      ],
+      "signature": "try_to_binary(expr [, fmt])",
+      "in_scope": true
+    },
+    {
+      "name": "try_to_file",
+      "categories": [
+        "File functions"
+      ],
+      "doc_slugs": [
+        "try_to_file"
+      ],
+      "signature": "try_to_file(path)",
+      "in_scope": false,
+      "excluded_reason": "file",
+      "excluded_detail": "Requires Unity Catalog volumes."
+    },
+    {
+      "name": "try_to_number",
+      "categories": [
+        "Numeric scalar functions",
+        "Cast functions and constructors"
+      ],
+      "doc_slugs": [
+        "try_to_number"
+      ],
+      "signature": "try_to_number(expr, fmt )",
+      "in_scope": true
+    },
+    {
+      "name": "try_to_time",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "try_to_time"
+      ],
+      "signature": "try_to_time(expr[,fmt])",
+      "in_scope": true
+    },
+    {
+      "name": "try_to_timestamp",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "try_to_timestamp"
+      ],
+      "signature": "try_to_timestamp(expr[,fmt])",
+      "in_scope": true
+    },
+    {
+      "name": "try_url_decode",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "try_url_decode"
+      ],
+      "signature": "try_url_decode(str)",
+      "in_scope": true
+    },
+    {
+      "name": "try_variant_get",
+      "categories": [
+        "VARIANT functions"
+      ],
+      "doc_slugs": [
+        "try_variant_get"
+      ],
+      "signature": "try_variant_get(variantExpr,path,type)",
+      "in_scope": true
+    },
+    {
+      "name": "try_zstd_decompress",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "try_zstd_decompress"
+      ],
+      "signature": "try_zstd_decompress(value)",
+      "in_scope": true
+    },
+    {
+      "name": "tuple_difference_double",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_difference_double"
+      ],
+      "signature": "tuple_difference_double(first, second)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_difference_integer",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_difference_integer"
+      ],
+      "signature": "tuple_difference_integer(first, second)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_intersection_agg_double",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "tuple_intersection_agg_double"
+      ],
+      "signature": "tuple_intersection_agg_double(sketch [, mode ])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_intersection_agg_integer",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "tuple_intersection_agg_integer"
+      ],
+      "signature": "tuple_intersection_agg_integer(sketch [, mode ])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_intersection_double",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_intersection_double"
+      ],
+      "signature": "tuple_intersection_double(first, second [, mode ])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_intersection_integer",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_intersection_integer"
+      ],
+      "signature": "tuple_intersection_integer(first, second [, mode ])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_sketch_agg_double",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "tuple_sketch_agg_double"
+      ],
+      "signature": "tuple_sketch_agg_double(key, summary [, lgNomEntries [, mode ]])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_sketch_agg_integer",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "tuple_sketch_agg_integer"
+      ],
+      "signature": "tuple_sketch_agg_integer(key, summary [, lgNomEntries [, mode ]])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_sketch_estimate_double",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_sketch_estimate_double"
+      ],
+      "signature": "tuple_sketch_estimate_double(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_sketch_estimate_integer",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_sketch_estimate_integer"
+      ],
+      "signature": "tuple_sketch_estimate_integer(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_sketch_summary_double",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_sketch_summary_double"
+      ],
+      "signature": "tuple_sketch_summary_double(sketch [, mode ])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_sketch_summary_integer",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_sketch_summary_integer"
+      ],
+      "signature": "tuple_sketch_summary_integer(sketch [, mode ])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_sketch_theta_double",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_sketch_theta_double"
+      ],
+      "signature": "tuple_sketch_theta_double(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_sketch_theta_integer",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_sketch_theta_integer"
+      ],
+      "signature": "tuple_sketch_theta_integer(sketch)",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_union_agg_double",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "tuple_union_agg_double"
+      ],
+      "signature": "tuple_union_agg_double(sketch [, lgNomEntries [, mode ]])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_union_agg_integer",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "tuple_union_agg_integer"
+      ],
+      "signature": "tuple_union_agg_integer(sketch [, lgNomEntries [, mode ]])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_union_double",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_union_double"
+      ],
+      "signature": "tuple_union_double(first, second [, lgNomEntries [, mode ]])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "tuple_union_integer",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "tuple_union_integer"
+      ],
+      "signature": "tuple_union_integer(first, second [, lgNomEntries [, mode ]])",
+      "in_scope": false,
+      "excluded_reason": "datasketches",
+      "excluded_detail": "Requires byte-compatible Apache DataSketches serialization; deferred sub-project."
+    },
+    {
+      "name": "typeof",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "typeof"
+      ],
+      "signature": "typeof(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "ucase",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "ucase"
+      ],
+      "signature": "ucase(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "unbase64",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "unbase64"
+      ],
+      "signature": "unbase64(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "unhex",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "unhex"
+      ],
+      "signature": "unhex(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "uniform",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "uniform"
+      ],
+      "signature": "uniform(expr1, expr2 [,seed])",
+      "in_scope": true
+    },
+    {
+      "name": "unix_date",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "unix_date"
+      ],
+      "signature": "unix_date(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "unix_micros",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "unix_micros"
+      ],
+      "signature": "unix_micros(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "unix_millis",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "unix_millis"
+      ],
+      "signature": "unix_millis(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "unix_seconds",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "unix_seconds"
+      ],
+      "signature": "unix_seconds(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "unix_timestamp",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "unix_timestamp"
+      ],
+      "signature": "unix_timestamp([expr[, fmt]])",
+      "in_scope": true
+    },
+    {
+      "name": "upper",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "upper"
+      ],
+      "signature": "upper(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "url_decode",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "url_decode"
+      ],
+      "signature": "url_decode(str)",
+      "in_scope": true
+    },
+    {
+      "name": "url_encode",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "url_encode"
+      ],
+      "signature": "url_encode(str)",
+      "in_scope": true
+    },
+    {
+      "name": "user",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "user"
+      ],
+      "signature": "user()",
+      "in_scope": true
+    },
+    {
+      "name": "uuid",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "uuid"
+      ],
+      "signature": "uuid()",
+      "in_scope": true
+    },
+    {
+      "name": "var_pop",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "var_pop"
+      ],
+      "signature": "var_pop(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "var_samp",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "var_samp"
+      ],
+      "signature": "var_samp(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "variance",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "variance"
+      ],
+      "signature": "variance(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "variant_explode",
+      "categories": [
+        "VARIANT functions"
+      ],
+      "doc_slugs": [
+        "variant_explode"
+      ],
+      "signature": "variant_explode(input)",
+      "in_scope": true
+    },
+    {
+      "name": "variant_explode_outer",
+      "categories": [
+        "VARIANT functions"
+      ],
+      "doc_slugs": [
+        "variant_explode_outer"
+      ],
+      "signature": "variant_explode_outer(input)",
+      "in_scope": true
+    },
+    {
+      "name": "variant_get",
+      "categories": [
+        "VARIANT functions"
+      ],
+      "doc_slugs": [
+        "variant_get"
+      ],
+      "signature": "variant_get(variantExpr,path,type)",
+      "in_scope": true
+    },
+    {
+      "name": "vector_avg",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "vector_avg"
+      ],
+      "signature": "vector_avg(vectors)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "vector_cosine_similarity",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "vector_cosine_similarity"
+      ],
+      "signature": "vector_cosine_similarity(vector1, vector2)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "vector_inner_product",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "vector_inner_product"
+      ],
+      "signature": "vector_inner_product(vector1, vector2)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "vector_l2_distance",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "vector_l2_distance"
+      ],
+      "signature": "vector_l2_distance(vector1, vector2)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "vector_norm",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "vector_norm"
+      ],
+      "signature": "vector_norm(vector [, degree ])",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "vector_normalize",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "vector_normalize"
+      ],
+      "signature": "vector_normalize(vector [, degree ])",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "vector_search",
+      "categories": [
+        "AI functions"
+      ],
+      "doc_slugs": [
+        "vector_search"
+      ],
+      "signature": "vector_search(index, query, num_results)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "vector_sum",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "vector_sum"
+      ],
+      "signature": "vector_sum(vectors)",
+      "in_scope": false,
+      "excluded_reason": "ai-vector",
+      "excluded_detail": "Requires Databricks Model Serving / Vector Search."
+    },
+    {
+      "name": "version",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "version"
+      ],
+      "signature": "version()",
+      "in_scope": true
+    },
+    {
+      "name": "weekday",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "weekday"
+      ],
+      "signature": "weekday(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "weekofyear",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "weekofyear"
+      ],
+      "signature": "weekofyear(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "width_bucket",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "width_bucket"
+      ],
+      "signature": "width_bucket(expr, minExpr, maxExpr, numBuckets)",
+      "in_scope": true
+    },
+    {
+      "name": "window",
+      "categories": [
+        "Date, timestamp, and interval functions",
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "window"
+      ],
+      "signature": "window(expr, width[, step[, start]])",
+      "in_scope": true
+    },
+    {
+      "name": "window_time",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "window_time"
+      ],
+      "signature": "window_time(window)",
+      "in_scope": true
+    },
+    {
+      "name": "xpath",
+      "categories": [
+        "XPath and XML functions"
+      ],
+      "doc_slugs": [
+        "xpath"
+      ],
+      "signature": "xpath(xml, xpath)",
+      "in_scope": true
+    },
+    {
+      "name": "xpath_boolean",
+      "categories": [
+        "XPath and XML functions"
+      ],
+      "doc_slugs": [
+        "xpath_boolean"
+      ],
+      "signature": "xpath_boolean(xml, xpath)",
+      "in_scope": true
+    },
+    {
+      "name": "xpath_double",
+      "categories": [
+        "XPath and XML functions"
+      ],
+      "doc_slugs": [
+        "xpath_double"
+      ],
+      "signature": "xpath_double(xml, xpath)",
+      "in_scope": true
+    },
+    {
+      "name": "xpath_float",
+      "categories": [
+        "XPath and XML functions"
+      ],
+      "doc_slugs": [
+        "xpath_float"
+      ],
+      "signature": "xpath_float(xml, xpath)",
+      "in_scope": true
+    },
+    {
+      "name": "xpath_int",
+      "categories": [
+        "XPath and XML functions"
+      ],
+      "doc_slugs": [
+        "xpath_int"
+      ],
+      "signature": "xpath_int(xml, xpath)",
+      "in_scope": true
+    },
+    {
+      "name": "xpath_long",
+      "categories": [
+        "XPath and XML functions"
+      ],
+      "doc_slugs": [
+        "xpath_long"
+      ],
+      "signature": "xpath_long(xml, xpath)",
+      "in_scope": true
+    },
+    {
+      "name": "xpath_number",
+      "categories": [
+        "XPath and XML functions"
+      ],
+      "doc_slugs": [
+        "xpath_number"
+      ],
+      "signature": "xpath_number(xml, xpath)",
+      "in_scope": true
+    },
+    {
+      "name": "xpath_short",
+      "categories": [
+        "XPath and XML functions"
+      ],
+      "doc_slugs": [
+        "xpath_short"
+      ],
+      "signature": "xpath_short(xml, xpath)",
+      "in_scope": true
+    },
+    {
+      "name": "xpath_string",
+      "categories": [
+        "XPath and XML functions"
+      ],
+      "doc_slugs": [
+        "xpath_string"
+      ],
+      "signature": "xpath_string(xml, xpath)",
+      "in_scope": true
+    },
+    {
+      "name": "xxhash64",
+      "categories": [
+        "Miscellaneous functions"
+      ],
+      "doc_slugs": [
+        "xxhash64"
+      ],
+      "signature": "xxhash64(expr1 [, \u2026])",
+      "in_scope": true
+    },
+    {
+      "name": "year",
+      "categories": [
+        "Date, timestamp, and interval functions"
+      ],
+      "doc_slugs": [
+        "year"
+      ],
+      "signature": "year(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "zeroifnull",
+      "categories": [
+        "Numeric scalar functions"
+      ],
+      "doc_slugs": [
+        "zeroifnull"
+      ],
+      "signature": "zeroifnull(expr)",
+      "in_scope": true
+    },
+    {
+      "name": "zip_with",
+      "categories": [
+        "Array functions"
+      ],
+      "doc_slugs": [
+        "zip_with"
+      ],
+      "signature": "zip_with(expr1, expr2, func)",
+      "in_scope": true
+    },
+    {
+      "name": "zstd_compress",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "zstd_compress"
+      ],
+      "signature": "zstd_compress (value[,level[,streaming_mode]])",
+      "in_scope": true
+    },
+    {
+      "name": "zstd_decompress",
+      "categories": [
+        "String and binary functions"
+      ],
+      "doc_slugs": [
+        "zstd_decompress"
+      ],
+      "signature": "zstd_decompress(value)",
+      "in_scope": true
+    }
+  ]
+}

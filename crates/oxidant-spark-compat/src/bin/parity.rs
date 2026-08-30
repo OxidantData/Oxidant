@@ -7,6 +7,10 @@
 //!     Replay the corpus and fail if parity dropped below the committed baseline.
 //!   oxidant-parity file [--corpus spark|databricks] <name.sql.out>
 //!     Replay a single golden file and print its per-block verdicts (debugging).
+//!   oxidant-parity functions [--markdown] [--json <path>]
+//!     Diff oxidant's live function registry against the Databricks builtin-function surface
+//!     (`databricks-functions.json`). Prints the headline + per-category rollup; `--markdown`
+//!     emits the full matrix on stdout (this is how `docs/databricks-functions.md` is generated).
 //!
 //! `--corpus` defaults to `spark` (the vendored Apache Spark `sql-tests` corpus); the
 //! `databricks` corpus is the authored Databricks SQL corpus under `databricks-tests/`,
@@ -25,8 +29,11 @@ async fn main() {
         "golden" => golden(&args[1..]).await,
         "ratchet" => ratchet(&args[1..]).await,
         "file" => file(&args[1..]).await,
+        "functions" => functions(&args[1..]).await,
         other => {
-            eprintln!("unknown command: {other}\nusage: oxidant-parity [golden|ratchet|file] ...");
+            eprintln!(
+                "unknown command: {other}\nusage: oxidant-parity [golden|ratchet|file|functions] ..."
+            );
             std::process::exit(2);
         }
     }
@@ -197,6 +204,58 @@ async fn file(args: &[String]) {
         println!("  [{}] {} -- {}", f.bucket, f.sql, f.detail);
     }
     let _ = bucket_key; // keep import used if failures empty
+}
+
+/// Diff oxidant's live function registry against the Databricks builtin-function surface.
+///
+/// Unlike `golden`/`ratchet` this replays no SQL — it boots one engine, reads the registry that
+/// answers `SHOW FUNCTIONS`, and scores it against the checked-in `databricks-functions.json`
+/// catalog. Cheap enough to run on every change to `spark_functions/`.
+async fn functions(args: &[String]) {
+    let report = oxidant_spark_compat::functions::run().await;
+
+    if let Some(path) = flag(args, "--json") {
+        std::fs::write(&path, report.to_json()).unwrap_or_else(|e| panic!("write {path}: {e}"));
+        eprintln!("wrote {path}");
+    }
+
+    // `--markdown` writes the matrix to stdout and nothing else, so it can be redirected
+    // straight into `docs/databricks-functions.md`.
+    if args.iter().any(|a| a == "--markdown") {
+        print!("{}", report.to_markdown());
+        return;
+    }
+
+    println!("\n=== Oxidant ↔ Databricks SQL function coverage ===");
+    println!(
+        "in scope : {:>6.1}%  ({}/{} functions registered, {} missing)",
+        report.coverage_pct(),
+        report.registered,
+        report.in_scope,
+        report.missing
+    );
+    println!(
+        "surface  : {} documented Databricks functions; engine registry holds {}",
+        report.documented, report.engine_registry_size
+    );
+    println!("\nout of scope:");
+    for (reason, n) in &report.excluded {
+        println!("  {reason:<16} {n:>4}");
+    }
+    println!("\nby category (registered / in scope):");
+    for c in &report.categories {
+        println!(
+            "  {:<44} {:>3} / {:<3}{}",
+            c.category,
+            c.registered,
+            c.in_scope,
+            if c.missing.is_empty() {
+                String::new()
+            } else {
+                format!("  missing: {}", c.missing.join(", "))
+            }
+        );
+    }
 }
 
 /// Tiny `--flag value` extractor.
