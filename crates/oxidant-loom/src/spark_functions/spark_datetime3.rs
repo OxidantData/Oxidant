@@ -20,10 +20,12 @@
 //! - `to_timestamp_ntz(str [, fmt])` — parse a string/date/timestamp to a naive timestamp; NULL on a
 //!   parse mismatch (non-ANSI).
 //! - `try_to_timestamp(str [, fmt])` — like `to_timestamp` but never errors: NULL on failure.
-//! - `unix_seconds(ts)` / `unix_millis(ts)` — epoch seconds / millis as `bigint` (floor toward -inf).
+//! - `unix_seconds(ts)` / `unix_millis(ts)` / `unix_micros(ts)` — epoch seconds / millis / micros
+//!   as `bigint` (floor toward -inf).
 //! - `unix_date(date)` — days since 1970-01-01 as `int`.
 //! - `date_from_unix_date(int)` — `date` from days-since-epoch.
-//! - `date_add(date, numDays)` — `date` plus N days (DataFusion-54 has no builtin; verified absent).
+//! - `date_add(date, numDays)` / `dateadd(date, numDays)` — `date` plus N days (DataFusion-54 has
+//!   no builtin; verified absent). `dateadd` is Databricks' spelling of the same function.
 //!
 //! Dropped: `timestampdiff(unit, ...)` is NOT reachable as a UDF. Spark's grammar special-cases the
 //! bare `unit` keyword, but DataFusion/sqlparser (Databricks dialect) parses `timestampdiff(MONTH,
@@ -60,9 +62,12 @@ pub fn register(ctx: &SessionContext) {
     )));
     ctx.register_udf(ScalarUDF::from(UnixEpoch::new(EpochOut::Seconds)));
     ctx.register_udf(ScalarUDF::from(UnixEpoch::new(EpochOut::Millis)));
+    ctx.register_udf(ScalarUDF::from(UnixEpoch::new(EpochOut::Micros)));
     ctx.register_udf(ScalarUDF::from(UnixDate::new()));
     ctx.register_udf(ScalarUDF::from(DateFromUnixDate::new()));
     ctx.register_udf(ScalarUDF::from(DateAdd::new("date_add", 1)));
+    // Databricks spells the same two-argument function `dateadd`.
+    ctx.register_udf(ScalarUDF::from(DateAdd::new("dateadd", 1)));
     ctx.register_udf(ScalarUDF::from(DateAdd::new("date_sub", -1)));
 }
 
@@ -75,11 +80,11 @@ fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
 // Hinnant's algorithms, valid across the full proleptic Gregorian range.
 // ---------------------------------------------------------------------------
 
-const MICROS_PER_DAY: i64 = 86_400_000_000;
+pub(super) const MICROS_PER_DAY: i64 = 86_400_000_000;
 const MICROS_PER_SEC: i64 = 1_000_000;
 
 /// (year, month, day) -> days since 1970-01-01.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+pub(super) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
@@ -89,7 +94,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 /// days since 1970-01-01 -> (year, month, day).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(super) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -103,7 +108,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// Whether `(y, m, d)` is a valid proleptic-Gregorian calendar date.
-fn is_valid_ymd(y: i64, m: u32, d: u32) -> bool {
+pub(super) fn is_valid_ymd(y: i64, m: u32, d: u32) -> bool {
     if !(1..=12).contains(&m) || d < 1 {
         return false;
     }
@@ -628,10 +633,12 @@ fn parse_fixed_pattern(input: &str, fmt: &str) -> Option<i64> {
 enum EpochOut {
     Seconds,
     Millis,
+    Micros,
 }
 
-/// `unix_seconds(ts)` / `unix_millis(ts)` — epoch seconds / millis from a timestamp, as `bigint`.
-/// Division floors toward -inf so negative (pre-epoch) instants are handled like Spark.
+/// `unix_seconds(ts)` / `unix_millis(ts)` / `unix_micros(ts)` — epoch seconds / millis / micros
+/// from a timestamp, as `bigint`. Division floors toward -inf so negative (pre-epoch) instants are
+/// handled like Spark (`unix_micros` divides by 1, so it is the raw micros).
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct UnixEpoch {
     out: EpochOut,
@@ -652,6 +659,7 @@ impl ScalarUDFImpl for UnixEpoch {
         match self.out {
             EpochOut::Seconds => "unix_seconds",
             EpochOut::Millis => "unix_millis",
+            EpochOut::Micros => "unix_micros",
         }
     }
     fn signature(&self) -> &Signature {
@@ -674,6 +682,7 @@ impl ScalarUDFImpl for UnixEpoch {
         let divisor = match self.out {
             EpochOut::Seconds => 1_000_000,
             EpochOut::Millis => 1_000,
+            EpochOut::Micros => 1,
         };
         let mut out = Int64Array::builder(n);
         for i in 0..n {

@@ -1,5 +1,5 @@
 {
-  "strict_pass": 1,
-  "semantic_pass": 1,
-  "blocks_total": 15
+ "strict_pass": 35,
+ "semantic_pass": 36,
+ "blocks_total": 50
 }

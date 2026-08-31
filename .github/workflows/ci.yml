@@ -5,7 +5,8 @@ name: CI
 # `ubuntu-latest` as a fast canary that also proves hosted runners still work.
 # Per-run tiers:
 #   - every PR/push: rustfmt, clippy+test (the Spark-SQL parity ratchet is folded into it
-#     as steps — fails anything that drops parity below parity/baseline.json), coverage gates
+#     as steps — fails anything that drops parity below parity/baseline.json), coverage gates,
+#     line coverage (blocking: fails below the coverage-floor.json ratchet)
 #   - main pushes, PRs labeled `full-gates`, manual dispatch: query-gates (official TPC
 #     dbgen/dsdgen at SF1 — TPC-H/TPC-DS/distributed suites) — skipped on routine PRs
 # Heavier gates live elsewhere:
@@ -25,11 +26,12 @@ on:
       - "docs/**"
       - "**/*.md"
       - "LICENSE"
+  # NOTE: no `paths-ignore` here, deliberately. These jobs are required status checks on
+  # `main`, and a workflow that never triggers never reports — a docs-only PR would sit
+  # unmergeable forever waiting for a check that cannot arrive. Instead the workflow always
+  # runs and the `changes` job below skips the expensive work when only docs changed. A
+  # skipped job satisfies a required status check; an absent one does not.
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
-      - "LICENSE"
   workflow_dispatch:
 
 permissions:
@@ -46,9 +48,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Did this PR touch anything that can affect the build? Everything below keys off this.
+  # Cheap (a checkout and one `git diff`), so it costs a docs-only PR seconds rather than the
+  # ~50 minutes a full instrumented coverage run takes.
+  changes:
+    name: detect code changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "not a pull_request — running everything"
+            exit 0
+          fi
+          base="origin/${{ github.base_ref }}"
+          changed=$(git diff --name-only "$base"...HEAD)
+          echo "changed files:"; echo "$changed"
+          # Anything that is not docs/markdown/LICENSE counts as code.
+          if echo "$changed" | grep -qvE '^(docs/|LICENSE$)|\.md$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "docs-only change — build/test/coverage jobs will skip"
+          fi
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
@@ -75,6 +109,8 @@ jobs:
     # tracks getting back to 4vcpu (single-Arrow toolchain, throwaway clippy
     # target dir).
     runs-on: blacksmith-8vcpu-ubuntu-2404
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # Fail fast rather than burning an hour on a wedged runner. The suite compiles the workspace
     # twice over (see the disk-reclaim step) and then runs the distributed tests serially, so the
     # honest ceiling is well above the ~10 min this takes on `main`. 180: the limited-debuginfo
@@ -165,6 +201,21 @@ jobs:
         run: |
           set -o pipefail
           ./target/debug/oxidant-parity ratchet --baseline parity/baseline.json --out-dir parity | tee parity-run.log
+      # Databricks corpus ratchet (KAN-107). Same binary, same pipeline, its own baseline —
+      # the authored Databricks corpus is what gates the function work that the vendored Spark
+      # goldens do not exercise (`months_between`, `sha2`, `width_bucket`, the timezone shifts).
+      - name: Databricks parity ratchet (vs parity/baseline-databricks.json)
+        run: |
+          set -o pipefail
+          ./target/debug/oxidant-parity ratchet --corpus databricks \
+            --baseline parity/baseline-databricks.json --out-dir parity/databricks \
+            | tee databricks-parity-run.log
+      # Coverage of the Databricks builtin-function surface. Reported, not gated: it reads the
+      # live registry and prints the headline into the job summary so a wave's effect is visible
+      # on the PR without anyone re-running it locally.
+      - name: Databricks function coverage
+        if: always()
+        run: ./target/debug/oxidant-parity functions | tee function-coverage.log
       - name: Publish parity headline to job summary
         if: always()
         run: |
@@ -173,6 +224,18 @@ jobs:
             echo ""
             echo '```'
             grep -E '^(parity:|✓|✗)' parity-run.log 2>/dev/null || echo "(no headline — see logs)"
+            echo '```'
+            echo ""
+            echo "## Databricks parity gate"
+            echo ""
+            echo '```'
+            grep -E '^(parity:|✓|✗)' databricks-parity-run.log 2>/dev/null || echo "(no headline — see logs)"
+            echo '```'
+            echo ""
+            echo "## Databricks function coverage"
+            echo ""
+            echo '```'
+            grep -E '^(in scope|surface)' function-coverage.log 2>/dev/null || echo "(no headline — see logs)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload parity scoreboard
@@ -185,19 +248,25 @@ jobs:
             parity/report.md
             parity/parity.html
             parity/scoreboard.json
+            parity/databricks/parity.json
+            parity/databricks/report.md
+            parity/databricks/scoreboard.json
           retention-days: 30
           if-no-files-found: ignore
 
   # Informational llvm-cov line-coverage report on every PR and main push. Mirrors the
   # nightly job in coverage-nightly.yml so coverage deltas are visible on the PR itself.
-  # NON-BLOCKING by design (continue-on-error: true): it must never gate a merge — do not
-  # add it to required status checks. Gotchas (AGENTS.md): separate target dir
-  # target/llvm-cov-target, build oxidant-cli into it first, `--html` without
-  # `--output-path`, artifact lives at target/llvm-cov/html.
+  # BLOCKING: this job gates the merge. It fails if total line coverage falls below the
+  # floor committed in `coverage-floor.json` (minus a small tolerance), so a PR cannot quietly
+  # dilute coverage by adding untested code. Raise the floor when coverage improves — same
+  # ratchet discipline as parity/baseline.json.
+  # Gotchas (AGENTS.md): separate target dir target/llvm-cov-target, build oxidant-cli into it
+  # first, `--html` without `--output-path`, artifact lives at target/llvm-cov/html.
   line-coverage:
-    name: line coverage (informational, non-blocking)
+    name: line coverage
     runs-on: ubuntu-latest
-    continue-on-error: true
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # Cold-cache runs compile the whole workspace twice (oxidant-cli prebuild, then
     # instrumented `cargo test --workspace`). ~45–60 min is a projection, not a measurement:
     # this job has never completed a run — every attempt so far died inside the build, so
@@ -205,26 +274,47 @@ jobs:
     # cache invalidation.
     timeout-minutes: 180
     env:
-      # Same switch as build-test: limited debug info (debug = 1). With the profiles' full
-      # debuginfo each oxidant-execution integration binary is ~1–2 GB at link time, and
-      # linking ~56 of them under `-C instrument-coverage` exhausts the free disk on a
-      # public-repo `ubuntu-latest` runner (4 vCPU / 16 GB RAM / ~14 GB free SSD). `ld`
-      # mmaps its output file, so that ENOSPC surfaces as `collect2: ld terminated with
-      # signal 7 [Bus error]` — the failure PR #96's line-coverage job hit. Disk, not
-      # memory, is the binding constraint; see the disk-reclaim step below.
-      CARGO_PROFILE_TEST_DEBUG: "1"
-      CARGO_PROFILE_DEV_DEBUG: "1"
+      # debug = 0, not the 1 that build-test uses. Measured on run 33284678644: the
+      # instrumented build ran the runner from 104 GB free to 1.6 GB and died with
+      # `rustc-LLVM ERROR: IO failure on output stream: No space left on device`, having
+      # never reached the link of the last test binary. Disk is the binding constraint.
+      #
+      # Why debug info is what costs, and why only here: on Linux the linker copies DWARF
+      # into every output binary, and `cargo llvm-cov --workspace` links ~160 statically
+      # linked test binaries that each pull in the whole of DataFusion. The same run on
+      # macOS fits in 54 GB because Mach-O leaves DWARF in the `.o` files and links a debug
+      # map instead — same objects, ~2x less total bytes.
+      #
+      # Dropping it is safe for coverage specifically: `-C instrument-coverage` writes its
+      # region/filename tables into the `__llvm_covmap` / `__llvm_prf_names` sections, which
+      # are emitted independently of `-C debuginfo`. Verified before this change by running
+      # collect / `report --html` / `report --summary-only --json` — the exact three-step
+      # pipeline used below — against a probe crate at debug = 0: line, region and function
+      # counts were all correct, including an uncalled function reported as missed.
+      #
+      # The cost is unreadable backtraces if an instrumented test panics. Reproduce such a
+      # failure under `clippy + test`, which keeps debug = 1.
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
-      # Same reclaim as build-test (and oxidant-image.yml): a standard `ubuntu-latest`
-      # runner leaves only ~14 GB free, and the instrumented build writes a second full
-      # target dir (target/llvm-cov-target) on top of the workspace's. Dropping the
-      # preinstalled SDKs buys ~25 GB, which is what keeps `ld` off ENOSPC/SIGBUS.
+      # Goes further than build-test's reclaim, because this job writes a second full
+      # target dir (target/llvm-cov-target) on top of the workspace's. Measured on run
+      # 33284678644: 86 GB free at job start, 111 GB after this step — the preinstalled
+      # SDKs are worth ~25 GB. The extra removals below (Swift, PowerShell, miniconda,
+      # the preloaded Docker images) are headroom on top of that; each is `|| true` so a
+      # runner image that stops shipping one of them does not fail the job.
+      #
+      # Reclaim alone was never going to be enough — that run still exhausted 104 GB. The
+      # fix is debug = 0 in this job's env; this step just keeps the margin comfortable.
       - name: Reclaim runner disk
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/share/swift /usr/local/share/powershell \
+            /usr/share/miniconda /usr/local/lib/node_modules || true
+          sudo docker image prune -a -f >/dev/null 2>&1 || true
           df -h /
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
@@ -233,7 +323,11 @@ jobs:
           rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
         with:
-          key: llvm-cov # instrumented artifacts must not pollute the shared CI cache
+          # Bumped from `llvm-cov` when this job moved to debug = 0. rust-cache keys on the
+          # toolchain and Cargo.lock, not on CARGO_PROFILE_*, so the old key would restore
+          # debug = 1 artifacts that this build cannot reuse and must still store — the one
+          # thing this job has no room for. Bump again on any future profile change here.
+          key: llvm-cov-debug0 # instrumented artifacts must not pollute the shared CI cache
       # Prebuilt binary. `cargo install cargo-llvm-cov --locked` compiled it from source
       # on every run, which cost more than the coverage pass itself.
       - uses: taiki-e/install-action@cargo-llvm-cov
@@ -245,8 +339,33 @@ jobs:
       # constraint (runner disk — see the reclaim step above), it only makes the job
       # slower. Reinstate `--jobs 2` if a future failure actually shows memory pressure
       # rather than the ENOSPC/SIGBUS linker signature.
+      #
+      # Split build+run from report generation so the stale-object purge below can sit between
+      # them. `--no-report` collects the .profraw data without exporting.
+      - name: Collect coverage (build + run instrumented tests)
+        run: cargo llvm-cov --workspace --no-report
+      # THE reason this job never once went green. `cargo llvm-cov report` passes every file in
+      # debug/deps as an `-object` to `llvm-cov export`. A build that is killed mid-link leaves
+      # its partial linker output behind as `<binary>-<hash>.tmpXXXXXX`, and rust-cache faithfully
+      # restores that corpse into the next run, where export dies on it:
+      #
+      #   error: failed to load coverage: '…/deps/distributed_lakehouse-….tmpa296660':
+      #   malformed instrumentation profile data: symbol name is empty
+      #
+      # This is a separate failure from the ENOSPC the env block above addresses, and both are
+      # live: run 33284678644 ran out of disk during the build, and earlier runs that survived
+      # the build died here on a restored `.tmp*` corpse. They also feed each other — a build
+      # killed by ENOSPC is exactly what leaves one behind for the next run to choke on.
+      # Purging after the build (so nothing recreates them) and before the export is what makes
+      # the report reproducible.
+      - name: Purge partial linker artifacts before export
+        run: |
+          # `|| true`: find exits non-zero if the tree is missing, and the step runs under
+          # `bash -e`. Nothing to purge is a success, not a failure.
+          found=$(find target/llvm-cov-target -name '*.tmp*' -type f -print -delete 2>/dev/null | wc -l || true)
+          echo "purged ${found// /} partial linker artifact(s)"
       - name: Generate HTML coverage report
-        run: cargo llvm-cov --workspace --html
+        run: cargo llvm-cov report --html
       - name: Disk free after coverage
         if: always()
         run: df -h /
@@ -284,7 +403,48 @@ jobs:
           EOF
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+      # The gate. Runs after the summary so the numbers are visible in the job summary even on
+      # a failure, and reads the same /tmp/cov-summary.json that step produced.
+      - name: Coverage floor gate
+        run: |
+          python3 - <<'EOF'
+          import json, sys, pathlib
+
+          floor_path = pathlib.Path("coverage-floor.json")
+          summary_path = pathlib.Path("/tmp/cov-summary.json")
+          if not summary_path.is_file() or summary_path.stat().st_size == 0:
+              sys.exit("coverage summary missing — the report step did not produce one")
+
+          floor = json.loads(floor_path.read_text())
+          data = json.loads(summary_path.read_text())
+          tot = data["data"][0]["totals"]["lines"]
+          pct = 100.0 * tot["covered"] / tot["count"] if tot["count"] else 0.0
+
+          # Bootstrap: the floor can only be set from a real run of this job, and this job had
+          # never produced one. Report the number loudly and do not gate until it is committed —
+          # a floor of 0.0 would be a green light that means nothing.
+          if floor.get("measured_on") == "PENDING":
+              print(f"::warning::coverage floor is UNSET. Measured {pct:.2f}% "
+                    f"({tot['covered']}/{tot['count']}). Set line_pct to this value and "
+                    f"measured_on to today's date in coverage-floor.json to arm the gate.")
+              sys.exit(0)
+
+          minimum = floor["line_pct"] - floor["tolerance_pct"]
+          print(f"line coverage {pct:.2f}% "
+                f"({tot['covered']}/{tot['count']}), "
+                f"floor {floor['line_pct']:.2f}% - {floor['tolerance_pct']:.2f}% "
+                f"tolerance = {minimum:.2f}%")
+          if pct < minimum:
+              sys.exit(
+                  f"::error::line coverage {pct:.2f}% is below the floor {minimum:.2f}%. "
+                  "Add tests, or raise/lower coverage-floor.json deliberately with a reason."
+              )
+          if pct > floor["line_pct"] + floor["tolerance_pct"]:
+              print(f"::notice::coverage rose to {pct:.2f}% — consider raising the floor "
+                    f"in coverage-floor.json from {floor['line_pct']:.2f}%.")
+          EOF
       - name: Upload coverage HTML
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: llvm-cov-html
@@ -393,6 +553,8 @@ jobs:
   coverage:
     name: coverage gates
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the

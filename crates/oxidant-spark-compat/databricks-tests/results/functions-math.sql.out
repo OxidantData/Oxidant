@@ -1,0 +1,76 @@
+-- Authored golden (Databricks SQL language manual: numeric scalar functions).
+-- !query
+SELECT e() AS a
+-- !query schema
+struct<a:double>
+-- !query output
+2.718281828459045
+
+
+-- !query
+SELECT rint(CAST(2.5 AS DOUBLE)) AS a, rint(CAST(3.5 AS DOUBLE)) AS b,
+       rint(CAST(-2.5 AS DOUBLE)) AS c, rint(CAST(2.4 AS DOUBLE)) AS d
+-- !query schema
+struct<a:double,b:double,c:double,d:double>
+-- !query output
+2.0	4.0	-2.0	2.0
+
+
+-- !query
+SELECT hypot(CAST(3 AS DOUBLE), CAST(4 AS DOUBLE)) AS a,
+       expm1(CAST(0 AS DOUBLE)) AS b, log1p(CAST(0 AS DOUBLE)) AS c,
+       sec(CAST(0 AS DOUBLE)) AS d
+-- !query schema
+struct<a:double,b:double,c:double,d:double>
+-- !query output
+5.0	0.0	0.0	1.0
+
+
+-- !query
+SELECT mod(7, 3) AS a, mod(-7, 3) AS b, mod(7, -3) AS c
+-- !query schema
+struct<a:int,b:int,c:int>
+-- !query output
+1	-1	1
+
+
+-- !query
+SELECT pmod(7, 3) AS a, pmod(-7, 3) AS b, pmod(7, -3) AS c, pmod(-7, -3) AS d
+-- !query schema
+struct<a:int,b:int,c:int,d:int>
+-- !query output
+1	2	1	2
+
+
+-- !query
+SELECT negative(1) AS a, negative(-1) AS b, negative('-1.11') AS c
+-- !query schema
+struct<a:int,b:int,c:double>
+-- !query output
+-1	1	1.11
+
+
+-- !query
+SELECT bit_reverse(CAST(1 AS TINYINT)) AS a, bit_reverse(CAST(1 AS INT)) AS b,
+       bit_reverse(CAST(-1 AS INT)) AS c
+-- !query schema
+struct<a:tinyint,b:int,c:int>
+-- !query output
+-128	-2147483648	-1
+
+
+-- !query
+SELECT bit_get(CAST(11 AS BIGINT), 0) AS a, bit_get(CAST(11 AS BIGINT), 2) AS b
+-- !query schema
+struct<a:tinyint,b:tinyint>
+-- !query output
+1	0
+
+
+-- !query
+SELECT width_bucket(5.0, 0.0, 10.0, 5) AS a, width_bucket(-1.0, 0.0, 10.0, 5) AS b,
+       width_bucket(11.0, 0.0, 10.0, 5) AS c, width_bucket(5.0, 10.0, 0.0, 5) AS d
+-- !query schema
+struct<a:bigint,b:bigint,c:bigint,d:bigint>
+-- !query output
+3	0	6	3

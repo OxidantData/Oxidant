@@ -47,6 +47,16 @@ serde_json = "1"
 # Spark `from_json` parses date/timestamp leaves with Spark format patterns; chrono is already in the
 # tree via arrow (same 0.4 line), so the lock resolves to the existing version — no new dep tree.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# IANA tz database for `from_utc_timestamp`/`to_utc_timestamp`/`convert_timezone`
+# (`spark_functions/spark_timezone.rs`). Already in the lockfile via arrow-array and
+# datafusion-functions, so this adds no new dependency — only a direct edge.
+chrono-tz = { version = "0.10", default-features = false }
+# Spark hash functions (`spark_functions/spark_hash.rs`). DataFusion 54 ships md5 and
+# sha224/256/384/512 but no SHA-1 and no CRC-32, so `sha`/`sha1`/`sha2`/`crc32` need these
+# directly. All three are already in the lockfile via datafusion-functions and delta-kernel.
+sha1 = "0.10"
+sha2 = "0.10"
+crc32fast = "1"
 # `register_table`'s CTAS write path builds its own fresh runtime on a dedicated OS thread (the
 # DataFusion trait method is sync, but Glue/Hive/object-store writes are async) — needs `rt` in
 # [dependencies], not just as a test-only dev-dependency. `sync` adds `tokio::sync::Mutex`, used by

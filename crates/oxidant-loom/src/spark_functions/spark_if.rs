@@ -1,4 +1,5 @@
-//! Spark `if(cond, a, b)` — exactly `CASE WHEN cond THEN a ELSE b END` with the two result
+//! Spark `if(cond, a, b)` (and its Databricks spelling `iff`) — exactly
+//! `CASE WHEN cond THEN a ELSE b END` with the two result
 //! branches widened to their least-common type. DataFusion has no `if` builtin (its planner
 //! rejects the call with `Invalid function 'if'`).
 //!
@@ -36,19 +37,23 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 
-/// Register Spark's `if` into `ctx`.
+/// Register Spark's `if` (and Databricks' `iff` spelling of it) into `ctx`.
 pub fn register(ctx: &SessionContext) {
-    ctx.register_udf(ScalarUDF::from(SparkIf::new()));
+    ctx.register_udf(ScalarUDF::from(SparkIf::new("if")));
+    // `iff(cond, t, f)` is Databricks' name for exactly this function, down to the coercion rules.
+    ctx.register_udf(ScalarUDF::from(SparkIf::new("iff")));
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct SparkIf {
+    name: &'static str,
     signature: Signature,
 }
 
 impl SparkIf {
-    fn new() -> Self {
+    fn new(name: &'static str) -> Self {
         Self {
+            name,
             // `user_defined` so DataFusion calls our `coerce_types` (where we delegate branch
             // widening to the same helper a native `CASE` uses).
             signature: Signature::user_defined(Volatility::Immutable),
@@ -112,7 +117,7 @@ impl SparkIf {
 
 impl ScalarUDFImpl for SparkIf {
     fn name(&self) -> &str {
-        "if"
+        self.name
     }
 
     fn signature(&self) -> &Signature {
@@ -148,7 +153,7 @@ impl ScalarUDFImpl for SparkIf {
         let (Some(cond), Some(then_expr), Some(else_expr), None) =
             (it.next(), it.next(), it.next(), it.next())
         else {
-            return plan_err!("if expects exactly 3 arguments");
+            return plan_err!("{} expects exactly 3 arguments", self.name);
         };
         let case = Case::new(
             None,
@@ -161,7 +166,10 @@ impl ScalarUDFImpl for SparkIf {
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         // Unreachable: `simplify` always rewrites `if` to a `CASE` before execution (same contract
         // as DataFusion's `arrow_cast`). If this ever fires, the optimizer was bypassed.
-        exec_err!("if should have been simplified to CASE WHEN ... END before execution")
+        exec_err!(
+            "{} should have been simplified to CASE WHEN ... END before execution",
+            self.name
+        )
     }
 }
 

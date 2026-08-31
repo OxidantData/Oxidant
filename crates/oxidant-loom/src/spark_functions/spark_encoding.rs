@@ -5,8 +5,9 @@
 //!
 //! - `bit_count(x)` — number of set bits, **respecting the integer width** of the input
 //!   (`bit_count(CAST(-1 AS TINYINT))` = 8, not 64). Booleans map to 0/1. Returns `int`.
-//! - `getbit(x, pos)` — the bit at `pos` (0 = least-significant) of a 64-bit integer, as
-//!   `tinyint`. `pos` outside `[0, 63]` is a runtime error in Spark.
+//! - `getbit(x, pos)` / `bit_get(x, pos)` — the bit at `pos` (0 = least-significant) of a 64-bit
+//!   integer, as `tinyint`. `pos` outside `[0, 63]` is a runtime error in Spark. Two spellings of
+//!   one function.
 //! - `mask(str [, upper [, lower [, digit [, other]]]])` — replace upper-case letters with
 //!   `upper` (default `X`), lower-case with `lower` (default `x`), digits with `digit`
 //!   (default `n`), and every other char with `other` (default unchanged). A `NULL` mask char
@@ -30,7 +31,10 @@ use datafusion::prelude::SessionContext;
 /// Register all encoding/bit/url Spark functions into `ctx`.
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(BitCount::new()));
-    ctx.register_udf(ScalarUDF::from(GetBit::new()));
+    // `bit_get` is Spark's other spelling of `getbit`. Registered as an alias here rather
+    // than in `register_spark_function_aliases`, which runs before this module and can only
+    // target DataFusion built-ins.
+    ctx.register_udf(ScalarUDF::from(GetBit::new()).with_aliases(["bit_get"]));
     ctx.register_udf(ScalarUDF::from(Mask::new()));
     ctx.register_udf(ScalarUDF::from(ParseUrl::new()));
     ctx.register_udf(ScalarUDF::from(UrlEncode::new()));

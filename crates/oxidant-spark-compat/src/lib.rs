@@ -33,9 +33,11 @@
 //! - [`runner`]    — replay a whole file / corpus, collecting reports.
 //! - [`report`]    — aggregate into a JSON + markdown parity scoreboard.
 //! - [`splitter`]  — `.sql` input helpers (`--IMPORT` resolution; secondary to golden replay).
+//! - [`functions`] — Oxidant's live function registry vs. the Databricks builtin surface.
 
 pub mod classify;
 pub mod format;
+pub mod functions;
 pub mod golden;
 pub mod normalize;
 pub mod report;
