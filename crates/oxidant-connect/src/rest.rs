@@ -1491,6 +1491,8 @@ impl StatementStore {
             retention_freed = retention_freed.saturating_add(events.freed_bytes);
         }
         let before = disk::measure_roots(&roots).billed;
+        #[cfg(test)]
+        disk::sweep_midpoint();
         // The running total, decremented by what each unlink reports. The whole tree used to be
         // re-walked *per candidate* — pruning 10,000 statements meant 10,000 full recursive
         // directory walks interleaved with 10,000 lock/unlock cycles of the store mutex that
@@ -1554,9 +1556,25 @@ impl StatementStore {
         let usage = disk::measure_roots(&roots);
         report.used_bytes = usage.billed;
         report.foreign_bytes = usage.foreign;
-        report.freed_bytes = before
-            .saturating_sub(report.used_bytes)
-            .saturating_add(retention_freed);
+        // `before - used`, NOT `before - used_bytes`: the bytes this sweep actually unlinked,
+        // summed from the `spend` calls above, rather than the difference between two walks of
+        // the tree.
+        //
+        // The difference is not equivalent, because the two walks are not of the same tree.
+        // Nothing here holds a lock over the filesystem: a spill landing, a journal segment
+        // being rewritten, any concurrent write between the two `measure_roots` calls lands in
+        // `before - used_bytes` and is reported as though the sweeper had reclaimed it. That is
+        // wrong twice over — it misreports the log line an operator reads, and it made
+        // `a_free_space_shortfall_the_engine_did_not_cause_deletes_nothing` flaky: that test
+        // asserts the sweeper freed nothing, and CI saw `freed_bytes: 4376` with every removal
+        // counter at zero, i.e. bytes "freed" by a sweep that unlinked nothing. Byte-identical
+        // trees passed and failed the same assertion minutes apart.
+        //
+        // Summing the unlinks is both deterministic and closer to what the field means. It does
+        // report gross rather than net: pruning a statement that appends a tombstone now counts
+        // the bytes removed, not the removal minus the tombstone. `used_bytes` remains the
+        // re-measured truth for what is on disk, which is the number `/api/status` serves.
+        report.freed_bytes = before.saturating_sub(used).saturating_add(retention_freed);
         report.over_budget = report.used_bytes > cfg.disk_max_bytes;
 
         // The free-space floor, measured *after* the pruning it does not drive — nothing above
@@ -8421,7 +8439,8 @@ mod tests {
         assert_eq!(report.orphan_results_removed, 0, "{report:?}");
         assert_eq!(report.rolled_logs_removed, 0, "{report:?}");
         assert_eq!(report.dumps_removed, 0, "{report:?}");
-        assert_eq!(report.freed_bytes, 0, "{report:?}");
+        // Substance before arithmetic: these say "nothing was deleted" directly, so a real
+        // regression fails on the file it lost rather than on a byte count that only implies it.
         assert!(rolled.exists() && dump.exists(), "{report:?}");
         for id in &ids {
             assert!(
@@ -8434,6 +8453,11 @@ mod tests {
             5,
             "and the whole history is still there"
         );
+        // Exact, and safe to assert exactly: `freed_bytes` sums what the sweep unlinked. It was
+        // once `before - used_bytes`, a difference between two separate walks of the tree, which
+        // made this line flaky — CI hit `freed_bytes: 4376` here with every removal counter at
+        // zero, because a concurrent write between the walks counts as bytes reclaimed.
+        assert_eq!(report.freed_bytes, 0, "{report:?}");
 
         // What the engine does instead: stop writing the large thing, and say so.
         let counters = store.status_counters().expect("history is on");
@@ -8451,6 +8475,57 @@ mod tests {
         assert!(
             store.history.as_ref().expect("history").results.is_paused(),
             "spill is paused while the volume is short"
+        );
+        store.shutdown_for_test();
+    }
+
+    /// Regression for the flake in
+    /// [`a_free_space_shortfall_the_engine_did_not_cause_deletes_nothing`]: `freed_bytes` counts
+    /// what the sweep unlinked, never the difference between two walks of the tree.
+    ///
+    /// It used to be `before - used_bytes` — two separate `measure_roots` calls with the whole
+    /// prune pass between them and nothing holding the filesystem still. Any byte that left the
+    /// tree in that window was reported as bytes the sweeper reclaimed, so CI saw
+    /// `freed_bytes: 4376` on a sweep whose every removal counter was zero, and byte-identical
+    /// trees passed and failed the assertion minutes apart.
+    ///
+    /// The hook makes that window deterministic: a file disappears mid-sweep, by a hand that is
+    /// not the sweeper's. Under the old arithmetic this test reports 4096 and fails.
+    #[tokio::test]
+    async fn freed_bytes_counts_what_the_sweep_unlinked_not_the_walk_delta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Nowhere near any limit, so the sweeper has no reason to unlink anything.
+        let store = history_store_with(dir.path(), |c| {
+            c.disk_max_bytes = u64::MAX;
+            c.disk_min_free_bytes = 0;
+        });
+
+        // Measured (it is inside a budget root) but not a shape the sweeper prunes or retention
+        // expires — the same rule as `the_sweeper_never_unlinks_a_file_the_engine_did_not_write`.
+        let interloper = dir.path().join("logs").join("not-a-log.txt");
+        std::fs::create_dir_all(interloper.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&interloper, vec![b'x'; 4_096]).expect("write");
+
+        let victim = interloper.clone();
+        disk::SWEEP_MIDPOINT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&victim).expect("the interloper removes its own file");
+            }));
+        });
+        let report = store.sweep_disk();
+        disk::SWEEP_MIDPOINT.with(|hook| *hook.borrow_mut() = None);
+
+        assert!(
+            !interloper.exists(),
+            "the hook must actually have changed the tree, or this proves nothing"
+        );
+        assert!(
+            !report.removed_anything(),
+            "the sweeper unlinked nothing: {report:?}"
+        );
+        assert_eq!(
+            report.freed_bytes, 0,
+            "4 KiB left the tree under the sweeper, but the sweeper did not free them: {report:?}"
         );
         store.shutdown_for_test();
     }
