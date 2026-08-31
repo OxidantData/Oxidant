@@ -1219,11 +1219,21 @@ mod tests {
             )
             .expect("seed");
         }
-        let w = RollingWriter::open_at(c, utc(2026, 8, 26, 14, 0), None).expect("open");
         probes.store(0, Ordering::Relaxed);
 
-        let mut attempts = HashMap::new();
-        w.convert_pending(&mut attempts);
+        // The pass under test is the boot pass itself: `open_at` queues exactly one
+        // `Job::Rolled`, and the worker is purely message-driven, so with no logging in this
+        // test nothing ever rolls and no second pass exists.
+        //
+        // It used to open the writer, reset the counter, and then run `convert_pending` itself —
+        // a second pass racing the boot pass, which the test only won sometimes. When the boot
+        // pass converted all five files first, the test's own pass found nothing pending and
+        // returned at the `pending.is_empty()` guard *before* probing, so the counter read 0.
+        // CI hit exactly that under the slower instrumented build: `left: 0, right: 1`.
+        let w = RollingWriter::open_at(c, utc(2026, 8, 26, 14, 0), None).expect("open");
+        // `Job::Stop` goes down the same channel as that boot `Job::Rolled` and the queue is
+        // FIFO, so joining the worker here proves the boot pass has run. `close()` flushes and
+        // syncs but queues nothing, so it cannot smuggle in another pass.
         w.shutdown();
 
         assert_eq!(
