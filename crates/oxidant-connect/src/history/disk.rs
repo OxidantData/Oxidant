@@ -405,6 +405,28 @@ pub(crate) fn remove(file: &Prunable) -> Option<u64> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Test seam: runs between the sweep's two [`measure_roots`] calls.
+    ///
+    /// That window is the one place the sweep's accounting can be lied to — the tree is walked
+    /// twice with no lock over the filesystem in between, so a spill landing or a journal
+    /// segment being rewritten changes the second walk. A test sets this hook to make that
+    /// change happen on purpose. Nothing in production ever sets it.
+    pub(crate) static SWEEP_MIDPOINT: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Fire the [`SWEEP_MIDPOINT`] hook, if a test set one.
+#[cfg(test)]
+pub(crate) fn sweep_midpoint() {
+    SWEEP_MIDPOINT.with(|hook| {
+        if let Some(f) = hook.borrow().as_ref() {
+            f();
+        }
+    });
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
