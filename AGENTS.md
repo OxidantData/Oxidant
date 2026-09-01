@@ -57,6 +57,96 @@ pulls in real DataFusion/Arrow/tonic and the engine executes SQL end-to-end.
 - Spark-SQL parity gate: `cargo build -p oxidant-spark-compat --bin oxidant-parity` then
   `./target/debug/oxidant-parity ratchet --baseline parity/baseline.json --out-dir parity`.
 
+## Code Review Rules
+
+Apply these rules to behavior introduced or changed by the diff. Report a finding only when there
+is a reachable correctness, security, reliability, operability, or cost impact; name the trigger,
+impact, and safe path. Do not report formatting or pre-existing debt unless the change worsens it,
+and do not assume green CI proves the high-risk properties below. Apply every group relevant to the
+changed behavior; security-focused reviews start with trust boundaries but follow their effects
+into correctness and delivery. If changed code merely passes through an existing violation without
+expanding its reachability, exposure, or impact, record it as context rather than a finding.
+
+### Security and trust boundaries
+
+- Treat Spark Connect, REST/UI, MCP, Flight, catalog/config, object-store, pipeline, artifact/UDF,
+  and workflow inputs as trust boundaries. A new or expanded route must state its trust model and
+  authenticate **before** parsing privileged mutations or sensitive exports. Use the shared bearer
+  gate for token-protected operational routes, preserving disabled/`404`, invalid/`401`, and
+  constant-time comparison behavior. The token is not transport security and does not authenticate
+  Spark Connect, REST statements, or general Flight query/shuffle traffic; authenticated Flight
+  `ACTION_LOGS` is a deliberate exception. Existing perimeter-trusted endpoints are not a reason
+  to demand an unrelated auth retrofit, but public exposure or broader authority without an
+  explicit design and negative tests is a blocker.
+- When client-controlled data selects a URL, host, worker, catalog, object location, filesystem
+  path, executable, argument, or credential source, validate it at the sink and keep it separate
+  from deployment-owned state. Bound request/upload/output size, time, process count, and memory.
+  Use server-generated temporary names; invoke a fixed executable without a shell and pass only
+  server-derived or allowlisted arguments. Treat UDF, pickle, and similar deserialization as code
+  execution requiring explicit opt-in, authorization, isolation, and resource bounds.
+  Deployment-owned endpoints are an exception only when clients cannot rewrite them.
+- When Lake Formation is enabled, authorization, principal, vended credentials, and driver/worker
+  enforcement metadata must resolve before the first protected read and must not degrade to ambient
+  credentials or an unenforced provider on mismatch. An explicit "not governed" result and reuse of
+  an already-enforced cached provider during transient revalidation are intentional exceptions. Do
+  not introduce or widen a path that emits secret values through protocol responses, process
+  arguments, logs, errors, history, dumps, examples, or workflow artifacts. For engine-created
+  history, result, and log artifacts under the data directory or its overrides, preserve redaction
+  and the Unix `0600` file/`0700` directory creation guarantees.
+
+### Query, protocol, and distributed correctness
+
+- Changes at Spark Connect or Arrow boundaries must preserve client-visible schemas, ordering,
+  types, null/error/status behavior, and operation/session identity. Successful query-result
+  streams retain typed zero-row Arrow batches and terminal `ResultComplete`; error and cancellation
+  paths must not emit false completion. Add project-owned `StageTicket`/protobuf fields with unused
+  tags and defaults older peers can ignore. Require a focused stock-PySpark, protocol, or round-trip
+  regression test; aggregate parity counts alone are not proof of changed behavior.
+- Planner or generated-stage-SQL changes that alter supported shapes must exercise
+  `plan_distributed_logical` directly and reparse emitted SQL under the worker's Databricks dialect
+  against realistic `shuffle_input*` tables. Dispatch or scheduler changes that affect placement
+  must use a real two-worker test proving single-node result equality and worker task/stage evidence.
+  Strict mode fails closed when workers are configured but unavailable or a shape is unsupported;
+  intentional local paths remain valid with no configured workers, strict mode off, or a table
+  created only in the driver. Preserve snapshot, policy, and principal metadata through initial
+  dispatch, retries, and recomputation.
+- Retry-classification changes must account for whether the original task can still run: client
+  deadlines/timeouts, driver cancellation, and ordinary execution failures remain terminal.
+  Preserve the separately bounded paths for transport/availability failures, missing-shuffle
+  producer recomputation, opt-in speculation, and the single worker-local no-progress retry with a
+  flipped join strategy. Test attempt bounds, stage-metadata propagation, slot release,
+  partial-spill cleanup, and committed-output retention.
+- Memory-pool, join, shuffle, spill, optimizer, or cache changes must retain result equality and
+  authorization under the bounded-memory, spill-threshold, or skew condition they affect; timing
+  alone is not correctness evidence, and tuning may not remove a resource bound for a benchmark win.
+
+### Delivery, deployment, and evidence
+
+- Required PR checks must always be created and report a result. Do not remove one, mask its
+  failure, or add filters that leave it absent; use the existing `detect code changes` pattern for
+  docs-only skips. A parity/coverage-floor reduction or skip/oracle change needs a documented root
+  cause plus targeted regression evidence. Apply `full-gates` to TPC-H/TPC-DS planner, stage-SQL,
+  distributed-execution, or harness changes; it complements rather than replaces focused tests.
+  Preserve the release-PR -> human merge -> tag -> workflow-dispatched binary/image pipeline.
+- Dependency changes that alter resolution must update `Cargo.lock` and review newly introduced
+  advisory, license, wildcard, and source findings. Existing `cargo deny` debt is not an unrelated
+  blocker, but the diff must not add an unapproved finding or weaken `deny.toml`.
+- Privileged workflow, image, and deployment changes must not broaden GitHub/IAM permissions,
+  secret reach, public ingress, or mutable execution inputs without demonstrated need. Pin new
+  third-party actions to commit SHAs, images to digests, and downloaded installers to fixed versions
+  with publisher checksum or signature verification. Preserve IMDSv2, encrypted storage, non-root
+  hardening, scoped ingress, and Flight ingress limited to driver/worker security groups. IAM
+  wildcards require an API that cannot scope resources plus narrow actions, principal, and available
+  conditions. Changes to deployed capacity, storage, network, or retention defaults require
+  blast-radius, rollback, and relative-cost analysis.
+- Treat user-facing README/docs/examples and performance or support statements as product contracts
+  that must match verified runtime and release behavior. Separate released facts, branch-only
+  behavior, roadmap, and inference. Performance claims require a reproducible command and raw result
+  artifact plus commit/version, hardware, data/query set, build profile, relevant
+  cache/memory/shuffle settings, and correctness result; distributed claims also require strict-mode
+  worker-stage evidence. Label single-node, force-spill, synthetic/subset, cherry-picked, or
+  composed-best results and limit conclusions to the measured scope.
+
 ### Running the engine + a hello-world query
 - Start the server: `./target/debug/oxidant start --port 50051` (a **daemon** — `oxidant
   status` / `stop` / `restart` drive it; `oxidant spark server … --foreground` is the
@@ -235,4 +325,3 @@ unmergeable. A *skipped* job satisfies a required check; an *absent* one does no
 | coverage gates | yes | clickbench, clickbench-grpc, correctness |
 | Spark SQL parity ratchet | yes | `oxidant-parity ratchet --baseline parity/baseline.json` |
 | line coverage | yes | disk reclaim + `CARGO_PROFILE_*_DEBUG=1` + `cargo llvm-cov --workspace --no-report`, purge `*.tmp*`, `report --html`, floor gate vs `coverage-floor.json` |
-
