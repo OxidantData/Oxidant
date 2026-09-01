@@ -495,14 +495,24 @@ impl CatalogRegistry {
         self.lock().catalogs.get(name).cloned()
     }
 
-    /// All catalog names, built-in first, then external in a stable (sorted) order.
+    /// All catalog names for listings, in a stable (sorted) order.
+    ///
+    /// When at least one external catalog is registered, the built-in
+    /// `spark_catalog` is a fallback nothing needs to see — an operator who
+    /// wired a real metastore wants the listing to show exactly what they
+    /// configured (a Glue deployment shows one catalog: `glue`). The builtin
+    /// stays registered and resolvable ([`contains`] / [`provider`] are
+    /// unchanged); only the listing hides it. With no external catalogs the
+    /// builtin is the whole catalog surface, so it lists as before.
     pub fn catalog_names(&self) -> Vec<String> {
         let state = self.lock();
         let mut names: Vec<String> = state.catalogs.keys().cloned().collect();
         names.sort();
-        let mut out = vec![DEFAULT_CATALOG.to_string()];
-        out.extend(names.into_iter().filter(|n| n != DEFAULT_CATALOG));
-        out
+        if names.is_empty() {
+            return vec![DEFAULT_CATALOG.to_string()];
+        }
+        names.retain(|n| n != DEFAULT_CATALOG);
+        names
     }
 
     /// The current catalog name.
@@ -678,7 +688,11 @@ mod tests {
         assert_eq!(reg.current_namespace(), vec![DEFAULT_NAMESPACE.to_string()]);
         reg.register("prod", Arc::new(fake()));
         assert!(reg.contains("prod"));
-        assert_eq!(reg.catalog_names(), vec!["spark_catalog", "prod"]);
+        // The builtin is hidden once an external catalog exists — the listing
+        // shows exactly what the operator configured.
+        assert_eq!(reg.catalog_names(), vec!["prod"]);
+        // ... but it stays registered and selectable as the fallback.
+        assert!(reg.contains(DEFAULT_CATALOG));
         reg.set_current_catalog("prod").unwrap();
         assert_eq!(reg.current_catalog(), "prod");
         assert!(reg.set_current_catalog("nope").is_err());
