@@ -998,6 +998,20 @@ impl PgWire {
         result
     }
 
+    /// Forget the *control* session when a call on it failed, for exactly
+    /// the reason the replication session gets dropped: the socket's death
+    /// is only ever discovered by using it, and a cached corpse answers
+    /// every retry with the same error until the process restarts. A
+    /// publisher restart kills this connection just as it kills the
+    /// stream's — and `slot_metrics` is on every plan, so a dead control
+    /// connection is a pipeline that never comes back.
+    fn control_forget_on_error<T>(&mut self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            self.control = None;
+        }
+        result
+    }
+
     /// Drop the slot, waiting a bounded time for whoever holds it to let go.
     ///
     /// `DROP_REPLICATION_SLOT … WAIT` blocks until the slot goes inactive, and there is no
@@ -1018,7 +1032,8 @@ impl PgWire {
                      WHERE slot_name::text = $1 AND active_pid IS NOT NULL",
                     &[slot],
                 )
-                .await?;
+                .await;
+            let held = self.control_forget_on_error(held)?;
             let Some(pid) = held
                 .first()
                 .and_then(|row| row.first())
@@ -1060,7 +1075,8 @@ impl CdcWire for PgWire {
                  WHERE slot_name::text = $1",
                 &[slot.as_str()],
             )
-            .await?;
+            .await;
+        let existing = self.control_forget_on_error(existing)?;
         // Presence is the row, not the value: a slot that has never confirmed anything has a
         // NULL `confirmed_flush_lsn` and is still very much there.
         let existed = !existing.is_empty();
@@ -1215,7 +1231,8 @@ impl CdcWire for PgWire {
                  LEFT JOIN pg_replication_slots s ON s.slot_name::text = $1",
                 &[slot.as_str()],
             )
-            .await?;
+            .await;
+        let row = self.control_forget_on_error(row)?;
         let row = row.first().ok_or_else(|| {
             Error::Io("postgres_cdc: the server did not report its flush LSN".into())
         })?;

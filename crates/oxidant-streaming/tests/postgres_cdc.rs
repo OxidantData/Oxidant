@@ -966,3 +966,48 @@ async fn the_thousand_row_fixture_snapshots_every_row_exactly_once() {
         let _ = control.execute(statement).await;
     }
 }
+
+/// The control connection dies mid-life — a publisher restart, a failover, an
+/// operator's `pg_terminate_backend`. The first plan after the kill may fail
+/// while it discovers the corpse; the NEXT one must have re-dialled.
+///
+/// Regression test for the shape the pipeline's log showed after a source
+/// restart: `slot_metrics` on every plan, run against a control session that
+/// was cached at startup and never dropped — so the scheduler's retries all
+/// read the same dead socket, forever. The replication session had
+/// `forget_on_error`; the control session now has the same.
+#[tokio::test]
+#[ignore = "set OXIDANT_PG_TEST_DSN to run this against a real server"]
+async fn a_lost_control_connection_is_re_dialled() {
+    gated!(connect);
+    let fixture = Fixture::new(&connect, "ctl_reconnect", "id int primary key").await;
+    let engine = Engine::new();
+    let mut source = fixture.source();
+
+    // Open the source: the slot and both sessions now exist.
+    let _ = one_batch(&mut source, &engine).await;
+
+    // Kill the control session server-side. The control session is an
+    // ordinary client backend; the replication session is a walsender and
+    // has its own recovery (tested in postgres_cdc.rs's unit tests).
+    fixture
+        .sql(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE application_name = 'oxidant-postgres-cdc' \
+               AND backend_type = 'client backend' \
+               AND pid <> pg_backend_pid()",
+        )
+        .await;
+
+    // The discovery plan is allowed to fail: the socket's death is only
+    // learned by using it.
+    let _ = source.plan_batch(&engine).await;
+
+    // The retry must dial a fresh control connection rather than answer with
+    // the same error again — this is the assertion that fails without the
+    // fix, every time, forever.
+    source
+        .plan_batch(&engine)
+        .await
+        .expect("the retry re-dials the control connection");
+}
