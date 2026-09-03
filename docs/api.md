@@ -23,6 +23,7 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/v1/catalogs/{catalog}/namespaces` | Schemas in a catalog |
 | `GET` | `/api/v1/catalogs/{catalog}/tables` | Tables in `?namespace=` (default `default`) |
 | `GET` | `/api/v1/catalogs/{catalog}/tables/{table}/columns` | Columns and types of one table |
+| `GET` | `/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/stats` | Freshness of one table, from its snapshot metadata |
 | `GET` | `/api/v1/catalogs/autocomplete` | Identifier suggestions for a dotted `?prefix=` |
 | `GET` | `/api/dashboards` | Dashboards, newest-updated first |
 | `POST` | `/api/dashboards` | Create a dashboard |
@@ -159,7 +160,7 @@ worker endpoints (see [workers.md](workers.md)).
 
 ## Catalog browsing
 
-Four routes walk the warehouse one level at a time, which is what lets a client load only what
+These routes walk the warehouse one level at a time, which is what lets a client load only what
 it is showing — the embedded console's [catalog rail](web-ui.md#the-catalog-rail) is one such
 client.
 
@@ -186,6 +187,42 @@ curl -s "http://localhost:4040/api/v1/catalogs/spark_catalog/tables/orders/colum
 - An unknown catalog is `404`. A table that cannot be described — because it does not exist, or
   because its source is unreachable — is `500 describe table: unable to fetch columns`; there is
   no `404` on that route to tell the two apart.
+- **The stats route below is the one exception to the query-parameter rule** — its namespace is
+  a path segment, still dot-joined (`.../namespaces/a.b/tables/t/stats`).
+
+### Table freshness
+
+```sh
+curl -s http://localhost:4040/api/v1/catalogs/prod/namespaces/sales/tables/orders/stats
+```
+
+```json
+{ "row_count": 128394, "data_updated_at": 1717171717000, "format": "iceberg", "stats_source": "snapshot_metadata" }
+```
+
+Read for pollers that need to know how current a table is without paying for a scan: this route
+runs no query and opens no data file. It reads an Iceberg table's current snapshot summary out
+of `metadata.json` (no manifest list, no manifests), or resolves a Delta snapshot far enough for
+its commit timestamp (no `Add` replay).
+
+All four keys are always present; an absent value is `null`, never a missing key.
+
+- `data_updated_at` is milliseconds since the Unix epoch — the Iceberg snapshot's `timestamp-ms`,
+  or Delta's In-Commit Timestamp when enabled and otherwise the latest commit file's
+  last-modified time.
+- `row_count` is Iceberg's `total-records`, the table's count as of that snapshot. It is `null`
+  for Delta (the log carries no cheap row count), when the writer recorded no `total-records`,
+  and when the snapshot still has merge-on-read delete files — `total-records` does not subtract
+  the rows they mask, so it would be an upper bound rather than a count.
+- `format` is what the catalog declares: `iceberg`, `delta`, `parquet`, `csv`, `json`, or
+  `unknown` for a session-registered table in `spark_catalog`.
+- `stats_source` is `snapshot_metadata` when the numbers came from the table's own metadata, and
+  `unavailable` when the table is readable but has nothing to report — a format with no snapshot
+  metadata, or an Iceberg table created but never committed to.
+- **`unavailable` never means "could not read".** An unknown catalog or table is `404`; a table
+  whose metadata exists but cannot be read (a corrupt `metadata.json`, an unreachable store) is
+  `500 table stats: unable to read this table's <format> snapshot metadata`, with the failing
+  location in the server log rather than the response.
 
 ### Autocomplete
 
