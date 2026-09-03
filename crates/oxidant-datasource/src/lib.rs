@@ -325,6 +325,49 @@ fn delta_column_mappings(schema: &delta_kernel::schema::Schema) -> Vec<ColumnMap
     output
 }
 
+/// Freshness read from a Delta table's latest (or `version`-pinned) commit.
+///
+/// Deliberately cheaper than [`delta_active_files`]: building the [`delta_kernel::Snapshot`]
+/// replays the `_delta_log` far enough to know the current protocol/metadata and commit, but
+/// never calls `scan_builder()`/`scan_metadata()` — so no per-file `Add` action is enumerated
+/// and no data file is read. Delta's CRC-cached file stats (`Snapshot::get_file_stats_if_present`)
+/// carry file/byte counts but no row count, so there is no cheap row-count source here —
+/// `row_count` is left to the caller to report as `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeltaSnapshotStats {
+    /// The resolved version's commit timestamp, in milliseconds since the Unix epoch: the
+    /// In-Commit Timestamp when enabled, otherwise the commit file's filesystem
+    /// last-modified time (`Snapshot::get_timestamp`). `None` only if the commit's timestamp
+    /// could not be read (a missing or unreadable commit file).
+    pub updated_at_ms: Option<i64>,
+}
+
+/// Resolve [`DeltaSnapshotStats`] for a Delta table without reading any data file.
+pub async fn delta_snapshot_stats(
+    store: Arc<dyn ObjectStore>,
+    table_location: &str,
+    version: Option<u64>,
+) -> Result<DeltaSnapshotStats> {
+    let table_root = table_url(table_location)?;
+    tokio::task::spawn_blocking(move || {
+        use delta_kernel::Snapshot;
+        use delta_kernel_default_engine::DefaultEngineBuilder;
+
+        let engine = DefaultEngineBuilder::new(store).build();
+        let mut builder = Snapshot::builder_for(table_root.as_str());
+        if let Some(version) = version {
+            builder = builder.at_version(version);
+        }
+        let snapshot = builder
+            .build(&engine)
+            .map_err(|e| Error::Io(format!("Delta snapshot resolution failed: {e}")))?;
+        let updated_at_ms = snapshot.get_timestamp(&engine).ok();
+        Ok(DeltaSnapshotStats { updated_at_ms })
+    })
+    .await
+    .map_err(|e| Error::Execution(format!("Delta stats task failed: {e}")))?
+}
+
 /// Hive-style partition pruning: keep only paths whose `key=value` segments match `filter`.
 ///
 /// `filter` is a simple SQL fragment like `year = 2024 AND month = 3` or `region='us'`.
@@ -604,6 +647,50 @@ pub async fn iceberg_active_files(
                 .as_ref(),
         ),
     })
+}
+
+/// Row count and freshness read straight from an Iceberg table's CURRENT snapshot summary.
+///
+/// Parses only the metadata JSON — the same `TableMetadata` [`iceberg_active_files`] parses
+/// before it goes on to fetch the manifest list and manifests. This stops one step earlier: no
+/// manifest list, no manifest, no data file is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcebergSnapshotStats {
+    /// `total-records` from the current snapshot's summary, when the writer recorded one.
+    pub row_count: Option<i64>,
+    /// The current snapshot's `timestamp-ms`.
+    pub updated_at_ms: i64,
+}
+
+/// Resolve [`IcebergSnapshotStats`] for a table's current snapshot, or `None` if the table has
+/// no snapshot yet (freshly created, no commits).
+pub async fn iceberg_snapshot_stats(
+    store: Arc<dyn ObjectStore>,
+    table_location: &str,
+    metadata_location: Option<&str>,
+) -> Result<Option<IcebergSnapshotStats>> {
+    use iceberg::spec::TableMetadata;
+
+    let table_root = table_url(table_location)?;
+    let metadata_url = match metadata_location {
+        Some(location) => resolve_location(&table_root, location)?,
+        None => discover_iceberg_metadata(store.as_ref(), &table_root).await?,
+    };
+    let metadata_bytes = get_bytes(store.as_ref(), &metadata_url).await?;
+    let metadata: TableMetadata = serde_json::from_slice(&metadata_bytes)
+        .map_err(|e| Error::Io(format!("invalid Iceberg metadata `{metadata_url}`: {e}")))?;
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return Ok(None);
+    };
+    let row_count = snapshot
+        .summary()
+        .additional_properties
+        .get("total-records")
+        .and_then(|v| v.parse::<i64>().ok());
+    Ok(Some(IcebergSnapshotStats {
+        row_count,
+        updated_at_ms: snapshot.timestamp_ms(),
+    }))
 }
 
 fn iceberg_delete_applies(
@@ -1352,6 +1439,153 @@ mod tests {
         assert!(
             err.to_string().contains("incompatible snapshot identity"),
             "got: {err}"
+        );
+    }
+
+    /// Bare `metadata.json` for [`iceberg_snapshot_stats`] tests: no manifest list, no
+    /// manifest, no data file — that's the point, the function under test never reads them.
+    fn write_iceberg_metadata_only(
+        dir: &std::path::Path,
+        current_snapshot_id: Option<i64>,
+        summary: serde_json::Value,
+        timestamp_ms: i64,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir.join("metadata")).unwrap();
+        let snapshots: Vec<serde_json::Value> = current_snapshot_id
+            .into_iter()
+            .map(|id| {
+                serde_json::json!({
+                    "snapshot-id": id,
+                    "sequence-number": 1,
+                    "timestamp-ms": timestamp_ms,
+                    "summary": summary,
+                    "manifest-list": local_url(&dir.join("metadata/unread-snap.avro")),
+                    "schema-id": 0
+                })
+            })
+            .collect();
+        let metadata = serde_json::json!({
+            "format-version": 2,
+            "table-uuid": "00000000-0000-0000-0000-000000000099",
+            "location": local_url(dir),
+            "last-sequence-number": 1,
+            "last-updated-ms": timestamp_ms,
+            "last-column-id": 1,
+            "current-schema-id": 0,
+            "schemas": [{
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+            }],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 999,
+            "properties": {},
+            "current-snapshot-id": current_snapshot_id,
+            "snapshots": snapshots,
+            "snapshot-log": [],
+            "metadata-log": [],
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "default-sort-order-id": 0,
+            "refs": {}
+        });
+        let path = dir.join("metadata/00001-fixture.metadata.json");
+        std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn iceberg_snapshot_stats_reads_total_records_and_timestamp_from_the_summary() {
+        let dir = TempDir::new().unwrap();
+        let metadata_path = write_iceberg_metadata_only(
+            dir.path(),
+            Some(7),
+            serde_json::json!({"operation": "append", "total-records": "12345"}),
+            1_700_000_000_000,
+        );
+        let metadata_location = local_url(&metadata_path);
+
+        let stats = iceberg_snapshot_stats(
+            local_store(),
+            dir.path().to_str().unwrap(),
+            Some(&metadata_location),
+        )
+        .await
+        .unwrap()
+        .expect("table has a current snapshot");
+
+        assert_eq!(stats.row_count, Some(12_345));
+        assert_eq!(stats.updated_at_ms, 1_700_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn iceberg_snapshot_stats_is_none_without_a_current_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let metadata_path = write_iceberg_metadata_only(dir.path(), None, serde_json::json!({}), 0);
+        let metadata_location = local_url(&metadata_path);
+
+        let stats = iceberg_snapshot_stats(
+            local_store(),
+            dir.path().to_str().unwrap(),
+            Some(&metadata_location),
+        )
+        .await
+        .unwrap();
+
+        assert!(stats.is_none(), "a freshly created table has no snapshot");
+    }
+
+    #[tokio::test]
+    async fn iceberg_snapshot_stats_is_none_when_the_summary_has_no_total_records() {
+        let dir = TempDir::new().unwrap();
+        let metadata_path = write_iceberg_metadata_only(
+            dir.path(),
+            Some(1),
+            serde_json::json!({"operation": "append"}),
+            1_700_000_000_000,
+        );
+        let metadata_location = local_url(&metadata_path);
+
+        let stats = iceberg_snapshot_stats(
+            local_store(),
+            dir.path().to_str().unwrap(),
+            Some(&metadata_location),
+        )
+        .await
+        .unwrap()
+        .expect("table has a current snapshot");
+
+        // The timestamp is still exposed; only the row count is genuinely absent from this
+        // writer's summary.
+        assert_eq!(stats.row_count, None);
+        assert_eq!(stats.updated_at_ms, 1_700_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn delta_snapshot_stats_reads_the_latest_commit_timestamp() {
+        let dir = TempDir::new().unwrap();
+        let table = dir.path();
+        let initial = delta_metadata_lines(serde_json::json!({
+            "minReaderVersion": 1,
+            "minWriterVersion": 2
+        }));
+        write_delta_commit(table, 0, &[initial, delta_add("a.parquet", 3, None)]);
+        write_delta_commit(table, 1, &[delta_add("b.parquet", 4, None)]);
+
+        let latest = delta_snapshot_stats(local_store(), table.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(
+            latest.updated_at_ms.is_some(),
+            "expected the latest commit's timestamp"
+        );
+
+        let pinned = delta_snapshot_stats(local_store(), table.to_str().unwrap(), Some(0))
+            .await
+            .unwrap();
+        assert!(
+            pinned.updated_at_ms.is_some(),
+            "expected version 0's commit timestamp"
         );
     }
 }
