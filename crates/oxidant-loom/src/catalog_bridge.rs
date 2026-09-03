@@ -1286,6 +1286,92 @@ pub async fn estimate_bytes_for_metadata(state: &SessionState, md: &TableMetadat
     }
 }
 
+/// The `GET .../tables/{table}/stats` REST response body: freshness read straight from the
+/// table format's own snapshot/commit metadata, never by scanning a data file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableFreshnessStats {
+    /// Row count reported by the format's snapshot metadata (Iceberg's `total-records`).
+    /// `None` when the format doesn't carry one cheaply (Delta) or none was recorded.
+    pub row_count: Option<i64>,
+    /// Milliseconds since the Unix epoch the current snapshot/commit was produced.
+    pub data_updated_at: Option<i64>,
+    /// `"iceberg"`, `"delta"`, or `"unknown"` for any other/unreadable format.
+    pub format: &'static str,
+    /// `"snapshot_metadata"` when `data_updated_at`/`row_count` came from the format's own
+    /// metadata, `"unavailable"` when the format or table state has nothing to report.
+    pub stats_source: &'static str,
+}
+
+impl TableFreshnessStats {
+    fn unavailable(format: &'static str) -> Self {
+        Self {
+            row_count: None,
+            data_updated_at: None,
+            format,
+            stats_source: "unavailable",
+        }
+    }
+}
+
+/// Resolve [`TableFreshnessStats`] for a catalog table without ever scanning a data file.
+///
+/// Iceberg: parses the current snapshot's summary out of `metadata.json` (no manifest list, no
+/// manifest). Delta: resolves the latest (or pinned) `delta_kernel::Snapshot` for its commit
+/// timestamp, without replaying `Add` actions. Any other format, or a lookup/parse failure for
+/// one of these two, reports `"unavailable"` rather than erroring — this backs a REST stats
+/// endpoint that must never 500 or fall back to a scan.
+pub async fn table_freshness_stats(
+    state: &SessionState,
+    md: &TableMetadata,
+) -> TableFreshnessStats {
+    use datafusion::datasource::listing::ListingTableUrl;
+
+    let format_name = match md.format {
+        TableFormat::Iceberg => "iceberg",
+        TableFormat::Delta => "delta",
+        _ => return TableFreshnessStats::unavailable("unknown"),
+    };
+
+    let Ok(root) = ListingTableUrl::parse(crate::shard::ensure_collection_url(&md.location)) else {
+        return TableFreshnessStats::unavailable(format_name);
+    };
+    if ensure_remote_store(state, &root, Some(&md.storage_options)).is_err() {
+        return TableFreshnessStats::unavailable(format_name);
+    }
+    let Ok(store) = state.runtime_env().object_store(&root) else {
+        return TableFreshnessStats::unavailable(format_name);
+    };
+
+    match md.format {
+        TableFormat::Iceberg => {
+            let metadata_location = md.properties.get("metadata_location").map(String::as_str);
+            match oxidant_datasource::iceberg_snapshot_stats(store, &md.location, metadata_location)
+                .await
+            {
+                Ok(Some(stats)) => TableFreshnessStats {
+                    row_count: stats.row_count,
+                    data_updated_at: Some(stats.updated_at_ms),
+                    format: "iceberg",
+                    stats_source: "snapshot_metadata",
+                },
+                Ok(None) | Err(_) => TableFreshnessStats::unavailable("iceberg"),
+            }
+        }
+        TableFormat::Delta => {
+            match oxidant_datasource::delta_snapshot_stats(store, &md.location, None).await {
+                Ok(stats) if stats.updated_at_ms.is_some() => TableFreshnessStats {
+                    row_count: None,
+                    data_updated_at: stats.updated_at_ms,
+                    format: "delta",
+                    stats_source: "snapshot_metadata",
+                },
+                Ok(_) | Err(_) => TableFreshnessStats::unavailable("delta"),
+            }
+        }
+        _ => unreachable!("filtered to Iceberg/Delta above"),
+    }
+}
+
 /// List+shard files then build a [`ListingTable`], or an empty MemTable when this shard is vacant.
 /// Replicated tables (full file set on every worker) are served through the process-global
 /// [`crate::dim_cache`]: the listing's object metadata fingerprints the data version.
