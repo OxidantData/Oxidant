@@ -337,8 +337,15 @@ fn delta_column_mappings(schema: &delta_kernel::schema::Schema) -> Vec<ColumnMap
 pub struct DeltaSnapshotStats {
     /// The resolved version's commit timestamp, in milliseconds since the Unix epoch: the
     /// In-Commit Timestamp when enabled, otherwise the commit file's filesystem
-    /// last-modified time (`Snapshot::get_timestamp`). `None` only if the commit's timestamp
-    /// could not be read (a missing or unreadable commit file).
+    /// last-modified time (`Snapshot::get_timestamp`).
+    ///
+    /// `None` when the snapshot resolved but has no readable timestamp. The dominant cause is
+    /// benign — log cleanup drops the commit file at a checkpointed version, so an untouched
+    /// table keeps a valid snapshot with no commit file to date it — but `get_timestamp` also
+    /// reports an unreadable In-Commit Timestamp through the same untyped error, and kernel
+    /// keeps the distinction private (`LogSegmentFiles::latest_commit_file` is `pub(crate)`).
+    /// So `None` is "no timestamp to report", NOT proof the table is healthy; a table that
+    /// cannot be opened at all fails earlier, as an `Err` from this function.
     pub updated_at_ms: Option<i64>,
 }
 
@@ -657,7 +664,22 @@ pub async fn iceberg_active_files(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IcebergSnapshotStats {
     /// `total-records` from the current snapshot's summary, when the writer recorded one.
-    pub row_count: Option<i64>,
+    ///
+    /// This is the table's row count **as of this snapshot**, not a lifetime sum: Iceberg
+    /// carries it forward per commit as `previous total-records + added-records -
+    /// deleted-records` (see `iceberg::spec::snapshot_summary`), which is also why
+    /// `added-records` — this one commit's insertions — is the wrong key to read for a row
+    /// count.
+    ///
+    /// It counts records in the snapshot's **data** files and does not subtract rows masked by
+    /// merge-on-read delete files, so on a table with live position/equality deletes it is an
+    /// upper bound on what a scan returns. [`Self::has_delete_files`] says when that is the
+    /// case; callers that must not report a wrong count should suppress it then.
+    pub total_records: Option<i64>,
+    /// Whether the current snapshot still carries merge-on-read delete files
+    /// (`total-position-deletes` or `total-equality-deletes` above zero in its summary).
+    /// `false` also when the writer recorded neither key.
+    pub has_delete_files: bool,
     /// The current snapshot's `timestamp-ms`.
     pub updated_at_ms: i64,
 }
@@ -682,13 +704,17 @@ pub async fn iceberg_snapshot_stats(
     let Some(snapshot) = metadata.current_snapshot() else {
         return Ok(None);
     };
-    let row_count = snapshot
-        .summary()
-        .additional_properties
-        .get("total-records")
-        .and_then(|v| v.parse::<i64>().ok());
+    let summary = snapshot.summary();
+    let count = |key: &str| -> Option<i64> {
+        summary
+            .additional_properties
+            .get(key)
+            .and_then(|v| v.trim().parse::<i64>().ok())
+    };
     Ok(Some(IcebergSnapshotStats {
-        row_count,
+        total_records: count("total-records"),
+        has_delete_files: count("total-position-deletes").unwrap_or(0) > 0
+            || count("total-equality-deletes").unwrap_or(0) > 0,
         updated_at_ms: snapshot.timestamp_ms(),
     }))
 }
@@ -1514,8 +1540,44 @@ mod tests {
         .unwrap()
         .expect("table has a current snapshot");
 
-        assert_eq!(stats.row_count, Some(12_345));
+        assert_eq!(stats.total_records, Some(12_345));
+        assert!(!stats.has_delete_files);
         assert_eq!(stats.updated_at_ms, 1_700_000_000_000);
+    }
+
+    /// `total-records` counts the snapshot's data-file records and does NOT subtract rows
+    /// masked by merge-on-read deletes, so a summary that still reports delete files is
+    /// flagged — otherwise a caller would publish a row count larger than a scan returns.
+    #[tokio::test]
+    async fn iceberg_snapshot_stats_flags_merge_on_read_delete_files() {
+        let dir = TempDir::new().unwrap();
+        let metadata_path = write_iceberg_metadata_only(
+            dir.path(),
+            Some(9),
+            serde_json::json!({
+                "operation": "overwrite",
+                "total-records": "100",
+                "total-position-deletes": "7",
+                "total-equality-deletes": "0"
+            }),
+            1_700_000_000_000,
+        );
+        let metadata_location = local_url(&metadata_path);
+
+        let stats = iceberg_snapshot_stats(
+            local_store(),
+            dir.path().to_str().unwrap(),
+            Some(&metadata_location),
+        )
+        .await
+        .unwrap()
+        .expect("table has a current snapshot");
+
+        assert_eq!(stats.total_records, Some(100));
+        assert!(
+            stats.has_delete_files,
+            "7 position deletes are outstanding, so 100 is an upper bound"
+        );
     }
 
     #[tokio::test]
@@ -1557,7 +1619,7 @@ mod tests {
 
         // The timestamp is still exposed; only the row count is genuinely absent from this
         // writer's summary.
-        assert_eq!(stats.row_count, None);
+        assert_eq!(stats.total_records, None);
         assert_eq!(stats.updated_at_ms, 1_700_000_000_000);
     }
 
