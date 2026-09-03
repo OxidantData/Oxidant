@@ -2181,6 +2181,10 @@ fn app(state: RestState) -> Router {
             "/api/v1/catalogs/{catalog}/tables/{table}/columns",
             get(list_columns),
         )
+        .route(
+            "/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/stats",
+            get(table_stats),
+        )
         .route("/api/v1/cluster/status", get(cluster_status))
         .route("/api/v1/logs", get(list_logs))
         .route("/api/v1/logs/files", get(list_log_files))
@@ -2547,6 +2551,60 @@ async fn list_columns(
             "describe table: unable to fetch columns",
         ),
     }
+}
+
+/// `GET /api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/stats` — freshness a
+/// harvester can poll without scanning the table: the current Iceberg snapshot's summary, or
+/// Delta's latest commit timestamp. Never runs a query and never scans a data file; a table
+/// whose format carries no such metadata reports nulls with `"unavailable"` rather than erroring.
+async fn table_stats(
+    State(state): State<RestState>,
+    Path((catalog, namespace, table)): Path<(String, String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    let engine = state.service.engine();
+    let registry = state.service.registry();
+    // Namespaces are dot-joined everywhere else; split on '.' for consistency.
+    let ns_parts: Vec<String> = namespace.split('.').map(|s| s.to_string()).collect();
+
+    let stats = if catalog == DEFAULT_CATALOG {
+        // Builtin tables are session-registered Parquet/CSV/temp views, not a lakehouse format
+        // with snapshot metadata — but a wrong name still 404s like every other route here.
+        let schema = ns_parts
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+        if !engine
+            .builtin_table_names(&schema)
+            .iter()
+            .any(|name| name == &table)
+        {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        oxidant_loom::catalog_bridge::TableFreshnessStats {
+            row_count: None,
+            data_updated_at: None,
+            format: "unknown",
+            stats_source: "unavailable",
+        }
+    } else {
+        let provider = registry.provider(&catalog).ok_or(StatusCode::NOT_FOUND)?;
+        let md = match provider.load_table(&ns_parts, &table).await {
+            Ok(md) => md,
+            // `Error::Plan` is the provider's "doesn't exist" classification (see
+            // `CatalogProvider::table_exists`'s doc comment) — everything else is a genuine
+            // backend failure, reported the same way `list_tables`/`list_namespaces` do.
+            Err(oxidant_catalog::Error::Plan(_)) => return Err(StatusCode::NOT_FOUND),
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        };
+        oxidant_loom::catalog_bridge::table_freshness_stats(&engine.session_state(), &md).await
+    };
+
+    Ok(Json(json!({
+        "row_count": stats.row_count,
+        "data_updated_at": stats.data_updated_at,
+        "format": stats.format,
+        "stats_source": stats.stats_source,
+    })))
 }
 
 async fn autocomplete_catalog(
@@ -3988,6 +4046,161 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    /// Repo-root-relative path to the committed sample tables (same fixture tree
+    /// `tests/local_catalog.rs` reads through SQL).
+    fn sample_data_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sample-data")
+            .canonicalize()
+            .expect("sample-data tree is committed at the repo root")
+    }
+
+    /// A `local` catalog config over one table per format `table_stats` has to guard: Parquet
+    /// (no snapshot metadata), Delta, and Iceberg.
+    fn sample_catalog_conf(
+        warehouse: &std::path::Path,
+    ) -> std::collections::HashMap<String, String> {
+        let root = sample_data_dir();
+        let tables = serde_json::json!({
+            "samples.nation_parquet": {
+                "format": "parquet",
+                "location": root.join("parquet/tpch_nation.parquet").to_string_lossy(),
+            },
+            "samples.nation_delta": {
+                "format": "delta",
+                "location": root.join("delta/tpch_nation").to_string_lossy(),
+            },
+            "samples.nation_iceberg": {
+                "format": "iceberg",
+                "location": root.join("iceberg/tpch_nation").to_string_lossy(),
+            },
+        });
+        std::collections::HashMap::from([
+            (
+                "spark.sql.catalog.local.type".to_string(),
+                "local".to_string(),
+            ),
+            (
+                "spark.sql.catalog.local.warehouse".to_string(),
+                warehouse.to_string_lossy().to_string(),
+            ),
+            (
+                "spark.sql.catalog.local.tables".to_string(),
+                tables.to_string(),
+            ),
+        ])
+    }
+
+    /// [`test_state`] built around a declared catalog rather than a bare engine, for tests that
+    /// need a registered `CatalogProvider` (e.g. `table_stats`).
+    async fn test_state_with_catalog(
+        conf: std::collections::HashMap<String, String>,
+    ) -> (RestState, Router) {
+        let state = RestState {
+            service: Arc::new(OxidantService::with_catalogs(conf).await),
+            store: StatementStore::new(),
+            log_buffer: LogBuffer::new(MAX_LOG_LINES),
+            logs: LogView::default(),
+            status_token: None,
+            dumps: None,
+        };
+        (state.clone(), app(state))
+    }
+
+    #[tokio::test]
+    async fn table_stats_reads_the_iceberg_current_snapshot_summary() {
+        // The exact `total-records` extraction is guarded at the `oxidant-datasource` unit
+        // level (`iceberg_snapshot_stats_reads_total_records_and_timestamp_from_the_summary`)
+        // against a fixture whose summary carries one; this fixture (shared with
+        // `tests/local_catalog.rs`) doesn't record `total-records`, so `row_count` is
+        // correctly null here — this test guards the REST wiring end-to-end instead.
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (_state, app) = test_state_with_catalog(sample_catalog_conf(warehouse.path())).await;
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/local/namespaces/samples/tables/nation_iceberg/stats",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["format"], "iceberg", "{body}");
+        assert_eq!(body["stats_source"], "snapshot_metadata", "{body}");
+        assert!(
+            body["data_updated_at"].as_i64().unwrap_or(0) > 0,
+            "expected timestamp-ms from the current snapshot: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn table_stats_reads_delta_commit_timestamp_but_not_a_scanned_row_count() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (_state, app) = test_state_with_catalog(sample_catalog_conf(warehouse.path())).await;
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/local/namespaces/samples/tables/nation_delta/stats",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["format"], "delta", "{body}");
+        assert_eq!(body["stats_source"], "snapshot_metadata", "{body}");
+        assert!(
+            body["data_updated_at"].as_i64().unwrap_or(0) > 0,
+            "expected the latest commit's timestamp: {body}"
+        );
+        // No cheap row count in the delta-kernel log metadata this reads — never a data scan
+        // to compute one.
+        assert!(body["row_count"].is_null(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn table_stats_reports_unavailable_for_a_format_with_no_snapshot_metadata() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (_state, app) = test_state_with_catalog(sample_catalog_conf(warehouse.path())).await;
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/local/namespaces/samples/tables/nation_parquet/stats",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["format"], "unknown", "{body}");
+        assert_eq!(body["stats_source"], "unavailable", "{body}");
+        assert!(body["row_count"].is_null(), "{body}");
+        assert!(body["data_updated_at"].is_null(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn table_stats_404s_on_a_missing_table_in_a_registered_catalog() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (_state, app) = test_state_with_catalog(sample_catalog_conf(warehouse.path())).await;
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/local/namespaces/samples/tables/does_not_exist/stats",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn table_stats_404s_on_an_unregistered_catalog() {
+        let (_guard, _state, app) = test_state();
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/nope/namespaces/samples/tables/nation_iceberg/stats",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn table_stats_404s_on_a_missing_builtin_table() {
+        let (_guard, _state, app) = test_state();
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/spark_catalog/namespaces/default/tables/does_not_exist/stats",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     }
 
     #[tokio::test]
