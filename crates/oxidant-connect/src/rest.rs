@@ -2555,12 +2555,18 @@ async fn list_columns(
 
 /// `GET /api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/stats` — freshness a
 /// harvester can poll without scanning the table: the current Iceberg snapshot's summary, or
-/// Delta's latest commit timestamp. Never runs a query and never scans a data file; a table
-/// whose format carries no such metadata reports nulls with `"unavailable"` rather than erroring.
+/// Delta's latest commit timestamp. Never runs a query and never scans a data file.
+///
+/// Three outcomes a caller must be able to tell apart, so they get three different answers:
+/// a table with freshness reports it (`"stats_source": "snapshot_metadata"`); a readable table
+/// with nothing to report — a format that carries no snapshot metadata, an Iceberg table with
+/// no snapshot yet — reports nulls with `"unavailable"`; and a table whose metadata could not
+/// be read (corrupt `metadata.json`, unreachable store) is a `500`, never a `200` that a
+/// harvester would file away as "this table just has no stats".
 async fn table_stats(
     State(state): State<RestState>,
     Path((catalog, namespace, table)): Path<(String, String, String)>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Response {
     let engine = state.service.engine();
     let registry = state.service.registry();
     // Namespaces are dot-joined everywhere else; split on '.' for consistency.
@@ -2578,7 +2584,7 @@ async fn table_stats(
             .iter()
             .any(|name| name == &table)
         {
-            return Err(StatusCode::NOT_FOUND);
+            return error_response(StatusCode::NOT_FOUND, "unknown table");
         }
         oxidant_loom::catalog_bridge::TableFreshnessStats {
             row_count: None,
@@ -2587,24 +2593,54 @@ async fn table_stats(
             stats_source: "unavailable",
         }
     } else {
-        let provider = registry.provider(&catalog).ok_or(StatusCode::NOT_FOUND)?;
+        let Some(provider) = registry.provider(&catalog) else {
+            return error_response(StatusCode::NOT_FOUND, "unknown catalog");
+        };
         let md = match provider.load_table(&ns_parts, &table).await {
             Ok(md) => md,
             // `Error::Plan` is the provider's "doesn't exist" classification (see
             // `CatalogProvider::table_exists`'s doc comment) — everything else is a genuine
             // backend failure, reported the same way `list_tables`/`list_namespaces` do.
-            Err(oxidant_catalog::Error::Plan(_)) => return Err(StatusCode::NOT_FOUND),
-            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(oxidant_catalog::Error::Plan(_)) => {
+                return error_response(StatusCode::NOT_FOUND, "unknown table")
+            }
+            Err(e) => {
+                tracing::warn!(catalog = %catalog, namespace = %namespace, table = %table,
+                    error = %e, "table stats: loading catalog metadata failed");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "table stats: unable to load the table from its catalog",
+                );
+            }
         };
-        oxidant_loom::catalog_bridge::table_freshness_stats(&engine.session_state(), &md).await
+        match oxidant_loom::catalog_bridge::table_freshness_stats(&engine.session_state(), &md)
+            .await
+        {
+            Ok(stats) => stats,
+            // The table exists and the engine could not read its own format metadata. The
+            // detail names object-store locations, so it goes to the log, not the body.
+            Err(e) => {
+                tracing::warn!(catalog = %catalog, namespace = %namespace, table = %table,
+                    format = e.format, error = %e.detail,
+                    "table stats: reading snapshot metadata failed");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!(
+                        "table stats: unable to read this table's {} snapshot metadata",
+                        e.format
+                    ),
+                );
+            }
+        }
     };
 
-    Ok(Json(json!({
+    Json(json!({
         "row_count": stats.row_count,
         "data_updated_at": stats.data_updated_at,
         "format": stats.format,
         "stats_source": stats.stats_source,
-    })))
+    }))
+    .into_response()
 }
 
 async fn autocomplete_catalog(
@@ -4058,11 +4094,20 @@ mod tests {
     }
 
     /// A `local` catalog config over one table per format `table_stats` has to guard: Parquet
-    /// (no snapshot metadata), Delta, and Iceberg.
+    /// (no snapshot metadata), Delta, Iceberg — plus `nation_broken`, an Iceberg table whose
+    /// `metadata.json` is not parseable, written into `warehouse` so the "could not read" path
+    /// has a table to fail on.
     fn sample_catalog_conf(
         warehouse: &std::path::Path,
     ) -> std::collections::HashMap<String, String> {
         let root = sample_data_dir();
+        let broken = warehouse.join("nation_broken");
+        std::fs::create_dir_all(broken.join("metadata")).expect("broken fixture dir");
+        std::fs::write(
+            broken.join("metadata/00001-broken.metadata.json"),
+            b"{ this is not iceberg metadata",
+        )
+        .expect("broken fixture metadata");
         let tables = serde_json::json!({
             "samples.nation_parquet": {
                 "format": "parquet",
@@ -4075,6 +4120,10 @@ mod tests {
             "samples.nation_iceberg": {
                 "format": "iceberg",
                 "location": root.join("iceberg/tpch_nation").to_string_lossy(),
+            },
+            "samples.nation_broken": {
+                "format": "iceberg",
+                "location": broken.to_string_lossy(),
             },
         });
         std::collections::HashMap::from([
@@ -4163,10 +4212,39 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["format"], "unknown", "{body}");
+        // The format is known — it just carries no snapshot metadata. Reporting it as
+        // `unknown` would tell a harvester the engine cannot identify the table at all.
+        assert_eq!(body["format"], "parquet", "{body}");
         assert_eq!(body["stats_source"], "unavailable", "{body}");
         assert!(body["row_count"].is_null(), "{body}");
         assert!(body["data_updated_at"].is_null(), "{body}");
+    }
+
+    /// A table the engine cannot read is not a table with no stats: a harvester that polls
+    /// `200 {"stats_source": "unavailable"}` files it away as "this format has nothing" and
+    /// never looks again, so a corrupt `metadata.json` has to surface as a failure.
+    #[tokio::test]
+    async fn table_stats_500s_when_the_iceberg_metadata_cannot_be_read() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (_state, app) = test_state_with_catalog(sample_catalog_conf(warehouse.path())).await;
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/local/namespaces/samples/tables/nation_broken/stats",
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("iceberg"),
+            "{body}"
+        );
+        // The object-store location the read failed on stays in the log, not the body.
+        assert!(
+            !body.to_string().contains("nation_broken/metadata"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

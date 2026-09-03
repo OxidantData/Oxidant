@@ -1291,14 +1291,23 @@ pub async fn estimate_bytes_for_metadata(state: &SessionState, md: &TableMetadat
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableFreshnessStats {
     /// Row count reported by the format's snapshot metadata (Iceberg's `total-records`).
-    /// `None` when the format doesn't carry one cheaply (Delta) or none was recorded.
+    /// `None` when the format doesn't carry one cheaply (Delta), when none was recorded, or
+    /// when the recorded one is known to overcount — an Iceberg snapshot with outstanding
+    /// merge-on-read deletes, where `total-records` is an upper bound on what a scan returns.
     pub row_count: Option<i64>,
     /// Milliseconds since the Unix epoch the current snapshot/commit was produced.
     pub data_updated_at: Option<i64>,
-    /// `"iceberg"`, `"delta"`, or `"unknown"` for any other/unreadable format.
+    /// The table's format as the catalog declares it: `"iceberg"`, `"delta"`, `"parquet"`,
+    /// `"csv"` or `"json"`. A format with no snapshot metadata is still named honestly — it
+    /// pairs with `stats_source: "unavailable"`, not with a pretend-unknown format. Callers
+    /// with no catalog entry to read a format from (the REST route's builtin-catalog branch,
+    /// where a table is a session-registered file or temp view) construct `"unknown"`.
     pub format: &'static str,
     /// `"snapshot_metadata"` when `data_updated_at`/`row_count` came from the format's own
-    /// metadata, `"unavailable"` when the format or table state has nothing to report.
+    /// metadata, `"unavailable"` when the table is readable but has nothing to report (a
+    /// format that carries no snapshot metadata, an Iceberg table with no snapshot yet, a
+    /// Delta version whose commit file no longer dates it). A table whose metadata could not
+    /// be READ never lands here — that is [`TableStatsError`].
     pub stats_source: &'static str,
 }
 
@@ -1313,60 +1322,106 @@ impl TableFreshnessStats {
     }
 }
 
+/// [`table_freshness_stats`] could not read the table's format metadata at all: a corrupt or
+/// missing `metadata.json`, an unreadable `_delta_log`, an object store that cannot be reached
+/// or configured.
+///
+/// Kept distinct from an `Ok` with `stats_source: "unavailable"`, which says the table is fine
+/// and simply has no freshness to report. Collapsing the two would let a broken table poll as a
+/// merely-statless one forever, which is precisely the failure a freshness harvester exists to
+/// notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableStatsError {
+    /// The format whose metadata could not be read (`"iceberg"` or `"delta"`).
+    pub format: &'static str,
+    /// The underlying failure. Carries object-store locations, so it belongs in a server log
+    /// rather than in a response body.
+    pub detail: String,
+}
+
+impl fmt::Display for TableStatsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "reading {} table metadata: {}", self.format, self.detail)
+    }
+}
+
+impl std::error::Error for TableStatsError {}
+
 /// Resolve [`TableFreshnessStats`] for a catalog table without ever scanning a data file.
 ///
 /// Iceberg: parses the current snapshot's summary out of `metadata.json` (no manifest list, no
-/// manifest). Delta: resolves the latest (or pinned) `delta_kernel::Snapshot` for its commit
-/// timestamp, without replaying `Add` actions. Any other format, or a lookup/parse failure for
-/// one of these two, reports `"unavailable"` rather than erroring — this backs a REST stats
-/// endpoint that must never 500 or fall back to a scan.
+/// manifest). Delta: resolves the latest `delta_kernel::Snapshot` for its commit timestamp,
+/// without replaying `Add` actions. A format that carries neither is `Ok` with
+/// `stats_source: "unavailable"`; so is an Iceberg table with no snapshot yet. Failing to read
+/// the metadata that does exist is an [`Err`] — see [`TableStatsError`].
 pub async fn table_freshness_stats(
     state: &SessionState,
     md: &TableMetadata,
-) -> TableFreshnessStats {
+) -> Result<TableFreshnessStats, TableStatsError> {
     use datafusion::datasource::listing::ListingTableUrl;
 
     let format_name = match md.format {
         TableFormat::Iceberg => "iceberg",
         TableFormat::Delta => "delta",
-        _ => return TableFreshnessStats::unavailable("unknown"),
+        TableFormat::Parquet => "parquet",
+        TableFormat::Csv => "csv",
+        TableFormat::Json => "json",
+    };
+    if !matches!(md.format, TableFormat::Iceberg | TableFormat::Delta) {
+        return Ok(TableFreshnessStats::unavailable(format_name));
+    }
+    let failed = |detail: String| TableStatsError {
+        format: format_name,
+        detail,
     };
 
-    let Ok(root) = ListingTableUrl::parse(crate::shard::ensure_collection_url(&md.location)) else {
-        return TableFreshnessStats::unavailable(format_name);
-    };
-    if ensure_remote_store(state, &root, Some(&md.storage_options)).is_err() {
-        return TableFreshnessStats::unavailable(format_name);
-    }
-    let Ok(store) = state.runtime_env().object_store(&root) else {
-        return TableFreshnessStats::unavailable(format_name);
-    };
+    let root = ListingTableUrl::parse(crate::shard::ensure_collection_url(&md.location))
+        .map_err(|e| failed(format!("invalid table location `{}`: {e}", md.location)))?;
+    ensure_remote_store(state, &root, Some(&md.storage_options))
+        .map_err(|e| failed(format!("registering the object store for `{root}`: {e}")))?;
+    let store = state
+        .runtime_env()
+        .object_store(&root)
+        .map_err(|e| failed(format!("resolving the object store for `{root}`: {e}")))?;
 
     match md.format {
         TableFormat::Iceberg => {
             let metadata_location = md.properties.get("metadata_location").map(String::as_str);
-            match oxidant_datasource::iceberg_snapshot_stats(store, &md.location, metadata_location)
-                .await
-            {
-                Ok(Some(stats)) => TableFreshnessStats {
-                    row_count: stats.row_count,
+            let stats =
+                oxidant_datasource::iceberg_snapshot_stats(store, &md.location, metadata_location)
+                    .await
+                    .map_err(|e| failed(e.to_string()))?;
+            Ok(match stats {
+                // `total-records` does not subtract merge-on-read deletes, so it is only a row
+                // count while the snapshot has none outstanding.
+                Some(stats) => TableFreshnessStats {
+                    row_count: if stats.has_delete_files {
+                        None
+                    } else {
+                        stats.total_records
+                    },
                     data_updated_at: Some(stats.updated_at_ms),
                     format: "iceberg",
                     stats_source: "snapshot_metadata",
                 },
-                Ok(None) | Err(_) => TableFreshnessStats::unavailable("iceberg"),
-            }
+                // No current snapshot: created, never committed to. Readable, nothing to say.
+                None => TableFreshnessStats::unavailable("iceberg"),
+            })
         }
         TableFormat::Delta => {
-            match oxidant_datasource::delta_snapshot_stats(store, &md.location, None).await {
-                Ok(stats) if stats.updated_at_ms.is_some() => TableFreshnessStats {
+            let stats = oxidant_datasource::delta_snapshot_stats(store, &md.location, None)
+                .await
+                .map_err(|e| failed(e.to_string()))?;
+            Ok(match stats.updated_at_ms {
+                Some(updated_at_ms) => TableFreshnessStats {
                     row_count: None,
-                    data_updated_at: stats.updated_at_ms,
+                    data_updated_at: Some(updated_at_ms),
                     format: "delta",
                     stats_source: "snapshot_metadata",
                 },
-                Ok(_) | Err(_) => TableFreshnessStats::unavailable("delta"),
-            }
+                // The log replayed, but the resolved version has no commit file to date it.
+                None => TableFreshnessStats::unavailable("delta"),
+            })
         }
         _ => unreachable!("filtered to Iceberg/Delta above"),
     }
