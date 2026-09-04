@@ -23,8 +23,9 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/v1/catalogs/{catalog}/namespaces` | Schemas in a catalog |
 | `GET` | `/api/v1/catalogs/{catalog}/tables` | Tables in `?namespace=` (default `default`) |
 | `GET` | `/api/v1/catalogs/{catalog}/tables/{table}/columns` | Columns and types of one table |
-| `GET` | `/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/stats` | Freshness of one table, from its snapshot metadata |
+| `GET` | `/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/stats` | Freshness, catalog comment, and column comments of one table |
 | `PUT` | `/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/comment` | Set or clear a table's catalog comment |
+| `PUT` | `/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/columns/{column}/comment` | Set or clear one column's catalog comment |
 | `GET` | `/api/v1/catalogs/autocomplete` | Identifier suggestions for a dotted `?prefix=` |
 | `GET` | `/api/dashboards` | Dashboards, newest-updated first |
 | `POST` | `/api/dashboards` | Create a dashboard |
@@ -198,7 +199,11 @@ curl -s http://localhost:4040/api/v1/catalogs/prod/namespaces/sales/tables/order
 ```
 
 ```json
-{ "row_count": 128394, "data_updated_at": 1717171717000, "format": "iceberg", "stats_source": "snapshot_metadata" }
+{
+  "row_count": 128394, "data_updated_at": 1717171717000, "format": "iceberg", "stats_source": "snapshot_metadata",
+  "comment": "canonical order fact table",
+  "columns": [ { "name": "order_id", "comment": "surrogate key" }, { "name": "region", "comment": null } ]
+}
 ```
 
 Read for pollers that need to know how current a table is without paying for a scan: this route
@@ -206,7 +211,15 @@ runs no query and opens no data file. It reads an Iceberg table's current snapsh
 of `metadata.json` (no manifest list, no manifests), or resolves a Delta snapshot far enough for
 its commit timestamp (no `Add` replay).
 
-All four keys are always present; an absent value is `null`, never a missing key.
+All six keys are always present; an absent value is `null` (or, for `columns`, `[]`), never a
+missing key.
+
+- `comment` and `columns` carry the same catalog comments the [table](#table-comment) and
+  [column](#column-comment) comment routes set — in the `"comment"` vocabulary those routes use —
+  so a platform harvesting freshness through this route picks them up in the same poll, no second
+  round trip. `columns` lists every column the catalog declared a schema for, in schema order;
+  it is `[]` for the builtin catalog (no `CatalogProvider` to ask) and for an external table whose
+  schema fell back to file inference rather than a catalog-declared one.
 
 - `data_updated_at` is milliseconds since the Unix epoch — the Iceberg snapshot's `timestamp-ms`,
   or Delta's In-Commit Timestamp when enabled and otherwise the latest commit file's
@@ -274,6 +287,38 @@ cleared the comment.
   should retry.
 - Every other backend failure (throttling, network, a malformed table definition) is `500`, with
   the detail in the server log rather than the response.
+
+### Column comment
+
+```sh
+curl -s -X PUT http://localhost:4040/api/v1/catalogs/prod/namespaces/sales/tables/orders/columns/region/comment \
+  -H 'Content-Type: application/json' \
+  -d '{"comment": "ISO region code"}'
+```
+
+```json
+{ "comment": "ISO region code" }
+```
+
+Sets one column's comment through `CatalogProvider::alter_table` (Glue's per-column
+`Comment`, on `StorageDescriptor.Columns` or `PartitionKeys`; the Hive-style column comment).
+Same body shape and clearing rule as [the table-comment route above](#table-comment) — an absent
+`comment` field, an explicit `null`, `""`, and a whitespace-only string all clear it — and the
+same unknown-key rejection, scoped to one column.
+
+- Same "wrong coordinates" `404`s as the table-comment route: an unregistered catalog (including
+  `spark_catalog`) and an unknown table.
+- **An unknown column is `404`.** Checked against the table's declared schema before the catalog
+  is asked to alter anything, so a typo in the column name reads as "no such column", not folded
+  into "no such table". This check only runs when the table's schema is known; a table whose
+  schema fell back to file inference is not pre-validated (see [table stats](#table-freshness)'s
+  note on when `columns` can be empty).
+- Same `409` for a config-declared table, the same `403` for a provider's access-denied refusal
+  (verbatim), and the same `501` for a catalog with no `alter_table` at all, for the same reasons
+  as the table-comment route.
+- **A comment longer than 255 characters is `400`.** Glue's `Column.Comment` cap is tighter than
+  its table-level `Description` cap (2048) — applied uniformly here the same way, counting
+  characters, and leaving the stored comment untouched.
 
 ### Autocomplete
 

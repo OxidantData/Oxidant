@@ -13,8 +13,9 @@
 //! DDL coverage (KAN-100): `create_database` → `CreateDatabase`, `drop_database` →
 //! `DeleteDatabase` (CASCADE emulated by deleting the database's tables first — Glue has no
 //! cascade flag), `drop_table` → `DeleteTable`, `alter_table` → `GetTable` + `UpdateTable`
-//! (properties / comment / location / added columns — `RENAME COLUMN` / `CHANGE COLUMN` deferred
-//! until Loom wires those ALTER forms into the SPI), `list_partitions` → `GetPartitions`
+//! (properties / comment / location / added columns / per-column comment — `RENAME COLUMN` /
+//! `CHANGE COLUMN` deferred until Loom wires those ALTER forms into the SPI), `list_partitions` →
+//! `GetPartitions`
 //! (paginated), and `repair_table` (`MSCK REPAIR TABLE`): scan the table's storage location for
 //! Hive-style `key=value/` partition directories via `object_store` and `BatchCreatePartition`
 //! the ones Glue doesn't know yet.
@@ -603,6 +604,7 @@ fn parse_glue_table(catalog_name: &str, db: &str, table: &str, t: &Table) -> Res
     // Every Glue `Parameters` entry is already a string pair; `metadata_location` (the Iceberg
     // current-metadata pointer, Athena/Spark/Glue convention) is just one of them.
     let properties = parameters;
+    let column_comments = glue_column_comments(data_cols, part_cols);
 
     let md = TableMetadata::new(
         format!("{catalog_name}.{db}.{table}"),
@@ -611,7 +613,8 @@ fn parse_glue_table(catalog_name: &str, db: &str, table: &str, t: &Table) -> Res
     )
     .with_comment(comment)
     .with_properties(properties)
-    .with_partition_columns(partition_columns);
+    .with_partition_columns(partition_columns)
+    .with_column_comments(column_comments);
     Ok(match schema {
         Some(s) => md.with_schema(Arc::new(s)),
         None => md,
@@ -707,6 +710,22 @@ fn glue_column_pairs(data_cols: &[Column], part_cols: &[Column]) -> Vec<(String,
         .collect()
 }
 
+/// Flatten a Glue table's data + partition columns into a `name -> comment` map, skipping columns
+/// with no comment (or an empty one — Glue does not distinguish "never set" from `""`). Feeds
+/// [`TableMetadata::column_comments`].
+fn glue_column_comments(data_cols: &[Column], part_cols: &[Column]) -> HashMap<String, String> {
+    data_cols
+        .iter()
+        .chain(part_cols.iter())
+        .filter_map(|col| {
+            col.comment
+                .as_deref()
+                .filter(|c| !c.is_empty())
+                .map(|c| (col.name.clone(), c.to_string()))
+        })
+        .collect()
+}
+
 /// Copy a Glue [`Table`] (as returned by `GetTable`) into the [`TableInput`] `UpdateTable`
 /// expects — the update replaces the whole definition, so everything Glue tracks must ride
 /// along or it would be silently dropped. Read-only fields (`DatabaseName`, `CreateTime`, ...)
@@ -790,6 +809,41 @@ fn apply_table_changes(input: &mut TableInput, changes: &[TableChange]) -> Resul
                     );
                 }
                 sd.columns = Some(columns);
+            }
+            TableChange::SetColumnComment { column, comment } => {
+                // The comment lives on the `Column` entry itself (data columns in
+                // `StorageDescriptor.Columns`, or a partition key in `PartitionKeys` — both are
+                // the same `Column` type), so this mutates that one entry's `comment` field in
+                // place and leaves every other column, and the table's own `Description`,
+                // untouched.
+                let comment = comment.clone().filter(|c| !c.is_empty());
+                let mut found = false;
+                if let Some(sd) = input.storage_descriptor.as_mut() {
+                    if let Some(col) = sd
+                        .columns
+                        .as_mut()
+                        .and_then(|cols| cols.iter_mut().find(|c| c.name == *column))
+                    {
+                        col.comment = comment.clone();
+                        found = true;
+                    }
+                }
+                if !found {
+                    if let Some(col) = input
+                        .partition_keys
+                        .as_mut()
+                        .and_then(|cols| cols.iter_mut().find(|c| c.name == *column))
+                    {
+                        col.comment = comment;
+                        found = true;
+                    }
+                }
+                if !found {
+                    return Err(Error::Plan(format!(
+                        "column `{column}` not found on table `{}`",
+                        input.name
+                    )));
+                }
             }
         }
     }
@@ -1250,6 +1304,207 @@ mod tests {
             .expect("storage descriptor")
             .columns()
             .is_empty());
+    }
+
+    #[test]
+    fn apply_table_changes_sets_a_column_comment_on_the_right_column_only() {
+        let mut input = TableInput::builder()
+            .name("t")
+            .storage_descriptor(
+                StorageDescriptor::builder()
+                    .location("s3://x/")
+                    .columns(col("id", "bigint"))
+                    .columns(col("region", "string"))
+                    .build(),
+            )
+            .description("table comment")
+            .build()
+            .expect("input");
+
+        apply_table_changes(
+            &mut input,
+            &[TableChange::SetColumnComment {
+                column: "region".to_string(),
+                comment: Some("US region code".to_string()),
+            }],
+        )
+        .expect("apply");
+
+        let sd = input.storage_descriptor().expect("storage descriptor");
+        let comments: Vec<(&str, Option<&str>)> = sd
+            .columns()
+            .iter()
+            .map(|c| (c.name(), c.comment()))
+            .collect();
+        assert_eq!(
+            comments,
+            vec![("id", None), ("region", Some("US region code"))],
+            "only the named column's comment changes"
+        );
+        assert_eq!(
+            input.description(),
+            Some("table comment"),
+            "the table-level comment is untouched by a column-comment change"
+        );
+    }
+
+    #[test]
+    fn apply_table_changes_clears_a_column_comment_with_empty_string_and_none() {
+        let mut input = TableInput::builder()
+            .name("t")
+            .storage_descriptor(
+                StorageDescriptor::builder()
+                    .location("s3://x/")
+                    .columns(
+                        Column::builder()
+                            .name("id")
+                            .r#type("bigint")
+                            .comment("was documented")
+                            .build()
+                            .expect("column"),
+                    )
+                    .build(),
+            )
+            .build()
+            .expect("input");
+
+        apply_table_changes(
+            &mut input,
+            &[TableChange::SetColumnComment {
+                column: "id".to_string(),
+                comment: Some(String::new()),
+            }],
+        )
+        .expect("apply");
+        assert_eq!(
+            input.storage_descriptor().unwrap().columns()[0].comment(),
+            None,
+            "empty comment clears, doesn't set \"\""
+        );
+
+        apply_table_changes(
+            &mut input,
+            &[TableChange::SetColumnComment {
+                column: "id".to_string(),
+                comment: Some("back".to_string()),
+            }],
+        )
+        .expect("apply");
+        apply_table_changes(
+            &mut input,
+            &[TableChange::SetColumnComment {
+                column: "id".to_string(),
+                comment: None,
+            }],
+        )
+        .expect("apply");
+        assert_eq!(
+            input.storage_descriptor().unwrap().columns()[0].comment(),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_table_changes_column_comment_can_target_a_partition_key() {
+        let mut input = TableInput::builder()
+            .name("t")
+            .storage_descriptor(
+                StorageDescriptor::builder()
+                    .location("s3://x/")
+                    .columns(col("id", "bigint"))
+                    .build(),
+            )
+            .partition_keys(col("dt", "string"))
+            .build()
+            .expect("input");
+
+        apply_table_changes(
+            &mut input,
+            &[TableChange::SetColumnComment {
+                column: "dt".to_string(),
+                comment: Some("partition date".to_string()),
+            }],
+        )
+        .expect("apply");
+
+        assert_eq!(input.partition_keys()[0].comment(), Some("partition date"));
+        // The data column is untouched.
+        assert_eq!(
+            input.storage_descriptor().unwrap().columns()[0].comment(),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_table_changes_column_comment_on_unknown_column_errors_and_leaves_input_untouched() {
+        let mut input = TableInput::builder()
+            .name("t")
+            .storage_descriptor(
+                StorageDescriptor::builder()
+                    .location("s3://x/")
+                    .columns(col("id", "bigint"))
+                    .build(),
+            )
+            .build()
+            .expect("input");
+        let err = apply_table_changes(
+            &mut input,
+            &[TableChange::SetColumnComment {
+                column: "nope".to_string(),
+                comment: Some("x".to_string()),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
+        assert_eq!(
+            input.storage_descriptor().unwrap().columns()[0].comment(),
+            None,
+            "the untouched column must not have picked up a stray comment"
+        );
+    }
+
+    #[test]
+    fn parse_glue_table_extracts_table_and_column_comments() {
+        let t = Table::builder()
+            .name("t")
+            .description("table level comment")
+            .storage_descriptor(
+                StorageDescriptor::builder()
+                    .location("s3://x/")
+                    .columns(
+                        Column::builder()
+                            .name("id")
+                            .r#type("bigint")
+                            .comment("primary key")
+                            .build()
+                            .expect("column"),
+                    )
+                    .columns(col("name", "string"))
+                    .build(),
+            )
+            .partition_keys(
+                Column::builder()
+                    .name("dt")
+                    .r#type("string")
+                    .comment("partition date")
+                    .build()
+                    .expect("column"),
+            )
+            .build()
+            .expect("table");
+
+        let md = parse_glue_table("cat", "db", "t", &t).expect("parsed");
+        assert_eq!(md.comment.as_deref(), Some("table level comment"));
+        assert_eq!(
+            md.column_comments.get("id").map(String::as_str),
+            Some("primary key")
+        );
+        assert_eq!(
+            md.column_comments.get("dt").map(String::as_str),
+            Some("partition date")
+        );
+        // A column with no comment is simply absent from the map, not an empty string.
+        assert!(!md.column_comments.contains_key("name"));
     }
 
     // `table_to_input` feeds `alter_table`'s `UpdateTable` — everything Glue tracks on the
@@ -1847,6 +2102,11 @@ mod tests {
 
     const ALTER_BEFORE_JSON: &str = r#"{"Table":{"Name":"orders_alter","StorageDescriptor":{"Location":"s3://bucket/db1/orders_alter/","Columns":[{"Name":"id","Type":"bigint"}]},"PartitionKeys":[],"Parameters":{"keep_me":"1","drop_me":"2"}}}"#;
     const ALTER_AFTER_JSON: &str = r#"{"Table":{"Name":"orders_alter","StorageDescriptor":{"Location":"s3://bucket/db1/orders_alter_new/","Columns":[{"Name":"id","Type":"bigint"},{"Name":"region","Type":"string"}]},"PartitionKeys":[],"Parameters":{"keep_me":"1","new_prop":"v1"},"Description":"updated comment"}}"#;
+    // `id` already carries a comment and the table has its own — both must survive a
+    // column-comment change untouched, which is exactly what the tests below check.
+    const COLUMN_COMMENT_BEFORE_JSON: &str = r#"{"Table":{"Name":"orders_cc","StorageDescriptor":{"Location":"s3://bucket/db1/orders_cc/","Columns":[{"Name":"id","Type":"bigint","Comment":"already documented"},{"Name":"region","Type":"string"}]},"PartitionKeys":[],"Description":"table level comment","Parameters":{}}}"#;
+    const COLUMN_COMMENT_SET_AFTER_JSON: &str = r#"{"Table":{"Name":"orders_cc","StorageDescriptor":{"Location":"s3://bucket/db1/orders_cc/","Columns":[{"Name":"id","Type":"bigint","Comment":"already documented"},{"Name":"region","Type":"string","Comment":"US region code"}]},"PartitionKeys":[],"Description":"table level comment","Parameters":{}}}"#;
+    const COLUMN_COMMENT_CLEARED_AFTER_JSON: &str = r#"{"Table":{"Name":"orders_cc","StorageDescriptor":{"Location":"s3://bucket/db1/orders_cc/","Columns":[{"Name":"id","Type":"bigint"},{"Name":"region","Type":"string"}]},"PartitionKeys":[],"Description":"table level comment","Parameters":{}}}"#;
 
     /// Stub for `CREATE DATABASE`, `DROP DATABASE` (`IF EXISTS`/`CASCADE`), and `DROP TABLE`
     /// (`IF EXISTS`): dispatches on the database/table name embedded in the request body (the
@@ -2184,6 +2444,161 @@ mod tests {
         // The rejected change must be caught before any `UpdateTable` call — the table stays
         // untouched (the trait contract).
         assert!(update_calls.lock().expect("lock").is_empty());
+    }
+
+    /// Stub for column-comment `alter_table`: the same two-`GetTable`-then-`UpdateTable` shape as
+    /// [`spawn_alter_stub`], parametrized on the before/after `GetTable` bodies so one helper
+    /// covers both the "set" and the "clear" scenario below.
+    async fn spawn_column_comment_stub(
+        before: &'static str,
+        after: &'static str,
+        update_calls: Arc<Mutex<Vec<String>>>,
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let port = listener.local_addr().expect("local addr").port();
+        let get_table_calls = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let update_calls = update_calls.clone();
+                let get_table_calls = get_table_calls.clone();
+                tokio::spawn(async move {
+                    let request = read_stub_request(&mut sock).await;
+                    if request.is_empty() {
+                        return;
+                    }
+                    if request.contains("UpdateTable") {
+                        update_calls.lock().expect("lock").push(request.clone());
+                        write_stub_response(&mut sock, "200 OK", "{}").await;
+                    } else if request.contains("GetTable") {
+                        let body = if get_table_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            before
+                        } else {
+                            after
+                        };
+                        write_stub_response(&mut sock, "200 OK", body).await;
+                    } else {
+                        write_stub_response(
+                            &mut sock,
+                            "400 Bad Request",
+                            r#"{"__type":"ValidationException","message":"?"}"#,
+                        )
+                        .await;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn alter_table_sets_a_column_comment_without_touching_siblings_or_table_comment() {
+        let update_calls = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_column_comment_stub(
+            COLUMN_COMMENT_BEFORE_JSON,
+            COLUMN_COMMENT_SET_AFTER_JSON,
+            update_calls.clone(),
+        )
+        .await;
+        let cat = stub_catalog(port);
+
+        let md = cat
+            .alter_table(
+                &["db1".to_string()],
+                "orders_cc",
+                vec![TableChange::SetColumnComment {
+                    column: "region".to_string(),
+                    comment: Some("US region code".to_string()),
+                }],
+            )
+            .await
+            .expect("alter");
+
+        assert_eq!(
+            md.column_comments.get("region").map(String::as_str),
+            Some("US region code")
+        );
+        // The sibling column's pre-existing comment must survive the rewrite untouched.
+        assert_eq!(
+            md.column_comments.get("id").map(String::as_str),
+            Some("already documented")
+        );
+        // So must the table-level comment.
+        assert_eq!(md.comment.as_deref(), Some("table level comment"));
+
+        let calls = update_calls.lock().expect("lock");
+        assert_eq!(calls.len(), 1);
+        let body = &calls[0];
+        assert!(body.contains(r#""Comment":"US region code""#), "{body}");
+        assert!(body.contains(r#""Comment":"already documented""#), "{body}");
+        assert!(
+            body.contains(r#""Description":"table level comment""#),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alter_table_clears_a_column_comment_through_glue() {
+        let update_calls = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_column_comment_stub(
+            COLUMN_COMMENT_BEFORE_JSON,
+            COLUMN_COMMENT_CLEARED_AFTER_JSON,
+            update_calls.clone(),
+        )
+        .await;
+        let cat = stub_catalog(port);
+
+        let md = cat
+            .alter_table(
+                &["db1".to_string()],
+                "orders_cc",
+                vec![TableChange::SetColumnComment {
+                    column: "id".to_string(),
+                    comment: None,
+                }],
+            )
+            .await
+            .expect("alter");
+
+        assert!(!md.column_comments.contains_key("id"), "cleared");
+        assert!(!md.column_comments.contains_key("region"), "was never set");
+        assert_eq!(md.comment.as_deref(), Some("table level comment"));
+
+        let calls = update_calls.lock().expect("lock");
+        assert_eq!(calls.len(), 1);
+        assert!(
+            !calls[0].contains("already documented"),
+            "the cleared comment must not ride along in the request: {}",
+            calls[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn alter_table_rejects_a_column_comment_for_an_unknown_column() {
+        let update_calls = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_alter_stub(update_calls.clone()).await;
+        let cat = stub_catalog(port);
+
+        let err = cat
+            .alter_table(
+                &["db1".to_string()],
+                "orders_alter",
+                vec![TableChange::SetColumnComment {
+                    column: "nope".to_string(),
+                    comment: Some("x".to_string()),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Plan(_)), "{err:?}");
+        assert!(
+            update_calls.lock().expect("lock").is_empty(),
+            "a rejected change must never reach UpdateTable"
+        );
     }
 
     async fn spawn_partitions_stub() -> u16 {

@@ -102,6 +102,9 @@ pub(crate) struct TableEntry {
     pub partition_columns: HiveColumns,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// Per-column comments, keyed by column name. A column absent here has no comment set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub column_comments: BTreeMap<String, String>,
     /// Table properties. Carries `metadata_location` for Iceberg entries, matching Glue.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub properties: BTreeMap<String, String>,

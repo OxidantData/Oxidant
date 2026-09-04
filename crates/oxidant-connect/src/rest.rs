@@ -15,6 +15,8 @@
 //! - `GET  /api/v1/catalogs/{catalog}/tables/{table}/columns?namespace=...` — list columns.
 //! - `PUT  /api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/comment` — set/clear
 //!   a table's catalog comment.
+//! - `PUT  /api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/columns/{column}/comment`
+//!   — set/clear one column's catalog comment.
 //! - `GET  /api/v1/catalogs/autocomplete?prefix=...` — catalog/schema/table/column suggestions.
 //! - `GET  /api/v1/cluster/status` — single-node / local-cluster / distributed + workers + process metrics.
 //! - `GET /api/v1/logs` — recent process log lines (in-memory ring buffer). **Bearer token
@@ -2191,6 +2193,10 @@ fn app(state: RestState) -> Router {
             "/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/comment",
             put(set_table_comment),
         )
+        .route(
+            "/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/columns/{column}/comment",
+            put(set_column_comment),
+        )
         .route("/api/v1/cluster/status", get(cluster_status))
         .route("/api/v1/logs", get(list_logs))
         .route("/api/v1/logs/files", get(list_log_files))
@@ -2569,6 +2575,14 @@ async fn list_columns(
 /// no snapshot yet — reports nulls with `"unavailable"`; and a table whose metadata could not
 /// be read (corrupt `metadata.json`, unreachable store) is a `500`, never a `200` that a
 /// harvester would file away as "this table just has no stats".
+///
+/// `comment` and `columns` ride along on the same response, in the vocabulary the comment-write
+/// routes use (`"comment"`), so a platform harvesting freshness through this route does not need
+/// a second round trip to pick up what `PUT .../comment` and `PUT .../columns/{column}/comment`
+/// stored. `comment` is the table's catalog comment (`null` when unset); `columns` is
+/// `[{"name": ..., "comment": ...}]` for every column the catalog declared a schema for — `[]`
+/// for the builtin catalog (no `CatalogProvider` to ask) and for an external table whose schema
+/// falls back to file inference (see [`TableMetadata::schema`](oxidant_catalog::TableMetadata)).
 async fn table_stats(
     State(state): State<RestState>,
     Path((catalog, namespace, table)): Path<(String, String, String)>,
@@ -2578,7 +2592,7 @@ async fn table_stats(
     // Namespaces are dot-joined everywhere else; split on '.' for consistency.
     let ns_parts: Vec<String> = namespace.split('.').map(|s| s.to_string()).collect();
 
-    let stats = if catalog == DEFAULT_CATALOG {
+    let (stats, comment, columns) = if catalog == DEFAULT_CATALOG {
         // Builtin tables are session-registered Parquet/CSV/temp views, not a lakehouse format
         // with snapshot metadata — but a wrong name still 404s like every other route here.
         let schema = ns_parts
@@ -2592,12 +2606,13 @@ async fn table_stats(
         {
             return error_response(StatusCode::NOT_FOUND, "unknown table");
         }
-        oxidant_loom::catalog_bridge::TableFreshnessStats {
+        let stats = oxidant_loom::catalog_bridge::TableFreshnessStats {
             row_count: None,
             data_updated_at: None,
             format: "unknown",
             stats_source: "unavailable",
-        }
+        };
+        (stats, None, Vec::new())
     } else {
         let Some(provider) = registry.provider(&catalog) else {
             return error_response(StatusCode::NOT_FOUND, "unknown catalog");
@@ -2619,25 +2634,45 @@ async fn table_stats(
                 );
             }
         };
-        match oxidant_loom::catalog_bridge::table_freshness_stats(&engine.session_state(), &md)
-            .await
-        {
-            Ok(stats) => stats,
-            // The table exists and the engine could not read its own format metadata. The
-            // detail names object-store locations, so it goes to the log, not the body.
-            Err(e) => {
-                tracing::warn!(catalog = %catalog, namespace = %namespace, table = %table,
+        let stats =
+            match oxidant_loom::catalog_bridge::table_freshness_stats(&engine.session_state(), &md)
+                .await
+            {
+                Ok(stats) => stats,
+                // The table exists and the engine could not read its own format metadata. The
+                // detail names object-store locations, so it goes to the log, not the body.
+                Err(e) => {
+                    tracing::warn!(catalog = %catalog, namespace = %namespace, table = %table,
                     format = e.format, error = %e.detail,
                     "table stats: reading snapshot metadata failed");
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!(
-                        "table stats: unable to read this table's {} snapshot metadata",
-                        e.format
-                    ),
-                );
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!(
+                            "table stats: unable to read this table's {} snapshot metadata",
+                            e.format
+                        ),
+                    );
+                }
+            };
+        // Column order follows the declared schema when there is one. A table whose schema
+        // fell back to file inference (`md.schema: None`) still surfaces any comments the
+        // catalog has on record for it, listed alphabetically rather than dropped.
+        let columns: Vec<Value> = match md.schema.as_ref() {
+            Some(schema) => schema
+                .fields()
+                .iter()
+                .map(|f| json!({ "name": f.name(), "comment": md.column_comments.get(f.name().as_str()) }))
+                .collect(),
+            None => {
+                let mut names: Vec<&String> = md.column_comments.keys().collect();
+                names.sort();
+                names
+                    .into_iter()
+                    .map(|n| json!({ "name": n, "comment": md.column_comments.get(n) }))
+                    .collect()
             }
-        }
+        };
+        (stats, md.comment.clone(), columns)
     };
 
     Json(json!({
@@ -2645,6 +2680,8 @@ async fn table_stats(
         "data_updated_at": stats.data_updated_at,
         "format": stats.format,
         "stats_source": stats.stats_source,
+        "comment": comment,
+        "columns": columns,
     }))
     .into_response()
 }
@@ -2763,6 +2800,116 @@ async fn set_table_comment(
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "table comment: unable to alter the table in its catalog",
+            )
+        }
+    }
+}
+
+/// Glue caps a `Column.Comment` at 255 characters — tighter than the 2048-character table
+/// `Description` cap `MAX_COMMENT_CHARS` enforces. Applied uniformly for the same reason: an
+/// oversized column comment fails the same way on every catalog, as a `400` naming the limit,
+/// instead of an opaque `500` from a provider-side validation error.
+const MAX_COLUMN_COMMENT_CHARS: usize = 255;
+
+/// `PUT /api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/columns/{column}/comment`
+/// — set or clear one column's comment (`{"comment": "..."}`) via
+/// `CatalogProvider::alter_table`'s `TableChange::SetColumnComment`, answering with the
+/// post-write state. Same body shape, clearing rule, and response shape as
+/// [`set_table_comment`] — see its doc for the full rationale — scoped to one column.
+///
+/// The failure mapping mirrors [`set_table_comment`]'s (`403` provider refusal verbatim, `404`
+/// wrong coordinates, `409` config-declared table, `501` no `alter_table` at all, `500`
+/// everything else), plus one more case unique to a column-scoped write: **`404` on a column
+/// name the table doesn't have.** That check runs as a fresh [`CatalogProvider::load_table`]
+/// *before* `alter_table` is called, rather than by pattern-matching the alter error afterward —
+/// `Error::Plan` from `alter_table` already means two different things for the table-comment
+/// route (doesn't exist vs. a declared-table conflict) and a column-comment attempt on a
+/// declared table must still read as `409`, not `404`, so a *third* meaning ("this column isn't
+/// on the table") cannot be layered onto the same error variant without them colliding. The
+/// pre-check only fires when the table's schema is known (`TableMetadata::schema.is_some()`); a
+/// table whose schema fell back to file inference is not pre-validated and any "column not
+/// found" the provider itself raises there is reported as the table-level fallback (`404`
+/// unknown table if the table also turns out to be gone, `409` if it's declared) rather than the
+/// more precise `404 unknown column` — a known, narrow gap rather than a guess.
+async fn set_column_comment(
+    State(state): State<RestState>,
+    Path((catalog, namespace, table, column)): Path<(String, String, String, String)>,
+    Json(body): Json<SetCommentBody>,
+) -> Response {
+    let registry = state.service.registry();
+    // Namespaces are dot-joined everywhere else; split on '.' for consistency.
+    let ns_parts: Vec<String> = namespace.split('.').map(|s| s.to_string()).collect();
+
+    let Some(provider) = registry.provider(&catalog) else {
+        return error_response(StatusCode::NOT_FOUND, "unknown catalog");
+    };
+    // Same clearing rule as the table-comment route: absent/null/""/whitespace-only all clear.
+    let comment = body.comment.filter(|c| !c.trim().is_empty());
+    if let Some(c) = comment.as_deref() {
+        let len = c.chars().count();
+        if len > MAX_COLUMN_COMMENT_CHARS {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "column comment: {len} characters exceeds the \
+                     {MAX_COLUMN_COMMENT_CHARS}-character limit"
+                ),
+            );
+        }
+    }
+
+    match provider.load_table(&ns_parts, &table).await {
+        Ok(md) => {
+            let unknown_column = md
+                .schema
+                .as_ref()
+                .is_some_and(|schema| !schema.fields().iter().any(|f| f.name() == &column));
+            if unknown_column {
+                return error_response(StatusCode::NOT_FOUND, "unknown column");
+            }
+        }
+        Err(oxidant_catalog::Error::Plan(_)) => {
+            return error_response(StatusCode::NOT_FOUND, "unknown table")
+        }
+        Err(e) => {
+            tracing::warn!(catalog = %catalog, namespace = %namespace, table = %table,
+                error = %e, "column comment: loading catalog metadata failed");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "column comment: unable to load the table from its catalog",
+            );
+        }
+    }
+
+    let change = oxidant_catalog::TableChange::SetColumnComment {
+        column: column.clone(),
+        comment,
+    };
+    match provider.alter_table(&ns_parts, &table, vec![change]).await {
+        Ok(md) => Json(json!({ "comment": md.column_comments.get(&column) })).into_response(),
+        // See the doc comment above: by the time `alter_table` itself fails with `Plan`, the
+        // column-existence pre-check above already ruled out "unknown column" for a table with a
+        // known schema, so this is the same "doesn't exist vs. declared-table conflict" question
+        // `set_table_comment` answers the same way.
+        Err(oxidant_catalog::Error::Plan(detail)) => {
+            match provider.table_exists(&ns_parts, &table).await {
+                Ok(true) => error_response(StatusCode::CONFLICT, &detail),
+                _ => error_response(StatusCode::NOT_FOUND, "unknown table"),
+            }
+        }
+        Err(oxidant_catalog::Error::Io(detail)) if is_access_denied(&detail) => {
+            error_response(StatusCode::FORBIDDEN, &detail)
+        }
+        Err(oxidant_catalog::Error::Unsupported(detail)) => {
+            error_response(StatusCode::NOT_IMPLEMENTED, &detail)
+        }
+        Err(e) => {
+            tracing::warn!(catalog = %catalog, namespace = %namespace, table = %table,
+                column = %column, error = %e,
+                "column comment: altering the table in its catalog failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "column comment: unable to alter the table in its catalog",
             )
         }
     }
@@ -4372,6 +4519,72 @@ mod tests {
         assert_eq!(body["stats_source"], "unavailable", "{body}");
         assert!(body["row_count"].is_null(), "{body}");
         assert!(body["data_updated_at"].is_null(), "{body}");
+        // `nation_parquet` is config-declared, which carries no comment and no declared schema —
+        // `comment`/`columns` are still present keys, just empty, never dropped from the body.
+        assert!(body["comment"].is_null(), "{body}");
+        assert_eq!(body["columns"].as_array().map(Vec::len), Some(0), "{body}");
+    }
+
+    #[tokio::test]
+    async fn table_stats_carries_the_table_and_column_comments() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (state, app) =
+            test_state_with_catalog(empty_local_catalog_conf(warehouse.path())).await;
+        let provider = state
+            .service
+            .registry()
+            .provider("local")
+            .expect("local catalog registered");
+        provider
+            .create_table(
+                &["live".to_string()],
+                "orders",
+                two_column_test_schema(),
+                oxidant_catalog::TableFormat::Parquet,
+                None,
+                &[],
+            )
+            .await
+            .expect("create managed table");
+        provider
+            .alter_table(
+                &["live".to_string()],
+                "orders",
+                vec![
+                    oxidant_catalog::TableChange::SetComment(Some(
+                        "canonical orders table".to_string(),
+                    )),
+                    oxidant_catalog::TableChange::SetColumnComment {
+                        column: "amount".to_string(),
+                        comment: Some("gross amount, pre-tax".to_string()),
+                    },
+                ],
+            )
+            .await
+            .expect("alter");
+
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/local/namespaces/live/tables/orders/stats",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["comment"], "canonical orders table", "{body}");
+        let columns = body["columns"].as_array().expect("columns array");
+        assert_eq!(columns.len(), 2, "{body}");
+        let amount = columns
+            .iter()
+            .find(|c| c["name"] == "amount")
+            .expect("amount column present");
+        assert_eq!(amount["comment"], "gross amount, pre-tax", "{body}");
+        let id = columns
+            .iter()
+            .find(|c| c["name"] == "id")
+            .expect("id column present");
+        assert!(
+            id["comment"].is_null(),
+            "a sibling with no comment set: {body}"
+        );
     }
 
     /// A table the engine cannot read is not a table with no stats: a harvester that polls
@@ -4459,6 +4672,16 @@ mod tests {
     fn comment_test_schema() -> oxidant_catalog::arrow::datatypes::SchemaRef {
         use oxidant_catalog::arrow::datatypes::{DataType, Field, Schema};
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]))
+    }
+
+    /// Two columns, so a column-comment write can be checked against a sibling that must stay
+    /// untouched.
+    fn two_column_test_schema() -> oxidant_catalog::arrow::datatypes::SchemaRef {
+        use oxidant_catalog::arrow::datatypes::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("amount", DataType::Int64, true),
+        ]))
     }
 
     async fn put_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -4599,10 +4822,19 @@ mod tests {
 
         async fn load_table(
             &self,
-            _namespace: &[String],
-            _table: &str,
+            namespace: &[String],
+            table: &str,
         ) -> oxidant_catalog::Result<oxidant_catalog::TableMetadata> {
-            Err(oxidant_catalog::Error::Plan("not used by this test".into()))
+            // `set_table_comment` never calls `load_table`, so this went unused there; the
+            // column-comment route pre-checks the column against a fresh `load_table` before
+            // ever calling `alter_table`, so this now needs to succeed (with the column those
+            // tests target) to let the refusal below actually be reached.
+            Ok(oxidant_catalog::TableMetadata::new(
+                format!("denying.{}.{table}", namespace.join(".")),
+                "mem://denying",
+                oxidant_catalog::TableFormat::Parquet,
+            )
+            .with_schema(comment_test_schema()))
         }
 
         async fn alter_table(
@@ -4665,10 +4897,17 @@ mod tests {
 
         async fn load_table(
             &self,
-            _namespace: &[String],
-            _table: &str,
+            namespace: &[String],
+            table: &str,
         ) -> oxidant_catalog::Result<oxidant_catalog::TableMetadata> {
-            Err(oxidant_catalog::Error::Plan("not used by this test".into()))
+            // Same reasoning as `DenyingCatalog::load_table` above: the column-comment route's
+            // pre-check needs this to succeed so it reaches the (missing) `alter_table` override.
+            Ok(oxidant_catalog::TableMetadata::new(
+                format!("inert.{}.{table}", namespace.join(".")),
+                "mem://inert",
+                oxidant_catalog::TableFormat::Parquet,
+            )
+            .with_schema(comment_test_schema()))
         }
     }
 
@@ -4863,6 +5102,304 @@ mod tests {
             .expect("load");
         assert_eq!(
             loaded.comment.as_deref(),
+            Some("keep me"),
+            "an unrecognized body must not clear the comment"
+        );
+    }
+
+    // ---- set_column_comment ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn set_column_comment_sets_reads_back_and_clears_without_touching_siblings_or_table_comment(
+    ) {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (state, app) =
+            test_state_with_catalog(empty_local_catalog_conf(warehouse.path())).await;
+        let provider = state
+            .service
+            .registry()
+            .provider("local")
+            .expect("local catalog registered");
+        provider
+            .create_table(
+                &["live".to_string()],
+                "orders",
+                two_column_test_schema(),
+                oxidant_catalog::TableFormat::Delta,
+                None,
+                &[],
+            )
+            .await
+            .expect("create managed table");
+        provider
+            .alter_table(
+                &["live".to_string()],
+                "orders",
+                vec![oxidant_catalog::TableChange::SetComment(Some(
+                    "table comment".to_string(),
+                ))],
+            )
+            .await
+            .expect("set table comment");
+
+        let uri = "/api/v1/catalogs/local/namespaces/live/tables/orders/columns/amount/comment";
+        let (status, body) =
+            put_json(&app, uri, json!({ "comment": "gross amount, pre-tax" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["comment"], "gross amount, pre-tax", "{body}");
+
+        let loaded = provider
+            .load_table(&["live".to_string()], "orders")
+            .await
+            .expect("load");
+        assert_eq!(
+            loaded.column_comments.get("amount").map(String::as_str),
+            Some("gross amount, pre-tax")
+        );
+        assert!(
+            !loaded.column_comments.contains_key("id"),
+            "a sibling column must not pick up a comment"
+        );
+        assert_eq!(
+            loaded.comment.as_deref(),
+            Some("table comment"),
+            "the table-level comment must survive a column-comment write"
+        );
+
+        // An empty string clears the comment, same as an explicit `null`.
+        let (status, body) = put_json(&app, uri, json!({ "comment": "" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["comment"].is_null(), "{body}");
+        let loaded = provider
+            .load_table(&["live".to_string()], "orders")
+            .await
+            .expect("load");
+        assert!(!loaded.column_comments.contains_key("amount"));
+        assert_eq!(loaded.comment.as_deref(), Some("table comment"));
+    }
+
+    #[tokio::test]
+    async fn set_column_comment_404s_on_a_missing_table() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (_state, app) = test_state_with_catalog(sample_catalog_conf(warehouse.path())).await;
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/local/namespaces/samples/tables/does_not_exist/columns/x/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn set_column_comment_404s_on_an_unregistered_catalog() {
+        let (_guard, _state, app) = test_state();
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/nope/namespaces/samples/tables/nation_iceberg/columns/x/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn set_column_comment_404s_on_an_unknown_column() {
+        // The table exists and its schema is known — `n_name` is a real column on it, `nope`
+        // isn't, so this must be told apart from "unknown table" rather than folded into it.
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (state, app) =
+            test_state_with_catalog(empty_local_catalog_conf(warehouse.path())).await;
+        let provider = state
+            .service
+            .registry()
+            .provider("local")
+            .expect("local catalog registered");
+        provider
+            .create_table(
+                &["live".to_string()],
+                "orders",
+                two_column_test_schema(),
+                oxidant_catalog::TableFormat::Delta,
+                None,
+                &[],
+            )
+            .await
+            .expect("create managed table");
+
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/local/namespaces/live/tables/orders/columns/nope/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("column"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_column_comment_403s_when_the_provider_denies_access() {
+        let (_guard, state, app) = test_state();
+        state
+            .service
+            .registry()
+            .register("denying", Arc::new(DenyingCatalog));
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/denying/namespaces/ns/tables/t/columns/id/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("AccessDeniedException"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_column_comment_501s_on_a_catalog_that_cannot_alter_tables() {
+        let (_guard, state, app) = test_state();
+        state
+            .service
+            .registry()
+            .register("inert", Arc::new(InertCatalog));
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/inert/namespaces/ns/tables/t/columns/id/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("does not support altering tables"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_column_comment_409s_on_a_config_declared_table() {
+        // Same "exists, just not ours to edit" rule as the table-comment route: a declared
+        // table's column comment write is refused with the provider's own sentence, never a
+        // `404` for a table the caller can list and query.
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (state, app) = test_state_with_catalog(sample_catalog_conf(warehouse.path())).await;
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/local/namespaces/samples/tables/nation_parquet/columns/n_name/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("declared in configuration"),
+            "{body}"
+        );
+        let loaded = state
+            .service
+            .registry()
+            .provider("local")
+            .expect("local catalog registered")
+            .load_table(&["samples".to_string()], "nation_parquet")
+            .await
+            .expect("load");
+        assert!(
+            loaded.column_comments.is_empty(),
+            "the refused write must not have landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_column_comment_rejects_an_oversized_comment_without_touching_the_column() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (state, app) =
+            test_state_with_catalog(empty_local_catalog_conf(warehouse.path())).await;
+        let provider = state
+            .service
+            .registry()
+            .provider("local")
+            .expect("local catalog registered");
+        provider
+            .create_table(
+                &["live".to_string()],
+                "orders",
+                comment_test_schema(),
+                oxidant_catalog::TableFormat::Delta,
+                None,
+                &[],
+            )
+            .await
+            .expect("create managed table");
+
+        let uri = "/api/v1/catalogs/local/namespaces/live/tables/orders/columns/id/comment";
+        put_json(&app, uri, json!({ "comment": "keep me" })).await;
+
+        // Glue's `Column.Comment` cap (255 chars) is tighter than the table `Description` cap.
+        let too_long = "x".repeat(MAX_COLUMN_COMMENT_CHARS + 1);
+        let (status, body) = put_json(&app, uri, json!({ "comment": too_long })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("255"),
+            "{body}"
+        );
+        let loaded = provider
+            .load_table(&["live".to_string()], "orders")
+            .await
+            .expect("load");
+        assert_eq!(
+            loaded.column_comments.get("id").map(String::as_str),
+            Some("keep me"),
+            "a rejected comment must leave the stored one alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_column_comment_rejects_an_unrecognized_body_instead_of_clearing() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (state, app) =
+            test_state_with_catalog(empty_local_catalog_conf(warehouse.path())).await;
+        let provider = state
+            .service
+            .registry()
+            .provider("local")
+            .expect("local catalog registered");
+        provider
+            .create_table(
+                &["live".to_string()],
+                "orders",
+                comment_test_schema(),
+                oxidant_catalog::TableFormat::Delta,
+                None,
+                &[],
+            )
+            .await
+            .expect("create managed table");
+
+        let uri = "/api/v1/catalogs/local/namespaces/live/tables/orders/columns/id/comment";
+        put_json(&app, uri, json!({ "comment": "keep me" })).await;
+        let (status, body) = put_json(&app, uri, json!({ "description": "oops" })).await;
+        assert!(status.is_client_error(), "{status} {body}");
+        let loaded = provider
+            .load_table(&["live".to_string()], "orders")
+            .await
+            .expect("load");
+        assert_eq!(
+            loaded.column_comments.get("id").map(String::as_str),
             Some("keep me"),
             "an unrecognized body must not clear the comment"
         );

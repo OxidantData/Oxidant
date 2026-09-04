@@ -241,6 +241,7 @@ impl LocalCatalog {
         }
         md.comment = entry.comment.clone();
         md.properties = entry.properties.clone().into_iter().collect();
+        md.column_comments = entry.column_comments.clone().into_iter().collect();
         md
     }
 }
@@ -453,6 +454,7 @@ impl CatalogProvider for LocalCatalog {
             columns,
             partition_columns: partitions,
             comment: None,
+            column_comments: BTreeMap::new(),
             properties: BTreeMap::new(),
             storage_options: BTreeMap::new(),
         };
@@ -582,16 +584,18 @@ impl CatalogProvider for LocalCatalog {
         }
         let key = table_key(&db, table);
         let name = self.name.clone();
-        let updated =
-            self.manifest
-                .update(move |manifest| {
-                    let entry = manifest.tables.get_mut(&key).ok_or_else(|| {
-                        Error::Plan(format!("table `{name}.{key}` does not exist"))
-                    })?;
-                    // Validate every change before applying any: a provider that rejects a change
-                    // must leave the table untouched, per the SPI contract.
-                    for change in &changes {
-                        if let TableChange::AddColumns(fields) = change {
+        let updated = self
+            .manifest
+            .update(move |manifest| {
+                let entry = manifest
+                    .tables
+                    .get_mut(&key)
+                    .ok_or_else(|| Error::Plan(format!("table `{name}.{key}` does not exist")))?;
+                // Validate every change before applying any: a provider that rejects a change
+                // must leave the table untouched, per the SPI contract.
+                for change in &changes {
+                    match change {
+                        TableChange::AddColumns(fields) => {
                             for field in fields {
                                 oxidant_catalog::hive_types::arrow_type_to_hive(field.data_type())
                                     .ok_or_else(|| {
@@ -604,39 +608,60 @@ impl CatalogProvider for LocalCatalog {
                                     })?;
                             }
                         }
+                        TableChange::SetColumnComment { column, .. } => {
+                            let exists = entry.columns.iter().any(|(n, _)| n == column)
+                                || entry.partition_columns.iter().any(|(n, _)| n == column);
+                            if !exists {
+                                return Err(Error::Plan(format!(
+                                    "column `{column}` does not exist on table `{name}.{key}`"
+                                )));
+                            }
+                        }
+                        _ => {}
                     }
-                    for change in &changes {
-                        match change {
-                            TableChange::SetProperties(props) => {
-                                for (k, v) in props {
-                                    entry.properties.insert(k.clone(), v.clone());
+                }
+                for change in &changes {
+                    match change {
+                        TableChange::SetProperties(props) => {
+                            for (k, v) in props {
+                                entry.properties.insert(k.clone(), v.clone());
+                            }
+                        }
+                        TableChange::UnsetProperties(keys) => {
+                            for k in keys {
+                                entry.properties.remove(k);
+                            }
+                        }
+                        TableChange::SetComment(comment) => {
+                            entry.comment = comment.clone();
+                        }
+                        TableChange::SetLocation(location) => {
+                            entry.location = location.clone();
+                        }
+                        TableChange::AddColumns(fields) => {
+                            for field in fields {
+                                let ty = oxidant_catalog::hive_types::arrow_type_to_hive(
+                                    field.data_type(),
+                                )
+                                .expect("validated above");
+                                entry.columns.push((field.name().clone(), ty));
+                            }
+                        }
+                        TableChange::SetColumnComment { column, comment } => {
+                            match comment.as_deref().filter(|c| !c.is_empty()) {
+                                Some(c) => {
+                                    entry.column_comments.insert(column.clone(), c.to_string());
                                 }
-                            }
-                            TableChange::UnsetProperties(keys) => {
-                                for k in keys {
-                                    entry.properties.remove(k);
-                                }
-                            }
-                            TableChange::SetComment(comment) => {
-                                entry.comment = comment.clone();
-                            }
-                            TableChange::SetLocation(location) => {
-                                entry.location = location.clone();
-                            }
-                            TableChange::AddColumns(fields) => {
-                                for field in fields {
-                                    let ty = oxidant_catalog::hive_types::arrow_type_to_hive(
-                                        field.data_type(),
-                                    )
-                                    .expect("validated above");
-                                    entry.columns.push((field.name().clone(), ty));
+                                None => {
+                                    entry.column_comments.remove(column);
                                 }
                             }
                         }
                     }
-                    Ok(entry.clone())
-                })
-                .await?;
+                }
+                Ok(entry.clone())
+            })
+            .await?;
         Ok(self.managed_metadata(&db, table, &updated))
     }
 }
@@ -891,6 +916,17 @@ mod tests {
                 )
                 .await
                 .err(),
+            catalog
+                .alter_table(
+                    &["raw".into()],
+                    "events",
+                    vec![TableChange::SetColumnComment {
+                        column: "id".to_string(),
+                        comment: Some("x".to_string()),
+                    }],
+                )
+                .await
+                .err(),
         ] {
             let err = err.expect("DDL on a declared table must fail");
             assert!(
@@ -942,6 +978,100 @@ mod tests {
         let schema = altered.schema.expect("schema");
         assert_eq!(schema.fields().len(), 4);
         assert_eq!(schema.field(3).name(), "amount");
+    }
+
+    #[tokio::test]
+    async fn alter_table_sets_and_clears_a_column_comment_without_touching_siblings_or_table_comment(
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = catalog(dir.path()).await;
+        catalog
+            .create_table(
+                &["live".into()],
+                "t",
+                schema(),
+                TableFormat::Delta,
+                None,
+                &[],
+            )
+            .await
+            .expect("create");
+        catalog
+            .alter_table(
+                &["live".into()],
+                "t",
+                vec![TableChange::SetComment(Some("table comment".into()))],
+            )
+            .await
+            .expect("set table comment");
+
+        let altered = catalog
+            .alter_table(
+                &["live".into()],
+                "t",
+                vec![TableChange::SetColumnComment {
+                    column: "name".to_string(),
+                    comment: Some("display name".into()),
+                }],
+            )
+            .await
+            .expect("set column comment");
+        assert_eq!(
+            altered.column_comments.get("name").map(String::as_str),
+            Some("display name")
+        );
+        assert!(
+            !altered.column_comments.contains_key("id"),
+            "a sibling column must not pick up a comment"
+        );
+        assert_eq!(
+            altered.comment.as_deref(),
+            Some("table comment"),
+            "the table-level comment must survive a column-comment write"
+        );
+
+        let cleared = catalog
+            .alter_table(
+                &["live".into()],
+                "t",
+                vec![TableChange::SetColumnComment {
+                    column: "name".to_string(),
+                    comment: None,
+                }],
+            )
+            .await
+            .expect("clear column comment");
+        assert!(!cleared.column_comments.contains_key("name"));
+        assert_eq!(cleared.comment.as_deref(), Some("table comment"));
+    }
+
+    #[tokio::test]
+    async fn alter_table_rejects_a_column_comment_for_an_unknown_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = catalog(dir.path()).await;
+        catalog
+            .create_table(
+                &["live".into()],
+                "t",
+                schema(),
+                TableFormat::Delta,
+                None,
+                &[],
+            )
+            .await
+            .expect("create");
+        let err = catalog
+            .alter_table(
+                &["live".into()],
+                "t",
+                vec![TableChange::SetColumnComment {
+                    column: "nope".to_string(),
+                    comment: Some("x".into()),
+                }],
+            )
+            .await
+            .expect_err("unknown column must be rejected");
+        assert!(matches!(err, Error::Plan(_)), "got: {err:?}");
     }
 
     #[tokio::test]

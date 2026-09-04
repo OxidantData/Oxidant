@@ -89,6 +89,11 @@ pub struct TableMetadata {
     /// Table properties / parameters (e.g. Hive's `parameters` map, Glue's `Parameters` map).
     /// Empty when the source doesn't surface these.
     pub properties: HashMap<String, String>,
+    /// Per-column comments, keyed by column name (e.g. Glue's `StorageDescriptor.Columns[].Comment`
+    /// / `PartitionKeys[].Comment`, Hive's per-column `comment`). A column absent from this map has
+    /// no comment set — that is not the same as an empty string, which a provider treats as
+    /// "clear". Empty when the source doesn't surface these or no column has one.
+    pub column_comments: HashMap<String, String>,
 }
 
 impl TableMetadata {
@@ -103,6 +108,7 @@ impl TableMetadata {
             partition_columns: Vec::new(),
             comment: None,
             properties: HashMap::new(),
+            column_comments: HashMap::new(),
         }
     }
 
@@ -133,6 +139,12 @@ impl TableMetadata {
     /// Builder: attach table properties/parameters.
     pub fn with_properties(mut self, properties: HashMap<String, String>) -> Self {
         self.properties = properties;
+        self
+    }
+
+    /// Builder: attach per-column comments.
+    pub fn with_column_comments(mut self, column_comments: HashMap<String, String>) -> Self {
+        self.column_comments = column_comments;
         self
     }
 }
@@ -375,9 +387,10 @@ pub trait CatalogProvider: Send + Sync {
     /// rejects a change it cannot honor (e.g. an unrepresentable column type) with
     /// [`Error::Unsupported`] and must then leave the table untouched.
     ///
-    /// KAN-100 covers properties, comment, location, and `ADD COLUMNS` only — `RENAME COLUMN` /
-    /// `CHANGE COLUMN` are deferred until Loom wires those ALTER variants into the SPI (Glue
-    /// would require a full `StorageDescriptor` column-list rewrite for each rename/type change).
+    /// KAN-100 covers properties, comment, location, `ADD COLUMNS`, and per-column comment only —
+    /// `RENAME COLUMN` / `CHANGE COLUMN` are deferred until Loom wires those ALTER variants into
+    /// the SPI (Glue would require a full `StorageDescriptor` column-list rewrite for each
+    /// rename/type change).
     ///
     /// Default: `Unsupported`.
     async fn alter_table(
@@ -437,6 +450,13 @@ pub enum TableChange {
     SetLocation(String),
     /// `ADD COLUMNS (...)` — append data columns (Arrow fields) to the table schema.
     AddColumns(Vec<Field>),
+    /// `ALTER COLUMN col COMMENT '...'` — set the comment on one existing column (`None`
+    /// clears it). A provider that cannot find `column` on the table rejects this with
+    /// [`Error::Plan`] rather than silently no-opping.
+    SetColumnComment {
+        column: String,
+        comment: Option<String>,
+    },
 }
 
 /// The per-session set of named catalogs plus the current catalog / namespace pointers.
