@@ -2579,10 +2579,20 @@ async fn list_columns(
 /// `comment` and `columns` ride along on the same response, in the vocabulary the comment-write
 /// routes use (`"comment"`), so a platform harvesting freshness through this route does not need
 /// a second round trip to pick up what `PUT .../comment` and `PUT .../columns/{column}/comment`
-/// stored. `comment` is the table's catalog comment (`null` when unset); `columns` is
-/// `[{"name": ..., "comment": ...}]` for every column the catalog declared a schema for — `[]`
-/// for the builtin catalog (no `CatalogProvider` to ask) and for an external table whose schema
-/// falls back to file inference (see [`TableMetadata::schema`](oxidant_catalog::TableMetadata)).
+/// stored. `comment` is the table's catalog comment (`null` when unset).
+///
+/// `columns` is `[{"name": ..., "comment": ...}]`, and what it covers depends on whether the
+/// catalog declared a schema (see [`TableMetadata::schema`](oxidant_catalog::TableMetadata)):
+///
+/// - Schema declared — every column, in schema order. The table's full column list.
+/// - Builtin catalog — `[]`: there is no `CatalogProvider` to ask for comments.
+/// - Schema fell back to file inference (`md.schema` is `None` — a Glue table with an
+///   `array<…>` / `struct<…>` / `map<…>` column, which `columns_to_schema` maps
+///   all-or-nothing) — **only the columns that have a comment on record**, name-sorted. The
+///   catalog's column list is not reachable from `TableMetadata` in that case, so the choice is
+///   between keeping the comments a harvester came for and dropping them; this keeps them, at
+///   the cost of `columns` being a subset rather than the schema. A caller that needs the
+///   authoritative column list asks `GET .../tables/{table}/columns`, which infers it.
 async fn table_stats(
     State(state): State<RestState>,
     Path((catalog, namespace, table)): Path<(String, String, String)>,
@@ -2827,10 +2837,13 @@ const MAX_COLUMN_COMMENT_CHARS: usize = 255;
 /// declared table must still read as `409`, not `404`, so a *third* meaning ("this column isn't
 /// on the table") cannot be layered onto the same error variant without them colliding. The
 /// pre-check only fires when the table's schema is known (`TableMetadata::schema.is_some()`); a
-/// table whose schema fell back to file inference is not pre-validated and any "column not
-/// found" the provider itself raises there is reported as the table-level fallback (`404`
-/// unknown table if the table also turns out to be gone, `409` if it's declared) rather than the
-/// more precise `404 unknown column` — a known, narrow gap rather than a guess.
+/// table whose schema fell back to file inference is not pre-validated, so a "column not found"
+/// the provider itself raises there comes back through the table-level `Plan` fallback below —
+/// `409` carrying the provider's own sentence whenever the table still exists, which is *every*
+/// such case and not only a config-declared one, and `404 unknown table` only if the table has
+/// since gone. Closing that gap needs a catalog column list that survives an unmappable column
+/// type, which `TableMetadata` does not carry today; until it does this is a known gap rather
+/// than a guess, and the `409` body names the column so the caller can still tell what happened.
 async fn set_column_comment(
     State(state): State<RestState>,
     Path((catalog, namespace, table, column)): Path<(String, String, String, String)>,
@@ -4909,6 +4922,119 @@ mod tests {
             )
             .with_schema(comment_test_schema()))
         }
+    }
+
+    /// A catalog whose table has comments on record but **no declared schema** — what the Glue
+    /// provider produces for a table with an `array<…>` / `struct<…>` / `map<…>` column, since
+    /// `columns_to_schema` maps all-or-nothing. Neither `LocalCatalog` fixture can reach this
+    /// state (a managed table's columns are always mappable, a declared one never has comments),
+    /// so the two routes' behavior on it is only pinnable with a fake.
+    struct InferredSchemaCatalog;
+
+    #[async_trait::async_trait]
+    impl oxidant_catalog::CatalogProvider for InferredSchemaCatalog {
+        fn name(&self) -> &str {
+            "inferred"
+        }
+
+        async fn list_namespaces(
+            &self,
+            _parent: &[String],
+        ) -> oxidant_catalog::Result<Vec<Vec<String>>> {
+            Ok(vec![])
+        }
+
+        async fn list_tables(&self, _namespace: &[String]) -> oxidant_catalog::Result<Vec<String>> {
+            Ok(vec!["t".to_string()])
+        }
+
+        async fn load_table(
+            &self,
+            namespace: &[String],
+            table: &str,
+        ) -> oxidant_catalog::Result<oxidant_catalog::TableMetadata> {
+            // No `with_schema`: the type of `payload` (a `struct<…>`) has no faithful Arrow
+            // mapping, so the whole schema falls back to file inference. `Parquet` keeps
+            // `table_freshness_stats` from touching the (nonexistent) store.
+            Ok(oxidant_catalog::TableMetadata::new(
+                format!("inferred.{}.{table}", namespace.join(".")),
+                "mem://inferred",
+                oxidant_catalog::TableFormat::Parquet,
+            )
+            .with_comment(Some("table comment".to_string()))
+            .with_column_comments(std::collections::HashMap::from([
+                ("region".to_string(), "ISO region code".to_string()),
+                ("id".to_string(), "surrogate key".to_string()),
+            ])))
+        }
+
+        async fn alter_table(
+            &self,
+            _namespace: &[String],
+            _table: &str,
+            _changes: Vec<oxidant_catalog::TableChange>,
+        ) -> oxidant_catalog::Result<oxidant_catalog::TableMetadata> {
+            // What `apply_table_changes` in `oxidant-catalog-glue` raises for a column the Glue
+            // table does not have.
+            Err(oxidant_catalog::Error::Plan(
+                "column `nope` not found on table `t`".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn table_stats_columns_on_an_inference_schema_table_is_the_commented_subset() {
+        // Documented contract, and the reason it is worth pinning: with no declared schema there
+        // is no column list to report, so `columns` carries the commented columns (name-sorted)
+        // rather than dropping the comments the harvester came for. It is a *subset*, not the
+        // table's schema — anything that changes that has to change `docs/api.md` too.
+        let (_guard, state, app) = test_state();
+        state
+            .service
+            .registry()
+            .register("inferred", Arc::new(InferredSchemaCatalog));
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/catalogs/inferred/namespaces/ns/tables/t/stats",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["comment"], "table comment", "{body}");
+        assert_eq!(
+            body["columns"],
+            json!([
+                { "name": "id", "comment": "surrogate key" },
+                { "name": "region", "comment": "ISO region code" },
+            ]),
+            "commented columns only, sorted by name: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_column_comment_on_an_inference_schema_table_reports_the_catalog_refusal() {
+        // The pre-check needs a declared schema, so on this table an unknown column reaches the
+        // provider and comes back through the `Plan` fallback as a `409` naming the column —
+        // *not* a `404 unknown table`, which would send the caller hunting for a typo in the
+        // table name. `docs/api.md` says a `409` here is either this or a config-declared table.
+        let (_guard, state, app) = test_state();
+        state
+            .service
+            .registry()
+            .register("inferred", Arc::new(InferredSchemaCatalog));
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/inferred/namespaces/ns/tables/t/columns/nope/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("column `nope` not found"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

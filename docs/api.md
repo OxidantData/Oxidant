@@ -217,9 +217,16 @@ missing key.
 - `comment` and `columns` carry the same catalog comments the [table](#table-comment) and
   [column](#column-comment) comment routes set — in the `"comment"` vocabulary those routes use —
   so a platform harvesting freshness through this route picks them up in the same poll, no second
-  round trip. `columns` lists every column the catalog declared a schema for, in schema order;
-  it is `[]` for the builtin catalog (no `CatalogProvider` to ask) and for an external table whose
-  schema fell back to file inference rather than a catalog-declared one.
+  round trip.
+- `columns` lists every column, in schema order, **when the catalog declared a schema** — then it
+  is the table's full column list. It is `[]` for the builtin catalog (no `CatalogProvider` to
+  ask). For an external table whose schema fell back to file inference rather than a
+  catalog-declared one — a Glue table with an `array<…>` / `struct<…>` / `map<…>` column, say,
+  which is mapped all-or-nothing — the catalog's column list is not available on this path, so
+  `columns` carries **only the columns that have a comment**, sorted by name. The comments are
+  kept rather than dropped, but that list is a subset and not the table's schema: a caller that
+  needs the authoritative column list asks
+  `GET /api/v1/catalogs/{catalog}/tables/{table}/columns`.
 
 - `data_updated_at` is milliseconds since the Unix epoch — the Iceberg snapshot's `timestamp-ms`,
   or Delta's In-Commit Timestamp when enabled and otherwise the latest commit file's
@@ -310,12 +317,15 @@ same unknown-key rejection, scoped to one column.
   `spark_catalog`) and an unknown table.
 - **An unknown column is `404`.** Checked against the table's declared schema before the catalog
   is asked to alter anything, so a typo in the column name reads as "no such column", not folded
-  into "no such table". This check only runs when the table's schema is known; a table whose
-  schema fell back to file inference is not pre-validated (see [table stats](#table-freshness)'s
-  note on when `columns` can be empty).
-- Same `409` for a config-declared table, the same `403` for a provider's access-denied refusal
-  (verbatim), and the same `501` for a catalog with no `alter_table` at all, for the same reasons
-  as the table-comment route.
+  into "no such table". This check only runs when the table's schema is known; on a table whose
+  schema fell back to file inference (see [table stats](#table-freshness)) there is no column
+  list to pre-validate against, and an unknown column comes back as `409` carrying the catalog's
+  own `column \`…\` not found on table \`…\`` sentence instead.
+- `409` therefore means one of two things — a config-declared table, or an unknown column on a
+  table with no catalog-declared schema. The message says which; both are "this write will not
+  land", neither is "no such table".
+- The same `403` for a provider's access-denied refusal (verbatim) and the same `501` for a
+  catalog with no `alter_table` at all, for the same reasons as the table-comment route.
 - **A comment longer than 255 characters is `400`.** Glue's `Column.Comment` cap is tighter than
   its table-level `Description` cap (2048) — applied uniformly here the same way, counting
   characters, and leaving the stored comment untouched.
