@@ -13,6 +13,8 @@
 //! - `GET  /api/v1/catalogs/{catalog}/namespaces` — list databases/schemas.
 //! - `GET  /api/v1/catalogs/{catalog}/tables?namespace=...` — list tables.
 //! - `GET  /api/v1/catalogs/{catalog}/tables/{table}/columns?namespace=...` — list columns.
+//! - `PUT  /api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/comment` — set/clear
+//!   a table's catalog comment.
 //! - `GET  /api/v1/catalogs/autocomplete?prefix=...` — catalog/schema/table/column suggestions.
 //! - `GET  /api/v1/cluster/status` — single-node / local-cluster / distributed + workers + process metrics.
 //! - `GET /api/v1/logs` — recent process log lines (in-memory ring buffer). **Bearer token
@@ -35,7 +37,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{self, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use datafusion::arrow::json::{ArrayWriter, WriterBuilder};
 use futures::StreamExt;
@@ -2185,6 +2187,10 @@ fn app(state: RestState) -> Router {
             "/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/stats",
             get(table_stats),
         )
+        .route(
+            "/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/comment",
+            put(set_table_comment),
+        )
         .route("/api/v1/cluster/status", get(cluster_status))
         .route("/api/v1/logs", get(list_logs))
         .route("/api/v1/logs/files", get(list_log_files))
@@ -2641,6 +2647,76 @@ async fn table_stats(
         "stats_source": stats.stats_source,
     }))
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SetCommentBody {
+    /// Absent, explicit `null`, and `""` all clear the comment (`SetComment(None)`); any other
+    /// string sets it verbatim. `#[serde(default)]` is what makes "absent" and "null" the same
+    /// case — there is no reason to reject a client that just omits the field.
+    #[serde(default)]
+    comment: Option<String>,
+}
+
+/// `PUT /api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/comment` — set or clear
+/// one table's catalog-level comment (`{"comment": "..."}`) via
+/// `CatalogProvider::alter_table`'s `TableChange::SetComment`, answering with the post-write
+/// state.
+///
+/// Only a registered external catalog implements `alter_table`; the builtin `spark_catalog` has
+/// no `CatalogProvider` to alter, so it `404`s exactly like any other unregistered catalog name —
+/// the same "wrong coordinates" answer `table_stats` gives, never a silent no-op.
+///
+/// A provider's access-denied refusal is the caller's own permission signal, not an engine
+/// failure, so it surfaces as `403` carrying the catalog's own message verbatim — the Oxidant
+/// Platform shows *why* the write was refused instead of a generic "internal error". Every other
+/// provider failure still maps to `500`, same as `table_stats`: this route must not flatten a
+/// permission refusal into the same bucket as a throttled/unreachable backend.
+async fn set_table_comment(
+    State(state): State<RestState>,
+    Path((catalog, namespace, table)): Path<(String, String, String)>,
+    Json(body): Json<SetCommentBody>,
+) -> Response {
+    let registry = state.service.registry();
+    // Namespaces are dot-joined everywhere else; split on '.' for consistency.
+    let ns_parts: Vec<String> = namespace.split('.').map(|s| s.to_string()).collect();
+
+    let Some(provider) = registry.provider(&catalog) else {
+        return error_response(StatusCode::NOT_FOUND, "unknown catalog");
+    };
+    // There is no such thing as a table comment that is `""` rather than unset.
+    let comment = body.comment.filter(|c| !c.is_empty());
+    let change = oxidant_catalog::TableChange::SetComment(comment);
+    match provider.alter_table(&ns_parts, &table, vec![change]).await {
+        Ok(md) => Json(json!({ "comment": md.comment })).into_response(),
+        // `Error::Plan` is the provider's "doesn't exist" classification (see
+        // `CatalogProvider::table_exists`'s doc comment) — everything else below is a genuine
+        // backend failure, reported the same way `table_stats` does.
+        Err(oxidant_catalog::Error::Plan(_)) => {
+            error_response(StatusCode::NOT_FOUND, "unknown table")
+        }
+        // The provider's own refusal, not the engine's: pass its message through verbatim rather
+        // than flattening it into a `500` like every other backend failure below.
+        Err(oxidant_catalog::Error::Io(detail)) if is_access_denied(&detail) => {
+            error_response(StatusCode::FORBIDDEN, &detail)
+        }
+        Err(e) => {
+            tracing::warn!(catalog = %catalog, namespace = %namespace, table = %table,
+                error = %e, "table comment: altering the table in its catalog failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "table comment: unable to alter the table in its catalog",
+            )
+        }
+    }
+}
+
+/// Whether a provider's [`oxidant_catalog::Error::Io`] detail names an access-control refusal
+/// rather than a network/throttling/other backend failure. Glue and Lake Formation both fold
+/// `AccessDeniedException` into `Error::Io` (`classify_glue_failure`) and deliberately keep the
+/// service error code in the message text for exactly this kind of grep.
+fn is_access_denied(detail: &str) -> bool {
+    detail.contains("AccessDenied")
 }
 
 async fn autocomplete_catalog(
@@ -4279,6 +4355,213 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    // ---- set_table_comment -----------------------------------------------------------------
+
+    /// [`sample_catalog_conf`] declares every table from config, and `LocalCatalog::alter_table`
+    /// refuses to alter a declared table (config is the operator's statement of intent) — so
+    /// these tests need a *managed* table, created straight through the provider the way
+    /// `LakeSink` would, over a bare local catalog with nothing declared.
+    fn empty_local_catalog_conf(
+        warehouse: &std::path::Path,
+    ) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([
+            (
+                "spark.sql.catalog.local.type".to_string(),
+                "local".to_string(),
+            ),
+            (
+                "spark.sql.catalog.local.warehouse".to_string(),
+                warehouse.to_string_lossy().to_string(),
+            ),
+        ])
+    }
+
+    fn comment_test_schema() -> oxidant_catalog::arrow::datatypes::SchemaRef {
+        use oxidant_catalog::arrow::datatypes::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]))
+    }
+
+    async fn put_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn set_table_comment_sets_reads_back_and_clears() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (state, app) =
+            test_state_with_catalog(empty_local_catalog_conf(warehouse.path())).await;
+        let provider = state
+            .service
+            .registry()
+            .provider("local")
+            .expect("local catalog registered");
+        provider
+            .create_table(
+                &["live".to_string()],
+                "orders",
+                comment_test_schema(),
+                oxidant_catalog::TableFormat::Delta,
+                None,
+                &[],
+            )
+            .await
+            .expect("create managed table");
+
+        let uri = "/api/v1/catalogs/local/namespaces/live/tables/orders/comment";
+        let (status, body) = put_json(&app, uri, json!({ "comment": "hot path" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["comment"], "hot path", "{body}");
+        let loaded = provider
+            .load_table(&["live".to_string()], "orders")
+            .await
+            .expect("load");
+        assert_eq!(loaded.comment.as_deref(), Some("hot path"));
+
+        // An empty string clears the comment, same as an explicit `null`.
+        let (status, body) = put_json(&app, uri, json!({ "comment": "" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["comment"].is_null(), "{body}");
+        let loaded = provider
+            .load_table(&["live".to_string()], "orders")
+            .await
+            .expect("load");
+        assert_eq!(loaded.comment, None);
+
+        put_json(&app, uri, json!({ "comment": "set again" })).await;
+        let (status, body) = put_json(&app, uri, json!({ "comment": null })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["comment"].is_null(), "{body}");
+        let loaded = provider
+            .load_table(&["live".to_string()], "orders")
+            .await
+            .expect("load");
+        assert_eq!(loaded.comment, None);
+    }
+
+    #[tokio::test]
+    async fn set_table_comment_404s_on_a_missing_table() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (_state, app) = test_state_with_catalog(sample_catalog_conf(warehouse.path())).await;
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/local/namespaces/samples/tables/does_not_exist/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn set_table_comment_404s_on_an_unregistered_catalog() {
+        let (_guard, _state, app) = test_state();
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/nope/namespaces/samples/tables/nation_iceberg/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn set_table_comment_404s_on_the_builtin_catalog() {
+        // `spark_catalog` has no `CatalogProvider` to alter — wrong coordinates, same as the
+        // unregistered-catalog case above, never a silent no-op.
+        let (_guard, _state, app) = test_state();
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/spark_catalog/namespaces/default/tables/does_not_exist/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    /// A catalog provider that unconditionally refuses `alter_table` the way Glue does when the
+    /// caller's IAM principal lacks `glue:UpdateTable` — `Error::Io` carrying
+    /// `AccessDeniedException` in the message (see `classify_glue_failure` in
+    /// `oxidant-catalog-glue`).
+    struct DenyingCatalog;
+
+    #[async_trait::async_trait]
+    impl oxidant_catalog::CatalogProvider for DenyingCatalog {
+        fn name(&self) -> &str {
+            "denying"
+        }
+
+        async fn list_namespaces(
+            &self,
+            _parent: &[String],
+        ) -> oxidant_catalog::Result<Vec<Vec<String>>> {
+            Ok(vec![])
+        }
+
+        async fn list_tables(&self, _namespace: &[String]) -> oxidant_catalog::Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn load_table(
+            &self,
+            _namespace: &[String],
+            _table: &str,
+        ) -> oxidant_catalog::Result<oxidant_catalog::TableMetadata> {
+            Err(oxidant_catalog::Error::Plan("not used by this test".into()))
+        }
+
+        async fn alter_table(
+            &self,
+            _namespace: &[String],
+            _table: &str,
+            _changes: Vec<oxidant_catalog::TableChange>,
+        ) -> oxidant_catalog::Result<oxidant_catalog::TableMetadata> {
+            Err(oxidant_catalog::Error::Io(
+                "aws glue UpdateTable: AccessDeniedException: User: arn:aws:iam::123:user/kai is \
+                 not authorized to perform: glue:UpdateTable"
+                    .to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn set_table_comment_403s_when_the_provider_denies_access() {
+        let (_guard, state, app) = test_state();
+        state
+            .service
+            .registry()
+            .register("denying", Arc::new(DenyingCatalog));
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/denying/namespaces/ns/tables/t/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("AccessDeniedException"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

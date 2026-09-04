@@ -24,6 +24,7 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/v1/catalogs/{catalog}/tables` | Tables in `?namespace=` (default `default`) |
 | `GET` | `/api/v1/catalogs/{catalog}/tables/{table}/columns` | Columns and types of one table |
 | `GET` | `/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/stats` | Freshness of one table, from its snapshot metadata |
+| `PUT` | `/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/comment` | Set or clear a table's catalog comment |
 | `GET` | `/api/v1/catalogs/autocomplete` | Identifier suggestions for a dotted `?prefix=` |
 | `GET` | `/api/dashboards` | Dashboards, newest-updated first |
 | `POST` | `/api/dashboards` | Create a dashboard |
@@ -223,6 +224,32 @@ All four keys are always present; an absent value is `null`, never a missing key
   whose metadata exists but cannot be read (a corrupt `metadata.json`, an unreachable store) is
   `500 table stats: unable to read this table's <format> snapshot metadata`, with the failing
   location in the server log rather than the response.
+
+### Table comment
+
+```sh
+curl -s -X PUT http://localhost:4040/api/v1/catalogs/prod/namespaces/sales/tables/orders/comment \
+  -H 'Content-Type: application/json' \
+  -d '{"comment": "canonical order fact table"}'
+```
+
+```json
+{ "comment": "canonical order fact table" }
+```
+
+Sets a table's catalog-level comment through `CatalogProvider::alter_table` (Glue's
+`Description`, the Hive-style table comment). An absent `comment` field, an explicit `null`, and
+`""` all clear it (`{"comment": null}`); the response is always the post-write value, `null` when
+cleared.
+
+- Only a registered external catalog can be altered this way — `spark_catalog` (the builtin
+  catalog) and an unknown catalog name both answer `404`, same "wrong coordinates" rule as the
+  stats route above.
+- An unknown table is `404`.
+- **A provider's access-denied refusal is `403`, not `500`.** Glue's `AccessDeniedException` (the
+  caller's IAM principal lacks `glue:UpdateTable`) surfaces as `403` carrying the catalog's own
+  message verbatim, so a caller sees *why* the write was refused. Every other backend failure
+  (throttling, network, an unsupported change) is still `500`.
 
 ### Autocomplete
 
