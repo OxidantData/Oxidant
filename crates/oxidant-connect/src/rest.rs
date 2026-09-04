@@ -2649,11 +2649,25 @@ async fn table_stats(
     .into_response()
 }
 
+/// Glue caps a table `Description` at 2048 characters — the tightest limit among the catalogs
+/// this route can write to. Checking it here turns "the caller sent too much text" into a `400`
+/// that names the limit, instead of the opaque `500` a provider-side `ValidationException`
+/// becomes. A provider may still reject a shorter comment for its own reasons; that stays a
+/// `500`.
+const MAX_COMMENT_CHARS: usize = 2048;
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetCommentBody {
-    /// Absent, explicit `null`, and `""` all clear the comment (`SetComment(None)`); any other
-    /// string sets it verbatim. `#[serde(default)]` is what makes "absent" and "null" the same
-    /// case — there is no reason to reject a client that just omits the field.
+    /// Absent, explicit `null`, `""`, and whitespace-only all clear the comment
+    /// (`SetComment(None)`); any other string is stored verbatim, leading/trailing whitespace
+    /// included. `#[serde(default)]` is what makes "absent" and "null" the same case — there is
+    /// no reason to reject a client that just omits the field.
+    ///
+    /// `deny_unknown_fields` is load-bearing *because* the field is optional: without it a
+    /// misspelled or wrong-shaped body (`{"description": "..."}` — Glue's own name for this
+    /// field) would deserialize to "no comment given" and silently wipe an existing comment with
+    /// a `200`. A body this route does not understand must be rejected, never guessed at.
     #[serde(default)]
     comment: Option<String>,
 }
@@ -2663,15 +2677,31 @@ struct SetCommentBody {
 /// `CatalogProvider::alter_table`'s `TableChange::SetComment`, answering with the post-write
 /// state.
 ///
+/// The body is the whole desired state of the comment, so an absent/`null`/empty/whitespace-only
+/// `comment` clears it. The response reports `alter_table`'s returned metadata, which the SPI
+/// defines as the *post-alter* state (Glue re-reads the table with a fresh `GetTable`;
+/// `LocalCatalog` returns the persisted manifest entry) — not an echo of the request.
+///
 /// Only a registered external catalog implements `alter_table`; the builtin `spark_catalog` has
 /// no `CatalogProvider` to alter, so it `404`s exactly like any other unregistered catalog name —
 /// the same "wrong coordinates" answer `table_stats` gives, never a silent no-op.
 ///
-/// A provider's access-denied refusal is the caller's own permission signal, not an engine
-/// failure, so it surfaces as `403` carrying the catalog's own message verbatim — the Oxidant
-/// Platform shows *why* the write was refused instead of a generic "internal error". Every other
-/// provider failure still maps to `500`, same as `table_stats`: this route must not flatten a
-/// permission refusal into the same bucket as a throttled/unreachable backend.
+/// The failure mapping separates *whose fault it is*, because the caller acts on each one
+/// differently:
+///
+/// - `403` — a provider's access-denied refusal, carrying the catalog's own message verbatim, so
+///   the Oxidant Platform shows *why* the write was refused instead of a generic "internal
+///   error".
+/// - `404` — the table does not exist.
+/// - `409` — the table exists but this catalog will not alter it (a `LocalCatalog` table declared
+///   in configuration). `Error::Plan` is *both* "doesn't exist" and "exists, refused", so the
+///   two are told apart by asking the provider whether the table exists; answering `404` for a
+///   table the caller can see listed and queried would be a lie.
+/// - `501` — the catalog has no `alter_table` at all (`Error::Unsupported`: the SPI default, e.g.
+///   Hive and REST catalogs). Never `500`: this is permanent, and a client that retries it is
+///   wasting its time.
+/// - `500` — everything else (throttling, network, a malformed table definition). The detail can
+///   name object-store locations, so it goes to the log, not the body.
 async fn set_table_comment(
     State(state): State<RestState>,
     Path((catalog, namespace, table)): Path<(String, String, String)>,
@@ -2684,21 +2714,48 @@ async fn set_table_comment(
     let Some(provider) = registry.provider(&catalog) else {
         return error_response(StatusCode::NOT_FOUND, "unknown catalog");
     };
-    // There is no such thing as a table comment that is `""` rather than unset.
-    let comment = body.comment.filter(|c| !c.is_empty());
+    // There is no such thing as a table comment that is `""` — or `"   "` — rather than unset:
+    // both render as nothing and mean nothing, so they clear. A comment that survives that is
+    // stored verbatim; trimming a caller's text would be editing their content behind their back.
+    let comment = body.comment.filter(|c| !c.trim().is_empty());
+    if let Some(c) = comment.as_deref() {
+        let len = c.chars().count();
+        if len > MAX_COMMENT_CHARS {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "table comment: {len} characters exceeds the {MAX_COMMENT_CHARS}-character \
+                     limit"
+                ),
+            );
+        }
+    }
     let change = oxidant_catalog::TableChange::SetComment(comment);
     match provider.alter_table(&ns_parts, &table, vec![change]).await {
         Ok(md) => Json(json!({ "comment": md.comment })).into_response(),
         // `Error::Plan` is the provider's "doesn't exist" classification (see
-        // `CatalogProvider::table_exists`'s doc comment) — everything else below is a genuine
-        // backend failure, reported the same way `table_stats` does.
-        Err(oxidant_catalog::Error::Plan(_)) => {
-            error_response(StatusCode::NOT_FOUND, "unknown table")
+        // `CatalogProvider::table_exists`'s doc comment), but it is *also* how a provider refuses
+        // to alter a table that plainly exists — `LocalCatalog` answers it for a table declared
+        // in configuration. Ask before choosing: "unknown table" about a table the caller can
+        // list, query and read stats for would send them hunting for a typo that isn't there.
+        Err(oxidant_catalog::Error::Plan(detail)) => {
+            match provider.table_exists(&ns_parts, &table).await {
+                // The provider's own sentence says what to do about it ("edit the config file
+                // instead"), which is the whole value of surfacing it — same rule as `403`.
+                Ok(true) => error_response(StatusCode::CONFLICT, &detail),
+                // Missing, or the existence probe itself failed: "not found" is the honest
+                // reading of a `Plan` error with nothing to contradict it.
+                _ => error_response(StatusCode::NOT_FOUND, "unknown table"),
+            }
         }
         // The provider's own refusal, not the engine's: pass its message through verbatim rather
-        // than flattening it into a `500` like every other backend failure below.
+        // than flattening it into a `500` like the backend failures below.
         Err(oxidant_catalog::Error::Io(detail)) if is_access_denied(&detail) => {
             error_response(StatusCode::FORBIDDEN, &detail)
+        }
+        // Not a failure — a capability this catalog does not have and never will on this build.
+        Err(oxidant_catalog::Error::Unsupported(detail)) => {
+            error_response(StatusCode::NOT_IMPLEMENTED, &detail)
         }
         Err(e) => {
             tracing::warn!(catalog = %catalog, namespace = %namespace, table = %table,
@@ -2712,11 +2769,32 @@ async fn set_table_comment(
 }
 
 /// Whether a provider's [`oxidant_catalog::Error::Io`] detail names an access-control refusal
-/// rather than a network/throttling/other backend failure. Glue and Lake Formation both fold
-/// `AccessDeniedException` into `Error::Io` (`classify_glue_failure`) and deliberately keep the
-/// service error code in the message text for exactly this kind of grep.
+/// rather than a network/throttling/other backend failure.
+///
+/// This is a **heuristic over free-form provider text**, and it is worth being precise about why
+/// it cannot be anything better here. The SPI collapses every non-"doesn't exist" failure into
+/// one `Error::Io(String)`, so the only thing left to read is the message. AWS providers do keep
+/// the service error code in it on purpose — `classify_glue_failure` renders
+/// `aws glue UpdateTable: AccessDeniedException: ...`, `classify_lakeformation_failure` the same
+/// for `aws lakeformation ...` — but a non-AWS provider is under no such obligation, hence the
+/// lowercase phrasings below (S3's code is a bare `AccessDenied`, and plenty of catalogs just
+/// say "access denied").
+///
+/// The two limits a caller should know about:
+///
+/// - **False negatives are the safe side.** A provider that phrases its refusal some other way
+///   falls through to `500`, which is wrong but not misleading about permissions.
+/// - **False positives are possible**, because the detail may quote caller-supplied text (a
+///   comment containing "access denied", echoed back in a validation error). That is exactly why
+///   the `403` body is the provider's own sentence rather than a claim of our own about the
+///   caller's permissions.
 fn is_access_denied(detail: &str) -> bool {
-    detail.contains("AccessDenied")
+    let detail = detail.to_ascii_lowercase();
+    // `accessdenied` covers `AccessDeniedException` and S3's bare `AccessDenied`; the IAM
+    // message body reliably carries "not authorized to perform".
+    ["accessdenied", "access denied", "not authorized to perform"]
+        .iter()
+        .any(|needle| detail.contains(needle))
 }
 
 async fn autocomplete_catalog(
@@ -4562,6 +4640,260 @@ mod tests {
                 .contains("AccessDeniedException"),
             "{body}"
         );
+    }
+
+    /// A catalog that simply does not implement `alter_table` — the SPI default, which is what
+    /// `HiveCatalog` and `RestCatalog` currently use.
+    struct InertCatalog;
+
+    #[async_trait::async_trait]
+    impl oxidant_catalog::CatalogProvider for InertCatalog {
+        fn name(&self) -> &str {
+            "inert"
+        }
+
+        async fn list_namespaces(
+            &self,
+            _parent: &[String],
+        ) -> oxidant_catalog::Result<Vec<Vec<String>>> {
+            Ok(vec![])
+        }
+
+        async fn list_tables(&self, _namespace: &[String]) -> oxidant_catalog::Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn load_table(
+            &self,
+            _namespace: &[String],
+            _table: &str,
+        ) -> oxidant_catalog::Result<oxidant_catalog::TableMetadata> {
+            Err(oxidant_catalog::Error::Plan("not used by this test".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn set_table_comment_501s_on_a_catalog_that_cannot_alter_tables() {
+        // `Error::Unsupported` is permanent, not a backend hiccup: a `500` would tell the Platform
+        // to retry a thing that can never work, and hide that the affordance should be off.
+        let (_guard, state, app) = test_state();
+        state
+            .service
+            .registry()
+            .register("inert", Arc::new(InertCatalog));
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/inert/namespaces/ns/tables/t/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("does not support altering tables"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_table_comment_409s_on_a_config_declared_table() {
+        // A declared table is listed, queryable and has stats — calling it an "unknown table"
+        // would send the caller hunting for a typo that isn't there. It exists; it is just not
+        // ours to edit, and the provider's own sentence says where to edit it instead.
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (state, app) = test_state_with_catalog(sample_catalog_conf(warehouse.path())).await;
+        let (status, body) = put_json(
+            &app,
+            "/api/v1/catalogs/local/namespaces/samples/tables/nation_parquet/comment",
+            json!({ "comment": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("declared in configuration"),
+            "{body}"
+        );
+        let loaded = state
+            .service
+            .registry()
+            .provider("local")
+            .expect("local catalog registered")
+            .load_table(&["samples".to_string()], "nation_parquet")
+            .await
+            .expect("load");
+        assert_eq!(
+            loaded.comment, None,
+            "the refused write must not have landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_table_comment_treats_a_whitespace_only_comment_as_clearing() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (state, app) =
+            test_state_with_catalog(empty_local_catalog_conf(warehouse.path())).await;
+        let provider = state
+            .service
+            .registry()
+            .provider("local")
+            .expect("local catalog registered");
+        provider
+            .create_table(
+                &["live".to_string()],
+                "orders",
+                comment_test_schema(),
+                oxidant_catalog::TableFormat::Delta,
+                None,
+                &[],
+            )
+            .await
+            .expect("create managed table");
+
+        let uri = "/api/v1/catalogs/local/namespaces/live/tables/orders/comment";
+        put_json(&app, uri, json!({ "comment": "hot path" })).await;
+        // `"   "` is not a comment that happens to be blank, it is no comment — same as `""`.
+        let (status, body) = put_json(&app, uri, json!({ "comment": " \t\n " })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["comment"].is_null(), "{body}");
+        let loaded = provider
+            .load_table(&["live".to_string()], "orders")
+            .await
+            .expect("load");
+        assert_eq!(loaded.comment, None);
+
+        // Interior and edge whitespace around real text is the caller's content, kept verbatim.
+        let (status, body) = put_json(&app, uri, json!({ "comment": "  hot path  " })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["comment"], "  hot path  ", "{body}");
+    }
+
+    #[tokio::test]
+    async fn set_table_comment_rejects_an_oversized_comment_without_touching_the_table() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (state, app) =
+            test_state_with_catalog(empty_local_catalog_conf(warehouse.path())).await;
+        let provider = state
+            .service
+            .registry()
+            .provider("local")
+            .expect("local catalog registered");
+        provider
+            .create_table(
+                &["live".to_string()],
+                "orders",
+                comment_test_schema(),
+                oxidant_catalog::TableFormat::Delta,
+                None,
+                &[],
+            )
+            .await
+            .expect("create managed table");
+
+        let uri = "/api/v1/catalogs/local/namespaces/live/tables/orders/comment";
+        put_json(&app, uri, json!({ "comment": "keep me" })).await;
+
+        // One over Glue's `Description` cap: a `400` naming the limit, not the generic `500` a
+        // provider-side `ValidationException` would turn into.
+        let too_long = "x".repeat(MAX_COMMENT_CHARS + 1);
+        let (status, body) = put_json(&app, uri, json!({ "comment": too_long })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("2048"),
+            "{body}"
+        );
+        let loaded = provider
+            .load_table(&["live".to_string()], "orders")
+            .await
+            .expect("load");
+        assert_eq!(
+            loaded.comment.as_deref(),
+            Some("keep me"),
+            "a rejected comment must leave the stored one alone"
+        );
+
+        // The cap counts characters, not bytes, because that is what Glue's length constraint
+        // counts — a multi-byte comment at the limit is accepted, not rejected at a third of it.
+        let at_limit = "é".repeat(MAX_COMMENT_CHARS);
+        let (status, body) = put_json(&app, uri, json!({ "comment": at_limit })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["comment"].as_str().map(|c| c.chars().count()),
+            Some(MAX_COMMENT_CHARS),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_table_comment_rejects_an_unrecognized_body_instead_of_clearing() {
+        // The field is optional, so an unknown key would otherwise deserialize to "no comment
+        // given" and silently wipe the stored one with a `200`. `{"description": ...}` is the
+        // likeliest way to get this wrong — it is Glue's own name for the field.
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        let (state, app) =
+            test_state_with_catalog(empty_local_catalog_conf(warehouse.path())).await;
+        let provider = state
+            .service
+            .registry()
+            .provider("local")
+            .expect("local catalog registered");
+        provider
+            .create_table(
+                &["live".to_string()],
+                "orders",
+                comment_test_schema(),
+                oxidant_catalog::TableFormat::Delta,
+                None,
+                &[],
+            )
+            .await
+            .expect("create managed table");
+
+        let uri = "/api/v1/catalogs/local/namespaces/live/tables/orders/comment";
+        put_json(&app, uri, json!({ "comment": "keep me" })).await;
+        let (status, body) = put_json(&app, uri, json!({ "description": "oops" })).await;
+        assert!(status.is_client_error(), "{status} {body}");
+        let loaded = provider
+            .load_table(&["live".to_string()], "orders")
+            .await
+            .expect("load");
+        assert_eq!(
+            loaded.comment.as_deref(),
+            Some("keep me"),
+            "an unrecognized body must not clear the comment"
+        );
+    }
+
+    #[test]
+    fn is_access_denied_reads_the_refusals_providers_actually_send() {
+        // What `classify_glue_failure` / `classify_lakeformation_failure` render.
+        assert!(is_access_denied(
+            "aws glue UpdateTable: AccessDeniedException: User: arn:aws:iam::123:user/kai is not \
+             authorized to perform: glue:UpdateTable"
+        ));
+        assert!(is_access_denied(
+            "aws lakeformation GetTemporaryGlueTableCredentials: AccessDeniedException: \
+             Insufficient Lake Formation permission(s) on orders"
+        ));
+        // S3's code is a bare `AccessDenied`, and non-AWS providers use prose.
+        assert!(is_access_denied("s3 PutObject: AccessDenied"));
+        assert!(is_access_denied("rest catalog: 403 Access Denied"));
+        assert!(is_access_denied("rest catalog: 403 access denied"));
+
+        // A backend failure is not a permission refusal — these must stay `500`s.
+        assert!(!is_access_denied(
+            "aws glue UpdateTable: ThrottlingException: Rate exceeded"
+        ));
+        assert!(!is_access_denied(
+            "aws glue UpdateTable: ValidationException: Description too long"
+        ));
+        assert!(!is_access_denied(
+            "connection closed before message completed"
+        ));
     }
 
     #[tokio::test]
