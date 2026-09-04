@@ -24,6 +24,7 @@ checking cluster state — no Spark client needed. Base URL below is `http://loc
 | `GET` | `/api/v1/catalogs/{catalog}/tables` | Tables in `?namespace=` (default `default`) |
 | `GET` | `/api/v1/catalogs/{catalog}/tables/{table}/columns` | Columns and types of one table |
 | `GET` | `/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/stats` | Freshness of one table, from its snapshot metadata |
+| `PUT` | `/api/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/comment` | Set or clear a table's catalog comment |
 | `GET` | `/api/v1/catalogs/autocomplete` | Identifier suggestions for a dotted `?prefix=` |
 | `GET` | `/api/dashboards` | Dashboards, newest-updated first |
 | `POST` | `/api/dashboards` | Create a dashboard |
@@ -223,6 +224,56 @@ All four keys are always present; an absent value is `null`, never a missing key
   whose metadata exists but cannot be read (a corrupt `metadata.json`, an unreachable store) is
   `500 table stats: unable to read this table's <format> snapshot metadata`, with the failing
   location in the server log rather than the response.
+
+### Table comment
+
+```sh
+curl -s -X PUT http://localhost:4040/api/v1/catalogs/prod/namespaces/sales/tables/orders/comment \
+  -H 'Content-Type: application/json' \
+  -d '{"comment": "canonical order fact table"}'
+```
+
+```json
+{ "comment": "canonical order fact table" }
+```
+
+Sets a table's catalog-level comment through `CatalogProvider::alter_table` (Glue's
+`Description`, the Hive-style table comment). The body is the whole desired state of the comment,
+so an absent `comment` field, an explicit `null`, `""`, and a whitespace-only string all clear it;
+any other string is stored verbatim, leading and trailing whitespace included. The response
+reports what the provider says it stored after the write (Glue re-reads the table; the local
+catalog returns the persisted entry), not an echo of the request — `null` when cleared.
+
+A body with any other key is rejected rather than guessed at: because `comment` is optional, a
+misspelling would otherwise read as "no comment given" and silently wipe the stored one. Sending
+`{"description": "..."}` — Glue's own name for this field — is a `4xx`, not a `200` that quietly
+cleared the comment.
+
+- Only a registered external catalog can be altered this way — `spark_catalog` (the builtin
+  catalog) and an unknown catalog name both answer `404`, same "wrong coordinates" rule as the
+  stats route above.
+- An unknown table is `404`.
+- **A table that exists but is not the catalog's to edit is `409`, not `404`.** A local-catalog
+  table declared in the config's `tables:` block is read-only by design; it answers `409` with the
+  provider's own message (*edit the config file instead*). Only tables the catalog manages —
+  created through it, e.g. by a pipeline sink or CTAS — can have their comment set here. Calling a
+  table the caller can list, query and read stats for "unknown" would send them hunting for a typo
+  that isn't there.
+- **A comment longer than 2048 characters is `400`**, naming the limit, and the stored comment is
+  left alone. 2048 is Glue's cap on `Description` and is applied uniformly so an oversized comment
+  fails the same way on every catalog, instead of becoming an opaque `500` from a provider-side
+  validation error. The limit counts characters, not bytes.
+- **A provider's access-denied refusal is `403`, not `500`.** Glue's `AccessDeniedException` (the
+  caller's IAM principal lacks `glue:UpdateTable`) surfaces as `403` carrying the catalog's own
+  message verbatim, so a caller sees *why* the write was refused. This is matched on the
+  provider's message text — AWS providers keep the service error code in it deliberately — so a
+  catalog that phrases a refusal in some unanticipated way falls through to `500` rather than
+  being mislabelled.
+- **A catalog with no `alter_table` at all is `501`** (currently the Hive and REST/Unity
+  catalogs), carrying the provider's message. It is permanent, so it is not a `500` a client
+  should retry.
+- Every other backend failure (throttling, network, a malformed table definition) is `500`, with
+  the detail in the server log rather than the response.
 
 ### Autocomplete
 
