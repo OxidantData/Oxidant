@@ -387,27 +387,27 @@ impl ScalarUDFImpl for Modulo {
         // `1.0 % 0.0` raised while `mod(1.0, 0.0)` returned null, and `pmod` on decimals leaked a
         // raw Arrow "Divide by zero error". Apply the same guard here, on the same types the
         // planner guards, so the function spellings and the operator agree.
-        let guard = |e: Expr| -> Expr {
-            let ty = info.get_data_type(&e).unwrap_or(DataType::Null);
-            if matches!(
-                ty,
-                DataType::Decimal128(_, _)
-                    | DataType::Decimal256(_, _)
-                    | DataType::Float16
-                    | DataType::Float32
-                    | DataType::Float64
-            ) {
-                Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                    super::spark_nonzero_divisor::udf(),
-                    vec![e],
-                ))
-            } else {
-                // Integral modulo by zero already raises DIVIDE_BY_ZERO in DataFusion, exactly as
-                // Spark does, so the guard would be redundant.
-                e
-            }
+        //
+        // Do not default a failed type lookup to Null: that would skip the guard and let a
+        // float/decimal zero divisor through as a quiet null.
+        let b_ty = info.get_data_type(&b)?;
+        let b = if matches!(
+            b_ty,
+            DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+        ) {
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                super::spark_nonzero_divisor::udf(),
+                vec![b],
+            ))
+        } else {
+            // Integral modulo by zero already raises DIVIDE_BY_ZERO in DataFusion, exactly as
+            // Spark does, so the guard would be redundant.
+            b
         };
-        let b = guard(b);
         let rem = |l: Expr, r: Expr| {
             Expr::BinaryExpr(BinaryExpr::new(Box::new(l), Operator::Modulo, Box::new(r)))
         };
@@ -421,8 +421,8 @@ impl ScalarUDFImpl for Modulo {
         // JVM promotes byte/short `%`/`+` to int, then Pmod narrows. DataFusion
         // Int8/Int16 `+` wraps, so widen only that adjustment to Int32.
         let rem_ab = rem(a, b.clone());
-        let ty = info.get_data_type(&rem_ab).unwrap_or(DataType::Int32);
-        let zero = ScalarValue::new_zero(&ty).unwrap_or(ScalarValue::Int32(Some(0)));
+        let ty = info.get_data_type(&rem_ab)?;
+        let zero = ScalarValue::new_zero(&ty)?;
         let rem_negative = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(rem_ab.clone()),
             Operator::Lt,
@@ -752,17 +752,66 @@ mod tests {
                 DataType::Int16,
                 -16384,
             ),
+            (
+                "SELECT pmod(CAST(-1 AS SMALLINT), CAST(-32768 AS SMALLINT)) AS x",
+                DataType::Int16,
+                -1,
+            ),
             // Int32 wrap matches Spark; do not widen this path.
             (
                 "SELECT pmod(-1, CAST(-2147483648 AS INT)) AS x",
                 DataType::Int32,
                 2147483647,
             ),
+            (
+                "SELECT pmod(CAST(2 AS INT), CAST(-2147483648 AS INT)) AS x",
+                DataType::Int32,
+                2,
+            ),
+            (
+                "SELECT pmod(CAST(-2147483648 AS INT), CAST(-1 AS INT)) AS x",
+                DataType::Int32,
+                0,
+            ),
         ] {
             let (ty, got) = signed_int(q).await;
             assert_eq!(ty, want_ty, "{q} type");
             assert_eq!(got, want, "{q}");
         }
+    }
+
+    /// Values match Spark; result scale/precision still follow DataFusion coercion
+    /// (`decimal(10,0)` here vs Spark `decimal(3,0)`).
+    #[tokio::test]
+    async fn pmod_decimal_value_matches_spark() {
+        let engine = crate::Engine::new();
+        let q = "SELECT pmod(CAST(-7 AS DECIMAL(3,0)), 3) AS x";
+        let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        let col = batches[0].column(0);
+        assert_eq!(col.null_count(), 0, "{q}");
+        let got = format!("{col:?}");
+        assert!(got.contains("2"), "{q}: expected value 2, got {got}");
+    }
+
+    /// Current-behavior probe: IEEE `<` treats -0.0 as less than +0.0, so the
+    /// CASE rewrite turns Spark's -0.0 remainder into +0.0. Not a regression
+    /// from the abs rewrite; not claimed as Spark parity.
+    #[tokio::test]
+    async fn pmod_signed_zero_is_a_known_spark_divergence() {
+        let engine = crate::Engine::new();
+        let q = "SELECT pmod(CAST(-6.0 AS DOUBLE), CAST(3.0 AS DOUBLE)) AS x";
+        let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        let col = batches[0].column(0);
+        let arr = col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap_or_else(|| panic!("{q}: expected Float64, got {:?}", col.data_type()));
+        let v = arr.value(0);
+        assert_eq!(v, 0.0, "{q}");
+        assert!(
+            !v.is_sign_negative(),
+            "{q}: probe expected +0.0 (Spark returns -0.0)"
+        );
     }
 
     #[tokio::test]
