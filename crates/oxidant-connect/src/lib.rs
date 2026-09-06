@@ -8,7 +8,7 @@
 //! `ResultComplete`. The **DataFrame API** lowers Spark Connect relation/expression trees
 //! (`Project`/`Filter`/`Aggregate`/`Join`/`Sort`/`SetOp`/… and their expressions) to DataFusion
 //! logical plans in [`translate`], so `df.select(...).filter(...).groupBy(...).agg(...)` runs
-//! without SQL. `AnalyzePlan` answers `SparkVersion` and `Schema` (with Arrow→Spark type
+//! without SQL. `AnalyzePlan` answers `SparkVersion`, `Schema`, and `DdlParse` (Arrow→Spark type
 //! conversion in [`types`]); `Config` get/set is a real session store. Validated end-to-end
 //! against stock `pyspark-connect` 4.0 (`spark.sql(...)` + the DataFrame API).
 //!
@@ -1579,6 +1579,21 @@ impl SparkConnectService for OxidantService {
                     })
                     .unwrap_or(false);
                 Some(out::Result::IsStreaming(out::IsStreaming { is_streaming }))
+            }
+            // PySpark `createDataFrame(rows, "v long")` / `fromDDL`. Side-effect free:
+            // parse the schema string; never run DDL or touch a catalog.
+            Some(Analyze::DdlParse(d)) => {
+                const MAX_DDL_PARSE_CHARS: usize = 64 * 1024;
+                if d.ddl_string.len() > MAX_DDL_PARSE_CHARS {
+                    return Err(Status::invalid_argument(format!(
+                        "DDL schema exceeds {MAX_DDL_PARSE_CHARS} characters"
+                    )));
+                }
+                let arrow_ty = oxidant_loom::spark_functions::parse_spark_schema(&d.ddl_string)
+                    .map_err(|e| Status::invalid_argument(format!("invalid schema DDL: {e}")))?;
+                Some(out::Result::DdlParse(out::DdlParse {
+                    parsed: Some(types::arrow_to_spark(&arrow_ty)),
+                }))
             }
             other => {
                 return Err(Status::unimplemented(format!(

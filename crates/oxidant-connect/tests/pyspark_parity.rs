@@ -484,3 +484,120 @@ async fn analyze_is_local_and_is_streaming_are_false() {
         })
     ));
 }
+
+/// Stock PySpark `createDataFrame(..., "v long")` sends `AnalyzePlan.DdlParse` before
+/// ingestion. The RPC must parse the schema, not return UNIMPLEMENTED.
+#[tokio::test]
+async fn analyze_ddl_parse_named_field_list() {
+    let mut client = boot(free_port()).await;
+    let result = analyze(
+        &mut client,
+        sc::analyze_plan_request::Analyze::DdlParse(sc::analyze_plan_request::DdlParse {
+            ddl_string: "v long".to_string(),
+        }),
+    )
+    .await;
+    let sc::analyze_plan_response::Result::DdlParse(parsed) = result else {
+        panic!("expected DdlParse result, got {result:?}")
+    };
+    let dt = parsed.parsed.expect("parsed DataType");
+    let Some(sc::data_type::Kind::Struct(st)) = dt.kind else {
+        panic!("expected struct schema for `v long`, got {dt:?}")
+    };
+    assert_eq!(st.fields.len(), 1);
+    assert_eq!(st.fields[0].name, "v");
+    assert!(st.fields[0].nullable);
+    assert!(matches!(
+        st.fields[0].data_type.as_ref().unwrap().kind,
+        Some(sc::data_type::Kind::Long(_))
+    ));
+
+    let result = analyze(
+        &mut client,
+        sc::analyze_plan_request::Analyze::DdlParse(sc::analyze_plan_request::DdlParse {
+            ddl_string: "`v v` long".to_string(),
+        }),
+    )
+    .await;
+    let sc::analyze_plan_response::Result::DdlParse(parsed) = result else {
+        panic!("expected DdlParse for quoted identifier")
+    };
+    let dt = parsed.parsed.expect("parsed DataType");
+    let Some(sc::data_type::Kind::Struct(st)) = dt.kind else {
+        panic!("expected struct for quoted identifier")
+    };
+    assert_eq!(st.fields[0].name, "v v");
+}
+
+/// Nested / decimal DDL must agree with the equivalent struct spelling. This is
+/// analysis only: it must not create a catalog object.
+#[tokio::test]
+async fn analyze_ddl_parse_nested_and_decimal() {
+    let mut client = boot(free_port()).await;
+    for ddl in [
+        "id long, nested struct<a:int,b:string>, tags array<string>, amounts map<string,decimal(10,2)>",
+        "struct<id:long,nested:struct<a:int,b:string>,tags:array<string>,amounts:map<string,decimal(10,2)>>",
+    ] {
+        let result = analyze(
+            &mut client,
+            sc::analyze_plan_request::Analyze::DdlParse(sc::analyze_plan_request::DdlParse {
+                ddl_string: ddl.to_string(),
+            }),
+        )
+        .await;
+        let sc::analyze_plan_response::Result::DdlParse(parsed) = result else {
+            panic!("{ddl}: expected DdlParse, got {result:?}")
+        };
+        let dt = parsed.parsed.expect("parsed DataType");
+        let Some(sc::data_type::Kind::Struct(st)) = dt.kind else {
+            panic!("{ddl}: expected struct, got {dt:?}")
+        };
+        assert_eq!(st.fields.len(), 4, "{ddl}");
+        assert_eq!(st.fields[0].name, "id");
+        assert!(matches!(
+            st.fields[0].data_type.as_ref().unwrap().kind,
+            Some(sc::data_type::Kind::Long(_))
+        ));
+        assert!(matches!(
+            st.fields[1].data_type.as_ref().unwrap().kind,
+            Some(sc::data_type::Kind::Struct(_))
+        ));
+        assert!(matches!(
+            st.fields[2].data_type.as_ref().unwrap().kind,
+            Some(sc::data_type::Kind::Array(_))
+        ));
+        assert!(matches!(
+            st.fields[3].data_type.as_ref().unwrap().kind,
+            Some(sc::data_type::Kind::Map(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn analyze_ddl_parse_rejects_malformed_and_oversized_input() {
+    let mut client = boot(free_port()).await;
+    let req = |ddl: String| sc::AnalyzePlanRequest {
+        session_id: SESSION.to_string(),
+        analyze: Some(sc::analyze_plan_request::Analyze::DdlParse(
+            sc::analyze_plan_request::DdlParse { ddl_string: ddl },
+        )),
+        ..Default::default()
+    };
+
+    let err = client
+        .analyze_plan(req("v notatype".to_string()))
+        .await
+        .expect_err("malformed schema must fail");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+    let msg = err.message().to_ascii_lowercase();
+    assert!(
+        !msg.contains("unimplemented"),
+        "malformed schema is invalid, not unimplemented: {err}"
+    );
+
+    let err = client
+        .analyze_plan(req("x".repeat(64 * 1024 + 1)))
+        .await
+        .expect_err("oversized schema must fail");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+}
