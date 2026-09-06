@@ -7,12 +7,12 @@ use std::time::Duration;
 use datafusion::logical_expr::LogicalPlan;
 use oxidant_catalog::TableFormat;
 use oxidant_common::{Error, Result};
+use oxidant_loom::Engine;
 use oxidant_loom::arrow::datatypes::SchemaRef;
 use oxidant_loom::arrow::record_batch::RecordBatch;
-use oxidant_loom::Engine;
 use tokio::sync::RwLock;
 
-use crate::checkpoint::{checkpoint_store, CheckpointStore};
+use crate::checkpoint::{CheckpointStore, checkpoint_store};
 use crate::config::{ExpectationAction, StreamExpectation, StreamQueryConfig};
 use crate::input::MicroBatchInput;
 use crate::kafka::KafkaSource;
@@ -120,6 +120,8 @@ struct ManagedQuery {
     /// Observable status and progress. Cheap to read at any time.
     state: RwLock<StreamingQuery>,
     checkpoint: CheckpointStore,
+    /// Waiters for [`StreamingQueryManager::await_termination`]. Signaled by stop/fail.
+    terminated: tokio::sync::Notify,
 }
 
 /// The moving parts of a micro-batch, held only while one runs.
@@ -257,6 +259,7 @@ impl StreamingQueryManager {
             }),
             state: RwLock::new(q),
             checkpoint,
+            terminated: tokio::sync::Notify::new(),
         };
         self.queries
             .write()
@@ -297,6 +300,7 @@ impl StreamingQueryManager {
         state.status.is_active = false;
         state.status.is_data_available = false;
         state.status.message = format!("terminated with error: {message}");
+        q.terminated.notify_waiters();
     }
 
     pub async fn stop(&self, query_id: &str) -> bool {
@@ -306,7 +310,63 @@ impl StreamingQueryManager {
         let mut state = q.state.write().await;
         state.status.is_active = false;
         state.status.message = "stopped".into();
+        q.terminated.notify_waiters();
         true
+    }
+
+    /// Wait until the query is inactive, or until `timeout` elapses.
+    ///
+    /// Returns `true` if the query terminated. A timed wait that expires while the query is
+    /// still active returns `false` — Spark's `awaitTermination(timeoutMs)` contract. A query
+    /// that failed is reported as an error so the client does not treat the failure as a clean
+    /// stop. Subscribe-then-recheck so a stop between the first status read and the wait cannot
+    /// be missed.
+    pub async fn await_termination(
+        &self,
+        query_id: &str,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<bool> {
+        let q = self
+            .lookup(query_id)
+            .await
+            .ok_or_else(|| Error::Execution("unknown query".into()))?;
+        let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
+        loop {
+            {
+                let state = q.state.read().await;
+                if !state.status.is_active {
+                    if state.status.message.starts_with("terminated with error:") {
+                        return Err(Error::Execution(state.status.message.clone()));
+                    }
+                    return Ok(true);
+                }
+            }
+            let remaining = match deadline {
+                None => None,
+                Some(d) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= d {
+                        return Ok(false);
+                    }
+                    Some(d.saturating_duration_since(now))
+                }
+            };
+            let notified = q.terminated.notified();
+            {
+                let state = q.state.read().await;
+                if !state.status.is_active {
+                    continue;
+                }
+            }
+            match remaining {
+                None => notified.await,
+                Some(rem) => {
+                    if tokio::time::timeout(rem, notified).await.is_err() {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
     }
 
     /// Run one micro-batch for `query_id` using `engine`.
@@ -484,7 +544,7 @@ impl StreamingQueryManager {
                             "expectation `{}` failed on batch {batch_id}: {violations} record(s) \
                              do not satisfy `{}`; the table is unchanged",
                             expectation.label, expectation.check
-                        )))
+                        )));
                     }
                 }
             }
@@ -830,7 +890,7 @@ pub fn build_source(
             return Err(Error::Unsupported(format!(
                 "readStream.format(`{other}`) — supported: kafka, postgres_cdc, parquet, json, \
                  csv, rate"
-            )))
+            )));
         }
     })
 }
@@ -951,6 +1011,7 @@ pub(crate) mod test_harness {
             }),
             state: RwLock::new(q),
             checkpoint,
+            terminated: tokio::sync::Notify::new(),
         };
         mgr.queries
             .write()
@@ -1578,5 +1639,73 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn timed_await_termination_is_false_while_the_query_is_active() {
+        let engine = Engine::new();
+        let mgr = StreamingQueryManager::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = mgr
+            .start(
+                &engine,
+                "await-timeout".into(),
+                dir.path().to_string_lossy().into_owned(),
+                Trigger::Once,
+            )
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let terminated = mgr
+            .await_termination(&id.id, Some(Duration::from_millis(50)))
+            .await
+            .unwrap();
+        assert!(!terminated, "active query must not report termination");
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "timed wait must actually wait, not return immediately"
+        );
+        assert!(mgr.status(&id.id).await.unwrap().is_active);
+    }
+
+    #[tokio::test]
+    async fn await_termination_is_true_after_stop() {
+        let engine = Engine::new();
+        let mgr = StreamingQueryManager::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = mgr
+            .start(
+                &engine,
+                "await-stop".into(),
+                dir.path().to_string_lossy().into_owned(),
+                Trigger::Once,
+            )
+            .await
+            .unwrap();
+        assert!(mgr.stop(&id.id).await);
+        let terminated = mgr.await_termination(&id.id, None).await.unwrap();
+        assert!(terminated);
+    }
+
+    #[tokio::test]
+    async fn await_termination_propagates_a_failed_query() {
+        let engine = Engine::new();
+        let mgr = StreamingQueryManager::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = mgr
+            .start(
+                &engine,
+                "await-fail".into(),
+                dir.path().to_string_lossy().into_owned(),
+                Trigger::Once,
+            )
+            .await
+            .unwrap();
+        mgr.fail(&id.id, "sink lost permissions").await;
+        let err = mgr
+            .await_termination(&id.id, None)
+            .await
+            .expect_err("failed query must not look like a clean stop");
+        assert!(err.to_string().contains("sink lost permissions"), "{err}");
     }
 }
