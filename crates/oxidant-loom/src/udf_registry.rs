@@ -39,6 +39,17 @@ impl UdfRegistry {
         self.defs.insert(def.name.to_lowercase(), def);
     }
 
+    /// Validate and install `def` on `ctx`, then keep it in the session registry.
+    ///
+    /// Order matters: inserting first made a rejected body (`length(a)`, unknown
+    /// identifier, unsupported return type) survive in `SHOW FUNCTIONS` / worker
+    /// JSON even though DataFusion never got the UDF.
+    pub fn register_sql_fn_on_context(&mut self, def: UdfDef, ctx: &SessionContext) -> Result<()> {
+        register_sql_udf_on_ctx(ctx, &def)?;
+        self.register_sql_fn(def);
+        Ok(())
+    }
+
     /// The (lowercased) names of every session UDF registered so far. Backs `SHOW FUNCTIONS`.
     pub fn names(&self) -> Vec<String> {
         self.defs.keys().cloned().collect()
@@ -542,6 +553,21 @@ mod tests {
         assert!(
             msg.contains("unsupported") || msg.contains("unknown"),
             "got {err}"
+        );
+        let describe = engine
+            .sql("DESCRIBE FUNCTION review_bad_ident")
+            .await
+            .expect_err("rejected CREATE must not leave a session UDF");
+        assert!(
+            describe
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("review_bad_ident")
+                || describe
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("unknown"),
+            "got {describe}"
         );
     }
 }

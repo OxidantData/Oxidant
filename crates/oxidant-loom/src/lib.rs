@@ -3607,8 +3607,7 @@ impl Engine {
         // SQL user-defined functions: `CREATE [OR REPLACE] FUNCTION … RETURN …`
         if let Some(def) = udf_registry::try_create_function(query) {
             let mut reg = self.udf_registry.lock().unwrap();
-            reg.register_sql_fn(def.clone());
-            reg.apply_to_context(&self.ctx)?;
+            reg.register_sql_fn_on_context(def, &self.ctx)?;
             return Ok(vec![]);
         }
         // SPARK-29628 (`INVALID_TEMP_OBJ_REFERENCE`): a *persistent* `CREATE VIEW` may not reference
