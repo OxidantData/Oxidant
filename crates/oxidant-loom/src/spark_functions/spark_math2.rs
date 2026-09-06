@@ -15,9 +15,10 @@
 //! **Lowered to native expressions** — `mod` and `pmod`. Both are registered as UDFs whose
 //! [`ScalarUDFImpl::simplify`] rewrites them into arithmetic the optimizer understands, so they
 //! pick up DataFusion's own numeric coercion and constant folding instead of an opaque call.
-//! `mod(a, b)` is `a % b` (remainder, taking the sign of the dividend). `pmod(a, b)` is the
-//! *positive* modulo `((a % b) + abs(b)) % b`, which is Spark's rule in both signs:
-//! `pmod(-7, 3)` = 2 and `pmod(-7, -3)` = 2.
+//! `mod(a, b)` is `a % b` (remainder, taking the sign of the dividend). `pmod(a, b)` follows
+//! Spark 4.0.0 `Pmod`: remainder `r = a % b`, then `r` if `r >= 0` else `(r + b) % b`. That
+//! uses the signed divisor, so `pmod(-7, 3)` = 2 and `pmod(-7, -3)` = -1. The previous
+//! always-non-negative rewrite `((a % b) + abs(b)) % b` disagreed with Spark on the last case.
 //!
 //! **`width_bucket(value, min, max, numBuckets)`** returns the 1-based bucket of an equi-width
 //! histogram over `[min, max)`, as `bigint`, with Spark's out-of-range conventions: `0` below the
@@ -35,6 +36,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, plan_err, DataFusionError, Result, ScalarValue};
+use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::type_coercion::binary::binary_numeric_coercion;
 use datafusion::logical_expr::{
@@ -412,18 +414,31 @@ impl ScalarUDFImpl for Modulo {
         if !self.positive {
             return Ok(ExprSimplifyResult::Simplified(rem(a, b)));
         }
-        // `((a % b) + abs(b)) % b` is Spark's positive modulo in all four sign combinations:
-        // pmod(7, 3) = 1, pmod(-7, 3) = 2, pmod(7, -3) = 1, pmod(-7, -3) = 2.
-        let abs_b = Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-            datafusion::functions::math::abs(),
-            vec![b.clone()],
+        // Spark `Pmod`: r = a % b; if r < 0 then (r + b) % b else r.
+        // apache/spark@fa33ea000a0bda9e5a3fa1af98e8e85b8cc5e4d4 arithmetic.scala.
+        // Adding abs(b) instead of the signed divisor made pmod(-7, -3) return 2.
+        let rem_ab = rem(a, b.clone());
+        let ty = info.get_data_type(&rem_ab).unwrap_or(DataType::Int32);
+        let zero = ScalarValue::new_zero(&ty).unwrap_or(ScalarValue::Int32(Some(0)));
+        let rem_negative = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(rem_ab.clone()),
+            Operator::Lt,
+            Box::new(Expr::Literal(zero, None)),
         ));
-        let shifted = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(rem(a, b.clone())),
-            Operator::Plus,
-            Box::new(abs_b),
-        ));
-        Ok(ExprSimplifyResult::Simplified(rem(shifted, b)))
+        let adjusted = rem(
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(rem_ab.clone()),
+                Operator::Plus,
+                Box::new(b.clone()),
+            )),
+            b,
+        );
+        let case = Case::new(
+            None,
+            vec![(Box::new(rem_negative), Box::new(adjusted))],
+            Some(Box::new(rem_ab)),
+        );
+        Ok(ExprSimplifyResult::Simplified(Expr::Case(case)))
     }
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         exec_err!(
@@ -603,21 +618,85 @@ mod tests {
         }
     }
 
-    /// `mod` takes the sign of the dividend; `pmod` never returns a negative.
+    /// Signed integer from a one-row, one-column query. Substring matches on
+    /// pretty-printed tables cannot tell `2` from `-2` or pin the type.
+    async fn signed_int(q: &str) -> (DataType, i64) {
+        let engine = crate::Engine::new();
+        let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(batches.len(), 1, "{q}: expected one batch");
+        let col = batches[0].column(0);
+        assert_eq!(col.len(), 1, "{q}: expected one row");
+        assert_eq!(col.null_count(), 0, "{q}: unexpected null");
+        match col.data_type() {
+            DataType::Int32 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32Array");
+                (DataType::Int32, i64::from(arr.value(0)))
+            }
+            DataType::Int64 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64Array");
+                (DataType::Int64, arr.value(0))
+            }
+            other => panic!("{q}: expected Int32/Int64, got {other:?}"),
+        }
+    }
+
+    /// `mod` takes the sign of the dividend. Spark's `pmod` adjusts a negative
+    /// remainder by the *signed* divisor, so `pmod(-7, -3)` is `-1` (Spark 4.0.0
+    /// `Pmod`, apache/spark@fa33ea000a0bda9e5a3fa1af98e8e85b8cc5e4d4). The
+    /// previous always-non-negative rewrite produced `2` for that input.
     #[tokio::test]
     async fn mod_and_pmod_signs_match_spark() {
         for (q, want) in [
-            ("SELECT mod(7, 3) AS x", "1"),
-            ("SELECT mod(-7, 3) AS x", "-1"),
-            ("SELECT mod(7, -3) AS x", "1"),
-            ("SELECT pmod(7, 3) AS x", "1"),
-            ("SELECT pmod(-7, 3) AS x", "2"),
-            ("SELECT pmod(7, -3) AS x", "1"),
-            ("SELECT pmod(-7, -3) AS x", "2"),
+            ("SELECT mod(7, 3) AS x", 1),
+            ("SELECT mod(-7, 3) AS x", -1),
+            ("SELECT mod(7, -3) AS x", 1),
+            ("SELECT pmod(7, 3) AS x", 1),
+            ("SELECT pmod(-7, 3) AS x", 2),
+            ("SELECT pmod(7, -3) AS x", 1),
+            ("SELECT pmod(-7, -3) AS x", -1),
         ] {
-            let got = row(q).await;
-            assert!(got.contains(want), "{q} -> want {want}, got:\n{got}");
+            let (ty, got) = signed_int(q).await;
+            assert!(
+                matches!(ty, DataType::Int32 | DataType::Int64),
+                "{q} type {ty:?}"
+            );
+            assert_eq!(got, want, "{q}");
         }
+
+        // Column path: VALUES so constant folding cannot hide a kernel mismatch.
+        let engine = crate::Engine::new();
+        let q = "SELECT a, b, pmod(a, b) AS actual \
+                 FROM (VALUES (7, 3), (-7, 3), (7, -3), (-7, -3)) AS v(a, b) \
+                 ORDER BY a, b";
+        let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        let batch = &batches[0];
+        fn col_i64(batch: &datafusion::arrow::record_batch::RecordBatch, i: usize) -> Vec<i64> {
+            let col = batch.column(i);
+            if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                return (0..arr.len()).map(|j| i64::from(arr.value(j))).collect();
+            }
+            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                return (0..arr.len()).map(|j| arr.value(j)).collect();
+            }
+            panic!("column {i} is {:?}, not Int32/Int64", col.data_type());
+        }
+        let rows: Vec<(i64, i64, i64)> = col_i64(batch, 0)
+            .into_iter()
+            .zip(col_i64(batch, 1))
+            .zip(col_i64(batch, 2))
+            .map(|((a, b), p)| (a, b, p))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(-7, -3, -1), (-7, 3, 2), (7, -3, 1), (7, 3, 1)],
+            "{q}"
+        );
     }
 
     #[tokio::test]

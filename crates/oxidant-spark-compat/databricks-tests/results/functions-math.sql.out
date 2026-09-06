@@ -39,7 +39,7 @@ SELECT pmod(7, 3) AS a, pmod(-7, 3) AS b, pmod(7, -3) AS c, pmod(-7, -3) AS d
 -- !query schema
 struct<a:int,b:int,c:int,d:int>
 -- !query output
-1	2	1	2
+1	2	1	-1
 
 
 -- !query
