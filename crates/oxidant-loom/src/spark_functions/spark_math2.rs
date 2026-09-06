@@ -32,11 +32,11 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
 };
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::{exec_err, plan_err, DataFusionError, Result, ScalarValue};
-use datafusion::logical_expr::expr::Case;
+use datafusion::common::{DataFusionError, Result, ScalarValue, exec_err, plan_err};
+use datafusion::logical_expr::expr::{Case, Cast};
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::type_coercion::binary::binary_numeric_coercion;
 use datafusion::logical_expr::{
@@ -417,6 +417,9 @@ impl ScalarUDFImpl for Modulo {
         // Spark `Pmod`: r = a % b; if r < 0 then (r + b) % b else r.
         // apache/spark@fa33ea000a0bda9e5a3fa1af98e8e85b8cc5e4d4 arithmetic.scala.
         // Adding abs(b) instead of the signed divisor made pmod(-7, -3) return 2.
+        //
+        // JVM promotes byte/short `%`/`+` to int, then Pmod narrows. DataFusion
+        // Int8/Int16 `+` wraps, so widen only that adjustment to Int32.
         let rem_ab = rem(a, b.clone());
         let ty = info.get_data_type(&rem_ab).unwrap_or(DataType::Int32);
         let zero = ScalarValue::new_zero(&ty).unwrap_or(ScalarValue::Int32(Some(0)));
@@ -425,14 +428,27 @@ impl ScalarUDFImpl for Modulo {
             Operator::Lt,
             Box::new(Expr::Literal(zero, None)),
         ));
-        let adjusted = rem(
-            Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(rem_ab.clone()),
-                Operator::Plus,
-                Box::new(b.clone()),
-            )),
-            b,
-        );
+        let adjusted = if matches!(ty, DataType::Int8 | DataType::Int16) {
+            let to_int = |e: Expr| Expr::Cast(Cast::new(Box::new(e), DataType::Int32));
+            let wide = rem(
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(to_int(rem_ab.clone())),
+                    Operator::Plus,
+                    Box::new(to_int(b.clone())),
+                )),
+                to_int(b),
+            );
+            Expr::Cast(Cast::new(Box::new(wide), ty))
+        } else {
+            rem(
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(rem_ab.clone()),
+                    Operator::Plus,
+                    Box::new(b.clone()),
+                )),
+                b,
+            )
+        };
         let case = Case::new(
             None,
             vec![(Box::new(rem_negative), Box::new(adjusted))],
@@ -628,6 +644,17 @@ mod tests {
         assert_eq!(col.len(), 1, "{q}: expected one row");
         assert_eq!(col.null_count(), 0, "{q}: unexpected null");
         match col.data_type() {
+            DataType::Int8 => {
+                let arr = col.as_any().downcast_ref::<Int8Array>().expect("Int8Array");
+                (DataType::Int8, i64::from(arr.value(0)))
+            }
+            DataType::Int16 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .expect("Int16Array");
+                (DataType::Int16, i64::from(arr.value(0)))
+            }
             DataType::Int32 => {
                 let arr = col
                     .as_any()
@@ -642,7 +669,7 @@ mod tests {
                     .expect("Int64Array");
                 (DataType::Int64, arr.value(0))
             }
-            other => panic!("{q}: expected Int32/Int64, got {other:?}"),
+            other => panic!("{q}: expected integer, got {other:?}"),
         }
     }
 
@@ -697,6 +724,45 @@ mod tests {
             vec![(-7, -3, -1), (-7, 3, 2), (7, -3, 1), (7, 3, 1)],
             "{q}"
         );
+    }
+
+    /// Spark evaluates `r + b` for tinyint/smallint pmod in `int`, then narrows.
+    /// DataFusion `Int8`/`Int16` `+` wraps, so `pmod(-1tinyint, -128tinyint)`
+    /// became 127 instead of Spark's -1.
+    #[tokio::test]
+    async fn pmod_tinyint_smallint_adjust_in_int_like_spark() {
+        for (q, want_ty, want) in [
+            (
+                "SELECT pmod(CAST(-1 AS TINYINT), CAST(-128 AS TINYINT)) AS x",
+                DataType::Int8,
+                -1i64,
+            ),
+            (
+                "SELECT pmod(CAST(-64 AS TINYINT), CAST(-65 AS TINYINT)) AS x",
+                DataType::Int8,
+                -64,
+            ),
+            (
+                "SELECT pmod(CAST(-50 AS TINYINT), CAST(-100 AS TINYINT)) AS x",
+                DataType::Int8,
+                -50,
+            ),
+            (
+                "SELECT pmod(CAST(-16384 AS SMALLINT), CAST(-16385 AS SMALLINT)) AS x",
+                DataType::Int16,
+                -16384,
+            ),
+            // Int32 wrap matches Spark; do not widen this path.
+            (
+                "SELECT pmod(-1, CAST(-2147483648 AS INT)) AS x",
+                DataType::Int32,
+                2147483647,
+            ),
+        ] {
+            let (ty, got) = signed_int(q).await;
+            assert_eq!(ty, want_ty, "{q} type");
+            assert_eq!(got, want, "{q}");
+        }
     }
 
     #[tokio::test]
