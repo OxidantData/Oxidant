@@ -118,17 +118,6 @@ pub fn try_create_function(sql: &str) -> Option<UdfDef> {
     })
 }
 
-fn spark_type_to_arrow(t: &str) -> DataType {
-    match t.to_uppercase().as_str() {
-        "INT" | "INTEGER" => DataType::Int32,
-        "BIGINT" | "LONG" => DataType::Int64,
-        "DOUBLE" | "FLOAT" => DataType::Float64,
-        "BOOLEAN" | "BOOL" => DataType::Boolean,
-        "STRING" | "VARCHAR" => DataType::Utf8,
-        _ => DataType::Int32,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum BodyExpr {
     Null,
@@ -179,7 +168,12 @@ fn tokenize_body(s: &str) -> std::result::Result<Vec<Tok>, String> {
             out.push(Tok::Int(n));
             continue;
         }
-        if matches!(c, '+' | '-' | '*' | '/' | '(' | ')') {
+        // Spark `--` comments run to the end of the body. Without this, `a--1`
+        // is `a - (-1)` and CREATE succeeds with the wrong value.
+        if c == '-' && i + 1 < b.len() && b[i + 1] as char == '-' {
+            break;
+        }
+        if matches!(c, '+' | '-' | '*' | '(' | ')') {
             out.push(Tok::Op(c));
             i += 1;
             continue;
@@ -235,7 +229,7 @@ fn parse_add(toks: &[Tok], mut i: usize) -> std::result::Result<(BodyExpr, usize
 fn parse_mul(toks: &[Tok], mut i: usize) -> std::result::Result<(BodyExpr, usize), String> {
     let (mut left, n) = parse_atom(toks, i)?;
     i = n;
-    while let Some(Tok::Op(op @ ('*' | '/'))) = toks.get(i) {
+    while let Some(Tok::Op(op @ '*')) = toks.get(i) {
         let (right, n) = parse_atom(toks, i + 1)?;
         left = BodyExpr::Binary(Box::new(left), *op, Box::new(right));
         i = n;
@@ -287,12 +281,6 @@ fn eval_body(expr: &BodyExpr, env: &HashMap<String, ScalarValue>) -> DfResult<Sc
                 '+' => a.checked_add(b),
                 '-' => a.checked_sub(b),
                 '*' => a.checked_mul(b),
-                '/' => {
-                    if b == 0 {
-                        return exec_err!("division by zero in SQL function");
-                    }
-                    a.checked_div(b)
-                }
                 _ => return exec_err!("unsupported operator in SQL function"),
             };
             let n = n.ok_or_else(|| {
@@ -373,15 +361,29 @@ impl ScalarUDFImpl for SqlUdf {
                 args.args.len()
             );
         }
-        let n = args
+        let array_lens: Vec<usize> = args
             .args
             .iter()
-            .map(|a| match a {
-                ColumnarValue::Array(arr) => arr.len(),
-                ColumnarValue::Scalar(_) => 1,
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                ColumnarValue::Scalar(_) => None,
             })
-            .max()
-            .unwrap_or(1);
+            .collect();
+        let n = match array_lens.as_slice() {
+            [] => 1,
+            lens => {
+                let n = lens[0];
+                if lens.iter().any(|&l| l != n) {
+                    return exec_err!("SQL function {} got mixed argument lengths", self.name);
+                }
+                n
+            }
+        };
+        if n == 0 {
+            return Ok(ColumnarValue::Array(
+                datafusion::arrow::array::new_empty_array(&self.return_type),
+            ));
+        }
         let mut values = Vec::with_capacity(n);
         for row in 0..n {
             let mut env = HashMap::new();
@@ -421,13 +423,18 @@ fn register_sql_udf_on_ctx(ctx: &SessionContext, def: &UdfDef) -> Result<()> {
             def.name
         )));
     }
-    let return_type = spark_type_to_arrow(&def.return_type);
-    if !matches!(return_type, DataType::Int32 | DataType::Int64) {
-        return Err(Error::Plan(format!(
-            "unsupported SQL function return type `{}` for `{}`",
-            def.return_type, def.name
-        )));
-    }
+    // Allowlist the SQL tokens, not spark_type_to_arrow's Int32 catch-all
+    // (TINYINT/FOOBAR would otherwise register as INT).
+    let return_type = match def.return_type.to_uppercase().as_str() {
+        "INT" | "INTEGER" => DataType::Int32,
+        "BIGINT" | "LONG" => DataType::Int64,
+        other => {
+            return Err(Error::Plan(format!(
+                "unsupported SQL function return type `{other}` for `{}`",
+                def.name
+            )));
+        }
+    };
     let udf = SqlUdf {
         name: def.name.clone(),
         body: parsed,
@@ -569,5 +576,57 @@ mod tests {
                     .contains("unknown"),
             "got {describe}"
         );
+    }
+
+    #[tokio::test]
+    async fn sql_udf_rejects_slash_instead_of_truncating() {
+        let engine = crate::Engine::new();
+        let err = engine
+            .sql("CREATE FUNCTION review_div(a INT) RETURNS INT RETURN a / 2")
+            .await
+            .expect_err("integer / is not Spark SQL");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(msg.contains("unsupported"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn sql_udf_sql_comment_is_not_minus_minus() {
+        let engine = crate::Engine::new();
+        engine
+            .sql("CREATE FUNCTION review_comment(a INT) RETURNS INT RETURN a--1")
+            .await
+            .unwrap();
+        assert_eq!(
+            i32_col(&engine, "SELECT review_comment(5) AS value").await,
+            vec![5]
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_udf_rejects_unknown_return_type_token() {
+        let engine = crate::Engine::new();
+        for q in [
+            "CREATE FUNCTION review_tiny() RETURNS TINYINT RETURN 7",
+            "CREATE FUNCTION review_foo() RETURNS FOOBAR RETURN 7",
+        ] {
+            let err = engine.sql(q).await.expect_err(q);
+            let msg = err.to_string().to_ascii_lowercase();
+            assert!(msg.contains("unsupported"), "{q}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sql_udf_empty_input_returns_zero_rows() {
+        let engine = crate::Engine::new();
+        engine
+            .sql("CREATE FUNCTION review_add_empty(x INT, y INT) RETURNS INT RETURN x + y")
+            .await
+            .unwrap();
+        let batches = engine
+            .sql("SELECT review_add_empty(v, 1) AS value FROM (VALUES (1)) AS t(v) WHERE false")
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 0, "empty input must not invent a row");
     }
 }
