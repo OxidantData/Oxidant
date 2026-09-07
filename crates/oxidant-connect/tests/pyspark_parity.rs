@@ -484,3 +484,222 @@ async fn analyze_is_local_and_is_streaming_are_false() {
         })
     ));
 }
+
+/// Stock PySpark `createDataFrame(..., "v long")` sends `AnalyzePlan.DdlParse` before
+/// ingestion. The RPC must parse the schema, not return UNIMPLEMENTED.
+#[tokio::test]
+async fn analyze_ddl_parse_named_field_list() {
+    let mut client = boot(free_port()).await;
+    let result = analyze(
+        &mut client,
+        sc::analyze_plan_request::Analyze::DdlParse(sc::analyze_plan_request::DdlParse {
+            ddl_string: "v long".to_string(),
+        }),
+    )
+    .await;
+    let sc::analyze_plan_response::Result::DdlParse(parsed) = result else {
+        panic!("expected DdlParse result, got {result:?}")
+    };
+    let dt = parsed.parsed.expect("parsed DataType");
+    let Some(sc::data_type::Kind::Struct(st)) = dt.kind else {
+        panic!("expected struct schema for `v long`, got {dt:?}")
+    };
+    assert_eq!(st.fields.len(), 1);
+    assert_eq!(st.fields[0].name, "v");
+    assert!(st.fields[0].nullable);
+    assert!(matches!(
+        st.fields[0].data_type.as_ref().unwrap().kind,
+        Some(sc::data_type::Kind::Long(_))
+    ));
+
+    let result = analyze(
+        &mut client,
+        sc::analyze_plan_request::Analyze::DdlParse(sc::analyze_plan_request::DdlParse {
+            ddl_string: "`v v` long".to_string(),
+        }),
+    )
+    .await;
+    let sc::analyze_plan_response::Result::DdlParse(parsed) = result else {
+        panic!("expected DdlParse for quoted identifier")
+    };
+    let dt = parsed.parsed.expect("parsed DataType");
+    let Some(sc::data_type::Kind::Struct(st)) = dt.kind else {
+        panic!("expected struct for quoted identifier")
+    };
+    assert_eq!(st.fields[0].name, "v v");
+}
+
+#[tokio::test]
+async fn analyze_ddl_parse_unicode_identifiers() {
+    let mut client = boot(free_port()).await;
+    for (ddl, expected_name, expected_kind) in [
+        (
+            "café long",
+            "café",
+            sc::data_type::Kind::Long(sc::data_type::Long::default()),
+        ),
+        (
+            "名前 string",
+            "名前",
+            sc::data_type::Kind::String(sc::data_type::String::default()),
+        ),
+        (
+            "struct<𐐀_2:int>",
+            "𐐀_2",
+            sc::data_type::Kind::Integer(sc::data_type::Integer::default()),
+        ),
+        (
+            "`col😀` long",
+            "col😀",
+            sc::data_type::Kind::Long(sc::data_type::Long::default()),
+        ),
+        (
+            "struct<`名``前😀`:string>",
+            "名`前😀",
+            sc::data_type::Kind::String(sc::data_type::String::default()),
+        ),
+    ] {
+        let result = analyze(
+            &mut client,
+            sc::analyze_plan_request::Analyze::DdlParse(sc::analyze_plan_request::DdlParse {
+                ddl_string: ddl.to_string(),
+            }),
+        )
+        .await;
+        let sc::analyze_plan_response::Result::DdlParse(parsed) = result else {
+            panic!("{ddl}: expected DdlParse, got {result:?}")
+        };
+        let dt = parsed.parsed.expect("parsed DataType");
+        let Some(sc::data_type::Kind::Struct(st)) = dt.kind else {
+            panic!("{ddl}: expected struct, got {dt:?}")
+        };
+        assert_eq!(st.fields.len(), 1, "{ddl}");
+        assert_eq!(st.fields[0].name, expected_name, "{ddl}");
+        assert!(st.fields[0].nullable, "{ddl}");
+        assert_eq!(
+            st.fields[0].data_type.as_ref().unwrap().kind,
+            Some(expected_kind),
+            "{ddl}"
+        );
+    }
+}
+
+/// Nested / decimal DDL must agree with the equivalent struct spelling. This is
+/// analysis only: it must not create a catalog object.
+#[tokio::test]
+async fn analyze_ddl_parse_nested_and_decimal() {
+    let mut client = boot(free_port()).await;
+    for ddl in [
+        "id long, nested struct<a:int,b:string>, tags array<string>, amounts map<string,decimal(10,2)>",
+        "struct<id:long,nested:struct<a:int,b:string>,tags:array<string>,amounts:map<string,decimal(10,2)>>",
+    ] {
+        let result = analyze(
+            &mut client,
+            sc::analyze_plan_request::Analyze::DdlParse(sc::analyze_plan_request::DdlParse {
+                ddl_string: ddl.to_string(),
+            }),
+        )
+        .await;
+        let sc::analyze_plan_response::Result::DdlParse(parsed) = result else {
+            panic!("{ddl}: expected DdlParse, got {result:?}")
+        };
+        let dt = parsed.parsed.expect("parsed DataType");
+        let Some(sc::data_type::Kind::Struct(st)) = dt.kind else {
+            panic!("{ddl}: expected struct, got {dt:?}")
+        };
+        assert_eq!(st.fields.len(), 4, "{ddl}");
+        assert_eq!(st.fields[0].name, "id");
+        assert!(matches!(
+            st.fields[0].data_type.as_ref().unwrap().kind,
+            Some(sc::data_type::Kind::Long(_))
+        ));
+        assert!(matches!(
+            st.fields[1].data_type.as_ref().unwrap().kind,
+            Some(sc::data_type::Kind::Struct(_))
+        ));
+        assert!(matches!(
+            st.fields[2].data_type.as_ref().unwrap().kind,
+            Some(sc::data_type::Kind::Array(_))
+        ));
+        assert!(matches!(
+            st.fields[3].data_type.as_ref().unwrap().kind,
+            Some(sc::data_type::Kind::Map(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn analyze_ddl_parse_rejects_malformed_and_oversized_input() {
+    let mut client = boot(free_port()).await;
+    let req = |ddl: String| sc::AnalyzePlanRequest {
+        session_id: SESSION.to_string(),
+        analyze: Some(sc::analyze_plan_request::Analyze::DdlParse(
+            sc::analyze_plan_request::DdlParse { ddl_string: ddl },
+        )),
+        ..Default::default()
+    };
+
+    for ddl in [
+        "v notatype",
+        "",
+        " \t\n",
+        "a int,, b string",
+        "col😀 long",
+        "😀 long",
+        "café",
+        "名前 notatype",
+        "café long;",
+        "名前 string,",
+        "café array<int",
+        "`名前",
+        "`名``",
+        "struct<`名``前`:string,>",
+    ] {
+        let err = client
+            .analyze_plan(req(ddl.to_string()))
+            .await
+            .expect_err("malformed schema must fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{ddl}: {err}");
+        let msg = err.message().to_ascii_lowercase();
+        assert!(
+            !msg.contains("unimplemented"),
+            "malformed schema is invalid, not unimplemented: {err}"
+        );
+    }
+
+    // The cap is in UTF-8 bytes, not Unicode characters. A valid schema exactly
+    // at the cap must work, even after malformed requests on the same client.
+    const MAX_BYTES: usize = 64 * 1024;
+    let name = format!("{}a", "é".repeat((MAX_BYTES - " long".len()) / "é".len()));
+    let at_limit = format!("{name} long");
+    assert_eq!(at_limit.len(), MAX_BYTES);
+    assert!(at_limit.chars().count() < MAX_BYTES);
+    let resp = client
+        .analyze_plan(req(at_limit.clone()))
+        .await
+        .expect("schema at the byte limit must succeed")
+        .into_inner();
+    let Some(sc::analyze_plan_response::Result::DdlParse(parsed)) = resp.result else {
+        panic!("expected DdlParse result")
+    };
+    let dt = parsed.parsed.expect("parsed DataType");
+    let Some(sc::data_type::Kind::Struct(st)) = dt.kind else {
+        panic!("expected struct schema")
+    };
+    assert_eq!(st.fields.len(), 1);
+    assert_eq!(st.fields[0].name, name);
+    assert!(st.fields[0].nullable);
+    assert!(matches!(
+        st.fields[0].data_type.as_ref().unwrap().kind,
+        Some(sc::data_type::Kind::Long(_))
+    ));
+
+    for ddl in ["x".repeat(MAX_BYTES + 1), format!("{at_limit} ")] {
+        assert_eq!(ddl.len(), MAX_BYTES + 1);
+        let err = client
+            .analyze_plan(req(ddl))
+            .await
+            .expect_err("oversized schema must fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+    }
+}

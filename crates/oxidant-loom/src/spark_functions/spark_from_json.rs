@@ -206,9 +206,10 @@ fn tokenize(s: &str) -> std::result::Result<Vec<Tok>, String> {
     let bytes = s.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
-        let c = bytes[i] as char;
+        // Keep byte offsets on UTF-8 boundaries when classifying or slicing tokens.
+        let c = s[i..].chars().next().unwrap();
         match c {
-            c if c.is_whitespace() => i += 1,
+            c if c.is_whitespace() => i += c.len_utf8(),
             '<' => {
                 out.push(Tok::Lt);
                 i += 1;
@@ -250,8 +251,9 @@ fn tokenize(s: &str) -> std::result::Result<Vec<Tok>, String> {
                         i += 1;
                         break;
                     }
-                    name.push(bytes[i] as char);
-                    i += 1;
+                    let c = s[i..].chars().next().unwrap();
+                    name.push(c);
+                    i += c.len_utf8();
                 }
                 out.push(Tok::Word(name));
             }
@@ -267,10 +269,12 @@ fn tokenize(s: &str) -> std::result::Result<Vec<Tok>, String> {
             }
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
-                while i < bytes.len()
-                    && ((bytes[i] as char).is_alphanumeric() || bytes[i] as char == '_')
-                {
-                    i += 1;
+                while i < bytes.len() {
+                    let c = s[i..].chars().next().unwrap();
+                    if !c.is_alphanumeric() && c != '_' {
+                        break;
+                    }
+                    i += c.len_utf8();
                 }
                 out.push(Tok::Word(s[start..i].to_string()));
             }
@@ -1059,6 +1063,71 @@ mod tests {
                 Field::new("b", DataType::Utf8, true),
             ]))
         );
+    }
+
+    #[test]
+    fn parses_unicode_identifiers() {
+        for (name, sql_type, data_type) in [
+            ("café", "long", DataType::Int64),
+            ("名前", "string", DataType::Utf8),
+            ("𐐀_2", "int", DataType::Int32),
+        ] {
+            let expected = DataType::Struct(Fields::from(vec![Field::new(name, data_type, true)]));
+            for ddl in [
+                format!("{name} {sql_type}"),
+                format!("struct<{name}:{sql_type}>"),
+                format!("\u{2003}{name}\u{a0}{sql_type}\n"),
+            ] {
+                assert_eq!(parse_spark_schema(&ddl).unwrap(), expected, "{ddl}");
+            }
+        }
+    }
+
+    #[test]
+    fn parses_quoted_unicode_identifiers() {
+        for (quoted, name) in [
+            ("`café`", "café"),
+            ("`名前`", "名前"),
+            ("`col😀`", "col😀"),
+            ("`名``前😀`", "名`前😀"),
+            ("`名😀```", "名😀`"),
+            ("```名前`", "`名前"),
+            ("``", ""),
+        ] {
+            assert_eq!(tokenize(quoted).unwrap(), vec![Tok::Word(name.to_string())]);
+            let expected = DataType::Struct(Fields::from(vec![
+                Field::new(name, DataType::Int64, true),
+                Field::new("next", DataType::Int32, true),
+            ]));
+            for ddl in [
+                format!("{quoted} long, next int"),
+                format!("struct<{quoted}:long,next:int>"),
+            ] {
+                assert_eq!(parse_spark_schema(&ddl).unwrap(), expected, "{ddl}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_unicode_schema_without_panicking() {
+        for ddl in [
+            "col😀 long",
+            "😀 long",
+            "café",
+            "名前 notatype",
+            "café long;",
+            "名前 string,",
+            "café array<int",
+            "café decimal(10,é)",
+            "café decimal(999999999999999999999999,2)",
+            "struct<名前:string,>",
+            "`名前",
+            "`名``",
+            "struct<`名``前`:string,>",
+            r#"{"type":"café"}"#,
+        ] {
+            assert!(parse_spark_schema(ddl).is_err(), "must reject {ddl}");
+        }
     }
 
     #[test]
