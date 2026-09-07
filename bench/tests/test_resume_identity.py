@@ -232,6 +232,94 @@ class ResumeIdentityTests(unittest.TestCase):
             self.assertEqual(names, ["Q1", "Q2"])
             self.assertEqual(payload["queries"][1]["error"], "missing q2.sql")
 
+    def test_tpcds_skip_does_not_drop_unread_prior_queries(self):
+        module = _load_runner("tpcds")
+        with TemporaryDirectory(prefix="benchmark-skip-keep-") as directory:
+            tmp = Path(directory)
+            queries = tmp / "queries"
+            queries.mkdir()
+            sql = "SELECT 1 AS same_query"
+            (queries / "q1.sql").write_text(sql)
+            import sys as _sys
+
+            _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+            from resume_identity import run_identity, source_sha_for, sql_sha256
+
+            runner = Path(__file__).resolve().parents[1] / "tpcds" / "run-ec2-connect.py"
+            identity = run_identity(
+                endpoint="sc://127.0.0.1:1",
+                dataset="TPC-DS SF100 (Glue db via EC2 Connect)",
+                machine="m",
+                tries=1,
+                source_sha=source_sha_for(runner),
+            )
+            sha = sql_sha256(sql)
+            output = tmp / "result.json"
+            output.write_text(
+                json.dumps(
+                    {
+                        **identity,
+                        "queries": [
+                            {
+                                "query": "Q1",
+                                "hot_s": 1.0,
+                                "elapsed_s": 1.0,
+                                "error": None,
+                                "sql_sha256": sha,
+                            },
+                            {
+                                "query": "Q2",
+                                "hot_s": 2.0,
+                                "elapsed_s": 2.0,
+                                "error": None,
+                                "sql_sha256": "q2-prior",
+                            },
+                            {
+                                "query": "Q3",
+                                "hot_s": 3.0,
+                                "elapsed_s": 3.0,
+                                "error": None,
+                                "sql_sha256": "q3-prior",
+                            },
+                        ],
+                    }
+                )
+            )
+            argv = [
+                "runner",
+                "--endpoint",
+                "sc://127.0.0.1:1",
+                "--glue-database",
+                "db",
+                "--machine",
+                "m",
+                "--tries",
+                "1",
+                "--start",
+                "1",
+                "--end",
+                "1",
+                "--queries",
+                str(queries),
+                "--out",
+                str(output),
+            ]
+            old = sys.argv
+            Session.queries = []
+            try:
+                sys.argv = argv
+                self.assertEqual(module.main(), 0)
+            finally:
+                sys.argv = old
+            self.assertEqual(Session.queries, [])
+            payload = json.loads(output.read_text())
+            names = [row["query"] for row in payload["queries"]]
+            self.assertEqual(
+                names,
+                ["Q1", "Q2", "Q3"],
+                "SKIP of Q1 overwrote --out and dropped unread prior queries",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -207,14 +207,31 @@ def session_dead(err: str) -> bool:
     )
 
 
-def persist(out: Path, identity: dict, failures: int, results: list) -> None:
+def persist(
+    out: Path,
+    identity: dict,
+    failures: int,
+    results: list,
+    prior: dict | None = None,
+) -> None:
+    merged = dict(prior or {})
+    for row in results:
+        name = row.get("query")
+        if isinstance(name, str) and name:
+            merged[name] = row
+    queries = sorted(
+        merged.values(),
+        key=lambda row: int(str(row.get("query", "Q0"))[1:])
+        if str(row.get("query", "Q0"))[1:].isdigit()
+        else 0,
+    )
     payload = {
         **identity,
         "run_date": str(date.today()),
         "failures": failures,
-        "queries": results,
+        "queries": queries,
         "elapsed_total_s": sum(
-            r["elapsed_s"] for r in results if r.get("elapsed_s") is not None
+            r["elapsed_s"] for r in queries if r.get("elapsed_s") is not None
         ),
     }
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -289,7 +306,7 @@ def main() -> int:
                     "error": f"missing {qpath.name}",
                 }
             )
-            persist(args.out, identity, failures, results)
+            persist(args.out, identity, failures, results, prior)
             continue
 
         orig = qpath.read_text()
@@ -302,7 +319,7 @@ def main() -> int:
                 elapsed = prev.get("elapsed_s")
             print(f"{name} SKIP (prior {elapsed:.4f}s)", flush=True)
             results.append(prev)
-            persist(args.out, identity, failures, results)
+            persist(args.out, identity, failures, results, prior)
             continue
         times: list[float | None] = []
         err: str | None = None
@@ -369,7 +386,7 @@ def main() -> int:
                 "sql_sha256": sha,
             }
         )
-        persist(args.out, identity, failures, results)
+        persist(args.out, identity, failures, results, prior)
 
     try:
         spark.stop()
