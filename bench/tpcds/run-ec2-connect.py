@@ -17,9 +17,15 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import time
 from datetime import date
 from pathlib import Path
+
+_BENCH = Path(__file__).resolve().parent.parent
+if str(_BENCH) not in sys.path:
+    sys.path.insert(0, str(_BENCH))
+from resume_identity import can_reuse, run_identity, reusable_prior, source_sha_for, sql_sha256
 
 TABLES = [
     "call_center",
@@ -235,12 +241,16 @@ def main() -> int:
 
     from pyspark.sql import SparkSession
 
+    identity = run_identity(
+        endpoint=args.endpoint,
+        dataset=f"TPC-DS SF100 (Glue {args.glue_database} via EC2 Connect)",
+        machine=args.machine,
+        tries=args.tries,
+        source_sha=source_sha_for(Path(__file__)),
+    )
     prior: dict = {}
     if args.out.exists() and not args.no_resume:
-        prior = {
-            q["query"]: q
-            for q in json.loads(args.out.read_text()).get("queries", [])
-        }
+        prior = reusable_prior(json.loads(args.out.read_text()), identity)
 
     def new_spark() -> SparkSession:
         return SparkSession.builder.remote(args.endpoint).getOrCreate()
@@ -254,24 +264,30 @@ def main() -> int:
         name = f"Q{n}"
         qpath = args.queries / f"q{n}.sql"
         if not qpath.exists():
-            print(f"{name} SKIP (missing {qpath.name})", flush=True)
+            print(f"{name} FAIL (missing {qpath.name})", flush=True)
+            failures += 1
+            results.append(
+                {
+                    "query": name,
+                    "tries": [],
+                    "elapsed_s": None,
+                    "hot_s": None,
+                    "error": f"missing {qpath.name}",
+                }
+            )
             continue
 
+        orig = qpath.read_text()
+        sql = qualify(orig, args.glue_database)
+        sha = sql_sha256(orig)
         prev = prior.get(name)
-        done = prev and prev.get("error") is None and (
-            prev.get("hot_s") is not None or prev.get("elapsed_s") is not None
-        )
-        if done:
-            # tries=1 entries store hot_s=None; .get(key, default) does not fall back
-            # when the key exists with a None value.
+        if can_reuse(prev, sql_sha=sha):
             elapsed = prev.get("hot_s")
             if elapsed is None:
                 elapsed = prev.get("elapsed_s")
             print(f"{name} SKIP (prior {elapsed:.4f}s)", flush=True)
             results.append(prev)
             continue
-
-        sql = qualify(qpath.read_text(), args.glue_database)
         times: list[float | None] = []
         err: str | None = None
         for try_i in range(args.tries):
@@ -334,14 +350,12 @@ def main() -> int:
                 "elapsed_s": elapsed,
                 "hot_s": hot,
                 "error": err,
+                "sql_sha256": sha,
             }
         )
         payload = {
-            "dataset": f"TPC-DS SF100 (Glue {args.glue_database} via EC2 Connect)",
-            "machine": args.machine,
+            **identity,
             "run_date": str(date.today()),
-            "endpoint": args.endpoint,
-            "tries": args.tries,
             "failures": failures,
             "queries": results,
             "elapsed_total_s": sum(
