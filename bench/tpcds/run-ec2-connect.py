@@ -210,10 +210,9 @@ def session_dead(err: str) -> bool:
 def persist(
     out: Path,
     identity: dict,
-    failures: int,
     results: list,
     prior: dict | None = None,
-) -> None:
+) -> int:
     merged = dict(prior or {})
     for row in results:
         name = row.get("query")
@@ -224,6 +223,13 @@ def persist(
         key=lambda row: int(str(row.get("query", "Q0"))[1:])
         if str(row.get("query", "Q0"))[1:].isdigit()
         else 0,
+    )
+    # Failed attempts can lack an error string (e.g. exhausted reconnects).
+    failures = sum(
+        1
+        for row in queries
+        if row.get("error")
+        or (row.get("hot_s") is None and row.get("elapsed_s") is None)
     )
     payload = {
         **identity,
@@ -236,6 +242,7 @@ def persist(
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2) + "\n")
+    return failures
 
 
 def main() -> int:
@@ -296,7 +303,6 @@ def main() -> int:
         qpath = args.queries / f"q{n}.sql"
         if not qpath.exists():
             print(f"{name} FAIL (missing {qpath.name})", flush=True)
-            failures += 1
             results.append(
                 {
                     "query": name,
@@ -306,7 +312,7 @@ def main() -> int:
                     "error": f"missing {qpath.name}",
                 }
             )
-            persist(args.out, identity, failures, results, prior)
+            failures = persist(args.out, identity, results, prior)
             continue
 
         orig = qpath.read_text()
@@ -319,7 +325,7 @@ def main() -> int:
                 elapsed = prev.get("elapsed_s")
             print(f"{name} SKIP (prior {elapsed:.4f}s)", flush=True)
             results.append(prev)
-            persist(args.out, identity, failures, results, prior)
+            failures = persist(args.out, identity, results, prior)
             continue
         times: list[float | None] = []
         err: str | None = None
@@ -363,7 +369,6 @@ def main() -> int:
                 break
 
         if len(times) < args.tries or any(t is None for t in times):
-            failures += 1
             hot = None
             elapsed = None
         elif args.tries == 1:
@@ -386,7 +391,7 @@ def main() -> int:
                 "sql_sha256": sha,
             }
         )
-        persist(args.out, identity, failures, results, prior)
+        failures = persist(args.out, identity, results, prior)
 
     try:
         spark.stop()
@@ -397,7 +402,8 @@ def main() -> int:
         r["elapsed_s"] for r in results if r.get("elapsed_s") is not None
     )
     print(
-        f"\n=== DONE failures={failures} elapsed_total={elapsed_total:.4f}s → {args.out} ===",
+        f"\n=== DONE artifact_failures={failures} "
+        f"selected_elapsed_total={elapsed_total:.4f}s → {args.out} ===",
         flush=True,
     )
     return 1 if failures else 0

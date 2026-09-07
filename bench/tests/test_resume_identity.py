@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 
 class _Result:
@@ -76,6 +79,21 @@ def _seed(output: Path) -> None:
             }
         )
     )
+
+
+def _invoke_tpcds(module, queries: Path, output: Path, *, end: int, tries: int = 1):
+    """Exercise real argparse/SQL handling/JSON writes; Spark is in-process only."""
+    argv = [
+        "runner", "--endpoint", "sc://fixture.invalid:50051",
+        "--glue-database", "fixture_db", "--machine", "fixture-machine",
+        "--tries", str(tries), "--start", "1", "--end", str(end),
+        "--queries", str(queries), "--out", str(output),
+    ]
+    Session.queries = []
+    stdout = io.StringIO()
+    with patch.object(sys, "argv", argv), redirect_stdout(stdout):
+        rc = module.main()
+    return rc, json.loads(output.read_text()), stdout.getvalue()
 
 
 class ResumeIdentityTests(unittest.TestCase):
@@ -231,6 +249,108 @@ class ResumeIdentityTests(unittest.TestCase):
             names = [row["query"] for row in payload["queries"]]
             self.assertEqual(names, ["Q1", "Q2"])
             self.assertEqual(payload["queries"][1]["error"], "missing q2.sql")
+
+    def test_tpcds_partial_resume_keeps_missing_sibling_failure(self):
+        # Fixture results test checkpoint status, not engine performance.
+        module = _load_runner("tpcds")
+        for variant in ("skip", "execute"):
+            with self.subTest(variant=variant), TemporaryDirectory(
+                prefix="benchmark-missing-resume-"
+            ) as directory:
+                tmp = Path(directory)
+                queries = tmp / "queries"
+                queries.mkdir()
+                q1 = queries / "q1.sql"
+                q1.write_text("SELECT 1 AS one")
+                output = tmp / "result.json"
+                rc, original, _ = _invoke_tpcds(module, queries, output, end=2)
+                self.assertEqual(rc, 1)
+                self.assertEqual(original["failures"], 1)
+                self.assertEqual(original["queries"][1]["error"], "missing q2.sql")
+                if variant == "execute":
+                    q1.write_text("SELECT 9 AS changed")
+
+                rc, resumed, stdout = _invoke_tpcds(module, queries, output, end=1)
+                self.assertEqual(
+                    Session.queries, [] if variant == "skip" else [q1.read_text()]
+                )
+                self.assertEqual([r["query"] for r in resumed["queries"]], ["Q1", "Q2"])
+                self.assertEqual(resumed["queries"][1], original["queries"][1])
+                self.assertEqual(resumed["failures"], 1)
+                self.assertEqual(rc, 1, "retained Q2 failure must keep the artifact failed")
+                self.assertIn("artifact_failures=1", stdout)
+                self.assertIn("selected_elapsed_total=", stdout)
+
+                # Repair the actual missing input; replacing Q2 clears its failure.
+                (queries / "q2.sql").write_text("SELECT 2 AS two")
+                rc, repaired, stdout = _invoke_tpcds(module, queries, output, end=2)
+                self.assertEqual(Session.queries, ["SELECT 2 AS two"])
+                self.assertEqual(repaired["failures"], 0)
+                self.assertEqual(rc, 0)
+                self.assertIn("artifact_failures=0", stdout)
+
+    def test_tpcds_partial_resume_counts_failed_attempt_without_error(self):
+        module = _load_runner("tpcds")
+        for variant in ("skip", "execute"):
+            with self.subTest(variant=variant), TemporaryDirectory(
+                prefix="benchmark-failed-attempt-resume-"
+            ) as directory:
+                tmp = Path(directory)
+                queries = tmp / "queries"
+                queries.mkdir()
+                q1 = queries / "q1.sql"
+                q1.write_text("SELECT 1 AS one")
+                q2_sql = "SELECT 2 AS two"
+                (queries / "q2.sql").write_text(q2_sql)
+                output = tmp / "result.json"
+                q2_calls = 0
+
+                def fixture_sql(session, sql):
+                    nonlocal q2_calls
+                    session.queries.append(sql)
+                    if sql == q2_sql:
+                        q2_calls += 1
+                        if q2_calls > 1:
+                            raise RuntimeError("NO_ACTIVE_SESSION fixture failure")
+                    return _Result()
+
+                # The real retry loop exhausts reconnects after Q2's cold try.
+                # Only Spark and its reconnect delay are fixtures; no live service.
+                with patch.object(Session, "sql", fixture_sql), patch.object(
+                    module.time, "sleep"
+                ):
+                    original_rc, original, _ = _invoke_tpcds(
+                        module, queries, output, end=3, tries=3
+                    )
+                failed = original["queries"][1]
+                self.assertEqual(q2_calls, 5)
+                self.assertIsNone(failed["error"])
+                self.assertEqual(len(failed["tries"]), 2)
+                self.assertIsNotNone(failed["tries"][0])
+                self.assertIsNone(failed["tries"][1])
+                self.assertIsNone(failed["elapsed_s"])
+                if variant == "execute":
+                    q1.write_text("SELECT 9 AS changed")
+
+                rc, resumed, stdout = _invoke_tpcds(
+                    module, queries, output, end=1, tries=3
+                )
+                self.assertEqual(
+                    Session.queries, [] if variant == "skip" else [q1.read_text()] * 3
+                )
+                self.assertEqual(resumed["queries"][1:], original["queries"][1:])
+                self.assertEqual(resumed["failures"], 2)
+                self.assertEqual(original["failures"], 2)
+                self.assertEqual(original_rc, 1)
+                self.assertEqual(rc, 1)
+                self.assertIn("artifact_failures=2", stdout)
+
+                # A successful Q2 retry replaces that failed row, but not missing Q3.
+                rc, repaired, _ = _invoke_tpcds(module, queries, output, end=2, tries=3)
+                self.assertEqual(Session.queries, [q2_sql] * 3)
+                self.assertEqual(repaired["failures"], 1)
+                self.assertEqual(repaired["queries"][2], original["queries"][2])
+                self.assertEqual(rc, 1)
 
     def test_tpcds_skip_does_not_drop_unread_prior_queries(self):
         module = _load_runner("tpcds")
