@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::datatypes::DataType;
+use datafusion::common::exec_err;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
@@ -35,6 +36,18 @@ impl ArtifactStore {
 
 pub type SharedArtifacts = Arc<Mutex<ArtifactStore>>;
 
+fn python_udfs_allowed() -> bool {
+    std::env::var("OXIDANT_ALLOW_PYTHON_UDF")
+        .ok()
+        .as_deref()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
+fn python_udf_disabled_message() -> String {
+    "Python UDF execution is disabled (OXIDANT_ALLOW_PYTHON_UDF=false)".to_string()
+}
+
 /// Handle `Command.register_function` from PySpark.
 pub fn register_connect_udf(
     ctx: &SessionContext,
@@ -45,6 +58,9 @@ pub fn register_connect_udf(
     if let Some(sc::common_inline_user_defined_function::Function::PythonUdf(py)) =
         udf.function.as_ref()
     {
+        if !python_udfs_allowed() {
+            return Err(Status::permission_denied(python_udf_disabled_message()));
+        }
         let return_type = py
             .output_type
             .as_ref()
@@ -142,18 +158,21 @@ fn eval_python_udf_scalar(
     args: &[ScalarValue],
     return_type: &DataType,
 ) -> datafusion::common::Result<ScalarValue> {
-    let allow = std::env::var("OXIDANT_ALLOW_PYTHON_UDF")
-        .ok()
-        .as_deref()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
-    if !allow {
-        return Ok(default_scalar_for_type(return_type));
+    if !python_udfs_allowed() {
+        return exec_err!("{}", python_udf_disabled_message());
     }
     let dir = std::env::temp_dir().join("oxidant-pyudf");
-    std::fs::create_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        datafusion::common::DataFusionError::Execution(format!(
+            "Python UDF '{name}' could not create a scratch directory: {e}"
+        ))
+    })?;
     let script = dir.join(format!("{name}.pkl"));
-    std::fs::write(&script, command).ok();
+    std::fs::write(&script, command).map_err(|e| {
+        datafusion::common::DataFusionError::Execution(format!(
+            "Python UDF '{name}' could not write its payload: {e}"
+        ))
+    })?;
     let arg_literals: Vec<String> = args.iter().map(|v| format!("{v:?}")).collect();
     let out = std::process::Command::new("python3")
         .arg("-c")
@@ -171,22 +190,123 @@ fn eval_python_udf_scalar(
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
             parse_python_result(&s, return_type)
         }
-        _ => Ok(default_scalar_for_type(return_type)),
-    }
-}
-
-fn default_scalar_for_type(dt: &DataType) -> ScalarValue {
-    match dt {
-        DataType::Utf8 => ScalarValue::Utf8(Some(String::new())),
-        DataType::Int64 => ScalarValue::Int64(Some(0)),
-        _ => ScalarValue::Int32(Some(0)),
+        Ok(o) => exec_err!(
+            "Python UDF '{name}' exited unsuccessfully (status {})",
+            o.status
+        ),
+        Err(e) => exec_err!("Python UDF '{name}' could not be started: {e}"),
     }
 }
 
 fn parse_python_result(s: &str, dt: &DataType) -> datafusion::common::Result<ScalarValue> {
     match dt {
         DataType::Utf8 => Ok(ScalarValue::Utf8(Some(s.to_string()))),
-        DataType::Int64 => Ok(ScalarValue::Int64(Some(s.parse().unwrap_or(0)))),
-        _ => Ok(ScalarValue::Int32(Some(s.parse().unwrap_or(0)))),
+        DataType::Int64 => {
+            let v = s.parse::<i64>().map_err(|_| {
+                datafusion::common::DataFusionError::Execution(format!(
+                    "Python UDF returned {s:?}, which is not an Int64"
+                ))
+            })?;
+            Ok(ScalarValue::Int64(Some(v)))
+        }
+        _ => {
+            let v = s.parse::<i32>().map_err(|_| {
+                datafusion::common::DataFusionError::Execution(format!(
+                    "Python UDF returned {s:?}, which is not an Int32"
+                ))
+            })?;
+            Ok(ScalarValue::Int32(Some(v)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_allow_python_udf<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("OXIDANT_ALLOW_PYTHON_UDF").ok();
+        match value {
+            Some(v) => std::env::set_var("OXIDANT_ALLOW_PYTHON_UDF", v),
+            None => std::env::remove_var("OXIDANT_ALLOW_PYTHON_UDF"),
+        }
+        let out = f();
+        match previous {
+            Some(v) => std::env::set_var("OXIDANT_ALLOW_PYTHON_UDF", v),
+            None => std::env::remove_var("OXIDANT_ALLOW_PYTHON_UDF"),
+        }
+        out
+    }
+
+    #[test]
+    fn disabled_python_udf_is_an_error_not_a_zero() {
+        let err = with_allow_python_udf(Some("false"), || {
+            eval_python_udf_scalar("review_plus_one", b"unused", &[], &DataType::Int32)
+                .expect_err("disabled UDF must fail")
+        });
+        let msg = err.to_string();
+        assert!(
+            msg.to_ascii_lowercase().contains("disabled")
+                || msg.to_ascii_lowercase().contains("permission"),
+            "error must say the UDF is disabled, got {msg}"
+        );
+        assert!(
+            !msg.contains("unused") && !msg.contains("pickle"),
+            "error must not leak the serialized function: {msg}"
+        );
+    }
+
+    #[test]
+    fn process_or_parse_failure_is_an_error_not_a_zero() {
+        let err = with_allow_python_udf(Some("true"), || {
+            eval_python_udf_scalar(
+                "broken",
+                b"not-a-pickle",
+                &[ScalarValue::Int32(Some(1))],
+                &DataType::Int32,
+            )
+            .expect_err("a failing python UDF must fail the query")
+        });
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("not-a-pickle"),
+            "error must not leak serialized bytes: {msg}"
+        );
+        let ok_zero = ScalarValue::Int32(Some(0));
+        assert_ne!(
+            format!("{err}"),
+            format!("{ok_zero}"),
+            "must not present a successful zero"
+        );
+    }
+
+    #[test]
+    fn register_refuses_python_udf_when_disabled() {
+        let ctx = SessionContext::new();
+        let mut registry = UdfRegistry::default();
+        let udf = sc::CommonInlineUserDefinedFunction {
+            function_name: "review_plus_one".to_string(),
+            function: Some(
+                sc::common_inline_user_defined_function::Function::PythonUdf(sc::PythonUdf {
+                    output_type: None,
+                    command: b"unused".to_vec(),
+                    ..Default::default()
+                }),
+            ),
+            ..Default::default()
+        };
+        let err = with_allow_python_udf(Some("false"), || {
+            register_connect_udf(&ctx, &mut registry, &udf).expect_err("register must refuse")
+        });
+        assert_ne!(err.code(), tonic::Code::Ok);
+        let msg = err.message().to_ascii_lowercase();
+        assert!(
+            msg.contains("disabled") || msg.contains("permission"),
+            "register error must name the policy, got {err}"
+        );
     }
 }
