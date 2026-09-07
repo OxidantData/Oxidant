@@ -9,8 +9,8 @@ use oxidant_streaming::{
 };
 use tonic::Status;
 
-use crate::OxidantService;
 use crate::translate;
+use crate::OxidantService;
 use oxidant_loom::Engine;
 
 impl OxidantService {

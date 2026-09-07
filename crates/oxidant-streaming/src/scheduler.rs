@@ -7,12 +7,12 @@ use std::time::Duration;
 use datafusion::logical_expr::LogicalPlan;
 use oxidant_catalog::TableFormat;
 use oxidant_common::{Error, Result};
-use oxidant_loom::Engine;
 use oxidant_loom::arrow::datatypes::SchemaRef;
 use oxidant_loom::arrow::record_batch::RecordBatch;
+use oxidant_loom::Engine;
 use tokio::sync::RwLock;
 
-use crate::checkpoint::{CheckpointStore, checkpoint_store};
+use crate::checkpoint::{checkpoint_store, CheckpointStore};
 use crate::config::{ExpectationAction, StreamExpectation, StreamQueryConfig};
 use crate::input::MicroBatchInput;
 use crate::kafka::KafkaSource;
