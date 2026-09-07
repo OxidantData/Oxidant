@@ -119,9 +119,10 @@ One image covers both roles — override the command per role:
 docker run --read-only --tmpfs /tmp --tmpfs /var/lib/oxidant/spill \
   -p 50051:50051 -p 4040:4040 ghcr.io/oxidantdata/oxidant:latest
 
-# Arrow Flight worker (same image, different command)
+# Arrow Flight worker (same image, different command; `--foreground` is required —
+# without it `oxidant worker` exits 1 so a supervisor can restart it)
 docker run --read-only --tmpfs /tmp --tmpfs /var/lib/oxidant/spill \
-  ghcr.io/oxidantdata/oxidant:latest worker --port 50561
+  ghcr.io/oxidantdata/oxidant:latest worker --port 50561 --foreground
 ```
 
 Set `OXIDANT_WORKER_SERVICE` on the driver so it can discover workers (see

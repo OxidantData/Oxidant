@@ -438,8 +438,9 @@ impl ReconcileReport {
     ///
     /// The two non-zero answers are kept apart because they call for different things. "The target
     /// no longer says what the source says" is a data problem someone has to look at; "the
-    /// publisher was unreachable" is a network blip, and a CI step written as
-    /// `reconcile || page_the_data_team` should not page for one. `1` is drift and only drift; any
+    /// publisher was unreachable" is a network blip. Branch on 0 / 1 / 2 — a CI step written as
+    /// `reconcile || page_the_data_team` pages for every nonzero status, including incomplete
+    /// comparison. `1` is drift and only drift; any
     /// operational failure — an unreachable publisher, a `--table` typo, an unwalkable key type —
     /// is `2`, whether it comes back as a per-table `source_error` or as an error from the command
     /// itself. Failure outranks drift when a run hit both: the run was incomplete, so its
@@ -1945,8 +1946,8 @@ mod tests {
     fn a_table_that_could_not_be_read_exits_two_rather_than_one() {
         // The two non-zero answers call for different things. `1` means the target stopped saying
         // what the source says — someone has to look at the data. `2` means the comparison did not
-        // happen, which for a CI step written as `reconcile || page_the_data_team` is a network
-        // blip, not a page.
+        // happen, which is an operational failure (exit 2), not drift (exit 1). A shell
+        // `cmd || page` would page for both.
         let failed = report(vec![failed_report("connection refused")]);
         assert_eq!(failed.exit_code(), EXIT_FAILED);
         assert_eq!(failed.errored(), 1);

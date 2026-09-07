@@ -149,10 +149,30 @@ pipeline has not created it yet), `source_error` (this table could not be read
 at all). The process exits **0** when every table is `in_sync`, **1** when any
 drifted, and **2** when any could not be compared — an unreachable publisher, a
 `--table` that matches nothing, a key type the walk refuses, an overlapping key
-space. Drift and "could not run" get different codes on purpose: a CI step
-written as `reconcile || page_the_data_team` should not page for a network
-blip. A run that hit both exits 2, because an incomplete run's "no drift here"
-is only a claim about the tables it read.
+space. Drift and "could not run" get different codes on purpose: a CI step must
+branch on the status, not use `reconcile || page_the_data_team`. A shell
+OR-list runs its right side for every nonzero exit, so status 2 (network
+blip / incomplete comparison) would page the same as drift:
+
+```sh
+if oxidant pipeline reconcile -c oxidant.yaml; then
+  status=0
+else
+  status=$?
+fi
+case "$status" in
+  0) printf '%s\n' 'Comparison completed: in sync' ;;
+  1) printf '%s\n' 'Comparison completed: drift found' ;;
+  2) printf '%s\n' 'Comparison incomplete: inspect the reported operational error' ;;
+  *) printf '%s\n' "Unexpected reconcile status: $status" ;;
+esac
+exit "$status"
+```
+
+Capturing `$?` in the `else` branch keeps the original status even under
+`set -e`. Wire paging to the `1` branch (and inspect `2` as ops), not to
+every nonzero. A run that hit both exits 2, because an incomplete run's
+"no drift here" is only a claim about the tables it read.
 
 One table's failure does not discard the others' results: it is reported as
 that table's `source_error`, with its error in place of the comparison, and

@@ -262,9 +262,9 @@ pub async fn run(config: Option<OxidantConfig>, command: Command) -> Result<()> 
 
 /// A reconcile that could not run: `EXIT_FAILED`, never the exit code drift owns.
 ///
-/// `docs/cli.md` and `docs/pipelines.md` both publish this split, and a CI step written as
-/// `reconcile || page_the_data_team` is the reason it matters: a network blip should not read the
-/// same way as a target that stopped saying what the source says.
+/// `docs/cli.md` and `docs/postgres-cdc.md` both publish this split. Do not document
+/// `reconcile || page_the_data_team`: a shell OR-list pages for every nonzero status,
+/// including incomplete comparison (2). Branch on 0 / 1 / 2 instead.
 fn reconcile_failed(error: &Error) -> ! {
     eprintln!("oxidant: {error}");
     std::process::exit(oxidant_pipelines::EXIT_FAILED)
@@ -818,5 +818,65 @@ mod tests {
             at: SystemTime::now(),
             kind: RunEventKind::PassComplete { outcomes: vec![] },
         });
+    }
+
+    #[test]
+    fn reconcile_status_example_selects_only_the_intended_branch() {
+        // The documented three-way branch (docs/postgres-cdc.md §4). A shell OR-list
+        // pages for every nonzero status; this captures $? in else so 2 stays 2
+        // even under set -e (OxidantData/Oxidant#185).
+        let script = r#"
+set -e
+reconcile() { return "$1"; }
+if reconcile "$CODE"; then
+  status=0
+else
+  status=$?
+fi
+case "$status" in
+  0) printf '%s\n' 'Comparison completed: in sync' ;;
+  1) printf '%s\n' 'Comparison completed: drift found' ;;
+  2) printf '%s\n' 'Comparison incomplete: inspect the reported operational error' ;;
+  *) printf '%s\n' "Unexpected reconcile status: $status" ;;
+esac
+exit "$status"
+"#;
+        let cases: &[(i32, &str)] = &[
+            (0, "Comparison completed: in sync"),
+            (1, "Comparison completed: drift found"),
+            (
+                2,
+                "Comparison incomplete: inspect the reported operational error",
+            ),
+            (3, "Unexpected reconcile status: 3"),
+        ];
+        for &(code, want) in cases {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .env("CODE", code.to_string())
+                .output()
+                .expect("sh");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                output.status.code(),
+                Some(code),
+                "code={code} stdout={stdout:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(stdout.trim(), want, "code={code}");
+            assert!(
+                !stdout.contains("PAGE"),
+                "example must not invoke a pager: {stdout}"
+            );
+        }
+
+        // Control: `cmd || page` does page on incomplete comparison (2).
+        let or_list = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"(exit 2) || printf '%s\n' PAGE; exit 0"#)
+            .output()
+            .expect("sh");
+        assert_eq!(String::from_utf8_lossy(&or_list.stdout).trim(), "PAGE");
     }
 }
