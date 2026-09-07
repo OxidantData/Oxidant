@@ -2105,7 +2105,7 @@ async fn resolve_lakehouse_provider(
     }
     let metadata_location = md.properties.get("metadata_location").map(String::as_str);
     let resolved = oxidant_datasource::active_files_for_scan(
-        store,
+        store.clone(),
         &md.location,
         match md.format {
             TableFormat::Delta => "delta",
@@ -2119,6 +2119,19 @@ async fn resolve_lakehouse_provider(
     .await
     .map_err(oxidant_to_df)?;
     record_lakehouse_snapshot(&md.name, &resolved.snapshot);
+    // Delta `schemaString` is the authority on TIMESTAMP vs TIMESTAMP_NTZ. Hive/Glue
+    // `timestamp` is wall-clock, so catalog schema must not override a UTC Delta write
+    // (OxidantData/Oxidant#147).
+    let delta_schema = if md.format == TableFormat::Delta {
+        oxidant_datasource::delta_write::current_metadata(store.as_ref(), root.prefix())
+            .await
+            .ok()
+            .flatten()
+            .map(|meta| meta.schema)
+    } else {
+        None
+    };
+    let declared_schema = delta_schema.or_else(|| md.schema.clone());
     if let Some(mapping) = resolved
         .column_mappings
         .iter()
@@ -2140,7 +2153,7 @@ async fn resolve_lakehouse_provider(
         // This needs a schema, and only the catalog has one: there is no data file to infer from.
         // Without a declared schema the old error stands, because guessing a column list would
         // make a downstream query fail somewhere much less obvious.
-        return match &md.schema {
+        return match &declared_schema {
             Some(schema) => Ok(ProviderResolution {
                 provider: crate::shard::empty_table(schema.clone()).map_err(oxidant_to_df)?,
                 snapshot_key: Some(md.name.clone()),
@@ -2154,7 +2167,7 @@ async fn resolve_lakehouse_provider(
         };
     }
 
-    let table_schema = match &md.schema {
+    let table_schema = match &declared_schema {
         Some(schema) => schema.clone(),
         None => {
             infer_parquet_schema(state, &resolved.files[0].location, resolved.files[0].size).await?
@@ -2301,7 +2314,7 @@ async fn resolve_lakehouse_provider(
         file_schema,
         partition_fields,
         groups,
-        case_insensitive_schema_adapter: md.schema.is_some(),
+        case_insensitive_schema_adapter: declared_schema.is_some(),
         statistics: logical_statistics,
         write_target,
     });

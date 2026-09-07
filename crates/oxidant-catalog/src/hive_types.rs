@@ -54,12 +54,14 @@ pub fn hive_type_to_arrow(ty: &str) -> Option<DataType> {
         "string" | "varchar" | "char" | "text" => DataType::Utf8,
         "boolean" | "bool" => DataType::Boolean,
         "date" => DataType::Date32,
-        // Spark TIMESTAMP is a UTC instant. Hive's unadorned `timestamp` is that type
-        // in Spark catalogs; wall-clock values are `timestamp_ntz` (Spark 3.4+).
-        // Mapping both to NTZ made a Delta `timestamp` table read back as TimestampNTZ
-        // and fail a second write (OxidantData/Oxidant#147).
-        "timestamp" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        // Hive/Glue/Athena `timestamp` is wall-clock (NTZ). Spark UTC instants are
+        // Hive `timestamp with local time zone`. `timestamp_ntz` is Spark-only and is
+        // accepted on read but not emitted to Glue (OxidantData/Oxidant#147).
+        "timestamp" => DataType::Timestamp(TimeUnit::Microsecond, None),
         "timestamp_ntz" => DataType::Timestamp(TimeUnit::Microsecond, None),
+        "timestamp with local time zone" => {
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        }
         "binary" => DataType::Binary,
         // Parameterized: varchar(n) / char(n) → Utf8 (length is a constraint, not an Arrow type);
         // decimal(p,s) → Decimal128(p,s). Anything else falls through to `None`.
@@ -115,8 +117,8 @@ pub fn arrow_type_to_hive(dt: &DataType) -> Option<String> {
         DataType::Utf8 | DataType::LargeUtf8 => "string".to_string(),
         DataType::Boolean => "boolean".to_string(),
         DataType::Date32 | DataType::Date64 => "date".to_string(),
-        DataType::Timestamp(_, Some(_)) => "timestamp".to_string(),
-        DataType::Timestamp(_, None) => "timestamp_ntz".to_string(),
+        DataType::Timestamp(_, Some(_)) => "timestamp with local time zone".to_string(),
+        DataType::Timestamp(_, None) => "timestamp".to_string(),
         DataType::Binary | DataType::LargeBinary => "binary".to_string(),
         DataType::Decimal128(p, s) => format!("decimal({p},{s})"),
         _ => return None,
@@ -253,11 +255,15 @@ mod tests {
             ("binary", DataType::Binary),
             (
                 "timestamp",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
             ),
             (
                 "timestamp_ntz",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "timestamp with local time zone",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             ),
         ];
         for (hive, arrow) in cases {
@@ -337,16 +343,24 @@ mod tests {
         assert_eq!(columns_to_schema(cols), None);
     }
 
-    /// Spark TIMESTAMP is a UTC instant; TIMESTAMP_NTZ is wall-clock. Catalog metadata
-    /// must not collapse both to Hive `timestamp` and reconstruct NTZ (OxidantData/Oxidant#147).
+    /// Hive/Glue `timestamp` is Athena wall-clock (NTZ). Spark UTC instants are
+    /// `timestamp with local time zone`. Do not collapse Glue `timestamp` to UTC
+    /// (OxidantData/Oxidant#147 follow-up).
     #[test]
-    fn timestamp_instant_and_ntz_round_trip_as_distinct_types() {
-        let instant = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    fn hive_unadorned_timestamp_is_wall_clock_not_utc() {
         let ntz = DataType::Timestamp(TimeUnit::Microsecond, None);
-        assert_eq!(arrow_type_to_hive(&instant).as_deref(), Some("timestamp"));
-        assert_eq!(arrow_type_to_hive(&ntz).as_deref(), Some("timestamp_ntz"));
-        assert_eq!(hive_type_to_arrow("timestamp"), Some(instant));
-        assert_eq!(hive_type_to_arrow("timestamp_ntz"), Some(ntz));
+        let instant = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        assert_eq!(hive_type_to_arrow("timestamp"), Some(ntz.clone()));
+        assert_eq!(
+            hive_type_to_arrow("timestamp with local time zone"),
+            Some(instant.clone())
+        );
+        assert_eq!(hive_type_to_arrow("timestamp_ntz"), Some(ntz.clone()));
+        assert_eq!(arrow_type_to_hive(&ntz).as_deref(), Some("timestamp"));
+        assert_eq!(
+            arrow_type_to_hive(&instant).as_deref(),
+            Some("timestamp with local time zone")
+        );
     }
 
     #[test]
@@ -365,11 +379,11 @@ mod tests {
             (DataType::Date32, "date"),
             (
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                "timestamp",
+                "timestamp with local time zone",
             ),
             (
                 DataType::Timestamp(TimeUnit::Microsecond, None),
-                "timestamp_ntz",
+                "timestamp",
             ),
             (DataType::Binary, "binary"),
             (DataType::Decimal128(15, 2), "decimal(15,2)"),
