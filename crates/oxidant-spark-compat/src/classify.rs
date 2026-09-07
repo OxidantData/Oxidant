@@ -72,12 +72,11 @@ impl Bucket {
     /// Whether this counts toward the **semantic** parity score (right answer / right
     /// rejection, allowing benign schema-name and both-error divergences).
     pub fn is_semantic_pass(self) -> bool {
-        // `Ordering` counts: same rows in a different order is semantically correct when the
-        // query's `ORDER BY` leaves ties unordered — and it keeps the score deterministic
-        // (tie-order can otherwise vary run-to-run).
+        // Ordering is triage-only: an unequal-key ORDER BY reversal is not semantic credit
+        // (OxidantData/Oxidant#191). SchemaOnly is name-only; type changes are not semantic.
         matches!(
             self,
-            Bucket::Pass | Bucket::ErrorParity | Bucket::SchemaOnly | Bucket::Ordering
+            Bucket::Pass | Bucket::ErrorParity | Bucket::SchemaOnly
         )
     }
 }
@@ -121,17 +120,23 @@ fn references_test_registered_udf(sql: &str) -> bool {
 
 /// Classify one replayed block against its golden expectation.
 pub fn classify(golden: &GoldenBlock, actual: &Outcome) -> Verdict {
-    // A nondeterministic query is unscoreable against a fixed golden — bucket it stably (excluded
-    // from both pass scores) so the corpus totals and the ratchet are reproducible. Errors are
-    // exempt: if the query errors on both sides it is still a deterministic outcome.
+    let expects_error = golden.expects_error();
+
+    // Accepting a query Spark rejects is MissingError even if the SQL mentions rand()
+    // (OxidantData/Oxidant#191). Nondeterminism only applies to successful vs successful.
+    if expects_error && matches!(actual, Outcome::Ok { .. }) {
+        return Verdict {
+            bucket: Bucket::MissingError,
+            detail: "oxidant accepted a query Spark rejects".into(),
+        };
+    }
+
     if is_nondeterministic(&golden.sql) && matches!(actual, Outcome::Ok { .. }) {
         return Verdict {
             bucket: Bucket::Nondeterministic,
             detail: "uses rand/uuid/shuffle — unscoreable vs fixed golden".into(),
         };
     }
-
-    let expects_error = golden.expects_error();
 
     match actual {
         Outcome::Err { message } => {
@@ -144,9 +149,15 @@ pub fn classify(golden: &GoldenBlock, actual: &Outcome) -> Verdict {
                 };
             }
             if expects_error {
+                if error_causes_compatible(&golden.output, message) {
+                    return Verdict {
+                        bucket: Bucket::ErrorParity,
+                        detail: String::new(),
+                    };
+                }
                 return Verdict {
-                    bucket: Bucket::ErrorParity,
-                    detail: String::new(),
+                    bucket: Bucket::ExecError,
+                    detail: first_line(message),
                 };
             }
             // oxidant errored but Spark expected rows: bucket by the kind of error. Order matters
@@ -191,8 +202,17 @@ pub fn classify(golden: &GoldenBlock, actual: &Outcome) -> Verdict {
                 };
             }
             if output_ok && !schema_ok {
+                if schema_types_match(&golden.schema, schema) {
+                    return Verdict {
+                        bucket: Bucket::SchemaOnly,
+                        detail: format!(
+                            "schema: golden `{}` vs oxidant `{}`",
+                            golden.schema, schema
+                        ),
+                    };
+                }
                 return Verdict {
-                    bucket: Bucket::SchemaOnly,
+                    bucket: Bucket::Correctness,
                     detail: format!("schema: golden `{}` vs oxidant `{}`", golden.schema, schema),
                 };
             }
@@ -230,6 +250,45 @@ fn attribute_value_diff(sql: &str, golden: &str, actual: &str) -> Bucket {
         return Bucket::Datetime;
     }
     Bucket::Correctness
+}
+
+fn error_causes_compatible(golden_output: &str, actual: &str) -> bool {
+    let class = extract_error_class(golden_output).unwrap_or_default();
+    if class.is_empty() {
+        return true;
+    }
+    if looks_like_missing_relation(actual) {
+        let c = class.to_uppercase();
+        return c.contains("TABLE") || c.contains("RELATION") || c.contains("NOSUCH");
+    }
+    if class.contains("DIVIDE") || class.contains("ARITHMETIC") {
+        let a = actual.to_lowercase();
+        return a.contains("divide") || a.contains("arithmetic") || a.contains("div 0");
+    }
+    true
+}
+
+fn extract_error_class(output: &str) -> Option<String> {
+    let key = "\"errorClass\"";
+    let i = output.find(key)?;
+    let rest = output[i + key.len()..].trim_start_matches([' ', ':', '"']);
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn schema_types_match(golden: &str, actual: &str) -> bool {
+    schema_field_types(golden) == schema_field_types(actual)
+}
+
+fn schema_field_types(schema: &str) -> Vec<String> {
+    let inner = schema
+        .strip_prefix("struct<")
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(schema);
+    inner
+        .split(',')
+        .filter_map(|field| field.rsplit_once(':').map(|(_, ty)| ty.trim().to_string()))
+        .collect()
 }
 
 fn looks_like_missing_relation(msg: &str) -> bool {

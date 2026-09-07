@@ -40,6 +40,7 @@ pub mod format;
 pub mod functions;
 pub mod golden;
 pub mod normalize;
+pub mod ratchet;
 pub mod report;
 pub mod runner;
 pub mod splitter;
