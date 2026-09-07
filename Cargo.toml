@@ -41,7 +41,7 @@ oxidant-loom       = { path = "crates/oxidant-loom" }
 oxidant-execution  = { path = "crates/oxidant-execution" }
 oxidant-gpu        = { path = "crates/oxidant-gpu" }
 oxidant-connect    = { path = "crates/oxidant-connect" }
-# Control-plane / platform crates (Databricks-like layer).
+# Control-plane / platform crates (managed-workspace layer).
 # Spark parity harness (golden SQL tests + scoreboard).
 oxidant-spark-compat = { path = "crates/oxidant-spark-compat" }
 oxidant-streaming   = { path = "crates/oxidant-streaming" }

@@ -27,7 +27,7 @@
 //!
 //! **Freshness.** Publishing is deliberately not per-commit: the Iceberg tree describes the table
 //! as of the Delta version it was generated from, so Iceberg readers trail Delta readers by at
-//! most one publish interval. Databricks' UniForm behaves the same way, for the same reason —
+//! most one publish interval. Similar systems' UniForm-style readers behave the same way, for the same reason —
 //! rewriting a manifest per micro-batch would cost more than the data write.
 
 use std::collections::BTreeMap;

@@ -1,6 +1,6 @@
 //! AUTO CDC (SCD Type 1) merge planning and execution.
 //!
-//! A Databricks `AUTO CDC` flow is a *streaming merge*: every micro-batch of the source is
+//! An `AUTO CDC` flow is a *streaming merge*: every micro-batch of the source is
 //! merged into the target by key, with the row carrying the largest `SEQUENCE BY` value winning.
 //! SCD Type 1 keeps no history — the target holds exactly the current state of each key.
 //!
@@ -15,17 +15,17 @@
 //! * **Deletes are physical and leave no tombstone.** Once `APPLY AS DELETE WHEN` removes a key,
 //!   nothing records *when* it was removed, so a record for that key that arrives in a *later*
 //!   micro-batch is treated as new — even if its `SEQUENCE BY` value is older than the delete's.
-//!   Within one batch the delete still wins. This matches Databricks' SCD Type 1, which also
+//!   Within one batch the delete still wins. This matches the reference AUTO CDC implementation's SCD Type 1, which also
 //!   deletes the row outright; keeping a tombstone would mean carrying a column the target does
 //!   not declare and never being able to drop it. "Out of order safe" therefore means *within a
 //!   batch, and against rows still present in the target* — not across a delete.
 //! * **A NULL `SEQUENCE BY` value is an error**, not a silently dropped row: a row with no
 //!   ordering value cannot be placed against the target, and dropping it would lose a change
-//!   event without a word. Databricks fails the same way.
+//!   event without a word. The reference implementation fails the same way.
 //! * **NULL key values compare equal**, via `IS NOT DISTINCT FROM`. A NULL-keyed row is one key
 //!   like any other; with plain `=` it would never match the target and the target would grow a
 //!   fresh duplicate row per batch, forever. This is the one semantic here that **deliberately
-//!   diverges from Databricks**, whose `MERGE` matches keys with `=` and so does re-insert a
+//!   diverges from the reference implementation**, whose `MERGE` matches keys with `=` and so does re-insert a
 //!   NULL-keyed row every batch — a parity test would differ on exactly that row.
 //!
 //! The generated statement is:
@@ -424,7 +424,7 @@ impl CdcMerge {
     /// The merge orders every decision by that column, so a row without one cannot be placed
     /// against the target at all. The alternative — the `IS NOT NULL` filter in the statement
     /// quietly eating the row — loses a change event, and a lost delete or truncate is not a
-    /// small loss. Databricks fails on a null sequencing value too.
+    /// small loss. The reference implementation fails on a null sequencing value too.
     fn reject_null_sequence(&self, batch: &[RecordBatch]) -> Result<()> {
         let nulls: usize = batch
             .iter()
@@ -932,7 +932,7 @@ mod tests {
     #[tokio::test]
     async fn a_null_sequence_value_fails_the_batch() {
         // Dropping the row silently would lose a change event — and a lost delete or truncate
-        // is not a small loss. Databricks fails on a null sequencing value too.
+        // is not a small loss. The reference implementation fails on a null sequencing value too.
         let engine = Engine::new();
         let merge = CdcMerge::new(&cfg(), &nullable_schema(), "t8").expect("plan");
         let err = merge
@@ -989,7 +989,7 @@ mod tests {
     #[tokio::test]
     async fn a_record_arriving_after_a_delete_recreates_the_key() {
         // Documented, not accidental: an SCD1 delete is physical and leaves no tombstone, so
-        // nothing remains to compare a later record's sequence against. Databricks behaves the
+        // nothing remains to compare a later record's sequence against. The reference implementation behaves the
         // same way. Locked in here so a change to it is a deliberate one.
         let engine = Engine::new();
         let merge = CdcMerge::new(&cfg(), &schema(), "t10").expect("plan");

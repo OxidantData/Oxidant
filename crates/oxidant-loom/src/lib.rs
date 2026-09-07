@@ -244,10 +244,10 @@ pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Rewrite Postgres/TPC-DS bare interval arithmetic (`date + 30 days`, `date - 14 days`)
-/// into qualified `INTERVAL 'N' DAY` that DataFusion's Databricks dialect accepts.
+/// into qualified `INTERVAL 'N' DAY` that DataFusion's Spark dialect accepts.
 ///
 /// Official `dsqgen` (oxidant dialect) emits this form for date windows (Q5/Q12/Q16/…).
-/// Spark/Postgres accept it; sqlparser-under-Databricks rejects with
+/// Spark/Postgres accept it; sqlparser under the Spark dialect rejects with
 /// `Expected: ), found: days`. Already-qualified `INTERVAL …` forms and string literals
 /// are left untouched. Returns `None` when nothing changed.
 fn rewrite_bare_pg_interval_literals(sql: &str) -> Option<String> {
@@ -543,7 +543,7 @@ fn interval_unit_len(b: &[u8]) -> Option<usize> {
 /// Move the unit of a Spark `INTERVAL` literal out of the string and into the qualifier position
 /// DataFusion's parser demands: `interval '30 days'` → `interval '30' DAY`.
 ///
-/// Spark accepts the unit either inside the literal or as a following token; the Databricks
+/// Spark accepts the unit either inside the literal or as a following token; the Spark
 /// dialect oxidant plans on (`Dialect::require_interval_qualifier`) accepts only the latter and
 /// otherwise fails with `INTERVAL requires a unit after the literal value` before execution
 /// starts — TPC-DS Q12/Q20/Q98 (`+ interval '30 days'`) never reached the engine at SF100.
@@ -797,15 +797,15 @@ fn temporal_unit_token_len(b: &[u8]) -> Option<usize> {
 /// Spark's default parser (`spark.sql.parser.escapedStringLiterals=false`) runs `unescapeSQLString`
 /// on every `'…'` literal: `\\`→`\`, `\n`→newline, `\t`→tab, `\uXXXX`→code point, octal `\ooo`→char,
 /// `\'`→`'`, and (Spark's LIKE-pattern carve-out) `\%`/`\_` kept verbatim. DataFusion parses on the
-/// Databricks dialect, which (like ANSI SQL) treats backslash as an ordinary character inside `'…'`
+/// Spark dialect, which (like ANSI SQL) treats backslash as an ordinary character inside `'…'`
 /// and only recognizes `''` quote-doubling — so without this pass oxidant would feed the raw
 /// backslashes to the planner and compute the wrong value (e.g. `'a\nb'` would stay a 4-char string
 /// instead of Spark's 3-char `a⏎b`). Reproducing Spark's documented default-parser decode here and
-/// re-encoding the *value* as a Databricks-dialect literal is a faithful syntax→equivalent-plan
+/// re-encoding the *value* as a Spark-dialect literal is a faithful syntax→equivalent-plan
 /// lowering, not a lossy rewrite.
 ///
 /// The re-encoding emits the decoded value back as `'…'`, doubling any `'` to `''` and embedding
-/// real backslashes / control chars / unicode directly, because the Databricks dialect keeps
+/// real backslashes / control chars / unicode directly, because the Spark dialect keeps
 /// backslashes literal and decodes only `''`. The scan is comment-/identifier-/double-quote-aware so
 /// only single-quoted literals are touched; a literal containing no backslash is copied byte-for-byte
 /// (the common case — zero risk to `''`-only literals), and an unterminated literal is left intact so
@@ -873,7 +873,7 @@ fn unescape_spark_string_literals(sql: &str) -> Option<String> {
                 }
                 i = after;
             }
-            // Double-quoted string literal (Databricks dialect) — copy verbatim (`""` doubling).
+            // Double-quoted string literal (Spark dialect) — copy verbatim (`""` doubling).
             // Left to the existing scanner/parser rules per Spark's literal handling.
             b'"' => {
                 let start = i;
@@ -1070,7 +1070,7 @@ fn decimal_ps(num: &str) -> Option<(u8, u8)> {
 /// rewrite is faithful, not lossy.
 ///
 /// The scan is string-/identifier-/comment-aware: single- and double-quoted strings (`"…"` is a
-/// string literal under the Databricks dialect), backtick-quoted identifiers, and `--`/`/* */`
+/// string literal under the Spark dialect), backtick-quoted identifiers, and `--`/`/* */`
 /// comments are copied through verbatim, so a literal like `'1L'` or a column `` `2Y` `` is never
 /// touched. A numeric token is only rewritten when it sits in code position (the preceding char is
 /// not an identifier char or `.`) and the suffix is followed by a non-identifier boundary, so
@@ -1221,14 +1221,14 @@ struct CreateViewInfo {
 /// Recognize a `CREATE VIEW` statement and extract its name, temporary-ness, and the relations its
 /// body references. Returns `None` for any non-`CREATE VIEW` statement (and for anything sqlparser
 /// cannot parse), in which case the caller leaves engine behavior completely unchanged. Parsing
-/// uses the same Databricks dialect the engine plans with, so the AST matches what DataFusion sees.
+/// uses the same Spark dialect the engine plans with, so the AST matches what DataFusion sees.
 fn analyze_create_view(query: &str) -> Option<CreateViewInfo> {
     use datafusion::sql::sqlparser::ast::{visit_relations, ObjectName, Statement};
-    use datafusion::sql::sqlparser::dialect::DatabricksDialect;
+    use datafusion::sql::sqlparser::dialect::DatabricksDialect as SparkDialect;
     use datafusion::sql::sqlparser::parser::Parser;
     use std::ops::ControlFlow;
 
-    let stmts = Parser::parse_sql(&DatabricksDialect {}, query).ok()?;
+    let stmts = Parser::parse_sql(&SparkDialect {}, query).ok()?;
     let [stmt] = stmts.as_slice() else {
         return None;
     };
@@ -1290,7 +1290,7 @@ fn register_spark_function_aliases(ctx: &SessionContext) {
         ("char", "chr"),
         // Spark `array(e1, …)` constructs an array — identical to DataFusion's `make_array`.
         ("array", "make_array"),
-        // Spark's `curdate()` and Databricks' `getdate()` are `current_date()`. Spark itself
+        // Spark's `curdate()` and the common alias `getdate()` are `current_date()`. Spark itself
         // renders `curdate()` in a result-column name as `current_date()`, so aliasing (rather
         // than a distinct UDF) also reproduces the output naming.
         ("curdate", "current_date"),
@@ -2109,7 +2109,7 @@ pub struct CreatedTableMeta {
     pub partition_columns: Vec<String>,
 }
 
-/// Execution statistics for a completed query — the substrate for Databricks-style observability
+/// Execution statistics for a completed query — the substrate for Spark-platform-style observability
 /// (query time, rows returned, bytes scanned). Populated from DataFusion's `ExecutionPlan` metrics
 /// by [`Engine::sql_with_stats`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -3316,8 +3316,9 @@ impl Engine {
         // Title, Referer) — decisive for the string/scan-heavy queries (Q20–Q28, Q34/Q35).
         {
             let opts = config.options_mut();
-            // Parse SQL the Spark way: the Databricks dialect (Databricks SQL *is* Spark SQL) uses
-            // backticks for identifiers and treats `"..."` as a STRING LITERAL — Spark's default
+            // Parse SQL the Spark way: the Spark dialect (Spark and its downstream-compatible
+            // dialects share this SQL surface) uses backticks for identifiers and treats
+            // `"..."` as a STRING LITERAL — Spark's default
             // (`spark.sql.ansi.double_quoted_identifiers=false`). DataFusion's Generic dialect treats
             // `"..."` as an identifier, which mis-parses Spark string literals like
             // `next_day("2015-07-23", "Mon")`.
@@ -5183,7 +5184,7 @@ impl Engine {
     }
 
     /// Run a row-returning `query` and return its result batches **plus** execution statistics —
-    /// the substrate for Databricks-style observability (duration, rows, bytes scanned).
+    /// the substrate for Spark-platform-style observability (duration, rows, bytes scanned).
     ///
     /// Unlike [`Engine::sql`], this builds the physical plan explicitly and *retains* it, so
     /// DataFusion's per-operator metrics can be read after execution (`plan.metrics()`); `df.collect()`
@@ -7607,7 +7608,7 @@ fn take_trailing_like<'a>(rest: &'a [&'a str]) -> (Option<String>, &'a [&'a str]
 /// A compiled `SHOW … LIKE '<pattern>'` matcher — Spark's pattern language, which is **not** SQL
 /// `LIKE`.
 ///
-/// Databricks/Spark document the argument of every `SHOW` listing as a `regex_pattern` where "`*`
+/// Spark documents the argument of every `SHOW` listing as a `regex_pattern` where "`*`
 /// alone matches 0 or more characters and `|` is used to separate multiple different regexes, any
 /// of which can match". Spark implements it once, in `StringUtils.filterPattern`, and routes
 /// `SHOW FUNCTIONS`, `SHOW TABLES`, `SHOW VIEWS` and `SHOW TABLE EXTENDED` through it: split on
@@ -10923,7 +10924,7 @@ mod tests {
             "SELECT CAST(1.0 AS DECIMAL(2,1)), CAST(0.1 AS DECIMAL(1,1)), \
              CAST(123 AS DECIMAL(3,0)), CAST(0.001 AS DECIMAL(3,3))"
         );
-        // Protected contexts: string literals ('…' and Databricks "…"), backtick identifiers,
+        // Protected contexts: string literals ('…' and Spark-dialect "…"), backtick identifiers,
         // comments, ordinary identifiers, hex, and plain numbers are all left untouched.
         for q in [
             "SELECT '1L' AS s",
@@ -10969,7 +10970,7 @@ mod tests {
         for q in [
             "SELECT 'a' ILIKE 'b'",     // no backslash anywhere → byte-identical, borrowed
             "SELECT 'it''s fine'",      // `''` quote-doubling preserved verbatim
-            "SELECT \"a\\nb\" AS s",    // Databricks `"…"` literal left to the parser
+            "SELECT \"a\\nb\" AS s",    // Spark dialect `"…"` literal left to the parser
             "SELECT 1 -- a\\nb keep\n", // backslash inside a comment is not a literal
             "SELECT `c\\d` FROM t",     // backtick identifier untouched
         ] {

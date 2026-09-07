@@ -1,7 +1,7 @@
 //! Format sniffing for `discover:` — turning a directory tree into catalog tables.
 //!
 //! The rules mirror how each format actually announces itself on disk, so a directory written
-//! by Spark, Databricks, or Oxidant itself is recognized without being told what it is:
+//! by Spark, other Spark-compatible engines, or Oxidant itself is recognized without being told what it is:
 //!
 //! | Signal | Format |
 //! |---|---|

@@ -25,10 +25,10 @@
 //! - `unix_date(date)` — days since 1970-01-01 as `int`.
 //! - `date_from_unix_date(int)` — `date` from days-since-epoch.
 //! - `date_add(date, numDays)` / `dateadd(date, numDays)` — `date` plus N days (DataFusion-54 has
-//!   no builtin; verified absent). `dateadd` is Databricks' spelling of the same function.
+//!   no builtin; verified absent). `dateadd` is a common alternate spelling of the same function.
 //!
 //! Dropped: `timestampdiff(unit, ...)` is NOT reachable as a UDF. Spark's grammar special-cases the
-//! bare `unit` keyword, but DataFusion/sqlparser (Databricks dialect) parses `timestampdiff(MONTH,
+//! bare `unit` keyword, but DataFusion/sqlparser (Spark dialect) parses `timestampdiff(MONTH,
 //! ...)` with `MONTH` as a *column reference*, so planning fails with "No field named month" before
 //! any UDF runs; the quoted form `timestampdiff('MONTH', ...)` is itself a Spark ParseException
 //! (`INVALID_PARAMETER_VALUE.DATETIME_UNIT`). A faithful implementation needs a parser/AST change,
@@ -66,7 +66,7 @@ pub fn register(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(UnixDate::new()));
     ctx.register_udf(ScalarUDF::from(DateFromUnixDate::new()));
     ctx.register_udf(ScalarUDF::from(DateAdd::new("date_add", 1)));
-    // Databricks spells the same two-argument function `dateadd`.
+    // Some Spark dialects spell the same two-argument function `dateadd`.
     ctx.register_udf(ScalarUDF::from(DateAdd::new("dateadd", 1)));
     ctx.register_udf(ScalarUDF::from(DateAdd::new("date_sub", -1)));
 }

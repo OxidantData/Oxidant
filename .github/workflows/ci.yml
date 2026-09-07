@@ -201,19 +201,19 @@ jobs:
         run: |
           set -o pipefail
           ./target/debug/oxidant-parity ratchet --baseline parity/baseline.json --out-dir parity | tee parity-run.log
-      # Databricks corpus ratchet (KAN-107). Same binary, same pipeline, its own baseline —
-      # the authored Databricks corpus is what gates the function work that the vendored Spark
+      # Spark-compat corpus ratchet (KAN-107). Same binary, same pipeline, its own baseline —
+      # the authored Spark-compat corpus is what gates the function work that the vendored Spark
       # goldens do not exercise (`months_between`, `sha2`, `width_bucket`, the timezone shifts).
-      - name: Databricks parity ratchet (vs parity/baseline-databricks.json)
+      - name: Spark-compat parity ratchet (vs parity/baseline-spark.json)
         run: |
           set -o pipefail
-          ./target/debug/oxidant-parity ratchet --corpus databricks \
-            --baseline parity/baseline-databricks.json --out-dir parity/databricks \
-            | tee databricks-parity-run.log
-      # Coverage of the Databricks builtin-function surface. Reported, not gated: it reads the
-      # live registry and prints the headline into the job summary so a wave's effect is visible
-      # on the PR without anyone re-running it locally.
-      - name: Databricks function coverage
+          ./target/debug/oxidant-parity ratchet --corpus spark-compat \
+            --baseline parity/baseline-spark.json --out-dir parity/spark-compat \
+            | tee spark-compat-parity-run.log
+      # Coverage of the documented Spark builtin-function surface. Reported, not gated: it reads
+      # the live registry and prints the headline into the job summary so a wave's effect is
+      # visible on the PR without anyone re-running it locally.
+      - name: Spark function coverage
         if: always()
         run: ./target/debug/oxidant-parity functions | tee function-coverage.log
       - name: Publish parity headline to job summary
@@ -226,13 +226,13 @@ jobs:
             grep -E '^(parity:|✓|✗)' parity-run.log 2>/dev/null || echo "(no headline — see logs)"
             echo '```'
             echo ""
-            echo "## Databricks parity gate"
+            echo "## Spark-compat parity gate"
             echo ""
             echo '```'
-            grep -E '^(parity:|✓|✗)' databricks-parity-run.log 2>/dev/null || echo "(no headline — see logs)"
+            grep -E '^(parity:|✓|✗)' spark-compat-parity-run.log 2>/dev/null || echo "(no headline — see logs)"
             echo '```'
             echo ""
-            echo "## Databricks function coverage"
+            echo "## Spark function coverage"
             echo ""
             echo '```'
             grep -E '^(in scope|surface)' function-coverage.log 2>/dev/null || echo "(no headline — see logs)"
@@ -248,9 +248,9 @@ jobs:
             parity/report.md
             parity/parity.html
             parity/scoreboard.json
-            parity/databricks/parity.json
-            parity/databricks/report.md
-            parity/databricks/scoreboard.json
+            parity/spark-compat/parity.json
+            parity/spark-compat/report.md
+            parity/spark-compat/scoreboard.json
           retention-days: 30
           if-no-files-found: ignore
 
@@ -548,7 +548,7 @@ jobs:
 
   # ClickBench / correctness coverage on small synthetic data. Required gate: all 43 queries must
   # pass. Fixed by switching queries.sql identifiers from ANSI double-quotes to backtick-quotes so
-  # they are parsed as identifiers (not string literals) under the Databricks dialect. See
+  # they are parsed as identifiers (not string literals) under the Spark dialect. See
   # bench/clickbench/COVERAGE_GATE_KNOWN_ISSUES.md for the historical context.
   coverage:
     name: coverage gates

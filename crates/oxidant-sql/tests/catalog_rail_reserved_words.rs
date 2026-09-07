@@ -8,14 +8,14 @@
 //! it built is a syntax error about a set operator.
 //!
 //! A hand-maintained list drifts against the parser with nothing to say so, so this test asks
-//! the parser. It lives here because this crate owns "what the Databricks dialect reserves"
+//! the parser. It lives here because this crate owns "what the Spark dialect reserves"
 //! (`dialect/intercept.rs` parses with the same dialect the engine does) and reads the rail's
 //! source from the workspace — like `oxidant-ui-server`'s own connector-event test, a missing
 //! sibling crate skips rather than fails, so either crate still builds packaged on its own.
 
 use std::collections::BTreeSet;
 
-use datafusion::sql::sqlparser::dialect::DatabricksDialect;
+use datafusion::sql::sqlparser::dialect::DatabricksDialect as SparkDialect;
 use datafusion::sql::sqlparser::keywords::{
     ALL_KEYWORDS, RESERVED_FOR_COLUMN_ALIAS, RESERVED_FOR_IDENTIFIER, RESERVED_FOR_TABLE_ALIAS,
 };
@@ -51,7 +51,7 @@ fn rail_reserved(source: &str) -> BTreeSet<String> {
 /// parses with the name swallowed by a clause — `FROM cat.ns.limit` read as a `LIMIT` — is the
 /// same bug wearing a wrong answer instead of a message.
 fn parses_as_written(sql: &str, name: &str) -> bool {
-    match Parser::parse_sql(&DatabricksDialect {}, sql) {
+    match Parser::parse_sql(&SparkDialect {}, sql) {
         Ok(stmts) => stmts.len() == 1 && stmts[0].to_string().contains(name),
         Err(_) => false,
     }
@@ -101,7 +101,7 @@ fn every_word_the_parser_rejects_bare_is_one_the_rail_quotes() {
         .collect();
     assert!(
         missing.is_empty(),
-        "the Databricks dialect reserves these and the catalog rail inserts them bare — a \
+        "the Spark dialect reserves these and the catalog rail inserts them bare — a \
          click on a name like this builds a statement that means something else. Add them to \
          `RESERVED` in crates/oxidant-ui-server/src/catalog_rail.js: {missing:?}"
     );

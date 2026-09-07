@@ -16,7 +16,7 @@ pub enum SkipReason {
     /// Uses `udf(...)` wrappers that require a registered Python/Scala/Java UDF.
     RequiresUdf,
     /// The input file carries an explicit `--SKIP <reason>` directive (used by the
-    /// authored Databricks corpus for statements that need machinery oxidant does not
+    /// authored Spark-compat corpus for statements that need machinery oxidant does not
     /// have yet, e.g. Delta storage or a Lake Formation catalog).
     Marked(String),
 }

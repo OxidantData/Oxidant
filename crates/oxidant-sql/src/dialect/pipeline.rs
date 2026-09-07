@@ -15,7 +15,7 @@
 //! ```
 //!
 //! Stage 1 ([`StrRule`]s) runs pre-parse on the raw text; the result is parsed once with the
-//! Databricks dialect and handed to Stage 2 ([`StatementIntercept`]s); if no rule claims the
+//! Spark dialect and handed to Stage 2 ([`StatementIntercept`]s); if no rule claims the
 //! statement, the (possibly rewritten) text is returned for `ctx.sql()` to plan. Stage 3
 //! ([`NamingRule`]s) is a separate post-plan step — [`DialectPipeline::apply_output_naming`] —
 //! because it operates on the analyzed `LogicalPlan`, not on SQL text.

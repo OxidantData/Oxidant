@@ -8,8 +8,8 @@
 //! `get`/`get_opts`/`get_ranges` calls are served from the local file
 //! (`GetResultPayload::File` — the same shape `LocalFileSystem` returns), and entries
 //! revalidate against S3 `HEAD` (size + etag) after `OXIDANT_S3_CACHE_TTL_MS` so an overwritten
-//! object is never served stale past the TTL. Same disk-cache pattern Databricks and
-//! Snowflake run for remote tables.
+//! object is never served stale past the TTL. Same disk-cache pattern managed remote-table
+//! caches use.
 //!
 //! Correctness contract:
 //! - Read-path only: writes (`put`/`delete`/copy/rename/multipart) delegate to the inner

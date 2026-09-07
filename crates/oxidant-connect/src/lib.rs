@@ -620,7 +620,7 @@ impl OxidantService {
             complete.schema = Some(types::schema_to_spark(first.schema().as_ref()));
         }
         // Carry per-query execution metrics (duration / rows / bytes scanned) on the terminal
-        // response so a client (the gateway) can surface Databricks-style observability.
+        // response so a client (the gateway) can surface managed-platform-style observability.
         if let Some(stats) = stats {
             complete.metrics = Some(stats_to_metrics(stats));
         }

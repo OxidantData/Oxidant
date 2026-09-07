@@ -1,6 +1,6 @@
 //! Spark's cryptographic-digest functions.
 //!
-//! `docs/databricks-coverage.md` used to describe this category as "alias work, not new
+//! `docs/spark-coverage.md` describes this category as "alias work, not new
 //! implementation". That is wrong, and it is worth recording why: DataFusion 54's
 //! `DigestAlgorithm` (`datafusion-functions-54.1.0/src/crypto/basic.rs`) offers exactly
 //! `Md5, Sha224, Sha256, Sha384, Sha512, Blake2s, Blake2b, Blake3` — **no SHA-1 and no CRC-32**.

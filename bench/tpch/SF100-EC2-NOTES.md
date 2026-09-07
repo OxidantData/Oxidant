@@ -30,10 +30,10 @@ Engine defaults that make this topology viable (do not revert without re-validat
 | Cascaded `NO_ACTIVE_SESSION` | No reconnect after driver death | `bench/tpch/run-ec2-connect.py` / `bench/tpcds/run-ec2-connect.py` |
 | **Driver-local SF100** (workers ~0% CPU, driver NetworkIn multi‑GiB) | Empty `OXIDANT_WORKERS` (Route53 race) + soft local fallback | **ASG private-IP membership** (no Route53); pin `OXIDANT_WORKERS`; `OXIDANT_DISTRIBUTED_STRICT=1` |
 
-### What Spark EMR / Databricks do (and we must match)
+### What managed Spark platforms do (and we must match)
 
-- **Driver ≠ executor.** EMR master / Databricks driver coordinates; cores / worker nodes own scans, shuffles, and joins. Publishing “distributed” numbers from a driver that scanned S3 alone is invalid.
-- **Cluster manager hands out executor IPs.** YARN/EMR and Databricks do **not** rely on a shared DNS name for executors. Oxidant EC2 uses the same idea: IAM `DescribeAutoScalingGroups` + `DescribeInstances` → private `ip:50561` list in `OXIDANT_WORKERS`. No Route53; no UDP broadcast.
+- **Driver ≠ executor.** The cluster manager's master/driver node coordinates; cores / worker nodes own scans, shuffles, and joins. Publishing “distributed” numbers from a driver that scanned S3 alone is invalid.
+- **Cluster manager hands out executor IPs.** YARN/EMR and other managed Spark cluster managers do **not** rely on a shared DNS name for executors. Oxidant EC2 uses the same idea: IAM `DescribeAutoScalingGroups` + `DescribeInstances` → private `ip:50561` list in `OXIDANT_WORKERS`. No Route53; no UDP broadcast.
 - **Fail closed.** Missing executors is an error (or a blocked cluster), not a silent single-node run. Use `--distributed-strict true` on every honesty deploy.
 
 **Do not restart TPC-H/TPC-DS on a stack that fails the distribution smoke check** in [`docs/distributed-ec2.md`](../../docs/distributed-ec2.md) § Driver vs workers.

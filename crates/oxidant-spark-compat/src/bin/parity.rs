@@ -1,20 +1,22 @@
 //! `oxidant-parity` — run Spark's golden SQL corpus through oxidant and emit the parity scoreboard.
 //!
 //! Usage:
-//!   oxidant-parity golden [--corpus spark|databricks] [--filter <substr>] [--out-dir <dir>]
+//!   oxidant-parity golden [--corpus spark|spark-compat] [--filter <substr>] [--out-dir <dir>]
 //!     Replay the corpus, write `<out-dir>/parity.json` + `parity.md`, print the headline.
-//!   oxidant-parity ratchet [--corpus spark|databricks] [--baseline <path>] [--out-dir <dir>]
+//!   oxidant-parity ratchet [--corpus spark|spark-compat] [--baseline <path>] [--out-dir <dir>]
 //!     Replay the corpus and fail if parity dropped below the committed baseline.
-//!   oxidant-parity file [--corpus spark|databricks] <name.sql.out>
+//!   oxidant-parity file [--corpus spark|spark-compat] <name.sql.out>
 //!     Replay a single golden file and print its per-block verdicts (debugging).
 //!   oxidant-parity functions [--markdown] [--json <path>]
-//!     Diff oxidant's live function registry against the Databricks builtin-function surface
-//!     (`databricks-functions.json`). Prints the headline + per-category rollup; `--markdown`
-//!     emits the full matrix on stdout (this is how `docs/databricks-functions.md` is generated).
+//!     Diff oxidant's live function registry against the documented Spark builtin-function
+//!     surface (`spark-functions.json`). Prints the headline + per-category rollup;
+//!     `--markdown` emits the full matrix on stdout (this is how `docs/spark-functions.md` is
+//!     generated).
 //!
 //! `--corpus` defaults to `spark` (the vendored Apache Spark `sql-tests` corpus); the
-//! `databricks` corpus is the authored Databricks SQL corpus under `databricks-tests/`,
-//! scored through the same pipeline with its own baseline/artifact defaults.
+//! `spark-compat` corpus is an authored Spark SQL corpus under `spark-compat-tests/` covering
+//! statement categories the vendored corpus does not, scored through the same pipeline with its
+//! own baseline/artifact defaults.
 
 use oxidant_spark_compat::report::{bucket_key, CorpusReport};
 use oxidant_spark_compat::runner;
@@ -44,7 +46,7 @@ fn corpus(args: &[String]) -> Corpus {
     match flag(args, "--corpus") {
         None => Corpus::Spark,
         Some(name) => Corpus::from_name(&name)
-            .unwrap_or_else(|| panic!("unknown --corpus {name:?} (expected spark|databricks)")),
+            .unwrap_or_else(|| panic!("unknown --corpus {name:?} (expected spark|spark-compat)")),
     }
 }
 
@@ -185,7 +187,7 @@ async fn file(args: &[String]) {
         i += 1;
     }
     let Some(name) = name else {
-        eprintln!("usage: oxidant-parity file [--corpus spark|databricks] <name.sql.out>");
+        eprintln!("usage: oxidant-parity file [--corpus spark|spark-compat] <name.sql.out>");
         std::process::exit(2);
     };
     let report = runner::run_file(corpus, name).await;
@@ -206,10 +208,10 @@ async fn file(args: &[String]) {
     let _ = bucket_key; // keep import used if failures empty
 }
 
-/// Diff oxidant's live function registry against the Databricks builtin-function surface.
+/// Diff oxidant's live function registry against the documented Spark builtin-function surface.
 ///
 /// Unlike `golden`/`ratchet` this replays no SQL — it boots one engine, reads the registry that
-/// answers `SHOW FUNCTIONS`, and scores it against the checked-in `databricks-functions.json`
+/// answers `SHOW FUNCTIONS`, and scores it against the checked-in `spark-functions.json`
 /// catalog. Cheap enough to run on every change to `spark_functions/`.
 async fn functions(args: &[String]) {
     let report = oxidant_spark_compat::functions::run().await;
@@ -220,13 +222,13 @@ async fn functions(args: &[String]) {
     }
 
     // `--markdown` writes the matrix to stdout and nothing else, so it can be redirected
-    // straight into `docs/databricks-functions.md`.
+    // straight into `docs/spark-functions.md`.
     if args.iter().any(|a| a == "--markdown") {
         print!("{}", report.to_markdown());
         return;
     }
 
-    println!("\n=== Oxidant ↔ Databricks SQL function coverage ===");
+    println!("\n=== Oxidant ↔ Spark SQL function coverage ===");
     println!(
         "in scope : {:>6.1}%  ({}/{} functions registered, {} missing)",
         report.coverage_pct(),
@@ -235,7 +237,7 @@ async fn functions(args: &[String]) {
         report.missing
     );
     println!(
-        "surface  : {} documented Databricks functions; engine registry holds {}",
+        "surface  : {} documented Spark functions; engine registry holds {}",
         report.documented, report.engine_registry_size
     );
     println!("\nout of scope:");
