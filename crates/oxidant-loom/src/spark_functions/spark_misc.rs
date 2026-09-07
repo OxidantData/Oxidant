@@ -14,8 +14,9 @@
 //!   `fmt` (`hex` default, also `utf-8`/`utf8` and `base64`). `to_binary` raises a runtime error on
 //!   malformed input; `try_to_binary` returns `NULL`. The format string is matched
 //!   case-insensitively; an unknown format is a (planning-ish) error. NULL in any argument => NULL.
-//! - `current_database()` / `current_schema()` — the current schema name; Spark's default is
-//!   `default`. `current_catalog()` — the current catalog; Spark's default is `spark_catalog`.
+//! - `current_database()` / `current_schema()` — the session's current schema name; Spark's
+//!   default is `default`. `current_catalog()` — the session's current catalog; Spark's default
+//!   is `spark_catalog`. Reads the same per-session cell as `USE` / `setCurrentCatalog`.
 //!   Returns `string`.
 //! - `assert_true(expr [, msg])` — returns `NULL` when `expr` is `true`; raises a runtime error
 //!   (Spark `USER_RAISED_EXCEPTION`) when `expr` is `false` or `NULL`. With one argument the default
@@ -435,8 +436,10 @@ impl ScalarUDFImpl for ToBinary {
 // current_database / current_schema / current_catalog
 // ---------------------------------------------------------------------------
 
-/// `current_database()` / `current_schema()` / `current_catalog()` — constant scalars matching
-/// Spark's defaults (`default` / `default` / `spark_catalog`).
+/// `current_database()` / `current_schema()` / `current_catalog()` — session scalars.
+/// Defaults match Spark (`default` / `default` / `spark_catalog`) when no session
+/// configuration is attached. Volatile so reusable logical plans (including views)
+/// cannot fold the builtin defaults before the executing query binds its names.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct CurrentName {
     name: &'static str,
@@ -449,7 +452,7 @@ impl CurrentName {
         Self {
             name,
             value,
-            signature: Signature::nullary(Volatility::Stable),
+            signature: Signature::nullary(Volatility::Volatile),
         }
     }
 }
@@ -464,10 +467,18 @@ impl ScalarUDFImpl for CurrentName {
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
     }
-    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-            self.value.to_string(),
-        ))))
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let value = args
+            .config_options
+            .extensions
+            .get::<crate::session_names::QuerySessionNames>()
+            .map(|names| match self.name {
+                "current_catalog" => names.catalog.as_str(),
+                _ => names.namespace.as_str(),
+            })
+            .unwrap_or(self.value)
+            .to_string();
+        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(value))))
     }
 }
 
@@ -705,6 +716,69 @@ mod tests {
         assert!(run("SELECT current_catalog() AS x")
             .await
             .contains("spark_catalog"));
+    }
+
+    #[tokio::test]
+    async fn current_catalog_follows_the_session_not_the_builtin_default() {
+        // Name resolution already honors set_current_catalog; the SQL function still
+        // returned spark_catalog (OxidantData/Oxidant#126).
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use oxidant_catalog::{CatalogProvider, TableMetadata};
+        use oxidant_common::Result;
+
+        struct EmptyCat;
+        #[async_trait]
+        impl CatalogProvider for EmptyCat {
+            fn name(&self) -> &str {
+                "prod"
+            }
+            async fn list_namespaces(&self, parent: &[String]) -> Result<Vec<Vec<String>>> {
+                if parent.is_empty() {
+                    Ok(vec![vec!["sales".to_string()]])
+                } else {
+                    Ok(vec![])
+                }
+            }
+            async fn list_tables(&self, _namespace: &[String]) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn load_table(&self, namespace: &[String], table: &str) -> Result<TableMetadata> {
+                Err(oxidant_common::Error::Plan(format!(
+                    "no such table: {}.{table}",
+                    namespace.join(".")
+                )))
+            }
+        }
+
+        let engine = Engine::new();
+        engine.register_catalog("prod", Arc::new(EmptyCat));
+        let s1 = engine.for_session("s1");
+        let s2 = engine.for_session("s2");
+        s1.set_current_catalog("prod").await.unwrap();
+        s1.set_current_namespace("sales").await.unwrap();
+        let pretty = |batches: &[crate::arrow::record_batch::RecordBatch]| {
+            crate::arrow::util::pretty::pretty_format_batches(batches)
+                .unwrap()
+                .to_string()
+        };
+        let c1 = pretty(&s1.sql("SELECT current_catalog() AS c").await.unwrap());
+        assert!(c1.contains("prod"), "s1 catalog: {c1}");
+        assert!(!c1.contains("spark_catalog"), "s1 catalog: {c1}");
+        let d1 = pretty(
+            &s1.sql("SELECT current_database() AS d, current_schema() AS s")
+                .await
+                .unwrap(),
+        );
+        assert!(d1.contains("sales"), "s1 database/schema: {d1}");
+        let c2 = pretty(&s2.sql("SELECT current_catalog() AS c").await.unwrap());
+        assert!(
+            c2.contains("spark_catalog"),
+            "s2 must keep the builtin catalog: {c2}"
+        );
+        let d2 = pretty(&s2.sql("SELECT current_database() AS d").await.unwrap());
+        assert!(d2.contains("default"), "s2 database: {d2}");
     }
 
     #[tokio::test]
