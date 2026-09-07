@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::functions::core::expr_fn::get_field;
@@ -1079,10 +1079,15 @@ fn plan_err(e: datafusion::error::DataFusionError) -> Status {
     Status::invalid_argument(format!("plan: {e}"))
 }
 
-/// The `(format, options)` of a streaming `Read` — `readStream.format(f).option(k, v)`.
-pub type StreamingReadSpec = (String, std::collections::BTreeMap<String, String>);
+/// The format, options, and optional declared schema of a streaming `Read`.
+#[derive(Debug, Clone)]
+pub struct StreamingReadSpec {
+    pub format: String,
+    pub options: std::collections::BTreeMap<String, String>,
+    pub schema: Option<SchemaRef>,
+}
 
-/// Extract the streaming read's format and options from a `Read` node.
+/// Extract the streaming read's format, options, and schema from a `Read` node.
 pub fn streaming_read_spec(r: &sc::Read) -> Result<StreamingReadSpec, Status> {
     let Some(sc::read::ReadType::DataSource(d)) = r.read_type.as_ref() else {
         return Err(Status::unimplemented(
@@ -1100,7 +1105,27 @@ pub fn streaming_read_spec(r: &sc::Read) -> Result<StreamingReadSpec, Status> {
     if let Some(path) = d.paths.first() {
         options.entry("path".to_string()).or_insert(path.clone());
     }
-    Ok((format, options))
+    let schema = match d.schema.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Some(parse_declared_stream_schema(s)?),
+        None => None,
+    };
+    Ok(StreamingReadSpec {
+        format,
+        options,
+        schema,
+    })
+}
+
+fn parse_declared_stream_schema(s: &str) -> Result<SchemaRef, Status> {
+    let dt = oxidant_loom::spark_functions::parse_spark_schema(s)
+        .map_err(|e| inval(format!("readStream.schema: {e}")))?;
+    match dt {
+        DataType::Struct(fields) if !fields.is_empty() => Ok(Arc::new(Schema::new(fields))),
+        DataType::Struct(_) => Err(inval("readStream.schema is an empty struct")),
+        other => Err(inval(format!(
+            "readStream.schema must be a struct of fields, got {other}"
+        ))),
+    }
 }
 
 /// Lower a streaming `Read` to a scan of its micro-batch input table.
@@ -1110,20 +1135,21 @@ pub fn streaming_read_spec(r: &sc::Read) -> Result<StreamingReadSpec, Status> {
 /// `oxidant_streaming::input`. The input is keyed by the read's format and options so this
 /// translator and the `WriteStreamOperationStart` handler independently land on the same one.
 async fn streaming_read(ctx: &SessionContext, r: &sc::Read) -> Result<LogicalPlan, Status> {
-    let (format, options) = streaming_read_spec(r)?;
+    let spec = streaming_read_spec(r)?;
     // No engine: a Connect `readStream` has no pipeline checkpoint root, so there is no
     // object-store location for a connector to resolve.
     let schema = oxidant_streaming::source_schema(
         None,
         &oxidant_streaming::StreamQueryConfig {
-            source_format: format.clone(),
-            source_options: options.clone(),
+            source_format: spec.format.clone(),
+            source_options: spec.options.clone(),
+            source_schema: spec.schema.clone(),
             ..Default::default()
         },
     )
-    .map_err(|e| inval(format!("readStream.format(`{format}`): {e}")))?;
+    .map_err(|e| inval(format!("readStream.format(`{}`): {e}", spec.format)))?;
 
-    let input = oxidant_streaming::stream_input(&format, &options, schema)
+    let input = oxidant_streaming::stream_input(&spec.format, &spec.options, schema)
         .map_err(|e| inval(format!("streaming input: {e}")))?;
     if !ctx.table_exist(input.name()).unwrap_or(false) {
         ctx.register_table(input.name(), input.provider())
@@ -1181,3 +1207,49 @@ trait Pipe: Sized {
     }
 }
 impl<T> Pipe for T {}
+
+#[cfg(test)]
+mod stream_schema_tests {
+    use super::*;
+    use oxidant_loom::arrow::datatypes::DataType;
+
+    fn json_read(schema: Option<&str>) -> sc::Read {
+        sc::Read {
+            is_streaming: true,
+            read_type: Some(sc::read::ReadType::DataSource(sc::read::DataSource {
+                format: Some("json".into()),
+                schema: schema.map(|s| s.to_string()),
+                paths: vec!["/tmp/stream-in".into()],
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn declared_ddl_schema_is_not_dropped() {
+        let spec = streaming_read_spec(&json_read(Some("name STRING, v LONG"))).unwrap();
+        let schema = spec.schema.expect("schema");
+        assert_eq!(schema.field(0).name(), "name");
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).name(), "v");
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn empty_file_stream_without_schema_is_a_plan_error() {
+        let spec = streaming_read_spec(&json_read(None)).unwrap();
+        assert!(spec.schema.is_none());
+        let err = oxidant_streaming::source_schema(
+            None,
+            &oxidant_streaming::StreamQueryConfig {
+                source_format: spec.format,
+                source_options: spec.options,
+                source_schema: spec.schema,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("schema"), "{msg}");
+    }
+}

@@ -63,14 +63,17 @@ impl OxidantService {
         // The source is described by the streaming `Read` at the bottom of the input relation,
         // NOT by the writer's format/options — conflating the two made a Kafka→Delta pipeline try
         // to read Delta and write Kafka options.
-        let (source_format, source_options) = match start.input.as_ref() {
+        let (source_format, source_options, source_schema) = match start.input.as_ref() {
             Some(rel) => match translate::relation::find_streaming_read(rel) {
-                Some(read) => translate::relation::streaming_read_spec(read)?,
-                None => (String::new(), Default::default()),
+                Some(read) => {
+                    let spec = translate::relation::streaming_read_spec(read)?;
+                    (spec.format, spec.options, spec.schema)
+                }
+                None => (String::new(), Default::default(), None),
             },
-            None => (String::new(), Default::default()),
+            None => (String::new(), Default::default(), None),
         };
-        let config = StreamQueryConfig::from_spark(
+        let mut config = StreamQueryConfig::from_spark(
             &source_format,
             &source_options
                 .iter()
@@ -81,6 +84,7 @@ impl OxidantService {
             &start.options,
             start.partitioning_column_names.clone(),
         );
+        config.source_schema = source_schema;
 
         // Translate the DataFrame transformation once; the query manager re-executes it per
         // micro-batch against the swappable streaming input. Capturing the inputs the
