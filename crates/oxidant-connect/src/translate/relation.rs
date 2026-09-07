@@ -90,9 +90,20 @@ async fn translate(ctx: &SessionContext, rel: &sc::Relation) -> Result<LogicalPl
             build(LogicalPlanBuilder::from(input).limit(o.offset as usize, None))
         }
         RelType::Tail(t) => {
-            // No native tail; approximate as a limit (last-N semantics need full materialization).
+            // Spark `DataFrame.tail(n)` is last-N of the defined output order, not
+            // `limit(n)` / head. Negative n is invalid (do not wrap to usize). N=0 is
+            // empty. N larger than the input returns the whole input.
+            if t.limit < 0 {
+                return Err(inval(format!("tail limit must be >= 0, got {}", t.limit)));
+            }
             let input = child(ctx, &t.input).await?;
-            build(LogicalPlanBuilder::from(input).limit(0, Some(t.limit as usize)))
+            let n = t.limit as usize;
+            if n == 0 {
+                return build(LogicalPlanBuilder::from(input).limit(0, Some(0)));
+            }
+            let total = count_plan_rows(ctx, &input).await?;
+            let skip = total.saturating_sub(n);
+            build(LogicalPlanBuilder::from(input).limit(skip, Some(n)))
         }
         RelType::Join(j) => join(ctx, j).await,
         RelType::SetOp(s) => set_op(ctx, s).await,
@@ -1077,6 +1088,18 @@ fn is_numeric(dt: &datafusion::arrow::datatypes::DataType) -> bool {
 
 fn plan_err(e: datafusion::error::DataFusionError) -> Status {
     Status::invalid_argument(format!("plan: {e}"))
+}
+
+/// Row count of `plan` for Tail skip = count.saturating_sub(n). Scans the input
+/// once here; the subsequent limit(skip, n) scans it again. Spark's tail also
+/// materializes. Distributed last-N is not claimed by this path.
+async fn count_plan_rows(ctx: &SessionContext, plan: &LogicalPlan) -> Result<usize, Status> {
+    let df = ctx
+        .execute_logical_plan(plan.clone())
+        .await
+        .map_err(plan_err)?;
+    let batches = df.collect().await.map_err(plan_err)?;
+    Ok(batches.iter().map(|b| b.num_rows()).sum())
 }
 
 /// The `(format, options)` of a streaming `Read` — `readStream.format(f).option(k, v)`.

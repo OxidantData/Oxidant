@@ -140,6 +140,87 @@ async fn count_rows(client: &mut SparkConnectServiceClient<Channel>, plan: sc::R
     rows
 }
 
+async fn collect_i64(
+    client: &mut SparkConnectServiceClient<Channel>,
+    plan: sc::Relation,
+) -> Result<Vec<i64>, tonic::Status> {
+    use oxidant_loom::arrow::ipc::reader::StreamReader;
+    let req = sc::ExecutePlanRequest {
+        session_id: SESSION.to_string(),
+        plan: Some(sc::Plan {
+            op_type: Some(sc::plan::OpType::Root(plan)),
+        }),
+        ..Default::default()
+    };
+    let mut stream = client.execute_plan(req).await?.into_inner();
+    let mut out = Vec::new();
+    while let Some(msg) = stream.message().await? {
+        if let Some(sc::execute_plan_response::ResponseType::ArrowBatch(b)) = msg.response_type {
+            let reader = StreamReader::try_new(std::io::Cursor::new(b.data), None).unwrap();
+            for rb in reader {
+                let rb = rb.unwrap();
+                let col = rb
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap_or_else(|| panic!("col0 {:?}", rb.schema()));
+                out.extend(col.iter().map(|v| v.unwrap()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn tail_rel(input: sc::Relation, n: i32) -> sc::Relation {
+    rel(sc::relation::RelType::Tail(Box::new(sc::Tail {
+        input: boxed(input),
+        limit: n,
+    })))
+}
+
+fn sql_rel(query: &str) -> sc::Relation {
+    rel(sc::relation::RelType::Sql(sc::Sql {
+        query: query.to_string(),
+        ..Default::default()
+    }))
+}
+
+/// Spark `DataFrame.tail(2)` on an ordered five-row frame must return the last two rows,
+/// not `limit(2)` / head.
+#[tokio::test]
+async fn tail_returns_last_ordered_rows_not_first() {
+    let mut client = boot(free_port()).await;
+    let src = sql_rel("SELECT v FROM (VALUES (1), (2), (3), (4), (5)) AS t(v) ORDER BY v");
+    let got = collect_i64(&mut client, tail_rel(src, 2))
+        .await
+        .unwrap_or_else(|e| panic!("tail: {e}"));
+    assert_eq!(got, vec![4, 5], "tail must not silently return head");
+}
+
+#[tokio::test]
+async fn tail_zero_is_empty_and_oversize_returns_all() {
+    let mut client = boot(free_port()).await;
+    let src = local_relation(vec![1, 2, 3], vec![10, 20, 30]);
+    let empty = collect_i64(&mut client, tail_rel(src.clone(), 0))
+        .await
+        .unwrap_or_else(|e| panic!("tail 0: {e}"));
+    assert_eq!(empty, Vec::<i64>::new());
+    let all = collect_i64(&mut client, tail_rel(src, 10))
+        .await
+        .unwrap_or_else(|e| panic!("tail 10: {e}"));
+    assert_eq!(all, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn tail_negative_is_invalid() {
+    let mut client = boot(free_port()).await;
+    let src = local_relation(vec![1], vec![1]);
+    let err = collect_i64(&mut client, tail_rel(src, -1))
+        .await
+        .expect_err("negative tail must not succeed as head");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+}
+
 #[tokio::test]
 async fn filter_lowers_and_executes() {
     let mut client = boot(free_port()).await;
