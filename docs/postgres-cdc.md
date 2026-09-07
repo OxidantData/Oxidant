@@ -436,11 +436,13 @@ after.
 `schema_change` event to the connector log and a line to stderr, and keeps
 ingesting on the schema the streaming DataFrame was planned against — a column
 the source has never seen is dropped, and one the publisher no longer sends is
-NULL-filled (the `DROP COLUMN` behaviour §7 promises). Restarting the pipeline
-re-introspects and picks the new column up. Propagating it *without* a restart
-means evolving the micro-batch schema, the merge's projection and the Delta
-target together mid-query, which is a change to the streaming engine rather than
-to this connector.
+NULL-filled (the `DROP COLUMN` behaviour §7 promises). That alarm is only for a
+table this source replicates: pgoutput announces every table in the publication,
+and a sibling's `ADD COLUMN` is ignored the same way its rows are. Restarting
+the pipeline re-introspects and picks the new column up. Propagating it
+*without* a restart means evolving the micro-batch schema, the merge's
+projection and the Delta target together mid-query, which is a change to the
+streaming engine rather than to this connector.
 
 **Unchanged TOAST is emitted as NULL.** The decoder keeps the distinction (`u`
 is not `n` on the wire), but the emitted batch has one way to say "no value".

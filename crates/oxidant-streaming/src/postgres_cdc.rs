@@ -1716,6 +1716,16 @@ impl PostgresCdcSource {
     /// Record a relation's shape, and report the first time it stops matching the schema this
     /// source emits.
     fn remember(&mut self, relation: Relation) {
+        // pgoutput announces every table in the publication. This source only replicates
+        // `self.tables`; a sibling's ADD COLUMN is not this stream's schema_change
+        // (OxidantData/Oxidant#165). `project` already drops those changes the same way.
+        if !self
+            .tables
+            .iter()
+            .any(|t| t.qualified() == relation.qualified())
+        {
+            return;
+        }
         let emitted: Vec<&str> = self
             .schema
             .fields()
@@ -4406,6 +4416,47 @@ mod tests {
         let log = std::fs::read_to_string(dir.path().join("sales_suppliers.jsonl")).unwrap();
         assert!(log.contains("\"event\":\"schema_change\""), "got: {log}");
         assert!(log.contains("region"), "the added column is named: {log}");
+    }
+
+    #[tokio::test]
+    async fn a_shape_change_on_another_publication_table_is_not_this_stream_alarm() {
+        // pgoutput sends Relation for every table in the publication. This stream
+        // only replicates sales_suppliers; tms.loads gaining a column must not
+        // raise schema_change here (OxidantData/Oxidant#165).
+        let engine = Engine::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut stream = a_transaction();
+        stream.insert(
+            0,
+            xlog(
+                0x0f0,
+                relation_msg(
+                    16386,
+                    "tms",
+                    "loads",
+                    &[(true, "id", oids::INT8), (false, "new_col", 25)],
+                ),
+            ),
+        );
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(stream)));
+        wire.lock().await.slot_existed = true;
+        let mut source = PostgresCdcSource::with_wire(
+            options(),
+            vec![suppliers()],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::new(Some(dir.path()), "sales_suppliers"),
+        );
+        let batches = stream_once(&mut source, &engine).await;
+        assert_eq!(batches[0].num_rows(), 3);
+        let log = std::fs::read_to_string(dir.path().join("sales_suppliers.jsonl")).unwrap();
+        assert!(
+            !log.contains("schema_change"),
+            "other-table relation must not alarm this stream: {log}"
+        );
+        assert!(
+            !log.contains("tms.loads"),
+            "other-table name must not appear: {log}"
+        );
     }
 
     // -----------------------------------------------------------------------------------------
