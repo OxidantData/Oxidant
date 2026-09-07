@@ -187,6 +187,55 @@ async fn partitioned_delta_middle_column_keeps_declared_order() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(id.value(0), 1);
+
+    let only_name = engine
+        .sql("SELECT name FROM t")
+        .await
+        .unwrap_or_else(|e| panic!("name: {e}"));
+    let name = only_name[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name.value(0), "ada");
+    assert_eq!(only_name[0].schema().field(0).name(), "name");
+
+    let reordered = engine
+        .sql("SELECT seq, name, id FROM t")
+        .await
+        .unwrap_or_else(|e| panic!("reordered: {e}"));
+    assert_eq!(reordered[0].schema().field(0).name(), "seq");
+    assert_eq!(reordered[0].schema().field(1).name(), "name");
+    assert_eq!(reordered[0].schema().field(2).name(), "id");
+    let seq = reordered[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let name = reordered[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let id = reordered[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(seq.value(0), 2);
+    assert_eq!(name.value(0), "ada");
+    assert_eq!(id.value(0), 1);
+
+    let counted = engine
+        .sql("SELECT COUNT(*) FROM t")
+        .await
+        .unwrap_or_else(|e| panic!("count: {e}"));
+    let n = counted[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT(*) Int64");
+    assert_eq!(n.value(0), 1);
 }
 
 /// Control: partitioning on the last declared column already worked.
@@ -197,13 +246,21 @@ async fn partitioned_delta_last_column_still_reads() {
     let engine = Engine::new();
     engine.register_delta("t", path).await.unwrap();
     let batches = engine
-        .sql("SELECT id, name FROM t WHERE seq = '2'")
+        .sql("SELECT id, name, seq FROM t WHERE seq = '2'")
         .await
         .unwrap_or_else(|e| panic!("control: {e}"));
+    assert_eq!(batches[0].schema().field(0).name(), "id");
+    assert_eq!(batches[0].schema().field(1).name(), "name");
+    assert_eq!(batches[0].schema().field(2).name(), "seq");
     let name = batches[0]
         .column(1)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(name.value(0), "ada");
+    let star = engine
+        .sql("SELECT * FROM t")
+        .await
+        .unwrap_or_else(|e| panic!("control star: {e}"));
+    assert_eq!(star[0].schema().field(2).name(), "seq");
 }

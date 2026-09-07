@@ -2050,13 +2050,18 @@ async fn parquet_metadata_provider_with_assignment(
     )
     .await;
     let provider: Arc<dyn TableProvider> = Arc::new(LakehouseTableProvider {
-        schema: table_schema,
-        file_schema,
-        partition_fields,
+        schema: table_schema.clone(),
+        file_schema: file_schema.clone(),
+        partition_fields: partition_fields.clone(),
         groups,
         case_insensitive_schema_adapter: md.schema.is_some(),
         statistics: logical_statistics,
         write_target,
+        declared_to_physical: LakehouseTableProvider::map_declared_to_physical(
+            &table_schema,
+            &file_schema,
+            &partition_fields,
+        )?,
     });
     match dim_cache_fingerprint {
         Some((fingerprint, source_bytes)) => {
@@ -2297,13 +2302,18 @@ async fn resolve_lakehouse_provider(
     )
     .await;
     let provider: Arc<dyn TableProvider> = Arc::new(LakehouseTableProvider {
-        schema: table_schema,
-        file_schema,
-        partition_fields,
+        schema: table_schema.clone(),
+        file_schema: file_schema.clone(),
+        partition_fields: partition_fields.clone(),
         groups,
         case_insensitive_schema_adapter: md.schema.is_some(),
         statistics: logical_statistics,
         write_target,
+        declared_to_physical: LakehouseTableProvider::map_declared_to_physical(
+            &table_schema,
+            &file_schema,
+            &partition_fields,
+        )?,
     });
     let provider = match dim_source_bytes {
         Some(source_bytes) => {
@@ -2345,30 +2355,47 @@ struct LakehouseTableProvider {
     /// Where an `INSERT` into this table writes, when one is possible. `None` makes the table
     /// read-only — the object store for its location could not be resolved.
     write_target: Option<LakehouseWriteTarget>,
+    /// Declared schema index → physical scan index (`file_schema` then partition fields).
+    /// Built once at resolve so a split mismatch fails before the first scan.
+    declared_to_physical: Vec<usize>,
 }
 
 impl LakehouseTableProvider {
-    /// Map a column index in the declared table schema onto DataFusion's physical
-    /// scan schema (`file_schema` followed by Hive partition fields).
-    ///
-    /// Partition columns live in the directory path, so they are not in the parquet
-    /// file. DataFusion therefore appends them after the file columns. Delta and
-    /// Iceberg declare those columns in table-schema order, which is often *not*
-    /// last. Passing declared indices straight into `FileScanConfig` then swaps
-    /// types and values (OxidantData/Oxidant#113).
+    /// Declared schema index → DataFusion physical scan index (`file_schema` then
+    /// Hive partition fields). Built at provider construction so a split that
+    /// cannot cover `schema()` fails at resolve, not mid-query.
+    fn map_declared_to_physical(
+        schema: &SchemaRef,
+        file_schema: &SchemaRef,
+        partition_fields: &[datafusion::arrow::datatypes::FieldRef],
+    ) -> DfResult<Vec<usize>> {
+        (0..schema.fields().len())
+            .map(|declared_idx| {
+                let name = schema.field(declared_idx).name();
+                if let Ok(i) = file_schema.index_of(name) {
+                    return Ok(i);
+                }
+                let file_len = file_schema.fields().len();
+                partition_fields
+                    .iter()
+                    .position(|f| f.name() == name)
+                    .map(|p| file_len + p)
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "declared column `{name}` is neither a file column nor a partition column"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
     fn physical_index(&self, declared_idx: usize) -> DfResult<usize> {
-        let name = self.schema.field(declared_idx).name();
-        if let Ok(i) = self.file_schema.index_of(name) {
-            return Ok(i);
-        }
-        let file_len = self.file_schema.fields().len();
-        self.partition_fields
-            .iter()
-            .position(|f| f.name() == name)
-            .map(|p| file_len + p)
+        self.declared_to_physical
+            .get(declared_idx)
+            .copied()
             .ok_or_else(|| {
                 DataFusionError::Internal(format!(
-                    "declared column `{name}` is neither a file column nor a partition column"
+                    "declared column index {declared_idx} is outside the physical remap"
                 ))
             })
     }
