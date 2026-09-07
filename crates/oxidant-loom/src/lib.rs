@@ -43,6 +43,7 @@ pub mod s3_cache;
 
 /// S3 / object-store scan I/O counters + range-read concurrency (KAN-153).
 pub mod s3_io;
+mod session_names;
 /// Worker-side stage plan cache (R5-4 / KAN-2): a distributed stage is planned once per
 /// worker, not once per task. See [`stage_plan_cache`].
 pub mod stage_plan_cache;
@@ -2187,31 +2188,6 @@ tokio::task_local! {
     /// Task-local — concurrent stage tasks on one worker keep independent selections
     /// (same idiom as `shard::with_replicated_tables`).
     static JOIN_STRATEGY_FLIP: ();
-    /// Per-execution session catalog/namespace for `current_catalog()` /
-    /// `current_database()` / `current_schema()`. The DataFusion SessionContext is
-    /// shared across Connect sessions; these SQL functions must not be rewritten in
-    /// that shared registry (OxidantData/Oxidant#126).
-    static SESSION_NAMES: (String, Vec<String>);
-}
-
-/// Run `fut` with this handle's current catalog/namespace visible to Spark name UDFs.
-pub(crate) async fn with_session_names<F, T>(catalog: String, namespace: Vec<String>, fut: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    SESSION_NAMES.scope((catalog, namespace), fut).await
-}
-
-/// `current_catalog` / `current_database` / `current_schema` as of this execution.
-/// `None` when invoked outside [`with_session_names`] (falls back to Spark defaults).
-pub(crate) fn session_current_name(which: &str) -> Option<String> {
-    SESSION_NAMES
-        .try_with(|(catalog, namespace)| match which {
-            "current_catalog" => catalog.clone(),
-            "current_database" | "current_schema" => namespace.last().cloned().unwrap_or_default(),
-            _ => String::new(),
-        })
-        .ok()
 }
 
 /// Whether the current task is a KAN-53 stall-retry attempt (see [`JOIN_STRATEGY_FLIP`]).
@@ -3725,8 +3701,8 @@ impl Engine {
             return Ok(vec![]);
         }
         let df = self.plan_spark(query).await?;
-        let (cat, ns) = self.current_catalog_and_namespace();
-        let batches = with_session_names(cat, ns, self.collect_join_guarded(df)).await?;
+        let (execution, df) = self.bind_session_names(df);
+        let batches = execution.collect_join_guarded(df).await?;
         // The view planned/created successfully — update the temp-view registry. A new temporary
         // view is recorded; a persistent view with the same name removes any prior temp entry
         // (DataFusion keeps a single namespace, so the persistent definition now shadows it).
@@ -3740,6 +3716,40 @@ impl Engine {
             self.note_catalog_change(&cv.name);
         }
         Ok(batches)
+    }
+
+    /// Bind names only to this execution, after the reusable logical plan has been built.
+    /// The shared UDF registry, views and stage-plan templates retain unbound functions;
+    /// neither `sql` nor `sql_with_stats` caches a bound physical plan or query result.
+    /// Repeating SQL after USE (or on another session) therefore takes a fresh snapshot.
+    ///
+    /// Keep the snapshot in both the DataFrame and a private execution handle: join-guard
+    /// replanning clones that handle's state and must retain the same values. Catalogs,
+    /// runtime and bounded memory pool stay shared; no shared context config is changed.
+    fn bind_session_names(
+        &self,
+        df: datafusion::dataframe::DataFrame,
+    ) -> (Self, datafusion::dataframe::DataFrame) {
+        let (catalog, namespace) = self.current_catalog_and_namespace();
+        let (mut state, plan) = df.into_parts();
+        state
+            .config_mut()
+            .options_mut()
+            .extensions
+            .insert(session_names::QuerySessionNames {
+                catalog,
+                namespace: namespace.last().cloned().unwrap_or_default(),
+            });
+        // DataFusion's physical expression planner reads ExecutionProps, not SessionConfig.
+        state.execution_props_mut().config_options = Some(state.config_options().clone());
+        let execution = Self {
+            ctx: Arc::new(SessionContext::new_with_state(state.clone())),
+            ..self.clone()
+        };
+        (
+            execution,
+            datafusion::dataframe::DataFrame::new(state, plan),
+        )
     }
 
     /// Create the managed directory and run a lowered `CREATE EXTERNAL TABLE` DDL, materializing a
@@ -5228,20 +5238,14 @@ impl Engine {
         }
         let start = std::time::Instant::now();
         let df = self.plan_spark(query).await?;
+        let (execution, df) = self.bind_session_names(df);
         let plan = df
             .create_physical_plan()
             .await
             .map_err(|e| Error::Execution(e.to_string()))?;
-        let batches = {
-            let (cat, ns) = self.current_catalog_and_namespace();
-            with_session_names(
-                cat,
-                ns,
-                datafusion::physical_plan::collect(plan.clone(), self.ctx.task_ctx()),
-            )
+        let batches = datafusion::physical_plan::collect(plan.clone(), execution.ctx.task_ctx())
             .await
-            .map_err(|e| Error::Execution(e.to_string()))?
-        };
+            .map_err(|e| Error::Execution(e.to_string()))?;
         let output_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let stats = QueryStats {
             duration_ms: start.elapsed().as_millis() as u64,

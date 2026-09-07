@@ -437,8 +437,9 @@ impl ScalarUDFImpl for ToBinary {
 // ---------------------------------------------------------------------------
 
 /// `current_database()` / `current_schema()` / `current_catalog()` — session scalars.
-/// Defaults match Spark (`default` / `default` / `spark_catalog`) when no session is in
-/// scope. Volatile so the planner cannot fold the builtin names forever.
+/// Defaults match Spark (`default` / `default` / `spark_catalog`) when no session
+/// configuration is attached. Volatile so reusable logical plans (including views)
+/// cannot fold the builtin defaults before the executing query binds its names.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct CurrentName {
     name: &'static str,
@@ -466,9 +467,17 @@ impl ScalarUDFImpl for CurrentName {
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
     }
-    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let value =
-            crate::session_current_name(self.name).unwrap_or_else(|| self.value.to_string());
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let value = args
+            .config_options
+            .extensions
+            .get::<crate::session_names::QuerySessionNames>()
+            .map(|names| match self.name {
+                "current_catalog" => names.catalog.as_str(),
+                _ => names.namespace.as_str(),
+            })
+            .unwrap_or(self.value)
+            .to_string();
         Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(value))))
     }
 }

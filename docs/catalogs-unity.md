@@ -203,11 +203,16 @@ Reaching plain Delta tables would require a native Unity Catalog API client. The
 
 ### `current_catalog()` / `current_database()` follow the session
 
-`SELECT current_catalog()` and `current_database()` / `current_schema()` read the
-same per-session catalog/namespace cell that `USE`, `setCurrentCatalog`, and
-unqualified name resolution use. Two Connect sessions on one shared engine keep
-independent values; the functions are not rewritten in the shared DataFusion
-registry.
+For local row-returning queries through `Engine::sql` and `Engine::sql_with_stats`,
+`current_catalog()`, `current_database()` and `current_schema()` use an immutable
+snapshot of the session's catalog/namespace at execution planning. This includes
+multi-partition queries: DataFusion carries the snapshot in its physical expressions,
+not a Tokio task-local. A later `USE` or `setCurrentCatalog` is visible to the next
+query, including identical SQL; concurrent sessions do not share the snapshot.
+The shared function registry and reusable logical plans remain unbound.
+
+This local-engine regression coverage does not establish propagation through
+`sql_stream` or distributed stage execution, or stock-PySpark end-to-end coverage.
 
 ### Not covered
 
