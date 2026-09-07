@@ -197,6 +197,52 @@ async fn tail_returns_last_ordered_rows_not_first() {
     assert_eq!(got, vec![4, 5], "tail must not silently return head");
 }
 
+/// Last-N is positional in the defined order, not "largest n values". DESC tail
+/// of 1..5 is [2, 1], not [5, 4].
+#[tokio::test]
+async fn tail_preserves_desc_order_suffix() {
+    let mut client = boot(free_port()).await;
+    let src = sql_rel("SELECT v FROM (VALUES (1), (2), (3), (4), (5)) AS t(v) ORDER BY v DESC");
+    let got = collect_i64(&mut client, tail_rel(src, 2))
+        .await
+        .unwrap_or_else(|e| panic!("tail desc: {e}"));
+    assert_eq!(got, vec![2, 1]);
+}
+
+#[tokio::test]
+async fn tail_of_empty_input_is_empty() {
+    let mut client = boot(free_port()).await;
+    let src = sql_rel("SELECT v FROM (VALUES (1)) AS t(v) WHERE 1 = 0");
+    let got = collect_i64(&mut client, tail_rel(src, 2))
+        .await
+        .unwrap_or_else(|e| panic!("tail empty: {e}"));
+    assert_eq!(got, Vec::<i64>::new());
+}
+
+/// Filter then tail: last two of {3,4,5} ordered by v.
+#[tokio::test]
+async fn tail_after_filter_is_suffix_of_filtered_order() {
+    let mut client = boot(free_port()).await;
+    let src =
+        sql_rel("SELECT v FROM (VALUES (1), (2), (3), (4), (5)) AS t(v) WHERE v >= 3 ORDER BY v");
+    let got = collect_i64(&mut client, tail_rel(src, 2))
+        .await
+        .unwrap_or_else(|e| panic!("tail filter: {e}"));
+    assert_eq!(got, vec![4, 5]);
+}
+
+/// Tied sort keys: last-N follows the ORDER BY tie-break, not an unstable pick.
+#[tokio::test]
+async fn tail_keeps_order_by_tie_break() {
+    let mut client = boot(free_port()).await;
+    let src =
+        sql_rel("SELECT v FROM (VALUES (1, 2), (1, 1), (2, 0)) AS t(k, v) ORDER BY k ASC, v ASC");
+    let got = collect_i64(&mut client, tail_rel(src, 2))
+        .await
+        .unwrap_or_else(|e| panic!("tail tie: {e}"));
+    assert_eq!(got, vec![2, 0]);
+}
+
 #[tokio::test]
 async fn tail_zero_is_empty_and_oversize_returns_all() {
     let mut client = boot(free_port()).await;

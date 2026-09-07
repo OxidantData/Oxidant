@@ -91,8 +91,10 @@ async fn translate(ctx: &SessionContext, rel: &sc::Relation) -> Result<LogicalPl
         }
         RelType::Tail(t) => {
             // Spark `DataFrame.tail(n)` is last-N of the defined output order, not
-            // `limit(n)` / head. Negative n is invalid (do not wrap to usize). N=0 is
-            // empty. N larger than the input returns the whole input.
+            // `limit(n)` / head. Collect once and keep the suffix (Spark CollectTailExec
+            // / takeRight). Count-then-OFFSET would scan twice and can return head when
+            // the second scan is longer. Negative n is invalid. N=0 is empty. N larger
+            // than the input returns the whole input. Distributed last-N is not claimed.
             if t.limit < 0 {
                 return Err(inval(format!("tail limit must be >= 0, got {}", t.limit)));
             }
@@ -101,9 +103,7 @@ async fn translate(ctx: &SessionContext, rel: &sc::Relation) -> Result<LogicalPl
             if n == 0 {
                 return build(LogicalPlanBuilder::from(input).limit(0, Some(0)));
             }
-            let total = count_plan_rows(ctx, &input).await?;
-            let skip = total.saturating_sub(n);
-            build(LogicalPlanBuilder::from(input).limit(skip, Some(n)))
+            tail_suffix_plan(ctx, input, n).await
         }
         RelType::Join(j) => join(ctx, j).await,
         RelType::SetOp(s) => set_op(ctx, s).await,
@@ -1090,16 +1090,53 @@ fn plan_err(e: datafusion::error::DataFusionError) -> Status {
     Status::invalid_argument(format!("plan: {e}"))
 }
 
-/// Row count of `plan` for Tail skip = count.saturating_sub(n). Scans the input
-/// once here; the subsequent limit(skip, n) scans it again. Spark's tail also
-/// materializes. Distributed last-N is not claimed by this path.
-async fn count_plan_rows(ctx: &SessionContext, plan: &LogicalPlan) -> Result<usize, Status> {
-    let df = ctx
-        .execute_logical_plan(plan.clone())
-        .await
-        .map_err(plan_err)?;
+/// Last `n` rows of `batches` in encounter order (Spark takeRight). Empty `n` or
+/// empty input yields no batches. A request larger than the input keeps every row.
+fn take_last_n_rows(
+    batches: Vec<datafusion::arrow::record_batch::RecordBatch>,
+    n: usize,
+) -> Vec<datafusion::arrow::record_batch::RecordBatch> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let mut skip = total.saturating_sub(n);
+    let mut out = Vec::new();
+    for batch in batches {
+        let rows = batch.num_rows();
+        if rows == 0 {
+            continue;
+        }
+        if skip >= rows {
+            skip -= rows;
+            continue;
+        }
+        let start = skip;
+        skip = 0;
+        out.push(batch.slice(start, rows - start));
+    }
+    out
+}
+
+/// Execute `input` once and scan a MemTable of its last `n` rows. One pass, so a
+/// later execute cannot pick a different cardinality (count-then-OFFSET head).
+async fn tail_suffix_plan(
+    ctx: &SessionContext,
+    input: LogicalPlan,
+    n: usize,
+) -> Result<LogicalPlan, Status> {
+    let schema = Arc::new(input.schema().as_arrow().clone());
+    let df = ctx.execute_logical_plan(input).await.map_err(plan_err)?;
     let batches = df.collect().await.map_err(plan_err)?;
-    Ok(batches.iter().map(|b| b.num_rows()).sum())
+    let suffix = take_last_n_rows(batches, n);
+    let mem = MemTable::try_new(schema, vec![suffix])
+        .map_err(|e| inval(format!("tail memtable: {e}")))?;
+    let seq = LOCAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    build(LogicalPlanBuilder::scan(
+        format!("spark_tail_{seq}"),
+        provider_as_source(Arc::new(mem)),
+        None,
+    ))
 }
 
 /// The `(format, options)` of a streaming `Read` — `readStream.format(f).option(k, v)`.
@@ -1204,3 +1241,46 @@ trait Pipe: Sized {
     }
 }
 impl<T> Pipe for T {}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::take_last_n_rows;
+    use datafusion::arrow::array::{Array, Int64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    fn batch(vals: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vals.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    fn col(b: &RecordBatch) -> Vec<i64> {
+        let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        (0..a.len()).map(|i| a.value(i)).collect()
+    }
+
+    fn concat(batches: &[RecordBatch]) -> Vec<i64> {
+        batches.iter().flat_map(col).collect()
+    }
+
+    #[test]
+    fn last_n_spans_two_batches() {
+        let out = take_last_n_rows(vec![batch(&[1, 2, 3]), batch(&[4, 5])], 3);
+        assert_eq!(concat(&out), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn last_n_larger_than_input_is_all() {
+        let out = take_last_n_rows(vec![batch(&[1, 2])], 10);
+        assert_eq!(concat(&out), vec![1, 2]);
+    }
+
+    #[test]
+    fn last_n_empty_input_is_empty() {
+        assert!(take_last_n_rows(vec![], 2).is_empty());
+    }
+}
