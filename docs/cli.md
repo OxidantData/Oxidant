@@ -112,7 +112,8 @@ oxidant sql -f report.sql --format csv > report.csv
 
 ## Server flags: `--sample-data` (bundled sample tables)
 
-`oxidant start` accepts `--sample-data <DIR>` (env: `OXIDANT_SAMPLE_DATA_DIR`). When
+`oxidant start` accepts `--sample-data <DIR>` (env: `OXIDANT_SAMPLE_DATA_DIR`, or
+`OXIDANT_SAMPLE_DATA=1` to enable the bundled tree). The flag wins. When
 set, the server registers the sample-data tree at `<DIR>` as the `samples` schema of the
 built-in `spark_catalog` catalog at startup — parquet tables under their bare names
 (`samples.tpch_nation`, …), CSV as `…_csv`, Delta as `…_delta`, Iceberg as `…_iceberg`.

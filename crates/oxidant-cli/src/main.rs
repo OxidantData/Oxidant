@@ -529,26 +529,49 @@ fn catalog_conf(args: &[String]) -> std::collections::HashMap<String, String> {
     out
 }
 
-/// `--sample-data <DIR>` (or `OXIDANT_SAMPLE_DATA_DIR`): preload the bundled sample tables
-/// under the `samples` schema at startup. The flag wins over the env var; an empty value is
-/// treated as unset. When neither is set, a bundled sample-data tree installed next to the
-/// binary is auto-discovered (release tarballs / curl|sh / deb / rpm layouts).
+/// `--sample-data <DIR>` (or `OXIDANT_SAMPLE_DATA_DIR`) wins. `OXIDANT_SAMPLE_DATA=1`
+/// enables the bundled tree without a CLI flag. Empty values are unset. When none of
+/// those select a path, a bundled tree next to the binary is auto-discovered.
 fn sample_data_dir(args: &[String]) -> Option<std::path::PathBuf> {
-    let explicit = sample_data_dir_from(
+    let discovered = std::env::current_exe()
+        .ok()
+        .and_then(|exe| resolve_sample_data_dir(exe.parent()?));
+    sample_data_dir_resolved(
         flag(args, "--sample-data"),
         std::env::var("OXIDANT_SAMPLE_DATA_DIR").ok(),
-    );
-    if explicit.is_some() {
-        return explicit;
-    }
-    let exe = std::env::current_exe().ok()?;
-    resolve_sample_data_dir(exe.parent()?)
+        std::env::var("OXIDANT_SAMPLE_DATA").ok(),
+        discovered,
+    )
 }
 
 fn sample_data_dir_from(flag: Option<String>, env: Option<String>) -> Option<std::path::PathBuf> {
     flag.or(env)
         .filter(|s| !s.trim().is_empty())
         .map(std::path::PathBuf::from)
+}
+
+fn sample_data_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Flag and `OXIDANT_SAMPLE_DATA_DIR` win. `OXIDANT_SAMPLE_DATA=1` enables the bundled tree
+/// (discovered path, else `sample-data`) without a unit-file flag (OxidantData/Oxidant#131).
+fn sample_data_dir_resolved(
+    flag: Option<String>,
+    dir_env: Option<String>,
+    enable_env: Option<String>,
+    discovered: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if let Some(p) = sample_data_dir_from(flag, dir_env) {
+        return Some(p);
+    }
+    if sample_data_enabled(enable_env.as_deref()) {
+        return discovered.or_else(|| Some(std::path::PathBuf::from("sample-data")));
+    }
+    discovered
 }
 
 /// Sample-data auto-discovery. `exe_dir` is the directory of the current executable; the
@@ -1304,6 +1327,32 @@ mod tests {
         );
         assert_eq!(sample_data_dir_from(None, Some("  ".to_string())), None);
         assert_eq!(sample_data_dir_from(None, None), None);
+    }
+
+    #[test]
+    fn oxidant_sample_data_one_enables_bundled_tree_flag_wins() {
+        use std::path::PathBuf;
+        assert_eq!(
+            sample_data_dir_resolved(None, None, Some("1".into()), None),
+            Some(PathBuf::from("sample-data"))
+        );
+        assert_eq!(
+            sample_data_dir_resolved(Some("/explicit".into()), None, Some("1".into()), None),
+            Some(PathBuf::from("/explicit"))
+        );
+        assert_eq!(
+            sample_data_dir_resolved(None, None, Some("0".into()), None),
+            None
+        );
+        assert_eq!(
+            sample_data_dir_resolved(
+                None,
+                None,
+                Some("true".into()),
+                Some(PathBuf::from("/opt/oxidant/sample-data"))
+            ),
+            Some(PathBuf::from("/opt/oxidant/sample-data"))
+        );
     }
 
     /// A fake installed tree: `mkdir -p <root>/<rel>/parquet`.

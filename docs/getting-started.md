@@ -156,7 +156,7 @@ oxidant start --port <PORT> [--ui-port <PORT>] [--ui-bind <ADDR>] [--no-ui]
   distributable queries across them (static list — see [workers.md](workers.md)).
 - `--mode local-cluster --workers N` — embed N in-process workers instead of remote ones
   (see [workers.md](workers.md)). With no workers at all, the driver runs every query itself.
-- `--sample-data` — register a sample-data tree as the `samples` schema at startup (env: `OXIDANT_SAMPLE_DATA_DIR`).
+- `--sample-data` — register a sample-data tree as the `samples` schema at startup (env: `OXIDANT_SAMPLE_DATA_DIR`, or `OXIDANT_SAMPLE_DATA=1` to enable the bundled tree). The flag wins.
 - `--catalog-conf` — register an external catalog at startup (see [catalogs-glue.md](catalogs-glue.md)).
 
 ## Sample data
