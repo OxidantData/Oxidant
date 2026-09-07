@@ -32,10 +32,10 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
 };
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::{DataFusionError, Result, ScalarValue, exec_err, plan_err};
+use datafusion::common::{exec_err, plan_err, DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::expr::{Case, Cast};
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::type_coercion::binary::binary_numeric_coercion;
