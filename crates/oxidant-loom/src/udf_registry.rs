@@ -66,8 +66,22 @@ impl UdfRegistry {
 
     pub fn apply_to_context(&self, ctx: &SessionContext) -> Result<()> {
         for def in self.defs.values() {
+            // Python/Connect entries have no SQL body. Installing them as SQL is
+            // `udf … has no body` and used to fail an unrelated later CREATE FUNCTION
+            // (OxidantData/Oxidant#177).
+            if def.sql_body.is_none() {
+                continue;
+            }
             register_sql_udf_on_ctx(ctx, def)?;
         }
+        Ok(())
+    }
+
+    /// Validate and install one SQL function on `ctx`, then record it. A failure
+    /// leaves the registry unchanged.
+    pub fn install_sql(&mut self, ctx: &SessionContext, def: UdfDef) -> Result<()> {
+        register_sql_udf_on_ctx(ctx, &def)?;
+        self.register_sql_fn(def);
         Ok(())
     }
 }
@@ -208,5 +222,24 @@ mod tests {
         let def =
             try_create_function("CREATE FUNCTION foo1a1(a INT) RETURNS INT RETURN 1;").unwrap();
         assert_eq!(def.param_names, vec!["a".to_string()]);
+    }
+
+    /// Python Connect registration used to insert `sql_body: None`. Applying the whole
+    /// registry then failed with `udf … has no body` and blocked a later SQL CREATE.
+    #[test]
+    fn apply_to_context_skips_python_defs_without_sql_body() {
+        let mut reg = UdfRegistry::new();
+        reg.register_sql_fn(UdfDef {
+            name: "registry_python".into(),
+            sql_body: None,
+            param_names: vec!["v".into()],
+            return_type: "INT".into(),
+        });
+        let sql = try_create_function("CREATE FUNCTION registry_after() RETURNS INT RETURN 7")
+            .expect("parse");
+        reg.register_sql_fn(sql);
+        let ctx = SessionContext::new();
+        reg.apply_to_context(&ctx)
+            .expect("a Python registry entry must not block SQL function apply");
     }
 }

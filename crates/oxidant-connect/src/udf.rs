@@ -54,7 +54,6 @@ pub fn register_connect_udf(
 
         let arg_count = udf.arguments.len();
         let command = py.command.clone();
-        let udf_name = name.clone();
 
         let py_udf = PythonUdf {
             name: name.clone(),
@@ -63,13 +62,9 @@ pub fn register_connect_udf(
             arg_count,
         };
         ctx.register_udf(ScalarUDF::from(py_udf));
-
-        registry.register_sql_fn(UdfDef {
-            name: udf_name,
-            sql_body: None,
-            param_names: (0..arg_count).map(|i| format!("arg{i}")).collect(),
-            return_type: "INT".into(),
-        });
+        // Do not insert a body-less SQL def. `apply_to_context` used to treat every
+        // registry entry as SQL and fail `CREATE FUNCTION` in another session
+        // (OxidantData/Oxidant#177). Python lives on the DataFusion context only.
         return Ok(());
     }
 
