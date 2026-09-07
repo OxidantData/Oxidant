@@ -153,16 +153,41 @@ pub struct FileSource {
     /// recorded here — the offset log names its files, and that is what a replay reads.
     seen: HashSet<String>,
     schema: SchemaRef,
+    /// True when `schema` came from `readStream.schema(...)` and must not be replaced by
+    /// per-file inference.
+    schema_pinned: bool,
+    /// `readStream.option(...)` — CSV `header`/`delimiter` and similar.
+    options: BTreeMap<String, String>,
 }
 
 impl FileSource {
     pub fn new(path: impl AsRef<Path>, format: &str) -> Self {
+        Self::with_schema(path, format, None)
+    }
+
+    pub fn with_schema(path: impl AsRef<Path>, format: &str, schema: Option<SchemaRef>) -> Self {
+        Self::with_options(path, format, schema, BTreeMap::new())
+    }
+
+    pub fn with_options(
+        path: impl AsRef<Path>,
+        format: &str,
+        schema: Option<SchemaRef>,
+        options: BTreeMap<String, String>,
+    ) -> Self {
+        let pinned = schema
+            .as_ref()
+            .map(|s| !s.fields().is_empty())
+            .unwrap_or(false);
         Self {
             path: path.as_ref().to_path_buf(),
             format: format.to_ascii_lowercase(),
             seen: HashSet::new(),
-            // A directory of not-yet-existing files has no schema until the first file lands.
-            schema: std::sync::Arc::new(oxidant_loom::arrow::datatypes::Schema::empty()),
+            schema: schema.unwrap_or_else(|| {
+                std::sync::Arc::new(oxidant_loom::arrow::datatypes::Schema::empty())
+            }),
+            schema_pinned: pinned,
+            options,
         }
     }
 
@@ -173,7 +198,11 @@ impl FileSource {
         let mut files: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.is_file() && !self.seen.contains(&p.to_string_lossy().to_string()))
+            .filter(|p| {
+                p.is_file()
+                    && !self.seen.contains(&p.to_string_lossy().to_string())
+                    && is_stream_data_file(p, &self.format)
+            })
             .collect();
         // Deterministic order so a restart replays files the same way it first read them.
         files.sort();
@@ -222,12 +251,33 @@ impl Source for FileSource {
         // friends are DuckDB table functions that this engine has never registered, so the SQL
         // form this used to build could not resolve for any format.
         let ctx = engine.ctx();
+        let pinned = self.schema_pinned.then(|| self.schema.clone());
         let mut all = Vec::new();
         for path in &range.items {
             let df = match self.format.as_str() {
-                "parquet" => ctx.read_parquet(path, ParquetReadOptions::default()).await,
-                "json" => ctx.read_json(path, JsonReadOptions::default()).await,
-                "csv" => ctx.read_csv(path, CsvReadOptions::default()).await,
+                "parquet" => {
+                    let mut opts = ParquetReadOptions::default();
+                    if let Some(s) = pinned.as_ref() {
+                        opts.schema = Some(s.as_ref());
+                    }
+                    ctx.read_parquet(path, opts).await
+                }
+                "json" => {
+                    let mut opts = JsonReadOptions::default();
+                    if let Some(s) = pinned.as_ref() {
+                        opts.schema = Some(s.as_ref());
+                    }
+                    ctx.read_json(path, opts).await
+                }
+                "csv" => {
+                    let mut opts = CsvReadOptions::default()
+                        .has_header(csv_has_header(&self.options))
+                        .delimiter(csv_delimiter(&self.options));
+                    if let Some(s) = pinned.as_ref() {
+                        opts = opts.schema(s.as_ref());
+                    }
+                    ctx.read_csv(path, opts).await
+                }
                 other => {
                     return Err(oxidant_common::Error::Unsupported(format!(
                         "readStream.format(`{other}`) is not a file source"
@@ -239,10 +289,16 @@ impl Source for FileSource {
                 .collect()
                 .await
                 .map_err(|e| oxidant_common::Error::Execution(format!("read `{path}`: {e}")))?;
-            if let Some(b) = batches.first() {
-                self.schema = b.schema();
+            if self.schema_pinned {
+                for b in batches {
+                    all.push(project_to_schema(b, &self.schema)?);
+                }
+            } else {
+                if let Some(b) = batches.first() {
+                    self.schema = b.schema();
+                }
+                all.extend(batches);
             }
-            all.extend(batches);
         }
         // Marked consumed only once every file in the range has been read. Marking them one at a
         // time would strand the rows already collected when a later file fails: the error
@@ -264,6 +320,81 @@ impl Source for FileSource {
             return;
         }
         self.seen.extend(offsets.entries.keys().cloned());
+    }
+}
+
+/// Reorder / select columns so a file batch matches the declared stream schema.
+///
+/// DataFusion's JSON reader with a schema still follows physical key order in some
+/// cases; the micro-batch input rejects any schema that is not identical to the
+/// planned one, so this is required rather than optional.
+fn project_to_schema(batch: RecordBatch, want: &SchemaRef) -> oxidant_common::Result<RecordBatch> {
+    if batch.schema().as_ref() == want.as_ref() {
+        return Ok(batch);
+    }
+    let mut cols = Vec::with_capacity(want.fields().len());
+    for f in want.fields() {
+        let idx = batch.schema().index_of(f.name()).map_err(|_| {
+            oxidant_common::Error::Execution(format!(
+                "streaming file is missing declared column `{}` (have {:?})",
+                f.name(),
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|c| c.name().as_str())
+                    .collect::<Vec<_>>()
+            ))
+        })?;
+        let col = batch.column(idx);
+        if col.data_type() != f.data_type() {
+            return Err(oxidant_common::Error::Execution(format!(
+                "streaming file column `{}` has type {}, declared {}",
+                f.name(),
+                col.data_type(),
+                f.data_type()
+            )));
+        }
+        cols.push(col.clone());
+    }
+    RecordBatch::try_new(want.clone(), cols)
+        .map_err(|e| oxidant_common::Error::Execution(format!("project stream schema: {e}")))
+}
+
+fn csv_has_header(options: &BTreeMap<String, String>) -> bool {
+    options
+        .get("header")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn csv_delimiter(options: &BTreeMap<String, String>) -> u8 {
+    options
+        .get("delimiter")
+        .or_else(|| options.get("sep"))
+        .and_then(|s| s.as_bytes().first().copied())
+        .unwrap_or(b',')
+}
+
+fn is_stream_data_file(path: &Path, format: &str) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    if name.starts_with('.') || name.starts_with('_') || name.ends_with(".crc") {
+        return false;
+    }
+    match format {
+        "json" => {
+            let lower = name.to_ascii_lowercase();
+            lower.ends_with(".json") || lower.ends_with(".jsonl")
+        }
+        "csv" => {
+            let lower = name.to_ascii_lowercase();
+            lower.ends_with(".csv") || lower.ends_with(".txt")
+        }
+        "parquet" => name.to_ascii_lowercase().ends_with(".parquet"),
+        _ => true,
     }
 }
 
@@ -470,5 +601,128 @@ mod tests {
             entries: [("/data/a.json".to_string(), 1i64)].into_iter().collect(),
         });
         assert!(src.seen.contains("/data/a.json"));
+    }
+
+    #[test]
+    fn declared_schema_is_known_before_any_file_arrives() {
+        use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let src = FileSource::with_schema("/tmp/empty-stream", "json", Some(schema.clone()));
+        assert_eq!(src.schema().fields().len(), 2);
+        assert_eq!(src.schema().field(0).name(), "name");
+        assert_eq!(src.schema().field(1).name(), "v");
+        assert_eq!(src.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(src.schema().field(1).data_type(), &DataType::Int64);
+    }
+
+    #[tokio::test]
+    async fn declared_schema_keeps_field_order_when_json_keys_differ() {
+        use oxidant_loom::arrow::array::{Int64Array, StringArray};
+        use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let dir = tempfile::TempDir::new().unwrap();
+        // Physical JSON key order is v then name; declared order is name then v.
+        std::fs::write(dir.path().join("a.json"), "{\"v\":1,\"name\":\"one\"}\n").unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let engine = Engine::new();
+        let mut src = FileSource::with_schema(dir.path(), "json", Some(schema.clone()));
+        assert_eq!(src.schema().as_ref(), schema.as_ref());
+        let range = src.plan_batch(&engine).await.unwrap();
+        let batches = src.poll_range(&engine, &range).await.unwrap();
+        let batch = &batches[0];
+        assert_eq!(batch.schema().field(0).name(), "name");
+        assert_eq!(batch.schema().field(1).name(), "v");
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "one"
+        );
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        // Planning schema must not have been replaced by the inferred file schema.
+        assert_eq!(src.schema().field(0).name(), "name");
+    }
+
+    #[tokio::test]
+    async fn incompatible_file_column_is_an_error_not_a_swap() {
+        use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("a.json"),
+            "{\"name\":\"one\",\"v\":\"not-a-long\"}\n",
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let engine = Engine::new();
+        let mut src = FileSource::with_schema(dir.path(), "json", Some(schema));
+        let range = src.plan_batch(&engine).await.unwrap();
+        let err = src.poll_range(&engine, &range).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("v") || msg.contains("type") || msg.contains("schema"),
+            "{msg}"
+        );
+    }
+
+    /// Spark CSV streaming defaults `header=false`. A file whose first line is data
+    /// (`one,1`) must yield that row, not treat it as a header and return nothing.
+    #[tokio::test]
+    async fn csv_declared_schema_reads_first_line_as_data() {
+        use oxidant_loom::arrow::array::{Int64Array, StringArray};
+        use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.csv"), "one,1\n").unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let engine = Engine::new();
+        let mut src = FileSource::with_schema(dir.path(), "csv", Some(schema));
+        let range = src.plan_batch(&engine).await.unwrap();
+        let batches = src.poll_range(&engine, &range).await.unwrap();
+        assert!(!batches.is_empty(), "csv first line is data, not a header");
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "one"
+        );
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
     }
 }

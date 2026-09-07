@@ -161,9 +161,14 @@ fn shared() -> &'static Mutex<HashMap<String, Arc<MicroBatchInput>>> {
 
 /// The table name a *shared* (analysis-only) streaming input resolves to.
 ///
-/// Derived from the read's format and options so repeated analysis of the same streaming
-/// DataFrame reuses one table rather than registering a new one per call.
-pub fn stream_input_name(format: &str, options: &BTreeMap<String, String>) -> String {
+/// Derived from the read's format, options, and declared schema so repeated analysis of
+/// the same streaming DataFrame reuses one table, and two reads that differ only in
+/// `readStream.schema(...)` do not share a MicroBatchInput.
+pub fn stream_input_name(
+    format: &str,
+    options: &BTreeMap<String, String>,
+    schema: Option<&oxidant_loom::arrow::datatypes::Schema>,
+) -> String {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -171,6 +176,12 @@ pub fn stream_input_name(format: &str, options: &BTreeMap<String, String>) -> St
     for (k, v) in options {
         k.hash(&mut hasher);
         v.hash(&mut hasher);
+    }
+    if let Some(schema) = schema {
+        for f in schema.fields() {
+            f.name().hash(&mut hasher);
+            format!("{:?}", f.data_type()).hash(&mut hasher);
+        }
     }
     format!("_oxidant_stream_{:016x}", hasher.finish())
 }
@@ -198,7 +209,7 @@ pub fn stream_input(
         return Ok(input);
     }
 
-    let name = stream_input_name(format, options);
+    let name = stream_input_name(format, options, Some(schema.as_ref()));
     let mut guard = shared().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = guard.get(&name) {
         return Ok(existing.clone());
@@ -231,16 +242,31 @@ mod tests {
     #[test]
     fn the_shared_name_is_stable_for_the_same_read_and_differs_across_reads() {
         assert_eq!(
-            stream_input_name("kafka", &opts("events")),
-            stream_input_name("kafka", &opts("events"))
+            stream_input_name("kafka", &opts("events"), None),
+            stream_input_name("kafka", &opts("events"), None)
         );
         assert_ne!(
-            stream_input_name("kafka", &opts("events")),
-            stream_input_name("kafka", &opts("audit"))
+            stream_input_name("kafka", &opts("events"), None),
+            stream_input_name("kafka", &opts("audit"), None)
         );
         assert_ne!(
-            stream_input_name("kafka", &opts("events")),
-            stream_input_name("rate", &opts("events"))
+            stream_input_name("kafka", &opts("events"), None),
+            stream_input_name("rate", &opts("events"), None)
+        );
+    }
+
+    #[test]
+    fn declared_schema_is_part_of_the_shared_input_identity() {
+        let a = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
+        let b = Schema::new(vec![Field::new("v", DataType::Int64, true)]);
+        let empty = BTreeMap::new();
+        assert_ne!(
+            stream_input_name("json", &empty, Some(&a)),
+            stream_input_name("json", &empty, Some(&b))
+        );
+        assert_eq!(
+            stream_input_name("json", &empty, Some(&a)),
+            stream_input_name("json", &empty, Some(&a))
         );
     }
 

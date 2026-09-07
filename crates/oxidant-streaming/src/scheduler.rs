@@ -808,7 +808,12 @@ pub fn build_source(
                 .get("path")
                 .cloned()
                 .unwrap_or_else(|| "/tmp/oxidant-stream-in".into());
-            Box::new(FileSource::new(path, &config.source_format))
+            Box::new(FileSource::with_options(
+                path,
+                &config.source_format,
+                config.source_schema.clone(),
+                config.source_options.clone(),
+            ))
         }
         "kafka" => Box::new(KafkaSource::from_options(&options)?),
         // Constructing this one talks to Postgres: it validates the server's setup and
@@ -838,7 +843,27 @@ pub fn build_source(
 /// The schema a source emits, known before the query runs. Used by the Connect translator to
 /// plan the streaming DataFrame.
 pub fn source_schema(engine: Option<&Engine>, config: &StreamQueryConfig) -> Result<SchemaRef> {
-    Ok(build_source(engine, config)?.schema())
+    if let Some(schema) = &config.source_schema {
+        if schema.fields().is_empty() {
+            return Err(Error::Plan(
+                "readStream.schema is empty; a file stream needs at least one field".into(),
+            ));
+        }
+        let fmt = config.source_format.to_ascii_lowercase();
+        // Declared schema applies to file sources. kafka/rate have a fixed physical
+        // schema; pinning a user struct here would mismatch the first batch.
+        if matches!(fmt.as_str(), "parquet" | "json" | "csv") {
+            return Ok(schema.clone());
+        }
+    }
+    let schema = build_source(engine, config)?.schema();
+    let fmt = config.source_format.to_ascii_lowercase();
+    if schema.fields().is_empty() && matches!(fmt.as_str(), "parquet" | "json" | "csv") {
+        return Err(Error::Plan(format!(
+            "readStream.format(`{fmt}`) requires .schema(...)"
+        )));
+    }
+    Ok(schema)
 }
 
 async fn build_sink(
