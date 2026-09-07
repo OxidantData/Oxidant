@@ -54,9 +54,12 @@ pub fn hive_type_to_arrow(ty: &str) -> Option<DataType> {
         "string" | "varchar" | "char" | "text" => DataType::Utf8,
         "boolean" | "bool" => DataType::Boolean,
         "date" => DataType::Date32,
-        // Hive `timestamp` is microsecond, no timezone — the standard Hive/Spark→Arrow mapping and
-        // what Spark-written Parquet stores (logical TIMESTAMP_MICROS / INT96 reads as micros).
-        "timestamp" => DataType::Timestamp(TimeUnit::Microsecond, None),
+        // Spark TIMESTAMP is a UTC instant. Hive's unadorned `timestamp` is that type
+        // in Spark catalogs; wall-clock values are `timestamp_ntz` (Spark 3.4+).
+        // Mapping both to NTZ made a Delta `timestamp` table read back as TimestampNTZ
+        // and fail a second write (OxidantData/Oxidant#147).
+        "timestamp" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        "timestamp_ntz" => DataType::Timestamp(TimeUnit::Microsecond, None),
         "binary" => DataType::Binary,
         // Parameterized: varchar(n) / char(n) → Utf8 (length is a constraint, not an Arrow type);
         // decimal(p,s) → Decimal128(p,s). Anything else falls through to `None`.
@@ -112,9 +115,8 @@ pub fn arrow_type_to_hive(dt: &DataType) -> Option<String> {
         DataType::Utf8 | DataType::LargeUtf8 => "string".to_string(),
         DataType::Boolean => "boolean".to_string(),
         DataType::Date32 | DataType::Date64 => "date".to_string(),
-        // Hive `timestamp` has no unit/timezone distinction — every Arrow timestamp variant
-        // declares the same Hive type string (the engine's writer controls the physical encoding).
-        DataType::Timestamp(_, _) => "timestamp".to_string(),
+        DataType::Timestamp(_, Some(_)) => "timestamp".to_string(),
+        DataType::Timestamp(_, None) => "timestamp_ntz".to_string(),
         DataType::Binary | DataType::LargeBinary => "binary".to_string(),
         DataType::Decimal128(p, s) => format!("decimal({p},{s})"),
         _ => return None,
@@ -251,6 +253,10 @@ mod tests {
             ("binary", DataType::Binary),
             (
                 "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            (
+                "timestamp_ntz",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
             ),
         ];
@@ -331,6 +337,18 @@ mod tests {
         assert_eq!(columns_to_schema(cols), None);
     }
 
+    /// Spark TIMESTAMP is a UTC instant; TIMESTAMP_NTZ is wall-clock. Catalog metadata
+    /// must not collapse both to Hive `timestamp` and reconstruct NTZ (OxidantData/Oxidant#147).
+    #[test]
+    fn timestamp_instant_and_ntz_round_trip_as_distinct_types() {
+        let instant = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let ntz = DataType::Timestamp(TimeUnit::Microsecond, None);
+        assert_eq!(arrow_type_to_hive(&instant).as_deref(), Some("timestamp"));
+        assert_eq!(arrow_type_to_hive(&ntz).as_deref(), Some("timestamp_ntz"));
+        assert_eq!(hive_type_to_arrow("timestamp"), Some(instant));
+        assert_eq!(hive_type_to_arrow("timestamp_ntz"), Some(ntz));
+    }
+
     #[test]
     fn arrow_type_to_hive_round_trips_hive_type_to_arrow() {
         // Every scalar hive_type_to_arrow maps FROM should round-trip back to an equivalent
@@ -346,8 +364,12 @@ mod tests {
             (DataType::Boolean, "boolean"),
             (DataType::Date32, "date"),
             (
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 "timestamp",
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                "timestamp_ntz",
             ),
             (DataType::Binary, "binary"),
             (DataType::Decimal128(15, 2), "decimal(15,2)"),
