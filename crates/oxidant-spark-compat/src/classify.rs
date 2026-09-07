@@ -174,14 +174,19 @@ pub fn classify(golden: &GoldenBlock, actual: &Outcome) -> Verdict {
                 detail: first_line(message),
             }
         }
-        Outcome::Ok { schema, output } => {
+        Outcome::Ok {
+            schema,
+            output,
+            rows,
+        } => {
             if expects_error {
                 return Verdict {
                     bucket: Bucket::MissingError,
                     detail: "oxidant accepted a query Spark rejects".into(),
                 };
             }
-            let output_ok = normalize::outputs_match(&golden.sql, &golden.output, output);
+            let golden_rows = normalize::parse_output_rows(&golden.output);
+            let output_ok = normalize::rows_match(&golden.sql, &golden_rows, rows);
             let schema_ok = schema == &golden.schema;
 
             if output_ok && schema_ok {
@@ -197,7 +202,8 @@ pub fn classify(golden: &GoldenBlock, actual: &Outcome) -> Verdict {
                 };
             }
             // Output differs — try to attribute the divergence.
-            let bucket = attribute_value_diff(&golden.sql, &golden.output, output);
+            let bucket =
+                attribute_value_diff(&golden.sql, &golden_rows, rows, &golden.output, output);
             Verdict {
                 bucket,
                 detail: diff_summary(&golden.output, output),
@@ -207,11 +213,17 @@ pub fn classify(golden: &GoldenBlock, actual: &Outcome) -> Verdict {
 }
 
 /// When two same-shape outputs disagree, guess *why* from the values themselves.
-fn attribute_value_diff(sql: &str, golden: &str, actual: &str) -> Bucket {
+fn attribute_value_diff(
+    sql: &str,
+    golden_rows: &[String],
+    actual_rows: &[String],
+    golden: &str,
+    actual: &str,
+) -> Bucket {
     // Same multiset but different order on an ordered query → ordering.
     if normalize::is_order_sensitive(sql) {
-        let mut g: Vec<&str> = golden.lines().collect();
-        let mut a: Vec<&str> = actual.lines().collect();
+        let mut g = golden_rows.to_vec();
+        let mut a = actual_rows.to_vec();
         g.sort();
         a.sort();
         if g == a {
@@ -319,13 +331,18 @@ mod tests {
         }
     }
 
+    fn ok(schema: &str, output: &str) -> Outcome {
+        Outcome::Ok {
+            schema: schema.into(),
+            output: output.into(),
+            rows: normalize::parse_output_rows(output),
+        }
+    }
+
     #[test]
     fn exact_match_is_pass() {
         let g = golden("SELECT 1", "struct<1:int>", "1");
-        let a = Outcome::Ok {
-            schema: "struct<1:int>".into(),
-            output: "1".into(),
-        };
+        let a = ok("struct<1:int>", "1");
         assert_eq!(classify(&g, &a).bucket, Bucket::Pass);
     }
 
@@ -345,20 +362,14 @@ mod tests {
     #[test]
     fn value_mismatch_is_correctness() {
         let g = golden("SELECT x FROM t", "struct<x:int>", "5");
-        let a = Outcome::Ok {
-            schema: "struct<x:int>".into(),
-            output: "6".into(),
-        };
+        let a = ok("struct<x:int>", "6");
         assert_eq!(classify(&g, &a).bucket, Bucket::Correctness);
     }
 
     #[test]
     fn schema_name_divergence_is_schema_only() {
         let g = golden("SELECT count(a) FROM t", "struct<count(a):bigint>", "3");
-        let a = Outcome::Ok {
-            schema: "struct<count(t.a):bigint>".into(),
-            output: "3".into(),
-        };
+        let a = ok("struct<count(t.a):bigint>", "3");
         assert_eq!(classify(&g, &a).bucket, Bucket::SchemaOnly);
     }
 
@@ -413,10 +424,26 @@ mod tests {
             "struct<>",
             "org.apache.spark.sql.AnalysisException\n{}",
         );
-        let a = Outcome::Ok {
-            schema: "struct<a:int>".into(),
-            output: "1".into(),
-        };
+        let a = ok("struct<a:int>", "1");
         assert_eq!(classify(&g, &a).bucket, Bucket::MissingError);
+    }
+
+    #[test]
+    fn empty_cell_is_not_classified_as_zero_rows() {
+        let g = golden("SELECT X''", "struct<X'':binary>", "");
+        let a = Outcome::Ok {
+            schema: "struct<X'':binary>".into(),
+            output: String::new(),
+            rows: vec![String::new()],
+        };
+        assert_ne!(classify(&g, &a).bucket, Bucket::Pass);
+    }
+
+    #[test]
+    fn nested_order_by_compares_as_a_row_bag() {
+        let sql = "SELECT x FROM t WHERE x IN (SELECT y FROM u ORDER BY y)";
+        let g = golden(sql, "struct<x:int>", "1\n2");
+        let a = ok("struct<x:int>", "2\n1");
+        assert_eq!(classify(&g, &a).bucket, Bucket::Pass);
     }
 }

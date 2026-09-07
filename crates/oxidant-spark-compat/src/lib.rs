@@ -173,8 +173,10 @@ pub enum Outcome {
     Ok {
         /// Spark-style schema, e.g. `struct<count(a):bigint>`.
         schema: String,
-        /// Output rendered the Spark way: tab-joined cells per row, `\n`-joined, normalized.
+        /// Output rendered the Spark way: tab-joined cells per row, `\\n`-joined. Diagnostic only.
         output: String,
+        /// Individual rows before joining. Zero rows and one empty cell stay distinct.
+        rows: Vec<String>,
     },
     /// Query failed inside oxidant (parse / plan / execute). We keep the message for triage.
     Err {

@@ -97,6 +97,7 @@ async fn replay(engine: &Engine, b: &GoldenBlock) -> Outcome {
                 Outcome::Ok {
                     schema: f.schema,
                     output,
+                    rows: f.rows,
                 }
             } else if is_read_only(&b.sql) {
                 // Zero-row read: recover the schema without side effects.
@@ -106,6 +107,7 @@ async fn replay(engine: &Engine, b: &GoldenBlock) -> Outcome {
                         Outcome::Ok {
                             schema: f.schema,
                             output: String::new(),
+                            rows: f.rows,
                         }
                     }
                     Err(e) => Outcome::Err {
@@ -117,6 +119,7 @@ async fn replay(engine: &Engine, b: &GoldenBlock) -> Outcome {
                 Outcome::Ok {
                     schema: "struct<>".into(),
                     output: String::new(),
+                    rows: Vec::new(),
                 }
             }
         }
