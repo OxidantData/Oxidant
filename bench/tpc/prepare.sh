@@ -51,21 +51,21 @@ fi
 
 "$ROOT/bench/tpc/generate.sh"
 
-if { [[ "$SUITE" == "tpch" ]] && compgen -G "$PARQUET/lineitem/part-*.parquet" >/dev/null; } \
-  || { [[ "$SUITE" == "tpcds" ]] && compgen -G "$PARQUET/store_sales/part-*.parquet" >/dev/null; }; then
-  echo "[prepare] parquet already at $PARQUET — skipping convert"
-else
-  if ! python3 -c 'import pyarrow' 2>/dev/null; then
-    VENV="${DATA_ROOT}/.tpc-venv"
-    if [[ ! -x "$VENV/bin/python" ]]; then
-      echo "[prepare] creating $VENV with pyarrow ..."
-      python3 -m venv "$VENV"
-      "$VENV/bin/pip" install -q 'pyarrow>=14'
-    fi
-    PYTHON="$VENV/bin/python"
-  else
-    PYTHON=python3
+if ! python3 -c 'import pyarrow' 2>/dev/null; then
+  VENV="${DATA_ROOT}/.tpc-venv"
+  if [[ ! -x "$VENV/bin/python" ]]; then
+    echo "[prepare] creating $VENV with pyarrow ..."
+    python3 -m venv "$VENV"
+    "$VENV/bin/pip" install -q 'pyarrow>=14'
   fi
+  PYTHON="$VENV/bin/python"
+else
+  PYTHON=python3
+fi
+
+if "$PYTHON" "$ROOT/bench/tpc/tbl_to_parquet.py" --suite "$SUITE" --raw "$OUT/raw" --out "$PARQUET" --check-complete; then
+  echo "[prepare] parquet complete at $PARQUET — skipping convert"
+else
   "$PYTHON" "$ROOT/bench/tpc/tbl_to_parquet.py" --suite "$SUITE" --raw "$OUT/raw" --out "$PARQUET"
 fi
 
