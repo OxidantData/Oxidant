@@ -1716,6 +1716,17 @@ impl PostgresCdcSource {
     /// Record a relation's shape, and report the first time it stops matching the schema this
     /// source emits.
     fn remember(&mut self, relation: Relation) {
+        // Drift is per table. The Arrow schema is the first table's columns, so comparing
+        // every Relation to it names `tms.loads` with columns from sibling tables
+        // (OxidantData/Oxidant#150). A publication sibling this stream does not replicate
+        // is not this connector's schema_change.
+        let Some(table) = self
+            .tables
+            .iter()
+            .find(|t| t.qualified() == relation.qualified())
+        else {
+            return;
+        };
         let emitted: Vec<&str> = self
             .schema
             .fields()
@@ -1729,17 +1740,12 @@ impl PostgresCdcSource {
             .map(|column| emitted.iter().position(|name| *name == column.name))
             .collect();
 
-        // A column `exclude_columns:` names is absent from the emitted schema *by construction*,
-        // so it does not map — and reporting it as "added" fired a `schema_change` alarm naming a
-        // column the operator deliberately kept out, on every run, on a correctly configured
-        // pipeline. Restarting, as the alarm instructs, reproduces it. That trains people to
-        // ignore exactly the alert a real `ADD COLUMN` needs them to read.
+        let expected: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
         let added: Vec<&str> = relation
             .columns
             .iter()
-            .zip(&projection)
-            .filter(|(_, mapped)| mapped.is_none())
-            .map(|(column, _)| column.name.as_str())
+            .filter(|column| !expected.iter().any(|name| *name == column.name))
+            .map(|column| column.name.as_str())
             .filter(|name| {
                 !self
                     .options
@@ -1747,7 +1753,7 @@ impl PostgresCdcSource {
                     .contains(&name.to_ascii_lowercase())
             })
             .collect();
-        let dropped: Vec<&str> = emitted
+        let dropped: Vec<&str> = expected
             .iter()
             .filter(|name| !relation.columns.iter().any(|c| c.name == **name))
             .copied()
@@ -4447,6 +4453,103 @@ mod tests {
         assert!(
             !log.contains("schema_change"),
             "nothing changed on the publisher: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sibling_table_in_the_same_connector_does_not_cross_wire_columns() {
+        let engine = Engine::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let loads = TableSchema {
+            schema: "tms".into(),
+            table: "loads".into(),
+            columns: vec![
+                ColumnSchema {
+                    name: "load_id".into(),
+                    type_oid: oids::INT8,
+                    type_modifier: -1,
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    warning: None,
+                },
+                ColumnSchema {
+                    name: "status".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    warning: None,
+                },
+            ],
+            keys: vec!["load_id".into()],
+            replica_identity: 'd',
+        };
+        let stops = TableSchema {
+            schema: "tms".into(),
+            table: "stops".into(),
+            columns: vec![
+                ColumnSchema {
+                    name: "stop_id".into(),
+                    type_oid: oids::INT8,
+                    type_modifier: -1,
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    warning: None,
+                },
+                ColumnSchema {
+                    name: "city".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    warning: None,
+                },
+            ],
+            keys: vec!["stop_id".into()],
+            replica_identity: 'd',
+        };
+        let stream = vec![
+            xlog(
+                0x100,
+                relation_msg(
+                    RELATION_OID,
+                    "tms",
+                    "loads",
+                    &[(true, "load_id", oids::INT8), (false, "status", 25)],
+                ),
+            ),
+            xlog(
+                0x108,
+                relation_msg(
+                    16386,
+                    "tms",
+                    "stops",
+                    &[(true, "stop_id", oids::INT8), (false, "city", 25)],
+                ),
+            ),
+            xlog(0x110, begin_msg(0x200, COMMIT_TIME)),
+            xlog(
+                0x120,
+                change_msg(b'I', RELATION_OID, b'N', &[Some("1"), Some("dispatched")]),
+            ),
+            xlog(0x150, commit_msg(0x200, 0x200, COMMIT_TIME)),
+        ];
+        let wire = std::sync::Arc::new(tokio::sync::Mutex::new(FakeWire::new(stream)));
+        wire.lock().await.slot_existed = true;
+        let mut options = options();
+        options.tables = vec!["tms.loads".into(), "tms.stops".into()];
+        options.name = "logistics".into();
+        let mut source = PostgresCdcSource::with_wire(
+            options,
+            vec![loads, stops],
+            Box::new(Spy(wire.clone())),
+            ConnectorLog::new(Some(dir.path()), "logistics"),
+        );
+        let _batches = stream_once(&mut source, &engine).await;
+        let log = std::fs::read_to_string(dir.path().join("logistics.jsonl")).unwrap();
+        assert!(
+            !log.contains("schema_change"),
+            "matching per-table columns must not look like a shape change: {log}"
         );
     }
 
