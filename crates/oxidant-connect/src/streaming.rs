@@ -107,7 +107,7 @@ impl OxidantService {
                         return Err(Status::unimplemented(format!(
                             "this streaming query reads {n} streaming sources; Oxidant runs one \
                              source per query (stream-stream joins are not implemented)"
-                        )))
+                        )));
                     }
                 }
             }
@@ -251,11 +251,21 @@ impl OxidantService {
                     },
                 ))
             }
-            Some(sc::streaming_query_command::Command::AwaitTermination(_)) => Some(
-                sc::streaming_query_command_result::ResultType::AwaitTermination(
-                    sc::streaming_query_command_result::AwaitTerminationResult { terminated: true },
-                ),
-            ),
+            Some(sc::streaming_query_command::Command::AwaitTermination(cmd)) => {
+                let timeout = cmd
+                    .timeout_ms
+                    .and_then(|ms| u64::try_from(ms).ok().map(std::time::Duration::from_millis));
+                let terminated = self
+                    .streaming
+                    .await_termination(&qid.id, timeout)
+                    .await
+                    .map_err(crate::err_to_status)?;
+                Some(
+                    sc::streaming_query_command_result::ResultType::AwaitTermination(
+                        sc::streaming_query_command_result::AwaitTerminationResult { terminated },
+                    ),
+                )
+            }
             _ => None,
         };
         Ok(sc::StreamingQueryCommandResult {
