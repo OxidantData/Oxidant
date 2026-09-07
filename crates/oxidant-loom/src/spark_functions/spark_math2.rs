@@ -15,9 +15,10 @@
 //! **Lowered to native expressions** — `mod` and `pmod`. Both are registered as UDFs whose
 //! [`ScalarUDFImpl::simplify`] rewrites them into arithmetic the optimizer understands, so they
 //! pick up DataFusion's own numeric coercion and constant folding instead of an opaque call.
-//! `mod(a, b)` is `a % b` (remainder, taking the sign of the dividend). `pmod(a, b)` is the
-//! *positive* modulo `((a % b) + abs(b)) % b`, which is Spark's rule in both signs:
-//! `pmod(-7, 3)` = 2 and `pmod(-7, -3)` = 2.
+//! `mod(a, b)` is `a % b` (remainder, taking the sign of the dividend). `pmod(a, b)` follows
+//! Spark 4.0.0 `Pmod`: remainder `r = a % b`, then `r` if `r >= 0` else `(r + b) % b`. That
+//! uses the signed divisor, so `pmod(-7, 3)` = 2 and `pmod(-7, -3)` = -1. The previous
+//! always-non-negative rewrite `((a % b) + abs(b)) % b` disagreed with Spark on the last case.
 //!
 //! **`width_bucket(value, min, max, numBuckets)`** returns the 1-based bucket of an equi-width
 //! histogram over `[min, max)`, as `bigint`, with Spark's out-of-range conventions: `0` below the
@@ -35,6 +36,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, plan_err, DataFusionError, Result, ScalarValue};
+use datafusion::logical_expr::expr::{Case, Cast};
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::type_coercion::binary::binary_numeric_coercion;
 use datafusion::logical_expr::{
@@ -385,45 +387,74 @@ impl ScalarUDFImpl for Modulo {
         // `1.0 % 0.0` raised while `mod(1.0, 0.0)` returned null, and `pmod` on decimals leaked a
         // raw Arrow "Divide by zero error". Apply the same guard here, on the same types the
         // planner guards, so the function spellings and the operator agree.
-        let guard = |e: Expr| -> Expr {
-            let ty = info.get_data_type(&e).unwrap_or(DataType::Null);
-            if matches!(
-                ty,
-                DataType::Decimal128(_, _)
-                    | DataType::Decimal256(_, _)
-                    | DataType::Float16
-                    | DataType::Float32
-                    | DataType::Float64
-            ) {
-                Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                    super::spark_nonzero_divisor::udf(),
-                    vec![e],
-                ))
-            } else {
-                // Integral modulo by zero already raises DIVIDE_BY_ZERO in DataFusion, exactly as
-                // Spark does, so the guard would be redundant.
-                e
-            }
+        //
+        // Do not default a failed type lookup to Null: that would skip the guard and let a
+        // float/decimal zero divisor through as a quiet null.
+        let b_ty = info.get_data_type(&b)?;
+        let b = if matches!(
+            b_ty,
+            DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+        ) {
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                super::spark_nonzero_divisor::udf(),
+                vec![b],
+            ))
+        } else {
+            // Integral modulo by zero already raises DIVIDE_BY_ZERO in DataFusion, exactly as
+            // Spark does, so the guard would be redundant.
+            b
         };
-        let b = guard(b);
         let rem = |l: Expr, r: Expr| {
             Expr::BinaryExpr(BinaryExpr::new(Box::new(l), Operator::Modulo, Box::new(r)))
         };
         if !self.positive {
             return Ok(ExprSimplifyResult::Simplified(rem(a, b)));
         }
-        // `((a % b) + abs(b)) % b` is Spark's positive modulo in all four sign combinations:
-        // pmod(7, 3) = 1, pmod(-7, 3) = 2, pmod(7, -3) = 1, pmod(-7, -3) = 2.
-        let abs_b = Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-            datafusion::functions::math::abs(),
-            vec![b.clone()],
+        // Spark `Pmod`: r = a % b; if r < 0 then (r + b) % b else r.
+        // apache/spark@fa33ea000a0bda9e5a3fa1af98e8e85b8cc5e4d4 arithmetic.scala.
+        // Adding abs(b) instead of the signed divisor made pmod(-7, -3) return 2.
+        //
+        // JVM promotes byte/short `%`/`+` to int, then Pmod narrows. DataFusion
+        // Int8/Int16 `+` wraps, so widen only that adjustment to Int32.
+        let rem_ab = rem(a, b.clone());
+        let ty = info.get_data_type(&rem_ab)?;
+        let zero = ScalarValue::new_zero(&ty)?;
+        let rem_negative = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(rem_ab.clone()),
+            Operator::Lt,
+            Box::new(Expr::Literal(zero, None)),
         ));
-        let shifted = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(rem(a, b.clone())),
-            Operator::Plus,
-            Box::new(abs_b),
-        ));
-        Ok(ExprSimplifyResult::Simplified(rem(shifted, b)))
+        let adjusted = if matches!(ty, DataType::Int8 | DataType::Int16) {
+            let to_int = |e: Expr| Expr::Cast(Cast::new(Box::new(e), DataType::Int32));
+            let wide = rem(
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(to_int(rem_ab.clone())),
+                    Operator::Plus,
+                    Box::new(to_int(b.clone())),
+                )),
+                to_int(b),
+            );
+            Expr::Cast(Cast::new(Box::new(wide), ty))
+        } else {
+            rem(
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(rem_ab.clone()),
+                    Operator::Plus,
+                    Box::new(b.clone()),
+                )),
+                b,
+            )
+        };
+        let case = Case::new(
+            None,
+            vec![(Box::new(rem_negative), Box::new(adjusted))],
+            Some(Box::new(rem_ab)),
+        );
+        Ok(ExprSimplifyResult::Simplified(Expr::Case(case)))
     }
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         exec_err!(
@@ -603,21 +634,184 @@ mod tests {
         }
     }
 
-    /// `mod` takes the sign of the dividend; `pmod` never returns a negative.
+    /// Signed integer from a one-row, one-column query. Substring matches on
+    /// pretty-printed tables cannot tell `2` from `-2` or pin the type.
+    async fn signed_int(q: &str) -> (DataType, i64) {
+        let engine = crate::Engine::new();
+        let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(batches.len(), 1, "{q}: expected one batch");
+        let col = batches[0].column(0);
+        assert_eq!(col.len(), 1, "{q}: expected one row");
+        assert_eq!(col.null_count(), 0, "{q}: unexpected null");
+        match col.data_type() {
+            DataType::Int8 => {
+                let arr = col.as_any().downcast_ref::<Int8Array>().expect("Int8Array");
+                (DataType::Int8, i64::from(arr.value(0)))
+            }
+            DataType::Int16 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .expect("Int16Array");
+                (DataType::Int16, i64::from(arr.value(0)))
+            }
+            DataType::Int32 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32Array");
+                (DataType::Int32, i64::from(arr.value(0)))
+            }
+            DataType::Int64 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64Array");
+                (DataType::Int64, arr.value(0))
+            }
+            other => panic!("{q}: expected integer, got {other:?}"),
+        }
+    }
+
+    /// `mod` takes the sign of the dividend. Spark's `pmod` adjusts a negative
+    /// remainder by the *signed* divisor, so `pmod(-7, -3)` is `-1` (Spark 4.0.0
+    /// `Pmod`, apache/spark@fa33ea000a0bda9e5a3fa1af98e8e85b8cc5e4d4). The
+    /// previous always-non-negative rewrite produced `2` for that input.
     #[tokio::test]
     async fn mod_and_pmod_signs_match_spark() {
         for (q, want) in [
-            ("SELECT mod(7, 3) AS x", "1"),
-            ("SELECT mod(-7, 3) AS x", "-1"),
-            ("SELECT mod(7, -3) AS x", "1"),
-            ("SELECT pmod(7, 3) AS x", "1"),
-            ("SELECT pmod(-7, 3) AS x", "2"),
-            ("SELECT pmod(7, -3) AS x", "1"),
-            ("SELECT pmod(-7, -3) AS x", "2"),
+            ("SELECT mod(7, 3) AS x", 1),
+            ("SELECT mod(-7, 3) AS x", -1),
+            ("SELECT mod(7, -3) AS x", 1),
+            ("SELECT pmod(7, 3) AS x", 1),
+            ("SELECT pmod(-7, 3) AS x", 2),
+            ("SELECT pmod(7, -3) AS x", 1),
+            ("SELECT pmod(-7, -3) AS x", -1),
         ] {
-            let got = row(q).await;
-            assert!(got.contains(want), "{q} -> want {want}, got:\n{got}");
+            let (ty, got) = signed_int(q).await;
+            assert!(
+                matches!(ty, DataType::Int32 | DataType::Int64),
+                "{q} type {ty:?}"
+            );
+            assert_eq!(got, want, "{q}");
         }
+
+        // Column path: VALUES so constant folding cannot hide a kernel mismatch.
+        let engine = crate::Engine::new();
+        let q = "SELECT a, b, pmod(a, b) AS actual \
+                 FROM (VALUES (7, 3), (-7, 3), (7, -3), (-7, -3)) AS v(a, b) \
+                 ORDER BY a, b";
+        let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        let batch = &batches[0];
+        fn col_i64(batch: &datafusion::arrow::record_batch::RecordBatch, i: usize) -> Vec<i64> {
+            let col = batch.column(i);
+            if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                return (0..arr.len()).map(|j| i64::from(arr.value(j))).collect();
+            }
+            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                return (0..arr.len()).map(|j| arr.value(j)).collect();
+            }
+            panic!("column {i} is {:?}, not Int32/Int64", col.data_type());
+        }
+        let rows: Vec<(i64, i64, i64)> = col_i64(batch, 0)
+            .into_iter()
+            .zip(col_i64(batch, 1))
+            .zip(col_i64(batch, 2))
+            .map(|((a, b), p)| (a, b, p))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(-7, -3, -1), (-7, 3, 2), (7, -3, 1), (7, 3, 1)],
+            "{q}"
+        );
+    }
+
+    /// Spark evaluates `r + b` for tinyint/smallint pmod in `int`, then narrows.
+    /// DataFusion `Int8`/`Int16` `+` wraps, so `pmod(-1tinyint, -128tinyint)`
+    /// became 127 instead of Spark's -1.
+    #[tokio::test]
+    async fn pmod_tinyint_smallint_adjust_in_int_like_spark() {
+        for (q, want_ty, want) in [
+            (
+                "SELECT pmod(CAST(-1 AS TINYINT), CAST(-128 AS TINYINT)) AS x",
+                DataType::Int8,
+                -1i64,
+            ),
+            (
+                "SELECT pmod(CAST(-64 AS TINYINT), CAST(-65 AS TINYINT)) AS x",
+                DataType::Int8,
+                -64,
+            ),
+            (
+                "SELECT pmod(CAST(-50 AS TINYINT), CAST(-100 AS TINYINT)) AS x",
+                DataType::Int8,
+                -50,
+            ),
+            (
+                "SELECT pmod(CAST(-16384 AS SMALLINT), CAST(-16385 AS SMALLINT)) AS x",
+                DataType::Int16,
+                -16384,
+            ),
+            (
+                "SELECT pmod(CAST(-1 AS SMALLINT), CAST(-32768 AS SMALLINT)) AS x",
+                DataType::Int16,
+                -1,
+            ),
+            // Int32 wrap matches Spark; do not widen this path.
+            (
+                "SELECT pmod(-1, CAST(-2147483648 AS INT)) AS x",
+                DataType::Int32,
+                2147483647,
+            ),
+            (
+                "SELECT pmod(CAST(2 AS INT), CAST(-2147483648 AS INT)) AS x",
+                DataType::Int32,
+                2,
+            ),
+            (
+                "SELECT pmod(CAST(-2147483648 AS INT), CAST(-1 AS INT)) AS x",
+                DataType::Int32,
+                0,
+            ),
+        ] {
+            let (ty, got) = signed_int(q).await;
+            assert_eq!(ty, want_ty, "{q} type");
+            assert_eq!(got, want, "{q}");
+        }
+    }
+
+    /// Values match Spark; result scale/precision still follow DataFusion coercion
+    /// (`decimal(10,0)` here vs Spark `decimal(3,0)`).
+    #[tokio::test]
+    async fn pmod_decimal_value_matches_spark() {
+        let engine = crate::Engine::new();
+        let q = "SELECT pmod(CAST(-7 AS DECIMAL(3,0)), 3) AS x";
+        let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        let col = batches[0].column(0);
+        assert_eq!(col.null_count(), 0, "{q}");
+        let got = format!("{col:?}");
+        assert!(got.contains("2"), "{q}: expected value 2, got {got}");
+    }
+
+    /// Current-behavior probe: IEEE `<` treats -0.0 as less than +0.0, so the
+    /// CASE rewrite turns Spark's -0.0 remainder into +0.0. Not a regression
+    /// from the abs rewrite; not claimed as Spark parity.
+    #[tokio::test]
+    async fn pmod_signed_zero_is_a_known_spark_divergence() {
+        let engine = crate::Engine::new();
+        let q = "SELECT pmod(CAST(-6.0 AS DOUBLE), CAST(3.0 AS DOUBLE)) AS x";
+        let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        let col = batches[0].column(0);
+        let arr = col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap_or_else(|| panic!("{q}: expected Float64, got {:?}", col.data_type()));
+        let v = arr.value(0);
+        assert_eq!(v, 0.0, "{q}");
+        assert!(
+            !v.is_sign_negative(),
+            "{q}: probe expected +0.0 (Spark returns -0.0)"
+        );
     }
 
     #[tokio::test]
