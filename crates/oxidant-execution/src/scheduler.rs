@@ -213,6 +213,19 @@ async fn run_stage_inner_impl(
         }
     }
 
+    // Leaf tickets evaluate SQL against the worker's local engine. Relocating to an
+    // alternate concatenates a different worker's rows as if they were this partition
+    // (OxidantData/Oxidant#182). Same-endpoint retries above still run; refuse a
+    // different worker until portable split identity exists.
+    if ticket.upstream_stage_ids.is_empty() {
+        return Err(last_err.unwrap_or_else(|| {
+            Error::Execution(
+                "leaf stage input is worker-local; refusing relocation to an alternate worker"
+                    .into(),
+            )
+        }));
+    }
+
     // Try alternate healthy workers not yet attempted.
     for alt in membership.endpoints() {
         if tried.contains(&alt) {
