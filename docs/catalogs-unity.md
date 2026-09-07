@@ -201,21 +201,13 @@ $ curl -s http://localhost:18080/api/2.1/unity-catalog/iceberg/v1/catalogs/unity
 
 Reaching plain Delta tables would require a native Unity Catalog API client. There is none.
 
-### `current_catalog()` does not report the default catalog
+### `current_catalog()` / `current_database()` follow the session
 
-```
->>> SELECT current_catalog() AS c, current_database() AS d
-+---------------+---------+
-|             c |       d |
-+---------------+---------+
-| spark_catalog | default |
-+---------------+---------+
-```
-
-Name *resolution* honors the default catalog (2-part and bare names resolve into `uc`), but the
-`current_catalog()` / `current_database()` SQL functions are not wired to the session's
-catalog pointers and still report the builtin. `SHOW`/`DESCRIBE` and `USE` do read the session
-state; only these two functions are wrong.
+`SELECT current_catalog()` and `current_database()` / `current_schema()` read the
+same per-session catalog/namespace cell that `USE`, `setCurrentCatalog`, and
+unqualified name resolution use. Two Connect sessions on one shared engine keep
+independent values; the functions are not rewritten in the shared DataFusion
+registry.
 
 ### Not covered
 

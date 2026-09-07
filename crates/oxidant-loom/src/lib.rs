@@ -2187,6 +2187,31 @@ tokio::task_local! {
     /// Task-local — concurrent stage tasks on one worker keep independent selections
     /// (same idiom as `shard::with_replicated_tables`).
     static JOIN_STRATEGY_FLIP: ();
+    /// Per-execution session catalog/namespace for `current_catalog()` /
+    /// `current_database()` / `current_schema()`. The DataFusion SessionContext is
+    /// shared across Connect sessions; these SQL functions must not be rewritten in
+    /// that shared registry (OxidantData/Oxidant#126).
+    static SESSION_NAMES: (String, Vec<String>);
+}
+
+/// Run `fut` with this handle's current catalog/namespace visible to Spark name UDFs.
+pub(crate) async fn with_session_names<F, T>(catalog: String, namespace: Vec<String>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    SESSION_NAMES.scope((catalog, namespace), fut).await
+}
+
+/// `current_catalog` / `current_database` / `current_schema` as of this execution.
+/// `None` when invoked outside [`with_session_names`] (falls back to Spark defaults).
+pub(crate) fn session_current_name(which: &str) -> Option<String> {
+    SESSION_NAMES
+        .try_with(|(catalog, namespace)| match which {
+            "current_catalog" => catalog.clone(),
+            "current_database" | "current_schema" => namespace.last().cloned().unwrap_or_default(),
+            _ => String::new(),
+        })
+        .ok()
 }
 
 /// Whether the current task is a KAN-53 stall-retry attempt (see [`JOIN_STRATEGY_FLIP`]).
@@ -3700,7 +3725,8 @@ impl Engine {
             return Ok(vec![]);
         }
         let df = self.plan_spark(query).await?;
-        let batches = self.collect_join_guarded(df).await?;
+        let (cat, ns) = self.current_catalog_and_namespace();
+        let batches = with_session_names(cat, ns, self.collect_join_guarded(df)).await?;
         // The view planned/created successfully — update the temp-view registry. A new temporary
         // view is recorded; a persistent view with the same name removes any prior temp entry
         // (DataFusion keeps a single namespace, so the persistent definition now shadows it).
@@ -5206,9 +5232,16 @@ impl Engine {
             .create_physical_plan()
             .await
             .map_err(|e| Error::Execution(e.to_string()))?;
-        let batches = datafusion::physical_plan::collect(plan.clone(), self.ctx.task_ctx())
+        let batches = {
+            let (cat, ns) = self.current_catalog_and_namespace();
+            with_session_names(
+                cat,
+                ns,
+                datafusion::physical_plan::collect(plan.clone(), self.ctx.task_ctx()),
+            )
             .await
-            .map_err(|e| Error::Execution(e.to_string()))?;
+            .map_err(|e| Error::Execution(e.to_string()))?
+        };
         let output_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let stats = QueryStats {
             duration_ms: start.elapsed().as_millis() as u64,
