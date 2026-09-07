@@ -156,6 +156,8 @@ pub struct FileSource {
     /// True when `schema` came from `readStream.schema(...)` and must not be replaced by
     /// per-file inference.
     schema_pinned: bool,
+    /// `readStream.option(...)` — CSV `header`/`delimiter` and similar.
+    options: BTreeMap<String, String>,
 }
 
 impl FileSource {
@@ -164,6 +166,15 @@ impl FileSource {
     }
 
     pub fn with_schema(path: impl AsRef<Path>, format: &str, schema: Option<SchemaRef>) -> Self {
+        Self::with_options(path, format, schema, BTreeMap::new())
+    }
+
+    pub fn with_options(
+        path: impl AsRef<Path>,
+        format: &str,
+        schema: Option<SchemaRef>,
+        options: BTreeMap<String, String>,
+    ) -> Self {
         let pinned = schema
             .as_ref()
             .map(|s| !s.fields().is_empty())
@@ -176,6 +187,7 @@ impl FileSource {
                 std::sync::Arc::new(oxidant_loom::arrow::datatypes::Schema::empty())
             }),
             schema_pinned: pinned,
+            options,
         }
     }
 
@@ -186,7 +198,11 @@ impl FileSource {
         let mut files: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.is_file() && !self.seen.contains(&p.to_string_lossy().to_string()))
+            .filter(|p| {
+                p.is_file()
+                    && !self.seen.contains(&p.to_string_lossy().to_string())
+                    && is_stream_data_file(p, &self.format)
+            })
             .collect();
         // Deterministic order so a restart replays files the same way it first read them.
         files.sort();
@@ -254,9 +270,11 @@ impl Source for FileSource {
                     ctx.read_json(path, opts).await
                 }
                 "csv" => {
-                    let mut opts = CsvReadOptions::default();
+                    let mut opts = CsvReadOptions::default()
+                        .has_header(csv_has_header(&self.options))
+                        .delimiter(csv_delimiter(&self.options));
                     if let Some(s) = pinned.as_ref() {
-                        opts.schema = Some(s.as_ref());
+                        opts = opts.schema(s.as_ref());
                     }
                     ctx.read_csv(path, opts).await
                 }
@@ -341,6 +359,43 @@ fn project_to_schema(batch: RecordBatch, want: &SchemaRef) -> oxidant_common::Re
     }
     RecordBatch::try_new(want.clone(), cols)
         .map_err(|e| oxidant_common::Error::Execution(format!("project stream schema: {e}")))
+}
+
+fn csv_has_header(options: &BTreeMap<String, String>) -> bool {
+    options
+        .get("header")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn csv_delimiter(options: &BTreeMap<String, String>) -> u8 {
+    options
+        .get("delimiter")
+        .or_else(|| options.get("sep"))
+        .and_then(|s| s.as_bytes().first().copied())
+        .unwrap_or(b',')
+}
+
+fn is_stream_data_file(path: &Path, format: &str) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    if name.starts_with('.') || name.starts_with('_') || name.ends_with(".crc") {
+        return false;
+    }
+    match format {
+        "json" => {
+            let lower = name.to_ascii_lowercase();
+            lower.ends_with(".json") || lower.ends_with(".jsonl")
+        }
+        "csv" => {
+            let lower = name.to_ascii_lowercase();
+            lower.ends_with(".csv") || lower.ends_with(".txt")
+        }
+        "parquet" => name.to_ascii_lowercase().ends_with(".parquet"),
+        _ => true,
+    }
 }
 
 /// Rate source for tests: emits N rows per batch.
@@ -628,6 +683,46 @@ mod tests {
         assert!(
             msg.contains("v") || msg.contains("type") || msg.contains("schema"),
             "{msg}"
+        );
+    }
+
+    /// Spark CSV streaming defaults `header=false`. A file whose first line is data
+    /// (`one,1`) must yield that row, not treat it as a header and return nothing.
+    #[tokio::test]
+    async fn csv_declared_schema_reads_first_line_as_data() {
+        use oxidant_loom::arrow::array::{Int64Array, StringArray};
+        use oxidant_loom::arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.csv"), "one,1\n").unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let engine = Engine::new();
+        let mut src = FileSource::with_schema(dir.path(), "csv", Some(schema));
+        let range = src.plan_batch(&engine).await.unwrap();
+        let batches = src.poll_range(&engine, &range).await.unwrap();
+        assert!(!batches.is_empty(), "csv first line is data, not a header");
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "one"
+        );
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
         );
     }
 }
