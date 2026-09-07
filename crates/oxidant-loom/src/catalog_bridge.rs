@@ -2198,7 +2198,8 @@ async fn resolve_lakehouse_provider(
             .map(|(url, file)| (url.clone(), file.size))
             .collect(),
         Some(table_name),
-    );
+    )
+    .map_err(oxidant_to_df)?;
     let selected_locations = selected
         .into_iter()
         .map(|(url, _)| url.as_str().to_string())

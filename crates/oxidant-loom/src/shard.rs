@@ -110,6 +110,15 @@ impl Drop for ShardEnvWriteGuard {
 
 impl ShardAssignment {
     pub fn from_env() -> Option<Self> {
+        Self::assignment_from_env().ok().flatten()
+    }
+
+    /// Process env assignment for file listing.
+    ///
+    /// `Ok(None)` is intentional single-node / unsharded operation. `Ok(Some)` is a
+    /// validated shard. `Err` is configured sharding that cannot be applied: callers
+    /// must refuse the scan instead of retaining every file (OxidantData/Oxidant#184).
+    pub fn assignment_from_env() -> Result<Option<Self>> {
         // Test builds: wait out any in-flight shard-env mutation (`SHARD_ENV_GATE`).
         #[cfg(test)]
         let _gate = shard_env_read_guard();
@@ -117,29 +126,39 @@ impl ShardAssignment {
         // A task-scoped explicit assignment (in-process workers / tests) wins over the
         // process-global env, which can only name one shard per process.
         if let Ok(assignment) = SHARD_ASSIGNMENT_CONTEXT.try_with(|a| *a) {
-            return Some(assignment);
+            return Ok(Some(assignment));
         }
-        let count: usize = std::env::var("OXIDANT_WORKER_COUNT")
+        let count: usize = match std::env::var("OXIDANT_WORKER_COUNT")
             .ok()
             .and_then(|s| s.parse().ok())
-            .filter(|&n| n > 1)?;
+            .filter(|&n| n > 1)
+        {
+            Some(count) => count,
+            None => return Ok(None),
+        };
 
         let index = if let Ok(s) = std::env::var("OXIDANT_SHARD_INDEX") {
-            s.parse().ok()?
+            s.parse().map_err(|_| {
+                Error::Execution(format!(
+                    "OXIDANT_SHARD_INDEX {s:?} is not a non-negative integer; refusing unrestricted file selection"
+                ))
+            })?
         } else if let Ok(name) = std::env::var("OXIDANT_POD_NAME") {
             // StatefulSet: oxidant-<cluster>-worker-0
-            name.rsplit('-').next()?.parse().ok()?
+            match name.rsplit('-').next().and_then(|s| s.parse().ok()) {
+                Some(index) => index,
+                None => return Ok(None),
+            }
         } else {
-            return None;
+            return Ok(None);
         };
 
         if index >= count {
-            eprintln!(
-                "oxidant-loom: OXIDANT_SHARD_INDEX {index} >= OXIDANT_WORKER_COUNT {count}; ignoring shard config"
-            );
-            return None;
+            return Err(Error::Execution(format!(
+                "OXIDANT_SHARD_INDEX {index} >= OXIDANT_WORKER_COUNT {count}; refusing unrestricted file selection"
+            )));
         }
-        Some(Self { index, count })
+        Ok(Some(Self { index, count }))
     }
 }
 
@@ -432,7 +451,7 @@ pub async fn apply_file_shard(
         urls,
         file_extension,
         table_name,
-        ShardAssignment::from_env(),
+        ShardAssignment::assignment_from_env()?,
     )
     .await
 }
@@ -445,8 +464,12 @@ pub async fn apply_file_shard(
 pub fn apply_known_file_shard(
     files: Vec<(ListingTableUrl, u64)>,
     table_name: Option<&str>,
-) -> Vec<(ListingTableUrl, u64)> {
-    apply_known_file_shard_with(files, table_name, ShardAssignment::from_env())
+) -> Result<Vec<(ListingTableUrl, u64)>> {
+    Ok(apply_known_file_shard_with(
+        files,
+        table_name,
+        ShardAssignment::assignment_from_env()?,
+    ))
 }
 
 /// Same as [`apply_known_file_shard`] with an explicit assignment for tests.
@@ -484,7 +507,7 @@ pub async fn list_visible_file_shard(
         urls,
         file_extension,
         table_name,
-        ShardAssignment::from_env(),
+        ShardAssignment::assignment_from_env()?,
     )
     .await
 }
@@ -1143,11 +1166,11 @@ mod tests {
         std::env::set_var("OXIDANT_WORKER_COUNT", "2");
         std::env::set_var("OXIDANT_SHARD_INDEX", "0");
         let files = vec![(dummy_url("a.parquet"), 100), (dummy_url("b.parquet"), 60)];
-        let env_shard = apply_known_file_shard(files.clone(), Some("orders"));
+        let env_shard = apply_known_file_shard(files.clone(), Some("orders")).unwrap();
         assert_eq!(env_shard.len(), 1, "env shard 0 owns the larger file");
 
         let other = with_shard_assignment(ShardAssignment { index: 1, count: 2 }, async {
-            apply_known_file_shard(files.clone(), Some("orders"))
+            apply_known_file_shard(files.clone(), Some("orders")).unwrap()
         })
         .await;
         assert_eq!(
@@ -1162,7 +1185,9 @@ mod tests {
         );
         // Outside the scope the env answer is unchanged.
         assert_eq!(
-            apply_known_file_shard(files, Some("orders"))[0].0.as_str(),
+            apply_known_file_shard(files, Some("orders")).unwrap()[0]
+                .0
+                .as_str(),
             env_shard[0].0.as_str()
         );
         std::env::remove_var("OXIDANT_WORKER_COUNT");
@@ -1402,8 +1427,9 @@ mod tests {
         std::env::remove_var("OXIDANT_WORKER_COUNT");
     }
 
-    /// An index at/above the worker count disables sharding (with a warning) instead of
-    /// silently owning no files.
+    /// An index at/above the worker count is invalid configured sharding. `from_env`
+    /// stays `None` so Worker::new does not invent a shard, but file listing must refuse
+    /// rather than retain every file (OxidantData/Oxidant#184).
     #[test]
     fn from_env_rejects_out_of_range_index() {
         let _env = ShardEnvWriteGuard::take();
@@ -1414,6 +1440,14 @@ mod tests {
             None,
             "index == count is invalid"
         );
+        let files = vec![(dummy_url("a.parquet"), 100), (dummy_url("b.parquet"), 60)];
+        let err = apply_known_file_shard(files.clone(), Some("orders")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing unrestricted file selection"),
+            "invalid shard config must not scan every file: {msg}"
+        );
+        assert_eq!(files.len(), 2, "input list is unchanged on refusal");
         std::env::set_var("OXIDANT_SHARD_INDEX", "1");
         assert_eq!(
             ShardAssignment::from_env(),
@@ -1421,6 +1455,21 @@ mod tests {
         );
         std::env::remove_var("OXIDANT_WORKER_COUNT");
         std::env::remove_var("OXIDANT_SHARD_INDEX");
+    }
+
+    /// Count=1 (or absent) remains intentional single-node: every file is visible.
+    #[test]
+    fn single_node_still_reads_every_file() {
+        let _env = ShardEnvWriteGuard::take();
+        std::env::remove_var("OXIDANT_SHARD_INDEX");
+        std::env::remove_var("OXIDANT_POD_NAME");
+        std::env::set_var("OXIDANT_WORKER_COUNT", "1");
+        let files = vec![(dummy_url("a.parquet"), 100), (dummy_url("b.parquet"), 60)];
+        let all = apply_known_file_shard(files.clone(), Some("orders")).unwrap();
+        assert_eq!(all.len(), 2);
+        std::env::remove_var("OXIDANT_WORKER_COUNT");
+        let all = apply_known_file_shard(files, Some("dim")).unwrap();
+        assert_eq!(all.len(), 2, "replicated / unsharded still sees every file");
     }
 
     /// StatefulSet fallback: `OXIDANT_POD_NAME`'s trailing ordinal names the shard when

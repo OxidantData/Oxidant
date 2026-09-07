@@ -98,6 +98,7 @@ systemctl is-active polkit
 
 echo "[provision] installing bootstrap + systemd units"
 install -m 0755 /tmp/oxidant-files/bootstrap.sh /usr/local/lib/oxidant/bootstrap.sh
+install -m 0755 /tmp/oxidant-files/shard-membership.sh /usr/local/lib/oxidant/shard-membership.sh
 install -m 0755 /tmp/oxidant-files/shard-resolve.sh /usr/local/lib/oxidant/shard-resolve.sh
 install -m 0644 /tmp/oxidant-files/systemd/oxidant-bootstrap.service /etc/systemd/system/oxidant-bootstrap.service
 install -m 0644 /tmp/oxidant-files/systemd/oxidant-driver.service /etc/systemd/system/oxidant-driver.service
