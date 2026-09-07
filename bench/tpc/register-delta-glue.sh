@@ -2,7 +2,7 @@
 # Convert local Parquet dirs to Delta Lake on S3 and register in Glue.
 #
 # Usage:
-#   SF=10 SUITE=tpcds BUCKET=weft-artifacts-… ./bench/tpc/register-delta-glue.sh
+#   SF=10 SUITE=tpcds BUCKET=oxidant-artifacts-… ./bench/tpc/register-delta-glue.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

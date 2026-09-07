@@ -66,7 +66,7 @@ SF=100 SUITE=tpch DATA_ROOT=/data ./bench/tpc/prepare.sh
 SF=100 SUITE=tpcds DATA_ROOT=/data ./bench/tpc/prepare.sh
 
 # 3) Register on S3 + Glue (Parquet / Iceberg / Delta)
-BUCKET=weft-artifacts-$(aws sts get-caller-identity --query Account --output text)
+BUCKET=oxidant-artifacts-$(aws sts get-caller-identity --query Account --output text)
 SF=10 SUITE=tpcds BUCKET=$BUCKET ./bench/tpc/register-parquet-glue.sh
 SF=10 SUITE=tpcds BUCKET=$BUCKET SKIP_SYNC=1 ./bench/tpc/register-iceberg-glue.sh
 SF=10 SUITE=tpcds BUCKET=$BUCKET ./bench/tpc/register-delta-glue.sh

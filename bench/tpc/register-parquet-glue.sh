@@ -2,7 +2,7 @@
 # Sync local Parquet to S3 and register EXTERNAL Hive Parquet tables in Glue.
 #
 # Usage:
-#   SF=10 SUITE=tpcds BUCKET=weft-artifacts-… ./bench/tpc/register-parquet-glue.sh
+#   SF=10 SUITE=tpcds BUCKET=oxidant-artifacts-… ./bench/tpc/register-parquet-glue.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

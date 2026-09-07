@@ -2,7 +2,7 @@
 # Delete Oxidant TPC test datasets from S3 + Glue (sf1/sf10/sf100/sf300/sf1000).
 #
 # Usage:
-#   BUCKET=weft-artifacts-… ./bench/tpc/delete-tpc-datasets.sh
+#   BUCKET=oxidant-artifacts-… ./bench/tpc/delete-tpc-datasets.sh
 #   BUCKET=… DRY_RUN=1 ./bench/tpc/delete-tpc-datasets.sh
 set -euo pipefail
 
