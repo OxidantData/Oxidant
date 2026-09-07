@@ -2347,6 +2347,33 @@ struct LakehouseTableProvider {
     write_target: Option<LakehouseWriteTarget>,
 }
 
+impl LakehouseTableProvider {
+    /// Map a column index in the declared table schema onto DataFusion's physical
+    /// scan schema (`file_schema` followed by Hive partition fields).
+    ///
+    /// Partition columns live in the directory path, so they are not in the parquet
+    /// file. DataFusion therefore appends them after the file columns. Delta and
+    /// Iceberg declare those columns in table-schema order, which is often *not*
+    /// last. Passing declared indices straight into `FileScanConfig` then swaps
+    /// types and values (OxidantData/Oxidant#113).
+    fn physical_index(&self, declared_idx: usize) -> DfResult<usize> {
+        let name = self.schema.field(declared_idx).name();
+        if let Ok(i) = self.file_schema.index_of(name) {
+            return Ok(i);
+        }
+        let file_len = self.file_schema.fields().len();
+        self.partition_fields
+            .iter()
+            .position(|f| f.name() == name)
+            .map(|p| file_len + p)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "declared column `{name}` is neither a file column nor a partition column"
+                ))
+            })
+    }
+}
+
 /// Everything an `INSERT` into a lakehouse table needs, captured when the provider is built.
 ///
 /// The object store is held rather than re-resolved because `DataSink::write_all` only gets a
@@ -2467,6 +2494,14 @@ impl TableProvider for LakehouseTableProvider {
 
         let table_schema =
             TableSchema::new(self.file_schema.clone(), self.partition_fields.clone());
+        let declared_proj: Vec<usize> = match projection {
+            Some(p) => p.clone(),
+            None => (0..self.schema.fields().len()).collect(),
+        };
+        let physical_proj: Vec<usize> = declared_proj
+            .iter()
+            .map(|&i| self.physical_index(i))
+            .collect::<DfResult<Vec<_>>>()?;
         let mut plans: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>> =
             Vec::with_capacity(self.groups.len());
         for (store_url, files) in &self.groups {
@@ -2512,7 +2547,7 @@ impl TableProvider for LakehouseTableProvider {
                 .with_file_groups(file_groups)
                 .with_limit(limit)
                 .with_expr_adapter(expr_adapter)
-                .with_projection_indices(projection.cloned())?;
+                .with_projection_indices(Some(physical_proj.clone()))?;
             let builder = match statistics {
                 Some(stats) => builder.with_statistics(stats),
                 None => builder,
