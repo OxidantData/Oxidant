@@ -17,11 +17,17 @@ Example:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import re
+import sys
 import time
 from datetime import date
 from pathlib import Path
+
+_BENCH = Path(__file__).resolve().parent.parent
+if str(_BENCH) not in sys.path:
+    sys.path.insert(0, str(_BENCH))
+from qualify_sql import qualify_relations
 
 TABLES = [
     "lineitem",
@@ -36,14 +42,7 @@ TABLES = [
 
 
 def qualify(sql: str, database: str) -> str:
-    body = sql
-    for t in TABLES:
-        body = re.sub(
-            rf"(?i)(?<![\w.]){t}(?![\w.])",
-            f"glue.{database}.{t}",
-            body,
-        )
-    return body
+    return qualify_relations(sql, TABLES, "glue", database)
 
 
 def session_dead(err: str) -> bool:
@@ -113,13 +112,21 @@ def main() -> int:
     failures = 0
     for n in range(args.start, args.end + 1):
         name = f"Q{n}"
+        orig = (args.queries / f"q{n}.sql").read_text()
+        sql = qualify(orig, args.glue_database)
+        orig_sha = hashlib.sha256(orig.encode()).hexdigest()
+        xform_sha = hashlib.sha256(sql.encode()).hexdigest()
         prev = prior.get(name)
-        if prev and prev.get("hot_s") is not None and not prev.get("error"):
+        if (
+            prev
+            and prev.get("hot_s") is not None
+            and not prev.get("error")
+            and prev.get("transformed_sha256") == xform_sha
+        ):
             print(f"{name} SKIP (prior hot={prev['hot_s']:.4f}s)", flush=True)
             results.append(prev)
             continue
 
-        sql = qualify((args.queries / f"q{n}.sql").read_text(), args.glue_database)
         times: list[float | None] = []
         err: str | None = None
         for try_i in range(args.tries):
@@ -172,7 +179,14 @@ def main() -> int:
             hot = min(t for t in times[1:] if t is not None)
             print(f"{name} HOT {hot:.4f}s", flush=True)
         results.append(
-            {"query": name, "tries": times, "hot_s": hot, "error": err}
+            {
+                "query": name,
+                "tries": times,
+                "hot_s": hot,
+                "error": err,
+                "original_sha256": orig_sha,
+                "transformed_sha256": xform_sha,
+            }
         )
         # Checkpoint after every query so a kill still keeps progress.
         payload = {
