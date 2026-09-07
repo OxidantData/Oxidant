@@ -14,21 +14,11 @@ workloads no columnar engine serves well are planned as **Loom-native operators*
 (CSR adjacency, factorized/worst-case-optimal joins, semi-naive recursion), not a
 foreign evaluator. *"Oxidant starts where Sail ends."*
 
-## The decision that shapes everything
-
-The original pitch — "Bend is the execution substrate instead of Rust+DataFusion" —
-cannot pass the Phase 1 exit criterion (beat Sail's absolute ClickBench times on CPU).
-HVM2 has **no data plane** — 24-bit numerics, no hash table, no columnar/SIMD type, a
-4 GB heap, no I/O or FFI, a CUDA/4090-only GPU path — so on ClickBench (pure
-columnar/SIMD work) it loses **every** query. The full analysis, and the record of
-removing the never-wired `oxidant-hvm` scaffold, lives in
-[HVM_VERDICT.md](HVM_VERDICT.md).
-
 | # | Decision |
 |---|----------|
 | D1 | **Single vectorized backend** — Loom carries every query; no second runtime |
 | D2 | CPU core = **DataFusion now → native heavy-operator carve-out later** |
-| D3 | **HVM2 bet closed: removed, never wired** ([HVM_VERDICT.md](HVM_VERDICT.md)); irregular/graph compute → Loom-native operators as a separate program |
+| D3 | Irregular/graph compute → Loom-native operators as a separate program |
 | D4 | **Rust**; integration surface = **Spark Connect gRPC** |
 | D5 | Diverge from Sail on its weak spots: distributed maturity, multi-tenant concurrency, streaming |
 
@@ -64,13 +54,6 @@ inline hash salt** (DuckDB/DataFusion design), morsel-driven across cores, spill
 partitions independently under memory pressure, with strategy adapted to estimated
 cardinality. Per-row probe and the combine of partials alike stay in this vectorized
 kernel — there is no second backend to hand a step to.
-
-## The removed second backend (HVM2/Bend)
-
-The `oxidant-hvm` scaffold (Bend codegen → HVM2 runtime) was removed: the runtime's
-hard limits made it unusable for every query class Oxidant ships, and it was never
-wired into a query path. Verdict, in-repo evidence, and the guardrails that replace
-it: [HVM_VERDICT.md](HVM_VERDICT.md).
 
 ## Roadmap (exit criteria)
 

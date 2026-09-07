@@ -70,7 +70,6 @@ Architecture: [architecture.md](architecture.md).
 | `catalogs-glue.md` | Glue catalog end-to-end |
 | `streaming.md` | Structured Streaming: Kafka source, Delta sink, Glue live tables, Delta/Iceberg interoperability |
 | `architecture.md` | Canonical engine design |
-| `HVM_VERDICT.md` | HVM2/Bend backend verdict + removal record |
 | `CODEMAP.md` | This file |
 | `runtime-contract.md` | Contract for oxidant-platform consumers |
 | `distributed-ec2.md` | Packer AMI + CFN/ASG data plane |
