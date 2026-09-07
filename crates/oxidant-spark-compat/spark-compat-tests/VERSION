@@ -1,0 +1,4 @@
+Spark-compat golden test corpus (authored, not vendored)
+Source: Spark SQL language-manual statement categories
+Jira: epic KAN-88 (Spark SQL compatibility), story KAN-90
+Tag: spark-compat-sql-v1

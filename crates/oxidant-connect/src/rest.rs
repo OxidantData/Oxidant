@@ -1960,7 +1960,7 @@ fn validate_alias(raw: &str) -> Option<String> {
 
 /// Backtick-quote an identifier, **doubling** any backtick inside it.
 ///
-/// This is the Databricks dialect's own escape — its backquoted-identifier rule is
+/// This is the Spark dialect's own escape — its backquoted-identifier rule is
 /// `` '`' ( ~'`' | '``' )* '`' ``, with no backslash escape — so doubling is both the complete
 /// way to keep a name from breaking out of its quotes and the only way to keep it *the same
 /// name*. Stripping the backticks instead (what this did) is equally safe against injection
@@ -7652,7 +7652,7 @@ mod tests {
     /// `quote_identifier` used to *strip* backticks. That cannot break out of the quote, so it
     /// was never an injection — it just named a **different table**. The catalog rail
     /// (`catalog_rail.js`, pinned by `ui/src/lib/catalogRail.test.ts`) doubles them, which is
-    /// the Databricks dialect's own escape: its backquoted-identifier rule is
+    /// the Spark dialect's own escape: its backquoted-identifier rule is
     /// `` '`' ( ~'`' | '``' )* '`' ``, with no backslash escape. Two rules for one name is how
     /// a table previews fine from the rail and answers `500` when its columns are expanded.
     ///
@@ -7660,7 +7660,7 @@ mod tests {
     /// dialect change is caught here instead of in a warehouse.
     #[test]
     fn quoting_an_identifier_doubles_a_backtick_so_it_round_trips() {
-        use datafusion::sql::sqlparser::dialect::DatabricksDialect;
+        use datafusion::sql::sqlparser::dialect::DatabricksDialect as SparkDialect;
         use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 
         assert_eq!(quote_identifier("we`ird"), "`we``ird`");
@@ -7676,7 +7676,7 @@ mod tests {
             "Mixed Case",
         ] {
             let quoted = quote_identifier(name);
-            let tokens = Tokenizer::new(&DatabricksDialect {}, &quoted)
+            let tokens = Tokenizer::new(&SparkDialect {}, &quoted)
                 .tokenize()
                 .unwrap_or_else(|e| panic!("`{quoted}` does not tokenize: {e}"));
             // One token, and the name that comes back out is the name that went in.

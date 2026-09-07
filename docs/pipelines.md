@@ -71,7 +71,7 @@ YAML file:
   sink with no source of its own is refused when the graph is lowered rather than failing
   mid-run.
 - **Limits (deferred):** no Kafka sink.
-  `APPLY CHANGES INTO` (Databricks legacy syntax) is rejected — use `CREATE FLOW … AS AUTO CDC …` instead.
+  `APPLY CHANGES INTO` (the reference AUTO CDC implementation's legacy syntax) is rejected — use `CREATE FLOW … AS AUTO CDC …` instead.
   Interactive `spark.sql("CREATE STREAMING TABLE …")` still correctly rejects those statements;
   use `DefineSqlGraphElements` or the Python decorators instead.
 
@@ -280,16 +280,18 @@ rows at or below its own sequence. But three cases are worth stating outright:
 - **A delete leaves no tombstone.** SCD Type 1 removes the row, and nothing records *when*. A
   record for that key arriving in a **later** micro-batch is therefore treated as new, even if
   its `sequence_by` value is older than the delete's — the key comes back. Within one batch the
-  delete still wins. This matches Databricks' SCD Type 1; retaining tombstones would mean
-  carrying a column the target does not declare, with no rule for ever dropping it.
+  delete still wins. This matches the reference AUTO CDC implementation's SCD Type 1; retaining
+  tombstones would mean carrying a column the target does not declare, with no rule for ever
+  dropping it.
 - **A NULL `sequence_by` value fails the batch.** A row with no ordering value cannot be placed
   against the target, and dropping it silently would lose a change event — including a delete or
-  a truncate. Databricks fails the same way.
+  a truncate. The reference AUTO CDC implementation fails the same way.
 - **NULL key values compare equal.** A NULL-keyed row is one key like any other, matched with
-  `IS NOT DISTINCT FROM`. This is the one case here that **deliberately diverges from
-  Databricks**: Spark's `MERGE` matches keys with `=`, so a NULL-keyed row never matches the
-  target and is re-inserted on every micro-batch — an unbounded set of duplicates for one key,
-  which is a leak rather than a semantic. Expect a Databricks parity test to differ on this row.
+  `IS NOT DISTINCT FROM`. This is the one case here that **deliberately diverges from the
+  reference AUTO CDC implementation**: Spark's `MERGE` matches keys with `=`, so a NULL-keyed row
+  never matches the target and is re-inserted on every micro-batch — an unbounded set of
+  duplicates for one key, which is a leak rather than a semantic. Expect a reference-implementation
+  parity test to differ on this row.
 
 Two rows for the same key with the *same* `sequence_by` value have no natural winner. The merge
 breaks the tie deterministically — a delete first, then the remaining target columns descending

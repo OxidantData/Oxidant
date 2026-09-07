@@ -4181,7 +4181,7 @@ mod tests {
         dir
     }
 
-    /// Databricks/Athena parity: a lowercase catalog column (`vendorid`) binds to the mixed-case
+    /// Spark/Athena parity: a lowercase catalog column (`vendorid`) binds to the mixed-case
     /// file column (`VendorID`) case-insensitively, *and* the Int32 file is cast to the declared
     /// Int64 — so `SUM(vendorid)` returns the correct non-null total instead of NULL.
     #[tokio::test]

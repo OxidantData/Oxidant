@@ -11,7 +11,7 @@
 > yet**. This document remains the long-term user-facing deploy guide.
 
 Oxidant deploys entirely into **your own AWS account** (self-hosted, single-account). You get a
-Databricks-like workspace: SSO login, EKS-backed compute clusters you spin up and down, a local or
+managed Spark workspace: SSO login, EKS-backed compute clusters you spin up and down, a local or
 external (HMS / Glue / Unity) catalog with Unity-Catalog-style ACLs, and a web UI for SQL,
 notebooks, dashboards, and scheduled jobs.
 
@@ -67,5 +67,5 @@ Merges without a release label land on `main` with no version bump and no publis
 - **Governance**: `GRANT`/`REVOKE`/`SHOW GRANTS` in SQL or the Permissions UI; row filters and
   column masks apply at query time.
 - **Cost**: clusters auto-stop after an idle timeout; a small warm worker-pool trims cold-start.
-- **Migration from Spark/Databricks**: point existing PySpark at the cluster's Spark Connect
+- **Migration from managed Spark platforms**: point existing PySpark at the cluster's Spark Connect
   endpoint (`sc://…`); use the catalog browser + AI assist to port SQL.

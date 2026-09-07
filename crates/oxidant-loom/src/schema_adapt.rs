@@ -12,7 +12,7 @@
 //! Glue lowercases column names (`vendorid`), while the Parquet files often store mixed case
 //! (`VendorID`). The default adapter's case-sensitive `index_of("vendorid")` misses `VendorID`, so
 //! the column is treated as *missing from the file* and filled with NULLs — mixed-case columns read
-//! back null even though the data is right there. Databricks / Spark-on-Glue resolve this
+//! back null even though the data is right there. Spark-on-Glue deployments resolve this
 //! case-insensitively (`spark.sql.caseSensitive=false`); we match that.
 //!
 //! # The fix

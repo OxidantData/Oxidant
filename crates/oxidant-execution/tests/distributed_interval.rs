@@ -1,6 +1,6 @@
 //! TPC-DS Q12-shaped date window with Spark's `interval '30 days'` spelling.
 //!
-//! The Databricks dialect oxidant plans on rejects that form at parse time unless
+//! The Spark dialect oxidant plans on rejects that form at parse time unless
 //! `normalize_spark_sql` rewrites it. DataFusion's stage Unparser can also emit the
 //! Postgres-verbose form into stage SQL; workers re-parse that under the same dialect.
 //! This test locks the e2e path: a 2-worker distributed plan over a sharded fact with a

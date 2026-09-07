@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use datafusion::sql::sqlparser::ast::{CreateView, Statement};
-use datafusion::sql::sqlparser::dialect::DatabricksDialect;
+use datafusion::sql::sqlparser::dialect::DatabricksDialect as SparkDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use oxidant_common::{Error, Result};
 
@@ -632,7 +632,7 @@ fn parse_table_clauses(cursor: &mut Cursor<'_>, output: &mut ParsedOutput) -> Re
 }
 
 fn try_parse_create_view(stmt: &str) -> Result<CreateView> {
-    let stmts = Parser::parse_sql(&DatabricksDialect {}, stmt)
+    let stmts = Parser::parse_sql(&SparkDialect {}, stmt)
         .map_err(|e| plan_error(stmt, &format!("parse error: {e}")))?;
     let [Statement::CreateView(cv)] = stmts.as_slice() else {
         return Err(plan_error(stmt, "expected single CREATE VIEW statement"));
@@ -645,7 +645,7 @@ fn validate_query(query: &str) -> Result<()> {
     if query.is_empty() {
         return Err(plan_error(query, "query must not be empty"));
     }
-    match Parser::parse_sql(&DatabricksDialect {}, query) {
+    match Parser::parse_sql(&SparkDialect {}, query) {
         Ok(stmts) if stmts.len() == 1 => match &stmts[0] {
             Statement::Query(_) => Ok(()),
             _ => Err(plan_error(
@@ -659,11 +659,11 @@ fn validate_query(query: &str) -> Result<()> {
     }
 }
 
-/// Re-parse after normalizing Databricks-only constructs (`STREAM`, `READ_FILES`) so trailing
-/// junk is still rejected when the raw query does not parse.
+/// Re-parse after normalizing Spark dialect-extension constructs (`STREAM`, `READ_FILES`) so
+/// trailing junk is still rejected when the raw query does not parse.
 fn validate_dialect_extension_query(query: &str) -> Result<()> {
     let normalized = normalize_dialect_extensions_for_parse(query);
-    match Parser::parse_sql(&DatabricksDialect {}, &normalized) {
+    match Parser::parse_sql(&SparkDialect {}, &normalized) {
         Ok(stmts) if stmts.len() == 1 => match &stmts[0] {
             Statement::Query(_) => Ok(()),
             _ => Err(plan_error(
@@ -706,10 +706,10 @@ fn normalize_dialect_extensions_for_parse(query: &str) -> String {
                     if chars.peek() == Some(&')') {
                         chars.next();
                     }
-                    out.push_str("__databricks_stream__");
+                    out.push_str("__spark_stream__");
                 } else {
                     skip_stream_target(&mut chars);
-                    out.push_str("__databricks_stream__");
+                    out.push_str("__spark_stream__");
                 }
                 continue;
             }
@@ -1386,7 +1386,7 @@ impl<'a> Cursor<'a> {
 
     /// `IGNORE NULL UPDATES [ON {(cols) | * [EXCEPT (cols)]}] [EXCEPT (cols)]`.
     ///
-    /// A bare `IGNORE NULL UPDATES` means every column, which is what Databricks' boolean
+    /// A bare `IGNORE NULL UPDATES` means every column, which is what the underlying boolean
     /// `ignore_null_updates` flag does.
     fn parse_ignore_null_updates_clause(&mut self) -> Result<ColumnListPair> {
         if self.try_keyword("ON")? {

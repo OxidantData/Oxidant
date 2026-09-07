@@ -229,7 +229,7 @@ fn supported_shuffle_join_type(jt: JoinType) -> Result<()> {
         | JoinType::Full
         | JoinType::LeftSemi
         | JoinType::LeftAnti => Ok(()),
-        // Spark SQL / Databricks dialect has LEFT SEMI / LEFT ANTI only. Emitting RIGHT SEMI
+        // Spark SQL's dialect has LEFT SEMI / LEFT ANTI only. Emitting RIGHT SEMI
         // would pass planning and fail later when workers re-parse stage SQL.
         JoinType::RightSemi | JoinType::RightAnti => Err(Error::Unsupported(
             "auto-distribute: RIGHT SEMI / RIGHT ANTI shuffle joins are not supported \

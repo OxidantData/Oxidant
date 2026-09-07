@@ -305,7 +305,7 @@ describe("what a click inserts", () => {
   it("quotes the set operators and join modifiers, not just the obvious keywords", () => {
     // A schema called `minus` or a table called `anti` is not exotic, and bare it is not a
     // name: `FROM orders except` is a set operator with nothing on its right-hand side. The
-    // list is the Databricks dialect's own reserved sets, and
+    // list is the Spark dialect's own reserved sets, and
     // `crates/oxidant-sql/tests/catalog_rail_reserved_words.rs` asks the parser whether it is
     // still complete — this pins the shape a reader would look for.
     for (const kw of [

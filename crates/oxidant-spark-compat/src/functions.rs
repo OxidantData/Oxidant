@@ -1,13 +1,12 @@
-//! Function-coverage gap report: Oxidant's live function registry vs. the Databricks SQL
+//! Function-coverage gap report: Oxidant's live function registry vs. the documented Spark SQL
 //! builtin-function surface.
 //!
-//! The Databricks side is [`databricks-functions.json`](../databricks-functions.json) — one entry
-//! per distinct function name documented at
-//! <https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-functions-builtin>, carrying the
+//! The reference side is [`spark-functions.json`](../spark-functions.json) — one entry per
+//! distinct function name documented in a reference Spark SQL language manual, carrying the
 //! manual category it appears under and whether Oxidant intends to implement it (`in_scope`).
 //! Overload pages are merged and names come from the rendered signature, not the URL slug — see
-//! `scripts/scrape-databricks-functions.py`, which regenerates the catalog.
-//! Entries that are out of scope name *why* (`excluded_reason`): operator syntax, Databricks
+//! `scripts/collect-spark-functions.py`, which regenerates the catalog.
+//! Entries that are out of scope name *why* (`excluded_reason`): operator syntax, managed
 //! control-plane dependencies, or the Apache DataSketches binary formats.
 //!
 //! The Oxidant side is [`oxidant_loom::Engine::registered_function_names`] — the same union that
@@ -25,10 +24,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The checked-in Databricks function catalog.
-pub const CATALOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/databricks-functions.json");
+/// The checked-in Spark function catalog.
+pub const CATALOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/spark-functions.json");
 
-/// One entry as it appears in `databricks-functions.json`.
+/// One entry as it appears in `spark-functions.json`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CatalogEntry {
     pub name: String,
@@ -89,7 +88,7 @@ pub struct CategoryRow {
 pub struct FunctionsReport {
     pub source: String,
     pub scraped: String,
-    /// Every documented Databricks function page.
+    /// Every documented Spark function page.
     pub documented: usize,
     /// Those Oxidant intends to implement.
     pub in_scope: usize,
@@ -97,7 +96,7 @@ pub struct FunctionsReport {
     pub registered: usize,
     /// In-scope names the engine does not resolve.
     pub missing: usize,
-    /// Everything the engine resolves, including names Databricks does not document.
+    /// Everything the engine resolves, including names outside the documented surface.
     pub engine_registry_size: usize,
     /// Out-of-scope tallies, keyed by `excluded_reason`.
     pub excluded: BTreeMap<String, usize>,
@@ -118,19 +117,19 @@ impl FunctionsReport {
         serde_json::to_string_pretty(self).expect("serialize functions report") + "\n"
     }
 
-    /// Human-readable matrix, suitable for committing as `docs/databricks-functions.md`.
+    /// Human-readable matrix, suitable for committing as `docs/spark-functions.md`.
     pub fn to_markdown(&self) -> String {
         let mut s = String::new();
-        s.push_str("# Databricks SQL builtin-function coverage\n\n");
+        s.push_str("# Spark SQL builtin-function coverage\n\n");
         s.push_str(
             "**Generated — do not edit by hand.** Regenerate with:\n\n\
              ```sh\n\
              cargo build -p oxidant-spark-compat --bin oxidant-parity\n\
-             ./target/debug/oxidant-parity functions --markdown > docs/databricks-functions.md\n\
+             ./target/debug/oxidant-parity functions --markdown > docs/spark-functions.md\n\
              ```\n\n",
         );
         s.push_str(&format!(
-            "Databricks surface scraped {} from <{}>.\n\n",
+            "Spark builtin-function surface scraped {} (source: {}).\n\n",
             self.scraped, self.source
         ));
         s.push_str(
@@ -143,7 +142,7 @@ impl FunctionsReport {
         s.push_str("## Headline\n\n");
         s.push_str("| | |\n|---|---:|\n");
         s.push_str(&format!(
-            "| Documented Databricks functions | {} |\n",
+            "| Documented Spark functions | {} |\n",
             self.documented
         ));
         s.push_str(&format!("| In scope for Oxidant | {} |\n", self.in_scope));
@@ -154,7 +153,7 @@ impl FunctionsReport {
         ));
         s.push_str(&format!("| Missing | {} |\n", self.missing));
         s.push_str(&format!(
-            "| Engine registry size (incl. non-Databricks names) | {} |\n\n",
+            "| Engine registry size (incl. undocumented names) | {} |\n\n",
             self.engine_registry_size
         ));
 
@@ -220,7 +219,7 @@ pub async fn run() -> FunctionsReport {
         &std::fs::read_to_string(CATALOG_PATH)
             .unwrap_or_else(|e| panic!("read {CATALOG_PATH}: {e}")),
     )
-    .expect("parse databricks-functions.json");
+    .expect("parse spark-functions.json");
 
     let engine = oxidant_loom::Engine::new();
     let registered: BTreeSet<String> = engine.registered_function_names().into_iter().collect();
@@ -344,7 +343,7 @@ mod tests {
         }
     }
 
-    /// The rendered artifacts are the product here — `docs/databricks-functions.md` is generated
+    /// The rendered artifacts are the product here — `docs/spark-functions.md` is generated
     /// by `to_markdown`, so a panic or a malformed table in it is a broken doc, not a test-only
     /// concern.
     #[tokio::test]
@@ -352,10 +351,10 @@ mod tests {
         let r = run().await;
 
         let md = r.to_markdown();
-        assert!(md.starts_with("# Databricks SQL builtin-function coverage"));
+        assert!(md.starts_with("# Spark SQL builtin-function coverage"));
         // Headline, the per-category rollup, and the per-function table must all be present.
         for want in [
-            "| Documented Databricks functions |",
+            "| Documented Spark functions |",
             "| **Registered today** |",
             "### Out of scope",
             "## By manual category",

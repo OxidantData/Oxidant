@@ -23,9 +23,8 @@
 | [docs/deployment.md](docs/deployment.md) | Self-hosted platform deploy outline |
 | [docs/catalogs.md](docs/catalogs.md) | External catalog SPI (Hive / Glue / REST) |
 | [docs/runtime-contract.md](docs/runtime-contract.md) | Engine image env contract |
-| [docs/databricks-coverage.md](docs/databricks-coverage.md) | Databricks SQL coverage matrix (what works today + owning ticket) |
-| [docs/databricks-functions.md](docs/databricks-functions.md) | Databricks builtin-function coverage — generated, do not hand-edit (`oxidant-parity functions --markdown`) |
-| [docs/databricks-parity-plan.md](docs/databricks-parity-plan.md) | Databricks parity plan (Glue + Lake Formation epic) |
+| [docs/spark-coverage.md](docs/spark-coverage.md) | Spark SQL coverage matrix (what works today + owning ticket) |
+| [docs/spark-functions.md](docs/spark-functions.md) | Spark builtin-function coverage — generated, do not hand-edit (`oxidant-parity functions --markdown`) |
 
 Deployment options: the free Community AMI on AWS Marketplace (listing in progress) or
 `docker pull ghcr.io/oxidantdata/oxidant`; EC2 autoscaling via CloudFormation is
@@ -103,7 +102,7 @@ expanding its reachability, exposure, or impact, record it as context rather tha
   tags and defaults older peers can ignore. Require a focused stock-PySpark, protocol, or round-trip
   regression test; aggregate parity counts alone are not proof of changed behavior.
 - Planner or generated-stage-SQL changes that alter supported shapes must exercise
-  `plan_distributed_logical` directly and reparse emitted SQL under the worker's Databricks dialect
+  `plan_distributed_logical` directly and reparse emitted SQL under the worker's Spark dialect
   against realistic `shuffle_input*` tables. Dispatch or scheduler changes that affect placement
   must use a real two-worker test proving single-node result equality and worker task/stage evidence.
   Strict mode fails closed when workers are configured but unavailable or a shape is unsupported;
@@ -295,7 +294,7 @@ re-runs the full test suite under `target/llvm-cov-target/` (not `target/debug/`
 `cargo run -p oxidant-bench -- tpch-distributed --sf 1 --workers 2` is a **blocking** CI
 gate. The auto-splitter (`oxidant_execution::plan::plan_distributed`) unparses logical plans
 to stage SQL via DataFusion's `Unparser`, then workers re-parse that SQL under the
-Databricks dialect. Some Unparser output is **invalid on round-trip**:
+Spark dialect. Some Unparser output is **invalid on round-trip**:
 
 | Unparser output | Problem | Sanitized to |
 |----------------|---------|--------------|

@@ -5,7 +5,7 @@
 //! `hour`, … under their own names (verified against `datafusion-functions-54.1.0`, whose
 //! `DatePartFunc` carries only the `datepart` alias). Every one of these was therefore an
 //! `Invalid function` in oxidant, which is what made *Date, timestamp, and interval functions* the
-//! weakest category in `docs/databricks-functions.md`.
+//! weakest category in `docs/spark-functions.md`.
 //!
 //! All of these are pure calendar arithmetic over a UTC-naive instant, so they reuse the
 //! proleptic-Gregorian helpers in [`super::spark_datetime3`] rather than pulling in a date library.

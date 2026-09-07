@@ -2545,8 +2545,8 @@ pub(crate) fn expr_sql(up: &Unparser, e: &Expr) -> Result<String> {
 }
 
 /// [`expr_sql`] for expression positions in a **finalize** query (which the engine parses under
-/// the Databricks dialect). The Unparser double-quotes identifiers that collide with reserved
-/// words (`"value"`, TPC-H Q11's `ORDER BY value DESC`), but the Databricks dialect reads double
+/// the Spark dialect). The Unparser double-quotes identifiers that collide with reserved
+/// words (`"value"`, TPC-H Q11's `ORDER BY value DESC`), but the Spark dialect reads double
 /// quotes as *string literals* — so `ORDER BY "value"` silently sorted by a constant and
 /// returned the gather order. The Unparser only double-quotes identifiers (its string literals
 /// are single-quoted), so re-quoting them as backticks — which the dialect treats as identifiers
@@ -3598,7 +3598,7 @@ fn slice_placement_safe(lp: &LogicalPlan, table: &str) -> bool {
 ///
 /// Group keys and aggregate arguments are emitted as **bare column names**, never through the
 /// Unparser: it double-quotes identifiers that collide with reserved words (`channel`), and the
-/// workers' Databricks dialect reads a double-quoted token as a *string literal* — which turned
+/// workers' Spark dialect reads a double-quoted token as a *string literal* — which turned
 /// Q77's `channel` group column into the constant `'channel'` (the qualified naive path is saved
 /// by [`sanitize_generated_sql`]'s dot+quote rewrite, but this stage's columns are unqualified).
 /// [`union_split_outer_cols`] has already guaranteed these are plain columns.
@@ -5659,7 +5659,7 @@ pub(crate) fn flattened_group_exprs(group_expr: &[Expr]) -> Vec<&Expr> {
 /// Render the final stage's group-by over safe `g{j}` columns.
 ///
 /// The grouping construct appears only in `GROUP BY`; unlike the old positional lowering, it is
-/// never emitted into the partial SELECT list where Databricks would resolve `ROLLUP` as a scalar
+/// never emitted into the partial SELECT list where the Spark dialect would resolve `ROLLUP` as a scalar
 /// function. Keeping the explicit space (`ROLLUP (...)`) also matches the syntax accepted by the
 /// worker parser and by the original TPC-DS queries.
 pub(crate) fn final_group_by_sql(group_expr: &[Expr], flattened_len: usize) -> Result<String> {
@@ -5725,7 +5725,7 @@ pub(crate) fn final_group_by_sql(group_expr: &[Expr], flattened_len: usize) -> R
     }
 }
 
-/// Fix SQL fragments from DataFusion's Unparser that the Databricks-dialect re-parser rejects.
+/// Fix SQL fragments from DataFusion's Unparser that the Spark-dialect re-parser rejects.
 ///
 /// Two common failure modes when generated stage SQL is sent to workers:
 /// - `alias."col"` — dot access with a double-quoted column name;
@@ -5737,7 +5737,7 @@ pub(crate) fn sanitize_generated_sql(sql: &str) -> String {
 }
 
 /// DataFusion's Unparser emits Postgres-style combined interval literals
-/// (`INTERVAL '12 MONS'`, `INTERVAL '90 DAYS'`). Workers re-parse under the Databricks dialect,
+/// (`INTERVAL '12 MONS'`, `INTERVAL '90 DAYS'`). Workers re-parse under the Spark dialect,
 /// which requires a unit *after* the quoted value (`INTERVAL '12' MONTH`). Rewrite the combined
 /// form so stage SQL round-trips. Case-insensitive on the keyword and unit abbreviation.
 fn fix_interval_pg_style(sql: &str) -> String {
@@ -5855,7 +5855,7 @@ fn split_pg_interval_body(body: &str) -> Option<(&str, &'static str)> {
     Some((num, unit))
 }
 
-/// `"table".col` → `` `table`.col `` so dot access parses under the Databricks dialect.
+/// `"table".col` → `` `table`.col `` so dot access parses under the Spark dialect.
 fn fix_quoted_table_dot_access(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut i = 0;
@@ -6285,7 +6285,7 @@ mod sanitize_tests {
 
     #[test]
     fn sanitize_rewrites_pg_style_interval_literals() {
-        // Unparser form that broke TPC-H Q6 distributed stage SQL under Databricks dialect.
+        // Unparser form that broke TPC-H Q6 distributed stage SQL under the Spark dialect.
         assert_eq!(
             sanitize_generated_sql(
                 "SELECT * FROM t WHERE d < (CAST('1994-01-01' AS DATE) + INTERVAL '12 MONS')"

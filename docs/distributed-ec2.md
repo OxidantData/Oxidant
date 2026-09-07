@@ -28,11 +28,11 @@ PySpark / oxidant-bench  -->  oxidant driver :50051  (direct IP — no LB)
 
 | Approach | Verdict |
 |----------|---------|
-| **ASG → private IP list** (chosen) | Same idea as EMR/YARN / Databricks control plane: cluster manager hands the driver executor addresses. Auth is IAM instance role; traffic stays on private IPs; SGs restrict Flight to driver↔workers. |
+| **ASG → private IP list** (chosen) | Same idea as EMR/YARN / a managed Spark control plane: cluster manager hands the driver executor addresses. Auth is IAM instance role; traffic stays on private IPs; SGs restrict Flight to driver↔workers. |
 | Route53 multi-A | Extra moving part; TTL/upsert races left the driver with an empty worker set and silent local scans. Kept only as unused legacy tags on older stacks. |
 | UDP / LAN broadcast | **Not used.** Insecure, spoofable, and does not work across AWS subnets/AZs. |
 
-### Driver vs workers (Spark EMR / Databricks parity)
+### Driver vs workers (managed Spark platform parity)
 
 Treat the Connect driver like a **Spark driver / EMR master**, not like an executor:
 
@@ -78,7 +78,7 @@ wrong model for this workload:
 
 | Reality | Why an NLB does not help |
 |---------|--------------------------|
-| One Connect driver | Nothing to load-balance; Databricks / LakeSail / OSS Spark Connect also terminate on the driver (or a control-plane proxy), not an L4 VIP in front of query compute |
+| One Connect driver | Nothing to load-balance; OSS Spark Connect deployments also terminate on the driver (or a control-plane proxy), not an L4 VIP in front of query compute |
 | Workers are stateful Flight peers | Shuffle and shard index are per-instance; never put workers behind a shared VIP |
 | Honesty / bench runs | NLB health checks + target registration add minutes of false “unhealthy” while `oxidant-driver` is already listening — wasted wall clock, not signal |
 | Failure mode | ASG + TG health can mark the only driver unhealthy and black-hole clients even when `:50051` accepts connections |

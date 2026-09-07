@@ -23,11 +23,11 @@ fn corpus_is_vendored() {
     );
 }
 
-/// The authored Databricks corpus is independently selectable and its explicit skips remain
+/// The authored Spark-compat corpus is independently selectable and its explicit skips remain
 /// visible in the report instead of being silently omitted.
 #[tokio::test(flavor = "multi_thread")]
-async fn databricks_corpus_reports_explicit_skips() {
-    let report = runner::run_corpus(Corpus::Databricks, Some("copy-into")).await;
+async fn spark_compat_corpus_reports_explicit_skips() {
+    let report = runner::run_corpus(Corpus::SparkCompat, Some("copy-into")).await;
     assert_eq!(report.files_total, 1);
     assert_eq!(report.files_skipped, 1);
     assert_eq!(report.blocks_total, 0);

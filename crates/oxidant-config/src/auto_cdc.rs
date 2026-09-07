@@ -6,7 +6,7 @@ use crate::AutoCdcConfig;
 
 /// Resolve a key / `SEQUENCE BY` reference to the plain column name it names, if it is one.
 ///
-/// Databricks allows a struct expression for `SEQUENCE BY`; we do not, because the merge has to
+/// Some Spark-based CDC implementations allow a struct expression for `SEQUENCE BY`; we do not, because the merge has to
 /// compare the batch's ordering value against the one already persisted in the target, and only
 /// a stored column survives across micro-batches. Backticks are accepted and stripped so a
 /// reserved word spelled the way the SQL surface spells it still resolves.

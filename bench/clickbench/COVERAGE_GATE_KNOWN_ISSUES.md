@@ -4,7 +4,8 @@
 
 ## Root cause (identified and fixed)
 
-The `Engine` uses the **Databricks SQL dialect** (`opts.sql_parser.dialect = Dialect::Databricks`),
+The `Engine` uses DataFusion's Spark-compatible SQL dialect (`opts.sql_parser.dialect =
+Dialect::Databricks`, DataFusion's closest built-in match for Spark's parsing rules),
 which treats `"..."` as a **string literal**, not an identifier (matching Spark's default
 `spark.sql.ansi.double_quoted_identifiers=false`). The ClickBench `queries.sql` file used
 ANSI-standard double-quoted column identifiers (e.g. `"CounterID"`, `"EventDate"`).
@@ -27,7 +28,7 @@ but returned semantically wrong results.
 
 Converted all `"ColumnName"` identifiers in `bench/clickbench/queries.sql` to
 `` `ColumnName` `` (backtick-quoted). Backtick-quoted identifiers are recognized as identifiers by
-both the Databricks and Generic dialects. Also fixed the two inline SQL strings in
+both the Spark-compatible (`Databricks`) and `Generic` dialects. Also fixed the two inline SQL strings in
 `crates/oxidant-bench/src/main.rs` that used `\"EventDate\"` for the same reason.
 
 ## Acceptance criterion (met)

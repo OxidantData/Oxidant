@@ -1,6 +1,6 @@
 //! Stage 2 — statement-intercept registry (post-parse).
 //!
-//! Rules here see a parsed `sqlparser` [`Statement`] — parsed with the Databricks dialect, the
+//! Rules here see a parsed `sqlparser` [`Statement`] — parsed with the Spark dialect, the
 //! same dialect DataFusion plans with — and either **fully own** the statement (returning a
 //! [`LowerOutcome`]) or return `None` so the next rule, and ultimately `ctx.sql()`, sees the
 //! statement unchanged.
@@ -14,7 +14,7 @@
 
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::Statement;
-use datafusion::sql::sqlparser::dialect::DatabricksDialect;
+use datafusion::sql::sqlparser::dialect::DatabricksDialect as SparkDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
 use super::pipeline::LowerOutcome;
@@ -34,14 +34,14 @@ pub trait StatementIntercept: Send + Sync {
     ) -> Option<LowerOutcome<'static>>;
 }
 
-/// Parse `sql` with the Databricks dialect, returning the statement only when the input is
+/// Parse `sql` with the Spark dialect, returning the statement only when the input is
 /// exactly one statement.
 ///
 /// `None` — unparseable input or a multi-statement script — means "not interceptable": the
 /// pipeline passes the text through to `ctx.sql()` and lets DataFusion plan it (or report the
 /// parse error) exactly as it would without the dialect layer.
 pub fn parse_single_statement(sql: &str) -> Option<Statement> {
-    let stmts = Parser::parse_sql(&DatabricksDialect {}, sql).ok()?;
+    let stmts = Parser::parse_sql(&SparkDialect {}, sql).ok()?;
     let [stmt] = stmts.as_slice() else {
         return None;
     };
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn parses_use_statement() {
-        // The statement the `USE` intercept (KAN-96) will claim — verify the Databricks
+        // The statement the `USE` intercept (KAN-96) will claim — verify the Spark
         // dialect hands it to Stage 2 as a structured AST node, `;` and quoting included.
         match parse_single_statement("USE `my-db`;") {
             Some(Statement::Use(Use::Object(name))) => {

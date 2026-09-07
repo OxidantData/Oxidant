@@ -653,7 +653,7 @@ fn only_inner_joins(lp: &LogicalPlan) -> bool {
 /// `agg(…) FILTER (WHERE <branch predicate>)`, and one gather-combine stage recombines each
 /// branch's partials into its output columns (aliased back to the branch's original output
 /// names, which the outer placeholders resolve through their own aliases). The FILTER clause
-/// round-trips through the workers' Databricks-dialect parser (covered end-to-end by the Q88
+/// round-trips through the workers' Spark-dialect parser (covered end-to-end by the Q88
 /// shape test). Both stages gather to partition 0 like any global aggregation.
 fn merged_shared_scan_query(members: &[&MergeableBranch]) -> Result<DistributedQuery> {
     let input_sql = Unparser::default()

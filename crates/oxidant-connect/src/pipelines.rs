@@ -1645,7 +1645,7 @@ fn resolve_auto_cdc_flows(
         let source_sql = source_table.sql.clone();
         let source_sql_by_name = source_table.sql_by_name;
         let source_flows = source_table.append_flows.clone();
-        // In Databricks an AUTO CDC flow reads the source *dataset* — i.e. what the source table
+        // In the reference AUTO CDC implementation a flow reads the source *dataset* — i.e. what the source table
         // actually holds, after its expectations and deduplication. Since the target re-ingests
         // the raw stream rather than reading the table, those have to come along: a bronze table
         // with `ON VIOLATION DROP ROW` that dropped rows from itself while the CDC target merged
@@ -2935,7 +2935,7 @@ mod tests {
 
     #[test]
     fn auto_cdc_target_inherits_the_source_expectations_and_dedup() {
-        // Databricks' AUTO CDC reads the source *dataset*, i.e. post-expectation. Since the
+        // The reference AUTO CDC semantics read the source *dataset*, i.e. post-expectation. Since the
         // target re-ingests the raw stream instead of reading the table, the source's quality
         // rules have to be copied — otherwise a bronze `ON VIOLATION DROP ROW` drops rows from
         // bronze while the CDC target happily merges them.

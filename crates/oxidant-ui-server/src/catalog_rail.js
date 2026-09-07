@@ -168,7 +168,7 @@ var __oxidantCatalog = (function () {
      insert as themselves. A false positive here is not free, it is what every inserted name
      looks like, so the list is derived rather than guessed:
      `crates/oxidant-sql/tests/catalog_rail_reserved_words.rs` reads it back out of this file
-     and asks the Databricks dialect whether it is still both complete and minimal. */
+     and asks the Spark dialect whether it is still both complete and minimal. */
   var RESERVED = ('all analyze and anti array as asc asof between by case cluster connect '
     + 'create cross delete desc distinct distribute drop else end except exclude exists '
     + 'explain fetch for format from full global grant group having in inner insert intersect '

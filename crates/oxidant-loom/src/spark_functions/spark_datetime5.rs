@@ -21,7 +21,7 @@
 //! The three-argument unit forms — `datediff(unit, start, end)`, `dateadd(unit, value, expr)`,
 //! `timestampadd`, `timestampdiff` — are unreachable as UDFs for the same reason
 //! [`super::spark_datetime3`] records: Spark's grammar special-cases the bare unit keyword, but
-//! sqlparser's Databricks dialect parses `datediff(MONTH, a, b)` with `MONTH` as a *column
+//! sqlparser's Spark dialect parses `datediff(MONTH, a, b)` with `MONTH` as a *column
 //! reference*, so planning fails with "No field named month" before any UDF is invoked. Closing
 //! those needs a parser/`ExprPlanner` change, not another `register_udf`. The two-argument
 //! `datediff`/`date_diff` implemented here are a different, unambiguous signature.

@@ -247,7 +247,7 @@ trees over it:
               part-00000-….parquet   part-00001-….parquet     <- written once
                      |                       |
    _delta_log/*.json + checkpoints           metadata/*.avro + vN.metadata.json
-   (Spark, Databricks, Athena, Oxidant)      (Trino, Athena, DuckDB, Snowflake, Oxidant)
+   (Spark, Athena, Oxidant)                    (Trino, Athena, DuckDB, Snowflake, Oxidant)
 ```
 
 This is on by default for Delta sinks. Turn it off with `.option("icebergCompat", "false")`.

@@ -1,7 +1,7 @@
 //! Faithful lowering of Spark's `CREATE TABLE … USING <fmt>` DDL to DataFusion's real,
 //! format-backed `CREATE EXTERNAL TABLE`.
 //!
-//! sqlparser 0.62 (the Databricks dialect) does not consume Spark's `USING <provider>` clause in
+//! sqlparser 0.62 (the Spark dialect) does not consume Spark's `USING <provider>` clause in
 //! `CREATE TABLE`, and DataFusion's `DFParser` only special-cases `CREATE EXTERNAL` /
 //! `CREATE UNBOUNDED EXTERNAL`, so `CREATE TABLE t(a int) USING parquet` fails at parse
 //! (`found: USING`) — and every downstream statement then errors "table not found". We rewrite the

@@ -11,8 +11,8 @@
 //! - `isnull(expr)` / `isnotnull(expr)` → `expr IS [NOT] NULL`.
 //! - `equal_null(a, b)` → `a IS NOT DISTINCT FROM b`, Spark's null-safe equality (`a <=> b`):
 //!   two NULLs are equal and a NULL against a value is `false`, never NULL.
-//! - `like(str, pattern[, escape])` / `ilike(str, pattern[, escape])` → `Expr::Like`. Databricks
-//!   documents both an operator and a function spelling; only the operator parsed before. The
+//! - `like(str, pattern[, escape])` / `ilike(str, pattern[, escape])` → `Expr::Like`. Spark
+//!   documentation covers both an operator and a function spelling; only the operator parsed before. The
 //!   optional escape must be a backslash literal: DataFusion's LIKE kernel implements no other,
 //!   and a clean planning error beats matching against the wrong escape character.
 //!

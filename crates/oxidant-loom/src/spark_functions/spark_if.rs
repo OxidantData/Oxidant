@@ -1,4 +1,4 @@
-//! Spark `if(cond, a, b)` (and its Databricks spelling `iff`) — exactly
+//! Spark `if(cond, a, b)` (and its common alternate spelling `iff`) — exactly
 //! `CASE WHEN cond THEN a ELSE b END` with the two result
 //! branches widened to their least-common type. DataFusion has no `if` builtin (its planner
 //! rejects the call with `Invalid function 'if'`).
@@ -37,10 +37,10 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 
-/// Register Spark's `if` (and Databricks' `iff` spelling of it) into `ctx`.
+/// Register Spark's `if` (and the common alternate `iff` spelling of it) into `ctx`.
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(SparkIf::new("if")));
-    // `iff(cond, t, f)` is Databricks' name for exactly this function, down to the coercion rules.
+    // `iff(cond, t, f)` is another common name for exactly this function, down to the coercion rules.
     ctx.register_udf(ScalarUDF::from(SparkIf::new("iff")));
 }
 

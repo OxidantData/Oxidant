@@ -1,7 +1,7 @@
 //! The Spark-SQL → DataFusion dialect layer.
 //!
 //! Oxidant executes SQL on DataFusion, whose dialect is close to but not identical to Spark SQL. This
-//! module rewrites the well-defined, safe differences so existing Spark/Databricks SQL runs
+//! module rewrites the well-defined, safe differences so existing Spark SQL runs
 //! unchanged — the "drop-in" migration promise. Per the plan it's **incremental and
 //! test-corpus-driven**: a small set of correct rewrites beats a broad, buggy one, and the
 //! rewriter is **string-literal-aware** so it never touches the contents of a `'...'` literal.
@@ -15,7 +15,7 @@
 //!    leading-keyword rewrites only (e.g. [`str_rule::StripTemporaryView`], migrated from
 //!    `oxidant-loom::normalize_spark_sql`).
 //! 2. **Statement intercepts** ([`intercept`], post-parse) — AST-level rules that see a
-//!    `sqlparser` `Statement` parsed with the Databricks dialect and either fully own the
+//!    `sqlparser` `Statement` parsed with the Spark dialect and either fully own the
 //!    statement or pass it through. Home for `USE`, `LIKE ANY/ALL`, `PIVOT`/`UNPIVOT`,
 //!    `SHOW`/`DESCRIBE` (later tickets).
 //! 3. **Output naming** ([`naming`], post-plan) — renames anonymous result columns to
