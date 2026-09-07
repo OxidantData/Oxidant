@@ -203,7 +203,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![0i64, 1])),
                 Arc::new(StringArray::from(vec![Some(r#"quoted, "value""#), None])),
                 Arc::new(BooleanArray::from(vec![true, false])),
-                Arc::new(Float64Array::from(vec![Some(3.14), None])),
+                Arc::new(Float64Array::from(vec![Some(12.5), None])),
             ],
         )
         .unwrap();
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(first["v"], 0);
         assert_eq!(first["name"], r#"quoted, "value""#);
         assert_eq!(first["flag"], true);
-        assert!((first["n"].as_f64().unwrap() - 3.14).abs() < 1e-9);
+        assert!((first["n"].as_f64().unwrap() - 12.5).abs() < 1e-9);
         let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(second["v"], 1);
         assert!(second["name"].is_null());
