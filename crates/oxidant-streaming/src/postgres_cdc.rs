@@ -4617,6 +4617,7 @@ mod tests {
         );
     }
 
+    #[tokio::test]
     async fn a_publisher_that_goes_quiet_mid_transaction_does_not_end_the_batch_there() {
         // A batch must cover whole transactions: its range has to be a commit boundary, or a
         // replay of it cannot reproduce it. When the publisher pauses half way through one, the
