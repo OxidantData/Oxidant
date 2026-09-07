@@ -2,10 +2,8 @@
 //!
 //! Beyond the usual rewrites (predicate/projection pushdown, constant folding, join
 //! reorder), heddle owns plan-level decisions for Oxidant's single execution backend:
-//! the vectorized CPU core ([`oxidant-loom`](../oxidant_loom/index.html)). The
-//! Bend→HVM2 second-backend bet was evaluated and removed — see
-//! `docs/HVM_VERDICT.md`; irregular/graph compute is planned as Loom-native
-//! operators, not a second runtime.
+//! the vectorized CPU core ([`oxidant-loom`](../oxidant_loom/index.html)). Irregular/
+//! graph-shaped compute is planned as Loom-native operators, not a second runtime.
 
 use oxidant_plan::LogicalPlan;
 
