@@ -68,7 +68,10 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            # Single label: matrix.runner is interpolated as a string, so a
+            # label list here would be read as one literal label name. `fremont`
+            # alone uniquely selects the org self-hosted runner.
+            runner: fremont
           - platform: linux/arm64
             arch: arm64
             runner: ubuntu-24.04-arm

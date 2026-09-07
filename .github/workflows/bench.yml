@@ -29,9 +29,11 @@ concurrency:
 jobs:
   clickbench:
     name: ClickBench 43 queries vs Sail
-    # Blacksmith managed runner (per-minute billing). 16 vCPU keeps the hot-timing
-    # comparison against Sail's published numbers meaningful.
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    # Org self-hosted runner fremont-high-tower (20-core x86_64, no per-minute
+    # billing). 16+ vCPU keeps the hot-timing comparison against Sail's
+    # published numbers meaningful. Needs the `fremont` label (or `clickbench`
+    # once a dedicated bench box exists).
+    runs-on: [self-hosted, fremont]
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4

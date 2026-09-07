@@ -1,8 +1,9 @@
 name: CI
 
-# Rust CI for Oxidant. The heavy gates run on Blacksmith managed runners
-# (blacksmith-4vcpu-ubuntu-2404, per-minute billing); rustfmt stays on GitHub-hosted
-# `ubuntu-latest` as a fast canary that also proves hosted runners still work.
+# Rust CI for Oxidant. The heavy gates run on the org self-hosted runner
+# fremont-high-tower (20-core x86_64, label `fremont`, no per-minute billing);
+# rustfmt stays on GitHub-hosted `ubuntu-latest` as a fast canary that also
+# proves hosted runners still work.
 # Per-run tiers:
 #   - every PR/push: rustfmt, clippy+test (the Spark-SQL parity ratchet is folded into it
 #     as steps — fails anything that drops parity below parity/baseline.json), coverage gates,
@@ -108,7 +109,10 @@ jobs:
     # 4vcpu tier's disk is too small even though its CPU is adequate. KAN-74
     # tracks getting back to 4vcpu (single-Arrow toolchain, throwaway clippy
     # target dir).
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Org self-hosted runner fremont-high-tower (label `fremont`): 20 cores,
+    # 62 GB RAM, ~1 TB NVMe — no per-minute billing, and no XMinionStorageFull
+    # class of disk failure. KAN-74's 4vcpu downgrade question is moot here.
+    runs-on: [self-hosted, fremont]
     needs: changes
     if: needs.changes.outputs.code == 'true'
     # Fail fast rather than burning an hour on a wedged runner. The suite compiles the workspace
@@ -464,7 +468,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-gates'))
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: [self-hosted, fremont]
     # SF1 dsdgen + parquet convert + full Q1–Q99 + distributed execute is the long pole.
     timeout-minutes: 180
     env:
@@ -552,7 +556,7 @@ jobs:
   # bench/clickbench/COVERAGE_GATE_KNOWN_ISSUES.md for the historical context.
   coverage:
     name: coverage gates
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: [self-hosted, fremont]
     needs: changes
     if: needs.changes.outputs.code == 'true'
     steps:
