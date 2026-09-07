@@ -53,13 +53,30 @@ pub fn skip_reason(input_sql: &str) -> Option<SkipReason> {
     None
 }
 
-/// Collect setup SQL statements to execute before replaying golden blocks for a file that uses
-/// `--IMPORT`. Returns statements from imported files (transitively) plus any non-import,
-/// non-comment SQL from the file itself (e.g. `SET` directives, `CREATE VIEW` setup).
+/// Collect setup SQL to execute before replaying golden blocks.
+///
+/// Imported files and `--SET` directives are setup. Local statements of *this* file are not:
+/// the golden replay already runs them in order (OxidantData/Oxidant#189).
 pub fn setup_statements(inputs_root: &Path, rel_input: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    collect_setup(inputs_root, rel_input, &mut seen, &mut out);
+    collect_setup(inputs_root, rel_input, &mut seen, &mut out, false);
+    out
+}
+
+/// `--CONFIG_DIM*` assignments from an input file (not SQL comments to drop).
+pub fn config_dims(input_sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in input_sql.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("--CONFIG_DIM") else {
+            continue;
+        };
+        let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit()).trim();
+        if !rest.is_empty() {
+            out.push(rest.to_string());
+        }
+    }
     out
 }
 
@@ -68,6 +85,7 @@ fn collect_setup(
     rel_input: &str,
     seen: &mut HashSet<String>,
     out: &mut Vec<String>,
+    include_local: bool,
 ) {
     if !seen.insert(rel_input.to_string()) {
         return;
@@ -77,17 +95,15 @@ fn collect_setup(
         return;
     };
 
-    // Process imports first (depth-first), then local statements.
     let mut local_lines = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim_start();
         if let Some(import) = trimmed.strip_prefix("--IMPORT") {
             let import_path = import.trim().trim_start_matches("./");
-            collect_setup(inputs_root, import_path, seen, out);
+            collect_setup(inputs_root, import_path, seen, out, true);
             continue;
         }
         if trimmed.starts_with("--SET ") {
-            // Spark test directive: `--SET key=value` → `SET key=value`.
             let kv = trimmed.trim_start_matches("--SET ").trim();
             out.push(format!("SET {kv}"));
             continue;
@@ -95,7 +111,9 @@ fn collect_setup(
         if trimmed.starts_with("--") {
             continue;
         }
-        local_lines.push(line);
+        if include_local {
+            local_lines.push(line);
+        }
     }
     let local_sql = local_lines.join("\n");
     for stmt in split_statements(&local_sql) {
@@ -204,5 +222,36 @@ mod tests {
             skip_reason("-- this is not a --SKIP directive\nSELECT 1;"),
             None
         );
+    }
+
+    #[test]
+    fn local_sql_is_not_pre_executed_setup_and_config_dims_are_kept() {
+        let dir = std::env::temp_dir().join(format!("oxidant-189-setup-{}", std::process::id()));
+        let inputs = dir.join("inputs");
+        std::fs::create_dir_all(&inputs).unwrap();
+        std::fs::write(
+            inputs.join("case.sql"),
+            "--CONFIG_DIM1 spark.sql.autoBroadcastJoinThreshold=10485760\n\
+             --CONFIG_DIM1 spark.sql.autoBroadcastJoinThreshold=-1\n\
+             CREATE TABLE t (v INT) USING parquet;\n\
+             INSERT INTO t VALUES (1);\n\
+             SELECT COUNT(*) FROM t;\n\
+             DROP TABLE t;\n",
+        )
+        .unwrap();
+        let stmts = setup_statements(&inputs, "case.sql");
+        assert!(
+            stmts.is_empty(),
+            "local CREATE/INSERT/SELECT/DROP must not run before golden replay: {stmts:?}"
+        );
+        let dims = config_dims(&std::fs::read_to_string(inputs.join("case.sql")).unwrap());
+        assert_eq!(
+            dims,
+            vec![
+                "spark.sql.autoBroadcastJoinThreshold=10485760".to_string(),
+                "spark.sql.autoBroadcastJoinThreshold=-1".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -63,8 +63,17 @@ pub async fn run_file(corpus: Corpus, rel_out: &str) -> FileReport {
     for setup_sql in splitter::setup_statements(&inputs_dir, rel_input) {
         let eng = engine.clone();
         let sql = setup_sql.clone();
-        if let Err(join_err) = tokio::spawn(async move { eng.sql(&sql).await }).await {
-            let _ = panic_message(join_err);
+        match tokio::spawn(async move { eng.sql(&sql).await }).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return FileReport::skipped(rel_input, &format!("setup-error: {e}"));
+            }
+            Err(join_err) => {
+                return FileReport::skipped(
+                    rel_input,
+                    &format!("setup-panic: {}", panic_message(join_err)),
+                );
+            }
         }
     }
 
