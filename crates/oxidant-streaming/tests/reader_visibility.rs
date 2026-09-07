@@ -144,6 +144,40 @@ async fn a_derived_table_recomputes_from_the_upstream_it_was_just_given() {
     );
 }
 
+/// Writer and reader are different Engine instances (different processes in the
+/// demo). LakeSink invalidation is process-local, so the reader must re-resolve
+/// the lakehouse snapshot itself.
+#[tokio::test]
+async fn a_reader_engine_sees_commits_from_a_writer_engine() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let warehouse = dir.path().join("wh").to_string_lossy().to_string();
+    async fn engine(warehouse: &str) -> Engine {
+        let engine = Engine::new();
+        let catalog = oxidant_catalog_local::LocalCatalog::new(
+            "local",
+            warehouse.to_string(),
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("local catalog");
+        engine.register_catalog("local", Arc::new(catalog));
+        engine
+    }
+    let writer = engine(&warehouse).await;
+    let reader = engine(&warehouse).await;
+    let mut sink = open_sink(&writer, "events").await;
+    sink.write_batch(&[batch(&[1])], 0).await.expect("batch 0");
+    assert_eq!(ids(&reader, "local.live.events").await, vec![1]);
+    sink.write_batch(&[batch(&[2])], 1).await.expect("batch 1");
+    assert_eq!(
+        ids(&reader, "local.live.events").await,
+        vec![1, 2],
+        "a reader process must not serve a pinned snapshot until restart"
+    );
+}
+
 /// A table emptied by a `replace` is still a table: both ways of reading it return no rows.
 ///
 /// A recompute whose result is empty — an `INSERT OVERWRITE ... WHERE false`, a CDC target

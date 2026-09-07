@@ -737,9 +737,9 @@ impl SchemaProvider for OxidantSchemaProvider {
                             )));
                         }
                         None => {
-                            record_lakehouse_snapshot(snapshot_key, snapshot);
-                            cached.note_enforcement(&self.principal());
-                            return Ok(Some(cached.provider.clone()));
+                            // Unpinned reader: do not serve this snapshot forever. Same-process
+                            // writers call refresh_table; a writer in another process cannot
+                            // (OxidantData/Oxidant#164). Fall through and re-resolve.
                         }
                     }
                 } else {
