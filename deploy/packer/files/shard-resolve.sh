@@ -9,9 +9,13 @@
 # and queries silently return partial results. This timer-driven pass re-resolves the
 # index against settled membership and restarts oxidant-worker only when it actually
 # diverged, with two guards:
-#   - stability: the divergent index must reproduce on two polls 20s apart (a member-
-#     ship churn mid-refresh must not flap the worker), and
+#   - stability: the divergent index must reproduce on two consecutive timer polls
+#     (OnUnitActiveSec=2min, AccuracySec=30s; a membership churn mid-refresh must not
+#     flap the worker), and
 #   - hysteresis: at most one self-restart per 10 minutes.
+# Membership must be unique, exact-size, and include this instance. Do not insert an
+# unobserved self; an oversized InService set used to publish ordinal >= WORKER_COUNT
+# and disable file sharding (OxidantData/Oxidant#184).
 # Driver nodes exit immediately (OXIDANT_ROLE != worker). Enabled by oxidant-shard-resolve.timer.
 set -euo pipefail
 
@@ -22,6 +26,10 @@ AWS_BIN="${OXIDANT_AWS_BIN:-/usr/local/bin/aws}"
 export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
 log() { echo "[oxidant-shard-resolve] $*"; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=shard-membership.sh
+source "${SCRIPT_DIR}/shard-membership.sh"
 
 [[ -f "${ENV_FILE}" ]] || exit 0
 role="$(sed -n 's/^OXIDANT_ROLE=//p' "${ENV_FILE}" | head -1)"
@@ -50,23 +58,13 @@ mapfile -t PEER_IDS < <("${AWS_BIN}" autoscaling describe-auto-scaling-groups \
   --region "${REGION}" --auto-scaling-group-names "${WORKER_ASG}" \
   --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
   --output text 2>/dev/null | tr '\t' '\n' | sort -u)
-# Self must be in the set (we may not be InService yet / describe eventual consistency).
-if ! printf '%s\n' "${PEER_IDS[@]}" | grep -qx "${INSTANCE_ID}"; then
-  PEER_IDS+=("${INSTANCE_ID}")
-fi
-IFS=$'\n' PEER_IDS=($(printf '%s\n' "${PEER_IDS[@]}" | sort -u))
-# Incomplete membership: churn in progress — do nothing this round (bootstrap's
-# loud-fail covers the boot-time case; here the running worker keeps its index).
-(( ${#PEER_IDS[@]} >= WORKER_COUNT )) || exit 0
-
-RESOLVED=-1
-for i in "${!PEER_IDS[@]}"; do
-  [[ "${PEER_IDS[$i]}" == "${INSTANCE_ID}" ]] && RESOLVED=$i && break
-done
-(( RESOLVED >= 0 )) || exit 0
+# Incomplete, oversized, duplicate, or self-absent membership: churn in progress.
+# Keep the last validated index; do not insert this instance into an unobserved set
+# (that published ordinal >= WORKER_COUNT and disabled file sharding).
+RESOLVED="$(oxidant_resolve_shard_index "${WORKER_COUNT}" "${INSTANCE_ID}" "${PEER_IDS[@]}")" || exit 0
 [[ "${RESOLVED}" != "${CURRENT}" ]] || exit 0
 
-# Stability: the divergent index must reproduce on the next poll, 20s later.
+# Stability: the divergent index must reproduce on the next timer poll (~2 minutes).
 if [[ -f "${PENDING}" ]] && [[ "$(cat "${PENDING}")" == "${RESOLVED}" ]]; then
   rm -f "${PENDING}"
 else
