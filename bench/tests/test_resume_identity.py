@@ -191,6 +191,47 @@ class ResumeIdentityTests(unittest.TestCase):
                 sys.argv = old
             self.assertEqual(Session.queries, [])
 
+    def test_tpcds_missing_query_is_recorded_in_out(self):
+        module = _load_runner("tpcds")
+        with TemporaryDirectory(prefix="benchmark-missing-") as directory:
+            tmp = Path(directory)
+            queries = tmp / "queries"
+            queries.mkdir()
+            (queries / "q1.sql").write_text("SELECT 1 AS present")
+            output = tmp / "result.json"
+            argv = [
+                "runner",
+                "--endpoint",
+                "sc://127.0.0.1:1",
+                "--glue-database",
+                "db",
+                "--machine",
+                "m",
+                "--tries",
+                "1",
+                "--start",
+                "1",
+                "--end",
+                "2",
+                "--queries",
+                str(queries),
+                "--out",
+                str(output),
+            ]
+            old = sys.argv
+            Session.queries = []
+            try:
+                sys.argv = argv
+                self.assertEqual(module.main(), 1)
+            finally:
+                sys.argv = old
+            self.assertTrue(output.exists(), "trailing missing query left no --out artifact")
+            payload = json.loads(output.read_text())
+            self.assertEqual(payload["failures"], 1)
+            names = [row["query"] for row in payload["queries"]]
+            self.assertEqual(names, ["Q1", "Q2"])
+            self.assertEqual(payload["queries"][1]["error"], "missing q2.sql")
+
 
 if __name__ == "__main__":
     unittest.main()

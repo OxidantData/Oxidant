@@ -207,6 +207,20 @@ def session_dead(err: str) -> bool:
     )
 
 
+def persist(out: Path, identity: dict, failures: int, results: list) -> None:
+    payload = {
+        **identity,
+        "run_date": str(date.today()),
+        "failures": failures,
+        "queries": results,
+        "elapsed_total_s": sum(
+            r["elapsed_s"] for r in results if r.get("elapsed_s") is not None
+        ),
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2) + "\n")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--endpoint", required=True, help="sc://host:50051")
@@ -275,6 +289,7 @@ def main() -> int:
                     "error": f"missing {qpath.name}",
                 }
             )
+            persist(args.out, identity, failures, results)
             continue
 
         orig = qpath.read_text()
@@ -287,6 +302,7 @@ def main() -> int:
                 elapsed = prev.get("elapsed_s")
             print(f"{name} SKIP (prior {elapsed:.4f}s)", flush=True)
             results.append(prev)
+            persist(args.out, identity, failures, results)
             continue
         times: list[float | None] = []
         err: str | None = None
@@ -353,17 +369,7 @@ def main() -> int:
                 "sql_sha256": sha,
             }
         )
-        payload = {
-            **identity,
-            "run_date": str(date.today()),
-            "failures": failures,
-            "queries": results,
-            "elapsed_total_s": sum(
-                r["elapsed_s"] for r in results if r.get("elapsed_s") is not None
-            ),
-        }
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(payload, indent=2) + "\n")
+        persist(args.out, identity, failures, results)
 
     try:
         spark.stop()
