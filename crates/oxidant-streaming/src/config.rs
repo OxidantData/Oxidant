@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use datafusion::arrow::datatypes::SchemaRef;
+
 /// How a streaming query is wired: where rows come from, and where they land.
 /// What a violated expectation does to the micro-batch that violated it.
 ///
@@ -31,6 +33,9 @@ pub struct StreamQueryConfig {
     /// `readStream.option(...)`. Ordered so the derived streaming-input table name
     /// ([`crate::stream_input_name`]) is stable across runs.
     pub source_options: BTreeMap<String, String>,
+    /// `readStream.schema(...)` — Arrow schema decoded from the Connect DataSource
+    /// schema string. `None` means the source must infer (or refuse) at start.
+    pub source_schema: Option<SchemaRef>,
     /// `writeStream.format(...)` — `delta`, `parquet`, `json`, `csv`, or `memory`.
     pub sink_format: String,
     /// `writeStream.toTable("catalog.db.table")`.
@@ -62,6 +67,7 @@ impl Default for StreamQueryConfig {
         Self {
             source_format: "memory".into(),
             source_options: BTreeMap::new(),
+            source_schema: None,
             sink_format: "memory".into(),
             sink_table: None,
             sink_path: None,
@@ -115,6 +121,7 @@ impl StreamQueryConfig {
         Self {
             source_format: source_format.to_string(),
             source_options,
+            source_schema: None,
             sink_format: sink_format.to_string(),
             sink_table,
             sink_path,
@@ -164,6 +171,7 @@ impl StreamQueryConfig {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            source_schema: None,
             sink_format: if sink_format.is_empty() {
                 // `writeStream.toTable(...)` without a format is Delta: the only sink that
                 // commits atomically, so it is the right default for a live table.
