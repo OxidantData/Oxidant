@@ -17,9 +17,15 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import time
 from datetime import date
 from pathlib import Path
+
+_BENCH = Path(__file__).resolve().parent.parent
+if str(_BENCH) not in sys.path:
+    sys.path.insert(0, str(_BENCH))
+from qualify_sql import qualify_relations
 
 TABLES = [
     "call_center",
@@ -78,111 +84,14 @@ def rewrite_bare_intervals(sql: str) -> str:
     )
 
 
-# Tokenizer for qualify(): string literals / quoted identifiers and comments are opaque;
-# only bare words in table-reference position are ever rewritten.
-_TOKEN = re.compile(
-    r"(?P<str>'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\")"
-    r"|(?P<comment>--[^\n]*|/\*.*?\*/)"
-    r"|(?P<word>[A-Za-z_][\w$]*)"
-    r"|(?P<ws>\s+)"
-    r"|(?P<punct>.)",
-    re.DOTALL,
-)
-
-# Keywords after which the next identifier is a table reference.
-_TABLE_REF_START = {"from", "join", "into"}
-# Keywords that end the FROM list entirely (no comma resumes table references).
-_FROM_LIST_HARD_END = {
-    "where", "group", "order", "having", "limit", "offset", "union", "intersect",
-    "except", "minus", "window", "qualify", "select", "with", "values", "set",
-    "returning", "sort", "cluster", "distribute", "lateral", "pivot", "unpivot",
-    "tablesample",
-}
-# Keywords that only suspend the current reference (a top-level comma still resumes
-# the FROM list — TPC-DS mixes JOIN … ON (…) with comma-joins, e.g. Q49's
-# `LEFT OUTER JOIN web_returns wr ON (…) ,date_dim`).
-_FROM_LIST_SOFT_END = {"on", "using", "as"}
-
-
 def qualify(sql: str, database: str) -> str:
     """Qualify bare TPC-DS table references to glue.<db>.<table>.
 
-    A bare regex over table names also rewrites column aliases (`AS store_sales`
-    in Q31, `AS item` in Q49), alias-without-AS (`store_v1 store` in Q51,
-    `Call_Center` in Q91) and even string literals (`'store'` in Q49), producing
-    invalid SQL that the driver then cannot even parse. Instead, only rewrite a
-    table name in table-reference position: right after FROM/JOIN/INTO or after a
-    comma inside a FROM list. Aliases, column references and literals pass through.
+    Interval rewrite stays a separate transform; relation qualification does
+    not rewrite literals, comments or aliases (OxidantData/Oxidant#186).
     """
     body = rewrite_bare_intervals(sql)
-    names = set(TABLES)
-    tokens = list(_TOKEN.finditer(body))
-    out: list[str] = []
-    stack: list[tuple[bool, bool]] = []
-    expect_table = False
-    in_from = False
-    i = 0
-    while i < len(tokens):
-        m = tokens[i]
-        tok = m.group(0)
-        if m.lastgroup in ("str", "comment", "ws"):
-            out.append(tok)
-        elif m.lastgroup == "punct":
-            if tok == "(":
-                stack.append((expect_table, in_from))
-                expect_table = in_from = False
-            elif tok == ")":
-                expect_table, in_from = stack.pop() if stack else (False, False)
-                # What follows `)` is an alias, not a table reference.
-                expect_table = False
-            elif tok == "," and in_from:
-                expect_table = True
-            out.append(tok)
-        else:  # word
-            low = tok.lower()
-            if low in _TABLE_REF_START:
-                expect_table = in_from = True
-                out.append(tok)
-            elif low in _FROM_LIST_HARD_END:
-                expect_table = in_from = False
-                out.append(tok)
-            elif low in _FROM_LIST_SOFT_END:
-                expect_table = False
-                out.append(tok)
-            elif expect_table:
-                # Consume a dotted tail (db.table / catalog.db.table): already
-                # qualified references pass through untouched. Whitespace is only
-                # skipped while a dot actually follows, so no spacing is lost.
-                j = i + 1
-                tail = ""
-                while True:
-                    k = j
-                    if k < len(tokens) and tokens[k].lastgroup == "ws":
-                        k += 1
-                    m2 = k + 1
-                    if (
-                        k < len(tokens)
-                        and tokens[k].lastgroup == "punct"
-                        and tokens[k].group(0) == "."
-                    ):
-                        if m2 < len(tokens) and tokens[m2].lastgroup == "ws":
-                            m2 += 1
-                        if m2 < len(tokens) and tokens[m2].lastgroup == "word":
-                            tail += "".join(t.group(0) for t in tokens[j : m2 + 1])
-                            j = m2 + 1
-                            continue
-                    break
-                if not tail and low in names:
-                    out.append(f"glue.{database}.{low}")
-                else:
-                    out.append(tok + tail)
-                i = j
-                expect_table = False
-                continue
-            else:
-                out.append(tok)
-        i += 1
-    return "".join(out)
+    return qualify_relations(body, TABLES, "glue", database)
 
 
 def session_dead(err: str) -> bool:
