@@ -1948,7 +1948,7 @@ async fn parquet_metadata_provider(
         md,
         table_name,
         roots,
-        crate::shard::ShardAssignment::from_env(),
+        crate::shard::ShardAssignment::assignment_from_env().map_err(oxidant_to_df)?,
     )
     .await
 }
@@ -3667,6 +3667,33 @@ mod tests {
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Parquet catalog listing must not treat `index >= count` as unsharded (OxidantData/Oxidant#184).
+    #[tokio::test]
+    async fn parquet_listing_refuses_out_of_range_shard_env() {
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        let _env = crate::shard::ShardEnvWriteGuard::take();
+        std::env::set_var("OXIDANT_WORKER_COUNT", "2");
+        std::env::set_var("OXIDANT_SHARD_INDEX", "2");
+        let dir = write_parquet_dir();
+        let location =
+            crate::shard::ensure_collection_url(&format!("file://{}", dir.to_string_lossy()));
+        let root = ListingTableUrl::parse(&location).unwrap();
+        let ctx = SessionContext::new();
+        let md = TableMetadata::new("fake.ns.orders", location, TableFormat::Parquet);
+        let err = parquet_metadata_provider(&ctx.state(), &md, "orders", vec![root])
+            .await
+            .expect_err("invalid shard config must not list every parquet file");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing unrestricted file selection"),
+            "parquet listing still unsharded on invalid env: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("OXIDANT_WORKER_COUNT");
+        std::env::remove_var("OXIDANT_SHARD_INDEX");
     }
 
     /// Write a Hive-partitioned parquet layout: `<dir>/region=<r>/part-0.parquet`, each file
