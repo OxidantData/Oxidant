@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::{Result as DfResult, exec_err};
+use datafusion::common::{exec_err, Result as DfResult};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
@@ -168,10 +168,14 @@ fn tokenize_body(s: &str) -> std::result::Result<Vec<Tok>, String> {
             out.push(Tok::Int(n));
             continue;
         }
-        // Spark `--` comments run to the end of the body. Without this, `a--1`
-        // is `a - (-1)` and CREATE succeeds with the wrong value.
+        // Skip only the comment line: `a--1` stays `a`, while tokens on later
+        // lines must still be parsed and validated before registration.
         if c == '-' && i + 1 < b.len() && b[i + 1] as char == '-' {
-            break;
+            i += 2;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
         }
         if matches!(c, '+' | '-' | '*' | '(' | ')') {
             out.push(Tok::Op(c));
@@ -600,6 +604,68 @@ mod tests {
             i32_col(&engine, "SELECT review_comment(5) AS value").await,
             vec![5]
         );
+    }
+
+    #[tokio::test]
+    async fn sql_udf_multiline_comment_resumes_at_newline() {
+        for newline in ["\n", "\r\n"] {
+            let engine = crate::Engine::new();
+            engine
+                .sql(&format!(
+                    "CREATE FUNCTION comment_add(a INT) RETURNS INT RETURN a -- same-line comment{newline} + 2"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                i32_col(&engine, "SELECT comment_add(5)").await,
+                vec![7],
+                "line comments must not discard the rest of the body ({newline:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sql_udf_multiline_comment_rejects_unsupported_suffix_at_create() {
+        let engine = crate::Engine::new();
+        let before = engine.export_udfs_json();
+        let err = engine
+            .sql("CREATE FUNCTION comment_bad(a INT) RETURNS INT RETURN a -- comment\n + length(a)")
+            .await
+            .expect_err("an unsupported suffix after a line comment must fail at CREATE");
+        assert!(
+            matches!(err, Error::Plan(ref msg) if msg.contains("unsupported SQL function body")),
+            "got {err}"
+        );
+        assert_eq!(engine.export_udfs_json(), before);
+        engine
+            .sql("DESCRIBE FUNCTION comment_bad")
+            .await
+            .expect_err("rejected CREATE must not leave a registry entry");
+        engine
+            .sql("SELECT comment_bad(5)")
+            .await
+            .expect_err("rejected CREATE must not install a callable function");
+    }
+
+    #[tokio::test]
+    async fn sql_udf_multiline_comment_invalid_replace_preserves_existing_function() {
+        let engine = crate::Engine::new();
+        engine
+            .sql("CREATE FUNCTION comment_keep(a INT) RETURNS INT RETURN a * 2")
+            .await
+            .unwrap();
+        assert_eq!(i32_col(&engine, "SELECT comment_keep(5)").await, vec![10]);
+        let before = engine.export_udfs_json();
+        let err = engine
+            .sql("CREATE OR REPLACE FUNCTION comment_keep(a INT) RETURNS INT RETURN a -- comment\n + length(a)")
+            .await
+            .expect_err("an invalid replacement must fail at CREATE OR REPLACE");
+        assert!(
+            matches!(err, Error::Plan(ref msg) if msg.contains("unsupported SQL function body")),
+            "got {err}"
+        );
+        assert_eq!(engine.export_udfs_json(), before);
+        assert_eq!(i32_col(&engine, "SELECT comment_keep(5)").await, vec![10]);
     }
 
     #[tokio::test]
