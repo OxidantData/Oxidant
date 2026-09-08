@@ -48,12 +48,16 @@ Spark client at all.
 ```sh
 # 1. Install (macOS + Linux, x86_64/arm64)
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/OxidantData/Oxidant/releases/latest/download/oxidant-installer.sh | sh
+  https://github.com/OxidantData/Oxidant/releases/latest/download/oxidant-installer.sh \
+  -o oxidant-installer.sh && sh oxidant-installer.sh
 # or: brew install oxidantdata/tap/oxidant · or: docker pull ghcr.io/oxidantdata/oxidant
 
 # 2. Start the engine (gRPC on 50051, Web UI + REST on 4040)
 oxidant start --port 50051
 ```
+
+> Oxidant is not published to crates.io. `cargo install oxidant` installs an unrelated
+> crate of the same name — use one of the three commands above.
 
 ```python
 # 3. Query it from stock PySpark — no JVM on either side

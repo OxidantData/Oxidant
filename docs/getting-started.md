@@ -13,7 +13,9 @@ tables preloaded, so it is the zero-setup path.
 ### 1. Shell installer (macOS + Linux)
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/OxidantData/Oxidant/releases/latest/download/oxidant-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/OxidantData/Oxidant/releases/latest/download/oxidant-installer.sh \
+  -o oxidant-installer.sh && sh oxidant-installer.sh
 ```
 
 Installs `oxidant` into `~/.cargo/bin` (or `$CARGO_HOME/bin` if set); the script
@@ -22,7 +24,9 @@ only — for the sample tables, also grab the standalone archive (see
 [Sample data](#sample-data)):
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/OxidantData/Oxidant/releases/latest/download/sample-data.tar.gz | tar -xz
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/OxidantData/Oxidant/releases/latest/download/sample-data.tar.gz \
+  -o sample-data.tar.gz && tar -xzf sample-data.tar.gz
 ```
 
 ### 2. Homebrew (macOS + Linux)
@@ -129,7 +133,7 @@ oxidant is running
   uptime:         2 hours
   spark connect:  sc://0.0.0.0:50051
   ui + rest:      http://0.0.0.0:4040  (all interfaces; local http://127.0.0.1:4040)
-  health:         ok (single-node, version 0.2.0)
+  health:         ok (single-node, version 0.2.6)
   log:            ~/.local/share/oxidant/run/oxidant.log
   pidfile:        ~/.local/share/oxidant/run/oxidant.pid
   flags:          --port 50051

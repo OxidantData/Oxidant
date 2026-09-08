@@ -12,7 +12,7 @@ on:
       image:
         description: "Full image ref to smoke test"
         required: true
-        default: "ghcr.io/oxidantdata/oxidant:0.1.0"
+        default: "ghcr.io/oxidantdata/oxidant:latest"
 
 permissions:
   packages: read

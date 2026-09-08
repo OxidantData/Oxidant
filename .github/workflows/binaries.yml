@@ -13,6 +13,10 @@
 #      this repo (two v0.1.0 tag pushes produced zero workflow events), and a
 #      GITHUB_TOKEN push would not cascade anyway, so release.yml now fires this
 #      pipeline explicitly via `gh workflow run --ref <tag>`
+#   6. extra `preflight` job gating `plan`: refuses a tag that release.yml did not
+#      cut (see the job for why v0.2.3-v0.2.5 shipped empty)
+#   7. extra `verify-release` job: asserts the published release carries every
+#      expected asset, because `package-linux` uploads *after* `host` publishes
 # If you bump cargo-dist-version in dist-workspace.toml, regenerate locally with
 # `dist generate` and re-apply these edits.
 #
@@ -63,8 +67,78 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  # Refuse to build a tag that release.yml did not cut.
+  #
+  # v0.2.3, v0.2.4 and v0.2.5 were created straight from the GitHub Releases UI. That
+  # makes a *lightweight* tag on whatever commit is at the head of main, and it skips
+  # release.yml's `propose` job — the only thing that bumps the workspace version. All
+  # three tags therefore pointed at a Cargo.toml still reading 0.2.2, and dist refused
+  # them ("This workspace doesn't have anything for dist to Release!"). `plan` died in
+  # ~30s, every later job was skipped, and three assetless releases went public; the
+  # newest of them took over the `latest` pointer that README.md's install line follows.
+  #
+  # dist already fails on this, just illegibly and too late to stop the release object
+  # from existing. This job says why in one line, and puts the release back into draft
+  # so a hand-cut tag cannot sit on `latest` while someone works out what happened.
+  preflight:
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Need the tag object itself, which a shallow checkout does not fetch.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Tag must match the workspace version and come from release.yml
+        # PR runs (pr-run-mode = "plan") have no tag to check.
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          bad=""
+
+          # Distinguish "not fetched" from "lightweight" so a checkout problem is never
+          # reported as a process violation.
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG is not present in the checkout; cannot verify it. This is a" \
+                 "checkout problem, not a bad tag."
+            exit 1
+          fi
+
+          # release.yml:262 creates annotated tags (`git tag -a`). The GitHub UI and a
+          # bare `git tag` create lightweight ones, so this is the cheapest possible
+          # signal that the tag bypassed the release workflow.
+          if [ "$(git cat-file -t "refs/tags/$TAG")" != "tag" ]; then
+            bad="yes"
+            echo "::error::$TAG is a lightweight tag. Release tags must be cut by release.yml," \
+                 "which creates them annotated. Do not use the GitHub Releases UI or \`gh release create\`."
+          fi
+
+          if [ "$TAG" != "v${VERSION}" ]; then
+            bad="yes"
+            echo "::error::tag $TAG does not match the workspace version in Cargo.toml (${VERSION})." \
+                 "release.yml's propose job bumps Cargo.toml/Cargo.lock through a PR; that step was skipped," \
+                 "so dist has nothing to release and every artifact job would be skipped."
+          fi
+
+          if [ -n "$bad" ]; then
+            # Get the broken release off `latest` immediately. Drafting rather than
+            # deleting: reversible, and it keeps whatever release notes were written.
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft
+              echo "::warning::moved release $TAG back to draft so it cannot serve as \`latest\`"
+            fi
+            echo "::error::To release: label a PR patch/minor/major, or Actions -> release -> Run workflow."
+            exit 1
+          fi
+
+          echo "$TAG matches Cargo.toml ($VERSION) and is annotated."
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    needs: preflight
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
@@ -442,15 +516,71 @@ jobs:
           tar -czf sample-data.tar.gz sample-data
           gh release upload "${{ needs.plan.outputs.tag }}" sample-data.tar.gz --clobber --repo ${{ github.repository }}
 
+  # Assert the published release actually carries everything before anything announces it.
+  #
+  # `host` publishes the release, and only then does `package-linux` upload the .deb/.rpm
+  # and sample-data.tar.gz (it needs the release to exist for `gh release upload`). With
+  # fail-fast: false on that matrix, one arch can fail and leave a live, public, incomplete
+  # release — and sample-data.tar.gz uploads from the x86_64 leg alone, so losing that one
+  # leg silently breaks the download that docs/getting-started.md tells users to curl.
+  verify-release:
+    needs:
+      - plan
+      - host
+      - package-linux
+      - publish-homebrew-formula
+    if: ${{ always() && needs.host.result == 'success' }}
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Every expected asset is attached and non-empty
+        run: |
+          TAG="${{ needs.plan.outputs.tag }}"
+          VERSION="${TAG#v}"
+
+          # name<TAB>size for what actually landed on the release.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[] | "\(.name)\t\(.size)"' > actual.tsv
+
+          missing=0
+          while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            size=$(awk -F'\t' -v n="$name" '$1 == n {print $2}' actual.tsv)
+            if [ -z "$size" ]; then
+              echo "::error::release $TAG is missing asset $name"
+              missing=1
+            elif [ "$size" -eq 0 ]; then
+              echo "::error::release $TAG has a zero-byte asset $name"
+              missing=1
+            fi
+          done < <(./scripts/release-expected-assets.sh "$VERSION")
+
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::$TAG is incomplete. Re-run the failed job, then re-run this one;" \
+                 "do not leave the release published in this state."
+            exit 1
+          fi
+          echo "$TAG carries every expected asset."
+
   announce:
     needs:
       - plan
       - host
       - publish-homebrew-formula
+      # Hand-added: without these the workflow reports success while the release is
+      # missing its .deb/.rpm/sample-data, because package-linux runs after `host`
+      # has already published and does not fail-fast.
+      - package-linux
+      - verify-release
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
+    if: ${{ always() && needs.host.result == 'success' && needs.verify-release.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
