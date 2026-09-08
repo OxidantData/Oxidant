@@ -133,6 +133,20 @@ enum Tok {
     Op(char),
 }
 
+/// Maximum expression nesting accepted in a SQL function body.
+///
+/// `parse_add` → `parse_mul` → `parse_atom` recurse once per nesting level and
+/// run *before* any DataFusion recursion gate, so an unbounded body could
+/// overflow the production 32 MiB thread stack (`thread_stack_size` in the
+/// gateway/cli/bench mains) and abort the whole engine process: a probe
+/// against this crate's exact sources survived 6,000 levels but aborted at
+/// 12,000, while the same shape through plain `SELECT` is safely rejected by
+/// DataFusion's `RecursionLimitExceeded`. 100 keeps two orders of magnitude of
+/// headroom under the observed overflow while staying far above any
+/// hand-written integer body; deeper bodies are rejected at CREATE through the
+/// normal unsupported-body path.
+const MAX_BODY_DEPTH: usize = 100;
+
 fn tokenize_body(s: &str) -> std::result::Result<Vec<Tok>, String> {
     let mut out = Vec::new();
     let b = s.as_bytes();
@@ -192,7 +206,7 @@ fn parse_body(s: &str) -> std::result::Result<BodyExpr, String> {
     if toks.is_empty() {
         return Err("empty SQL function body".into());
     }
-    let (expr, i) = parse_add(&toks, 0)?;
+    let (expr, i) = parse_add(&toks, 0, 0)?;
     if i != toks.len() {
         return Err("unsupported SQL function body".into());
     }
@@ -219,39 +233,54 @@ fn body_unknown_idents<'a>(expr: &'a BodyExpr, params: &[String]) -> Vec<&'a str
     out
 }
 
-fn parse_add(toks: &[Tok], mut i: usize) -> std::result::Result<(BodyExpr, usize), String> {
-    let (mut left, n) = parse_mul(toks, i)?;
+fn parse_add(
+    toks: &[Tok],
+    mut i: usize,
+    depth: usize,
+) -> std::result::Result<(BodyExpr, usize), String> {
+    let (mut left, n) = parse_mul(toks, i, depth)?;
     i = n;
     while let Some(Tok::Op(op @ ('+' | '-'))) = toks.get(i) {
-        let (right, n) = parse_mul(toks, i + 1)?;
+        let (right, n) = parse_mul(toks, i + 1, depth)?;
         left = BodyExpr::Binary(Box::new(left), *op, Box::new(right));
         i = n;
     }
     Ok((left, i))
 }
 
-fn parse_mul(toks: &[Tok], mut i: usize) -> std::result::Result<(BodyExpr, usize), String> {
-    let (mut left, n) = parse_atom(toks, i)?;
+fn parse_mul(
+    toks: &[Tok],
+    mut i: usize,
+    depth: usize,
+) -> std::result::Result<(BodyExpr, usize), String> {
+    let (mut left, n) = parse_atom(toks, i, depth)?;
     i = n;
     while let Some(Tok::Op(op @ '*')) = toks.get(i) {
-        let (right, n) = parse_atom(toks, i + 1)?;
+        let (right, n) = parse_atom(toks, i + 1, depth)?;
         left = BodyExpr::Binary(Box::new(left), *op, Box::new(right));
         i = n;
     }
     Ok((left, i))
 }
 
-fn parse_atom(toks: &[Tok], i: usize) -> std::result::Result<(BodyExpr, usize), String> {
+fn parse_atom(
+    toks: &[Tok],
+    i: usize,
+    depth: usize,
+) -> std::result::Result<(BodyExpr, usize), String> {
+    if depth > MAX_BODY_DEPTH {
+        return Err(format!("body nesting deeper than {MAX_BODY_DEPTH} levels"));
+    }
     match toks.get(i) {
         Some(Tok::Op('-')) => {
-            let (inner, n) = parse_atom(toks, i + 1)?;
+            let (inner, n) = parse_atom(toks, i + 1, depth + 1)?;
             Ok((
                 BodyExpr::Binary(Box::new(BodyExpr::Int(0)), '-', Box::new(inner)),
                 n,
             ))
         }
         Some(Tok::Op('(')) => {
-            let (inner, n) = parse_add(toks, i + 1)?;
+            let (inner, n) = parse_add(toks, i + 1, depth + 1)?;
             match toks.get(n) {
                 Some(Tok::Op(')')) => Ok((inner, n + 1)),
                 _ => Err("unclosed '(' in SQL function body".into()),
@@ -694,5 +723,85 @@ mod tests {
             .unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 0, "empty input must not invent a row");
+    }
+
+    /// Deeply nested bodies must be rejected at CREATE, never abort the
+    /// process. 200 exceeds the documented nesting limit of 100; without the
+    /// bound the recursive-descent parser overflowed the 32 MiB production
+    /// thread stack somewhere between 6,000 and 12,000 levels and aborted the
+    /// whole engine process, while the same shape through plain SELECT was
+    /// safely rejected (`RecursionLimitExceeded`, limit 50).
+    #[tokio::test]
+    async fn sql_udf_rejects_deeply_nested_body_at_create() {
+        let engine = crate::Engine::new();
+        let before = engine.export_udfs_json();
+        let body = format!("{}1{}", "(".repeat(200), ")".repeat(200));
+        let err = engine
+            .sql(&format!(
+                "CREATE FUNCTION deep_nested() RETURNS INT RETURN {body}"
+            ))
+            .await
+            .expect_err("nesting beyond the documented limit must be rejected at CREATE");
+        assert!(
+            matches!(err, Error::Plan(ref msg) if msg.contains("unsupported SQL function body")),
+            "got {err}"
+        );
+        assert_eq!(
+            engine.export_udfs_json(),
+            before,
+            "rejected CREATE must not leave a registry entry"
+        );
+        engine
+            .sql("SELECT deep_nested()")
+            .await
+            .expect_err("rejected CREATE must not install a callable function");
+    }
+
+    /// A too-deep `CREATE OR REPLACE` must preserve the existing definition
+    /// and callable, mirroring the invalid-replacement contract for other
+    /// unsupported bodies.
+    #[tokio::test]
+    async fn sql_udf_deeply_nested_invalid_replace_preserves_existing_function() {
+        let engine = crate::Engine::new();
+        engine
+            .sql("CREATE FUNCTION deep_keep(a INT) RETURNS INT RETURN a * 2")
+            .await
+            .unwrap();
+        assert_eq!(
+            i32_col(&engine, "SELECT deep_keep(5) AS value").await,
+            vec![10]
+        );
+        let before = engine.export_udfs_json();
+        let body = format!("{}a{}", "(".repeat(200), ")".repeat(200));
+        let err = engine
+            .sql(&format!(
+                "CREATE OR REPLACE FUNCTION deep_keep(a INT) RETURNS INT RETURN {body}"
+            ))
+            .await
+            .expect_err("a too-deep replacement must fail at CREATE OR REPLACE");
+        assert!(
+            matches!(err, Error::Plan(ref msg) if msg.contains("unsupported SQL function body")),
+            "got {err}"
+        );
+        assert_eq!(engine.export_udfs_json(), before);
+        assert_eq!(
+            i32_col(&engine, "SELECT deep_keep(5) AS value").await,
+            vec![10]
+        );
+    }
+
+    /// The bound must not reject supported bodies: nesting up to the
+    /// documented limit of 100 still parses and evaluates.
+    #[tokio::test]
+    async fn sql_udf_accepts_nesting_to_the_documented_limit() {
+        let engine = crate::Engine::new();
+        let body = format!("{}7{}", "(".repeat(100), ")".repeat(100));
+        engine
+            .sql(&format!(
+                "CREATE FUNCTION deep_ok() RETURNS INT RETURN {body}"
+            ))
+            .await
+            .expect("nesting at the documented limit is inside the supported subset");
+        assert_eq!(i32_col(&engine, "SELECT deep_ok() AS value").await, vec![7]);
     }
 }

@@ -333,7 +333,12 @@ null operands propagate nulls. Line comments end at LF (including CRLF), so late
 body tokens are still parsed and validated. `/`, nested function calls, unknown
 identifiers and unsupported return types are rejected at CREATE rather than
 replaced with a default result. An invalid replacement leaves the old definition
-and callable unchanged.
+and callable unchanged. Body expressions nested deeper than 100 levels are
+rejected at CREATE with the same unsupported-body error: the body parser runs
+before any engine recursion gate, so without this limit a deeply nested body
+could overflow the engine's 32 MiB thread stack and abort the process (the
+same shape through plain `SELECT` is rejected by the engine's recursion limit
+of 50).
 
 ```sql
 CREATE FUNCTION review_double(a INT) RETURNS INT RETURN a * 2;
