@@ -41,6 +41,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 ARG CARGO_PROFILE
 COPY --from=planner /build/recipe.json recipe.json
+# cargo-chef 0.1.73 only prepares workspace members. This excluded local patch
+# must exist before cook, and its source changes must invalidate that cache layer.
+COPY vendor/datafusion-execution-54.1.0 vendor/datafusion-execution-54.1.0
 # Scoped to the one crate we actually ship: an unscoped cook builds dependencies
 # for all 24 workspace members. Must use the same profile as the build below, or
 # the cooked artifacts land in a different target dir and get recompiled.

@@ -13933,7 +13933,8 @@ mod tests {
             .unwrap();
         let query = "SELECT COUNT(*) AS c, SUM(length(l.s)) AS sl, SUM(length(r.s)) AS sr \
              FROM left_wide l JOIN right_wide r ON l.k = r.k";
-        let plan = engine.physical_plan(query).await.unwrap();
+        let df = engine.plan_spark(query).await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
         let budget = engine.hash_join_build_budget().unwrap();
         assert!(
             !hash_join_build_exceeds(plan.as_ref(), budget),
@@ -13951,43 +13952,36 @@ mod tests {
                 .any(|c| build_schema_has(c.as_ref(), col))
         }
         assert!(build_schema_has(plan.as_ref(), "s"));
-        // ...and the SAME query against a plain DataFusion session on the same 32 MiB pool
-        // (no oxidant guard) must fail with `Resources Exhausted`.
+        // ...and the actual first-attempt plan on the same 64 MiB pool, collected
+        // directly WITHOUT collect_join_guarded/retry, must exhaust it. Raw DataFusion
+        // defaults are not a valid control: they use different partitions/batch size
+        // and a partitioned hash join instead of the engine's broadcast upgrade (#199).
         {
-            use datafusion::execution::memory_pool::FairSpillPool;
-            use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-            let env = RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::new(FairSpillPool::new(64 * 1024 * 1024)))
-                .build_arc()
-                .unwrap();
-            let raw = SessionContext::new_with_config_rt(Default::default(), env);
-            raw.register_table(
-                "left_wide",
-                Arc::new(
-                    datafusion::datasource::MemTable::try_new(
-                        join_guard_wide_batches(LEFT, LEFT, 400)[0].schema(),
-                        vec![join_guard_wide_batches(LEFT, LEFT, 400)],
-                    )
-                    .unwrap(),
-                ),
-            )
-            .unwrap();
-            raw.register_table(
-                "right_wide",
-                Arc::new(
-                    datafusion::datasource::MemTable::try_new(
-                        join_guard_wide_batches(RIGHT, RIGHT, 400)[0].schema(),
-                        vec![join_guard_wide_batches(RIGHT, RIGHT, 400)],
-                    )
-                    .unwrap(),
-                ),
-            )
-            .unwrap();
-            let err = raw
-                .sql(query)
+            assert!(!join_strategy_flipped());
+            assert!(!engine.plan_time_smj_reroute(plan.as_ref()));
+            assert!(engine.plan_time_broadcast_upgrade(plan.as_ref()));
+            let (first_ctx, first_plan) = engine
+                .per_join_strategy_physical_plan(df.logical_plan().clone())
                 .await
-                .unwrap()
-                .collect()
+                .unwrap();
+            assert!(!engine.needs_smj_reroute(first_plan.as_ref()));
+            assert!(contains_hash_join(first_plan.as_ref()));
+            assert!(build_schema_has(first_plan.as_ref(), "s"));
+            let config = first_ctx.state().config().clone();
+            assert_eq!(config.target_partitions(), 2);
+            assert_eq!(config.batch_size(), 1024);
+            let display = datafusion::physical_plan::displayable(first_plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert!(
+                display.contains("HashJoinExec: mode=CollectLeft"),
+                "{display}"
+            );
+            assert!(Arc::ptr_eq(
+                &first_ctx.runtime_env().memory_pool,
+                &engine.ctx.runtime_env().memory_pool,
+            ));
+            let err = datafusion::physical_plan::collect(first_plan, first_ctx.task_ctx())
                 .await
                 .expect_err("unguarded hash join must exhaust the pool");
             assert!(
@@ -13995,6 +13989,12 @@ mod tests {
                     .to_ascii_lowercase()
                     .contains("resources exhausted"),
                 "expected pool exhaustion, got: {err}"
+            );
+            engine.wait_for_pool_drain().await;
+            assert_eq!(
+                first_ctx.runtime_env().memory_pool.reserved(),
+                0,
+                "the negative control must release the pool before the guarded query"
             );
         }
         let batches = engine

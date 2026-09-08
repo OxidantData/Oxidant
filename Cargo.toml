@@ -9,6 +9,13 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# Keep upstream development dependencies out of the Engine workspace lock.
+# Engine-owned pool regression tests exercise this dependency through DataFusion.
+exclude = ["vendor/datafusion-execution-54.1.0"]
+
+[patch.crates-io]
+# Narrow 54.1.0 accounting correction; see vendor/datafusion-execution-54.1.0/OXIDANT-PATCH.md.
+datafusion-execution = { version = "=54.1.0", path = "vendor/datafusion-execution-54.1.0" }
 
 [workspace.package]
 version = "0.2.2"

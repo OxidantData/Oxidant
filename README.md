@@ -150,3 +150,5 @@ the parity ratchet, the benchmark suites). Good first contributions are tagged i
 
 GNU Affero General Public License v3.0 — see [`LICENSE`](LICENSE). Commercial licensing:
 [`COMMERCIAL.md`](COMMERCIAL.md). Trademark policy: [`TRADEMARK.md`](TRADEMARK.md).
+Vendored dependency code retains its upstream license and notices; see the
+[DataFusion execution patch](vendor/datafusion-execution-54.1.0/OXIDANT-PATCH.md).
