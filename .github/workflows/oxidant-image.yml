@@ -131,6 +131,14 @@ jobs:
 
       - name: Export digest
         run: |
+          # `rm -rf` first: the amd64 leg runs on the persistent `fremont` runner, where
+          # /tmp survives between jobs. Without this the directory accumulates every digest
+          # ever built on that box, `upload-artifact` ships all of them (the amd64 artifact
+          # was 910 bytes against arm64's 244 — one empty file), and the merge job then asks
+          # `imagetools create` to bind digests whose images are long gone from GHCR:
+          #   ERROR: ghcr.io/oxidantdata/oxidant@sha256:58e5034...: not found
+          # That is what stopped v0.2.6 from publishing an image at all.
+          rm -rf /tmp/digests
           mkdir -p /tmp/digests
           # Strip the `sha256:` prefix: the bare hash is the filename (the merge job
           # re-adds `@sha256:`), and upload-artifact@v4 rejects ':' in paths.
