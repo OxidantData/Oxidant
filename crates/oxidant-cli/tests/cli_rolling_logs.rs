@@ -73,6 +73,32 @@ fn wait_for_log(root: &std::path::Path, child: &mut Child, what: &str) -> String
     );
 }
 
+/// Wait for `dir` to appear under `root`, or give up.
+///
+/// The journal directory is created during boot, but not necessarily before the first log line
+/// lands — on the self-hosted CI runner it consistently arrives after. Checking for it straight
+/// after [`wait_for_log`] therefore races the driver's own startup, and killing the child first
+/// makes that race unwinnable: the listing comes back `["logs"]` and the test fails on a machine
+/// that is merely ordering boot work differently. Poll while the child is still alive instead.
+fn wait_for_dir(root: &std::path::Path, dir: &std::path::Path, child: &mut Child, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if dir.is_dir() {
+            return;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("{what} exited before creating {}: {status}", dir.display());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "logs and history share one root: {:?}",
+        std::fs::read_dir(root)
+            .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+}
+
 /// Every line the writer produces leads with an RFC-3339 UTC timestamp — the whole reason a
 /// rolled log has a `ts` column for §6b's time-range filters to filter on.
 fn assert_timestamped(body: &str, what: &str) {
@@ -156,6 +182,15 @@ fn the_driver_writes_a_rolling_log_under_its_own_root() {
         .expect("spawn server");
 
     let body = wait_for_log(root.path(), &mut server, "the driver");
+    // The journal lives under the same root, so the two subsystems agree on where "here" is —
+    // which is what `OXIDANT_DATA_DIR_PER_PROCESS` splitting on `<role>-<port>` depends on.
+    // Checked before the kill, because the driver is the only thing that can still create it.
+    wait_for_dir(
+        root.path(),
+        &root.path().join("history").join("statements"),
+        &mut server,
+        "the driver",
+    );
     let _ = server.kill();
     let _ = server.wait();
 
@@ -163,15 +198,6 @@ fn the_driver_writes_a_rolling_log_under_its_own_root() {
     assert!(
         body.contains(r#"role="driver""#),
         "the driver's own log must say it is a driver: {body}"
-    );
-    // The journal lives under the same root, so the two subsystems agree on where "here" is —
-    // which is what `OXIDANT_DATA_DIR_PER_PROCESS` splitting on `<role>-<port>` depends on.
-    assert!(
-        root.path().join("history").join("statements").is_dir(),
-        "logs and history share one root: {:?}",
-        std::fs::read_dir(root.path())
-            .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
-            .unwrap_or_default()
     );
 }
 
