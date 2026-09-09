@@ -103,6 +103,43 @@ cargo run -p oxidant-bench --release -- tpch-bench --sf 100 \
   --json bench/tpch/results/tpch-sf100-glue.json
 ```
 
+## Conversion completion and resume
+
+`tbl_to_parquet.py` converts a table in staging before replacing its published
+output. Both suite converters and `--check-complete` use the same table validator.
+The version 2 `_oxidant_complete.json` binds source names/sizes/SHA-256 hashes to
+an exact, flat set of `part-*.parquet` files. Each output record contains its name,
+byte size, SHA-256 and Parquet row count; the marker also records the table row
+total. Footer validation and content hashing happen before publication and on
+reuse. A changed readable file, corrupt footer, missing/extra file, nested output
+or symlink cannot qualify as that completed table.
+
+A successful check leaves files untouched. A failed check exits nonzero; ordinary
+conversion rebuilds the affected table from the selected raw inputs, preserving
+other completed tables. Version 1 markers and missing/invalid markers are
+unverified and must be rebuilt, not upgraded by assigning hashes to existing
+parts. Keep any historical benchmark dataset/receipt separately before rebuilding
+it; this command is not an archival migration. `--force` also rebuilds.
+
+Checks read all source and output bytes (streamed hashing, not full tables in
+memory), plus output footers. This adds linear disk I/O; no scale-performance
+claim follows from the small regression fixtures. Run the local converter gates
+with an existing PyArrow installation:
+
+```sh
+python3 -m unittest discover -s bench/tpc/tests -p 'test_*.py' -v
+```
+
+This is **table-output integrity**, not a full dataset or benchmark certificate.
+The marker does not yet bind expected generator child indices, generator/scale,
+converter/schema/settings identity or a dataset-wide committed generation.
+TPC-DS `--only` validates only selected input tables, not the full suite; required
+table coverage, concurrent publishers and interruption during directory promotion
+remain separate acceptance work. Registration/other readers are not changed to
+enforce this validator. A checksum detects drift relative to the emitted marker,
+not malicious coordinated replacement of both metadata and data, or SQL result
+correctness. Existing historical timings and parity baselines are unchanged.
+
 ## Kits / license
 
 - Official downloads: [TPC current specifications](https://www.tpc.org/tpc_documents_current_versions/current_specifications.asp)
