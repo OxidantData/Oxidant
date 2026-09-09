@@ -18,10 +18,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
+import sys
 import time
 from datetime import date
 from pathlib import Path
+
+_BENCH = Path(__file__).resolve().parent.parent
+if str(_BENCH) not in sys.path:
+    sys.path.insert(0, str(_BENCH))
+from qualify_sql import qualify_relations
+from resume_identity import can_reuse, run_identity, reusable_prior, source_sha_for, sql_sha256
 
 TABLES = [
     "lineitem",
@@ -36,14 +42,7 @@ TABLES = [
 
 
 def qualify(sql: str, database: str) -> str:
-    body = sql
-    for t in TABLES:
-        body = re.sub(
-            rf"(?i)(?<![\w.]){t}(?![\w.])",
-            f"glue.{database}.{t}",
-            body,
-        )
-    return body
+    return qualify_relations(sql, TABLES, "glue", database)
 
 
 def session_dead(err: str) -> bool:
@@ -96,12 +95,16 @@ def main() -> int:
 
     from pyspark.sql import SparkSession
 
+    identity = run_identity(
+        endpoint=args.endpoint,
+        dataset=f"TPC-H SF100 (Glue {args.glue_database} via Connect)",
+        machine=args.machine,
+        tries=args.tries,
+        source_sha=source_sha_for(Path(__file__)),
+    )
     prior: dict = {}
     if args.out.exists() and not args.no_resume:
-        prior = {
-            q["query"]: q
-            for q in json.loads(args.out.read_text()).get("queries", [])
-        }
+        prior = reusable_prior(json.loads(args.out.read_text()), identity)
 
     def new_spark() -> SparkSession:
         return SparkSession.builder.remote(args.endpoint).getOrCreate()
@@ -113,13 +116,18 @@ def main() -> int:
     failures = 0
     for n in range(args.start, args.end + 1):
         name = f"Q{n}"
+        orig = (args.queries / f"q{n}.sql").read_text()
+        sql = qualify(orig, args.glue_database)
+        sha = sql_sha256(orig)
+        xform_sha = sql_sha256(sql)
         prev = prior.get(name)
-        if prev and prev.get("hot_s") is not None and not prev.get("error"):
-            print(f"{name} SKIP (prior hot={prev['hot_s']:.4f}s)", flush=True)
+        if can_reuse(prev, sql_sha=sha, transformed_sha=xform_sha):
+            elapsed = prev.get("hot_s")
+            if elapsed is None:
+                elapsed = prev.get("elapsed_s")
+            print(f"{name} SKIP (prior {elapsed:.4f}s)", flush=True)
             results.append(prev)
             continue
-
-        sql = qualify((args.queries / f"q{n}.sql").read_text(), args.glue_database)
         times: list[float | None] = []
         err: str | None = None
         for try_i in range(args.tries):
@@ -172,14 +180,19 @@ def main() -> int:
             hot = min(t for t in times[1:] if t is not None)
             print(f"{name} HOT {hot:.4f}s", flush=True)
         results.append(
-            {"query": name, "tries": times, "hot_s": hot, "error": err}
+            {
+                "query": name,
+                "tries": times,
+                "hot_s": hot,
+                "error": err,
+                "sql_sha256": sha,
+                "original_sha256": sha,
+                "transformed_sha256": xform_sha,
+            }
         )
-        # Checkpoint after every query so a kill still keeps progress.
         payload = {
-            "dataset": f"TPC-H SF100 (Glue {args.glue_database} via Connect)",
-            "machine": args.machine,
+            **identity,
             "run_date": str(date.today()),
-            "endpoint": args.endpoint,
             "failures": failures,
             "queries": results,
             "hot_total_s": sum(
