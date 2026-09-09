@@ -126,19 +126,13 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
-      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
-      - name: Add Rust toolchain to PATH (self-hosted runner)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # Self-healing: reinstalls rustup (pinned, checksum-verified) if the runner's
+      # home-directory install is gone, then installs the rust-toolchain.toml pin.
+      - uses: ./.github/actions/setup-rust
       # Persistent runner: capacity is provisioned by its operator, not reclaimed
       # by deleting shared SDKs or another job's tool cache.
       - name: Report runner disk capacity
         run: df -h /
-      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
-        run: |
-          rustup show
-          rustup component add clippy
-          rustc --version && cargo --version
       # Sole writer of the shared cache. Every job below restores this same key with
       # `save-if: false`: they all use one key, and GitHub only lets one job reserve it, so
       # without a designated writer they race and the first to finish wins. That was the
@@ -457,12 +451,7 @@ jobs:
       OXIDANT_TPC_DATA: ${{ github.workspace }}/.tpc-data
     steps:
       - uses: actions/checkout@v4
-      - name: Add Rust toolchain to PATH (self-hosted runner)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
-        run: |
-          rustup show
-          rustc --version && cargo --version
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace
@@ -548,14 +537,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
-      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
-      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
-      - name: Add Rust toolchain to PATH (self-hosted runner)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
-        run: |
-          rustup show
-          rustc --version && cargo --version
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace
