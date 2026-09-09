@@ -5587,6 +5587,54 @@ mod tests {
         assert_eq!(result["schema"]["fields"][0]["name"], "hello");
     }
 
+    /// Issue #206: the documented getting-started flow — boot with `--sample-data <DIR>`,
+    /// then query `samples.*` through the statement API — must resolve the tables boot
+    /// registered. The wiring under test is the one `serve()` uses: registration writes into
+    /// the service's engine catalog, and `POST /api/v1/statements` executes through
+    /// `execute_sql`'s shared REST session — so a boot/query session split (the shape #206
+    /// was reported as) fails here loudly instead of reaching a user.
+    #[tokio::test]
+    async fn sample_tables_registered_at_boot_resolve_through_the_statement_api() {
+        let (_env, state, app) = test_state();
+        let registered = state
+            .service
+            .engine()
+            .register_sample_tables(sample_data_dir())
+            .await;
+        assert!(
+            registered >= 24,
+            "the bundled tree carries 8 tables x parquet/csv plus delta/iceberg pairs; \
+             got {registered}"
+        );
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/statements?wait=true",
+            json!({ "sql": "SELECT count(*) AS n FROM samples.tpch_nation" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "succeeded", "{body}");
+        let id = body["statementId"].as_str().unwrap().to_string();
+
+        let (status, result) = get_json(&app, &format!("/api/v1/statements/{id}/result")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result["rows"][0]["n"], 25, "{result}");
+
+        // The catalog surface the getting-started doc walks next answers through the same
+        // statement path. (`IN <one-part>` names a *catalog* in this grammar, so the schema
+        // is addressed two-part.)
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/statements?wait=true",
+            json!({ "sql": "SHOW TABLES IN spark_catalog.samples" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "succeeded", "{body}");
+        assert_eq!(body["rowCount"].as_i64().unwrap(), 24, "{body}");
+    }
+
     #[tokio::test]
     async fn submit_without_wait_returns_202_pending() {
         let (_env, _state, app) = test_state();

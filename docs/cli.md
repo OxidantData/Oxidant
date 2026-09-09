@@ -37,6 +37,11 @@ server-side — cancel it via the API or Web UI).
 oxidant sql --url http://driver.internal:4040 -e "SELECT count(*) FROM glue.oxidant_demo.orders"
 ```
 
+The URL is the server's **UI/REST port** (`--ui-port` at `oxidant start`, default 4040), not the
+Spark Connect gRPC port. `sql` has no `--port` flag — unknown flags are refused at parse time,
+because a silently ignored `--port 4040` used to run the statement embedded instead of against
+the server you meant, and report that server's tables as `not found` (issue #206).
+
 `--timeout` applies only to this path; an embedded statement runs to completion locally.
 
 ## SQL input

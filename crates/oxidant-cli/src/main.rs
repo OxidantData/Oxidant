@@ -733,7 +733,67 @@ struct SqlOptions {
     sample_data: Option<String>,
 }
 
+/// The flags `oxidant sql` understands, in either `--name value` or `--name=value` form.
+/// Everything is valued (there are no boolean switches), which is what lets
+/// [`reject_unknown_sql_flags`] walk positionally: a known flag consumes the next token.
+const SQL_FLAGS: &[&str] = &[
+    "-e",
+    "-f",
+    "--format",
+    "--timeout",
+    "--url",
+    "--config",
+    "-c",
+    "--sample-data",
+];
+
+/// Refuse flags `oxidant sql` does not understand instead of silently ignoring them.
+///
+/// The hand-rolled [`flag`] scanner reads the flags it knows and leaves everything else in
+/// place, so a mistyped or misplaced flag used to vanish — with real consequences: `--port`
+/// is an `oxidant start` flag, and `oxidant sql --port 41990 -e …` was parsed as *no server
+/// requested*, dropping the statement into an embedded engine with no sample data and
+/// reporting the just-started server's tables as `not found` (issue #206 — a "server can't
+/// resolve the sample tables it registered" report that was never the server). Loud and
+/// early beats plausible and wrong.
+fn reject_unknown_sql_flags(args: &[String]) -> oxidant_common::Result<()> {
+    let mut i = 0;
+    while i < args.len() {
+        let token = &args[i];
+        // `--` ends flag scanning; everything after it is positional (stdin SQL mode has
+        // none, but rejecting it would break the convention for no benefit).
+        if token == "--" {
+            return Ok(());
+        }
+        if !token.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        let name = token.split_once('=').map(|(n, _)| n).unwrap_or(token);
+        if SQL_FLAGS.contains(&name) {
+            // `--name=value` carries its value; `--name value` consumes the next token.
+            if !token.contains('=') {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        let hint = if name == "--port" {
+            " — `--port` is an `oxidant start` flag; `oxidant sql` reaches a running server's \
+             statement API by URL: --url http://localhost:<ui-port> \
+             (default http://localhost:4040)"
+        } else {
+            ""
+        };
+        return Err(oxidant_common::Error::Io(format!(
+            "unknown flag `{name}` for `oxidant sql`{hint}"
+        )));
+    }
+    Ok(())
+}
+
 fn sql_options(args: &[String]) -> oxidant_common::Result<SqlOptions> {
+    reject_unknown_sql_flags(args)?;
     let source = match (flag(args, "-e"), flag(args, "-f")) {
         (Some(sql), None) => SqlSource::Inline(sql),
         (None, Some(path)) => SqlSource::File(path),
@@ -1246,6 +1306,59 @@ mod tests {
     fn sql_options_rejects_e_and_f_together() {
         let parsed = sql_options(&args(&["oxidant", "sql", "-e", "SELECT 1", "-f", "q.sql"]));
         assert!(parsed.is_err());
+    }
+
+    /// Issue #206: `oxidant sql --port 41990 -e …` silently ignored `--port` (an
+    /// `oxidant start` flag), ran embedded with no sample data, and reported the just-started
+    /// server's tables as `not found`. Unknown flags are now refused at parse time, and
+    /// `--port` names the remedy.
+    #[test]
+    fn sql_options_rejects_unknown_flags_and_answers_port_with_url() {
+        let parsed = sql_options(&args(&[
+            "oxidant", "sql", "--port", "41990", "-e", "SELECT 1",
+        ]));
+        let err = parsed.expect_err("--port must be rejected").to_string();
+        assert!(err.contains("unknown flag `--port`"), "{err}");
+        assert!(err.contains("--url"), "{err}");
+
+        let parsed = sql_options(&args(&["oxidant", "sql", "-e", "SELECT 1", "--prot", "9"]));
+        let err = parsed
+            .expect_err("typo --prot must be rejected")
+            .to_string();
+        assert!(err.contains("unknown flag `--prot`"), "{err}");
+
+        let parsed = sql_options(&args(&["oxidant", "sql", "-e", "SELECT 1", "--serve"]));
+        assert!(parsed.is_err());
+    }
+
+    /// Every documented flag keeps parsing, in both `--name value` and `--name=value` form,
+    /// and a flag's *value* is never mistaken for a flag.
+    #[test]
+    fn sql_options_accepts_every_known_flag_in_both_forms() {
+        let opts = sql_options(&args(&[
+            "oxidant",
+            "sql",
+            "-e",
+            "--select-odd-looking-value",
+            "--format=json",
+            "--timeout",
+            "9",
+            "--url=http://h:9",
+            "-c",
+            "c.yaml",
+            "--sample-data",
+            "/d",
+        ]))
+        .unwrap();
+        assert_eq!(
+            opts.source,
+            SqlSource::Inline("--select-odd-looking-value".to_string())
+        );
+        assert_eq!(opts.url, "http://h:9");
+        // `--` ends flag scanning: anything after it is left alone.
+        let opts =
+            sql_options(&args(&["oxidant", "sql", "-e", "SELECT 1", "--", "--port"])).unwrap();
+        assert_eq!(opts.source, SqlSource::Inline("SELECT 1".to_string()));
     }
 
     #[test]
