@@ -37,6 +37,39 @@ benchmarks in `bench/`; the Python helper package in `python/pyoxidant`.
 3. **One backend, no second runtime.** Execution work lands as Loom operators.
 4. **Every claim is measured.** Performance changes ride with a ClickBench/TPC-H number.
 
+## Releasing
+
+**Never cut a release from the GitHub Releases UI or with `gh release create`.**
+
+Releases go through [`.github/workflows/release.yml`](.github/workflows/release.yml) only:
+
+1. Label the PR `patch`, `minor`, or `major` before merging to main (precedence:
+   major > minor > patch). Or: Actions -> release -> Run workflow.
+2. That opens a `release/vX.Y.Z` PR bumping the workspace version in `Cargo.toml` and
+   `Cargo.lock`. Merge it — it has to go green like any other PR.
+3. That merge tags the version (annotated, by `github-actions[bot]`) and dispatches
+   `binaries.yml` (tarballs, curl installer, Homebrew formula, .deb/.rpm) and
+   `oxidant-image.yml` (GHCR).
+
+The bump in step 2 is the whole point. Tagging by hand creates a *lightweight* tag on a
+commit whose `Cargo.toml` still holds the previous version, and cargo-dist then refuses to
+build anything ("This workspace doesn't have anything for dist to Release!"). That is
+exactly how v0.2.3, v0.2.4 and v0.2.5 shipped as public releases with zero assets while
+`latest` — which the README's install line follows — pointed at the newest empty one.
+
+Two guards now catch it: `preflight` in `binaries.yml` rejects a lightweight or
+version-mismatched tag (and puts the release back into draft), and `verify-release`
+refuses to let the pipeline announce a release that is missing assets. To check a live
+release the way a user would:
+
+```sh
+./scripts/release-healthcheck.sh          # whatever /releases/latest resolves to
+./scripts/release-healthcheck.sh v0.2.6   # a specific release
+```
+
+`release-healthcheck.yml` runs the same script daily and after every release, and files a
+single tracking issue when a documented install path breaks.
+
 ## Commit / MR conventions
 
 - Conventional-commit style subjects (`feat(loom): …`, `fix(connect): …`).

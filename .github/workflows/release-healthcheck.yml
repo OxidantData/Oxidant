@@ -1,0 +1,90 @@
+# Checks that the release GitHub serves as `latest` is actually installable, by probing the
+# exact URLs README.md and docs/getting-started.md tell users to run.
+#
+# Every other gate we have watches the pipeline's own state. This one watches the user's
+# path, which is the gap that let v0.2.3-v0.2.5 sit as assetless releases: `binaries.yml`
+# was red, but `latest` still resolved to an empty release and the documented curl|sh line
+# quietly did nothing (curl -f writes no output, so `| sh` reads empty stdin and exits 0).
+# The first report came from a user who fell back to 0.2.2.
+name: release-healthcheck
+
+on:
+  schedule:
+    # Daily. The window between a bad release and the first user hitting it is what this
+    # is meant to shrink; a day is enough to beat "somebody eventually filed an issue".
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to check (default: whatever /releases/latest resolves to)"
+        required: false
+        default: ""
+  workflow_run:
+    # Runs after a release publishes, so a half-uploaded release is caught immediately
+    # rather than at the next scheduled tick.
+    workflows: [binaries]
+    types: [completed]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe the documented install paths
+        id: probe
+        run: |
+          set -o pipefail
+          # Tee so the issue body can quote exactly what failed.
+          if ./scripts/release-healthcheck.sh "${{ inputs.tag }}" 2>&1 | tee report.txt; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update the tracking issue
+        if: steps.probe.outputs.status == 'fail'
+        run: |
+          TITLE="Release healthcheck: the latest release is not installable"
+          cat > body.md <<EOF
+          The documented install paths are failing as of $(date -u +%FT%TZ).
+
+          Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          \`\`\`
+          $(cat report.txt)
+          \`\`\`
+          EOF
+
+          # One issue, reused. A daily cron that opens a fresh issue every morning gets
+          # muted, which would defeat the point.
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+                       --label release-health --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file body.md
+          else
+            # The label may not exist yet on a fresh checkout of this workflow.
+            gh label create release-health --repo "$GITHUB_REPOSITORY" \
+              --description "Automated release install-path healthcheck" --color B60205 2>/dev/null || true
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+              --label release-health --body-file body.md
+          fi
+
+      - name: Close the tracking issue once healthy
+        if: steps.probe.outputs.status == 'pass'
+        run: |
+          for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+                       --label release-health --json number --jq '.[].number'); do
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" \
+              --comment "Release healthcheck is green again as of run $GITHUB_RUN_ID."
+          done
+
+      - name: Fail the run if anything is broken
+        if: steps.probe.outputs.status == 'fail'
+        run: exit 1
