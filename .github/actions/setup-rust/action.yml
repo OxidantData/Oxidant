@@ -1,0 +1,55 @@
+# Taken from #200 (gnanirahulnutakki/fix-engine-ci-ownership) so the release-pipeline fix
+# in this PR is not blocked behind that draft. If #200 lands first, drop this copy and
+# keep theirs -- the files are identical.
+name: Set up Rust toolchain (self-healing)
+description: >-
+  Ensures rustup and the rust-toolchain.toml-pinned toolchain are usable on the
+  runner. GitHub-hosted images preinstall Rust system-wide; the org self-hosted
+  runner (fremont) keeps rustup in the runner user's home, which is mutable
+  machine state. On 2026-09-09 every fremont job failed in seconds with exit
+  127 (`rustup: command not found`) after that home-directory state changed,
+  while the same workflow had passed the day before. Instead of assuming
+  preinstalled state, this action reinstalls rustup — pinned version,
+  checksum-verified against the publisher hash — whenever it is missing, and
+  lets rustup auto-install the pinned toolchain from rust-toolchain.toml.
+runs:
+  using: composite
+  steps:
+    - name: Add cargo bin to PATH
+      shell: bash
+      run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+    - name: Install rustup if missing (pinned, checksum-verified)
+      shell: bash
+      run: |
+        set -euo pipefail
+        export PATH="$HOME/.cargo/bin:$PATH"
+        if command -v rustup >/dev/null 2>&1; then
+          echo "rustup already present: $(rustup --version)"
+          exit 0
+        fi
+        echo "::warning::rustup not found on PATH — reinstalling pinned rustup-init"
+        version="1.29.1"
+        # Publisher checksum for x86_64-unknown-linux-gnu, from
+        # https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init.sha256
+        sha256="dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71"
+        base="https://static.rust-lang.org/rustup/archive/${version}/x86_64-unknown-linux-gnu"
+        curl -fsSL "$base/rustup-init" -o /tmp/rustup-init
+        echo "$sha256  /tmp/rustup-init" | sha256sum -c -
+        chmod +x /tmp/rustup-init
+        # --default-toolchain none: rust-toolchain.toml in the checked-out repo
+        # selects the real toolchain (1.90 + rustfmt + clippy) below.
+        /tmp/rustup-init -y --default-toolchain none --profile minimal
+        rm -f /tmp/rustup-init
+    - name: Install pinned toolchain + verify
+      shell: bash
+      run: |
+        set -euo pipefail
+        export PATH="$HOME/.cargo/bin:$PATH"
+        # Runs in the checked-out workspace, so the rust-toolchain.toml override
+        # applies: no-arg `rustup toolchain install` installs the pinned channel
+        # (1.90) plus its declared components (rustfmt, clippy). Explicit, not
+        # the deprecated auto-install-on-use path.
+        rustup toolchain install
+        rustup show
+        rustc --version
+        cargo --version

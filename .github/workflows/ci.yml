@@ -124,10 +124,10 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
-      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
-      - name: Add Rust toolchain to PATH (self-hosted runner)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # The runner's home-directory rustup install vanished on 2026-09-09 and every fremont
+      # job started dying in seconds with exit 127, so pointing PATH at it is not enough --
+      # this action reinstalls rustup (pinned, checksum-verified) when it is missing.
+      - uses: ./.github/actions/setup-rust
       # `iceberg` 0.8 is the newest release compatible with the pinned Rust 1.90, and it pulls
       # `parquet`/`arrow` 57 alongside the workspace's 58. `cargo test --workspace` therefore builds
       # two full Arrow stacks plus a test binary per crate, which overruns the ~14 GB a standard
@@ -476,8 +476,10 @@ jobs:
       OXIDANT_TPC_DATA: ${{ github.workspace }}/.tpc-data
     steps:
       - uses: actions/checkout@v4
-      - name: Add Rust toolchain to PATH (self-hosted runner)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # The runner's home-directory rustup install vanished on 2026-09-09 and every fremont
+      # job started dying in seconds with exit 127, so pointing PATH at it is not enough --
+      # this action reinstalls rustup (pinned, checksum-verified) when it is missing.
+      - uses: ./.github/actions/setup-rust
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
           rustup show
@@ -561,10 +563,10 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
-      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
-      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
-      - name: Add Rust toolchain to PATH (self-hosted runner)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # The runner's home-directory rustup install vanished on 2026-09-09 and every fremont
+      # job started dying in seconds with exit 127, so pointing PATH at it is not enough --
+      # this action reinstalls rustup (pinned, checksum-verified) when it is missing.
+      - uses: ./.github/actions/setup-rust
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
         run: |
           rustup show
