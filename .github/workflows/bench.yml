@@ -37,14 +37,7 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
-      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
-      - name: Add Rust toolchain to PATH (self-hosted runner)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
-        run: |
-          rustup show
-          rustc --version && cargo --version
+      - uses: ./.github/actions/setup-rust
       # Builds oxidant, fetches hits.parquet if absent, runs all 43 queries over live gRPC.
       - name: benchmark
         run: ./bench/clickbench/benchmark.sh

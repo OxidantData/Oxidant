@@ -18,7 +18,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -35,6 +38,7 @@ except ImportError as e:
 
 # Spark's default spark.sql.files.maxPartitionBytes — good part size for file sharding.
 DEFAULT_TARGET_PART_BYTES = 128 * 1024 * 1024
+COMPLETE_MARKER = "_oxidant_complete.json"
 
 # TPC-H schemas (spec types → Arrow). Money columns are decimal(15,2).
 TPCH_SCHEMAS: dict[str, pa.Schema] = {
@@ -136,6 +140,134 @@ TPCH_SCHEMAS: dict[str, pa.Schema] = {
 
 def _part_path(dest_dir: Path, part_idx: int) -> Path:
     return dest_dir / f"part-{part_idx:05d}.parquet"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_inventory(sources: list[Path]) -> list[dict]:
+    records = []
+    for src in sources:
+        records.append(
+            {
+                "name": src.name,
+                "size": src.stat().st_size,
+                "sha256": _sha256_file(src),
+            }
+        )
+    return records
+
+
+def _output_inventory(dest: Path) -> list[dict]:
+    """Bind the complete, flat output set to its bytes and Parquet row counts."""
+    records = []
+    for part in sorted(dest.iterdir()):
+        if part.name == COMPLETE_MARKER:
+            continue
+        if (
+            not re.fullmatch(r"part-\d{5,}\.parquet", part.name)
+            or part.is_symlink()
+            or not part.is_file()
+        ):
+            raise ValueError(f"unexpected table output: {part}")
+        with pq.ParquetFile(part) as reader:
+            rows = reader.metadata.num_rows
+        records.append(
+            {
+                "name": part.name,
+                "size": part.stat().st_size,
+                "sha256": _sha256_file(part),
+                "rows": rows,
+            }
+        )
+    if not records:
+        raise ValueError(f"no Parquet parts in {dest}")
+    return records
+
+
+def _write_complete_marker(dest: Path, sources: list[Path]) -> None:
+    parts = _output_inventory(dest)
+    payload = {
+        "version": 2,
+        "sources": _source_inventory(sources),
+        "parts": parts,
+        "rows": sum(part["rows"] for part in parts),
+    }
+    (dest / COMPLETE_MARKER).write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def table_is_complete(dest: Path, sources: list[Path]) -> bool:
+    marker = dest / COMPLETE_MARKER
+    if not marker.is_file():
+        return False
+    try:
+        payload = json.loads(marker.read_text())
+        # Legacy markers bind only names, not output content; rebuild, never adopt.
+        if not isinstance(payload, dict) or payload.get("version") != 2:
+            return False
+        if payload.get("sources") != _source_inventory(sources):
+            return False
+        parts = _output_inventory(dest)
+        return (
+            payload.get("parts") == parts
+            and payload.get("rows") == sum(part["rows"] for part in parts)
+        )
+    except (OSError, ValueError, pa.ArrowException):
+        return False
+
+
+def _publish_dir(staging: Path, dest: Path) -> None:
+    old = dest.parent / f".{dest.name}.old"
+    if old.exists():
+        shutil.rmtree(old)
+    if dest.exists():
+        dest.rename(old)
+    staging.rename(dest)
+    if old.exists():
+        shutil.rmtree(old)
+
+
+def _convert_table(
+    name: str,
+    sources: list[Path],
+    dest: Path,
+    schema: pa.Schema | None,
+    row_group: int,
+    target_part_bytes: int,
+    *,
+    force: bool = False,
+) -> None:
+    if not force and table_is_complete(dest, sources):
+        print(f"[parquet] skip {name} (complete)")
+        return
+    staging = dest.parent / f".{name}.converting"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    try:
+        part = 0
+        wrote = False
+        for src in sources:
+            if src.stat().st_size == 0:
+                print(f"[parquet] skip empty {src.name}")
+                continue
+            part = _convert_one(
+                src, staging, schema, row_group, target_part_bytes, start_part=part
+            )
+            wrote = True
+        if not wrote:
+            raise SystemExit(f"no non-empty sources for table {name}")
+        _write_complete_marker(staging, sources)
+        _publish_dir(staging, dest)
+    except BaseException:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 _SQL_TYPE_RE = re.compile(
@@ -321,25 +453,15 @@ def convert_tpch(
         if not sources:
             raise SystemExit(f"missing {raw / (name + '.tbl')} (and no .tbl.N parts)")
         dest = out / name
-        existing = sorted(dest.glob("part-*.parquet"))
-        if existing and all(p.stat().st_size > 0 for p in existing) and not force:
-            print(f"[parquet] skip {name} ({len(existing)} parts exist)")
-            continue
-        if force and dest.exists():
-            import shutil
-
-            shutil.rmtree(dest)
-        part = 0
-        wrote = False
-        for src in sources:
-            if src.stat().st_size == 0:
-                # Parallel dbgen children can emit empty part files for sparse tables.
-                print(f"[parquet] skip empty {src.name}")
-                continue
-            part = _convert_one(src, dest, schema, row_group, target_part_bytes, start_part=part)
-            wrote = True
-        if not wrote:
-            raise SystemExit(f"no non-empty sources for table {name} under {raw}")
+        _convert_table(
+            name,
+            sources,
+            dest,
+            schema,
+            row_group,
+            target_part_bytes,
+            force=force,
+        )
 
 
 _TPCDS_PART_RE = re.compile(r"^(.+)_(\d+)_(\d+)\.dat$")
@@ -368,15 +490,10 @@ def _tpcds_sources(raw: Path) -> dict[str, list[Path]]:
     return by_table
 
 
-def convert_tpcds(
-    raw: Path,
-    out: Path,
-    row_group: int,
-    target_part_bytes: int,
-    *,
-    force: bool = False,
-    only: set[str] | None = None,
-) -> None:
+def _tpcds_plan(
+    raw: Path, only: set[str] | None
+) -> list[tuple[str, list[Path], pa.Schema]]:
+    """Resolve every required table before checking or publishing any output."""
     here = Path(__file__).resolve().parent
     cols_path = here / "tpcds_columns.tsv"
     types_path = here / "tpcds_types.tsv"
@@ -386,39 +503,73 @@ def convert_tpcds(
         )
     schemas = load_tpcds_schemas(cols_path, types_path)
 
+    required = set(schemas) if only is None else only
+    if not required:
+        raise ValueError("no TPC-DS tables selected")
+    unknown = required - schemas.keys()
+    if unknown:
+        raise ValueError(f"unknown TPC-DS tables: {', '.join(sorted(unknown))}")
     by_table = _tpcds_sources(raw)
-    if not by_table:
-        raise SystemExit(f"no .dat files under {raw}")
-    for name, sources in sorted(by_table.items()):
-        if name == "dbgen_version":
-            continue
-        if only is not None and name not in only:
-            continue
-        schema = schemas.get(name)
-        if schema is None:
-            print(f"[parquet] skip unknown table `{name}` (not in {cols_path.name})")
-            continue
-        dest = out / name
-        existing = sorted(dest.glob("part-*.parquet"))
-        if existing and all(p.stat().st_size > 0 for p in existing) and not force:
-            print(f"[parquet] skip {name} ({len(existing)} parts exist)")
-            continue
-        if force and dest.exists():
-            import shutil
+    missing = required - by_table.keys()
+    if missing:
+        raise ValueError(f"missing TPC-DS sources under {raw}: {', '.join(sorted(missing))}")
+    for name in sorted(required):
+        sources = by_table[name]
+        if not all(src.is_file() for src in sources):
+            raise ValueError(f"TPC-DS sources for {name} must be files")
+        # Empty parallel children are allowed, but a wholly empty table is not
+        # convertible under the existing table writer's contract.
+        if not any(src.stat().st_size > 0 for src in sources):
+            raise ValueError(f"no non-empty sources for table {name}")
+    # Unclassified raw files are not required tables and cannot establish coverage.
+    return [(name, by_table[name], schemas[name]) for name in sorted(required)]
 
-            shutil.rmtree(dest)
-        part = 0
-        wrote = False
-        for src in sources:
-            if src.stat().st_size == 0:
-                # Parallel dsdgen children can emit empty CHILD parts; aborting
-                # mid-table leaves a partial Parquet dir and breaks --force restarts.
-                print(f"[parquet] skip empty {src.name}")
-                continue
-            part = _convert_one(src, dest, schema, row_group, target_part_bytes, start_part=part)
-            wrote = True
-        if not wrote:
-            raise SystemExit(f"no non-empty sources for table {name} under {raw}")
+
+def convert_tpcds(
+    raw: Path,
+    out: Path,
+    row_group: int,
+    target_part_bytes: int,
+    *,
+    force: bool = False,
+    only: set[str] | None = None,
+) -> None:
+    try:
+        plan = _tpcds_plan(raw, only)
+    except (OSError, ValueError) as e:
+        raise SystemExit(str(e)) from None
+    for name, sources, schema in plan:
+        dest = out / name
+        _convert_table(
+            name,
+            sources,
+            dest,
+            schema,
+            row_group,
+            target_part_bytes,
+            force=force,
+        )
+
+
+def dataset_is_complete(
+    suite: str,
+    raw: Path,
+    out: Path,
+    *,
+    only: set[str] | None = None,
+) -> bool:
+    if suite == "tpch":
+        names = list(TPCH_SCHEMAS)
+        for name in names:
+            sources = _tpch_sources(raw, name)
+            if not sources or not table_is_complete(out / name, sources):
+                return False
+        return True
+    try:
+        plan = _tpcds_plan(raw, only)
+    except (OSError, ValueError):
+        return False
+    return all(table_is_complete(out / name, sources) for name, sources, _ in plan)
 
 
 def main() -> None:
@@ -441,12 +592,22 @@ def main() -> None:
     )
     ap.add_argument(
         "--only",
-        default="",
-        help="Comma-separated table names to convert (TPC-DS only)",
+        default=None,
+        help="Comma-separated exact table names (TPC-DS only); omit for all declared tables",
+    )
+    ap.add_argument(
+        "--check-complete",
+        action="store_true",
+        help="Exit 0 if every required table has a matching completion marker; do not convert.",
     )
     args = ap.parse_args()
-    args.out.mkdir(parents=True, exist_ok=True)
+    # An explicit empty/invalid token must not become the default full suite.
+    only = set(args.only.split(",")) if args.only is not None else None
+    if args.check_complete:
+        ok = dataset_is_complete(args.suite, args.raw, args.out, only=only)
+        sys.exit(0 if ok else 1)
     if args.suite == "tpch":
+        args.out.mkdir(parents=True, exist_ok=True)
         convert_tpch(
             args.raw,
             args.out,
@@ -455,7 +616,6 @@ def main() -> None:
             force=args.force,
         )
     else:
-        only = {t.strip() for t in args.only.split(",") if t.strip()} or None
         convert_tpcds(
             args.raw,
             args.out,

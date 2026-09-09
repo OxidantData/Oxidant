@@ -43,6 +43,7 @@ pub mod s3_cache;
 
 /// S3 / object-store scan I/O counters + range-read concurrency (KAN-153).
 pub mod s3_io;
+mod session_names;
 /// Worker-side stage plan cache (R5-4 / KAN-2): a distributed stage is planned once per
 /// worker, not once per task. See [`stage_plan_cache`].
 pub mod stage_plan_cache;
@@ -3608,8 +3609,7 @@ impl Engine {
         // SQL user-defined functions: `CREATE [OR REPLACE] FUNCTION … RETURN …`
         if let Some(def) = udf_registry::try_create_function(query) {
             let mut reg = self.udf_registry.lock().unwrap();
-            reg.register_sql_fn(def.clone());
-            reg.apply_to_context(&self.ctx)?;
+            reg.register_sql_fn_on_context(def, &self.ctx)?;
             return Ok(vec![]);
         }
         // SPARK-29628 (`INVALID_TEMP_OBJ_REFERENCE`): a *persistent* `CREATE VIEW` may not reference
@@ -3701,7 +3701,8 @@ impl Engine {
             return Ok(vec![]);
         }
         let df = self.plan_spark(query).await?;
-        let batches = self.collect_join_guarded(df).await?;
+        let (execution, df) = self.bind_session_names(df);
+        let batches = execution.collect_join_guarded(df).await?;
         // The view planned/created successfully — update the temp-view registry. A new temporary
         // view is recorded; a persistent view with the same name removes any prior temp entry
         // (DataFusion keeps a single namespace, so the persistent definition now shadows it).
@@ -3715,6 +3716,40 @@ impl Engine {
             self.note_catalog_change(&cv.name);
         }
         Ok(batches)
+    }
+
+    /// Bind names only to this execution, after the reusable logical plan has been built.
+    /// The shared UDF registry, views and stage-plan templates retain unbound functions;
+    /// neither `sql` nor `sql_with_stats` caches a bound physical plan or query result.
+    /// Repeating SQL after USE (or on another session) therefore takes a fresh snapshot.
+    ///
+    /// Keep the snapshot in both the DataFrame and a private execution handle: join-guard
+    /// replanning clones that handle's state and must retain the same values. Catalogs,
+    /// runtime and bounded memory pool stay shared; no shared context config is changed.
+    fn bind_session_names(
+        &self,
+        df: datafusion::dataframe::DataFrame,
+    ) -> (Self, datafusion::dataframe::DataFrame) {
+        let (catalog, namespace) = self.current_catalog_and_namespace();
+        let (mut state, plan) = df.into_parts();
+        state
+            .config_mut()
+            .options_mut()
+            .extensions
+            .insert(session_names::QuerySessionNames {
+                catalog,
+                namespace: namespace.last().cloned().unwrap_or_default(),
+            });
+        // DataFusion's physical expression planner reads ExecutionProps, not SessionConfig.
+        state.execution_props_mut().config_options = Some(state.config_options().clone());
+        let execution = Self {
+            ctx: Arc::new(SessionContext::new_with_state(state.clone())),
+            ..self.clone()
+        };
+        (
+            execution,
+            datafusion::dataframe::DataFrame::new(state, plan),
+        )
     }
 
     /// Create the managed directory and run a lowered `CREATE EXTERNAL TABLE` DDL, materializing a
@@ -5203,11 +5238,12 @@ impl Engine {
         }
         let start = std::time::Instant::now();
         let df = self.plan_spark(query).await?;
+        let (execution, df) = self.bind_session_names(df);
         let plan = df
             .create_physical_plan()
             .await
             .map_err(|e| Error::Execution(e.to_string()))?;
-        let batches = datafusion::physical_plan::collect(plan.clone(), self.ctx.task_ctx())
+        let batches = datafusion::physical_plan::collect(plan.clone(), execution.ctx.task_ctx())
             .await
             .map_err(|e| Error::Execution(e.to_string()))?;
         let output_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -13897,7 +13933,8 @@ mod tests {
             .unwrap();
         let query = "SELECT COUNT(*) AS c, SUM(length(l.s)) AS sl, SUM(length(r.s)) AS sr \
              FROM left_wide l JOIN right_wide r ON l.k = r.k";
-        let plan = engine.physical_plan(query).await.unwrap();
+        let df = engine.plan_spark(query).await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
         let budget = engine.hash_join_build_budget().unwrap();
         assert!(
             !hash_join_build_exceeds(plan.as_ref(), budget),
@@ -13915,43 +13952,36 @@ mod tests {
                 .any(|c| build_schema_has(c.as_ref(), col))
         }
         assert!(build_schema_has(plan.as_ref(), "s"));
-        // ...and the SAME query against a plain DataFusion session on the same 32 MiB pool
-        // (no oxidant guard) must fail with `Resources Exhausted`.
+        // ...and the actual first-attempt plan on the same 64 MiB pool, collected
+        // directly WITHOUT collect_join_guarded/retry, must exhaust it. Raw DataFusion
+        // defaults are not a valid control: they use different partitions/batch size
+        // and a partitioned hash join instead of the engine's broadcast upgrade (#199).
         {
-            use datafusion::execution::memory_pool::FairSpillPool;
-            use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-            let env = RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::new(FairSpillPool::new(64 * 1024 * 1024)))
-                .build_arc()
-                .unwrap();
-            let raw = SessionContext::new_with_config_rt(Default::default(), env);
-            raw.register_table(
-                "left_wide",
-                Arc::new(
-                    datafusion::datasource::MemTable::try_new(
-                        join_guard_wide_batches(LEFT, LEFT, 400)[0].schema(),
-                        vec![join_guard_wide_batches(LEFT, LEFT, 400)],
-                    )
-                    .unwrap(),
-                ),
-            )
-            .unwrap();
-            raw.register_table(
-                "right_wide",
-                Arc::new(
-                    datafusion::datasource::MemTable::try_new(
-                        join_guard_wide_batches(RIGHT, RIGHT, 400)[0].schema(),
-                        vec![join_guard_wide_batches(RIGHT, RIGHT, 400)],
-                    )
-                    .unwrap(),
-                ),
-            )
-            .unwrap();
-            let err = raw
-                .sql(query)
+            assert!(!join_strategy_flipped());
+            assert!(!engine.plan_time_smj_reroute(plan.as_ref()));
+            assert!(engine.plan_time_broadcast_upgrade(plan.as_ref()));
+            let (first_ctx, first_plan) = engine
+                .per_join_strategy_physical_plan(df.logical_plan().clone())
                 .await
-                .unwrap()
-                .collect()
+                .unwrap();
+            assert!(!engine.needs_smj_reroute(first_plan.as_ref()));
+            assert!(contains_hash_join(first_plan.as_ref()));
+            assert!(build_schema_has(first_plan.as_ref(), "s"));
+            let config = first_ctx.state().config().clone();
+            assert_eq!(config.target_partitions(), 2);
+            assert_eq!(config.batch_size(), 1024);
+            let display = datafusion::physical_plan::displayable(first_plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert!(
+                display.contains("HashJoinExec: mode=CollectLeft"),
+                "{display}"
+            );
+            assert!(Arc::ptr_eq(
+                &first_ctx.runtime_env().memory_pool,
+                &engine.ctx.runtime_env().memory_pool,
+            ));
+            let err = datafusion::physical_plan::collect(first_plan, first_ctx.task_ctx())
                 .await
                 .expect_err("unguarded hash join must exhaust the pool");
             assert!(
@@ -13959,6 +13989,12 @@ mod tests {
                     .to_ascii_lowercase()
                     .contains("resources exhausted"),
                 "expected pool exhaustion, got: {err}"
+            );
+            engine.wait_for_pool_drain().await;
+            assert_eq!(
+                first_ctx.runtime_env().memory_pool.reserved(),
+                0,
+                "the negative control must release the pool before the guarded query"
             );
         }
         let batches = engine

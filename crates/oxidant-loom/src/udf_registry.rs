@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::Result as DfResult;
+use datafusion::common::{exec_err, Result as DfResult};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
@@ -37,6 +37,17 @@ impl UdfRegistry {
 
     pub fn register_sql_fn(&mut self, def: UdfDef) {
         self.defs.insert(def.name.to_lowercase(), def);
+    }
+
+    /// Validate and install `def` on `ctx`, then keep it in the session registry.
+    ///
+    /// Order matters: inserting first made a rejected body (`length(a)`, unknown
+    /// identifier, unsupported return type) survive in `SHOW FUNCTIONS` / worker
+    /// JSON even though DataFusion never got the UDF.
+    pub fn register_sql_fn_on_context(&mut self, def: UdfDef, ctx: &SessionContext) -> Result<()> {
+        register_sql_udf_on_ctx(ctx, &def)?;
+        self.register_sql_fn(def);
+        Ok(())
     }
 
     /// The (lowercased) names of every session UDF registered so far. Backs `SHOW FUNCTIONS`.
@@ -107,21 +118,250 @@ pub fn try_create_function(sql: &str) -> Option<UdfDef> {
     })
 }
 
-fn spark_type_to_arrow(t: &str) -> DataType {
-    match t.to_uppercase().as_str() {
-        "INT" | "INTEGER" => DataType::Int32,
-        "BIGINT" | "LONG" => DataType::Int64,
-        "DOUBLE" | "FLOAT" => DataType::Float64,
-        "BOOLEAN" | "BOOL" => DataType::Boolean,
-        "STRING" | "VARCHAR" => DataType::Utf8,
-        _ => DataType::Int32,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum BodyExpr {
+    Null,
+    Int(i64),
+    Ident(String),
+    Binary(Box<BodyExpr>, char, Box<BodyExpr>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Tok {
+    Ident(String),
+    Int(i64),
+    Op(char),
+}
+
+/// Maximum expression nesting accepted in a SQL function body.
+///
+/// `parse_add` → `parse_mul` → `parse_atom` recurse once per nesting level and
+/// run *before* any DataFusion recursion gate, so an unbounded body could
+/// overflow the production 32 MiB thread stack (`thread_stack_size` in the
+/// gateway/cli/bench mains) and abort the whole engine process: a probe
+/// against this crate's exact sources survived 6,000 levels but aborted at
+/// 12,000, while the same shape through plain `SELECT` is safely rejected by
+/// DataFusion's `RecursionLimitExceeded`. 100 keeps two orders of magnitude of
+/// headroom under the observed overflow while staying far above any
+/// hand-written integer body; deeper bodies are rejected at CREATE through the
+/// normal unsupported-body path.
+const MAX_BODY_DEPTH: usize = 100;
+
+fn tokenize_body(s: &str) -> std::result::Result<Vec<Tok>, String> {
+    let mut out = Vec::new();
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            i += 1;
+            while i < b.len() {
+                let d = b[i] as char;
+                if d.is_ascii_alphanumeric() || d == '_' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            out.push(Tok::Ident(s[start..i].to_string()));
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let start = i;
+            while i < b.len() && (b[i] as char).is_ascii_digit() {
+                i += 1;
+            }
+            let n: i64 = s[start..i]
+                .parse()
+                .map_err(|_| "bad integer in SQL function body".to_string())?;
+            out.push(Tok::Int(n));
+            continue;
+        }
+        // Skip only the comment line: `a--1` stays `a`, while tokens on later
+        // lines must still be parsed and validated before registration.
+        if c == '-' && i + 1 < b.len() && b[i + 1] as char == '-' {
+            i += 2;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if matches!(c, '+' | '-' | '*' | '(' | ')') {
+            out.push(Tok::Op(c));
+            i += 1;
+            continue;
+        }
+        return Err(format!("unsupported token `{c}` in SQL function body"));
+    }
+    Ok(out)
+}
+
+fn parse_body(s: &str) -> std::result::Result<BodyExpr, String> {
+    let toks = tokenize_body(s)?;
+    if toks.is_empty() {
+        return Err("empty SQL function body".into());
+    }
+    let (expr, i) = parse_add(&toks, 0, 0)?;
+    if i != toks.len() {
+        return Err("unsupported SQL function body".into());
+    }
+    Ok(expr)
+}
+
+fn body_unknown_idents<'a>(expr: &'a BodyExpr, params: &[String]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    fn walk<'a>(expr: &'a BodyExpr, params: &[String], out: &mut Vec<&'a str>) {
+        match expr {
+            BodyExpr::Ident(name) => {
+                if !params.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                    out.push(name.as_str());
+                }
+            }
+            BodyExpr::Binary(l, _, r) => {
+                walk(l, params, out);
+                walk(r, params, out);
+            }
+            BodyExpr::Null | BodyExpr::Int(_) => {}
+        }
+    }
+    walk(expr, params, &mut out);
+    out
+}
+
+fn parse_add(
+    toks: &[Tok],
+    mut i: usize,
+    depth: usize,
+) -> std::result::Result<(BodyExpr, usize), String> {
+    let (mut left, n) = parse_mul(toks, i, depth)?;
+    i = n;
+    while let Some(Tok::Op(op @ ('+' | '-'))) = toks.get(i) {
+        let (right, n) = parse_mul(toks, i + 1, depth)?;
+        left = BodyExpr::Binary(Box::new(left), *op, Box::new(right));
+        i = n;
+    }
+    Ok((left, i))
+}
+
+fn parse_mul(
+    toks: &[Tok],
+    mut i: usize,
+    depth: usize,
+) -> std::result::Result<(BodyExpr, usize), String> {
+    let (mut left, n) = parse_atom(toks, i, depth)?;
+    i = n;
+    while let Some(Tok::Op(op @ '*')) = toks.get(i) {
+        let (right, n) = parse_atom(toks, i + 1, depth)?;
+        left = BodyExpr::Binary(Box::new(left), *op, Box::new(right));
+        i = n;
+    }
+    Ok((left, i))
+}
+
+fn parse_atom(
+    toks: &[Tok],
+    i: usize,
+    depth: usize,
+) -> std::result::Result<(BodyExpr, usize), String> {
+    if depth > MAX_BODY_DEPTH {
+        return Err(format!("body nesting deeper than {MAX_BODY_DEPTH} levels"));
+    }
+    match toks.get(i) {
+        Some(Tok::Op('-')) => {
+            let (inner, n) = parse_atom(toks, i + 1, depth + 1)?;
+            Ok((
+                BodyExpr::Binary(Box::new(BodyExpr::Int(0)), '-', Box::new(inner)),
+                n,
+            ))
+        }
+        Some(Tok::Op('(')) => {
+            let (inner, n) = parse_add(toks, i + 1, depth + 1)?;
+            match toks.get(n) {
+                Some(Tok::Op(')')) => Ok((inner, n + 1)),
+                _ => Err("unclosed '(' in SQL function body".into()),
+            }
+        }
+        Some(Tok::Int(n)) => Ok((BodyExpr::Int(*n), i + 1)),
+        Some(Tok::Ident(name)) if name.eq_ignore_ascii_case("null") => Ok((BodyExpr::Null, i + 1)),
+        Some(Tok::Ident(name)) => Ok((BodyExpr::Ident(name.to_lowercase()), i + 1)),
+        _ => Err("unsupported SQL function body".into()),
+    }
+}
+
+fn eval_body(expr: &BodyExpr, env: &HashMap<String, ScalarValue>) -> DfResult<ScalarValue> {
+    match expr {
+        BodyExpr::Null => Ok(ScalarValue::Null),
+        BodyExpr::Int(n) => Ok(ScalarValue::Int64(Some(*n))),
+        BodyExpr::Ident(name) => env.get(name).cloned().ok_or_else(|| {
+            datafusion::common::DataFusionError::Execution(format!(
+                "unknown parameter `{name}` in SQL function body"
+            ))
+        }),
+        BodyExpr::Binary(l, op, r) => {
+            let lv = eval_body(l, env)?;
+            let rv = eval_body(r, env)?;
+            if lv.is_null() || rv.is_null() {
+                return Ok(ScalarValue::Null);
+            }
+            let a = scalar_i64(&lv)?;
+            let b = scalar_i64(&rv)?;
+            let n = match op {
+                '+' => a.checked_add(b),
+                '-' => a.checked_sub(b),
+                '*' => a.checked_mul(b),
+                _ => return exec_err!("unsupported operator in SQL function"),
+            };
+            let n = n.ok_or_else(|| {
+                datafusion::common::DataFusionError::Execution(
+                    "integer overflow in SQL function".into(),
+                )
+            })?;
+            Ok(ScalarValue::Int64(Some(n)))
+        }
+    }
+}
+
+fn scalar_i64(v: &ScalarValue) -> DfResult<i64> {
+    match v {
+        ScalarValue::Int8(Some(n)) => Ok(i64::from(*n)),
+        ScalarValue::Int16(Some(n)) => Ok(i64::from(*n)),
+        ScalarValue::Int32(Some(n)) => Ok(i64::from(*n)),
+        ScalarValue::Int64(Some(n)) => Ok(*n),
+        ScalarValue::UInt8(Some(n)) => Ok(i64::from(*n)),
+        ScalarValue::UInt16(Some(n)) => Ok(i64::from(*n)),
+        ScalarValue::UInt32(Some(n)) => Ok(i64::from(*n)),
+        other => exec_err!("SQL function expected an integer argument, got {other}"),
+    }
+}
+
+fn cast_to_return(v: ScalarValue, dt: &DataType) -> DfResult<ScalarValue> {
+    if v.is_null() {
+        return ScalarValue::try_from(dt)
+            .map_err(|e| datafusion::common::DataFusionError::Execution(e.to_string()));
+    }
+    match dt {
+        DataType::Int32 => {
+            let n = i32::try_from(scalar_i64(&v)?).map_err(|_| {
+                datafusion::common::DataFusionError::Execution(
+                    "integer overflow converting SQL function result to INT".into(),
+                )
+            })?;
+            Ok(ScalarValue::Int32(Some(n)))
+        }
+        DataType::Int64 => Ok(ScalarValue::Int64(Some(scalar_i64(&v)?))),
+        _ => exec_err!("unsupported SQL function return type {dt}"),
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SqlUdf {
     name: String,
-    body: String,
+    body: BodyExpr,
     param_names: Vec<String>,
     return_type: DataType,
 }
@@ -145,9 +385,56 @@ impl ScalarUDFImpl for SqlUdf {
         Ok(self.return_type.clone())
     }
 
-    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
-        // v1: SQL UDF bodies in parity tests are constant expressions (`RETURN 1`, `RETURN a`, etc.).
-        Ok(ColumnarValue::Scalar(eval_scalar_expr(&self.body)?))
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        if args.args.len() != self.param_names.len() {
+            return exec_err!(
+                "SQL function {} expects {} argument(s), got {}",
+                self.name,
+                self.param_names.len(),
+                args.args.len()
+            );
+        }
+        let array_lens: Vec<usize> = args
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                ColumnarValue::Scalar(_) => None,
+            })
+            .collect();
+        let n = match array_lens.as_slice() {
+            [] => 1,
+            lens => {
+                let n = lens[0];
+                if lens.iter().any(|&l| l != n) {
+                    return exec_err!("SQL function {} got mixed argument lengths", self.name);
+                }
+                n
+            }
+        };
+        if n == 0 {
+            return Ok(ColumnarValue::Array(
+                datafusion::arrow::array::new_empty_array(&self.return_type),
+            ));
+        }
+        let mut values = Vec::with_capacity(n);
+        for row in 0..n {
+            let mut env = HashMap::new();
+            for (name, arg) in self.param_names.iter().zip(&args.args) {
+                let sv = match arg {
+                    ColumnarValue::Scalar(s) => s.clone(),
+                    ColumnarValue::Array(a) => ScalarValue::try_from_array(a, row)?,
+                };
+                env.insert(name.to_lowercase(), sv);
+            }
+            let raw = eval_body(&self.body, &env)?;
+            values.push(cast_to_return(raw, &self.return_type)?);
+        }
+        if values.len() == 1 {
+            Ok(ColumnarValue::Scalar(values.pop().unwrap()))
+        } else {
+            Ok(ColumnarValue::Array(ScalarValue::iter_to_array(values)?))
+        }
     }
 }
 
@@ -156,36 +443,39 @@ fn register_sql_udf_on_ctx(ctx: &SessionContext, def: &UdfDef) -> Result<()> {
         .sql_body
         .as_ref()
         .ok_or_else(|| Error::Plan(format!("udf `{}` has no body", def.name)))?;
+    let parsed = parse_body(body).map_err(|e| {
+        Error::Plan(format!(
+            "unsupported SQL function body for `{}`: {e}",
+            def.name
+        ))
+    })?;
+    let unknown = body_unknown_idents(&parsed, &def.param_names);
+    if let Some(name) = unknown.first() {
+        return Err(Error::Plan(format!(
+            "unsupported SQL function body for `{}`: unknown identifier `{name}`",
+            def.name
+        )));
+    }
+    // Allowlist the SQL tokens, not spark_type_to_arrow's Int32 catch-all
+    // (TINYINT/FOOBAR would otherwise register as INT).
+    let return_type = match def.return_type.to_uppercase().as_str() {
+        "INT" | "INTEGER" => DataType::Int32,
+        "BIGINT" | "LONG" => DataType::Int64,
+        other => {
+            return Err(Error::Plan(format!(
+                "unsupported SQL function return type `{other}` for `{}`",
+                def.name
+            )));
+        }
+    };
     let udf = SqlUdf {
         name: def.name.clone(),
-        body: body.clone(),
+        body: parsed,
         param_names: def.param_names.clone(),
-        return_type: spark_type_to_arrow(&def.return_type),
+        return_type,
     };
     ctx.register_udf(ScalarUDF::from(udf));
     Ok(())
-}
-
-#[allow(dead_code)]
-fn scalar_to_sql_lit(sv: &ScalarValue) -> String {
-    match sv {
-        ScalarValue::Int32(Some(v)) => v.to_string(),
-        ScalarValue::Int64(Some(v)) => v.to_string(),
-        ScalarValue::Float64(Some(v)) => v.to_string(),
-        ScalarValue::Boolean(Some(v)) => v.to_string(),
-        ScalarValue::Utf8(Some(v)) => format!("'{v}'"),
-        _ => "NULL".to_string(),
-    }
-}
-
-fn eval_scalar_expr(expr: &str) -> DfResult<ScalarValue> {
-    if let Ok(v) = expr.trim().parse::<i32>() {
-        return Ok(ScalarValue::Int32(Some(v)));
-    }
-    if expr.trim().eq_ignore_ascii_case("NULL") {
-        return Ok(ScalarValue::Null);
-    }
-    Ok(ScalarValue::Int32(Some(1)))
 }
 
 /// Thread-safe wrapper used by [`crate::Engine`].
@@ -208,5 +498,310 @@ mod tests {
         let def =
             try_create_function("CREATE FUNCTION foo1a1(a INT) RETURNS INT RETURN 1;").unwrap();
         assert_eq!(def.param_names, vec!["a".to_string()]);
+    }
+
+    async fn i32_col(engine: &crate::Engine, q: &str) -> Vec<i32> {
+        use datafusion::arrow::array::Int32Array;
+        let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        let col = batches[0].column(0);
+        let arr = col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap_or_else(|| panic!("{q}: expected Int32, got {:?}", col.data_type()));
+        (0..arr.len()).map(|i| arr.value(i)).collect()
+    }
+
+    /// Control: a constant SQL function must still return its literal.
+    #[tokio::test]
+    async fn sql_udf_constant_body_returns_the_literal() {
+        let engine = crate::Engine::new();
+        engine
+            .sql("CREATE FUNCTION review_seven() RETURNS INT RETURN 7")
+            .await
+            .unwrap();
+        assert_eq!(
+            i32_col(&engine, "SELECT review_seven() AS value").await,
+            vec![7]
+        );
+    }
+
+    /// `RETURN a * 2` must use the argument. The previous evaluator returned 1 for
+    /// every non-literal body.
+    #[tokio::test]
+    async fn sql_udf_evaluates_parameter_expression_per_row() {
+        let engine = crate::Engine::new();
+        engine
+            .sql("CREATE FUNCTION review_double(a INT) RETURNS INT RETURN a * 2")
+            .await
+            .unwrap();
+        assert_eq!(
+            i32_col(
+                &engine,
+                "SELECT review_double(v) AS value FROM (VALUES (2), (5)) AS t(v) ORDER BY v"
+            )
+            .await,
+            vec![4, 10]
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_udf_rejects_an_unsupported_body_instead_of_returning_one() {
+        let engine = crate::Engine::new();
+        let err = engine
+            .sql("CREATE FUNCTION review_bad(a INT) RETURNS INT RETURN length(a)")
+            .await
+            .expect_err("unsupported body must not register");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("unsupported") || msg.contains("invalid"),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_udf_two_arg_add() {
+        let engine = crate::Engine::new();
+        engine
+            .sql("CREATE FUNCTION review_add(x INT, y INT) RETURNS INT RETURN x + y")
+            .await
+            .unwrap();
+        assert_eq!(
+            i32_col(&engine, "SELECT review_add(2, 3) AS value").await,
+            vec![5]
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_udf_rejects_unsupported_return_type() {
+        let engine = crate::Engine::new();
+        let err = engine
+            .sql("CREATE FUNCTION review_d(a INT) RETURNS DOUBLE RETURN a * 2")
+            .await
+            .expect_err("non-integer return types are out of the supported subset");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(msg.contains("unsupported"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn sql_udf_rejects_unknown_identifier_at_create() {
+        let engine = crate::Engine::new();
+        let err = engine
+            .sql("CREATE FUNCTION review_bad_ident(a INT) RETURNS INT RETURN b * 2")
+            .await
+            .expect_err("unknown identifier must not register");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("unsupported") || msg.contains("unknown"),
+            "got {err}"
+        );
+        let describe = engine
+            .sql("DESCRIBE FUNCTION review_bad_ident")
+            .await
+            .expect_err("rejected CREATE must not leave a session UDF");
+        assert!(
+            describe
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("review_bad_ident")
+                || describe
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("unknown"),
+            "got {describe}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_udf_rejects_slash_instead_of_truncating() {
+        let engine = crate::Engine::new();
+        let err = engine
+            .sql("CREATE FUNCTION review_div(a INT) RETURNS INT RETURN a / 2")
+            .await
+            .expect_err("integer / is not Spark SQL");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(msg.contains("unsupported"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn sql_udf_sql_comment_is_not_minus_minus() {
+        let engine = crate::Engine::new();
+        engine
+            .sql("CREATE FUNCTION review_comment(a INT) RETURNS INT RETURN a--1")
+            .await
+            .unwrap();
+        assert_eq!(
+            i32_col(&engine, "SELECT review_comment(5) AS value").await,
+            vec![5]
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_udf_multiline_comment_resumes_at_newline() {
+        for newline in ["\n", "\r\n"] {
+            let engine = crate::Engine::new();
+            engine
+                .sql(&format!(
+                    "CREATE FUNCTION comment_add(a INT) RETURNS INT RETURN a -- same-line comment{newline} + 2"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                i32_col(&engine, "SELECT comment_add(5)").await,
+                vec![7],
+                "line comments must not discard the rest of the body ({newline:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sql_udf_multiline_comment_rejects_unsupported_suffix_at_create() {
+        let engine = crate::Engine::new();
+        let before = engine.export_udfs_json();
+        let err = engine
+            .sql("CREATE FUNCTION comment_bad(a INT) RETURNS INT RETURN a -- comment\n + length(a)")
+            .await
+            .expect_err("an unsupported suffix after a line comment must fail at CREATE");
+        assert!(
+            matches!(err, Error::Plan(ref msg) if msg.contains("unsupported SQL function body")),
+            "got {err}"
+        );
+        assert_eq!(engine.export_udfs_json(), before);
+        engine
+            .sql("DESCRIBE FUNCTION comment_bad")
+            .await
+            .expect_err("rejected CREATE must not leave a registry entry");
+        engine
+            .sql("SELECT comment_bad(5)")
+            .await
+            .expect_err("rejected CREATE must not install a callable function");
+    }
+
+    #[tokio::test]
+    async fn sql_udf_multiline_comment_invalid_replace_preserves_existing_function() {
+        let engine = crate::Engine::new();
+        engine
+            .sql("CREATE FUNCTION comment_keep(a INT) RETURNS INT RETURN a * 2")
+            .await
+            .unwrap();
+        assert_eq!(i32_col(&engine, "SELECT comment_keep(5)").await, vec![10]);
+        let before = engine.export_udfs_json();
+        let err = engine
+            .sql("CREATE OR REPLACE FUNCTION comment_keep(a INT) RETURNS INT RETURN a -- comment\n + length(a)")
+            .await
+            .expect_err("an invalid replacement must fail at CREATE OR REPLACE");
+        assert!(
+            matches!(err, Error::Plan(ref msg) if msg.contains("unsupported SQL function body")),
+            "got {err}"
+        );
+        assert_eq!(engine.export_udfs_json(), before);
+        assert_eq!(i32_col(&engine, "SELECT comment_keep(5)").await, vec![10]);
+    }
+
+    #[tokio::test]
+    async fn sql_udf_rejects_unknown_return_type_token() {
+        let engine = crate::Engine::new();
+        for q in [
+            "CREATE FUNCTION review_tiny() RETURNS TINYINT RETURN 7",
+            "CREATE FUNCTION review_foo() RETURNS FOOBAR RETURN 7",
+        ] {
+            let err = engine.sql(q).await.expect_err(q);
+            let msg = err.to_string().to_ascii_lowercase();
+            assert!(msg.contains("unsupported"), "{q}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sql_udf_empty_input_returns_zero_rows() {
+        let engine = crate::Engine::new();
+        engine
+            .sql("CREATE FUNCTION review_add_empty(x INT, y INT) RETURNS INT RETURN x + y")
+            .await
+            .unwrap();
+        let batches = engine
+            .sql("SELECT review_add_empty(v, 1) AS value FROM (VALUES (1)) AS t(v) WHERE false")
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 0, "empty input must not invent a row");
+    }
+
+    /// Deeply nested bodies must be rejected at CREATE, never abort the
+    /// process. 200 exceeds the documented nesting limit of 100; without the
+    /// bound the recursive-descent parser overflowed the 32 MiB production
+    /// thread stack somewhere between 6,000 and 12,000 levels and aborted the
+    /// whole engine process, while the same shape through plain SELECT was
+    /// safely rejected (`RecursionLimitExceeded`, limit 50).
+    #[tokio::test]
+    async fn sql_udf_rejects_deeply_nested_body_at_create() {
+        let engine = crate::Engine::new();
+        let before = engine.export_udfs_json();
+        let body = format!("{}1{}", "(".repeat(200), ")".repeat(200));
+        let err = engine
+            .sql(&format!(
+                "CREATE FUNCTION deep_nested() RETURNS INT RETURN {body}"
+            ))
+            .await
+            .expect_err("nesting beyond the documented limit must be rejected at CREATE");
+        assert!(
+            matches!(err, Error::Plan(ref msg) if msg.contains("unsupported SQL function body")),
+            "got {err}"
+        );
+        assert_eq!(
+            engine.export_udfs_json(),
+            before,
+            "rejected CREATE must not leave a registry entry"
+        );
+        engine
+            .sql("SELECT deep_nested()")
+            .await
+            .expect_err("rejected CREATE must not install a callable function");
+    }
+
+    /// A too-deep `CREATE OR REPLACE` must preserve the existing definition
+    /// and callable, mirroring the invalid-replacement contract for other
+    /// unsupported bodies.
+    #[tokio::test]
+    async fn sql_udf_deeply_nested_invalid_replace_preserves_existing_function() {
+        let engine = crate::Engine::new();
+        engine
+            .sql("CREATE FUNCTION deep_keep(a INT) RETURNS INT RETURN a * 2")
+            .await
+            .unwrap();
+        assert_eq!(
+            i32_col(&engine, "SELECT deep_keep(5) AS value").await,
+            vec![10]
+        );
+        let before = engine.export_udfs_json();
+        let body = format!("{}a{}", "(".repeat(200), ")".repeat(200));
+        let err = engine
+            .sql(&format!(
+                "CREATE OR REPLACE FUNCTION deep_keep(a INT) RETURNS INT RETURN {body}"
+            ))
+            .await
+            .expect_err("a too-deep replacement must fail at CREATE OR REPLACE");
+        assert!(
+            matches!(err, Error::Plan(ref msg) if msg.contains("unsupported SQL function body")),
+            "got {err}"
+        );
+        assert_eq!(engine.export_udfs_json(), before);
+        assert_eq!(
+            i32_col(&engine, "SELECT deep_keep(5) AS value").await,
+            vec![10]
+        );
+    }
+
+    /// The bound must not reject supported bodies: nesting up to the
+    /// documented limit of 100 still parses and evaluates.
+    #[tokio::test]
+    async fn sql_udf_accepts_nesting_to_the_documented_limit() {
+        let engine = crate::Engine::new();
+        let body = format!("{}7{}", "(".repeat(100), ")".repeat(100));
+        engine
+            .sql(&format!(
+                "CREATE FUNCTION deep_ok() RETURNS INT RETURN {body}"
+            ))
+            .await
+            .expect("nesting at the documented limit is inside the supported subset");
+        assert_eq!(i32_col(&engine, "SELECT deep_ok() AS value").await, vec![7]);
     }
 }

@@ -92,6 +92,8 @@ jobs:
           rustup component add rustfmt
           rustc --version && cargo --version
       - run: cargo fmt --all -- --check
+      - name: CI resource ownership contracts (offline)
+        run: python3 -B scripts/tests/test_ci_ownership.py
       - name: ASG membership bootstrap tests
         run: bash deploy/packer/tests/test_asg_membership.sh
       - name: Session Manager contracts
@@ -116,7 +118,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     # Fail fast rather than burning an hour on a wedged runner. The suite compiles the workspace
-    # twice over (see the disk-reclaim step) and then runs the distributed tests serially, so the
+    # twice over and then runs the distributed tests serially, so the
     # honest ceiling is well above the ~10 min this takes on `main`. 180: the limited-debuginfo
     # switch (CARGO_PROFILE_*_DEBUG=1 below, `debug = 1`) invalidated the cached dev/test artifacts,
     # so the first run after it recompiles the world and blew the old 90 min ceiling — a
@@ -124,45 +126,13 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
-      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
-      - name: Add Rust toolchain to PATH (self-hosted runner)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      # `iceberg` 0.8 is the newest release compatible with the pinned Rust 1.90, and it pulls
-      # `parquet`/`arrow` 57 alongside the workspace's 58. `cargo test --workspace` therefore builds
-      # two full Arrow stacks plus a test binary per crate, which overruns the ~14 GB a standard
-      # runner leaves free and kills the job with no log to show for it. Reclaiming the preinstalled
-      # SDKs buys ~25 GB. This can go away once the toolchain moves to 1.92+ and `iceberg` 0.9 can
-      # share the workspace's Arrow.
-      - name: Reclaim runner disk
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
-          df -h /
-      - name: Start MinIO service container
-        run: |
-          # Self-hosted runners are persistent: a canceled earlier job can leave the
-          # container behind, and docker run --name then fails with a name conflict.
-          docker rm -f oxidant-minio 2>/dev/null || true
-          docker run -d --name oxidant-minio \
-            -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin123 \
-            quay.io/minio/minio:latest server /data
-          for _ in $(seq 1 30); do
-            curl -fsS http://127.0.0.1:9000/minio/health/live && break
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:9000/minio/health/live
-          docker run --rm --network host \
-            -e MC_HOST_local=http://minioadmin:minioadmin123@127.0.0.1:9000 \
-            minio/mc mb --ignore-existing local/oxidant-test
-      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
-        run: |
-          rustup show
-          rustup component add clippy
-          rustc --version && cargo --version
+      # Self-healing: reinstalls rustup (pinned, checksum-verified) if the runner's
+      # home-directory install is gone, then installs the rust-toolchain.toml pin.
+      - uses: ./.github/actions/setup-rust
+      # Persistent runner: capacity is provisioned by its operator, not reclaimed
+      # by deleting shared SDKs or another job's tool cache.
+      - name: Report runner disk capacity
+        run: df -h /
       # Sole writer of the shared cache. Every job below restores this same key with
       # `save-if: false`: they all use one key, and GitHub only lets one job reserve it, so
       # without a designated writer they race and the first to finish wins. That was the
@@ -184,18 +154,23 @@ jobs:
       # two_sharded_tables_auto_shuffle_join; cargo test runs the binaries serially and stays
       # well under that.
       - name: test (workspace)
-        run: cargo test --workspace
+        run: python3 -B scripts/ci_minio.py run -- cargo test --workspace
         env:
           OXIDANT_MINIO_TEST: "1"
-          OXIDANT_MINIO_ENDPOINT: "http://127.0.0.1:9000"
           # Limited debug info (debug = 1): the full test/dev profiles' debuginfo makes each
           # oxidant-execution integration binary ~1-2 GB at link time, and linking them in
           # parallel exhausts the runner's free disk (collect2: ld terminated with signal 7
           # [Bus error] on main, 2026-07-30 — `ld` mmaps its output file, so ENOSPC surfaces
-          # as SIGBUS rather than "No space left on device"). Compare the disk-reclaim step
-          # above, which buys headroom for the same job. Assertions/backtraces are unaffected.
+          # as SIGBUS rather than "No space left on device"). Persistent-runner capacity
+          # is reported above, not reclaimed from shared SDKs. Assertions/backtraces are unaffected.
           CARGO_PROFILE_TEST_DEBUG: "1"
           CARGO_PROFILE_DEV_DEBUG: "1"
+      - name: Clean up owned MinIO containers
+        if: always()
+        run: |
+          if [[ -n "${CI_MINIO_STATE:-}" ]]; then
+            python3 -B scripts/ci_minio.py cleanup "$CI_MINIO_STATE"
+          fi
       # Spark-SQL parity ratchet, folded in from the old standalone parity job: the binary
       # compiles incrementally on this job's workspace artifacts, and one fewer job means one
       # fewer checkout + cache restore. Fails the run if parity drops below parity/baseline.json.
@@ -476,12 +451,7 @@ jobs:
       OXIDANT_TPC_DATA: ${{ github.workspace }}/.tpc-data
     steps:
       - uses: actions/checkout@v4
-      - name: Add Rust toolchain to PATH (self-hosted runner)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
-        run: |
-          rustup show
-          rustc --version && cargo --version
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace
@@ -504,7 +474,9 @@ jobs:
         run: cargo build -p oxidant-bench
       - name: Fetch + build official TPC kits (dbgen / dsdgen)
         run: |
-          command -v gcc >/dev/null || { sudo apt-get update -y && sudo apt-get install -y build-essential flex bison; }
+          for tool in gcc g++ make flex bison; do
+            command -v "$tool" >/dev/null || { echo "Missing host build dependency: $tool (runner operator must provision it)" >&2; exit 1; }
+          done
           export DATA_ROOT="$(dirname "$OXIDANT_TPC_KITS")"
           export KITS_DIR="$OXIDANT_TPC_KITS"
           mkdir -p "$KITS_DIR" "$OXIDANT_TPC_DATA"
@@ -520,10 +492,14 @@ jobs:
         id: duckdb
         continue-on-error: true
         run: |
-          command -v unzip >/dev/null || { sudo apt-get update -y && sudo apt-get install -y unzip; }
-          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.3.2/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
-          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
-          duckdb --version
+          command -v unzip >/dev/null || { echo "Missing host dependency: unzip (runner operator must provision it)" >&2; exit 1; }
+          duckdb_dir=$(mktemp -d "${RUNNER_TEMP:?}/oxidant-duckdb.XXXXXXXX")
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.3.2/duckdb_cli-linux-amd64.zip -o "$duckdb_dir/duckdb.zip"
+          unzip -q "$duckdb_dir/duckdb.zip" -d "$duckdb_dir"
+          "$duckdb_dir/duckdb" --version
+          # The unchanged Rust oracle resolves `duckdb` from PATH first.
+          # Export only after successful setup, preserving the optional outcome.
+          echo "$duckdb_dir" >> "$GITHUB_PATH"
       - name: TPC-H coverage (official dbgen SF1)
         run: cargo run -p oxidant-bench -- tpch --sf 1 --data "${OXIDANT_TPC_DATA}/tpch-sf1"
       - name: TPC-H distributed (2 workers, SF1)
@@ -561,14 +537,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
-      # Self-hosted runner: rustup/cargo live in the ubuntu user's home and are not on the
-      # runner service's default PATH (GitHub-hosted images preinstall them system-wide).
-      - name: Add Rust toolchain to PATH (self-hosted runner)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
-        run: |
-          rustup show
-          rustc --version && cargo --version
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace

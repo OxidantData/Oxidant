@@ -118,7 +118,7 @@ other 3 first-pass statements were setup/DDL warm-ups (see methodology table).
 | `CREATE TEMPORARY VIEW` | Supported | `CREATE TEMPORARY VIEW cov_tv AS SELECT id FROM cov_t` → OK; `SHOW VIEWS` reports it with `isTemporary = true`. Temp/persistent distinction is tracked in `Engine::sql` (`temp_views`, `analyze_create_view`) since DataFusion has none. | — |
 | `CREATE MATERIALIZED VIEW` | N/A (interactive) / Supported (SDP) | Interactive `spark.sql`: `Materialized views not supported`. **Pipeline context:** `DefineSqlGraphElements` / `StartRun` materializes MVs via the declarative runner (full recompute + atomic replace). | — |
 | `CREATE STREAMING TABLE` | N/A (interactive) / Supported (SDP) | Interactive `spark.sql`: parser rejects `STREAMING`. **Pipeline context:** `DefineSqlGraphElements` + `StartRun` builds streaming tables from Kafka/spool sources and SQL flows. | — |
-| `CREATE FUNCTION` (SQL body) | Partial | `CREATE OR REPLACE FUNCTION cov_add2(x INT) RETURNS INT RETURN x + 100` → OK, but `SELECT cov_add2(1)` → `1` and `SELECT cov_add2(5)` → `1`. The definition registers (`crates/oxidant-loom/src/udf_registry.rs` → `try_create_function`) but the body is not evaluating the argument. | KAN-110 |
+| `CREATE FUNCTION` (SQL body) | Partial | The earlier fabricated-`1` result is repaired for the [local integer subset](#local-integer-sql-function-subset). Parameter expressions evaluate per row; unsupported bodies and return types are rejected before registration. Full typing and client/worker acceptance remain separate. | KAN-110 / #174 |
 | `CREATE CATALOG` | Missing | `CREATE CATALOG IF NOT EXISTS cov_cat` → `ParserError("Expected: an object type after CREATE, found: CATALOG")` | KAN-100 |
 | `CREATE CONNECTION` | N/A | `CREATE CONNECTION cov_conn TYPE mysql …` → `ParserError("… found: CONNECTION")`. Unity Catalog Lakehouse Federation object. | — |
 | `CREATE EXTERNAL LOCATION` / `CREATE CREDENTIAL` | N/A | `CREATE EXTERNAL LOCATION cov_loc URL 's3://b/p' …` → `ParserError("Expected: TABLE, found: LOCATION")`. Unity Catalog securable. | — |
@@ -321,7 +321,45 @@ functions are the ones that actually failed.
 | Misc / system functions | Partial | 4/15. Working: `current_catalog`, `current_database`, `current_schema`, `version`, `uuid`, `assert_true`. Missing: `current_user`/`user`/`session_user`, `current_version`, `monotonically_increasing_id`, `spark_partition_id`, `input_file_name`, `raise_error`, `aes_encrypt`, `bitmap_count`, `java_method`, `reflect`, `stack`. | KAN-93 |
 | Geospatial functions (`ST_*`) | Missing | 0/3 — `st_point`, `st_area`, `st_astext` → `Invalid function`. | KAN-93 |
 | AI functions (`ai_query`, `ai_analyze_sentiment`, `vector_search`) | N/A | 0/3 — all `Invalid function`. Require a managed platform's model-serving / vector-search integration. | — |
-| SQL UDFs (`CREATE FUNCTION … RETURN`) | Partial | Registers, but evaluates wrong: after `CREATE OR REPLACE FUNCTION cov_add2(x INT) RETURNS INT RETURN x + 100`, both `SELECT cov_add2(1)` and `SELECT cov_add2(5)` → `1`. | KAN-110 |
+| SQL UDFs (`CREATE FUNCTION … RETURN`) | Partial | [Local integer subset](#local-integer-sql-function-subset): `RETURN a * 2` on inputs 2 and 5 returns 4 and 10 with the declared integer output type, not a fabricated constant. | KAN-110 / #174 |
+
+### Local integer SQL function subset
+
+Local row-returning `Engine::sql` and `Engine::sql_with_stats` queries can invoke
+SQL functions created through `Engine::sql`. The supported body subset is integer
+literals, `NULL`, parameter references, parentheses, unary minus, and `+`, `-`, `*`.
+Return types are `INT`/`INTEGER` and `BIGINT`/`LONG`. Values are evaluated per row;
+null operands propagate nulls. Line comments end at LF (including CRLF), so later
+body tokens are still parsed and validated. `/`, nested function calls, unknown
+identifiers and unsupported return types are rejected at CREATE rather than
+replaced with a default result. An invalid replacement leaves the old definition
+and callable unchanged. Body expressions nested deeper than 100 levels are
+rejected at CREATE with the same unsupported-body error: the body parser runs
+before any engine recursion gate, so without this limit a deeply nested body
+could overflow the engine's 32 MiB thread stack and abort the process (the
+same shape through plain `SELECT` is rejected by the engine's recursion limit
+of 50).
+
+```sql
+CREATE FUNCTION review_double(a INT) RETURNS INT RETURN a * 2;
+SELECT review_double(v) AS value FROM (VALUES (2), (5)) AS t(v) ORDER BY v;
+-- 4, 10
+```
+
+Coverage: `udf_registry::tests`, `tests/session_current_names.rs`, and
+`tests/session_sql_udf.rs` in `oxidant-loom`. The combined tests feed a varying
+nullable column and `length(current_schema())` into one SQL UDF, through both
+local entry points, concurrent sessions, repeated SQL after USE/replacement, and
+local join replanning. Catalog-name fixtures are in-process; they do not establish
+external catalog-provider integration.
+
+This is not full Spark SQL function support. Declared parameter typing, general
+coercion and mixed-width ANSI arithmetic are not established. UDF registration
+remains shared between engine session handles; session-specific current-name
+snapshots do not imply UDF-registry isolation. Stock-PySpark/Connect clients,
+streaming, distributed worker propagation, worker-sync atomicity and distributed
+plan-cache invalidation require separate acceptance. No parity baseline or
+full-corpus metric is updated by these focused tests.
 
 ## G. Data types
 

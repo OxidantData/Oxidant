@@ -201,21 +201,18 @@ $ curl -s http://localhost:18080/api/2.1/unity-catalog/iceberg/v1/catalogs/unity
 
 Reaching plain Delta tables would require a native Unity Catalog API client. There is none.
 
-### `current_catalog()` does not report the default catalog
+### `current_catalog()` / `current_database()` follow the session
 
-```
->>> SELECT current_catalog() AS c, current_database() AS d
-+---------------+---------+
-|             c |       d |
-+---------------+---------+
-| spark_catalog | default |
-+---------------+---------+
-```
+For local row-returning queries through `Engine::sql` and `Engine::sql_with_stats`,
+`current_catalog()`, `current_database()` and `current_schema()` use an immutable
+snapshot of the session's catalog/namespace at execution planning. This includes
+multi-partition queries: DataFusion carries the snapshot in its physical expressions,
+not a Tokio task-local. A later `USE` or `setCurrentCatalog` is visible to the next
+query, including identical SQL; concurrent sessions do not share the snapshot.
+The shared function registry and reusable logical plans remain unbound.
 
-Name *resolution* honors the default catalog (2-part and bare names resolve into `uc`), but the
-`current_catalog()` / `current_database()` SQL functions are not wired to the session's
-catalog pointers and still report the builtin. `SHOW`/`DESCRIBE` and `USE` do read the session
-state; only these two functions are wrong.
+This local-engine regression coverage does not establish propagation through
+`sql_stream` or distributed stage execution, or stock-PySpark end-to-end coverage.
 
 ### Not covered
 
