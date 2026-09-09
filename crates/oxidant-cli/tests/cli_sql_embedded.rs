@@ -237,3 +237,38 @@ fn an_explicit_url_still_routes_to_the_rest_api() {
         "the query must NOT have been answered locally"
     );
 }
+
+/// Issue #206: `oxidant sql --port 41990 -e …` used to *silently ignore* `--port` (it is an
+/// `oxidant start` flag; `sql` never had one) and run the statement in an embedded engine
+/// with no sample data — reporting a healthy, just-started server's sample tables as
+/// `not found`. Unknown flags are now refused at parse time, before any engine boots, and
+/// `--port`'s error names the remedy.
+#[test]
+fn an_unknown_flag_is_refused_and_port_names_the_url_flag() {
+    let output = run_sql(&["--port", "41990", "-e", "SELECT 1"]);
+    assert!(
+        !output.status.success(),
+        "--port must be refused, not silently ignored"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown flag `--port`"),
+        "the error should name the flag, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--url"),
+        "the error should name the remedy, got: {stderr}"
+    );
+    assert!(
+        !stdout_of(&output).contains("1"),
+        "the query must NOT have run anywhere"
+    );
+
+    let output = run_sql(&["-e", "SELECT 1", "--serve"]);
+    assert!(!output.status.success(), "unknown flags must be refused");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown flag `--serve`"),
+        "the error should name the flag, got: {stderr}"
+    );
+}
