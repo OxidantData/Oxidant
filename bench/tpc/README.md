@@ -114,6 +114,22 @@ total. Footer validation and content hashing happen before publication and on
 reuse. A changed readable file, corrupt footer, missing/extra file, nested output
 or symlink cannot qualify as that completed table.
 
+TPC-DS also checks **required-table coverage**: without `--only`, both conversion
+and `--check-complete` require all 24 tables declared in `tpcds_columns.tsv`.
+`--only income_band,reason` is an intentional subset, not a full-suite certificate.
+Every requested name must match a declared table exactly and have raw sources;
+checks additionally require completed output for every requested table. Empty
+selections/tokens, unknown names, case changes and surrounding whitespace are
+refused, not normalized or silently dropped. Repeated valid names are harmless.
+
+The shared TPC-DS selection plan checks all required inputs before creating output,
+discarding staging or replacing any table, including with `--force`. Each selected
+source must be a file, and every required table needs a nonempty source. Empty
+parallel children remain allowed alongside nonempty children. Existing parallel
+`table_CHILD_TOTAL.dat` files still take precedence over `table.dat`; this is not
+validation of the expected child-index set. `dbgen_version` and other unclassified
+raw files are ignored by both paths and cannot satisfy missing table coverage.
+
 A successful check leaves files untouched. A failed check exits nonzero; ordinary
 conversion rebuilds the affected table from the selected raw inputs, preserving
 other completed tables. Version 1 markers and missing/invalid markers are
@@ -130,15 +146,18 @@ with an existing PyArrow installation:
 python3 -m unittest discover -s bench/tpc/tests -p 'test_*.py' -v
 ```
 
-This is **table-output integrity**, not a full dataset or benchmark certificate.
-The marker does not yet bind expected generator child indices, generator/scale,
-converter/schema/settings identity or a dataset-wide committed generation.
-TPC-DS `--only` validates only selected input tables, not the full suite; required
-table coverage, concurrent publishers and interruption during directory promotion
-remain separate acceptance work. Registration/other readers are not changed to
-enforce this validator. A checksum detects drift relative to the emitted marker,
-not malicious coordinated replacement of both metadata and data, or SQL result
-correctness. Existing historical timings and parity baselines are unchanged.
+These are **table-output integrity and required-table coverage**, separate from
+full dataset or benchmark certification. They do not establish expected generator
+child indices, generator revision/scale factor, raw-byte completeness relative to
+the intended generator run, or converter/schema/settings identity. Preflight is
+not whole-dataset atomicity: later parsing/I/O failures may follow publication of
+earlier tables, and concurrent publication or interruption during promotion remain
+separate acceptance work. Registration/consumer readers are not changed to enforce
+this validator. A checksum detects drift relative to the emitted marker, not
+malicious coordinated replacement of metadata and data or SQL result correctness.
+The regression fixtures are tiny authored flat files, including all 24 table
+names; they are not toolkit-generated scale data, SQL or benchmark execution.
+Existing historical timings and parity baselines are unchanged.
 
 ## Kits / license
 

@@ -490,15 +490,10 @@ def _tpcds_sources(raw: Path) -> dict[str, list[Path]]:
     return by_table
 
 
-def convert_tpcds(
-    raw: Path,
-    out: Path,
-    row_group: int,
-    target_part_bytes: int,
-    *,
-    force: bool = False,
-    only: set[str] | None = None,
-) -> None:
+def _tpcds_plan(
+    raw: Path, only: set[str] | None
+) -> list[tuple[str, list[Path], pa.Schema]]:
+    """Resolve every required table before checking or publishing any output."""
     here = Path(__file__).resolve().parent
     cols_path = here / "tpcds_columns.tsv"
     types_path = here / "tpcds_types.tsv"
@@ -508,18 +503,42 @@ def convert_tpcds(
         )
     schemas = load_tpcds_schemas(cols_path, types_path)
 
+    required = set(schemas) if only is None else only
+    if not required:
+        raise ValueError("no TPC-DS tables selected")
+    unknown = required - schemas.keys()
+    if unknown:
+        raise ValueError(f"unknown TPC-DS tables: {', '.join(sorted(unknown))}")
     by_table = _tpcds_sources(raw)
-    if not by_table:
-        raise SystemExit(f"no .dat files under {raw}")
-    for name, sources in sorted(by_table.items()):
-        if name == "dbgen_version":
-            continue
-        if only is not None and name not in only:
-            continue
-        schema = schemas.get(name)
-        if schema is None:
-            print(f"[parquet] skip unknown table `{name}` (not in {cols_path.name})")
-            continue
+    missing = required - by_table.keys()
+    if missing:
+        raise ValueError(f"missing TPC-DS sources under {raw}: {', '.join(sorted(missing))}")
+    for name in sorted(required):
+        sources = by_table[name]
+        if not all(src.is_file() for src in sources):
+            raise ValueError(f"TPC-DS sources for {name} must be files")
+        # Empty parallel children are allowed, but a wholly empty table is not
+        # convertible under the existing table writer's contract.
+        if not any(src.stat().st_size > 0 for src in sources):
+            raise ValueError(f"no non-empty sources for table {name}")
+    # Unclassified raw files are not required tables and cannot establish coverage.
+    return [(name, by_table[name], schemas[name]) for name in sorted(required)]
+
+
+def convert_tpcds(
+    raw: Path,
+    out: Path,
+    row_group: int,
+    target_part_bytes: int,
+    *,
+    force: bool = False,
+    only: set[str] | None = None,
+) -> None:
+    try:
+        plan = _tpcds_plan(raw, only)
+    except (OSError, ValueError) as e:
+        raise SystemExit(str(e)) from None
+    for name, sources, schema in plan:
         dest = out / name
         _convert_table(
             name,
@@ -546,17 +565,11 @@ def dataset_is_complete(
             if not sources or not table_is_complete(out / name, sources):
                 return False
         return True
-    by_table = _tpcds_sources(raw)
-    if not by_table:
+    try:
+        plan = _tpcds_plan(raw, only)
+    except (OSError, ValueError):
         return False
-    for name, sources in by_table.items():
-        if name == "dbgen_version":
-            continue
-        if only is not None and name not in only:
-            continue
-        if not table_is_complete(out / name, sources):
-            return False
-    return True
+    return all(table_is_complete(out / name, sources) for name, sources, _ in plan)
 
 
 def main() -> None:
@@ -579,8 +592,8 @@ def main() -> None:
     )
     ap.add_argument(
         "--only",
-        default="",
-        help="Comma-separated table names to convert (TPC-DS only)",
+        default=None,
+        help="Comma-separated exact table names (TPC-DS only); omit for all declared tables",
     )
     ap.add_argument(
         "--check-complete",
@@ -588,12 +601,13 @@ def main() -> None:
         help="Exit 0 if every required table has a matching completion marker; do not convert.",
     )
     args = ap.parse_args()
-    only = {t.strip() for t in args.only.split(",") if t.strip()} or None
+    # An explicit empty/invalid token must not become the default full suite.
+    only = set(args.only.split(",")) if args.only is not None else None
     if args.check_complete:
         ok = dataset_is_complete(args.suite, args.raw, args.out, only=only)
         sys.exit(0 if ok else 1)
-    args.out.mkdir(parents=True, exist_ok=True)
     if args.suite == "tpch":
+        args.out.mkdir(parents=True, exist_ok=True)
         convert_tpch(
             args.raw,
             args.out,
